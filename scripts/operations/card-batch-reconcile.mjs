@@ -1,4 +1,5 @@
 /** Periodic terminal-PR recovery, pending-card drain and due-batch flush. */
+import { DRAIN_HARD_DEADLINE_MS } from '../lib/tick-deadline.mjs';
 import { drainCursorPath, readDrainCursor, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
 import { reconcileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
 import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
@@ -75,6 +76,8 @@ export async function reconcileCardBatches({
   // permanently busy spool cannot starve the owed filings (or the reverse).
   const cursorPath = drainCursorPath(stateDir);
   const deadlineAt = tickStart + drainBudgetMs;
+  // Nothing the drain STARTS may run past this: every wait and subprocess in it is capped at the time left (tick-deadline.mjs).
+  const hardDeadlineAt = tickStart + DRAIN_HARD_DEADLINE_MS;
   // ONE card allowance for the whole tick, shared by the spool drain and the owed filings (including a filing's nested drain).
   const counter = { left: 0 };
   const acquireWaitMs = () => Math.min(DRAIN_ACQUIRE_WAIT_MS, Math.max(0, deadlineAt - clock()));
@@ -96,7 +99,7 @@ export async function reconcileCardBatches({
           const result = await drain({ drainPending: true, session: `card-batch-reconcile-${randomUUID()}` }, {
             pendingDir, write: line => log(line.trimEnd()),
             batch: (input, options) => batch(input, { ...options, stateDir }),
-            drainLimit: { counter, deadlineAt, now: clock, cursorPath, acquireWaitMs: acquireWaitMs(), acquireWait: acquireWaitMs },
+            drainLimit: { counter, deadlineAt, hardDeadlineAt, now: clock, cursorPath, acquireWaitMs: acquireWaitMs(), acquireWait: acquireWaitMs },
           });
           if (!result.ok) throw new Error(result.reason ?? 'pending drain failed');
           // No lane in time: this tick's drain is over (the owed step would only wait for the same pool).
@@ -110,9 +113,9 @@ export async function reconcileCardBatches({
   const drainOwedStep = async () => {
     if (loadFilingSettings().filingEnabled === false || clock() >= deadlineAt || drainDeferred || counter.left <= 0) return;
     try {
-      const owed = await reconcileOwedPrevention({ stateDir, deadlineAt, now: clock, cursorPath, counter,
+      const owed = await reconcileOwedPrevention({ stateDir, deadlineAt, hardDeadlineAt, now: clock, cursorPath, counter,
         file: input => fileOwed(input, { owedClaimed: true, loadFilingSettings, pendingDir, skipPendingDrain: true,
-          drainLimit: { deadlineAt, now: clock }, acquireWait: acquireWaitMs,
+          drainLimit: { deadlineAt, hardDeadlineAt, now: clock }, acquireWait: acquireWaitMs,
           batch: (card, options) => batch(card, { ...options, stateDir }), write: line => log(line.trimEnd()) }),
       });
       for (const result of owed) {

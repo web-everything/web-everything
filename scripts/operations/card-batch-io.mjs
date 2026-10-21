@@ -1,4 +1,5 @@
 /** Durable card admission: exclusive lease, isolated Git objects, remote recovery, atomic membership. */
+import { boundExec } from '../lib/tick-deadline.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   closeSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync,
@@ -388,6 +389,8 @@ export async function admitCard(input, {
   owner = `${process.pid}:${randomUUID()}`, policy, leaseMs = 60_000, crashAt, hook,
   gh = defaultGh,
   log = line => process.stderr.write(`${line}\n`),
+  // In-tick callers pass a hard deadline: every git call below is capped at the time left and none starts past it.
+  deadline,
 } = {}) {
   const now = () => ms(clock());
   const initial = planAdmit({ state: null, input, policy, now: now(), owner });
@@ -439,7 +442,7 @@ export async function admitCard(input, {
     const seq = recorded?.batchRef ? recorded.seq : (recorded?.seq ?? 0) + 1;
     const ref = `refs/heads/${recorded?.batchRef ?? `lane/card-batch-${input.kind}-${seq}`}`;
     scratch = mkdtempSync(join(tmpdir(), 'card-batch-'));
-    const git = gitIn(scratch);
+    const git = gitIn(scratch, boundExec(execFileSync, deadline));
     // Resolve remote aliases in the producer repo; all writes happen in this private repository.
     let target = remote;
     const aliases = git(['remote'], { cwd: repoDir }).trim().split('\n');

@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, linkSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { STEP_MIN_MS } from './tick-deadline.mjs';
 import { cursorSeed, readDrainCursor, rotateAfter, writeDrainCursor } from './prevention-drain-cursor.mjs';
 import { acquireLease, atomicRecord, cardBatchStateDir, tokenOf } from '../operations/card-batch-io.mjs';
 
@@ -51,7 +52,7 @@ export async function fileOwedPrevention(input, file, { stateDir = cardBatchStat
 // `maxFilings`/`deadlineAt`/`cursorPath` are the health-watch tick's cap: at most `maxFilings` filings are STARTED, none
 // once the deadline has passed, and the cursor makes the next call resume after the last one handled (round-robin).
 export async function reconcileOwedPrevention({ stateDir = cardBatchStateDir(), file,
-  maxFilings = Infinity, deadlineAt = Infinity, now = Date.now, cursorPath, counter } = {}) {
+  maxFilings = Infinity, deadlineAt = Infinity, now = Date.now, cursorPath, counter, hardDeadlineAt = Infinity } = {}) {
   let names;
   try { names = readdirSync(directory(stateDir)); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
   names = names.filter(name => /^[a-f0-9]{64}\.json$/.test(name)).sort();
@@ -67,13 +68,13 @@ export async function reconcileOwedPrevention({ stateDir = cardBatchStateDir(), 
       if (!record) continue;
       if (record.status === 'done') continue;
     } catch (e) {
-      if (now() >= deadlineAt || (counter ? counter.left <= 0 : started >= maxFilings)) break;
+      if (now() >= deadlineAt || hardDeadlineAt - now() < STEP_MIN_MS.owedFiling || (counter ? counter.left <= 0 : started >= maxFilings)) break;
       started++; if (counter) counter.left--;
       results.push({ ok: false, step: 'owed', reason: `owed record ${name.slice(0, 12)} unreadable: ${e.message}` });
       if (cursorPath) writeDrainCursor(cursorPath, { owed: name });
       continue;
     }
-    if (now() >= deadlineAt || (counter ? counter.left <= 0 : started >= maxFilings)) break;
+    if (now() >= deadlineAt || hardDeadlineAt - now() < STEP_MIN_MS.owedFiling || (counter ? counter.left <= 0 : started >= maxFilings)) break;
     started++;
     if (counter) counter.left--;
     try {

@@ -106,6 +106,7 @@ import {
   remainingAfter,
 } from '../lib/card-dedupe.mjs';
 
+import { STEP_MIN_MS, boundExec, isBudgetError, makeDeadline } from '../lib/tick-deadline.mjs';
 import { cursorSeed, readDrainCursor, rotateAfter, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
 
@@ -396,6 +397,8 @@ export async function drainPendingPrevention({ lane }, {
   // behind the others instead of blocking the head. Unset = the whole spool in order, as before.
   // `counter` ({left}) is one card allowance shared with the other drain steps of the same tick.
   maxCards = Infinity, deadlineAt = Infinity, now = Date.now, cursorPath, counter,
+  // The HARD deadline of the tick's drain: no card is started with too little time left to finish it.
+  hardDeadlineAt = Infinity,
 } = {}) {
   let entries;
   try { entries = readdirSync(pendingDir).filter(name => name.endsWith('.json')).sort(); }
@@ -407,6 +410,7 @@ export async function drainPendingPrevention({ lane }, {
   let started = 0;
   for (const name of entries) {
     if (now() >= deadlineAt) break;
+    if (hardDeadlineAt - now() < STEP_MIN_MS.pendingCard) break;
     // The allowance is spent BEFORE any per-card work (parse, ls-tree, admission): a lookup that throws still counts as an attempt,
     // so a failing spool cannot be walked card by card past the cap.
     if (counter ? counter.left-- <= 0 : started++ >= maxCards) break;
@@ -433,7 +437,10 @@ export async function drainPendingPrevention({ lane }, {
         rmSync(path);
         write(`land-prevention-card: batched ${entry.rel} into ${result.batchRef} (from the pending spool)\n`);
       }
-    } catch (error) { write(`land-prevention-card: pending ${name} retained — ${errorReason(error)}\n`); }
+    } catch (error) {
+      write(`land-prevention-card: pending ${name} retained — ${errorReason(error)}\n`);
+      if (isBudgetError(error)) break; // out of tick time mid-card: it stays in the spool and is retried first next tick
+    }
     // Handled, landed or not: the next tick resumes after it, so a refused card is behind every other one.
     if (cursorPath) writeDrainCursor(cursorPath, { pending: name });
   }
@@ -514,7 +521,7 @@ export async function landPreventionCard(input, options = {}) {
 }
 
 async function landPreventionCardImpl(input, {
-  exec = defaultExec,
+  exec: execRaw = defaultExec,
   pendingDir = pendingPreventionDir(),
   write = (line) => process.stdout.write(line),
   mkTmp = () => mkdtempSync(join(tmpdir(), 'land-prevention-card-')),
@@ -531,6 +538,16 @@ async function landPreventionCardImpl(input, {
   acquireWait,
   skipPendingDrain = false,
 } = {}) {
+  // Inside the health-watch tick (`drainLimit.hardDeadlineAt`) EVERY wait and subprocess below is capped at the time left, and a
+  // step the remaining time cannot cover is deferred (card stays in the spool / owed) rather than started.
+  const inTick = drainLimit.hardDeadlineAt !== undefined;
+  const deadline = inTick ? makeDeadline(drainLimit.hardDeadlineAt, drainLimit.now ?? Date.now) : undefined;
+  const exec = boundExec(execRaw, deadline);
+  const outOfBudget = (error) => inTick && (isBudgetError(error) || deadline.left() <= 0);
+  const deferTick = (step, why) => {
+    write(`land-prevention-card: ${why}; deferred to the next tick\n`);
+    return { ok: true, skipped: true, deferred: true, step, pr: null };
+  };
   const filing = loadFilingSettings();
   write(`${formatPreventionBatchSettings(filing)}\n`);
   if (filing.filingEnabled === false) {
@@ -595,7 +612,7 @@ async function landPreventionCardImpl(input, {
       // A real child failure carries the pool's diagnostic on stderr, after the `Command failed:` line.
       const text = [e?.message, e?.stderr, e?.stdout].map(part => String(part ?? '')).join('\n');
       // A capped acquire that found no lane in time ends this tick's drain: the cards stay put (an owed filing stays owed), no error.
-      if (waitMs !== undefined && (e?.killed || e?.code === 'ETIMEDOUT' || isNoLaneInTime(text))) {
+      if (waitMs !== undefined && (e?.killed || e?.code === 'ETIMEDOUT' || isNoLaneInTime(text) || outOfBudget(e))) {
         write(`land-prevention-card: no lane within ${waitMs}ms; deferred to the next tick\n`);
         return { ok: true, skipped: true, deferred: true, step: 'acquire-deferred', pr: null };
       }
@@ -620,7 +637,10 @@ async function landPreventionCardImpl(input, {
       write('land-prevention-card: tick deadline reached after the lane acquire; deferred to the next tick\n');
       return { ok: true, skipped: true, deferred: true, step: 'deadline-deferred', pr: null };
     }
-    if (!skipPendingDrain) await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write, ...drainLimit });
+    if (!skipPendingDrain) {
+      await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write, batchOptions: inTick ? { deadline } : {}, ...drainLimit,
+        hardDeadlineAt: inTick ? drainLimit.hardDeadlineAt : Infinity });
+    }
     if (input.foldOpenSingles) {
       const summary = await foldOpenSingles({ lane }, { exec, batch, write });
       return { ok: true, step: 'folded', ...summary };
@@ -629,10 +649,15 @@ async function landPreventionCardImpl(input, {
 
 
     // DEDUPE BEFORE FILING. A failure here never blocks the filing: it files exactly as before.
+    if (inTick && deadline.left() < STEP_MIN_MS.dedupe + STEP_MIN_MS.fileItem + STEP_MIN_MS.admit) {
+      return deferTick('budget-deferred', 'not enough tick time left for dedupe + file-item + admission');
+    }
     let plan = null;
     try {
-      plan = dedupe(input, { lane, write });
+      plan = dedupe(input, { lane, write, ...(inTick ? { readPrCards: dir => readPrHostedCards({
+        exec: (c, a, o) => String(execFileSyncThrottled(c, a, { ...o, timeout: Math.max(1_000, deadline.left()) })), cwd: dir }) } : {}) });
     } catch (e) {
+      if (outOfBudget(e)) return deferTick('budget-deferred', 'tick time ran out during dedupe');
       write(`land-prevention-card: dedupe failed, filing as before — ${String(e?.message || e).split('\n')[0]}\n`);
     }
     const mentioned = []; // mentions appended to a card in THIS lane (landed by the PR below)
@@ -688,9 +713,11 @@ async function landPreventionCardImpl(input, {
       ];
       let filed;
       try {
+        if (inTick && deadline.left() < STEP_MIN_MS.fileItem + STEP_MIN_MS.admit) return deferTick('budget-deferred', 'not enough tick time left for file-item + admission');
         filed = parseRunJsonTail(exec('node', fileArgv, { cwd: lane, timeout: FILE_ITEM_TIMEOUT_MS }));
       } catch (e) {
         filed = parseRunJsonTail(e?.stdout);
+        if (!filed && outOfBudget(e)) return deferTick('budget-deferred', 'tick time ran out during file-item');
         if (!filed) return fail('file-item', String(e?.message || e).split('\n')[0]);
       }
       num = filed?.verdict?.num ?? null;
@@ -712,7 +739,9 @@ async function landPreventionCardImpl(input, {
         const preventionSettings = loadBatchSettings();
         const retries = Math.ceil(preventionSettings.batchLeaseWaitMinutes * 60 / 30);
         result = await batch({ laneDir: lane, cardPath: rel, kind: 'prevention', actor: 'mechanical', idemKey, source },
-          { preventionSettings, retries, pause: () => wait(30_000) });
+          { preventionSettings, retries, ...(inTick ? { deadline } : {}),
+            // The lease wait is min(configured, time left): never a 30 s sleep that outlasts the tick.
+            pause: () => wait(inTick ? Math.max(0, Math.min(30_000, deadline.left() - STEP_MIN_MS.admit - 1_000)) : 30_000) });
       } catch (error) { result = { batched: false, reason: `admission failed: ${errorReason(error)}` }; }
       if (result?.batched) {
         write(`land-prevention-card: batched ${rel} into ${result.batchRef}\n`);
@@ -726,6 +755,9 @@ async function landPreventionCardImpl(input, {
         return { ok: true, step: 'held', num, rel, pr: null, url: null, reason };
       }
     }
+
+    // The commit / verify gate / open-PR path takes up to 70 + 45 minutes: it never runs inside a tick. The card stays owed / in the spool.
+    if (inTick) return deferTick('tick-deferred', 'this filing needs its own PR (batching disabled or sidecar mentions), which cannot run inside the tick');
 
     if (mentioned.length) {
       // SHADOW (card xafcvmh): this filing adds sidecars to existing cards, so it still opens its own PR. Log what a
@@ -797,11 +829,14 @@ async function landPreventionCardImpl(input, {
       ...(recorded.length ? { mentions: recorded.length } : {}),
     };
   } catch (e) {
+    if (outOfBudget(e)) return deferTick('budget-deferred', 'tick time ran out');
     return fail('unexpected', String(e?.message || e));
   } finally {
     if (laneNum != null) {
       try {
-        exec('node', [LANE_POOL_CLI, 'release', `--lane=${laneNum}`, `--session=${input.session}`], { cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS });
+        // Release is not skipped when the budget is gone (the lane would leak until its TTL), but it is bounded: 5-30 s in a tick.
+        execRaw('node', [LANE_POOL_CLI, 'release', `--lane=${laneNum}`, `--session=${input.session}`],
+          { cwd: REPO_ROOT, timeout: inTick ? Math.min(30_000, Math.max(5_000, deadline.left())) : ACQUIRE_TIMEOUT_MS });
       } catch (e) {
         write(`land-prevention-card: lane-${laneNum} release failed (non-fatal, will age out on its own TTL) — ${String(e?.message || e)}\n`);
       }
