@@ -304,4 +304,22 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-auto-rebased');
     expect(plan.alerts.find((a) => a.kind === 'overlay-set-aside')?.detail).toMatchObject({ ref: 'lane/container' });
   });
+
+  it('a remembered head git can no longer read counts as foreign: set aside, never rebased (fail closed, Codex round 4)', async () => {
+    const f = fixture({ mode: 'on' });
+    const x1 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v1' }) });
+    f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) });
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const base = {
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
+      prState: async (pr) => (pr === PR ? 'MERGED' : 'OPEN'), prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []),
+      autoRebase: { mode: 'on', source: 'test' },
+    };
+    expect((await planRebuild(base)).decisions[0]).toMatchObject({ reason: 'applied-auto-rebased' });
+    const gone = await planRebuild({ ...base, adoptedHeads: [{ pr: 4242, sha: 'deadbeef'.repeat(5) }] });
+    expect(gone.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(gone.alerts.map((a) => a.kind)).toContain('overlay-set-aside');
+  });
 });

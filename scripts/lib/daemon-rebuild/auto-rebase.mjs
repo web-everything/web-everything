@@ -57,8 +57,23 @@ export async function mergedPrOldHeads({
   // history with X beyond main) is not this PR's content: a merge with X as base could drop it, so X is refused.
   // A head built ON X (X its ancestor — e.g. the overlay being rebased, or one stacked on it) holds X's content plus its
   // own after it: that is not foreign content INSIDE X.
-  const foreign = (sha, pr) => otherHeads.some((h) => h?.sha && Number(h.pr) !== pr && h.sha !== sha && FULL_SHA_RE.test(h.sha)
-    && !isAnc(sha, h.sha) && lines(git(['merge-base', '--all', sha, h.sha])).some((b) => !isAnc(b, mainSha)));
+  // FAIL CLOSED: a head git cannot answer for (object gone, e.g. collected after a force-push) counts as foreign — the
+  // overlay is then set aside, never rebased over work that can no longer be ruled out.
+  const ancStrict = (a, b) => {
+    const r = git(['merge-base', '--is-ancestor', a, b]);
+    return r.status === 0 ? true : r.status === 1 ? false : null;
+  };
+  const foreign = (sha, pr) => otherHeads.some((h) => {
+    if (!h?.sha || Number(h.pr) === pr || h.sha === sha) return false;
+    if (!FULL_SHA_RE.test(h.sha) || git(['cat-file', '-e', `${h.sha}^{commit}`]).status !== 0) return true;
+    const built = ancStrict(sha, h.sha);
+    if (built === null) return true;
+    if (built) return false;
+    const mb = git(['merge-base', '--all', sha, h.sha]);
+    if (mb.status === 1 && !String(mb.stdout ?? '').trim()) return false; // unrelated histories: nothing shared
+    if (mb.status !== 0) return true;
+    return lines(mb).some((b) => ancStrict(b, mainSha) !== true);
+  });
   const keep = (sha, pr) => FULL_SHA_RE.test(sha) && sha !== ovSha && isAnc(sha, ovSha) && !isAnc(sha, mainSha)
     && onlyPrOwnHistory(git, mainSha, sha) && !foreign(sha, pr);
   const found = new Map();

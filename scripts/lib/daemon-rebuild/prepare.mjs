@@ -272,6 +272,15 @@ export async function prepareRebuild({
       && !seen.has(`${h.pr}:${h.sha}`) && seen.add(`${h.pr}:${h.sha}`)
       && !(fetchedMainSha && git(['merge-base', '--is-ancestor', h.sha, fetchedMainSha]).status === 0));
     if (JSON.stringify(next) !== JSON.stringify(prev)) { state.adoptedHeads = next; writeState(); }
+    // Keep every remembered head's objects alive (a GC root per head): a collected head could no longer be checked for
+    // foreign work, and auto-rebase.mjs would then (correctly, fail closed) refuse every rebase. Best effort.
+    try {
+      const NS = 'refs/we-adopted-heads/';
+      const have = new Set(String(git(['for-each-ref', '--format=%(refname)', NS]).stdout ?? '').split('\n').filter(Boolean));
+      const want = new Set(next.map((h) => `${NS}${h.sha}`));
+      for (const h of next) if (!have.has(`${NS}${h.sha}`)) git(['update-ref', `${NS}${h.sha}`, h.sha]);
+      for (const r of have) if (!want.has(r)) git(['update-ref', '-d', r]);
+    } catch { /* best effort: a missing object only makes auto-rebase fail closed */ }
     return next;
   })();
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
