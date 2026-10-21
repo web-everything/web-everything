@@ -6,35 +6,55 @@
  *
  * WHAT IT DOES. When an overlay conflicts with main, look for HARD evidence that the overlay carries an EARLIER head X of
  * a PR that has since merged: X is an ancestor of the overlay tip, not of main, and X is
- *   - a head of that PR this clone itself merged as an overlay (a rebuild-committed `merge overlay <ref> (PR #N)` record
- *     on HEAD or its reflog), or one an earlier auto-rebase recorded (`auto-rebased past PR #N at <X>`), with PR #N MERGED;
+ *   - a head of that PR a build this clone ADOPTED applied (its own rebuild state, `state.adoptedHeads` — never commit
+ *     text, which anyone can write), with PR #N MERGED; or a base an earlier adopted auto-rebase proved;
  *   - or the `before` commit of a GitHub head_ref_force_pushed event on a PR whose merge commit is on main and whose
  *     merge touched a conflicted file.
  * Then the overlay is merged onto the build with X as the merge base (`git merge-tree --merge-base=X`). That keeps EVERY
  * change the overlay made after X (its own behaviour) and lets main's side win only for what X itself carried — the
  * merged PR's own older content. If no candidate merges cleanly, nothing is resolved: the caller sets the overlay aside.
- * No look-alike evidence (author, subject, patch text) is ever used, and no hunk is ever resolved by picking a side.
+ * X must carry only the PR's own work beyond main (no merge of another branch in main..X), so the merge can only ever
+ * replace that PR's older content. No look-alike evidence (author, subject, patch text) is ever used, and no hunk is
+ * ever resolved by picking a side.
  */
 
-import { FULL_SHA_RE, REBUILD_IDENTITY_ENV, verifyRev } from './shared.mjs';
+import { FULL_SHA_RE, verifyRev } from './shared.mjs';
 
 const MERGE_PR_RE = /^Merge pull request #(\d+) from /;
-const REBUILD_RECORD_RE = /^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /;
-const REBASED_RE = / \(auto-rebased past PR #(\d+) at ([0-9a-f]{40})\)/;
 /** How many relevant merged PRs' force-push histories one overlay may read (each is a GitHub call). */
 const MAX_FORCE_PUSH_READS = 5;
 
 const lines = (r) => (r.status === 0 ? String(r.stdout ?? '').split('\n').filter((l) => l.trim()) : []);
 
 /**
+ * X's own history beyond main is only the PR's own work: every merge commit in main..X merges main-reachable history in
+ * (its other parents are all ancestors of main). A PR head that merged ANOTHER branch carries that branch's content,
+ * which a merge with X as base could silently drop — such an X is never a candidate (fail closed: set aside instead).
+ */
+function onlyPrOwnHistory(git, mainSha, sha) {
+  const merges = git(['rev-list', '--merges', '--parents', sha, '--not', mainSha]);
+  if (merges.status !== 0) return false;
+  for (const l of lines(merges)) {
+    const [, ...parents] = l.split(' ');
+    const offMain = parents.filter((p) => git(['merge-base', '--is-ancestor', p, mainSha]).status !== 0);
+    if (offMain.length > 1) return false;
+  }
+  return true;
+}
+
+/**
  * The merged-PR old heads an overlay carries, newest first (a candidate that contains another comes before it).
+ * Evidence is never read from commit text: `adoptedHeads` are the `{pr, sha}` this clone's own rebuild state recorded
+ * from builds it ADOPTED (state.adoptedHeads), each kept only while its PR reads MERGED, or `proven` entries this same
+ * plan already proved; `prForcePushes` are GitHub head_ref_force_pushed `before` commits of merged PRs on main.
  * @returns {Promise<{candidates:Array<{sha:string, pr:number, evidence:string}>, mergedPrs:number[]}>}
  */
 export async function mergedPrOldHeads({
-  git, mainSha, ovSha, headSha = null, conflictFiles = [], stateOf = async () => null, prForcePushes = null,
+  git, mainSha, ovSha, conflictFiles = [], stateOf = async () => null, prForcePushes = null, adoptedHeads = [],
 }) {
   const isAnc = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
-  const keep = (sha) => FULL_SHA_RE.test(sha) && sha !== ovSha && isAnc(sha, ovSha) && !isAnc(sha, mainSha);
+  const keep = (sha) => FULL_SHA_RE.test(sha) && sha !== ovSha && isAnc(sha, ovSha) && !isAnc(sha, mainSha)
+    && onlyPrOwnHistory(git, mainSha, sha);
   const found = new Map();
   const add = (sha, pr, evidence) => { if (!found.has(sha) && keep(sha)) found.set(sha, { sha, pr, evidence }); };
 
@@ -50,26 +70,14 @@ export async function mergedPrOldHeads({
     if (conflictSet.size === 0 || touched.some((f) => conflictSet.has(f))) mergedPrs.push(Number(hit[1]));
   }
 
-  // (a) heads this clone merged itself (or recorded at an earlier auto-rebase), for a PR that is now MERGED.
-  const builds = [...new Set([headSha, ...lines(git(['reflog', '-n', '50', '--format=%H', 'HEAD']))].filter((s) => s && FULL_SHA_RE.test(s)))];
-  const recorded = [];
-  for (const b of builds) {
-    for (const l of lines(git(['log', '--first-parent', '-n', '200', '--format=%P%x09%ce%x09%s', b, '--not', mainSha]))) {
-      const [parents, committer, ...rest] = l.split('\t');
-      const subject = rest.join('\t');
-      const ps = String(parents ?? '').split(' ');
-      if (committer !== REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL || ps.length !== 2) continue;
-      const rb = subject.match(REBASED_RE);
-      if (rb) recorded.push({ sha: rb[2], pr: Number(rb[1]), evidence: 'recorded-auto-rebase' });
-      const hit = subject.match(REBUILD_RECORD_RE);
-      if (hit?.[2] != null && FULL_SHA_RE.test(ps[1])) recorded.push({ sha: ps[1], pr: Number(hit[2]), evidence: 'adopted-head' });
-    }
-  }
-  for (const r of recorded) {
-    if (found.has(r.sha) || !keep(r.sha)) continue;
+  // (a) heads of a now-MERGED PR that this clone's own builds adopted (recorded in its rebuild state, never in git text).
+  for (const h of Array.isArray(adoptedHeads) ? adoptedHeads : []) {
+    const pr = Number(h?.pr);
+    if (!Number.isInteger(pr) || pr <= 0 || typeof h?.sha !== 'string' || found.has(h.sha) || !keep(h.sha)) continue;
+    if (h.proven === true) { add(h.sha, pr, h.evidence ?? 'proven'); continue; }
     let st = null;
-    try { st = await stateOf(r.pr); } catch { st = null; }
-    if (st === 'MERGED') add(r.sha, r.pr, r.evidence);
+    try { st = await stateOf(pr); } catch { st = null; }
+    if (st === 'MERGED') add(h.sha, pr, 'adopted-head');
   }
 
   // (b) heads GitHub says were force-pushed away from a relevant merged PR.

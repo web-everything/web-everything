@@ -201,4 +201,50 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     expect(isAncestor(f.clone, container, plan.finalSha)).toBe(true);
     expect(isAncestor(f.clone, mainSha, plan.finalSha)).toBe(true);
   });
+
+  it('a fallback re-plan with the plan\'s autoRebaseCtx keeps the rebase (never silently back to off) — Codex audit', async () => {
+    const f = fixture({ mode: 'on' });
+    const x1 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v1' }) });
+    f.push('lane/container', x1, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) });
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const overlays = [{ ref: 'lane/container', pr: 5801 }];
+    const plan = await planRebuild({
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays, prState: async () => 'OPEN',
+      prForcePushes: async (pr) => (pr === PR ? [{ before: x1 }] : []), autoRebase: { mode: 'on', source: 'test' },
+    });
+    expect(plan.autoRebaseCtx.adoptedHeads).toEqual([expect.objectContaining({ pr: PR, sha: x1, proven: true })]);
+    // a smoke fallback has no prState / force-push reader: the ctx alone must reproduce the same rebased build
+    const fallback = await planRebuild({ git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays, ...plan.autoRebaseCtx });
+    expect(fallback.decisions[0]).toMatchObject({ action: 'apply', reason: 'applied-auto-rebased' });
+    expect(fallback.finalSha).toBe(plan.finalSha);
+  });
+
+  it('a merged-PR head that merged ANOTHER branch in is never a base: its foreign content could be dropped — Codex audit', async () => {
+    const f = fixture({ mode: 'on' });
+    const hotfix = f.push('lane/hotfix', f.init, { 'hotfix.txt': 'live hotfix\n' });
+    const x1 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v1' }) });
+    gitOk(dirname(f.clone) + '/author', ['merge', '-q', '--no-edit', hotfix]); // the PR branch merges the hotfix branch
+    gitOk(dirname(f.clone) + '/author', ['push', '-q', 'origin', '+HEAD:refs/heads/lane/standing-ruling']);
+    const x1h = gitOk(dirname(f.clone) + '/author', ['rev-parse', 'HEAD']).trim();
+    const container = f.push('lane/container', x1h, { [GATE]: lines({ 2: 'grant v1', 10: 'own' }) });
+    const x2 = f.push('lane/standing-ruling', f.init, { [GATE]: lines({ 2: 'grant v2' }) }); // final PR: no hotfix
+    f.mergePr(PR, x2, 'lane/standing-ruling');
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: 'lane/container', pr: 5801 }],
+      prState: async () => 'OPEN', prForcePushes: async (pr) => (pr === PR ? [{ before: x1h }, { before: x1 }] : []),
+      autoRebase: { mode: 'on', source: 'test' },
+    });
+    expect(plan.ok).toBe(true);
+    // x1h is refused (it merged a foreign branch); x1 is a valid PR-own head, and with x1 as base the hotfix is the
+    // container's own content after x1, so it is KEPT (with x1h as base it would have been dropped)
+    expect(plan.decisions[0]).toMatchObject({ action: 'apply', reason: 'applied-auto-rebased' });
+    expect(plan.alerts.find((a) => a.kind === 'overlay-auto-rebased')?.detail.base.sha).toBe(x1);
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:hotfix.txt`])).toBe('live hotfix\n');
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:${GATE}`])).toBe(lines({ 2: 'grant v2', 10: 'own' }));
+    expect(isAncestor(f.clone, container, plan.finalSha)).toBe(true);
+    expect(plan.alerts.find((a) => a.kind === 'overlay-auto-rebased')?.detail.base.sha).not.toBe(x1h);
+  });
 });

@@ -48,7 +48,7 @@ export function alertsFilePath(root, env = process.env) {
 }
 
 const EMPTY_STATE = Object.freeze({
-  adopted: null, rejected: null, inProgress: null, quarantine: null, unverified: null, building: null, held: null, busySkippedTrees: null, smokePassed: null, pinnedNotified: null, onceNotified: null,
+  adopted: null, rejected: null, inProgress: null, quarantine: null, unverified: null, building: null, held: null, busySkippedTrees: null, smokePassed: null, pinnedNotified: null, onceNotified: null, adoptedHeads: null,
 });
 
 /**
@@ -74,6 +74,7 @@ export function readRebuildState(root, env = process.env) {
       smokePassed: parsed?.smokePassed ?? null,
       pinnedNotified: parsed?.pinnedNotified ?? null,
       onceNotified: parsed?.onceNotified ?? null,
+      adoptedHeads: parsed?.adoptedHeads ?? null,
     };
   } catch {
     return { ...EMPTY_STATE };

@@ -257,12 +257,26 @@ export async function prepareRebuild({
   // Held item 212 — stacked overlay PRs apply as stacks (only their tops) unless `overlay.stackMode` says independent.
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
+  // overlay-rebase-on-merge — the overlay heads this clone's ADOPTED builds applied ({pr, sha}), accumulated from the
+  // rebuild state's own `adopted.applied` (written only at adoption, never read from commit text). Bounded, newest kept.
+  const adoptedHeads = (() => {
+    const prev = Array.isArray(state.adoptedHeads) ? state.adoptedHeads : [];
+    const add = (state.adopted?.applied ?? []).flatMap((a) => [
+      ...(a?.pr != null && typeof a.sha === 'string' ? [{ pr: Number(a.pr), sha: a.sha }] : []),
+      ...(a?.mergedPr != null && typeof a.rebaseBase === 'string' ? [{ pr: Number(a.mergedPr), sha: a.rebaseBase }] : []),
+    ]);
+    const seen = new Set();
+    const next = [...add, ...prev].filter((h) => Number.isInteger(h.pr) && /^[0-9a-f]{40}$/.test(h.sha)
+      && !seen.has(`${h.pr}:${h.sha}`) && seen.add(`${h.pr}:${h.sha}`)).slice(0, 500);
+    if (JSON.stringify(next) !== JSON.stringify(prev)) { state.adoptedHeads = next; writeState(); }
+    return next;
+  })();
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
-    autoRebase: resolveOverlayAutoRebase(env),
+    autoRebase: resolveOverlayAutoRebase(env), adoptedHeads,
   });
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.

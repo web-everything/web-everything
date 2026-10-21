@@ -726,6 +726,7 @@ export async function smokeAndAdopt({
         git, headSha: prevHead, mainRef: 'origin/main',
         overlays: kept.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
+        ...(plan.autoRebaseCtx ?? {}), // overlay-rebase-on-merge: same mode + proven bases as the plan it falls back from
       });
       const failedNames = failedA.map((r) => r.name).join(',');
       let failed = planA2.reason ?? 'not planned';
@@ -768,6 +769,7 @@ export async function smokeAndAdopt({
     const planB = await planRebuild({
       git, headSha: prevHead, mainRef: 'origin/main', overlays: pinnedOverlays,
       edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
+      ...(plan.autoRebaseCtx ?? {}), // overlay-rebase-on-merge: same mode + proven bases as the plan it falls back from
     });
     // x9diisp/overlay-pin — like planA2, plain main must never lose an overlay the running build carries (e.g. a
     // pinned head that only merged thanks to a suspect it now leaves out): refused as unplannable instead.
