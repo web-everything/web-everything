@@ -31,7 +31,7 @@ export default {
       '102 101 node /Users/user/Review Work/scripts/operations/review-loop-cli.mjs --pr=1',
     ];
     const jsonPreloads = [1, 2, 3].map(pr =>
-      `node -r ./package.json scripts/operations/review-loop-cli.mjs --pr=${pr} --repo=web-everything/web-everything`);
+      `node -r ./package.json scripts/operations/review-loop-cli.mjs --pr=${pr} --repo=${HEALTHY_REPO}`);
     for (const [name, commands, expected] of [['independent rounds', independent, 3], ['spaced parent/child paths', spaced, 1],
       ['relative JSON preloads', jsonPreloads, 3]]) {
       const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => commands.join('\n') });
