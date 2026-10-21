@@ -15,7 +15,7 @@ import { STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
 export const DEFAULT_REPOS = Object.freeze([CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug]);
 export const DRAIN_LOG = join(homedir(), 'workspace', 'plateau-app', '.drain-daemon', 'daemon.log');
 export const STALLED_AFTER_ENV = 'WE_PR_SWEEP_STALLED_AFTER_MINUTES';
-const LIST_FIELDS = 'number,title,url,isDraft,headRefOid,updatedAt,labels,statusCheckRollup,body,createdAt';
+const LIST_FIELDS = 'number,state,title,url,isDraft,headRefOid,updatedAt,labels,statusCheckRollup,body,createdAt';
 /** Plain `gh` through execFileSync, deliberately NOT the throttled wrapper: that one creates lock dirs and appends call
  *  logs, and this operation must write nothing. */
 const ghSync = (_file, args, opts) => execFileSync('gh', args, { maxBuffer: 256 * 1024 * 1024, ...opts });
@@ -82,7 +82,9 @@ export function createPrSweepReader({ run = ghSync, now = () => Date.now(), read
   settings = () => readSettings({}) } = {}) {
   return (input = {}) => {
     const cfg = settings();
-    const repos = input.repo ? [String(input.repo)] : (Array.isArray(cfg?.prSweep?.repos) && cfg.prSweep.repos.length ? cfg.prSweep.repos : DEFAULT_REPOS);
+    const configured = Array.isArray(cfg?.prSweep?.repos) && cfg.prSweep.repos.length ? cfg.prSweep.repos : DEFAULT_REPOS;
+    // PR numbers are repo-local. Without --repo, a targeted lookup belongs to the primary configured repo only.
+    const repos = input.repo ? [String(input.repo)] : input.pr !== undefined ? configured.slice(0, 1) : configured;
     const unreadable = [];
     const prs = [];
     for (const repo of repos) {
@@ -94,6 +96,10 @@ export function createPrSweepReader({ run = ghSync, now = () => Date.now(), read
       } catch (e) { unreadable.push(`${repo}: ${String(e?.message ?? e).split('\n')[0]}`); continue; }
       if (list.length >= LIST_LIMIT) unreadable.push(`${repo}: open PR list hit the ${LIST_LIMIT} cap; some PRs were not swept`);
       for (const p of list) {
+        if (p.state !== 'OPEN') {
+          unreadable.push(`${repo}#${p.number}: PR is ${p.state ?? 'unknown'}, not OPEN`);
+          continue;
+        }
         try {
           const paged = (path) => JSON.parse(run('gh', ['api', '--paginate', '--slurp', `${path}?per_page=100`], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 120_000 })).flat();
           const comments = paged(`repos/${repo}/issues/${p.number}/comments`)
