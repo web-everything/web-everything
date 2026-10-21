@@ -8,7 +8,8 @@
  *     - for each head a grant cites: that the commit belongs to THIS PR, and that its net diff vs current main is
  *       entirely cards (fail closed).
  *   The result is the `standingRuling` scope the pure grant reader needs; without it no automation-posted grant
- *   counts. Reads only, on the daemon's App identity (personal read routing off). Diagnostics are redacted.
+ *   counts. This module only reads, on the daemon's App identity (personal read routing off); its `ghApp` exec is
+ *   shared with `auto-round-grant-io.mjs`, which also posts through it. Diagnostics are redacted.
  */
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readHumanSurfaceNetFiles } from '../lib/human-surface-net-diff.mjs';

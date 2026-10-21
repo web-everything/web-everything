@@ -3,7 +3,8 @@
  * @description The operator's standing ruling, automated (operator 2026-10-19; confirmed 2026-10-20 "Ok" to
  *   "automate, capped at 3 per PR"): when a card-only PR hits its review round cap, the system grants +1 round
  *   itself instead of waiting for a person to run `extend-rounds` by hand. PURE — the IO shell is
- *   `auto-round-grant-io.mjs`, and the grant itself is the `extend-rounds` operation, never re-implemented here.
+ *   `auto-round-grant-io.mjs`, which posts the same `buildRoundExtensionComment` record `extend-rounds` writes (on the
+ *   App identity, not through that operation: its operator-credential check does not apply to an automatic grant).
  *
  *   Eligibility (ALL must hold; otherwise nothing happens and the needs-you event stays for a person):
  *     - the note is `round-cap-exhausted` (never `ci-heal-exhausted`, never a not-converging takeover);

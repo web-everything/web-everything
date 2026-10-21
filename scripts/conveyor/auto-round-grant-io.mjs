@@ -9,8 +9,9 @@
  *   body is the shared `buildRoundExtensionComment` record, with the ruling id and the judged head added.
  *
  *   IDEMPOTENT per (PR, head, cap episode) and CAPPED per PR under concurrency: one lock + ledger per PR under the
- *   coordination root (`withPrLedger`). The ledger is SEEDED, on first use, with the trusted automatic grants
- *   already on the PR; used = max(trusted on GitHub, seed + every reservation). A reservation is written BEFORE
+ *   coordination root (`withPrLedger`). The ledger is SEEDED, on first use, with every automation-posted grant
+ *   record already on the PR (verified or not); used = max(verified on GitHub, every record now, seed + every
+ *   reservation). A reservation is written BEFORE
  *   the post and never released — a failed or crashed run keeps its slot and the event stays for a person.
  *   The PR head is re-read right before the post; a moved head never gets the grant.
  */

@@ -9,7 +9,7 @@ import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, parseRedTeamComment, parseRedTeamGateMarker, readRedTeamDisposition, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
-import { planRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
+import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
@@ -481,7 +481,19 @@ describe('applyRedTeamGate', () => {
         expect(read(null)).toMatchObject({ outcome: 'round-cap', sendBack: [] });
         expect(redTeamEnqueueHold({ comments, pr: 4722, head: HEAD, repo: REPO, standingRuling: scope, confirmedBreaks: CONFIRMED_BREAKS_DEFAULTS, env: {} }))
           .toMatch(/confirmed a break requiring send-back/);
+        // The drain's enqueue hold holds either way (the break is the fixer's, or the operator's): never released early.
+        expect(redTeamEnqueueHold({ comments, pr: 4722, head: HEAD, repo: REPO, standingRuling: null, confirmedBreaks: CONFIRMED_BREAKS_DEFAULTS, env: {} }))
+          .toMatch(/confirmed a break requiring send-back/);
         expect(planRedTeamStatusLabels({ labels: [], comments, repo: REPO, pr: 4722, head: HEAD, env: {}, standingRuling: scope }).add).toBe('red-team:blocked');
+        // The label sync reads the scope itself unless its caller passes the one it already read.
+        const scopeReads = [];
+        const provider = { readPrState: () => ({ headRefOid: HEAD, labels: [] }), readComments: () => comments };
+        const sync = over => syncRedTeamStatusLabels({ repo: REPO, pr: 4722, head: HEAD, env: { WE_RED_TEAM_STATUS_LABELS: 'true' }, provider, dryRun: true,
+          readGrantScope: a => { scopeReads.push(a); return scope; }, ...over });
+        expect(sync({}).add).toBe('red-team:blocked');
+        expect(scopeReads).toEqual([{ repo: REPO, pr: { number: 4722, headRefOid: HEAD, comments } }]);
+        sync({ standingRuling: null });
+        expect(scopeReads).toHaveLength(1);
         const asked = [];
         const held = readGrantScope => redTeamRulingHeld({ repo: REPO, pr: 4722, headSha: HEAD, labels: ['review:accepted'], comments,
           setting: CONFIRMED_BREAKS_DEFAULTS, readGrantScope: a => { asked.push(a); return readGrantScope(); } });

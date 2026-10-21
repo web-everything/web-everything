@@ -204,7 +204,7 @@ describe('read-time scope (standing-ruling-io)', () => {
     expect(standingRulingScope({ repo: WE, pr: { number: 5654, headRefOid: HEAD2, comments } },
       { readRuling, cardOnly: ({ head }) => { if (head === HEAD2) throw new Error('git'); return true; }, unedited: () => [] })).toBeNull();
   });
-  it('stuckAfterGrant and the hook judge the PR\'s current head, not only the cited one', () => {
+  it('stuckAfterGrant judges the PR\'s current head, not only the cited one', () => {
     const scopeOf = vi.fn(() => null);
     const p = { number: 5654, headRefOid: HEAD, labels: [{ name: 'status:at-round-limit' }], comments: [autoGrant()] };
     stuckAfterGrant({ repo: 'we', pr: p }, { scopeOf, now: () => Date.now() });
@@ -318,6 +318,13 @@ describe('the grant', () => {
     const grants = roundExtensionGrants(gh.t.comments, { repo: WE, pr: 5654, standingRuling: scope() });
     expect(grants).toEqual([expect.objectContaining({ by: 1, standingRuling: RULING_ID, head: HEAD })]);
     expect(body).toContain(STANDING_RULING); expect(body).toContain('Automatic grant 1/3'); expect(body).toContain(RULING_ID);
+  });
+  // PR #5758: every scope the hook reads judges the PR's live head too, not only the head a grant cites.
+  it('passes the live thread head to every scope read', () => {
+    const gh = fakeGh(); const scopeOf = vi.fn(deps(gh).scopeOf);
+    expect(call(deps(gh, { scopeOf }))).toMatchObject({ action: 'granted' });
+    expect(scopeOf.mock.calls.length).toBeGreaterThanOrEqual(3);
+    for (const [a] of scopeOf.mock.calls) expect(a.pr).toMatchObject({ number: 5654, headRefOid: HEAD });
   });
   it('no recorded ruling: nothing is posted', () => {
     const gh = fakeGh();
