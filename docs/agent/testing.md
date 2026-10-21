@@ -1274,6 +1274,9 @@ separate from transient infrastructure failures and their retry streak.
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.
+If `run` exits 75 (host busy or queue full), do not loop: re-run it once with `run --wait-ms=540000 -- …`,
+which keeps re-trying admission itself (load gate and slot queue, holding its queue place) and still exits 75
+when the budget runs out. `heavyAdmission.runWaitMs` sets a default budget through the settings cascade.
 `WE_FULL_SUITE_OK` bypasses only full-suite selection, never admission. Guard tests should
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.

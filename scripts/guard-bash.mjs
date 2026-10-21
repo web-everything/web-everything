@@ -2446,11 +2446,13 @@ const POLLING_TAIL = 'Ordinary non-waiting loops (`for f in *.mjs; do …; done`
 // agents for hours. So an agent is told to check ONCE, then keep going, or finish and report what is pending.
 const POLLING_ADVICE_AGENT = ' Do not wait in a shell, and do NOT end your turn to wait: nothing resumes a subagent or worker, so it would sit idle forever. '
   + 'Instead: (a) do ONE bounded check right now (a single read, or for the verify gate ONE foreground call, '
-  + '`node scripts/verify-lane.mjs check --wait=540000 --json`, which polls internally; use one bounded `--wait=` call wherever the tool has it); '
+  + '`node scripts/verify-lane.mjs check --wait=540000 --json`, which polls internally; use one bounded `--wait=` call wherever the tool has it; '
+  + 'when `heavy-admission.mjs run` exits 75 (host busy or queue full), re-run it ONCE as `node scripts/readiness/heavy-admission.mjs run --wait-ms=540000 -- <cmd>`, which re-tries admission internally); '
   + '(b) then CONTINUE with the next step of your task; (c) if nothing else is left, FINISH and report what is still pending (the daemon owns it from there). '
   + POLLING_TAIL;
 const POLLING_ADVICE_INTERACTIVE = ' Do not wait in a shell. Instead: (a) do ONE bounded check now, then carry on with other work; '
-  + '(b) for the verify gate use ONE bounded foreground call, `node scripts/verify-lane.mjs check --wait=540000 --json` (it polls internally); '
+  + '(b) for the verify gate use ONE bounded foreground call, `node scripts/verify-lane.mjs check --wait=540000 --json` (it polls internally), '
+  + 'and when `heavy-admission.mjs run` exits 75 (host busy or queue full) re-run it ONCE as `node scripts/readiness/heavy-admission.mjs run --wait-ms=540000 -- <cmd>` (it re-tries admission internally); '
   + 'or (c) report what is still pending and stop (you, the operator, resume this session; the #5137 await-verify flow covers dispatched work). '
   + POLLING_TAIL;
 /** The DENY reason for a polling loop / long sleep, else null. Pure; every session kind. `settings` is injectable for tests. */
