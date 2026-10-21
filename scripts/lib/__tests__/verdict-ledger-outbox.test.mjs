@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
@@ -346,6 +346,9 @@ describe('real git: outbox + plumbing flush', () => {
     expect(canonicalRemote('host:/repo.git').startsWith('file:')).toBe(false);
     // ...while a flat-namespace provider folds them.
     expect(canonicalRemote('git@github.com:o/r.git')).toBe(canonicalRemote('ssh://git@github.com/o/r'));
+    // Round 8: on a generic host, different users' homes and `repo` vs `repo.git` stay distinct.
+    expect(canonicalRemote('alice@host:repo.git')).not.toBe(canonicalRemote('bob@host:repo.git'));
+    expect(canonicalRemote('ssh://host/srv/repo')).not.toBe(canonicalRemote('ssh://host/srv/repo.git'));
   });
 
   it('an unanswered push whose noise mentions "cannot lock ref" is still UNKNOWN: kept queued, never thrown', async () => {
@@ -392,6 +395,50 @@ describe('real git: outbox + plumbing flush', () => {
       // The older verdict was queued by a lock loser; then a later append wins the lock.
       enqueueOutboxEntry(outboxDir, { path: ledgerGitPath(REPO), repo: REPO, message: 'm', ...checkLedgerAppendRows([older], REPO) }, { now: () => Date.now() - 1000 });
       appendLedgerRows({ board: ctx.clone, repo: REPO, records: [newer], outbox: true, outboxDir, log: quiet });
+      const verdicts = ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').map((l) => JSON.parse(l).verdict);
+      expect(verdicts).toEqual(['accepted', 'changes']);
+    });
+  });
+
+  it('an UNKNOWN push keeps the append\'s ORIGINAL order: it never lands after a newer queued verdict (round 8)', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      const older = buildVerdictRecord({ repo: REPO, pr: 78, verdict: 'accepted', at: '2026-10-21T12:00:00.000Z', source: 'test' });
+      const newer = buildVerdictRecord({ repo: REPO, pr: 78, verdict: 'changes', at: '2026-10-21T12:05:00.000Z', source: 'test' });
+      let first = true;
+      const run = (args, opts) => {
+        if (args[0] === 'push' && first) {
+          first = false;
+          // While the OLDER append's push hangs, a NEWER append queues (it lost the lock).
+          enqueueOutboxEntry(outboxDir, { path: ledgerGitPath(REPO), repo: REPO, message: 'm', ...checkLedgerAppendRows([newer], REPO) }, { now: () => Date.now() + 1000 });
+          throw Object.assign(new Error('Command failed'), { stderr: 'fatal: the remote end hung up unexpectedly\n', status: 128 });
+        }
+        return realGit(args, opts);
+      };
+      const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [older], outbox: true, outboxDir, gitRun: run, log: quiet });
+      expect(r).toMatchObject({ queued: true });
+      flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, log: quiet });
+      const verdicts = ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').map((l) => JSON.parse(l).verdict);
+      expect(verdicts).toEqual(['accepted', 'changes']);
+    });
+  });
+
+  it('an unreadable older entry blocks newer ones until it can be read; the order survives recovery (round 8)', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      const older = buildVerdictRecord({ repo: REPO, pr: 79, verdict: 'accepted', at: '2026-10-21T12:00:00.000Z', source: 'test' });
+      const newer = buildVerdictRecord({ repo: REPO, pr: 79, verdict: 'changes', at: '2026-10-21T12:05:00.000Z', source: 'test' });
+      const oldName = enqueueOutboxEntry(outboxDir, { path: ledgerGitPath(REPO), repo: REPO, message: 'm', ...checkLedgerAppendRows([older], REPO) }, { now: () => Date.now() - 1000 });
+      const file = join(outboxDir, oldName);
+      chmodSync(file, 0o000); // unreadable for now
+      try {
+        const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [newer], outbox: true, outboxDir, log: quiet });
+        // Waited behind the unreadable older entry (root reads through chmod 000, so only the final order is checked there).
+        if (process.getuid?.() !== 0) expect(r).toMatchObject({ queued: true });
+      } finally { chmodSync(file, 0o644); }
+      flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, log: quiet });
       const verdicts = ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').map((l) => JSON.parse(l).verdict);
       expect(verdicts).toEqual(['accepted', 'changes']);
     });

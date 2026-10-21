@@ -177,24 +177,31 @@ export function canonicalRemote(url, base = process.cwd()) {
   // `host:/path` are ABSOLUTE — different repositories on a generic host. Only providers whose paths are known to be
   // flat (one namespace, whatever the spelling) fold the two.
   const u = String(url ?? '').trim();
-  const proto = /^([a-z][a-z0-9+.-]*):\/\/(?:[^@/]+@)?(\[[^\]]+\]|[^/:]+)(?::(\d+))?(\/.*)$/i.exec(u);
-  const scp = /^(?:[^@/]+@)?([^:/\\]+):(.+)$/.exec(u);
+  const proto = /^([a-z][a-z0-9+.-]*):\/\/(?:([^@/]+)@)?(\[[^\]]+\]|[^/:]+)(?::(\d+))?(\/.*)$/i.exec(u);
+  const scp = /^(?:([^@/]+)@)?([^:/\\]+):(.+)$/.exec(u);
+  let user = null;
   let host = null;
   let port = null;
   let path = null;
   if (proto && proto[1].toLowerCase() !== 'file') {
     const scheme = proto[1].toLowerCase();
-    host = proto[2]; path = proto[4]; // absolute
+    user = proto[2] ?? null; host = proto[3]; path = proto[5]; // absolute
     const defaults = { ssh: '22', 'git+ssh': '22', 'ssh+git': '22', https: '443', http: '80', git: '9418' };
-    port = proto[3] && proto[3] !== defaults[scheme] ? proto[3] : null;
+    port = proto[4] && proto[4] !== defaults[scheme] ? proto[4] : null;
   } else if (!proto && scp && !/^[a-zA-Z]:[\\/]/.test(u) && !u.startsWith('/') && !u.startsWith('.')) {
-    host = scp[1];
-    path = scp[2].startsWith('/') ? scp[2] : `~/${scp[2]}`;
+    user = scp[1] ?? null; host = scp[2];
+    path = scp[3].startsWith('/') ? scp[3] : `~/${scp[3]}`;
   }
   if (!host) return `file:${resolve(base, u.replace(/^file:\/\//, '')).replace(/\/+$/, '')}`;
   host = host.toLowerCase();
-  if (FLAT_PATH_HOSTS.has(host)) path = `/${path.replace(/^~\//, '').replace(/^\/+/, '')}`;
-  return `${host}${port ? `:${port}` : ''}${path.startsWith('/') ? '' : '/'}${path.replace(/\/+$/, '').replace(/\.git$/, '')}`;
+  path = path.replace(/\/+$/, '');
+  if (FLAT_PATH_HOSTS.has(host)) {
+    // One namespace: the user is only an auth detail, `~/` and `/` are the same place, `.git` is optional.
+    return `${host}${port ? `:${port}` : ''}/${path.replace(/^~\//, '').replace(/^\/+/, '').replace(/\.git$/, '')}`;
+  }
+  // Generic host (round 8): the user decides whose HOME `~/` is, and `repo` and `repo.git` may both exist.
+  const who = path.startsWith('~/') && user ? `${user}@` : '';
+  return `${who}${host}${port ? `:${port}` : ''}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
 /**
@@ -513,9 +520,10 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
     if (!names.length && !memory.length) break;
     const entries = [];
     let ioError = null;
+    let blockedAt = null; // the first unreadable entry: nothing that sorts after it may pass it (round 8)
     for (const name of names) {
       const r = readEntry(dir, name, log);
-      if (r.io) { ioError = ioError ?? r.io; continue; }
+      if (r.io) { ioError = ioError ?? r.io; blockedAt = blockedAt ?? name; continue; }
       if (!r.entry) continue;
       if (originKey && r.entry.originKey && r.entry.originKey !== originKey) {
         if (!skippedForeign.has(name)) log(`verdict-ledger-outbox: entry ${name} is for another remote (${r.entry.originKey}); left for its own flusher`);
@@ -529,6 +537,14 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
     // its call. Names start with the append time, so one sort orders disk and memory entries alike.
     entries.push(...memory);
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    // Round 8: an entry we cannot read right now still holds its place in the order. Everything after it waits
+    // (memory rows included), so a recovered older verdict can never land after, and supersede, a newer one.
+    if (blockedAt) {
+      const keep = entries.filter((e) => e.name < blockedAt);
+      if (keep.length < entries.length) log(`verdict-ledger-outbox: ${entries.length - keep.length} entr${entries.length - keep.length === 1 ? 'y waits' : 'ies wait'} behind unreadable ${blockedAt} in ${dir}`);
+      entries.length = 0;
+      entries.push(...keep);
+    }
     if (ioError) log(`verdict-ledger-outbox: some entries in ${dir} are unreadable right now (${ioError.message}); left in place for a later flush`);
     if (!entries.length) { stopped = ioError ? 'io' : 'nothing-flushable'; break; }
     let landed = null;
@@ -788,7 +804,8 @@ export function appendViaOutbox(o) {
   if (owner) {
     // ── LOCK WON: our rows stay in memory. ──
     // Named like a queue entry, stamped with THIS call's time, so it sorts after everything queued before it.
-    const SELF = `${String(Math.max(0, Math.trunc(c.now()))).padStart(15, '0')}-${process.pid}-memory.json`;
+    const selfAt = Math.max(0, Math.trunc(c.now()));
+    const SELF = `${String(selfAt).padStart(15, '0')}-${process.pid}-memory.json`;
     let result = null;
     let failure = null;
     try { result = flushHeld({ ...c, owner, originKey, inMemory: [{ name: SELF, entry }] }); } catch (e) { failure = e; }
@@ -806,7 +823,7 @@ export function appendViaOutbox(o) {
     } else {
       // Unknown push outcome, lease lost, or budget spent: keep the rows — durably — for a later flush.
       try {
-        enqueueOutboxEntry(c.dir, entry, { now: c.now, log: c.log });
+        enqueueOutboxEntry(c.dir, entry, { now: () => selfAt, log: c.log }); // the ORIGINAL order key (round 8)
         const why = failure ? String(failure?.message ?? failure).split('\n')[0] : `flush stopped (${result?.stopped ?? 'unknown'})`;
         c.log(`verdict-ledger-outbox: ${why}; this append is queued in ${c.dir}`);
         outcome = queued(attempts);
