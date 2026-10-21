@@ -1,6 +1,6 @@
 /** Periodic terminal-PR recovery, pending-card drain and due-batch flush. */
 import { drainCursorPath, readDrainCursor, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
-import { reconcileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
+import { hasOwedWork, reconcileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
 import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { readFileSync, readdirSync, rmSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
@@ -85,7 +85,9 @@ export async function reconcileCardBatches({
   const perTick = () => { const n = loadFilingSettings().drainCardsPerTick; return Number.isSafeInteger(n) && n > 0 ? n : 1; };
   const drainPendingStep = async () => {
     // An empty state directory is also an open slot: recover a spool even before its first admission.
-    if (!(drainNeeded || !files.some(file => file.isFile() && file.name.endsWith('.json')))) return;
+    // Owed work also opens the slice: the owed filing used to drain the spool itself after its acquire (base), and now that the
+    // nested drain is skipped this slice is the spool's retry, so it must not hinge on a recovered or empty batch slot.
+    if (!(drainNeeded || hasOwedWork(stateDir) || !files.some(file => file.isFile() && file.name.endsWith('.json')))) return;
     // An owed-first deferral (no lane) ends the tick's drain; an exhausted allowance must not even acquire.
     if (drainDeferred || counter.left <= 0) return;
     try {

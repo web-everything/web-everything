@@ -308,6 +308,13 @@ export function parseRunJsonTail(out) {
 export const ACQUIRE_TIMEOUT_MS = 3 * 60_000;
 /** Extra time past a capped acquire's wait for the pool scan itself. */
 export const ACQUIRE_SCAN_SLACK_MS = 10_000;
+/**
+ * Did a capped acquire merely run out of time / find every lane busy? Matches lane-pool's own diagnostics: "no lane within
+ * Nms" (shared-scan lock contention), "(N all held/dirty)", and a timeout. A "failed to provision" pool is an operational
+ * failure and stays an error.
+ */
+export const isNoLaneInTime = text => !/failed to provision/i.test(text)
+  && /no lane within|no free lane|all held\/dirty|timed out|ETIMEDOUT/i.test(text);
 export const FILE_ITEM_TIMEOUT_MS = 2 * 60_000;
 export const VERIFY_TIMEOUT_MS = 70 * 60_000;
 export const OPEN_PR_TIMEOUT_MS = 45 * 60_000;
@@ -580,7 +587,7 @@ async function landPreventionCardImpl(input, {
       // A real child failure carries the pool's diagnostic on stderr, after the `Command failed:` line.
       const text = [e?.message, e?.stderr, e?.stdout].map(part => String(part ?? '')).join('\n');
       // A capped acquire that found no lane in time ends this tick's drain: the cards stay put (an owed filing stays owed), no error.
-      if (waitMs !== undefined && (e?.killed || e?.code === 'ETIMEDOUT' || /no free lane|timed out|ETIMEDOUT/i.test(text))) {
+      if (waitMs !== undefined && (e?.killed || e?.code === 'ETIMEDOUT' || isNoLaneInTime(text))) {
         write(`land-prevention-card: no lane within ${waitMs}ms; deferred to the next tick\n`);
         return { ok: true, skipped: true, deferred: true, step: 'acquire-deferred', pr: null };
       }

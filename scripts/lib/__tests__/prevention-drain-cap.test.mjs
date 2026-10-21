@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { drainPendingPrevention } from '../../operations/land-prevention-card.mjs';
 import { reconcileOwedPrevention } from '../prevention-filing-owed.mjs';
-import { landPreventionCard } from '../../operations/land-prevention-card.mjs';
+import { isNoLaneInTime, landPreventionCard } from '../../operations/land-prevention-card.mjs';
 import { reconcileCardBatches } from '../../operations/card-batch-reconcile.mjs';
 import { cursorSeed, drainCursorPath, readDrainCursor, resetDrainCursorMemory, rotateAfter } from '../prevention-drain-cursor.mjs';
 import { resolvePreventionBatchSettings } from '../card-batch-settings.mjs';
@@ -103,6 +103,19 @@ describe('lane acquire under the cap', () => {
     const result = await landPreventionCard({ title: 't', session: 's' }, { ...options(f, exec, undefined), owedClaimed: true, acquireWait: () => 7000 });
     expect(exec.mock.calls[0][1]).toContain('--wait-ms=7000');
     expect(result).toMatchObject({ ok: true, skipped: true, deferred: true });
+  });
+  it('classifies lane-pool\'s actual diagnostics: contention and all-busy defer, a provisioning failure stays an error', async () => {
+    const contention = 'no lane within 5000ms in pool "web-everything" — a different acquire\'s shared acquirability scan was still running (lock contention)';
+    const busy = 'no free lane in pool "web-everything" (12 all held/dirty) — release one or `provision` more';
+    const provision = 'no free lane in pool "web-everything" — every candidate this call tried was claimed but failed to provision (see the warnings above)';
+    expect([contention, busy, provision].map(isNoLaneInTime)).toEqual([true, true, false]);
+    for (const [message, deferred] of [[contention, true], [busy, true], [provision, false]]) {
+      const f = fixture();
+      const exec = () => { throw Object.assign(new Error('Command failed: node lane-pool.mjs acquire'), { status: 1, stderr: Buffer.from(`${message}\n`) }); };
+      const result = await landPreventionCard(input, options(f, exec, 5000));
+      expect(result.deferred === true).toBe(deferred);
+      expect(result.ok).toBe(deferred);
+    }
   });
   it('any other acquire failure is still an error', async () => {
     const f = fixture(); const exec = () => { throw new Error('lane-pool crashed'); };
@@ -300,6 +313,21 @@ describe('the probe tick', () => {
     await reconcileCardBatches({ ...base(f), drain, loadFilingSettings: settings(), clock: () => t });
     expect(drain.mock.calls[0][1].drainLimit.acquireWaitMs).toBe(30_000); // the snapshot
     expect(await drain.mock.results[0].value).toMatchObject({ live: 15_000 }); // the live value after time passed
+  });
+
+  it('owed work opens the standalone spool slice even when every top-level slot is sealed (the retry the skipped nested drain used to give)', async () => {
+    const f = tickFixture(); owedPending(f);
+    writeFileSync(join(f.stateDir, 'org-repo-prevention.json'), JSON.stringify({ seq: 9, batchRef: 'lane/card-batch-prevention-9', sealedAt: '2026-10-18T12:00:00Z', pr: 0 }));
+    const drain = vi.fn(async () => ({ ok: true }));
+    await reconcileCardBatches({ ...base(f), drain, fileOwed: vi.fn(async () => ({ ok: true, skipped: true })), loadFilingSettings: settings() });
+    expect(drain).toHaveBeenCalledOnce();
+  });
+  it('without owed work a sealed-only state still does not open the slice (unchanged from base)', async () => {
+    const f = tickFixture();
+    writeFileSync(join(f.stateDir, 'org-repo-prevention.json'), JSON.stringify({ seq: 9, batchRef: 'lane/card-batch-prevention-9', sealedAt: '2026-10-18T12:00:00Z', pr: 0 }));
+    const drain = vi.fn(async () => ({ ok: true }));
+    await reconcileCardBatches({ ...base(f), drain, loadFilingSettings: settings() });
+    expect(drain).not.toHaveBeenCalled();
   });
 
   it('the budget counts from the START of the tick: terminal-PR recovery that used it leaves no drain', async () => {
