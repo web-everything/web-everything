@@ -1,4 +1,5 @@
 ---
+bornAs: x33b7wo
 kind: story
 size: 5
 status: open
