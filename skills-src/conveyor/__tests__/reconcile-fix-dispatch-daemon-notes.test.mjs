@@ -289,3 +289,16 @@ describe('runReconcileNotesAllRepos — an INFO note is a log line only (live #5
     expect(out.finishedSessionReap).toMatchObject({ rows: [], error: expect.stringContaining('boom') });
   });
 });
+
+describe('runReconcileNotesAllRepos — the unbound finished-session pass runs after the note path (live 2026-10-21 14:25Z)', () => {
+  it('passes the note-path pids as skipPids and merges its rows; an unbound failure never breaks the pass', () => {
+    const info = { kind: 'released-claim-session-ignored', prNumber: 5758, pid: 41862, text: 't' };
+    const tick = () => ({ notes: [info], prsByNumber: new Map() });
+    const reapUnbound = vi.fn(() => ({ rows: [{ pid: 95540, decision: 'reap', result: 'stopped', unbound: true }] }));
+    const out = runReconcileNotesAllRepos({ repos: ['repo-a'], tick, dryRun: true, reapFinished: () => ({ rows: [] }), reapUnbound });
+    expect(reapUnbound).toHaveBeenCalledWith({ skipPids: new Set([41862]), dryRun: true });
+    expect(out.finishedSessionReap.rows).toEqual([expect.objectContaining({ pid: 95540, unbound: true })]);
+    const bad = runReconcileNotesAllRepos({ repos: ['repo-a'], tick, dryRun: true, reapFinished: () => ({ rows: [] }), reapUnbound: () => { throw new Error('boom'); } });
+    expect(bad.finishedSessionReap.rows).toEqual([]);
+  });
+});

@@ -145,3 +145,68 @@ describe('readLiveFixClaimStrict — fails closed, unlike readLiveFixClaim (Code
     expect(() => readLiveFixClaimStrict({ repo: 'we', pr: 5758, lockRoot })).toThrow(/being acquired/);
   });
 });
+
+describe('unbound finished sessions — PR closed/merged, or head moved past the lane (live 2026-10-21 14:25Z: pids 95540, 98331)', async () => {
+  const { planUnboundFinishedSession, runUnboundFinishedSessionReap, unboundCandidate } = await import('../finished-session-reap.mjs');
+  const { parseSessionSlug } = await import('../session-slug.mjs');
+  const { buildFixBeginComment, buildFixEndComment } = await import('../fix-procedure.mjs');
+  const { AUTOMATION_LOGINS } = await import('../../lib/marker-authorship.mjs');
+  const AUTO = { login: AUTOMATION_LOGINS[0] };
+  const STARTED = RELEASED - 60 * 60_000;
+  const agent = (over = {}) => ({ id: '6142e61f', pid: 98331, name: 'fix-5729', state: 'done', status: 'idle', cwd: `${ROOT}/5e53`, startedAt: STARTED, ...over });
+  const begin = (at) => ({ author: AUTO, createdAt: new Date(at).toISOString(), body: buildFixBeginComment({ who: 'fix-5729', why: 'x', branch: 'lane/x', headSha: 'a'.repeat(40), ttlMinutes: 60 }) });
+  const end = (at) => ({ author: AUTO, createdAt: new Date(at).toISOString(), body: buildFixEndComment({ who: 'fix-5729', headSha: 'a'.repeat(40) }) });
+  const open = (comments) => ({ state: 'OPEN', comments });
+  const p = (o) => planUnboundFinishedSession({ agent: agent(), nowMs: NOW, afterMs: 10 * 60_000, dispatchRoot: ROOT, pidAlive: true, ...o });
+
+  it('candidate: fix/ci-heal, listing state done, dispatch dir, id+pid; never review, item kinds, lanes, permission waits', () => {
+    const c = (a) => unboundCandidate(a, { dispatchRoot: ROOT, parseSlug: parseSessionSlug });
+    expect(c(agent())).toEqual({ repo: 'we', pr: 5729 });
+    expect(c(agent({ name: 'ci-heal-5729' }))).toEqual({ repo: 'we', pr: 5729 });
+    for (const over of [{ name: 'review-5729' }, { name: 'prepare-x1' }, { state: 'working' }, { cwd: '/ws/.lanes/web-everything/lane-3' }, { id: '' }, { pid: null },
+      { status: 'waiting', waitingFor: 'permission to run Bash' }]) expect(c(agent(over))).toBeNull();
+  });
+  it('reaps: PR CLOSED/MERGED long enough', () => {
+    expect(p({ pr: { state: 'CLOSED', closedAt: new Date(NOW - 54 * 60_000).toISOString(), comments: [] } }).decision).toBe('reap');
+    expect(p({ pr: { state: 'MERGED', mergedAt: new Date(NOW - 11 * 60_000).toISOString(), comments: [] } }).decision).toBe('reap');
+  });
+  it('reaps: open PR whose latest fix marker is a fix-end after the session started', () => {
+    expect(p({ pr: open([begin(STARTED + 1000), end(RELEASED)]) }).decision).toBe('reap');
+  });
+  it.each([
+    ['closed too recently', { pr: { state: 'CLOSED', closedAt: new Date(NOW - 5 * 60_000).toISOString() } }, /< 10m/],
+    ['closed with no close time', { pr: { state: 'CLOSED' } }, /no readable close time/],
+    ['a later fix-begin (claim held again)', { pr: open([end(RELEASED - 1000), begin(RELEASED)]) }, /fix-begin/],
+    ['session started after the fix-end', { agent: agent({ startedAt: RELEASED + 1000 }), pr: open([end(RELEASED)]) }, /new work/],
+    ['fix-end too recent', { pr: open([end(NOW - 60_000)]) }, /< 10m/],
+    ['no fix marker', { pr: open([]) }, /no fix marker/],
+    ['untrusted fix-end only', { pr: open([{ ...end(RELEASED), author: { login: 'rando' } }]) }, /no fix marker/],
+    ['equal marker times', { pr: open([begin(RELEASED), end(RELEASED)]) }, /ambiguous/],
+    ['PR unreadable', { pr: null }, /unreadable/],
+    ['a claim lock exists', { pr: { state: 'CLOSED', closedAt: new Date(NOW - 54 * 60_000).toISOString() }, liveClaim: { meta: { who: 'x' } } }, /claim lock/],
+    ['claim store unreadable', { pr: { state: 'CLOSED', closedAt: new Date(NOW - 54 * 60_000).toISOString() }, claimReadError: 'EACCES' }, /unreadable/],
+    ['pid exited', { pr: { state: 'CLOSED', closedAt: new Date(NOW - 54 * 60_000).toISOString() }, pidAlive: false }, /exited/],
+    ['not a dispatch dir', { agent: agent({ cwd: '/ws/x' }), pr: { state: 'CLOSED', closedAt: new Date(NOW - 54 * 60_000).toISOString() } }, /dispatch dir/],
+  ])('holds: %s', (_l, o, re) => {
+    const r = p(o);
+    expect(r.decision).toBe('hold');
+    expect(r.reason).toMatch(re);
+  });
+  it('run: stops by id, skips pids the note path judged, skips dead pids without a PR read, caps PR reads, never throws', () => {
+    const stop = vi.fn(() => ({ stopped: true }));
+    const readPr = vi.fn(() => ({ state: 'CLOSED', closedAt: new Date(NOW - 54 * 60_000).toISOString(), comments: [] }));
+    const agents = [agent(), agent({ id: 'b', pid: 2, name: 'fix-5492' }), agent({ id: 'c', pid: 3, name: 'fix-1' }), agent({ id: 'd', pid: 4, name: 'fix-2' })];
+    const out = runUnboundFinishedSessionReap({ nowMs: NOW, settings, dispatchRoot: ROOT, listAgents: () => agents, readPr, readClaim: () => null,
+      probePid: (pid) => pid !== 3, stop, skipPids: new Set([2]), maxPrReads: 1 });
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(stop).toHaveBeenCalledWith({ handle: '6142e61f' });
+    expect(readPr).toHaveBeenCalledTimes(1);
+    expect(out.rows.map((r) => [r.pid, r.decision])).toEqual([[98331, 'reap'], [4, 'hold']]);
+    expect(out.rows[1].reason).toMatch(/budget/);
+    expect(formatFinishedSessionReapLines(out)[0]).toMatch(/^finished-session-reap \(unbound\): we PR #5729 pid 98331/);
+    expect(runUnboundFinishedSessionReap({ settings, dispatchRoot: ROOT, listAgents: () => { throw new Error('x'); } }).error).toMatch(/listing failed/);
+    const dry = vi.fn();
+    runUnboundFinishedSessionReap({ nowMs: NOW, settings, dispatchRoot: ROOT, listAgents: () => [agent()], readPr, readClaim: () => null, probePid: () => true, stop: dry, dryRun: true });
+    expect(dry).not.toHaveBeenCalled();
+  });
+});

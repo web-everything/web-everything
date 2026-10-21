@@ -82,7 +82,7 @@ import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mj
 import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatch-claim.mjs'; // dup-heal-dispatch
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
 import { isInfoNote } from '../../scripts/lib/pr-comment-policy.mjs';
-import { runFinishedSessionReap, formatFinishedSessionReapLines } from '../../scripts/conveyor/finished-session-reap.mjs';
+import { runFinishedSessionReap, runUnboundFinishedSessionReap, formatFinishedSessionReapLines } from '../../scripts/conveyor/finished-session-reap.mjs';
 import { applyReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs'; // #3383 follow-up — tag at dispatch, see runTickAllRepos
 import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-health.mjs'; // card x5kagse
 import { runSupersedeWatch, formatSupersedeLines } from '../../scripts/conveyor/supersede-watch.mjs'; // card xiqtf7w
@@ -389,6 +389,8 @@ export function runReconcileNotesAllRepos({
   publish = publishAttention, safety = resolveFixSafety(), autoRoundGrant = defaultAutoRoundGrant, stuckAfterGrant = defaultStuckAfterGrant,
   dryRun = defaultNoteCommentDryRun(), verdictSettings = resolveCiHealVerdictSettings(), readRequiredChecks = defaultReadRequiredChecks,
   reapFinished = runFinishedSessionReap,
+  // Off under a test run unless injected (the real pass lists sessions and reads GitHub).
+  reapUnbound = process.env.VITEST ? null : runUnboundFinishedSessionReap,
   ...tickOpts
 } = {}) {
   process.stderr.write(`policy · fix.alertAtRoundCap=${safety.value.alertAtRoundCap} (${safety.sources.alertAtRoundCap})\n`);
@@ -510,6 +512,15 @@ export function runReconcileNotesAllRepos({
   let finishedSessionReap = { rows: [] };
   try { finishedSessionReap = reapFinished({ notes: infoNotes, dryRun }); }
   catch (e) { finishedSessionReap = { rows: [], error: redactedFirstLine(e) }; process.stderr.write(`finished-session-reap failed: ${redactedFirstLine(e)}\n`); }
+  // Sessions reconcile no longer binds to an open PR (PR closed/merged, or its head moved past the session's lane).
+  if (reapUnbound) {
+    try {
+      const skipPids = new Set(infoNotes.map((n) => n.pid).filter(Number.isInteger));
+      const unbound = reapUnbound({ skipPids, dryRun });
+      finishedSessionReap = { ...finishedSessionReap, rows: [...(finishedSessionReap.rows ?? []), ...(unbound?.rows ?? [])], ...(unbound?.error ? { unboundError: unbound.error } : {}) };
+      if (unbound?.error) process.stderr.write(`finished-session-reap (unbound): ${unbound.error}\n`);
+    } catch (e) { process.stderr.write(`finished-session-reap (unbound) failed: ${redactedFirstLine(e)}\n`); }
+  }
   for (const line of formatFinishedSessionReapLines(finishedSessionReap)) process.stderr.write(`${line}\n`);
   return { repos: perRepo, notes, refusals, comments, autoGrants, finishedSessionReap };
 }
