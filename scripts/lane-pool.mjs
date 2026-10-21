@@ -180,6 +180,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 // xbdixjc — the lane hold rule: every release/reset/remove/reclaim below asks it (pure rule in lane-lease.mjs).
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
+import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
 import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
@@ -274,7 +275,18 @@ const tryGit = (args, cwd, opts = {}) => {
 // throws immediately, unretried, exactly as before.
 const FETCH_LOCK_RETRY_ATTEMPTS = 4;
 const FETCH_LOCK_RETRY_BASE_MS = 250;
-function fetchOriginPruneWithRetry(dir) {
+// lane-git-diet — before EVERY lane fetch, make sure the lane's local config excludes `ops/*` from the default
+// fetch and keeps fetched objects packed (see ./lib/lane-git-diet.mjs: the ~10 MB verdict-ledger blob landed loose
+// in every lane on every fetch). Idempotent; a config failure never blocks the fetch itself.
+function ensureLaneDietConfig(dir, current) {
+  try {
+    applyLaneDietConfig((args) => git(args, dir, { timeout: LOCAL_GIT_TIMEOUT_MS }), current);
+  } catch (e) {
+    log(`  ⚠ ${dir}: lane git-diet config not applied (${String(e && e.message ? e.message : e).split('\n')[0]})`);
+  }
+}
+function fetchOriginPruneWithRetry(dir, dietConfig) {
+  ensureLaneDietConfig(dir, dietConfig);
   return retryTransientGit(() => git(['fetch', 'origin', '--prune', '--quiet'], dir, { timeout: NETWORK_GIT_TIMEOUT_MS }), { attempts: FETCH_LOCK_RETRY_ATTEMPTS, baseMs: FETCH_LOCK_RETRY_BASE_MS });
 }
 
@@ -845,6 +857,12 @@ function cloneLane(repo, n) {
   log(`  clone lane-${n} ← ${repo.originUrl} ${ref.length ? `(--reference ${repo.referencePath})` : '(no --reference: shallow)'} …`);
   gitQuiet(['clone', '--quiet', '-c', 'gc.auto=0', ...ref, repo.originUrl, dest]);
   gitQuiet(['config', '--local', 'gc.auto', '0'], dest);
+  // lane-git-diet — `git clone` ignores a negative refspec on its initial fetch, so the fresh clone still carries
+  // `origin/ops/*`. Apply the diet config and drop those tracking refs now (readers fetch them by name on demand).
+  ensureLaneDietConfig(dest);
+  for (const ref of (tryGit(['for-each-ref', '--format=%(refname)', 'refs/remotes/origin/ops/'], dest) || '').split('\n').filter(Boolean)) {
+    tryGit(['update-ref', '--no-deref', '-d', ref], dest);
+  }
   // Pin a stable local default branch so refresh's hard-reset target is unambiguous.
   tryGit(['checkout', '--quiet', '-B', repo.branch, `origin/${repo.branch}`], dest);
 }
@@ -868,10 +886,10 @@ function healSharedStoreFor(repo, err) {
     return false;
   }
 }
-function fetchOriginHealing(repo, n, { allowReclone = false } = {}) {
+function fetchOriginHealing(repo, n, { allowReclone = false, dietConfig } = {}) {
   const dir = laneDir(repo, n);
   try {
-    return fetchOriginPruneWithRetry(dir);
+    return fetchOriginPruneWithRetry(dir, dietConfig);
   } catch (e) {
     // xsxu243 — a commit-graph error may live in the SHARED reference store (read through objects/info/alternates), where
     // no per-lane repair can reach it: regenerate that derived cache once (locked, logged), then retry before any lane-level heal.
@@ -1177,9 +1195,20 @@ function liveRemoteShas(dir) {
  *  landing, whose local remote-tracking ref lingers). Used to re-verify containment right before the
  *  destructive reset, on data no older than the fetch that immediately precedes it — no second network call. */
 function localRemoteShas(dir) {
-  const out = tryGit(['for-each-ref', '--format=%(objectname)', 'refs/remotes/origin'], dir);
+  // lane-git-diet — `refs/remotes/origin/ops/*` is excluded from the default fetch (negative refspec), so an ops
+  // tracking ref a reader fetched by name earlier is NOT refreshed by the fetch this relies on. Leave it out of the
+  // "fresh after fetch" set: fewer proofs only ever makes a reset MORE conservative. Symbolic refs are not
+  // independently refreshed either: an innocent-looking alias (including origin/HEAD or a multi-hop alias)
+  // can resolve to an excluded ops ref or a ref outside origin. Only direct non-ops tracking refs are proofs.
+  const out = tryGit(['for-each-ref', '--format=%(objectname) %(refname) %(symref)', 'refs/remotes/origin/'], dir);
   if (out === null) return new Set();
-  return new Set(out.split('\n').filter(Boolean));
+  const shas = new Set();
+  for (const line of out.split('\n').filter(Boolean)) {
+    const [sha, ref, symref] = line.split(' ');
+    if (symref || ref.startsWith('refs/remotes/origin/ops/')) continue;
+    shas.add(sha);
+  }
+  return shas;
 }
 
 // Returns { skipped: boolean, dirty, uncommitted, ahead } so callers can tell an actually-reset lane
@@ -1873,19 +1902,22 @@ function logReclaimedAheadCommits(dir, branch, n) {
 const acquireResetSnapshots = new Map();
 
 function scrubClaimedLaneConfig(dir, reason) {
-  const { removed, kept } = scrubRiskyLaneConfig(dir, { log });
+  let dietConfig;
+  // Reuse an unchanged scrub read for the next fetch. Removing an include can also remove diet settings.
+  const { removed, kept } = scrubRiskyLaneConfig(dir, { log, onConfig: (output) => { dietConfig = laneDietConfigState(output); } });
   if (removed.length) journalLaneEvent(dir, { action: 'config-scrub', removed, kept, reason });
+  return removed.length ? undefined : dietConfig;
 }
 
 function provisionClaimedLane(repo, chosen, targetWasReserved) {
   const dir = laneDir(repo, chosen);
-  scrubClaimedLaneConfig(dir, 'before acquire hand-out');
+  const dietConfig = scrubClaimedLaneConfig(dir, 'before acquire hand-out');
   if (!flags['no-reset'] && !targetWasReserved) {
     // xj1vryw — this process just WON the lane's lease, so it may repair it: a corrupt clone (broken index, missing
     // object, dangling ref) is healed or quarantined + re-provisioned here, so acquire hands out a healthy lane.
     // LAZY on purpose: the health probe costs ~6 git spawns, so a healthy lane (the common case) never pays for it —
     // it runs only once the fetch or the pre-reset checks below actually fail with a corruption-shaped error.
-    fetchOriginHealing(repo, chosen, { allowReclone: true });
+    fetchOriginHealing(repo, chosen, { allowReclone: true, dietConfig });
     const repairUnhealthyClone = () => {
       let health = diagnoseLane(dir);
       if (!health.ok) {
