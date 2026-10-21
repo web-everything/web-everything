@@ -19,6 +19,26 @@ const plan = (comments, options = {}, over = {}) => core.planReconcile({ reviewT
     labels: [{ name: 'review:changes' }], statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
     comments: [{ body: '🔁 human review — changes requested\n\nRepair the bug.' }, ...comments], ...over }], ...options });
 
+const H = 'a'.repeat(40);
+const autoGrant = { id: 'IC_auto', author: bot, createdAt: '2026-10-15T11:00:00Z', body: grants.buildRoundExtensionComment({
+  repo: 'we', pr: 5169, by: 1, actor: 'chalbert', channel: 'standing-ruling-auto', reason: 'ruling', at: '2026-10-15T11:00Z',
+  standingRuling: 'web-everything/web-everything#5751', head: H, episode: `web-everything/web-everything#5169@${H}:fix:12/10` }) };
+const verified = { id: 'web-everything/web-everything#5751', author: 'chalbert', by: 1, maxPerPr: 3,
+  repos: ['web-everything/web-everything'], cardOnlyHeads: { [H]: true }, uneditedComments: ['IC_auto'] };
+
+describe('an automatic (standing-ruling) grant frees a round NOW (live #5690)', () => {
+  // Twelve rounds spent against a cap of 10: an additive +1 (cap 11) would leave the PR stuck at its limit.
+  const over = [...Array.from({ length: 12 }, round), autoGrant];
+  it('is anchored at the rounds spent when posted even with the anchor setting off', () => {
+    for (const roundExtensionAnchor of [{ value: 'grant', source: 'standard' }, { value: 'off', source: 'repo' }]) {
+      expect(plan(over, { roundCap: 10, roundExtensionAnchor }, { standingRuling: verified }).dispatch[0]).toMatchObject({ kind: 'fix', attempts: 12 });
+    }
+  });
+  it('without the verified scope it counts for nothing (cap stays 10)', () => {
+    expect(plan(over, { roundCap: 10 }).refusals[0]).toMatchObject({ kind: 'cap-exhausted', attempts: 12, cap: 10 });
+  });
+});
+
 describe('grants anchored to spent rounds', () => {
   it('anchors +1 at eight spent rounds and owes the resulting head a review', () => {
     const comments = [...Array.from({ length: 8 }, round), grant()];

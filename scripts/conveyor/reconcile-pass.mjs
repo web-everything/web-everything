@@ -50,6 +50,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
  * cannot corrupt anything, and a lease taken inside a one-shot read is a lease nothing releases when the process
  * is killed.
  */
+import { enrichPrsWithStandingRulingGrants } from './standing-ruling-io.mjs';
 import { enrichPrsWithOwedMainRule, resolveRefreshSettings } from '../lib/renamed-pr-refresh.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -1462,6 +1463,8 @@ export function runReconcilePass({
   enrichRulings = enrichPrsWithIgnoredRulings,
   enrichScopeBloat = enrichPrsWithScopeBloat, // card x29vm8a
   enrichCodeQL = enrichPrsWithCodeQL, // card x8cnbii — the drain's CodeQL hold is owed a ci-heal
+  // Standing-ruling round grants (operator option B, 2026-10-20): verify the ruling + cited heads at read time.
+  enrichStandingRulingGrants = enrichPrsWithStandingRulingGrants,
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
@@ -1546,8 +1549,9 @@ export function runReconcilePass({
   const mechanicalSetting = mechanicalRoundsSetting(loadMechanicalRoundsSetting, env);
   // The git evidence is read in THIS checkout, so only for the repo it is a clone of (WE); elsewhere no PR carries
   // facts and the normal cap applies. Skipped entirely when mechanical rounds count toward the cap.
-  const prs = repoKey === 'we' && mechanicalSetting.mechanicalRoundsCountTowardCap === false
+  const prsBeforeRulings = repoKey === 'we' && mechanicalSetting.mechanicalRoundsCountTowardCap === false
     ? enrichMechanicalRound(prsBeforeMechanical, { defaultBranch }) : prsBeforeMechanical;
+  const prs = enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug });
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
