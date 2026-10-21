@@ -80,6 +80,9 @@ try { ({ remainingStandDownFindings } = await import('../conveyor/ruling-resolve
 catch { /* Staged copies still surface the question without remaining findings. */ }
 let needsPersonRow;
 try { ({ needsPersonRow } = await import('./operator-queue-needs-person.mjs')); } catch { /* optional in staged copies */ }
+// An open, still-collecting card batch is held on purpose; staged copies without the module keep alerting.
+let isCollectingBatchPr = () => false;
+try { ({ isCollectingBatchPr } = await import('./card-batch-hold-state.mjs')); } catch { /* optional in staged copies */ }
 
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
 let rulingLedger = null;
@@ -751,6 +754,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         if (readyNumbersThisRepo.has(pr.number)) continue;
         const row = needsPersonRow?.(repo, pr);
         if (!row) continue;
+        // Only the withdrawn-draft notice is expected for a collecting batch; any other person-note still raises.
+        if (row.kind === 'draft-withdrawn' && pr.isDraft === true && isCollectingBatchPr(repo, pr.number)) continue;
         const notReady = report.notReady.findIndex(r => r.repo === repo && r.number === pr.number);
         report.needsPerson.push({ ...row, alsoNotReady: notReady < 0 ? [] : report.notReady.splice(notReady, 1)[0].reasons });
       }
