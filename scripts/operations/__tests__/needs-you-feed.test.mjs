@@ -349,3 +349,19 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(kept.incomplete).toBe(true);
   });
 });
+
+describe('stall sweep coexistence', () => {
+  it('a new queue item for a PR head with an open stalled item is not published twice; an open one is never cleared by it', async () => {
+    const { mkdtempSync, writeFileSync, mkdirSync } = await import('node:fs');
+    const { join: j } = await import('node:path'); const { tmpdir: t } = await import('node:os');
+    const { runOnce, sidecarsOf, replay } = await import('../needs-you-feed.mjs');
+    const root = mkdtempSync(j(t(), 'nyf-stalled-')); const path = j(root, 'needs-you-events.jsonl');
+    const head = 'a'.repeat(40); const repo = 'web-everything/web-everything';
+    mkdirSync(root, { recursive: true });
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [`${repo}#5@${head}:stalled`] }));
+    const report = { ready: [], rulingNeeded: [{ repo, number: 5, head, reason: 'parked' }] };
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    await runOnce({ exec: async () => JSON.stringify(report), settings, liveGate: false, log: () => {} });
+    expect(replay({ path })).toEqual([]);
+  });
+});

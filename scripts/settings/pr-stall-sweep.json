@@ -5,6 +5,7 @@
     "maxActionsPerSweep": 3,
     "maxActionsPerHour": 6,
     "maxActionsPerPrHead": 1,
+    "digest": true,
     "staleHoldAutoResume": false,
     "grantCeiling": 10,
     "maxFixListLines": 20,

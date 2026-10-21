@@ -286,6 +286,15 @@ describe('wiring', () => {
     await runPrSweep({ ...base, persist: () => order.push('persist'), stallSweep: async () => { order.push('stall'); return { state: {} }; } });
     expect(order).toEqual(['persist', 'stall', 'persist']);
   });
+  it('a pass with items publishes the operator digest; a skipped pass does not', async () => {
+    const stallDigest = vi.fn(() => ({ lines: ['x'], fresh: [1], notified: true, errors: [] }));
+    const report = await runPrSweep({ ...base, stallDigest, stallSweep: async () => ({ mode: 'shadow', state: {}, items: [], act: [], dir: '/tmp/pr-stall-sweep', digest: true }) });
+    expect(stallDigest).toHaveBeenCalledOnce(); expect(report.stallSweep.digest).toEqual({ published: 1, alerted: 1, notified: true });
+    expect(stallDigest.mock.calls[0][1]).toMatchObject({ stateDir: '/tmp/pr-stall-sweep', enabled: true });
+    const skipped = vi.fn();
+    await runPrSweep({ ...base, stallDigest: skipped, stallSweep: async () => ({ mode: 'shadow', skipped: 'not-due', state: {} }) });
+    expect(skipped).not.toHaveBeenCalled();
+  });
   it('a dry run does not run it', async () => {
     const stallSweep = vi.fn();
     await runPrSweep({ ...base, dryRun: true, stallSweep });

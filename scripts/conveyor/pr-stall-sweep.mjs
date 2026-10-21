@@ -31,8 +31,8 @@ export const STALL_SWEEP_MODE_ENV = 'WE_PR_STALL_SWEEP_MODE';
 export const STALL_SWEEP_DIR_ENV = 'WE_PR_STALL_SWEEP_DIR';
 /** The standard values; the classifier's policies are leaves of the same block, checked by its validators. */
 export const STALL_SWEEP_DEFAULTS = Object.freeze({ mode: 'off', intervalMinutes: 15, maxActionsPerSweep: 3, maxActionsPerHour: 6,
-  maxActionsPerPrHead: 1, ...CLASSIFY_DEFAULTS });
-const SCALARS = ['mode', 'intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'staleHoldAutoResume', 'grantCeiling', 'maxFixListLines'];
+  maxActionsPerPrHead: 1, digest: true, ...CLASSIFY_DEFAULTS });
+const SCALARS = ['mode', 'digest', 'intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'staleHoldAutoResume', 'grantCeiling', 'maxFixListLines'];
 const SETTINGS_FILE = join(ROOT, 'scripts/settings/pr-stall-sweep.json');
 const envName = (k) => `WE_PR_STALL_SWEEP_${k.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
 const msg = (e) => String(e?.message ?? e).split('\n')[0].slice(0, 200);
@@ -50,7 +50,7 @@ export function resolveStallSweepSettings({ env = process.env, read = readFileSy
     envValues[k] = typeof d === 'boolean' ? (['1', 'true'].includes(raw) ? true : ['0', 'false'].includes(raw) ? false : raw)
       : typeof d === 'number' ? Number(raw) : String(raw).trim().toLowerCase();
   }
-  const valid = { ...CLASSIFY_VALID, mode: (v) => STALL_SWEEP_MODES.includes(v),
+  const valid = { ...CLASSIFY_VALID, mode: (v) => STALL_SWEEP_MODES.includes(v), digest: (v) => typeof v === 'boolean',
     ...Object.fromEntries(['intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead'].map((k) => [k, (v) => Number.isSafeInteger(v) && v > 0])) };
   let platform = {};
   try { const p = readPlatformPreferences({ env, readFile: read }); errors.push(...p.errors); if (p.errors.length) layerUnreadable = true; platform = 'prStallSweep' in p.prefs ? p.prefs.prStallSweep : {}; }
@@ -189,6 +189,7 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   // Under test only an explicitly passed dir is ever written (never an env override that could fall back to home).
   const outDir = dir ?? (isUnderTest(env) ? null : stallSweepDir(env));
   if (!outDir) return { ...base, skipped: 'under-test' };
+  Object.assign(base, { dir: outDir, digest: cfg.digest });
 
   const raw = await (read ?? createPrSweepReader({ run: strictGh(gh), readText: strictDrainText() }))({});
   const report = assessPrSweep(raw);

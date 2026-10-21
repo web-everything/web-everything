@@ -65,7 +65,7 @@ const sectionReasons = {
 // Only these kinds can be represented (and therefore resolved by absence) in itemsFromReport.
 // Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
 // a successful queue read supplies no evidence that their independently owned condition resolved.
-const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
+export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -134,7 +134,8 @@ export function replay({ path = feedPath(), since = '1970-01-01T00:00:00Z' } = {
 }
 // Keep the original sidecars only for the canonical filename. Overrides get their own namespace,
 // keyed by resolved path, so changing filenames neither inherits open keys nor another stream's cursor.
-function sidecarsOf(path) {
+/** Exported for the PR stall sweep's `stalled` publisher, which shares this state file and its lock. */
+export function sidecarsOf(path) {
   const absolute = checkedFeedPath(path);
   if (basename(absolute) === 'needs-you-events.jsonl') return {
     state: join(dirname(absolute), 'needs-you-feed-state.json'), ack: join(dirname(absolute), 'needs-you-ack'),
@@ -239,7 +240,12 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   return withFileLock(`${statePath}.lock`, () => {
     if (!owns()) return { lines: [], superseded: true };
     const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
-    const result = diffFeed(prev.openKeys, items, now, { clearKinds: REPORT_KINDS });
+    // The PR stall sweep's open `stalled` item already asks about this PR head: a NEW queue item for it is not
+    // published twice (one already open stays, so it is never cleared by this filter).
+    const stalled = prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length));
+    const asked = i => !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
+    const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
+    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;
