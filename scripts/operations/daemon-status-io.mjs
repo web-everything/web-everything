@@ -80,7 +80,7 @@ export function isDaemonLabel(label) {
   return typeof label === 'string' && (label.startsWith('com.we.') || label === 'com.plateau.drain-daemon');
 }
 
-function defaultLaunchAgentsDir(env) {
+export function defaultLaunchAgentsDir(env = process.env) {
   const fromEnv = typeof env?.[WE_LAUNCH_AGENTS_DIR_ENV] === 'string' ? env[WE_LAUNCH_AGENTS_DIR_ENV].trim() : '';
   return fromEnv || join(homedir(), 'Library', 'LaunchAgents');
 }

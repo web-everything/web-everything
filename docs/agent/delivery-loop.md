@@ -4,6 +4,8 @@
 the part that is genuinely non-obvious — getting review that is actually independent — is written down
 nowhere else. This is that.
 
+For the command reference for routine orchestration, see [Orchestrator operations](orchestrator-operations.md).
+
 ## The loop
 
 ```
