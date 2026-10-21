@@ -1158,7 +1158,9 @@ export async function acquireSlotBlocking({
   // heavy-run-wait — a wait budget applies only to a caller that would otherwise defer; anything else is unchanged.
   // The ceiling still caps it: a budget never waits past `ceilingMs`, and since the budget expiry is checked before the
   // ceiling, a budgeted caller only ever DEFERS there — never takes the onTimeout=run unslotted fallback (Codex audit).
-  const budgetMs = canDefer && Number.isFinite(waitMs) && waitMs > 0 ? Math.max(0, Math.floor(Math.min(waitMs, ceilingMs))) : 0;
+  // A ceiling that is not a positive number (0 / negative / NaN) never shrinks or disables the budget (2nd audit).
+  const ceilingCap = Number.isFinite(ceilingMs) && ceilingMs > 0 ? ceilingMs : Infinity;
+  const budgetMs = canDefer && Number.isFinite(waitMs) && waitMs > 0 ? Math.max(1, Math.floor(Math.min(waitMs, ceilingCap))) : 0;
   const budgetSrc = `wait budget ${budgetMs}ms (${waitSource})`;
   if (budgetMs > 0) stillWaitingLogMs = Math.min(stillWaitingLogMs, RUN_WAIT_PROGRESS_MS);
 
@@ -1207,7 +1209,7 @@ export async function acquireSlotBlocking({
   let lastProgressAt = startedAt;
   try {
     for (;;) {
-      const attempt = now();
+      let attempt = now();
       const host = hostLoadBypassed ? { admitted: true } : hostAdmission({ env, interactive, log: (m) => {
         if (!hostPolicyLogged) { log(`${m}\n`); hostPolicyLogged = true; }
       } });
@@ -1248,6 +1250,9 @@ export async function acquireSlotBlocking({
         hostLoadBypassed = true;
         log(`heavy-command admission: proceeding despite host load: ${host.reason}; mandatory caller reached host.maxWaitMs=${hostMaxWaitMs} (${hostWaitSource}); still requires a free slot\n`);
       }
+      // A host check can take real time (macOS memory reads spawn a subprocess): re-read the clock so the expiry
+      // check and the slot attempt below never use a stale timestamp (2nd audit). Budget mode only.
+      if (budgetMs > 0) attempt = now();
       // heavy-run-wait — budget expiry is checked BEFORE the slot attempt (no late admission) and BEFORE the ceiling
       // (so a budgeted caller never reaches the onTimeout=run fallback): the budget ends in a DEFERRAL only.
       if (budgetMs > 0 && attempt - startedAt >= budgetMs) {
@@ -1287,7 +1292,7 @@ export async function acquireSlotBlocking({
         ceilingChecked = true;
         const m = Math.round(ceilingMs / 60_000);
         const result = { ok: false, slot: null, timedOut: true, ceilingHit: true, waitedMs: attempt - startedAt };
-        if (onTimeout === 'run') {
+        if (onTimeout === 'run' && budgetMs === 0) { // a budgeted caller never takes the unslotted fallback
           log(`⚠⚠ heavy-command admission: HARD CEILING of ${m}m exceeded waiting for capacity (cap=${cap}) — a slot holder may be wedged; proceeding unslotted. Escape hatch: WE_HEAVY_ADMISSION=off. [${src}]\n`);
           return result;
         }
@@ -1303,7 +1308,7 @@ export async function acquireSlotBlocking({
           : `heavy-command admission: still waiting for a free slot (cap=${cap}) after ${Math.round((attempt - startedAt) / 60_000)}m — every held slot's holder still appears alive; will ${onTimeout === 'run' ? 'proceed unslotted' : 'defer'} at the ${Math.round(ceilingMs / 60_000)}m ceiling.\n`);
         lastLoggedAt = attempt;
       }
-      await sleep(budgetMs > 0 ? Math.max(1, Math.min(pollMs + Math.floor(random() * pollMs / 2), budgetMs - (attempt - startedAt))) : pollMs);
+      await sleep(budgetMs > 0 ? Math.max(1, Math.min(pollMs + Math.floor(random() * pollMs / 2), budgetMs - (now() - startedAt))) : pollMs);
     }
   } finally {
     clearWaiting({ lockRoot, owner });

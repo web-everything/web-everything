@@ -2136,6 +2136,26 @@ describe('heavy-run-wait — a wait budget re-tries the load gate and the slot q
     expect(heldSlots({ lockRoot, cap: 1 })).toHaveLength(0);
   });
 
+  it.each([0, -5, NaN])('AUDIT 2: a non-positive / NaN ceiling (%s) never disables the budget or reopens the unslotted fallback', async (ceilingMs) => {
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
+    let clock = T0; const logs = [];
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol({ onTimeout: 'run', fastSlots: 0 }),
+      ceilingMs, waitMs: 5000, pollMs: 1000, now: () => clock, log: (m) => logs.push(m), hostAdmission: () => ({ admitted: true }),
+      sleep: async (ms) => { clock += ms; } });
+    expect(r).toMatchObject({ ok: false, deferred: true });
+    expect(r.waitedMs).toBeLessThanOrEqual(5000);
+    expect(logs.join('')).not.toMatch(/proceeding unslotted/);
+  });
+
+  it('AUDIT 2: time spent INSIDE the host check counts — a deadline crossed there is not followed by a late admission', async () => {
+    let clock = T0;
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol({ fastSlots: 0 }), waitMs: 1000, pollMs: 1000,
+      now: () => clock, log: () => {}, hostAdmission: () => { clock += 1500; return { admitted: true }; }, // a slow (subprocess) host check
+      sleep: async () => { throw new Error('must not sleep'); } });
+    expect(r).toMatchObject({ ok: false, deferred: true, waitBudgetHit: true, waitedMs: 1500 });
+    expect(heldSlots({ lockRoot, cap: 1 })).toHaveLength(0);
+  });
+
   it('AUDIT: the waiting marker keeps its ORIGINAL requestedAt through the host wait (the FCFS position, not just presence)', async () => {
     let clock = T0; const stamps = []; let checks = 0;
     await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol(), waitMs: 60_000, now: () => clock, log: () => {},
