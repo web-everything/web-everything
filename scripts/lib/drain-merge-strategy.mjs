@@ -38,6 +38,7 @@ import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReas
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
 import { createHash } from 'node:crypto';
+import { computeClearanceCoverage } from './approval-binding.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -222,6 +223,11 @@ export function createDrainMergeStrategy({
   const grantScopeFor = (c, headSha, comments) => {
     try { return readGrantScope({ repo: slugOf(c.repo), pr: { number: c.num, headRefOid: headSha, comments } }) ?? null; } catch { return null; }
   };
+  // approval-binding (2026-10-21): lazy, read-only git coverage of the operator's clearance at a head, from this clone.
+  // Evaluated only when the sha rule fails on a PR with a recorded clearance; a sibling repo's head is not readable
+  // here, so it stays uncovered (fail closed).
+  const coverageFor = (c, comments) => (head) => computeClearanceCoverage({ comments, liveHead: head, exec, cwd,
+    reviews: () => statusProvider.readPrReviews(slugOf(c.repo), c.num) });
   const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) });
   const say = (line) => { if (!quiet) log.write(`${line}\n`); };
   /**
@@ -328,7 +334,7 @@ export function createDrainMergeStrategy({
         if (!safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
         const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
         const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
-          standingRuling: grantScopeFor(c, headSha, pages.flat()) });
+          standingRuling: grantScopeFor(c, headSha, pages.flat()), clearanceCoverage: coverageFor(c, pages.flat()) });
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
@@ -373,8 +379,9 @@ export function createDrainMergeStrategy({
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const standingRuling = grantScopeFor(c, headSha, pages.flat());
-        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
-        try { syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
+        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling,
+          clearanceCoverage: coverageFor(c, pages.flat()) });
+        try { syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling, clearanceCoverage: coverageFor(c, pages.flat()),
           live, comments: pages.flat(), provider: statusProvider, dryRun, log: say }); }
         catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
         if (reason) {

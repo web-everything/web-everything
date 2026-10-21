@@ -33,6 +33,8 @@ import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
  * duplicates a PR already shown in NEEDS YOU.
  */
 import { readSettings } from '../lib/settings-files.mjs';
+import { execFileSync as execFileSyncRaw } from 'node:child_process';
+import { computeClearanceCoverage, ghFormalReviewsReader } from '../lib/approval-binding.mjs';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -130,8 +132,8 @@ export function rulingNeededRow(repo, pr) {
 }
 
 /** A red-team round-cap ruling and its read-only operator command suggestions. PURE. */
-export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
-  const need = redTeamRulingNeeded(pr, setting, { repo: repo || pr?.repo || null });
+export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS, { clearanceCoverage = null } = {}) {
+  const need = redTeamRulingNeeded(pr, setting, { repo: repo || pr?.repo || null, clearanceCoverage });
   if (!need) return null;
   const command = `node scripts/review-set-label.mjs ${pr.number} --repo=${repo}`;
   return {
@@ -747,7 +749,12 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       }
       for (const pr of prs) {
         report.rulingNeeded.push(...mergeRulingRows(
-          rulingNeededRow(repo, pr), redTeamRulingRow(repo, pr, redTeamSetting),
+          rulingNeededRow(repo, pr), redTeamRulingRow(repo, pr, redTeamSetting, {
+            // approval-binding: an operator ruling on an older head still counts when git (this checkout) proves the
+            // live head carries the same net change. Lazy — run only when the sha rule fails on a recorded clearance.
+            clearanceCoverage: (head) => computeClearanceCoverage({ comments: pr.comments, liveHead: head, exec: execFileSyncRaw,
+              reviews: ghFormalReviewsReader({ exec: execFileSyncRaw, repo, pr: pr.number }) }),
+          }),
         ));
       }
       for (const pr of prs) {
