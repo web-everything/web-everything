@@ -9,11 +9,13 @@ tags: []
 
 # Drain holds and verdicts read the post-observation snapshot in the same pass
 
-Found at PR #5492 (head fa23a3d), operator-carded as expedite under decision xugqjw1: in the drain main pass (we:scripts/merge-ai-prs.mjs:6275) the ledger observation is appended, but the holds and verdicts that follow still read the snapshot taken before it, so a head-moved or carried row written in this pass is not seen until the next pass. Fix: re-read or fold the new rows into the snapshot after the observation append, with a bounded cost. [A1] Executable: node --test we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs, where a head-moved observation appended in a pass changes that same pass's hold decision. Priority: expedite (operator 2026-10-18, review-stringency expedite outcome).
+Found at PR #5492 (head fa23a3d), operator-carded as expedite under decision xugqjw1: in the drain main pass (we:scripts/merge-ai-prs.mjs:6275) the ledger observation is appended, but the holds and verdicts that follow still read the snapshot taken before it, so a head-moved or carried row written in this pass is not seen until the next pass. Fix: re-read or fold the new rows into the snapshot after the observation append, with a bounded cost. Priority: expedite (operator 2026-10-18, review-stringency expedite outcome).
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `node --test we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs` fails before this item lands and passes after. Planned cases:
+  - `head-moved and carried observations update same-pass holds and verdicts` (we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs) — both the hold and the verdict read the rows appended in this pass.
+  - `snapshot refresh reads only the appended rows` (we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs) — the refresh reads the ledger from the pre-append offset, never the whole file.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

@@ -11,11 +11,14 @@ tags: []
 
 # Collector seal timeout is resumable with bounded retries then a held reason
 
-Per decision x5ioz96 fork 6 skeptic amendment: the root cause of the stuck batch is the seal job timing out (spawnSync ETIMEDOUT) and leaving step ready terminal. A seal timeout resumes from the last completed step with a bounded retry count (a setting with its source logged), then holds with a named reason. [A1] Executable: node --test we:scripts/operations/__tests__/card-batch-seal-io.test.mjs, where a timeout at step ready resumes on the next tick, the retry count is bounded, and exhaustion sets a held reason.
+Per decision x5ioz96 fork 6 skeptic amendment: the root cause of the stuck batch is the seal job timing out (spawnSync ETIMEDOUT) and leaving step ready terminal. A seal timeout resumes from the last completed step with a bounded retry count (a setting with its source logged), then holds with a named reason.
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `node --test we:scripts/operations/__tests__/card-batch-seal-io.test.mjs` fails before this item lands and passes after. Planned cases:
+  - `timeout at step ready resumes from the last completed step on the next tick` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs).
+  - `retry count is bounded by the setting, with its source logged` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs).
+  - `retry exhaustion holds with a named reason` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — the state keeps sealedAt and the held reason names the timed-out step.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

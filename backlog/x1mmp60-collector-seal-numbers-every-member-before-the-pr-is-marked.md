@@ -11,11 +11,14 @@ tags: []
 
 # Collector seal numbers every member before the PR is marked ready
 
-Per decision x5ioz96 fork 5 (statute backlog-ids-numbered-before-publish): add a number-members seal step after record-sealed and before verify, calling the declared numbering operation once over the whole branch so sibling references resolve together. It fails closed: if numbering fails the batch stays held and never reaches ready. [A1] Executable: node --test we:scripts/operations/__tests__/card-batch-seal.test.mjs and we:scripts/operations/__tests__/card-batch-seal-io.test.mjs, where the step order is record-sealed, number-members, verify, remove-hold, ready, label-on-green and a numbering failure leaves the batch held.
+Per decision x5ioz96 fork 5 (statute backlog-ids-numbered-before-publish): add a number-members seal step after record-sealed and before verify, calling the declared numbering operation once over the whole branch so sibling references resolve together. It fails closed: if numbering fails the batch stays held and never reaches ready.
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `node --test we:scripts/operations/__tests__/card-batch-seal.test.mjs we:scripts/operations/__tests__/card-batch-seal-io.test.mjs` fails before this item lands and passes after. Planned cases:
+  - `seal steps run record-sealed, number-members, verify, remove-hold, ready, label-on-green` (we:scripts/operations/__tests__/card-batch-seal.test.mjs).
+  - `numbers all siblings in one pass so cross-references resolve` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — two members that name each other both carry the new numbers.
+  - `numbering failure retains the hold and never reaches ready` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
