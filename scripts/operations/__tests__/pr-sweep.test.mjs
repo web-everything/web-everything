@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from 'vitest';
 vi.hoisted(() => { process.env.WE_AUTOMATION_LOGINS = 'web-everything,plateau-worker[bot],plateau-reviewer[bot],plateau-merger[bot]'; });
 import { isReadOnlyOperation } from '../registry.mjs';
 import {
-  assessPrSweep, finishPrSweep, needsDecisionOpen, openFixClaim, referralHoldOpen, renderSweepTable,
+  assessPrSweep, finishPrSweep, humanReviewHold, needsDecisionOpen, openFixClaim, referralHoldOpen, renderSweepTable,
 } from '../pr-sweep-core.mjs';
 import { prSweepOperation, PR_SWEEP_OP } from '../pr-sweep.mjs';
 import { createPrSweepReader, parseDrainSkips, parseLiveJobs, resolveStalledAfter, LIST_LIMIT } from '../pr-sweep-io.mjs';
@@ -350,5 +350,40 @@ describe('io helpers', () => {
     };
     const out = createPrSweepReader({ run, ps: () => '', readText: () => '', now: () => NOW, settings: () => ({}) })({ repo: REPO });
     expect(out.prs[0]).toMatchObject({ number: 9, repo: REPO, headCommittedAt: '2026-10-21T00:00:00Z', comments: [{ author: { login: 'chalbert' }, body: 'hi' }], labelEvents: [{ label: 'review:human', at: '2026-10-21T00:30:00Z' }] });
+  });
+});
+
+describe('humanReviewHold: the gate behind "your review" (#5768)', () => {
+  const H = '18088fcad0000000000000000000000000000000';
+  const sentBack = c('web-everything', '2026-10-21T14:29:00Z', redTeamGateMarker(5768, H, 'sent-back'));
+  const base = { number: 5768, headRefOid: H, labels: L('review:human', 'advisory:accepted', 'red-team:clear'), comments: [] };
+  const at = Date.parse('2026-10-21T14:35:00Z');
+
+  it('a clean PR is the operator\'s to review', () => {
+    expect(humanReviewHold(base, at)).toEqual([]);
+  });
+  it('the #5768 shape (red-team:blocked, review:changes, sent-back) is held for every reason', () => {
+    const r = humanReviewHold({ ...base, labels: L('review:human', 'advisory:accepted', 'review:changes', 'red-team:blocked', 'status:sent-back-red-team'), comments: [sentBack] }, at);
+    expect(r).toEqual(expect.arrayContaining(['the red team blocked the live head', 'it was sent back (review:changes)', 'an unanswered red-team send-back on the live head']));
+  });
+  it('a send-back record alone holds it, even before any label caught up (the stale-snapshot case)', () => {
+    expect(humanReviewHold({ ...base, comments: [sentBack] }, at)).toEqual(['an unanswered red-team send-back on the live head']);
+  });
+  it('red-team:pending holds it; red-team:clear does not', () => {
+    expect(humanReviewHold({ ...base, labels: L('review:human', 'advisory:accepted', 'red-team:pending') }, at)).toEqual(['the red team has not cleared the live head']);
+  });
+  it('a LATER operator comment answers the send-back; an earlier one or an outsider does not', () => {
+    expect(humanReviewHold({ ...base, comments: [sentBack, c('chalbert', '2026-10-21T14:31:00Z', 'ok, proceed')] }, at)).toEqual([]);
+    expect(humanReviewHold({ ...base, comments: [c('chalbert', '2026-10-21T14:20:00Z', 'earlier'), sentBack] }, at)).not.toEqual([]);
+    expect(humanReviewHold({ ...base, comments: [sentBack, c('mallory', '2026-10-21T14:31:00Z', 'ok')] }, at)).not.toEqual([]);
+  });
+  it('a send-back for another head or from an outsider does not hold it', () => {
+    expect(humanReviewHold({ ...base, comments: [c('web-everything', '2026-10-21T14:29:00Z', redTeamGateMarker(5768, 'f'.repeat(40), 'sent-back'))] }, at)).toEqual([]);
+    expect(humanReviewHold({ ...base, comments: [c('mallory', '2026-10-21T14:29:00Z', redTeamGateMarker(5768, H, 'sent-back'))] }, at)).toEqual([]);
+  });
+  it('an open fix claim holds it; a released one does not', () => {
+    const claim = c('plateau-worker[bot]', '2026-10-21T14:30:00Z', '🔒 conveyor fix-begin — fix claim held');
+    expect(humanReviewHold({ ...base, comments: [claim] }, at)).toEqual(['a fix claim is open']);
+    expect(humanReviewHold({ ...base, comments: [claim, c('plateau-worker[bot]', '2026-10-21T14:32:00Z', '🔓 conveyor fix-end — fix claim released')] }, at)).toEqual([]);
   });
 });

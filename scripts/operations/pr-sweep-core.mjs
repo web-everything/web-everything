@@ -30,7 +30,7 @@ import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authors
 import { openReferralFindings } from './record-referral-ruling.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, gateOutcomesForHead, redTeamRulingNeeded, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, gateOutcomesForHead, parseRedTeamGateMarker, redTeamRulingNeeded, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
 
 export { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT };
 /** A fix claim comment with no later release counts as a live fixer for this long. */
@@ -296,6 +296,39 @@ export function deriveWaitingOn(pr, ctx) {
     return done('ready-to-merge', 'drain', moved('ready-to-merge', 'review:accepted'), 'ready; the drain has not merged it yet', null, ['label ready-to-merge']);
   }
   return done('unclassified', 'nobody', null, 'no signal says who moves next', actions.why, []);
+}
+
+const GATE_HOLD_LABELS = Object.freeze({
+  'red-team:pending': 'the red team has not cleared the live head', 'red-team:blocked': 'the red team blocked the live head',
+  'review:changes': 'it was sent back (review:changes)', 'status:sent-back-red-team': 'the red team sent it back',
+  'status:fixing': 'a fixer owns it', 'review-status:fixing': 'a fixer owns it',
+});
+
+/**
+ * THE GATE BEHIND "your review". A PR with `review:human` + `advisory:accepted` is the operator's to review only while
+ * nothing else owns the next move: the red team is clear on the live head (no `red-team:pending` / `red-team:blocked`,
+ * no UNANSWERED red-team gate send-back for it), it carries no `review:changes` / send-back label, and no fix claim is
+ * open. Live miss (#5768, 14:3xZ): the needs-you feed said "all gates pass - your review" for a PR the red team had
+ * sent back two confirmed breaks on a minute earlier, because the queue's snapshot still held the old labels. Returns
+ * the reasons it is NOT ready (empty = ready). A send-back is answered by a LATER operator comment. PURE.
+ * @param {object} pr {number, headRefOid, labels, comments}
+ * @param {number} now epoch ms
+ * @returns {string[]}
+ */
+export function humanReviewHold(pr, now) {
+  const reasons = new Set(labelNames(pr).filter((l) => GATE_HOLD_LABELS[l]).map((l) => GATE_HOLD_LABELS[l]));
+  const head = String(pr?.headRefOid ?? '').toLowerCase();
+  const list = sorted(pr?.comments);
+  let sentBackAt = null;
+  for (const e of list) {
+    const m = trusted(e) ? parseRedTeamGateMarker(bodyOf(e.c)) : null;
+    if (m && m.pr === Number(pr.number) && m.rev === head && m.outcome === GATE_OUTCOMES.SENT_BACK) sentBackAt = e.at ?? 0;
+  }
+  if (sentBackAt !== null && !list.some((e) => e.at !== null && e.at > sentBackAt && isOperatorAuthored(e.c))) {
+    reasons.add('an unanswered red-team send-back on the live head');
+  }
+  if (openFixClaim(pr?.comments, now)) reasons.add('a fix claim is open');
+  return [...reasons];
 }
 
 /** The live jobs that cover this PR: ps processes naming it, plus an open fix claim. PURE. */

@@ -8,6 +8,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
+import { humanReviewHold } from './pr-sweep-core.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
@@ -166,8 +167,34 @@ export function monitorCommand(path = feedPath()) {
   path = checkedFeedPath(path);
   return `tail -n 0 -F '${path.replace(/'/g, "'\\''")}' | grep --line-buffered NEEDS-YOU`;
 }
+/**
+ * Drop "your review" items whose LIVE PR no longer qualifies (red team not clear on the live head, sent back, a fix
+ * claim open): operator-queue's report can lag the labels by a tick, and a notification cannot be taken back. A PR
+ * that cannot be read is KEPT (an alert is never suppressed on missing evidence); the failure is logged. Only items
+ * that came from the queue's `ready` section are judged. Returns `{kept, held}`.
+ */
+export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error } = {}) {
+  const ready = new Set((report.ready ?? []).map((r) => `${r.repo}#${r.number ?? r.pr}`));
+  const kept = []; const held = [];
+  for (const item of items) {
+    if (item.kind !== 'needs-you' || !ready.has(`${item.repo}#${item.pr}`)) { kept.push(item); continue; }
+    try {
+      const opts = { cwd, encoding: 'utf8', timeout: 60000, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024 };
+      const view = JSON.parse(String(await gh('gh', ['pr', 'view', String(item.pr), '--repo', item.repo, '--json', 'labels,headRefOid'], opts)));
+      const pages = JSON.parse(String(await gh('gh', ['api', '--paginate', '--slurp', `repos/${item.repo}/issues/${item.pr}/comments?per_page=100`], opts)));
+      if (!Array.isArray(pages) || !view || typeof view.headRefOid !== 'string') throw new Error('unreadable live PR');
+      const comments = pages.flat().map((c) => ({ author: { login: c.user?.login ?? '' }, body: c.body ?? '', createdAt: c.created_at }));
+      const reasons = humanReviewHold({ number: item.pr, headRefOid: view.headRefOid, labels: view.labels ?? [], comments }, now);
+      if (reasons.length) { held.push({ item, reasons }); continue; }
+    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); }
+    kept.push(item);
+  }
+  kept.incomplete = items.incomplete;
+  return { kept, held };
+}
 export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled, home = homedir(), now = new Date(), checkoutRoot = CHECKOUT_ROOT,
-  env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true } = {}) {
+  env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true,
+  liveGate = true } = {}) {
   logSettings(settings, log);
   assertProducerCheckout(checkoutRoot, { env, settings });
   let stdout, failedRead = false;
@@ -180,7 +207,9 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   const report = JSON.parse(String(stdout));
   if (!report || typeof report !== 'object' || !Array.isArray(report.ready)) throw new Error('needs-you-feed: invalid operator-queue report');
   if (failedRead) report.incomplete = true;
-  const items = itemsFromReport(report);
+  const gated = !liveGate ? { kept: itemsFromReport(report), held: [] } : await gateReadyItems(itemsFromReport(report), report, { gh, cwd: checkoutRoot, now: new Date(now).getTime(), log });
+  for (const { item, reasons } of gated.held) log(`needs-you-feed ${item.repo}#${item.pr} held back from your review: ${reasons.join('; ')}`);
+  const items = gated.kept;
   // Resolve before locking: gh admission/network waits must not hold the feed-state lock.
   for (const item of items) if (!item.head) {
     try {
