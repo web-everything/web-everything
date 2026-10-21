@@ -61,8 +61,19 @@ describe('ensureLaneHooksPath (injected IO) — the EFFECTIVE value, every scope
     expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run, write: false }).status).toBe('unset');
     expect(g.calls).toHaveLength(1);
   });
-  it('a checkout with no .githooks/pre-commit is skipped', () => {
-    expect(ensureLaneHooksPath('/l', { exists: () => false, run: () => { throw new Error('no'); } }).status).toBe('skipped');
+  it('a checkout that does not track .githooks/pre-commit is skipped', () => {
+    const untracked = () => { throw Object.assign(new Error('did not match any file'), { status: 1 }); };
+    expect(ensureLaneHooksPath('/l', { exists: () => false, run: untracked }).status).toBe('skipped');
+  });
+  it('a TRACKED pre-commit that is missing (deleted / dangling symlink) is an error, not skipped', () => {
+    const logs = [];
+    const result = ensureLaneHooksPath('/l', { exists: () => false, run: () => '.githooks/pre-commit\n', log: (l) => logs.push(l) });
+    expect(result).toMatchObject({ status: 'error' });
+    expect(result.detail).toMatch(/tracked but missing/);
+  });
+  it('a failing tracked-check (not exit 1) is an error, never skipped', () => {
+    const boom = () => { throw Object.assign(new Error('not a git repository'), { status: 128 }); };
+    expect(ensureLaneHooksPath('/l', { exists: () => false, run: boom, log: () => {} }).status).toBe('error');
   });
 });
 

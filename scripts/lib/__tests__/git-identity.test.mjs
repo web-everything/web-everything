@@ -60,6 +60,16 @@ describe('hook repair failures cannot silently disable commit guards', () => {
       }
       run(['config', '--local', '--unset', 'core.hooksPath']);
       expect(ensureLaneHooksPath(dir, { run, log: () => {} }).status).toBe('error');
+      // A TRACKED hook replaced by a dangling symlink runs nothing either: error, never `skipped`.
+      run(['add', '.githooks/pre-commit']);
+      rmSync(join(dir, '.githooks/pre-commit'));
+      symlinkSync(join(dir, 'nowhere'), join(dir, '.githooks/pre-commit'));
+      const dangling = ensureLaneHooksPath(dir, { run, log: () => {} });
+      expect(dangling.status).toBe('error');
+      expect(dangling.detail).toMatch(/tracked but missing/);
+      rmSync(join(dir, '.githooks/pre-commit'));
+      run(['rm', '-q', '--cached', '.githooks/pre-commit']);
+      expect(ensureLaneHooksPath(dir, { run, log: () => {} }).status).toBe('skipped');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

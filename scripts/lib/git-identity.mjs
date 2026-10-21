@@ -232,7 +232,7 @@ export function invokedAsScript(argv1, metaUrl) {
  * ran there; a worktree-scope `core.hooksPath=/dev/null` also beat a correct local value (audit findings).
  * Repair: replace all `--local` values, drop a lane-owned `--worktree` override, re-read. A global/system override is NOT ours to
  * change — reported as `override`. Idempotent (reads first, writes only on a difference), logged. Skipped when the
- * checkout has no `.githooks/pre-commit`. A pre-commit git would not run (not executable/readable) is `error` on
+ * checkout does not track `.githooks/pre-commit` (a tracked one that is missing is `error`). A pre-commit git would not run (not executable/readable) is `error` on
  * every path — git ignores it, so no hooksPath value protects the lane; the tracked file is not chmod-ed here.
  * `write: false` only reports (read-only callers like `status`). Never throws.
  * @returns {{status:'ok'|'set'|'unset'|'override'|'skipped'|'error', was?:string|null, scope?:string, detail?:string}}
@@ -246,7 +246,15 @@ export function ensureLaneHooksPath(dir, {
 } = {}) {
   try {
     const hook = join(dir, LANE_HOOKS_PATH, 'pre-commit');
-    if (!exists(hook)) return { status: 'skipped' };
+    if (!exists(hook)) {
+      // Skip only a checkout that does not TRACK the hook (`ls-files --error-unmatch` exits 1). A tracked hook that is
+      // deleted or a dangling symlink runs nothing, so it must not pass as `skipped` (self-review finding).
+      try { run(['ls-files', '--error-unmatch', '--', `${LANE_HOOKS_PATH}/pre-commit`]); } catch (e) {
+        if (e?.status === 1) return { status: 'skipped' };
+        throw e;
+      }
+      throw new Error(`${LANE_HOOKS_PATH}/pre-commit is tracked but missing (or a dangling symlink), so git runs no pre-commit guard (restore it from git)`);
+    }
     // A correct core.hooksPath proves nothing if git skips the hook itself (red-team finding: a 0644 pre-commit).
     if (!runnable(hook)) throw new Error(`${LANE_HOOKS_PATH}/pre-commit is not executable, so git ignores it (restore its mode: chmod +x ${LANE_HOOKS_PATH}/pre-commit)`);
     const effective = () => {
