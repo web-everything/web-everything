@@ -143,7 +143,9 @@ import { parseMergeTree, manifestConflictDisposition, rebaseDropManifest } from 
 // best-effort macOS notify (never throws; a delivery failure must never break the sweep).
 import { planNoteComment, postNoteComment } from './reconcile-note-comment.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
-import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from './unowned-rebase-attempt-count.mjs';
+import { standingRulingScope } from './standing-ruling-io.mjs';
+import { ROUND_EXTENSION_MARKER } from './round-extension-mark.mjs';
+import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, grantedRebaseCap, loadUnownedRebaseSettings, UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, countUnownedRebaseInfraFailures, countUnownedRebaseAggregateAttempts, shouldCountRebaseInfra, formatUnownedRebaseInfraMarker } from './unowned-rebase-attempt-count.mjs';
 import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 // #4118 (c) — the SAME name-based, gh-agents-truth liveness check `review-status-tag.mjs` already uses, and for
 // the identical reason its own docblock states: staying independent of `reconcile-core.mjs#assessLiveness`'s
@@ -1377,6 +1379,8 @@ export function watchParkedPrConflicts({
   // site below (a probe failure/`null`/empty result falls back to the existing whole-file check, unchanged).
   computeConflictingPaths = defaultConflictingFilePaths,
   attemptMechanicalRebase = defaultAttemptUnownedConflictRebase,
+  unownedRebaseSettings = loadUnownedRebaseSettings(),
+  standingRulingFor = standingRulingScope,
   listAgents = defaultListAgents,
   now = Date.now(),
   queueScope = {},
@@ -1402,6 +1406,49 @@ export function watchParkedPrConflicts({
   // the provider's `currentRepo()` exists exactly for this ("fires only when `--repo` was omitted", its own
   // docblock) and was simply never called here.
   let resolvedRepo = repo;
+  const infraRetryCap = unownedRebaseSettings.value.infraRetryCap ?? UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT;
+  const markInfraFailure = (pr, result) => {
+    if (!shouldCountRebaseInfra(result)) return;
+    try { provider.postComment(resolvedRepo, pr.number, formatUnownedRebaseInfraMarker(result, pr.headRefOid)); }
+    catch { /* best-effort counter */ }
+  };
+  // Operator round grants (`extend-rounds`, and verified standing-ruling grants) reach these two caps too, each as
+  // "one more attempt from when it was posted" (`grantedRebaseCap`). Read only AT the base cap: below it a grant
+  // cannot change the decision, so the healthy path pays no standing-ruling read.
+  const grantedCap = (pr, comments, baseCap, used, count) => {
+    if (!(used >= baseCap)) return baseCap;
+    // Reuse the repo the caller supplied (the daemon always passes --repo); never a currentRepo() read here.
+    const grantRepo = resolvedRepo ?? repo;
+    if (grantRepo == null) return baseCap;
+    // No grant comment on the thread → nothing can raise the cap; skip the injected scope reader entirely.
+    if (!Array.isArray(comments) || !comments.some(c => typeof c?.body === 'string' && c.body.startsWith(ROUND_EXTENSION_MARKER))) return baseCap;
+    let standingRuling = null;
+    try { standingRuling = standingRulingFor({ repo: grantRepo, pr: { number: pr.number, headRefOid: pr.headRefOid, comments } }) ?? null; }
+    catch { standingRuling = null; }
+    return grantedRebaseCap(baseCap, comments, count, { repo: grantRepo, pr: Number(pr.number), standingRuling }).cap;
+  };
+  const infraCountFor = pr => prefix => countUnownedRebaseInfraFailures(prefix, { ...unownedRebaseSettings.value, headSha: pr.headRefOid });
+  // The top's aggregate counter (content + infra, whole history, no cutoff): grants never loosen it beyond +by.
+  const attemptCount = prefix => countUnownedRebaseAggregateAttempts(prefix);
+  const surfaceInfraCap = (entry, pr, comments, failures, cap = infraRetryCap) => {
+    entry.unownedRebaseInfraCapExhausted = true;
+    entry.unownedRebaseInfraFailures = failures;
+    if (cap !== infraRetryCap) entry.unownedRebaseInfraCap = cap;
+    const note = {
+      kind: 'round-cap-exhausted', prNumber: pr.number, attempts: failures, cap,
+      capKind: 'unowned-mechanical-rebase-infra',
+      text: `PR #${pr.number}: unowned-mechanical-rebase-infra auto-repair rounds exhausted (${failures}/${cap}) — a person must take it over`,
+    };
+    const notePlan = planNoteComment(note, comments);
+    if (!notePlan.alreadyPosted) {
+      try { postNoteComment({ repo: resolvedRepo, pr: pr.number, body: notePlan.body }); }
+      catch { /* failed escalation must still fall through to the conflict owner */ }
+      try { notifyDesktopChecked({ title: 'Conveyor: unowned rebase infra cap exhausted', body: note.text }); }
+      catch { /* best-effort notification */ }
+    }
+    entry.roundCapNote = notePlan.alreadyPosted ? null : notePlan.key;
+  };
+
   for (const pr of Array.isArray(prs) ? prs : []) {
     const parked = isParkedConflictTarget(pr);
     const queued = !parked && isQueuedConflictTarget(pr);
@@ -1886,26 +1933,25 @@ export function watchParkedPrConflicts({
           const disposition = computeConflictDisposition({ pr, repo: resolvedRepo });
           entry.conflictDisposition = disposition;
           if (disposition === 'clean' || disposition === 'manifest-only') {
-            // #xu38vlf (epic #4075/#3383) — CAP THE RETRY. Before this fix, an `action:'skip'`/`'error'` result
-            // fell through to the ordinary bounce below in the SAME sweep, which already exits this population
-            // (CONFLICT_LABEL applies before the sweep ends) — but a THROW from the git-level attempt itself (a
-            // stale lock, a corrupted ref, a protected-branch push denial) aborted the WHOLE per-PR handler
-            // before any label ever applied, so the PR stayed unowned and this same attempt retried again next
-            // sweep — unbounded, forever, with nothing durable recording it. `countUnownedRebaseAttempts` reads
-            // this population's OWN durable per-attempt marker (posted below, the MOMENT the outcome is known
-            // to be a retry-worthy one — `'skip'`/`'error'`, INCLUDING a caught throw — never on a clean
-            // `rebased`/`current` success, so the common healthy path stays exactly as quiet as before this
-            // fix) — once it reaches the cap, this file stops attempting the rebase and surfaces it once via
-            // the reconcile-notes channel + a desktop notify, then falls through to the ordinary bounce, exactly
-            // like a `skip`/`error` disposition already does.
-            const attemptsSoFar = countUnownedRebaseAttempts(existingComments);
-            if (attemptsSoFar >= UNOWNED_REBASE_ATTEMPT_CAP) {
+            // Infrastructure failures also have their own (earlier-surfacing) budget, but never more runs than the
+            // shared aggregate cap below allows.
+            // Main's aggregate ceiling: content skips + infra failures share one cap over the whole history.
+            // Operator round grants raise each cap only as "N more attempts from when the grant was posted".
+            const attemptsSoFar = attemptCount(existingComments);
+            const infraFailures = infraCountFor(pr)(existingComments);
+            const infraCap = grantedCap(pr, existingComments, infraRetryCap, infraFailures, infraCountFor(pr));
+            const attemptCap = infraFailures >= infraCap ? UNOWNED_REBASE_ATTEMPT_CAP
+              : grantedCap(pr, existingComments, UNOWNED_REBASE_ATTEMPT_CAP, attemptsSoFar, attemptCount);
+            if (infraFailures >= infraCap) {
+              surfaceInfraCap(entry, pr, existingComments, infraFailures, infraCap);
+            } else if (attemptsSoFar >= attemptCap) {
               entry.unownedRebaseAttempts = attemptsSoFar;
               entry.unownedRebaseCapExhausted = true;
+              if (attemptCap !== UNOWNED_REBASE_ATTEMPT_CAP) entry.unownedRebaseAttemptCap = attemptCap;
               const note = {
-                kind: 'round-cap-exhausted', prNumber: pr?.number, attempts: attemptsSoFar, cap: UNOWNED_REBASE_ATTEMPT_CAP,
+                kind: 'round-cap-exhausted', prNumber: pr?.number, attempts: attemptsSoFar, cap: attemptCap,
                 capKind: 'unowned-mechanical-rebase',
-                text: `PR #${pr?.number}: unowned-mechanical-rebase auto-repair rounds exhausted (${attemptsSoFar}/${UNOWNED_REBASE_ATTEMPT_CAP}) — a person must take it over`,
+                text: `PR #${pr?.number}: unowned-mechanical-rebase auto-repair rounds exhausted (${attemptsSoFar}/${attemptCap}) — a person must take it over`,
               };
               const notePlan = planNoteComment(note, existingComments);
               if (!notePlan.alreadyPosted) {
@@ -1918,6 +1964,7 @@ export function watchParkedPrConflicts({
               let result;
               try { result = attemptMechanicalRebase({ pr, repo: resolvedRepo }); }
               catch (eAttempt) { result = { action: 'error', reason: String((eAttempt && eAttempt.message) || eAttempt) }; }
+              markInfraFailure(pr, result);
               entry.mechanicalRebase = { action: result?.action, reason: result?.reason ?? null };
               if (result?.action === 'rebased' || result?.action === 'current') {
                 // Resolved mechanically — no label, no bounce, no fix agent spent on a conflict a rebuild already
@@ -1926,12 +1973,12 @@ export function watchParkedPrConflicts({
                 results.push(entry);
                 continue;
               }
-              // `action === 'skip'` (a REAL, non-manifest conflict the read-only probe missed — e.g. `main`
-              // moved between the probe and the attempt), `'error'` (a plumbing failure), or the caught-throw
-              // above — durably record this attempt BEFORE falling through, so the count advances even if the
-              // fall-through below (the comment/dispatch/label writes) itself then throws.
-              try { provider.postComment(resolvedRepo, pr?.number, UNOWNED_REBASE_ATTEMPT_MARKER); }
-              catch { /* best-effort — worst case this ONE attempt goes uncounted, same exposure as before this fix */ }
+              // Errors spend the infra budget; other unsuccessful outcomes retain the base's durable marker.
+              // The aggregate counter includes both, so splitting markers never relaxes its ceiling.
+              if (!shouldCountRebaseInfra(result)) {
+                try { provider.postComment(resolvedRepo, pr?.number, UNOWNED_REBASE_ATTEMPT_MARKER); }
+                catch { /* best-effort counter */ }
+              }
             }
           }
         }

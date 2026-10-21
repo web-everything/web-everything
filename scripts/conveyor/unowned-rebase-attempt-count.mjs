@@ -17,17 +17,17 @@
  * silently retried forever, with no cap and no operator-visible trace beyond a per-tick `entry.error` line
  * nobody centrally watches.
  *
- * MARKER POSTED THE MOMENT THE OUTCOME IS KNOWN TO BE RETRY-WORTHY, NEVER ON A CLEAN SUCCESS. Unlike
- * `conflict-fix-round-count.mjs`'s marker (posted only once a round FULLY completes and re-arms), this marker
- * is posted by the IO shell right after `attemptMechanicalRebase` returns (or throws) `'skip'`/`'error'` —
- * BEFORE anything else that could itself throw (the comment/dispatch/label writes below it), so a persistently
- * failing attempt still durably advances the count even if everything downstream of it also fails. A clean
- * `'rebased'`/`'current'` result posts nothing: the common healthy path pays no extra write, and there is no
- * "next attempt" to bound in the first place once the conflict is actually resolved.
+ * Markers are posted as soon as an unsuccessful outcome is known, before downstream writes. Errors and
+ * throws use the separate infrastructure marker; other unsuccessful outcomes retain the legacy attempt marker.
+ * Clean successes post neither. Both count toward the aggregate cap over the whole history; the independent
+ * head-scoped infrastructure cap may surface earlier but can never relax the aggregate ceiling.
  *
  * PURE reader (this file, mirrors every sibling counter's split); the writer (posting the marker comment) lives
  * in the IO shell (`parked-pr-conflict-watch.mjs`), same split as every sibling counter in this directory.
  */
+import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
+import { roundExtensionGrants } from './round-extension-mark.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 /**
@@ -70,4 +70,81 @@ export function countUnownedRebaseAttempts(comments) {
     if (typeof body === 'string' && body.trimStart().startsWith(UNOWNED_REBASE_ATTEMPT_MARKER) && isTrustedMarkerAuthor(c)) n += 1;
   }
   return n;
+}
+
+/** Independent stable prefix: infrastructure never spends a content round. */
+export const UNOWNED_REBASE_INFRA_MARKER = '🔁 conveyor — unowned mechanical rebase infrastructure failure';
+export const UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT = 10;
+
+/** Resolve the operator cutoff; null means count all historical attempts. */
+export function loadUnownedRebaseSettings({ env = process.env, platform = platformPreference('unownedRebase', { env }),
+  repo = readSettings()?.unownedRebase } = {}) {
+  return cascadePolicy('unownedRebase', repo, { standard: { countSince: null, infraRetryCap: UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT }, platform, env,
+    envValues: { countSince: env.WE_UNOWNED_REBASE_COUNT_SINCE,
+      infraRetryCap: env.WE_UNOWNED_REBASE_INFRA_RETRY_CAP === undefined ? undefined : Number(env.WE_UNOWNED_REBASE_INFRA_RETRY_CAP) },
+    valid: { infraRetryCap: v => Number.isInteger(v) && v > 0, countSince: v => typeof v === 'string'
+      && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(v)
+      && Number.isFinite(Date.parse(v)) } });
+}
+
+
+/** An error result or caught exception spends only the infrastructure budget. */
+export function shouldCountRebaseInfra(result) {
+  return result instanceof Error || result?.thrown === true || result?.action === 'error';
+}
+
+/** Put head before the free-text reason so reason tokens cannot impersonate a head. */
+export function formatUnownedRebaseInfraMarker(result, headSha) {
+  const reason = String(result?.reason ?? result?.message ?? result ?? '')
+    .replace(/[\r\n\u2028\u2029]+/g, ' ').trim().slice(0, 120);
+  const head = headSha ? ` head=${String(headSha).replace(/\s/g, '')}` : '';
+  return `${UNOWNED_REBASE_INFRA_MARKER}${head} outcome=infra:${reason}`;
+}
+
+/** Trusted leading markers only; legacy headless markers match every head. Same cutoff as content. */
+export function countUnownedRebaseInfraFailures(comments, { countSince, headSha } = {}) {
+  if (!Array.isArray(comments)) return 0;
+  const cutoff = Date.parse(countSince);
+  return comments.filter(c => {
+    if (Date.parse(c?.createdAt) < cutoff || !isTrustedMarkerAuthor(c)) return false;
+    const body = typeof c === 'string' ? c : c?.body;
+    if (typeof body !== 'string') return false;
+    const line = body.trimStart().split(/[\r\n\u2028\u2029]/, 1)[0];
+    if (!line.startsWith(UNOWNED_REBASE_INFRA_MARKER)) return false;
+    const metadata = line.slice(UNOWNED_REBASE_INFRA_MARKER.length).split(' outcome=')[0];
+    const markerHead = metadata.match(/(?:^|\s)head=(\S+)/)?.[1];
+    return !headSha || !markerHead || markerHead === headSha;
+  }).length;
+}
+
+/**
+ * The aggregate ceiling main has always enforced: content skips AND infrastructure failures (errors, throws) share
+ * ONE {@link UNOWNED_REBASE_ATTEMPT_CAP}, counted over the PR's whole history (no `countSince` cutoff, every head).
+ * The separate infra budget above may only surface earlier, never let more attempts run than this.
+ * @param {Array<{body?:string,createdAt?:string}|string>|null|undefined} comments
+ * @returns {number}
+ */
+export function countUnownedRebaseAggregateAttempts(comments) {
+  return countUnownedRebaseAttempts(comments) + countUnownedRebaseInfraFailures(comments);
+}
+
+/**
+ * we:scripts/conveyor/unowned-rebase-attempt-count.mjs#grantedRebaseCap — the cap after operator round grants.
+ * PR #5716 stayed at "unowned-mechanical-rebase-infra auto-repair rounds exhausted (10/10)" after the operator
+ * granted +1 with `extend-rounds`: these two caps never read the grant. Each audited grant (operator-authored, or
+ * an automation-posted standing-ruling grant inside the scope the IO shell verified — the SAME reader and
+ * ten-round ceiling `reconcile-core.mjs` uses) means "N more attempts from the moment it was posted":
+ * cap' = max(cap, attemptsBeforeGrant + by). Bounded: no grant → the base cap, and every grant is a visible,
+ * authenticated PR comment. `count` is the cap's own counter, run over the thread prefix before the grant.
+ * @param {number} cap
+ * @param {Array<object>} comments - chronological, as the conflict watch lists them
+ * @param {(prefix:Array<object>) => number} count
+ * @param {{repo:string, pr:number, standingRuling?:object|null}} scope
+ * @returns {{cap:number, grants:number}}
+ */
+export function grantedRebaseCap(cap, comments, count, { repo, pr, standingRuling = null }) {
+  if (!Array.isArray(comments)) return { cap, grants: 0 };
+  const grants = roundExtensionGrants(comments, { repo, pr, standingRuling });
+  return { cap: Math.max(cap, ...grants.map(g => count(comments.slice(0, g.index)) + g.by)),
+    grants: grants.reduce((sum, g) => sum + g.by, 0) };
 }

@@ -1,3 +1,4 @@
+import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 /**
  * @file parked-pr-conflict-watch.test.mjs — `#xw0odtv`. PURE logic tests for `isParkedConflictTarget` /
  * `planConflictLabelChange` + IO-shell tests over injected fakes (no `gh` process anywhere in this file),
@@ -2874,6 +2875,123 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
     // where that same rebase-drop instead throws every sweep (a stale `.git/index.lock`, exactly the kind of
     // persistent local failure this card's own text names) — the exact case that used to retry silently forever
     // with zero cap and zero operator-visible trace before this fix.
+    it('round grants raise the aggregate cap, reuse the supplied repo, and pass the current head to the scope reader', () => {
+      const provider = fakeProvider();
+      provider.currentRepo = vi.fn(() => { throw new Error('unexpected repo read'); });
+      const headRefOid = 'a'.repeat(40);
+      const pr = { number: 5716, mergeable: 'CONFLICTING', headRefName: 'lane/granted', headRefOid, labels: [] };
+      const thread = Array.from({ length: 3 }, () => ({ body: UNOWNED_REBASE_ATTEMPT_MARKER, author: { login: 'web-everything' } }));
+      const standingRulingFor = vi.fn(() => null);
+      const attempt = vi.fn(() => ({ action: 'current' }));
+      const sweep = () => watchParkedPrConflicts({ repo: 'o/n', sameLineConflict: 'stand-down',
+        listPrs: () => [pr], provider, postFinding: () => {}, listPrComments: () => thread,
+        computeConflictDisposition: () => 'clean', attemptMechanicalRebase: attempt, standingRulingFor,
+        unownedRebaseSettings: { value: { infraRetryCap: 10 }, sources: {} },
+      })[0];
+      expect(sweep().unownedRebaseCapExhausted).toBe(true);
+      expect(standingRulingFor).not.toHaveBeenCalled(); // no marker: no scope read at the cap
+      const grant = { author: { login: 'chalbert' }, body: buildRoundExtensionComment({ repo: 'o/n', pr: 5716,
+        by: 1, actor: 'chalbert', channel: 'test', reason: 'one more', at: '2026-10-20T20:58:54Z' }) };
+      thread.unshift(grant);
+      expect(sweep().unownedRebaseCapExhausted).toBe(true); // early grant does not buy a future attempt
+      thread.shift();
+      thread.push(grant);
+      expect(sweep().routedTo).toBe('mechanical-rebase');
+      expect(attempt).toHaveBeenCalledTimes(1);
+      expect(standingRulingFor).toHaveBeenLastCalledWith({ repo: 'o/n', pr: { number: 5716, headRefOid, comments: thread } });
+      thread.push({ body: UNOWNED_REBASE_ATTEMPT_MARKER, author: { login: 'web-everything' } });
+      expect(sweep()).toMatchObject({ unownedRebaseCapExhausted: true, unownedRebaseAttemptCap: 4 });
+      expect(attempt).toHaveBeenCalledTimes(1);
+      expect(provider.currentRepo).not.toHaveBeenCalled();
+    });
+
+    it('does not read the scope below the base cap even with a grant; scope errors cannot authenticate automation grants', () => {
+      const pr = { number: 5716, mergeable: 'CONFLICTING', headRefName: 'lane/granted', labels: [] };
+      const thread = [{ author: { login: 'web-everything' }, body: buildRoundExtensionComment({ repo: 'o/n', pr: 5716,
+        by: 1, actor: 'chalbert', channel: 'test', reason: 'one more', at: '2026-10-20T20:58:54Z' }) }];
+      const standingRulingFor = vi.fn(() => { throw new Error('scope unavailable'); });
+      const attempt = vi.fn(() => ({ action: 'current' }));
+      const sweep = () => watchParkedPrConflicts({ repo: 'o/n', sameLineConflict: 'stand-down',
+        listPrs: () => [pr], provider: fakeProvider(), postFinding: () => {}, listPrComments: () => thread,
+        computeConflictDisposition: () => 'clean', attemptMechanicalRebase: attempt, standingRulingFor,
+        unownedRebaseSettings: { value: { infraRetryCap: 10 }, sources: {} },
+      })[0];
+      expect(sweep().routedTo).toBe('mechanical-rebase');
+      expect(standingRulingFor).not.toHaveBeenCalled();
+      thread.unshift(...Array.from({ length: 3 }, () => ({ body: UNOWNED_REBASE_ATTEMPT_MARKER, author: { login: 'web-everything' } })));
+      expect(sweep().unownedRebaseCapExhausted).toBe(true);
+      expect(standingRulingFor).toHaveBeenCalledTimes(1);
+      expect(attempt).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([true, false])('automation grants require the verified scope (verified=%s)', verified => {
+      const head = 'b'.repeat(40);
+      const pr = { number: 5716, mergeable: 'CONFLICTING', headRefName: 'lane/granted', headRefOid: head, labels: [] };
+      const thread = Array.from({ length: 3 }, () => ({ body: UNOWNED_REBASE_ATTEMPT_MARKER, author: { login: 'web-everything' } }));
+      thread.push({ id: 'grant-1', author: { login: 'web-everything' }, createdAt: '2026-10-20T20:58:54Z',
+        body: buildRoundExtensionComment({ repo: 'o/n', pr: 5716, by: 1, actor: 'chalbert', channel: 'test',
+          reason: 'one more', at: '2026-10-20T20:58:54Z', standingRuling: 'ruling-1', head,
+          episode: `o/n#5716@${head}:unowned-mechanical-rebase:3/3` }) });
+      const standingRulingFor = vi.fn(() => verified ? { id: 'ruling-1', author: 'chalbert', by: 1, maxPerPr: 1,
+        repos: ['o/n'], cardOnlyHeads: { [head]: true }, uneditedComments: ['grant-1'] } : null);
+      const attempt = vi.fn(() => ({ action: 'current' }));
+      const [entry] = watchParkedPrConflicts({ repo: 'o/n', sameLineConflict: 'stand-down',
+        listPrs: () => [pr], provider: fakeProvider(), postFinding: () => {}, listPrComments: () => thread,
+        computeConflictDisposition: () => 'clean', attemptMechanicalRebase: attempt, standingRulingFor,
+        unownedRebaseSettings: { value: { infraRetryCap: 10 }, sources: {} },
+      });
+      expect(attempt).toHaveBeenCalledTimes(verified ? 1 : 0);
+      expect(entry.unownedRebaseCapExhausted).toBe(verified ? undefined : true);
+    });
+
+    it('LIVE #5716 — an operator round grant buys exactly one more attempt past the infra cap; a forged grant buys none', () => {
+      postNoteComment.mockClear();
+      notifyDesktopChecked.mockClear();
+      const provider = fakeProvider();
+      const pr = { number: 5716, mergeable: 'CONFLICTING', headRefName: 'lane/pa-226-card',
+        headRefOid: 'a36abe60326770912776a49e14e65cc609a9726f', labels: [] }; // no baseRefName: skip the card-file git probe
+      const thread = [];
+      const attempt = vi.fn(() => ({ action: 'error', reason: 'card squash changed the PR net patch; refusing push' }));
+      vi.spyOn(provider, 'postComment').mockImplementation((_repo, _pr, body) => {
+        thread.push({ body, author: { login: 'web-everything' } });
+      });
+      let replayedNotes = 0;
+      const sweep = () => {
+        const [entry] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+          repo: 'o/n', listPrs: () => [pr], provider, postFinding: () => {},
+          unownedRebaseSettings: { value: { countSince: null, infraRetryCap: 2 }, sources: {} },
+          standingRulingFor: () => null,
+          computeConflictDisposition: () => 'clean', attemptMechanicalRebase: attempt,
+          listPrComments: () => thread,
+        });
+        for (const [note] of postNoteComment.mock.calls.slice(replayedNotes)) thread.push({ body: note.body, author: { login: 'web-everything' } });
+        replayedNotes = postNoteComment.mock.calls.length;
+        return entry;
+      };
+      const grant = (login) => ({ author: { login }, createdAt: '2026-10-20T20:58:54Z', body: buildRoundExtensionComment({
+        repo: 'o/n', pr: 5716, by: 1, actor: 'chalbert', channel: 'claude-code-chat',
+        reason: 'operator 2026-10-20: "Ok" — one more mechanical-rebase attempt', at: '2026-10-20T20:58:54Z' }) });
+      for (let i = 0; i < 3; i += 1) sweep();
+      expect(attempt).toHaveBeenCalledTimes(2);
+      expect(sweep().unownedRebaseInfraCapExhausted).toBe(true);
+      // A grant body posted by a non-operator login is not an operator grant: still capped, no attempt.
+      thread.push(grant('random-user'));
+      expect(sweep().unownedRebaseInfraCapExhausted).toBe(true);
+      expect(attempt).toHaveBeenCalledTimes(2);
+      // The operator's own grant: one more attempt from now, then capped again at 3/3 and surfaced once.
+      thread.push(grant('chalbert'));
+      const granted = sweep();
+      expect(granted.unownedRebaseInfraCapExhausted).toBeFalsy();
+      expect(attempt).toHaveBeenCalledTimes(3);
+      const again = sweep();
+      expect(again.unownedRebaseInfraCapExhausted).toBe(true);
+      expect(again.unownedRebaseInfraCap).toBe(3);
+      expect(sweep().unownedRebaseInfraCapExhausted).toBe(true);
+      expect(attempt).toHaveBeenCalledTimes(3);
+      expect(postNoteComment.mock.calls.map(([n]) => n.body.match(/unowned-mechanical-rebase-infra:\d+\/\d+/)?.[0]))
+        .toEqual(['unowned-mechanical-rebase-infra:2/2', 'unowned-mechanical-rebase-infra:3/3']);
+    });
+
     it('REPLAY — real PR #2709 shape: a persistently throwing mechanical rebase is capped at 3 attempts and surfaced exactly once', () => {
       postNoteComment.mockClear();
       notifyDesktopChecked.mockClear();
