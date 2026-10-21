@@ -1,21 +1,21 @@
 ---
+bornAs: xs1toee
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/lease-reaper-run-index.mjs", "we:scripts/conveyor/__tests__/lease-reaper-run-index.test.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
 dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Document at the setting that maxAgeMs must exceed the longest possible wrapper lifetime. Better,… (from web-everything/web-everything#5289 review)
+# Prevention — Extract one isListingTrusted(readOptions, headSha) helper and use it at both sites, and add a dec… (from web-everything/web-everything#5280 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/lease-reaper-run-index.mjs:67` — Document at the setting that maxAgeMs must exceed the longest possible wrapper lifetime. Better, only age-skip records that cached as having no in-flight pairs, so a record with a live pair is never skipped. File this as a backlog item.
-2. `we:scripts/conveyor/__tests__/lease-reaper-run-index.test.mjs:107` — Add a deterministic exception-injection test for the resolver fallback and verify that removing the catch makes that named test fail.
+1. `we:scripts/merge-ai-prs.mjs:841` — Extract one `isListingTrusted(readOptions, headSha)` helper and use it at both sites, and add a decision-table row for `workflowOnly` with `filesComplete: true` and no head.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5289@9bbe808e358f3bb0aec3256a21ae8d21af412c12
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5280@dc0603ef2c365fddf581108bb4377352d7f79f51
 
 ## Acceptance
 

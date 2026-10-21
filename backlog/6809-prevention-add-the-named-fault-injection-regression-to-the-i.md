@@ -1,21 +1,21 @@
 ---
+bornAs: xtkb29x
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/file-item.mjs", "we:scripts/operations/__tests__/file-item.test.mjs"]
+scope: ["we:backlog/4647-consume-the-real-dispatch-cli-outcome-without-releasing-succ.md"]
 dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Add a unit test with a throwing readTip for an ordinary filing. A reader-level contract test, 'or… (from web-everything/web-everything#5242 review)
+# Prevention — Add the named fault-injection regression to the implementation plan and run it as a deterministic… (from web-everything/web-everything#5427 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/file-item.mjs:172` — Add a unit test with a throwing `readTip` for an ordinary filing. A reader-level contract test, 'ordinary filings never call readTip', is the cheapest durable guard.
-2. `we:scripts/operations/file-item.mjs:78` — Compute one `isOperatorTask(input)` predicate in `we:scripts/backlog/operator-task.mjs` and import it in both places. Add a test that a non-boolean `operatorTask` is refused.
+1. `we:backlog/4647-consume-the-real-dispatch-cli-outcome-without-releasing-succ.md` — Add the named fault-injection regression to the implementation plan and run it as a deterministic suite gate; reversing persistence and signalling must make it fail.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5242@72e418e28c1cab6371928510d5f42a7c16bb1673
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5427@d7ae195c0d82eac15af97c68f6957a258085a43c
 
 ## Acceptance
 

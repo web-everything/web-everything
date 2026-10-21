@@ -1,23 +1,22 @@
 ---
+bornAs: xsgc4w9
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/lib/review-core.mjs", "we:scripts/settings/tests-first.json", "we:scripts/__tests__/check-standards-rules.test.mjs", "we:scripts/lib/__tests__/review-core.test.mjs"]
-dateOpened: "2026-10-17"
+scope: ["we:backlog/5209-prevention-delete-the-receipt-after-a-successful-apply-or-re.md"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add a lint test that enumerates non-literal bad acceptance shapes (empty section, no [An] line, a… (from web-everything/web-everything#5501 review)
+# Prevention — A deterministic check that every we:path:N-M citation in a backlog card falls inside the file and… (from web-everything/web-everything#5315 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/check-standards-rules.mjs:1443` — Add a lint test that enumerates non-literal bad acceptance shapes (empty section, no [A<n>] line, a TODO variant) and states which are in scope.
-2. `we:scripts/lib/review-core.mjs:331` — When adding a settings switch, assert that the whole behaviour disappears (for example, the mandate has no 'COVERAGE' wording) rather than only the new string.
-3. `we:scripts/settings/tests-first.json:2` — Add a layout test in we:settings-files.test.mjs that rejects top-level `$`-prefixed keys other than `$comment`.
-4. `we:scripts/check-standards-rules.mjs:1443` — Extend the deterministic standards gate with a structured executable-acceptance requirement and negative tests for absent acceptance and prose-only acceptance.
+1. `we:backlog/5209-prevention-delete-the-receipt-after-a-successful-apply-or-re.md:26` — A deterministic check that every `we:path:N-M` citation in a backlog card falls inside the file and, ideally, starts and ends on a statement boundary. This would go in check:standards or check-backlog-item.
+2. `we:backlog/5209-prevention-delete-the-receipt-after-a-successful-apply-or-re.md` — Add the planned CLI regression with parsed-stdout assertions so automated tests enforce the structured failure contract.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5501@0324572dee9b0b22317d5918dbd812d5e8898d48
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5315@4b8bb0c5490599e2a73634f765f4faf729df4e6e
 
 ## Acceptance
 

@@ -1,21 +1,23 @@
 ---
+bornAs: xsd19oz
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/__tests__/sim/world-env.mjs", "we:scripts/operations/file-item-io.mjs", "we:scripts/operations/__tests__/file-item-io.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/conveyor/__tests__/nightly-coroner-job.test.mjs"]
+dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Prevention — A dead-export check (an unused-export lint) over scripts/conveyor/__tests__/sim/ would flag a hel… (from web-everything/web-everything#5242 review)
+# Prevention — Add a table-driven test that sets every key of NIGHTLY_DEFAULTS to a nondefault value, runs tick… (from web-everything/web-everything#5487 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/__tests__/sim/world-env.mjs:4` — A dead-export check (an unused-export lint) over scripts/conveyor/__tests__/sim/ would flag a helper that only its own test imports.
-2. `we:scripts/operations/file-item-io.mjs:39` — A check:standards rule that flags a hard-coded IANA zone outside we:local-date.mjs, plus a test that an ordinary file-item run still uses localToday.
+1. `we:scripts/conveyor/__tests__/nightly-coroner-job.test.mjs:225` — Add a table-driven test that sets every key of `NIGHTLY_DEFAULTS` to a nondefault value, runs `tick` and `runNightlyCoronerJob`, and asserts the observable effect of each. Also add a standards check that every `NIGHTLY_DEFAULTS` key appears in a test with a nondefault literal.
+2. `we:scripts/conveyor/__tests__/nightly-coroner-job.test.mjs` — A standards check that, for each key in NIGHTLY_DEFAULTS, requires a test referencing the key with a value different from the default; failing that, a review-lens note.
+3. `we:scripts/conveyor/__tests__/nightly-coroner-job.test.mjs` — Add a parameterized configuration-contract test covering default and valid nondefault attempt limits, and run it as a deterministic CI gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5242@d804ef21283d80d698ad2dc420349b35167eddb8
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5487@1cbf326956bd56f0480ff93918b949b545fff4c8
 
 ## Acceptance
 

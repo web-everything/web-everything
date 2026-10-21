@@ -1,20 +1,21 @@
 ---
+bornAs: xs30vqr
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/conveyor/__tests__/review-hold-reconcile.test.mjs"]
-dateOpened: "2026-10-17"
+scope: ["we:backlog/xmp4wwb-prevention-extend-the-backlog-card-standards-check-so-that-e.md"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — For every new setting that gates an existing writer, require one test that flips only that settin… (from web-everything/web-everything#5465 review)
+# Prevention — Consolidate the Acceptance-mapping detail into #5360; give tracked guards stable identifiers and… (from web-everything/web-everything#5352 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/review-hold-reconcile.mjs:256` — For every new setting that gates an existing writer, require one test that flips only that setting and asserts the writer's proof or IO is not called. A review lens covers this; a deterministic gate is not practical.
+1. `we:backlog/6141-prevention-extend-the-backlog-card-standards-check-so-that-e.md:14` — Consolidate the Acceptance-mapping detail into #5360; give tracked guards stable identifiers and gate creation of multiple open prevention cards against the same guard identifier.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5465@d3c0c02fd8a06bd85dcc2fcc08252aa03f3a4ec7
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5352@a0fd11a59519305d814b44e685291e5883b1ba8e
 
 ## Acceptance
 

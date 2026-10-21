@@ -1,20 +1,23 @@
 ---
+bornAs: xrwol5h
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xmp4wwb-prevention-extend-the-backlog-card-standards-check-so-that-e.md"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/lib/operator-send-backs.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/lib/__tests__/operator-send-backs.test.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Consolidate the Acceptance-mapping detail into #5360; give tracked guards stable identifiers and… (from web-everything/web-everything#5352 review)
+# Prevention — Add a test that replays a legacy-thread fixture (operator send-back, unmarked fix, operator accep… (from web-everything/web-everything#5356 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xmp4wwb-prevention-extend-the-backlog-card-standards-check-so-that-e.md:14` — Consolidate the Acceptance-mapping detail into #5360; give tracked guards stable identifiers and gate creation of multiple open prevention cards against the same guard identifier.
+1. `we:scripts/lib/operator-send-backs.mjs:69` — Add a test that replays a legacy-thread fixture (operator send-back, unmarked fix, operator accept) and asserts the intended outcome. Better, add a lens question to the review checklist for any new fail-closed hold: 'who can release this, and what happens to threads that predate it?'
+2. `we:scripts/conveyor/reconcile-core.mjs:2535` — A check:standards rule or test convention: every new `continue`/refusal branch in planReconcile needs a named test that reaches it. This is the same class as the filed card x6pj1po (fail-closed holds need test-covered paths).
+3. `we:scripts/lib/operator-send-backs.mjs:63` — Add a deterministic regression matrix to the existing quoted-evidence test covering valid evidence headings followed by fenced, indented, and blockquoted references, asserting that ledger, queue, and verdict holds remain active.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5352@a0fd11a59519305d814b44e685291e5883b1ba8e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5356@32f04330210174c1b298f9fff4b02097c3160f84
 
 ## Acceptance
 

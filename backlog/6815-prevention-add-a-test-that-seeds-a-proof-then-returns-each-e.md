@@ -1,20 +1,22 @@
 ---
+bornAs: xu89sl4
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-rebuild/__tests__/smoke.test.mjs"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Extract one isListingTrusted(readOptions, headSha) helper and use it at both sites, and add a dec… (from web-everything/web-everything#5280 review)
+# Prevention — Add a test that seeds a proof, then returns each environment verdict (auth-broken, env-timeout, e… (from web-everything/web-everything#5456 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/merge-ai-prs.mjs:841` — Extract one `isListingTrusted(readOptions, headSha)` helper and use it at both sites, and add a decision-table row for `workflowOnly` with `filesComplete: true` and no head.
+1. `we:scripts/lib/daemon-rebuild/smoke.mjs:664` — Add a test that seeds a proof, then returns each environment verdict (auth-broken, env-timeout, env-unavailable, transient) from the reused smoke. It should assert the classifier-specific alert and reason, and that `rejected` stays unset. Better still, route the reused path through the classifier loop and skip only the rejection and fallback steps.
+2. `we:scripts/lib/daemon-rebuild/smoke.mjs:40` — Hash the whole harness import closure of `we:daemon-live-smoke.mjs`, reusing `collectImportClosure`. Alternatively add a check:standards rule that every file imported by the smoke runner feeds `smokePassIdentity`.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5280@dc0603ef2c365fddf581108bb4377352d7f79f51
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5456@68cd1be796b426c4d418139e451855f016410ddc
 
 ## Acceptance
 

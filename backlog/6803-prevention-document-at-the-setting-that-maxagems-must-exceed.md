@@ -1,22 +1,22 @@
 ---
+bornAs: xscvbtg
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/fast-drain-scope.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/conveyor/lease-reaper-run-index.mjs", "we:scripts/conveyor/__tests__/lease-reaper-run-index.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add the two fallback CLI cases and a WE_FAST_DRAIN_LISTING=live case to the existing run() harnes… (from web-everything/web-everything#5316 review)
+# Prevention — Document at the setting that maxAgeMs must exceed the longest possible wrapper lifetime. Better,… (from web-everything/web-everything#5289 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/merge-ai-prs.mjs:4960` — Add the two fallback CLI cases and a `WE_FAST_DRAIN_LISTING=live` case to the existing `run()` harness. A branch-coverage threshold on merge-ai-prs listOne would catch the class.
-2. `we:scripts/lib/enqueue-on-event.mjs:454` — Cap the buffer at a generous bound (e.g. 256 KB, keeping head and tail), or match the timings line incrementally with a line buffer. Add a test that feeds more than the cap and still extracts the timings. A lint rule against unbounded `+=` accumulation on child streams would catch the class.
-3. `we:scripts/lib/__tests__/fast-drain-scope.test.mjs` — Add deterministic CLI tests injecting both failures and asserting successful live-listing fallback; include them in the existing test gate.
+1. `we:scripts/conveyor/lease-reaper-run-index.mjs:67` — Document at the setting that maxAgeMs must exceed the longest possible wrapper lifetime. Better, only age-skip records that cached as having no in-flight pairs, so a record with a live pair is never skipped. File this as a backlog item.
+2. `we:scripts/conveyor/__tests__/lease-reaper-run-index.test.mjs:107` — Add a deterministic exception-injection test for the resolver fallback and verify that removing the catch makes that named test fail.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5316@02f9dde83c5cd6ebc6e92d6601f95f46f2b6a846
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5289@9bbe808e358f3bb0aec3256a21ae8d21af412c12
 
 ## Acceptance
 

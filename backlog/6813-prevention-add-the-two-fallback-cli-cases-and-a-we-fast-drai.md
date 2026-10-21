@@ -1,21 +1,23 @@
 ---
+bornAs: xtx14s2
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-rebuild/__tests__/smoke.test.mjs"]
-dateOpened: "2026-10-16"
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/fast-drain-scope.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a test that seeds a proof, then returns each environment verdict (auth-broken, env-timeout, e… (from web-everything/web-everything#5456 review)
+# Prevention — Add the two fallback CLI cases and a WE_FAST_DRAIN_LISTING=live case to the existing run() harnes… (from web-everything/web-everything#5316 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/daemon-rebuild/smoke.mjs:664` — Add a test that seeds a proof, then returns each environment verdict (auth-broken, env-timeout, env-unavailable, transient) from the reused smoke. It should assert the classifier-specific alert and reason, and that `rejected` stays unset. Better still, route the reused path through the classifier loop and skip only the rejection and fallback steps.
-2. `we:scripts/lib/daemon-rebuild/smoke.mjs:40` — Hash the whole harness import closure of `we:daemon-live-smoke.mjs`, reusing `collectImportClosure`. Alternatively add a check:standards rule that every file imported by the smoke runner feeds `smokePassIdentity`.
+1. `we:scripts/merge-ai-prs.mjs:4960` — Add the two fallback CLI cases and a `WE_FAST_DRAIN_LISTING=live` case to the existing `run()` harness. A branch-coverage threshold on merge-ai-prs listOne would catch the class.
+2. `we:scripts/lib/enqueue-on-event.mjs:454` — Cap the buffer at a generous bound (e.g. 256 KB, keeping head and tail), or match the timings line incrementally with a line buffer. Add a test that feeds more than the cap and still extracts the timings. A lint rule against unbounded `+=` accumulation on child streams would catch the class.
+3. `we:scripts/lib/__tests__/fast-drain-scope.test.mjs` — Add deterministic CLI tests injecting both failures and asserting successful live-listing fallback; include them in the existing test gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5456@68cd1be796b426c4d418139e451855f016410ddc
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5316@02f9dde83c5cd6ebc6e92d6601f95f46f2b6a846
 
 ## Acceptance
 

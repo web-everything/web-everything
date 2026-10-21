@@ -1,22 +1,24 @@
 ---
+bornAs: xtvow7w
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-ledger-facts.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/drain-ledger-facts.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/conveyor/__tests__/fixer-settings-1018.test.mjs", "we:scripts/settings/fix.json"]
+dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Prevention — Add a drain wiring test that runs a fake-gh pass and asserts the ledger rows. A cheaper alternati… (from web-everything/web-everything#5195 review)
+# Prevention — A review lens or lint rule that flags assertions whose only subject is output the test itself pro… (from web-everything/web-everything#5615 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/merge-ai-prs.mjs:5703` — Add a drain wiring test that runs a fake-gh pass and asserts the ledger rows. A cheaper alternative is a check:standards rule that every export in drain-ledger-*.mjs is referenced by a wiring test.
-2. `we:scripts/merge-ai-prs.mjs:3092` — Add a decision-table test for the recorders covering the read-ok/write-miss product across consecutive passes. Optionally dedup the home spill by (pr, reasonCode, last event) when the miss flag is set.
-3. `we:scripts/lib/drain-ledger-facts.mjs:47` — Add a decision-table test for `planDrainLedgerFacts` that crosses `reviewGate` facts with `decision` values (merge, skip, held) and asserts each fact kind's write or no-write. Also gate the restamp on `v.decision === 'merge'`.
+1. `we:scripts/conveyor/__tests__/fixer-settings-1018.test.mjs:24` — A review lens or lint rule that flags assertions whose only subject is output the test itself produced. Alternatively, make resolveFixSettings log all leaves through logCascadeSources so the test can assert on real resolver output.
+2. `we:scripts/conveyor/__tests__/fixer-settings-1018.test.mjs:35` — Add named cases for built-in fallback, ignored platform preference, and each preserved routing path, then run them as a deterministic CI gate; alternatively reference existing named tests that assert these contracts.
+3. `we:scripts/settings/fix.json:2` — Add deterministic resolver tests for absent settings and conflicting platform preferences, asserting both the resolved value and source.
+4. `we:scripts/settings/fix.json:2` — Add a deterministic routing regression matrix covering the three exceptional paths with the threshold set to four.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5195@20579a25576d5e07af60023a4a27033ab9c1e241
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5615@dfdc65892253631ef312eefb479f424f6dcf9827
 
 ## Acceptance
 

@@ -1,20 +1,22 @@
 ---
+bornAs: xsqurha
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/fast-drain-scope.mjs", "we:scripts/lib/__tests__/fast-drain-scope.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/operations/file-item.mjs", "we:scripts/operations/__tests__/file-item.test.mjs"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Add a test that round-trips the actual kind through writeShaCache/readShaCache on a temp dir. Bet… (from web-everything/web-everything#5282 review)
+# Prevention — Add a unit test with a throwing readTip for an ordinary filing. A reader-level contract test, 'or… (from web-everything/web-everything#5242 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/fast-drain-scope.mjs:45` — Add a test that round-trips the actual kind through writeShaCache/readShaCache on a temp dir. Better, make shaCachePath throw or log on an invalid kind instead of silently returning null, or export the kind regex so callers can assert against it.
+1. `we:scripts/operations/file-item.mjs:172` — Add a unit test with a throwing `readTip` for an ordinary filing. A reader-level contract test, 'ordinary filings never call readTip', is the cheapest durable guard.
+2. `we:scripts/operations/file-item.mjs:78` — Compute one `isOperatorTask(input)` predicate in `we:scripts/backlog/operator-task.mjs` and import it in both places. Add a test that a non-boolean `operatorTask` is refused.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5282@de28e7794f84eed3ed23ae230b7c9cbd146e9ecc
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5242@72e418e28c1cab6371928510d5f42a7c16bb1673
 
 ## Acceptance
 
