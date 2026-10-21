@@ -39,7 +39,7 @@ Operator 2026-10-18 "Ok", verbatim idea: "group more finding in a single pr, cou
 
 **Not absorbed: the rule-file conflicts.** PRs 5515, 5524, 5527, 5532 each edit one shared check file. Those are code, and "code never joins a collector". Card 6250 (not "372": that number is the loan data table) keeps that half; the card-filing half of 6250 is covered by the collector.
 
-**Carved child (build, not a fork): self-heal a sealed collector.** A sealed state whose PR is merged or closed on GitHub retires itself (GitHub is the truth; a closed-unmerged batch first carries its unlanded members into the fresh batch, so no card is dropped), a seal-job timeout becomes resumable with bounded retries then a held reason, and a batch held for an unextractable finding gets an age escape, so none of these can block admission again. Proof required: before/after on the live 327-card spool draining into a fresh batch. Predicted scope: `we:scripts/operations/card-batch-seal-io.mjs`, `we:scripts/operations/card-batch.mjs`. Filed separately after this ratification; the forks below do not depend on it.
+**Carved child (build, not a fork): self-heal a sealed collector.** A sealed state whose PR is merged or closed on GitHub retires itself (GitHub is the truth; a batch closed without a merge or a split is archived and its members surfaced to the operator, so no card is dropped silently), a seal-job timeout becomes resumable with bounded retries then a held reason, and a batch held for an unextractable finding gets an age escape, so none of these can block admission again. Proof required: before/after on the live 327-card spool draining into a fresh batch. Predicted scope: `we:scripts/operations/card-batch-seal-io.mjs`, `we:scripts/operations/card-batch.mjs`. Filed separately after this ratification; the forks below do not depend on it.
 
 ## Recommended path at a glance
 
@@ -141,7 +141,7 @@ Screen: flagged(impl) -> tooling ownership, invisible across the WE-FUI boundary
 
 ## Acceptance
 
-- [A1] **Executable** - after the carved child lands: `node --test we:scripts/operations/__tests__/card-batch-seal-io.test.mjs` covers a sealed state whose PR is merged retiring on the next admission, and the 327-card spool drains into a new batch (live before/after count).
+- [A1] **Executable** - after the carved child lands: x5nmdnt's [A1] cases pass, among them `retires a sealed state whose PR merged on the next admission` (we:scripts/operations/__tests__/card-batch.test.mjs) and `closed-unmerged batch is archived, retired and surfaced` (we:scripts/operations/__tests__/card-batch-io.test.mjs), and the 327-card spool drains into a new batch (live before/after count).
 
 ## Non-goals
 
@@ -152,7 +152,7 @@ Screen: flagged(impl) -> tooling ownership, invisible across the WE-FUI boundary
 1. **Untrusted text** - n/a: a decision card; no input is parsed.
 2. **Truncated reads** - n/a: no reads.
 3. **Shared state files** - the collector state file is shared; retirement runs under the existing lease (the carved child, x5nmdnt).
-4. **Fail closed** - an unreadable PR state keeps the batch sealed and holds, never retires. A closed-unmerged batch with a member whose bytes cannot be read also stays sealed and held.
+4. **Fail closed** - an unreadable PR state keeps the batch sealed and holds, never retires.
 5. **Identity scoping** - state is keyed by repo and kind.
-6. **State over time** - the stuck state is exactly this class; GitHub is the truth source. Merged: retire. Closed, not merged: carry every unlanded, unextracted member into the fresh batch, then retire (closing a whole batch is not a rejection; Fork 4 (c)). Unreadable: stay sealed and held. Each row has a named case in x5nmdnt.
+6. **State over time** - the stuck state is exactly this class; GitHub is the truth source. Merged: retire. Closed by a split: retire (the survivors are on the remainder PR). Closed otherwise: archive with its members, retire, and surface the members as needs-you. Unreadable: stay sealed and held. Each row has a named case in x5nmdnt.
 7. **Who wrote it** - n/a: mechanical filers only.

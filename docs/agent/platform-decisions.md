@@ -6447,10 +6447,10 @@ as implementation destinations.
 6. **Ownership.** The coordinator owns the collector branch (lease plus state file). A sealed state whose PR is
    merged or closed on GitHub is retired on the next admission; an unreadable PR state keeps it sealed and held.
 
-**Defended by (planned cases, named in each slice's [A1]):** rules 1 to 3 by xpabefb (`code changes refuse
-collection`, `ruling is declared with disabled 8/60 defaults`, `count wins simultaneous count and age thresholds`,
-`every stream value is a cascade setting with its source logged`, `high and urgent bypass with shipped defaults`);
-rule 4 by xf1z2w3 (`extracted member cannot re-enter a collector`); rule 5 by x1mmp60; rule 6 by x5nmdnt, one
-case per PR state (merged, closed-unmerged with its members carried, unreadable).
+**Defended by (planned cases, named in each slice's [A1]):** rules 1 to 3 by xpabefb (code is refused
+collection; the ruling stream is declared with 8 / 60 defaults and refuses while disabled; count wins a tie; every
+value is a cascade setting with its source logged; high and urgent bypass); rule 4 by xf1z2w3 (`extracted member
+cannot re-enter a collector`); rule 5 by x1mmp60; rule 6 by x5nmdnt, one case per PR state (merged, closed by a
+split, closed otherwise with its members archived and surfaced, unreadable).
 
 **Lineage:** `#x5ioz96` (ruled 2026-10-18). Epic x87psvt.

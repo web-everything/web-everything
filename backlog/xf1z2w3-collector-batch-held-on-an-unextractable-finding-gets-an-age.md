@@ -4,14 +4,14 @@ size: 3
 parent: "x87psvt"
 status: open
 blockedBy: ["x5nmdnt"]
-scope: ["we:scripts/operations/card-batch-extract.mjs", "we:scripts/operations/card-batch.mjs", "we:scripts/operations/__tests__/card-batch-extract.test.mjs", "we:scripts/operations/__tests__/card-batch.test.mjs"]
+scope: ["we:scripts/operations/card-batch-extract.mjs", "we:scripts/operations/card-batch.mjs", "we:scripts/operations/card-batch-io.mjs", "we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/operations/__tests__/card-batch-extract.test.mjs", "we:scripts/operations/__tests__/card-batch.test.mjs"]
 dateOpened: "2026-10-18"
 tags: []
 ---
 
 # Collector batch held on an unextractable finding gets an age escape
 
-Per decision x5ioz96 fork 4 skeptic amendment: a finding that names no single card file, or several, holds the batch for a person with no age escape today. After a bounded age (a setting with its source logged) the hold escalates to the operator as needs-you and the batch no longer blocks admission of new cards into a fresh batch. The admission refusal lives in the planner (`state?.sealedAt` refuses `batch-sealed` in we:scripts/operations/card-batch.mjs), so the escape must change admission there, not only the extract module. The held batch's own members are never dropped: they stay on the held PR, which keeps its hold label and is named in the needs-you escalation, until a person resolves the finding.
+Per decision x5ioz96 fork 4 skeptic amendment: a finding that names no single card file, or several, holds the batch for a person with no age escape today. After a bounded age (a setting with its source logged) the hold escalates to the operator as needs-you and the batch no longer blocks admission of new cards into a fresh batch. The admission refusal lives in the planner (`state?.sealedAt` refuses `batch-sealed` in we:scripts/operations/card-batch.mjs), so the escape must change admission there, not only the extract module. The planner is pure, so the write that frees the active slot (archive the held state to `sealed/`, then retire the slot) is in we:scripts/operations/card-batch-io.mjs or the seal job's retire in we:scripts/operations/card-batch-seal-io.mjs. The held batch's own members are never dropped: they stay on the held PR, which keeps its hold label and is named in the needs-you escalation, until a person resolves the finding.
 
 ## Acceptance
 
@@ -39,5 +39,5 @@ One line per class: either the handling, or `n/a: <why>`.
 3. **Shared state files** — TODO: the handling, or n/a: <why>.
 4. **Fail closed** — TODO: the handling, or n/a: <why>.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
+6. **State over time** — an aged hold leaves the active slot as a `sealed/` archive. If a person later merges its PR, it retires; if they close it without a merge, x5nmdnt's seal-scan row archives it as `closedUnmerged` and surfaces its members. Its cards are never silently dropped.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
