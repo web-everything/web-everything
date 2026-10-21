@@ -87,6 +87,24 @@ export function decideRearm({ currentLabels = [] } = {}) {
   return decideSetLabel({ to: 'rearm', currentLabels });
 }
 
+/** #5771: a stable token for the RECORDED accept (reviewed sha + diff + contribution fingerprints), so a release proved for one accept
+ * is never honoured for a replacement accept comment. `null` when there is no trusted record. */
+export function acceptEvidenceToken(comments) {
+  const rec = latestAcceptRecord(comments);
+  return rec ? `${rec.sha}/${rec.diff ?? ''}/${rec.contribution ?? ''}` : null;
+}
+
+/** #5771: on the planner's FRESH snapshot, is the recorded accept still the PROVED one and unsuperseded (same evidence token, no
+ * later verdict/hold comment, no pending review, not human-cleared)? A release key is honoured only while this holds. Comments only
+ * (the planner carries no formal reviews); the tick re-proves (incl. formal reviews) right after the re-plan, and the merge gate
+ * re-reads everything independently. */
+export function acceptStillUnsupersededOnSnapshot(pr, evidence) {
+  const names = (pr.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+  if (names.includes('review:pending') || !evidence || acceptEvidenceToken(pr.comments) !== evidence) return false;
+  const rec = latestAcceptRecord(pr.comments);
+  return !!rec && !rec.humanCleared && !rec.laterVerdict && !rec.laterBodyDerivedHold;
+}
+
 /** #5628: nominate moved agent accepts for a live check, or prove re-arm is owed.
  * The writer requires proof; the planner can nominate without fetching a diff. */
 export function staleAcceptanceOwed(pr, { requireProof = true } = {}) {

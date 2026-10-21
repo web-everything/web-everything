@@ -126,7 +126,15 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
 import { ciHealOwed } from './ci-heal-rule.mjs';
-import { staleAcceptanceOwed } from './rearm-review.mjs';
+import { staleAcceptanceOwed, acceptStillUnsupersededOnSnapshot } from './rearm-review.mjs';
+
+/** #5771: keys are `pr@head#<accept evidence token>`; honoured only for the exact PR, head and proved accept, while it stands. */
+function releasedStaleAccept(keys, pr) {
+  if (!Array.isArray(keys)) return false;
+  const prefix = `${pr.number}@${String(pr.headRefOid ?? '').toLowerCase()}#`;
+  const key = keys.find(k => typeof k === 'string' && k.startsWith(prefix));
+  return !!key && acceptStillUnsupersededOnSnapshot(pr, key.slice(prefix.length));
+}
 import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
@@ -2046,6 +2054,9 @@ export function planReconcile({
   // #3902 — the review-label healer policy, see the `restore-review-label` STUCK variant below. A caller may pass
   // it; omitted, it is the one env read in this file (`WE_REVIEW_LABEL_HEAL`, via {@link resolveReviewLabelHealMode}).
   reviewLabelHeal = resolveReviewLabelHealMode(globalThis.process?.env ?? {}),
+  // #5771 - `pr@head` (lowercase) keys whose stale accept the caller just PROVED still covers that exact head. The stale-accept
+  // branch skips only those, so the PR falls through to its normal rows (attempts/cap) instead of holding forever.
+  staleAcceptReleased = null,
   // Card xu1nixv (incident 2026-10-08) — the published red-main priority record (`we:scripts/lib/main-red-priority.mjs`,
   // `{repo, pr, expiresAt}`), pure data in. While main is red, the PR that owns the fix is planned FIRST (so it heads
   // every queue that consumes this plan in order), is promoted from draft at once, and is never told to wait for main
@@ -2724,7 +2735,8 @@ export function planReconcile({
     // #5628: a recorded accept on an older head needs the existing guarded re-arm,
     // then the ordinary review dispatcher. The write half compares recorded
     // fingerprints before re-arming; a read miss never revokes an acceptance.
-    if (reviewLabelHeal !== 'off' && withPhase.check === 'green' && staleAcceptanceOwed(pr, { requireProof: false })) {
+    if (reviewLabelHeal !== 'off' && withPhase.check === 'green' && staleAcceptanceOwed(pr, { requireProof: false })
+        && !releasedStaleAccept(staleAcceptReleased, pr)) {
       dispatch.push({ ...base, ...withPhase, kind: 'restore-review-label', variant: 'stale-accept',
         label: 'review:pending', why: 'head moved past its accept — verify coverage, then guarded re-arm hands a stale accept to independent review' });
       continue;

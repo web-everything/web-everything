@@ -1,3 +1,4 @@
+import { acceptEvidenceToken } from '../rearm-review.mjs';
 import { describe, expect, it, vi } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
 import { planCiHealSpawns } from '../tick-core.mjs';
@@ -117,6 +118,28 @@ describe('PR sweep: named singleton owners', () => {
     expect(plan({ ...p, labels: labels('review:pending') }).dispatch).toEqual([
       expect.objectContaining({ kind: 'review', prNumber: 5628 }),
     ]);
+  });
+
+  it('#5771: a PROVED-covered stale accept (pr@head key) skips the stale-accept row and gets its normal rows, attempts/cap included; any other head re-holds', () => {
+    const p = pr(5771, { labels: labels('ready-to-merge', 'review:accepted'), statusCheckRollup: [check('SUCCESS')],
+      comments: [{ author: { login: 'web-everything' }, createdAt: '2026-10-18T18:00:00Z',
+        body: `✅ review — accepted\n\n<!-- reviewed-sha: ${oldHead} -->` }] });
+    expect(plan(p).dispatch).toEqual([expect.objectContaining({ variant: 'stale-accept' })]);
+    const ev = acceptEvidenceToken(p.comments);
+    const released = plan(p, { staleAcceptReleased: [`5771@${head.toLowerCase()}#${ev}`] });
+    expect(released.dispatch.some(d => d.variant === 'stale-accept')).toBe(false);
+    const row = [...released.refusals, ...released.dispatch].find(d => d.prNumber === 5771);
+    expect(row, JSON.stringify(released)).toBeDefined();
+    expect(Number.isInteger(row.attempts) && Number.isInteger(row.cap) && row.cap > 0).toBe(true);
+    // TOCTOU (audit): a hold comment or pending label that lands after the proof but before the re-plan keeps the row.
+    const key = [`5771@${head.toLowerCase()}#${ev}`];
+    const hold = { author: { login: 'web-everything' }, createdAt: '2026-10-18T19:00:00Z', body: '🔁 review — changes requested\n\nplease redo' };
+    expect(plan({ ...p, comments: [...p.comments, hold] }, { staleAcceptReleased: key }).dispatch).toEqual([expect.objectContaining({ variant: 'stale-accept' })]);
+    expect(plan({ ...p, labels: labels('ready-to-merge', 'review:accepted', 'review:pending') }, { staleAcceptReleased: key }).dispatch.some(d => d.variant === 'stale-accept')).toBe(true);
+    // Bound to the proved head: a key for another head (or another PR) changes nothing.
+    for (const key of [`5771@${oldHead}#${ev}`, `5772@${head}#${ev}`, '5771', `5771@${head.toLowerCase()}`, `5771@${head.toLowerCase()}#other-accept`]) {
+      expect(plan(p, { staleAcceptReleased: [key] }).dispatch).toEqual([expect.objectContaining({ variant: 'stale-accept' })]);
+    }
   });
 
   it.each(['same-head', 'human'])('#5628: preserves %s acceptances', mode => {

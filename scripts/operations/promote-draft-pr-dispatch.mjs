@@ -73,7 +73,7 @@ import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
 import { spawnCiHealRearm } from '../conveyor/ci-heal-mark.mjs';
-import { staleAcceptanceOwed } from '../conveyor/rearm-review.mjs';
+import { staleAcceptanceOwed, acceptEvidenceToken } from '../conveyor/rearm-review.mjs';
 import { createGhProvider, PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
 import { latestAcceptRecord, isKnownMachineBody } from '../lib/accept-carry-forward.mjs';
 import { execFileSync } from 'node:child_process';
@@ -214,7 +214,7 @@ export function defaultRearmStaleAcceptance({ repoSlug, prNumber, headSha,
           need(!staleAcceptanceOwed({ ...fresh, headDiff: net.text, headContribution: net.text }), 'live diff does NOT match the accepted diff (accept stale)');
         } catch (e) { failed.push(`probe threw (${safe(e?.name, 24)}; message withheld)`); }
         const covers = failed.length === 0;
-        return { ok: false, ...(covers ? { covers: true, coveredHead: headSha } : {}),
+        return { ok: false, ...(covers ? { covers: true, coveredHead: headSha, acceptEvidence: acceptEvidenceToken(fresh.comments) } : {}),
           reason: covers ? 'acceptance still covers the head (live diff match, accept unsuperseded)' : `refused, covers=false: ${failed.join('; ')}` };
       }
     }

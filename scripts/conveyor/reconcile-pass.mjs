@@ -1441,6 +1441,7 @@ export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = pr
  * @returns {{dispatch:Array<object>, refusals:Array<object>, notes:Array<object>, prs:number, agents:number}}
  */
 export function runReconcilePass({
+  staleAcceptReleased = null, // #5771 - `pr@head` keys of proven-covered stale accepts, passed to planReconcile
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
@@ -1578,6 +1579,7 @@ export function runReconcilePass({
     ...prOwnershipSettings(loadPrOwnership, env),
     // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
     mainRedPriority: readPriority(),
+    ...(Array.isArray(staleAcceptReleased) && staleAcceptReleased.length ? { staleAcceptReleased } : {}),
   });
   return { ...plan, owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
