@@ -645,8 +645,16 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
       if (!ruling && !(record.rulings ?? []).some(r => r.key === f.key) && (record.superseded ?? []).some(s => s.key === f.key)) {
         ruling = { key: f.key, result: 'not-real', superseded: true };
       }
+      // The gate's own `blocked` list decides block-or-clear (flattened ruling keys can collide: a carry backing is keyed
+      // by its SOURCE finding, which may also be a live-head finding). The ruling found above only names the clearing
+      // kind (card / not-real) and who ruled; a disagreement with the gate is never resolved, it stays paused.
+      const gateBlocked = state.blocked.includes(f.key);
+      if (gateBlocked) {
+        ruling = state.rulings.filter(r => r.key === f.key && r.result === 'block').at(-1) ?? { key: f.key, result: 'block' };
+      }
       if (!ruling) return stay(`finding ${findingLoc(where)} has no readable ruling on the live head`);
       if (!RULING_RESULTS.has(ruling.result)) return stay(`finding ${findingLoc(where)} carries an unknown ruling (${ruling.result})`);
+      if (!gateBlocked && ruling.result === 'block') return stay(`finding ${findingLoc(where)}: the gate clears it but its ruling reads block (reader disagreement)`);
       // An operator ruling counts only on the exact head it names, unless it is the backing of a carry the gate
       // accepted onto THIS head's record (the carry entry is the live-head proof; the backing names its source head).
       if (ruling.operator && ruling.head !== head && !carry) return stay(`finding ${findingLoc(where)} is ruled for a different head (${String(ruling.head).slice(0, 9)})`);
