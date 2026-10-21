@@ -1632,7 +1632,8 @@ including before tonight's deadline after a restart; multiple missed nights coal
 `coroner.nightly.laneWaitMs` defaults to 600000 and is passed to lane-pool's normal `--wait-ms`.
 `attempts` defaults to 3; the daemon retries the whole run with exponential backoff starting at
 `retryBackoffMin` (10 minutes). `deadlineEt` defaults to `03:30` on the following ET calendar date;
-no attempts launch after that deadline, including late catch-up. DST uses New York wall time:
+no attempts launch after that deadline, including late catch-up.
+`runTimeoutMin` (default 30) caps each extractor CLI run; a run past it is killed and the attempt fails. DST uses New York wall time:
 nonexistent deadlines expire at the first valid instant after the spring-forward gap; ambiguous
 deadlines use the first occurrence. Pin ordinary, gap (multiple configured minutes), and repeated
 wall times to explicit UTC instants in the named deadline tests.
@@ -1657,6 +1658,8 @@ an existing report through its receipt rather than extracting twice. Never prune
 The child leases a lane via the lane-pool CLI, runs its `coroner-extract.mjs` (which imports
 `coroner-rounds.mjs`) with explicit `--since`/`--until`, `--json`, `--no-save`, and releases the lane in
 `finally`. If present, `coroner-false-findings.mjs` is invoked with the same window and `--json`.
+Both CLIs must declare every option in `coronerExtractorArgs`; a contract test runs that exact argv
+through both real parsers, so the job and the scripts cannot drift.
 Resolve both extractor filenames to physical paths before invoking Node: CLI entry guards may
 compare argv with Node's canonical module URL, so a symlinked lane or script can otherwise exit
 successfully without output. The `nightly-coroner-symlinked-lane` soak break exercises both CLIs
