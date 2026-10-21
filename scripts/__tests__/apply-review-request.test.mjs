@@ -468,13 +468,19 @@ describe('the ledger push can only fast-forward the transport branch (C3)', () =
 describe('no other code on the ledger path pushes (C3)', () => {
   const SCRIPTS = join(REPO_ROOT, 'scripts');
   const TRANSPORT = 'scripts/lib/git-transport-branch.mjs';
-  // The ledger append's push is the transport's. The other files are in the STATIC import closure only because
+  const OUTBOX = 'scripts/lib/verdict-ledger-outbox.mjs';
+  // THE LEDGER APPEND'S ONE PUSH (2026-10-21) is the plumbing commit in `verdict-ledger-outbox.mjs` — the outbox
+  // flusher and the direct (CI) path share it. It REPLACED the ledger's use of the transport's worktree push: the
+  // transport's own push stays only for the non-ledger stagers (verdict requests, PR views, handoff), and is in this
+  // closure because the io-shell still READS through that module. The test below proves the io-shell no longer
+  // reaches the worktree stager, so the two are never both a ledger push path. The other files are in the STATIC import closure only because
   // the verdict-ledger / review-escalation modules import them; they push lane refs, not the transport branch,
   // and are not on the ledger-append call path. They are pinned by count rather than ignored: a NEW push in any
   // file here, or in a file newly pulled into the closure, changes this map and must be reviewed on purpose.
   // (`fix-procedure.mjs` counts three because one hit is the `cmd === 'push'` CLI verb, not a git call.)
   const KNOWN_PUSH_SITES = {
     [TRANSPORT]: 1,
+    [OUTBOX]: 1,
     'scripts/lib/rebase-drop-manifest.mjs': 1,
     'scripts/lib/nnn-collision-heal.mjs': 1,
     'scripts/conveyor/fix-procedure.mjs': 3,
@@ -511,6 +517,17 @@ describe('no other code on the ledger path pushes (C3)', () => {
       'scripts/lib/verdict-ledger-io.mjs', 'scripts/lib/git-transport-branch.mjs',
       'scripts/apply-review-request.mjs', 'scripts/collect-review-requests.mjs',
     ]));
+  });
+
+  it('the ledger writes ONLY through the plumbing push: the io-shell no longer reaches the worktree stager', () => {
+    const io = readFileSync(join(SCRIPTS, 'lib', 'verdict-ledger-io.mjs'), 'utf8')
+      .split('\n').filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join('\n');
+    expect(io).not.toMatch(/stageOnTransportBranch/);
+    const outbox = readFileSync(join(SCRIPTS, 'lib', 'verdict-ledger-outbox.mjs'), 'utf8');
+    expect(outbox).not.toMatch(/stageOnTransportBranch\s*\(/);
+    const site = pushSites.find((s) => s.startsWith(`${OUTBOX}:`));
+    const line = outbox.split('\n')[Number(site.split(':')[1]) - 1];
+    expect(line).toMatch(/\['push', '--quiet', 'origin', `\$\{commit\}:\$\{ref\}`\]/);
   });
 
   it('finds exactly the known push sites per file, so a new one cannot appear unnoticed', () => {

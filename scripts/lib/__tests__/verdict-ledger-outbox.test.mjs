@@ -11,7 +11,7 @@
 import { describe, it, expect } from 'vitest';
 import { spawn, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import {
   appendLedgerRows, ledgerGitPath, readLedgerFromGit, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
@@ -26,7 +26,7 @@ import { buildVerdictRecord } from '../verdict-ledger.mjs';
 import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
 
 const REPO = 'web-everything/web-everything';
-const IO_MODULE = resolve(fileURLToPath(new URL('..', import.meta.url)), 'verdict-ledger-io.mjs');
+const IO_MODULE = join(dirname(fileURLToPath(import.meta.url)), '..', 'verdict-ledger-io.mjs');
 const row = (pr) => buildVerdictRecord({ repo: REPO, pr, verdict: 'accepted', at: '2026-10-21T12:00:00.000Z', source: 'test' });
 const noSleep = () => {};
 const quiet = () => {};

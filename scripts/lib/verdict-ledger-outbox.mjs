@@ -445,6 +445,34 @@ export function appendViaOutbox(o) {
   return { status: 'appended', queued: false, rows: mine.rows, duplicates: mine.duplicates, attempts: result.attempts, outboxDir: c.dir };
 }
 
+/**
+ * THE DIRECT PATH (CI, where an outbox would die with the runner, and unit seams): the SAME plumbing commit and the
+ * SAME push site as the flusher, for this call's rows only, retried on a fetched tip up to `attempts` times. The
+ * ledger therefore has ONE push shape; the worktree stager in `git-transport-branch.mjs` no longer carries ledger
+ * rows at all. THROWS `OutboxFlushError` when every attempt failed.
+ * @returns {{status: 'appended', attempts: number, rows: number, duplicates: number}}
+ */
+export function appendDirect(o) {
+  const c = common(o);
+  const attempts = Math.max(1, o.attempts ?? 5);
+  const entry = { path: o.path, repo: o.repo, message: o.message, lines: o.lines, ids: o.ids };
+  const errors = [];
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const out = pushBatch({ board: c.board, branch: c.branch, entries: [{ name: 'direct', entry }], run: c.run, allowRef: c.allowRef });
+      const mine = out.counts.get('direct');
+      return { status: 'appended', attempts: attempt, rows: mine.rows, duplicates: mine.duplicates };
+    } catch (e) {
+      errors.push(e);
+      if (attempt >= attempts) {
+        throw new OutboxFlushError(`verdict-ledger: direct append failed after ${attempt} attempts: ${String(e?.message ?? e).split('\n')[0]}`, { errors, attempts: attempt });
+      }
+      if (c.onRetry) c.onRetry({ attempt, error: e });
+      c.sleep(Math.min(250 * 2 ** (attempt - 1), 4000) + Math.floor(c.random() * 500));
+    }
+  }
+}
+
 function defaultGit(args, opts = {}) {
   return execFileSync('git', args, {
     encoding: 'utf8',
