@@ -334,8 +334,8 @@ function resolveRepo() {
     fail(`could not determine an origin URL — pass --origin=<url> (looked in ${topLevel})`);
   }
   const name = explicitPool || flags.name || basename(originUrl).replace(/\.git$/, '');
-  // Default integration branch: the reference's origin/HEAD if known, else `main`.
-  const head = tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, { timeout: LOCAL_GIT_TIMEOUT_MS });
+  // Only discover a default when --branch is absent; explicit-branch acquire must not pay for an unused probe.
+  const head = flags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, { timeout: LOCAL_GIT_TIMEOUT_MS });
   const branch = flags.branch || (head ? head.replace(/^origin\//, '') : 'main');
   return { name, originUrl: originUrl || null, referencePath: topLevel, branch, poolDir: join(POOL_ROOT, name) };
 }
