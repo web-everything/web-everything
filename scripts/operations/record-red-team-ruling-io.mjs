@@ -9,10 +9,10 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readConfirmedBreaks, readOperatorRulings, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, readConfirmedBreaks, readOperatorRulings, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { openPrHeadBacklog, resolveCardRef } from './record-referral-ruling-io.mjs';
-import { assertHumanOperator, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
+import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { automationStateRoot } from '../lib/automation-home.mjs';
 import { defaultSpawnDetached } from './detached-dispatch.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
@@ -129,7 +129,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
     if (head !== p.head) throw new Error(`PR #${p.pr}'s head moved to ${head} since the plan (${p.head}); nothing written — re-run against the new head`);
     const comments = operatorBoundComments(thread.comments);
     let now;
-    try { now = rulableBreaks({ comments, labels: thread.labels, pr: p.pr, head, setting: p.setting, scope: p.scope, ruling: p.ruling }); }
+    try { now = rulableBreaks({ comments, labels: thread.labels, pr: p.pr, head, setting: p.setting, scope: p.scope, ruling: p.ruling, citesCard: Boolean(p.cardRef) }); }
     catch (e) { throw new Error(`${e.message}; nothing written`); }
     if (now.state.resultId !== p.resultId) throw new Error(`the red-team result on the live head changed since the plan (${p.resultId} -> ${now.state.resultId}); nothing written — re-run`);
     const rulable = now.rulable.map((f) => f.index);
@@ -138,8 +138,17 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
     return { comments, labels: thread.labels ?? [] };
   };
   const disposition = (p, comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: p.pr, head: p.head, setting: p.setting, operatorRulings: p.scope });
-  const proveReleased = (p, what) => {
+  /** After the write: same head, same result, the record WE wrote is in the thread as a human operator's comment, and
+   *  the gate (reading that thread) no longer holds or sends back any selected break. */
+  const proveReleased = (p, what, record) => {
     const after = readThread({ repo: p.repo, pr: p.pr });
+    const head = String(after.headRefOid ?? '').toLowerCase();
+    if (head !== p.head) throw new Error(`${what} was posted but PR #${p.pr}'s head moved to ${head}; the ruling binds to ${p.head} only — inspect and re-run on the new head`);
+    const comments = operatorBoundComments(after.comments);
+    if (liveResultGateState(comments, p.pr, head).resultId !== p.resultId) throw new Error(`${what} was posted but the live red-team result changed; inspect the thread before retrying`);
+    if (record && !comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isHumanOperatorComment(c))) {
+      throw new Error(`${what} is not in the read-back as a human operator's comment (altered, or posted as another account); inspect the thread before retrying`);
+    }
     const d = disposition(p, after.comments);
     const still = p.indices.filter((i) => d.held.some((f) => f.index === i) || d.sendBack.some((f) => f.index === i));
     if (still.length) throw new Error(`${what} was posted but the gate still holds break(s) ${still.map((i) => `#${i}`).join(', ')} `
@@ -164,9 +173,10 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
       if (p.cardRef) {
         // An EXISTING card: one release record citing it, then the reason. Nothing is filed.
         if (!/^we:backlog\/[A-Za-z0-9][A-Za-z0-9._-]*\.md(?:@pr[1-9]\d{0,8})?$/.test(p.cardRef)) throw new Error(`--card resolved to an unsafe reference ${JSON.stringify(p.cardRef)}; nothing written`);
-        post(p.repo, p.pr, operatorRecord(p, OPERATOR_CARD_OUTCOME, `- ${p.indices.length} finding(s) carded by the operator to \`${p.cardRef}\` ${indexList(p)}.`));
+        const record = operatorRecord(p, OPERATOR_CARD_OUTCOME, `- ${p.indices.length} finding(s) carded by the operator to \`${p.cardRef}\` ${indexList(p)}.`);
+        post(p.repo, p.pr, record);
         post(p.repo, p.pr, reasonBody(p, `Carded to the existing card \`${p.cardRef}\`; no new card is filed.`));
-        proveReleased(p, 'the operator-card record');
+        proveReleased(p, 'the operator-card record', record);
         return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
       }
       const session = p.session;
@@ -196,7 +206,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
         plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card });
       post(p.repo, p.pr, record);
       post(p.repo, p.pr, reasonBody(p, `Follow-up card queued through the prevention landing job (${session}); filing may be paused, in which case it is owed in the spool.`));
-      proveReleased(p, 'the operator-card record');
+      proveReleased(p, 'the operator-card record', record);
       return { ruling: 'card', head: p.head, indices: p.indices, card: { session, reconciled: spawned }, labels: resync(p) };
     },
     [RED_TEAM_RULING_NOT_REAL_EFFECT]: (p) => {
@@ -205,7 +215,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
         plan: { sendBack: [], card: [], advisory: p.findings } });
       post(p.repo, p.pr, record);
       post(p.repo, p.pr, reasonBody(p, 'Recorded as not real: the break stays advisory. This does not clear `review:human` or approve the PR.'));
-      proveReleased(p, 'the not-real record');
+      proveReleased(p, 'the not-real record', record);
       return { ruling: 'not-real', head: p.head, indices: p.indices, cause: p.cause ?? null, labels: resync(p) };
     },
     [RED_TEAM_RULING_BLOCK_EFFECT]: async (p) => {

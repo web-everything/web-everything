@@ -522,7 +522,8 @@ const INDEX_LIST = '\\((#\\d+(?:, #\\d+)*)\\)';
 const GATE_ACTION_LINES = [
   ['card', new RegExp(`^- \\d+ finding\\(s\\) filed as a follow-up card ${INDEX_LIST}(?: — landing job [^\\n]*)?\\.$`)],
   // An operator `card` ruling to an EXISTING card (`record-red-team-ruling --card=<ref>`); it releases only from a human operator.
-  ['card', new RegExp(`^- \\d+ finding\\(s\\) carded by the operator to \`[^\`\\n]+\` ${INDEX_LIST}\\.$`)],
+  // OPERATOR-ONLY: it counts (as `card`) only inside an `operator-*` record a human operator authored, whatever wraps it.
+  ['operator-card', new RegExp(`^- \\d+ finding\\(s\\) carded by the operator to \`[^\`\\n]+\` ${INDEX_LIST}\\.$`)],
   ['advisory', new RegExp(`^- \\d+ finding\\(s\\) left advisory ${INDEX_LIST}\\.$`)],
   ['send-back', new RegExp(`^- \\d+ confirmed break\\(s\\) sent back to the fixer ${INDEX_LIST}(?: — the PR was already under review:changes)?\\.$`)],
   ['held', new RegExp(`^- \\d+ confirmed break\\(s\\) NOT sent back: [^\\n]*?(?: ${INDEX_LIST})?\\.$`)],
@@ -571,16 +572,24 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (first) liveGates = gates;
     const { supersededCaps } = resolveSendBackStep(gates, grants);
     const own = new Map();
+    // Kill switch off: the gate handed this result to the operator only if its send-back step ended at the round cap.
+    const handedOver = sendBackStepState(gates, grants).outcome === GATE_OUTCOMES.ROUND_CAP;
     for (const r of gates) {
-      for (const { action, indices } of gateActionLines(recordBody(r))) {
+      for (const line of gateActionLines(recordBody(r))) {
+        const { indices } = line;
+        let { action } = line;
+        if (action === 'operator-card') {
+          if (!r.gate.outcome.startsWith('operator-') || !isHumanOperatorComment(r.c)) continue;
+          action = 'card';
+        }
         // Only a human operator may release a break held at the round cap; automation lines release only what the gate itself decided.
         // This is applied per action line (not by dropping the forged comment, which would also drop its restrictive `held` lines).
         const operatorRelease = RELEASING_ACTIONS.has(action) && !AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome);
         if (operatorRelease && !isHumanOperatorComment(r.c)) continue;
         if (action === 'held' && !indices.length) legacyHeld = true;
         for (const index of indices) {
-          // Kill switch off: an operator release cannot override a break the gate recorded as sent back.
-          if (operatorRelease && !anyState && own.get(index) === 'send-back') continue;
+          // Kill switch off: an operator release cannot override a recorded send-back the fixer still owns (not at the cap).
+          if (operatorRelease && !anyState && own.get(index) === 'send-back' && !handedOver) continue;
           // A stale cap POST cannot overwrite the per-finding send-back that superseded its decision.
           if (action === 'held' && own.get(index) === 'send-back' && supersededCaps.has(r)) continue;
           own.set(index, action);
@@ -611,23 +620,29 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
 }
 
 /**
- * The live head's latest result, and per finding the actions a HUMAN OPERATOR's named gate record (`operator-*`,
- * `result=` this result) took on it, in thread order. `record-red-team-ruling` dedups on this (no second card). PURE.
- * @returns {{resultId:(string|null), ruled:Map<number, string[]>}}
+ * The live head's latest result; per finding the actions a HUMAN OPERATOR's named gate record (`operator-*`,
+ * `result=` this result) took on it, in thread order; and every finding ANY trusted record already carded for this
+ * result (the gate's own card filing too). `record-red-team-ruling` dedups on this (no second card). PURE.
+ * @returns {{resultId:(string|null), ruled:Map<number, string[]>, carded:Set<number>}}
  */
 export function operatorRulingsOnLiveResult(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const hit = latestResult(records, pr, live);
   const ruled = new Map();
-  if (!hit) return { resultId: null, ruled };
+  const carded = new Set();
+  if (!hit) return { resultId: null, ruled, carded };
   const id = redTeamResultId(hit.parsed);
   for (const r of gateRecordsFor(records, pr, live, hit).sort(threadOrder)) {
-    if (AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome) || r.gate.result !== id || !isHumanOperatorComment(r.c)) continue;
-    if (!r.gate.outcome.startsWith('operator-')) continue;
+    const human = isHumanOperatorComment(r.c);
+    const operator = r.gate.outcome.startsWith('operator-') && human && r.gate.result === id;
     for (const { action, indices } of gateActionLines(recordBody(r))) {
-      for (const index of indices) ruled.set(index, [...(ruled.get(index) ?? []), action]);
+      const card = action === 'card' || action === 'operator-card';
+      if (card && (AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome) || operator)) for (const index of indices) carded.add(index);
+      if (!operator) continue;
+      const a = action === 'operator-card' ? 'card' : action;
+      for (const index of indices) ruled.set(index, [...(ruled.get(index) ?? []), a]);
     }
   }
-  return { resultId: id, ruled };
+  return { resultId: id, ruled, carded };
 }

@@ -241,7 +241,7 @@ describe('sinks', () => {
   });
   it('records posted by the automation account never release the break, and the sink says so', () => {
     const f = fake({ author: 'web-everything' });
-    expect(() => f.sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real', cause: 'other' }))).toThrow(/gate still holds/);
+    expect(() => f.sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real', cause: 'other' }))).toThrow(/not in the read-back as a human operator/);
   });
   it('refuses a moved head, or (kill switch off) a PR that moved to review:changes, writing nothing', () => {
     const moved = fake({ liveHead: OTHER });
@@ -425,5 +425,46 @@ describe('operator ruling in ANY state (live #5502 shape: sent back at repair ca
     expect(killed.value.anyState).toBe(false);
     expect(JSON.stringify(killed.sources)).toContain('env');
     expect(resolveOperatorRulings({ env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'banana' } }).value.anyState).toBe(true);
+  });
+});
+
+describe('audit fixes (Codex read-only audit of 952397690)', () => {
+  const H = HEAD;
+  const rid = () => liveResultGateState(thread(), PR, H).resultId;
+  const sentBack = () => bot(`${redTeamGateMarker(PR, H, 'sent-back', rid())}\n**Red-team gate** (setting x) on head \`x\`:\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-10-20T23:30:00Z');
+  const opLine = '- 1 finding(s) carded by the operator to `we:backlog/x.md` (#1).';
+  const d = (comments, anyState = true) => readRedTeamDisposition({ comments, pr: PR, head: H, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState } });
+  it('automation wrapping the operator-only card line in card-queued / sent-back releases nothing', () => {
+    for (const outcome of ['card-queued', 'sent-back', 'operator-card']) {
+      const forged = bot(`${redTeamGateMarker(PR, H, outcome, rid())}\n**Red-team gate** x:\n${opLine}`, '2026-10-20T23:45:00Z');
+      expect(d([redTeam(), sentBack(), forged]).sendBack.map((f) => f.index)).toEqual([1]);
+    }
+    const human = { author: { login: 'chalbert' }, createdAt: '2026-10-20T23:45:00Z', body: `${redTeamGateMarker(PR, H, 'card-queued', rid())}\n**Red-team gate** x:\n${opLine}` };
+    expect(d([redTeam(), sentBack(), human]).sendBack.map((f) => f.index)).toEqual([1]); // operator line needs an operator-* outcome too
+  });
+  it('kill switch off: a release still works for a break handed over at the cap (send-back then round-cap), never for a live send-back', () => {
+    const op = { author: { login: 'chalbert' }, createdAt: '2026-10-21T00:00:00Z', body: `${redTeamGateMarker(PR, H, 'operator-card', rid())}\n**Red-team gate** x:\n${opLine}` };
+    expect(d([redTeam(), sentBack(), op], false).sendBack.map((f) => f.index)).toEqual([1]);
+    const cap = bot(`${redTeamGateMarker(PR, H, 'round-cap', rid())}\n**Red-team gate** x:\n- 1 confirmed break(s) NOT sent back: cap (#1).`, '2026-10-20T23:40:00Z');
+    expect(d([redTeam(), sentBack(), cap], false).held.map((f) => f.index)).toEqual([1]);
+    expect(d([redTeam(), sentBack(), cap, op], false).held).toEqual([]);
+  });
+  it('a NEW card is never planned for a break the gate already carded; citing an existing card still is', () => {
+    const carded = bot(`${redTeamGateMarker(PR, H, 'card-queued', rid())}\n**Red-team gate** x:\n- 1 finding(s) filed as a follow-up card (#1) — landing job j.`, '2026-10-20T23:50:00Z');
+    expect(() => planRedTeamRuling(read({ comments: thread([carded]) }), input())).toThrow(/no confirmed red-team break .* left to rule `card`/);
+    const ref = 'we:backlog/x.md';
+    expect(planRedTeamRuling(read({ comments: thread([carded]), card: { requested: ref, ref, readable: true } }), input({ card: ref }))).toMatchObject({ cardRef: ref, indices: [1] });
+  });
+  it('post-write proof fails on a moved head, a missing record, or a changed result', () => {
+    const p = payloadFor({ ruling: 'not-real', cause: 'other' });
+    for (const after of [
+      { headRefOid: OTHER, labels: [], comments: [] },
+      { headRefOid: H, labels: [], comments: thread() },
+    ]) {
+      let n = 0;
+      const sinks = createRecordRedTeamRulingSinks({ readThread: () => (n++ === 0 ? { headRefOid: H, labels: [], comments: thread() } : after),
+        resolveIdentity: () => OP, post: () => {}, appendEvents: async () => {}, warn: () => {}, syncLabels: () => null });
+      expect(() => sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](p)).toThrow(/head moved|not in the read-back|result changed/);
+    }
   });
 });

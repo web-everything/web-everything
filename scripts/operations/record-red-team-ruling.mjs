@@ -117,7 +117,7 @@ export function buildRuleReasonComment({ head, ruling, actor, channel, at, reaso
  *   - OFF (kill switch): today's restriction. Only a result parked at the round cap, never under `review:changes`,
  *     and only the breaks the gate still holds for the operator.
  */
-export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruling }) {
+export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruling, citesCard = false }) {
   const anyState = scope?.anyState !== false;
   const state = liveResultGateState(comments, pr, head);
   if (!state.result) throw new Error(`no red-team result on the live head ${head.slice(0, 9)} — nothing to rule on`);
@@ -134,9 +134,12 @@ export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruli
     if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)');
     return { state, atCap, anyState, rulable: held, noun: 'held for the operator' };
   }
-  const { ruled } = operatorRulingsOnLiveResult(comments, pr, head);
+  const { ruled, carded } = operatorRulingsOnLiveResult(comments, pr, head);
   const action = RULING_ACTION[ruling];
-  const rulable = state.result.findings.filter((f) => f.confirmed && ruled.get(f.index)?.at(-1) !== action);
+  // A NEW card filing is never made for a break already carded by anyone (the gate or an operator); citing an
+  // existing card (--card) files nothing, so it only has to differ from the latest operator ruling.
+  const rulable = state.result.findings.filter((f) => f.confirmed && ruled.get(f.index)?.at(-1) !== action
+    && !(ruling === 'card' && !citesCard && carded.has(f.index)));
   if (!rulable.length) throw new Error(`no confirmed red-team break on the live head is left to rule \`${ruling}\` (none confirmed, or each already ruled \`${ruling}\` by the operator on this result)`);
   return { state, atCap, anyState, rulable, noun: `confirmed and not already ruled \`${ruling}\` on the live head` };
 }
@@ -167,7 +170,7 @@ export function planRedTeamRuling(read, input) {
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error('the PR head could not be read; nothing to rule on');
   const comments = operatorBoundComments(read.comments);
   const scope = read.scope?.value ?? OPERATOR_RULINGS_DEFAULTS;
-  const { state, atCap, rulable, noun } = rulableBreaks({ comments, labels: read.labels, pr, head, setting: read.setting, scope, ruling });
+  const { state, atCap, rulable, noun } = rulableBreaks({ comments, labels: read.labels, pr, head, setting: read.setting, scope, ruling, citesCard: Boolean(read.card) });
   const selected = selectBreaks(rulable, input.break, noun);
   const unconfirmed = selected.filter((f) => !f.confirmed);
   if (unconfirmed.length) throw new Error(`break(s) ${unconfirmed.map((f) => `#${f.index}`).join(', ')} were not confirmed by the re-check; only a confirmed break can be ruled on`);
