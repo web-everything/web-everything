@@ -20,6 +20,8 @@ const jitSubject = /^drain: JIT-number (.+) at land \(#2288\)$/;
  */
 export function trustedDrainAuthors({ cwd = process.cwd(), exec = execFileSync } = {}) {
   try {
+    // A recent-commit cutoff would revoke an established author when another drain
+    // identity numbers 100 cards. Bound the read by time and bytes instead.
     const history = exec('git', ['log', '--grep=^drain: JIT-number ', '--format=%an%x00%ae%x00%s', 'origin/main'], { cwd, encoding: 'utf8', stdio: 'pipe', timeout: 60_000, maxBuffer: 4 * 1024 * 1024 });
     return new Set(lines(history).flatMap(line => {
       const [name, email, subject] = line.split('\0');
