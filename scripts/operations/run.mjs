@@ -55,6 +55,7 @@ import { graduationProgressReportOperation, GRADUATION_PROGRESS_REPORT_OP } from
 import { createScorecardReader, createPromotionsReader, createProbationReader } from './graduation-progress-report-io.mjs';
 import { selectSupervisionLevel, DEFAULT_BACKDOWN_THRESHOLDS } from '../lib/provider-routing.mjs';
 import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
+import { resolveCardOnlyReviewSettings } from '../lib/review-seat-settings.mjs';
 import { prStatusOperation, PR_STATUS_OP } from './pr-status.mjs';
 import { createPrReader } from './pr-status-io.mjs';
 import { staleStateOperation, STALE_STATE_OP } from './stale-state.mjs';
@@ -211,7 +212,8 @@ export const OPERATIONS = Object.freeze({
       antigravityReview: antigravityReviewFromEnv() };
     // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
     const seats = savedRun?.op === REVIEW_PR_OP
-      ? reviewSeatOptionsForRun(savedRun, seatSettings, live) : { securitySeat, cardOnlyLight, ...live, seatSettings };
+      ? reviewSeatOptionsForRun(savedRun, seatSettings, live)
+      : { securitySeat, cardOnlyLight, cardCoverageToCards: cardOnlyLight && resolveCardOnlyReviewSettings().value.coverageToCards === true, ...live, seatSettings };
     return {
       declaration: reviewPrOperation({
         ...seats,

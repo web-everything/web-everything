@@ -1,5 +1,6 @@
 import { reviewPrStepNames } from './review-pr-completion.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { CARD_REVIEW_CLASS, cardReviewClass, isCardCoverageFinding } from '../lib/card-review-class.mjs';
 import { advisoryLabelOutcome } from '../lib/review-advisory-outcome.mjs';
 export { advisoryLabelOutcome, deriveAdvisoryOutcome } from '../lib/review-advisory-outcome.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock, operatorSendBackVerdict } from '../lib/operator-send-backs.mjs';
@@ -1424,6 +1425,8 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     netChangedFiles,
     // The old path of every rename or copy in the net diff (the path-only list above lacks it); read by the roster check only.
     netRenameSources,
+    // Card review class (prototype) — git-read frontmatter of each touched card; present only on a card-only read.
+    ...(raw.cardFrontmatter && typeof raw.cardFrontmatter === 'object' ? { cardFrontmatter: raw.cardFrontmatter } : {}),
     // THE BASIS IS PINNED TO COMMITS, NOT REFS. `base` is already a merge-base SHA. `rev` used to be
     // `computeNetDiffPaths`'s `candidate`, i.e. `origin/<headRefName>` — a ref that moves the moment the lane
     // pushes again, so the recorded basis stopped describing the diff that was actually judged. The io shell
@@ -1607,7 +1610,12 @@ export function buildReviewJudgeRequest({ read, lens, aim = '', seatProvider = n
 /** The single blocking Codex correctness seat for a verified card-only net diff. */
 export function buildCardOnlyJudgeRequest(read, aim = '') {
   const { allowedTools, model, seatProvider, ...request } = buildReviewJudgeRequest({ read, lens: 'correctness', aim });
-  return { ...request, providerName: 'codex', mandate: request.mandate + '\n\n' + CODEX_ADVISORY_SANDBOX_CORRECTION };
+  const focus = read?.cardReview?.class === CARD_REVIEW_CLASS.CARD && read.cardReview.coverageToCards === true
+    ? '\n\nCARD TEXT ONLY: this diff is backlog card text. Spend your attention on contradictions (with itself, other cards, '
+      + 'or ratified rules) and on missing or unstated decisions. A test-plan gap is still worth reporting as COVERAGE; '
+      + 'on card text it is filed as a card suggestion, not a blocker.'
+    : '';
+  return { ...request, providerName: 'codex', mandate: request.mandate + '\n\n' + CODEX_ADVISORY_SANDBOX_CORRECTION + focus };
 }
 
 /**
@@ -2371,6 +2379,8 @@ export function reviewPrOperation({
   // `seatSecurityForTouchSet`); a resume reads it off the saved run (`securitySeatFromRun`), never re-derives it.
   securitySeat = true,
   cardOnlyLight = false,
+  // Card review class (prototype) — `review.cardOnly.coverageToCards`; off unless the caller resolved it on.
+  cardCoverageToCards = false,
   // Zero is reserved for historical declaration fixtures; operational settings require at least one.
   minNonClaudeSeats = seatSettings?.minNonClaudeSeats ?? 1,
 } = {}) {
@@ -2634,7 +2644,9 @@ export function reviewPrOperation({
         // THE ROSTER, RECORDED BY THE BUILD ITSELF (not an input a caller could name): a resume reads it back with
         // `securitySeatFromRun`, so a seat that failed or has not answered yet cannot change it. `seatSteps` and the
         // minimum are read back the same way by `reviewSeatOptionsForRun`, at every cursor position.
-        return { ...finding, referralVerifierDeclared: verifierDeclared, cardOnlyLight, securitySeat: securitySeat !== false, seatSteps: seats.map((seat) => seat.step), minNonClaudeSeats };
+        return { ...finding, referralVerifierDeclared: verifierDeclared, cardOnlyLight,
+          ...(cardOnlyLight ? { cardReview: { ...cardReviewClass(finding), coverageToCards: cardCoverageToCards === true } } : {}),
+          securitySeat: securitySeat !== false, seatSteps: seats.map((seat) => seat.step), minNonClaudeSeats };
       },
     }),
 
@@ -2951,7 +2963,17 @@ export function reviewPrOperation({
           // #4815 — the confirmation turn first: an unreproduced tool-less claim is an advisory note from here on.
           const confirmed = applyVerification({ seat, findings: answer.findings, known: knownVerified, settled: settledClaims });
           unverifiedClaims.push(...confirmed.downgraded);
-          const seatAnswerFindings = confirmed.findings;
+          // Card review class (prototype, operator OK 2026-10-21) — on a provably card-text diff (`read.cardReview`,
+          // recorded at read so a resume decides the same), test-plan COVERAGE from the correctness seat is a card
+          // suggestion, not a referral or a blocking finding. Every other class still blocks; an operator `block`
+          // ruling on the same finding still promotes it back (the blocked-referral binding below).
+          const cardCoverage = read.cardReview?.class === CARD_REVIEW_CLASS.CARD && read.cardReview.coverageToCards === true
+            && seat.lens === 'correctness' && Array.isArray(confirmed.findings)
+            ? confirmed.findings.filter(isCardCoverageFinding) : [];
+          deferredAdvisory.push(...cardCoverage.map((f) => ({
+            ...f, deferred: 'card-review-class: test-plan coverage on card text', category: f.category ? `${seat.lens}/${f.category}` : seat.lens,
+          })));
+          const seatAnswerFindings = cardCoverage.length ? confirmed.findings.filter((f) => !cardCoverage.includes(f)) : confirmed.findings;
           const roundScoped = classifyReferralsByRound(
             (seatAnswerFindings ?? []).filter(requiresMandatoryReferral).map((original) => ({ seat: seat.step, original })),
             { identity: read.findingIdentity, head: read.netBasis?.rev ?? null, latestFix: read.latestFix,

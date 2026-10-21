@@ -1,5 +1,6 @@
-import { readRedTeamTiming } from './red-team-gate.mjs';
+import { readRedTeamProbes, readRedTeamTiming } from './red-team-gate.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { CARD_REVIEW_CLASS, cardReviewClass } from './card-review-class.mjs';
 /** Shared scheduling policy; importing it never loads a review dispatcher or CLI. */
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
@@ -70,10 +71,16 @@ export function redTeamOwedForPass(loopPayload) {
 }
 
 
-/** A pinned reviewed head owes the panel seat regardless of the panel verdict. */
+/**
+ * A pinned reviewed head owes the panel seat regardless of the panel verdict — except a head in the `card` review
+ * class (`cardReviewClass`: provably card text, no decision or ratified card) while `skipCardOnly` is on, which
+ * keeps the card-only skip the post-accept timing already had. A decision card, a ratified rule or anything not
+ * provably card-only still owes it.
+ */
 export function redTeamPanelSeatOwed(loopPayload, env = process.env) {
-  return readRedTeamTiming({ env }).value.timing === 'panel-seat'
-    && /^[a-f0-9]{40}$/i.test(loopPayload?.findings?.read?.netBasis?.rev ?? '');
+  const read = loopPayload?.findings?.read;
+  if (readRedTeamTiming({ env }).value.timing !== 'panel-seat' || !/^[a-f0-9]{40}$/i.test(read?.netBasis?.rev ?? '')) return false;
+  return !(readRedTeamProbes({ env }).value.skipCardOnly && cardReviewClass(read).class === CARD_REVIEW_CLASS.CARD);
 }
 
 /** Net diff includes rename/copy sources; unknown paths cannot justify skipping.

@@ -172,14 +172,17 @@ export function resolveCardOnlyReviewSettings({ env = process.env, platform,
   file = REVIEW_SETTINGS_FILE, readFile = p => readFileSync(p, 'utf8'), log = m => console.error(m) } = {}) {
   let tool = {};
   try { tool = JSON.parse(readFile(file))?.cardOnly ?? {}; } catch { /* absent layer */ }
-  const project = value => Object.fromEntries(['lightLane', 'claudeSeat']
+  const project = value => Object.fromEntries(['lightLane', 'claudeSeat', 'coverageToCards']
     .filter(key => typeof value?.[key] === 'boolean').map(key => [key, value[key]]));
   const parse = value => normOnOff(value) === 'on' ? true : normOnOff(value) === 'off' ? false : undefined;
   const result = cascadePolicy('review.cardOnly', project(tool), {
-    standard: { lightLane: true, claudeSeat: false },
+    // coverageToCards (card review class prototype, operator OK 2026-10-21): test-plan COVERAGE on a provably
+    // card-text diff becomes a card suggestion instead of a blocking referral.
+    standard: { lightLane: true, claudeSeat: false, coverageToCards: true },
     platform: project(platform ?? platformPreference('review', { env })?.cardOnly), env,
-    envValues: { lightLane: parse(env.WE_REVIEW_CARD_ONLY_LIGHT_LANE), claudeSeat: parse(env.WE_REVIEW_CARD_ONLY_CLAUDE_SEAT) },
-    valid: { lightLane: v => typeof v === 'boolean', claudeSeat: v => typeof v === 'boolean' },
+    envValues: { lightLane: parse(env.WE_REVIEW_CARD_ONLY_LIGHT_LANE), claudeSeat: parse(env.WE_REVIEW_CARD_ONLY_CLAUDE_SEAT),
+      coverageToCards: parse(env.WE_REVIEW_CARD_ONLY_COVERAGE_TO_CARDS) },
+    valid: { lightLane: v => typeof v === 'boolean', claudeSeat: v => typeof v === 'boolean', coverageToCards: v => typeof v === 'boolean' },
   });
   log(formatCascadeSourcesLine('review.cardOnly', result));
   return result;

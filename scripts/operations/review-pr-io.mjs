@@ -1,4 +1,5 @@
 import { readLivePrContext } from '../lib/review-pr-snapshot.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -373,6 +374,9 @@ export function readPr({
     // recording it would pin the basis to a tree that was never read.
     comments: view.comments,
     net: { ...netPaths, revSha },
+    // Card review class (prototype) — both sides' frontmatter of each touched card, read from git at the pinned
+    // base and head. Carried only for a card-only net diff, so every other read is byte-identical to before.
+    ...cardFrontmatterField({ exec: gitExec, paths: netPaths.paths, base: netPaths.base, rev: revSha }),
     latestFix, deltaReview,
     diff: netText,
     ...(stackBase ? { stackBase } : {}),
@@ -382,6 +386,35 @@ export function readPr({
     // set, so an `off` read is byte-identical to before. An unknown round is `null`: the budget never acts on it.
     ...(budget !== ROUND_BUDGET_OFF ? { roundBudget: budget, reviewRound: readReviewRound({ repo, pr, head: revSha, readLedgerRows }) } : {}),
   };
+}
+
+/**
+ * Card review class (prototype) — `{cardFrontmatter: {path: {old, new}}}` for a card-only net diff, else `{}`.
+ * Each side is the card's frontmatter lines at that commit (`null` when the file is absent there). A path whose
+ * read fails is LEFT OUT, so `cardReviewClass` falls back to the diff and then to `full` (fail-closed).
+ */
+export function cardFrontmatterField({ exec, paths, base, rev } = {}) {
+  const pinned = (s) => typeof s === 'string' && /^[0-9a-f]{40,64}$/i.test(s);
+  if (!Array.isArray(paths) || !isCardOnlyDiff(paths) || !pinned(base) || !pinned(rev)) return {};
+  const side = (commit, path) => {
+    const listed = String(exec('git', ['ls-tree', '--name-only', commit, '--', path], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim();
+    if (!listed) return null;
+    return frontmatterLines(String(exec('git', ['cat-file', 'blob', `${commit}:${path}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || ''));
+  };
+  const out = {};
+  for (const path of paths) {
+    if (/^backlog\/raised-by\//.test(path)) continue;
+    try { out[path] = { old: side(base, path), new: side(rev, path) }; } catch { /* left out: fail closed */ }
+  }
+  return { cardFrontmatter: out };
+}
+
+/** Lines between a leading `---` and the next `---`, or `[]` when the text opens with no frontmatter. PURE. */
+export function frontmatterLines(text) {
+  const lines = String(text).split('\n');
+  if (lines[0]?.trim() !== '---') return [];
+  const end = lines.findIndex((l, i) => i > 0 && l.trim() === '---');
+  return end < 0 ? [] : lines.slice(1, end);
 }
 
 /** The repo's verdict-ledger rows (the default reader for the round count and the shadow). Throws when unreadable. */
