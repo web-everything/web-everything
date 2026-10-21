@@ -307,3 +307,28 @@ describe('identity binding', () => {
     await expect(mk({ login: 'web-everything[bot]', type: 'Bot' })({ ...payload, actor: 'auto-policy' })).rejects.toThrow(/inner reached/);
   });
 });
+
+describe('standalone CLI', () => {
+  it('--preview runs end to end (no judge is built, no write effect runs) and prints the plan', async () => {
+    const { main } = await import('../record-red-team-ruling-cli.mjs');
+    const { createMemoryRunStore } = await import('../run-store.mjs');
+    const { createRecordRedTeamRulingReader } = await import('../record-red-team-ruling-io.mjs');
+    const writes = [];
+    const entry = () => ({
+      declaration: recordRedTeamRulingOperation({ readRulingContext: createRecordRedTeamRulingReader({ assertFresh: () => {},
+        readThread: () => ({ headRefOid: HEAD, labels: [], comments: thread() }), resolveIdentity: () => OP, now: () => 'T' }) }),
+      sinks: new Proxy({}, { get: (_t, k) => (...a) => { writes.push(k); } }),
+    });
+    const chunks = [];
+    const orig = process.stdout.write;
+    const { vi } = await import('vitest');
+    const spy = vi.spyOn(await import('../../lib/write-all-sync.mjs'), 'writeAllSync').mockImplementation((_fd, t) => { chunks.push(String(t)); });
+    try {
+      const code = await main(['--pr=5530', '--repo=o/r', '--break=1', '--ruling=card', '--actor=chalbert', '--channel=chat', '--reason=ok', '--preview'],
+        { entry, stores: { store: createMemoryRunStore(), callLog: undefined } });
+      expect(code).toBe(0);
+    } finally { spy.mockRestore(); void orig; }
+    expect(chunks.join('')).not.toMatch(/uses no judge/);
+    expect(writes).toEqual([]);
+  });
+});

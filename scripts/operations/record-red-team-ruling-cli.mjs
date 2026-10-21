@@ -17,17 +17,17 @@ import { runOperationCli, buildCliSpec } from './cli-adapter.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { recordRedTeamRulingEntry } from './record-red-team-ruling-io.mjs';
 
-export async function main(argv) {
-  const { declaration, sinks } = recordRedTeamRulingEntry();
+export async function main(argv, { entry = recordRedTeamRulingEntry, stores } = {}) {
+  const { declaration, sinks } = entry();
   if (argv.includes('--help')) { writeAllSync(1, `${buildCliSpec(declaration).usage}\n`); return 0; }
   const registry = createRegistry();
   registry.register(declaration);
   const preview = argv.includes('--preview');
   const outcome = await runOperationCli({
     declaration, argv, registry, sinks,
-    store: preview ? createMemoryRunStore() : createFileRunStore(),
-    callLog: preview ? undefined : createFileCallLogStore(),
-    makeJudge: () => { throw new Error('record-red-team-ruling uses no judge'); },
+    store: stores?.store ?? (preview ? createMemoryRunStore() : createFileRunStore()),
+    callLog: stores ? stores.callLog : preview ? undefined : createFileCallLogStore(),
+    makeJudge: () => null, // no judge is used; runOperationCli builds one eagerly after the parse
     newRunId: () => newRunId(declaration.name),
   });
   writeAllSync(1, `${outcome.lines.join('\n')}\n`);
