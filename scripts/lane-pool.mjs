@@ -180,6 +180,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 // xbdixjc — the lane hold rule: every release/reset/remove/reclaim below asks it (pure rule in lane-lease.mjs).
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
+import { applyLaneDietConfig } from './lib/lane-git-diet.mjs';
 import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
@@ -274,7 +275,18 @@ const tryGit = (args, cwd, opts = {}) => {
 // throws immediately, unretried, exactly as before.
 const FETCH_LOCK_RETRY_ATTEMPTS = 4;
 const FETCH_LOCK_RETRY_BASE_MS = 250;
+// lane-git-diet — before EVERY lane fetch, make sure the lane's local config excludes `ops/*` from the default
+// fetch and keeps fetched objects packed (see ./lib/lane-git-diet.mjs: the ~10 MB verdict-ledger blob landed loose
+// in every lane on every fetch). Idempotent; a config failure never blocks the fetch itself.
+function ensureLaneDietConfig(dir) {
+  try {
+    applyLaneDietConfig((args) => git(args, dir, { timeout: LOCAL_GIT_TIMEOUT_MS }));
+  } catch (e) {
+    log(`  ⚠ ${dir}: lane git-diet config not applied (${String(e && e.message ? e.message : e).split('\n')[0]})`);
+  }
+}
 function fetchOriginPruneWithRetry(dir) {
+  ensureLaneDietConfig(dir);
   return retryTransientGit(() => git(['fetch', 'origin', '--prune', '--quiet'], dir, { timeout: NETWORK_GIT_TIMEOUT_MS }), { attempts: FETCH_LOCK_RETRY_ATTEMPTS, baseMs: FETCH_LOCK_RETRY_BASE_MS });
 }
 
@@ -845,6 +857,12 @@ function cloneLane(repo, n) {
   log(`  clone lane-${n} ← ${repo.originUrl} ${ref.length ? `(--reference ${repo.referencePath})` : '(no --reference: shallow)'} …`);
   gitQuiet(['clone', '--quiet', '-c', 'gc.auto=0', ...ref, repo.originUrl, dest]);
   gitQuiet(['config', '--local', 'gc.auto', '0'], dest);
+  // lane-git-diet — `git clone` ignores a negative refspec on its initial fetch, so the fresh clone still carries
+  // `origin/ops/*`. Apply the diet config and drop those tracking refs now (readers fetch them by name on demand).
+  ensureLaneDietConfig(dest);
+  for (const ref of (tryGit(['for-each-ref', '--format=%(refname)', 'refs/remotes/origin/ops/'], dest) || '').split('\n').filter(Boolean)) {
+    tryGit(['update-ref', '--no-deref', '-d', ref], dest);
+  }
   // Pin a stable local default branch so refresh's hard-reset target is unambiguous.
   tryGit(['checkout', '--quiet', '-B', repo.branch, `origin/${repo.branch}`], dest);
 }
@@ -1177,9 +1195,12 @@ function liveRemoteShas(dir) {
  *  landing, whose local remote-tracking ref lingers). Used to re-verify containment right before the
  *  destructive reset, on data no older than the fetch that immediately precedes it — no second network call. */
 function localRemoteShas(dir) {
-  const out = tryGit(['for-each-ref', '--format=%(objectname)', 'refs/remotes/origin'], dir);
+  // lane-git-diet — `refs/remotes/origin/ops/*` is excluded from the default fetch (negative refspec), so an ops
+  // tracking ref a reader fetched by name earlier is NOT refreshed by the fetch this relies on. Leave it out of the
+  // "fresh after fetch" set: fewer proofs only ever makes a reset MORE conservative.
+  const out = tryGit(['for-each-ref', '--format=%(objectname) %(refname)', 'refs/remotes/origin'], dir);
   if (out === null) return new Set();
-  return new Set(out.split('\n').filter(Boolean));
+  return new Set(out.split('\n').filter(Boolean).filter((l) => !l.includes(' refs/remotes/origin/ops/')).map((l) => l.split(' ')[0]));
 }
 
 // Returns { skipped: boolean, dirty, uncommitted, ahead } so callers can tell an actually-reset lane
