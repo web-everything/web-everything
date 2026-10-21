@@ -159,7 +159,7 @@ describe('buildCombined + verifyUnion (real git)', () => {
     const { cwd, base, branch } = repo();
     const del = branch('del', () => { rmSync(join(cwd, 'backlog/5473-other.md')); });
     const run = (cmd, args, o = {}) => {
-      if (args[0] === 'ls-tree' && args[1] === base) return { status: 128, stdout: '', stderr: 'fatal: read error' };
+      if (args[0] === 'ls-tree' && args.includes(base)) return { status: 128, stdout: '', stderr: 'fatal: read error' };
       try { return { status: 0, stdout: execFileSync(cmd, args, { cwd, encoding: 'utf8', input: o.input }), stderr: '' }; }
       catch (e) { return { status: e.status ?? 1, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? '') }; }
     };
@@ -194,6 +194,26 @@ describe('buildCombined + verifyUnion (real git)', () => {
       expect(built.ok).toBe(true);
       expect(verifyUnion({ base: r.base, combined: built.commit, sources, cwd: r.cwd }).ok).toBe(true);
       for (const s of sources) expect(sourceLanded({ ref: built.commit, source: s, cwd: r.cwd }).ok).toBe(true);
+    });
+    it.each([
+      ['a non-ASCII path (git C-quotes it in line output)', 'backlog/7001-café.md'],
+      ['a path with a glob character', 'backlog/7002-st*r.md'],
+    ])('a source changing %s has not landed while main lacks the change', (_, path) => {
+      const r = repo();
+      const seeded = r.branch('seed', () => writeFileSync(join(r.cwd, path), card([1])));
+      const src = (() => { git(r.cwd, 'checkout', '-q', '-b', 'src2', seeded); writeFileSync(join(r.cwd, path), card([1, 9])); git(r.cwd, 'add', '--', path); git(r.cwd, 'commit', '-qm', 'src2'); const s = git(r.cwd, 'rev-parse', 'HEAD'); git(r.cwd, 'checkout', '-q', 'main'); return s; })();
+      expect(sourceLanded({ ref: seeded, source: { num: 1, headSha: src }, cwd: r.cwd })).toMatchObject({ ok: false, reason: expect.stringContaining('is not on main') });
+      expect(sourceLanded({ ref: src, source: { num: 1, headSha: src }, cwd: r.cwd }).ok).toBe(true);
+      const proof = verifyUnion({ base: seeded, combined: seeded, sources: [{ num: 1, headSha: src }], cwd: r.cwd });
+      expect(proof.missing.map(m => m.line)).toContain(entry(9));
+    });
+    it('a byte change in non-UTF-8 content is never read as unchanged (refuses)', () => {
+      const r = repo();
+      const bin = 'backlog/7003-bytes.md';
+      const seeded = r.branch('seed', () => writeFileSync(join(r.cwd, bin), Buffer.from([0x61, 0xff, 0x0a])));
+      const src = (() => { git(r.cwd, 'checkout', '-q', '-b', 'src3', seeded); writeFileSync(join(r.cwd, bin), Buffer.from([0x61, 0xfe, 0x0a])); git(r.cwd, 'add', '--', bin); git(r.cwd, 'commit', '-qm', 'src3'); const s = git(r.cwd, 'rev-parse', 'HEAD'); git(r.cwd, 'checkout', '-q', 'main'); return s; })();
+      expect(sourceLanded({ ref: seeded, source: { num: 1, headSha: src }, cwd: r.cwd })).toMatchObject({ ok: false, reason: expect.stringMatching(/not valid UTF-8/) });
+      expect(() => verifyUnion({ base: seeded, combined: seeded, sources: [{ num: 1, headSha: src }], cwd: r.cwd })).toThrow(/not valid UTF-8/);
     });
     it('two sources that set different modes on one file disagree', () => {
       const r = repo();
@@ -820,7 +840,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     it('a git read error inside the union proof refuses the whole group (never read as "absent")', () => {
       const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
       const statePath = join(tmp(), 's.json');
-      const run = (cmd, args, o) => (args[0] === 'ls-tree' && args[1] === t.base ? { status: 128, stdout: '', stderr: 'fatal: read error' } : t.opts.run(cmd, args, o));
+      const run = (cmd, args, o) => (args[0] === 'ls-tree' && args.includes(t.base) ? { status: 128, stdout: '', stderr: 'fatal: read error' } : t.opts.run(cmd, args, o));
       const r = createCardGrouping({ ...t.opts, run, statePath }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
       expect(r.reason).toMatch(/^union check error \(ls-tree /);
       expect(Object.keys(readGroupState(statePath).failed)).toHaveLength(1);

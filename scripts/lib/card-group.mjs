@@ -168,7 +168,11 @@ export function readReferenceMap({ base, cwd, run = gitRun }) {
   return { ok: true, map: bornAsIndexFromItems(items.filter(i => !ambiguous.has(i.bornAs))), ambiguous };
 }
 
-const lines = r => String(r.stdout ?? '').split('\n').map(l => l.trim()).filter(Boolean);
+// Paths are read NUL-separated (`-z`) and passed as literal pathspecs: git C-quotes a non-ASCII or special name in
+// line output (`"k/caf\303\251.md"`), and a `*` in a name is a glob. Either would read a changed file as absent.
+const zNames = r => String(r.stdout ?? '').split('\0').filter(Boolean);
+const LITERAL = { GIT_LITERAL_PATHSPECS: '1' };
+const utf8 = new TextDecoder('utf-8', { fatal: true });
 
 /** IO: make sure every sha is in the object DB; fetch by sha only (no ref, no FETCH_HEAD). */
 export function ensureCommits({ shas, cwd, run = gitRun }) {
@@ -185,9 +189,9 @@ export function sourceFiles({ base, headSha, cwd, run = gitRun }) {
   const mb = run('git', ['merge-base', base, headSha], { cwd });
   const mbSha = String(mb.stdout ?? '').trim();
   if (mb.status !== 0 || !SHA.test(mbSha)) return null;
-  const d = run('git', ['diff', '--name-only', '--no-renames', mbSha, headSha], { cwd });
+  const d = run('git', ['diff', '--name-only', '-z', '--no-renames', mbSha, headSha], { cwd });
   if (d.status !== 0) return null;
-  return { mergeBase: mbSha, files: lines(d) };
+  return { mergeBase: mbSha, files: zNames(d) };
 }
 
 /** True only when the whole change list is backlog cards. */
@@ -278,22 +282,24 @@ const countOf = arr => { const m = new Map(); for (const l of arr) m.set(l, (m.g
 /** PURE: `needle` appears in `hay` in the same order (not necessarily adjacent). */
 export const isSubsequence = (needle, hay) => { let i = 0; for (const l of hay) if (i < needle.length && l === needle[i]) i++; return i === needle.length; };
 /**
- * IO: a file's normalized lines at `ref`, or null when the path is ABSENT there. Absence is proven by an
- * empty `ls-tree`; any git failure (ls-tree or show) THROWS, so a read error can never pass as "absent".
- */
-/**
- * IO: a file's normalized lines at `ref`, plus what a line comparison cannot see: the tree entry's `mode` (100644, 100755, 120000 …)
- * and `eol` (the file ends with a newline; an empty file counts as ending with one). Null when absent.
+ * IO: a file's normalized lines at `ref`, plus what a line comparison cannot see: the tree entry's `mode`
+ * (100644, 100755, 120000 …) and `eol` (the file ends with a newline; an empty file counts as ending with one).
+ * Null when the path is ABSENT there, proven by no exact `ls-tree` row; any git failure (ls-tree or show) or
+ * non-UTF-8 content THROWS, so neither a read error nor a lossy decode can pass as "absent" or "unchanged".
  */
 function readEntry({ ref, path, cwd, run, norm }) {
-  const ls = run('git', ['ls-tree', ref, '--', path], { cwd });
+  const ls = run('git', ['ls-tree', '-z', ref, '--', path], { cwd, env: LITERAL });
   if (ls.status !== 0) throw new Error(`ls-tree ${String(ref).slice(0, 10)} ${path} failed`);
-  const row = String(ls.stdout ?? '').trim();
+  // `<mode> <type> <oid>\t<path>`: only a row naming exactly this path counts (never a prefix or pattern match).
+  const row = zNames(ls).find(r => r.slice(r.indexOf('\t') + 1) === path);
   if (!row) return null;
   const mode = row.split(/\s/)[0];
-  const r = run('git', ['show', `${ref}:${path}`], { cwd });
+  const r = run('git', ['show', `${ref}:${path}`], { cwd, encoding: 'buffer' });
   if (r.status !== 0) throw new Error(`show ${String(ref).slice(0, 10)}:${path} failed`);
-  const text = String(r.stdout ?? '');
+  // Byte-exact: invalid UTF-8 would decode to U+FFFD and hide a byte change, so it refuses (throws) instead.
+  let text;
+  try { text = Buffer.isBuffer(r.stdout) ? utf8.decode(r.stdout) : String(r.stdout ?? ''); }
+  catch { throw new Error(`${path} at ${String(ref).slice(0, 10)} is not valid UTF-8 text`); }
   return { lines: splitLines(text).map(norm), mode, eol: text === '' || text.endsWith('\n') };
 }
 /** PURE: what a source sets beyond its lines: `mode` / `eol` when its head differs from its merge base (else null). */
@@ -309,18 +315,19 @@ const keptOrder = (head, target) => { const have = new Set(target); return head.
 function sourceChange({ onto, headSha, cwd, run, norm }) {
   const mb = String(run('git', ['merge-base', onto, headSha], { cwd }).stdout ?? '').trim();
   if (!SHA.test(mb)) throw new Error('no merge base');
-  const names = run('git', ['diff', '--name-only', '--no-renames', mb, headSha], { cwd });
+  const names = run('git', ['diff', '--name-only', '-z', '--no-renames', mb, headSha], { cwd });
   if (names.status !== 0) throw new Error('diff failed');
-  const d = run('git', ['diff', '-U0', '--no-renames', '--no-color', mb, headSha], { cwd });
-  if (d.status !== 0) throw new Error('diff failed');
-  const plus = parseDiffLines(d.stdout);
   const out = new Map();
-  for (const path of lines(names)) {
+  for (const path of zNames(names)) {
     const fromEntry = readEntry({ ref: mb, path, cwd, run, norm }), toEntry = readEntry({ ref: headSha, path, cwd, run, norm });
     if (toEntry === null) { out.set(path, { deletedFile: true }); continue; }
     const fromLines = fromEntry?.lines ?? [], toLines = toEntry.lines;
     const from = countOf(fromLines), to = countOf(toLines);
-    const addedSeq = (plus.get(path)?.added ?? []).map(norm).filter(l => (to.get(l) ?? 0) > (from.get(l) ?? 0));
+    // One path per diff, so the patch header's own quoting of the name never matters.
+    const d = run('git', ['diff', '-U0', '--no-renames', '--no-color', mb, headSha, '--', path], { cwd, env: LITERAL });
+    if (d.status !== 0) throw new Error('diff failed');
+    const added = [...parseDiffLines(d.stdout).values()].flatMap(f => f.added);
+    const addedSeq = added.map(norm).filter(l => (to.get(l) ?? 0) > (from.get(l) ?? 0));
     // A mode-only or final-newline-only change has no differing line, so it is carried separately (`meta`).
     out.set(path, { from, to, addedSeq, head: toLines, meta: metaChange(fromEntry, toEntry) });
   }
@@ -343,9 +350,9 @@ export function verifyUnion({ base, combined, sources, cwd, run = gitRun, refere
   const perFile = [];
   const changes = sources.map(s => ({ s, change: sourceChange({ onto: base, headSha: s.headSha, cwd, run, norm }) }));
   const paths = new Set(changes.flatMap(x => [...x.change.keys()]));
-  const changed = run('git', ['diff', '--name-only', '--no-renames', base, combined], { cwd });
+  const changed = run('git', ['diff', '--name-only', '-z', '--no-renames', base, combined], { cwd });
   if (changed.status !== 0) throw new Error('combined diff failed');
-  for (const p of lines(changed)) if (!paths.has(p)) outside.push(p);
+  for (const p of zNames(changed)) if (!paths.has(p)) outside.push(p);
   for (const path of [...paths].sort()) {
     if (changes.some(x => x.change.get(path)?.deletedFile)) { unsupported.push(`${path} deleted by a source`); continue; }
     const baseEntry = readEntry({ ref: base, path, cwd, run, norm }), combinedEntry = readEntry({ ref: combined, path, cwd, run, norm });
