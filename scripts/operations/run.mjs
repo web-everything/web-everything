@@ -106,7 +106,7 @@ import { createResolveReader, createResolveSinks } from './resolve-io.mjs';
 import { scaffoldOperation, SCAFFOLD_OP } from './scaffold.mjs';
 import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
 import { fileItemOperation, FILE_ITEM_OP } from './file-item.mjs';
-import { createFileItemReader, createFileItemSinks } from './file-item-io.mjs';
+import { createFileItemReader, createFileItemSinks, fileItemRoot } from './file-item-io.mjs';
 import { openPrOperation, OPEN_PR_OP } from './open-pr.mjs';
 import { createOpenPrSinks, deriveLaneRef } from './open-pr-io.mjs';
 import { PARK_LABELS } from '../pr-land.mjs';
@@ -307,10 +307,13 @@ export const OPERATIONS = Object.freeze({
   // wraps scaffold's own read/plan/write (unchanged) and adds the clear-for-build hand-off as a second effect,
   // so filing an item has ONE declared call end to end instead of a card + a separately-remembered gesture.
   // Graduated from `origin/lane/mechanical-dispatcher` (#3548); see `file-item.mjs`'s own header.
-  [FILE_ITEM_OP]: () => ({
-    declaration: fileItemOperation({ readScaffoldContext: createFileItemReader() }),
-    sinks: createFileItemSinks(),
-  }),
+  [FILE_ITEM_OP]: () => {
+    const root = fileItemRoot(); // WE_FILE_ITEM_ROOT, else this checkout — see file-item-io.mjs
+    return {
+      declaration: fileItemOperation({ readScaffoldContext: createFileItemReader({ root }) }),
+      sinks: createFileItemSinks({ root }),
+    };
+  },
   [SUGGEST_NEXT_OP]: () => ({
     declaration: suggestNextOperation({
       loadBoard: createBoardReader(),

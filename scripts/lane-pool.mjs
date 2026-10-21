@@ -80,6 +80,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname } from 'node:os';
 import { join, basename, resolve, dirname, sep } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
+import { daemonCloneRoots } from './lib/daemon-clone-registry.mjs';
 import { readGit } from './lib/proc-read.mjs';
 // #4415 — live incident 2026-09-29: `deadLeasePlan`'s own `gh pr list --state all` (below) was a bare,
 // unattributed, GraphQL-backed `execFileSync`, run on EVERY `acquire` and EVERY `list --acquirable` scan
@@ -94,7 +95,7 @@ import { ghRestGetPaged } from './lib/gh-rest-read.mjs';
 // this repo's own isolation boundary (#2123/#104), so the CLI's guard is redundant for ANY session working in
 // one — dispatched or a human-driven single session alike — without ever touching the primary checkout.
 import { ensureWorktreeIsolationOff } from './lib/dispatch-bg-isolation.mjs';
-import { guardedPoolRoot, referenceArgs, checkoutRootFor } from './lib/lane-pool-paths.mjs';
+import { guardedPoolRoot, referenceArgs, checkoutRootFor, workspaceFor } from './lib/lane-pool-paths.mjs';
 import {
   LEASE_FILENAME,
   DEFAULT_LEASE_TTL_MINUTES,
@@ -189,10 +190,12 @@ const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',
 const [, , cmd, ...rest] = process.argv;
 const flags = {};
 const positionals = [];
+const clonePaths = [];
 for (const a of rest) {
   if (a.startsWith('--')) {
     const eq = a.indexOf('=');
     if (eq === -1) flags[a.slice(2)] = true;
+    else if (a.slice(2, eq) === 'clone') { clonePaths.push(a.slice(eq + 1)); flags.clone = true; }
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   } else positionals.push(a);
 }
@@ -843,8 +846,9 @@ function cloneLane(repo, n) {
   }
   const ref = cloneReferenceArgs(repo.referencePath);
   log(`  clone lane-${n} ← ${repo.originUrl} ${ref.length ? `(--reference ${repo.referencePath})` : '(no --reference: shallow)'} …`);
-  gitQuiet(['clone', '--quiet', '-c', 'gc.auto=0', ...ref, repo.originUrl, dest]);
+  gitQuiet(['clone', '--quiet', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...ref, repo.originUrl, dest]);
   gitQuiet(['config', '--local', 'gc.auto', '0'], dest);
+  gitQuiet(['config', '--local', 'maintenance.auto', 'false'], dest);
   // Pin a stable local default branch so refresh's hard-reset target is unambiguous.
   tryGit(['checkout', '--quiet', '-B', repo.branch, `origin/${repo.branch}`], dest);
 }
@@ -4429,6 +4433,7 @@ const KNOWN_FLAGS = new Set([
   'leased-only',
   // Host churn cut (2026-10-04) — status's opt-in reuse window for a signature-matched cached probe.
   'max-age-ms',
+  'clone', // apply-git-maintenance-config: repeatable explicit clone selector
   'watch', // gc --watch: recurring serialized maintenance, lanes.gc.schedule between passes
 ]);
 
@@ -4448,10 +4453,32 @@ function cmdGc(repo) {
   tick();
 }
 
+// Explicit --clone selects only those clones; otherwise sweep every known pool and daemon clone.
+function cmdApplyGitMaintenanceConfig() {
+  if (flags.clone && (!clonePaths.length || clonePaths.some((p) => !p.trim()))) fail('--clone=<path> requires a non-empty path');
+  const clones = clonePaths.length ? clonePaths.map((p) => resolve(expandHome(p))) : [
+    ...existingPools().flatMap((name) => {
+      const repo = { poolDir: join(POOL_ROOT, name) };
+      return existingLanes(repo).map((n) => laneDir(repo, n));
+    }),
+    ...daemonCloneRoots(workspaceFor(CHECKOUT_ROOT)).filter((dir) => existsSync(join(dir, '.git'))),
+  ];
+  for (const dir of new Set(clones.map(resolveReal))) {
+    if (!existsSync(join(dir, '.git'))) fail(`not a clone: ${dir}`);
+    for (const [key, value] of [['gc.auto', '0'], ['maintenance.auto', 'false']]) {
+      const before = tryGit(['config', '--local', '--get', key], dir);
+      if (!flags['dry-run'] && before !== value) gitQuiet(['config', '--local', key, value], dir);
+      const after = flags['dry-run'] ? value : git(['config', '--local', '--get', key], dir);
+      log(`${dir}: ${key} ${before ?? '(unset)'} -> ${after}${flags['dry-run'] ? ' (dry-run)' : ''} (source: fixed clone provisioning policy)`);
+    }
+  }
+}
+
 // ── dispatch ──────────────────────────────────────────────────────────────────────────────────────
 const COMMANDS = {
   // Scheduler entrypoint: safe to invoke every tick; interval + host mutex suppress duplicate passes.
   gc: cmdGc,
+  'apply-git-maintenance-config': cmdApplyGitMaintenanceConfig,
   provision: cmdProvision,
   refresh: cmdRefresh,
   status: printStatus,
@@ -4471,10 +4498,11 @@ const COMMANDS = {
 if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
-    'usage: lane-pool.mjs <gc|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
+    'usage: lane-pool.mjs <apply-git-maintenance-config|gc|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
       '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
+      '  # apply-git-maintenance-config [--dry-run] [--clone=<path> repeatable]: apply fixed Git config to all pool/daemon clones, or only selected clones\n' +
       '  # gc [--watch]: serialized maintenance; --watch repeats at lanes.gc.schedule (default 24h), host load may defer a pass\n' +
       '  # status --leased-only (#4345): skip git for every unleased lane, keep the full probe only for leased ones\n' +
       '  # acquire (auto-pick, no --lane): on a full pool, grows it by up to --growth-max-new=N new lanes (default 4, env ' +
@@ -4504,4 +4532,5 @@ if (unknownFlags.length) {
   );
 }
 
-COMMANDS[cmd](resolveRepo());
+if (cmd === 'apply-git-maintenance-config') cmdApplyGitMaintenanceConfig();
+else COMMANDS[cmd](resolveRepo());

@@ -30,7 +30,9 @@ import { dirname, join, resolve } from 'node:path';
 
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
-import { assertRunRecord, isValidRunId, parseRunRecord, serializeRunRecord } from './run-record.mjs';
+import { assertRunRecord, isValidRunId, parseRunRecord, REVIEW_RUN_ID_PREFIX, serializeRunRecord } from './run-record.mjs';
+
+export { REVIEW_RUN_ID_PREFIX };
 
 export {
   EFFECT_STATUSES,
@@ -145,6 +147,21 @@ export function daemonJobsDir(daemon, env = process.env) {
   return join(daemonJobsRoot(env), daemon);
 }
 
+/**
+ * PR #5520 operator send-back — THE REVIEW-RUN NAMESPACE. The merge guard's run-evidence readers
+ * (`we:scripts/conveyor/review-referral-hold.mjs`) find `review-pr` runs by file name: the shared store holds
+ * ~140k records of every operation, too many to open on each guard call. A review run written under another name
+ * (`--run-id=custom-live`) was invisible to them, so an unfinished review of the live head read as "no review
+ * run". So the name is made true here, the one writer: a `review-pr` record is written only under a
+ * `review-pr-` id, and no other operation may write one there (which would hide or replace a review run).
+ */
+function assertReviewRunNamespace(record) {
+  if ((record.op === 'review-pr') !== record.id.startsWith(REVIEW_RUN_ID_PREFIX)) {
+    throw new TypeError(`operations: run id ${JSON.stringify(record.id)} does not match operation \`${record.op}\` — `
+      + `a review-pr run's id starts \`${REVIEW_RUN_ID_PREFIX}\`, and no other operation's does`);
+  }
+}
+
 /** The on-disk path of one run. Refuses an id that is not filename-safe. */
 export function runPath(id, dir = resolveRunsDir()) {
   if (!isValidRunId(id)) throw new TypeError(`operations: invalid run id ${JSON.stringify(id)}`);
@@ -188,6 +205,7 @@ export function readRun(id, dir = resolveRunsDir()) {
  */
 export function writeRun(record, dir = resolveRunsDir()) {
   assertRunRecord(record, 'run record being written');
+  assertReviewRunNamespace(record);
   const path = runPath(record.id, dir);
   mkdirSync(dir, { recursive: true });
   writeJsonAtomic(path, record); // temp file + validate + same-fs rename: safe across daemon processes

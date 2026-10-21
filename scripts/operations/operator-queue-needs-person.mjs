@@ -1,6 +1,7 @@
 /** Pure projection of outstanding trusted conveyor questions into operator queue rows. */
 import { NOTE_COMMENT_MARKER } from '../conveyor/reconcile-note-comment.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from '../lib/marker-authorship.mjs';
+import { WITHDRAWN_LABEL } from '../conveyor/draft-promotion-rule.mjs';
 
 export function latestUnresolvedPersonNote(comments = []) {
   const ordered = [...comments].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
@@ -14,6 +15,14 @@ export function latestUnresolvedPersonNote(comments = []) {
 }
 
 export function needsPersonRow(repo, pr) {
+  if ((pr.state ?? 'OPEN') === 'OPEN' && pr.isDraft === true
+      && pr.labels?.some(l => (typeof l === 'string' ? l : l?.name) === WITHDRAWN_LABEL)) {
+    const command = `gh pr edit ${pr.number} --repo=${repo} --remove-label ${WITHDRAWN_LABEL}`;
+    return { repo, number: pr.number, title: pr.title, kind: 'draft-withdrawn',
+      noteAt: pr.updatedAt ?? null, headline: 'Withdrawn draft — explicit operator release required',
+      detail: 'Release the withdrawal only when this PR should return to the guarded promotion and review path.',
+      command, commands: { releaseDraft: command } };
+  }
   const note = latestUnresolvedPersonNote(pr.comments);
   if (!note) return null;
   const { number, title } = pr;

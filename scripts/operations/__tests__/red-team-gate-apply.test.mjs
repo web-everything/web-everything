@@ -4,14 +4,15 @@
  */
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
-import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
+import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, createRedTeamGateIo, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, parseRedTeamComment, parseRedTeamGateMarker, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, readRedTeamDisposition, parseRedTeamComment, parseRedTeamGateMarker, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
+import { standingRulingScope } from '../../conveyor/standing-ruling-io.mjs';
 import { runReviewLabelCli } from '../../review-set-label.mjs';
 import { readReviewRound, readReviewRoundAsOf } from '../review-pr-io.mjs';
 
@@ -153,6 +154,33 @@ describe('applyRedTeamGate', () => {
     expect(calls).toEqual([]);
   });
 
+  it('records a paused owed card once and reads its finding as already handled', async () => {
+    const comments = [comment([F({ impactIfUnfixed: 'degraded' })])];
+    let attempts = 0;
+    const { io, calls } = fakeIo({ comments, fileCard: () => {
+      attempts++;
+      return { ok: false, skipped: true, step: 'paused', reason: 'filing paused', num: null, url: null };
+    } });
+    const result = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(result.status).toBe('applied');
+    expect(gateExitCode(result)).toBe(0);
+    expect(calls[0][1].body).toContain('recorded, owed as a follow-up card (#1) — filing paused; will file on resume.');
+    expect(calls[0][1].body).not.toMatch(/FAILED|undefined|null/);
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: { degraded: 'send-back' } }).sendBack).toEqual([]);
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('already-acted');
+    expect(attempts).toBe(1);
+  });
+
+  it.each([
+    { ok: false, step: 'paused', error: 'could not record owed filing' },
+    { ok: false, skipped: true, step: 'other', error: 'other failure' },
+  ])('keeps an unrecorded or unrelated filing failure retryable: %j', async card => {
+    const { io, calls } = fakeIo({ comments: [comment([F({ impactIfUnfixed: 'degraded' })])], fileCard: () => card });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('card-failed');
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('card-failed');
+    expect(calls).toEqual([]);
+  });
+
   // F4: the round is the only bound on send-backs. An unreadable round must not be read as "round 1".
   it('an unreadable round counts as the cap: no send-back, the operator rules', async () => {
     for (const unreadable of [null, undefined, NaN, '3']) {
@@ -202,6 +230,39 @@ describe('applyRedTeamGate', () => {
     const capRecord = (round = 12, grantIds = null) => ({ author: { login: 'web-everything' }, createdAt: '2026-10-10T03:00:00Z',
       body: buildGateComment({ pr: 4722, head: HEAD, outcome: GATE_OUTCOMES.ROUND_CAP, plan: { sendBack: [{ index: 1 }], card: [], advisory: [] },
         round, grantIds, result: redTeamResultId(parseRedTeamComment(comment([F()]).body)) }) });
+
+    // Standing-ruling grants (operator option B): the gate uses the SAME trusted reader, so an App-posted grant
+    // counts only when the io hands it the scope verified from GitHub at this read.
+    const autoGrant = (at = '2026-10-19T12:00:00Z') => ({ id: 'IC_auto', author: { login: 'web-everything' }, createdAt: at,
+      body: buildRoundExtensionComment({ repo: REPO, pr: 4722, by: 1, actor: 'chalbert', channel: 'standing-ruling-auto', reason: 'ruling', at,
+        standingRuling: `${REPO}#5751`, head: HEAD, episode: `${REPO}#4722@${HEAD}:review:12/12` }) });
+    const verified = { id: `${REPO}#5751`, author: 'chalbert', by: 1, maxPerPr: 3, repos: [REPO], cardOnlyHeads: { [HEAD]: true }, uneditedComments: ['IC_auto'] };
+    it('the production IO uses the GitHub standing-ruling verifier', () => {
+      expect(createRedTeamGateIo({ env: { VITEST: 'true' } }).standingRuling).toBe(standingRulingScope);
+    });
+    it('a standing-ruling grant reopens the send-back only under the verified scope', async () => {
+      const comments = [comment([F()]), capRecord(), autoGrant()];
+      const without = fakeIo({ comments, round: 12, readRoundAsOf: () => 12 });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, without.io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
+      const unverified = fakeIo({ comments, round: 12, readRoundAsOf: () => 12, standingRuling: () => ({ ...verified, cardOnlyHeads: { [HEAD]: false } }) });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, unverified.io)).toMatchObject({ status: 'already-acted', outcome: 'round-cap' });
+      const ok = fakeIo({ comments, round: 12, readRoundAsOf: () => 12, standingRuling: () => verified });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722, dryRun: true }, ok.io)).toMatchObject({ status: 'dry-run', reopened: true, cap: 13, outcome: 'sent-back' });
+      // The pure readers treat a verified automatic grant exactly like a manual grant at the same position, and an
+      // unverified one exactly like no grant at all.
+      const pr = { number: 4722, repo: REPO, headRefOid: HEAD, labels: ['review:accepted'], comments };
+      const manual = { ...pr, comments: [comment([F()]), capRecord(), grant(1)] };
+      const none = { ...pr, comments: [comment([F()]), capRecord()] };
+      expect(redTeamRulingNeeded({ ...pr, standingRuling: verified })).toEqual(redTeamRulingNeeded(manual));
+      expect(redTeamRulingNeeded(pr)).toEqual(redTeamRulingNeeded(none));
+    });
+
+    it('a failed standing-ruling verification stops before any write', async () => {
+      const { io, calls } = fakeIo({ comments: [comment([F()]), capRecord(), autoGrant()], round: 12,
+        standingRuling: () => { throw new Error('verification unavailable'); } });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'error', reason: 'verification unavailable' });
+      expect(calls).toEqual([]);
+    });
 
     const readerShapes = {
       complete: c => c,
@@ -564,6 +625,7 @@ describe('review-job runs the gate right after the red team', () => {
   function jobIo(verdict, over = {}) {
     const calls = [];
     const io = {
+    redTeamTimingSetting: () => ({ value: { timing: 'post-accept' }, sources: { timing: 'tool' }, invalid: [] }),
       root: '/daemon', now: (() => { let t = 0; return () => { t += 10; return t; }; })(), newActorId: () => 'a',
       readPrevCompletion: () => null, report: () => {}, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
       acquireLane: () => ({ lanePath: '/lanes/lane-7' }), runLoop: () => ({ status: 0, stdout: JSON.stringify(loop(verdict)), stderr: '' }),

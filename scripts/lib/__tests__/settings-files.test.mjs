@@ -160,3 +160,14 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     expect(readCostAdmissionSettings({ env: {} })).toBeTruthy();
   });
 });
+
+
+it('owns birth numbering settings once under backlog.cardNumbering', () => {
+  const { settings, owners, duplicates, errors } = readDeclaredSettings();
+  expect(errors).toEqual([]);
+  expect(duplicates).toEqual([]);
+  expect(settings.backlog.cardNumbering).toMatchObject({ atBirth: 'on', atBirthRemote: 'required' });
+  expect(owners['backlog.cardNumbering.atBirth']).toBe('settings/number-at-birth.json');
+  expect(owners['backlog.cardNumbering.atBirthRemote']).toBe('settings/number-at-birth.json');
+  expect(settings.numberAtBirth).toBeUndefined();
+});

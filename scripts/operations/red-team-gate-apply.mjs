@@ -32,6 +32,7 @@ import { signalFixDispatch } from '../lib/fix-handoff.mjs';
  *     node scripts/operations/red-team-gate-apply.mjs --pr=<n> --repo=<owner/repo> [--dry-run]
  */
 import { readDrainQueueSafety, dequeueSentBack, sendBackReason } from '../lib/drain-queue-safety.mjs';
+import { readSavedRedTeamResult } from '../lib/drain-saved-red-team.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -40,7 +41,9 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
+  withholdUnpublishableFindings,
 } from '../lib/red-team-gate.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
 import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
@@ -106,8 +109,9 @@ export function buildGateComment({ pr, head, outcome, plan, round, result = null
       : `- ${plan.sendBack.length} confirmed break(s) sent back to the fixer (${plan.sendBack.map((f) => `#${f.index}`).join(', ')})${sendBackResult?.already ? ' — the PR was already under review:changes' : ''}.`);
   }
   if (plan.card.length) {
-    lines.push(`- ${plan.card.length} finding(s) filed as a follow-up card (${plan.card.map((f) => `#${f.index}`).join(', ')})`
-      + `${cardResult?.ok ? ` — landing job ${sanitizeCardField(cardResult.session ?? cardResult.handle ?? '', 120)}` : ` — FILING FAILED: ${sanitizeCardField(cardResult?.error ?? 'unknown', 300)}`}.`);
+    const owed = cardResult?.step === 'paused' && cardResult?.skipped === true;
+    lines.push(`- ${plan.card.length} finding(s) ${owed ? 'recorded, owed as a follow-up card' : 'filed as a follow-up card'} (${plan.card.map((f) => `#${f.index}`).join(', ')})`
+      + `${owed ? ' — filing paused; will file on resume' : cardResult?.ok ? ` — landing job ${sanitizeCardField(cardResult.session ?? cardResult.handle ?? '', 120)}` : ` — FILING FAILED: ${sanitizeCardField(cardResult?.error ?? 'unknown', 300)}`}.`);
   }
   if (plan.advisory.length) lines.push(`- ${plan.advisory.length} finding(s) left advisory (${plan.advisory.map((f) => `#${f.index}`).join(', ')}).`);
   return lines.join('\n');
@@ -131,10 +135,24 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
   try {
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
+    // Verify once for this read; both the retry decision and the cap must use the same trusted grant scope.
+    // Verify once for this read; a failed verification is an error status (no write), never a silent fallback.
+    const standingRuling = io.standingRuling?.({ repo, pr: { ...view, number: pr } }) ?? null;
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    const { result: parsed, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo);
+    const posted = liveResultGateState(view?.comments, pr, head, null, repo, standingRuling);
+    const saved = posted.result ? null : (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
+    const { result, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = saved ? liveResultGateState(view?.comments, pr, head, saved, repo, standingRuling) : posted;
+    let parsed = result;
     if (!parsed) return { status: 'no-red-team-on-head', head };
+    // Saved evidence may be precisely the result whose comment failed this scrub. Check raw fields
+    // before clipping, plus the composed comment/card (including scope) before any publication.
+    if (!posted.result) {
+      parsed = { ...parsed, findings: withholdUnpublishableFindings(parsed.findings, [
+        buildSendBackBody({ pr, head, findings: parsed.findings }),
+        ...Object.values(buildRedTeamCardInput({ repo, pr, head, findings: parsed.findings })),
+      ]) };
+    }
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
     if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
@@ -149,7 +167,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     const round = sendPending ? io.readRound({ repo, pr, head }) : null;
     // The operator's audited grants raise the cap with the same grant-time anchor fix dispatch uses. The anchor counts
     // this head like `readRound` does when the thread shows its review before the grant (thread order, not clocks).
-    const grants = sendPending ? gateRoundGrants(view?.comments, pr, repo) : [];
+    const grants = sendPending ? gateRoundGrants(view?.comments, pr, repo, standingRuling) : [];
     const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at, g) => {
       const reviewed = Number.isInteger(headReviewIndex) && Number.isInteger(g?.index) && headReviewIndex < g.index;
       try { return io.readRoundAsOf?.({ repo, pr, at, head: reviewed ? head : null }) ?? null; } catch { return null; }
@@ -197,8 +215,8 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     let cardMarker = null;
     if (cardPending) {
       cardResult = io.fileCard(cardInput);
-      // A card that was not filed records nothing: a permanent per-head record here would make the failure unretryable.
-      if (!cardResult?.ok) return { status: 'card-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, error: cardResult?.error ?? 'unknown' };
+      // A durable owed filing is handled on resume; every other failure must remain retryable.
+      if (!cardResult?.ok && !(cardResult?.step === 'paused' && cardResult?.skipped === true)) return { status: 'card-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, error: cardResult?.error ?? 'unknown' };
       cardMarker = record(GATE_OUTCOMES.CARD_QUEUED, { sendBack: [], card: plan.card, advisory: sendPending ? [] : plan.advisory }, { cardResult });
       // The job is spawned but its record is not on the PR: the next run would queue a DUPLICATE card. Say so, loudly.
       if (cardMarker !== 'posted') return { status: 'card-record-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, error: cardMarker };
@@ -240,6 +258,8 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
       comments: readCompletePrComments(Number(pr), { repo }),
     }),
     readSetting: () => readConfirmedBreaks({ env }),
+    readSavedResult: args => readSavedRedTeamResult({ ...args, env }),
+    standingRuling: standingRulingScope,
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
     readRoundAsOf: ({ repo, pr, at, head }) => readReviewRoundAsOf({ repo, pr, at, head }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).

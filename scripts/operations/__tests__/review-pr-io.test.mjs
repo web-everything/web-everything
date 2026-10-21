@@ -1,5 +1,5 @@
 import { buildOperatorRulingComment, referralFindingKey, mandatoryReferralReviewer, normalizeFinding, renderReferralRecord,
-  readReferralRecords, validateReferralRecord, mandatoryReferralState, activeReferrals, REFERRAL_CARRY_REASON } from '../../lib/jury-core.mjs';
+  readReferralRecords, validateReferralRecord, mandatoryReferralState, activeReferrals, REFERRAL_CARRY_REASON, REFERRAL_DROP_REASON } from '../../lib/jury-core.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
 /**
@@ -1471,6 +1471,62 @@ describe('#4315 durable referral effects', () => {
       at: '2026-10-04T12:01:00Z', clearerId: '', rulings: [{ runId: 'later-run', key: linked.referrals[0].key, result: 'not-real', supersedes: ['later-run:0'] }] }) });
     expect(mandatoryReferralState(h.state.comments, { repo: 'o/r', pr: 7, head: old.head }).blocked).toEqual([]);
     expect(await stateAfter()).toBe('ruled');
+  });
+
+  const aliasSubjects = [
+    ['chalbert/web-everything', 'web-everything/web-everything', true],
+    ['web-everything/web-everything', 'chalbert/web-everything', true],
+    ['web-everything/web-everything', 'other/repo', false],
+  ];
+  it.each(aliasSubjects)('disabled seat preserves operator block for %s / %s', async (recordRepo, rulingRepo, matches) => {
+    const h = harness({ failure: 'judge', env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' } });
+    h.payload.read.repo = recordRepo;
+    const old = { ...seedReferrals(h, ['judgeAntigravityReview'], h.state.headRefOid), repo: recordRepo };
+    h.state.comments[0].body = renderReferralRecord(old);
+    const key = old.referrals[0].key;
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: rulingRepo, pr: 7, head: old.head, actor: 'chalbert', channel: 'test', reason: 'real defect',
+      at: '2026-10-04T12:00:00Z', clearerId: '', rulings: [{ runId: old.runId, key, result: 'block' }] }) });
+    const settled = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(settled.records.find(r => r.runId === old.runId).dropped ?? []).toHaveLength(matches ? 0 : 1);
+    expect(settled.blocked).toEqual(matches ? [key] : []);
+    expect(h.ledger.some(r => r.actor?.channel === 'mandatory-referral-retired')).toBe(!matches);
+  });
+
+  it.each(aliasSubjects)('legacy dropped finding with operator block is never retired in ledger for %s / %s', async (recordRepo, rulingRepo, matches) => {
+    const h = harness({ failure: 'judge' });
+    h.payload.read.repo = recordRepo;
+    const old = { ...seedReferrals(h, ['judgeAntigravityReview'], h.state.headRefOid), repo: recordRepo };
+    const key = old.referrals[0].key;
+    old.dropped = [{ key, reason: REFERRAL_DROP_REASON }];
+    h.state.comments[0].body = renderReferralRecord(old);
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: rulingRepo, pr: 7, head: old.head, actor: 'chalbert', channel: 'test', reason: 'real defect',
+      at: '2026-10-04T12:00:00Z', clearerId: '', rulings: [{ runId: old.runId, key, result: 'block' }] }) });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(h.ledger.some(r => r.actor?.channel === 'mandatory-referral-retired')).toBe(!matches);
+  });
+
+  it.each(aliasSubjects)('current operator block prevents earlier clearance carry for %s / %s', async (recordRepo, rulingRepo, matches) => {
+    const h = harness({ failure: 'judge' });
+    h.payload.read.repo = recordRepo;
+    const { current } = seedCarry(h, { attempted: true });
+    // Preserve authored bytes by re-rendering each fixture with its chosen subject.
+    h.state.comments = h.state.comments.map(c => {
+      const records = readReferralRecords([c]).records;
+      if (records.length) return { ...c, body: renderReferralRecord({ ...records[0], repo: recordRepo }) };
+      return c;
+    });
+    // Replace the older ruling too: its encoded payload must match the chosen repo.
+    h.state.comments.pop();
+    const operator = (repo, head, runId, key, result, at) => ({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo, pr: 7, head, actor: 'chalbert', channel: 'test', reason: 'operator decision',
+      at, clearerId: '', rulings: [{ runId, key, result }] }) });
+    h.state.comments.push(operator(recordRepo, 'b'.repeat(40), 'earlier-run', current.referrals[0].key, 'not-real', '2026-10-04T12:00:00Z'));
+    h.state.comments.push(operator(rulingRepo, current.head, current.runId, current.referrals[0].key, 'block', '2026-10-04T13:00:00Z'));
+    const settled = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(settled.records.find(r => r.runId === current.runId).carried ?? []).toHaveLength(matches ? 0 : 1);
+    expect(settled.blocked).toEqual(matches ? [current.referrals[0].key] : []);
   });
 
   it('a disabled seat never retires a finding the operator ruled on, in the thread or the ledger', async () => {
