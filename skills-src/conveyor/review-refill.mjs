@@ -145,11 +145,13 @@ export function createReviewRefill({
   let lastFlushAt = -Infinity;
   let announcedMode = null;
   let savedMinutes = 0;
+  // Logging is best-effort: a throwing logger must never change what the refill decides or keeps.
+  const say = (line) => { try { log(line); } catch { /* logging never changes behavior */ } };
   const mode = () => {
     let s;
     try { s = settings(); } catch { s = { mode: 'off', source: 'standard' }; }
     const key = `${s.mode}/${s.source}`;
-    if (key !== announcedMode) { announcedMode = key; try { log(`refill: review.refillOnCompletion=${s.mode} (${s.source})${s.mode === 'on' ? ' - on is not built yet, running as shadow' : ''}`); } catch { /* log only */ } }
+    if (key !== announcedMode) { announcedMode = key; try { say(`refill: review.refillOnCompletion=${s.mode} (${s.source})${s.mode === 'on' ? ' - on is not built yet, running as shadow' : ''}`); } catch { /* log only */ } }
     return s.mode;
   };
 
@@ -190,7 +192,7 @@ export function createReviewRefill({
   function flush() {
     if (mode() === 'off') { freed = []; return []; }
     const t = now();
-    for (const [k, w] of would) if (t - w.at > WOULD_TTL_MS) { would.delete(k); log(`refill-shadow: ${k} was never dispatched by a pass within ${WOULD_TTL_MS / 60_000} min - dropped`); }
+    for (const [k, w] of would) if (t - w.at > WOULD_TTL_MS) { would.delete(k); say(`refill-shadow: ${k} was never dispatched by a pass within ${WOULD_TTL_MS / 60_000} min - dropped`); }
     if (!freed.length) return [];
     if (t - lastFlushAt < minPlanGapMs) { schedule(); return []; }
     const release = lock.tryAcquire('refill');
@@ -214,10 +216,10 @@ export function createReviewRefill({
         const slot = freed.shift();
         would.set(keyOf(row.repo, row.prNumber), { at: t, by: slot.by, freedAt: slot.at });
         out.push(row);
-        log(`refill-shadow: would dispatch #${row.prNumber} now (${row.repo}; slot freed at ${hhmmss(slot.at)} by ${slot.by})`);
+        say(`refill-shadow: would dispatch #${row.prNumber} now (${row.repo}; slot freed at ${hhmmss(slot.at)} by ${slot.by})`);
       }
     } catch (e) {
-      log(`refill-shadow: failed, waiting for the pass: ${String(e?.message ?? e).split('\n')[0]}`);
+      say(`refill-shadow: failed, waiting for the pass: ${String(e?.message ?? e).split('\n')[0]}`);
     } finally { release(); }
     return out;
   }
@@ -244,20 +246,23 @@ export function createReviewRefill({
   function notePass(result) {
     if (mode() === 'off' || result?.skipped) { planning = new Map(); return; } // no plan was made: keep any older queue, which keeps aging
     const end = now();
-    for (const d of (Array.isArray(result?.dispatched) ? result.dispatched : [])) {
-      const k = keyOf(d.repo, d.prNumber);
-      const w = would.get(k);
-      if (!w) continue;
-      would.delete(k);
-      const at = Number.isFinite(d.at) ? d.at : end; // pass end is an upper bound when the dispatch time is not recorded
-      const mins = Math.max(0, (at - w.at) / 60_000);
-      savedMinutes += mins;
-      log(`refill-shadow: pass dispatched #${d.prNumber} (${d.repo}) ${mins.toFixed(1)} min after the refill would have${Number.isFinite(d.at) ? '' : ' (upper bound: pass end time)'}; idle-slot minutes saved ${mins.toFixed(1)}, total ${savedMinutes.toFixed(1)}`);
-    }
     // The queue ages from when its OLDEST plan was captured, not from when the pass ended.
     try { queue = planning.size ? { at: Math.min(...[...planning.values()].map((p) => p.at)), rows: buildQueue(result) } : null; } catch { queue = null; } // doubt: no queue
     planning = new Map();
     freed = []; // the pass just refilled whatever it could
+    // The queue is already replaced; this idle-minutes comparison is best-effort and cannot leave an old queue behind.
+    try {
+      for (const d of (Array.isArray(result?.dispatched) ? result.dispatched : [])) {
+        const k = keyOf(d.repo, d.prNumber);
+        const w = would.get(k);
+        if (!w) continue;
+        would.delete(k);
+        const at = Number.isFinite(d.at) ? d.at : end; // pass end is an upper bound when the dispatch time is not recorded
+        const mins = Math.max(0, (at - w.at) / 60_000);
+        savedMinutes += mins;
+        say(`refill-shadow: pass dispatched #${d.prNumber} (${d.repo}) ${mins.toFixed(1)} min after the refill would have${Number.isFinite(d.at) ? '' : ' (upper bound: pass end time)'}; idle-slot minutes saved ${mins.toFixed(1)}, total ${savedMinutes.toFixed(1)}`);
+      }
+    } catch { /* comparison only */ }
   }
 
   async function guardPass(fn) {

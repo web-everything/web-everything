@@ -37,13 +37,14 @@ function rig({ mode = 'shadow', budgetLeft = 3, view = (n) => ({ state: 'OPEN', 
   let live = 8;
   let liveThrows = false;
   let budgetNull = false;
+  let logThrows = false;
   const reads = [];
   const downstream = vi.fn();
   const r = createReviewRefill({
     budget: () => { if (liveThrows) throw new Error('ps failed'); return budgetNull ? null : { live, left: budgetLeft, max: 8 }; },
     order: (reviews) => [...reviews].sort((a, b) => a.prNumber - b.prNumber),
     readPr: ({ repo, pr }) => { reads.push(`${repo}#${pr}`); return view(pr); },
-    log: (l) => logs.push(l),
+    log: (l) => { if (logThrows) throw new Error('log down'); logs.push(l); },
     settings: () => ({ mode, source: 'test' }),
     now: () => t,
     setTimer: (fn, ms) => { const h = { fn, ms, unref() {} }; timers.push(h); return h; },
@@ -51,6 +52,7 @@ function rig({ mode = 'shadow', budgetLeft = 3, view = (n) => ({ state: 'OPEN', 
   });
   return {
     r, logs, timers, reads, downstream,
+    setLogThrows: (b) => { logThrows = b; },
     setLive: (n) => { live = n; }, advance: (ms) => { t += ms; }, setThrow: (b) => { liveThrows = b; }, setBudgetNull: (b) => { budgetNull = b; },
     fire: () => { const h = timers.shift(); h.fn(); },
   };
@@ -100,6 +102,29 @@ describe('silent cascade and start-up log', () => {
 });
 
 describe('aborted and skipped passes', () => {
+  it('a throwing logger cannot leave the previous queue behind', async () => {
+    const h = rig();
+    await runPass(h); freeSlot(h); h.fire();                    // would-dispatch #2 is recorded
+    expect(h.logs.some((l) => l.includes('would dispatch #2'))).toBe(true);
+    h.r.poll();                                                  // keep prevLive current
+    h.setLogThrows(true);
+    // the next pass dispatches #2 and plans #3,#4 only; its comparison log throws
+    await expect(h.r.guardPass(async () => {
+      h.r.tapPlan(null)({ repo: 'o/r', plan: { dispatch: [{ kind: 'review', prNumber: 2 }, { kind: 'review', prNumber: 3 }, { kind: 'review', prNumber: 4 }] },
+        rawPrs: [2, 3, 4].map((n) => ({ number: n, headRefOid: HEAD(n) })) });
+      return { dispatched: [{ repo: 'o/r', prNumber: 2 }], notStarted: [] };
+    })).resolves.toEqual({ dispatched: [{ repo: 'o/r', prNumber: 2 }], notStarted: [] });
+    expect(h.r._state().queue.rows.map((x) => x.prNumber)).toEqual([3, 4]); // the NEW queue, without #2
+    expect(h.r.lock.holder()).toBeNull();
+  });
+  it('a throwing logger never breaks a flush or the setting announcement', async () => {
+    const h = rig();
+    h.setLogThrows(true);
+    await runPass(h); freeSlot(h);
+    expect(() => h.fire()).not.toThrow();
+    expect(() => h.r.start()).not.toThrow();
+    expect(h.r._state().would.has('o/r#2')).toBe(true);        // the decision was kept even though the log line failed
+  });
   it('a pass that aborts leaves no plans behind, so a later skipped pass builds no queue', async () => {
     const h = rig();
     await expect(h.r.guardPass(async () => {
