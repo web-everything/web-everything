@@ -61,6 +61,27 @@ export function cachedLaneScan(scan, { dir, root, now = Date.now(), write = true
   return lanes;
 }
 
+// Lane-owned config that points git at another worktree, or lets a missing object trigger a lazy fetch that runs a
+// lane-chosen transport command (promisor remotes, upload-pack, git proxy). Env pins cannot switch these off on every git.
+const LANE_REDIRECT_KEY_RE = /^(core\.(worktree|gitproxy|alternaterefscommand)|extensions\.partialclone|remote\..+\.(promisor|partialclonefilter|uploadpack|vcs))$/i;
+
+/** The local/worktree-scope config keys in {@link LANE_CONFIG_LIST_ARGS} output that redirect the probe or run a transport. Pure. */
+export function laneRedirectConfig(listOutput) {
+  const parts = String(listOutput ?? '').split('\0');
+  const found = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const key = parts[i + 1].split('\n')[0];
+    if ((parts[i] === 'local' || parts[i] === 'worktree') && LANE_REDIRECT_KEY_RE.test(key)) found.push(key);
+  }
+  return found;
+}
+
+/** Env every lane probe git runs under, on top of the repo's lane hardening. */
+export function laneProbeEnv(path) {
+  return { ...laneGitHardeningEnv(laneGitEnv(path)), GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0',
+    GIT_NO_LAZY_FETCH: '1' };
+}
+
 /**
  * FRESH safety read of ONE lane, right now (never the cache). Unsafe when the worktree has any change (tracked or
  * untracked or ignored), index flags that may hide edits, any stash, or any commit absent from local origin refs. Any git error,
@@ -72,11 +93,12 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
   const unsafe = (reason, error) => ({ hasUnsafeWork: true, fresh: true, observedAt, reason, ...(error ? { error } : {}) });
   if (typeof path !== 'string' || !path) return unsafe('no lane path');
   const git = argv => String(exec('git', hardenLaneGitArgs(argv), { cwd: path, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
-    env: { ...laneGitHardeningEnv(laneGitEnv(path)), GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat',
-      GIT_OPTIONAL_LOCKS: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }));
+    env: laneProbeEnv(path), stdio: ['ignore', 'pipe', 'pipe'] }));
   try {
     // Config reads execute no drivers. Refuse lane-owned filters before status can run a clean filter.
-    if (laneFilterDrivers(git([...LANE_CONFIG_LIST_ARGS])).length) return unsafe('lane Git filter drivers present');
+    const config = git([...LANE_CONFIG_LIST_ARGS]);
+    if (laneFilterDrivers(config).length) return unsafe('lane Git filter drivers present');
+    if (laneRedirectConfig(config).length) return unsafe('lane Git config redirects objects, transport or worktree');
     // Status can enter submodules with their own untrusted filter config. Do not run that recursive probe.
     if (git(['ls-files', '--stage', '-z']).split('\0').some(entry => entry.startsWith('160000 '))) {
       return unsafe('submodule safety requires separate inspection');

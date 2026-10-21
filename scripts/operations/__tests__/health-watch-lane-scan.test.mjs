@@ -79,7 +79,7 @@ describe('health-watch persistent lane scan', () => {
     now = 42000;
     alive = false;
     const second = createStaleStateReader(options)();
-    expect(run).toHaveBeenCalledTimes(2); // one full status and one leased-lane ahead probe
+    expect(run).toHaveBeenCalledTimes(3); // one full status, one leased-lane config read and one ahead probe
     expect(readClaim).toHaveBeenCalledTimes(2);
     expect(second.records.map(r => r.kind)).toEqual(['lane-lease', 'lane-lease', 'claim']);
     expect(first.records[0]).toMatchObject({ ownerPidAlive: true, hasUnsafeWork: true, lane: { ahead: 2 } });
@@ -134,7 +134,7 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
     try {
       r.read();
       expect(r.run.mock.calls.map(([bin, , options]) => [bin === 'git', options.cwd, options.env.GIT_CEILING_DIRECTORIES]))
-        .toEqual([[false, '/fixture', '/'], [true, '/fixture/lane-1', '/fixture']]);
+        .toEqual([[false, '/fixture', '/'], [true, '/fixture/lane-1', '/fixture'], [true, '/fixture/lane-1', '/fixture']]);
       for (const [, , options] of r.run.mock.calls) {
         expect(options.env).not.toHaveProperty('GIT_DIR');
         expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
@@ -262,6 +262,8 @@ describe('fresh per-lane safety check before any destructive action', () => {
         for (const key of selectors) expect(options.env).not.toHaveProperty(key);
         expect(options.env.GIT_CEILING_DIRECTORIES).toBe('/fixture');
         expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
+        // A missing object must never trigger a lazy fetch through lane-chosen transport config.
+        expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
       }
     } finally { vi.unstubAllEnvs(); }
   });
@@ -447,6 +449,36 @@ describe('lane action guard with real Git', () => {
     writeFileSync(join(path, 'tracked.txt'), 'modified content\n');
     expect(guardLaneAction({ path, action: 'reclaim', log: vi.fn() }).act).toBe(false);
     expect(existsSync(marker)).toBe(false);
+  });
+
+  it.each([
+    ['extensions.partialclone', 'origin', 'partial-clone lazy fetch'],
+    ['remote.origin.promisor', 'true', 'promisor remote lazy fetch'],
+    ['remote.origin.uploadpack', 'MARKER', 'lane-chosen upload-pack transport'],
+    ['core.gitProxy', 'MARKER', 'lane-chosen git proxy'],
+  ])('refuses a lane whose config enables %s (%s) without executing the marker', (key, value) => {
+    const { path, git } = fixture();
+    const scripts = temp();
+    const marker = join(scripts, 'executed');
+    const script = join(scripts, 'marker.sh');
+    writeFileSync(script, `#!/bin/sh\necho executed >> '${marker}'\n`, { mode: 0o700 });
+    git(['config', key, value === 'MARKER' ? script : value]);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { reason: 'lane Git config redirects objects, transport or worktree' } });
+    }
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('refuses a lane that redirects its worktree, instead of probing a different clean checkout', () => {
+    const { path, git } = fixture();
+    const elsewhere = fixture().path; // a different, genuinely clean and pushed checkout
+    writeFileSync(join(path, 'untracked.txt'), 'local data\n');
+    git(['config', 'core.worktree', elsewhere]);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { hasUnsafeWork: true } });
+    }
   });
 
   it.each(['clean', 'smudge', 'process'])('refuses a lane-local %s filter without executing it', driver => {

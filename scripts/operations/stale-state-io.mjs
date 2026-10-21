@@ -11,9 +11,9 @@ import { createClaimReader, REPO_ROOT } from './claim-io.mjs';
 import { createFileRunStore } from './run-store.mjs';
 import { idFromName } from '../backlog/id.mjs';
 import { readField } from '../backlog/frontmatter.mjs';
-import { cachedLaneScan } from '../lib/health-watch-lane-scan.mjs';
+import { cachedLaneScan, laneProbeEnv, laneRedirectConfig } from '../lib/health-watch-lane-scan.mjs';
 import { laneGitEnv } from '../lib/git-transport-branch.mjs';
-import { hardenLaneGitArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { hardenLaneGitArgs, LANE_CONFIG_LIST_ARGS } from '../lib/lane-git-hardening.mjs';
 import { probePid } from '../conveyor/reconcile-pass.mjs';
 
 /** Bind external reads, including subprocesses and clock, for fixture-only tests. */
@@ -31,7 +31,7 @@ export function createStaleStateReader({
   });
   // A lane's own .git/config is untrusted: any git run inside one gets the repo's lane hardening, like freshLaneSafety.
   const laneGit = (argv, cwd) => run('git', hardenLaneGitArgs(argv), {
-    cwd, env: { ...laneGitHardeningEnv(laneGitEnv(cwd)), GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0' },
+    cwd, env: laneProbeEnv(cwd),
     encoding: 'utf8', timeout: 120_000, maxBuffer: 32 * 1024 * 1024,
   });
   return () => {
@@ -69,6 +69,8 @@ export function createStaleStateReader({
           let ahead = null;
           if (!lane.readError && lane.lease) {
             try {
+              // A lane redirecting its worktree or transport is reported unknown, never probed.
+              if (laneRedirectConfig(laneGit([...LANE_CONFIG_LIST_ARGS], lane.path)).length) throw new Error('redirecting lane config');
               // Behind cannot detect unpushed commits. Count commits absent from local origin refs.
               const raw = String(laneGit(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'], lane.path)).trim();
               if (/^\d+$/.test(raw)) ahead = Number(raw);

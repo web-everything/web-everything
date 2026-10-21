@@ -6,10 +6,11 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
 
 const at = '2026-09-15T12:00:00.000Z';
-function fixture({ leases = [], claims = {}, runs = {}, probe = () => false, ahead = '0' } = {}) {
+function fixture({ leases = [], claims = {}, runs = {}, probe = () => false, ahead = '0', configList = '' } = {}) {
   const run = vi.fn((bin, argv, opts) => {
     expect(opts.env.GIT_OPTIONAL_LOCKS).toBe('0');
     if (bin === 'git') {
+      if (argv[0] === 'config') return configList;
       expect(argv).toEqual(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']);
       if (ahead instanceof Error) throw ahead;
       return ahead;
@@ -86,12 +87,21 @@ describe('stale-state — observed liveness, no cleanup', () => {
     const { run, read } = fixture({ leases: [lease()] });
     vi.stubEnv('GIT_EXTERNAL_DIFF', 'echo inherited');
     try { read(); } finally { vi.unstubAllEnvs(); }
-    const [, , opts] = run.mock.calls.find(([bin]) => bin === 'git');
+    for (const [, , gitOpts] of run.mock.calls.filter(([b]) => b === 'git')) {
+      expect(gitOpts.env.GIT_NO_LAZY_FETCH).toBe('1');
+      expect(gitOpts.env.GIT_CONFIG_NOSYSTEM).toBe('1');
+    }
+    const [, , opts] = run.mock.calls.find(([bin, argv]) => bin === 'git' && argv[0] === 'rev-list');
     const pins = Object.entries(opts.env).filter(([k]) => k.startsWith('GIT_CONFIG_KEY_')).map(([, v]) => v);
     expect(pins).toEqual(expect.arrayContaining(['core.fsmonitor', 'core.hooksPath']));
     expect(opts.env.GIT_EXTERNAL_DIFF).toBeUndefined();
     expect(opts.env.GIT_CONFIG_NOSYSTEM).toBe('1');
     expect(opts.env.GIT_OPTIONAL_LOCKS).toBe('0');
+  });
+  it('reports a lane with redirecting config unknown, without running the ahead probe', async () => {
+    const { run, declaration } = fixture({ leases: [lease()], configList: 'local\0core.worktree\n/elsewhere\0' });
+    expect((await invoke(declaration)).records[0].hasUnsafeWork).toBeNull();
+    expect(run.mock.calls.some(([bin, argv]) => bin === 'git' && argv[0] === 'rev-list')).toBe(false);
   });
   it('enumerates claims and all runs, retaining missing and corrupt evidence', async () => {
     const { declaration } = fixture({
