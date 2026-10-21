@@ -86,7 +86,8 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
     if (typeof status !== 'string') return unsafe('status unreadable');
     if (status.trim()) return unsafe('worktree has changes');
     if (hasHiddenIndexFlags(git)) return unsafe('index flags may hide worktree changes');
-    const stash = git(['stash', 'list']);
+    // `stash list` is `git log -g`: a lane-set log.showSignature + gpg.program must not run a verifier.
+    const stash = git(['stash', 'list', '--no-show-signature']);
     if (stash.trim()) return unsafe('stash entries present');
     // Protect work held by other branches, tags or custom refs, plus a detached HEAD.
     const ahead = git(['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']).trim();

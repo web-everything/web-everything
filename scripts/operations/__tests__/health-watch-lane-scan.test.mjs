@@ -164,7 +164,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     ['git', ['ls-files', '--stage', '-z']],
     ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
     ['git', ['ls-files', '-v']],
-    ['git', ['stash', 'list']],
+    ['git', ['stash', 'list', '--no-show-signature']],
     ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']],
   ];
   const gitMocks = [];
