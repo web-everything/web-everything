@@ -165,6 +165,32 @@ export function readRedTeamProbes({ env = process.env, path = RED_TEAM_SETTINGS_
   return resolved;
 }
 
+/**
+ * `redTeam.operatorRulings.anyState` (default true; kill switch env {@link OPERATOR_RULINGS_ENV}=false): may an
+ * OPERATOR ruling (`record-red-team-ruling`, a human operator account) rule on a confirmed break in ANY state of the
+ * live result (at the round cap, sent back, or carded)? Off restores the round-cap-only rule: the CLI refuses a
+ * result not parked at the cap, and this reader lets an operator release override only what the gate handed over,
+ * never a recorded send-back. Automation never gets this: an operator release counts only from a human operator. */
+export const OPERATOR_RULINGS_DEFAULTS = Object.freeze({ anyState: true });
+export const OPERATOR_RULINGS_ENV = 'WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE';
+export function resolveOperatorRulings({ file = {}, platform, env = {} } = {}) {
+  const raw = env[OPERATOR_RULINGS_ENV];
+  const v = raw === undefined || raw === '' ? undefined : String(raw).trim().toLowerCase();
+  const anyState = v === undefined ? undefined : ['true', 'on', '1'].includes(v) ? true : ['false', 'off', '0'].includes(v) ? false : raw;
+  const pick = (o) => (o?.operatorRulings?.anyState === undefined ? {} : { anyState: o.operatorRulings.anyState });
+  return resolveCascade({ standard: OPERATOR_RULINGS_DEFAULTS, platform: pick(platform), tool: pick(file?.redTeam),
+    envValues: { anyState }, valid: (x) => typeof x === 'boolean' });
+}
+export function readOperatorRulings({ env = process.env, path = RED_TEAM_SETTINGS_FILE, log = () => {} } = {}) {
+  let file = {};
+  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
+  let platform;
+  try { platform = platformPreference('redTeam', { env }); } catch { platform = undefined; }
+  const resolved = resolveOperatorRulings({ file, platform, env });
+  log(formatCascadeSourcesLine('redTeam.operatorRulings', resolved));
+  return resolved;
+}
+
 // ── The decision ────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** A finding's class. Fail closed: confirmed with no stated (or an unknown) impact is `broken`. PURE. */
@@ -495,6 +521,8 @@ function operatorRuled(records, pr, head) {
 const INDEX_LIST = '\\((#\\d+(?:, #\\d+)*)\\)';
 const GATE_ACTION_LINES = [
   ['card', new RegExp(`^- \\d+ finding\\(s\\) filed as a follow-up card ${INDEX_LIST}(?: — landing job [^\\n]*)?\\.$`)],
+  // An operator `card` ruling to an EXISTING card (`record-red-team-ruling --card=<ref>`); it releases only from a human operator.
+  ['card', new RegExp(`^- \\d+ finding\\(s\\) carded by the operator to \`[^\`\\n]+\` ${INDEX_LIST}\\.$`)],
   ['advisory', new RegExp(`^- \\d+ finding\\(s\\) left advisory ${INDEX_LIST}\\.$`)],
   ['send-back', new RegExp(`^- \\d+ confirmed break\\(s\\) sent back to the fixer ${INDEX_LIST}(?: — the PR was already under review:changes)?\\.$`)],
   ['held', new RegExp(`^- \\d+ confirmed break\\(s\\) NOT sent back: [^\\n]*?(?: ${INDEX_LIST})?\\.$`)],
@@ -524,11 +552,12 @@ function gateActionLines(body) {
  * finding. A carried result also keeps the actions bound to the result it was carried from (the same findings,
  * re-keyed); the newer head's own records win. An operator ruling releases only what the gate handed over (`held`).
  */
-export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null } = {}) {
+export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings } = {}) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const result = latestResult(records, pr, live)?.parsed ?? null;
   const plan = planRedTeamActions(result, setting ?? readConfirmedBreaks({ env }).value);
+  const anyState = (operatorRulings ?? readOperatorRulings({ env }).value).anyState !== false;
   const actions = new Map();
   const grants = gateRoundGrants(comments, pr, repo, standingRuling);
   let legacyHeld = false, liveGates = [];
@@ -546,9 +575,12 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
       for (const { action, indices } of gateActionLines(recordBody(r))) {
         // Only a human operator may release a break held at the round cap; automation lines release only what the gate itself decided.
         // This is applied per action line (not by dropping the forged comment, which would also drop its restrictive `held` lines).
-        if (RELEASING_ACTIONS.has(action) && !AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome) && !isHumanOperatorComment(r.c)) continue;
+        const operatorRelease = RELEASING_ACTIONS.has(action) && !AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome);
+        if (operatorRelease && !isHumanOperatorComment(r.c)) continue;
         if (action === 'held' && !indices.length) legacyHeld = true;
         for (const index of indices) {
+          // Kill switch off: an operator release cannot override a break the gate recorded as sent back.
+          if (operatorRelease && !anyState && own.get(index) === 'send-back') continue;
           // A stale cap POST cannot overwrite the per-finding send-back that superseded its decision.
           if (action === 'held' && own.get(index) === 'send-back' && supersededCaps.has(r)) continue;
           own.set(index, action);
@@ -576,4 +608,26 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (action === 'send-back') sendBack.push(f);
   }
   return { result, sendBack, held, since: commentCreatedAt(capRecord) ?? null, outcome };
+}
+
+/**
+ * The live head's latest result, and per finding the actions a HUMAN OPERATOR's named gate record (`operator-*`,
+ * `result=` this result) took on it, in thread order. `record-red-team-ruling` dedups on this (no second card). PURE.
+ * @returns {{resultId:(string|null), ruled:Map<number, string[]>}}
+ */
+export function operatorRulingsOnLiveResult(comments, pr, head) {
+  const live = String(head ?? '').toLowerCase();
+  const records = indexedRecords(comments);
+  const hit = latestResult(records, pr, live);
+  const ruled = new Map();
+  if (!hit) return { resultId: null, ruled };
+  const id = redTeamResultId(hit.parsed);
+  for (const r of gateRecordsFor(records, pr, live, hit).sort(threadOrder)) {
+    if (AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome) || r.gate.result !== id || !isHumanOperatorComment(r.c)) continue;
+    if (!r.gate.outcome.startsWith('operator-')) continue;
+    for (const { action, indices } of gateActionLines(recordBody(r))) {
+      for (const index of indices) ruled.set(index, [...(ruled.get(index) ?? []), action]);
+    }
+  }
+  return { resultId: id, ruled };
 }
