@@ -1,0 +1,6 @@
+{
+  "cardBatchWiden": {
+    "$comment": "Card xafcvmh (#6636). mode: off|shadow|on. shadow only LOGS what the rolling card batch would have held for card-only filings that add raised-by files to existing cards; it opens and changes no PR. on is not built yet and behaves as shadow. Cascade: standard off, platform cardBatchWiden, repo (this file), env WE_CARD_BATCH_WIDEN; the winning layer is logged.",
+    "mode": "shadow"
+  }
+}
