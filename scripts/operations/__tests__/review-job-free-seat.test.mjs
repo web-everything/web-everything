@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -25,8 +25,9 @@ describe('free the live-review seat at the verdict: extra seats run detached', (
       const call = spawnBackground.mock.calls[0][0];
       expect(call.argv.slice(0, 2)).toEqual(['scripts/operations/review-extra-seats.mjs', 'run']);
       expect(call.argv).toEqual(expect.arrayContaining(['--background', '--run-id=run-1', '--pr=7', '--repo=o/r', '--lane=/lane']));
-      expect(call.logPath).toBe(join(dir, 'review-7.log'));
+      expect(call.logPath).toBe(join(dir, 'review-7.extra-seats.log'));
       const loopArg = call.argv.find((a) => a.startsWith('--loop-json='));
+      expect(loopArg).toMatch(/review-7\.loop\.[0-9a-f-]{36}\.json$/);
       expect(existsSync(loopArg.slice('--loop-json='.length))).toBe(true);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -36,7 +37,7 @@ describe('free the live-review seat at the verdict: extra seats run detached', (
     try {
       const io = createReviewJobIo({ root: dir, dir, env: {}, spawnBackground: () => { throw new Error('EMFILE'); } });
       expect(io.runExtraSeats(input)).toMatchObject({ status: 'error' });
-      expect(existsSync(join(dir, 'review-7.loop.json'))).toBe(false);
+      expect(readdirSync(dir).filter((f) => f.includes('.loop.'))).toEqual([]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -59,7 +60,7 @@ describe('finishBackgroundSeats', () => {
     try {
       writeFileSync(loop, '{}');
       let saved = null;
-      const io = { readRun: () => ({ id: 'run-1' }), writeRun: (r) => { saved = r; } };
+      const io = { update: (_id, fn) => { saved = fn({ id: 'run-1' }); } };
       finishBackgroundSeats({
         result: { seats: [{ seat: 's1', lens: 'correctness', provider: 'codex', startedAt: '2026-10-21T12:00:00Z', finishedAt: '2026-10-21T12:03:00Z', seatVerdict: 'ok', findingsCount: 2 }, { seat: 's2' }] },
         runId: 'run-1', loopFile: loop, io,
@@ -74,7 +75,7 @@ describe('finishBackgroundSeats', () => {
     const loop = join(dir, 'x.loop.json');
     try {
       writeFileSync(loop, '{}');
-      const io = { readRun: () => { throw new Error('disk'); }, writeRun: () => {} };
+      const io = { update: () => { throw new Error('disk'); } };
       expect(() => finishBackgroundSeats({ result: { seats: [{ seat: 's', startedAt: 't' }] }, runId: 'r', loopFile: loop, io })).not.toThrow();
       expect(existsSync(loop)).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }

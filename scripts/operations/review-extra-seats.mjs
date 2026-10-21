@@ -57,7 +57,7 @@ import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from
 import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
-import { readRun, writeRun } from './run-store.mjs';
+import { updateRunLocked } from './run-update-lock.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync,
@@ -1831,14 +1831,12 @@ export function resolvedReplayPayload({ view, diffText, repo, cwd, run, enabled 
  * The tail of a `run --background` seat process: record the seat timings the review job would have recorded had it
  * stayed, then drop the loop file. Best effort and contained: a failure here is only a stderr line.
  */
-export function finishBackgroundSeats({ result, runId, loopFile, io = { readRun, writeRun } }) {
+export function finishBackgroundSeats({ result, runId, loopFile, io = { update: updateRunLocked } }) {
   try {
     const rows = (Array.isArray(result?.seats) ? result.seats : []).filter((r) => r?.startedAt)
       .map((r) => seatTiming({ ...r, verdict: r.seatVerdict ?? r.verdict ?? null }));
     if (runId && rows.length) {
-      let run = io.readRun(runId);
-      for (const row of rows) run = withSeatTiming(run, row);
-      io.writeRun(run);
+      io.update(runId, (run) => rows.reduce((acc, row) => withSeatTiming(acc, row), run));
     }
   } catch (e) {
     process.stderr.write(`review-extra-seats: seat timing write failed (${String(e?.message ?? e).slice(0, 200)})\n`);
@@ -1869,6 +1867,15 @@ if (IS_CLI) {
       const wall = setTimeout(() => { Promise.resolve(shutdownActiveSeats()).finally(() => process.exit(124)); },
         resolveSeatTimeoutMs() + 5 * 60 * 1000);
       wall.unref();
+      // Hard backstop the event loop cannot provide (a synchronous probe can outlast the timer): a detached shell
+      // kills this exact process after the wall, guarded so a recycled pid is never touched.
+      try {
+        const backstop = spawn('/bin/sh', ['-c',
+          `sleep ${Math.ceil((resolveSeatTimeoutMs() + 8 * 60 * 1000) / 1000)}; ps -o command= -p ${process.pid} 2>/dev/null | grep -q review-extra-seats && kill -9 ${process.pid}`],
+        { detached: true, stdio: 'ignore' });
+        backstop.on('error', () => {});
+        backstop.unref();
+      } catch { /* the in-process timer remains */ }
     }
     runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() })
       .then((result) => {

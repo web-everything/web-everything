@@ -9,6 +9,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 import { listRunIds, readRun, writeRun } from './run-store.mjs';
+import { updateRunLocked } from './run-update-lock.mjs';
 import { savedRedTeamHash, savedRedTeamRunsDir, matchesSavedRedTeamHead, verifySavedRedTeamProvenance } from '../lib/saved-red-team-provenance.mjs';
 import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
@@ -284,10 +285,12 @@ export function backgroundExtraSeatsEnabled(env = process.env) {
 }
 
 /** Detached, unref'd spawn whose stdout/stderr append to the job's own log; returns the child pid. */
-function defaultSpawnBackground({ argv, cwd, env, logPath }) {
+function defaultSpawnBackground({ argv, cwd, env, logPath, loopFile = null }) {
   const fd = openSync(logPath, 'a');
   try {
     const child = spawn(process.execPath, argv, { cwd, env, detached: true, stdio: ['ignore', fd, fd] });
+    // An asynchronous spawn failure must not reach the job: drop the loop file and carry on.
+    child.once('error', () => { try { if (loopFile) rmSync(loopFile, { force: true }); } catch { /* best effort */ } });
     child.unref();
     return child.pid;
   } finally {
@@ -384,20 +387,22 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     runExtraSeats: ({ pr, repo, lanePath, loopPayload, slug, runId = null }) => {
       if (!extraSeatsEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
       const loopFile = join(dir, `${slug}.loop.json`);
+      const bgLoopFile = join(dir, `${slug}.loop.${randomUUID()}.json`);
       // Free the live-review seat at the verdict: the advisory seats run in their own detached process (own pid, not
       // counted as a review round) and this job exits. `WE_REVIEW_EXTRA_SEATS_BACKGROUND=0` restores the inline run.
       if (backgroundExtraSeatsEnabled(env)) {
         try {
           mkdirSync(dir, { recursive: true });
-          writeFileSync(loopFile, JSON.stringify(loopPayload));
+          writeFileSync(bgLoopFile, JSON.stringify(loopPayload));
           const pid = spawnBackground({
+            loopFile: bgLoopFile,
             argv: ['scripts/operations/review-extra-seats.mjs', 'run', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`,
-              `--loop-json=${loopFile}`, '--background', ...(runId ? [`--run-id=${runId}`] : [])],
-            cwd: root, env, logPath: jobLogPath(slug, dir),
+              `--loop-json=${bgLoopFile}`, '--background', ...(runId ? [`--run-id=${runId}`] : [])],
+            cwd: root, env, logPath: join(dir, `${slug}.extra-seats.log`),
           });
           return { status: 'background', reason: `extra seats handed to a detached process${pid ? ` (pid ${pid})` : ''}; the job's review seat is free`, ...(pid ? { pid } : {}) };
         } catch (e) {
-          try { rmSync(loopFile, { force: true }); } catch { /* best effort */ }
+          try { rmSync(bgLoopFile, { force: true }); } catch { /* best effort */ }
           return { status: 'error', reason: `background launch failed: ${String(e?.message ?? e).slice(0, 250)}` };
         }
       }
@@ -552,16 +557,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (redTeam.seat && Object.keys(redTeam.seat).some(key =>
         savedRedTeamHash([records[index][key] ?? null]) !== savedRedTeamHash([redTeam.seat[key] ?? null])))
         throw new Error('saved red-team result changed before attestation');
-      writeRun({ ...run, findings: { ...run.findings, savedRedTeamResult: {
-        writer: 'review-job', references: [{ path, index }], sha256: savedRedTeamHash([records[index]]),
-      } } }, runsDir);
+      const savedRedTeamResult = { writer: 'review-job', references: [{ path, index }], sha256: savedRedTeamHash([records[index]]) };
+      updateRunLocked(runId, (fresh) => ({ ...fresh, findings: { ...fresh.findings, savedRedTeamResult } }), runsDir);
       return true;
     },
     recordSeatTimings: (runId, rows) => {
       if (!runId || !rows.length) return;
-      let run = readRun(runId);
-      for (const row of rows) run = withSeatTiming(run, row);
-      writeRun(run);
+      updateRunLocked(runId, (run) => rows.reduce((acc, row) => withSeatTiming(acc, row), run));
     },
     log: (line) => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
   };
