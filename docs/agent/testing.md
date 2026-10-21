@@ -1924,6 +1924,13 @@ refresh must not change the selected role, applied token provenance, or recorded
 The standalone gh shim recognizes `WE_GH_DAEMON_CALLER` and launchd labels under
 `com.we.` / `com.plateau.`. A daemon cache miss gets one synchronous refresh CLI attempt
 (90-second timeout), then refuses personal auth by default, including after an App 401.
+`gh-app-shim.test.mjs` names this boundary in `bounds on-demand refresh and refuses
+after timeout`: intercept the refresh spawn, assert `timeout: 90000`, return
+`ETIMEDOUT`, and assert refusal with zero real-gh invocations. No wall-clock wait is needed.
+`github-app-auth-env.test.mjs` checks `refreshes legacy after the role applies,
+without replacing role outcome` for successful and failed legacy refreshes with minted
+and cached role tokens, including
+caller/shared status writes and the selected role token's source, installation and SHA-256 hash.
 Install the daemon refusal shim before reading keys/caches or refreshing tokens, including
 when no App is configured. If installation fails, stop before the daemon tick runs.
 The pass daemon and await-verify loop must propagate `GithubAppAuthGuardError` even

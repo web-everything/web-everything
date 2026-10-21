@@ -13,7 +13,8 @@ PR #5729 made we:scripts/lib/gh-app-shim.mjs#buildGhShimSettingsEnv throw for a 
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — Add `createPrLandRunner refuses daemon shim installation errors before invoking gh`, driving a daemon-marked environment through the land runner with a failed guarded-shim write; assert rejection and zero legacy-shim or real-gh calls. The test must fail against the current swallowed-error path. Run `npm run test:unit -- <suite>` from the WE checkout, using the repository-relative path for suite `we:scripts/operations/__tests__/open-pr-io-org-shim.test.mjs`.
+- [A2] **Executable** — In the same test file, parameterize explicit and XPC-only daemon markers and absent/later/first shim PATH entries; daemon failures refuse, interactive failures preserve best-effort fallback, and successful installation places the guarded shim first without duplicating it.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

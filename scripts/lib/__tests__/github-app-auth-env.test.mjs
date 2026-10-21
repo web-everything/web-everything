@@ -5,6 +5,7 @@
  *   no real network, no real GitHub App needed.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -711,7 +712,8 @@ describe('daemon refresh lookahead and legacy fallback liveness', () => {
     expect(env.WE_GH_DAEMON_CALLER).toBe(daemon ? 'buffer-probe' : undefined);
   });
 
-  it.each([false, true])('refreshes legacy after the role applies, without replacing role outcome (legacy failure=%s)', async (failLegacy) => {
+  it.each([false, true].flatMap((failLegacy) => ['mint', 'cache'].map((source) => [failLegacy, source])))
+  ('refreshes legacy after the role applies, without replacing role outcome (legacy failure=%s, role source=%s)', async (failLegacy, source) => {
     const { resolveDeliveryIdentity } = await import('../github-app-identity.mjs');
     const now = Date.now();
     const identity = resolveDeliveryIdentity({ tool: { worker: { appId: '2', installations: { 'web-everything': '22' }, key: { file: '/fixture/worker-key' } } } });
@@ -722,17 +724,29 @@ describe('daemon refresh lookahead and legacy fallback liveness', () => {
       return { token: appId === '2' ? 'fixture-worker' : 'fixture-legacy', expiresAt: new Date(now + 3600e3).toISOString(), permissions: FULL_PERMS };
     });
     const writeCache = vi.fn();
+    const writeStatus = vi.fn();
+    const writeCallerStatus = vi.fn();
     const result = await ensureFreshGithubAppEnv({
-      ...NOOP_STATUS, env, identity, role: 'worker', daemon: true, now, cachePath: '/fixture/cache.json',
-      readCache: () => null, writeCache, mint, canReadKey: () => true,
+      writeStatus, writeCallerStatus, caller: 'fixture-daemon', env, identity, role: 'worker', daemon: true, now, cachePath: '/fixture/cache.json',
+      readCache: (path) => source === 'cache' && path !== '/fixture/cache.json'
+        ? { v: CACHE_VERSION, appId: '2', installationId: '22', token: 'fixture-worker', expiresAt: new Date(now + 3600e3).toISOString() }
+        : null,
+      writeCache, mint, canReadKey: () => true,
       getInstallationInfo: async () => ({ repositorySelection: 'all' }), required: { permissions: {}, repos: [] },
       extraInstallations: false, setEnv, installShim: async () => ({ ok: true }), log: { error() {} },
     });
-    expect(result).toMatchObject({ applied: true, role: 'worker', appId: '2' });
-    expect(mint.mock.calls.map(([a]) => a.appId)).toEqual(['2', CONFIGURED_ENV.WE_GITHUB_APP_ID]);
+    expect(result).toEqual({ applied: true, reason: 'ok', role: 'worker', requestedRole: 'worker', appId: '2' });
+    expect(mint.mock.calls.map(([a]) => a.appId)).toEqual(source === 'mint' ? ['2', CONFIGURED_ENV.WE_GITHUB_APP_ID] : [CONFIGURED_ENV.WE_GITHUB_APP_ID]);
     expect(setEnv).toHaveBeenCalledTimes(1);
     expect(setEnv).toHaveBeenCalledWith('fixture-worker');
     expect(env.WE_GH_AUTH_INSTALLATION).toBe('22');
+    expect(env.WE_GH_AUTH_SOURCE).toBe(source);
+    expect(env.WE_GH_AUTH_TOKEN_HASH).toBe(createHash('sha256').update('fixture-worker').digest('hex'));
+    expect(writeStatus).not.toHaveBeenCalled();
+    expect(writeCallerStatus).toHaveBeenCalledTimes(1);
+    expect(writeCallerStatus).toHaveBeenCalledWith(expect.any(String), {
+      caller: 'fixture-daemon', daemon: true, ...result, checkedAt: new Date(now).toISOString(),
+    });
     if (!failLegacy) expect(writeCache).toHaveBeenCalledWith('/fixture/cache.json', expect.objectContaining({ token: 'fixture-legacy' }));
   });
 });

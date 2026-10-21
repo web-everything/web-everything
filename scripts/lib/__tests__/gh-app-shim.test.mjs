@@ -1021,11 +1021,14 @@ describe('daemon personal-auth fallback guard', () => {
       personalFallbackPolicy: policy ?? { personalFallback: 'refuse', source: { personalFallback: 'default' } },
     }));
     let entryPoint = shim;
-    if (remotes !== undefined) {
+    if (remotes !== undefined || refresh === 'timeout') {
       entryPoint = join(dir, 'with-remotes.cjs');
       writeFileSync(entryPoint, `const cp = require('node:child_process');
 const original = cp.spawnSync;
-cp.spawnSync = (file, args, ...rest) => file === '/usr/bin/git'
+cp.spawnSync = (file, args, ...rest) => file === ${JSON.stringify(process.execPath)} && args?.[0] === ${JSON.stringify(refreshCliPath)} && ${JSON.stringify(refresh === 'timeout')}
+  ? (require('node:fs').appendFileSync(${JSON.stringify(calls)}, JSON.stringify(rest[0]) + '\\n'),
+    { status: null, error: Object.assign(new Error('fixture timed out'), { code: 'ETIMEDOUT' }) })
+  : file === '/usr/bin/git' && ${JSON.stringify(remotes !== undefined)}
   ? { status: 0, stdout: ${JSON.stringify(remotes)} }
   : original(file, args, ...rest);
 require(${JSON.stringify(shim)});
@@ -1037,6 +1040,19 @@ require(${JSON.stringify(shim)});
     const argvSeen = () => JSON.parse(readFileSync(argvLog, 'utf8'));
     return { dir, cache, run, invoked, calls, argvSeen };
   }
+
+  it('bounds on-demand refresh and refuses after timeout', () => {
+    const f = fixture({ refresh: 'timeout' });
+    try {
+      const r = f.run();
+      const attempts = readFileSync(f.calls, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0].timeout).toBe(90000);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('REFUSING personal-auth fallback');
+      expect(existsSync(f.invoked)).toBe(false);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
 
   it.each(['missing', 'failure'])('refuses stale caches when refresh is %s, without invoking gh', (refresh) => {
     const f = fixture({ refresh });

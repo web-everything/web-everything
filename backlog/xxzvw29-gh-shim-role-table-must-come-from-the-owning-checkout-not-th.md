@@ -13,7 +13,8 @@ we:scripts/lib/gh-app-shim.mjs#buildGhShimSettingsEnv bakes roleTable/callerRole
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — Add `shared shim role table follows the owning checkout across conflicting writers`, with two writers supplying conflicting WE_PLATFORM_PREFERENCES_FILE and WE_DELIVERY_IDENTITY values (including none). Render and execute each shim, asserting the owning checkout's worker App token and caller-role mapping win both times. The test must fail with the current writer-derived role table. Run `npm run test:unit -- <suite>` from the WE checkout, using the repository-relative path for suite `we:scripts/lib/__tests__/gh-app-shim.test.mjs`.
+- [A2] **Executable** — In the same suite, cover absent and partial owner roles, an unavailable owner checkout, and owner configuration changes between writes; preserve personal-auth refusal on every daemon error path and never substitute a writer's role configuration.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
