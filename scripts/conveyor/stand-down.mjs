@@ -219,15 +219,40 @@ const validGateRedRetries = v => Number.isInteger(v) && v >= 0 && v <= GATE_RED_
 export function resolveGateRedRetries({ env = process.env, read = readFileSync, platform } = {}) {
   let tool;
   try { tool = JSON.parse(read(join(dirname(STAND_DOWN_SETTINGS_FILE), 'fix.json'), 'utf8'))?.fix?.standDown?.gateRedRetries; } catch { /* standard */ }
-  const resolved = cascadePolicy('fix', tool === undefined ? undefined : { standDown: { gateRedRetries: tool } }, {
-    standard: { standDown: { gateRedRetries: 1 } }, platform, env,
-    valid: { standDown: validGateRedRetries },
-  });
   const raw = env?.WE_FIX_STAND_DOWN_GATE_RED_RETRIES;
   const fromEnv = raw === undefined || raw === '' ? undefined : Number(raw);
-  if (fromEnv !== undefined && validGateRedRetries(fromEnv)) return { value: fromEnv, source: 'env' };
+  // ONE cascade (so its source log is the effective value): env rides as a whole `standDown` block.
+  const resolved = cascadePolicy('fix', tool === undefined ? undefined : { standDown: { gateRedRetries: tool } }, {
+    standard: { standDown: { gateRedRetries: 1 } }, platform, env,
+    envValues: { standDown: fromEnv === undefined ? undefined : { gateRedRetries: fromEnv } },
+    valid: { standDown: v => validGateRedRetries(v) || (v !== null && typeof v === 'object' && validGateRedRetries(v.gateRedRetries)) },
+  });
   const value = resolved.value?.standDown?.gateRedRetries;
-  return validGateRedRetries(value) ? { value, source: resolved.sources?.['standDown.gateRedRetries'] ?? 'standard' } : { value: 1, source: 'standard' };
+  const source = resolved.sources?.['standDown.gateRedRetries'] ?? resolved.sources?.standDown ?? 'standard';
+  return validGateRedRetries(value) ? { value, source } : { value: 1, source: 'standard' };
+}
+
+/** Live PR #5768 — the durable record the ci-heal dispatcher posts BEFORE it launches a gate-red retry, so the retry is
+ *  spent even when the session dies before its own fix-begin (`reconcile-core.mjs#gateRedRetryState`). */
+export const GATE_RED_RETRY_MARKER = '🔁 conveyor gate-red retry — one own-failure ci-heal dispatched';
+const GATE_RED_RETRY_TRAILER_RE = /<!--\s*gate-red-retry head=([0-9a-f]{7,40})\s*-->\s*$/i;
+
+/** Pure. The record's body: leading marker line, plain explanation, end-anchored machine trailer. */
+export function buildGateRedRetryRecordComment({ head, allowance = 1, source = 'standard' } = {}) {
+  if (!isSafeGitSha(head)) throw new TypeError('buildGateRedRetryRecordComment: head must be a git sha');
+  return [
+    GATE_RED_RETRY_MARKER,
+    '',
+    `A fixer stood down on \`${head.slice(0, 9)}\` because its gate stayed red. That is a failed gate, not a question, so the conveyor`
+      + ` dispatched this head's automatic ci-heal retry (fix.standDown.gateRedRetries=${allowance}, source: ${source}). It first checks`
+      + ' whether each failing test also fails on main. If the gate is still red after it, this head goes to a person.',
+    `<!-- gate-red-retry head=${head} -->`,
+  ].join('\n');
+}
+
+/** Pure: is `body` a gate-red retry record (leading marker AND end-anchored trailer)? Authorship is the caller's check. */
+export function isGateRedRetryRecord(body) {
+  return typeof body === 'string' && body.trimStart().startsWith(GATE_RED_RETRY_MARKER) && GATE_RED_RETRY_TRAILER_RE.test(body);
 }
 
 /** Evidence about the current head only; updatedAt also moves on comments and is never head-change proof. */

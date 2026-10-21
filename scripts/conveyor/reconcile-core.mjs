@@ -140,7 +140,7 @@ import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
   CONCURRENT_AUTHOR_PAUSE_MARKER, concurrentAuthorPauses, isConcurrentAuthorStandDown,
   standDownComments,
-  standDownHeadChangeAt, standDownTrailerReason, standDownReason,
+  standDownHeadChangeAt, standDownTrailerReason, standDownReason, isGateRedRetryRecord,
 } from './stand-down.mjs';
 import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
@@ -827,8 +827,9 @@ export const GATE_RED_STAND_DOWN_REASONS = Object.freeze(['gate-red']);
  * 1; 0 is the kill switch) whose brief first checks each failing test against main. Never unlimited:
  *   - every unresolved stand-down on the head must be gate-red — any real question (needs-judgment, conflict, …)
  *     keeps the head terminal exactly as before;
- *   - the grant is spent by any trusted ci-heal fix-begin posted after the first gate-red stand-down (the retry ran);
- *   - more gate-red stand-downs than the allowance (the retry itself stood down gate-red) is terminal + needs-you.
+ *   - the grant is spent by the dispatcher's retry record (posted before launch, fail closed) or a trusted ci-heal
+ *     fix-begin, at or after the gate-red stand-down;
+ *   - a second gate-red stand-down on the head (the retry itself stood down gate-red) is terminal + needs-you.
  * Pure.
  * @param {Array<object>} unresolved - {@link unresolvedStandDowns} for the current head
  * @param {Array<object>} comments - the full thread
@@ -847,13 +848,17 @@ export function gateRedRetryState(unresolved, comments, { retries = 0 } = {}) {
   // A retry's own durable trace: the ci-heal session's fix-begin claim comment, posted after the stand-down.
   // No readable stand-down time means no proof the retry has not run: fail closed (spent).
   const trusted = (Array.isArray(comments) ? comments : []).filter(c => isTrustedMarkerAuthor(c));
+  // Two durable traces, either one spends a retry: the dispatcher's own retry record, posted (fail closed) BEFORE the
+  // ci-heal launches (`ci-heal-pr-dispatch.mjs`), and the ci-heal session's fix-begin claim. Same-second counts.
   const spent = !Number.isFinite(firstMs) ? allowance : trusted.filter(c => {
     const body = typeof c?.body === 'string' ? c.body : '';
-    return body.trimStart().startsWith(FIX_BEGIN_MARKER) && /<!--\s*fix-claim who=ci-heal-/.test(body)
-      && Date.parse(c?.createdAt) > firstMs;
+    return (isGateRedRetryRecord(body) || (body.trimStart().startsWith(FIX_BEGIN_MARKER) && /<!--\s*fix-claim who=ci-heal-/.test(body)))
+      && Date.parse(c?.createdAt) >= firstMs;
   }).length;
   const detail = standDownReason(typeof list.at(-1) === 'string' ? list.at(-1) : list.at(-1)?.body);
-  const grant = allowance > 0 && list.length <= allowance && spent < allowance;
+  // Exactly ONE gate-red stand-down on the head: a second one (the retry itself stood down) is terminal whatever the
+  // allowance; the allowance only bounds retries that ended without standing down.
+  const grant = allowance > 0 && list.length === 1 && spent < allowance;
   return { eligible: true, grant, exhausted: !grant && allowance > 0, gateRedCount: list.length, spent, firstAt, detail };
 }
 
@@ -2756,7 +2761,10 @@ export function planReconcile({
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
     };
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red');
+    // Live #5768: a gate-red retry grant routes a red PR through THIS ci-red branch even when its labels say
+    // `bounced` (the stand-down came from a review-fix round), so every ci-heal guard below still applies.
+    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
+      || (gateRedRetryGrants.has(prNumber) && check.state === 'red');
     if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
@@ -3723,29 +3731,18 @@ export function planReconcile({
     });
   }
 
-  // Live PR #5768 — a gate-red retry grant buys ONE own-failure ci-heal, nothing else: any other dispatch planned for
-  // that PR is refused as the stand-down it still is, and the ci-heal carries the grant so its brief checks main first.
+  // Live PR #5768 — a gate-red retry grant buys ONE own-failure ci-heal (plus the ordinary mechanical re-run that
+  // precedes one), nothing else: any other dispatch planned for that PR is refused as the stand-down it still is, and
+  // the ci-heal carries the grant so its brief checks main first.
   if (gateRedRetryGrants.size) {
     const kept = [];
     for (const entry of dispatch) {
       const grant = gateRedRetryGrants.get(entry.prNumber);
       if (!grant) { kept.push(entry); continue; }
       if (entry.kind === 'ci-heal') { kept.push({ ...entry, gateRedRetry: grant }); continue; }
-      // Live #5768 itself: the stand-down came from a review-fix round, so the planner plans that `fix` again. Its
-      // required check is red (the gate that stood it down), so the owed retry is the ci-heal of that red — never the
-      // review fix — under the same heal budget every ci-heal pays. The review findings wait for the next head.
-      const sourcePr = entry.kind === 'fix' ? prs.find(p => Number(p?.number) === entry.prNumber) : null;
-      const failing = sourcePr ? splitFailingChecks(sourcePr.statusCheckRollup, requiredChecks) : null;
-      if (failing?.required.length) {
-        const healBudget = healBudgetFor(sourcePr);
-        if (healBudget.chargeable < ciHealCap) {
-          const { findings: _f, isConflict: _c, advisoryPending: _a, cap: _cap, joinedInputs: _j, ...rest } = entry;
-          kept.push({ ...rest, kind: 'ci-heal', attempts: healBudget.chargeable, gateRedRetry: grant,
-            failingRequiredChecks: failing.required, nonRequiredRed: failing.nonRequired, ciHealBudget: healBudget.log,
-            why: `gate-red retry (fix.standDown.gateRedRetries=${grant.allowance}, source: ${grant.source}): a fixer stood down because the gate stayed red; the required check is failing (${failing.required.join(', ')}), so this head's ONE own-failure ci-heal runs instead of the planned \`fix\` — ${healBudget.chargeable} of ${ciHealCap} CI-heal attempts spent (cap from ${ciHealCapSource})` });
-          continue;
-        }
-      }
+      // The ordinary own-failure path's mechanical step before a heal (re-run the failed required jobs on the same
+      // head, no agent, its own per-head budget) stays allowed: it never spends the retry, and a heal follows it.
+      if (entry.kind === 'ci-timeout-rerun') { kept.push(entry); continue; }
       refusals.push({ ...entry, kind: 'stood-down', plannedKind: entry.kind,
         why: `a fix agent stood down because the gate was red; the gate-red retry grants only an own-failure ci-heal, not a \`${entry.kind}\` — terminal on this head otherwise (fix.standDown.gateRedRetries=${grant.allowance}, source: ${grant.source})` });
     }
