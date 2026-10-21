@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import { buildOperatorRulingComment, readReferralRecords, REFERRAL_SUPERSEDE_REASON } from '../../lib/jury-core.mjs';
 import { liveReferralState } from '../../lib/referral-live-context.mjs';
 import { openReferralFindings } from '../../operations/record-referral-ruling.mjs';
@@ -19,7 +19,7 @@ import {
   referralHoldSendBackBody, REFERRAL_HOLD_AUTO_RESOLVED,
 } from '../review-referral-hold.mjs';
 import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
-import { handleReferralHoldAutoResolve, operatorHoldsFromPlan, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
+import { defaultSendBackReferralHold, handleReferralHoldAutoResolve, operatorHoldsFromPlan, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 
 const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 const here = dirname(fileURLToPath(import.meta.url));
@@ -456,5 +456,19 @@ describe('policy: referralHoldAutoResolve is a setting (value and source logged)
     const settings = { value: { enabled: true, onBlock: 'pause', onClean: 'resume' }, sources: { onBlock: 'env' } };
     expect(decide(asPr(fx, [...fx.comments, block]), hold, { settings })).toMatchObject({ outcome: 'stay',
       why: expect.stringMatching(/onBlock=pause \(source: env\)/) });
+  });
+});
+
+describe('the real sender runs a static helper file (no dynamic import inside a code string)', () => {
+  it('spawns scripts/conveyor/referral-hold-send-back.mjs with the args in env and parses its last JSON line', () => {
+    const exec = vi.fn(() => 'noise\n{"action":"send-back","sentBack":true}\n');
+    const out = defaultSendBackReferralHold({ repo, pr: 1, head: 'a'.repeat(40) }, { exec });
+    expect(out).toEqual({ action: 'send-back', sentBack: true });
+    const [bin, argv, opts] = exec.mock.calls[0];
+    expect(bin).toBe(process.execPath);
+    expect(argv).toHaveLength(1);
+    expect(resolvePath(argv[0])).toBe(resolvePath(here, '..', 'referral-hold-send-back.mjs'));
+    expect(JSON.parse(opts.env.WE_AUTO_RESOLVE_SEND_BACK)).toMatchObject({ pr: 1 });
+    expect(readFileSync(argv[0], 'utf8')).not.toMatch(/await import\(/);
   });
 });

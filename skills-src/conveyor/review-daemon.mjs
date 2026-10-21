@@ -491,16 +491,11 @@ export function handleReferralHoldAutoResolve({ repo, row, auto, rawPrs = null, 
 
 /** The real send-back: the SAME follow-up effect `record-referral-ruling` runs for a block ruling
  *  (`record-referral-ruling-io.mjs#createRecordReferralRulingSinks`, head re-check + `review-set-label --to=changes` +
- *  the ledger send-back row). That effect is async and the tick is not, so it runs in a short child process. */
+ *  the ledger send-back row). That effect is async and the tick is not, so it runs in a short child process
+ *  (`scripts/conveyor/referral-hold-send-back.mjs`, static imports only). */
 export function defaultSendBackReferralHold(args, { exec = execFileSync } = {}) {
-  const io = new URL('../../scripts/operations/record-referral-ruling-io.mjs', import.meta.url).href;
-  const rr = new URL('../../scripts/operations/record-referral-ruling.mjs', import.meta.url).href;
-  const code = `const { createRecordReferralRulingSinks } = await import(${JSON.stringify(io)});
-const { OPERATOR_RULING_FOLLOW_UP_EFFECT } = await import(${JSON.stringify(rr)});
-const a = JSON.parse(process.env.WE_AUTO_RESOLVE_SEND_BACK);
-const r = await createRecordReferralRulingSinks()[OPERATOR_RULING_FOLLOW_UP_EFFECT]({ ...a, action: 'send-back' });
-process.stdout.write(JSON.stringify(r) + '\\n');`;
-  const out = exec(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 180_000,
+  const child = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/conveyor/referral-hold-send-back.mjs');
+  const out = exec(process.execPath, [child], { encoding: 'utf8', timeout: 180_000,
     env: { ...process.env, WE_AUTO_RESOLVE_SEND_BACK: JSON.stringify(args) }, stdio: ['ignore', 'pipe', 'pipe'] });
   return JSON.parse(String(out).trim().split('\n').filter(Boolean).at(-1) ?? '{}');
 }
