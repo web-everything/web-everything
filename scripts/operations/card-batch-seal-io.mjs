@@ -4,7 +4,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writ
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { acquireLease, atomicRecord, cardBatchStateDir, catFileBatch, provenMergedLanding, retireBatch, retireTerminalBatch, tokenOf } from './card-batch-io.mjs';
+import { acquireLease, atomicRecord, cardBatchStateDir, catFileBatch, provenMergedLanding, retireBatch, retireTerminalBatch, sealJobEnv, tokenOf } from './card-batch-io.mjs';
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
 import { effectiveCardBatchPolicy, loadVerifyRetryMinutes } from '../lib/card-batch-settings.mjs';
@@ -385,7 +385,7 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       let child;
       try {
         child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${path}`],
-          { cwd: ROOT, detached: true, stdio: ['ignore', log, log] });
+          { cwd: ROOT, detached: true, stdio: ['ignore', log, log], env: sealJobEnv() });
       } finally { if (typeof log === 'number') { try { closeSync(log); } catch { /* the child holds its own copy */ } } }
       // Wait only for OS launch, never child completion/verification. Launch failures reach probeErrors.
       await new Promise((resolve, reject) => {
