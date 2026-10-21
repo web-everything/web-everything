@@ -85,7 +85,7 @@ import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { readFileSync } from 'node:fs';
-import { resolveStandDownHoldsAcrossHeads } from './stand-down.mjs';
+import { resolveStandDownHoldsAcrossHeads, resolveGateRedRetries } from './stand-down.mjs';
 import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -1477,6 +1477,8 @@ export function runReconcilePass({
   loadOperatorRulingRounds = loadOperatorRulingExtraRounds,
   loadRoundExtensionAnchorSetting = loadRoundExtensionAnchor,
   loadStandDownHoldsAcrossHeads = resolveStandDownHoldsAcrossHeads,
+  // `fix.standDown.gateRedRetries` (standard 1 → platform → fix.json → env; live PR #5768). Injectable.
+  loadGateRedRetries = resolveGateRedRetries,
   // `review.*` settings (env > we:scripts/review-settings.json > built-in) — read for takeoverReviewAttempts. Injectable.
   loadReviewSettings = resolveReviewSettings,
   // `review.mechanicalRoundsCountTowardCap` (policy cascade, logged with its source layer) and the git evidence a
@@ -1560,10 +1562,12 @@ export function runReconcilePass({
   console.error(`fix.staleCiRerun=${staleCiRerunSetting.value} (${staleCiRerunSetting.source})`);
   const standDownHoldsAcrossHeads = loadStandDownHoldsAcrossHeads({ env });
   console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
+  const gateRedRetries = loadGateRedRetries({ env });
+  console.error(`fix.standDown.gateRedRetries=${gateRedRetries.value} (source: ${gateRedRetries.source})`);
   const timing = resolveTimingPolicy({ env });
   const plan = planReconcile({
     reviewTiming: timing.review, fixTiming: timing.fix,
-    standDownHoldsAcrossHeads,
+    standDownHoldsAcrossHeads, gateRedRetries,
     owedCiRerun: owedCiRerunSetting.value,
     staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),

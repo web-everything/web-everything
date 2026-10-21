@@ -140,7 +140,7 @@ import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
   CONCURRENT_AUTHOR_PAUSE_MARKER, concurrentAuthorPauses, isConcurrentAuthorStandDown,
   standDownComments,
-  standDownHeadChangeAt,
+  standDownHeadChangeAt, standDownTrailerReason, standDownReason,
 } from './stand-down.mjs';
 import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
@@ -794,8 +794,13 @@ export function isAwaitingPermission(agent) {
  * @returns {number}
  */
 export function countUnresolvedStandDowns(comments, options = {}) {
-  if (!Array.isArray(comments)) return 0;
-  let n = 0;
+  return unresolvedStandDowns(comments, options).length;
+}
+
+/** The comments {@link countUnresolvedStandDowns} counts, in thread order (same filters). Pure. */
+export function unresolvedStandDowns(comments, options = {}) {
+  if (!Array.isArray(comments)) return [];
+  const out = [];
   for (let i = 0; i < comments.length; i += 1) {
     const c = comments[i];
     if (!standDownComments([c], options).length) continue;
@@ -806,9 +811,49 @@ export function countUnresolvedStandDowns(comments, options = {}) {
     if (isStandDownSuperseded(comments, i)) continue;
     if (isAdvisoryMechanismStandDownSuperseded(comments, i)) continue;
     if (isOperatorAnswerStandDownSuperseded(comments, i)) continue;
-    n += 1;
+    out.push(c);
   }
-  return n;
+  return out;
+}
+
+/** Live PR #5768 — the stand-down reasons that mean "the gate failed", not "a question for a person". */
+export const GATE_RED_STAND_DOWN_REASONS = Object.freeze(['gate-red']);
+
+/**
+ * we:scripts/conveyor/reconcile-core.mjs#gateRedRetryState — live PR #5768 (2026-10-21): a fix agent stood down with
+ * `reason=gate-red` because ONE out-of-diff test stayed red, and never checked whether that test is red on main too.
+ * REFUSAL 1 then read it as "a question for a person" and refused the owed own-failure ci-heal every pass for hours.
+ * A gate-red stand-down is a failed gate, so this grants ONE ci-heal per head (`fix.standDown.gateRedRetries`, standard
+ * 1; 0 is the kill switch) whose brief first checks each failing test against main. Never unlimited:
+ *   - every unresolved stand-down on the head must be gate-red — any real question (needs-judgment, conflict, …)
+ *     keeps the head terminal exactly as before;
+ *   - the grant is spent by any trusted ci-heal fix-begin posted after the first gate-red stand-down (the retry ran);
+ *   - more gate-red stand-downs than the allowance (the retry itself stood down gate-red) is terminal + needs-you.
+ * Pure.
+ * @param {Array<object>} unresolved - {@link unresolvedStandDowns} for the current head
+ * @param {Array<object>} comments - the full thread
+ * @param {{retries:number}} o
+ * @returns {{eligible:boolean, grant:boolean, exhausted:boolean, gateRedCount:number, spent:number, firstAt:?string, detail:?string}}
+ */
+export function gateRedRetryState(unresolved, comments, { retries = 0 } = {}) {
+  const list = Array.isArray(unresolved) ? unresolved : [];
+  const none = { eligible: false, grant: false, exhausted: false, gateRedCount: 0, spent: 0, firstAt: null, detail: null };
+  if (!list.length) return none;
+  const reasons = list.map(c => standDownTrailerReason(typeof c === 'string' ? c : c?.body));
+  if (!reasons.every(r => GATE_RED_STAND_DOWN_REASONS.includes(r))) return none;
+  const allowance = Number.isInteger(retries) && retries > 0 ? retries : 0;
+  const firstAt = list.map(c => c?.createdAt).filter(t => Number.isFinite(Date.parse(t))).sort()[0] ?? null;
+  const firstMs = firstAt ? Date.parse(firstAt) : NaN;
+  // A retry's own durable trace: the ci-heal session's fix-begin claim comment, posted after the stand-down.
+  // No readable stand-down time means no proof the retry has not run: fail closed (spent).
+  const spent = !Number.isFinite(firstMs) ? allowance : (Array.isArray(comments) ? comments : []).filter(c => {
+    const body = typeof c?.body === 'string' ? c.body : '';
+    return body.trimStart().startsWith(FIX_BEGIN_MARKER) && /<!--\s*fix-claim who=ci-heal-/.test(body)
+      && isTrustedMarkerAuthor(c) && Date.parse(c?.createdAt) > firstMs;
+  }).length;
+  const detail = standDownReason(typeof list.at(-1) === 'string' ? list.at(-1) : list.at(-1)?.body);
+  const grant = allowance > 0 && list.length <= allowance && spent < allowance;
+  return { eligible: true, grant, exhausted: !grant && allowance > 0, gateRedCount: list.length, spent, firstAt, detail };
 }
 
 /** How long after a review/fix session reports `blocked-on-infra` before it counts as finished, so the PR is
@@ -1963,6 +2008,10 @@ export function planReconcile({
   operatorRulingExtraRounds = resolveOperatorRulingExtraRounds(),
   roundExtensionAnchor = resolveRoundExtensionAnchor(),
   standDownHoldsAcrossHeads = { value: false, source: 'standard' },
+  // `fix.standDown.gateRedRetries` ({value, source}; see {@link gateRedRetryState}): how many own-failure ci-heals a
+  // gate-red stand-down earns on its head. 0 here keeps this pure core byte-identical; the IO shell passes the
+  // resolved cascade (standard 1, `we:scripts/conveyor/stand-down.mjs#resolveGateRedRetries`).
+  gateRedRetries = { value: 0, source: 'caller-default' },
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
   // protection, `we:scripts/lib/required-status-checks.mjs`), threaded straight through to `classifyPr` so
@@ -2001,6 +2050,8 @@ export function planReconcile({
   const notes = [];
   // PR number → the live reviewer the joined-fix cap set aside for a CI heal. It still refuses a second review.
   const liveReviewers = new Map();
+  // PR number → the gate-red retry REFUSAL 1 granted this pass (live PR #5768); filtered to a ci-heal after the loop.
+  const gateRedRetryGrants = new Map();
   const counts = durableCounts && typeof durableCounts === 'object' ? durableCounts : {};
   const ciHealCap = Number.isInteger(ciHealCapArg) && ciHealCapArg >= 0 ? ciHealCapArg : ciHealBudget.cap;
   const ciHealCapSource = ciHealCap === ciHealCapArg ? 'caller' : ciHealBudget.capSource;
@@ -2350,15 +2401,39 @@ export function planReconcile({
     // A stand-down none of these predicates excludes — including an unanswered fix agent's genuine
     // needs-judgment/gate-red/lane-ref-gone escalation outside the advisory-fix shape above, and any human
     // `/finish` stand-down — stays terminal exactly as before.
-    const stoodDown = countUnresolvedStandDowns(pr?.comments, {
+    const unresolved = unresolvedStandDowns(pr?.comments, {
       headRefOid: pr?.headRefOid, headChangedAt: standDownHeadChangeAt(pr),
       lapseOnNewHead: standDownHoldsAcrossHeads.value ? 'off' : 'on',
     });
-    if (stoodDown > 0) {
+    const stoodDown = unresolved.length;
+    // Live PR #5768 — a gate-red stand-down is a failed gate, not a question: ONE own-failure ci-heal per head
+    // (see {@link gateRedRetryState}); the post-loop filter below keeps that grant to a ci-heal only.
+    const gateRed = stoodDown > 0 ? gateRedRetryState(unresolved, pr?.comments, { retries: gateRedRetries.value }) : null;
+    const gateRedSetting = `fix.standDown.gateRedRetries=${gateRedRetries.value} (source: ${gateRedRetries.source})`;
+    if (gateRed?.grant) {
+      gateRedRetryGrants.set(prNumber, {
+        head: pr?.headRefOid ?? null, standDownAt: gateRed.firstAt, detail: gateRed.detail,
+        allowance: gateRedRetries.value, source: gateRedRetries.source, spent: gateRed.spent,
+      });
+    } else if (stoodDown > 0) {
       refuse('stood-down', {
         standDowns: stoodDown,
-        why: `a fix agent already stopped here to ask a question — re-dispatching would re-ask it forever. Terminal on this head until an explicit operator answer is recorded with stand-down-answer.mjs. fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source}).`,
+        ...(gateRed?.eligible ? { gateRedRetry: { spent: gateRed.spent, gateRedStandDowns: gateRed.gateRedCount, allowance: gateRedRetries.value } } : {}),
+        why: gateRed?.eligible
+          ? (gateRed.exhausted
+            ? `the gate stayed red after the automatic gate-red retry on this head (${gateRed.gateRedCount} gate-red stand-down(s), ${gateRed.spent} retry ci-heal(s) run) — terminal on this head; a person must look. ${gateRedSetting}.`
+            : `a fix agent stood down because the gate was red, and the gate-red retry is turned off (${gateRedSetting}) — terminal on this head until an explicit operator answer is recorded with stand-down-answer.mjs.`)
+          : `a fix agent already stopped here to ask a question — re-dispatching would re-ask it forever. Terminal on this head until an explicit operator answer is recorded with stand-down-answer.mjs. fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source}).`,
       });
+      if (gateRed?.exhausted) {
+        notes.push({
+          kind: 'gate-red-retry-exhausted', prNumber, head: pr?.headRefOid ?? null, parkToHuman: true,
+          gateRedStandDowns: gateRed.gateRedCount, spent: gateRed.spent, allowance: gateRedRetries.value,
+          text: `PR #${prNumber}: needs you — the gate stayed red after the automatic gate-red retry on head \`${String(pr?.headRefOid ?? '?').slice(0, 9)}\``
+            + ` (${gateRed.gateRedCount} gate-red stand-down(s), ${gateRed.spent} retry ci-heal(s) run; ${gateRedSetting}).`
+            + (gateRed.detail ? ` Last stand-down: ${gateRed.detail}` : ''),
+        });
+      }
       continue;
     }
 
@@ -3647,6 +3722,20 @@ export function planReconcile({
     });
   }
 
+  // Live PR #5768 — a gate-red retry grant buys ONE own-failure ci-heal, nothing else: any other dispatch planned for
+  // that PR is refused as the stand-down it still is, and the ci-heal carries the grant so its brief checks main first.
+  if (gateRedRetryGrants.size) {
+    const kept = [];
+    for (const entry of dispatch) {
+      const grant = gateRedRetryGrants.get(entry.prNumber);
+      if (!grant) { kept.push(entry); continue; }
+      if (entry.kind === 'ci-heal') { kept.push({ ...entry, gateRedRetry: grant }); continue; }
+      refusals.push({ ...entry, kind: 'stood-down', plannedKind: entry.kind,
+        why: `a fix agent stood down because the gate was red; the gate-red retry grants only an own-failure ci-heal, not a \`${entry.kind}\` — terminal on this head otherwise (fix.standDown.gateRedRetries=${grant.allowance}, source: ${grant.source})` });
+    }
+    dispatch.splice(0, dispatch.length, ...kept);
+  }
+
   for (const entry of dispatch) {
     if (entry.kind !== 'fix' && entry.kind !== 'card-batch-extract') continue;
     const sourcePr = prs.find((pr) => Number(pr?.number) === entry.prNumber);
@@ -3663,6 +3752,7 @@ export function planReconcile({
       continue;
     }
     if (!['fix', 'ci-heal'].includes(entry.kind)) { timedDispatch.push(entry); continue; }
+    if (entry.gateRedRetry) { timedDispatch.push(entry); continue; } // the gate-red retry stays a ci-heal (never joined)
     const pr = prs.find(p => Number(p.number) === entry.prNumber);
     const facts = timingFacts(pr, { agents, repo, requiredChecks,
       reviewDispatched: dispatch.some(d => d.prNumber === entry.prNumber && d.kind === 'review') });

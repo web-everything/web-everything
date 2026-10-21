@@ -205,6 +205,31 @@ export function resolveStandDownHoldsAcrossHeads({ env = process.env, read = rea
   return { value: resolved.value[key], source: resolved.sources[key] };
 }
 
+/** `fix.standDown.gateRedRetries` bounds: 0 is the kill switch; never more than 3 (no unlimited retries). */
+export const GATE_RED_RETRIES_MAX = 3;
+const validGateRedRetries = v => Number.isInteger(v) && v >= 0 && v <= GATE_RED_RETRIES_MAX;
+
+/**
+ * Live PR #5768 — how many own-failure ci-heals a `reason=gate-red` stand-down earns on its head
+ * (`we:scripts/conveyor/reconcile-core.mjs#gateRedRetryState`). Standard 1 → platform preference → fix.json
+ * `fix.standDown.gateRedRetries` → env `WE_FIX_STAND_DOWN_GATE_RED_RETRIES`; 0 turns it off. An invalid value
+ * (non-integer, negative, above {@link GATE_RED_RETRIES_MAX}) never overrides a lower layer.
+ * @returns {{value:number, source:string}}
+ */
+export function resolveGateRedRetries({ env = process.env, read = readFileSync, platform } = {}) {
+  let tool;
+  try { tool = JSON.parse(read(join(dirname(STAND_DOWN_SETTINGS_FILE), 'fix.json'), 'utf8'))?.fix?.standDown?.gateRedRetries; } catch { /* standard */ }
+  const resolved = cascadePolicy('fix', tool === undefined ? undefined : { standDown: { gateRedRetries: tool } }, {
+    standard: { standDown: { gateRedRetries: 1 } }, platform, env,
+    valid: { standDown: validGateRedRetries },
+  });
+  const raw = env?.WE_FIX_STAND_DOWN_GATE_RED_RETRIES;
+  const fromEnv = raw === undefined || raw === '' ? undefined : Number(raw);
+  if (fromEnv !== undefined && validGateRedRetries(fromEnv)) return { value: fromEnv, source: 'env' };
+  const value = resolved.value?.standDown?.gateRedRetries;
+  return validGateRedRetries(value) ? { value, source: resolved.sources?.['standDown.gateRedRetries'] ?? 'standard' } : { value: 1, source: 'standard' };
+}
+
 /** Evidence about the current head only; updatedAt also moves on comments and is never head-change proof. */
 export function standDownHeadChangeAt(pr) {
   const commit = (Array.isArray(pr?.commits) ? pr.commits : []).find(c => isSafeGitSha(c?.oid) && isSafeGitSha(pr?.headRefOid) && sameCommit(c.oid, pr.headRefOid));
