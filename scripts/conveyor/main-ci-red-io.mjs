@@ -306,8 +306,9 @@ export async function withWorkerRole(fn, env = process.env) {
 }
 
 /** Start the owner session through the declared dispatch-lane sink. */
-export const defaultDispatchOwner = (request) => withWorkerRole(() => dispatchOwner(request));
-async function dispatchOwner({ prompt, sessionSlug }) {
+/** `sinkOptions` is the test seam for the dispatch-lane sink's own effects (spawn, settings, lane, cwd); production passes none. */
+export const defaultDispatchOwner = (request, sinkOptions = {}) => withWorkerRole(() => dispatchOwner(request, sinkOptions));
+async function dispatchOwner({ prompt, sessionSlug }, sinkOptions) {
   const io = await import('../operations/dispatch-lane-io.mjs');
   const { DISPATCH_EFFECT } = await import('../operations/dispatch-lane.mjs');
   const { dispatchModesFromEnv } = await import('../operations/dispatch-provider-registry.mjs');
@@ -315,7 +316,7 @@ async function dispatchOwner({ prompt, sessionSlug }) {
   const route = routeAvailableCiHeal({ scope: [], reason: 'main-red' });
   if (route?.outcome === 'refused') return { held: true, reason: route.refusal ?? 'route refused' };
   // A main fix has no PR: force the `claude --bg` brief path (the mechanical ci-heal wrapper needs a PR) and no probation worker.
-  const sinks = io.createDispatchSinks({ root: io.REPO_ROOT, modes: { ...dispatchModesFromEnv(), 'ci-heal': 'agent' }, extraArgs: io.agentArgsFromEnv() });
+  const sinks = io.createDispatchSinks({ root: io.REPO_ROOT, modes: { ...dispatchModesFromEnv(), 'ci-heal': 'agent' }, extraArgs: io.agentArgsFromEnv(), ...sinkOptions });
   const out = await sinks[DISPATCH_EFFECT]({
     launchKind: 'ci-heal', prompt, sessionSlug, lane: null, scope: [], pr: null, reason: 'main-red', repo: 'we',
     probationWorker: null, routing: route ? { ...route, probationWorker: null } : null,

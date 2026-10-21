@@ -27,3 +27,45 @@ it('the main-red owner dispatch reads the worker role in every identity channel 
   expect(seen).toEqual(['worker']);
   expect(process.env.WE_GITHUB_APP_ROLE).toBe('observer');
 });
+
+// Real sink plumbing (createDispatchSinks -> defaultClaudeProvider) with only the OS effects injected: each identity
+// channel records the role it reads from process.env at the moment it runs.
+const realPlumbing = async (extra = {}) => {
+  const io = await import('../../operations/dispatch-lane-io.mjs');
+  const { mkdtempSync } = await import('node:fs'); const { tmpdir } = await import('node:os'); const { join } = await import('node:path');
+  const role = () => process.env.WE_GITHUB_APP_ROLE;
+  const seen = { settings: [], spawn: [], wrapped: [], durable: [] };
+  const sinkOptions = {
+    root: mkdtempSync(join(tmpdir(), 'ci-heal-role-')),
+    reserveLane: () => ({ reserved: false }), releaseLane: () => {}, mintSessionId: () => '11111111-1111-4111-8111-111111111111',
+    sessionCwdFor: () => '/nonexistent/cwd', ensureSessionCwd: (c) => c, grantLanePermission: () => {}, ensureWorktreeIsolation: () => {},
+    resolveSettingsEnv: () => { seen.settings.push(role()); seen.durable.push(role()); return {}; },
+    provider: (request) => io.defaultClaudeProvider(request, {
+      spawnAgent: () => { seen.spawn.push(role()); return 'backgrounded 11111111-1111-4111-8111-111111111111'; },
+      wrapKind: () => extra.wrapped === true,
+      launchWrapped: () => { seen.wrapped.push(io.workerSpawnEnv().WE_GITHUB_APP_ROLE); return { wrapperPid: 1, handle: 'pid:1' }; },
+    }),
+    ...extra.sinkOptions,
+  };
+  return { sinkOptions, seen };
+};
+
+it('the real dispatch plumbing (settings, durable settings, direct spawn) reads the worker role; the parent stays observer', async () => {
+  process.env.WE_GITHUB_APP_ROLE = 'observer';
+  const { sinkOptions, seen } = await realPlumbing();
+  const { defaultDispatchOwner } = await import('../main-ci-red-io.mjs');
+  await defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, sinkOptions);
+  expect(seen).toMatchObject({ settings: ['worker'], durable: ['worker'], spawn: ['worker'], wrapped: [] });
+  expect(process.env.WE_GITHUB_APP_ROLE).toBe('observer');
+});
+
+it('the detached worker wrapper launch reads the worker role, and a rejected dispatch still restores observer', async () => {
+  process.env.WE_GITHUB_APP_ROLE = 'observer';
+  const { sinkOptions, seen } = await realPlumbing({ wrapped: true });
+  const { defaultDispatchOwner } = await import('../main-ci-red-io.mjs');
+  await defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, sinkOptions);
+  expect(seen.wrapped).toEqual(['worker']);
+  const failing = await realPlumbing({ sinkOptions: { reserveLane: () => { throw Error('lane down'); } } });
+  await expect(defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, failing.sinkOptions)).rejects.toThrow('lane down');
+  expect(process.env.WE_GITHUB_APP_ROLE).toBe('observer');
+});
