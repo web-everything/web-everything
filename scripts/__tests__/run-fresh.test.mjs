@@ -47,6 +47,9 @@ describe('run-fresh', () => {
     ['restart-runner', '--checkout=/stable', '--supervisor=/stable/supervisor.mjs'],
     ['restart-runner', '--dry-run=true'],
     ['dispatch-lane'],
+    ['extend-rounds'],
+    ['review-set-label'],
+    ['toString'],
     ['review-pr'],
     ['future-detached-operation'],
     ['../operations/restart-runner'],
@@ -62,11 +65,11 @@ describe('run-fresh', () => {
     expect(parseAcquire('{"lane":7,"path":"/x"}')).toBeNull();
     expect(parseAcquire('/lanes/lane-7')).toBeNull();
   });
-  it('runs the operation inside the lane with the terminal passed through, then releases by holder slug', async () => {
+  it.each(['land-human-only', 'record-referral-ruling'])('runs %s inside the lane with the terminal passed through, then releases by holder slug', async (name) => {
     const { spawn, calls } = fakeSpawn({ opStatus: 3 });
-    expect(await runFresh(['land-human-only', '--pr=5', '--dry-run=true'], opts(spawn))).toBe(3);
+    expect(await runFresh([name, '--pr=5', '--dry-run=true'], opts(spawn))).toBe(3);
     const op = calls.find((c) => String(c.args[0]).endsWith('run.mjs'));
-    expect(op.args).toEqual(['/lanes/lane-7/scripts/operations/run.mjs', 'land-human-only', '--pr=5', '--dry-run=true']);
+    expect(op.args).toEqual(['/lanes/lane-7/scripts/operations/run.mjs', name, '--pr=5', '--dry-run=true']);
     expect(op.opts).toMatchObject({ cwd: '/lanes/lane-7', stdio: 'inherit' });
     expect(calls.at(-1).args).toEqual(['/repo/scripts/lane-pool.mjs', 'release', '--lane=7', `--session=${lease.holder}`, '--repo=/repo']);
   });
