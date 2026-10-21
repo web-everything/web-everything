@@ -2,8 +2,8 @@
  * @file scripts/operations/__tests__/pr-sweep-io-real.test.mjs
  * @description #2949 fidelity qualifier for `pr-sweep-io.mjs`: the two local reads it makes, proven against the
  *   real thing instead of stubs. `ps` is a REAL subprocess whose argv names a review job; the drain-log tail reads a
- *   REAL file inside a `withRealRepo` fixture (a missing file must throw, a large file must be tailed, the newest
- *   skip-reasons row must win). Isolated subprocess probes also defend zero writes by the default reader and CLI wiring.
+ *   REAL file in a temp directory (a missing file must throw, a large file must be tailed, the newest skip-reasons
+ *   row must win). Isolated subprocess probes also defend zero writes by the default reader and CLI wiring.
  */
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -12,8 +12,8 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { parseDrainSkips, parseLiveJobs, tailOf } from '../pr-sweep-io.mjs';
-import { withRealRepo } from './helpers/real-repo.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
+import { withRealRepo } from './helpers/real-repo.mjs';
 
 async function withTempDir(fn) {
   const root = mkdtempSync(join(tmpdir(), 'pr-sweep-'));
@@ -134,7 +134,7 @@ it.each([0, 37, 10_000])('tailOf bounds disk reads for a file of %i bytes', asyn
     writeFileSync(hook, preload);
     const result = spawnSync(process.execPath, ['--import', hook, '--input-type=module', '-e',
       `import { tailOf } from ${JSON.stringify(url)};
-       // Module loading can use fs.readSync too; measure only the tailOf call.
+       // Module loading can itself call readSync; measure only the operation below.
        globalThis.sweepReads.length = 0;
        tailOf(${JSON.stringify(log)}, 4096); console.log(JSON.stringify(globalThis.sweepReads));`], { encoding: 'utf8', timeout: 10_000, env: childEnv() });
     expect(result.status, result.stderr).toBe(0);
@@ -150,15 +150,17 @@ it('parseLiveJobs finds a REAL running review-job process in the real `ps` outpu
   } finally { child.kill(); }
 });
 
-it('tailOf reads the end of a REAL log, throws for a missing one, and the newest skip row wins', async () => {
-  await withRealRepo(async ({ root }) => {
-    const log = join(root, 'daemon.log');
+it('tailOf reads a REAL external log without changing the checkout, throws for a missing one, and the newest skip row wins', async () => {
+  await withRealRepo(async ({ tmp, root }) => {
+    const log = join(tmp, 'daemon.log');
     const filler = 'x'.repeat(200);
     const row = (n) => `merge-ai-prs · skip-reasons: [{"num":${n},"repo":"o/r","kind":"red-team-pending","reason":"r"}]`;
     writeFileSync(log, `${row(1)}\n${Array.from({ length: 50 }, () => filler).join('\n')}\n${row(2)}\n${filler}\n`);
+    const before = snapshot(root);
     const tail = tailOf(log, 4096);
     expect(tail.length).toBeLessThanOrEqual(4096);
     expect(parseDrainSkips(tail).rows.map((r) => r.num)).toEqual([2]);
-    expect(() => tailOf(join(root, 'absent.log'))).toThrow(/does not exist/);
+    expect(() => tailOf(join(tmp, 'absent.log'))).toThrow(/does not exist/);
+    expect(snapshot(root)).toEqual(before);
   });
 });
