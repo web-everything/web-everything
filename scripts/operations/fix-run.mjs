@@ -61,7 +61,7 @@ export async function carryAcceptedPush({ repo, pr, head, lanePath, weRoot, run 
   const labels = (Array.isArray(view?.labels) ? view.labels : []).map(l => (typeof l === 'string' ? l : l?.name));
   if (!labels.includes('review:accepted')) return { carried: false, reason: '' };
   if (view.headRefOid !== head) return { carried: false, reason: `live head ${String(view.headRefOid).slice(0, 9)} is not the pushed head` };
-  const { attemptVerdictCarry, contributionPatchId, resolveCarryAcrossRebase } = await import('../lib/rebase-verdict-carry.mjs');
+  const { attemptVerdictCarry, contributionPatchId, resolveCarryAcrossRebase, gitCitedLineReader } = await import('../lib/rebase-verdict-carry.mjs');
   const { proveIdenticalNetPatch } = await import('../lib/identical-net-patch.mjs');
   const comments = await readComments(pr, { repo });
   const laneGit = (f, a, o) => run(f, a, { ...o, cwd: lanePath });
@@ -71,6 +71,7 @@ export async function carryAcceptedPush({ repo, pr, head, lanePath, weRoot, run 
     readCarryEvidence: () => ({ headSha: view.headRefOid, comments }),
     contributionPatchId: ({ sha }) => contributionPatchId({ sha, exec: laneGit }),
     proveIdenticalNetPatch: ({ fromSha, toSha }) => proveIdenticalNetPatch({ fromSha, toSha, cwd: lanePath, exec: execFileSync }),
+    readCitedLine: ({ sha, file, line }) => gitCitedLineReader({ cwd: lanePath })({ sha, file, line }),
     restampVerdict: ({ newHead, reason }) => {
       try {
         run('node', [resolve(weRoot, 'scripts', 'review-set-label.mjs'), String(pr), ...(repo ? [`--repo=${repo}`] : []), '--to=restamp',

@@ -88,7 +88,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { execRead } from '../lib/proc-read.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-import { contributionPatchId, attemptVerdictCarry, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
+import { contributionPatchId, attemptVerdictCarry, resolveCarryAcrossRebase, gitCitedLineReader } from '../lib/rebase-verdict-carry.mjs';
 import { proveIdenticalNetPatch } from '../lib/identical-net-patch.mjs';
 import { readRedTeamTiming, readRedTeamProbes, readConfirmedBreaks, planRedTeamActions } from '../lib/red-team-gate.mjs';
 import { savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
@@ -316,6 +316,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     // The second, stricter proof the shared carry requires (paths, modes, changed bytes, positions); see identical-net-patch.mjs.
     proveIdenticalNetPatch: ({ fromSha, toSha, repo }) => proveIdenticalNetPatch({ fromSha, toSha,
       cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, exec: (f, a, o) => execFileSync(f, a, { ...o, env }) }),
+    readCitedLine: ({ sha, file, line, repo }) => gitCitedLineReader({ cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env })({ sha, file, line }),
     restampVerdict: ({ pr, repo, newHead, reason }) => {
       const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`,
         '--to=restamp', '--actor=review-carry', `--new-head=${newHead}`, `--reason=${reason}`],

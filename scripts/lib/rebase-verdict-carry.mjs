@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { ensureCommitReadable } from './carry-equivalence.mjs';
@@ -6,14 +7,24 @@ import { parseReviewedSha, findAcceptVerdictComment } from './review-escalation.
 import { latestAcceptRecord, isLaterVerdictBody } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { gateOutcomesForHead, parseRedTeamGateMarker, parseRedTeamComment, breakClass, RED_TEAM_COMMENT_MARKER,
-  liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from './red-team-gate.mjs';
+  liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId, redTeamCarryLinesMarker, parseRedTeamCarryLinesMarker, unchangedCitedLines } from './red-team-gate.mjs';
 import { parseVerdictCarriedMarker, buildVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 const HEX = /^[0-9a-f]{40}$/;
 
 // Only consume complete, known provenance shapes. A marker proves where a
 // record belongs; it does not make arbitrary surrounding text informational.
+/** The cited-line record's whole body (marker + one prose line). PURE; the carry recognizes exactly this shape. */
+export function carryLinesBody({ pr, from, to, result, unchanged }) {
+  const marker = redTeamCarryLinesMarker({ pr, from, to, result, unchanged });
+  const listed = parseRedTeamCarryLinesMarker(marker).unchanged;
+  return `${marker}\nRed-team cited lines unchanged across the carry: ${listed.length ? listed.map(i => `#${i}`).join(', ') : 'none'} (operator rulings on these breaks carry; the others are re-ruled).`;
+}
+
 export function informationalProvenance(body, sha, pr) {
   let rest = String(body ?? '').replace(/\r\n?|\u2028|\u2029/g, '\n').trim();
+  // The carry's own cited-line record for a carry ONTO this head: informational only in its exact rendered shape.
+  const citedRecord = parseRedTeamCarryLinesMarker(rest);
+  if (citedRecord) return citedRecord.to === sha && citedRecord.pr === Number(pr) && rest === carryLinesBody(citedRecord);
   const sameRecord = record => record?.rev === sha && record.pr === Number(pr);
   const gate = parseRedTeamGateMarker(rest);
   if (gate) {
@@ -174,6 +185,15 @@ export function attemptVerdictCarry(io, { pr, repo, expectHead = null } = {}) {
         'Review verdict carried across an identical contribution.',
         ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(pr, prior.sha), redTeamMarker(pr, evidence.headSha))] : [])].join('\n');
       io.postCarryComment({ pr, repo, body });
+      // Operator red-team rulings follow the carry only for breaks whose cited line is byte-identical on both heads
+      // (red-team-gate.mjs#redTeamCarryLinesMarker). No reader, or any failure: no record, so no operator release carries.
+      if (decided && decided.resultId === redTeamResultId(prior.advisory) && typeof io.readCitedLine === 'function') {
+        try {
+          const unchanged = unchangedCitedLines((prior.advisory.findings ?? []).filter(f => f.confirmed), { fromSha: prior.sha, toSha: evidence.headSha,
+            readLine: (sha, file, line) => io.readCitedLine({ sha, file, line, repo }) });
+          io.postCarryComment({ pr, repo, body: carryLinesBody({ pr, from: prior.sha, to: evidence.headSha, result: decided.resultId, unchanged }) });
+        } catch (e) { log(`verdict-carry: PR #${pr} cited-line record not posted (${String(e?.message ?? e).slice(0, 200)}); operator red-team rulings will not carry`); }
+      }
       log(`verdict-carry: PR #${pr} carried ${prior.sha} → ${evidence.headSha} (patch-id ${headPatchId}); no round consumed`);
       return { carried: true, reason: decision.reason, fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId };
     }
@@ -192,4 +212,26 @@ export function resolveCarryAcrossRebase({ env = process.env, readFile = readFil
     if (['on', 'off'].includes(value)) return { value, source: 'settings' };
   } catch { /* default */ }
   return { value: 'off', source: 'default' };
+}
+
+/** `readCitedLine` for the carry: the RAW BYTES (hex) of line `line` (1-based) of the BLOB `file` at `sha`, or null.
+ *  The object must be a blob (never a tree), the line must exist (a trailing newline adds no line), and bytes are
+ *  compared undecoded, so different bytes never compare equal. The path must be a plain repo-relative path (no `..`,
+ *  no leading `/`, no `:`). It runs git ITSELF (`execFileSync`, Buffer output) in `cwd`: a caller's string-decoding
+ *  exec wrapper would collapse distinct bytes, so only a Buffer is accepted; anything else is unreadable (null). */
+export function gitCitedLineReader({ cwd, env = process.env, exec = execFileSync } = {}) {
+  return ({ sha, file, line }) => {
+    if (!HEX.test(String(sha ?? '')) || typeof file !== 'string' || !file || file.startsWith('/') || file.includes(':')
+      || file.split('/').includes('..') || !Number.isInteger(line) || line < 1) return null;
+    const spec = `${sha}:${file}`;
+    try { if (String(exec('git', ['cat-file', '-t', spec], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim() !== 'blob') return null; } catch { return null; }
+    let buf;
+    try { buf = exec('git', ['cat-file', 'blob', spec], { cwd, env, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return null; }
+    if (!Buffer.isBuffer(buf)) return null;
+    const lines = [];
+    let start = 0;
+    for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a) { lines.push(buf.subarray(start, i)); start = i + 1; }
+    if (start < buf.length) lines.push(buf.subarray(start));
+    return line <= lines.length ? lines[line - 1].toString('hex') : null;
+  };
 }
