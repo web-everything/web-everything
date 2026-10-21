@@ -9,15 +9,16 @@ import { closeSync, existsSync, fstatSync, openSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { readSettings } from '../lib/settings-files.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
 
-export const DEFAULT_REPOS = Object.freeze(['web-everything/web-everything', 'plateauapp/plateau-app']);
+export const DEFAULT_REPOS = Object.freeze([CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug]);
 export const DRAIN_LOG = join(homedir(), 'workspace', 'plateau-app', '.drain-daemon', 'daemon.log');
 export const STALLED_AFTER_ENV = 'WE_PR_SWEEP_STALLED_AFTER_MINUTES';
 const LIST_FIELDS = 'number,title,url,isDraft,headRefOid,updatedAt,labels,statusCheckRollup';
 /** Plain `gh` through execFileSync, deliberately NOT the throttled wrapper: that one creates lock dirs and appends call
  *  logs, and this operation must write nothing. */
-const ghSync = (_file, args, opts) => execFileSync('gh', args, opts);
+const ghSync = (_file, args, opts) => execFileSync('gh', args, { maxBuffer: 256 * 1024 * 1024, ...opts });
 export const LIST_LIMIT = 1000;
 const SKIP_MARKER = 'merge-ai-prs · skip-reasons:';
 
@@ -61,7 +62,7 @@ export function parseLiveJobs(psText) {
   return jobs;
 }
 
-function tailOf(path, bytes = 4_000_000) {
+export function tailOf(path, bytes = 4_000_000) {
   if (!existsSync(path)) throw new Error(`${path} does not exist`);
   const fd = openSync(path, 'r');
   try {
