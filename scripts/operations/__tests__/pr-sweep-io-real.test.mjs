@@ -11,9 +11,10 @@ import { join } from 'node:path';
 import { expect, it } from 'vitest';
 import { parseDrainSkips, parseLiveJobs, tailOf } from '../pr-sweep-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 
 it('parseLiveJobs finds a REAL running review-job process in the real `ps` output', () => {
-  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)', '--', '/x/scripts/operations/review-job.mjs', 'run', '--pr=7777', '--repo=o/r'], { stdio: 'ignore' });
+  const child = spawn(process.execPath, ['-e', keepAliveScript({ maxLifetimeMs: 20_000 }), '--', '/x/scripts/operations/review-job.mjs', 'run', '--pr=7777', '--repo=o/r'], { stdio: 'ignore' });
   try {
     const ps = execFileSync('ps', ['-axo', 'pid,etime,command'], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
     expect(parseLiveJobs(ps)).toContainEqual({ kind: 'review-job', pr: 7777, repo: 'o/r', source: 'ps' });

@@ -71,8 +71,9 @@ export function referralHoldOpen(comments, { headCommittedAt = null } = {}) {
   const list = sorted(comments);
   let hold = null;
   for (const e of list) {
+    if (!isTrustedMarkerAuthor(e.c)) continue;
     const body = bodyOf(e.c);
-    if (trusted(e) && (body.includes(`<!-- ${REFERRAL_HOLD_MARKER}`) || HOLD_LEAD.test(body))) hold = e;
+    if (body.includes(`<!-- ${REFERRAL_HOLD_MARKER}`) || HOLD_LEAD.test(body)) hold = e;
   }
   if (!hold || hold.at === null) return null;
   if (!/need a ruling|waiting on your ruling|referral/i.test(bodyOf(hold.c))) return null;
