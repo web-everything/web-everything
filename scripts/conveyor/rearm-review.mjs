@@ -87,6 +87,16 @@ export function decideRearm({ currentLabels = [] } = {}) {
   return decideSetLabel({ to: 'rearm', currentLabels });
 }
 
+/** #5771: on the planner's FRESH snapshot, is the recorded accept still unsuperseded (no later verdict/hold comment, no pending
+ * review, not human-cleared)? A release key is honoured only while this holds, closing the window between the live proof and the
+ * re-plan. Comments only (the planner carries no formal reviews); the proof already read those, and the merge gate re-reads all. */
+export function acceptStillUnsupersededOnSnapshot(pr) {
+  const names = (pr.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+  if (names.includes('review:pending')) return false;
+  const rec = latestAcceptRecord(pr.comments);
+  return !!rec && !rec.humanCleared && !rec.laterVerdict && !rec.laterBodyDerivedHold;
+}
+
 /** #5628: nominate moved agent accepts for a live check, or prove re-arm is owed.
  * The writer requires proof; the planner can nominate without fetching a diff. */
 export function staleAcceptanceOwed(pr, { requireProof = true } = {}) {

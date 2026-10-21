@@ -129,6 +129,11 @@ describe('PR sweep: named singleton owners', () => {
     const row = [...released.refusals, ...released.dispatch].find(d => d.prNumber === 5771);
     expect(row, JSON.stringify(released)).toBeDefined();
     expect(Number.isInteger(row.attempts) && Number.isInteger(row.cap) && row.cap > 0).toBe(true);
+    // TOCTOU (audit): a hold comment or pending label that lands after the proof but before the re-plan keeps the row.
+    const key = [`5771@${head.toLowerCase()}`];
+    const hold = { author: { login: 'web-everything' }, createdAt: '2026-10-18T19:00:00Z', body: '🔁 review — changes requested\n\nplease redo' };
+    expect(plan({ ...p, comments: [...p.comments, hold] }, { staleAcceptReleased: key }).dispatch).toEqual([expect.objectContaining({ variant: 'stale-accept' })]);
+    expect(plan({ ...p, labels: labels('ready-to-merge', 'review:accepted', 'review:pending') }, { staleAcceptReleased: key }).dispatch.some(d => d.variant === 'stale-accept')).toBe(true);
     // Bound to the proved head: a key for another head (or another PR) changes nothing.
     for (const key of [`5771@${oldHead}`, `5772@${head}`, '5771']) {
       expect(plan(p, { staleAcceptReleased: [key] }).dispatch).toEqual([expect.objectContaining({ variant: 'stale-accept' })]);

@@ -126,7 +126,7 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
 import { ciHealOwed } from './ci-heal-rule.mjs';
-import { staleAcceptanceOwed } from './rearm-review.mjs';
+import { staleAcceptanceOwed, acceptStillUnsupersededOnSnapshot } from './rearm-review.mjs';
 import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
@@ -2728,7 +2728,8 @@ export function planReconcile({
     // then the ordinary review dispatcher. The write half compares recorded
     // fingerprints before re-arming; a read miss never revokes an acceptance.
     if (reviewLabelHeal !== 'off' && withPhase.check === 'green' && staleAcceptanceOwed(pr, { requireProof: false })
-        && !(Array.isArray(staleAcceptReleased) && staleAcceptReleased.includes(`${pr.number}@${String(pr.headRefOid ?? '').toLowerCase()}`))) {
+        && !(Array.isArray(staleAcceptReleased) && staleAcceptReleased.includes(`${pr.number}@${String(pr.headRefOid ?? '').toLowerCase()}`)
+          && acceptStillUnsupersededOnSnapshot(pr))) {
       dispatch.push({ ...base, ...withPhase, kind: 'restore-review-label', variant: 'stale-accept',
         label: 'review:pending', why: 'head moved past its accept — verify coverage, then guarded re-arm hands a stale accept to independent review' });
       continue;
