@@ -28,7 +28,7 @@
  *
  * PURE core: {@link planFinishedSessionReap}. IO shell: {@link runFinishedSessionReap}.
  */
-import { readFileSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
@@ -83,21 +83,23 @@ export function resolveFinishedSessionReapSettings({ env = process.env, file = n
 }
 
 /**
- * IO, STRICT: is there ANY fix-claim lock on this PR? Returns `null` ONLY when `lock.json` is confirmed absent
+ * IO, STRICT: is there ANY fix-claim lock on this PR? Returns `null` ONLY when the claim's lock DIR is confirmed absent
  * (ENOENT). A released claim's lock dir is removed (`fix-procedure.mjs#releaseFixClaim` → `releaseLockDir`), so a
  * finished session has none. Any lock that exists — live, expired, unparseable, odd timestamps, unreadable
  * heartbeat — is returned (or throws) and the caller HOLDS: lease interpretation is never trusted to prove
  * absence here (`readLiveFixClaim` maps corrupt/unreadable/expired-looking entries to `null`, which fails open).
  */
-export function readLiveFixClaimStrict({ repo, pr, lockRoot = fixDispatchClaimRoot(), readFile = readFileSync, readEntry = readLockEntry }) {
+export function readLiveFixClaimStrict({ repo, pr, lockRoot = fixDispatchClaimRoot(), stat = statSync, readEntry = readLockEntry }) {
   const resource = fixDispatchResource({ repo: repoKeyOf(repo), pr: Number(pr), kind: FIXING_KIND });
-  try { readFile(join(lockDirFor(lockRoot, resource), 'lock.json'), 'utf8'); } catch (e) {
+  // The lock DIR, not lock.json: acquisition reserves the dir before writing the file, so a dir with no file yet is
+  // a claim being taken right now (Codex audit round 3). Only a confirmed-absent dir means "no claim".
+  try { stat(lockDirFor(lockRoot, resource)); } catch (e) {
     if (e?.code === 'ENOENT') return null;
     throw new Error(`claim lock unreadable: ${e?.code ?? String(e?.message ?? e).split('\n')[0]}`);
   }
   let entry = null;
   try { entry = readEntry(lockRoot, resource); } catch { entry = null; }
-  if (!entry) throw new Error('claim lock present but unparseable');
+  if (!entry) throw new Error('claim lock dir present without a readable entry (being acquired, or unparseable)');
   return entry; // present at all = held for this purpose, expired or not
 }
 

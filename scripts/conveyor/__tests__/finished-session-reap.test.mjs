@@ -136,7 +136,12 @@ describe('readLiveFixClaimStrict — fails closed, unlike readLiveFixClaim (Code
   });
   it('a read error other than ENOENT → throws', () => {
     const { lockRoot } = setup();
-    const readFile = () => { const e = new Error('denied'); e.code = 'EACCES'; throw e; };
-    expect(() => readLiveFixClaimStrict({ repo: 'we', pr: 5758, lockRoot, readFile })).toThrow(/EACCES/);
+    const stat = () => { const e = new Error('denied'); e.code = 'EACCES'; throw e; };
+    expect(() => readLiveFixClaimStrict({ repo: 'we', pr: 5758, lockRoot, stat })).toThrow(/EACCES/);
+  });
+  it('a lock dir with no lock.json yet (claim being acquired) → throws, held (Codex audit round 3)', () => {
+    const { lockRoot, dir } = setup();
+    mkdirSync(dir, { recursive: true });
+    expect(() => readLiveFixClaimStrict({ repo: 'we', pr: 5758, lockRoot })).toThrow(/being acquired/);
   });
 });
