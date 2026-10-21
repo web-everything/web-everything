@@ -5,6 +5,8 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { promoteDraftsGuarded, promoteDraftsThenReplan, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../review-tick-promote.mjs';
 
@@ -137,7 +139,8 @@ describe('promoteDraftsGuarded — the fast promoter\'s own guards decide (card 
 describe('review daemon: same-pass stale-accept re-arm + review (#5771)', () => {
   it('boots in native Node without requiring the stale-accept provider export', () => {
     // Vite can tolerate a missing named export; real daemon and smoke children use native ESM linking.
-    const entry = new URL('../../../skills-src/conveyor/review-daemon.mjs', import.meta.url).href;
+    // Resolve a filesystem path first so Vite cannot rewrite the entry to an HTTP asset URL.
+    const entry = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), '../../../skills-src/conveyor/review-daemon.mjs')).href;
     const out = execFileSync(process.execPath, ['--input-type=module', '-e',
       `const daemon = await import(${JSON.stringify(entry)}); process.stdout.write(typeof daemon.runReviewTick);`,
     ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
