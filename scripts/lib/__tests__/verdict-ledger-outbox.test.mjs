@@ -359,6 +359,12 @@ describe('real git: outbox + plumbing flush', () => {
     expect(canonicalRemote('alice@gitbox:repo.git')).toBe(canonicalRemote('alice@gitbox:~/repo.git'));
     expect(canonicalRemote('alice@gitbox:~bob/repo.git')).toBe(canonicalRemote('ssh://alice@gitbox/~bob/repo.git'));
     expect(canonicalRemote('alice@gitbox:~bob/repo.git')).not.toBe(canonicalRemote('alice@gitbox:~/repo.git'));
+    // Round 11: http and https are different endpoints; a named home is the same whoever logs in.
+    expect(canonicalRemote('http://gitbox/srv/repo')).not.toBe(canonicalRemote('https://gitbox/srv/repo'));
+    expect(canonicalRemote('alice@gitbox:~shared/repo.git')).toBe(canonicalRemote('bob@gitbox:~shared/repo.git'));
+    // Several push destinations: one rejected, one accepted -> never a verdict.
+    expect(classifyPushFailure(err(`!\tabc:${REF}\t[rejected] (fetch first)\n*\tabc:${REF}\t[new branch]\n`), REF)).toBe('unknown');
+    expect(classifyPushFailure(err(`!\tabc:${REF}\t[rejected] (fetch first)\n!\tabc:${REF}\t[remote rejected] (hook declined)\n`), REF)).toBe('refused');
   });
 
   it('an unanswered push whose noise mentions "cannot lock ref" is still UNKNOWN: kept queued, never thrown', async () => {
@@ -442,12 +448,14 @@ describe('real git: outbox + plumbing flush', () => {
       const newer = buildVerdictRecord({ repo: REPO, pr: 79, verdict: 'changes', at: '2026-10-21T12:05:00.000Z', source: 'test' });
       const oldName = enqueueOutboxEntry(outboxDir, { path: ledgerGitPath(REPO), repo: REPO, message: 'm', ...checkLedgerAppendRows([older], REPO) }, { now: () => Date.now() - 1000 });
       const file = join(outboxDir, oldName);
-      chmodSync(file, 0o000); // unreadable for now
+      // Deterministically unreadable, root included: a DIRECTORY where the entry file should be (EISDIR).
+      const bytes = readFileSync(file);
+      rmSync(file);
+      mkdirSync(file);
       try {
         const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [newer], outbox: true, outboxDir, log: quiet });
-        // Waited behind the unreadable older entry (root reads through chmod 000, so only the final order is checked there).
-        if (process.getuid?.() !== 0) expect(r).toMatchObject({ queued: true });
-      } finally { chmodSync(file, 0o644); }
+        expect(r).toMatchObject({ queued: true }); // waited behind the unreadable older entry
+      } finally { rmSync(file, { recursive: true, force: true }); writeFileSync(file, bytes); }
       flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, log: quiet });
       const verdicts = ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').map((l) => JSON.parse(l).verdict);
       expect(verdicts).toEqual(['accepted', 'changes']);
@@ -506,6 +514,19 @@ describe('real git: outbox + plumbing flush', () => {
   it('the backstop always scans its own workspace outbox root, from a primary-checkout layout too (round 7)', () => {
     expect(defaultOutboxRoot('/w/repo/scripts/lib/verdict-ledger-outbox.mjs')).toBe('/w/.operations/verdict-ledger-outbox');
     expect(defaultOutboxRoot('/w/.lanes/web-everything/lane-3/scripts/lib/verdict-ledger-outbox.mjs')).toBe('/w/.operations/verdict-ledger-outbox');
+  });
+
+  it('a pushurl pointing elsewhere (or several push URLs) is refused BEFORE publication (round 11)', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      git(['config', 'remote.origin.pushurl', join(ctx.tmp, 'elsewhere.git')], { cwd: ctx.clone });
+      const pushes = [];
+      const run = (args, opts) => { if (args[0] === 'push') pushes.push(args); return realGit(args, opts); };
+      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(15)], outbox: true, outboxDir: join(ctx.tmp, 'ob'), gitRun: run, log: quiet }))
+        .toThrow(/exactly ONE push destination/);
+      expect(pushes).toEqual([]);
+      expect(listOutboxEntries(join(ctx.tmp, 'ob'))).toEqual([]);
+    });
   });
 
   it('the plumbing push never follows tags', async () => {

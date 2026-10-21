@@ -83,16 +83,18 @@ const RACE_REASON_RE = /fetch first|non-fast-forward|stale info|cannot lock ref|
  * form `<flag>\t<src>:<dst>\t<summary>`. Diagnostic prose (stderr, `remote:` lines, the formatted message) never does.
  */
 export function classifyPushFailure(e, ref = 'refs/heads/ops/review-requests') {
+  const verdicts = [];
   for (const line of String(e?.stdout ?? '').split(/\r?\n/)) {
     const m = /^([ +\-*=!])\t([^\t]*):([^\t]+)\t(.*)$/.exec(line);
     if (!m || m[3] !== ref) continue;
-    if (m[1] !== '!') return 'unknown'; // a non-rejected record for our ref beside a failed exit: never "not landed"
-    // Round 6: only an EXPLICIT `[rejected]` / `[remote rejected]` summary is a verdict. `[remote failure]` (the
-    // remote never confirmed: it may have updated the ref) and anything unrecognised stay UNKNOWN.
-    if (!/^\[(rejected|remote rejected)\]/.test(m[4].trim())) return 'unknown';
-    return RACE_REASON_RE.test(m[4]) ? 'race' : 'refused';
+    // A non-rejected record for our ref beside a failed exit is never "not landed". Round 6: only an EXPLICIT
+    // `[rejected]` / `[remote rejected]` summary is a verdict; `[remote failure]` and anything else stay UNKNOWN.
+    if (m[1] !== '!' || !/^\[(rejected|remote rejected)\]/.test(m[4].trim())) return 'unknown';
+    verdicts.push(RACE_REASON_RE.test(m[4]) ? 'race' : 'refused');
   }
-  return 'unknown';
+  // Round 11: EVERY record for our ref must be a rejection (several destinations: one may have accepted).
+  if (!verdicts.length) return 'unknown';
+  return verdicts.every((v) => v === 'race') ? 'race' : 'refused';
 }
 
 /** A push-phase failure of the flush. `results` holds the entries that DID land before it. */
@@ -187,7 +189,7 @@ export function canonicalRemote(url, base = process.cwd()) {
   if (proto && proto[1].toLowerCase() !== 'file') {
     const scheme = proto[1].toLowerCase();
     user = proto[2] ?? null; host = proto[3]; path = proto[5]; // absolute, except git's `ssh://host/~/path`
-    transport = /ssh/.test(scheme) ? 'ssh' : scheme === 'git' ? 'git' : 'http';
+    transport = /ssh/.test(scheme) ? 'ssh' : scheme; // round 11: http and https are different endpoints
     if (transport === 'ssh' && path.startsWith('/~')) path = path.slice(1); // `/~/x` and `/~user/x` are home paths
     const defaults = { ssh: '22', 'git+ssh': '22', 'ssh+git': '22', https: '443', http: '80', git: '9418' };
     port = proto[4] && proto[4] !== defaults[scheme] ? proto[4] : null;
@@ -205,7 +207,8 @@ export function canonicalRemote(url, base = process.cwd()) {
   }
   // Generic host (round 8): the user decides whose HOME `~/` is, and `repo` and `repo.git` may both exist.
   // Round 9: the transport class too (an https and an ssh daemon on one host may serve different trees).
-  const who = path.startsWith('~') && user ? `${user}@` : '';
+  // Only the IMPLICIT home (`~/…`) depends on the login; `~name/…` names its home whoever logs in (round 11).
+  const who = path.startsWith('~/') && user ? `${user}@` : '';
   return `${transport}://${who}${host}${port ? `:${port}` : ''}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
@@ -411,6 +414,7 @@ function readBlobAt(run, board, tip, path, env) {
 function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined }) {
   const ref = assertPushRef(branch, allowRef);
   const env = boardEnv(board);
+  assertSingleDestination({ board, run, env });
   retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board, env }), sleep ? { sleep } : {});
   const tip = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}^{commit}`], { cwd: board, env })).trim();
   if (!/^[0-9a-f]{40,64}$/.test(tip)) throw new Error(`verdict-ledger-outbox: origin/${branch} did not resolve to a commit`);
@@ -470,6 +474,22 @@ function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined })
     try { rmSync(tmp, { recursive: true, force: true }); } catch { /* a temp dir left behind never undoes a push */ }
   }
   return { pushed: true, counts };
+}
+
+/**
+ * ONE publication destination, and it is the one we fetch (and reconcile) from (round 11: `remote.origin.pushurl`
+ * can point elsewhere, and several push URLs can split one push into an accepted and a rejected half). Anything
+ * else is refused BEFORE publication, so the refusal is a truthful "not recorded".
+ */
+function assertSingleDestination({ board, run, env }) {
+  const list = (args) => String(run(args, { cwd: board, env })).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const push = list(['remote', 'get-url', '--push', '--all', 'origin']);
+  const fetch = list(['remote', 'get-url', '--all', 'origin']);
+  if (!push.length && !fetch.length) return; // nothing configured to compare (a seam): the push itself decides
+  const canon = (u) => canonicalRemote(u, resolve(board));
+  if (push.length !== 1 || fetch.length !== 1 || canon(push[0]) !== canon(fetch[0])) {
+    throw new Error(`verdict-ledger-outbox: refusing to publish: origin must have exactly ONE push destination equal to its fetch URL (push: ${push.join(', ') || '(none)'}; fetch: ${fetch.join(', ') || '(none)'})`);
+  }
 }
 
 /**
