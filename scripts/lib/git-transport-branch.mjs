@@ -156,6 +156,15 @@ export const DIRTY_PROBE_ARGS = Object.freeze([
 ]);
 
 /**
+ * Index flags can hide edits from status: assume-unchanged (`h`), skip-worktree (`S`), or both (`s`).
+ * Destructive cleanup requires every tracked file to carry the plain `H` tag. Probe errors propagate
+ * so callers refuse cleanup when the index cannot be read.
+ */
+export function hasHiddenIndexFlags(run, options) {
+  return run(['ls-files', '-v'], options).split(/\r?\n/).some((line) => line && line[0] !== 'H');
+}
+
+/**
  * Best-effort recovery of killed writers. Only old wt-<milliseconds> directories directly in the transport
  * root qualify. Save a clean HEAD not known to be on origin BEFORE removing its worktree; dirty or broken
  * worktrees stay put. All git and filesystem probes are injectable, just like the staging path.
@@ -188,9 +197,7 @@ export function reclaimStrandedTransportWorktrees({
         const ownerPid = readOwnerPid(read, ownerFile(root, name));
         if (ownerPid && alive(ownerPid)) continue; // its writer is still running, however long that takes
         const wtOpts = { cwd: path, env: worktreeGitEnv(path) };
-        // The index can hide edits from status too: `update-index --assume-unchanged` (tag `h`) and
-        // `--skip-worktree` (tag `S`). Every tracked file must carry the plain `H` tag.
-        const hiddenIndexBits = run(['ls-files', '-v'], wtOpts).split(/\r?\n/).some((line) => line && line[0] !== 'H');
+        const hiddenIndexBits = hasHiddenIndexFlags(run, wtOpts);
         if (hiddenIndexBits || run([...DIRTY_PROBE_ARGS], wtOpts).trim()) {
           warn(`git-transport-branch: WARNING dirty stranded worktree ${path}; left untouched`);
           continue;

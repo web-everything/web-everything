@@ -12,6 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { platformPreference, resolveCascade } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
+import { hasHiddenIndexFlags } from './git-transport-branch.mjs';
 
 export function resolveLaneScanPolicy({ env = process.env,
   platform = platformPreference('healthWatch', { env }), tool = readDeclaredSettings().settings?.healthWatch,
@@ -61,8 +62,8 @@ export function cachedLaneScan(scan, { dir, root, now = Date.now(), write = true
 
 /**
  * FRESH safety read of ONE lane, right now (never the cache). Unsafe when the worktree has any change (tracked or
- * untracked), any stash, or any commit absent from local origin refs. Any git error, timeout or unparseable output is
- * UNSAFE: this answers "may I destroy this lane's state?", so not knowing is no.
+ * untracked), index flags that may hide edits, any stash, or any commit absent from local origin refs. Any git error,
+ * timeout or unparseable output is UNSAFE: this answers "may I destroy this lane's state?", so not knowing is no.
  * @returns {{hasUnsafeWork:boolean, fresh:true, observedAt:string, reason:string, error?:string}}
  */
 export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = {}) {
@@ -75,6 +76,7 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
     const status = git(['status', '--porcelain', '--untracked-files=all']);
     if (typeof status !== 'string') return unsafe('status unreadable');
     if (status.trim()) return unsafe('worktree has changes');
+    if (hasHiddenIndexFlags(git)) return unsafe('index flags may hide worktree changes');
     const stash = git(['stash', 'list']);
     if (stash.trim()) return unsafe('stash entries present');
     const ahead = git(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']).trim();

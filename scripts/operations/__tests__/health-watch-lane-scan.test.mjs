@@ -124,6 +124,7 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
 describe('fresh per-lane safety check before any destructive action', () => {
   const commands = [
     ['git', ['status', '--porcelain', '--untracked-files=all']],
+    ['git', ['ls-files', '-v']],
     ['git', ['stash', 'list']],
     ['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']],
   ];
@@ -136,7 +137,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
   });
   const git = outputs => {
     const replies = new Map(commands.map((command, i) => [JSON.stringify(command),
-      [outputs.status, outputs.stash, outputs['rev-list']][i]]));
+      [outputs.status, outputs['ls-files'] ?? 'H tracked.txt\n', outputs.stash, outputs['rev-list']][i]]));
     const exec = vi.fn((bin, argv) => {
       const out = replies.get(JSON.stringify([bin, argv]));
       if (out instanceof Error) throw out;
@@ -157,6 +158,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     freshLaneSafety({ path: '/l', exec });
     expect(exec.mock.calls.map(([bin, argv]) => [bin, argv])).toEqual([
       ['git', ['status', '--porcelain', '--untracked-files=all']],
+      ['git', ['ls-files', '-v']],
       ['git', ['stash', 'list']],
       ['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']],
     ]);
@@ -173,6 +175,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     const exec = vi.fn((bin, argv) => {
       const command = JSON.stringify([bin, argv]);
       if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all']])) return status;
+      if (command === JSON.stringify(['git', ['ls-files', '-v']])) return 'H tracked.txt\n';
       if (command === JSON.stringify(['git', ['stash', 'list']])) return '';
       if (command === JSON.stringify(['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']])) return count;
       if (argv.includes('status')) return '';
@@ -180,6 +183,24 @@ describe('fresh per-lane safety check before any destructive action', () => {
     });
     gitMocks.push(exec);
     expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({ hasUnsafeWork: true, reason });
+  });
+  it.each(['h', 'S', 's', 'M', '?'])(
+    'refuses every destructive action when index tag %s hides work despite clean status', tag => {
+      const exec = git({ status: '', 'ls-files': `H ordinary.txt\n${tag} tracked.txt\n`, stash: '', 'rev-list': '0' });
+      expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({
+        hasUnsafeWork: true, fresh: true, reason: 'index flags may hide worktree changes',
+      });
+      for (const action of ['reclaim', 'reset', 'reuse', 'release-on-behalf']) {
+        expect(guardLaneAction({ path: '/l', action, exec, log: vi.fn() })).toMatchObject({
+          act: false, fresh: { hasUnsafeWork: true, reason: 'index flags may hide worktree changes' },
+        });
+      }
+    });
+  it('refuses destructive action when the index flag probe fails', () => {
+    const exec = git({ status: '', 'ls-files': new Error('index unreadable'), stash: '', 'rev-list': '0' });
+    expect(guardLaneAction({ path: '/l', action: 'reset', exec, log: vi.fn() })).toMatchObject({
+      act: false, fresh: { hasUnsafeWork: true, reason: 'fresh safety check failed', error: 'index unreadable' },
+    });
   });
   it('any error, timeout or unparseable output is unsafe', () => {
     for (const outputs of [{ status: new Error('timeout') }, { status: '', stash: new Error('locked') },
