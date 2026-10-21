@@ -110,6 +110,61 @@ describe('verify-lane writer — overlapping-runs race (#2833 finding 1)', () =>
 });
 
 describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)', () => {
+  it('non-leader timeout does not sweep unrelated group orphans', () => {
+    // Isolate the shared group from Vitest/the agent shell. The supervisor leads it; verify-lane and an
+    // unrelated, reparented sleeper share it. Removing the caller's leader guard kills this survivor.
+    const supervisor = join(dir, 'shared-group.mjs');
+    writeFileSync(supervisor, `import { execFileSync, spawn, spawnSync } from 'node:child_process';
+const snapshot = (pid) => execFileSync('ps', ['-o', 'pid=,ppid=,pgid=,stat=', '-p', String(pid)], { encoding: 'utf8' }).trim().split(/\\s+/);
+const sleeper = spawnSync(process.execPath, ['-e', "const c = require('node:child_process').spawn('sleep', ['120'], { stdio: 'ignore' }); console.log(c.pid); c.unref();"], { encoding: 'utf8', timeout: 10_000 });
+const orphan = Number(sleeper.stdout.trim());
+if (sleeper.status !== 0 || !Number.isInteger(orphan) || orphan <= 1) throw new Error('could not start unrelated sleeper');
+let verify;
+try {
+  let before;
+  const deadline = Date.now() + 10_000;
+  do {
+    before = snapshot(orphan);
+    if (Number(before[1]) === 1) break;
+    await new Promise((r) => setTimeout(r, 20));
+  } while (Date.now() < deadline);
+  verify = spawn(process.execPath, [${JSON.stringify(VERIFY_LANE)}, '--gate=sleep 120', '--json'], {
+    cwd: ${JSON.stringify(dir)}, detached: false, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const closed = new Promise((resolve, reject) => { verify.once('error', reject); verify.once('close', (code, signal) => resolve({ code, signal })); });
+  let stdout = '', stderr = '';
+  verify.stdout.on('data', (chunk) => { stdout += chunk; });
+  verify.stderr.on('data', (chunk) => { stderr += chunk; });
+  const verifier = snapshot(verify.pid);
+  const result = await closed;
+  let after = null;
+  try { process.kill(orphan, 0); after = snapshot(orphan); } catch {}
+  console.log(JSON.stringify({ leader: process.pid, before, verifier, after, ...result, stdout, stderr }));
+} finally {
+  try { process.kill(orphan, 'SIGKILL'); } catch {}
+  if (verify && verify.exitCode === null) { try { verify.kill('SIGKILL'); } catch {} }
+}
+`);
+    const r = spawnSync(process.execPath, [supervisor], {
+      cwd: dir, detached: true, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
+        WE_VERIFY_PHASE_TIMEOUT_MS: '2000' },
+    });
+    expect(r.error).toBeUndefined();
+    expect(r.status, r.stderr).toBe(0);
+    const result = JSON.parse(r.stdout.trim());
+    expect(Number(result.before[1])).toBe(1);
+    expect(Number(result.before[2])).toBe(result.leader);
+    expect(Number(result.verifier[2])).toBe(result.leader);
+    expect(Number(result.verifier[0])).not.toBe(result.leader);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain('phase exceeded phaseTimeoutMs=2000 (env)');
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
+    expect(result.after, 'unrelated orphan must survive the non-leader timeout').not.toBeNull();
+    expect(result.after[3]).not.toMatch(/^Z/); // A killed but unreaped zombie is not a survivor.
+    expect(result.after.slice(0, 3)).toEqual(result.before.slice(0, 3));
+  }, 70_000);
+
   it('kills a hung gate phase and its whole process tree at phaseTimeoutMs, recording a timeout (never green)', () => {
     // The gate forks a grandchild that would outlive a plain kill of the shell, then hangs (the 8h42m vitest case).
     const pidFile = join(dir, 'grandchild.pid');
