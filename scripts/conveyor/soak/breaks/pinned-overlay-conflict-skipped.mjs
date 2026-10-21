@@ -27,6 +27,7 @@ import { pathToFileURL } from 'node:url';
 import { runSoak } from '../soak.mjs';
 import { rebuildMechanismSource } from '../rebuild-mechanism-source.mjs';
 import { cloneFacts } from '../invariants.mjs';
+import { seedDefaultFleet } from '../fleet.mjs';
 
 const OVERLAY_REF = 'lane/xpinskip-pinned-overlay-fixture';
 const CONFLICT_PATH = 'soak/pinned-overlay-conflict.md';
@@ -57,6 +58,7 @@ export default {
       name: 'break:pinned-overlay-conflict-skipped',
       rounds: FINAL_ROUND + 1,
       mainEvery: 0,
+      fleet: false,
       scorecards: false,
       log,
       setup(w) {
@@ -82,6 +84,10 @@ export default {
           ctx.overlaySha = sha;
           overlaysModule.addOverlay(w.simCloneRoot, { ref: OVERLAY_REF, pr: null }, { env: w.env });
           api.moveMain(w, { [CONFLICT_PATH]: 'main side\n' }, 'soak: main conflicts with a new pinned overlay');
+          // Seed after the first main move: BEHIND PRs owe the drain a rebase, not a review.
+          // This scenario runs review/fix daemons only, so keep their initial work dispatchable.
+          ctx.fleet = seedDefaultFleet(w);
+          for (const pr of ctx.fleet) if (pr.owes) api.owe(pr.pr, pr.owes, pr.note);
           say(`registered mechanism overlay ${OVERLAY_REF} (${sha.slice(0, 9)}) and moved main — the newcomer should be skipped`);
           return;
         }
