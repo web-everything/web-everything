@@ -20,7 +20,7 @@ export default {
   },
   async run({ root = REPO_ROOT } = {}) {
     const base = mkdtempSync(join(tmpdir(), 'soak-symbolic-ops-'));
-    const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     try {
       const origin = join(base, 'origin.git'), reference = join(base, 'reference'), pool = join(base, 'pool');
       git(['init', '--quiet', '--bare', '--initial-branch=trunk', origin]);
@@ -33,7 +33,7 @@ export default {
       git(['push', '--quiet', 'origin', 'HEAD:refs/heads/trunk'], reference);
       const cli = (args) => spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), ...args,
         `--origin=${origin}`, `--reference=${reference}`, '--name=symbolic-ops', '--branch=trunk', '--no-install'], {
-        encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: pool }, timeout: 30000,
+        encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: pool }, timeout: 30000, maxBuffer: 1024 * 1024,
       });
       const provision = cli(['provision', '--count=1']);
       if (provision.status !== 0) throw Error(`fixture provision failed: ${provision.stderr}`);
