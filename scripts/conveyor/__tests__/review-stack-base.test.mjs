@@ -544,7 +544,8 @@ const makeRepo = () => {
     GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.test', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.test',
     GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z' };
   const run = (args, opts = {}) => String(execFileSync('git', ['-C', dir, '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args],
-    { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], ...opts }));
+    // Bounded: a wedged git (index.lock, a stalled fs under host load) fails this test, never hangs the worker.
+    { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, killSignal: 'SIGKILL', ...opts }));
   const sha = (rev) => run(['rev-parse', rev]).trim();
   const write = (file, text) => writeFileSync(join(dir, file), text);
   const commit = (msg, files) => { for (const [f, t] of Object.entries(files)) write(f, t); run(['add', '-A']); run(['commit', '-q', '-m', msg]); return sha('HEAD'); };
