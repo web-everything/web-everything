@@ -117,7 +117,7 @@ export function planBundleRepairs({ clones = [], ledger = [], settings = BUNDLE_
   if (s.enabled !== true) return { off: 'disabled', dispatch: [], held: [] };
   if (killed) return { off: 'kill-switch', dispatch: [], held: [] };
   const entries = Array.isArray(ledger) ? ledger : [];
-  let running = entries.filter((e) => e.status === 'running' || e.stopPending).length;
+  let running = entries.filter((e) => e.status === 'running' || e.stopPending || (e.launching && now < e.deadlineAt)).length;
   const dispatch = [];
   const held = [];
   const candidates = clones.filter((c) => isOverlayHold(c?.held)).sort((a, b) => a.held.since - b.held.since);
@@ -129,7 +129,9 @@ export function planBundleRepairs({ clones = [], ledger = [], settings = BUNDLE_
     const heldMin = (now - c.held.since) / MINUTE;
     if (heldMin < s.triggerMinutes) { hold(HOLD_RULES.UNDER_TRIGGER, `held ${Math.floor(heldMin)} min (trigger ${s.triggerMinutes} min)`); continue; }
     const holdId = holdIdFor(c, c.held);
-    const live = entries.find((e) => e.cloneKey === c.cloneKey && (e.status === 'running' || e.stopPending));
+    // Live = running, a session whose stop is pending, or a reservation whose launch is not patched in yet (bounded
+    // by its deadline, so a crashed launcher cannot block the clone forever).
+    const live = entries.find((e) => e.cloneKey === c.cloneKey && (e.status === 'running' || e.stopPending || (e.launching && now < e.deadlineAt)));
     if (live) { hold(HOLD_RULES.ONE_PER_CLONE, `a repair is already running on this clone (${live.session ?? live.holdId})`); continue; }
     const prior = entries.find((e) => e.holdId === holdId);
     if (prior) { hold(HOLD_RULES.ONE_PER_HOLD, `this hold already had its one repair attempt (${prior.status})`); continue; }
@@ -178,7 +180,7 @@ export function planReconcile(ledger, { clones = [], now, outcomeFor = () => nul
       continue;
     }
     if (!watched) {
-      if (e.stopPending && pastDeadline && !raised.has('wall-time')) act(e.status, 'wall-time', 'the session could not be stopped and is past its wall time');
+      if ((e.stopPending || e.stopSettledAt === now) && pastDeadline && !raised.has('wall-time')) act(e.status, 'wall-time', 'the session could not be stopped before its wall time');
       continue;
     }
     const outcome = outcomeFor(e.holdId);
@@ -263,5 +265,5 @@ export function escalationItem(entry, { reason, detail, host, weRoot }) {
 /** PURE: drop settled entries older than 7 days; never a running/repaired one, never the current hold's tombstone. */
 export function pruneLedger(ledger, { now, liveHoldIds = new Set() }) {
   return (Array.isArray(ledger) ? ledger : []).filter((e) => ['running', 'repaired'].includes(e.status)
-    || e.stopPending || e.escalationPending?.length || liveHoldIds.has(e.holdId) || now - (e.startedAt ?? 0) < 7 * 24 * 60 * MINUTE);
+    || e.stopPending || e.launching || e.escalationPending?.length || liveHoldIds.has(e.holdId) || now - (e.startedAt ?? 0) < 7 * 24 * 60 * MINUTE);
 }

@@ -160,6 +160,10 @@ describe('planReconcile — the escalation path', () => {
     const settledNow = entry({ status: 'cleared', stopSettledAt: NOW });
     expect(planReconcile([settledNow], { clones: [], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) })[0].escalate).toBe('conflict-override-used');
   });
+  it('round 5: a stop that only succeeded on the retry tick still escalates the wall-time overrun', () => {
+    const settledNow = entry({ status: 'cleared', stopSettledAt: NOW, deadlineAt: NOW - MIN });
+    expect(planReconcile([settledNow], { clones: [{ ...c, held: null }], now: NOW })[0]).toMatchObject({ escalate: 'wall-time' });
+  });
   it('round 4: a session that cannot be stopped escalates wall-time once, cleared or repaired', () => {
     const stuck = entry({ status: 'cleared', stopPending: true, deadlineAt: NOW });
     expect(planReconcile([stuck], { clones: [{ ...c, held: null }], now: NOW })[0]).toMatchObject({ escalate: 'wall-time', stop: true, status: 'cleared' });
@@ -289,19 +293,52 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
     expect(existsSync(join(dir, 'bundle-repair'))).toBe(false);
   });
 
-  it('a live pass holding the ledger lock makes another pass fail closed (no launch), and the lock is released after', async () => {
+  it('the ledger lock: a live holder makes another pass fail closed; a dead holder is taken over once; released after', async () => {
     const { dir, dispatched, seams } = setup();
-    const { withFileLock } = await import('../../lib/atomic-json-file.mjs');
+    const { hostname } = await import('node:os');
     mkdirSync(join(dir, 'bundle-repair'), { recursive: true });
-    writeFileSync(`${ledgerPath(dir)}.lock`, `${process.pid}\n`); // a live holder (this process)
-    const quick = (d, fn) => defaultLock(d, fn, { withFileLock, timeoutMs: 200 });
-    await expect(runBundleRepairs({ ...seams, lock: quick, ...settings() })).rejects.toThrow(/timed out/);
+    const lockFile = `${ledgerPath(dir)}.lock`;
+    writeFileSync(lockFile, JSON.stringify({ pid: process.pid, host: hostname() })); // a live holder (this process)
+    await expect(runBundleRepairs({ ...seams, lock: undefined, ...settings() })).rejects.toThrow(/lock is held/);
     expect(dispatched).toEqual([]);
-    const { unlinkSync } = await import('node:fs');
-    unlinkSync(`${ledgerPath(dir)}.lock`);
-    await runBundleRepairs({ ...seams, lock: quick, ...settings() });
+    writeFileSync(lockFile, JSON.stringify({ pid: 2 ** 30, host: hostname() })); // a dead holder
+    const deadLock = (d, fn) => defaultLock(d, fn, { isAlive: () => false });
+    await runBundleRepairs({ ...seams, lock: deadLock, ...settings() });
     expect(dispatched).toHaveLength(1);
-    expect(existsSync(`${ledgerPath(dir)}.lock`)).toBe(false);
+    expect(existsSync(lockFile)).toBe(false);
+    expect(existsSync(`${lockFile}.takeover`)).toBe(false);
+    writeFileSync(`${lockFile}.takeover`, 'x'); writeFileSync(lockFile, JSON.stringify({ pid: 2 ** 30, host: hostname() }));
+    expect(() => deadLock(dir, () => 'ran')).toThrow(/takeover/);
+  });
+
+  it('round 5: an unreadable ledger fails closed (never read as empty)', async () => {
+    const { dir, dispatched, seams } = setup();
+    mkdirSync(join(dir, 'bundle-repair'), { recursive: true });
+    writeFileSync(ledgerPath(dir), '{not json');
+    await expect(runBundleRepairs({ ...seams, ...settings() })).rejects.toThrow(/unknown ledger/);
+    writeFileSync(ledgerPath(dir), JSON.stringify({ not: 'a list' }));
+    await expect(runBundleRepairs({ ...seams, ...settings() })).rejects.toThrow(/unknown ledger/);
+    expect(dispatched).toEqual([]);
+  });
+
+  it('round 5: a reservation settled by another pass mid-launch gets its late session stopped; the clone stays blocked meanwhile', async () => {
+    const { dir, stopped, seams } = setup();
+    const s = await runBundleRepairs({
+      ...seams, ...settings(),
+      dispatch: async () => {
+        // another pass settles the reservation while this launch is in flight
+        const l = readLedger(dir); l[0].status = 'cleared'; writeFileSync(ledgerPath(dir), JSON.stringify(l));
+        return { handle: 'late' };
+      },
+    });
+    expect(s.dispatched).toHaveLength(1);
+    expect(stopped).toEqual([readLedger(dir)[0].holdId]);
+    expect(readLedger(dir)[0]).toMatchObject({ handle: 'late', status: 'cleared' });
+    expect(readLedger(dir)[0].launching).toBeUndefined();
+    // while a reservation is launching, the clone is live for planning
+    const c = clone(60);
+    const launching = [{ cloneKey: KEY, holdId: 'x', status: 'cleared', launching: true, deadlineAt: NOW + MIN }];
+    expect(planBundleRepairs({ clones: [c], ledger: launching, settings: on(), now: NOW }).held[0].rule).toBe(HOLD_RULES.ONE_PER_CLONE);
   });
 
   it('round 4: unreadable rebuild state is unknown, not cleared', async () => {

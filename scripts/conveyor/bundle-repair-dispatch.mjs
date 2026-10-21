@@ -40,7 +40,7 @@
  *   node scripts/conveyor/bundle-repair-dispatch.mjs record --hold=<id> --session=<slug> < outcome.json   (the session's one write)
  */
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -68,7 +68,21 @@ export function outcomePath(dir, holdId) {
 }
 const shadowPath = (dir, holdId) => join(repairDir(dir), 'shadow', `${holdId}.md`);
 function readJson(path, fallback) { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return fallback; } }
-export function readLedger(dir) { const v = readJson(ledgerPath(dir), []); return Array.isArray(v) ? v : []; }
+/** The ledger. Missing = empty; unreadable, malformed or not a list THROWS — an unknown ledger never reads as "no
+ *  repair ever ran" (that would re-launch a running clone's repair and overwrite its supervision). */
+export function readLedger(dir) {
+  let text;
+  try { text = readFileSync(ledgerPath(dir), 'utf8'); } catch (e) {
+    if (e?.code === 'ENOENT') return [];
+    throw new Error(`bundle-repair: the ledger is unreadable (${e?.code ?? e?.message}) — refusing to act on an unknown ledger`);
+  }
+  let v;
+  try { v = JSON.parse(text); } catch { throw new Error(`bundle-repair: the ledger ${ledgerPath(dir)} is not JSON — refusing to act on an unknown ledger`); }
+  if (!Array.isArray(v) || v.some((x) => !x || typeof x !== 'object' || typeof x.holdId !== 'string')) {
+    throw new Error(`bundle-repair: the ledger ${ledgerPath(dir)} is not a list of entries — refusing to act on an unknown ledger`);
+  }
+  return v;
+}
 
 // ── settings ─────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -175,10 +189,10 @@ const FINISHED = new Set(['done', 'failed', 'stopped', 'completed', 'killed']);
 /** The real host seams, loaded once per pass (only the ones the caller did not supply) so every step inside the
  *  ledger lock is synchronous. */
 async function loadHostDeps({ needStop, needPublish, needEvents }) {
-  const [reaper, salvage, feed, overlays, { withFileLock }, lane] = await Promise.all([
+  const [reaper, salvage, feed, overlays, lane] = await Promise.all([
     needStop ? import('./session-reaper.mjs') : null, needStop ? import('../lib/lane-salvage.mjs') : null,
     needPublish ? import('../operations/needs-you-feed.mjs') : null, needEvents ? import('../lib/daemon-overlays.mjs') : null,
-    import('../lib/atomic-json-file.mjs'), import('../operations/dispatch-lane.mjs'),
+    import('../operations/dispatch-lane.mjs'),
   ]);
   const stop = needStop ? (entry) => {
     let handle = entry.handle;
@@ -192,14 +206,44 @@ async function loadHostDeps({ needStop, needPublish, needEvents }) {
     }
     if (handle) reaper.stopSessionWithRetry({ handle });
   } : null;
-  return { stop, publish: needPublish ? (item, { now }) => feed.publishAttention(item, { now }) : null, eventsFilePath: overlays?.eventsFilePath, withFileLock, lane };
+  return { stop, publish: needPublish ? (item, { now }) => feed.publishAttention(item, { now }) : null, eventsFilePath: overlays?.eventsFilePath, lane };
 }
 
-/** The ledger lock: the shared `withFileLock` (PID-liveness stale takeover with post-move verification), around a
- *  SYNCHRONOUS critical section only — the awaited launch happens outside it, after its reservation is on disk. */
-export function defaultLock(dir, fn, { withFileLock, timeoutMs = 30_000 } = {}) {
-  mkdirSync(repairDir(dir), { recursive: true });
-  return withFileLock(`${ledgerPath(dir)}.lock`, fn, { timeoutMs });
+const pidAlive = (pid) => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return true; // unknown → assume alive (fail closed)
+  try { process.kill(pid, 0); return true; } catch (e) { return e?.code !== 'ESRCH'; }
+};
+
+/**
+ * The ledger lock, around a SYNCHRONOUS critical section only — the awaited launch happens outside it, after its
+ * reservation is on disk. Exclusive create; NO time-based takeover. A lock whose holder is a DEAD process on this
+ * host is taken over only under a second exclusive `takeover` lock, re-reading the lock's exact bytes first, so two
+ * takers can never both win (the second re-reads the first's live lock and backs off). Anything unverifiable —
+ * a garbled lock, another host's lock, a takeover lock left by a crash — fails CLOSED with a message naming the file.
+ */
+export function defaultLock(dir, fn, { isAlive = pidAlive, host = hostname() } = {}) {
+  const path = `${ledgerPath(dir)}.lock`;
+  mkdirSync(dirname(path), { recursive: true });
+  const mine = JSON.stringify({ pid: process.pid, host, at: new Date().toISOString(), nonce: randomBytes(8).toString('hex') });
+  const create = (p, text) => { try { writeFileSync(p, text, { flag: 'wx' }); return true; } catch (e) { if (e?.code === 'EEXIST') return false; throw e; } };
+  if (!create(path, mine)) {
+    let raw = null; let holder = null;
+    try { raw = readFileSync(path, 'utf8'); holder = JSON.parse(raw); } catch { holder = null; }
+    if (!holder || holder.host !== host || isAlive(holder.pid)) {
+      throw new Error(`bundle-repair: the ledger lock is held (${holder ? `pid ${holder.pid} on ${holder.host}` : 'unreadable holder'}) — skipped this pass; lock file ${path}`);
+    }
+    const takeover = `${path}.takeover`;
+    if (!create(takeover, mine)) throw new Error(`bundle-repair: a lock takeover is in progress or was left by a crash — ${takeover}`);
+    try {
+      let again = null;
+      try { again = readFileSync(path, 'utf8'); } catch { again = null; }
+      if (again === raw) unlinkSync(path); // still exactly the dead holder's bytes
+      if (!create(path, mine)) throw new Error(`bundle-repair: the ledger lock was taken by another pass — skipped this pass; lock file ${path}`);
+    } finally { try { unlinkSync(takeover); } catch { /* best effort */ } }
+  }
+  try { return fn(); } finally {
+    try { if (readFileSync(path, 'utf8') === mine) unlinkSync(path); } catch { /* best effort */ }
+  }
 }
 
 function writeJsonAtomicSync(path, value) {
@@ -237,7 +281,7 @@ export async function runBundleRepairs({
   stop ??= deps.stop;
   publish ??= deps.publish;
   overrideFor ??= (entry) => readConflictOverride(entry, { env, eventsFilePath: deps.eventsFilePath });
-  lock ??= (d, fn) => defaultLock(d, fn, { withFileLock: deps.withFileLock });
+  lock ??= (d, fn) => defaultLock(d, fn);
   const keyToRoot = await rootsByKey();
   // `held: undefined` = UNKNOWN (no rebuild state could be read) — never read as "not held".
   const clones = (selfSync || []).map((c) => ({ cloneKey: c.cloneKey, root: keyToRoot.get(c.cloneKey) ?? null, held: c.rebuild ? (c.rebuild.held ?? null) : undefined }));
@@ -339,7 +383,7 @@ export async function runBundleRepairs({
       // RESERVE BEFORE LAUNCH: on disk (inside this lock) as an indeterminate running repair before anything spawns.
       const token = randomBytes(24).toString('hex');
       const deadlineAt = now + settings.wallTimeMinutes * 60_000;
-      ledger.push({ ...base, handle: null, deadlineAt, status: 'running', indeterminate: true, tokenHash: sha256(token) });
+      ledger.push({ ...base, handle: null, deadlineAt, status: 'running', indeterminate: true, launching: true, tokenHash: sha256(token) });
       reserved.push({ t, filled, token, base });
     }
     persist(ledger);
@@ -364,7 +408,14 @@ export async function runBundleRepairs({
       const ledger = readLedger(dir);
       const entry = ledger.find((x) => x.holdId === t.holdId);
       if (!entry) return;
-      if (patch.handle !== undefined) { entry.handle = patch.handle; delete entry.indeterminate; }
+      delete entry.launching;
+      if (patch.handle !== undefined) {
+        entry.handle = patch.handle;
+        delete entry.indeterminate;
+        // Another pass settled this reservation while the launch was in flight: the session it started is no longer
+        // supervised as a running repair, so stop it now (a failed stop stays pending and keeps the clone blocked).
+        if (entry.status !== 'running') { tryStop(entry); log(`bundle-repair: stopped late-launched ${entry.session} (entry already ${entry.status})`); }
+      }
       else if (patch.failedNotApplied) {
         Object.assign(entry, { status: 'dispatch-failed', endedAt: now, endReason: patch.failedNotApplied });
         delete entry.indeterminate;
