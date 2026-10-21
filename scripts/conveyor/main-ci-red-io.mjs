@@ -289,6 +289,14 @@ async function defaultGates() {
   return { killed, fixGate };
 }
 
+/**
+ * The ci-heal owner session OPENS a repair PR, so it must play the worker App role. health-watch runs as the read-only
+ * `observer` and exports WE_GITHUB_APP_ROLE=observer; a `--bg` session reads its env only from the `--settings` env
+ * the sink writes, and the shim copies the dispatcher's role there (gh-app-shim.mjs ~874), so the owner would
+ * otherwise write PRs as observer ("Resource not accessible by integration").
+ */
+export const workerRoleSettings = (resolve) => (cwd) => ({ ...(resolve(cwd) || {}), WE_GITHUB_APP_ROLE: 'worker' });
+
 /** Start the owner session through the declared dispatch-lane sink. */
 export async function defaultDispatchOwner({ prompt, sessionSlug }) {
   const io = await import('../operations/dispatch-lane-io.mjs');
@@ -298,7 +306,8 @@ export async function defaultDispatchOwner({ prompt, sessionSlug }) {
   const route = routeAvailableCiHeal({ scope: [], reason: 'main-red' });
   if (route?.outcome === 'refused') return { held: true, reason: route.refusal ?? 'route refused' };
   // A main fix has no PR: force the `claude --bg` brief path (the mechanical ci-heal wrapper needs a PR) and no probation worker.
-  const sinks = io.createDispatchSinks({ root: io.REPO_ROOT, modes: { ...dispatchModesFromEnv(), 'ci-heal': 'agent' }, extraArgs: io.agentArgsFromEnv() });
+  const sinks = io.createDispatchSinks({ root: io.REPO_ROOT, modes: { ...dispatchModesFromEnv(), 'ci-heal': 'agent' }, extraArgs: io.agentArgsFromEnv(),
+    resolveSettingsEnv: workerRoleSettings(io.resolveDispatchSettingsEnv) });
   const out = await sinks[DISPATCH_EFFECT]({
     launchKind: 'ci-heal', prompt, sessionSlug, lane: null, scope: [], pr: null, reason: 'main-red', repo: 'we',
     probationWorker: null, routing: route ? { ...route, probationWorker: null } : null,
