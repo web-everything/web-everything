@@ -178,7 +178,13 @@ export function defaultRearmStaleAcceptance({ repoSlug, prNumber, headSha,
       fresh = readPr(repoSlug, prNumber);
       if (fresh.state !== 'OPEN' || fresh.headRefOid !== headSha
           || !staleAcceptanceOwed({ ...fresh, headDiff: net.text, headContribution: net.text })) {
-        return { ok: false, reason: 'acceptance still covers the head, or review state changed' };
+        // #5771: `covers: true` only when the live proof ITSELF shows the accept still covers this head (same open PR and
+        // head, accept still owed on the cheap nomination, not owed once the live diff is supplied). The tick reads it to
+        // release its stale-accept hold; any other refusal (state moved, labels changed) stays a plain refusal.
+        const covers = fresh.state === 'OPEN' && fresh.headRefOid === headSha
+          && staleAcceptanceOwed(fresh, { requireProof: false })
+          && !staleAcceptanceOwed({ ...fresh, headDiff: net.text, headContribution: net.text });
+        return { ok: false, ...(covers ? { covers: true } : {}), reason: 'acceptance still covers the head, or review state changed' };
       }
     }
     return rearm({ repo: repoSlug, pr: prNumber, onlyIfAccepted: true, actor: 'conveyor stale-accept recovery' });

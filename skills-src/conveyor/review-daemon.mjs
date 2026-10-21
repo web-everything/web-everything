@@ -1728,7 +1728,7 @@ export function buildCliDaemonEffects({
       promoteDrafts: promoteDraftsGuarded,
       rearmStaleAccepts: ({ repo, pr, headSha }) => defaultRearmStaleAcceptance({ repoSlug: repo, prNumber: pr, headSha }),
       noteRearms: ({ repo, rearms, replanError }) => {
-        for (const r of rearms) log.error(`review-daemon: ${repo}#${r.pr} stale-accept re-arm ${r.ok ? 'done' : 'refused'} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
+        for (const r of rearms) log.error(`review-daemon: ${repo}#${r.pr} stale-accept re-arm ${r.ok ? 'done' : r.released ? 'released' : 'refused'} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
         if (replanError) log.error(`review-daemon: ${repo} post-re-arm re-plan failed (review goes out next pass): ${replanError}`);
       },
       notePromotions: ({ repo, promotions, replanError }) => {
