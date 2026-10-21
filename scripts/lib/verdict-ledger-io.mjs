@@ -114,12 +114,14 @@ const defaultLog = (line) => { try { process.stderr.write(`${line}\n`); } catch 
 
 
 export class LedgerAppendExhaustedError extends Error {
-  constructor({ repo, attempts, errors }) {
-    super(`verdict-ledger-io: append to ${repo} FAILED after ${attempts} attempts; last error: ${errors.at(-1)?.message ?? 'unknown'}`);
+  /** `indeterminate`: a push got no answer, so the rows MAY be on the remote (event ids make a retry safe). */
+  constructor({ repo, attempts, errors, indeterminate = false, detail = null }) {
+    super(`verdict-ledger-io: append to ${repo} FAILED after ${attempts} attempts${indeterminate ? ' (outcome UNKNOWN: the rows may be on the remote)' : ''}; last error: ${detail ?? errors.at(-1)?.message ?? 'unknown'}`);
     this.name = 'LedgerAppendExhaustedError';
     this.repo = repo;
     this.attempts = attempts;
     this.errors = errors;
+    this.indeterminate = indeterminate;
   }
 }
 
@@ -195,7 +197,7 @@ export function appendLedgerRows({
         run: gitRun ?? transport.run, now: transport.now, sleep, random, log, onRetry, removeEntry,
       });
     } catch (e) {
-      if (e instanceof OutboxFlushError) throw new LedgerAppendExhaustedError({ repo, attempts: e.attempts, errors: e.errors });
+      if (e instanceof OutboxFlushError) throw new LedgerAppendExhaustedError({ repo, attempts: e.attempts, errors: e.errors, indeterminate: e.kind === 'ambiguous', detail: e.message });
       throw e;
     }
   }
@@ -208,7 +210,7 @@ export function appendLedgerRows({
       run: transport.run ?? gitRun, sleep, random, log, onRetry,
     });
   } catch (e) {
-    if (e instanceof OutboxFlushError) throw new LedgerAppendExhaustedError({ repo, attempts: e.attempts, errors: e.errors });
+    if (e instanceof OutboxFlushError) throw new LedgerAppendExhaustedError({ repo, attempts: e.attempts, errors: e.errors, indeterminate: e.kind === 'ambiguous', detail: e.message });
     throw e;
   }
 }

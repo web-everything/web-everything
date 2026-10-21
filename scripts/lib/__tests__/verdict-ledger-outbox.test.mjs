@@ -142,11 +142,12 @@ describe('real git: outbox + plumbing flush', () => {
     await withBareOrigin(async (ctx) => {
       ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
       const outboxDir = join(ctx.tmp, 'outbox');
-      // The crash: the flushed entry cannot be removed right after a successful push (a process killed there leaves
-      // the same disk state). The row IS recorded, so the append reports it landed; the entry stays behind.
+      // The crash: a queued entry is pushed, then cannot be removed (a process killed there leaves the same disk
+      // state). The row IS recorded, so the flush reports it; the entry stays behind.
+      enqueueOutboxEntry(outboxDir, { path: ledgerGitPath(REPO), repo: REPO, message: 'm', ...checkLedgerAppendRows([row(7)], REPO) });
       const crash = () => { throw new Error('simulated crash after push'); };
-      const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(7)], outbox: true, outboxDir, log: quiet, removeEntry: crash });
-      expect(r).toMatchObject({ status: 'appended', queued: false, rows: 1 });
+      const first = flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, log: quiet, removeEntry: crash });
+      expect(first).toMatchObject({ ok: true, flushed: 1, pushed: true });
       expect(originRows(ctx)).toEqual([7]);
       expect(listOutboxEntries(outboxDir)).toHaveLength(1);
       const commits = originCommits(ctx);
@@ -261,6 +262,62 @@ describe('real git: outbox + plumbing flush', () => {
       expect(flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, log: quiet })).toMatchObject({ ok: true, flushed: 0 });
       expect(originRows(ctx)).toEqual([5]);
     });
+  });
+
+  it('lock won at once: the rows ride the flush in memory and are NEVER written to the outbox', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      let seenDuringPush = null;
+      const run = (args, opts) => { if (args[0] === 'push') seenDuringPush = listOutboxEntries(outboxDir).length; return realGit(args, opts); };
+      const r = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(8)], outbox: true, outboxDir, gitRun: run, log: quiet });
+      expect(r).toMatchObject({ queued: false, rows: 1 });
+      expect(seenDuringPush).toBe(0);
+    });
+  });
+
+  it('a REFUSED push (remote rejected) with the lock won throws, and nothing was ever queued', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      const run = (args, opts) => {
+        if (args[0] === 'push') { const e = new Error('Command failed'); e.stderr = ' ! [remote rejected] x -> ops/review-requests (pre-receive hook declined)\nerror: failed to push some refs\n'; e.status = 1; throw e; }
+        return realGit(args, opts);
+      };
+      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(9)], outbox: true, outboxDir, gitRun: run, log: quiet }))
+        .toThrow(LedgerAppendExhaustedError);
+      expect(listOutboxEntries(outboxDir)).toEqual([]);
+    });
+  });
+
+  it('the direct path: an earlier unanswered push keeps the failure INDETERMINATE even when later attempts fail to fetch', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      let n = 0;
+      const run = (args, opts) => {
+        if (args[0] === 'push') { const e = new Error('Command failed'); e.stderr = 'fatal: the remote end hung up unexpectedly\n'; e.status = 128; throw e; }
+        if (args[0] === 'fetch' && ++n > 2) { const e = new Error('Command failed'); e.stderr = 'fatal: unable to access remote\n'; e.status = 128; throw e; }
+        return realGit(args, opts);
+      };
+      let err;
+      try { appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(10)], outbox: false, run, attempts: 2, sleep: noSleep }); } catch (e) { err = e; }
+      expect(err).toBeInstanceOf(LedgerAppendExhaustedError);
+      expect(err.indeterminate).toBe(true);
+      expect(err.message).toMatch(/outcome UNKNOWN/);
+    });
+  });
+
+  it('a backstop flusher that fails to start later is logged, never an unhandled error', () => {
+    const dir = join(mkdtempSync(join(tmpdir(), 'ob-')), 'outbox');
+    enqueueOutboxEntry(dir, { path: ledgerGitPath(REPO), repo: REPO, message: 'm', ...checkLedgerAppendRows([row(11)], REPO) });
+    const handlers = {};
+    const spawnFn = () => ({ pid: 1, on: (ev, fn) => { handlers[ev] = fn; }, unref() {} });
+    const logs = [];
+    const r = spawnBoardLedgerOutboxFlush({ board: '/nowhere', env: { [OUTBOX_DIR_ENV]: dir }, spawnFn, log: (l) => logs.push(l) });
+    expect(r).toMatchObject({ spawned: true });
+    expect(typeof handlers.error).toBe('function');
+    handlers.error(new Error('spawn EAGAIN'));
+    expect(logs.join('\n')).toMatch(/ledger-write-miss: .*failed to start \(spawn EAGAIN\)/);
   });
 
   it('the plumbing push never follows tags', async () => {
