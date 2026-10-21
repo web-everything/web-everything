@@ -122,6 +122,10 @@ export function rearmStaleAcceptsThenReplan({ plan, rawPrs = null, repo, rearm, 
 
   const rearms = [];
   for (const [pr, headSha] of rows) {
+    if (headSha.length !== 40 || !/^[a-f0-9]{40}$/i.test(headSha)) {
+      rearms.push({ pr, ok: false, why: 'stale-accept row requires a 40-hex head SHA' });
+      continue;
+    }
     let result;
     try { result = rearm({ repo, pr, headSha }); } catch (e) { result = { ok: false, reason: oneLine(e) }; }
     // #5771: ONE coverage check. A refusal that PROVED the accept still covers the live head (`covers: true`) is not a
