@@ -349,6 +349,10 @@ describe('real git: outbox + plumbing flush', () => {
     // Round 8: on a generic host, different users' homes and `repo` vs `repo.git` stay distinct.
     expect(canonicalRemote('alice@host:repo.git')).not.toBe(canonicalRemote('bob@host:repo.git'));
     expect(canonicalRemote('ssh://host/srv/repo')).not.toBe(canonicalRemote('ssh://host/srv/repo.git'));
+    // Round 9: git's `ssh://user@host/~/path` is home-relative too, and the same repo as its scp spelling.
+    expect(canonicalRemote('ssh://alice@gitbox/~/repo.git')).not.toBe(canonicalRemote('ssh://bob@gitbox/~/repo.git'));
+    expect(canonicalRemote('ssh://alice@gitbox/~/repo.git')).toBe(canonicalRemote('alice@gitbox:repo.git'));
+    expect(canonicalRemote('https://gitbox/srv/repo')).not.toBe(canonicalRemote('ssh://gitbox/srv/repo'));
   });
 
   it('an unanswered push whose noise mentions "cannot lock ref" is still UNKNOWN: kept queued, never thrown', async () => {
@@ -441,6 +445,47 @@ describe('real git: outbox + plumbing flush', () => {
       flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, log: quiet });
       const verdicts = ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').map((l) => JSON.parse(l).verdict);
       expect(verdicts).toEqual(['accepted', 'changes']);
+    });
+  });
+
+  it('a winner row held back behind an unreadable entry is NOT dropped after a partial batch (round 9)', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const outboxDir = join(ctx.tmp, 'outbox');
+      const v = (verdict, min) => buildVerdictRecord({ repo: REPO, pr: 80, verdict, at: `2026-10-21T12:0${min}:00.000Z`, source: 'test' });
+      const q = (rec, dt) => enqueueOutboxEntry(outboxDir, { path: ledgerGitPath(REPO), repo: REPO, message: 'm', ...checkLedgerAppendRows([rec], REPO) }, { now: () => Date.now() + dt });
+      q(v('changes', 0), -3000);                       // A: flushable
+      const bName = q(v('accepted', 1), -2000);        // B: unreadable at first
+      const bFile = join(outboxDir, bName);
+      chmodSync(bFile, 0o000);
+      let pushes = 0;
+      const run = (args, opts) => {
+        if (args[0] === 'push' && ++pushes === 1) { chmodSync(bFile, 0o644); q(v('accepted', 9), +5000); } // B recovers, D queues
+        return realGit(args, opts);
+      };
+      try {
+        appendLedgerRows({ board: ctx.clone, repo: REPO, records: [v('changes', 5)], outbox: true, outboxDir, gitRun: run, log: quiet }); // C
+      } finally { try { chmodSync(bFile, 0o644); } catch { /* gone */ } }
+      flushLedgerOutbox({ board: ctx.clone, dir: outboxDir, log: quiet });
+      const ats = ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').map((l) => JSON.parse(l).at.slice(14, 16));
+      expect(ats).toEqual(['00', '01', '05', '09']); // A, B, C, D: append order, whatever became readable when
+    });
+  });
+
+  it('a throwing onRetry observer never erases an UNKNOWN push outcome (round 9)', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const run = (args, opts) => {
+        if (args[0] === 'push') throw Object.assign(new Error('Command failed'), { stderr: 'fatal: the remote end hung up unexpectedly\n', status: 128 });
+        if (args[0] === 'merge-base') throw Object.assign(new Error('not ancestor'), { status: 1 });
+        return realGit(args, opts);
+      };
+      let err;
+      try {
+        appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(14)], outbox: false, run, attempts: 2, sleep: noSleep, log: quiet, onRetry: () => { throw new Error('observer broke'); } });
+      } catch (e) { err = e; }
+      expect(err).toBeInstanceOf(LedgerAppendExhaustedError);
+      expect(err.indeterminate).toBe(true);
     });
   });
 

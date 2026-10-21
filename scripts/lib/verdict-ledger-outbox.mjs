@@ -180,16 +180,19 @@ export function canonicalRemote(url, base = process.cwd()) {
   const proto = /^([a-z][a-z0-9+.-]*):\/\/(?:([^@/]+)@)?(\[[^\]]+\]|[^/:]+)(?::(\d+))?(\/.*)$/i.exec(u);
   const scp = /^(?:([^@/]+)@)?([^:/\\]+):(.+)$/.exec(u);
   let user = null;
+  let transport = null;
   let host = null;
   let port = null;
   let path = null;
   if (proto && proto[1].toLowerCase() !== 'file') {
     const scheme = proto[1].toLowerCase();
-    user = proto[2] ?? null; host = proto[3]; path = proto[5]; // absolute
+    user = proto[2] ?? null; host = proto[3]; path = proto[5]; // absolute, except git's `ssh://host/~/path`
+    transport = /ssh/.test(scheme) ? 'ssh' : scheme === 'git' ? 'git' : 'http';
+    if (transport === 'ssh' && path.startsWith('/~/')) path = path.slice(1);
     const defaults = { ssh: '22', 'git+ssh': '22', 'ssh+git': '22', https: '443', http: '80', git: '9418' };
     port = proto[4] && proto[4] !== defaults[scheme] ? proto[4] : null;
   } else if (!proto && scp && !/^[a-zA-Z]:[\\/]/.test(u) && !u.startsWith('/') && !u.startsWith('.')) {
-    user = scp[1] ?? null; host = scp[2];
+    user = scp[1] ?? null; host = scp[2]; transport = 'ssh';
     path = scp[3].startsWith('/') ? scp[3] : `~/${scp[3]}`;
   }
   if (!host) return `file:${resolve(base, u.replace(/^file:\/\//, '')).replace(/\/+$/, '')}`;
@@ -200,8 +203,9 @@ export function canonicalRemote(url, base = process.cwd()) {
     return `${host}${port ? `:${port}` : ''}/${path.replace(/^~\//, '').replace(/^\/+/, '').replace(/\.git$/, '')}`;
   }
   // Generic host (round 8): the user decides whose HOME `~/` is, and `repo` and `repo.git` may both exist.
-  const who = path.startsWith('~/') && user ? `${user}@` : '';
-  return `${who}${host}${port ? `:${port}` : ''}${path.startsWith('/') ? '' : '/'}${path}`;
+  // Round 9: the transport class too (an https and an ssh daemon on one host may serve different trees).
+  const who = path.startsWith('~') && user ? `${user}@` : '';
+  return `${transport}://${who}${host}${port ? `:${port}` : ''}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
 /**
@@ -583,7 +587,7 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
           throw new OutboxFlushError(`verdict-ledger-outbox: flush of ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} failed (${why}): ${String(e?.message ?? e).split('\n')[0]}`,
             { errors, attempts, results, kind: race ? 'budget' : 'flush' });
         }
-        if (onRetry) onRetry({ attempt: attempts, error: e });
+        if (onRetry) { try { onRetry({ attempt: attempts, error: e }); } catch (cbErr) { log(`verdict-ledger-outbox: onRetry callback failed (ignored): ${cbErr?.message ?? cbErr}`); } }
         log(`verdict-ledger-outbox: push lost a race, refetching (${String(e?.message ?? e).split('\n')[0].slice(0, 300)})`);
         const pause = Math.min(250 * 2 ** (retry - 1), 4000) + Math.floor(random() * 500);
         sleep(Math.max(0, Math.min(pause, hardDeadline - Date.now())));
@@ -600,7 +604,8 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
       if (memory.some((m) => m.name === name)) continue; // in memory only: nothing to remove
       try { removeEntry(join(dir, name)); } catch (e) { removeFailed = removeFailed ?? e; }
     }
-    memory = [];
+    // Round 9: only what was just PUBLISHED leaves memory; a row held back behind an unreadable entry stays in order.
+    memory = memory.filter((m) => !entries.some((e) => e.name === m.name));
     if (removeFailed) {
       log(`verdict-ledger-outbox: flushed entries could not be removed from ${dir} (${removeFailed.message}); the next flush replays them as a no-op`);
       stopped = 'remove-failed';
@@ -921,7 +926,8 @@ export function appendDirect(o) {
         throw new OutboxFlushError(`verdict-ledger: direct append failed after ${attempt} attempts${unknown ? ' (push outcome UNKNOWN: the remote may hold it)' : ''}: ${String(e?.message ?? e).split('\n')[0]}`,
           { errors, attempts: attempt, kind: unknown ? 'ambiguous' : 'flush' });
       }
-      if (c.onRetry) c.onRetry({ attempt, error: e });
+      // Round 9: an observer's failure must never replace the publication state (an UNKNOWN push stays UNKNOWN).
+      if (c.onRetry) { try { c.onRetry({ attempt, error: e }); } catch (cbErr) { c.log(`verdict-ledger: onRetry callback failed (ignored): ${cbErr?.message ?? cbErr}`); } }
       clampedSleep(Math.min(250 * 2 ** (attempt - 1), 4000) + Math.floor(c.random() * 500));
       if (Date.now() >= directDeadline) {
         throw new OutboxFlushError(`verdict-ledger: direct append budget ${c.budgetMs}ms spent after ${attempt} attempts${unresolved ? ' (push outcome UNKNOWN: the remote may hold it)' : ''}`,
