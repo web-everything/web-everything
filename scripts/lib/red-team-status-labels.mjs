@@ -7,7 +7,7 @@ import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-s
 export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 
 export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {} } = {}) {
-  const disposition = readRedTeamDisposition({ comments, pr, head, env });
+  const disposition = readRedTeamDisposition({ comments, pr, head, env, repo });
   const desired = disposition.sendBack.length || disposition.held.length ? 'red-team:blocked'
     : disposition.result ? 'red-team:clear'
       : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
