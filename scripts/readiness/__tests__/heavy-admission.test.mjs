@@ -2096,12 +2096,53 @@ describe('heavy-run-wait — a wait budget re-tries the load gate and the slot q
     expect(heldSlots({ lockRoot, cap: 1 })).toHaveLength(0);
   });
 
-  it('a mandatory (non-deferring) caller ignores the budget — its existing wait is unchanged', async () => {
-    let clock = T0; let checks = 0;
+  it('a mandatory (non-deferring) caller ignores the budget — its existing host wait is unchanged', async () => {
+    let clock = T0; let checks = 0; const sleeps = [];
     const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: false, policy: pol(), waitMs: 1000, pollMs: 1000,
       now: () => clock, log: () => {}, hostAdmission: () => (++checks <= 3 ? overloaded : { admitted: true }),
-      sleep: async (ms) => { clock += ms; } });
+      sleep: async (ms) => { sleeps.push(ms); clock += ms; } });
     expect(r).toMatchObject({ ok: true, slot: 0 });
+    expect(sleeps).toEqual([1000, 1000, 1000]); // waited out the load at pollMs, no jitter, no early bypass
+    expect(r.waitedMs).toBe(3000);
+  });
+
+  // Codex audit (2026-10-21) — the three ways a budget could have weakened admission. Each is a regression test.
+  it('AUDIT: onTimeout=run with a ceiling BELOW the budget never runs unslotted — the budget is capped at the ceiling and defers', async () => {
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
+    let clock = T0; const calls = []; const logs = [];
+    const r = await runUnderAdmission({ lockRoot, cap: 1, owner: 'B', command: 'echo hi', ceilingMs: 1000, waitMs: 2000,
+      policy: pol({ onTimeout: 'run', fastSlots: 0 }), exec: (cmd) => calls.push(cmd), log: (m) => logs.push(m),
+      now: () => clock, sleep: async (ms) => { clock += ms; } });
+    expect(r.exitCode).toBe(ADMISSION_DEFERRED_EXIT);
+    expect(r.admission).toMatchObject({ ok: false, deferred: true, waitBudgetHit: true, waitedMs: 1000 });
+    expect(calls).toEqual([]);
+    expect(logs.join('')).not.toMatch(/proceeding unslotted/);
+    // Same, with host load blocking until after the ceiling (the audit's exact repro).
+    clock = T0; let checks = 0;
+    const r2 = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'C', canDefer: true, policy: pol({ onTimeout: 'run', fastSlots: 0 }),
+      ceilingMs: 1000, waitMs: 2000, now: () => clock, log: () => {}, random: () => 0,
+      hostAdmission: () => (clock - T0 < 2000 && ++checks ? overloaded : { admitted: true }), sleep: async (ms) => { clock += ms; } });
+    expect(r2).toMatchObject({ ok: false, deferred: true });
+    expect(r2.waitedMs).toBe(1000); // the ceiling caps the host wait too
+  });
+
+  it('AUDIT: a slot that frees only AFTER the budget (timer oversleep) is not taken — expiry is checked before the attempt', async () => {
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
+    let clock = T0;
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol({ fastSlots: 0 }), waitMs: 1000, pollMs: 1000,
+      now: () => clock, log: () => {}, hostAdmission: () => ({ admitted: true }),
+      sleep: async () => { clock += 1100; releaseOwnedSlot({ lockRoot, cap: 1, owner: 'HOLDER' }); } });
+    expect(r).toMatchObject({ ok: false, deferred: true, waitBudgetHit: true, waitedMs: 1100 });
+    expect(heldSlots({ lockRoot, cap: 1 })).toHaveLength(0);
+  });
+
+  it('AUDIT: the waiting marker keeps its ORIGINAL requestedAt through the host wait (the FCFS position, not just presence)', async () => {
+    let clock = T0; const stamps = []; let checks = 0;
+    await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol(), waitMs: 60_000, now: () => clock, log: () => {},
+      hostAdmission: () => (++checks <= 5 ? overloaded : { admitted: true }),
+      sleep: async (ms) => { stamps.push(listWaiting(lockRoot).find((w) => w.owner === 'B')?.requestedAt); clock += ms; } });
+    expect(stamps).toHaveLength(5);
+    expect(new Set(stamps)).toEqual(new Set([iso(T0)]));
   });
 
   it('heavyAdmission.runWaitMs resolves through the cascade as a per-caller leaf (tool and env honoured on the shared pool)', () => {
@@ -2144,6 +2185,11 @@ describe('heavy-run-wait — a wait budget re-tries the load gate and the slot q
       { cwd: lockRoot, env: cliEnv(pool), encoding: 'utf8', timeout: 30_000 });
     expect(bad.status).toBe(3);
     expect(bad.stderr).toMatch(/--wait-ms=soon must be a whole number/);
+    for (const flag of ['--wait-ms', '--wait-ms=', '--wait-ms=1.5', '--wait-ms=-1']) {
+      const b = spawnSync(process.execPath, [CLI, 'run', flag, '--', process.execPath, '-e', '0'],
+        { cwd: lockRoot, env: cliEnv(pool), encoding: 'utf8', timeout: 30_000 });
+      expect(b.status).toBe(3);
+    }
   }, 30_000);
 
   it('the `run` CLI: a slot freed by a holder that exits mid-wait is taken and the command runs', () => {
@@ -2157,9 +2203,15 @@ describe('heavy-run-wait — a wait budget re-tries the load gate and the slot q
     { encoding: 'utf8' }));
     tryAcquireSlot({ lockRoot: root, cap: 2, owner: 'H0', nowMs: Date.now(), nowIso: new Date().toISOString(), pid, slots: [0] });
     tryAcquireSlot({ lockRoot: root, cap: 2, owner: 'H1', nowMs: Date.now(), nowIso: new Date().toISOString(), pid, slots: [1] });
-    const r = spawnSync(process.execPath, [CLI, 'run', '--wait-ms=20000', '--', process.execPath, '-e', 'process.stdout.write("ran")'],
+    // The wrapped command reads the pool's status itself: it runs while holding exactly one slot.
+    const r = spawnSync(process.execPath, [CLI, 'run', '--wait-ms=20000', '--', process.execPath, CLI, 'status'],
       { cwd: lockRoot, env: cliEnv(pool, { WE_HEAVY_ADMISSION_FAST_SLOTS: '0' }), encoding: 'utf8', timeout: 30_000 });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe('ran');
+    const status = JSON.parse(r.stdout.trim());
+    // (the dead holder's OTHER slot is not reclaimed until someone needs it, so it may still be listed)
+    const mine = status.held.filter((h) => h.owner !== 'H0' && h.owner !== 'H1');
+    expect(mine).toHaveLength(1);
+    expect(mine[0].owner).toMatch(/#\d+$/); // the run wrapper's own per-process owner
+    expect(r.stderr).toMatch(/acquired slot-\d after waiting/);
   }, 30_000);
 });

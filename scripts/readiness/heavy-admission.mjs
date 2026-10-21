@@ -1125,8 +1125,9 @@ let admissionPolicyLogged = false;
  * heavy-run-wait — `waitMs` (> 0, only with `canDefer`) is a re-queueable caller's own wait budget: instead of
  * deferring at once on host load, it keeps re-checking load (jittered sleeps) and the slot queue until admitted or
  * the budget elapses, then defers exactly as before. Its waiting marker stays in place the whole time, so it keeps
- * its first-come-first-served position. The budget only ever ends in a deferral: it never runs unslotted, never
- * bypasses the load gate, and never lengthens the ceiling. One progress line per {@link RUN_WAIT_PROGRESS_MS}.
+ * its first-come-first-served position. The budget is capped at `ceilingMs`, its expiry is checked BEFORE each slot
+ * attempt and before the ceiling, and it only ever ends in a deferral: it never runs unslotted (whatever onTimeout
+ * says), never bypasses the load gate, and never lengthens the ceiling. One progress line per {@link RUN_WAIT_PROGRESS_MS}.
  * @param {object} opts
  * @param {string} opts.lockRoot
  * @param {number} opts.cap
@@ -1155,7 +1156,9 @@ export async function acquireSlotBlocking({
 }) {
   if (isAdmissionOff(env)) return { ok: false, slot: null, timedOut: false, disabled: true, waitedMs: 0 };
   // heavy-run-wait — a wait budget applies only to a caller that would otherwise defer; anything else is unchanged.
-  const budgetMs = canDefer && Number.isFinite(waitMs) && waitMs > 0 ? Math.floor(waitMs) : 0;
+  // The ceiling still caps it: a budget never waits past `ceilingMs`, and since the budget expiry is checked before the
+  // ceiling, a budgeted caller only ever DEFERS there — never takes the onTimeout=run unslotted fallback (Codex audit).
+  const budgetMs = canDefer && Number.isFinite(waitMs) && waitMs > 0 ? Math.max(0, Math.floor(Math.min(waitMs, ceilingMs))) : 0;
   const budgetSrc = `wait budget ${budgetMs}ms (${waitSource})`;
   if (budgetMs > 0) stillWaitingLogMs = Math.min(stillWaitingLogMs, RUN_WAIT_PROGRESS_MS);
 
@@ -1245,6 +1248,12 @@ export async function acquireSlotBlocking({
         hostLoadBypassed = true;
         log(`heavy-command admission: proceeding despite host load: ${host.reason}; mandatory caller reached host.maxWaitMs=${hostMaxWaitMs} (${hostWaitSource}); still requires a free slot\n`);
       }
+      // heavy-run-wait — budget expiry is checked BEFORE the slot attempt (no late admission) and BEFORE the ceiling
+      // (so a budgeted caller never reaches the onTimeout=run fallback): the budget ends in a DEFERRAL only.
+      if (budgetMs > 0 && attempt - startedAt >= budgetMs) {
+        log(`⚠ heavy-command admission-deferred: no slot after waiting ${Math.round((attempt - startedAt) / 1000)}s (cap=${cap}, ${budgetSrc}) — NOT running unslotted; the caller re-queues (exit ${ADMISSION_DEFERRED_EXIT})\n`);
+        return { ok: false, slot: null, timedOut: true, deferred: true, waitBudgetHit: true, waitedMs: attempt - startedAt };
+      }
       reapStaleWaiters({ lockRoot, nowMs: attempt, apply: true, ...seams });
       let snapshot = null;
       if (policy.settings.fastScale?.maxSlots > policy.settings.fastSlots) {
@@ -1287,11 +1296,6 @@ export async function acquireSlotBlocking({
           return { ...result, deferred: true };
         }
         log(`heavy-command admission: still queued past the ${m}m ceiling (cap=${cap}) — this caller cannot defer, so it keeps waiting; never runs unslotted [${src}]\n`);
-      }
-      // heavy-run-wait — the budget ends in a DEFERRAL only (never unslotted, whatever onTimeout says).
-      if (budgetMs > 0 && attempt - startedAt >= budgetMs) {
-        log(`⚠ heavy-command admission-deferred: no slot after waiting ${Math.round((attempt - startedAt) / 1000)}s (cap=${cap}, ${budgetSrc}) — NOT running unslotted; the caller re-queues (exit ${ADMISSION_DEFERRED_EXIT})\n`);
-        return { ok: false, slot: null, timedOut: true, deferred: true, waitBudgetHit: true, waitedMs: attempt - startedAt };
       }
       if (attempt - lastLoggedAt >= stillWaitingLogMs) {
         log(budgetMs > 0
@@ -1841,7 +1845,8 @@ async function main(argv) {
     let waitMs = policy.settings.runWaitMs ?? 0;
     let waitSource = `heavyAdmission.runWaitMs (${policy.sources.runWaitMs ?? 'standard'})`;
     if (flags['wait-ms'] != null) {
-      const v = Number(flags['wait-ms']);
+      const raw = flags['wait-ms'];
+      const v = typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : NaN; // bare / empty / non-digit → usage error
       if (!isValidRunWaitMs(v)) {
         process.stderr.write(`✗ heavy-admission run: --wait-ms=${flags['wait-ms']} must be a whole number of ms between 0 and ${MAX_RUN_WAIT_MS}\n`);
         process.exit(3);
