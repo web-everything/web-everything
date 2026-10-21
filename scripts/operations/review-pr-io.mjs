@@ -390,16 +390,19 @@ export function readPr({
 
 /**
  * Card review class (prototype) — `{cardFrontmatter: {path: {old, new}}}` for a card-only net diff, else `{}`.
- * Each side is the card's frontmatter lines at that commit (`null` when the file is absent there). A path whose
- * read fails is LEFT OUT, so `cardReviewClass` falls back to the diff and then to `full` (fail-closed).
+ * Each side is the card's raw frontmatter TEXT at that commit (`null` when the file is absent there, `''` when it
+ * has no frontmatter). A path whose read fails is LEFT OUT, so `cardReviewClass` falls back to the diff and then
+ * to `full` (fail-closed). Raised-by pointer notes carry no frontmatter and are skipped.
  */
 export function cardFrontmatterField({ exec, paths, base, rev } = {}) {
   const pinned = (s) => typeof s === 'string' && /^[0-9a-f]{40,64}$/i.test(s);
   if (!Array.isArray(paths) || !isCardOnlyDiff(paths) || !pinned(base) || !pinned(rev)) return {};
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] };
   const side = (commit, path) => {
-    const listed = String(exec('git', ['ls-tree', '--name-only', commit, '--', path], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim();
+    const listed = String(exec('git', ['ls-tree', '--name-only', commit, '--', path], opts) || '').replace(/\r?\n$/, '');
     if (!listed) return null;
-    return frontmatterLines(String(exec('git', ['cat-file', 'blob', `${commit}:${path}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || ''));
+    if (listed !== path) throw new Error('ls-tree named a different path');
+    return frontmatterText(String(exec('git', ['cat-file', 'blob', `${commit}:${path}`], opts) || ''));
   };
   const out = {};
   for (const path of paths) {
@@ -409,12 +412,12 @@ export function cardFrontmatterField({ exec, paths, base, rev } = {}) {
   return { cardFrontmatter: out };
 }
 
-/** Lines between a leading `---` and the next `---`, or `[]` when the text opens with no frontmatter. PURE. */
-export function frontmatterLines(text) {
-  const lines = String(text).split('\n');
-  if (lines[0]?.trim() !== '---') return [];
-  const end = lines.findIndex((l, i) => i > 0 && l.trim() === '---');
-  return end < 0 ? [] : lines.slice(1, end);
+/** The text between a first line of exactly `---` and the next line of exactly `---`, else `''`. PURE. */
+export function frontmatterText(text) {
+  const lines = String(text).replace(/\r/g, '').split('\n');
+  if (lines[0] !== '---') return '';
+  const end = lines.findIndex((l, i) => i > 0 && l === '---');
+  return end < 0 ? '' : lines.slice(1, end).join('\n');
 }
 
 /** The repo's verdict-ledger rows (the default reader for the round count and the shadow). Throws when unreadable. */

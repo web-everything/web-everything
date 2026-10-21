@@ -123,6 +123,7 @@ import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, 
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 
@@ -552,6 +553,16 @@ export function speculativeRedTeamWallMs(env = process.env) {
  *   - accepted + no model call (disabled, skipped, a prior row to resume, no read sunk) → `sequential`.
  * Never throws past its own `try` (the caller also contains it). Removes the pass's files when done.
  */
+/**
+ * Card review class (prototype) — the panel seat's own card-only skip is a complete result, not missing
+ * infrastructure, but ONLY when the head provably did not owe the seat (`redTeamPanelSeatOwed` false: a
+ * card-class read under panel-seat timing). Any other skip on a panel-seat head still blocks on infra.
+ */
+export function cardClassSkip(redTeam, loopPayload, env = process.env) {
+  return redTeam?.status === 'skipped' && redTeam.reason === 'red team skipped: card-only'
+    && !redTeamPanelSeatOwed(loopPayload, env);
+}
+
 export function settleSpeculativeRedTeam({ spec, accepted, out, input, panelSeat = false }, io) {
   const at = (ms) => (Number.isFinite(ms) && Number.isFinite(spec.startedAt) ? ms - spec.startedAt : null);
   const timings = (pass) => ({
@@ -925,7 +936,8 @@ function runReviewArc({
       }
       if (panelAccepted && (plan.sendBack.length || seatsBox.panelResult.redTeamGate?.sendBack)) {
         classified = { ...classified, verdict: 'changes', outcome: 'bounced' };
-      } else if (panelAccepted && (redTeam.status !== 'ran' || !['ok', 'not-needed'].includes(redTeam.recheckStatus))) {
+      } else if (panelAccepted && !cardClassSkip(redTeam, seatsBox.input.loopPayload)
+        && (redTeam.status !== 'ran' || !['ok', 'not-needed'].includes(redTeam.recheckStatus))) {
         classified = { ...classified, verdict: null, outcome: BLOCKED_ON_INFRA, label: 'panel red-team seat has no complete result' };
       }
       if (panelAccepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: seatsBox.panelResult.redTeam });
