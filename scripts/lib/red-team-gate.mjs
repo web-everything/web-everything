@@ -524,8 +524,7 @@ function operatorRuled(records, pr, head) {
 const INDEX_LIST = '\\((#\\d+(?:, #\\d+)*)\\)';
 const GATE_ACTION_LINES = [
   ['card', new RegExp(`^- \\d+ finding\\(s\\) filed as a follow-up card ${INDEX_LIST}(?: — landing job [^\\n]*)?\\.$`)],
-  // An operator `card` ruling to an EXISTING card (`record-red-team-ruling --card=<ref>`); it releases only from a human operator.
-  // OPERATOR-ONLY: it counts (as `card`) only inside an `operator-*` record a human operator authored, whatever wraps it.
+  // OPERATOR-ONLY (`record-red-team-ruling --card=<ref>`): it counts (as `card`) only inside an `operator-*` record a human operator authored, whatever wraps it.
   ['operator-card', new RegExp(`^- \\d+ finding\\(s\\) carded by the operator to \`[^\`\\n]+\` ${INDEX_LIST}\\.$`)],
   ['advisory', new RegExp(`^- \\d+ finding\\(s\\) left advisory ${INDEX_LIST}\\.$`)],
   ['send-back', new RegExp(`^- \\d+ confirmed break\\(s\\) sent back to the fixer ${INDEX_LIST}(?: — the PR was already under review:changes)?\\.$`)],
