@@ -1206,4 +1206,21 @@ describe('paused review ruling recovery', () => {
     expect(post.mock.calls.every(([body]) => !body.startsWith(REARM_COMMENT_MARKER))).toBe(true);
     expect(decideSameHeadHold(p, [evidence()], { repo })).not.toBeNull();
   });
+  it('a live referral that owes a person is never cool-down released, and a cool-down hold never comments', () => {
+    const p = subject(false, { labels: [{ name: 'review:pending' }] });
+    const runs = [0, 1, 2].map(i => ({ ...evidence(), parked: false, id: `lost-${i}`,
+      completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
+    const retry = { cooldownReleases: 6, source: 'tool' }, now = at + 3 * 3600_000;
+    const held = decideSameHeadHold(p, runs, { repo, env: {}, now, retry });
+    expect(held).toMatchObject({ kind: 'same-head', retryAt: null, noVerdict: { exhausted: false } });
+    const post = vi.fn(), args = { repo, prNumber: p.number, pr: p, comments: p.comments, post, log: vi.fn(), now, publishNeedsYou: vi.fn() };
+    notifyReferralHold({ ...args, hold: held, dir: temp() });
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0][0]).toContain('Waiting on your ruling');
+    // Main's cool-down suppression: a temporary (retryAt) same-head hold posts nothing even when a person is owed.
+    notifyReferralHold({ ...args, hold: { ...held, episode: 'cooling', retryAt: now + 1 }, dir: temp() });
+    expect(post).toHaveBeenCalledTimes(1);
+    // Without the live referral, main's cool-down release still applies to the same runs.
+    expect(decideSameHeadHold(pr({ labels: [{ name: 'review:pending' }] }), runs, { repo, env: {}, now, retry })).toBeNull();
+  });
 });

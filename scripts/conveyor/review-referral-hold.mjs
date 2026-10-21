@@ -351,7 +351,16 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
   return !(head && parseReviewedSha(pr?.comments) === head);
 }
 
-export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env) } = {}) {
+/** True when the live referral gate on the PR's current head owes a person (the overlay's paused-referral case).
+ * A read failure counts as owing one: the stricter answer keeps the hold. */
+export function pausedReferralNeedsPerson(pr, { repo, cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
+  if (!sha(pr?.headRefOid)) return false;
+  try { return classifyPausedReview(pr, liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable })).action === 'raise'; }
+  catch { return true; }
+}
+
+export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env),
+  needsPerson = p => pausedReferralNeedsPerson(p, { repo }) } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
@@ -375,7 +384,8 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // Cool-down releases already spent on this head/wake, including unfinished retries.
   const spent = count - (max + VERDICT_RETRY_EXTRA);
   const releases = validCooldownReleases(retry?.cooldownReleases) ? Math.min(retry.cooldownReleases, VERDICT_COOLDOWN_MAX_RELEASES) : 0;
-  if (noVerdict && spent < releases) {
+  // A live referral that owes a person keeps the permanent paused-referral hold: no cool-down release re-runs it.
+  if (noVerdict && spent < releases && !needsPerson(pr)) {
     const cooldown = Math.min(VERDICT_COOLDOWN_BASE_MS * 2 ** spent, VERDICT_COOLDOWN_CAP_MS);
     // A pre-wake panel may finish after the newer crashes; its write-back still sets the cooldown floor.
     const latestCompletedAt = history.reduce((latest, r) => Math.max(latest,
@@ -387,7 +397,7 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   }
   const head = pr.headRefOid;
   // Past the last release: the permanent hold main has always had, now also raised to the operator (needs-you).
-  const noVerdictExhausted = noVerdict && retryAt === null;
+  const noVerdictExhausted = noVerdict && spent >= releases;
   const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '')
     + (retryAt !== null ? `; the next automatic re-run is due at ${new Date(retryAt).toISOString()}` : '');
@@ -623,7 +633,8 @@ export function notifyReferralHold({ repo, prNumber, hold, comments = [], pr,
     paused = classifyPausedReview(pr, liveReferralState(pr, { repo, pr: Number(prNumber),
       cardReadable: ref => referralCardReadable(ref, REPO_ROOT) }));
   }
-  if (hold.kind === 'same-head' && (!paused || paused.action === 'none')) return;
+  // A cool-down hold (retryAt set) is temporary and never comments; a permanent one comments only when a person is owed.
+  if (hold.kind === 'same-head' && (hold.retryAt != null || !paused || paused.action === 'none')) return;
   const marker = `<!-- review-referral-hold: ${hold.episode} -->`;
   const path = join(dir, `${hash([repo, prNumber, hold.episode])}.json`);
   mkdirSync(dir, { recursive: true });
