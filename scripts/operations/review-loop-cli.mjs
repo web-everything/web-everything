@@ -89,7 +89,7 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_LENS, SECURITY_SEAT_STEP, seatSecurityForTouchSet, securitySeatFromRun } from './review-pr.mjs';
-import { parallelSeatsEnabled, seatsByTouchSetEnabled, resolveCardOnlyReviewSettings } from '../lib/review-seat-settings.mjs';
+import { parallelSeatsEnabled, seatsByTouchSetEnabled, resolveCardClassSettings, resolveCardOnlyReviewSettings } from '../lib/review-seat-settings.mjs';
 import { planReviewDispatch } from './review-dispatch.mjs';
 import { READ_SINK_ENV, withReadSink } from '../lib/review-speculative-red-team.mjs';
 // #4493 — this file's own mechanized prevention filing had the SAME orphaned-card bug `we:scripts/review-set-
@@ -437,7 +437,7 @@ export const TOUCH_SET_FILE_CAP = 100;
  * @param {{enabled?: boolean, store?: {read: Function}, readChangedFiles?: (o: {pr: number, repo: string}) => string[]}} [o]
  * @returns {{securitySeat: boolean, reason: string}}
  */
-export function chooseSecuritySeat(argv, { enabled = true, store = null, readChangedFiles = defaultReadChangedFiles, cardOnly = resolveCardOnlyReviewSettings().value } = {}) {
+export function chooseSecuritySeat(argv, { enabled = true, store = null, readChangedFiles = defaultReadChangedFiles, cardOnly = resolveCardOnlyReviewSettings().value, cardClass = resolveCardClassSettings().value } = {}) {
   const resumeId = argvFlag(argv, 'resume');
   if (resumeId) {
     try { const saved = store?.read(resumeId); return { securitySeat: securitySeatFromRun(saved), cardOnlyLight: saved?.findings?.read?.cardOnlyLight === true, reason: `--resume ${resumeId}: roster read off the saved run` }; } catch {
@@ -459,7 +459,9 @@ export function chooseSecuritySeat(argv, { enabled = true, store = null, readCha
     return { securitySeat: true, reason: `touch-set ${Array.isArray(files) ? `has ${files.length} file(s), may be truncated` : 'unreadable'} — full roster` };
   }
   if (cardOnly.lightLane && isCardOnlyDiff(files) && (argvFlag(argv, 'lens') || DEFAULT_LENS) === 'correctness') {
-    return { securitySeat: cardOnly.claudeSeat, cardOnlyLight: true, reason: 'card-only light lane: Codex correctness' };
+    // Card review class — `review.cardClass.lenses` may add the security seat (it can never remove correctness).
+    const security = cardOnly.claudeSeat || (cardClass?.enabled === true && Array.isArray(cardClass.lenses) && cardClass.lenses.includes('security'));
+    return { securitySeat: security, cardOnlyLight: true, reason: `card-only light lane: Codex correctness${security ? ' + security' : ''}` };
   }
   if (!enabled) return { securitySeat: true, reason: 'review.seatsByTouchSet is off — full roster' };
   const plan = seatSecurityForTouchSet({ changedFiles: files, lens: argvFlag(argv, 'lens') || DEFAULT_LENS });

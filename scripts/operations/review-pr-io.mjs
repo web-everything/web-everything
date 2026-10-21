@@ -1,4 +1,5 @@
 import { readLivePrContext } from '../lib/review-pr-snapshot.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -383,6 +384,9 @@ export function readPr({
     // recording it would pin the basis to a tree that was never read.
     comments: view.comments,
     net: { ...netPaths, revSha },
+    // Card review class (prototype) — both sides' frontmatter of each touched card, read from git at the pinned
+    // base and head. Carried only for a card-only net diff, so every other read is byte-identical to before.
+    ...cardFrontmatterField({ exec: gitExec, paths: netPaths.paths, base: netPaths.base, rev: revSha }),
     latestFix, deltaReview,
     // #5492 rebuild slice 4 — rendered to the jurors; its `keys` (exactly what is rendered) become the verdict's `seenKeys`.
     ledgerQuestions: readQuestionsSafely(readQuestions, { repo, pr, head: revSha }),
@@ -407,6 +411,39 @@ export function defaultOpenQuestions({ repo, pr, head }, { settings = readLedger
   if (!renderOpenQuestions) return null;
   const q = read({ repo, pr, head });
   return writeSeen || q.status !== 'ok' ? q : { ...q, keys: null };
+}
+
+/**
+ * Card review class (prototype) — `{cardFrontmatter: {path: {old, new}}}` for a card-only net diff, else `{}`.
+ * Each side is the card's raw frontmatter TEXT at that commit (`null` when the file is absent there, `''` when it
+ * has no frontmatter). A path whose read fails is LEFT OUT, so `cardReviewClass` falls back to the diff and then
+ * to `full` (fail-closed). Raised-by pointer notes carry no frontmatter and are skipped.
+ */
+export function cardFrontmatterField({ exec, paths, base, rev } = {}) {
+  const pinned = (s) => typeof s === 'string' && /^[0-9a-f]{40,64}$/i.test(s);
+  if (!Array.isArray(paths) || !isCardOnlyDiff(paths) || !pinned(base) || !pinned(rev)) return {};
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] };
+  const side = (commit, path) => {
+    const listed = String(exec('git', ['ls-tree', '--name-only', commit, '--', path], opts) || '').replace(/\r?\n$/, '');
+    if (!listed) return null;
+    if (listed !== path) throw new Error('ls-tree named a different path');
+    return frontmatterText(String(exec('git', ['cat-file', 'blob', `${commit}:${path}`], opts) || ''));
+  };
+  const out = {};
+  for (const path of paths) {
+    if (/^backlog\/raised-by\//.test(path)) continue;
+    try { out[path] = { old: side(base, path), new: side(rev, path) }; } catch { /* left out: fail closed */ }
+  }
+  return { cardFrontmatter: out };
+}
+
+/** The text between a first line of exactly `---` and the next line of exactly `---`, else `''`. CRs are KEPT (the
+ *  classifier refuses them). PURE. */
+export function frontmatterText(text) {
+  const lines = String(text).split('\n');
+  if (lines[0] !== '---') return '';
+  const end = lines.findIndex((l, i) => i > 0 && l === '---');
+  return end < 0 ? '' : lines.slice(1, end).join('\n');
 }
 
 /** The repo's verdict-ledger rows (the default reader for the round count and the shadow). Throws when unreadable. */
