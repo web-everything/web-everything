@@ -1,3 +1,6 @@
+import { beforeEach as beforeBuildPolicy, afterEach as afterBuildPolicy, vi as buildPolicyVi } from 'vitest';
+beforeBuildPolicy(() => buildPolicyVi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
+afterBuildPolicy(() => buildPolicyVi.unstubAllEnvs());
 /**
  * @file deliver-item-wrapper.test.mjs — argv-contract coverage for the #3627 minimal-delivery wrapper
  * PROTOTYPE (`we:scripts/operations/deliver-item-wrapper.mjs`). The file is still NOT wired into
@@ -116,7 +119,9 @@ import {
   mergeSettleResult, buildReportFromEnvelope, envelopeReportOrNull,
   // #4348-open-pr-retry
   classifyOpenPrFailure,
+  gateFailureResumePrompt,
 } from '../deliver-item-wrapper.mjs';
+import { laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 import { runDeliverItemCli } from '../deliver-item-run.mjs';
 import { REPO_ROOT } from '../minimal-context-provider.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
@@ -2015,6 +2020,20 @@ describe('runAgentToCompletion (#3627 bug 5 — real UUID session id, never sess
     expect(resolveReportsDir).toHaveBeenCalledWith('/fake/pool/lane-7');
     expect(readReport).toHaveBeenCalledWith('conveyor-1234', '/fake/pool/lane-7/.operations/delivery-reports');
   });
+
+  // The real default brief and the gate-failure resume prompt each carry the reviewer checklist exactly once.
+  it('composes the default v2 brief and the gate-failure resume prompt with the checklist once', async () => {
+    const count = text => text.split('# Reviewer expectations').length - 1;
+    const provider = { spawn: vi.fn() };
+    await runAgentToCompletion(
+      { item: '1234', sessionSlug: 'conveyor-1234', lane: 7, attemptTag: '', provider, claudeSessionId: 'x' },
+      { readReport: () => ({ status: 'done', outcome: 'done', filesTouched: [] }), loadItems: fakeLoadItems, resolveLane: fakeResolveLane },
+    );
+    expect(count(provider.spawn.mock.calls[0][0].prompt)).toBe(1);
+    for (const gateOutcome of ['fail', 'unrun']) {
+      expect(count(gateFailureResumePrompt({ failureOutput: 'x failed', gateOutcome }))).toBe(1);
+    }
+  });
 });
 
 // build-orphan-adopt (#4131/#4382 fix) — `resume: true` skips the agent turn entirely when the PRIOR attempt's
@@ -2360,6 +2379,89 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
     expect(result).toEqual({ mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' });
   });
 
+  it('parks review:human on a statute path in the lane\'s net diff even when the agent\'s report omits it', () => {
+    const runFn = (_bin, args) => (args.includes('merge-base') ? 'base\n' : '3\t1\tdocs/agent/platform-decisions.md\0');
+    const result = decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { notes: [] } },
+      filesTouched: ['a.mjs'], lanePath: '/lane',
+    }, { run: runFn });
+    expect(result).toEqual({ mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' });
+  });
+
+  it('reads the net diff hardened, commit against commit, with renames split so a moved statute file still counts', () => {
+    const calls = [];
+    const runFn = (_bin, args, opts) => {
+      calls.push({ args, opts });
+      return args.includes('merge-base') ? 'base\n' : '0\t5\tdocs/agent/platform-decisions.md\x005\t0\tdocs/agent/moved.md\0';
+    };
+    const result = decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { notes: [] } },
+      filesTouched: ['docs/agent/moved.md'], lanePath: '/lane',
+    }, { run: runFn });
+    expect(result.label).toBe('review:human');
+    const diff = calls.find(c => c.args.includes('--numstat'));
+    expect(diff.args).toEqual(expect.arrayContaining(['-z', '--no-renames', '--no-ext-diff', '--no-textconv', 'core.fsmonitor=false', 'base', 'HEAD']));
+    for (const c of calls) {
+      expect(c.opts.env).toEqual(laneGitHardeningEnv());
+      expect(c.args).toContain('--no-replace-objects');
+    }
+  });
+
+  // Without `-z`, git C-quotes a path with non-ASCII, `"` or control bytes (`"docs/agent/statute-\303\251.md"`),
+  // which no statute pattern matches. The mock answers exactly as git does for each argv.
+  it.each([
+    ['non-ASCII', 'docs/agent/statute-é.md', '"docs/agent/statute-\\303\\251.md"'],
+    ['a double quote', 'docs/agent/statute"draft.md', '"docs/agent/statute\\"draft.md"'],
+    ['a tab', 'docs/agent/statute\tnotes.md', '"docs/agent/statute\\tnotes.md"'],
+    ['a newline', 'docs/agent/statute\nnotes.md', '"docs/agent/statute\\nnotes.md"'],
+  ])('parks review:human on a statute path with %s in its name, which git would quote without -z', (_name, raw, quoted) => {
+    const runFn = (_bin, args) => {
+      if (args.includes('merge-base')) return 'base\n';
+      return args.includes('-z') ? `1\t0\t${raw}\0` : `1\t0\t${quoted}\n`;
+    };
+    const result = decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { notes: [] } },
+      filesTouched: ['a.mjs'], lanePath: '/lane',
+    }, { run: runFn });
+    expect(result).toEqual({ mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' });
+  });
+
+  it('parks review:human when the lane\'s net diff cannot be read — an unreadable diff never clears the statute check', () => {
+    const result = decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { notes: [] } },
+      filesTouched: ['a.mjs'], lanePath: '/lane',
+    }, { run: () => { throw new Error('git exploded'); } });
+    expect(result).toEqual({ mode: 'park', label: 'review:human', reason: 'lane net diff unreadable; the statute/policy-core check cannot clear' });
+  });
+
+  // Turning the self-review safeguard on must never lower the park label the escalation score asks for.
+  it.each([
+    ['a statute path', 'docs/agent/platform-decisions.md', 'review:human'],
+    ['a permission-change path', '.github/workflows/ci.yml', 'review:human'],
+    ['a blast-radius path', 'scripts/lane-pool.mjs', 'review:pending'],
+    ['a clean diff', 'reports/2026-09-09-note.md', 'review:pending'],
+  ])('with self-review on, %s parks at least as strictly as without it', (_name, file, expected) => {
+    const runFn = (_bin, args) => (args.includes('merge-base') ? 'base\n' : `3\t1\t${file}\0`);
+    const park = selfReview => decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', dismissed: [], ...(selfReview ? { selfReview: { notes: [] } } : {}) },
+      filesTouched: [file], lanePath: '/lane',
+    }, { run: runFn });
+    const rank = { 'ready-to-merge': 0, 'review:pending': 1, 'review:human': 2 };
+    const on = park(true);
+    expect(on.label).toBe(expected);
+    expect(rank[on.label]).toBeGreaterThanOrEqual(rank[park(false).label]);
+  });
+
+  // An oversized diff usually also trips the score's size signal (review:pending); that must not hide the human park.
+  it.each([['a small', '3\t1'], ['a size-escalating', '12000\t0']])('parks review:human when the self-review was incomplete, with %s numstat', (_name, counts) => {
+    const runFn = (_bin, args) => (args.includes('merge-base') ? 'base\n' : `${counts}\treports/2026-09-09-note.md\0`);
+    const result = decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { rounds: 0, notes: ['too large'], incomplete: true } },
+      filesTouched: ['reports/2026-09-09-note.md'], lanePath: '/lane',
+    }, { run: runFn });
+    expect(result).toMatchObject({ mode: 'park', label: 'review:human', reason: 'self-review incomplete; human review of the full diff is required' });
+  });
+
   it('still parks review:human on the agent\'s own needs-human-judgment outcome', () => {
     const result = decideParkMode({
       report: { outcome: 'needs-human-judgment', reason: 'a genuine taste call' }, convergeVerdict: noVerdict,
@@ -2383,7 +2485,7 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
   it('calls the REAL scoreEscalation for a clean small diff and labels ready-to-merge (label-on-green)', () => {
     const run = vi.fn((cmd, args) => {
       if (args.includes('merge-base')) return 'abc123\n';
-      if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\n';
+      if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\0';
       throw new Error(`unexpected: ${cmd} ${args}`);
     });
     const result = decideParkMode(
@@ -2398,7 +2500,7 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
   it('a LARGE real diff (>= the real 400-line threshold) escalates to review:pending via the real rubric, never silently clears', () => {
     const run = vi.fn((cmd, args) => {
       if (args.includes('merge-base')) return 'abc123\n';
-      if (args.includes('diff')) return '300\t200\treports/2026-09-09-big.md\n';
+      if (args.includes('diff')) return '300\t200\treports/2026-09-09-big.md\0';
       throw new Error(`unexpected: ${cmd} ${args}`);
     });
     const result = decideParkMode(
@@ -2414,7 +2516,7 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
   it('dismissed converge findings (from the real convergeVerdict.dismissed) escalate to review:pending via scoreEscalation', () => {
     const run = vi.fn((cmd, args) => {
       if (args.includes('merge-base')) return 'abc123\n';
-      if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\n';
+      if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\0';
       throw new Error(`unexpected: ${cmd} ${args}`);
     });
     const result = decideParkMode(
@@ -2447,7 +2549,7 @@ describe('decideParkMode (#3850 Fork 2 — the land-seam hold on a delegated exe
   const noVerdict = { verdict: 'land', dismissed: [] };
   const cleanRun = vi.fn((cmd, args) => {
     if (args.includes('merge-base')) return 'abc123\n';
-    if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\n';
+    if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\0';
     throw new Error(`unexpected: ${cmd} ${args}`);
   });
 
@@ -2488,7 +2590,7 @@ describe('decideParkMode (#3850 Fork 2 — the land-seam hold on a delegated exe
   it('a non-Claude executor never DOWNGRADES the real scoreEscalation rubric\'s own review:pending — same label, real reason', () => {
     const bigRun = vi.fn((cmd, args) => {
       if (args.includes('merge-base')) return 'abc123\n';
-      if (args.includes('diff')) return '300\t200\treports/2026-09-09-big.md\n';
+      if (args.includes('diff')) return '300\t200\treports/2026-09-09-big.md\0';
       throw new Error(`unexpected: ${cmd} ${args}`);
     });
     const result = decideParkMode(
@@ -3487,6 +3589,165 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
 
   // #3850 Fork 2 — END-TO-END through the REAL `deliverItem`, not just `decideParkMode` in isolation: proves
   // the real spawned `provider.vendor` actually reaches the park decision and shows up in the real PR outcome.
+  it('caps configured self-review and publishes remaining notes after resuming the same builder', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_MAX_ROUNDS', '2');
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    const reviewBuild = vi.fn(async () => ['a.mjs:1 remaining defect']);
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed', reviewBuild },
+    );
+    expect(result.result).toBe('PR #4321 (review:pending)');
+    expect(reviewBuild).toHaveBeenCalledTimes(3);
+    expect(provider.spawn).toHaveBeenCalledTimes(3);
+    for (const [call] of provider.spawn.mock.calls.slice(1)) {
+      expect(call.resumeSessionId).toBe('uuid-fixed');
+      expect(call.prompt.split('# Reviewer expectations')).toHaveLength(2);
+    }
+    expect(execFileSync.mock.calls.filter(([bin, args]) => bin === 'node' && args[1] === 'verify')).toHaveLength(3);
+    expect(execFileSync.mock.calls.some(([, args]) => args[0] === 'scripts/converge-cli.mjs')).toBe(false);
+    expect(readFileSync(join(lane, '.pr-body.md'), 'utf8')).toContain('a.mjs:1 remaining defect');
+  });
+
+  it('publishes an oversized diff with incomplete self-review notes in the PR body', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    const originalExec = execFileSync.getMockImplementation();
+    execFileSync.mockImplementation((cmd, args = [], ...rest) => {
+      if (cmd === 'git' && args.includes('origin/main...HEAD')) return 'x'.repeat(512 * 1024 + 1);
+      // The same oversized change also trips the escalation score's size signal (review:pending).
+      if (cmd === 'git' && args.includes('--numstat')) return '12000\t0\treports/big.md\0';
+      return originalExec(cmd, args, ...rest);
+    });
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed' },
+    );
+    expect(result.result).toBe('PR #4321 (review:human)');
+    expect(provider.spawn).toHaveBeenCalledOnce();
+    const body = readFileSync(join(lane, '.pr-body.md'), 'utf8');
+    expect(body).toContain('Self-review incomplete');
+    expect(body).toContain('human review of the full diff is required');
+  });
+
+  it('publishes the incomplete note when the net diff overflows the bounded read, and reads it hardened', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    const originalExec = execFileSync.getMockImplementation();
+    const diffCalls = [];
+    execFileSync.mockImplementation((cmd, args = [], opts = {}) => {
+      if (cmd === 'git' && args.includes('origin/main...HEAD')) {
+        diffCalls.push({ args, opts });
+        throw Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' });
+      }
+      return originalExec(cmd, args, opts);
+    });
+    const reviewBuild = vi.fn();
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      { spawn: vi.fn(), vendor: 'claude' }, { newSessionId: () => 'uuid-fixed', reviewBuild },
+    );
+    expect(result.result).toBe('PR #4321 (review:human)');
+    expect(reviewBuild).not.toHaveBeenCalled();
+    expect(readFileSync(join(lane, '.pr-body.md'), 'utf8')).toContain('human review of the full diff is required');
+    expect(diffCalls).toHaveLength(1);
+    expect(diffCalls[0].args).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv', 'core.fsmonitor=false']));
+    expect(diffCalls[0].opts.maxBuffer).toBe(512 * 1024 + 1);
+    expect(diffCalls[0].opts.env).toEqual(laneGitHardeningEnv());
+  });
+
+  // The default build settings replace the converge round with one self-review, so a Claude-executed delivery parks
+  // for independent review (review:pending), never label-on-green. Pinned with no build setting from env or platform.
+  it('with default build settings, a Claude-executed delivery self-reviews once, skips converge and parks review:pending', async () => {
+    for (const name of ['WE_BUILD_SELF_REVIEW_ENABLED', 'WE_BUILD_SELF_REVIEW_MAX_ROUNDS', 'WE_BUILD_FINAL_GATE', 'WE_BUILD_REVIEWER_EXPECTATIONS_ENABLED']) {
+      vi.stubEnv(name, undefined);
+    }
+    vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', join(tmpdir(), 'no-such-platform-preferences.json'));
+    const reviewBuild = vi.fn(async () => []);
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed', reviewBuild },
+    );
+    expect(result.result).toBe('PR #4321 (review:pending)');
+    expect(reviewBuild).toHaveBeenCalledOnce();
+    expect(provider.spawn).toHaveBeenCalledOnce();
+    expect(execFileSync.mock.calls.some(([, args]) => args?.[0] === 'scripts/converge-cli.mjs')).toBe(false);
+  });
+
+  // A self-review repair turn reports only the files IT changed; a statute path the builder touched in turn 1 must
+  // still park review:human, never be dropped from the park decision by the repair's narrower report.
+  it('parks review:human when turn 1 touched a statute path and the self-review repair touched only another file', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    tryReadDeliveryReport.mockImplementation(() => (provider.spawn.mock.calls.length > 1
+      ? { status: 'done', outcome: 'done', filesTouched: ['a.mjs'], reason: 'repaired' }
+      : { status: 'done', outcome: 'done', filesTouched: ['docs/agent/platform-decisions.md'], reason: 'did it' }));
+    const reviewBuild = vi.fn().mockResolvedValueOnce(['a.mjs:1 defect']).mockResolvedValue([]);
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed', reviewBuild },
+    );
+    expect(provider.spawn).toHaveBeenCalledTimes(2);
+    expect(result.result).toBe('PR #4321 (review:human)');
+    expect(readFileSync(join(lane, '.pr-body.md'), 'utf8')).toContain('- docs/agent/platform-decisions.md');
+  });
+
+  // Same class: the self-check never replaces a human label the escalation score asks for (a permission-change path).
+  it('parks review:human with self-review on when the net diff touches a permission-change path', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    const priorExec = execFileSync.getMockImplementation();
+    execFileSync.mockImplementation((cmd, args = [], opts) => (cmd === 'git' && args.includes('--numstat')
+      ? '3\t1\t.github/workflows/ci.yml\0' : priorExec(cmd, args, opts)));
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    tryReadDeliveryReport.mockReturnValue({ status: 'done', outcome: 'done', filesTouched: ['.github/workflows/ci.yml'], reason: 'did it' });
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed', reviewBuild: vi.fn().mockResolvedValue([]) },
+    );
+    expect(result.result).toBe('PR #4321 (review:human)');
+  });
+
+  // Same class: the repair turn's report must not clear turn 1's own needs-human-judgment park either.
+  it('parks review:human when turn 1 asked for human judgment and the self-review repair reported done', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    tryReadDeliveryReport.mockImplementation(() => (provider.spawn.mock.calls.length > 1
+      ? { status: 'done', outcome: 'done', filesTouched: ['a.mjs'], reason: 'repaired' }
+      : { status: 'done', outcome: 'needs-human-judgment', filesTouched: ['b.mjs'], reason: 'a genuine taste call' }));
+    const reviewBuild = vi.fn().mockResolvedValueOnce(['a.mjs:1 defect']).mockResolvedValue([]);
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed', reviewBuild },
+    );
+    expect(provider.spawn).toHaveBeenCalledTimes(2);
+    expect(result.result).toBe('PR #4321 (review:human)');
+  });
+
+  it.each([
+    ['the self-review is unavailable', { review: async () => { throw new Error('reviewer down'); }, redRepair: false }, 'self-review unavailable'],
+    ['the repair gate is red', { review: async () => ['a.mjs:1 defect'], redRepair: true }, 'self-review repair gate is red'],
+  ])('opens no PR and settles a failure when %s', async (_name, { review, redRepair }, message) => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    const originalExec = execFileSync.getMockImplementation();
+    let verifies = 0;
+    execFileSync.mockImplementation((cmd, args = [], opts) => {
+      if (cmd === 'node' && args[0] === 'scripts/operations/run.mjs' && args[1] === 'verify' && redRepair && ++verifies > 1) {
+        return JSON.stringify({ runId: 'run-2', op: 'verify', stopped: 'complete', applied: [],
+          verdict: { ok: false, cwd: lane, suite: 'run', passed: 1, failed: 1, unrun: 0, checks: [], blocking: [] } });
+      }
+      return originalExec(cmd, args, opts);
+    });
+    settleDispatchEffect.mockClear();
+    await expect(deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      { spawn: vi.fn(), vendor: 'claude' }, { newSessionId: () => 'uuid-fixed', reviewBuild: vi.fn(review) },
+    )).rejects.toThrow(message);
+    expect(execFileSync.mock.calls.some(([, args]) => args?.[1] === 'open-pr')).toBe(false);
+    expect(existsSync(join(lane, '.pr-body.md'))).toBe(false);
+    expect(settleDispatchEffect).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }));
+  });
+
   it('a Claude-executed delivery (provider.vendor="claude", the real registered CLAUDE_RESTRICTED_PROVIDER shape) opens label-on-green (ready-to-merge)', async () => {
     const result = await deliverItem(
       { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },

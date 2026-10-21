@@ -7,9 +7,9 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -38,6 +38,16 @@ import {
   runCodexDirectExec,
   codexDirectTask,
 } from '../codex-direct-task.mjs';
+
+// Historical orchestration fixtures isolate the new independently tested self-review.
+beforeEach(() => vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
+afterEach(() => vi.unstubAllEnvs());
+
+/** A fixture `--dir` standing for a WE checkout: the default full gate needs its scripts/verify-lane.mjs. */
+function weCheckout(dir) {
+  mkdirSync(join(dir, 'scripts'), { recursive: true });
+  writeFileSync(join(dir, 'scripts', 'verify-lane.mjs'), '');
+}
 
 function flagValue(argv, flag) {
   const i = argv.indexOf(flag);
@@ -624,7 +634,8 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
       return '';
     };
     const r = captureDiff({ dir: '/d', startSha: 'abc123', execFn });
-    expect(calls).toContain('-C /d add --intent-to-add -- new-file.txt');
+    // Every read carries the shared lane pins between `-C <dir>` and the subcommand.
+    expect(calls.some((c) => /^-C \/d .*core\.fsmonitor=false .* add --intent-to-add -- new-file\.txt$/.test(c))).toBe(true);
     expect(r.hasChanges).toBe(true);
     expect(r.diffStat).toContain('2 files changed');
   });
@@ -660,7 +671,7 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
 });
 
 describe('runGate — none/standards/full, never commits', () => {
-  it('mode "none" (default) runs nothing and passes', () => {
+  it('mode "none" runs nothing and passes', () => {
     const execFn = vi.fn();
     const r = runGate({ dir: '/d', mode: 'none', execFn });
     expect(r.ran).toBe(false);
@@ -675,22 +686,23 @@ describe('runGate — none/standards/full, never commits', () => {
     expect(r.pass).toBe(true);
   });
 
-  it('mode "full" runs check:standards then the full vitest suite', () => {
+  it('mode "full" runs verify-lane with the whole unit tier and standards', () => {
     const execFn = vi.fn(() => 'ok');
-    const r = runGate({ dir: '/d', mode: 'full', execFn });
-    expect(r.steps.map((s) => s.cmd)).toEqual(['npm run check:standards', 'npm run test:unit']);
+    // `/d` stands in for a WE checkout, which has scripts/verify-lane.mjs.
+    const r = runGate({ dir: '/d', mode: 'full', execFn, existsFn: () => true });
+    expect(r.steps.map((s) => s.cmd)).toEqual(['node scripts/verify-lane.mjs run --gate=npm run test:unit && npm run check:standards']);
   });
 
   it('a failing step is caught and reported, not thrown — and marks the gate failed', () => {
     const execFn = vi.fn((bin, args) => {
-      if (args.includes('check:standards')) { const e = new Error('exit 1'); e.stdout = 'BAD'; throw e; }
+      if (args.some(a => a.includes('check:standards'))) { const e = new Error('exit 1'); e.stdout = 'BAD'; throw e; }
       return 'ok';
     });
-    const r = runGate({ dir: '/d', mode: 'full', execFn });
+    const r = runGate({ dir: '/d', mode: 'full', execFn, existsFn: () => true });
     expect(r.pass).toBe(false);
     expect(r.steps[0].pass).toBe(false);
     expect(r.steps[0].output).toContain('BAD');
-    expect(r.steps[1].pass).toBe(true); // the second step still ran
+    expect(r.steps).toHaveLength(1); // verify-lane owns the full gate
   });
 });
 
@@ -777,7 +789,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       const stdout = '{}\n';
       const { fn: spawnFn, seen } = fakeSpawn(stdout);
       const logFile = explicitLog ? join(dir, 'logs', 'custom.jsonl') : undefined;
-      const report = await codexDirectTask({ dir: worktree, task: 'Inspect the checkout', stream: false, spawnFn, logFile });
+      const report = await codexDirectTask({ dir: worktree, task: 'Inspect the checkout', gate: 'none', stream: false, spawnFn, logFile });
       expect(seen.opts.cwd).toBe(worktree);
       expect(report.exitCode).toBe(0);
       expect(report.logFile).toBe(logFile ?? join(gitDir, 'codex-direct-task.jsonl'));
@@ -793,6 +805,22 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('isolates review final-message files so a previous clear verdict cannot be reused', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-review-output-'));
+    try {
+      const paths = [];
+      for (let i = 0; i < 2; i++) {
+        const { fn } = fakeSpawn('{}\n');
+        const r = await runCodexDirectExec({ dir, gitDir: dir, review: true, task: 'review',
+          logFile: join(dir, 'events.jsonl'), stream: false, spawnFn: fn });
+        paths.push(r.outputLastMessageFile);
+        if (i === 0) writeFileSync(r.outputLastMessageFile, '{"findings":[]}');
+        else expect(() => readFileSync(r.outputLastMessageFile, 'utf8')).toThrow();
+      }
+      expect(paths[0]).not.toBe(paths[1]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('spawns codex with the exact argv buildCodexDirectTaskArgv would produce, writes the task to stdin, and logs raw stdout to the log file', async () => {
@@ -852,6 +880,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
 
   it('#4665 isolates each edit run, honors the pool override, and leaves review permissions alone', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-permissions-test-'));
+    weCheckout(dir);
     const allocated = [];
     const env = { ...process.env, LANE_POOL_ROOT: join(dir, 'pool override'), TMPDIR: '/old/tmp' };
     const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
@@ -898,6 +927,29 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(lines.filter(l => l.startsWith('codex-route ·'))).toHaveLength(1);
       expect(lines).toContain('codex-usage · bucket=observed-bucket primary.used_percent=9');
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['false (silenced)', false, false],
+    ['a non-function value (stderr fallback)', true, true],
+    ['a throwing logger (swallowed)', () => { throw new Error('logger down'); }, false],
+  ])('log %s never aborts the run, and provenance reaches stderr only when it should', async (_name, log, expectStderr) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-nolog-'));
+    const { fn: spawnFn, seen } = fakeSpawn('{"type":"thread.started","thread_id":"t"}\n{"type":"turn.completed"}\n');
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const provenance = () => errSpy.mock.calls.map(c => String(c[0])).filter(l => /^(policy-cascade|codex-usage) ·/.test(l));
+    try {
+      const report = await codexDirectTask({ task: 'fix a typo', dir, gate: 'none', selfReview: false, log,
+        model: 'x', tier: 'haiku', stream: false, spawnFn,
+        execFn: (_bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '',
+        clearRolloutAfterRun: true,
+        collectQuotaFn: () => ({ quota: { raw: { limit_id: 'observed-bucket', primary: { used_percent: 9 } } }, deleted: true }),
+      });
+      expect(seen.argv).toBeDefined();
+      expect(report.events.threadId).toBe('t');
+      if (expectStderr) expect(provenance()).toContain('codex-usage · bucket=observed-bucket primary.used_percent=9');
+      else expect(provenance()).toEqual([]);
+    } finally { errSpy.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('codexDirectTask: with an explicit --dir, does NOT create a scratch clone, and captures a real diff via execFn', async () => {
@@ -1104,6 +1156,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
     [['--review'], 'review', 'gpt-6.1-sol', 'medium', 'tool', 'tool'],
   ])('%j', (flags, kind, model, effort, modelSource, effortSource) => {
     const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-'));
+    weCheckout(dir);
     const preload = `import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
@@ -1127,6 +1180,44 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
       expect(report.route).toMatchObject({ kind, model, effort, sources: { model: modelSource, effort: effortSource } });
       expect(flagValue(report.argv, '-m')).toBe(model);
       expect(report.argv).toContain(`model_reasoning_effort=${effort}`);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  // Text mode exits 1 on a red gate, and `--no-self-review` reaches codexDirectTask: with self-review forced on by
+  // the environment, `--ephemeral` is refused (exit 1) unless the flag turns it off.
+  it.each([
+    ['a green gate with --no-self-review exits 0', true, ['--no-self-review'], 0],
+    ['a red gate in text mode exits 1', false, ['--no-self-review'], 1],
+    ['--ephemeral without --no-self-review is refused while self-review is on', true, [], 1],
+  ])('%s', (_name, gateGreen, flags, status) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-exit-'));
+    weCheckout(dir);
+    const preload = `import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { EventEmitter } from 'node:events';
+      cp.execFileSync = (bin, args) => {
+        if (bin === 'npm' && args.includes('check:standards') && !${gateGreen}) throw Object.assign(new Error('standards red'), { status: 1 });
+        return args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
+      };
+      cp.spawn = () => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+        child.stdin = { on() {}, end() { setTimeout(() => {
+          child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'turn.completed' }) + '\\n'));
+          child.emit('close', 0);
+        }, 0); } };
+        child.kill = () => {};
+        return child;
+      };
+      syncBuiltinESMExports();`;
+    try {
+      const run = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+        'scripts/codex-direct-task.mjs', '--task=fixture', `--dir=${dir}`, '--no-stream', '--ephemeral', '--gate=standards', ...flags],
+      { encoding: 'utf8', env: { ...process.env, WE_CODEX_MODEL_BY_TASK: '{}', WE_BUILD_SELF_REVIEW_ENABLED: 'true' } });
+      expect(run.status, run.stderr).toBe(status);
+      if (status === 0) expect(run.stdout).toContain('gate (standards): PASS');
+      else if (flags.length) expect(run.stdout).toContain('gate (standards): FAIL');
+      else expect(run.stderr).toContain('--ephemeral requires self-review off');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
