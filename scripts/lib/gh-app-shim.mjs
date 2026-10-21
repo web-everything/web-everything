@@ -757,6 +757,19 @@ function unsupportedTargetHost(argv, env) {
     'search code': 'w', 'search commits': 'w', 'search issues': 'w', 'search prs': 'w', 'search repos': 'w',
     'auth status': 'at',
   }[command] || (argv[0] === 'browse' ? 'anprsw' : '');
+  // Value shorthands from gh 2.95 help: inside a bundle they take the rest as content
+  // (-BRelease/a/b is a base branch). Any shorthand in neither table is uncertain.
+  const valueShorthands = {
+    'pr list': 'aABHlLSs', 'issue list': 'aAlLmSs', 'pr create': 'aBbFHlmprTt', 'issue create': 'abFlmpTt',
+    'pr checks': 'i', 'pr checkout': 'b', 'pr merge': 'AbFt', 'pr close': 'c', 'pr diff': 'e', 'pr review': 'bF',
+    'pr revert': 'bFt', 'pr edit': 'BbFmt', 'issue edit': 'bFmt', 'issue close': 'cr', 'issue reopen': 'c',
+    'pr reopen': 'c', 'issue develop': 'bn', 'repo create': 'dghlrst', 'repo sync': 'b', 'repo edit': 'dh',
+    'release create': 'nFt', 'release list': 'LO', 'release download': 'ADOp', 'release edit': 'nFt',
+    'run list': 'bceLsuw', 'run view': 'aj', 'run rerun': 'j', 'run download': 'Dnp', 'workflow list': 'L',
+    'workflow view': 'r', 'workflow run': 'r', 'cache delete': 'r', 'cache list': 'kLOrS', 'label create': 'cd',
+    'label list': 'LS', 'label edit': 'cdn', 'ruleset list': 'Lo', 'ruleset view': 'o', 'secret set': 'abefov',
+    'secret list': 'aeo', 'variable set': 'befov', 'codespace create': 'bdlm', 'codespace cp': 'cp',
+  }[command] || (argv[0] === 'browse' ? 'bc' : '');
   // After \`--\` gh reads -x/o/r as a repository argument, unless pflag took the \`--\` as the value of an
   // option (\`pr list --app -- -R x/o/r\` still parses -R). Check both readings: every later argument is
   // a positional here, and the option scan below still runs over all of them.
@@ -774,31 +787,37 @@ function unsupportedTargetHost(argv, env) {
     const a = argv[i];
     // pflag permits boolean bundles before a value flag: -cRhost/o/r, -fsHOST/o/r, -ahHOST.
     // A known content flag consumes the remainder, so -bRhost/o/r stays body text.
+    // An unknown shorthand may be a boolean (-qRhost/o/r selects host) or a value option (the rest
+    // is content). Check both readings: a later selector still refuses its host, but no following
+    // argument is skipped as a value, so -q -R host/o/r and -qR host/o/r are both scanned.
     if (a.startsWith('-') && !a.startsWith('--')) {
       let consumed = false;
+      let uncertain = false;
       for (let j = 1; j < a.length; j++) {
         const flag = '-' + a[j];
+        const attached = j + 1 < a.length;
+        const nextValue = () => (uncertain ? argv[i + 1] : argv[++i]);
         if (flag === '-R' || repositoryFlags.includes(flag)) {
-          const value = j + 1 < a.length ? a.slice(j + 1).replace(/^=/, '') : argv[++i];
+          const value = attached ? a.slice(j + 1).replace(/^=/, '') : nextValue();
           const host = repoValueHost(value);
           if (host) return host;
-          consumed = true;
+          consumed = !uncertain;
           break;
         }
         // auth -h is --hostname and config -h is --host. pflag takes the next argument as its value
         // even when it starts with -.
         if ((argv[0] === 'auth' || argv[0] === 'config') && flag === '-h') {
-          const host = j + 1 < a.length ? a.slice(j + 1).replace(/^=/, '') : argv[++i];
+          const host = attached ? a.slice(j + 1).replace(/^=/, '') : nextValue();
           if (!publicHost(host ?? '')) return host || 'unknown';
-          consumed = true;
+          consumed = !uncertain;
           break;
         }
-        if (valueFlags.has(flag)) {
-          if (j + 1 === a.length) i++;
-          consumed = true;
+        if (valueFlags.has(flag) || valueShorthands.includes(a[j])) {
+          if (!attached && !uncertain) i++;
+          consumed = !uncertain;
           break;
         }
-        if (!booleanShorthands.includes(a[j])) break;
+        if (!booleanShorthands.includes(a[j])) uncertain = true;
       }
       if (consumed) continue;
     }

@@ -1382,6 +1382,23 @@ require(${JSON.stringify(shim)});
     ['pr', 'edit', '1', '--add-label', '--', '--repo', 'enterprise/owner/repo'],
     ['run', 'list', '-w', '--', '--repo=enterprise/owner/repo'],
     ['secret', 'remove', 'NAME', '-uRenterprise/owner/repo'],
+    // PR #5729 operator ruling: a bundled selector after a shorthand the tables do not know
+    // (checkout -q) is parsed like the separated form, attached or with a separate value.
+    ['pr', 'checkout', '-q', '-R', 'enterprise/owner/repo', '1'],
+    ['pr', 'checkout', '-q', '-Renterprise/owner/repo', '1'],
+    ['pr', 'checkout', '-qRenterprise/owner/repo', '1'],
+    ['pr', 'checkout', '-qR=enterprise/owner/repo', '1'],
+    ['pr', 'checkout', '-qR', 'enterprise/owner/repo', '1'],
+    ['pr', 'checkout', '-qR', 'github.corp.example/owner/repo', '1'],
+    ['pr', 'checkout', '-qRgit@enterprise:owner/repo', '1'],
+    ['pr', 'checkout', '-fqR', 'enterprise/owner/repo', '1'],
+    ['pr', 'checkout', '-qfRenterprise/owner/repo', '1'],
+    ['pr', 'checkout', '-Rqenterprise/owner/repo', '1'],
+    ['pr', 'view', '-xcR', 'enterprise/owner/repo', '1'],
+    ['issue', 'list', '-zwR=github.corp.example/owner/repo'],
+    ['secret', 'set', 'NAME', '-zr', 'enterprise/owner/repo'],
+    ['auth', 'status', '-xh', 'github.corp.example'],
+    ['auth', 'status', '-xhgithub.corp.example'],
   ])('refuses enterprise hosts before using a fresh public App cache: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {
@@ -1465,6 +1482,15 @@ require(${JSON.stringify(shim)});
     ['pr', 'comment', '123', '-b', 'https://docs.example.com'],
     ['repo', 'create', 'fixture-repo', '-h', 'https://docs.example.com'],
     ['search', 'issues', 'https://docs.example.com'],
+    // Controls for the bundled-selector scan: public selectors pass, and a known value
+    // shorthand still takes the rest of its bundle (or the next argument) as content.
+    ['pr', 'checkout', '-qR', 'web-everything/repo', '1'],
+    ['pr', 'checkout', '-qRgithub.com/web-everything/repo', '1'],
+    ['pr', 'checkout', '-Rq', '1'],
+    ['pr', 'checkout', '-bRelease/October/2026', '1'],
+    ['pr', 'checkout', '-fb', 'Release/October/2026', '1'],
+    ['run', 'list', '-LRelease/October/2026'],
+    ['label', 'edit', 'bug', '-nRelease/October/2026'],
   ])('keeps URLs and host-like option values in content for public calls: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {
