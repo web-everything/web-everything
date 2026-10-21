@@ -13,8 +13,9 @@
  *   to the built-in one: the built-in list is the guard's floor, so a setting can widen it but never weaken it.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, accessSync, statSync, realpathSync, constants } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 
@@ -202,6 +203,28 @@ export function withoutGitConfigEnv(env = process.env) {
   return out;
 }
 
+/** Would git actually run this hook? Git checks `access(X_OK)` and silently skips a hook that fails it; a shell hook
+ * must also be readable, and a directory is never a hook. (On Windows X_OK is an existence check, as in git.) */
+export function hookRunnable(path) {
+  try {
+    accessSync(path, constants.R_OK | constants.X_OK);
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Is `argv1` the module at `metaUrl`? Both sides go through the SAME canonicalization (native realpath of a file
+ * path), so a percent-encoded space, a symlinked checkout with or without `--preserve-symlinks-main`, or a
+ * case-variant path on a case-insensitive disk never makes an entry script silently skip its `main()`.
+ */
+export function invokedAsScript(argv1, metaUrl) {
+  if (!argv1) return false;
+  const canon = (p) => { try { return realpathSync.native(p); } catch { return resolve(p); } };
+  return canon(argv1) === canon(fileURLToPath(metaUrl));
+}
+
 /**
  * IO (injected): make a lane's EFFECTIVE `core.hooksPath` (what git resolves across every scope, incl. worktree
  * config) the tracked `.githooks`. The `prepare` npm script used to be the only thing that set it — `provision
@@ -209,17 +232,23 @@ export function withoutGitConfigEnv(env = process.env) {
  * ran there; a worktree-scope `core.hooksPath=/dev/null` also beat a correct local value (audit findings).
  * Repair: replace all `--local` values, drop a lane-owned `--worktree` override, re-read. A global/system override is NOT ours to
  * change — reported as `override`. Idempotent (reads first, writes only on a difference), logged. Skipped when the
- * checkout has no `.githooks/pre-commit`. `write: false` only reports (read-only callers like `status`). Never throws.
+ * checkout has no `.githooks/pre-commit`. A pre-commit git would not run (not executable/readable) is `error` on
+ * every path — git ignores it, so no hooksPath value protects the lane; the tracked file is not chmod-ed here.
+ * `write: false` only reports (read-only callers like `status`). Never throws.
  * @returns {{status:'ok'|'set'|'unset'|'override'|'skipped'|'error', was?:string|null, scope?:string, detail?:string}}
  */
 export function ensureLaneHooksPath(dir, {
   write = true,
   exists = existsSync,
+  runnable = hookRunnable,
   run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024, env: withoutGitConfigEnv(process.env) }),
   log = defaultWarn,
 } = {}) {
   try {
-    if (!exists(join(dir, LANE_HOOKS_PATH, 'pre-commit'))) return { status: 'skipped' };
+    const hook = join(dir, LANE_HOOKS_PATH, 'pre-commit');
+    if (!exists(hook)) return { status: 'skipped' };
+    // A correct core.hooksPath proves nothing if git skips the hook itself (red-team finding: a 0644 pre-commit).
+    if (!runnable(hook)) throw new Error(`${LANE_HOOKS_PATH}/pre-commit is not executable, so git ignores it (restore its mode: chmod +x ${LANE_HOOKS_PATH}/pre-commit)`);
     const effective = () => {
       try {
         // Git appends one LF; all whitespace inside the value belongs to the actual directory name.

@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -162,6 +162,21 @@ describe('end to end: real git commit through the hook', () => {
       writeFileSync(join(lane, 'scripts', rel), readFileSync(join(REPO, 'scripts', rel)));
     }
     const r = spawnSync(process.execPath, [join(lane, 'scripts/guard-git-identity.mjs')], { cwd: lane, env, encoding: 'utf8' });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/commit refused/);
+  });
+
+  it.each([[''], ['--preserve-symlinks-main']])('a SYMLINKED checkout path still runs the guard (NODE_OPTIONS=%j)', (nodeOptions) => {
+    const lane = makeRepo('real/.lanes/web-everything/lane-7');
+    setIdent(lane, placeholder);
+    for (const rel of ['guard-git-identity.mjs', 'lib/git-identity.mjs', 'lib/policy-cascade.mjs', 'lib/settings-files.mjs', 'lib/under-test.mjs', 'lib/under-test.cjs']) {
+      mkdirSync(dirname(join(lane, 'scripts', rel)), { recursive: true });
+      writeFileSync(join(lane, 'scripts', rel), readFileSync(join(REPO, 'scripts', rel)));
+    }
+    const link = join(base, 'link');
+    symlinkSync(join(base, 'real'), link, 'dir');
+    const viaLink = join(link, '.lanes/web-everything/lane-7');
+    const r = spawnSync(process.execPath, [join(viaLink, 'scripts/guard-git-identity.mjs')], { cwd: viaLink, env: { ...env, NODE_OPTIONS: nodeOptions }, encoding: 'utf8' });
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/commit refused/);
   });

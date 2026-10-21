@@ -35,30 +35,30 @@ describe('ensureLaneHooksPath (injected IO) — the EFFECTIVE value, every scope
   it('sets it when unset, and logs', () => {
     const g = fakeGit({});
     const logs = [];
-    expect(ensureLaneHooksPath('/l', { exists: has, run: g.run, log: (l) => logs.push(l) })).toMatchObject({ status: 'set', was: null });
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run, log: (l) => logs.push(l) })).toMatchObject({ status: 'set', was: null });
     expect(g.cfg.local).toBe(LANE_HOOKS_PATH);
     expect(logs[0]).toMatch(/core\.hooksPath \(unset\) → \.githooks/);
   });
   it('is idempotent: effective .githooks → no write', () => {
     const g = fakeGit({ local: '.githooks' });
-    expect(ensureLaneHooksPath('/l', { exists: has, run: g.run }).status).toBe('ok');
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run }).status).toBe('ok');
     expect(g.calls).toHaveLength(1);
   });
   it('a WORKTREE /dev/null override beating a correct local value is flagged and repaired', () => {
     const g = fakeGit({ local: '.githooks', worktree: '/dev/null' });
-    expect(ensureLaneHooksPath('/l', { exists: has, run: g.run, write: false })).toMatchObject({ status: 'override', scope: 'worktree' });
-    expect(ensureLaneHooksPath('/l', { exists: has, run: g.run })).toMatchObject({ status: 'set', was: '/dev/null', scope: 'worktree' });
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run, write: false })).toMatchObject({ status: 'override', scope: 'worktree' });
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run })).toMatchObject({ status: 'set', was: '/dev/null', scope: 'worktree' });
     expect(g.cfg.worktree).toBeUndefined();
   });
   it('an override the repair cannot remove (a higher scope, e.g. command) → override, logged', () => {
     const stubborn = { run: (args) => (args.join(' ') === GET.join(' ') ? 'command\t/dev/null\n' : ''), };
     const logs = [];
-    expect(ensureLaneHooksPath('/l', { exists: has, run: stubborn.run, log: (l) => logs.push(l) })).toMatchObject({ status: 'override', scope: 'command' });
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: stubborn.run, log: (l) => logs.push(l) })).toMatchObject({ status: 'override', scope: 'command' });
     expect(logs[0]).toMatch(/still \/dev\/null/);
   });
   it('write:false only reports', () => {
     const g = fakeGit({});
-    expect(ensureLaneHooksPath('/l', { exists: has, run: g.run, write: false }).status).toBe('unset');
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run, write: false }).status).toBe('unset');
     expect(g.calls).toHaveLength(1);
   });
   it('a checkout with no .githooks/pre-commit is skipped', () => {
@@ -109,7 +109,7 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
     git(['config', '--local', 'extensions.worktreeConfig', 'true'], lane);
     git(['config', '--worktree', 'core.hooksPath', '/dev/null'], lane);
     expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('/dev/null');
-    expect(runPool(['status', ...poolArgs()]).err).toMatch(/core\.hooksPath is not \.githooks in 1 lane\(s\) \(lane-1\)/);
+    expect(runPool(['status', ...poolArgs()]).err).toMatch(/pre-commit guards are not verified in 1 lane\(s\) \(lane-1\)/);
     expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('/dev/null'); // status wrote nothing
     expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
     expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('.githooks');
@@ -119,7 +119,7 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
     const lane = join(base, 'pool', 'hookspath', 'lane-1');
     git(['config', '--local', '--unset', 'core.hooksPath'], lane);
     const r = runPool(['status', ...poolArgs()]);
-    expect(r.err).toMatch(/core\.hooksPath is not \.githooks in 1 lane\(s\) \(lane-1\)/);
+    expect(r.err).toMatch(/pre-commit guards are not verified in 1 lane\(s\) \(lane-1\)/);
     expect(() => git(['config', '--local', '--get', 'core.hooksPath'], lane)).toThrow();
   });
 
@@ -145,6 +145,19 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
       expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('/dev/null');
     } finally {
       rmSync(lock, { force: true });
+    }
+  });
+
+  it('status flags a lane whose hooksPath is correct but whose pre-commit git would ignore (not executable)', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    git(['config', '--local', '--replace-all', 'core.hooksPath', '.githooks'], lane);
+    chmodSync(join(lane, '.githooks/pre-commit'), 0o644);
+    try {
+      const r = runPool(['status', ...poolArgs()]);
+      expect(r.err).toMatch(/pre-commit is not executable/);
+      expect(r.err).toMatch(/pre-commit guards are not verified in 1 lane\(s\) \(lane-1\)/);
+    } finally {
+      chmodSync(join(lane, '.githooks/pre-commit'), 0o755);
     }
   });
 });

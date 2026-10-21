@@ -18,8 +18,7 @@
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { sep } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { readGitIdentity, identityVerdict, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
+import { readGitIdentity, identityVerdict, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT, invokedAsScript } from './lib/git-identity.mjs';
 
 /** PURE: recognize the default pool and lane-pool's `lane-N` checkout names under arbitrary pool roots.
  * Do not depend on LANE_POOL_ROOT: the shell running a later commit need not inherit the provisioner's env.
@@ -83,8 +82,6 @@ export function main({ cwd = process.cwd(), env = process.env, err = (s) => proc
   return 1;
 }
 
-// `pathToFileURL`, not a `file://${argv[1]}` template: import.meta.url is percent-ENCODED, so a checkout path with a
-// space never matched and the guard silently skipped itself (audit finding).
-// Through realpath too: Node resolves the main module's symlinks, so a symlinked checkout would also never match.
-const invokedUrl = (p) => { try { return pathToFileURL(realpathSync(p)).href; } catch { return pathToFileURL(p).href; } };
-if (process.argv[1] && invokedUrl(process.argv[1]) === import.meta.url) process.exitCode = main();
+// Never a raw URL comparison: a percent-encoded space (audit finding) or a symlinked checkout under
+// --preserve-symlinks-main (red-team finding) made the guard silently skip itself. Both sides canonicalized alike.
+if (invokedAsScript(process.argv[1], import.meta.url)) process.exitCode = main();

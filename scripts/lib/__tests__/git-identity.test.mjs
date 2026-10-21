@@ -3,14 +3,15 @@
  *   Incident: 2026-10-05..20 the global git config said `test` / `test@test.com` and nothing flagged it.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync, rmSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
+import { resolve, join, dirname, relative } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { runInNewContext } from 'node:vm';
 import {
   checkGitIdentity, identityVerdict, parseIdent, readGitIdentity, resolveGitIdentityPlaceholders, BUILTIN_PLACEHOLDERS,
-  laneIdentityReport, ensureLaneHooksPath,
+  laneIdentityReport, ensureLaneHooksPath, hookRunnable, invokedAsScript,
 } from '../git-identity.mjs';
 
 describe('hook repair failures cannot silently disable commit guards', () => {
@@ -37,6 +38,50 @@ describe('hook repair failures cannot silently disable commit guards', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+  it('refuses a lane whose pre-commit exists but git would ignore (not executable), on every path', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'identity-hooks-noexec-'));
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(dir, 'global-config') };
+    const run = (args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      writeFileSync(env.GIT_CONFIG_GLOBAL, '');
+      run(['init', '-q']);
+      mkdirSync(join(dir, '.githooks'));
+      writeFileSync(join(dir, '.githooks/pre-commit'), '#!/bin/sh\ntouch hook-ran\n');
+      chmodSync(join(dir, '.githooks/pre-commit'), 0o644);
+      run(['config', '--local', 'core.hooksPath', '.githooks']);
+      run(['hook', 'run', '--ignore-missing', 'pre-commit']);
+      expect(existsSync(join(dir, 'hook-ran'))).toBe(false);
+      for (const write of [false, true]) {
+        const logs = [];
+        const result = ensureLaneHooksPath(dir, { run, write, log: (l) => logs.push(l) });
+        expect(result.status).toBe('error');
+        expect(result.detail).toMatch(/not executable/);
+        expect(logs.join('\n')).toMatch(/pre-commit guards may NOT run/);
+      }
+      run(['config', '--local', '--unset', 'core.hooksPath']);
+      expect(ensureLaneHooksPath(dir, { run, log: () => {} }).status).toBe('error');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('hookRunnable matches what git runs: executable regular file only', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'identity-hook-runnable-'));
+    try {
+      const file = join(dir, 'pre-commit');
+      writeFileSync(file, '#!/bin/sh\n');
+      chmodSync(file, 0o644);
+      expect(hookRunnable(file)).toBe(false);
+      chmodSync(file, 0o755);
+      expect(hookRunnable(file)).toBe(true);
+      symlinkSync(file, join(dir, 'via-link'));
+      expect(hookRunnable(join(dir, 'via-link'))).toBe(true);
+      mkdirSync(join(dir, 'a-dir'), { mode: 0o755 });
+      expect(hookRunnable(join(dir, 'a-dir'))).toBe(false);
+      expect(hookRunnable(join(dir, 'missing'))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it.each(['.githooks ', ' .githooks', '.githooks\t', '.githooks\r', '.githooks\n', '.githooks\u2028', '.githooks\u00a0'])('preserves the exact hooks directory %j for reporting and repair', (value) => {
     let effective = value;
     const calls = [];
@@ -47,14 +92,14 @@ describe('hook repair failures cannot silently disable commit guards', () => {
       effective = '.githooks';
       return '';
     };
-    expect(ensureLaneHooksPath('/lane', { write: false, exists: () => true, run })).toMatchObject({ status: 'override', was: value });
+    expect(ensureLaneHooksPath('/lane', { write: false, exists: () => true, runnable: () => true, run })).toMatchObject({ status: 'override', was: value });
     expect(calls).toHaveLength(1);
-    expect(ensureLaneHooksPath('/lane', { exists: () => true, run, log: () => {} })).toMatchObject({ status: 'set', was: value });
+    expect(ensureLaneHooksPath('/lane', { exists: () => true, runnable: () => true, run, log: () => {} })).toMatchObject({ status: 'set', was: value });
     expect(effective).toBe('.githooks');
   });
   it('does not falsely verify a repair that still resolves to a whitespace-suffixed directory', () => {
     const result = ensureLaneHooksPath('/lane', {
-      exists: () => true, log: () => {},
+      exists: () => true, runnable: () => true, log: () => {},
       run: (args) => args.join(' ') === get.join(' ') ? 'worktree\t.githooks \n' : '',
     });
     expect(result).toMatchObject({ status: 'override', was: '.githooks ', scope: 'worktree' });
@@ -62,7 +107,7 @@ describe('hook repair failures cannot silently disable commit guards', () => {
   it('replaces all duplicate local values before verifying the effective value', () => {
     let values = ['/dev/null', '/other-hooks'];
     const result = ensureLaneHooksPath('/lane', {
-      exists: () => true,
+      exists: () => true, runnable: () => true,
       run: (args) => {
         if (args.join(' ') === get.join(' ')) return `local\t${values.at(-1)}\n`;
         if (args.join(' ') !== 'config --local --replace-all core.hooksPath .githooks') {
@@ -78,7 +123,7 @@ describe('hook repair failures cannot silently disable commit guards', () => {
   it('logs write errors with the lane, failure and guard consequence', () => {
     const logs = [];
     const result = ensureLaneHooksPath('/lane', {
-      exists: () => true,
+      exists: () => true, runnable: () => true,
       run: (args) => {
         if (args.join(' ') === get.join(' ')) return 'local\t/dev/null\n';
         throw new Error('could not lock config file\nmore detail');
@@ -92,7 +137,7 @@ describe('hook repair failures cannot silently disable commit guards', () => {
     const logs = [];
     let calls = 0;
     const result = ensureLaneHooksPath('/lane', {
-      write, exists: () => true,
+      write, exists: () => true, runnable: () => true,
       run: () => { calls++; throw Object.assign(new Error('git config timed out'), { code: 'ETIMEDOUT' }); },
       log: (line) => logs.push(line),
     });
@@ -102,7 +147,7 @@ describe('hook repair failures cannot silently disable commit guards', () => {
   });
   it('only an absent key (git exit 1) is treated as unset', () => {
     const result = ensureLaneHooksPath('/lane', {
-      write: false, exists: () => true,
+      write: false, exists: () => true, runnable: () => true,
       run: () => { throw Object.assign(new Error('key absent'), { status: 1 }); },
     });
     expect(result).toMatchObject({ status: 'unset', was: null });
@@ -111,7 +156,7 @@ describe('hook repair failures cannot silently disable commit guards', () => {
     let reads = 0;
     const logs = [];
     const result = ensureLaneHooksPath('/lane', {
-      exists: () => true,
+      exists: () => true, runnable: () => true,
       run: (args) => {
         if (args.join(' ') !== get.join(' ')) return '';
         if (++reads === 1) return 'local\t/dev/null\n';
@@ -152,6 +197,28 @@ describe('hook repair failures cannot silently disable commit guards', () => {
       writeFileSync: () => { writes++; }, join: (...parts) => parts.join('/'),
     });
     expect(writes).toBe(1);
+  });
+});
+
+describe('invokedAsScript — entry scripts never silently skip main()', () => {
+  it('matches through a space, a symlink in either direction, and a relative argv[1]; rejects another file', () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'identity-entry-')));
+    try {
+      const real = join(base, 'has space', 'guard.mjs');
+      mkdirSync(dirname(real));
+      writeFileSync(real, '');
+      symlinkSync(join(base, 'has space'), join(base, 'link'), 'dir');
+      const viaLink = join(base, 'link', 'guard.mjs');
+      expect(invokedAsScript(real, pathToFileURL(real).href)).toBe(true);
+      expect(invokedAsScript(viaLink, pathToFileURL(real).href)).toBe(true);
+      expect(invokedAsScript(real, pathToFileURL(viaLink).href)).toBe(true);
+      expect(invokedAsScript(relative(process.cwd(), viaLink), pathToFileURL(real).href)).toBe(true);
+      writeFileSync(join(base, 'other.mjs'), '');
+      expect(invokedAsScript(join(base, 'other.mjs'), pathToFileURL(real).href)).toBe(false);
+      expect(invokedAsScript(undefined, pathToFileURL(real).href)).toBe(false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });
 

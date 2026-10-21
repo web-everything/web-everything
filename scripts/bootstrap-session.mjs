@@ -61,7 +61,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeLineSync } from './lib/write-all-sync.mjs';
 import { CONSTELLATION_REPOS, repoKeyForDir, siblingKeys } from './lib/constellation-repos.mjs';
-import { readGitIdentity, identityVerdict, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
+import { readGitIdentity, identityVerdict, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT, invokedAsScript } from './lib/git-identity.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -1046,4 +1046,6 @@ export function main(argv, io = defaultIo()) {
 }
 
 // `process.exitCode =`, not `process.exit()` — #3061's exit-wraps-call shape discards the callee's flush.
-if (import.meta.url === `file://${process.argv[1]}`) process.exitCode = main(process.argv.slice(2));
+// Shared canonical comparison: the raw `file://${argv[1]}` template skipped main (and its git-identity report) for a
+// checkout path with a space or a symlink.
+if (invokedAsScript(process.argv[1], import.meta.url)) process.exitCode = main(process.argv.slice(2));

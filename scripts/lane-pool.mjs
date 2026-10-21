@@ -2842,8 +2842,9 @@ function warnPlaceholderIdentity(lanes) {
   try {
     const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' });
     // REPORT-only here: `status` writes no state (stale-state and other readers pin that); provision/refresh/acquire set it.
-    const unhooked = lanes.filter(({ dir }) => ['unset', 'override', 'error'].includes(ensureLaneHooksPath(dir, { write: false, log }).status)).map((l) => `lane-${l.lane}`);
-    if (unhooked.length) log(`⚠ core.hooksPath is not .githooks in ${unhooked.length} lane(s) (${unhooked.slice(0, 5).join(', ')}${unhooked.length > 5 ? ', …' : ''}) — the pre-commit guards do not run there; \`provision\`/\`refresh\`/\`acquire\` sets it.`);
+    // Same allow-list as writeLaneEnv, so any other status (incl. a non-executable pre-commit → error) is flagged.
+    const unhooked = lanes.filter(({ dir }) => !['ok', 'set', 'skipped'].includes(ensureLaneHooksPath(dir, { write: false, log }).status)).map((l) => `lane-${l.lane}`);
+    if (unhooked.length) log(`⚠ the pre-commit guards are not verified in ${unhooked.length} lane(s) (${unhooked.slice(0, 5).join(', ')}${unhooked.length > 5 ? ', …' : ''}) — core.hooksPath is not .githooks or the hook is not runnable (per-lane detail above); \`provision\`/\`refresh\`/\`acquire\` repairs it or refuses the lane.`);
     const r = laneIdentityReport({ lanes, readIn: (dir) => readGitIdentity(dir, { env }), lists: resolveGitIdentityPlaceholders() });
     if (r.status === 'ok') return;
     const shown = r.bad.slice(0, 3).map((b) => `lane-${b.lane}: ${b.detail}`).join(' | ');
