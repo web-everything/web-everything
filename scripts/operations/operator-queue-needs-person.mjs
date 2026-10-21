@@ -15,7 +15,11 @@ export function latestUnresolvedPersonNote(comments = []) {
 }
 
 export function needsPersonRow(repo, pr) {
-  if ((pr.state ?? 'OPEN') === 'OPEN' && pr.isDraft === true
+  const note = latestUnresolvedPersonNote(pr.comments);
+  // A different outstanding question (e.g. round-cap-exhausted) is never masked by the withdrawn-draft row: only the
+  // withdrawn-draft notice may be suppressed for a collecting card batch (operator-queue main, PR #5800).
+  const otherQuestion = note && note.kind !== 'draft-withdrawn';
+  if (!otherQuestion && (pr.state ?? 'OPEN') === 'OPEN' && pr.isDraft === true
       && pr.labels?.some(l => (typeof l === 'string' ? l : l?.name) === WITHDRAWN_LABEL)) {
     const command = `gh pr edit ${pr.number} --repo=${repo} --remove-label ${WITHDRAWN_LABEL}`;
     return { repo, number: pr.number, title: pr.title, kind: 'draft-withdrawn',
@@ -23,7 +27,6 @@ export function needsPersonRow(repo, pr) {
       detail: 'Release the withdrawal only when this PR should return to the guarded promotion and review path.',
       command, commands: { releaseDraft: command } };
   }
-  const note = latestUnresolvedPersonNote(pr.comments);
   if (!note) return null;
   const { number, title } = pr;
   return {
