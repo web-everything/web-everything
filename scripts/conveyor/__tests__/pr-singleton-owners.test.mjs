@@ -136,7 +136,7 @@ describe('PR sweep: named singleton owners', () => {
     expect(plan(p).dispatch).toEqual([expect.objectContaining({ variant: 'stale-accept' })]);
     const rearm = vi.fn(() => ({ ok: true }));
     const result = promotion.defaultRearmStaleAcceptance({ repoSlug: repo, prNumber: 5628, headSha: head,
-      readPr: () => p, rearm, readNetDiff: () => mode === 'unreadable' ? { scored: false }
+      readPr: () => p, rearm, readReviews: () => [], readNetDiff: () => mode === 'unreadable' ? { scored: false }
         : { scored: true, rev: head, text: mode === 'unchanged' ? before : after } });
     expect(result.ok).toBe(mode === 'changed');
     expect(rearm).toHaveBeenCalledTimes(mode === 'changed' ? 1 : 0);
