@@ -1252,7 +1252,9 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
     const value = resolved ?? match?.[1] ?? first.value;
     // Include candidates beyond lexical option/root boundaries: '-Work', '--files=Work', and './Work'
     // can all be directory fragments after the space. Only filesystem resolution can rule them out.
-    const ambiguous = !first.value.startsWith('/') && mentionsReview && candidates.length > 1;
+    // Even a single suffix is uncertain if the lexical boundary truncated its path before that suffix.
+    const ambiguous = !first.value.startsWith('/') && mentionsReview
+      && (candidates.length > 1 || candidates.some(candidate => candidate.length > span.length));
     return { value, rest: text.slice(value.length).trimStart(), ambiguous };
   };
   const optionValue = (text, flag) => {
@@ -1278,7 +1280,25 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
   const script = (command) => {
     // Ambiguous options in an unrelated process cannot conceal a review entrypoint.
     if (!/review-(?:job|loop-cli)\.mjs/.test(command)) return '';
-    const runtime = word(command);
+    let runtime = word(command);
+    if (!/^["']/.test(command)) {
+      // argv[0] also loses its space boundaries in ps. A later /node (or another runtime) can
+      // complete the executable path rather than name a utility's argument. Resolve absolute
+      // candidates on disk; relative paths belong to another cwd and must hold on uncertainty.
+      // The first fragment can itself end in /node: /Applications/node -e Tools/bin/node.
+      const candidates = [];
+      for (const match of command.matchAll(/\/(?:node|nodejs|bun|electron)(?:\.exe)?(?=\s|$)/g)) {
+        const candidate = command.slice(0, match.index + match[0].length);
+        if (Buffer.byteLength(candidate) >= 4096) break;
+        if (candidate !== runtime.value) candidates.push(candidate);
+      }
+      if (candidates.length) {
+        const files = isScriptFile && runtime.value.startsWith('/')
+          ? [runtime.value, ...candidates].filter(candidate => isScriptFile(candidate)) : [];
+        if (files.length !== 1) throw new Error('ambiguous runtime path in process listing');
+        runtime = { value: files[0], rest: command.slice(files[0].length).trimStart() };
+      }
+    }
     if (!RUNTIME.test(runtime.value)) {
       // Only argv[0] can be a direct script; never consume a utility's arguments. Node shebang execution
       // appears as interpreter + script in ps, so its spaced paths use the runtime branch below.

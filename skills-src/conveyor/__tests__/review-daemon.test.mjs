@@ -65,7 +65,70 @@ const reviewStatusCalls = (calls) => calls.filter((c) => !(String(c.spec?.add ??
   || (!c.spec?.add && (c.spec?.remove ?? []).length && c.spec.remove.every((r) => r.startsWith('status:')))));
 
 describe('live review cap with Node configuration options', () => {
+  it('resolves absolute runtime paths without consuming a utility argument and holds conflicting paths', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'review-runtime-paths-'));
+    const prefix = join(root, 'Node');
+    const runtime = join(`${prefix} Tools`, 'bin', 'node');
+    const budget = tail => liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => [101, 102, 103].map(pr => `${pr} 1 ${runtime} ${tail} --pr=${pr}`).join('\n') });
+    try {
+      mkdirSync(join(`${prefix} Tools`, 'bin'), { recursive: true });
+      writeFileSync(runtime, '');
+      expect(budget('scripts/operations/review-loop-cli.mjs')).toMatchObject({ live: 3, left: 0 });
+      expect(budget('--require=./package.json scripts/operations/review-loop-cli.mjs'))
+        .toMatchObject({ live: 3, left: 0 });
+      expect(budget('"scripts/verify-lane.mjs" --files=scripts/operations/review-loop-cli.mjs'))
+        .toMatchObject({ live: 0, left: 3 });
+      writeFileSync(prefix, '');
+      expect(budget('scripts/operations/review-loop-cli.mjs'))
+        .toMatchObject({ left: 0, reason: expect.stringContaining('unknown') });
+      rmSync(runtime);
+      // Only the extensionless utility prefix exists; its arguments mention node and a review.
+      expect(budget('scripts/operations/review-loop-cli.mjs')).toMatchObject({ live: 0, left: 3 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each([
+    '/Applications/Node Tools/bin/node',
+    './Node Tools/bin/nodejs',
+    '../Bun Tools/bin/bun',
+    'Node Tools/bin/node',
+    '/Applications/Node -Tools/bin/node',
+    '/Applications/node -e Tools/bin/node',
+    './node --print Tools/bin/node',
+    'bun -p Tools/bin/bun',
+    '/Applications/Node\tTools/bin/electron',
+    '/Applications/Node\rTools/bin/node',
+    '/Applications/Node\u2028Tools/bin/node',
+    '/Applications/Nöde\u200b Tools/bin/node',
+    '/Applications/Node `Tools`/bin/node',
+    '/Applications/Node \\Tools/bin/node',
+    '"/Applications/Node Tools/bin/node"',
+  ])('holds dispatch for reviews behind a spaced runtime path: %s', async runtime => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => [101, 102, 103].map(pr =>
+        `${pr} 1 ${runtime} scripts/operations/review-loop-cli.mjs --pr=${pr}`).join('\n') });
+    expect(budget.left).toBe(0);
+    const dispatch = vi.fn();
+    const tick = runReviewTickAllRepos({ repos: ['review-cap-fixture/healthy'], liveReviewBudget: budget,
+      authGateOverride: () => ({ paused: false, reason: null }),
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 104 }], refusals: [] }),
+      dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      acquirableLanes: () => 40 });
+    expect(tick.deferredForCap).toBe(1);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    './Review -Work/scripts/operations/review-loop-cli.mjs',
+    '../Review --Work/scripts/operations/review-job.mjs',
+    'Review --files=Work/scripts/operations/review-loop-cli.mjs',
+    './Review ./Work/scripts/operations/review-loop-cli.mjs',
+    './Review ../Work/scripts/operations/review-loop-cli.mjs',
+    './Review - Work/scripts/operations/review-loop-cli.mjs',
+    '-r ./Boot -Work/boot.cjs scripts/operations/review-loop-cli.mjs',
     './Review.mjs Work/scripts/operations/review-loop-cli.mjs',
     '../Review.cjs Work/scripts/operations/review-job.mjs',
     'Review.js Work/scripts/operations/review-loop-cli.mjs',
@@ -89,7 +152,7 @@ describe('live review cap with Node configuration options', () => {
     '--import Boot.mjs Work/boot.mjs ./scripts/operations/review-loop-cli.mjs',
     './review-loop-cli.mjs Work/scripts/operations/review-job.mjs',
     './review-job.mjs Work/scripts/operations/review-loop-cli.mjs',
-  ])('holds dispatch for flattened relative paths with extension-like directories: %s', async argv => {
+  ])('holds dispatch for flattened relative paths with ambiguous directory fragments: %s', async argv => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
     const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
       listCommands: () => [1, 2, 3].map(pr => `${100 + pr} 1 node ${argv} --pr=${pr}`).join('\n') });

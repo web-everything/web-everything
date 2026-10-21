@@ -23,7 +23,10 @@ export default {
     const violations = [];
     // ps loses the argv boundary after an extension-like directory fragment. Exercise the budget
     // through the all-repository tick so an undercount cannot silently admit three more rounds.
-    for (const argv of ['./Review.mjs Work/scripts/operations/review-loop-cli.mjs',
+    for (const argv of ['./Review -Work/scripts/operations/review-loop-cli.mjs',
+      '../Review --Work/scripts/operations/review-job.mjs',
+      './Review ./Work/scripts/operations/review-loop-cli.mjs',
+      './Review.mjs Work/scripts/operations/review-loop-cli.mjs',
       '../Review.cjs Work/scripts/operations/review-job.mjs',
       'Review.js Work/scripts/operations/review-loop-cli.mjs',
       './Review.mjs\rWork/scripts/operations/review-loop-cli.mjs',
@@ -35,9 +38,14 @@ export default {
       '--require=../Boot.node Work/boot.cjs scripts/operations/review-loop-cli.mjs',
       '--import=./Boot.mjs Work/boot.mjs scripts/operations/review-loop-cli.mjs',
       '-r ./Boot.json -Work/boot.cjs scripts/operations/review-loop-cli.mjs',
-      '-r Boot.json Work/boot.hook ./scripts/operations/review-loop-cli.mjs']) {
+      '-r Boot.json Work/boot.hook ./scripts/operations/review-loop-cli.mjs'].map(argv => `node ${argv}`).concat([
+      '/Applications/Node Tools/bin/node scripts/operations/review-loop-cli.mjs',
+      '/Applications/node -e Tools/bin/node scripts/operations/review-loop-cli.mjs',
+      './Node Tools/bin/nodejs scripts/operations/review-loop-cli.mjs',
+      '../Bun Tools/bin/bun scripts/operations/review-job.mjs',
+    ])) {
       const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () =>
-        [1, 2, 3].map(pr => `${100 + pr} 1 node ${argv} --pr=${pr}`).join('\n') });
+        [1, 2, 3].map(pr => `${100 + pr} 1 ${argv} --pr=${pr}`).join('\n') });
       const held = runReviewTickAllRepos({
         repos: [HEALTHY_REPO], liveReviewBudget: budget,
         authGateOverride: () => ({ paused: false, reason: null }),
@@ -100,7 +108,12 @@ export default {
       writeFileSync(job, '');
       const tool = join(rootDir, 'tool');
       writeFileSync(tool, '');
+      const runtime = join(rootDir, 'Node Tools', 'bin', 'node');
+      mkdirSync(join(rootDir, 'Node Tools', 'bin'), { recursive: true });
+      writeFileSync(runtime, '');
       const cases = [
+        ['resolved spaced runtime', `${runtime} scripts/operations/review-loop-cli.mjs`, 1],
+        ['verifier behind spaced runtime', `${runtime} "scripts/verify-lane.mjs" --files=scripts/operations/review-loop-cli.mjs`, 0],
         ['extension-like checkout name', `node ${job} run --pr=1`, 1],
         ['dash in checkout name', 'node /a/Review - Work/review-job.mjs run --pr=1', 1],
         ['equals preload', 'node --import=/a/Boot Work/boot.mjs /a/review-job.mjs', 1],
