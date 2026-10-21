@@ -4,7 +4,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writ
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { acquireLease, atomicRecord, cardBatchStateDir, catFileBatch, provenMergedLanding, retireBatch, retireTerminalBatch, tokenOf } from './card-batch-io.mjs';
+import { acquireLease, atomicRecord, cardBatchStateDir, catFileBatch, provenMergedLanding, retireBatch, retireTerminalBatch, sealJobEnv, tokenOf } from './card-batch-io.mjs';
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
 import { effectiveCardBatchPolicy, loadVerifyRetryMinutes } from '../lib/card-batch-settings.mjs';
@@ -346,14 +346,6 @@ function rearmVerify(path, now, seen) {
     return true;
   } finally { if (tokenOf(lockPath) === lease.token) rmSync(lockPath, { force: true }); }
 }
-
-/**
- * The seal worker WRITES to the PR (body, hold label, ready/undo), so it must play the worker App role. A read-only
- * caller (health-watch is the `observer` role, and its auth setup exports WE_GITHUB_APP_ROLE=observer) would otherwise
- * hand its role to the detached child through the inherited env, and every write fails "Resource not accessible by
- * integration" forever (live 2026-10-21: #5790 stuck draft-withdrawn, #5794 stuck at record-sealed).
- */
-export const sealJobEnv = (env = process.env) => ({ ...env, WE_GITHUB_APP_ROLE: 'worker' });
 
 /** Tick only scans and launches; the detached worker owns verification and the admission lease. */
 export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_STATE_DIR,
