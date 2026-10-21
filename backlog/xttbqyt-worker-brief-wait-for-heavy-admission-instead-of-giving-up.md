@@ -1,5 +1,4 @@
 ---
-bornAs: xttbqyt
 kind: task
 status: open
 scope: ["we:scripts/worker-brief.mjs", "we:scripts/readiness/heavy-admission.mjs"]
