@@ -3,14 +3,13 @@ bornAs: xadunn9
 kind: story
 size: 1
 status: open
-scope: []
 dateOpened: "2026-10-08"
 tags: []
 ---
 
 # /wip deep links: ?card=N highlights a card, ?agent=<session> opens its agent panel (P3 of 128)
 
-Requested behavior: /wip?card=N scrolls to, highlights and focuses the card; /wip?agent=<session> opens the matching agent panel. Unknown identities show an inline notice. The original scope points outside WE; no matching WIP mount or mount test was found in this checkout. Scope is empty pending an ownership ruling, not a claim that no implementation is needed.
+Requested behavior: /wip?card=N scrolls to, highlights and focuses the card; /wip?agent=<session> opens the matching agent panel. Unknown identities show an inline notice. The original scope points outside WE; no matching WIP mount or mount test was found in this checkout. Scope is omitted pending an ownership ruling.
 
 ## Done when
 
