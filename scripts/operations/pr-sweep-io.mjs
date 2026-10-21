@@ -15,7 +15,7 @@ import { STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
 export const DEFAULT_REPOS = Object.freeze([CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug]);
 export const DRAIN_LOG = join(homedir(), 'workspace', 'plateau-app', '.drain-daemon', 'daemon.log');
 export const STALLED_AFTER_ENV = 'WE_PR_SWEEP_STALLED_AFTER_MINUTES';
-const LIST_FIELDS = 'number,title,url,isDraft,headRefOid,updatedAt,labels,statusCheckRollup';
+const LIST_FIELDS = 'number,title,url,isDraft,headRefOid,updatedAt,labels,statusCheckRollup,body,createdAt';
 /** Plain `gh` through execFileSync, deliberately NOT the throttled wrapper: that one creates lock dirs and appends call
  *  logs, and this operation must write nothing. */
 const ghSync = (_file, args, opts) => execFileSync('gh', args, { maxBuffer: 256 * 1024 * 1024, ...opts });

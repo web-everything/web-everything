@@ -27,13 +27,14 @@
  * exact next action. PURE: no fs, no clock, no network, no process in this file (`pr-sweep-io.mjs` has them all).
  */
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { openReferralFindings } from './record-referral-ruling.mjs';
 import { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, gateOutcomesForHead, redTeamRulingNeeded, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
 
 export { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT };
 /** A fix claim comment with no later release counts as a live fixer for this long. */
 export const FIX_CLAIM_LIVE_MS = 3 * 60 * 60_000;
-export const ACTORS = Object.freeze(['fixer', 'reviewer', 'red-team', 'drain', 'ci', 'operator', 'nobody']);
+export const ACTORS = Object.freeze(['fixer', 'reviewer', 'red-team', 'drain', 'ci', 'operator', 'nobody', 'system']);
 
 const REFERRAL_HOLD_MARKER = 'review-referral-hold';
 const HOLD_LEAD = /^\s*review paused:/i;
@@ -83,7 +84,29 @@ export function referralHoldOpen(comments, { headCommittedAt = null } = {}) {
     if (closesHold(e)) return null;
   }
   const n = /(\d+)\s+referrals?\s+need/i.exec(bodyOf(hold.c));
-  return { at: hold.at, count: n ? Number(n[1]) : null, text: bodyOf(hold.c).split('\n')[0].trim() };
+  return { at: hold.at, count: n ? Number(n[1]) : null, text: bodyOf(hold.c).split('\n')[0].trim(), body: bodyOf(hold.c) };
+}
+
+const PERSISTENCE_FAILED_RE = /referral persistence failed|referral-persistence-failed|ledger-write-miss/i;
+
+/**
+ * EVIDENCE BEHIND AN OPEN REFERRAL HOLD. A hold comment says "N referrals need a ruling", but that count can be stale:
+ * every finding on the live head may already have a standing ruling while the reviewer's referral save failed (live
+ * #5530). Counts the findings actually OPEN on the live head with the SAME reader `record-referral-ruling`'s plan uses
+ * (`openReferralFindings`), and whether a trusted comment at or after the hold reports a failed save. PURE.
+ * @returns {{open: Array<{key:string,file:string,line:(number|null)}>, ruled: number, persistenceFailed: boolean, unreadable: (string|null)}}
+ */
+export function holdEvidence(pr, hold) {
+  const persistenceFailed = PERSISTENCE_FAILED_RE.test(hold.body ?? '')
+    || sorted(pr.comments).some((e) => e.at !== null && e.at >= hold.at && trusted(e) && PERSISTENCE_FAILED_RE.test(bodyOf(e.c)));
+  try {
+    const r = openReferralFindings({ comments: pr.comments ?? [], repo: pr.repo, pr: pr.number, head: String(pr.headRefOid ?? '').toLowerCase(),
+      body: pr.body ?? '', createdAt: pr.createdAt ?? '' });
+    return { open: r.open.map((f) => ({ key: f.key, file: f.file, line: f.line })), ruled: r.ruled.length, persistenceFailed,
+      unreadable: r.malformed ? 'the referral thread is malformed' : null };
+  } catch (e) {
+    return { open: [], ruled: 0, persistenceFailed, unreadable: String(e?.message ?? e).split('\n')[0] };
+  }
 }
 
 /**
@@ -183,8 +206,22 @@ export function deriveWaitingOn(pr, ctx) {
   };
 
   const hold = referralHoldOpen(pr.comments, { headCommittedAt: pushedAt });
-  if (hold) return done('ruling-needed:referral-hold', 'operator', hold.at,
-    `review paused: ${hold.count ?? 'some'} referral(s) need an operator ruling (${hold.text})`, actions.referralRuling, ['review-referral-hold comment']);
+  if (hold) {
+    const ev = holdEvidence(pr, hold);
+    const keys = ev.open.map((f) => `${f.file}${f.line ? `:${f.line}` : ''}`);
+    const NO_ASK = { summary: 'no operator action: resumes on the next successful review save; the fix is the reviewer\'s outbox', command: null };
+    // An unreadable thread is never excused: the operator is asked, as before.
+    if (!ev.unreadable && ev.persistenceFailed) return done('system:ledger-write-miss', 'system', hold.at,
+      `the review is paused but the reviewer's referral save failed (ledger-write-miss); ${ev.open.length} finding(s) open on the live head${keys.length ? ` (${keys.join(', ')})` : ''}`,
+      NO_ASK, ['review-referral-hold comment', 'referral persistence failed']);
+    // STALE needs PROOF: at least one finding with a standing ruling and none open. A thread with no referral record at
+    // all proves nothing (a failed save leaves exactly that, live #5485), so the operator stays asked.
+    if (!ev.unreadable && ev.open.length === 0 && ev.ruled > 0) return done('system:stale-hold', 'system', hold.at,
+      'the hold is stale: every finding on the live head already has a standing ruling', NO_ASK, ['review-referral-hold comment', '0 open findings']);
+    return done('ruling-needed:referral-hold', 'operator', hold.at,
+      `review paused: ${ev.open.length || hold.count || 'some'} open referral(s) need an operator ruling${keys.length ? ` [${keys.join(', ')}]` : ''}${ev.unreadable ? ` (evidence unreadable: ${ev.unreadable})` : ''} (${hold.text})`,
+      actions.referralRuling, ['review-referral-hold comment', ...(keys.length ? [`open: ${keys.join(', ')}`] : [])]);
+  }
 
   const rt = redTeamRulingNeeded({ ...pr, number: pr.number }, CONFIRMED_BREAKS_DEFAULTS, { repo: pr.repo });
   if (rt) return done('ruling-needed:red-team-round-cap', 'operator', rt.since ?? null,
@@ -306,7 +343,7 @@ export function renderSweepTable(report) {
   if (stalled.length) {
     out.push('', 'STALLED — next action:');
     for (const r of stalled) {
-      out.push(`  ${r.repo}#${r.number}  ${r.title.slice(0, 70)}`, `    why:  ${r.stalledReason}; ${r.why}`, `    next: ${r.next.summary}`, `    run:  ${r.next.command}`);
+      out.push(`  ${r.repo}#${r.number}  ${r.title.slice(0, 70)}`, `    why:  ${r.stalledReason}; ${r.why}`, `    next: ${r.next.summary}`, `    run:  ${r.next.command ?? '(none)'}`);
     }
   }
   if (report.unreadable.length) out.push('', `UNREADABLE (not swept): ${report.unreadable.join('; ')}`);

@@ -16,6 +16,7 @@ import {
 import { prSweepOperation, PR_SWEEP_OP } from '../pr-sweep.mjs';
 import { createPrSweepReader, parseDrainSkips, parseLiveJobs, resolveStalledAfter, LIST_LIMIT } from '../pr-sweep-io.mjs';
 import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
+import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -74,6 +75,55 @@ describe('#5485: review paused on referrals (the live miss)', () => {
   it('the second live shape (head already reviewed, waiting on your ruling) is also a hold', () => {
     const second = c('plateau-reviewer[bot]', '2026-10-20T21:59:21Z', 'review paused: head 3d16f726a was already reviewed 1 time(s); it resumes on a new push or an explicit re-arm\n\nWaiting on your ruling (block, card or not-real):\n- `a.md:16` x\n\n<!-- review-referral-hold: abc -->');
     expect(referralHoldOpen([second], { labels: ['review:human'] })).not.toBeNull();
+  });
+});
+
+describe('referral hold evidence (#5530: stale or unsaved hold)', () => {
+  const finding = { summary: 'no named test for identity scoping', file: 'backlog/x.md', line: 33, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+  const seat = 'judgeCorrectnessAdvisory';
+  const reviewer = mandatoryReferralReviewer('review-pr-1');
+  const key = referralFindingKey(seat, finding);
+  const record = { version: 1, repo: REPO, pr: 5530, head: HEAD, runId: 'review-pr-1', reviewer, authorBody: '<!-- authored-by-actor: author -->',
+    attempted: true, referrals: [{ key, seat, original: finding, finding: normalizeFinding(finding) }], rulings: [] };
+  const recordComment = c('web-everything', '2026-10-21T08:23:00Z', renderReferralRecord(record));
+  const operatorRuling = c('chalbert', '2026-10-21T08:46:37Z', buildOperatorRulingComment({ version: 1, repo: REPO, pr: 5530, head: HEAD,
+    rulings: [{ runId: 'review-pr-1', key, result: 'not-real' }], actor: 'chalbert', channel: 'claude-code-chat', reason: 'not real', at: '2026-10-21T11:46:28Z', clearerId: 's1' }));
+  const plainHold = c('plateau-reviewer[bot]', '2026-10-21T08:46:29Z', 'review paused: 1 referrals need a ruling; it resumes on a new push, a ruling, or a send-back');
+  const failedHold = c('plateau-reviewer[bot]', '2026-10-21T09:50:47Z', 'review paused: 1 referrals need a ruling; it resumes on a new push, a ruling, or a send-back\n\nReferral persistence failed; the next bounded retry is at 2026-10-21T13:50:00Z');
+  const pr = (comments, over = {}) => mkPr({ number: 5530, body: '<!-- authored-by-actor: author -->', labels: L('review:human'), comments, ...over });
+
+  it('a truly open finding stays the operator\'s and its location is printed', () => {
+    const r = row(sweep([pr([recordComment, plainHold])]), 5530);
+    expect(r).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true });
+    expect(r.why).toContain('backlog/x.md:33');
+    expect(r.evidence).toContain('open: backlog/x.md:33');
+    expect(r.next.command).toContain('record-referral-ruling');
+  });
+  it('0 open findings (every one has a standing ruling) makes the hold stale: system, no operator ask', () => {
+    // The operator ruled BEFORE the later hold comment, so the hold is the newest event and still "open".
+    const r = row(sweep([pr([recordComment, operatorRuling, { ...plainHold, createdAt: '2026-10-21T09:00:00Z' }])]), 5530);
+    expect(r).toMatchObject({ waitingOn: 'system:stale-hold', actor: 'system' });
+    expect(r.next.command).toBeNull();
+    expect(r.next.summary).toMatch(/no operator action/);
+  });
+  it('a failed referral save is the system\'s even while a finding is open, and still names it', () => {
+    const r = row(sweep([pr([recordComment, failedHold])]), 5530);
+    expect(r).toMatchObject({ waitingOn: 'system:ledger-write-miss', actor: 'system' });
+    expect(r.why).toContain('backlog/x.md:33');
+    expect(r.next.summary).toMatch(/outbox/);
+  });
+  it('a later trusted ledger-write-miss comment also marks the hold as unsaved', () => {
+    const parked = c('plateau-reviewer[bot]', '2026-10-21T10:45:20Z', 'Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: verdict-ledger-io: append failed');
+    expect(row(sweep([pr([recordComment, plainHold, parked])]), 5530).waitingOn).toBe('system:ledger-write-miss');
+    // an outsider's claim must not excuse the operator
+    const forged = c('mallory', '2026-10-21T10:45:20Z', 'ledger-write-miss');
+    expect(row(sweep([pr([recordComment, plainHold, forged])]), 5530).actor).toBe('operator');
+  });
+  it('a system row is still STALLED once it outlives the threshold with no live job', () => {
+    const r = row(sweep([pr([recordComment, failedHold])], { liveJobs: [] }), 5530);
+    expect(r.stalled).toBe(true);
+    expect(r.stalledReason).toMatch(/waiting on system/);
+    expect(renderSweepTable(sweep([pr([recordComment, failedHold])])).join('\n')).toMatch(/run:  \(none\)/);
   });
 });
 
