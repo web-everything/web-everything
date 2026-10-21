@@ -536,10 +536,14 @@ describe('applyRedTeamGate', () => {
         expect(countGrantedRoundExtensions([restGrant], { repo: REPO, pr: 4722, standingRuling: { ...scope, cardOnlyHeads: { [HEAD]: false } } })).toBe(0);
         // Per episode and the per-PR cap hold across shapes too.
         expect(credited([restGrant, rest(autoGrant, 3)])).toBe(1);
+        const nth = (n) => rest({ ...autoGrant, id: `IC_auto${n}`, body: buildRoundExtensionComment({ repo: REPO, pr: 4722, by: 1, actor: 'chalbert',
+          channel: 'auto-round-grant', reason: 'r', at: autoGrant.createdAt, standingRuling: RULING_ID, head: HEAD, episode: `${REPO}#4722@${HEAD}:review:${11 + n}/${11 + n}` }) }, n);
+        const four = [1, 2, 3, 4].map(nth);
+        expect(countGrantedRoundExtensions(four, { repo: REPO, pr: 4722, standingRuling: { ...scope, uneditedComments: ['IC_auto1', 'IC_auto2', 'IC_auto3', 'IC_auto4'] } })).toBe(3);
         expect(readRedTeamDisposition({ comments: thread(restGrant), pr: 4722, head: HEAD, repo: REPO, setting: CONFIRMED_BREAKS_DEFAULTS, env: {}, standingRuling: scope }).outcome).toBe('sent-back');
       });
       it('the label provider keeps the comment id (the node id the unedited read returns)', () => {
-        expect(GH_ARGV.readComments(REPO, 4722).join(' ')).toMatch(/\{id: \.node_id, author: \{login: \.user\.login\}, body, createdAt: \.created_at\}/);
+        expect(GH_ARGV.readComments(REPO, 4722).join(' ')).toMatch(/\{id: \.node_id, url: \.html_url, author: \{login: \.user\.login\}, body, createdAt: \.created_at\}/);
         const line = JSON.stringify(labelProvider(autoGrant, 2));
         const comments = [comment([F()]), capRecord(), ...createGhProvider({ exec: () => `${line}\n` }).readComments(REPO, 4722)];
         expect(countGrantedRoundExtensions(comments, { repo: REPO, pr: 4722, standingRuling: scope })).toBe(1);
