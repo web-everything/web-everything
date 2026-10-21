@@ -80,7 +80,8 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
     if (hasHiddenIndexFlags(git)) return unsafe('index flags may hide worktree changes');
     const stash = git(['stash', 'list']);
     if (stash.trim()) return unsafe('stash entries present');
-    const ahead = git(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']).trim();
+    // Protect work held by other branches, tags or custom refs, plus a detached HEAD.
+    const ahead = git(['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']).trim();
     if (!/^\d+$/.test(ahead)) return unsafe('ahead count unreadable');
     if (Number(ahead) > 0) return unsafe(`${ahead} unpushed commit(s)`);
     return { hasUnsafeWork: false, fresh: true, observedAt, reason: 'clean, no stash, nothing unpushed' };

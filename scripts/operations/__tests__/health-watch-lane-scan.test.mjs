@@ -162,7 +162,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
     ['git', ['ls-files', '-v']],
     ['git', ['stash', 'list']],
-    ['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']],
+    ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']],
   ];
   const gitMocks = [];
   // Assert outside the checker: it catches exec errors, including failed assertions inside a mock.
@@ -205,14 +205,14 @@ describe('fresh per-lane safety check before any destructive action', () => {
         });
       }
     });
-  it('pins the exact git argv: untracked files listed in full, unpushed counted against origin refs only', () => {
+  it('pins the exact git argv: untracked files listed in full, all refs and HEAD counted against origin refs only', () => {
     const exec = git({ status: '', stash: '', 'rev-list': '0\n' });
     freshLaneSafety({ path: '/l', exec });
     expect(exec.mock.calls.map(([bin, argv]) => [bin, argv])).toEqual([
       ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
       ['git', ['ls-files', '-v']],
       ['git', ['stash', 'list']],
-      ['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']],
+      ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']],
     ]);
     for (const [, , options] of exec.mock.calls) {
       expect(options).toMatchObject({ cwd: '/l', encoding: 'utf8', timeout: 30_000 });
@@ -268,7 +268,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
       if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']])) return status;
       if (command === JSON.stringify(['git', ['ls-files', '-v']])) return 'H tracked.txt\n';
       if (command === JSON.stringify(['git', ['stash', 'list']])) return '';
-      if (command === JSON.stringify(['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']])) return count;
+      if (command === JSON.stringify(['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']])) return count;
       if (argv.includes('status')) return '';
       return '0\n';
     });
@@ -408,7 +408,29 @@ describe('lane action guard with real Git', () => {
       expect(git(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'])).toBe('1\n');
       return 'tracked.txt';
     } },
-  ])('reports $work unsafe and refuses every destructive action with real Git', ({ prepare, reason }) => {
+    ...[
+      { work: 'unpushed commit on a non-HEAD branch with pushed HEAD', ref: 'refs/heads/local-work', detached: false },
+      { work: 'unpushed commit on a non-HEAD branch with detached HEAD', ref: 'refs/heads/local-work', detached: true },
+      { work: 'unpushed commit held only by a tag', ref: 'refs/tags/local-work', detached: false },
+      { work: 'unpushed commit held only by a custom ref', ref: 'refs/local/work', detached: false },
+    ].map(({ work, ref, detached }) => ({
+      work, reason: '1 unpushed commit(s)', expectedContent: 'committed content\n',
+      prepare: ({ path, git, commit }) => {
+        const pushed = git(['rev-parse', 'HEAD']).trim();
+        const branch = git(['symbolic-ref', '--short', 'HEAD']).trim();
+        git(['switch', '--quiet', '--detach']);
+        writeFileSync(join(path, 'tracked.txt'), 'local data\n');
+        git(['add', 'tracked.txt']);
+        commit();
+        git(['update-ref', ref, 'HEAD']);
+        git(['switch', '--quiet', ...(detached ? ['--detach', pushed] : [branch])]);
+        expect(git([...DIRTY_PROBE_ARGS])).toBe('');
+        expect(git(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'])).toBe('0\n');
+        expect(git(['show', `${ref}:tracked.txt`])).toBe('local data\n');
+        return 'tracked.txt';
+      },
+    })),
+  ])('reports $work unsafe and refuses every destructive action with real Git', ({ prepare, reason, expectedContent }) => {
     const repo = fixture();
     const file = prepare(repo);
     expect(freshLaneSafety({ path: repo.path })).toMatchObject({ hasUnsafeWork: true, fresh: true, reason });
@@ -417,7 +439,7 @@ describe('lane action guard with real Git', () => {
         act: false, fresh: { hasUnsafeWork: true, reason },
       });
     }
-    expect(readFileSync(join(repo.path, file), 'utf8')).toBe('local data\n');
+    expect(readFileSync(join(repo.path, file), 'utf8')).toBe(expectedContent ?? 'local data\n');
   }, 30_000);
 });
 
