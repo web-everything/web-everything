@@ -54,9 +54,10 @@ describe('clear-human CLI hold ceremony', () => {
     vi.stubEnv('WE_VERDICT_LEDGER_BOARD', '');
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); });
-  function run(hold, currentLabels = labels, comments = [], thread = comments) {
+  function run(hold, currentLabels = labels, comments = [], thread = comments, identity = { login: 'chalbert', type: 'User' }) {
     const provider = {
       currentRepo: () => 'o/n', name: 'stub',
+      readPostingIdentity: vi.fn(() => { if (identity instanceof Error) throw identity; return identity; }),
       readPrState: () => ({ state: 'OPEN', headRefOid: head, headRefName: 'lane/x', baseRefName: 'release', labels: currentLabels, comments, body: '' }),
       readComments: () => thread,
       readLabels: () => currentLabels, setLabels: vi.fn(), postComment: vi.fn(),
@@ -71,10 +72,26 @@ describe('clear-human CLI hold ceremony', () => {
     } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; }
     return { provider, readHumanOnlyHold, exitCode, payload: JSON.parse(chunks.join('') || '{}') };
   }
+  it.each([
+    ['automation credentials', { login: 'web-everything', type: 'User' }],
+    ['an allowlisted Bot', { login: 'chalbert', type: 'Bot' }],
+    ['an allowlisted is_bot account', { login: 'chalbert', is_bot: true }],
+    ['a bot suffix', { login: 'chalbert[bot]' }],
+    ['an unreadable identity', new Error('identity unavailable')],
+    ['missing identity metadata', {}],
+  ])('refuses %s before writing a clearance or swapping labels', (_name, identity) => {
+    const r = run(true, labels, [], [], identity);
+    expect(r.exitCode).toBe(2);
+    expect(r.payload.error).toMatch(/clear-human.*posting identity/i);
+    expect(r.provider.setLabels).not.toHaveBeenCalled();
+    expect(r.provider.postComment).not.toHaveBeenCalled();
+  });
   it('records clearance and reviewed SHA at the live head', () => {
     const r = run(true);
     expect(r.exitCode).toBe(0);
     expect(r.provider.setLabels).toHaveBeenCalled();
+    expect(r.provider.readPostingIdentity).toHaveBeenCalledOnce();
+    expect(r.provider.readPostingIdentity).toHaveBeenCalledWith('o/n');
     const body = r.provider.postComment.mock.calls[0][2];
     expect(body).toContain(buildClearedHumanMarker('operator'));
     expect(body).toContain(buildReviewedShaMarker(head));
@@ -134,11 +151,13 @@ describe('clear-human CLI hold ceremony', () => {
     const provider = {
       currentRepo: () => 'o/n', name: 'stub',
       readPrState: () => {
+        // The identity lookup does not advance this PR-read race counter.
         reads++;
         if (when === 'before-swap' && reads === 2) repark();
         return { state: 'OPEN', headRefOid: head, headRefName: 'lane/x', baseRefName: 'release', labels: [...live], comments: [], body: '' };
       },
       readComments: () => [...thread],
+      readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }),
       readLabels: () => [...live],
       setLabels: vi.fn((_r, _n, { add, remove = [] }) => {
         // `inside-swap`: the park lands between the swap's own fresh read and its write.

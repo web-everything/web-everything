@@ -1158,6 +1158,10 @@ describe('the GH_COMMENT_MAX guard is reachable-around by nothing (PR #1057)', (
 const fs = require('fs');
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.GH_CALL_LOG, a.slice(0, 2).join(' ') + '\\n');
+if (a[0] === 'api' && a[1] === 'user') {
+  process.stdout.write(JSON.stringify({ login: 'chalbert', type: 'User' }));
+  process.exit(0);
+}
 if (a[0] === 'pr' && a[1] === 'view') {
   process.stdout.write(JSON.stringify({ labels: [{ name: 'review:human' }], comments: [], headRefOid: 'f'.repeat(40), state: 'OPEN' }));
   process.exit(0);
@@ -1231,7 +1235,7 @@ process.exit(0);
     // It observed the PR (a read) and then stopped. #2979 moved the fingerprint's diff read off `gh pr diff`
     // onto `computeNetDiffText` (which shells `git`), so no `pr diff` appears in the gh log any more. What
     // matters to this guard is unchanged and still asserted: no MUTATION happened.
-    expect(ghCalls()).toEqual(['pr view']);
+    expect(ghCalls()).toEqual(['api user', 'pr view']);
     expect(ghCalls().some((c) => c === 'pr edit' || c === 'pr comment')).toBe(false);
   });
 });
@@ -1258,6 +1262,11 @@ describe('clear-human drives the swap END-TO-END (#2895, PR #1056 C3)', () => {
 const fs = require('fs');
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.GH_CALL_LOG, JSON.stringify(a) + '\\n');
+if (a[0] === 'api' && a[1] === 'user') {
+  const routedAway = process.env.GH_REPO !== 'o/n' || process.env.WE_GH_THROTTLE_PERSONAL_ROUTE === '1';
+  process.stdout.write(JSON.stringify({ login: process.env.GH_TOKEN === 'fixture-automation-token' && !routedAway ? 'web-everything' : 'chalbert', type: 'User' }));
+  process.exit(0);
+}
 if (a[0] === 'pr' && a[1] === 'view') {
   const labels = fs.existsSync(process.env.GH_EDIT_FLAG)
     ? [{ name: 'review:accepted' }, { name: 'ready-to-merge' }]
@@ -1307,8 +1316,21 @@ process.exit(0);
     : []);
   /** The values that FOLLOW each occurrence of `flag` in an argv array (adjacency, not mere presence). */
   const valuesOf = (argv, flag) => argv.flatMap((a, i) => (a === flag ? [argv[i + 1]] : []));
-  const runClear = (extra) => spawnSync('node', [script, '1048', '--repo=o/n', '--to=clear-human',
-    `--actor=${ACTOR}`, `--reason=${REASON}`, ...extra], { encoding: 'utf8', env: env() });
+  const runClear = (extra, overrides = {}) => spawnSync('node', [script, '1048', '--repo=o/n', '--to=clear-human',
+    `--actor=${ACTOR}`, `--reason=${REASON}`, ...extra], { encoding: 'utf8', env: { ...env(), GH_TOKEN: '', GITHUB_TOKEN: '', ...overrides } });
+
+  it.each([
+    ['GH_TOKEN identifies the automation poster', {}],
+    ['the shell targets another repository', { GH_REPO: 'other/checkout' }],
+    ['personal read routing is enabled', { WE_GH_THROTTLE_PERSONAL_ROUTE: '1' }],
+  ])('refuses the real CLI when %s', (_name, overrides) => {
+    const r = runClear([], { GH_TOKEN: 'fixture-automation-token', ...overrides });
+    expect(r.status).toBe(2);
+    expect(JSON.parse(r.stdout.trim()).error).toMatch(/posting identity.*allowlisted human operator/);
+    expect(calls().map(a => a.slice(0, 2).join(' '))).toEqual(['api user']);
+    expect(existsSync(join(dir, 'edited'))).toBe(false);
+    expect(existsSync(join(dir, 'comment.md'))).toBe(false);
+  });
 
   it('returns ok:true and lands the label swap, the attributed comment and the reviewed-sha stamp', () => {
     const bodyPath = join(dir, 'findings.md');
@@ -1338,7 +1360,7 @@ process.exit(0);
       // carries `review:human`/`review:pending` and NOT `review:accepted`, so the durable record (with its
       // marker) goes first, where an orphan is inert. The dedicated ordering suite below owns that property; the
       // pin is kept here so a silent re-flip cannot pass this end-to-end test.
-      .toEqual(['pr view', 'pr comment', 'pr view', 'pr edit', 'pr view']);
+      .toEqual(['api user', 'pr view', 'pr comment', 'pr view', 'pr edit', 'pr view']);
 
     // 3. The durable comment — the honesty tax as it is actually posted, not as the module describes it.
     const comment = readFileSync(join(dir, 'comment.md'), 'utf8');
@@ -1794,6 +1816,10 @@ describe('#2844 — the review-set-label CLI refuses a self-cleared verdict (end
 const fs = require('fs');
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.GH_CALL_LOG, JSON.stringify(a) + '\\n');
+if (a[0] === 'api' && a[1] === 'user') {
+  process.stdout.write(JSON.stringify({ login: 'chalbert', type: 'User' }));
+  process.exit(0);
+}
 if (a[0] === 'pr' && a[1] === 'view') {
   process.stdout.write(JSON.stringify({
     labels: JSON.parse(process.env.GH_PR_LABELS).map((name) => ({ name })),
@@ -2102,6 +2128,7 @@ describe('the write arc and its #2964 ordering', () => {
       calls,
       name: 'stub',
       currentRepo: () => 'o/n',
+      readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }),
       readPrState: () => {
         calls.push('readPrState');
         return { labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body, title };
@@ -3671,7 +3698,7 @@ describe('#4315 direct acceptance boundary', () => {
     try {
       expect(() => runReviewLabelCli({ argv: ['7', '--repo=o/r', `--to=${to}`, '--actor=operator', '--reason=generic clearance'],
         allowClearHuman: true, defaultActor: 'operator', emit: x => output.push(x),
-        provider: { readPrState: () => state, postComment: () => writes.push('post'), setLabels: () => writes.push('label') },
+        provider: { readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }), readPrState: () => state, postComment: () => writes.push('post'), setLabels: () => writes.push('label') },
         buildComment: () => 'accept', successResult: x => x, refusalResult: x => x,
       })).toThrow();
       expect(output.join('')).toContain('mandatory referral hold');
@@ -3984,6 +4011,7 @@ describe('#5649 — approval rows at the label home', () => {
     const calls = [];
     return {
       calls, name: 'stub', currentRepo: () => 'o/n',
+      readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }),
       readPrState: () => ({ labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '' }),
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: () => { calls.push('setLabels'); },
