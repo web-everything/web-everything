@@ -513,11 +513,13 @@ export function cardGroupCandidates({ enqueueOutcomes = [], deferred = [] } = {}
   const waits = (Array.isArray(deferred) ? deferred : []).filter(overlapOnly);
   const repoOf = d => d.repo ?? d.overlapYield?.repo ?? null;
   const deferrals = waits.map(d => ({ num: Number(d.num), repo: repoOf(d), outcome: 'deferred', kind: 'overlap-yield', reason: d.waitOn.join(', ') }));
+  // PR numbers are repository-local: a target is keyed (and matched against the waits) by repo and number.
+  const key = (repo, num) => `${repoIdentity(repo)}#${num}`;
   const targets = new Map();
   for (const d of waits) {
     const pr = Number(d.overlapYield?.pr);
-    if (!Number.isInteger(pr) || targets.has(pr) || waits.some(x => Number(x.num) === pr)) continue;
-    targets.set(pr, { num: pr, repo: repoOf(d), outcome: 'yield-target', kind: 'overlap-yield', reason: `yielded to by #${d.num}`, yieldTarget: true });
+    if (!Number.isInteger(pr) || targets.has(key(repoOf(d), pr)) || waits.some(x => key(repoOf(x), Number(x.num)) === key(repoOf(d), pr))) continue;
+    targets.set(key(repoOf(d), pr), { num: pr, repo: repoOf(d), outcome: 'yield-target', kind: 'overlap-yield', reason: `yielded to by #${d.num}`, yieldTarget: true });
   }
   return [...(Array.isArray(enqueueOutcomes) ? enqueueOutcomes : []), ...deferrals, ...targets.values()];
 }
@@ -619,7 +621,10 @@ export function createCardGrouping({
         const groups = st.groups.filter(isLocalGroup);
         if (!groups.length) return { checked: 0 };
         const stampKey = repoIdentity(localSlug);
-        if (!force && now() - (st.lastReconcileAt?.[stampKey] ?? 0) < setting.reconcileSec * 1000) return { checked: 0, throttled: true };
+        // A stamp that is not a past time (corrupt file, clock stepped back) must not throttle forever.
+        const stamp = Number(st.lastReconcileAt?.[stampKey] ?? 0);
+        const fresh = Number.isFinite(stamp) && stamp <= now() && now() - stamp < setting.reconcileSec * 1000;
+        if (!force && fresh) return { checked: 0, throttled: true };
         if (dryRun) return { checked: 0, dryRun: true };
         mutate(s => { s.lastReconcileAt = { ...s.lastReconcileAt, [stampKey]: now() }; });
         const done = [], dissolved = [];

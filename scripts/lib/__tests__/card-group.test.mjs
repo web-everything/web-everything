@@ -436,6 +436,17 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       }
     });
 
+    it('keys yield targets by repository: a sibling repo\'s PR with the same number never suppresses or claims a local target', () => {
+      const wait = (num, repo, pr) => ({ num, repo, waitOn: [`overlap-yield:#${pr}`], overlapYield: { pr, repo } });
+      const targets = d => cardGroupCandidates({ deferred: d }).filter(o => o.yieldTarget).map(o => [o.num, o.repo]);
+      // A sibling deferral numbered #57 is not the local #57 that local #12 yields to.
+      expect(targets([wait(12, 'o/r', 57), wait(57, 'sib/x', 3)])).toEqual([[57, 'o/r'], [3, 'sib/x']]);
+      // A sibling target #40 registered first does not stand in for the local target #40.
+      expect(targets([wait(9, 'sib/x', 40), wait(1, 'o/r', 40)])).toEqual([[40, 'sib/x'], [40, 'o/r']]);
+      // Within one repository a target that is itself waiting is still not a separate target.
+      expect(targets([wait(1, 'o/r', 2), wait(2, 'O/R', 3)])).toEqual([[3, 'O/R']]);
+    });
+
     it('the ready PR the others yield to joins the group (two approved card PRs on one card), only when it would land now', () => {
       // #1 yields to #2; #2 is READY, so without joining it would be queued ahead and the group would never form.
       const octx = new Map([[overlapRowKey({ repo: null, number: 1 }), { yieldTo: 2, repo: null, files: [CARD], untilMs: 1_000, windowMinutes: 45 }]]);
@@ -855,6 +866,11 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(drain('o/foreign', T0 + 90_000)).toEqual({ r: { checked: 0, throttled: true }, calls: [] });
       expect(drain('O/R', T0 + 90_000)).toEqual({ r: { checked: 0, throttled: true }, calls: [] });
       expect(drain('o/r', T0 + 60_000 + 120_000).r).toMatchObject({ checked: 1 });
+      // A stamp in the future (corrupt file, clock stepped back) never throttles for good.
+      for (const bad of [T0 * 1000, 'soon']) {
+        writeFileSync(statePath, JSON.stringify({ groups: [group('g', 'o/r')], failed: {}, lastReconcileAt: { 'o/r': bad } }));
+        expect(drain('o/r', T0).r).toMatchObject({ checked: 1 });
+      }
     });
 
     it.each([
