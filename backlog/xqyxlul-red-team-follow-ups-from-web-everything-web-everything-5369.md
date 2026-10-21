@@ -12,7 +12,7 @@ tags: []
 Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5369 (reviewed head `9efb3ce64110bd258edaecb0400d89fb743c77b8`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
 1. `we:scripts/conveyor/fix-context-pack.mjs:221` — (failing-input, degraded) The context-pack command fails from supported sibling-repository lanes.
-   - Scenario: Dispatch a fix for Frontier UI, acquire its lane, and follow the new 'node we:scripts/operations/run.mjs revert-red-check ...' instruction after 'cd "$LANE"'. Frontier UI has no such runner. A read-only probe from /Users/nicolasgilbert/workspace/frontierui exited 1 with MODULE_NOT_FOUND for that exact path. Qualify the command with {{WE_ROOT}}, as the main brief does, so it works from sibling checkouts.
+   - Scenario: Dispatch a fix for Frontier UI, acquire its lane, and follow the new 'node we:scripts/operations/run.mjs revert-red-check ...' instruction after 'cd "$LANE"'. Frontier UI has no such runner. A read-only probe from a Frontier UI checkout exited 1 with MODULE_NOT_FOUND for that exact path. Qualify the command with {{WE_ROOT}}, as the main brief does, so it works from sibling checkouts.
    - Claude's re-check: The diff adds a cwd-relative 'node we:scripts/operations/run.mjs' in the fix-brief red-proof text. The brief's own version of the same command uses '{{WE_ROOT}}', which shows the runner lives in the web-everything checkout and not in sibling-repo lanes. Run from a non-WE lane, the relative path would fail to resolve.
 
 ## Acceptance
