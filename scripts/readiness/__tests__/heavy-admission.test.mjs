@@ -2153,6 +2153,15 @@ describe('heavy-run-wait — a wait budget re-tries the load gate and the slot q
     expect(heldSlots({ lockRoot, cap: 1 })).toHaveLength(0);
   });
 
+  it('AUDIT 3: a slow REJECTED host check counts too — no extra sleep past the budget, and waitedMs is the real wait', async () => {
+    let clock = T0; const sleeps = [];
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol(), waitMs: 1000,
+      now: () => clock, log: () => {}, hostAdmission: () => { clock += 1500; return overloaded; },
+      sleep: async (ms) => { sleeps.push(ms); clock += ms; } });
+    expect(r).toMatchObject({ ok: false, deferred: true, waitedMs: 1500 });
+    expect(sleeps).toEqual([]);
+  });
+
   it('AUDIT: the waiting marker keeps its ORIGINAL requestedAt through the host wait (the FCFS position, not just presence)', async () => {
     let clock = T0; const stamps = []; let checks = 0;
     await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', canDefer: true, policy: pol(), waitMs: 60_000, now: () => clock, log: () => {},
