@@ -87,6 +87,26 @@ describe('queue branch numbering', () => {
       { id: '6678-admission', num: '6678', bornAs: 'xwfgsk7' },
     ], { drainNumbered: pairs }), [])).toEqual([]);
   });
+  it('retains an accepted drain author after 100 newer numbering commits by another author', () => {
+    const main = [
+      ...Array.from({ length: 100 }, () => 'Recent\0recent@example.test\0drain: JIT-number xbbbbbb→#20 at land (#2288)'),
+      'Established\0established@example.test\0drain: JIT-number xaaaaaa→#10 at land (#2288)',
+    ];
+    const exec = vi.fn((_cmd, args) => {
+      if (args.at(-1) !== 'origin/main') return [
+        'Established\0established@example.test\0drain: JIT-number xabc123→#30 at land (#2288)',
+        'Forger\0forger@example.test\0drain: JIT-number xdef456→#31 at land (#2288)',
+      ].join('\n');
+      const limit = args.find(arg => arg.startsWith('--max-count='));
+      return (limit ? main.slice(0, Number(limit.split('=')[1])) : main).join('\n');
+    });
+    const pairs = drainNumberedPairs({ cwd: '/clone', exec });
+    expect(pairs).toEqual(new Set(['xabc123→30']));
+    expect(handNumberedNewItems(exemptDrainNumberedItems([
+      { id: '30-drained', num: '30', bornAs: 'xabc123' },
+      { id: '31-forged', num: '31', bornAs: 'xdef456' },
+    ], { drainNumbered: pairs }), [])).toEqual([expect.stringContaining('31-forged')]);
+  });
   it('refuses hash cards in merge groups even when drain numbering is off', () => {
     const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group', WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'off' };
     expect(mergeGroupHashRefusals({ env, files: ['backlog/xabc123-foo.md', 'backlog/5970-bar.md'] })).toEqual([
@@ -206,7 +226,7 @@ describe('queue branch numbering', () => {
   it('bounds the trusted identity read by time and output size', () => {
     const exec = vi.fn(() => 'Trusted\0drain@example.test\0drain: JIT-number xabc123→#42 at land (#2288)\n');
     expect(trustedDrainAuthors({ cwd: '/clone', exec })).toEqual(new Set(['Trusted\0drain@example.test']));
-    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['--grep=^drain: JIT-number ', 'origin/main']), expect.objectContaining({ timeout: 60000, maxBuffer: 4 * 1024 * 1024 }));
+    expect(exec).toHaveBeenCalledWith('git', ['log', '--grep=^drain: JIT-number ', '--format=%an%x00%ae%x00%s', 'origin/main'], expect.objectContaining({ timeout: 60000, maxBuffer: 4 * 1024 * 1024 }));
     expect(trustedDrainAuthors({ exec: () => { throw new Error('history unavailable'); } })).toEqual(new Set());
   });
   it('returns final without locking or pushing when nothing needs doing', () => {
