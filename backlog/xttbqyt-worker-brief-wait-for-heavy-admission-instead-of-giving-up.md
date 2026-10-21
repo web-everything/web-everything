@@ -8,11 +8,11 @@ tags: []
 
 # Worker brief: wait for heavy-admission instead of giving up
 
-Four workers on 2026-10-20 stopped with 'heavy-command admission deferred (exit 75), host load ~40/12' and left tests unrun. we:scripts/worker-brief.mjs should tell workers: tests go through node we:scripts/readiness/heavy-admission.mjs run -- ...; on exit 75, either wait via the sanctioned bounded wait (if the agent can) or hand back the exact lane, sha and command to the orchestrator. Never stop silently, never sleep-loop.
+Four workers on 2026-10-20 stopped with 'heavy-command admission deferred (exit 75), host load ~40/12' and left tests unrun. we:scripts/worker-brief.mjs should tell workers: from the repository root, tests go through `node scripts/readiness/heavy-admission.mjs run -- ...`; on exit 75, either wait via the sanctioned bounded wait (if the agent can) or hand back the exact lane, sha and command to the orchestrator. Never stop silently, never sleep-loop.
 
 ## Acceptance
 
-- [A1] **Executable** — a test on the worker-brief output asserts the printed block names `node we:scripts/readiness/heavy-admission.mjs run --` as the way to run tests, and states the exit-75 rule. It fails before this lands and passes after.
+- [A1] **Executable** — a test on the worker-brief output asserts the printed block names `node scripts/readiness/heavy-admission.mjs run --` as the way to run tests from the repository root, and states the exit-75 rule. It fails before this lands and passes after.
 - [A2] **Must** — the brief says: on exit 75, either wait through the sanctioned bounded wait (only if this agent can use it) or hand back the exact lane, sha, and command to the orchestrator in the final report.
 - [A3] **Must** — the brief forbids stopping silently, forbids a sleep loop, and forbids running the tests outside the gate to get around the deferral.
 - [A4] **Must** — a worker that hands back must say tests are NOT run; the brief never lets "deferred" read as "passed".
