@@ -23,10 +23,12 @@ import { judgeRound, isGuardPath } from '../lib/round-judge.mjs';
 import { verifyFinding, makeGitRepo } from '../lib/round-judge-verify.mjs';
 import { parseRedTeamGateMarker, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from '../lib/marker-authorship.mjs';
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
+import { GH_ARGV, parseJsonLines } from '../lib/review-label-provider.mjs';
 import { ROUND_EXTENSION_MARKER } from '../conveyor/round-extension-mark.mjs';
 
 export const REPLAY_PRS = Object.freeze([5701, 5654, 5690, 5769, 5530, 5784, 5492, 5502, 5729, 5758, 5759, 5485, 5768, 5775]);
-const REPO = 'web-everything/web-everything';
+const REPO = ghRepoSlug(DEFAULT_REPO_KEY);
 const bodyOf = (c) => (typeof c?.body === 'string' ? c.body : '');
 const timeOf = (c) => Date.parse(c?.createdAt ?? '') || 0;
 const WINDOW_MS = 36 * 3600e3;
@@ -123,9 +125,10 @@ function readPr(n, fromDir) {
     if (existsSync(p)) return JSON.parse(readFileSync(p, 'utf8'));
   }
   const env = { ...process.env }; delete env.GH_TOKEN; delete env.GITHUB_TOKEN;
-  const out = execFileSync('/opt/homebrew/bin/gh', ['pr', 'view', String(n), '--repo', REPO, '--json', 'number,comments,labels,files'],
-    { env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  return JSON.parse(out);
+  const run = (args) => execFileSync('/opt/homebrew/bin/gh', args, { env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const meta = JSON.parse(run(['pr', 'view', String(n), '--repo', REPO, '--json', 'number,labels,files,headRefOid']));
+  // The COMPLETE paginated thread (the sanctioned reader), never `gh pr view --json comments` (stops at one page).
+  return { ...meta, comments: parseJsonLines(run(GH_ARGV.readComments(REPO, n))) };
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
