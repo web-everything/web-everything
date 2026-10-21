@@ -1,3 +1,4 @@
+// @repo-scanning-test scope=files — every script naming an ops/* ref is a listed by-name reader or a known non-reader.
 /**
  * @file lane-git-diet.test.mjs — proof for the lane git diet: the config ops (pure + idempotent), the real-git
  *   semantics it relies on (negative refspec excludes ops/* from a default fetch, but an explicit full refspec
@@ -11,6 +12,7 @@ import { join, relative } from 'node:path';
 import {
   LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH, laneDietConfigOps, applyLaneDietConfig, OPS_REF_READERS,
 } from '../lane-git-diet.mjs';
+import { scopedScanFiles } from '../repo-scan-tests.mjs';
 
 const REPO = join(import.meta.dirname, '..', '..', '..');
 const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
@@ -89,9 +91,9 @@ describe('ops-ref reader inventory', () => {
   it('is complete: every script naming an ops/* ref in code is a listed reader or a known non-reader', () => {
     const listed = new Set([...OPS_REF_READERS.map((r) => r.file), ...Object.keys(NON_READERS)]);
     const unlisted = [];
-    for (const abs of walk(join(REPO, 'scripts'))) {
-      const code = readFileSync(abs, 'utf8').split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
-      const rel = relative(REPO, abs);
+    const files = scopedScanFiles(walk(join(REPO, 'scripts')).map((abs) => relative(REPO, abs)));
+    for (const rel of files) {
+      const code = readFileSync(join(REPO, rel), 'utf8').split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
       if (OPS_IN_CODE.test(code) && !listed.has(rel)) unlisted.push(rel);
     }
     expect(unlisted).toEqual([]);
