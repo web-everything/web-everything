@@ -4640,10 +4640,17 @@ async function runCli() {
     onDeferred: (reason) => process.stderr.write(`  ⚠ ${repoTag(repo)}${pr.number} ${reason}\n`),
   });
   const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
-  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
+  // xym8nt4 — this pass's published main-red repair PRs (local numbers), always from the LIVE red-main signal
+  // (fast path, pass start, then the red-main hold below), never from a cached candidate. A card group never holds
+  // one, never shields it from rebase/repair, and dissolves when it needs the group's card: red main holds the
+  // combined PR, so either hold would deadlock both.
+  let passMainFix = new Set();
+  const isMainFix = (c) => isLocalRepo(c?.repo) && passMainFix.has(Number(c?.num));
+  const mainFixFrom = (sig) => new Set(sig?.red ? (sig.fixPrs || []).map(Number).filter(Number.isInteger) : []);
+  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
-  const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
+  const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }),
     readQueue: () => readQueueFacts({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }),
     readQueueFiles: () => readQueueEntryFiles({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }) });
@@ -5078,6 +5085,7 @@ async function runCli() {
     const freeze = redMainBypass ? null : await readDrainFreezePass();
     const hold = redMainBypass ? null : drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: resolveRedMainHoldSetting().value === 'on' });
     const blocked = hold?.red && decideRedMainHold({ num: onlyPr, isLocal: true, signal: hold, setting: 'on' }).hold;
+    passMainFix = mainFixFrom(hold);
     const fast = blocked ? { fallback: true } : await enqueuePrestage({ cache: prestageCache, repo: localSlug, num: Number(onlyPr), settings: prestageSetting,
       readPr: async () => {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
@@ -5104,6 +5112,11 @@ async function runCli() {
     }
     process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
   }
+  // xym8nt4 — the repair PRs as of pass start, BEFORE the heal/rebase steps consult card-group membership (the
+  // red-main hold below refreshes it with the freeze applied). Records only: a manual freeze is re-read there.
+  passMainFix = !redMainBypass && resolveRedMainHoldSetting().value === 'on'
+    ? mainFixFrom(drainFreezeSignal({ state: {}, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: true }))
+    : new Set();
   // Keep listing, bare-loop and review-escalation policy on one fresh snapshot per pass.
   const workflowEditSetting = resolveDrainWorkflowEditHuman();
   process.stderr.write(`policy · drainWorkflowEditHuman=${workflowEditSetting.value} (${workflowEditSetting.source})\n`);
@@ -6210,8 +6223,10 @@ async function runCli() {
     const holdSetting = resolveRedMainHoldSetting();
     const holdOn = holdSetting.value === 'on';
     const freeze = redMainBypass ? null : await readDrainFreezePass();
+    passMainFix = new Set(); // xym8nt4 — refreshed from this hold's own signal (the freeze applied)
     if (!redMainBypass && (holdOn || freeze.frozen)) {
       const sig = drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn });
+      passMainFix = mainFixFrom(sig);
       if (sig.red) {
         redMainHeld = true;
         let held = 0;
@@ -6236,9 +6251,6 @@ async function runCli() {
             ? decideQuarantineHold({ num: v.num, files: filesOf(v.num), signal: sig, list: qList, fixFiles, now: Date.now() })
             : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: 'on' });
           if (d.hold) { v.decision = 'skip'; v.reason = freeze.frozen ? `${RED_MAIN_HOLD_REASON}: ${freeze.reason}; ${d.reason}` : d.reason; v.redMainHold = true; held++; }
-          // xym8nt4 — the published repair PR is never held by a card group (red main holds the combined PR, so a
-          // group hold would deadlock both); runCardGroupPass dissolves any group it needs.
-          else if (isLocalRepo(v.repo) && sig.fixPrs.includes(Number(v.num))) v.redMainFixPr = true;
         }
         if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
       }
@@ -6554,7 +6566,8 @@ async function runCli() {
   // groups (under any delivery strategy, so a switch to direct merging never strands a hold), then, under the merge
   // queue, forms at most one new group from the planner's overlap waits and the PRs they yield to. The cascade's
   // hold below then keeps every source out of the queue this same pass. Never throws.
-  runCardGroupPass({ grouping: cardGrouping, onlyPr, enqueues: mergeStrategy.enqueues(null), enqueueOutcomes, deferred: preparedPass.plan.deferred, verdicts });
+  runCardGroupPass({ grouping: cardGrouping, onlyPr, enqueues: mergeStrategy.enqueues(null), enqueueOutcomes, deferred: preparedPass.plan.deferred, verdicts,
+    mainFixNums: [...passMainFix], isLocalRepo });
   let deferred = [];
   if (DRY_RUN) {
     // Report the planned first-pass order (blockedBy + #2393 stackParents-honoured) without merging. Nothing has

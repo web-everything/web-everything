@@ -532,13 +532,18 @@ export function cardGroupCandidates({ enqueueOutcomes = [], deferred = [] } = {}
  * groups whatever the delivery strategy: a group formed under the merge queue must still release its holds after a
  * switch to direct merging. A new group forms only while the local repo merges through the queue; the cascade's
  * hold then keeps every source (the yield target included) out of the queue this same pass. While main is red the
- * pass's published repair PRs (`redMainFixPr`, set by the red-main gate) go to reconcile, which dissolves any group
+ * pass's published repair PRs (`mainFixNums`, from the live red-main signal) go to reconcile, which dissolves any group
  * they need, and no new group forms (only the repair may land). Never throws.
  */
-export function runCardGroupPass({ grouping, onlyPr = null, enqueues = false, enqueueOutcomes = [], deferred = [], verdicts = [], log = process.stderr } = {}) {
+export function runCardGroupPass({ grouping, onlyPr = null, enqueues = false, enqueueOutcomes = [], deferred = [], verdicts = [], mainFixNums = [], isLocalRepo = r => !r, log = process.stderr } = {}) {
   if (onlyPr != null) return { reconciled: null, grouping: null };
-  const mainFixPrs = (Array.isArray(verdicts) ? verdicts : []).filter(v => v?.redMainFixPr === true)
-    .map(v => ({ num: Number(v.num), repo: v.repo ?? null, files: v.listedFilesComplete === true ? v.listedFiles : null }));
+  // `mainFixNums`: the live signal's local repair PRs, whatever their decision this pass (one that still needs a
+  // rebase is `skip`, and must dissolve its group all the same). Files come from the pass listing when complete.
+  const list = Array.isArray(verdicts) ? verdicts : [];
+  const mainFixPrs = [...new Set((Array.isArray(mainFixNums) ? mainFixNums : []).map(Number).filter(n => Number.isInteger(n) && n > 0))].map(num => {
+    const v = list.find(x => isLocalRepo(x?.repo) && Number(x?.num) === num);
+    return { num, repo: null, files: v?.listedFilesComplete === true ? v.listedFiles : null };
+  });
   const reconciled = grouping.reconcile({ mainFixPrs });
   if (!enqueues) return { reconciled, grouping: null };
   if (mainFixPrs.length) return { reconciled, grouping: { reason: `main is red — only the repair PR(s) ${mainFixPrs.map(f => `#${f.num}`).join(', ')} land; no group forms` } };
@@ -556,6 +561,9 @@ export function createCardGrouping({
   // after proving no source is queued, so an enqueue can never pass its hold check and then race the claim.
   withLock = null, readQueue = null, readQueueFiles = null,
   cardConflictSettings = null,
+  // Is `c` a published main-red repair PR per this pass's LIVE red-main signal? Never read from a candidate field
+  // (a cached candidate would carry it past the red window). Such a PR is neither held nor treated as a member.
+  isMainFix = () => false,
 } = {}) {
   const say = line => { if (!quiet) log.write(`  card-group: ${line}\n`); };
   const isLocalGroup = g => sameRepo(g.repo, localSlug);
@@ -610,10 +618,14 @@ export function createCardGrouping({
     holdFor(c) {
       if (!statePath || !existsSync(statePath)) return null;
       return cardGroupHold(readGroupState(statePath, readFile), { num: c?.num, repo: c?.repo, localSlug,
-        files: c?.listedFilesComplete === true ? c.listedFiles : null, mainFix: c?.redMainFixPr === true });
+        files: c?.listedFilesComplete === true ? c.listedFiles : null, mainFix: isMainFix(c) === true });
     },
-    /** A source or combined PR of a recorded group: the drain's own rebase/repair must not move its head. */
+    /**
+     * A source or combined PR of a recorded group: the drain's own rebase/repair must not move its head. The
+     * published main-red repair PR is not exempted from rebase/repair: it must become landable (its group dissolves).
+     */
     inGroup(c) {
+      if (isMainFix(c) === true) return false;
       if (!statePath || !existsSync(statePath)) return false;
       return inCardGroup(readGroupState(statePath, readFile), { num: c?.num, repo: c?.repo, localSlug, headRef: c?.headRef });
     },

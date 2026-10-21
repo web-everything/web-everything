@@ -218,11 +218,13 @@ export function createDrainMergeStrategy({
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
   // xym8nt4 — a source PR of a post-approval card group never enqueues on its own (the combined PR carries it).
   // The SAME path resolver grouping writes through (`resolveCardGroupStatePath`), so an override never splits them.
+  // `isMainFix(c)`: is `c` a published main-red repair PR per THIS pass's live red-main signal (never a cached flag)?
+  isMainFix = () => false,
   cardGroupHold = (c) => {
     const path = resolveCardGroupStatePath(env);
     if (!path || !existsSync(path)) return null;
     return pureCardGroupHold(readGroupState(path), { num: c?.num, repo: c?.repo || localSlug, localSlug,
-      files: c?.listedFilesComplete === true ? c.listedFiles : null, mainFix: c?.redMainFixPr === true });
+      files: c?.listedFilesComplete === true ? c.listedFiles : null, mainFix: isMainFix(c) === true });
   },
 } = {}) {
   const { policy, note } = resolved;

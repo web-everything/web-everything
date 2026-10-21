@@ -255,9 +255,19 @@ describe('reservation, membership, queue wait', () => {
     expect(cardGroupHold(state, { num: 7, localSlug: 'o/r', files: ['backlog/1-a.md'], mainFix: 'yes' })).toMatchObject({ kind: 'card-grouped' });
     const dir = tmp(), statePath = join(dir, 's.json');
     writeFileSync(statePath, JSON.stringify(state));
-    const g = createCardGrouping({ localSlug: 'o/r', cwd: dir, statePath, settings: { enabled: true, maxSize: 8, eligibility: 'card-only', reconcileSec: 120, retryMin: 30, sources: {} }, quiet: true });
-    expect(g.holdFor({ num: 7, listedFilesComplete: true, listedFiles: ['backlog/1-a.md'], redMainFixPr: true })).toBeNull();
-    expect(g.holdFor({ num: 7, listedFilesComplete: true, listedFiles: ['backlog/1-a.md'] })).toMatchObject({ kind: 'card-grouped' });
+    const st = { groups: [{ ...state.groups[0], branch: 'lane/card-group-g' }], failed: {} };
+    writeFileSync(statePath, JSON.stringify(st));
+    const live = new Set([7, 5]); // this pass's live red-main signal
+    const g = createCardGrouping({ localSlug: 'o/r', cwd: dir, statePath, settings: { enabled: true, maxSize: 8, eligibility: 'card-only', reconcileSec: 120, retryMin: 30, sources: {} }, quiet: true,
+      isMainFix: c => live.has(c.num) });
+    expect(g.holdFor({ num: 7, listedFilesComplete: true, listedFiles: ['backlog/1-a.md'] })).toBeNull();
+    // A repair that is a SOURCE is not shielded from rebase/repair either: it must become landable.
+    expect(g.inGroup({ num: 5 })).toBe(false);
+    expect(g.holdFor({ num: 5 })).toBeNull();
+    // Main green again: the same PRs are held and members once more. A stale candidate field never exempts.
+    live.clear();
+    expect(g.holdFor({ num: 7, listedFilesComplete: true, listedFiles: ['backlog/1-a.md'], redMainFixPr: true })).toMatchObject({ kind: 'card-grouped' });
+    expect(g.inGroup({ num: 5, redMainFixPr: true })).toBe(true);
   });
   it('membership (an exemption) needs proof: recorded source, or combined PR number AND recorded branch', () => {
     const st = { groups: [{ ...state.groups[0], branch: 'lane/card-group-g' }], failed: {} };
@@ -841,16 +851,19 @@ describe('createCardGrouping — claim under the land mutex, close on current he
         const t = reconcileCase({ files: [CARD], mainFixPrs: [{ num: 99, repo: 'o/foreign', files: [CARD] }] });
         expect(t.state.groups).toHaveLength(1);
       });
-      it('runCardGroupPass hands the pass\'s repair PRs to reconcile and forms no group while one is published', () => {
+      it('runCardGroupPass hands the live repair PRs (any decision) to reconcile and forms no group while one is published', () => {
         const seen = [];
         const grouping = { reconcile: a => { seen.push(['reconcile', a]); return { checked: 0 }; }, form: () => { seen.push(['form']); return { reason: 'x' }; } };
-        const verdicts = [{ num: 99, decision: 'merge', redMainFixPr: true, listedFilesComplete: true, listedFiles: [CARD] },
-          { num: 98, decision: 'merge', redMainFixPr: true, listedFilesComplete: false, listedFiles: [CARD] }, { num: 5, decision: 'merge' }];
-        const r = runCardGroupPass({ grouping, enqueues: true, verdicts, log: { write: () => {} } });
-        expect(seen).toEqual([['reconcile', { mainFixPrs: [{ num: 99, repo: null, files: [CARD] }, { num: 98, repo: null, files: null }] }]]);
+        // #98 needs a rebase (decision skip) and has an incomplete file list; the sibling repo's #98 lends it no files;
+        // #97 has no verdict this pass; a stale `redMainFixPr` field on #5 never makes it a repair.
+        const verdicts = [{ num: 99, decision: 'merge', listedFilesComplete: true, listedFiles: [CARD] },
+          { num: 98, decision: 'skip', listedFilesComplete: false, listedFiles: [CARD] }, { num: 98, repo: 'sib/x', decision: 'merge', listedFilesComplete: true, listedFiles: [CARD] },
+          { num: 5, decision: 'merge', redMainFixPr: true }];
+        const r = runCardGroupPass({ grouping, enqueues: true, verdicts, mainFixNums: [99, '98', 97, 99], isLocalRepo: x => !x, log: { write: () => {} } });
+        expect(seen).toEqual([['reconcile', { mainFixPrs: [{ num: 99, repo: null, files: [CARD] }, { num: 98, repo: null, files: null }, { num: 97, repo: null, files: null }] }]]);
         expect(r.grouping).toMatchObject({ reason: expect.stringMatching(/main is red/) });
         seen.length = 0;
-        runCardGroupPass({ grouping, enqueues: true, verdicts: [{ num: 5, decision: 'merge' }], log: { write: () => {} } });
+        runCardGroupPass({ grouping, enqueues: true, verdicts, log: { write: () => {} } });
         expect(seen).toEqual([['reconcile', { mainFixPrs: [] }], ['form']]);
       });
     });

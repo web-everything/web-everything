@@ -109,10 +109,13 @@ describe('drain merge strategy — github-merge-queue', () => {
       writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: LOCAL, pr: 77, files: ['backlog/5360-prevention-card.md'], sources: [{ num: 5, headSha: HEAD }] }], failed: {} }));
       const env = { ...process.env, WE_DRAIN_CARD_GROUP_STATE: statePath };
       const repair = { num: 99, repo: null, listedFilesComplete: true, listedFiles: ['backlog/5360-prevention-card.md'] };
+      // Main green: held. A cached candidate still carrying an old repair flag is held all the same.
       const held = harness({ strategy: 'github-merge-queue', env });
       expect(held.s.enqueue(repair, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true, kind: 'card-grouped' });
-      const fix = harness({ strategy: 'github-merge-queue', env });
-      expect(fix.s.enqueue({ ...repair, redMainFixPr: true }, HEAD, { comments: [] })).not.toMatchObject({ kind: 'card-grouped' });
+      expect(held.s.enqueue({ ...repair, redMainFixPr: true }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true, kind: 'card-grouped' });
+      // Main red with #99 the published repair (the drain's live signal): never deferred by the group.
+      const fix = harness({ strategy: 'github-merge-queue', env, strategyExtra: { isMainFix: c => c.num === 99 && c.repo == null } });
+      expect(fix.s.enqueue(repair, HEAD, { comments: [] })).not.toMatchObject({ kind: 'card-grouped' });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
