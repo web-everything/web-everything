@@ -655,7 +655,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(gate.outcome).toBe('round-cap');
     const h = harness({ strategy: 'github-merge-queue', labels, liveComments: thread, now: () => 1000 });
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ kind: 'red-team-pending' });
-    thread.push({ user: { login: 'web-everything[bot]' }, body: buildVerdictComment({
+    thread.push({ user: { login: 'chalbert' }, body: buildVerdictComment({
       to: 'clear-human', actor: 'operator', headSha: HEAD, reason: 'accept the documented known risk',
     }) });
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });

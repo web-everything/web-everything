@@ -463,19 +463,27 @@ function operatorRuled(records, pr, head) {
   const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
+  const rulingHeads = new Set();
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
   for (let sha = head, rs = trusted, want = null; sha && rs.length;) {
     const result = latestResult(rs, pr, sha);
     // A carry hop counts only when the prior head's result is the one that was carried (same id).
     if (!result || (want && redTeamResultId(result.parsed) !== want)) return false;
+    rulingHeads.add(sha);
     want = redTeamResultId(result.parsed);
     const gates = gateRecordsFor(rs, pr, sha, result);
     const cap = gates.filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1);
-    const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
+    // Only a human operator's own clear-human comment is a ruling; an automation-posted copy (even by a trusted bot) is not.
+    const cleared = lastAt(rs, r => !r.from && isHumanOperatorComment(r.c) && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
-    if (cap && cleared && cleared.at > result.at && gates.every(r =>
+    // A plain accept of ANY head in this proven carry chain after the ceremony supersedes it.
+    // Scan the whole thread: accepts before or after a carry must survive its historical truncation.
+    const reviewed = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*(?:${[...rulingHeads].join('|')})\\s*-->`, 'i');
+    const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
+      && reviewed.test(recordBody(r)));
+    if (cap && cleared && !reaccepted && cleared.at > result.at && gates.every(r =>
       ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
     if (gates.some(r => !r.from && [GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome))) return false;
