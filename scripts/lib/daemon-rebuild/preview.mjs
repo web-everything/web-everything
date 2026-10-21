@@ -4,7 +4,7 @@
 
 import { gitRun } from '../main-staleness.mjs';
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
-import { findUnsafeLocalState } from './local-state.mjs';
+import { findUnsafeLocalState, knownInputsOf } from './local-state.mjs';
 import { overlayFilePath, readOverlayState } from '../daemon-overlays.mjs';
 import { readRebuildState } from './state.mjs';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
@@ -30,7 +30,7 @@ import { resolveOverlayConflict } from './overlay-strategies.mjs';
  * @param {{root:string, env?:NodeJS.ProcessEnv, prState?:(pr:number)=>(Promise<string|null>|string|null),
  *   originUrl?:string, run?:typeof gitRun, extraOverlays?:Array<{ref:string, pr?:number|null}>}} o
  * @returns {Promise<{dryRun:true, head:string|null, onMain:boolean|null, unsafe:object, plan:object,
- *   wouldDo:'nothing'|'nothing (still-rejected)'|'rebuild-and-smoke'|'refuse', overlayFile:string,
+ *   wouldDo:'nothing'|'nothing (still-rejected)'|'rebuild-and-smoke'|'hold (established-overlay-conflict)'|'refuse', overlayFile:string,
  *   overlays:Array<object>, overlayStateCorrupt:boolean, state:object, stillRejected:boolean}>}
  */
 export async function dryRunRebuild({
@@ -41,13 +41,14 @@ export async function dryRunRebuild({
   const head = verifyRev(rootGit, 'HEAD');
   const headRef = rootGit(['symbolic-ref', '--short', 'HEAD']);
   const onMain = headRef.status === 0 ? String(headRef.stdout ?? '').trim() === 'main' : null;
-  const unsafe = findUnsafeLocalState({ git: rootGit });
+  const state = readRebuildState(root, env);
+  // Match prepareRebuild: adopted inputs remain safe after their remote tips are rewritten or deleted.
+  const unsafe = findUnsafeLocalState({ git: rootGit, knownInputs: knownInputsOf(state) });
 
   const overlayFile = overlayFilePath(root, env);
   const overlayState = readOverlayState(root, { env });
   const overlayStateCorrupt = overlayState.corrupt;
   const overlays = overlayState.overlays.concat(extraOverlays);
-  const state = readRebuildState(root, env);
 
   let url = originUrl;
   if (!url) {
@@ -114,6 +115,8 @@ export async function dryRunRebuild({
   let wouldDo = 'refuse';
   if (unsafe.safe && onMain === true && plan.ok) {
     if (untrackedCollision.length > 0 || overlayStateCorrupt) wouldDo = 'refuse'; // mirrors doRebuild's refusals
+    // x9diisp — mirrors prepareRebuild: a plan that would lose overlays the running build carries is HELD, not built.
+    else if (plan.establishedLost?.length > 0) wouldDo = 'hold (established-overlay-conflict)';
     else if (plan.finalSha === head) wouldDo = 'nothing';
     else if (stillRejected) wouldDo = 'nothing (still-rejected)';
     else wouldDo = 'rebuild-and-smoke';

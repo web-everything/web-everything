@@ -2834,6 +2834,43 @@ describe('cards 5471 + 5470: the io read resolves the round settings and the led
     expect(readReviewRound({ repo: 'o/r', pr: 7, head: null, readLedgerRows: () => rows })).toBeNull();
   });
 
+  it('the round as of a grant time counts only heads reviewed by then; doubt is null (red-team gate grant anchor)', async () => {
+    const { readReviewRoundAsOf } = await import('../review-pr-io.mjs');
+    const timed = [
+      { type: 'review-run', pr: 7, headSha: 'a'.repeat(40), at: '2026-10-01T00:00:00Z' },
+      { type: 'review-run', pr: 7, headSha: 'b'.repeat(40), at: '2026-10-02T00:00:00Z' },
+      { type: 'review-run', pr: 7, headSha: H, at: '2026-10-03T00:00:00Z' },
+      { type: 'review-run', pr: 7, headSha: 'c'.repeat(40) },
+    ];
+    expect(readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: '2026-10-02T12:00:00Z', readLedgerRows: () => timed })).toBe(2);
+    expect(readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: '2026-10-09T00:00:00Z', readLedgerRows: () => timed })).toBe(3);
+    expect(readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: '2026-09-01T00:00:00Z', readLedgerRows: () => timed })).toBeNull();
+    expect(readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: 'nope', readLedgerRows: () => timed })).toBeNull();
+    expect(readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: '2026-10-09T00:00:00Z', readLedgerRows: () => { throw new Error('gone'); } })).toBeNull();
+  });
+
+  // PR #5744 round 4: the gated head's own ledger write can miss while its review is published. readReviewRound still
+  // counts that head, so the as-of round must count it too when the caller saw its review before the grant, or a +1
+  // grant buys nothing.
+  it('the round as of a grant counts a head the caller saw reviewed, matching readReviewRound without its row', async () => {
+    const { readReviewRoundAsOf } = await import('../review-pr-io.mjs');
+    const recorded = [
+      { type: 'review-run', pr: 7, headSha: 'a'.repeat(40), at: '2026-10-01T00:00:00Z' },
+      { type: 'review-run', pr: 7, headSha: 'b'.repeat(40), at: '2026-10-02T00:00:00Z' },
+    ];
+    const asOf = (at, o = {}) => readReviewRoundAsOf({ repo: 'o/r', pr: 7, at, head: H, readLedgerRows: () => recorded, ...o });
+    expect(readReviewRound({ repo: 'o/r', pr: 7, head: H, readLedgerRows: () => recorded })).toBe(3);
+    expect(asOf('2026-10-06T00:00:00Z')).toBe(3);
+    expect(asOf('2026-10-06T00:00:00Z', { head: H.toUpperCase() })).toBe(3);
+    // No head named, or one that is not a pinned sha: only the recorded heads count (a doubt never raises the round).
+    for (const o of [{ head: null }, { head: 'd'.repeat(39) }, { head: `${H} ` }]) expect(asOf('2026-10-06T00:00:00Z', o)).toBe(2);
+    // A recorded head is counted once, however its row is cased or timed.
+    const withHead = [...recorded, { type: 'review-run', pr: 7, headSha: H.toUpperCase(), at: '2026-10-03T00:00:00Z' }];
+    expect(asOf('2026-10-06T00:00:00Z', { readLedgerRows: () => withHead })).toBe(3);
+    expect(asOf('2026-10-06T00:00:00Z', { readLedgerRows: () => [] })).toBe(1);
+    expect(asOf('2026-10-06T00:00:00Z', { readLedgerRows: () => { throw new Error('gone'); } })).toBeNull();
+  });
+
   it('the round budget resolves from an explicit value, else the setting; any doubt is off', () => {
     expect(resolveRoundBudget(2)).toBe(2);
     expect(resolveRoundBudget(null, { settings: () => ({ roundBudget: 3 }) })).toBe(3);
