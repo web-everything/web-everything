@@ -8,7 +8,8 @@ export default {
   id: 'card-group-unresolved-repo-conflict-watch',
   title: 'an unresolved default repo made the conflict watch route open card-group members (exemption failed open)',
   card: 'PR #5762 / xym8nt4',
-  fixedBy: { sha: 'HEAD', where: 'lane/xym8nt4-card-group', paths: ['scripts/conveyor/parked-pr-conflict-watch.mjs'] },
+  // Pin the commit that introduced the fix so replay keeps targeting it after later commits land.
+  fixedBy: { sha: '3797ded9b', where: 'lane/xym8nt4-card-group', paths: ['scripts/conveyor/parked-pr-conflict-watch.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, this.fixedBy.paths[0]), 'utf8').includes('card-group membership unknown (fail closed)');
   },
