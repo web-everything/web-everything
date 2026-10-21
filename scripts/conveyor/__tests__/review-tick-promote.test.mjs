@@ -347,7 +347,8 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
   it('provider (diagnosable): every refusal names WHICH condition failed (plan-row head, later comment author/id, pending label, truncated thread, unreadable reviews)', () => {
     const hold = { id: 'IC_x1', author: { login: 'someone' }, createdAt: '2026-10-21T00:00:00Z', body: 'please look again before merging' };
     const reason = (c) => provider(DIFF, undefined, c).fn().reason;
-    expect(reason({ prOverride: { comments: [...pr.comments, hold] } })).toMatch(/covers=false: .*later non-machine comment\(s\) after the accept: someone#IC_x1:"please look again/);
+    expect(reason({ prOverride: { comments: [...pr.comments, hold] } })).toMatch(/covers=false: .*later non-machine comment\(s\) after the accept: someone#IC_x1@2026-10-21T00:00:00Z/);
+    expect(reason({ prOverride: { comments: [...pr.comments, { ...hold, body: 'token ghp_SECRET\rFORGED' }] } })).not.toMatch(/ghp_SECRET|\r/);
     expect(reason({ prOverride: { labels: [...pr.labels, { name: 'review:pending' }] } })).toMatch(/review:pending label present/);
     expect(reason({ reviews: null })).toMatch(/formal reviews unreadable/);
     expect(reason({ prOverride: { comments: [...pr.comments, ...Array.from({ length: 99 }, () => ({ viewerDidAuthor: true, body: '🔔 conveyor — note' }))] } })).toMatch(/thread truncated \(100 comments/);
