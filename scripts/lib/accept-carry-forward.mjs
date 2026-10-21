@@ -156,7 +156,20 @@ export function isKnownMachineBody(body, comment = undefined) {
   if (isLaterVerdictBody(text)) return false;
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
-  return isApprovalPreventionNotice(text, comment) || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
+  return isApprovalPreventionNotice(text, comment) || isTrustedFixRunNote(text, comment) || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
+}
+
+/** `fix-run.mjs`'s "codex repair unproductive" note (#5771 live): a mechanical status line that says nothing about the clearance.
+ * Needs the comment's metadata and a TRUSTED author, so a body-only caller and a forged lookalike both stay on the safe side. */
+// The WHOLE body, exactly `fix-run.mjs#escalationComment`: heading, one fenced block of `- <outcome>: <note>` lines (backticks
+// stripped, finding phrases removed by the writer), the fixed closing sentence, nothing else. Anything appended - prose, a verdict,
+// a marker - fails the match, and a note line carrying a marker/verdict glyph or the word "conveyor"/"review" is refused too.
+const FIX_RUN_UNPRODUCTIVE_RE = /^\s*\*\*fix-run: codex repair unproductive on [0-9a-f]{7,40}\*\*\n\n```text\n((?:- [a-z-]+: [^\n`]{0,260}\n)*- [a-z-]+: [^\n`]{0,260})\n```\n\nThe next repair falls back to Claude\.\s*$/;
+const FIX_RUN_NOTE_FORBIDDEN_RE = /<!--|[🔁🔧✅⏸📌🔒🔓🩹🔔]|conveyor|review|accept|changes|human|hold|park/i;
+function isTrustedFixRunNote(text, comment) {
+  if (comment === undefined || !isTrustedMarkerAuthor(comment)) return false;
+  const m = FIX_RUN_UNPRODUCTIVE_RE.exec(text);
+  return !!m && !FIX_RUN_NOTE_FORBIDDEN_RE.test(m[1]);
 }
 
 /**

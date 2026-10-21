@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+import { readMainFixPriority } from '../../scripts/lib/merge-queue-hook.mjs';
+import { repoKeyFromSlug } from '../../scripts/readiness/lane-manifest.mjs';
+import { redTeamEnabled } from '../../scripts/lib/review-red-team-policy.mjs';
+import { readDrainRedTeamRequests, finishDrainRedTeamRequest } from '../../scripts/lib/drain-red-team-requests.mjs';
+import { withReviewFetchTick } from '../../scripts/lib/review-fetch.mjs';
 /**
  * @file skills-src/conveyor/review-daemon.mjs
  * @description #3876 (epic #3383) — the standalone Review daemon: reconcile-pass.mjs (discovery) +
@@ -72,14 +77,17 @@
  * pass in this repo (`runner.mjs`'s `makeCliMechanicalPasses`) — it never fails the review tick itself.
  */
 
+import { readReviewEvidenceAtHead } from '../../scripts/lib/review-evidence-at-head.mjs';
+import { readRedTeamTiming } from '../../scripts/lib/red-team-gate.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
-import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
+import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
@@ -204,8 +212,15 @@ export function operatorHoldsFromPlan(plan) {
   for (const row of Array.isArray(plan?.refusals) ? plan.refusals : []) {
     const prNumber = Number(row?.prNumber);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue;
-    for (const kind of [row?.kind, row?.reviewRefusal?.kind]) {
-      if (OPERATOR_HOLD_KINDS.includes(kind)) seen.set(`${prNumber}|${kind}`, { prNumber, kind });
+    for (const refusal of [row, row?.reviewRefusal]) {
+      const kind = refusal?.kind;
+      if (!OPERATOR_HOLD_KINDS.includes(kind)) continue;
+      // A referral persist that failed with retries left is still owned by automation (it resumes on its own at the
+      // hold's `retryAt`), so it is not yet waiting on a person; only an exhausted budget is (live #5752).
+      const hold = refusal.referralHold;
+      if (kind === 'review-referrals-pending' && hold?.persistenceFailed === true && hold.exhausted === false
+        && Number.isFinite(hold.retryAt)) continue;
+      seen.set(`${prNumber}|${kind}`, { prNumber, kind });
     }
   }
   return [...seen.values()].sort((a, b) => a.prNumber - b.prNumber || a.kind.localeCompare(b.kind));
@@ -339,6 +354,66 @@ export function sweepReviewHolds(opts) {
   return [...repark, ...(sweepReviewHoldLabels(opts) ?? [])];
 }
 
+// Keep the dispatcher's fresh CI/head read authoritative, including when the head moved after listing.
+export const headBoundRedTeamCiGate = (gate, head) => input => {
+  const facts = gate(input);
+  return head && facts?.headSha?.toLowerCase() !== head.toLowerCase()
+    ? { ...facts, allowed: false, reason: 'head-changed' } : facts;
+};
+
+/**
+ * 2026-10-20 — the red team's fair share of a tick's dispatch seats. When the tick has fewer seats than owed rows,
+ * at least `min(reserved, seats, red-team rows)` of those seats go to red-team rows (`redTeamRequest` /
+ * `carriedAcceptHead`). Each red-team row moved in displaces the LAST non-red-team, non-main-fix row inside the
+ * seats, which moves to just after them (no row is dropped; order is otherwise kept). PURE.
+ * @returns {{reviews:Array<object>, moved:number[]}}
+ */
+export function reserveRedTeamSeats(reviews, { seats, reserved }) {
+  const isRedTeam = (d) => !!(d?.redTeamRequest || d?.carriedAcceptHead);
+  const n = Math.max(0, Math.min(Number(seats) || 0, reviews.length));
+  if (!(reserved > 0) || n >= reviews.length || n === 0) return { reviews, moved: [] };
+  const inside = reviews.slice(0, n);
+  const outside = reviews.slice(n);
+  const want = Math.min(reserved, n, reviews.filter(isRedTeam).length) - inside.filter(isRedTeam).length;
+  if (want <= 0) return { reviews, moved: [] };
+  const victims = [];
+  for (let i = inside.length - 1; i >= 0 && victims.length < want; i--) {
+    if (!isRedTeam(inside[i]) && !inside[i]?.mainFix) victims.unshift(i);
+  }
+  const picked = outside.filter(isRedTeam).slice(0, victims.length);
+  if (!picked.length) return { reviews, moved: [] };
+  const used = victims.slice(victims.length - picked.length);
+  const displaced = used.map((i) => inside[i]);
+  const keptInside = inside.filter((_, i) => !used.includes(i));
+  const keptOutside = outside.filter((d) => !picked.includes(d));
+  return { reviews: [...keptInside, ...picked, ...displaced, ...keptOutside], moved: picked.map((d) => Number(d.prNumber)) };
+}
+
+/** The red team's reserved dispatch seats, through the policy cascade (env > review-concurrency.json > standard 1). */
+export function resolveRedTeamSeatShare({ env = process.env,
+  toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
+  const raw = env?.WE_REVIEW_RED_TEAM_RESERVED_SEATS;
+  try {
+    const r = cascadePolicy('reviewConcurrency', tool && tool.redTeamReservedSeats !== undefined ? { redTeamReservedSeats: tool.redTeamReservedSeats } : undefined, {
+      env, standard: { redTeamReservedSeats: 1 },
+      envValues: { redTeamReservedSeats: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
+      valid: { redTeamReservedSeats: (v) => Number.isSafeInteger(v) && v >= 0 && v <= 8 },
+    });
+    return { reserved: r.value.redTeamReservedSeats, source: r.sources?.redTeamReservedSeats ?? 'standard' };
+  } catch { return { reserved: 1, source: 'standard' }; }
+}
+
+/** Pure plan for an otherwise eligible drain request; reason is also its dry-run explanation. */
+export function planRedTeamRequestAction({ request, subject, evidence, setting, atRoundCap }) {
+  if (!subject || subject.headRefOid?.toLowerCase() !== request.head.toLowerCase())
+    return { action: 'skip', reason: 'request head is not current' };
+  if (evidence || !setting) return { action: 'job', reason: 'dispatch red-team job' };
+  if (atRoundCap) return { action: 'skip', reason: `review round cap reached for #${request.pr}` };
+  return { action: 'fresh-review', reason: `would dispatch fresh review for #${request.pr} @${request.head.slice(0, 8)}` };
+}
+
 /**
  * One tick: discover PRs owed a review (`reconcile`), dispatch an independent review for each
  * (`dispatch`), then apply the two purely-informative labels (`tagRound`/`tagStatus`) — the exact sequence
@@ -406,9 +481,25 @@ export function runReviewTick({
   // existing caller unchanged; the real daemon wires `promoteDraftsGuarded`. `notePromotions` reports the rows.
   promoteDrafts = null,
   notePromotions = null,
+  // #5771 — `({repo, pr, headSha}) => {ok, reason}`: execute this pass's `restore-review-label` stale-accept rows through
+  // the guarded re-arm, then re-plan so the new head's review goes out THIS pass. `null` (the default) keeps every
+  // existing caller unchanged; the real daemon wires `rearmStaleAcceptanceGuarded`. `noteRearms` reports the rows.
+  rearmStaleAccepts = null,
+  noteRearms = null,
   onPlan = null,
+  readRedTeamRequests = null,
+  // `({repo, pr}) => {state}` — read only for a request whose PR is absent from the open listing, to expire a
+  // merged/closed PR's request. `null` (the default) never expires; the request is held with a logged reason.
+  readPrState = null,
+  // `{reserved:number, source:string}` — the red team's guaranteed share of this tick's dispatch seats (see
+  // {@link reserveRedTeamSeats}). `null` (the default) reserves nothing, so existing callers are unchanged.
+  redTeamSeatShare = null,
+  readReviewEvidence = null,
+  redTeamTimingSetting = readRedTeamTiming,
   // One-line failure causes (status sweep / status tag). The real daemon wires `log.error`; tests inject a spy.
   log = () => {},
+  readMainFixPr = readMainFixPriority,
+  finishRedTeamRequest = finishDrainRedTeamRequest,
   // Clock for the operator-hold snapshot's `observedAt` (injectable so tests stay deterministic).
   now = Date.now,
 } = {}) {
@@ -526,6 +617,17 @@ export function runReviewTick({
     replanError = out.replanError ?? null;
     if (out.promotions.length) { try { notePromotions?.({ repo, promotions: out.promotions, replanError: out.replanError }); } catch { /* report only */ } }
   }
+  if (typeof rearmStaleAccepts === 'function') {
+    const out = rearmStaleAcceptsThenReplan({
+      plan, rawPrs, repo, rearm: rearmStaleAccepts,
+      replan: (prs) => (sharedReads && prs
+        ? reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => rawAgents })
+        : reconcile({ repo, defaultBranch })),
+    });
+    ({ plan, rawPrs } = out);
+    replanError = replanError ?? out.replanError ?? null;
+    if (out.rearms.length) { try { noteRearms?.({ repo, rearms: out.rearms, replanError: out.replanError }); } catch { /* report only */ } }
+  }
   try { onPlan?.({ repo, plan, rawPrs }); } catch { /* observation never breaks a tick */ }
   // Captured at plan completion, never at log-read time. Only a plan that survived (re)planning is evidence.
   const operatorHolds = replanError ? null : { observedAt: now(), holds: operatorHoldsFromPlan(plan) };
@@ -545,6 +647,95 @@ export function runReviewTick({
   const mergeConflictedByPr = new Map((Array.isArray(rawPrs) ? rawPrs : [])
     .map((p) => [Number(p?.number), String(p?.mergeStateStatus ?? '').toUpperCase() === 'DIRTY']));
   const reviews = (plan.dispatch ?? []).filter((d) => d && d.kind === 'review');
+  // Re-use the ordinary lane/auth/CI/live-job guarded dispatch. A refusal always wins over a request.
+  if (readRedTeamRequests && Array.isArray(rawPrs)) {
+    // A queued accepted PR owes no jury review. That disposition does not discharge its red-team seat.
+    // Every actual review hold/refusal and every live dispatch still blocks this branch.
+    const blocked = new Set([...(plan.refusals ?? []).filter(d => !(d.kind === 'nothing-owed' && d.phase === 'queued')),
+      ...(plan.dispatch ?? [])].map(d => Number(d.prNumber)));
+    const setting = readReviewEvidence ? redTeamTimingSetting() : null;
+    if (setting) log(`review-daemon: redTeam.carriedAcceptTriggersReview=${setting.value.carriedAcceptTriggersReview} (source: ${setting.sources.carriedAcceptTriggersReview})`);
+    let mainFix = null;
+    try { mainFix = readMainFixPr(); } catch { /* unreadable priority grants no preference */ }
+    const ownsFix = request => !!mainFix && (mainFix.repo ?? 'we') === repoKeyFromSlug(request.repo)
+      && [mainFix.pr, ...(mainFix.prs || [])].includes(request.pr);
+    const requests = [...readRedTeamRequests()].sort((a, b) => Number(ownsFix(b)) - Number(ownsFix(a)));
+    const fixReviews = [];
+    // 2026-10-20 — every request this loop does not turn into a dispatch row says why (live: 12 requests sat for
+    // hours with no log line at all). `hold` writes the one-line reason; nothing here changes which branch holds.
+    const hold = (request, reason) => log(`review-daemon: red-team request #${request.pr} @${request.head.slice(0, 8)} held — ${reason}`);
+    for (const request of requests) {
+      if (request.repo.toLowerCase() !== repo.toLowerCase()) continue;
+      const subject = rawPrs.find(p => Number(p.number) === request.pr);
+      if (subject?.headRefOid && subject.headRefOid.toLowerCase() !== request.head.toLowerCase()) {
+        finishRedTeamRequest(request, { status: 'stale' });
+        hold(request, `head moved to ${subject.headRefOid.slice(0, 8)}; request finished as stale`);
+        continue;
+      }
+      if (!subject) {
+        // Not in the open-PR listing: a merged/closed PR owes no red team, so its request is finished (expired)
+        // rather than read again every tick. Only a confirmed MERGED/CLOSED state expires it.
+        let state = null;
+        try { state = readPrState ? readPrState({ repo, pr: request.pr }) : null; } catch (e) {
+          hold(request, `absent from the open-PR listing; state read failed (${String(e?.message ?? e).split('\n')[0]})`);
+          continue;
+        }
+        const st = String(state?.state ?? '').toUpperCase();
+        if (st === 'MERGED' || st === 'CLOSED') {
+          try {
+            finishRedTeamRequest(request, { status: 'expired' });
+            hold(request, `PR is ${st}; request finished as expired`);
+          } catch (e) { hold(request, `PR is ${st}; expiring the request failed (${String(e?.message ?? e).split('\n')[0]})`); }
+        } else hold(request, `absent from the open-PR listing (state ${st || 'unknown'})`);
+        continue;
+      }
+      if (blocked.has(request.pr)) {
+        const rows = [...(plan.refusals ?? []), ...(plan.dispatch ?? [])].filter(d => Number(d.prNumber) === request.pr
+          && !(d.kind === 'nothing-owed' && d.phase === 'queued'));
+        hold(request, `the review plan holds this PR (${rows.map(d => `${d.kind}${d.why ? `: ${String(d.why).slice(0, 160)}` : ''}`).join('; ') || 'already has a dispatch row this tick'})`);
+        continue;
+      }
+      if (!redTeamEnabled()) { hold(request, 'the red team is disabled (review-red-team-policy)'); continue; }
+      const labels = (subject?.labels ?? []).map(l => typeof l === 'string' ? l : l.name);
+      const missing = ['review:accepted', 'ready-to-merge'].filter(l => !labels.includes(l));
+      const blocking = labels.filter(l => ['review:changes', 'review:human', 'review:pending'].includes(l));
+      const headKnown = subject.headRefOid?.toLowerCase() === request.head.toLowerCase();
+      if (!headKnown || subject.isDraft || missing.length || blocking.length) {
+        hold(request, [headKnown ? null : 'the listing carries no head for this PR', subject.isDraft ? 'PR is a draft' : null, missing.length ? `missing ${missing.join(', ')}` : null,
+          blocking.length ? `carries ${blocking.join(', ')}` : null].filter(Boolean).join('; '));
+        continue;
+      }
+      let freshReview = false;
+      let attempts = 0;
+      if (readReviewEvidence) {
+        // Only the reconciler knows the exact shared count and effective cap (including
+        // operator verdicts, mechanical rounds and extensions). Never reconstruct them here.
+        const planned = (plan.refusals ?? []).find(d => Number(d.prNumber) === request.pr);
+        const budgetKnown = Number.isInteger(planned?.attempts) && planned.attempts >= 0
+          && Number.isInteger(planned?.cap) && planned.cap > 0;
+        attempts = budgetKnown ? Math.max(planned.attempts, planned.operatorFixBudget?.attempts ?? 0) : 0;
+        const action = planRedTeamRequestAction({ request, subject,
+          evidence: readReviewEvidence({ repo, pr: request.pr, head: request.head }),
+          setting: setting.value.carriedAcceptTriggersReview, atRoundCap: budgetKnown && attempts >= planned.cap });
+        if (action.action === 'skip') {
+          log(`review-daemon: ${action.reason}`);
+          hold(request, action.reason);
+          continue;
+        }
+        freshReview = action.action === 'fresh-review';
+        if (freshReview && !budgetKnown) {
+          log(`review-daemon: skipping fresh review for #${request.pr}: exact reconcile attempts/cap unavailable`);
+          hold(request, 'fresh review needs the exact reconcile attempts/cap, which the plan did not carry');
+          continue;
+        }
+      }
+      (ownsFix(request) ? fixReviews : reviews).push(freshReview
+        ? { kind: 'review', prNumber: request.pr, attempts, carriedAcceptHead: request.head }
+        : { kind: 'review', prNumber: request.pr, redTeamRequest: request });
+      blocked.add(request.pr);
+    }
+    reviews.unshift(...fixReviews);
+  }
   // Live-caught 2026-09-22, #xli631k: a PR that moved to being owed a FIX (not a review) used to never
   // reach `statusCandidates` at all, so its `review-status:reviewing` label sat stale once its review
   // session finished (PR #2472, ~2 hours stale). `selectStatusCandidates` now takes fix-owed entries as a
@@ -574,6 +765,17 @@ export function runReviewTick({
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
   const remainingReviewCapacity = () => liveReviewBudget && Number.isFinite(liveReviewBudget.left)
     ? Math.max(0, liveReviewBudget.left) : Infinity;
+  const initialLiveCap = remainingReviewCapacity();
+  const seats = Math.min(reviews.length, acquirable, initialLiveCap);
+  // 2026-10-20 — red-team rows were appended after every owed review, so under the live-review cap (3 seats,
+  // ~17 owed) they never reached a seat. They now get a reserved share of whatever seats this tick has.
+  if (redTeamSeatShare && redTeamSeatShare.reserved > 0) {
+    const share = reserveRedTeamSeats(reviews, { seats, reserved: redTeamSeatShare.reserved });
+    if (share.moved.length) {
+      reviews.splice(0, reviews.length, ...share.reviews);
+      log(`review-daemon: red-team seat share — moved #${share.moved.join(', #')} into this tick's ${seats} seat(s): redTeamReservedSeats=${redTeamSeatShare.reserved} (${redTeamSeatShare.source ?? 'standard'})`);
+    }
+  }
   const dispatchable = [];
   let occupiedLanes = 0;
   const dispatched = [];
@@ -583,6 +785,7 @@ export function runReviewTick({
     if (!hold) continue;
     try {
       notifyReferral({ repo, prNumber: row.prNumber, hold,
+        pr: (rawPrs ?? []).find(p => Number(p.number) === row.prNumber),
         comments: (rawPrs ?? []).find(p => Number(p.number) === row.prNumber)?.comments ?? [] });
     } catch (e) {
       failed.push({ prNumber: row.prNumber, error: `pause notice: ${String(e.message ?? e).split('\n')[0]}` });
@@ -630,7 +833,9 @@ export function runReviewTick({
     if (reserved) liveReviewBudget.left--;
     try {
       const subject = (Array.isArray(rawPrs) ? rawPrs : []).find(p => Number(p?.number) === Number(d.prNumber));
+      if (d.carriedAcceptHead) log(`review-daemon: dispatching fresh review for #${d.prNumber} @${d.carriedAcceptHead.slice(0, 8)} (carried accept, no review evidence)`);
       const result = dispatch({ pr: d.prNumber, repo,
+        ...(d.redTeamRequest ? { expectedRedTeamHead: d.redTeamRequest.head, drainRedTeamRequest: d.redTeamRequest } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes] } : {}),
         escalationReason: parseEscalationReason(subject?.body ?? ''),
@@ -658,13 +863,15 @@ export function runReviewTick({
       failed.push({ prNumber: d.prNumber, error: String((e && e.message) || e).split('\n')[0] });
       continue; // no round tag when the dispatch result is unknown
     }
+    if (d.redTeamRequest) continue; // A red-team retry does not spend another jury round.
     try { tagRound({ pr: d.prNumber, repo, round: (d.attempts ?? 0) + 1, currentLabels: labelsByPr.get(Number(d.prNumber)) }); }
     catch { /* cosmetic — a failed tag never fails the tick, see review-round-tag.mjs's own header */ }
   }
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
-  const liveCap = remainingReviewCapacity();
-  const capBound = !paused && liveCap < acquirable - occupiedLanes;
+  // Keep the original tick-start capacity in diagnostics; use refunded capacity for admission.
+  const liveCap = initialLiveCap;
+  const capBound = !paused && remainingReviewCapacity() < acquirable - occupiedLanes;
   const deferredTotal = reviews.length - dispatchable.length;
   const deferredForCap = capBound ? deferredTotal : 0;
   const deferredForLanes = paused || capBound ? 0 : deferredTotal;
@@ -672,7 +879,14 @@ export function runReviewTick({
   const deferReason = paused ? 'review owed, but dispatch is paused (Claude login)'
     : capBound ? `review owed, but held by the live-review cap (${liveReviewBudget?.reason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
       : `review owed, but no acquirable lane this tick (${acquirable} acquirable)`;
-  if (deferredForCap && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${deferredForCap} owed review(s) queued — ${liveReviewBudget.reason}\n`);
+  if (deferredTotal && liveCap < reviews.length && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${deferredTotal} owed review(s) queued — ${liveReviewBudget.reason}\n`);
+  // A queued red-team row has no hold label, so `explainPendingNotDispatched` never names it — say it here.
+  for (const d of reviews.slice(dispatchable.length)) {
+    const head = d.redTeamRequest?.head ?? d.carriedAcceptHead;
+    if (!head) continue;
+    try { log(`review-daemon: red-team request #${d.prNumber} @${head.slice(0, 8)} held — no dispatch seat this tick: ${deferReason}${redTeamSeatShare ? `; redTeamReservedSeats=${redTeamSeatShare.reserved} (${redTeamSeatShare.source ?? 'standard'})` : ''}`); }
+    catch { /* diagnostics never abort the tick */ }
+  }
   if (poolExhaustion && !paused) {
     try {
       if (acquirable === 0 && deferredForLanes > 0) poolExhaustion.exhausted({ repo, lanePoolRepo: poolExhaustionLanePoolRepo(repo), deferred: deferredForLanes });
@@ -1499,6 +1713,11 @@ export function buildCliDaemonEffects({
   runReview = (opts) => {
     const factsProvider = withFactsLabels(createGhProvider());
     return runReviewTickAllRepos({
+      readRedTeamRequests: readDrainRedTeamRequests,
+      readPrState: ({ repo, pr }) => JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'state'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, killSignal: 'SIGKILL' })),
+      redTeamSeatShare: resolveRedTeamSeatShare(),
+      readReviewEvidence: readReviewEvidenceAtHead,
       log: line => log.error(line),
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
       liveReviewBudget: liveReviewRoundBudget(),
@@ -1506,11 +1725,16 @@ export function buildCliDaemonEffects({
       refreshScopeBloat: refreshScopeBloatedPr,
       postRefreshMarker: defaultPostRebaseComment,
       promoteDrafts: promoteDraftsGuarded,
+      rearmStaleAccepts: rearmStaleAcceptanceGuarded,
+      noteRearms: ({ repo, rearms, replanError }) => {
+        for (const r of rearms) log.error(`review-daemon: ${repo}#${r.pr} stale-accept re-arm ${r.ok ? 'done' : r.released ? 'released' : 'refused'} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
+        if (replanError) log.error(`review-daemon: ${repo} post-re-arm re-plan failed (review goes out next pass): ${replanError}`);
+      },
       notePromotions: ({ repo, promotions, replanError }) => {
         for (const r of promotions) log.error(`review-daemon: ${repo}#${r.pr} same-pass promote ${r.action} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
         if (replanError) log.error(`review-daemon: ${repo} same-pass re-plan failed (review goes out next pass): ${replanError}`);
       },
-      dispatch: (o) => dispatchReviewByMode({ ...o, ciGate: readReviewCiGateFactsFirst }),
+      dispatch: ({ expectedRedTeamHead, ...o }) => dispatchReviewByMode({ ...o, ...(o.drainRedTeamRequest ? { mode: 'job' } : {}), ciGate: headBoundRedTeamCiGate(readReviewCiGateFactsFirst, expectedRedTeamHead) }),
       tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
       tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
       ...opts,
@@ -1539,7 +1763,7 @@ export function buildCliDaemonEffects({
   let priorityNames = new Set();
   return {
     intervalMs,
-    tickOnce: async () => {
+    tickOnce: () => withReviewFetchTick(async () => {
       const started = Date.now();
       const sharing = resolveReviewTickSharing();
       const plans = new Map();
@@ -1611,7 +1835,7 @@ export function buildCliDaemonEffects({
         log.error(`review-daemon: pass timings total ${seconds(Date.now() - started)} — reap ${seconds(phaseMs.reap)}, facts ${seconds(phaseMs.facts)}, review ${seconds(phaseMs.review)} (${repos}), convert ${seconds(phaseMs.convert)}, prep ${seconds(phaseMs.prep)} · reusePlan=${sharing.reusePlan} (source ${sharing.source.reusePlan}) repoConcurrency=${sharing.repoConcurrency} (source ${sharing.source.repoConcurrency})`);
       }
       return { ...result, sessionReap, convertAdvisory, prepReview };
-    },
+    }),
     sleep: realSleep,
     heartbeat: () => heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY }),
     onTick: (result) => {

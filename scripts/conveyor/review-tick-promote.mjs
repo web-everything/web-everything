@@ -21,8 +21,20 @@
  */
 import { defaultListDrafts, runDraftPromotionStep } from './draft-promotion-loop.mjs';
 import { resolveDraftPromotionSettings } from './draft-promotion-rule.mjs';
+// The guarded stale-accept provider ships with the planner (#5628); main may not export it yet.
+import * as promoteDispatch from '../operations/promote-draft-pr-dispatch.mjs';
 
 const oneLine = (e) => String(e?.message ?? e).split('\n')[0];
+
+/** Use the existing guarded provider when installed; keep the PR held when it is unavailable. */
+export function rearmStaleAcceptanceGuarded({
+  repo, pr, headSha, rearm = promoteDispatch.defaultRearmStaleAcceptance,
+} = {}) {
+  if (typeof rearm !== 'function') {
+    return { ok: false, reason: 'guarded stale-accept re-arm is unavailable in this checkout' };
+  }
+  return rearm({ repoSlug: repo, prNumber: pr, headSha });
+}
 
 /**
  * The real promote effect: the fast promoter's guarded step, scoped to one repo and to the given PR numbers.
@@ -78,5 +90,71 @@ export function promoteDraftsThenReplan({ plan, rawPrs = null, repo, promote, re
     return { plan: next, rawPrs: nextPrs ?? rawPrs, promotions, replanError: null };
   } catch (e) {
     return { plan, rawPrs: nextPrs ?? rawPrs, promotions, replanError: oneLine(e) };
+  }
+}
+
+/**
+ * LIVE 2026-10-21, PR #5771 (review:accepted, head moved past its accept): this daemon's plan carried a
+ * `restore-review-label` row (variant `stale-accept`, #5628) every tick, and held the PR's red-team request behind it
+ * ("the review plan holds this PR"), but only the FIX daemon executes that row — and its plan never produces it, so
+ * nothing ever re-armed review of the new head and the red team never ran (5 h). The daemon that PLANS the row now
+ * EXECUTES it: each owed row goes through the same guarded re-arm the fix daemon would use
+ * (`promote-draft-pr-dispatch.mjs#defaultRearmStaleAcceptance`: fresh read, live coverage proof, then the invariant-guarded
+ * `rearm-review.mjs` swap), and a re-armed PR is re-planned so its review is dispatched in the same pass. The guarded
+ * re-arm re-reads everything, so a row the fix daemon (or a human) already handled is a refusal here, not a second write.
+ *
+ * Fail closed: a refused or failed re-arm leaves the ORIGINAL plan in force (the PR keeps being held); a re-plan that
+ * throws keeps the original plan (the label swap is done, so the next pass dispatches the review). PURE apart from the
+ * injected effects.
+ * @param {{plan:object, rawPrs:Array|null, repo:string,
+ *   rearm:(o:{repo:string, pr:number, headSha:string})=>{ok:boolean, reason?:string},
+ *   replan:(prs:null)=>object}} o   `replan(null)` plans over a fresh read.
+ * @returns {{plan:object, rawPrs:Array|null, rearms:Array<{pr:number, ok:boolean, why:string}>, replanError:string|null}}
+ */
+export function rearmStaleAcceptsThenReplan({ plan, rawPrs = null, repo, rearm, replan }) {
+  const rows = new Map();
+  for (const d of plan?.dispatch ?? []) {
+    if (d && d.kind === 'restore-review-label' && d.variant === 'stale-accept' && Number.isInteger(Number(d.prNumber))) {
+      rows.set(Number(d.prNumber), String(d.headRefOid ?? ''));
+    }
+  }
+  if (!rows.size || typeof rearm !== 'function') return { plan, rawPrs, rearms: [], replanError: null };
+
+  const rearms = [];
+  for (const [pr, headSha] of rows) {
+    let result;
+    try { result = rearm({ repo, pr, headSha }); } catch (e) { result = { ok: false, reason: oneLine(e) }; }
+    // #5771: ONE coverage check. A refusal that PROVED the accept still covers the live head (`covers: true`) is not a
+    // reason to keep holding the PR: the plan's row only nominated it, the guarded re-arm checked it. Release the hold.
+    const released = result?.ok !== true && result?.covers === true && String(result?.coveredHead ?? '').toLowerCase() === headSha.toLowerCase();
+    rearms.push({ pr, ok: result?.ok === true, ...(released ? { released: true } : {}),
+      why: result?.ok === true ? 're-armed review of the moved head'
+        : released ? `acceptance verified to still cover the moved head — stale-accept hold released (${String(result?.reason ?? 'covers').slice(0, 120)})`
+          : String(result?.reason ?? 're-arm not confirmed') });
+  }
+  // Bound to the PROVED head: a row for a newer head (the PR moved again before a re-plan) is a fresh obligation, never released.
+  const releasedHeads = new Map(rearms.filter((r) => r.released).map((r) => [r.pr, rows.get(r.pr).toLowerCase()]));
+  /** Drop the released PRs' stale-accept rows (never any other row) so nothing holds their red-team request. */
+  const unhold = (p) => (!releasedHeads.size || !Array.isArray(p?.dispatch) ? p : { ...p, dispatch: p.dispatch.filter((d) =>
+    !(d && d.kind === 'restore-review-label' && d.variant === 'stale-accept' && releasedHeads.get(Number(d.prNumber)) === String(d.headRefOid ?? '').toLowerCase())) });
+  const rearmed = new Set(rearms.filter((r) => r.ok).map((r) => r.pr));
+  if (!rearmed.size || typeof replan !== 'function') return { plan: unhold(plan), rawPrs, rearms, replanError: null };
+
+  const name = (l) => (typeof l === 'string' ? l : l?.name);
+  const swap = (labels) => {
+    const kept = (Array.isArray(labels) ? labels : []).filter((l) => name(l) !== 'review:accepted');
+    return kept.some((l) => name(l) === 'review:pending') ? kept : [...kept, { name: 'review:pending' }];
+  };
+  const nextPrs = Array.isArray(rawPrs)
+    ? rawPrs.map((p) => (rearmed.has(Number(p?.number)) ? { ...p, labels: swap(p.labels) } : p))
+    : null;
+  try {
+    // A FRESH read, never the old snapshot with a synthesized label swap: the real swap's exact label result is GitHub's.
+    const next = replan(null);
+    if (!next || !Array.isArray(next.dispatch)) throw new Error('re-plan returned no dispatch list');
+    // A FRESH plan is never unheld from an earlier proof (audit): its rows are re-proved next pass.
+    return { plan: next, rawPrs: nextPrs ?? rawPrs, rearms, replanError: null };
+  } catch (e) {
+    return { plan: unhold(plan), rawPrs: nextPrs ?? rawPrs, rearms, replanError: oneLine(e) };
   }
 }

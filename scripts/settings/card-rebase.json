@@ -1,0 +1,4 @@
+{
+  "$comment": "cardRebase.squashToSingleCommit (boolean, standard true): card-only rebuilds preserve the net patch and co-authors in one commit on the pinned base, pushed with an expected-head lease. Cascade: standard → platform cardRebase → declared repo settings → WE_CARD_REBASE_SQUASH_TO_SINGLE_COMMIT (true/false/1/0). File evidence reuses cardConflicts.gitRecheckFiles.",
+  "cardRebase": { "squashToSingleCommit": true }
+}

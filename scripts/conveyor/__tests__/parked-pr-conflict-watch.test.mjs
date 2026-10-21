@@ -5,14 +5,22 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { readSharedOpenPrs } from '../../lib/pr-snapshot.mjs';
+
+vi.mock('../../lib/pr-snapshot.mjs', async (importOriginal) => ({
+  ...await importOriginal(), readSharedOpenPrs: vi.fn(() => null),
+}));
 
 import {
   CONFLICT_LABEL,
   CONFLICT_LABEL_META,
   isParkedConflictTarget,
+  rearmIsOwed,
   planConflictLabelChange,
   buildConflictComment,
   watchParkedPrConflicts,
+  formatConflictWatchSummary,
+  defaultAttemptCardConflictRebase,
   defaultListParkedPrs,
   isStatuteTierConflict,
   buildConflictFindingBody,
@@ -59,8 +67,10 @@ import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
 } from '../stand-down.mjs';
 import { mintSessionSlug } from '../session-slug.mjs';
-import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from '../unowned-rebase-attempt-count.mjs';
+import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
+import { UNOWNED_REBASE_INFRA_MARKER, countUnownedRebaseInfraFailures, formatUnownedRebaseInfraMarker, formatUnownedRebaseAttemptMarker, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from '../unowned-rebase-attempt-count.mjs';
 import { NOTE_COMMENT_MARKER, postNoteComment } from '../reconcile-note-comment.mjs';
+import { CARD_CONFLICT_PRECONDITION_REASONS } from '../../lib/card-conflict-resolve.mjs';
 import { notifyDesktopChecked } from '../branch-sync.mjs';
 
 // #xu38vlf — the two new operator-visible-escalation call sites (the round-cap-exhausted note on the unowned
@@ -283,12 +293,23 @@ describe('buildConflictComment — next-step wording across the full routing com
 });
 
 describe('defaultListParkedPrs — argv shape (exec injected, no real gh call)', () => {
+  it('requests headRefOid from the shared snapshot for card conflict rebases', () => {
+    const prs = [{ number: 42, headRefOid: 'a'.repeat(40) }];
+    vi.mocked(readSharedOpenPrs).mockReturnValueOnce(prs);
+    expect(defaultListParkedPrs({ repo: 'o/n' })).toBe(prs);
+    expect(readSharedOpenPrs).toHaveBeenLastCalledWith({
+      repo: 'o/n',
+      fields: 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files',
+      allowDeferred: true,
+    });
+  });
+
   it('queries open PRs with the narrow field set, no --repo when omitted', () => {
     let capturedArgv;
     const exec = (cmd, argv) => { capturedArgv = argv; return '[]'; };
     defaultListParkedPrs({ exec });
     expect(capturedArgv).toEqual(['pr', 'list', '--state', 'open', '--limit', '200',
-      '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files']);
+      '--json', 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files']);
   });
 
   it('appends --repo when given', () => {
@@ -296,7 +317,7 @@ describe('defaultListParkedPrs — argv shape (exec injected, no real gh call)',
     const exec = (cmd, argv) => { capturedArgv = argv; return '[]'; };
     defaultListParkedPrs({ exec, repo: 'o/n' });
     expect(capturedArgv).toEqual(['pr', 'list', '--state', 'open', '--limit', '200',
-      '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files', '--repo', 'o/n']);
+      '--json', 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files', '--repo', 'o/n']);
   });
 });
 
@@ -2029,7 +2050,7 @@ import { prFileContract } from './pr-file-test-helpers.mjs';
 prFileContract({
   name: 'parked-pr-conflict-watch', load: () => import('../parked-pr-conflict-watch.mjs'),
   reader: 'defaultListParkedPrs', run: 'watchParkedPrConflicts',
-  fields: 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files',
+  fields: 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files',
 });
 
 
@@ -2754,7 +2775,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       expect(provider.calls).toEqual([]); // no UNOWNED_REBASE_ATTEMPT_MARKER, no label — unchanged from before
     });
 
-    it('a `skip`/`error` outcome posts the durable attempt marker BEFORE falling through to the ordinary bounce', () => {
+    it('a content-conflict `skip` outcome posts the durable attempt marker BEFORE falling through to the ordinary bounce', () => {
       const provider = fakeProvider();
       const listPrs = () => [{ number: 1854, mergeable: 'CONFLICTING', headRefName: 'lane/1854-x', labels: [] }];
       const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
@@ -2771,6 +2792,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
 
     it('a THROW from attemptMechanicalRebase (a stale lock, a corrupted ref) is caught and treated as `action:\'error\'` — no longer escapes the whole per-PR handler', () => {
       const provider = fakeProvider();
+      const postComment = vi.spyOn(provider, 'postComment');
       const listPrs = () => [{ number: 1854, mergeable: 'CONFLICTING', headRefName: 'lane/1854-x', labels: [] }];
       const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider,
@@ -2781,9 +2803,9 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       });
       expect(results[0].mechanicalRebase.action).toBe('error');
       expect(results[0].mechanicalRebase.reason).toMatch(/index\.lock/);
-      // Still durably recorded (the attempt marker) and still bounced — nothing silently aborted.
+      // Infrastructure failures still bounce without spending the content-conflict cap.
       expect(results[0].routedTo).toBe('reconcile-finding');
-      expect(provider.calls[0]).toEqual(['postComment', 'o/n', 1854]);
+      expect(postComment.mock.calls.some(call => call[2].startsWith(UNOWNED_REBASE_ATTEMPT_MARKER))).toBe(false);
     });
 
     it('below the cap: attempts as usual and does NOT surface a note', () => {
@@ -2797,12 +2819,12 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
         repo: 'o/n', listPrs, provider,
         postFinding: () => {},
         computeConflictDisposition: () => 'clean',
-        attemptMechanicalRebase: () => { rebaseCalls += 1; return { action: 'error', reason: 'still stuck' }; },
+        attemptMechanicalRebase: () => { rebaseCalls += 1; return { action: 'skip', reason: 'content still conflicting' }; },
         listPrComments: () => priorAttempts,
       });
       expect(rebaseCalls).toBe(1); // still under the cap — one more real attempt is made
       expect(results[0].unownedRebaseCapExhausted).toBeUndefined();
-      expect(provider.calls.some((c) => c[0] === 'postComment')).toBe(true); // the (cap-1)th attempt marker
+      expect(provider.calls.some((c) => c[0] === 'postComment')).toBe(true); // content-conflict attempt marker
     });
 
     it('AT the cap: stops attempting, surfaces a round-cap-exhausted note (reconcile-notes channel + desktop notify), then still falls through to the ordinary bounce', () => {
@@ -2866,25 +2888,103 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       expect(notifyDesktopChecked).not.toHaveBeenCalled();
     });
 
-    // #xu38vlf — REPLAY PROOF, grounded in real PR web-everything/web-everything#2709's own real head ref (`gh pr view
-    // 2709 --json headRefName,baseRefName`, captured 2026-09-26: `lane/4138-pr-closed-reason-comment` off
-    // `main`) — the SAME PR this file's own header names as the original UNOWNED-population incident. This PR's
-    // REAL mechanical rebase-drop succeeded on its first attempt (a single real 🔧 conveyor-fix comment,
-    // 2026-09-26T11:37Z) — the shape the SOAK test above already replays tick-by-tick. SYNTHESIZED here: a run
-    // where that same rebase-drop instead throws every sweep (a stale `.git/index.lock`, exactly the kind of
-    // persistent local failure this card's own text names) — the exact case that used to retry silently forever
-    // with zero cap and zero operator-visible trace before this fix.
-    it('REPLAY — real PR #2709 shape: a persistently throwing mechanical rebase is capped at 3 attempts and surfaced exactly once', () => {
+    // Replay content-conflict skips against PR #2709's branch shape until the cap is exhausted.
+    it('REPLAY — persistent index.lock throws stop at the separate infra cap and surface once even when routing fails', () => {
+      postNoteComment.mockClear();
+      notifyDesktopChecked.mockClear();
+      const provider = fakeProvider();
+      const pr = { number: 2709, mergeable: 'CONFLICTING', headRefName: 'lane/2709-fix',
+        headRefOid: 'abc123', baseRefName: 'main', labels: [] };
+      const thread = [];
+      const attempt = vi.fn(() => { throw new Error("fatal: Unable to create '.git/index.lock': File exists."); });
+      const routed = vi.fn(() => { if (routed.mock.calls.length < 5) throw new Error('downstream routing unavailable'); });
+      vi.spyOn(provider, 'postComment').mockImplementation((_repo, _pr, body) => {
+        thread.push({ body, author: { login: 'web-everything' } });
+      });
+      let replayedNotes = 0;
+      const outcomes = [];
+      for (let sweep = 0; sweep < 5; sweep += 1) {
+        const [entry] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+          repo: 'o/n', listPrs: () => [pr], provider, postFinding: routed,
+          unownedRebaseSettings: { value: { countSince: null, infraRetryCap: 3 }, sources: {} },
+          computeConflictDisposition: () => 'clean', attemptMechanicalRebase: attempt,
+          listPrComments: () => thread,
+        });
+        outcomes.push(entry);
+        // Replay actual posted note bodies as durable trusted comments for the next sweep's dedup.
+        for (const [note] of postNoteComment.mock.calls.slice(replayedNotes)) {
+          thread.push({ body: note.body, author: { login: 'web-everything' } });
+        }
+        replayedNotes = postNoteComment.mock.calls.length;
+        expect(countUnownedRebaseAttempts(thread)).toBe(0);
+      }
+      expect(attempt).toHaveBeenCalledTimes(3);
+      expect(countUnownedRebaseInfraFailures(thread, { headSha: pr.headRefOid })).toBe(3);
+      expect(outcomes.slice(0, 3).every(entry => !entry.unownedRebaseInfraCapExhausted)).toBe(true);
+      expect(outcomes.slice(3).every(entry => entry.unownedRebaseInfraCapExhausted && entry.unownedRebaseInfraFailures === 3)).toBe(true);
+      expect(routed).toHaveBeenCalledTimes(5); // cap never suppresses the onward routing attempt
+      expect(outcomes[4].routedTo).toBe('reconcile-finding');
+      expect(postNoteComment).toHaveBeenCalledTimes(1);
+      expect(postNoteComment.mock.calls[0][0].body).toContain('unowned-mechanical-rebase-infra:3/3');
+      expect(notifyDesktopChecked).toHaveBeenCalledTimes(1);
+    });
+
+    it('LIVE #5716 — an operator round grant buys exactly one more attempt past the infra cap; a forged grant buys none', () => {
+      postNoteComment.mockClear();
+      notifyDesktopChecked.mockClear();
+      const provider = fakeProvider();
+      const pr = { number: 5716, mergeable: 'CONFLICTING', headRefName: 'lane/pa-226-card',
+        headRefOid: 'a36abe60326770912776a49e14e65cc609a9726f', labels: [] }; // no baseRefName: skip the card-file git probe
+      const thread = [];
+      const attempt = vi.fn(() => ({ action: 'error', reason: 'card squash changed the PR net patch; refusing push' }));
+      vi.spyOn(provider, 'postComment').mockImplementation((_repo, _pr, body) => {
+        thread.push({ body, author: { login: 'web-everything' } });
+      });
+      let replayedNotes = 0;
+      const sweep = () => {
+        const [entry] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+          repo: 'o/n', listPrs: () => [pr], provider, postFinding: () => {},
+          unownedRebaseSettings: { value: { countSince: null, infraRetryCap: 2 }, sources: {} },
+          standingRulingFor: () => null,
+          computeConflictDisposition: () => 'clean', attemptMechanicalRebase: attempt,
+          listPrComments: () => thread,
+        });
+        for (const [note] of postNoteComment.mock.calls.slice(replayedNotes)) thread.push({ body: note.body, author: { login: 'web-everything' } });
+        replayedNotes = postNoteComment.mock.calls.length;
+        return entry;
+      };
+      const grant = (login) => ({ author: { login }, createdAt: '2026-10-20T20:58:54Z', body: buildRoundExtensionComment({
+        repo: 'o/n', pr: 5716, by: 1, actor: 'chalbert', channel: 'claude-code-chat',
+        reason: 'operator 2026-10-20: "Ok" — one more mechanical-rebase attempt', at: '2026-10-20T20:58:54Z' }) });
+      for (let i = 0; i < 3; i += 1) sweep();
+      expect(attempt).toHaveBeenCalledTimes(2);
+      expect(sweep().unownedRebaseInfraCapExhausted).toBe(true);
+      // A grant body posted by a non-operator login is not an operator grant: still capped, no attempt.
+      thread.push(grant('random-user'));
+      expect(sweep().unownedRebaseInfraCapExhausted).toBe(true);
+      expect(attempt).toHaveBeenCalledTimes(2);
+      // The operator's own grant: one more attempt from now, then capped again at 3/3 and surfaced once.
+      thread.push(grant('chalbert'));
+      const granted = sweep();
+      expect(granted.unownedRebaseInfraCapExhausted).toBeFalsy();
+      expect(attempt).toHaveBeenCalledTimes(3);
+      const again = sweep();
+      expect(again.unownedRebaseInfraCapExhausted).toBe(true);
+      expect(again.unownedRebaseInfraCap).toBe(3);
+      expect(sweep().unownedRebaseInfraCapExhausted).toBe(true);
+      expect(attempt).toHaveBeenCalledTimes(3);
+      expect(postNoteComment.mock.calls.map(([n]) => n.body.match(/unowned-mechanical-rebase-infra:\d+\/\d+/)?.[0]))
+        .toEqual(['unowned-mechanical-rebase-infra:2/2', 'unowned-mechanical-rebase-infra:3/3']);
+    });
+
+    it('REPLAY — real PR #2709 shape: persistent content-conflict skips are capped at 3 attempts and surfaced exactly once', () => {
       postNoteComment.mockClear();
       notifyDesktopChecked.mockClear();
       const provider = fakeProvider();
       const pr2709 = {
         number: 2709, mergeable: 'CONFLICTING', headRefName: 'lane/4138-pr-closed-reason-comment', baseRefName: 'main', labels: [],
       };
-      // A fixed PR shape across every sweep — isolates the retry-cap dimension on its own, standing in for a
-      // real compounding outage (the SAME infra flake that keeps failing the rebase-drop also keeps the
-      // follow-up label/dispatch writes from ever sticking, so the PR never actually leaves the unowned
-      // population between sweeps — the exact scenario a single-sweep bounce cannot reach).
+      // Keep the PR in the same population across sweeps to isolate the content-conflict cap.
       let thread = [];
       const routed = [];
       const outcomes = [];
@@ -2894,7 +2994,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
           repo: 'web-everything/web-everything', listPrs: () => [pr2709], provider,
           postFinding: (o) => routed.push(o.pr.number),
           computeConflictDisposition: () => 'manifest-only', // real shape: the shared .lane-manifest.json collision
-          attemptMechanicalRebase: () => { throw new Error('fatal: Unable to create \'.git/index.lock\': File exists.'); },
+          attemptMechanicalRebase: () => ({ action: 'skip', reason: 'content conflict' }),
           listPrComments: () => thread,
         });
         const entry = results[0];
@@ -3555,4 +3655,414 @@ it('skips a deferred discovery pass without posting a finding', () => {
     listPrs: () => ({ outcome: 'deferred-low-budget', deferred: true }), postFinding,
   })).toEqual([]);
   expect(postFinding).not.toHaveBeenCalled();
+});
+
+
+describe('conflict rearm eligibility', () => {
+  it.each([
+    [undefined, false],
+    [[], false],
+    [['review:pending'], false],
+    [['review:human', 'ready-to-merge'], false],
+    [['review:changes'], true],
+    [[{ name: 'review:accepted' }], true],
+  ])('rearmIsOwed(%j) is %s', (labels, owed) => {
+    expect(rearmIsOwed(labels)).toBe(owed);
+  });
+
+  it.each(['rebased', 'current'])('a %s card skips pending-only rearm and rearms accepted reviews', action => {
+    for (const label of ['review:pending', 'review:accepted']) {
+      const pr = { number: 42, mergeable: 'CONFLICTING', baseRefName: 'main',
+        labels: [{ name: label }], files: [{ path: 'backlog/123-test.md' }] };
+      const postRearm = vi.fn();
+      const setLabels = vi.fn();
+      const [result] = watchParkedPrConflicts({
+        repo: 'o/n', listPrs: () => [pr],
+        provider: { ensureLabel() {}, setLabels, postComment() {} },
+        cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: {} },
+        listPrComments: () => [], listAgents: () => [],
+        attemptCardRebase: () => ({ action }), postRearm,
+      });
+      expect(postRearm).toHaveBeenCalledTimes(label === 'review:accepted' ? 1 : 0);
+      if (label === 'review:accepted') expect(postRearm).toHaveBeenCalledWith({ pr, repo: 'o/n' });
+      expect(setLabels).toHaveBeenLastCalledWith('o/n', 42, { remove: [CONFLICT_LABEL] });
+      expect(result.routedTo).toBe('card-conflict-resolver');
+      expect(result.error).toBeUndefined();
+    }
+  });
+
+  it.each(['review:pending', 'review:accepted', 'review:changes'])('resolved cards with %s only rearm when owed', label => {
+    const pr = { number: 42, mergeable: 'MERGEABLE', baseRefName: 'main',
+      labels: [CONFLICT_LABEL, label], files: [{ path: 'backlog/123-test.md' }] };
+    const postRearm = vi.fn();
+    const setLabels = vi.fn();
+    const [result] = watchParkedPrConflicts({
+      repo: 'o/n', listPrs: () => [pr],
+      provider: { ensureLabel() {}, setLabels, postComment() {} },
+      listAgents: () => [], postRearm,
+    });
+    expect(postRearm).toHaveBeenCalledTimes(label === 'review:pending' ? 0 : 1);
+    expect(setLabels).toHaveBeenCalledWith('o/n', 42, { add: undefined, remove: [CONFLICT_LABEL] });
+    expect(result.newlyResolved).toBe(true);
+    expect(result.error).toBeUndefined();
+  });
+
+  it.each(['CONFLICTING', 'MERGEABLE'])('preserves rearm stderr and the conflict marker for a %s card', mergeable => {
+    const cause = 'neither review:changes nor review:accepted is live — nothing to re-arm';
+    const error = Object.assign(new Error('Command failed: node rearm-review.mjs'), {
+      stderr: Buffer.from(`\n[gh-shim] warning: wrapper\n${cause}\nextra detail`),
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const setLabels = vi.fn();
+      const [result] = watchParkedPrConflicts({
+        repo: 'o/n', listPrs: () => [{ number: 42, mergeable, baseRefName: 'main',
+          labels: [CONFLICT_LABEL, 'review:accepted'], files: [{ path: 'backlog/123-test.md' }] }],
+        provider: { ensureLabel() {}, setLabels, postComment() {} },
+        cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: {} },
+        listPrComments: () => [], listAgents: () => [],
+        attemptCardRebase: () => ({ action: 'rebased' }),
+        postRearm: () => { throw error; },
+      });
+      expect(result.error).toBe(cause);
+      expect(setLabels.mock.calls.some(call => call[2].remove?.includes(CONFLICT_LABEL))).toBe(false);
+      if (mergeable === 'CONFLICTING') {
+        expect(result.rearmCause).toBe(cause);
+        expect(result.routedTo).toBe('card-conflict-rearm-pending');
+        expect(log).toHaveBeenCalledWith(`parked-pr-conflict-watch: PR #42: card rearm failed: ${cause}`);
+      }
+    } finally { log.mockRestore(); }
+  });
+});
+
+describe('conflict watch diagnostics', () => {
+  for (const labels of [
+    ['review:pending', 'review:changes', CONFLICT_LABEL],
+    ['review:pending', CONFLICT_LABEL],
+    ['review:accepted', 'ready-to-merge', CONFLICT_LABEL],
+  ]) {
+    it.each([
+      { action: 'skip', precondition: true, reason: 'ambiguous JIT reference mapping' },
+      { action: 'error', reason: 'card conflict fetch failed' },
+      { action: 'current', reason: 'already current' },
+      { action: 'rebased', reason: 'cards merged' },
+    ])(`retains card outcome %j exactly once through recovery for ${labels.join(', ')}`, outcome => {
+      const pr = { number: 42, mergeable: 'CONFLICTING', baseRefName: 'main',
+        labels: labels.map(name => ({ name })), files: [{ path: 'backlog/123-test.md' }] };
+      const postFinding = vi.fn();
+      const postRearm = vi.fn();
+      const postComment = vi.fn();
+      const results = watchParkedPrConflicts({
+        repo: 'o/n', sameLineConflict: 'fixer', listPrs: () => [pr],
+        provider: { ensureLabel() {}, setLabels() {}, postComment },
+        cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: {} },
+        listPrComments: () => [], listAgents: () => [],
+        attemptCardRebase: () => outcome, postRearm, postFinding,
+        computeConflictDisposition: () => 'clean', labelAgeMs: () => 0,
+      });
+      expect(results).toHaveLength(1);
+      expect(results[0].mechanicalRebase).toEqual(outcome);
+      expect(formatConflictWatchSummary(results, [pr]))
+        .toContain(`mechanicalRebase=${outcome.action} reason=${outcome.reason}`);
+      const resolved = ['current', 'rebased'].includes(outcome.action);
+      const owesRearm = labels.includes('review:changes') || labels.includes('review:accepted');
+      expect(postRearm).toHaveBeenCalledTimes(resolved && owesRearm ? 1 : 0);
+      const idle = labels.includes('review:pending') && !labels.includes('review:changes');
+      expect(postFinding).toHaveBeenCalledTimes(!resolved && idle ? 1 : 0);
+      expect(postComment.mock.calls.some(call => call[2].startsWith(UNOWNED_REBASE_ATTEMPT_MARKER))).toBe(outcome.action === 'skip');
+    });
+  }
+
+  it('preserves the card refusal when the unowned route also attempts a mechanical rebase', () => {
+    const outcome = { action: 'skip', precondition: true, reason: 'PR is not proven card-only' };
+    const attemptMechanicalRebase = vi.fn(() => ({ action: 'current', reason: 'already current' }));
+    const results = watchParkedPrConflicts({
+      repo: 'o/n', sameLineConflict: 'fixer',
+      listPrs: () => [{ number: 42, mergeable: 'CONFLICTING', baseRefName: 'main', labels: [],
+        files: [{ path: 'backlog/123-test.md' }] }],
+      provider: { ensureLabel() {}, setLabels() {}, postComment() {} },
+      cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: {} },
+      listPrComments: () => [], listAgents: () => [],
+      attemptCardRebase: () => outcome, attemptMechanicalRebase,
+      computeConflictDisposition: () => 'clean', ...noopRouting(),
+    });
+    expect(attemptMechanicalRebase).toHaveBeenCalledTimes(1);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ mechanicalRebase: outcome, routedTo: 'mechanical-rebase' });
+    expect(formatConflictWatchSummary(results)).toContain(`mechanicalRebase=skip reason=${outcome.reason}`);
+  });
+
+  it('retains a thrown card attempt when same-line recovery cannot read the thread', () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      let reads = 0;
+      const results = watchParkedPrConflicts({
+        repo: 'o/n', sameLineConflict: 'fixer',
+        listPrs: () => [{ number: 42, mergeable: 'CONFLICTING', baseRefName: 'main',
+          labels: ['review:pending', 'review:changes', CONFLICT_LABEL].map(name => ({ name })),
+          files: [{ path: 'backlog/123-test.md' }] }],
+        provider: { ensureLabel() {}, setLabels() {}, postComment() {} },
+        cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: {} },
+        listPrComments: () => ++reads === 1 ? [] : null, listAgents: () => [],
+        attemptCardRebase: () => { throw new Error('offline'); }, ...noopRouting(),
+      });
+      expect(results).toHaveLength(1);
+      expect(results[0].mechanicalRebase).toMatchObject({ action: 'error', cause: 'offline' });
+      expect(formatConflictWatchSummary(results)).toContain('cause=offline');
+    } finally { log.mockRestore(); }
+  });
+
+  it('reads missing files for an already-labelled queued card-only conflict and attempts card rebase', () => {
+    const pr = { number: 5697, mergeable: 'CONFLICTING', baseRefName: 'main',
+      labels: ['review:accepted', 'ready-to-merge', CONFLICT_LABEL].map(name => ({ name })) };
+    const listPrFiles = vi.fn(() => [{ path: 'backlog/123-test.md' }]);
+    const attemptCardRebase = vi.fn(() => ({ action: 'rebased' }));
+    const [result] = watchParkedPrConflicts({
+      repo: 'o/n', sameLineConflict: 'stand-down',
+      listPrs: () => [pr], provider: { ensureLabel() {}, setLabels() {}, postComment() {} },
+      cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: { autoResolveRaisedBy: 'test' } },
+      listPrFiles, listPrComments: () => [], listAgents: () => [],
+      attemptCardRebase, postRearm: () => {}, ...noopRouting(),
+    });
+    expect(listPrFiles).toHaveBeenCalledWith({ number: 5697, repo: 'o/n' });
+    expect(attemptCardRebase).toHaveBeenCalledWith({ pr, repo: 'o/n', cardConflictSettings: {
+      value: { autoResolveRaisedBy: true }, sources: { autoResolveRaisedBy: 'test' },
+    } });
+    expect(result.routedTo).toBe('card-conflict-resolver');
+  });
+
+  it.each(['message', 'stderr', 'stdout'])('retains and logs the meaningful %s of a thrown card rebase error', (field) => {
+    const cause = 'GraphQL: API rate limit exceeded';
+    const error = new Error(field === 'message' ? `\n[gh-shim] warning: wrapper\nwarning: shim active\n\n${cause}\nextra detail` : '');
+    if (field !== 'message') error[field] = Buffer.from(`\n[gh-shim] warning: wrapper\n${cause}\nextra detail`);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const [result] = watchParkedPrConflicts({
+        repo: 'o/n', sameLineConflict: 'stand-down',
+        listPrs: () => [{ number: 42, mergeable: 'CONFLICTING', baseRefName: 'main',
+          labels: [{ name: 'review:pending' }], files: [{ path: 'backlog/123-test.md' }] }],
+        provider: { ensureLabel() {}, setLabels() {}, postComment() {} },
+        cardConflictSettings: { value: { autoResolveRaisedBy: true }, sources: { autoResolveRaisedBy: 'test' } },
+        listPrComments: () => [], listAgents: () => [],
+        attemptCardRebase: () => { throw error; },
+        listPrFiles: () => [{ path: 'backlog/123-test.md' }],
+        computeConflictDisposition: () => 'real', ...noopRouting(),
+      });
+      expect(result.mechanicalRebase).toEqual({ action: 'error',
+        reason: 'card rebase unavailable; normal conflict owner required', cause });
+      expect(log.mock.calls.flat().join(' ')).toContain(cause);
+    } finally { log.mockRestore(); }
+  });
+
+  it('formats each PR and counts resolver, fixer, errors and skipped PRs', () => {
+    const results = [
+      { num: 1, isConflicting: true, owner: 'review', routedTo: 'card-conflict-resolver', mechanicalRebase: { action: 'rebased', reason: 'cards merged' } },
+      { num: 2, isConflicting: true, routedTo: 'reconcile-finding', mechanicalRebase: { action: 'error', reason: 'normal owner required', cause: 'rate limit' } },
+      { num: 3, isConflicting: false },
+    ];
+    expect(formatConflictWatchSummary(results)).toBe([
+      'PR #1: conflicting=yes owner=review routedTo=card-conflict-resolver mechanicalRebase=rebased reason=cards merged cause=-',
+      'PR #2: conflicting=yes owner=- routedTo=reconcile-finding mechanicalRebase=error reason=normal owner required cause=rate limit',
+      'PR #3: conflicting=no owner=- routedTo=- mechanicalRebase=- reason=- cause=-',
+      'Counts: considered=3 resolved by card resolver=1 sent to fixer=1 resolved=0 errors=1 skipped=1',
+    ].join('\n'));
+    expect(formatConflictWatchSummary([], [{ number: 4, mergeable: 'MERGEABLE' }])).toContain('PR #4: conflicting=no');
+  });
+
+  it('logs listing failure while preserving the thrown error', () => {
+    const error = new Error('GraphQL rate limit exhausted');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => watchParkedPrConflicts({ listPrs: () => { throw error; } })).toThrow(error);
+      expect(log).toHaveBeenCalledWith('parked-pr-conflict-watch: run skipped: open-PR listing failed: GraphQL rate limit exhausted');
+    } finally { log.mockRestore(); }
+  });
+
+  it('logs a skipped run when discovery has no gh slot, retaining empty results', () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(watchParkedPrConflicts({ listPrs: () => ({ outcome: 'deferred-low-budget', deferred: true, reason: 'no gh slot' }) })).toEqual([]);
+      expect(log).toHaveBeenCalledWith('parked-pr-conflict-watch: run skipped: open-PR listing unavailable: no gh slot');
+    } finally { log.mockRestore(); }
+  });
+});
+
+
+describe('newly resolved summary counts', () => {
+  it('separates successful resolutions from genuine errors', () => {
+    const summary = formatConflictWatchSummary([
+      { num: 1, newlyResolved: true },
+      { num: 2, remove: [CONFLICT_LABEL] },
+      { num: 3, newlyResolved: true, mechanicalRebase: { action: 'error' } },
+      { num: 4, newlyResolved: true, error: 'rearm failed' },
+      { num: 5, mechanicalRebase: { action: 'error' } },
+      { num: 6, error: 'read failed' },
+    ]);
+    expect(summary).toContain('resolved=3 errors=3');
+  });
+});
+
+describe('card rebase preconditions', () => {
+  const pr = { headRefName: 'lane/test', baseRefName: 'main', headRefOid: 'a'.repeat(40) };
+  it('tags a repository mismatch before any rebase', () => {
+    const run = vi.fn(() => ({ status: 0, stdout: 'git@github.com:other/repo.git' }));
+    expect(defaultAttemptCardConflictRebase({ pr, repo: 'o/n', run })).toEqual({
+      action: 'skip', precondition: true, reason: 'card conflict clone does not match PR repository',
+    });
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+  it('tags a non-main PR before any git work', () => {
+    const run = vi.fn();
+    expect(defaultAttemptCardConflictRebase({ pr: { ...pr, baseRefName: 'other' }, run })).toEqual({
+      action: 'skip', precondition: true, reason: 'not a main-base PR',
+    });
+    expect(run).not.toHaveBeenCalled();
+  });
+  it('tags a moved branch as a deferred precondition', () => {
+    const run = vi.fn(() => ({ status: 0, stdout: 'b'.repeat(40) }));
+    expect(defaultAttemptCardConflictRebase({ pr, run })).toEqual({
+      action: 'skip', precondition: true, deferred: true, reason: 'branch moved before recovery',
+    });
+    expect(run.mock.calls.some(call => call[1][0] === 'rebase')).toBe(false);
+  });
+});
+
+describe('attempt marker writes and operator cutoff in both populations', () => {
+  function sweep(population, { result, comments = [], countSince, readError, attemptError } = {}) {
+    const postComment = vi.fn();
+    const attempt = vi.fn(() => { if (attemptError) throw new Error(attemptError); return result; });
+    const pr = { number: 42, mergeable: 'CONFLICTING', headRefName: 'lane/test', baseRefName: 'main',
+      labels: population === 'card' ? [{ name: 'review:pending' }] : [],
+      files: [{ path: population === 'card' ? 'backlog/123-test.md' : 'scripts/test.mjs' }] };
+    watchParkedPrConflicts({
+      repo: 'o/n', sameLineConflict: 'stand-down', listPrs: () => [pr],
+      provider: { ensureLabel() {}, setLabels() {}, postComment },
+      cardConflictSettings: { value: { autoResolveRaisedBy: population === 'card' }, sources: {} },
+      unownedRebaseSettings: { value: { countSince }, sources: {} },
+      listPrComments: () => { if (readError) throw new Error('comment read failed'); return comments; },
+      listAgents: () => [], listPrFiles: () => pr.files,
+      computeConflictDisposition: () => 'clean', attemptCardRebase: attempt, attemptMechanicalRebase: attempt,
+      ...noopRouting(),
+    });
+    return { attempt, markers: postComment.mock.calls.map(call => call[2]).filter(body => body.startsWith(UNOWNED_REBASE_ATTEMPT_MARKER)) };
+  }
+
+  for (const population of ['card', 'unowned']) {
+    it.each([
+      { action: 'error', reason: 'no gh slot' },
+      { action: 'error', reason: 'gh throttle / rate limit' },
+      { action: 'error', reason: 'read failed' },
+      { action: 'current' },
+      { action: 'rebased' },
+    ])(`${population}: does not mark %j`, result => {
+      expect(sweep(population, { result }).markers).toEqual([]);
+    });
+
+    // 1020c unfreeze: main counts every unsuccessful skip, precondition and deferred ones included.
+    it.each([
+      { action: 'skip', precondition: true, reason: 'card conflict clone does not match PR repository' },
+      { action: 'skip', precondition: true, reason: 'not a main-base PR' },
+      ...CARD_CONFLICT_PRECONDITION_REASONS.map(reason => ({ action: 'skip', precondition: true, reason })),
+      { action: 'skip', precondition: true, deferred: true, reason: 'branch moved before recovery' },
+      { action: 'skip', deferred: true, reason: 'deferred' },
+    ])(`${population}: marks precondition/deferred skip %j`, result => {
+      expect(sweep(population, { result }).markers).toEqual([formatUnownedRebaseAttemptMarker(result)]);
+    });
+
+    it(`${population}: marks only content conflicts with a sanitized outcome`, () => {
+      expect(sweep(population, { result: { action: 'skip', reason: ' content\nconflict ' } }).markers)
+        .toEqual([`${UNOWNED_REBASE_ATTEMPT_MARKER} outcome=skip:content conflict`]);
+    });
+
+    it.each([
+      'conflict outside Also raised by list',
+      'unsupported conflict markers',
+      'section contains non-list content',
+      'missing or ambiguous Also raised by section',
+      'side already contains conflict markers',
+      'no complete list conflict',
+      'unreadable card',
+    ])(`${population}: posts a counted marker for resolver content refusal %s`, reason => {
+      expect(CARD_CONFLICT_PRECONDITION_REASONS).not.toContain(reason);
+      const result = { action: 'skip', reason };
+      expect(result).not.toHaveProperty('precondition');
+      expect(sweep(population, { result }).markers)
+        .toEqual([`${UNOWNED_REBASE_ATTEMPT_MARKER} outcome=skip:${reason}`]);
+    });
+
+    it(`${population}: never marks throws or comment read failures`, () => {
+      expect(sweep(population, { attemptError: 'no gh slot' }).markers).toEqual([]);
+      const read = sweep(population, { readError: true, result: { action: 'error', reason: 'read failed' } });
+      expect(read.markers).toEqual([]);
+      if (population === 'card') expect(read.attempt).not.toHaveBeenCalled();
+    });
+
+    // 1020c unfreeze (stricter side wins): main's cap counts the whole history, so a cutoff never reopens it.
+    it(`${population}: a loaded cutoff never reopens the aggregate cap`, () => {
+      const comments = Array.from({ length: UNOWNED_REBASE_ATTEMPT_CAP }, () => ({
+        body: UNOWNED_REBASE_ATTEMPT_MARKER, author: { login: 'web-everything' }, createdAt: '2026-10-01T00:00:00Z',
+      }));
+      expect(sweep(population, { result: { action: 'current' }, comments }).attempt).not.toHaveBeenCalled();
+      expect(sweep(population, { result: { action: 'current' }, comments, countSince: '2026-10-02T00:00:00Z' }).attempt).not.toHaveBeenCalled();
+    });
+
+    it(`${population}: content skips and infrastructure failures share one aggregate cap`, () => {
+      const by = { author: { login: 'web-everything' }, createdAt: '2026-10-01T00:00:00Z' };
+      const comments = [{ body: UNOWNED_REBASE_ATTEMPT_MARKER, ...by }, { body: `${UNOWNED_REBASE_INFRA_MARKER} head=old outcome=infra:x`, ...by },
+        { body: `${UNOWNED_REBASE_INFRA_MARKER} head=older outcome=infra:y`, ...by }];
+      expect(sweep(population, { result: { action: 'current' }, comments }).attempt).not.toHaveBeenCalled();
+      expect(sweep(population, { result: { action: 'current' }, comments: comments.slice(0, 2) }).attempt).toHaveBeenCalledTimes(1);
+    });
+  }
+});
+
+
+describe('infrastructure markers and caps in both populations', () => {
+  for (const population of ['card', 'unowned']) {
+    function sweep({ comments = [], result, throws = false, markerThrows = false, head = 'abc' } = {}) {
+      const attempt = vi.fn(() => { if (throws) throw new Error('index.lock exists'); return result; });
+      const postComment = vi.fn((_repo, _pr, body) => {
+        if (markerThrows && body.startsWith(UNOWNED_REBASE_INFRA_MARKER)) throw new Error('comment write unavailable');
+      });
+      const routed = vi.fn();
+      const pr = { number: 42, mergeable: 'CONFLICTING', headRefName: 'lane/test', headRefOid: head, baseRefName: 'main',
+        labels: population === 'card' ? [{ name: 'review:pending' }] : [],
+        files: [{ path: population === 'card' ? 'backlog/123-test.md' : 'scripts/test.mjs' }] };
+      const entries = watchParkedPrConflicts({
+        repo: 'o/n', sameLineConflict: 'stand-down', listPrs: () => [pr],
+        provider: { ensureLabel() {}, setLabels() {}, postComment },
+        cardConflictSettings: { value: { autoResolveRaisedBy: population === 'card' }, sources: {} },
+        unownedRebaseSettings: { value: { countSince: null, infraRetryCap: 2 }, sources: {} },
+        listPrComments: () => comments, listAgents: () => [], listPrFiles: () => pr.files,
+        computeConflictDisposition: () => 'clean', attemptCardRebase: attempt, attemptMechanicalRebase: attempt,
+        ...noopRouting(), postFinding: routed,
+      });
+      return { entries, attempt, postComment, routed };
+    }
+
+    it.each([false, true])(`${population}: writes head-scoped infrastructure markers for errors and throws (%s)`, throws => {
+      const { postComment } = sweep({ throws, result: { action: 'error', reason: 'offline' } });
+      const markers = postComment.mock.calls.map(call => call[2]).filter(body => body.startsWith(UNOWNED_REBASE_INFRA_MARKER));
+      expect(markers).toHaveLength(1);
+      expect(markers[0]).toContain('head=abc outcome=infra:');
+      expect(countUnownedRebaseAttempts(markers.map(body => ({ body, author: { login: 'web-everything' } })))).toBe(0);
+    });
+
+    it(`${population}: marker write failure still routes onward`, () => {
+      const { routed } = sweep({ throws: true, markerThrows: true });
+      expect(routed).toHaveBeenCalled();
+    });
+
+    it(`${population}: stops at its infrastructure cap and permits a new head`, () => {
+      const comments = Array.from({ length: 2 }, () => ({
+        body: formatUnownedRebaseInfraMarker({ action: 'error', reason: 'lock' }, 'abc'),
+        author: { login: 'web-everything' },
+      }));
+      const capped = sweep({ comments });
+      expect(capped.attempt).not.toHaveBeenCalled();
+      expect(capped.entries[0]).toMatchObject({ unownedRebaseInfraCapExhausted: true, unownedRebaseInfraFailures: 2 });
+      expect(capped.routed).toHaveBeenCalled();
+      expect(sweep({ comments, head: 'new', result: { action: 'current' } }).attempt).toHaveBeenCalledTimes(1);
+    });
+  }
 });

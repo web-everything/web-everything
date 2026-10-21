@@ -145,10 +145,12 @@ The `/review` changes-verdict posts a durable PR comment (header `🔁 human rev
 `🔁 review — changes requested`) summarizing what to fix. Read it — and the escalation block in the PR body:
 
 ```bash
-gh pr view {{PR_NUM}} --json title,body,comments --repo {{REPO}}
+node "{{WE_ROOT}}/scripts/pr-context.mjs" {{PR_NUM}} --repo={{REPO}} --head="$(git rev-parse HEAD)"
 ```
 
-Take the **latest** changes-requested comment as the authoritative ask.
+The shared read is pinned to the examined checkout head and TTL bounded. It is context for the repair;
+all live claim, label, base and hand-back checks below still apply. If the head differs, refresh the
+work order instead of substituting another SHA. Take the **latest** changes-requested comment as the ask.
 
 **If this prompt opens with a `Previous rounds` (or `Takeover`) section, read it first** (card xx0055i). It lists
 each earlier round's findings, what the previous fixer changed, which findings were raised again, and the current
@@ -203,7 +205,7 @@ There is no `review:changes` comment on this population — the finding is the a
 instead (leading line `⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.`):
 
 ```bash
-gh pr view {{PR_NUM}} --json title,body,comments --repo {{REPO}}
+node "{{WE_ROOT}}/scripts/pr-context.mjs" {{PR_NUM}} --repo={{REPO}} --head="$(git rev-parse HEAD)"
 ```
 
 Take the **latest** such comment as the authoritative ask — read its findings table and its

@@ -1,9 +1,11 @@
+import { provenanceRun } from '../../lib/__tests__/fixtures/saved-red-team-provenance.mjs';
+import { writeRun } from '../run-store.mjs';
 import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
 /**
  * #4194 — ADDED NON-CLAUDE REVIEW SEATS: advisory lenses + one extra juror routed to Codex/Gemini through the
  * direct-task scripts, BESIDE Claude's mandatory seats. No real codex/agy/git/GitHub process: every effect is a fake.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,7 +15,7 @@ import {
   reviewSeatRoutes, ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE, REVIEW_SEAT_MODELS,
 } from '../review-dispatch.mjs';
 import {
-  runExtraSeats, extraSeatsEnabled, resolveDailyCap, callsUsedToday, callsUsedTodayForProvider, quotaHold,
+  finishSpeculativeRedTeam, redTeamReadFingerprint, RED_TEAM_SEAT, runExtraSeats, extraSeatsEnabled, resolveDailyCap, callsUsedToday, callsUsedTodayForProvider, quotaHold,
   PROBE_INTERVAL_ENV, DEFAULT_PROBE_INTERVAL_MS, resolveProbeIntervalMs, probeDue, quotaHoldOrProbe,
   claudeFindingsFromLoop, buildSeatTask, parseSeatAnswer, classifySeatCall, buildSeatRows, seatCallArgv, capDay,
   renderSeatSummary, EXTRA_SEATS_ENV, DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,
@@ -32,6 +34,12 @@ import {
   buildAgyPrompt, buildAgyDirectTaskArgv, runAgyDirectExec, parseFlags as parseAgyFlags,
 } from '../../gemini-direct-task.mjs';
 import { EventEmitter } from 'node:events';
+
+// Hermetic: the repo's own review.json pauses claim-accuracy (operator 2026-10-21); these tests assert the standard routing, so read no settings file.
+vi.mock('../../lib/review-seat-settings.mjs', async (orig) => {
+  const real = await orig();
+  return { ...real, resolveExtraSeatsPausedLenses: (o = {}) => real.resolveExtraSeatsPausedLenses({ ...o, file: '/nonexistent/review.json' }) };
+});
 
 const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
@@ -666,6 +674,7 @@ describe('#4194 review-job — the seats run AFTER the arc, and can never change
   function fakeJobIo(over = {}) {
     const calls = [];
     const io = {
+    redTeamTimingSetting: () => ({ value: { timing: 'post-accept' }, sources: { timing: 'tool' }, invalid: [] }),
       root: '/daemon',
       now: (() => { let t = 1_000; return () => { t += 10; return t; }; })(),
       newActorId: () => 'actor',
@@ -916,4 +925,86 @@ it('keeps distinct per-seat policy models in separate calls and reserves both un
   expect(calls.filter(c => c[0] === 'seat').map(c => c[1].model).sort()).toEqual(['gpt-6-astra', 'gpt-6-sol']);
   expect(calls.filter(c => c[0] === 'reserve')).toEqual([['reserve', 'codex', 2, 2]]);
   expect(result.seats.find(s => s.lens === 'claim-accuracy').model).toBe('gpt-6-sol');
+});
+
+
+describe('speculative red-team supersession provenance', () => {
+  it.each(['missing', 'mismatched', 'valid'])('supersedes only with valid prior provenance (%s)', async proof => {
+    const root = mkdtempSync(join(tmpdir(), 'extra-seats-supersession-'));
+    try {
+      const env = { CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_TIMING: 'post-accept' };
+      const rev = 'a'.repeat(40);
+      const records = [{ dispatchKind: 'review-seat', seat: 'red-team', repo: REPO, pr: 5,
+        rev, callId: 'prior-call', status: 'ok', findings: [], recheckStatus: 'not-needed' }];
+      if (proof !== 'missing') {
+        const run = provenanceRun({ env, rows: records });
+        if (proof === 'mismatched') run.findings.savedRedTeamResult.sha256 = '0'.repeat(64);
+        writeRun(run, env.OPERATION_RUNS_DIR);
+      }
+      const loopPayload = { ...LOOP_PAYLOAD, verdict: { verdict: 'accept' },
+        findings: { ...LOOP_PAYLOAD.findings, judge: { findings: [] } } };
+      const pass = { status: 'speculated', rev, readFingerprint: redTeamReadFingerprint(loopPayload.findings.read),
+        callId: 'fresh-call', provider: 'codex', model: 'm', call: { status: 'ok' },
+        parsed: { [RED_TEAM_SEAT.key]: { ok: true, verdict: 'accept', findings: [] } },
+        findings: [], recheckStatus: 'not-needed', evidence: {}, quota: {}, startedAt: NOW, finishedAt: NOW };
+      const { io, rows } = fakeSeatIo({ readRecords: () => records });
+      const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env, post: false }, io);
+      expect(result.status).toBe(proof === 'valid' ? 'superseded' : 'ran');
+      if (proof !== 'valid') expect(rows.some(row => row.callId === 'fresh-call')).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+import { replayPayload, resolvedReplayPayload } from '../review-extra-seats.mjs';
+describe('red-team replay resolves inflated GitHub file evidence', () => {
+  const view = { title: 'card', headRefName: 'lane/cards', headRefOid: 'a'.repeat(40), baseRefName: 'main', files: [{ path: 'scripts/stale.mjs' }] };
+  const repo = 'web-everything/web-everything';
+  function run(_cmd, args) {
+    return { status: 0, stdout: args[0] === 'remote' ? `https://github.com/${repo}.git`
+      : args[0] === 'rev-parse' ? view.headRefOid : args[0] === 'diff' ? 'backlog/123-card.md' : '' };
+  }
+  it('the replay caller uses git net files before constructing the payload', () => {
+    const payload = resolvedReplayPayload({ view, diffText: 'd', repo, run });
+    expect(payload.findings.read.netChangedFiles).toEqual(['backlog/123-card.md']);
+    expect(payload.findings.read.netBasis.rev).toBe(view.headRefOid);
+  });
+  it('explicit realFiles, including null, override view.files', () => {
+    expect(replayPayload({ view, realFiles: ['backlog/123-card.md'] }).findings.read.netChangedFiles).toEqual(['backlog/123-card.md']);
+    expect(replayPayload({ view, realFiles: null }).findings.read.netChangedFiles).toBeNull();
+  });
+});
+
+describe('review.extraSeats.pausedLenses — a paused lens gets no seat, no reservation, no row', () => {
+  it('reviewSeatRoutes drops the paused advisory lens and keeps the extra juror and the other lenses', () => {
+    const { routes, skipped } = reviewSeatRoutes({ pausedLenses: ['claim-accuracy'] });
+    expect(routes.map((r) => r.lens)).not.toContain('claim-accuracy');
+    expect(skipped.map((r) => r.lens)).not.toContain('claim-accuracy');
+    expect(routes.some((r) => r.seat === 'extra-juror')).toBe(true);
+    expect(routes.filter((r) => r.seat === 'advisory-lens')).toHaveLength(ROUTED_ADVISORY_LENSES.length - 1);
+  });
+
+  it('runExtraSeats logs the paused line, calls no claim-accuracy seat, writes no claim-accuracy row', async () => {
+    const { io, calls, rows } = fakeSeatIo();
+    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: { WE_REVIEW_EXTRA_SEATS_PAUSED_LENSES: '["claim-accuracy"]' } }, io);
+    expect(r.status).toBe('ran');
+    expect(calls).toContainEqual(['log', 'extra-seats: lens claim-accuracy paused (env)']);
+    expect(rows.some((row) => JSON.stringify(row).includes('claim-accuracy'))).toBe(false);
+    expect(rows).toHaveLength(2);
+    expect(rows.some((row) => JSON.stringify(row).includes('correctness'))).toBe(true);
+  });
+
+  it('the repo settings file pauses claim-accuracy, and the standard is empty', async () => {
+    const real = await vi.importActual('../../lib/review-seat-settings.mjs');
+    expect(real.resolveExtraSeatsPausedLenses({ env: {} })).toEqual({ value: ['claim-accuracy'], source: 'setting' });
+    expect(real.resolveExtraSeatsPausedLenses({ env: {}, file: '/nonexistent' })).toEqual({ value: [], source: 'standard' });
+    expect(real.resolveExtraSeatsPausedLenses({ env: { WE_REVIEW_EXTRA_SEATS_PAUSED_LENSES: 'a, b' } }).value).toEqual(['a', 'b']);
+  });
+
+  it('a malformed layer (object instead of array) is ignored, never throws', async () => {
+    const real = await vi.importActual('../../lib/review-seat-settings.mjs');
+    const bad = JSON.stringify({ extraSeats: { pausedLenses: { nested: [] } } });
+    expect(real.resolveExtraSeatsPausedLenses({ env: {}, readFile: () => bad })).toEqual({ value: [], source: 'standard' });
+    expect(real.resolveExtraSeatsPausedLenses({ env: {}, file: '/nonexistent', platform: { pausedLenses: { nested: [] } } })).toEqual({ value: [], source: 'standard' });
+    expect(real.resolveExtraSeatsPausedLenses({ env: { WE_REVIEW_EXTRA_SEATS_PAUSED_LENSES: '{"a":1}' }, file: '/nonexistent' }).value).toEqual([]);
+  });
 });

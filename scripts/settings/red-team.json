@@ -1,6 +1,7 @@
 {
   "redTeam": {
-    "$comment": "statusLabels defaults true (WE_RED_TEAM_STATUS_LABELS override); head-bound derived status only, recorded results remain authoritative. skipCardOnly defaults true; card-only net diffs never schedule a pass.",
+    "$comment": "carriedAcceptTriggersReview defaults true (WE_RED_TEAM_CARRIED_ACCEPT_TRIGGERS_REVIEW override); missing head-bound review evidence triggers a fresh capped review. statusLabels defaults true (WE_RED_TEAM_STATUS_LABELS override); head-bound derived status only, recorded results remain authoritative. skipCardOnly defaults true; card-only net diffs never schedule a pass.",
+    "carriedAcceptTriggersReview": true,
     "confirmedBreaks": {
       "broken": "send-back",
       "degraded": "card",

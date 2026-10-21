@@ -45,6 +45,7 @@
 
 import { createFixHandoffSleep, createFixHandoffProbe } from '../../scripts/lib/fix-handoff.mjs';
 import { publishAttention } from '../../scripts/operations/needs-you-feed.mjs';
+import { autoRoundGrant as defaultAutoRoundGrant, firstLine as redactedFirstLine, stuckAfterGrant as defaultStuckAfterGrant } from '../../scripts/conveyor/auto-round-grant-io.mjs';
 import { resolveFixSafety } from '../../scripts/conveyor/repeated-finding-reset.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
@@ -383,7 +384,7 @@ let loggedNeedsHumanVoidSetting = false;
 
 export function runReconcileNotesAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment, parkToHuman = defaultParkToHuman,
-  publish = publishAttention, safety = resolveFixSafety(),
+  publish = publishAttention, safety = resolveFixSafety(), autoRoundGrant = defaultAutoRoundGrant, stuckAfterGrant = defaultStuckAfterGrant,
   dryRun = defaultNoteCommentDryRun(), verdictSettings = resolveCiHealVerdictSettings(), readRequiredChecks = defaultReadRequiredChecks,
   ...tickOpts
 } = {}) {
@@ -396,6 +397,7 @@ export function runReconcileNotesAllRepos({
   const notes = [];
   const refusals = [];
   const comments = [];
+  const autoGrants = [];
   for (const entry of perRepo) {
     if (entry.error) {
       refusals.push({ repo: entry.repo, prNumber: null, kind: 'tick-failed', why: entry.error });
@@ -403,13 +405,42 @@ export function runReconcileNotesAllRepos({
     }
     const { repo, result } = entry;
     const prsByNumber = result?.prsByNumber ?? new Map();
+    // Never silently stuck after an automatic grant: a PR still at its round limit well after one gets its
+    // needs-you event (published even though the grant's own pass suppressed it; the feed dedups per head).
+    if (!dryRun && safety.value.alertAtRoundCap) {
+      const noted = new Set((result?.notes ?? []).map((n) => n.prNumber));
+      for (const pr of prsByNumber.values()) {
+        if (noted.has(pr?.number)) continue;
+        let reason = null;
+        try { reason = stuckAfterGrant({ repo, pr }); } catch (e) { reason = null; process.stderr.write(`auto-round-grant stuck check ${repo}#${pr?.number}: ${redactedFirstLine(e)}\n`); }
+        if (!reason) continue;
+        autoGrants.push({ repo, prNumber: pr.number, action: 'stuck', why: reason });
+        process.stderr.write(`auto-round-grant ${repo}#${pr.number}: stuck — ${reason}\n`);
+        try { publish({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, pr: pr.number, head: pr.headRefOid ?? '', kind: 'at-round-limit', reason }); }
+        catch (e) { process.stderr.write(`needs-you publication failed: ${redactedFirstLine(e)}\n`); }
+      }
+    }
     for (const n of (result?.notes ?? [])) {
       const tagged = { ...n, repo };
       notes.push(tagged);
       const pr = prsByNumber.get(n.prNumber);
+      // The operator's standing ruling (2026-10-19, confirmed 2026-10-20): a card-only PR at its round cap gets +1
+      // round automatically, capped per PR (we:scripts/conveyor/auto-round-grant.mjs). A grant raises the cap, so
+      // this note, its comment, its parking and its needs-you event are all moot; anything else falls through.
+      let autoGrant = null;
+      if (!dryRun && pr && n.kind === 'round-cap-exhausted') {
+        try { autoGrant = autoRoundGrant({ repo, note: n, pr }); }
+        catch (e) { autoGrant = { action: 'failed', why: redactedFirstLine(e) }; }
+        if (autoGrant) {
+          autoGrants.push({ repo, prNumber: n.prNumber, ...autoGrant });
+          process.stderr.write(`auto-round-grant ${repo}#${n.prNumber}: ${autoGrant.action}${autoGrant.why ? ` — ${redactedFirstLine(autoGrant.why)}` : ''}${autoGrant.count ? ` (${autoGrant.count}/${autoGrant.max})` : ''}\n`);
+          if (autoGrant.action === 'granted') continue;
+        }
+      }
       if (!dryRun && safety.value.alertAtRoundCap && ['round-cap-exhausted', 'ci-heal-exhausted', 'ruling-dispute', 'ci-heal-escalated'].includes(n.kind)) {
         try { publish({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, pr: n.prNumber,
-          head: pr?.headRefOid ?? '', kind: ['round-cap-exhausted', 'ci-heal-exhausted'].includes(n.kind) ? 'at-round-limit' : 'escalated', reason: n.text }); }
+          head: pr?.headRefOid ?? '', kind: ['round-cap-exhausted', 'ci-heal-exhausted'].includes(n.kind) ? 'at-round-limit' : 'escalated',
+          reason: autoGrant?.action === 'cap-reached' ? autoGrant.reason : n.text }); }
         catch (e) { process.stderr.write(`needs-you publication failed: ${e.message}\n`); }
       }
       // card x9zznl9 (live #4535) — a `not-a-ci-break` verdict a required check has since contradicted is voided
@@ -467,7 +498,7 @@ export function runReconcileNotesAllRepos({
       });
     }
   }
-  return { repos: perRepo, notes, refusals, comments };
+  return { repos: perRepo, notes, refusals, comments, autoGrants };
 }
 
 /** The repo's live required-check set (branch protection, cached) — the SAME reader `reconcile-pass.mjs` uses. */
@@ -898,6 +929,7 @@ export async function runTickAllRepos({
     authPauseReason: authGate.reason,
     notes: notes.notes, // #4191 — every surfaced note this tick saw, repo-tagged
     noteComments: notes.comments, // #4191 — one row per note: posted / would-post (dryRun) / already-posted
+    autoRoundGrants: notes.autoGrants ?? [], // standing-ruling card-only round grants this tick decided
     statusTags, // #3383 follow-up — one row per dispatch-time `review-status:*` tag attempt this tick made
     awaitVerify, // #5137 — one row per recorded verify wait this tick read (wait / push / rerequest / resume)
     stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
