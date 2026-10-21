@@ -74,6 +74,14 @@ describe('false-refutation probes (audit round 2)', () => {
     const src = "function f() {\n  try { a() } catch (e) { console.error(e); return { status: 'error' } }\n  try { b() } catch {}\n}\n";
     expect(verifyFinding({ file: 'p.mjs', line: 2, summary: 'errors are silently discarded' }, R({ 'p.mjs': src })).status).toBe('inconclusive');
   });
+  it('an identifier used OUTSIDE a test body is not coverage', () => {
+    const r = verifyFinding({ file: 'pay.mjs', line: 1, summary: 'retryPayment is untested.' }, R({ 'pay.test.mjs': "it('arithmetic', () => { expect(1+1).toBe(2); });\nconst unused = retryPayment;\n" }));
+    expect(r.status).toBe('inconclusive');
+  });
+  it('one handled catch does not excuse another swallowing catch in the same function', () => {
+    const src = "function pay() {\n  try { charge(); } catch (e) { void e; }\n  try { audit(); } catch (e) {\n    console.error(e);\n    return { status: 'error' };\n  }\n}\n";
+    expect(verifyFinding({ file: 'p.mjs', line: 2, summary: 'Payment errors are silently discarded.' }, R({ 'p.mjs': src })).status).toBe('inconclusive');
+  });
   it('an absence claim is not refuted by the identifier being absent', () => {
     expect(verifyFinding({ file: 'r.mjs', line: 1, summary: 'The response omits required requestId.' }, R({ 'r.mjs': 'export function response() { return {}; }' })).status).toBe('inconclusive');
   });

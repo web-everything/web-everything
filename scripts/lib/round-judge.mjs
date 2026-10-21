@@ -238,7 +238,8 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   const prior = latest ? same.slice(0, -1) : [];
   const prev = prior.at(-1) ?? null;
   const grants = repo ? roundExtensionGrants(comments ?? [], { repo, pr }) : [];
-  const grantsSoFar = grants.reduce((n, g) => n + (g.by ?? 1), 0);
+  // The shared reader clamps its running total at 10; the judge's ceiling is its own, so validate each grant alone.
+  const grantsSoFar = repo ? (comments ?? []).reduce((n, c) => n + (roundExtensionGrants([c], { repo, pr })[0]?.by ?? 0), 0) : 0;
   const fileList = [...new Set((files ?? []).map(String))];
   const reasons = [];
 

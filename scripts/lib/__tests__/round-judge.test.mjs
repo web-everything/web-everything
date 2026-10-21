@@ -115,6 +115,12 @@ describe('verdict paths', () => {
       rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']])]);
     expect(r.verdict).toBe('grant');
   });
+  it('grants are counted past the shared reader clamp of 10', () => {
+    const many = Array.from({ length: 12 }, () => grantComment());
+    const r = judge([...many, rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke'], ['c.mjs', 3, 'three cccc broke']]), rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']])], { maxGrants: 12 });
+    expect(r.verdict).toBe('escalate');
+    expect(r.evidence.grantsSoFar).toBe(12);
+  });
   it('escalate only at the hard ceiling (setting, standard 20)', () => {
     const r = judge([grantComment(), grantComment(),
       rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke'], ['c.mjs', 3, 'three cccc broke']]),

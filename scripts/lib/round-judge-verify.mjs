@@ -60,6 +60,26 @@ const IMPORTISH = /^\s*(?:import\b|export\s*\{|export\s+\*|\/\/|\*|\/\*)|\brequi
 const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const wordSet = (l) => new Set(String(l).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
 
+const IND = (l) => l.length - l.trimStart().length;
+const TEST_TITLE = /^\s*(?:it|test)(?:\.[a-z]+)?\s*\(\s*(['"`])/;
+
+/** Line indexes that sit INSIDE an `it(` / `test(` call body (title line to its closing line). */
+function testBodyLines(lines) {
+  const inside = new Set();
+  lines.forEach((l, i) => {
+    if (!TEST_TITLE.test(l)) return;
+    const n = IND(l);
+    inside.add(i);
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const t = lines[j].trim();
+      if (t && IND(lines[j]) <= n && /^[})\]]/.test(t)) break; // the call's closing `})` at the title's indent
+      if (t && IND(lines[j]) <= n && !/^[})\]]/.test(t)) break;
+      inside.add(j);
+    }
+  });
+  return inside;
+}
+
 function checkCoverage(f, repo) {
   const ids = claimIdentifiers(f.summary).filter((x) => x.length >= 6).slice(0, 1); // the subject only
   const stem = stemOf(f.file);
@@ -69,18 +89,18 @@ function checkCoverage(f, repo) {
     const text = repo.read(path);
     if (text == null) continue;
     const lines = text.split('\n');
-    const firstTitle = lines.findIndex((l) => TITLE.test(l));
-    // 1. the subject identifier is USED inside a test body: whole word, after a test title, not an import / comment line.
+    const body = testBodyLines(lines);
+    // 1. the subject identifier is USED inside an it()/test() body: whole word, not an import / comment line.
     for (const id of ids) {
       const re = new RegExp(`(?<![\\w$])${esc(id)}(?![\\w$])`);
-      const at = lines.findIndex((l, i) => firstTitle >= 0 && i > firstTitle && re.test(l) && !IMPORTISH.test(l));
+      const at = lines.findIndex((l, i) => body.has(i) && re.test(l) && !IMPORTISH.test(l));
       if (at >= 0) return { status: 'refuted', evidence: `${path}:${at + 1} uses ${id}` };
     }
-    // 2. a test title, then a line inside a test, carries at least two whole-word distinctive terms (stem words excluded).
+    // 2. a test title, then a line inside a test body, carries at least two whole-word distinctive terms.
     const hits = (l) => { const w = wordSet(l); return terms.filter((x) => w.has(x)).length; };
     for (const t of titlesOf(text)) if (hits(t.title) >= 2) return { status: 'refuted', evidence: `${path}:${t.line} "${t.title.slice(0, 80)}"` };
     if (terms.length >= 2) {
-      const at = lines.findIndex((l, i) => firstTitle >= 0 && i > firstTitle && !IMPORTISH.test(l) && hits(l) >= 2);
+      const at = lines.findIndex((l, i) => body.has(i) && !IMPORTISH.test(l) && hits(l) >= 2);
       if (at >= 0) return { status: 'refuted', evidence: `${path}:${at + 1} ${lines[at].trim().slice(0, 80)}` };
     }
   }
@@ -90,7 +110,27 @@ function checkCoverage(f, repo) {
 const FN_DECL = /^(?:export\s+)?(?:async\s+)?function\b|^(?:export\s+)?(?:const|let)\s+\w+\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>/; // top-level only
 // A bare empty catch is a real swallow. One that carries a comment (`catch { /* log only */ }`) is a documented best-effort
 // step and does not by itself decide the claim.
-const EMPTY_CATCH = /catch\s*(?:\([^)]*\))?\s*\{\s*\}/;
+const LOGGY = /\b(?:console\.(?:error|warn|log)|throw\b|log(?:ger)?\.(?:error|warn)|\blog\()/;
+const STATUSY = /status\s*:\s*['"]error['"]|\bexitCode\s*=\s*[1-9]|return\s*\{[^}]*\berror\b|\bthrow\b/;
+/** Every `catch` block in some lines: { line (of the catch), body }. Brace counting; strings are not parsed. */
+function catchBlocks(lines) {
+  const out = [];
+  lines.forEach((l, i) => {
+    const m = /\bcatch\b\s*(?:\([^)]*\))?\s*\{/.exec(l);
+    if (!m) return;
+    let depth = 0, started = false, body = '';
+    for (let r = i; r < lines.length && r < i + 60; r += 1) {
+      const text = r === i ? lines[r].slice(m.index + m[0].length - 1) : lines[r];
+      for (const ch of text) {
+        if (ch === '{') { depth += 1; started = true; if (depth === 1) continue; }
+        if (ch === '}') { depth -= 1; if (started && depth === 0) { out.push({ line: i, body }); return; } }
+        if (depth >= 1) body += ch;
+      }
+      body += '\n';
+    }
+  });
+  return out;
+}
 
 function checkSilent(f, repo) {
   const text = repo.read(f.file);
@@ -104,11 +144,16 @@ function checkSilent(f, repo) {
   let hi = at + 1; while (hi < lines.length && !FN_DECL.test(lines[hi])) hi += 1;
   if (hi - lo > 120) return { status: 'inconclusive', evidence: null };
   const scope = lines.slice(lo, hi);
-  if (scope.some((l) => EMPTY_CATCH.test(l))) return { status: 'inconclusive', evidence: null }; // a real swallow is in there
-  const logAt = scope.findIndex((l) => /\b(?:console\.(?:error|warn|log)|throw\b|log(?:ger)?\.(?:error|warn))/.test(l));
-  const statusAt = scope.findIndex((l) => /status\s*:\s*['"]error['"]|\bexitCode\s*=\s*[1-9]|return\s*\{[^}]*\berror\b/.test(l));
-  return logAt >= 0 && statusAt >= 0
-    ? { status: 'refuted', evidence: `${f.file}:${lo + logAt + 1} logs/throws and ${f.file}:${lo + statusAt + 1} returns an error status, in the function holding line ${f.line}` }
+  const blocks = catchBlocks(scope);
+  if (!blocks.length) return { status: 'inconclusive', evidence: null };
+  // EVERY catch in the function must be handled (log / throw / error status) or be a documented empty best-effort one;
+  // a catch that does something else (e.g. `void e`) or is a bare `{}` is a real swallow and the claim stands.
+  const handled = blocks.map((b) => ({ ...b, log: LOGGY.test(b.body), status: STATUSY.test(b.body), commented: /\/\*|\/\//.test(b.body) && !b.body.replace(/\/\*.*?\*\/|\/\/.*$/gm, '').trim() }));
+  if (handled.some((b) => !b.log && !b.status && !b.commented)) return { status: 'inconclusive', evidence: null };
+  const good = handled.find((b) => b.log && b.status) ?? null;
+  const logAt = handled.find((b) => b.log); const statusAt = handled.find((b) => b.status);
+  return good || (logAt && statusAt)
+    ? { status: 'refuted', evidence: `${f.file}:${lo + (logAt ?? good).line + 1} logs/throws and ${f.file}:${lo + (statusAt ?? good).line + 1} returns an error status, every catch in the function holding line ${f.line} is handled` }
     : { status: 'inconclusive', evidence: null };
 }
 
