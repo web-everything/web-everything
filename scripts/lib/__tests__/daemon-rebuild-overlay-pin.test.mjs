@@ -142,6 +142,20 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
     expect(readRebuildState(f.clone, f.env).pinnedNotified ?? null).toBeNull();
   });
 
+  it('a stack base contained only in the NEW tip of a pinned top is brought back, never lost (Codex audit)', async () => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { 'base.txt': 'LIVE\n' });
+    addOverlay(f.clone, { ref: 'lane/base', pr: 5830 }, { env: f.env });
+    expect(await f.tick()).toMatchObject({ adopted: true });
+    expect(isAncestor(f.clone, base, f.head())).toBe(true);
+    // the moving branch is rebuilt ON the base (so the base looks contained in it) and conflicts with the live fixes
+    f.push('lane/moving', base, { [DAEMON]: lines({ 2: 'm2', 8: 'm8' }), 'moving.txt': 'v2\n' });
+    const second = await f.tick();
+    expect(second.alerts.find((x) => x.kind === 'overlay-pinned')?.detail).toMatchObject({ ref: 'lane/moving', adopted: f.mOld });
+    expect(isAncestor(f.clone, base, f.head())).toBe(true);
+    expect(readFileSync(join(f.clone, 'base.txt'), 'utf8')).toBe('LIVE\n');
+  });
+
   it('a clean new tip of a moving overlay just advances (no pin)', async () => {
     const f = fixture();
     await f.tick();

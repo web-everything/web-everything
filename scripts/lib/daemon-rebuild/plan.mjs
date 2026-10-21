@@ -696,7 +696,9 @@ export async function planRebuild({
   //     vanish silently: the whole plan is run again with that base as an ordinary independent overlay, so the normal
   //     rules decide (an established base goes first and the newcomer is parked; a pinned one refuses). Each pass adds
   //     at least one ref to `keepIndependent`, and a kept ref can no longer be set aside, so this ends.
-  const appliedRefs = () => new Set(applied.map((a) => a.ref));
+  // A top applied only at its PINNED old head (overlay-pin) is not the tip that contained or replaced the base, so it
+  // never suppresses the fallback: the base comes back (or the plan re-runs with it independent), never lost silently.
+  const appliedRefs = () => new Set(applied.filter((a) => !a.pinnedFrom).map((a) => a.ref));
   const lostBases = [];
   for (const d of decisions) {
     if (d.action !== 'skip' || !['stack-base-moved', 'stack-contained'].includes(d.reason) || !d.sha) continue;
