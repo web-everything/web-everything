@@ -330,7 +330,12 @@ export const OPERATIONS = Object.freeze({
   // #xewnork — did a check actually RUN on the head that is there now? Read-only, same no-sinks reasoning as
   // `suggest-next` and `gate-health`: every step is `compute`, so no effect exists for a sink to apply.
   [STALE_STATE_OP]: () => ({
-    declaration: staleStateOperation({ readState: createStaleStateReader() }),
+    declaration: staleStateOperation({ readState: createStaleStateReader({
+      laneScan: process.env.WE_HEALTH_WATCH_LANE_SCAN === '1' ? {
+        dir: process.env.WE_HEALTH_WATCH_LANE_SCAN_DIR || undefined,
+        write: process.env.WE_HEALTH_WATCH_LANE_SCAN_WRITE === '1',
+      } : undefined,
+    }) }),
     sinks: {},
   }),
   [PR_STATUS_OP]: () => ({

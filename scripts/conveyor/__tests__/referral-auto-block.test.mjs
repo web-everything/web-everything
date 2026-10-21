@@ -2,13 +2,14 @@
  * @file referral-auto-block.test.mjs — review.referralDefault=auto-block (operator ruling 2026-10-08).
  *   Red on the old code: no auto-policy actor, no sweep, no structured-block dispute.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { planAutoBlock, sweepAutoBlock, AUTO_BLOCK_REASON } from '../referral-auto-block.mjs';
+import { decideReferralHold, blockRuledReferralsFor } from '../review-referral-hold.mjs';
 import { sweepReviewHoldLabels } from '../review-hold-reconcile.mjs';
 import { openReferralFindings, planOperatorRuling, selectFindings } from '../../operations/record-referral-ruling.mjs';
 import { mandatoryReferralState, validateOperatorRuling, buildOperatorRulingComment, AUTO_POLICY_ACTOR, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
-import { ignoredRulings, rulingNeeded, RULING_NEEDED_LABEL } from '../../lib/ruling-ledger.mjs';
-import { resolveReviewSettings, validateReviewSettings } from '../../lib/review-settings.mjs';
+import { ignoredRulings, rulingNeeded, rulingDisputeText, fixerRulingBrief, renderRulingNotAddressed, RULING_NEEDED_LABEL } from '../../lib/ruling-ledger.mjs';
+import { resolveReviewSettings, validateReviewSettings, resolveReferralSafetySettings } from '../../lib/review-settings.mjs';
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 import { classifyEvent, normalizeComment } from '../../operations/coroner-rounds.mjs';
 import { H1, H2, H3, H4, repo, record, recordComment, iso } from './ruling-fixtures.mjs';
@@ -353,4 +354,153 @@ describe('fresh complete auto-block decisions (#5955)', () => {
     expect(reads).toBe(1);
   });
 
+});
+
+
+// A ruling is an event on the thread, not a wake that must happen after the pause.
+function replay5514({ actor = AUTO_POLICY_ACTOR, evidence = ['policy/pointer.md:12: the live code covers this case'] } = {}) {
+  const r = record({ head: H1, runId: 'review-pr-5514', pr: 5514 });
+  const key = r.referrals[0].key;
+  const initial = recordComment(r, 1);
+  const block = { author: { login: 'web-everything' }, createdAt: iso(2), body: buildOperatorRulingComment({
+    version: 1, repo, pr: 5514, head: H1, actor, channel: 'review daemon', reason: AUTO_BLOCK_REASON,
+    at: iso(2), clearerId: '', rulings: [{ runId: r.runId, key, result: 'block' }] }) };
+  const ruled = structuredClone(r);
+  ruled.rulings = [{ id: 'nr-5514', key, reviewerId: r.reviewer.id, lens: r.reviewer.lens,
+    result: 'not-real', rationale: 'the finding is disproved on the live head', evidence }];
+  // The ruling precedes the pause in this synthetic, head-and-key pinned replay.
+  const answer = recordComment(ruled, 16);
+  const pause = { author: { login: 'web-everything' }, createdAt: iso(29),
+    body: 'review paused: 1 referrals need a ruling' };
+  const pr = { number: 5514, headRefOid: H1, body: r.authorBody, comments: [initial, block, answer, pause] };
+  const run = { repo, pr: 5514, head: H1, parked: true, attempted: true, persistenceFailed: false,
+    startedAt: Date.parse(iso(20)), completedAt: Date.parse(iso(29)), count: 1 };
+  return { pr, run, r, ruled, answer, block };
+}
+
+describe('auto-policy supersession', () => {
+  // This health-watch build defaults review.autoBlockYieldsToReviewerNotReal OFF (main's policy-block precedence,
+  // unfreeze-healthwatch-top-1021e); these cases exercise the opt-in yield, so they opt in explicitly.
+  beforeEach(() => vi.stubEnv('WE_REVIEW_AUTO_BLOCK_YIELDS_TO_REVIEWER_NOT_REAL', 'true'));
+  afterEach(() => vi.unstubAllEnvs());
+  it('by default (no opt-in) the auto-policy block is retained over a later reviewer not-real', () => {
+    vi.unstubAllEnvs();
+    const { pr } = replay5514();
+    expect(resolveReferralSafetySettings({ fileConfig: null, platform: {}, env: {} }).value.autoBlockYieldsToReviewerNotReal).toBe(false);
+    expect(mandatoryReferralState(pr.comments, { head: H1, log: () => {} }).blocked).toHaveLength(1);
+  });
+  it('an auto-policy block is superseded by a later mandatory-reviewer not-real that carries evidence', () => {
+    const { pr } = replay5514();
+    const state = mandatoryReferralState(pr.comments, { head: H1 });
+    expect(state.pending).toEqual([]);
+    expect(state.blocked).toEqual([]);
+    expect(blockRuledReferralsFor(pr, { repo })).toEqual([]);
+    expect(openReferralFindings({ comments: pr.comments, repo, pr: pr.number, head: H1, body: pr.body }).open).toEqual([]);
+  });
+  it('PR 5514 replay: the 22:56 operator ruling under the legacy repo slug clears the 23:09 pause', () => {
+    const { pr, run, r } = replay5514();
+    const ruling = { version: 1, repo: 'chalbert/web-everything', pr: 5514, head: H1,
+      actor: OPERATOR_LOGINS[0], channel: 'operator', reason: 'the reviewer already disproved this finding',
+      at: '2026-10-17T22:56:39.107Z', clearerId: '',
+      rulings: [{ runId: r.runId, key: r.referrals[0].key, result: 'not-real' }] };
+    const comments = [pr.comments[0], { author: { login: OPERATOR_LOGINS[0] },
+      createdAt: '2026-10-17T22:56:46Z', body: buildOperatorRulingComment(ruling) },
+      { ...pr.comments.at(-1), createdAt: '2026-10-17T23:09:18Z' }];
+    const live = { ...pr, comments };
+    const parked = { ...run, startedAt: Date.parse('2026-10-17T23:00:00Z'), completedAt: Date.parse('2026-10-17T23:09:18Z') };
+    expect(decideReferralHold(live, [parked], { repo })).toBeNull();
+    expect(rulingNeeded(live)).toBeNull();
+    expect(openReferralFindings({ comments, repo, pr: 5514, head: H1 }).open).toEqual([]);
+  });
+  it('PR 5514 replay: a ruling for an unrelated repository never clears this finding', () => {
+    const { pr, run, r } = replay5514();
+    const ruling = { version: 1, repo: 'unrelated/web-everything', pr: 5514, head: H1,
+      actor: OPERATOR_LOGINS[0], channel: 'operator', reason: 'different repository', at: iso(16), clearerId: '',
+      rulings: [{ runId: r.runId, key: r.referrals[0].key, result: 'not-real' }] };
+    const live = { ...pr, comments: [pr.comments[0], { author: { login: OPERATOR_LOGINS[0] },
+      createdAt: iso(16), body: buildOperatorRulingComment(ruling) }, pr.comments.at(-1)] };
+    expect(decideReferralHold(live, [run], { repo })).not.toBeNull();
+    expect(rulingNeeded(live)?.findings).toHaveLength(1);
+  });
+  it('PR 5514 replay: a ruling before the pause already satisfies the live head and key', () => {
+    const { pr, run } = replay5514();
+    expect(decideReferralHold(pr, [run], { repo, now: Date.parse(iso(30)) })).toBeNull();
+    expect(blockRuledReferralsFor(pr, { repo })).toEqual([]);
+    expect(rulingNeeded(pr)).toBeNull();
+  });
+  it('an auto-policy block is NOT superseded by a not-real with no evidence, or by a non-mandatory reviewer', () => {
+    const { pr, answer, ruled } = replay5514();
+    for (const bad of [{ ...ruled, rulings: [{ ...ruled.rulings[0], evidence: [] }] },
+      { ...ruled, rulings: [{ ...ruled.rulings[0], reviewerId: 'other-reviewer' }] }]) {
+      const body = answer.body.replace(encodeURIComponent(JSON.stringify(ruled)), encodeURIComponent(JSON.stringify(bad)));
+      const comments = [...pr.comments.slice(0, 2), { ...answer, body }];
+      expect(mandatoryReferralState(comments, { head: H1 }).blocked).toHaveLength(1);
+    }
+  });
+  it('an operator-sourced block is never superseded by a reviewer not-real', () => {
+    const { pr } = replay5514({ actor: OPERATOR_LOGINS[0] });
+    expect(mandatoryReferralState(pr.comments, { head: H1 }).blocked).toHaveLength(1);
+  });
+  it('escalation and dispute text names an auto-policy block as auto-policy, never as the operator ruled', () => {
+    const { pr } = replay5514();
+    const next = record({ head: H2, runId: 'next', pr: 5514 });
+    const ig = ignoredRulings({ ...pr, headRefOid: H2, comments: [...pr.comments.slice(0, 2), recordComment(next, 35)] }, { humanAt: 1 });
+    expect(ig.matches).toHaveLength(1);
+    for (const text of [rulingDisputeText(5514, ig), fixerRulingBrief(ig), renderRulingNotAddressed(ig)]) {
+      expect(text).toContain('auto-policy');
+      expect(text).not.toMatch(/the operator (?:already )?(?:ruled|gave)|operator ruling/i);
+    }
+  });
+  it('PR 5514 replay: three escalations over an auto-block collapse to zero once the reviewer ruled not-real', () => {
+    const { pr, answer } = replay5514();
+    // Three earlier heads each auto-blocked the same finding, then the current head was auto-blocked too.
+    const earlier = [H2, H3, H4].flatMap((head, i) => {
+      const rec = record({ head, runId: `old-${i}`, pr: 5514 });
+      const op = { version: 1, repo, pr: 5514, head, actor: AUTO_POLICY_ACTOR, channel: 'review daemon',
+        reason: AUTO_BLOCK_REASON, at: iso(i - 8), clearerId: '',
+        rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result: 'block' }] };
+      return [recordComment(rec, i - 9), { author: { login: 'web-everything' }, createdAt: op.at, body: buildOperatorRulingComment(op) }];
+    });
+    const before = { ...pr, comments: [...earlier, ...pr.comments.slice(0, 2)] };
+    for (let tick = 0; tick < 3; tick++) expect(ignoredRulings(before, { humanAt: 1 })?.escalate).toBe(true);
+    const after = { ...before, comments: [...before.comments, answer, pr.comments.at(-1)] };
+    expect(ignoredRulings(after, { humanAt: 1 })).toBeNull();
+    expect(rulingNeeded(after, { humanAt: 1 })).toBeNull();
+  });
+  it('unknown or earlier reviewer chronology and an unreadable ruling record retain the auto-block', () => {
+    const { pr, answer } = replay5514();
+    for (const time of [undefined, iso(1), iso(2)]) {
+      const comments = [...pr.comments.slice(0, 2), { ...answer, createdAt: time }];
+      expect(mandatoryReferralState(comments, { head: H1 }).blocked).toHaveLength(1);
+    }
+    const corrupt = { author: { login: 'web-everything' }, createdAt: iso(18),
+      body: '<!-- mandatory-referral-operator-ruling-v1: unreadable -->' };
+    const state = mandatoryReferralState([...pr.comments, corrupt], { head: H1 });
+    expect(state.blocked).toHaveLength(1);
+    expect(state.pending).toContain('malformed-operator-ruling');
+  });
+  it('a new head or finding requires its own ruling', () => {
+    const { pr } = replay5514();
+    for (const current of [record({ head: H2, runId: 'new-head', pr: 5514 }),
+      record({ head: H1, runId: 'changed-finding', pr: 5514, summary: 'a different broken obligation' })]) {
+      const state = mandatoryReferralState([...pr.comments, recordComment(current, 40)], { head: current.head });
+      expect(state.pending).toContain(current.referrals[0].key);
+    }
+  });
+  it('the env rollback retains the block and logs its value and source', () => {
+    const { pr } = replay5514();
+    const log = vi.fn();
+    vi.stubEnv('WE_REVIEW_AUTO_BLOCK_YIELDS_TO_REVIEWER_NOT_REAL', 'false');
+    try {
+      expect(mandatoryReferralState(pr.comments, { head: H1, log }).blocked).toHaveLength(1);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('review.autoBlockYieldsToReviewerNotReal=false (env)'));
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('resolves the rollback through the review cascade with provenance', () => {
+    const settings = resolveReferralSafetySettings({ fileConfig: null, platform: { autoBlockYieldsToReviewerNotReal: false }, env: {} });
+    expect(settings.value.autoBlockYieldsToReviewerNotReal).toBe(false);
+    expect(settings.sources.autoBlockYieldsToReviewerNotReal).toBe('platform');
+    const { pr } = replay5514();
+    expect(mandatoryReferralState(pr.comments, { head: H1, autoBlockYieldsToReviewerNotReal: false }).blocked).toHaveLength(1);
+  });
 });

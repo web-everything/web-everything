@@ -19,7 +19,7 @@ beforeEach(() => {
 });
 afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
 const completion = () => applyCompletionUpdate(newCompletionRecord({ session: 'review-42', kind: 'review', pr: 42, now: () => start }),
-  { status: 'done', outcome: 'approved', runId: 'panel-42' }, () => '2026-10-02T11:00:00Z');
+  { status: 'done', outcome: 'approved', runId: 'review-pr-panel-42' }, () => '2026-10-02T11:00:00Z');
 function reader(options = {}) {
   const readSources = createAgentActivityReader({ root, projectsDir, listAgents: () => [],
     listJobs: () => listReviewJobAgents({ dir: jobsDir }), run: () => '{"lanes":[]}' });
@@ -36,7 +36,7 @@ describe('real stores, shared ingestion, and filesystem evidence', () => {
     utimesSync(jobLogPath('review-42', jobsDir), logTime, logTime);
     const native = join(root, 'codex.jsonl');
     writeFileSync(native, '{"provider":"codex"}\n');
-    const panel = newRunRecord({ id: 'panel-42', op: 'review-pr', input: { cwd: root } });
+    const panel = newRunRecord({ id: 'review-pr-panel-42', op: 'review-pr', input: { cwd: root } });
     panel.telemetry = [{ sessionId: 'codex-thread', lens: 'correctness', servedBackend: 'codex', transcriptFile: native },
       { sessionId: 'missing-native-thread', lens: 'security', servedBackend: 'codex' }];
     writeRun(panel, runsDir);
@@ -100,7 +100,7 @@ describe('real stores, shared ingestion, and filesystem evidence', () => {
     const project = join(projectsDir, projectSlugFor(root)); mkdirSync(project);
     const jurorPath = join(project, 'judge-session.jsonl'); writeFileSync(jurorPath, '{}\n');
     writeFileSync(join(project, 'fix-session.jsonl'), '{}\n');
-    const run = newRunRecord({ id: 'panel-42', op: 'review-pr', input: { cwd: root } });
+    const run = newRunRecord({ id: 'review-pr-panel-42', op: 'review-pr', input: { cwd: root } });
     run.telemetry = [{ servedBackend: 'claude', sessionId: 'judge-session', lens: 'design' }];
     writeRun(run, runsDir); writeCompletion(completion(), completionsDir);
     const readSources = createAgentActivityReader({ root, projectsDir,
@@ -112,7 +112,7 @@ describe('real stores, shared ingestion, and filesystem evidence', () => {
     expect(result.runs[1].jurors[0].transcriptPath).toBe(jurorPath);
     rmSync(jurorPath);
     expect(read({ pr: 42 }).runs[1].jurors[0].transcriptPath).toBeNull();
-    rmSync(join(runsDir, 'panel-42.json'));
+    rmSync(join(runsDir, 'review-pr-panel-42.json'));
     expect(read({ pr: 42 }).gaps.join(' ')).toMatch(/run record missing/);
   });
 

@@ -200,7 +200,7 @@ export async function dispatchCiHeal(planned, {
   // staged in front of the template (we:scripts/conveyor/fix-context-pack.mjs). A test that injects `readBrief` gets its own text.
   readBrief = (r) => packCiBrief(readFileSync(briefPath(r, 'ci-heal'), 'utf8')),
   packCiBrief = (template) => briefWithContextPack(template, {
-    kind: 'ci-heal', repo, toSlug: (k) => CONSTELLATION_REPOS[repoKeyForSlug(k) ?? k]?.slug ?? k, pr: planned.pr, exec: execFileSyncThrottled,
+    kind: 'ci-heal', repo, toSlug: (k) => CONSTELLATION_REPOS[repoKeyForSlug(k) ?? k]?.slug ?? k, pr: planned.pr, headSha: planned.headRefOid, exec: execFileSyncThrottled,
   }),
   sinks = createDispatchSinks({ root, actions, repo, extraArgs }),
   // #3967 multi-repo slice 7 — mirrors `reconcile-fix-dispatch.mjs#dispatchFix`'s own seam exactly: threaded

@@ -54,6 +54,7 @@ import { enrichPrsWithOwedMainRule, resolveRefreshSettings } from '../lib/rename
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
+import { reviewExecFileSync } from '../lib/review-fetch.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from '../operations/pr-status.mjs';
@@ -881,7 +882,7 @@ const GIT_LITERAL = ['--literal-pathspecs'];
  * @param {number} prNumber
  * @param {{exec?:Function, remote?:string}} [o]
  */
-export function defaultFetchRef(prNumber, { exec = execFileSync, remote = 'origin' } = {}) {
+export function defaultFetchRef(prNumber, { exec = reviewExecFileSync, remote = 'origin' } = {}) {
   const n = Number(prNumber);
   if (!Number.isInteger(n) || n <= 0 || String(n) !== String(prNumber)) return;
   try {

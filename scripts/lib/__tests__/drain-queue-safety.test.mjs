@@ -324,3 +324,13 @@ describe('confirmed dequeue', () => {
     expect(sendBackReason(['review:accepted', 'ready-to-merge'])).toBeNull();
   });
 });
+
+// A requested pass holds even when the scheduler has never written a live-head status.
+it('an old-head break does not count for the live head and the PR stays held pending', () => {
+  expect(hold({ scheduled: false, requestPending: true, comments: [clean(prior, 'web-everything', broken)] }))
+    .toMatch(/no recorded result on the live head/);
+});
+it('a break recorded on the live head still requires send-back', () => {
+  expect(hold({ scheduled: false, requestPending: true, comments: [clean(head, 'web-everything', broken)] }))
+    .toMatch(/requiring send-back/);
+});
