@@ -102,6 +102,19 @@ describe('gate-red stand-down earns ONE own-failure ci-heal per head (live PR #5
     expect(refusal(p).why).toMatch(/grants only an own-failure ci-heal, not a `fix`/);
   });
 
+  it('live #5768 labels (review:changes + red required check): the planned review fix becomes the ONE ci-heal', () => {
+    const finding = { body: '## changes requested\nfinding', author: BOT, createdAt: '2026-10-21T17:00:00Z' };
+    const live = pr5768([finding, standDown('2026-10-21T18:01:26Z')], {
+      labels: [{ name: 'review:changes' }, { name: 'review:human' }, { name: 'status:ci-red' }],
+    });
+    const before = plan(live, { value: 0, source: 'env' });
+    expect(before.dispatch.filter(d => d.prNumber === 5768)).toHaveLength(0);
+    const after = plan(live, ON);
+    expect(after.dispatch.filter(d => d.prNumber === 5768).map(d => d.kind)).toEqual(['ci-heal']);
+    expect(heals(after)[0]).toMatchObject({ failingRequiredChecks: ['test'], gateRedRetry: { allowance: 1 } });
+    expect(heals(after)[0].why).toMatch(/instead of the planned `fix`/);
+  });
+
   it('gateRedRetryState fails closed when the stand-down time is unreadable', () => {
     const c = { body: buildStandDownComment({ reason: 'gate-red' }), author: BOT };
     expect(gateRedRetryState([c], [c], { retries: 1 })).toMatchObject({ eligible: true, grant: false, exhausted: true });
