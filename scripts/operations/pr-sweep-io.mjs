@@ -11,11 +11,14 @@ import { join } from 'node:path';
 import { readSettings } from '../lib/settings-files.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
+import { annotateLapsedStandDowns, STAND_DOWN_MARKER } from '../conveyor/stand-down.mjs';
+import { readFixLoopRows, fixLoopConfig, fixLoopRedMainLapse } from '../conveyor/fix-loop-ledger.mjs';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
 export const DEFAULT_REPOS = Object.freeze([CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug]);
 export const DRAIN_LOG = join(homedir(), 'workspace', 'plateau-app', '.drain-daemon', 'daemon.log');
 export const STALLED_AFTER_ENV = 'WE_PR_SWEEP_STALLED_AFTER_MINUTES';
-const LIST_FIELDS = 'number,title,url,isDraft,headRefOid,updatedAt,labels,statusCheckRollup,body,createdAt';
+const LIST_FIELDS = 'number,state,title,url,isDraft,headRefOid,updatedAt,labels,statusCheckRollup,body,createdAt';
 /** Plain `gh` through execFileSync, deliberately NOT the throttled wrapper: that one creates lock dirs and appends call
  *  logs, and this operation must write nothing. */
 const ghSync = (_file, args, opts) => execFileSync('gh', args, { maxBuffer: 256 * 1024 * 1024, ...opts });
@@ -50,14 +53,20 @@ export function parseDrainSkips(text) {
 }
 
 /** Review / fix processes that name a PR, from `ps` output. PURE. */
-export function parseLiveJobs(psText) {
+/** `ps` etime (`[[dd-]hh:]mm:ss`) in seconds, or null. PURE. */
+export function etimeSeconds(v) {
+  const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(String(v ?? '').trim());
+  return m ? ((Number(m[1] ?? 0) * 24 + Number(m[2] ?? 0)) * 60 + Number(m[3])) * 60 + Number(m[4]) : null;
+}
+export function parseLiveJobs(psText, now = null) {
   const jobs = [];
   for (const line of String(psText ?? '').split('\n')) {
     const script = /\b(review-job|review-extra-seats|fix-run|ci-heal|deliver-item-run|red-team-gate-apply)\b[^\s]*\.mjs/.exec(line);
     const pr = /--pr[= ](\d+)/.exec(line);
     if (!script || !pr) continue;
     const repo = /--repo[= ]([\w.-]+\/[\w.-]+)/.exec(line);
-    jobs.push({ kind: script[1], pr: Number(pr[1]), repo: repo?.[1] ?? null, source: 'ps' });
+    const age = etimeSeconds(line.trim().split(/\s+/)[1]);
+    jobs.push({ kind: script[1], pr: Number(pr[1]), repo: repo?.[1] ?? null, source: 'ps', ...(Number.isFinite(now) && age !== null ? { startedAt: now - age * 1000 } : {}) });
   }
   return jobs;
 }
@@ -79,10 +88,22 @@ const jsonGh = (run, args) => JSON.parse(run('gh', args, { encoding: 'utf8', max
 /** The reader `run.mjs` binds. Every dependency is injectable for tests. */
 export function createPrSweepReader({ run = ghSync, now = () => Date.now(), readText = tailOf,
   ps = () => execFileSync('ps', ['-axo', 'pid,etime,command'], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
-  settings = () => readSettings({}) } = {}) {
+  settings = () => readSettings({}), lapseContext = () => ({ rows: readFixLoopRows(), config: fixLoopConfig() }) } = {}) {
   return (input = {}) => {
+    // The fix daemon's own stand-down lapse annotation (`pr-comments-complete.mjs`): a stand-down that lapsed on a new
+    // head, or a fix-loop hold whose attempts all ran while main was red, is not terminal. The ledger is read lazily,
+    // only for a thread that carries a stand-down; an unreadable ledger means no red-main lapse, as in the daemon.
+    let lapseCtx; let lapseRead = false;
+    const annotate = (pr) => {
+      if (!pr.comments.some((c) => c.body.trimStart().startsWith(STAND_DOWN_MARKER))) return pr;
+      if (!lapseRead) { lapseRead = true; try { lapseCtx = lapseContext(); } catch { lapseCtx = null; } }
+      return annotateLapsedStandDowns({ ...pr, headChangedAt: pr.headCommittedAt }, { onLapse: () => {},
+        ...(lapseCtx ? { redMainLapse: (head) => fixLoopRedMainLapse({ ...lapseCtx, repo: repoKeyForSlug(pr.repo), pr: pr.number, head }) } : {}) });
+    };
     const cfg = settings();
-    const repos = input.repo ? [String(input.repo)] : (Array.isArray(cfg?.prSweep?.repos) && cfg.prSweep.repos.length ? cfg.prSweep.repos : DEFAULT_REPOS);
+    const configured = Array.isArray(cfg?.prSweep?.repos) && cfg.prSweep.repos.length ? cfg.prSweep.repos : DEFAULT_REPOS;
+    // PR numbers are repo-local. Without --repo, a targeted lookup belongs to the primary configured repo only.
+    const repos = input.repo ? [String(input.repo)] : input.pr !== undefined ? configured.slice(0, 1) : configured;
     const unreadable = [];
     const prs = [];
     for (const repo of repos) {
@@ -94,20 +115,24 @@ export function createPrSweepReader({ run = ghSync, now = () => Date.now(), read
       } catch (e) { unreadable.push(`${repo}: ${String(e?.message ?? e).split('\n')[0]}`); continue; }
       if (list.length >= LIST_LIMIT) unreadable.push(`${repo}: open PR list hit the ${LIST_LIMIT} cap; some PRs were not swept`);
       for (const p of list) {
+        if (p.state !== 'OPEN') {
+          unreadable.push(`${repo}#${p.number}: PR is ${p.state ?? 'unknown'}, not OPEN`);
+          continue;
+        }
         try {
           const paged = (path) => JSON.parse(run('gh', ['api', '--paginate', '--slurp', `${path}?per_page=100`], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 120_000 })).flat();
           const comments = paged(`repos/${repo}/issues/${p.number}/comments`)
-            .map((c) => ({ id: c.id, author: { login: c.user?.login ?? '' }, user: c.user, body: c.body ?? '', createdAt: c.created_at }));
+            .map((c) => ({ id: c.node_id ?? c.id, databaseId: c.id, url: c.html_url, author: { login: c.user?.login ?? '' }, user: c.user, body: c.body ?? '', createdAt: c.created_at }));
           const labelEvents = paged(`repos/${repo}/issues/${p.number}/events`).filter((e) => e.event === 'labeled' && e.label?.name)
             .map((e) => ({ label: e.label.name, at: e.created_at }));
           const view = jsonGh(run, ['pr', 'view', String(p.number), '-R', repo, '--json', 'commits']);
           const commit = (view.commits ?? []).filter((c) => c.oid === p.headRefOid).pop();
-          prs.push({ ...p, repo, comments, labelEvents, headCommittedAt: commit?.committedDate ?? null });
+          prs.push(annotate({ ...p, repo, comments, labelEvents, headCommittedAt: commit?.committedDate ?? null }));
         } catch (e) { unreadable.push(`${repo}#${p.number}: ${String(e?.message ?? e).split('\n')[0]}`); }
       }
     }
     let liveJobs = [];
-    try { liveJobs = parseLiveJobs(ps()); } catch (e) { unreadable.push(`ps: ${String(e?.message ?? e).split('\n')[0]}`); }
+    try { liveJobs = parseLiveJobs(ps(), now()); } catch (e) { unreadable.push(`ps: ${String(e?.message ?? e).split('\n')[0]}`); }
     let drainSkips = [];
     try {
       const parsed = parseDrainSkips(readText(DRAIN_LOG));

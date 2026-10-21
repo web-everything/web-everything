@@ -83,19 +83,19 @@ export function classifySettings(raw = {}) {
 export const JUDGED_STATES = Object.freeze({ 'ruling-needed:referral-hold': 'referral-hold', 'ruling-needed:red-team-round-cap': 'red-team-cap',
   'at-round-limit': 'review-cap' });
 
-/** Automation-owned waits: past the threshold with no live job, the TOOLING is broken, so a card is filed through the
- *  existing health smell that owns that wait. Never an operator ask. */
+/** Automation-owned waits past the threshold with no live job: the TOOLING is broken; a card via that wait's smell. */
 const TOOLING_SMELL = Object.freeze({
   fixing: 'fixer-stuck', 'sent-back-red-team': 'fixer-stuck', draft: 'pr-no-owner', 'ci-failed': 'red-pr-unattended',
   'awaiting-ci': 'ci-job-hung', 'ready-to-merge': 'pr-stage-stall', 'in-merge-queue': 'pr-stage-stall',
-  // Only the drain skips that mean "the drain will get to it": an unknown or escalated skip kind is a person's.
+  'system:fix-stood-down': 'stood-down-prs', // terminal on the head (live #5768): the stand-down smell, or stateLanes -> operator
+  // Only the drain skips that mean "the drain will get to it"; an unknown or escalated skip kind is a person's.
   'drain-skip:queue-file-overlap': 'pr-stage-stall', 'drain-skip:overlap-yield': 'pr-stage-stall', 'drain-skip:ready-not-reached': 'pr-stage-stall',
 });
 /** Waits on the review daemon: ask it again, once per head. The sweep never spawns a review job itself. */
 const REVIEW_WAITS = new Set(['awaiting-review', 'human-review-pending-advisory', 'red-team-pending', 'drain-skip:red-team-pending']);
 /** The actor `deriveWaitingOn` sets for each state an automatic lane may act on. */
 const EXPECTED_ACTOR = Object.freeze({
-  'system:ledger-write-miss': 'system', 'system:stale-hold': 'system', 'red-team-sent-back-cleared': 'nobody',
+  'system:ledger-write-miss': 'system', 'system:stale-hold': 'system', 'system:fix-stood-down': 'system', 'red-team-sent-back-cleared': 'nobody',
   'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'red-team',
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
   'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain',
@@ -143,7 +143,9 @@ export function classifyStall(o) {
   try { return classifyUnsafe(o); } catch (e) {
     let key = '?#0@:unknown';
     try { const row = o?.row ?? {}; key = keyOf({ repo: row.repo ?? '?', number: row.number ?? 0, waitingOn: row.waitingOn ?? 'unknown' }, o?.head); } catch { /* keep the placeholder */ }
-    return { lane: 'operator', action: 'unclassified', reason: `fail-closed: classifier error (${String(e?.message ?? e).slice(0, 120)})`,
+    let message = 'unreadable error';
+    try { message = String(e?.message ?? e).slice(0, 120); } catch { /* thrown values can have unreadable getters or conversions */ }
+    return { lane: 'operator', action: 'unclassified', reason: `fail-closed: classifier error (${message})`,
       key, command: null, evidence: [] };
   }
 }
@@ -205,7 +207,7 @@ function classifyUnsafe(o = {}) {
   if (OPERATOR_STATES[state]) return operator(state, OPERATOR_STATES[state]);
   const smell = TOOLING_SMELL[state] ?? null;
   if (smell) {
-    return row.liveJob ? null : out('system', 'tooling-card', `waiting on ${row.actor} past the threshold with no live job; the tooling is stuck, not the PR`, { smell });
+    return row.liveJob ? null : out('system', 'tooling-card', `${state === 'system:fix-stood-down' ? row.why : `waiting on ${row.actor} past the threshold with no live job`}; the tooling is stuck, not the PR`, { smell });
   }
 
   const trigger = JUDGED_STATES[state];
