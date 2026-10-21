@@ -110,7 +110,9 @@ export function formatRelatedItemsPolicy(p) {
   const s = p.source ?? {};
   return `relatedItems.enabled=${p.enabled} (${s.enabled}), fileItem=${p.fileItem} (${s.fileItem}), `
     + `threshold=${p.threshold} (${s.threshold}), statuses=${p.statuses.join('|')} (${s.statuses}), `
-    + `resolvedWithinDays=${p.resolvedWithinDays} (${s.resolvedWithinDays}), synonyms=${p.synonyms.length} groups (${s.synonyms})`;
+    + `resolvedWithinDays=${p.resolvedWithinDays} (${s.resolvedWithinDays}), floor=${p.floor} (${s.floor}), limit=${p.limit} (${s.limit}), `
+    + `queryTerms=${p.queryTerms} (${s.queryTerms}), weights=text:${p.weights.text}/scope:${p.weights.scope}/tags:${p.weights.tags} (${s.weights}), `
+    + `synonyms=${p.synonyms.length} groups (${s.synonyms})`;
 }
 
 // ── Tokens with synonyms ─────────────────────────────────────────────────────────────────────────────────────────
@@ -249,6 +251,13 @@ export function scopeOverlap(queryScope, cardScope) {
 // ── Ranking ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
 const round = (n) => Math.round(n * 1000) / 1000;
+const ABOVE_IDS_CAP = 200;
+
+/** PURE. One spelling for a card reference: no `#`, and a numeric id without leading zeros (`001` ≡ `1`). */
+export const normalizeCardRef = (ref) => {
+  const s = String(ref ?? '').trim().replace(/^#/, '');
+  return /^\d+$/.test(s) ? String(Number(s)) : s;
+};
 
 /**
  * PURE. Rank `cards` against the query. Returns the eligible card count, the rows at or above `policy.floor`
@@ -260,8 +269,8 @@ const round = (n) => Math.round(n * 1000) / 1000;
  */
 export function rankRelatedItems({ query, cards = [], policy, today }) {
   const syn = compileSynonyms(policy.synonyms);
-  const exclude = new Set(splitList(query.exclude).map((s) => s.replace(/^#/, '')));
-  const pool = cards.filter((c) => !exclude.has(String(c.id)) && isEligible(c, policy, today))
+  const exclude = new Set(splitList(query.exclude).map(normalizeCardRef));
+  const pool = cards.filter((c) => !exclude.has(normalizeCardRef(c.id)) && isEligible(c, policy, today))
     .map((c) => ({ card: c, title: relatedTokens(c.title, syn), doc: relatedTokens(`${c.title} ${c.lead}`, syn) }));
   const text = String(query.text ?? '');
   const firstBreak = text.indexOf('\n');
@@ -294,7 +303,8 @@ export function rankRelatedItems({ query, cards = [], policy, today }) {
     const sharedTags = p.card.tags.map((t) => String(t).toLowerCase()).filter((t) => qTags.has(t));
     const tags = qTags.size ? sharedTags.length / qTags.size : 0;
     const score = Math.min(1, w.text * textScore + w.scope * scope.score + w.tags * tags);
-    if (score < policy.floor) continue;
+    // A floor above the threshold would hide a qualifying card from the gate, so the threshold caps it.
+    if (score < Math.min(policy.floor, policy.threshold)) continue;
     terms.sort((a, b) => idf(b) - idf(a));
     rows.push({
       id: p.card.id, title: p.card.title, status: p.card.status, rel: p.card.rel, score: round(score),
@@ -304,11 +314,14 @@ export function rankRelatedItems({ query, cards = [], policy, today }) {
   }
   rows.sort((a, b) => b.score - a.score || String(a.id).localeCompare(String(b.id), 'en', { numeric: true }));
   const limit = posInt(query.limit) ? query.limit : policy.limit;
+  const above = rows.filter((r) => r.score >= policy.threshold);
   return {
     query: { text: query.text, scope: splitList(query.scope), tags: [...qTags] },
     eligible: pool.length,
     threshold: policy.threshold,
-    aboveThreshold: rows.filter((r) => r.score >= policy.threshold).length,
+    aboveThreshold: above.length,
+    // Every card over the threshold (bounded), independent of `limit` — the file-item gate is satisfied by naming ANY of them.
+    aboveIds: above.slice(0, ABOVE_IDS_CAP).map((r) => String(r.id)),
     matches: rows.slice(0, limit),
   };
 }
@@ -343,9 +356,9 @@ export function planRelatedGate({ result, policy, input = {} }) {
   const mode = policy?.enabled === false ? 'off' : (policy?.fileItem ?? 'off');
   const none = { mode, checked: false, refuse: false, satisfied: true, above: [], lines: [], result: null };
   if (mode === 'off' || !result) return none;
-  const above = result.matches.filter((m) => m.score >= result.threshold).map((m) => String(m.id));
-  const named = new Set([...splitList(input.related), ...splitList(input.parent)].map((s) => s.replace(/^#/, '')));
-  const satisfied = !above.length || above.some((id) => named.has(id)) || Boolean(String(input.newBecause ?? '').trim());
+  const above = result.aboveIds ?? result.matches.filter((m) => m.score >= result.threshold).map((m) => String(m.id));
+  const named = new Set([...splitList(input.related), ...splitList(input.parent)].map(normalizeCardRef));
+  const satisfied = !above.length || above.some((id) => named.has(normalizeCardRef(id))) || Boolean(String(input.newBecause ?? '').trim());
   const refuse = mode === 'refuse' && !satisfied;
   const lines = above.length ? [
     `file-item: ${above.length} existing card(s) look related to this filing (mode ${mode}):`,

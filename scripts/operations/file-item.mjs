@@ -105,7 +105,9 @@ const withNewBecause = (input = {}) => (input['new-because'] !== undefined && in
 export function planRelatedCheck(ctx, input) {
   input = withNewBecause(input);
   if (!ctx) return { ...planRelatedGate({ result: null, policy: null }), policy: null };
-  if (ctx.error) return { ...planRelatedGate({ result: null, policy: null }), policy: null, error: ctx.error };
+  if (Object.hasOwn(ctx, 'error') || !ctx.policy) {
+    return { ...planRelatedGate({ result: null, policy: null }), policy: null, error: String(ctx.error ?? 'no policy read') };
+  }
   const policyLine = formatRelatedItemsPolicy(ctx.policy);
   const gateOff = !ctx.policy.enabled || ctx.policy.fileItem === 'off';
   const result = gateOff ? null : rankRelatedItems({
@@ -229,7 +231,10 @@ export function fileItemOperation({ readScaffoldContext, readRelated = null } = 
         if (typeof readRelated === 'function') {
           try { ctx = readRelated(); } catch (e) { ctx = { error: String(e?.message ?? e) }; }
         }
-        return planRelatedCheck(ctx, view.input);
+        // FAIL OPEN: a broken check never blocks or crashes a filing — it records why it did not run.
+        try { return planRelatedCheck(ctx, view.input); } catch (e) {
+          return { ...planRelatedGate({ result: null, policy: null }), policy: null, error: String(e?.message ?? e) };
+        }
       },
     }),
 

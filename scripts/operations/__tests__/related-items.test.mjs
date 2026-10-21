@@ -224,6 +224,23 @@ describe('file-item related-card gate', () => {
     }
   });
 
+  it('audit fixes: an empty-message reader error fails open; naming any over-threshold card satisfies even past --limit; 001 ≡ 1; floor never hides a qualifying card', () => {
+    const g = planRelatedCheck({ error: '' }, filing);
+    expect(g.refuse).toBe(false);
+    expect(g.checked).toBe(false);
+    const both = rankRelatedItems({ query: { text: 'shared node_modules across lanes copy-on-write', limit: 1 }, cards, policy: policy(), today: TODAY });
+    expect(both.matches).toHaveLength(1);
+    const second = both.aboveIds.find((id) => id !== both.matches[0].id);
+    expect(second).toBeTruthy();
+    expect(planRelatedGate({ result: both, policy: policy({ fileItem: 'refuse' }), input: { related: second } }).refuse).toBe(false);
+    const zeroPadded = { ...both, aboveIds: ['001'] };
+    expect(planRelatedGate({ result: zeroPadded, policy: policy({ fileItem: 'refuse' }), input: { parent: '1' } }).refuse).toBe(false);
+    const highFloor = rank('shared node_modules across lanes', { floor: 0.95 });
+    expect(highFloor.aboveThreshold).toBeGreaterThan(0);
+    expect(highFloor.matches.length).toBeGreaterThan(0);
+    expect(formatRelatedItemsPolicy(policy())).toMatch(/floor=.*limit=.*queryTerms=.*weights=text:/);
+  });
+
   it('an unrelated filing produces no lines even in refuse mode', () => {
     const g = planRelatedCheck(ctx({ fileItem: 'refuse' }), { title: 'Brand mark favicon gradient', digest: 'marketing site logo' });
     expect(g.above).toEqual([]);
