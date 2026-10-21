@@ -111,7 +111,7 @@ export function planRelatedCheck(ctx, input) {
   const policyLine = formatRelatedItemsPolicy(ctx.policy);
   const gateOff = !ctx.policy.enabled || ctx.policy.fileItem === 'off';
   const result = gateOff ? null : rankRelatedItems({
-    query: { text: `${input.title ?? ''}\n${input.digest ?? ''}`, scope: input.scope },
+    query: { text: `${input.title ?? ''}\n${input.digest ?? ''}`, scope: input.scope, named: [input.related, input.parent].filter(Boolean).join(',') },
     cards: ctx.cards, policy: ctx.policy, today: ctx.today,
   });
   const gate = planRelatedGate({ result, policy: ctx.policy, input });

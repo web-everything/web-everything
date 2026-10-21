@@ -315,6 +315,7 @@ export function rankRelatedItems({ query, cards = [], policy, today }) {
   rows.sort((a, b) => b.score - a.score || String(a.id).localeCompare(String(b.id), 'en', { numeric: true }));
   const limit = posInt(query.limit) ? query.limit : policy.limit;
   const above = rows.filter((r) => r.score >= policy.threshold);
+  const named = new Set(splitList(query.named).map(normalizeCardRef));
   return {
     query: { text: query.text, scope: splitList(query.scope), tags: [...qTags] },
     eligible: pool.length,
@@ -322,6 +323,9 @@ export function rankRelatedItems({ query, cards = [], policy, today }) {
     aboveThreshold: above.length,
     // Every card over the threshold (bounded), independent of `limit` — the file-item gate is satisfied by naming ANY of them.
     aboveIds: above.slice(0, ABOVE_IDS_CAP).map((r) => String(r.id)),
+    // The `query.named` cards (a filing's --related/--parent) that are over the threshold — checked against EVERY
+    // qualifying row, so the gate never depends on the display caps above.
+    namedAbove: above.filter((r) => named.has(normalizeCardRef(r.id))).map((r) => String(r.id)),
     matches: rows.slice(0, limit),
   };
 }
@@ -358,7 +362,8 @@ export function planRelatedGate({ result, policy, input = {} }) {
   if (mode === 'off' || !result) return none;
   const above = result.aboveIds ?? result.matches.filter((m) => m.score >= result.threshold).map((m) => String(m.id));
   const named = new Set([...splitList(input.related), ...splitList(input.parent)].map(normalizeCardRef));
-  const satisfied = !above.length || above.some((id) => named.has(normalizeCardRef(id))) || Boolean(String(input.newBecause ?? '').trim());
+  const namedHit = Array.isArray(result.namedAbove) && result.namedAbove.length > 0;
+  const satisfied = !above.length || namedHit || above.some((id) => named.has(normalizeCardRef(id))) || Boolean(String(input.newBecause ?? '').trim());
   const refuse = mode === 'refuse' && !satisfied;
   const lines = above.length ? [
     `file-item: ${above.length} existing card(s) look related to this filing (mode ${mode}):`,

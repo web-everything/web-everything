@@ -239,6 +239,11 @@ describe('file-item related-card gate', () => {
     expect(highFloor.aboveThreshold).toBeGreaterThan(0);
     expect(highFloor.matches.length).toBeGreaterThan(0);
     expect(formatRelatedItemsPolicy(policy())).toMatch(/floor=.*limit=.*queryTerms=.*weights=text:/);
+    // past the display cap: 201 qualifying cards, naming the 201st still satisfies the gate
+    const many = Array.from({ length: 201 }, (_, i) => ({ ...cards.find((c) => c.id === '5743'), id: String(7000 + i), rel: `backlog/${7000 + i}-x.md` }));
+    const g201 = planRelatedCheck({ cards: many, policy: policy({ fileItem: 'refuse' }), today: TODAY }, { ...filing, related: '7200' });
+    expect(g201.above.length).toBeLessThan(201);
+    expect(g201.refuse).toBe(false);
   });
 
   it('an unrelated filing produces no lines even in refuse mode', () => {
