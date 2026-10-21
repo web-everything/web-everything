@@ -2,7 +2,7 @@
 kind: decision
 size: 5
 status: open
-scope: ["we:scripts/operations/extend-rounds.mjs", "we:scripts/lib/red-team-gate.mjs", "we:scripts/conveyor/advisory-label-sweep.mjs"]
+scope: ["we:scripts/operations/extend-rounds.mjs", "we:scripts/lib/red-team-gate.mjs", "we:scripts/conveyor/advisory-label-sweep.mjs", "we:docs/agent/platform-decisions.md"]
 dateOpened: "2026-10-21"
 tags: ["review", "red-team", "round-cap", "judge"]
 ---
