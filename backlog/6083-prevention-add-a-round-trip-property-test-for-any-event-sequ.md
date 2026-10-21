@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/drain-ledger-facts.mjs", "we:scripts/lib/pr-state.mjs", "we:scripts/lib/__tests__/drain-ledger-facts.test.mjs", "we:scripts/lib/__tests__/pr-state.test.mjs"]
+scope: ["we:scripts/lib/drain-ledger-facts.mjs", "we:scripts/lib/pr-state.mjs", "we:scripts/lib/__tests__/drain-ledger-facts.test.mjs", "we:scripts/lib/pr-state/__tests__/pr-state.test.mjs"]
 dateOpened: "2026-10-13"
 tags: []
 ---

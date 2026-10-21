@@ -19,7 +19,9 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { cardFromText, planDedupe, appendMentions, CARD_DEDUPE_DEFAULTS } from '../lib/card-dedupe.mjs';
+import { cardFromText, planDedupe, CARD_DEDUPE_DEFAULTS } from '../lib/card-dedupe.mjs';
+
+import { parseRaisedBy, mergeRaisedBy } from '../lib/raised-by.mjs';
 
 const fm = (text, key) => new RegExp(`^${key}:[ \\t]*"?([^"\\n]*)"?$`, 'm').exec(/^---\n([\s\S]*?)\n---/.exec(text)?.[1] ?? '')?.[1]?.trim() || null;
 
@@ -42,12 +44,12 @@ export function replayDedupe(cards, { since, until, similarity = CARD_DEDUPE_DEF
     mechanical: /\n# .+\n\nFiled mechanically/.test(text),
   })).filter((r) => r.opened);
   rows.sort((a, b) => (a.opened < b.opened ? -1 : a.opened > b.opened ? 1 : a.rel < b.rel ? -1 : 1));
-  // `edits` carries the mentions the replay itself appended, keyed by card rel.
+  // Per-card raises generated during the replay; historical bodies stay immutable.
   const edits = new Map();
   const parsed = new Map(); // rel → parsed card (re-parsed only when the replay appends a mention to it)
   const pos = new Map(rows.map((r, i) => [r.rel, i]));
   const cardOf = (c) => {
-    if (!parsed.has(c.rel)) parsed.set(c.rel, { ...cardFromText({ rel: c.rel, text: edits.get(c.rel) ?? filedText(c.text) }), status: 'open' });
+    if (!parsed.has(c.rel)) parsed.set(c.rel, { ...cardFromText({ rel: c.rel, text: filedText(c.text), raisedBy: edits.get(c.rel) ?? [] }), status: 'open' });
     return parsed.get(c.rel);
   };
   const skipped = new Set(); // filings that became pure mentions: they never existed
@@ -68,7 +70,7 @@ export function replayDedupe(cards, { since, until, similarity = CARD_DEDUPE_DEF
     out.mentionedFindings += plan.matches.length;
     if (plan.action === 'mention') { out.mentions += 1; skipped.add(f.rel); } else if (plan.action === 'partial') out.partial += 1; else out.filed += 1;
     for (const m of plan.mentions) {
-      edits.set(m.card.rel, appendMentions(edits.get(m.card.rel) ?? filedText(rows[pos.get(m.card.rel)].text), m.lines));
+      edits.set(m.card.rel, mergeRaisedBy(edits.get(m.card.rel) ?? [], parseRaisedBy(m.lines.join('\n'))));
       parsed.delete(m.card.rel);
     }
     if (plan.matches.length) {

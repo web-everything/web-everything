@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:src/_data/backlog.js", "we:scripts/lib/backlog-index.cjs", "we:src/_data/__tests__/backlog.test.mjs", "we:scripts/lib/__tests__/backlog-index.test.mjs"]
+scope: ["we:src/_data/backlog.js", "we:scripts/lib/backlog-index.cjs", "we:src/_data/__tests__/backlog.test.mjs", "we:scripts/__tests__/backlog-index.test.mjs"]
 dateOpened: "2026-10-06"
 tags: []
 ---

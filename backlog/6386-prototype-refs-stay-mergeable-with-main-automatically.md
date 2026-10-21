@@ -2,8 +2,9 @@
 bornAs: x9diisp
 kind: story
 size: 3
-status: open
+status: resolved
 dateOpened: "2026-10-18"
+dateResolved: "2026-10-20"
 tags: []
 ---
 
@@ -34,3 +35,13 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## 2026-10-19 attempt (parked)
+
+- The work is on `lane/build-x9diisp-wip` (f1742d48e).
+- `lane/build-x9diisp` (087e37339) fails verify and must NOT be merged.
+- Two audit findings are still open:
+  - (a) An adopted overlay A can be dropped without a hold when its moved tip conflicts with an established overlay B (`we:scripts/lib/daemon-rebuild/prepare.mjs:266`).
+  - (b) An unsmoked baseline (`baselineOnly`) can be overwritten into a verified adoption (`we:scripts/lib/daemon-rebuild/prepare.mjs:422`).
+- Redesign suggestion: the hold uses the union of established-by-adoption, established-by-pin and established-by-tip. Planner ordering uses the tip. Bootstrap state stays separate and never counts as verified.
+- Build this as designed work via the builder, not as a hotfix.

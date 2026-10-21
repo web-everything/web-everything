@@ -7,8 +7,8 @@ status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/readiness/drain-lock.mjs", "we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/daemon-clone-lock.mjs", "we:scripts/pr-land.mjs", "we:scripts/lib/number-pending-hashes-before-push.mjs", "we:scripts/__tests__/merge-ai-prs-lock-refusal.test.mjs", "we:scripts/__tests__/merge-ai-prs-ci-lifecycle-and-land-effects.test.mjs", "we:scripts/readiness/__tests__/drain-lock.test.mjs", "we:scripts/lib/__tests__/daemon-self-sync.test.mjs", "we:scripts/lib/__tests__/daemon-clone-lock.test.mjs", "we:scripts/__tests__/pr-land.test.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs", "we:scripts/lib/__tests__/number-pending-hashes-before-push.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/push-if-green-numbers-pending-hashes.test.mjs"]
 scopeRationale: "The former monolithic we:scripts/__tests__/merge-ai-prs.test.mjs now covers resolution-basis behavior. Lock-refusal regressions belong in the planned we:scripts/__tests__/merge-ai-prs-lock-refusal.test.mjs, and synchronization regressions belong in we:scripts/__tests__/merge-ai-prs-ci-lifecycle-and-land-effects.test.mjs; both are explicitly scoped instead of the historical sibling test."
 dateOpened: "2026-10-10"
-preparedDate: "2026-10-18"
-preparedAgainstSha: "df2db797efe686ae3d0d78357ddaa19138de5252"
+preparedDate: "2026-10-20"
+preparedAgainstSha: "f3c7851de52d7c24bc6e01e89c1a422ebfa623df"
 tags: []
 ---
 
@@ -124,3 +124,5 @@ All implementation runs go through Node on `we:scripts/readiness/heavy-admission
 - Replace synchronous polling with asynchronous waiting in a separate change; preserve the refusal/result contract and test budget/cancellation semantics.
 - Split numbering and land keys only after contention observations justify revisiting their shared serialization contract; do not silently remove mutual exclusion.
 - Audit remaining whole-process and POC TTL renewal separately. Existing prepare-review checklist debt remains tracked by #5989; this card's refusal end states and durable retry tests are required now.
+
+revalidated: The added raisedBy validation and top-level backlog filtering do not alter the lock, renewal, recovery, or prevention-gate design and proof plan.

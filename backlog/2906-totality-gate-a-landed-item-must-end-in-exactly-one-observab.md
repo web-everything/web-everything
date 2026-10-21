@@ -6,7 +6,7 @@ dateOpened: "2026-08-03"
 tags: [merge-gate, review-integrity, check-standards, silent-failure]
 relatedTo: ["2899", "2900", "2874"]
 scope:
-  - we:scripts/lib/check-standards-rules.mjs
+  - we:scripts/check-standards-rules.mjs
   - we:scripts/__tests__/check-standards-rules.test.mjs
 ---
 

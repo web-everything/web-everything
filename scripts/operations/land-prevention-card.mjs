@@ -66,7 +66,7 @@
  * DEDUPE BEFORE FILING (operator go 2026-10-10). Right after the lane is acquired, {@link runCardDedupe} matches each
  * finding of this filing against the OPEN cards (the lane's origin/main `backlog/` plus cards still in open filing PRs)
  * by target file, defect class and claim similarity (`we:scripts/lib/card-dedupe.mjs`). A matched finding becomes an
- * "Also raised by" line on the existing card — appended in THIS lane and landed through the SAME commit → verify →
+ * "Also raised by" record for the existing card — created in THIS lane and landed through the SAME commit → verify →
  * open-pr sequence below, or, for a card that is still in an open PR, posted there as a PR comment. Only the unmatched
  * findings are filed; all matched → no new card. Off unless `cards.dedupe` resolves true (policy cascade in that
  * module); any dedupe failure files exactly as before.
@@ -100,9 +100,11 @@ import {
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
-  loadCardDedupePolicy, formatCardDedupePolicy, planDedupe, readOpenCards, readPrHostedCards, appendMentions, filingSource,
+  loadCardDedupePolicy, formatCardDedupePolicy, planDedupe, readOpenCards, readPrHostedCards, filingSource,
   remainingAfter,
 } from '../lib/card-dedupe.mjs';
+
+import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
 
 const HERE = resolve(fileURLToPath(import.meta.url), '..');
 export const REPO_ROOT = resolve(HERE, '..', '..');
@@ -217,6 +219,7 @@ export function parseLandPreventionCardArgv(argv = []) {
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   }
   if (flags['drain-pending'] === 'true' || flags['fold-open-singles'] === 'true') {
+    if (flags['dry-run'] === 'true') throw new TypeError('land-prevention-card: --dry-run is not supported for recovery modes');
     return { drainPending: flags['drain-pending'] === 'true', foldOpenSingles: flags['fold-open-singles'] === 'true',
       json: flags.json === 'true', session: flags.session || `prevention-recovery-${process.pid}` };
   }
@@ -229,6 +232,7 @@ export function parseLandPreventionCardArgv(argv = []) {
   }
   const retractFlags = ['retract-repo', 'retract-pr', 'retract-head'].map((k) => String(flags[k] ?? '').trim());
   return boundLandPreventionCardInput({
+    ...(flags['dry-run'] === 'true' ? { dryRun: true, root: flags.root ? resolve(flags.root) : REPO_ROOT } : {}),
     title: String(flags.title),
     kind: String(flags.kind),
     size: String(flags.size),
@@ -490,6 +494,28 @@ export async function landPreventionCard(input, {
   // leaks the lane" gap: `mkTmp()`/`writeFile()` (and any other step that is not its own already-labelled failure
   // mode below) must still release the lane and return a clean failure, never propagate an unhandled rejection.
   try {
+    if (input.dryRun && (input.drainPending || input.foldOpenSingles)) {
+      return fail('dry-run', '--dry-run is not supported for recovery modes');
+    }
+    if (input.dryRun) {
+      const root = input.root || REPO_ROOT;
+      const plan = dedupe(input, { lane: root, write });
+      if (!plan) return fail('dry-run', 'no backlog directory to read');
+      const creates = [];
+      const comments = [];
+      for (const m of plan.mentions) {
+        if (m.card.host !== 'main') { comments.push(m.card.host.pr); continue; }
+        const known = new Set(readRaisedBy(m.card.id, root).map(raisedByKey));
+        for (const line of m.lines) {
+          if (!known.has(raisedByKey(parseRaisedBy(line)[0]))) creates.push(raisedByFile(m.card.id, line).path);
+        }
+      }
+      // A new card's hash path is minted by file-item, so refuse an inexact preview.
+      if (plan.remaining) return fail('dry-run', 'unmatched findings require file-item; exact new card path is not yet allocated');
+      const result = { ok: true, step: 'dry-run', creates: [...new Set(creates)], modifies: [], comments };
+      write(`${JSON.stringify(result, null, 2)}\n`);
+      return result;
+    }
     const generic = /^File the prevention guard\(s\) owed by (\S+)#(\d+)'s/i.exec(input.title ?? '');
     if (generic) input = { ...input, title: preventionCardTitle({ repo: generic[1], pr: generic[2], digest: input.digest }) };
     let acquired;
@@ -540,12 +566,20 @@ export async function landPreventionCard(input, {
             write(`land-prevention-card: ${m.card.rel} is no longer open — filing its finding(s) instead\n`);
             continue;
           }
-          const next = appendMentions(text, m.lines);
-          if (next !== text) {
-            writeFile(path, next, 'utf8');
-            exec('git', ['-C', lane, 'add', '--', m.card.rel], {});
-            mentioned.push(m);
+          const known = new Set(readRaisedBy(m.card.id, lane, { body: text }).map(raisedByKey));
+          const paths = [];
+          for (const line of m.lines) {
+            const key = raisedByKey(parseRaisedBy(line)[0]);
+            if (known.has(key)) continue;
+            const file = raisedByFile(m.card.id, line);
+            const path = join(lane, file.path);
+            mkdirSync(resolve(path, '..'), { recursive: true });
+            writeFile(path, file.content, 'utf8');
+            exec('git', ['-C', lane, 'add', '--', file.path], {});
+            paths.push(file.path);
+            known.add(key);
           }
+          if (paths.length) mentioned.push({ ...m, paths });
           recorded.push(...asMatches);
         } else if (m.card.host?.pr) {
           try {
@@ -611,7 +645,7 @@ export async function landPreventionCard(input, {
       }
     }
 
-    write(`land-prevention-card: committing ${[rel, ...mentioned.map((m) => m.card.rel)].filter(Boolean).join(', ')}…\n`);
+    write(`land-prevention-card: committing ${[rel, ...mentioned.flatMap((m) => m.paths)].filter(Boolean).join(', ')}…\n`);
     try {
       if (rel) exec('git', ['-C', lane, 'add', '--', rel], {});
       const msgPath = scratchFile('commit-msg.txt');
@@ -643,7 +677,7 @@ export async function landPreventionCard(input, {
     write('land-prevention-card: opening the PR…\n');
     const bodyPath = scratchFile('pr-body.md');
     const mentionNote = mentioned.length
-      ? `\n\nDedupe before filing: ${mentioned.length} existing open card(s) got "Also raised by" lines instead of a new card: `
+      ? `\n\nDedupe before filing: ${mentioned.length} existing open card(s) got independent raised-by files instead of a new card: `
         + `${mentioned.map((m) => `\`${m.card.rel}\``).join(', ')}.\n`
       : '';
     writeFile(bodyPath, `Mechanically filed by the approval-time prevention filer (#4317).${mentionNote}\n\n${input.digest}\n`, 'utf8');
@@ -754,7 +788,7 @@ export async function runLandPreventionCardCli(argv = [], {
     // the next approval of this head instead of being lost (#4317 advisory review, 2026-09-29).
     // Not when a PR may already exist (open-pr reported a number/url but not `opened`): retracting then would
     // trade a lost guard for a duplicate card. That ambiguous case stays with the residual card xxe5jvs.
-    if (input.retract && result.pr == null && result.url == null) {
+    if (!input.dryRun && input.retract && result.pr == null && result.url == null) {
       try { retract({ ...input.retract, session: input.session, result }); } catch (e) {
         writeErr(`land-prevention-card: retraction threw (non-fatal) — ${String(e?.message || e)}\n`);
       }

@@ -14,7 +14,11 @@
  * X HOLDS for a bounded, non-renewable window (settings-driven, `we:scripts/drain-overlap-yield-config.json`,
  * on by default) while a LARGER PR Y sharing a changed file is open, in review, on the same base.
  *
- * SCENARIO (two, per backlog #4308's own Test plan item 3): the real `drain` pass daemon
+ * POLICY: `drain.overlapYieldRequiresLandable` now defaults ON. An in-review PR without readiness is no
+ * longer a yield target. The default-policy scenario checks that S lands while L remains in review; the
+ * original two #4308 scenarios explicitly opt OUT of this policy to retain their ordering and budget proofs.
+ *
+ * SCENARIOS: the real `drain` pass daemon
  * (`sim/daemon-host.mjs#PASS_DAEMONS.drain` — the real `scripts/merge-ai-prs.mjs --label=ready-to-merge`
  * spawned once per tick) against the fake GitHub. Large PR L and small PR S both touch `overlap/shared.md`; S
  * opens `ready-to-merge` + `review:accepted` (an automation-authored `reviewed-sha` marker for its head); L
@@ -112,6 +116,31 @@ function state(w, repo, num) {
   return w.gh.pr(repo, num)?.state;
 }
 
+async function runDefaultPolicy({ log }) {
+  let outcome = null;
+  const report = await runSoak({
+    name: 'break:small-pr-lands-over-large-in-review:default-policy',
+    rounds: 3,
+    daemons: ['drain'],
+    mainEvery: 0,
+    fleet: false,
+    scorecards: false,
+    setup(w) {
+      // Exercise the code default even if the invoking shell has an operator override.
+      delete w.env.WE_DRAIN_OVERLAP_YIELD_REQUIRES_LANDABLE;
+      return seedPair(w);
+    },
+    perRound(w, round, ctx) {
+      // L never clears review. Observe S after two ticks, well before its 45-minute budget could expire.
+      if (round === 2) outcome = { s: state(w, 'we', ctx.s), l: state(w, 'we', ctx.l) };
+    },
+    log,
+  });
+  const sawDefaultPolicy = report.ticks.some((t) => t.daemon === 'drain'
+    && (t.logs || []).some((line) => String(line).includes('drain.overlapYieldRequiresLandable=on (source: default)')));
+  return { report, outcome, sawYield: sawYieldLog(report, report.ctx?.s ?? -1), sawDefaultPolicy };
+}
+
 async function runWithinWindow({ log }) {
   let outcome = null;
   const report = await runSoak({
@@ -121,6 +150,7 @@ async function runWithinWindow({ log }) {
     mainEvery: 0,
     fleet: false,
     scorecards: false,
+    env: { WE_DRAIN_OVERLAP_YIELD_REQUIRES_LANDABLE: '0' },
     setup: seedPair,
     perRound(w, round, ctx) {
       // Round 2's perRound runs BEFORE that round's drain tick — well inside the 45-minute default window
@@ -150,6 +180,7 @@ async function runBudgetExpires({ log }) {
     mainEvery: 0,
     fleet: false,
     scorecards: false,
+    env: { WE_DRAIN_OVERLAP_YIELD_REQUIRES_LANDABLE: '0' },
     setup: seedPair,
     perRound(w, round, ctx) {
       // L NEVER clears review this whole run — the budget-expiry path is the only way S can ever land.
@@ -162,7 +193,7 @@ async function runBudgetExpires({ log }) {
 
 export default {
   id: 'small-pr-lands-over-large-in-review',
-  title: 'the drain lands a small ready PR over a larger, still-in-review, file-overlapping PR — conflicting it',
+  title: 'the drain applies the landable-target policy and preserves bounded overlap-yield when opted out',
   card: 'backlog #4308 (drain-overlap-yield-landing-order, decision #4307; live incident 2026-09-27, PR #2821/#2826)',
   fixedBy: { sha: 'PENDING-fill-in-at-land — see this file’s own header for the RED-side baseline sha', where: 'main', paths: ['scripts/conveyor/land-overlap-yield.mjs', 'scripts/merge-ai-prs.mjs'] },
   fixPresent(root) {
@@ -171,21 +202,32 @@ export default {
     } catch { return false; }
   },
   async run({ log } = {}) {
+    const defaultPolicy = await runDefaultPolicy({ log });
     const withinWindow = await runWithinWindow({ log });
     const budgetExpires = await runBudgetExpires({ log });
+    const reports = [defaultPolicy.report, withinWindow.report, budgetExpires.report];
     return {
       // `run.mjs`'s own CLI prints `report.ticks.length` — a real concatenation, not just for show.
-      ticks: [...withinWindow.report.ticks, ...budgetExpires.report.ticks],
-      violations: [...withinWindow.report.violations, ...budgetExpires.report.violations],
-      fatal: withinWindow.report.fatal || budgetExpires.report.fatal || null,
-      lines: [...withinWindow.report.lines, ...budgetExpires.report.lines],
-      ms: withinWindow.report.ms + budgetExpires.report.ms,
-      ctx: { withinWindow, budgetExpires },
+      ticks: reports.flatMap((r) => r.ticks),
+      violations: reports.flatMap((r) => r.violations),
+      fatal: reports.find((r) => r.fatal)?.fatal || null,
+      lines: reports.flatMap((r) => r.lines),
+      ms: reports.reduce((sum, r) => sum + r.ms, 0),
+      ctx: { defaultPolicy, withinWindow, budgetExpires },
     };
   },
   judge(report) {
     const problems = [];
-    const { withinWindow, budgetExpires } = report.ctx || {};
+    const { defaultPolicy, withinWindow, budgetExpires } = report.ctx || {};
+
+    if (!defaultPolicy?.outcome) problems.push(`default-policy: no post-pass outcome recorded${defaultPolicy?.report?.fatal ? ` (fatal: ${defaultPolicy.report.fatal})` : ''}`);
+    else {
+      const { s, l } = defaultPolicy.outcome;
+      if (s !== 'MERGED') problems.push(`default-policy: the small ready PR did not land promptly over an in-review target (state=${s})`);
+      if (l !== 'OPEN') problems.push(`default-policy: the large PR's review hold was bypassed (state=${l})`);
+      if (defaultPolicy.sawYield) problems.push('default-policy: the small PR yielded to a target that was not landable');
+      if (!defaultPolicy.sawDefaultPolicy) problems.push('default-policy: scenario-ran check failed — never observed the default landable-target policy');
+    }
 
     if (!withinWindow?.outcome) problems.push(`within-window: no post-pass outcome recorded${withinWindow?.report?.fatal ? ` (fatal: ${withinWindow.report.fatal})` : ''}`);
     else {

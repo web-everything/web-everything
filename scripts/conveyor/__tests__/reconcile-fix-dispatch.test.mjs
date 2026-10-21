@@ -10,7 +10,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import {
-  dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
+  withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
@@ -1910,5 +1910,27 @@ describe('routed Codex fallback', () => {
     expect(routeFixExecutor(planned, options)).toMatchObject({ executor: 'claude' });
     expect(readRouted).toHaveBeenCalledWith({ repo: 'fui', pr: 7 });
     expect(routeFixExecutor({ ...planned, headRefOid: 'new' }, options)).toMatchObject({ executor: 'codex' });
+  });
+});
+
+
+describe('stale-base mechanical fix brief', () => {
+  const staleBase = { missing: ['standards', 'new-job'], defaultBranch: 'main' };
+  it('leaves ordinary prompts alone and spells out the mechanical-only hand-back', () => {
+    expect(withStaleBase('brief', null)).toBe('brief');
+    const prompt = withStaleBase('brief', staleBase);
+    for (const text of ['base predates required job(s) standards, new-job', 'origin/main', 'no other edit',
+      'never touch any review:* label', 'conflict-fix-mark.mjs --base-ref=main', 'completion-cli report', 'fix-end']) {
+      expect(prompt).toContain(text);
+    }
+    expect(withPlannedContext('brief', { staleBase })).toContain(prompt);
+  });
+  it.each(['lane/3438-wire-reconcile-pass', 'some-hand-opened-branch'])('carries staleBase through planning %s', headRefName => {
+    const { planned, refusals } = planFixesFromReconcile([{
+      kind: 'fix', prNumber: 1764, headRefName, isConflict: true, mode: 'stale-base-rebase', staleBase,
+    }], findItemStub, () => [], () => [], 'we', () => ['src/x.ts']);
+    expect(refusals).toEqual([]);
+    expect(planned).toMatchObject([{ isConflict: true, staleBase }]);
+    expect(withPlannedContext('brief', planned[0])).toContain('base predates required job(s) standards, new-job');
   });
 });

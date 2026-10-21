@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/__tests__/citation-check.test.mjs", "we:scripts/lib/citation-check.mjs", "we:scripts/lib/__tests__/citation-check.test.mjs"]
+scope: ["we:scripts/__tests__/citation-check.test.mjs", "we:scripts/lib/citation-check.mjs"]
 dateOpened: "2026-10-01"
 tags: []
 ---

@@ -11,6 +11,7 @@
  * network or the repo's own board. `WE_BOARD_NOW` freezes the stamp so renders are comparable byte-for-byte.
  */
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { PR_STATUS_STATES } from '../conveyor/pr-status-label.mjs';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -117,6 +118,14 @@ describe('classifyPr', () => {
   it('ranks a changes-requested pull request as the AUTHOR\'s, even when it also carries the human hold', () => {
     // The ball is with the author lane. Surfacing it to the operator would bury the PRs that truly await them.
     expect(classifyPr(pr({ labels: ['review:changes', 'review:human'] }))).toBe('bounced');
+  });
+
+  it('keeps sent-back PRs bounced despite stale readiness and a red-team block', () => {
+    expect(classifyPr(pr({ labels: ['review:changes', 'status:ready-to-merge', 'red-team:blocked'] }))).toBe('bounced');
+  });
+
+  it.each([...PR_STATUS_STATES, 'awaiting-base', 'queued'])('does not derive queued from status:%s', status => {
+    expect(classifyPr(pr({ labels: [`status:${status}`] }))).toBe('open');
   });
 
   it('lets review:accepted supersede review:human', () => {

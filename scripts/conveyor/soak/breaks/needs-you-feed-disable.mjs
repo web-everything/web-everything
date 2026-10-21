@@ -1,9 +1,9 @@
 /** PR #5374: disabling a pinned producer must revoke its ownership and retire its process. */
-import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnKeepAlive } from '../../../lib/test-keepalive.mjs';
 import { ensureNeedsYouFeedJob, superviseNeedsYouFeed } from '../../needs-you-feed-job.mjs';
 import { createJobStore, selfHandle } from '../../../lib/daemon-jobs-runtime.mjs';
 import { markLaunching, markClaimed } from '../../../lib/daemon-jobs.mjs';
@@ -26,8 +26,8 @@ export default {
       const path = join(dir, 'events.jsonl');
       const settings = resolveSettings({ env: { WE_NEEDS_YOU_FEED: path }, file: {} });
       const { record } = ensureNeedsYouFeedJob({ store, codeSha: 'a'.repeat(40), input: { settings } });
-      child = spawn(process.execPath, ['-e', "process.once('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000);process.send('ready');"],
-        { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+      child = spawnKeepAlive({ prelude: "process.once('SIGTERM',()=>process.exit(0));", postlude: "process.send('ready');",
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
       await once(child, 'message');
       // This scenario owns the child; inject the start observation so it also runs where ps is sandboxed.
       const identity = selfHandle({ pid: child.pid, readStart: () => 'Thu Oct 15 12:00:00 2026' });

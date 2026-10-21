@@ -80,6 +80,9 @@ try { ({ remainingStandDownFindings } = await import('../conveyor/ruling-resolve
 catch { /* Staged copies still surface the question without remaining findings. */ }
 let needsPersonRow;
 try { ({ needsPersonRow } = await import('./operator-queue-needs-person.mjs')); } catch { /* optional in staged copies */ }
+// An open, still-collecting card batch is held on purpose; staged copies without the module keep alerting.
+let isCollectingBatchPr = () => false;
+try { ({ isCollectingBatchPr } = await import('./card-batch-hold-state.mjs')); } catch { /* optional in staged copies */ }
 
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
 let rulingLedger = null;
@@ -95,6 +98,10 @@ let LIST_COMMENTS_PAGE_SIZE = 100;
 let completeCommentsImportError;
 try { ({ readCompletePrComments, enrichStandDownHeadChange, LIST_COMMENTS_PAGE_SIZE = 100 } = await import('../conveyor/pr-comments-complete.mjs')); }
 catch (error) { completeCommentsImportError = error; }
+// Standing-ruling round grants (PR #5758): the red-team rows credit an automatic grant only with this verified scope.
+// A staged copy without the reader credits none (fail closed), as before.
+let enrichPrsWithStandingRulingGrants = (prs) => prs;
+try { ({ enrichPrsWithStandingRulingGrants } = await import('../conveyor/standing-ruling-io.mjs')); } catch { /* no automatic grant credit */ }
 const hasLabel = (pr, name) => (pr.labels ?? []).some((label) => label.name === name);
 
 /** Both GraphQL rollup variants, in the CheckRun shape used by every queue classifier. */
@@ -124,7 +131,7 @@ export function rulingNeededRow(repo, pr) {
 
 /** A red-team round-cap ruling and its read-only operator command suggestions. PURE. */
 export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
-  const need = redTeamRulingNeeded(pr, setting);
+  const need = redTeamRulingNeeded(pr, setting, { repo: repo || pr?.repo || null });
   if (!need) return null;
   const command = `node scripts/review-set-label.mjs ${pr.number} --repo=${repo}`;
   return {
@@ -402,9 +409,13 @@ export function evaluateNeedsYourMerge(pr, { files, changedFiles } = {}) {
   return { owed: false, paths: [], reasons: [hold.hold ? hold.error : 'touches no workflow or action file — the drain lands it'] };
 }
 
-/** Card 334 — the one command the operator runs for a needs-your-merge row. Pure. */
+/**
+ * Card 334 — the one command the operator runs for a needs-your-merge row. Pure. It goes through
+ * an explicit fast-forward update so even a checkout predating `we:scripts/run-fresh.mjs` gets the launcher.
+ * The launcher then runs it from a fresh lane at origin/main. A failed update stops before the operation runs.
+ */
 export function needsYourMergeCommand({ repo, number }) {
-  return `node scripts/operations/run.mjs land-human-only --pr=${number} --repo=${repo} --actor=<your login> `
+  return `git pull --ff-only origin main && node scripts/run-fresh.mjs land-human-only --pr=${number} --repo=${repo} --actor=<your login> `
     + "--channel=<where you said it> --reason='<your words>'";
 }
 
@@ -666,7 +677,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         prs = read([...listing, fields], Array.isArray);
         prs = prs.flatMap(completePr);
       }
-      prs = prs.map(pr => enrichStandDownHeadChange?.(pr, { repo, exec: execFileSync }) ?? pr);
+      // The repo travels with each PR: the red-team readers credit an operator round grant only for the PR's own repo.
+      prs = enrichPrsWithStandingRulingGrants(prs.map(pr => ({ ...(enrichStandDownHeadChange?.(pr, { repo, exec: execFileSync }) ?? pr), repo: pr.repo ?? repo })), { repo });
       const readyNumbersThisRepo = new Set();
       const redTeamSetting = readConfirmedBreaks().value;
       for (const listed of prs.filter((candidate) => hasLabel(candidate, 'review:human'))) {
@@ -742,6 +754,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         if (readyNumbersThisRepo.has(pr.number)) continue;
         const row = needsPersonRow?.(repo, pr);
         if (!row) continue;
+        // Only the withdrawn-draft notice is expected for a collecting batch; any other person-note still raises.
+        if (row.kind === 'draft-withdrawn' && pr.isDraft === true && isCollectingBatchPr(repo, pr.number)) continue;
         const notReady = report.notReady.findIndex(r => r.repo === repo && r.number === pr.number);
         report.needsPerson.push({ ...row, alsoNotReady: notReady < 0 ? [] : report.notReady.splice(notReady, 1)[0].reasons });
       }

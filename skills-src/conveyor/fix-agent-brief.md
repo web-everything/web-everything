@@ -365,6 +365,12 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 > applies unchanged (`stand-down.mjs {{PR_NUM}} --repo={{REPO}} --reason=conflict --detail=...`) — this mode
 > changes only what a *successful* resolution hands back with, never the escalation path.
 
+> **STALE-BASE MODE — dispatched with `mode: stale-base-rebase`.** The PR base is main but a required job
+> is missing because the base predates it. Rebase (or merge) onto current `origin/main` (usually conflict-free),
+> make no other edit, run the gate green, and push. **Touch no `review:*` label.** Hand back exactly like
+> STACKED-BASE MODE: `conflict-fix-mark.mjs` with `--base-ref=main`, then `completion-cli.mjs report`, then
+> `fix-procedure.mjs fix-end`. Never run `rearm-review.mjs`.
+
 **Build-brief discipline applies to the repair too** (statute:
 [we:docs/agent/platform-decisions.md#build-brief-discipline](../../../docs/agent/platform-decisions.md#build-brief-discipline),
 #2819): if the reviewer's finding names a category ("reject X") without enumerating its shapes, name the

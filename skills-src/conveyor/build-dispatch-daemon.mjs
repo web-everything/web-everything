@@ -56,7 +56,7 @@ import { admitLaunch, costAdmissionOn, freezeHolds, lightCapFor, summarizeCostAd
 import { readCostAdmissionSettings, readCostFacts } from '../../scripts/lib/cost-admission-facts.mjs';
 import { builderExecutorFor } from '../../scripts/lib/fix-slot-borrow.mjs';
 import { startDetachedLaunch, settleLaunches, PENDING_LAUNCHES_DIRNAME } from '../../scripts/conveyor/pending-launches.mjs';
-import { loadBuilderLaunchPolicy, formatBuilderLaunchPolicyLine, FREE_SLOTS } from '../../scripts/lib/builder-launch-policy.mjs';
+import { loadBuilderLaunchPolicy, formatBuilderLaunchPolicyLine, FREE_SLOTS, loadBuilderPausedPollPolicy, formatBuilderPausedPollPolicyLine, STANDARD_PAUSED_POLL_SEC } from '../../scripts/lib/builder-launch-policy.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -130,6 +130,14 @@ export const PAUSED_SYNC_MS_ENV = 'WE_BUILD_DAEMON_PAUSED_SYNC_MS';
 export const DEFAULT_PAUSED_SYNC_MS = 30 * 60 * 1000;
 
 // ── PURE CORE ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/** Stretch only the interval when both build caps are zero; every tick keeps its full behavior. */
+export function effectiveTickIntervalMs({ policy = {}, flagIntervalMs, defaultMs = DEFAULT_INTERVAL_MS, pausedPollSec = STANDARD_PAUSED_POLL_SEC } = {}) {
+  const configuredMs = Number(flagIntervalMs) > 0 ? Number(flagIntervalMs) : defaultMs;
+  return policy.maxConcurrentBuilds === 0 && policy.maxConcurrentExternalBuilds === 0
+    ? Math.max(configuredMs, pausedPollSec * 1000)
+    : configuredMs;
+}
 
 /** Is the kill switch engaged? Pure over its two inputs. */
 export function readKillSwitch({ env = {}, killFileExists = false, killFilePath = '' } = {}) {
@@ -3043,9 +3051,11 @@ async function live(flags) {
       : null,
     killSwitch: cliKillSwitch,
   });
-  const intervalMs = Number(flags['interval-ms']) > 0 ? Number(flags['interval-ms']) : DEFAULT_INTERVAL_MS;
+  const pausedPollPolicy = loadBuilderPausedPollPolicy();
+  const intervalMs = effectiveTickIntervalMs({ policy, flagIntervalMs: flags['interval-ms'], pausedPollSec: pausedPollPolicy.pausedPollSec });
   console.error(`build-dispatch-daemon: live on ${hostname()}:${process.pid}, caps Claude ${policy.maxConcurrentBuilds} / external ${policy.maxConcurrentExternalBuilds}, tick every ${intervalMs}ms${flags['self-sync'] ? ', self-sync ON' : ''}.`);
   console.error(`build-dispatch-daemon: ${formatBuilderLaunchPolicyLine({ maxLaunchesPerTick: policy.maxLaunchesPerTick, source: policy.maxLaunchesPerTickSource, invalid: policy.maxLaunchesPerTickInvalid })}`);
+  console.error(`build-dispatch-daemon: tick intervalMs=${intervalMs}, paused-stretched=${policy.maxConcurrentBuilds === 0 && policy.maxConcurrentExternalBuilds === 0}; ${formatBuilderPausedPollPolicyLine(pausedPollPolicy)}`);
   const { stoppedReason } = await runDaemonLoop({
     tickOnce, sleep: realSleep, isAlive, intervalMs, fixedCadence: true, maxTicks: flags.once ? 1 : Infinity,
     onTick: (r, _tick, loop) => {

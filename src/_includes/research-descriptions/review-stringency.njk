@@ -1,0 +1,39 @@
+{% raw %}
+<h2>The question</h2>
+<p>Every review finding is judged by the same bar. Should strictness depend on the kind of defect and on how far
+the work has been released, and if so how is the deferred part tracked so it is not forgotten?</p>
+
+<h2>What our own record shows</h2>
+<p>Window: 2026-10-03 to 2026-10-17, the web-everything repository only. 5,971 unique findings on 869 PRs,
+labelled into 42 classes by model judgement (about 10 to 15 percent boundary mislabels expected).</p>
+<table>
+<thead><tr><th>Finding</th><th>Number</th></tr></thead>
+<tbody>
+<tr><td>Missing test for a stated guarantee</td><td>794 findings (13.3%); 52.9 of 341 attributed fix rounds</td></tr>
+<tr><td>Guard weakened or bypassable</td><td>336</td></tr>
+<tr><td>Doc, skill or card drift</td><td>291; 76% false rate</td></tr>
+<tr><td>Ruled findings that were not real</td><td>257 of 780 (33%)</td></tr>
+<tr><td>Auto-block rulings over a reviewer not-real</td><td>126 of 134</td></tr>
+<tr><td>Fix rounds with a single cause</td><td>51 of 341; most bundle 3 to 5 reasons</td></tr>
+</tbody>
+</table>
+<p>No secret, injection, authorization, data-loss or local-path finding stalled delivery in the window. Timeouts,
+races, unbounded reads, non-hermetic tests and recovery paths did.</p>
+
+<h2>Outside models</h2>
+<ul>
+<li>OWASP ASVS: requirements carry the lowest level they apply to; stricter levels inherit.</li>
+<li>CVSS v4.0: severity is an intrinsic part plus an environmental modifier.</li>
+<li>Google SRE error budget policy: when the budget is spent, changes halt except P0 and security fixes (verified).</li>
+<li>SQALE and the Fowler quadrant: debt carries a fix cost and a cost of not fixing; only prudent and deliberate debt is acceptable (quadrant verified).</li>
+<li>Sonar: gate on new code, keep old debt separate (verified on the current docs page).</li>
+<li>AI-code failure modes: hallucinated packages, insecure completions (Pearce, Perry verified), test gaming, over-broad edits. The AIDev dataset abstract gives lower acceptance of agent PRs but no rejection reasons.</li>
+<li>DORA now lists five metrics, including deployment rework rate (corrected from four).</li>
+</ul>
+
+<h2>Proposal</h2>
+<p>Four outcomes (block, expedite, debt, advisory), four levels (internal delivery, dogfood, public preview, public
+release) where each level inherits the blocks below it, a class-by-level table in settings, and a debt register
+whose entries gate the move up a level. See the decision item for the table and the forks.</p>
+<p>Decision card: <a href="/backlog/xugqjw1-decision-review-stringency-classified-findings-per-level-out/">review stringency decision</a>.</p>
+{% endraw %}

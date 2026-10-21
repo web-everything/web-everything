@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/await-verify-pass.mjs", "we:scripts/verify-lane.mjs", "we:scripts/lib/verify-base-rerun.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/lib/lane-verify.mjs", "we:scripts/conveyor/__tests__/await-verify-pass.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/lib/__tests__/verify-base-rerun.test.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/lib/__tests__/lane-verify.test.mjs"]
+scope: ["we:scripts/conveyor/await-verify-pass.mjs", "we:scripts/verify-lane.mjs", "we:scripts/lib/verify-base-rerun.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/lib/lane-verify.mjs", "we:scripts/conveyor/__tests__/await-verify-pass.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/lib/__tests__/verify-base-rerun.test.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/__tests__/lane-verify.test.mjs"]
 dateOpened: "2026-10-07"
 tags: []
 ---

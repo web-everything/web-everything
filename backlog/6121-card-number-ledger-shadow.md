@@ -13,6 +13,18 @@ tags: [backlog, drain, numbering, ledger, shadow]
 
 Slice (a) of epic 6122: an append-only id-to-number ledger on ops/card-numbers, written by the drain at land, running beside today's rename numbering and checked against it.
 
+## Ruling 2026-10-19: signed-commit trust root is optional, off by default
+
+Operator ruling of 2026-10-19 (recorded in epic 6122), point 4: the signed-commit trust root becomes optional and
+off by default. Add a cascade setting `backlog.cardNumbering.ledgerAuth` with values `none` (default) and
+`signed`. In `none`, the fence is: the `ops/card-numbers` branch accepts pushes only through the drain transport
+(`allowRef`), a strict row-shape parse, and the two uniqueness invariants (one number per id, one id per number).
+In `signed`, everything below about the trust root, signing, checkpoints, quarantine and per-row signature
+verification applies. Where the Design text below says a row "must" be signed or the ledger "is unreadable"
+without a trusted signature, read it as applying in `signed` only. Key provisioning, the bootstrap trust-root PR
+and the `review:human` hold are required only when `ledgerAuth` is `signed`; they no longer block `--apply`.
+Cards numbered at birth (slice 6622) need no row, so this ledger carries only fallback and seed rows.
+
 ## Design
 
 - New module `we:scripts/lib/card-number-ledger.mjs`:

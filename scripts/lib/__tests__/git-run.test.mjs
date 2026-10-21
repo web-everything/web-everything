@@ -5,8 +5,45 @@
  *   unrelated histories` — a checkout defect, not a real conflict. See `git-run.mjs#ensureFullHistory`'s own
  *   header for the full incident and the live before/after evidence gathered against the real branch.
  */
-import { describe, it, expect } from 'vitest';
-import { parseIsShallow, ensureFullHistory } from '../git-run.mjs';
+import { describe, it, expect, vi } from 'vitest';
+import { gitRun, parseIsShallow, ensureFullHistory } from '../git-run.mjs';
+
+describe('gitRun', () => {
+  it('kills a timed-out command and reports failure with the timeout and first argument', () => {
+    const r = gitRun('sleep', ['5'], { timeoutMs: 200 });
+    expect(r.status).not.toBe(0);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/timed out/);
+    expect(r.stderr).toContain('git timed out after 200ms');
+    expect(r.stderr).toContain('5');
+  }, 10000);
+
+  it('passes stdin through without changing bytes and preserves success', () => {
+    const input = Buffer.from([0, 255, 10, 65]);
+    const r = gitRun(process.execPath, ['-e', 'process.stdin.pipe(process.stdout)'], { input, encoding: 'buffer' });
+    expect(r).toEqual({ status: 0, stdout: input, stderr: '' });
+  });
+
+  it('preserves a command failure status and stderr', () => {
+    const r = gitRun(process.execPath, ['-e', 'process.stderr.write("failed"); process.exit(7)']);
+    expect(r).toEqual({ status: 7, stdout: '', stderr: 'failed' });
+  });
+
+  it.each([
+    [undefined, 180000], ['250', 250], ['0', 180000], ['-1', 180000],
+    ['', 180000], ['invalid', 180000], ['Infinity', 180000],
+  ])('resolves WE_GIT_RUN_TIMEOUT_MS=%s to %s', async (value, expected) => {
+    vi.stubEnv('WE_GIT_RUN_TIMEOUT_MS', value);
+    vi.resetModules();
+    try {
+      const { GIT_RUN_TIMEOUT_MS } = await import('../git-run.mjs');
+      expect(GIT_RUN_TIMEOUT_MS).toBe(expected);
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  });
+});
 
 describe('parseIsShallow', () => {
   it("exit 0, stdout 'true' → true", () => {

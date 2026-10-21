@@ -24,3 +24,4 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3
 ## Also raised by
 
 - Also raised by web-everything/web-everything#4991 (finding 1: `we:backlog/5921-guard-refuse-the-merge-queue-strategy-while-merge-gate-is-no.md:13` — Backlog-card lint: every repo path in scope or body must exist on main, or the card must declare a dependency on the PR that adds it. Filed as a future check:standards rule.)
+- Also raised by web-everything/web-everything#5677 (finding 1: `we:backlog/6466-operator-override-feed-dedups-ended-events-by-their-own-key.md:6` — Add a check:standards rule that every path in a card's scope frontmatter exists on main, or the card declares a dependency on the PR that adds it.)

@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { writeStoredAwaitVerify, clearStoredAwaitVerify, awaitVerifyStoreKey } from '../../conveyor/await-verify.mjs';
@@ -165,7 +166,7 @@ describe('runWorker: the job record and the result channels', () => {
   });
 
   it('a timeout kills the child and is a contract violation (D6), with a signature that dedupes', async () => {
-    const s = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], timeoutMs: 300 });
+    const s = spec({ argv: ['-e', keepAliveScript()], timeoutMs: 300 });
     const { envelope } = await runWorker(s);
     expect(envelope.parse).toEqual({ ok: false, reason: 'timeout' });
     expect(envelope.result.signature).toBe('build|claude-p|timeout');
@@ -174,7 +175,7 @@ describe('runWorker: the job record and the result channels', () => {
 
   it('rejects successful output when the child subsequently fails (valid output x timeout / nonzero exit / signal)', async () => {
     const out = JSON.stringify(claudeStdout(DONE));
-    const hang = 'setInterval(()=>{},1000)';
+    const hang = keepAliveScript();
     const cases = {
       timeout: { argv: ['-e', `process.stdout.write(${out});${hang}`], timeoutMs: 400 },
       'nonzero exit': { argv: ['-e', `process.stdout.write(${out});process.exitCode=3`] },
@@ -226,10 +227,10 @@ describe('runWorker: the job record and the result channels', () => {
     const dir = tmp();
     const stopSource = new EventEmitter();
     const cases = {
-      timeout: [spec({ argv: ['-e', 'setInterval(()=>{},1000)'], timeoutMs: 300, session: 'build-4040' }, dir), {}],
+      timeout: [spec({ argv: ['-e', keepAliveScript()], timeoutMs: 300, session: 'build-4040' }, dir), {}],
       'nonzero exit': [spec({ argv: ['-e', 'process.exitCode=3'], session: 'build-4041' }, dir), {}],
       'no output': [spec({ argv: printing(claudeStdout(undefined)), session: 'build-4042' }, dir), {}],
-      aborted: [spec({ argv: ['-e', 'setInterval(()=>{},1000)'], session: 'build-4043' }, dir), { isOperatorStop: () => true, stopSource }],
+      aborted: [spec({ argv: ['-e', keepAliveScript()], session: 'build-4043' }, dir), { isOperatorStop: () => true, stopSource }],
     };
     for (const [name, [s, io]] of Object.entries(cases)) {
       const { envelope } = await runWorker(s, io);
@@ -266,7 +267,7 @@ describe('runWorker: the job record and the result channels', () => {
 
   it('a worker cannot pick its own failure class: a self-sent SIGTERM and a bare exit 143 are contract violations, never an operator stop', async () => {
     const dir = tmp();
-    const term = spec({ argv: ['-e', `process.kill(process.pid,'SIGTERM');setInterval(()=>{},1000)`], session: 'build-4006' }, dir);
+    const term = spec({ argv: ['-e', keepAliveScript({ prelude: "process.kill(process.pid,'SIGTERM');" })], session: 'build-4006' }, dir);
     expect((await runWorker(term)).envelope).toMatchObject({ outcome: 'blocked', parse: { ok: false, reason: 'ended-without-result' }, action: { type: 'product-fix-draft' }, result: { blocker: { kind: 'contract-violation' } } });
     expect(listDraftKeys(term.draftsDir)).toHaveLength(1);
     const exit143 = spec({ argv: ['-e', 'process.exitCode=143'], session: 'build-4009' }, dir);
@@ -278,7 +279,7 @@ describe('runWorker: the job record and the result channels', () => {
   it('an operator stop is the WRAPPER being told to stop: the signal reaches the child, the envelope is aborted, no draft, and the listeners are gone', async () => {
     const stopSource = new EventEmitter();
     const dir = tmp();
-    for (const [i, argv] of [['-e', 'setInterval(()=>{},1000)'], ['-e', `process.on('SIGTERM',()=>process.exit(143));setInterval(()=>{},1000)`]].entries()) {
+    for (const [i, argv] of [['-e', keepAliveScript()], ['-e', keepAliveScript({ prelude: "process.on('SIGTERM',()=>process.exit(143));" })]].entries()) {
       const s = spec({ argv, session: `build-402${i}` }, dir);
       const run = runWorker(s, { stopSource });
       for (let n = 0; n < 200 && !Number.isInteger(read(s)?.pid); n++) await new Promise((r) => setTimeout(r, 25)); // wait for the started record
@@ -296,7 +297,7 @@ describe('runWorker: the job record and the result channels', () => {
     const dir = tmp();
     const ready = join(dir, 'ready');
     // the child announces itself ONLY after its handler is installed, so the stop can never beat it (a default-action TERM would be a signal death)
-    const handler = `process.on('SIGTERM',()=>process.exit(0));require('fs').writeFileSync(${JSON.stringify(ready)},'1');setInterval(()=>{},1000)`;
+    const handler = keepAliveScript({ prelude: `process.on('SIGTERM',()=>process.exit(0));require('fs').writeFileSync(${JSON.stringify(ready)},'1');` });
     const variants = {
       'no output': ['-e', handler],
       'earlier valid output': ['-e', `process.stdout.write(${JSON.stringify(claudeStdout(DONE))});${handler}`],
@@ -321,7 +322,7 @@ describe('runWorker: the job record and the result channels', () => {
     const dir = tmp();
     const reraise = [];
     const stopSource = new EventEmitter();
-    const hung = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], session: 'build-4060' }, dir);
+    const hung = spec({ argv: ['-e', keepAliveScript()], session: 'build-4060' }, dir);
     const run = runWorker(hung, { stopSource, reraise: (sig) => reraise.push(sig) });
     for (let n = 0; n < 200 && !Number.isInteger(read(hung)?.pid); n++) await new Promise((r) => setTimeout(r, 25));
     stopSource.emit('SIGINT', 'SIGINT');
@@ -338,7 +339,7 @@ describe('runWorker: the job record and the result channels', () => {
 
   it('REAL signal to a REAL detached wrapper process: the stop reaches the worker, the aborted record is written, then the wrapper dies of the signal', async () => {
     const dir = tmp();
-    const s = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], session: 'build-4062' }, dir);
+    const s = spec({ argv: ['-e', keepAliveScript()], session: 'build-4062' }, dir);
     const specFile = join(dir, 'spec.json');
     writeFileSync(specFile, JSON.stringify(s));
     const wrapper = spawn(process.execPath, [join(process.cwd(), 'scripts/operations/worker-wrapper.mjs'), `--spec=${specFile}`], { stdio: 'ignore' });
@@ -362,7 +363,7 @@ describe('runWorker: the job record and the result channels', () => {
 
   it('classification: an overflow is not blamed on a timeout', async () => {
     const dir = tmp();
-    const flood = spec({ argv: ['-e', `const c='x'.repeat(1<<20);for(let i=0;i<10;i++)process.stdout.write(c);setInterval(()=>{},1000)`], session: 'build-4007', timeoutMs: 20_000 }, dir);
+    const flood = spec({ argv: ['-e', keepAliveScript({ prelude: "const c='x'.repeat(1<<20);for(let i=0;i<10;i++)process.stdout.write(c);" })], session: 'build-4007', timeoutMs: 20_000 }, dir);
     const { envelope } = await runWorker(flood);
     expect(envelope.parse).toEqual({ ok: false, reason: 'ended-without-result' });
     expect(envelope.result.signature).not.toContain('timeout');
@@ -370,7 +371,7 @@ describe('runWorker: the job record and the result channels', () => {
 
   it('a throwing started-record write kills the already-spawned child instead of orphaning it', async () => {
     let pid = null;
-    const s = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], session: 'build-4008' });
+    const s = spec({ argv: ['-e', keepAliveScript()], session: 'build-4008' });
     let calls = 0;
     const writeRecord = (rec, d) => { calls += 1; if (calls === 1) { pid = rec.pid; throw new Error('lock timeout'); } return writeCompletion(rec, d); };
     await expect(runWorker(s, { writeRecord })).rejects.toThrow(/lock timeout/); // infra fault, not filed as a worker contract violation
@@ -380,7 +381,7 @@ describe('runWorker: the job record and the result channels', () => {
   });
 
   it('an operator stop is aborted and makes no draft (D6)', async () => {
-    const s = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], timeoutMs: 300 });
+    const s = spec({ argv: ['-e', keepAliveScript()], timeoutMs: 300 });
     const { envelope } = await runWorker(s, { isOperatorStop: () => true });
     expect(envelope).toMatchObject({ outcome: 'aborted', action: { type: 'aborted' } });
     expect(listDraftKeys(s.draftsDir)).toEqual([]);

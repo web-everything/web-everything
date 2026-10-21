@@ -4,7 +4,7 @@ kind: story
 size: 3
 status: open
 blockedBy: ["2940"]
-scope: ["we:scripts/lib/lane-drain.mjs"]
+scope: ["we:scripts/lane-drain.mjs"]
 dateOpened: "2026-10-05"
 tags: []
 ---

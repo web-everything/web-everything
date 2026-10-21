@@ -22,6 +22,7 @@
 const { readdirSync, readFileSync, existsSync } = require('node:fs');
 const { join } = require('node:path');
 const { isTerminalStatus } = require('../../scripts/lib/backlog-status.cjs');
+const { readRaisedBy, withRaisedBy } = require('../../scripts/lib/raised-by.cjs');
 const matter = require('gray-matter');
 const { createHash } = require('node:crypto');
 const { createBacklogIndex } = require('../../scripts/lib/backlog-index.cjs');
@@ -361,7 +362,7 @@ function buildBacklog(fileNames) {
   // Eleventy, check:readiness, check:standards. We catch per-item, skip the bad file, and collect
   // it so the failure degrades to a reported warning, not a crash.
   const malformed = [];
-  const files = Array.isArray(fileNames) ? fileNames : readdirSync(BACKLOG_DIR).filter((f) => f.endsWith('.md'));
+  const files = (Array.isArray(fileNames) ? fileNames : readdirSync(BACKLOG_DIR)).filter((f) => /^[^/\\]+\.md$/.test(f));
   const index = createBacklogIndex({
     backlogDir: BACKLOG_DIR,
     loaderVersion: LOADER_VERSION,
@@ -399,7 +400,7 @@ function buildBacklog(fileNames) {
         ? (data.relatedReport.match(/(\d{4}-\d{2}-\d{2})/) || [])[1]
         : undefined;
 
-      return {
+      const item = {
         ...data,
         id,
         num,
@@ -417,9 +418,17 @@ function buildBacklog(fileNames) {
         scope: normalizeScope(data.scope),
         details: src.details || data.details || undefined,
       };
+      // Cache the authored body alongside the item; raises are merged after the cache read
+      // so independent raise-file changes never require re-reading an unchanged card.
+      return { body: content, item };
     },
   });
-  const items = index.load(files).filter(Boolean); // drop malformed cards (reported below)
+  // Drop malformed cards (reported below) before merging independently stored raises.
+  const items = index.load(files).filter(Boolean).map(({ body, item }) => {
+    item.raisedBy = readRaisedBy(item.num, ROOT, { body, bornAs: item.bornAs, backlogDir: BACKLOG_DIR });
+    if (item.raisedBy.length) item.details = derive(withRaisedBy(body, item.raisedBy)).details;
+    return item;
+  });
 
   if (malformed.length) {
     const lines = malformed.map((m) => `  • ${m.file} — ${m.reason}`).join('\n');

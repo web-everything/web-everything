@@ -3,14 +3,14 @@ bornAs: x7jac32
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/needs-you-feed.mjs", "we:scripts/lib/__tests__/needs-you-feed.test.mjs"]
+scope: ["we:scripts/operations/needs-you-feed.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
 # Needs-you feed waits for the mandatory reviewer's rulings before raising ruling-needed
 
-Live: #5482 (19:13 to 19:15Z) and #5486 (19:21 to 19:23Z) both raised ruling-needed and cleared about 2 minutes later, because the mandatory reviewer recorded the finding-specific rulings itself (#5486: both not-real, with evidence). Fix: the feed emits ruling-needed only for findings still unruled after the reviewer's ruling step, or after a settle window of about 3 minutes; a setting with its source logged. Belongs with decision xf5n5yw (#5503). [A1] Executable: node --test we:scripts/lib/__tests__/needs-you-feed.test.mjs, where a finding ruled within the window never raises ruling-needed. Priority: top (operator 2026-10-17).
+Live: #5482 (19:13 to 19:15Z) and #5486 (19:21 to 19:23Z) both raised ruling-needed and cleared about 2 minutes later, because the mandatory reviewer recorded the finding-specific rulings itself (#5486: both not-real, with evidence). Fix: the feed emits ruling-needed only for findings still unruled after the reviewer's ruling step, or after a settle window of about 3 minutes; a setting with its source logged. Belongs with decision xf5n5yw (#5503). [A1] Executable: node --test we:scripts/operations/__tests__/needs-you-feed.test.mjs, where a finding ruled within the window never raises ruling-needed. Priority: top (operator 2026-10-17).
 
 ## Acceptance
 

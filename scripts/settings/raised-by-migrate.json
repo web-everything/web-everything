@@ -1,0 +1,6 @@
+{
+  "$comment": "Maximum migratable PRs attempted per apply run; --max overrides WE_RAISED_BY_MIGRATE_MAX_PRS, then this setting. Dry runs inspect every candidate. If every mention is already on main, skip without pushing, restamping, or charging the cap; leave the original PR head intact for operator disposition.",
+  "raisedByMigrate": {
+    "maxPrsPerRun": 10
+  }
+}

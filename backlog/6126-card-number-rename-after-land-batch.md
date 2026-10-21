@@ -12,14 +12,25 @@ tags: [backlog, drain, merge-queue, numbering, ledger]
 
 # Batched rename-after-land job for ledger-numbered cards
 
-Slice (f) of epic 6122: in mode rename-after-land, a batch job opens one PR on a set cadence that renames landed x-id cards to their ledger NNN and rewrites references, landing through the merge queue. Idempotent; reuses the rename core in we:scripts/lane-drain.mjs.
+Slice (f) of epic 6122: in mode rename-after-land, a batch job opens one PR on a nightly cadence that renames landed x-id cards to their ledger NNN and rewrites references, landing through the merge queue. Idempotent; reuses the rename core in we:scripts/lane-drain.mjs.
+
+## Ruling 2026-10-19: nightly cadence, and x-id references are rewritten
+
+Operator ruling of 2026-10-19 (recorded in epic 6122), point 3: renames are NOT hourly. This job runs NIGHTLY.
+The cadence is its own setting, `backlog.cardNumbering.renameCadence`, default `nightly` (source logged through
+the cascade); it replaces `renameBatch.everyMinutes` (default 60) as the cadence knob, and `everyMinutes` below
+is read as legacy. Each nightly batch renames every fallback `x<6>` card that has a ledger row to `NNN-slug` and
+rewrites x-id references to the number everywhere they appear, including the ~830 lines in `backlog/` and the
+~890 lines outside it (mostly test fixtures and replays) that cite x-ids today, so humans see numbers, not a mix.
+`bornAs:` and `formerSlugs` values stay untouched, as designed below. Where the text below says "hourly", read
+"nightly".
 
 ## Design
 
 - New job `we:scripts/card-rename-batch.mjs`, run only when `backlog.cardNumbering.mode` is
   `rename-after-land`. `--dry-run` builds the commit and prints it, the rename-set digest and the diff, but
   pushes nothing and opens no PR. `--no-pr` pushes the branch but makes no `gh` call at all (no PR lookup,
-  open or close), for fixture runs against a local origin. Cadence is a setting, `backlog.cardNumbering.renameBatch.everyMinutes` (default 60), in
+  open or close), for fixture runs against a local origin. Cadence is a setting, `backlog.cardNumbering.renameBatch.everyMinutes` (legacy; the nightly `backlog.cardNumbering.renameCadence` replaces it), in
   we:scripts/settings/card-numbering.json through the same cascade.
 - Each run, in a fresh worktree from `origin/main`:
   1. List `x<6>` cards on main that have a ledger row. None: exit, no PR.
@@ -43,7 +54,7 @@ Slice (f) of epic 6122: in mode rename-after-land, a batch job opens one PR on a
     commit message and the PR body (`rename-set: <sha256>`).
   - Push only when the rename set changed. If the live tip's digest equals this run's, mint no commit and push
     nothing, even if main moved: a PR that is merely behind main is the drain's to bring up to date
-    (`rebaseDropManifest`), so the hourly cadence never restarts CI on its own. Never push while the batch PR
+    (`rebaseDropManifest`), so the nightly cadence never restarts CI on its own. Never push while the batch PR
     is in the merge queue; a head change would drop it from the queue. Wait for the next run.
   - Each attempt (at most 3) starts over, under the numbering lock:
     1. `git ls-remote origin refs/heads/lane/card-rename-batch`. Failure ends the run; only a successful empty

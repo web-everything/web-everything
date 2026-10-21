@@ -2,8 +2,8 @@
  * @file parallel-judges.test.mjs — `review.parallelSeats` and `review.seatsByTouchSet`.
  *
  * What this pins, end to end through the review daemon's own driver (`runReviewLoopOnce`) with a stub reader, a
- * scripted judge (real timers, small delays), recording sinks and an in-memory store:
- *   1. CONCURRENCY — every independent seat starts before any seat ends; wall time ≈ the slowest seat.
+ * scripted judge (small delays; a controlled clock for the concurrency proof), recording sinks and an in-memory store:
+ *   1. CONCURRENCY — every independent seat starts before any seat ends; elapsed time equals the slowest seat.
  *   2. SAME RECORD — findings, verdict, telemetry and effects are identical to the sequential drive for the same
  *      seat answers; only the step timings differ (and they show the overlap).
  *   3. ONE SEAT FAILS — the run stops exactly where the sequential drive stops, earlier seats committed, and the
@@ -18,7 +18,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 import { createRegistry, op } from '../registry.mjs';
 import { compute, judge as judgeStep } from '../step-kinds.mjs';
@@ -79,14 +79,15 @@ const DELAY = { correctness: 120, security: 90 };
 const delayFor = (lens) => DELAY[lens] ?? 60;
 const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 
-/** A scripted judge factory: every call is logged with its lens, cwd and real start/end instants. */
-function scriptedJudge({ fail = null } = {}) {
+/** A scripted judge factory: every call is logged with its lens, cwd and start/end instants. */
+function scriptedJudge({ fail = null, onStart = () => {} } = {}) {
   const calls = [];
   const make = () => async (request, opts) => {
     // #4815 — like the real adapter, a request carrying its own answer (`skipSpawn`) spawns nothing and is not a seat.
     if (request?.skipSpawn?.answer != null) return judgeOutcome(request.skipSpawn.answer);
     const call = { lens: request.lens, tools: Array.isArray(request.allowedTools) && request.allowedTools.length > 0, cwd: opts?.cwd ?? null, start: Date.now(), end: null };
     calls.push(call);
+    onStart(call);
     await sleep(delayFor(request.lens));
     call.end = Date.now();
     if (fail && fail(request.lens)) {
@@ -124,31 +125,46 @@ const substance = (run) => ({
 });
 
 describe('review.parallelSeats — concurrency and an identical record', () => {
-  it('starts every seat before any ends, and wall time is about the slowest seat', async () => {
-    const judge = scriptedJudge();
-    const { provider } = lanes();
-    const t0 = Date.now();
-    const { run } = await loop({ parallel: true, judge, seatLanes: provider, runId: 'r-par' });
-    const wall = Date.now() - t0;
-    expect(judge.calls.map((c) => c.lens).sort()).toEqual(['codex-correctness', 'correctness', 'security', 'simplicity'].sort());
-    const lastStart = Math.max(...judge.calls.map((c) => c.start));
-    const firstEnd = Math.min(...judge.calls.map((c) => c.end));
-    expect(lastStart).toBeLessThan(firstEnd);
-    const sum = judge.calls.reduce((n, c) => n + (c.end - c.start), 0);
-    expect(wall).toBeLessThan(sum * 0.75);
-    expect(run.seatTimings).toHaveLength(4);
-    for (const row of run.seatTimings) {
-      expect(Object.keys(row).sort()).toEqual(['seat', 'lens', 'provider', 'model', 'startedAt', 'finishedAt', 'verdict', 'findingsCount'].sort());
-      const call = judge.calls.find(c => c.lens === row.lens);
-      expect(Math.abs(Date.parse(row.startedAt) - call.start)).toBeLessThan(20);
-      expect(Math.abs(Date.parse(row.finishedAt) - call.end)).toBeLessThan(20);
-      expect(row.verdict).toBe(row.lens === 'security' ? 'changes' : 'accept');
-      expect(row.findingsCount).toBe(row.lens === 'security' ? 1 : 0);
+  it('starts every seat before any ends, and elapsed time equals the slowest seat', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      let started = 0;
+      let signalAllStarted;
+      const allStarted = new Promise((resolve) => { signalAllStarted = resolve; });
+      const judge = scriptedJudge({ onStart: () => { if (++started === 4) signalAllStarted(); } });
+      const { provider } = lanes();
+      const t0 = Date.now();
+      const pending = loop({ parallel: true, judge, seatLanes: provider, runId: 'r-par' });
+      // Hold every seat open until all four have started. Serializing even one seat cannot pass this barrier.
+      // Waiting for the starts also lets the driver's lazy imports settle before advancing the timers.
+      await allStarted;
+      expect(judge.calls.every((c) => c.end === null)).toBe(true);
+      await vi.runAllTimersAsync();
+      const { run } = await pending;
+      const wall = Date.now() - t0;
+      expect(judge.calls.map((c) => c.lens).sort()).toEqual(['codex-correctness', 'correctness', 'security', 'simplicity'].sort());
+      const lastStart = Math.max(...judge.calls.map((c) => c.start));
+      const firstEnd = Math.min(...judge.calls.map((c) => c.end));
+      expect(lastStart).toBeLessThan(firstEnd);
+      const sum = judge.calls.reduce((n, c) => n + (c.end - c.start), 0);
+      expect(wall).toBeLessThan(sum * 0.75);
+      expect(wall).toBe(Math.max(...judge.calls.map((c) => delayFor(c.lens))));
+      expect(run.seatTimings).toHaveLength(4);
+      for (const row of run.seatTimings) {
+        expect(Object.keys(row).sort()).toEqual(['seat', 'lens', 'provider', 'model', 'startedAt', 'finishedAt', 'verdict', 'findingsCount'].sort());
+        const call = judge.calls.find(c => c.lens === row.lens);
+        expect(Date.parse(row.startedAt)).toBe(call.start);
+        expect(Date.parse(row.finishedAt)).toBe(call.end);
+        expect(row.verdict).toBe(row.lens === 'security' ? 'changes' : 'accept');
+        expect(row.findingsCount).toBe(row.lens === 'security' ? 1 : 0);
+      }
+      // The run record's own step timings show the overlap too.
+      const seats = run.stepTimings.filter((t) => t.step.startsWith('judge') && t.step !== 'judgeReferralVerifier');
+      expect(seats).toHaveLength(4);
+      expect(Math.max(...seats.map((t) => Date.parse(t.startedAt)))).toBeLessThan(Math.min(...seats.map((t) => Date.parse(t.finishedAt))));
+    } finally {
+      vi.useRealTimers();
     }
-    // The run record's own step timings show the overlap too.
-    const seats = run.stepTimings.filter((t) => t.step.startsWith('judge') && t.step !== 'judgeReferralVerifier');
-    expect(seats).toHaveLength(4);
-    expect(Math.max(...seats.map((t) => Date.parse(t.startedAt)))).toBeLessThan(Math.min(...seats.map((t) => Date.parse(t.finishedAt))));
   });
 
   it('writes the same findings, verdict, telemetry and effects as the sequential drive', async () => {

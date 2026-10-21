@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { validateRaisedBy } from './check-standards-rules.mjs';
 import { isTerminalStatus } from './lib/backlog-status.cjs';
 import { relatedReportRefs } from './lib/related-report.cjs';
 /**
@@ -92,6 +93,7 @@ import {
   buildTrackedPathIndex, scopeBasenameMismatches, scopeBasenameMismatchMessage,
   checkLeashPin,
   findRelativeNodeScriptsAfterLaneCd,
+  findUnmanagedKeepAlives, KEEPALIVE_SCAN_DIRS, KEEPALIVE_HELPER_PATH, KEEPALIVE_EXEMPT_MARKER,
   scopeMissingTestFile, bodyDeliverablesMissingFromScope, deferredBlockedByFindings,
   dirLevelScopeFinding,
 } from './check-standards-rules.mjs';
@@ -267,7 +269,7 @@ const outgoingBacklogTargets = (changedFiles) => {
 // touches a backlog/*.md file; a diff that touches none gets the full backlog-load saving with ZERO added
 // overhead (`LINKED_FILES` stays `null`, `EFFECTIVE_FILES` falls back to plain `LOCAL_FILES` below).
 const CHANGED_BACKLOG_FILES = LOCAL_FILES_LIST
-  ? LOCAL_FILES_LIST.filter((f) => f.startsWith('backlog/') && f.endsWith('.md'))
+  ? LOCAL_FILES_LIST.filter((f) => f.startsWith('backlog/') && f.endsWith('.md') && !f.slice('backlog/'.length).includes('/'))
   : [];
 const LINKED_FILES = CHANGED_BACKLOG_FILES.length
   ? new Set([...linkedFilesFor(CHANGED_BACKLOG_FILES, { gitGrep }), ...outgoingBacklogTargets(CHANGED_BACKLOG_FILES)])
@@ -381,13 +383,15 @@ const loadBacklog = require(join(ROOT, 'src/_data/backlog.js'));
 // → note iff --local"). Full soundness argument: src/_data/backlog.js's `loadBacklogScoped` docblock. The
 // default no-flag run and a bare `--local` (no `--files=`) are untouched — `SCOPE_TO_FILES` is false.
 const backlogScopedFiles = SCOPE_TO_FILES
-  ? [...EFFECTIVE_FILES].filter((f) => f.startsWith('backlog/') && f.endsWith('.md')).map((f) => f.slice('backlog/'.length))
+  ? [...EFFECTIVE_FILES].filter((f) => /^backlog\/[^/]+\.md$/.test(f)).map((f) => f.slice('backlog/'.length))
   : null;
 const backlog = arr(
   SCOPE_TO_FILES
     ? loadBacklog.loadBacklogScoped(backlogScopedFiles)
     : (typeof loadBacklog === 'function' ? loadBacklog() : loadBacklog),
 );
+
+for (const message of validateRaisedBy(ROOT)) err(message);
 
 mark("Load specs");
 // ── 1. Spec ↔ description coverage ────────────────────────────────────────────
@@ -1048,7 +1052,7 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
     err(`"${path}" is a fix-evidence scratch file and must never be committed — it is shared by every fixer and conflicts every other PR that carries it. Post evidence as a PR comment (gh pr comment --body-file <file outside the repo>) and \`git rm --cached ${path}\`.`);
   }
   const changedScopeCards = new Set(scopeChanges.changedFiles.filter((f) =>
-    f.startsWith('backlog/') && f.endsWith('.md') && !scopeChanges.deletedFiles.includes(f)
+    /^backlog\/[^/]+\.md$/.test(f) && !scopeChanges.deletedFiles.includes(f)
     && (!LOCAL_FILES || LOCAL_FILES.has(f))));
   for (const file of readdirSync(join(ROOT, 'backlog')).filter((f) => f.endsWith('.md'))) {
     let raw, body = '';
@@ -3137,6 +3141,51 @@ else {
 }
 
 mark("19. Unfenced mandate params (#2967b)");
+// ── 19b. Unmanaged keep-alive children (keep-alive leak fix, 2026-10-20) ─────────────────────────────────────
+// A do-nothing empty-callback timer child outlives any test that fails to kill it (154 orphans, up to 19 days
+// old, live-caught). Keep-alives come from scripts/lib/test-keepalive.mjs only — anchored + bounded.
+// The git invocation lives here; the pure PARSER-based filter is `findUnmanagedKeepAlives`. The scan is NEVER skipped: a
+// failed or negative work-tree probe, a failed grep, or an unreadable listed file is itself a finding (fail
+// closed, loudly).
+{
+  let listed = null;
+  // Never skipped: a probe that fails, or a checkout git does not confirm as a work tree, is itself a finding.
+  let probe = null;
+  try { probe = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: ROOT, encoding: 'utf8' }).trim(); } catch (e) {
+    err(`keep-alive scan could not confirm a git work tree (${String(e.message).split('\n')[0]}) — the scan did not run`, { kind: 'unmanaged-keepalive' });
+  }
+  if (probe !== null && probe !== 'true') {
+    err(`keep-alive scan: git rev-parse --is-inside-work-tree said ${JSON.stringify(probe)} — the scan did not run`, { kind: 'unmanaged-keepalive' });
+  }
+  if (probe === 'true') {
+    try {
+      // --untracked: a brand-new file must be caught before it is ever committed.
+      listed = execFileSync('git', ['grep', '-l', '--untracked', '-E', 'set(Interval|Timeout)', '--', ...KEEPALIVE_SCAN_DIRS], { cwd: ROOT, encoding: 'utf8' });
+    } catch (e) {
+      if (e.status === 1) listed = ''; // exit 1 = no match
+      else err(`keep-alive scan could not list files (${String(e.message).split('\n')[0]}) — the scan did not run`, { kind: 'unmanaged-keepalive' });
+    }
+  }
+  const files = [];
+  for (const file of (listed ?? '').split('\n').filter(Boolean)) {
+    try { files.push({ file, content: readFileSync(join(ROOT, file), 'utf8') }); } catch (e) {
+      err(`keep-alive scan could not read ${file} (${e.code || e.message})`, { kind: 'unmanaged-keepalive', file });
+    }
+  }
+  for (const f of findUnmanagedKeepAlives(files)) {
+    if (f.reason === 'unparseable') {
+      err(`${f.file}:${f.line} could not be parsed by the keep-alive scan (${f.text}) — fix the syntax; an unparsed file is never assumed clean`,
+        { kind: 'unmanaged-keepalive', file: f.file });
+      continue;
+    }
+    err(`${f.file}:${f.line} spawns a bare empty-callback timer keep-alive — use spawnKeepAlive()/keepAliveScript() ` +
+      `from ${KEEPALIVE_HELPER_PATH} (anchored to the test runner + max lifetime) so it cannot be orphaned. ` +
+      `Code that only mentions the idiom and never runs it may carry a \`// ${KEEPALIVE_EXEMPT_MARKER} <reason>\` line comment on that call.`,
+      { kind: 'unmanaged-keepalive', file: f.file });
+  }
+}
+
+mark("19b. Unmanaged keep-alive children (keep-alive leak fix, 2026-10-20)");
 // ── Scope attribution (#952, ratified #949 Fork 3-A) ───────────────────────────
 // `--scope=<session>` (alias `--mine=<session>`) partitions errors by ownership: an error on a file THIS
 // session dirtied (per its claim-time baseline, #949 Fork 2-A) BLOCKS; a concurrent/pre-existing red is

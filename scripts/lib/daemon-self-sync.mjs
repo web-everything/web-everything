@@ -117,6 +117,7 @@ import { collectImportClosure, closureHits } from './import-closure.mjs';
 export { collectImportClosure };
 import { gateMergedCommit } from './daemon-live-smoke.mjs';
 import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
+import { readReadyCandidate } from './daemon-rebuild/state.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
 import {
@@ -133,6 +134,21 @@ import { resolveRebuildAsJob, rebuildJobsDir, REBUILD_JOB_KIND } from './daemon-
 import { createJobStore } from './daemon-jobs-runtime.mjs';
 import { cloneKey } from './daemon-overlays.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
+
+/** PURE: env → rebuild.maxAdoptWaitTicks → default, with the effective policy source. */
+export function resolveMaxAdoptWaitTicks(env = {}, settings = {}) {
+  const raw = env?.WE_DAEMON_REBUILD_MAX_ADOPT_WAIT_TICKS;
+  const n = typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : NaN;
+  if (Number.isSafeInteger(n) && n >= 0) return { value: n, source: 'env' };
+  const value = settings?.rebuild?.maxAdoptWaitTicks;
+  if (Number.isSafeInteger(value) && value >= 0) return { value, source: 'settings' };
+  return { value: 2, source: 'default' };
+}
+
+function loadAdoptWaitSettings() {
+  try { return JSON.parse(readFileSync(new URL('./daemon-rebuild-settings.json', import.meta.url), 'utf8')); }
+  catch { return {}; }
+}
 
 /** Setting: how long a STARVED reader (see `daemon-clone-lock.mjs` "reader fairness") waits, within the same
  *  tick, for draining writers to back off before it skips. Default 30s; a writer that already holds the clone
@@ -646,12 +662,14 @@ export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
  *   base?:string, pocBranch?:string, env?:NodeJS.ProcessEnv, log?:Console, timeoutMs?:number,
  *   readHead?:typeof readHeadSha, readOriginRef?:typeof readOriginRefSha, hasStaleRefusal?:(tickResult:any)=>boolean,
  *   gate?:typeof gateMergedCommit, mainOnly?:boolean, rebuild?:(o?:object)=>Promise<object>,
- *   acquireRead?:typeof acquireReadLock, releaseRead?:typeof releaseReadLock, readState?:typeof readRebuildState}} o
+ *   acquireRead?:typeof acquireReadLock, releaseRead?:typeof releaseReadLock, readState?:typeof readRebuildState,
+ *   readReady?:typeof readReadyCandidate, maxAdoptWaitTicks?:number}} o
  */
 export function withSelfSync(effects, {
   root, onRestart, sync = selfSyncCheckout, syncPoc = selfSyncCheckoutPoc, base = 'main', pocBranch, env = process.env,
   log = console, timeoutMs, readHead = readHeadSha, readOriginRef = readOriginRefSha, hasStaleRefusal, gate = gateMergedCommit,
   mainOnly = false, rebuild: rebuildOpt, acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
+  readReady = readReadyCandidate, maxAdoptWaitTicks: maxAdoptWaitTicksOpt,
   entries = [process.argv[1]], diffFiles = changedFilesBetween, importClosure = collectImportClosure,
   minRestartIntervalMs = resolveRestartMinIntervalMs(env), now = Date.now,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -673,6 +691,11 @@ export function withSelfSync(effects, {
 }) {
   const tick = effects.tickOnce;
   const realIo = rebuildOpt === undefined;
+  const adoptWait = maxAdoptWaitTicksOpt === undefined
+    ? resolveMaxAdoptWaitTicks(env, loadAdoptWaitSettings())
+    : { value: maxAdoptWaitTicksOpt, source: 'option' };
+  let readyIdentity = null;
+  let adoptWaitTicks = 0;
   const rebuildAsJob = rebuildAsJobOpt === undefined ? resolveSelfSyncRebuildAsJob({ entries, env }) : !!rebuildAsJobOpt;
   const rebuild = rebuildOpt ?? ((o = {}) => rebuildClone({
     root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o,
@@ -713,6 +736,9 @@ export function withSelfSync(effects, {
   let lastStuckLogAt = -Infinity;
   let lastNoMoveKey = null;
   const swapMinIntervalMs = swapSpaced ? bg.swapMinIntervalMs : minRestartIntervalMs;
+  if (!resolvedPocBranch && !vctx) {
+    log.error?.(`daemon-self-sync: rebuild.maxAdoptWaitTicks = ${adoptWait.value} (source ${adoptWait.source})`);
+  }
   // x0m7a8x — settings source, said once (the policy-cascade convention: every resolved setting names its source).
   if (!resolvedPocBranch && !vctx && realIo) {
     const asJob = rebuildAsJob;
@@ -896,12 +922,26 @@ export function withSelfSync(effects, {
 
       // ---- DEFAULT (non-POC) path — full clone rebuild (#4044 Module E, see file header) ----
 
+      // Only count candidates already smoke-passed at tick entry, still based on this clone's HEAD.
+      // This is a tick-boundary policy: it never interrupts a running tick or changes the clone lock.
+      const ready = readReady(root, env);
+      const identity = ready && readHead(syncOpts()) === ready.prevHead
+        ? JSON.stringify([ready.adopt?.finalSha, ready.passedAt, ready.prevHead]) : null;
+      adoptWaitTicks = identity === null ? 0 : identity === readyIdentity ? adoptWaitTicks + 1 : 1;
+      readyIdentity = identity;
+      let yieldForAdoption = adoptWaitTicks > adoptWait.value;
+
       checkTickStarved();
 
       // 1. Rebuild (gated: takes the WRITE lock itself). For a job-mode daemon (#4126) this is the job's fast tick
       //    side — adopt a smoke-passed candidate, else queue or watch the detached job; it never smokes here. An
       //    adopted build restarts INSTEAD of ticking — the read lock below is never even acquired for this tick.
       const rebuildResult = await rebuild();
+      if (rebuildResult?.moved) {
+        readyIdentity = null;
+        adoptWaitTicks = 0;
+        yieldForAdoption = false;
+      }
       if (resultReportsReclone(rebuildResult)) {
         // The checkout was replaced (plain origin/main, never smoked; this process's modules and cwd are the old
         // tree's). Run no children on it until a rebuild on it concludes (x0m7a8x: persisted, shared per clone).
@@ -965,7 +1005,10 @@ export function withSelfSync(effects, {
         // 2. Acquire the READ lock — refused (a writer, possibly a sibling process's rebuild, is active) means
         //    skip this tick entirely rather than ever read a tree mid-move.
         let acquired = acquireRead(root, { ...cloneLockOpts(), readerKey });
-        if (!acquired.ok && readerPriorityAfter > 0 && acquired.starved >= readerPriorityAfter) {
+        if (!acquired.ok && yieldForAdoption) {
+          log.error?.(`daemon-self-sync: yielding this tick for ready rebuild adoption — waited ${adoptWaitTicks} ticks, maxAdoptWaitTicks ${adoptWait.value}; skipping reader priority`);
+        }
+        if (!acquired.ok && !yieldForAdoption && readerPriorityAfter > 0 && acquired.starved >= readerPriorityAfter) {
           // Starvation smell + reader priority: every writer still draining now backs off (it has moved nothing
           // yet), so wait a bounded moment for the slot instead of losing yet another tick.
           log.error?.(`daemon-self-sync: reader starved — read refused ${acquired.starved} consecutive time(s) (writer ${acquired.heldBy ?? '?'}); claiming reader priority, waiting up to ${Math.round(priorityWaitMs / 1000)}s for draining writers to back off (#4044 never-read-mid-move kept)`);

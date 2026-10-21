@@ -16,6 +16,7 @@ import {
 } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, dirname } from 'node:path';
+import { keepAliveScript } from '../test-keepalive.mjs';
 import { spawnSync, spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
@@ -1197,7 +1198,7 @@ describe('rebuildClone', () => {
   it('a live sibling build lease makes a second rebuild yield rebuild-in-progress — no candidate, no smoke', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
-    const sibling = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 60000)'], { stdio: 'ignore' });
+    const sibling = spawn(process.execPath, ['-e', keepAliveScript({ maxLifetimeMs: 60_000 })], { stdio: 'ignore' });
     try {
       const building = {
         token: 'sib', pid: sibling.pid, host: hostname(), startedAt: new Date().toISOString(), path: join(env.WE_DAEMON_STATE_DIR, 'sib-candidate'),

@@ -3,7 +3,7 @@ bornAs: xvfvktj
 kind: decision
 parent: "3383"
 status: open
-scope: ["we:scripts/readiness/dispatch-plan.mjs", "we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js", "we:skills-src/split-backlog-item/SKILL.md", "we:scripts/operations/explore.mjs", "we:docs/agent/backlog-workflow.md"]
+scope: ["we:scripts/readiness/dispatch-plan.mjs", "we:skills-src/batch-backlog-items/parallel-execute.workflow.js", "we:skills-src/split-backlog-item/SKILL.md", "we:scripts/operations/explore.mjs", "we:docs/agent/backlog-workflow.md"]
 dateOpened: "2026-09-07"
 relatedTo: ["3820", "3816", "3779", "3922"]
 tags: [parallel, dispatch, split, workflow, conveyor]
@@ -13,7 +13,7 @@ tags: [parallel, dispatch, split, workflow, conveyor]
 
 Today's dispatch grain is **one backlog item, one lane, one agent, start to finish** — whether dispatched
 by the mechanical dispatcher (`#3383`) or a `/batch`/`/workflow` session. Parallelism only exists **across**
-items (`we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js`'s provably-disjoint worktree
+items (`we:skills-src/batch-backlog-items/parallel-execute.workflow.js`'s provably-disjoint worktree
 lanes), never **within** one. The operator asked for real research, not a pick, into three related but
 separate questions: (1) can ONE item's own build be decomposed into sub-briefs dispatched to several
 agents in parallel, and if so how do the pieces integrate; (2) should a rigorous pre-build pass determine
@@ -23,7 +23,7 @@ scope, is a coordinated shared-branch ("work committee") model ever better than 
 
 **Headline finding: none of the three questions need a new integration mechanism invented from scratch.**
 This repo already runs two structurally different, both-proven integration patterns for parallel work —
-git-is-the-arbiter disjoint-lane assembly (`we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js`)
+git-is-the-arbiter disjoint-lane assembly (`we:skills-src/batch-backlog-items/parallel-execute.workflow.js`)
 and predecessor-tip **chain stacking** for serial overlap (`#2387`) — and a real, lived example of the
 shared-branch model this decision was asked to evaluate (`origin/lane/mechanical-dispatcher`, governed by
 `we:.claude/skills/mechanical-delivery-doctrine/SKILL.md` rules 4/10). The open questions below are about
@@ -34,7 +34,7 @@ threshold a shared branch is worth its own proven cost** — not about designing
 
 | | recommended default | main alternative(s) | confidence |
 | --- | --- | --- | --- |
-| Fork 1 — split unit & integration mechanism | **(b) reuse `we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js`'s disjoint-lane assembly wholesale, fed sub-briefs instead of items** | (a) a new bespoke sub-brief dispatcher; (c) never split below the item | medium |
+| Fork 1 — split unit & integration mechanism | **(b) reuse `we:skills-src/batch-backlog-items/parallel-execute.workflow.js`'s disjoint-lane assembly wholesale, fed sub-briefs instead of items** | (a) a new bespoke sub-brief dispatcher; (c) never split below the item | medium |
 | Fork 2 — splittability gate: file-disjointness alone, or file+interface? | **(b) file-disjointness is necessary but not sufficient — require an interface-stability check before fan-out** | (a) file-disjointness (touch-set) alone | high |
 | Fork 3 — who runs the pre-build splittability analysis, and when | **(b) fold it into `we:skills-src/split-backlog-item/SKILL.md`'s existing investigation pass as a THIRD verdict (`could-not-split` / `could-split-into-cards` / `could-split-into-sub-briefs`), reserving the `explore` committee for genuinely ambiguous large items only** | (a) always convene an `explore` committee per item; (c) no gate — always attempt or never attempt | medium |
 | Fork 4 — overlapping-scope coordination: work committee vs. serial hold | **(c) keep serial hold as the default; add a narrow, explicitly-gated shared-branch escalation only when overlap persists past N held ticks AND touches ≤1 file** | (a) work-committee/shared-branch as a general alternative to serial holds; (b) never build it | medium |
@@ -55,7 +55,7 @@ risk, not a stylistic preference (confirmed against the two-confusion test: even
 budget, "which mechanism owns the merge" still has to be answered one way, because two merge authorities
 racing on the same assembly is a correctness hazard, not friction).
 
-**What already exists and is proven, not hypothetical.** `we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js` already does exactly the mechanics this fork needs, just fed a different
+**What already exists and is proven, not hypothetical.** `we:skills-src/batch-backlog-items/parallel-execute.workflow.js` already does exactly the mechanics this fork needs, just fed a different
 INPUT today:
 
 1. `plan` probes each unit's touch-set and partitions into provably-disjoint worktree lanes + one serial
@@ -85,25 +85,25 @@ thing this fork needs to add is: **the units being partitioned are sub-briefs ca
 (by Fork 3's investigation pass) instead of N separate backlog items** — the probe/partition/assembly/merge
 machinery is agnostic to that distinction; it already operates on touch-sets, not item identity.
 
-**Recommended default — (b) reuse `we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js`
+**Recommended default — (b) reuse `we:skills-src/batch-backlog-items/parallel-execute.workflow.js`
 wholesale, fed sub-briefs.** Concretely: Fork 3's investigation pass (extended
 `we:skills-src/split-backlog-item/SKILL.md`) produces named sub-briefs with predicted touch-sets, exactly
 the shape `we:skills-src/split-backlog-item/SKILL.md`'s step 2 (the #2619 touch-set probe) already authors
 onto a slice's `--scope`. Those sub-briefs feed the SAME probe→partition→worktree→assembly→one-merge
-pipeline `we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js` runs for cross-item batches.
+pipeline `we:skills-src/batch-backlog-items/parallel-execute.workflow.js` runs for cross-item batches.
 The item stays ONE card the whole time (never converted to an epic, unlike a real `/split`) — its
 sub-briefs are ephemeral dispatch units that exist only for the duration of one build, not new backlog
 entries. Per rule 3 of `we:.claude/skills/mechanical-delivery-doctrine/SKILL.md` ("the orchestrating
 session never edits or commits directly"), the single merge step must itself be a dispatched subsession's
 act, not the orchestrator's own `Edit`/`git commit` — mirroring how
-`we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js` already keeps the orchestrator's role
+`we:skills-src/batch-backlog-items/parallel-execute.workflow.js` already keeps the orchestrator's role
 to "acquire, brief, relay" for ordinary item dispatch.
 
 **Rejected alternative — (a) a new, bespoke sub-brief dispatcher.** This is exactly the "twin templates for
 the same job" drift multiple existing files warn against by name (`we:scripts/conveyor/reconcile-fix-dispatch.mjs`'s own header: "a second planner for the same job is the drift this file's
 phase-borrowing rule exists to prevent"; `we:scripts/conveyor/review-session-slug.mjs`'s header makes the
 identical point). A second probe/partition/assembly implementation for sub-item units would duplicate every
-hard-won fix `we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js` already carries — the
+hard-won fix `we:skills-src/batch-backlog-items/parallel-execute.workflow.js` already carries — the
 `process.cwd()` Workflow-sandbox crash fix, the push-carve-out redirection-token fix, the bounded-retry
 ref-lock fix (#1995), the `branchOk` assertion (#1869) — for no benefit this research found. Rejected as
 the default; confidence **high** that reuse beats a fresh build specifically, independent of this fork's
@@ -159,7 +159,7 @@ items fan out in wave 0, contending items chain into later waves); an interface-
 simply always wave 0.
 
 **Rejected alternative — (a) file-disjointness (touch-set) alone.** Cheaper to implement (it is what
-`we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js` already checks, unchanged) but the
+`we:skills-src/batch-backlog-items/parallel-execute.workflow.js` already checks, unchanged) but the
 failure mode above is not hypothetical for this repo's own work: the constellation's WE→FUI→Plateau
 boundary work and any `declared-once, callers-generated` operation (`#3031`'s own governing rule) are
 exactly the shape where two disjoint files agree on one not-yet-stable contract. Confidence **high** that
@@ -258,7 +258,7 @@ party proof that its failure mode (silent drift compounding into an expensive re
 theoretical, the moment discipline lapses.
 
 **What a shared branch trades away that today's serial hold gets for free.** The ENTIRE safety case behind
-`we:.claude/skills/batch-backlog-items/parallel-execute.workflow.js`'s disjoint-lane model and `#2387`'s
+`we:skills-src/batch-backlog-items/parallel-execute.workflow.js`'s disjoint-lane model and `#2387`'s
 overlap-stacking is "no two agents ever write to the same ref concurrently" — each lane owns its own
 worktree/clone, and integration happens at ONE supervised chokepoint. A work-committee model explicitly
 breaks that invariant on purpose: two agents commit to the SAME ref while both are still working. Human

@@ -3,7 +3,7 @@ bornAs: x4pif3w
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/drain-prestage.mjs", "we:scripts/lib/drain-prestage.test.mjs"]
+scope: ["we:scripts/lib/drain-prestage.mjs", "we:scripts/lib/__tests__/drain-prestage.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---

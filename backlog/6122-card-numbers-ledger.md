@@ -9,7 +9,10 @@ tags: [backlog, drain, merge-queue, numbering, ledger]
 
 # Card numbers as a ledger (no rename commits)
 
-Card 265 (operator OK 2026-10-12, reconfirmed 2026-10-13; policy decisions 2026-10-13 ~19:00 ET): x-id cards may land; the drain assigns the display number into an id-to-number ledger on an ops branch at land, and the ledger is the source of truth in every mode. When a card's file is renamed is a policy setting (`backlog.cardNumbering.mode`), defaulting to a batched rename after land. This takes the pre-enqueue numbering commit in we:scripts/lib/queue-branch-numbering.mjs, and its extra CI round, off the default path.
+Card 265 (operator OK 2026-10-12, reconfirmed 2026-10-13; policy decisions 2026-10-13 ~19:00 ET): x-id cards may land; the drain assigns the display number into an id-to-number ledger on an ops branch at land, and the ledger is the source of truth in every mode. When a card's file is renamed is a policy setting (`backlog.cardNumbering.mode`), defaulting to a nightly batched rename after land (ruling 2026-10-19). New cards are numbered at birth (slice 0); the ledger covers only the fallback. This takes the pre-enqueue numbering commit in we:scripts/lib/queue-branch-numbering.mjs, and its extra CI round, off the default path.
+
+> **Ruling 2026-10-19 supersedes the defaults below.** See "Ruling 2026-10-19". Where this card's older text says
+> hourly cadence, rename-after-land as a ledger-only fallback, or a signed-commit trust root, the ruling wins.
 
 ## Why now
 
@@ -24,23 +27,52 @@ Under the merge queue, `prepareBranchBeforeEnqueue` (we:scripts/lib/queue-branch
 
 The number is display data. It does not need to live in the file name.
 
-## Decision note — proposed replacement, awaiting linked operator approval
+## Ruling 2026-10-19
+
+Operator, verbatim, 2026-10-19 (in conversation, answering the re-check of this epic):
+
+> "Could be nightly even, the down side of hash is if a human loom at the code it might be messy to have a mix and it's not as easy to remember a hash as an id so less usable . Apart from that I am fine with"
+
+The ruling, in five points:
+
+1. Cards are numbered at birth, as new slice 0 (6622, "Card numbers assigned at birth").
+2. The ledger is the fallback for cards that could not be numbered at birth.
+3. Renames are NOT hourly. A NIGHTLY batch renames any fallback `x<6>` card to `NNN-slug` and rewrites x-id
+   references to numbers, including the ~830 backlog lines and ~890 non-backlog lines that cite x-ids today.
+   Humans then see numbers, not a mix. So the default mode is `rename-after-land` with cadence `nightly`.
+   The cadence is its own setting, `backlog.cardNumbering.renameCadence` (default `nightly`, source logged).
+4. The signed-commit trust root of 6121 becomes optional and off by default
+   (`backlog.cardNumbering.ledgerAuth: none|signed`, default `none`).
+5. The replacement invariant for 6127 is approved with this wording:
+   "Every backlog card on `main` has exactly one number, recorded where a reader can find it: in the file name
+   (`NNN-slug`) or in exactly one ledger row (`x<6>-slug`). No `x<6>` card file may be added to `main` without a
+   ledger row, and no id or number is bound to two cards. A merge group that adds an unledgered `x<6>` card, or
+   whose needed ledger is unreadable, is refused."
+
+All of these stay configurable policies (cascade settings), not constants.
+
+## Decision note — replacement invariant, approved 2026-10-19
 
 **Conflict.** #5057 made it "mechanically impossible to add a temp id in the queue": `mergeGroupHashRefusals`
 (we:scripts/lib/queue-branch-numbering.mjs:34-37, called from we:scripts/check-standards.mjs:787-789) refuses any
 merge group that carries an `x<6>` file name, unconditionally. Card 265 lets `x<6>` file names land on `main`.
 The two cannot both hold. Approval of card 265 alone does not establish approval of this specific relaxation.
 
-**Proposed replacement invariant.** *x-id cards may land. Every card on `main` gets a ledger number,
-assigned atomically by the drain's land step. Nothing unnumbered is user-visible.* Concretely: in every mode,
+**Approved replacement invariant (wording per the ruling, point 5).** *Every backlog card on `main` has exactly
+one number, recorded where a reader can find it: in the file name (`NNN-slug`) or in exactly one ledger row
+(`x<6>-slug`). No `x<6>` card file may be added to `main` without a ledger row, and no id or number is bound to
+two cards. A merge group that adds an unledgered `x<6>` card, or whose needed ledger is unreadable, is
+refused.* The earlier draft ("every card gets a ledger number, assigned atomically by the drain's land step;
+nothing unnumbered is user-visible") is replaced by this wording. Concretely: in every mode,
 the merge_group gate stops refusing ledgered `x<6>` file names and instead refuses any `x<6>`
 card in the group that has no ledger row. The "no hash on main" rule becomes "no unledgered hash on main".
 In mode `rename-before-enqueue`, new unledgered cards still require pre-enqueue numbering. Ledgered x-cards
 already landed in another mode remain legal on rollback and must never receive a replacement number.
 
-**Approval source:** pending. No verifiable comment or issue URL is present for this replacement invariant.
-Slice (d), 6127, retains its `humanGate` until the operator's approval is linked here. The quote previously
-recorded without a source is insufficient to clear that gate. This PR does not record a human verdict.
+**Approval source:** the operator's ruling of 2026-10-19, section "Ruling 2026-10-19" above (verbatim quote,
+point 5), given in conversation in answer to the design re-check of this epic. It approves the exact wording of
+the replacement invariant. This clears the `humanGate` on 6127. This PR records the operator's ruling; it adds
+no reviewer verdict.
 
 ## Card naming policy — `backlog.cardNumbering.mode`
 
@@ -52,8 +84,12 @@ An invalid value never overrides a lower layer; it is named and ignored.
 | Mode | What happens to a new card's file name | CI cost |
 |---|---|---|
 | `rename-before-enqueue` | The drain renames new unledgered cards on the PR branch before enqueue (`prepareBranchBeforeEnqueue`). Already ledgered cards keep their numbers; merge_group checks accept ledgered x-cards and refuse unledgered ones. KEPT and switchable, never deleted. Operator: "make sure the drain steps for the merge queue are just turned off for merge queue, not deleted". | one extra CI round per PR with new cards |
-| `rename-after-land` | **THE DEFAULT.** The ledger assigns the number at land; the card lands as an `x<6>-slug` file name. A batched rename PR, on a set cadence (about hourly), renames landed ledger-numbered x-id cards to an `NNN-slug` file name and rewrites references, through the merge queue. | one CI run per batch |
-| `ledger-only` | No renames. The x-id file name is permanent; readers show the ledger number. | none |
+| `rename-after-land` | **THE DEFAULT, cadence `nightly`.** The ledger assigns the number at land; the fallback card lands as an `x<6>-slug` file name. A NIGHTLY batch renames landed ledger-numbered x-id cards to an `NNN-slug` file name and rewrites every x-id reference (backlog and non-backlog) to the number, through the merge queue. Cadence is its own setting, `backlog.cardNumbering.renameCadence` (default `nightly`). | one CI run per nightly batch |
+| `ledger-only` | KEPT as a setting. No renames. The x-id file name is permanent; readers show the ledger number. | none |
+
+Cards numbered at birth (slice 0) are `NNN-slug` from the start and appear in no mode's rename set. The ledger
+authentication setting `backlog.cardNumbering.ledgerAuth` (`none` default, `signed` optional) is described in
+6121.
 
 The ledger is written and read in every mode, including `rename-before-enqueue` (the row records the number
 the rename chose). Optional in any mode: a generated by-number lookup (`we:backlog/by-number/NNN.md` pointers or
@@ -158,11 +194,12 @@ This prerequisite belongs to slice (d); slice (e)'s later local-ledger retiremen
 
 | Slice | Card | Size | blockedBy |
 |---|---|---|---|
+| (0) card numbers assigned at birth | 6622 | 5 | — |
 | (a) ledger store and assign-at-land, in shadow | 6121 | 5 | — |
 | (b) readers and renderers use the ledger | 6124 | 5 | 6121 |
 | (c) check-standards rules accept ledger-numbered x-id file names | 6125 | 3 | 6121, 6124 |
-| (f) batched rename-after-land job (cadence setting, merge queue, idempotent) | 6126 | 5 | 6121, 6124, 6125 |
-| (d) switch: flip `backlog.cardNumbering.mode` to `rename-after-land`; removes no code path | 6127 | 5 | 6121, 6124, 6125, 6126 |
+| (f) nightly batched rename-after-land job (cadence setting, merge queue, idempotent, rewrites x-id references) | 6126 | 5 | 6121, 6124, 6125 |
+| (d) switch: flip `backlog.cardNumbering.mode` to `rename-after-land` (approved invariant, humanGate cleared); removes no code path | 6127 | 5 | 6121, 6124, 6125, 6126 |
 | (e) policy docs, retire the local hash ledger, optional by-number lookup | 6128 | 3 | 6127 |
 
 Review prevention is tracked separately in 6123 (spec dependency/scope integrity and security evidence).
@@ -170,7 +207,7 @@ Review prevention is tracked separately in 6123 (spec dependency/scope integrity
 ## Estimated saving
 
 - One full CI round (about 14 min of wall time) per PR that carries a new card, and no approval drop from a
-  moved head. In the default mode that is replaced by one CI run per hourly rename batch.
+  moved head. In the default mode that is replaced by one CI run per nightly rename batch.
 - The numbering worktree, the full-tree reference rewrite and the queued-hash sweep leave the drain pass. The
   ledger append is one fetch plus one small push.
 
@@ -178,7 +215,7 @@ Review prevention is tracked separately in 6123 (spec dependency/scope integrity
 
 - [A1] **Executable** — in the default mode, a PR that carries a new `x<6>` card is enqueued at its judged
   head SHA (no drain commit on the branch), lands with its x-id file name, `node we:scripts/backlog.mjs show
-  <its number>` resolves it through the ledger, and the next rename batch renames it to an `NNN-slug` file name.
+  <its number>` resolves it through the ledger, and the next nightly rename batch renames it to an `NNN-slug` file name.
 - [A2] Setting `backlog.cardNumbering.mode` to `rename-before-enqueue` restores today's behaviour with no code
   change for new unledgered cards. Ledger-numbered cards already on main retain their mappings through main
   repair, branch numbering, queued sweeps/probes and merge_group checks. Slice (d)'s integration fixture must

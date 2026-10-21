@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/pr-state.mjs", "we:scripts/lib/pr-state/holds/same-head-cap.mjs", "we:scripts/lib/pr-state/holds/index.mjs", "we:scripts/lib/__tests__/pr-state.test.mjs", "we:scripts/lib/pr-state/holds/__tests__/same-head-cap.test.mjs", "we:scripts/lib/pr-state/holds/__tests__/index.test.mjs"]
+scope: ["we:scripts/lib/pr-state.mjs", "we:scripts/lib/pr-state/holds/same-head-cap.mjs", "we:scripts/lib/pr-state/holds/index.mjs", "we:scripts/lib/pr-state/__tests__/pr-state.test.mjs", "we:scripts/lib/pr-state/holds/__tests__/same-head-cap.test.mjs", "we:scripts/lib/pr-state/holds/__tests__/index.test.mjs"]
 dateOpened: "2026-10-07"
 tags: []
 ---

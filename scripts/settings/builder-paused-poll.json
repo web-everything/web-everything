@@ -1,0 +1,4 @@
+{
+  "$comment": "Paused builder health cadence. Standard 600 seconds → platform builder.pausedPollSec → this tool setting → WE_BUILDER_PAUSED_POLL_SEC. Integers from 1 through 2147483 seconds only (Node timer limit); invalid values fall back to 600 with a startup diagnostic.",
+  "builder": { "pausedPollSec": 600 }
+}

@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/verify-lane.mjs", "we:scripts/lib/lane-verify.mjs", "we:scripts/lib/__tests__/verify-since-last-green.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/lib/__tests__/lane-verify.test.mjs"]
+scope: ["we:scripts/verify-lane.mjs", "we:scripts/lib/lane-verify.mjs", "we:scripts/lib/__tests__/verify-since-last-green.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/__tests__/lane-verify.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---

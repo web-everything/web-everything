@@ -6,7 +6,7 @@ priority: high
 status: open
 scaffoldedBy: "investigate-dispatch-noop-lane-3-d65b5d9a"
 dateScaffolded: "2026-09-28"
-scope: ["we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/deliver-item-wrapper.test.mjs"]
+scope: ["we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs"]
 dateOpened: "2026-09-28"
 tags: ["build-dispatch"]
 ---
@@ -31,6 +31,6 @@ The delivery wrapper claims the card inside the WE lane (`claimItem({ lanePath }
 
 ## Done when
 
-1. **Executable** — a new case in `we:scripts/operations/deliver-item-wrapper.test.mjs` asserts that `releaseClaimAndLane` runs the release with `cwd` equal to the same lane path `claimItem` used. It fails today (no cwd) and passes after.
+1. **Executable** — a new case in `we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs` asserts that `releaseClaimAndLane` runs the release with `cwd` equal to the same lane path `claimItem` used. It fails today (no cwd) and passes after.
 2. A test where the claim returns a non-`active` result: the wrapper stops before `provider.spawn`.
 3. **Live proof** — a real builder dispatch that ends early (for example `not-ready`): the wrapper log shows the release succeeding (no `status is "open", expected "active"` line), and the card's status is back to `open` in the lane it was claimed in.

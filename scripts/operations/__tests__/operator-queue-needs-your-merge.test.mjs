@@ -8,7 +8,10 @@ vi.mock('node:child_process', async (original) => ({ ...await original(), execFi
 vi.mock('../../lib/gh-throttle.mjs', async (original) => ({
   ...await original(), execFileSyncThrottled: (...args) => execFileSync(...args),
 }));
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { evaluatePr, evaluateCeremonyOwed, evaluateNeedsYourMerge, needsYourMergeCommand, needsYourMergePrecheck, main } from '../operator-queue.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -18,7 +21,7 @@ const pr = (over = {}) => ({ number: 5298, title: 'fix red main: CI caps', headR
   labels: ['ready-to-merge', 'review:accepted'].map((name) => ({ name })), comments: [],
   statusCheckRollup: [green('test'), green('merge-gate'), { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }], ...over });
 const WF = [{ filename: '.github/workflows/ci.yml' }, { filename: 'scripts/x.mjs' }];
-const COMMAND = `node scripts/operations/run.mjs land-human-only --pr=5298 --repo=${REPO} --actor=<your login> --channel=<where you said it> --reason='<your words>'`;
+const COMMAND = `git pull --ff-only origin main && node scripts/run-fresh.mjs land-human-only --pr=5298 --repo=${REPO} --actor=<your login> --channel=<where you said it> --reason='<your words>'`;
 
 const originalExitCode = process.exitCode;
 beforeEach(() => { execFileSync.mockReset(); });
@@ -67,6 +70,38 @@ describe('needs your merge — evaluation', () => {
   });
   it('the command is the land-human-only operation', () => {
     expect(needsYourMergeCommand({ repo: REPO, number: 5298 })).toBe(COMMAND);
+  });
+  it.each([0, 1])('bootstraps a checkout missing the launcher, stopping if update fails (status %s)', (updateStatus) => {
+    const dir = mkdtempSync(join(tmpdir(), 'merge-bootstrap-'));
+    try {
+      mkdirSync(join(dir, 'bin'));
+      // Simulate the update without network access or git writes. The launcher is initially absent.
+      writeFileSync(join(dir, 'bin', 'git'), `#!/bin/sh
+test "$*" = 'pull --ff-only origin main' || exit 90
+echo UPDATE_ATTEMPTED
+${updateStatus ? 'exit 1' : `mkdir -p scripts
+echo 'console.log("FRESH_LAUNCHER", JSON.stringify(process.argv.slice(2)))' > scripts/run-fresh.mjs`}
+`, { mode: 0o755 });
+      const command = needsYourMergeCommand({ repo: REPO, number: 5298 })
+        .replace('<your login>', 'operator')
+        .replace('<where you said it>', 'terminal')
+        .replace('<your words>', 'approved in person');
+      const result = spawnSync('/bin/sh', ['-c', command], {
+        cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}` },
+      });
+      expect(result.stdout, result.stderr).toContain('UPDATE_ATTEMPTED');
+      expect(result.status).toBe(updateStatus);
+      expect(result.stderr).not.toContain('MODULE_NOT_FOUND');
+      if (updateStatus === 0) {
+        expect(result.stdout).toContain('FRESH_LAUNCHER');
+        expect(result.stdout).toContain('"land-human-only","--pr=5298"');
+        expect(result.stdout).toContain('"--reason=approved in person"');
+      } else {
+        expect(result.stdout).not.toContain('FRESH_LAUNCHER');
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
