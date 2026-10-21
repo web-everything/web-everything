@@ -13,10 +13,10 @@ const ENV = 'WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE';
 const lines = (value) => Array.isArray(value) ? value : String(value).split(/\r?\n/).filter(Boolean);
 const cardId = (path) => idFromName(basename(path, '.md'));
 const jitSubject = /^drain: JIT-number (.+) at land \(#2288\)$/;
-/** Identity allowlist comes only from already accepted main, never from the PR. */
+/** Read all accepted main drain history, never the PR: returning authors must not expire after 100 commits. */
 export function trustedDrainAuthors({ cwd = process.cwd(), exec = execFileSync } = {}) {
   try {
-    const history = exec('git', ['log', '--max-count=100', '--grep=^drain: JIT-number ', '--format=%an%x00%ae%x00%s', 'origin/main'], { cwd, encoding: 'utf8', stdio: 'pipe', timeout: 60_000, maxBuffer: 4 * 1024 * 1024 });
+    const history = exec('git', ['log', '--grep=^drain: JIT-number ', '--format=%an%x00%ae%x00%s', 'origin/main'], { cwd, encoding: 'utf8', stdio: 'pipe', timeout: 60_000, maxBuffer: 4 * 1024 * 1024 });
     return new Set(lines(history).flatMap(line => {
       const [name, email, subject] = line.split('\0');
       return name && email && jitSubject.test(subject ?? '') ? [`${name}\0${email}`] : [];
