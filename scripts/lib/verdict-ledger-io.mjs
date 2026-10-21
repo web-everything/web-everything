@@ -188,7 +188,7 @@ export function appendLedgerRows({
   const directSeam = ['run', 'mkdir', 'write', 'read', 'rm'].some((k) => transport[k] !== undefined);
   const cascade = resolveOutboxSettings({ repo: settings ?? readSettings(), env });
   const settingsLine = formatOutboxSettings(cascade);
-  if (!loggedCaps.has(settingsLine)) { loggedCaps.add(settingsLine); (log ?? defaultLog)(settingsLine); }
+  if (!loggedCaps.has(settingsLine)) { loggedCaps.add(settingsLine); try { (log ?? defaultLog)(settingsLine); } catch { /* a log sink never decides an outcome */ } }
   if (outbox ?? (cascade.enabled && !directSeam)) {
     try {
       const dir = outboxDir ?? outboxDirFor({ board, env, ...(gitRun ? { run: gitRun } : {}) });

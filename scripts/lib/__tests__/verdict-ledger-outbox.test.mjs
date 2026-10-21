@@ -529,6 +529,24 @@ describe('real git: outbox + plumbing flush', () => {
     });
   });
 
+  it('a THROWING logger never turns a landed (reconciled) push into a failure, in either path (round 12)', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      // The push lands, then its acknowledgement is "lost"; reconciliation proves it landed; every log line throws.
+      const lossy = (args, opts) => {
+        const out = realGit(args, opts);
+        if (args[0] === 'push') throw Object.assign(new Error('Command failed'), { stderr: 'fatal: the remote end hung up unexpectedly\n', status: 128 });
+        return out;
+      };
+      const boom = () => { throw new Error('log sink failed'); };
+      const a = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(16)], outbox: true, outboxDir: join(ctx.tmp, 'ob'), gitRun: lossy, log: boom });
+      expect(a).toMatchObject({ status: 'appended', queued: false });
+      const d = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(17)], outbox: false, run: lossy, log: boom, sleep: noSleep, onRetry: () => { throw new Error('observer broke'); } });
+      expect(d).toMatchObject({ status: 'appended' });
+      expect(originRows(ctx).sort((x, y) => x - y)).toEqual([16, 17]);
+    });
+  });
+
   it('the plumbing push never follows tags', async () => {
     await withBareOrigin(async (ctx) => {
       ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });

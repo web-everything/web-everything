@@ -265,7 +265,8 @@ const entrySum = (e) => createHash('sha256').update(JSON.stringify([e.path, e.re
  * A failure of the final directory fsync is logged, not thrown: the entry is already visible to flushers, so
  * reporting "not queued" would be the one wrong answer.
  */
-export function enqueueOutboxEntry(dir, entry, { now = Date.now, log = defaultLog } = {}) {
+export function enqueueOutboxEntry(dir, entry, { now = Date.now, log: rawLog = defaultLog } = {}) {
+  const log = safeLog(rawLog);
   ensureDurableDir(dir);
   const t = now();
   const name = `${String(Math.max(0, Math.trunc(t))).padStart(15, '0')}-${process.pid}-${randomBytes(6).toString('hex')}.json`;
@@ -648,7 +649,7 @@ function common(o) {
     now: o.now ?? Date.now,
     sleep: o.sleep ?? defaultSleep,
     random: o.random ?? Math.random,
-    log: o.log ?? defaultLog,
+    log: safeLog(o.log ?? defaultLog),
     budgetMs: o.budgetMs ?? settings.flushBudgetMs,
     staleMs: o.staleMs ?? settings.staleMs,
     onRetry: o.onRetry ?? null,
@@ -1039,6 +1040,14 @@ async function runBackstopCli(argv) {
 // No top-level await: this module is imported by the io-shell, and must stay a plain synchronous module.
 if (process.argv[1] && resolve(process.argv[1]) === THIS_FILE && ['flush', 'flush-repos'].includes(process.argv[2])) {
   runBackstopCli(process.argv).catch((e) => defaultLog(`ledger-write-miss: verdict-ledger outbox backstop crashed (${e?.message ?? e})`));
+}
+
+/**
+ * A logger that can never throw (round 12): a diagnostic sink failing must never replace a publication outcome
+ * (landed, queued or unknown) with an exception.
+ */
+function safeLog(log) {
+  return (line) => { try { log(line); } catch { /* a log sink failure is never an outcome */ } };
 }
 
 function defaultLog(line) { try { process.stderr.write(`${line}\n`); } catch { /* never fails a write */ } }
