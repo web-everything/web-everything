@@ -418,9 +418,14 @@ describe('the ledger push can only fast-forward the transport branch (C3)', () =
     repo: REPO, pr: 4318, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test',
   });
 
+  const SHA = 'c'.repeat(40);
   function pushArgvFor(records) {
     const calls = [];
-    const run = (args, opts) => { calls.push(Object.assign([...args], { cwd: opts?.cwd })); return args[0] === 'diff' ? 'verdict-ledger/x.jsonl\n' : ''; };
+    // The plumbing append (2026-10-21): object-producing calls answer an object id; everything else is empty.
+    const run = (args, opts) => {
+      calls.push(Object.assign([...args], { cwd: opts?.cwd, index: opts?.env?.GIT_INDEX_FILE }));
+      return ['rev-parse', 'hash-object', 'write-tree', 'commit-tree'].includes(args[0]) ? `${SHA}\n` : '';
+    };
     appendLedgerRows({
       board: '/board', repo: REPO, records, run, sleep: () => {}, now: () => 1,
       mkdir: () => {}, write: () => {}, read: () => null, rm: () => {},
@@ -436,17 +441,21 @@ describe('the ledger push can only fast-forward the transport branch (C3)', () =
     expect(calls).toBeInstanceOf(Array);
   });
 
-  it('pushes exactly HEAD to the transport branch: no force, no plus-refspec, no other ref', () => {
+  it('pushes exactly the one plumbing commit to the transport branch: no force, no plus-refspec, no other ref', () => {
     const pushes = calls.filter((a) => a[0] === 'push');
-    expect(pushes.map((a) => [...a])).toEqual([['push', '--quiet', 'origin', `HEAD:refs/heads/${LEDGER_TRANSPORT_BRANCH}`]]);
+    expect(pushes.map((a) => [...a])).toEqual([['push', '--quiet', 'origin', `${SHA}:refs/heads/${LEDGER_TRANSPORT_BRANCH}`]]);
+    // That commit is the one commit-tree built on the fetched tip, nothing else.
+    const commitTree = calls.find((a) => a[0] === 'commit-tree');
+    expect([...commitTree].slice(0, 4)).toEqual(['commit-tree', SHA, '-p', SHA]);
   });
 
-  it('pushes from the dedicated transport worktree, never from the board checkout it was called with', () => {
-    const [push] = calls.filter((a) => a[0] === 'push');
-    expect(push.cwd).toMatch(/^\/board\/\.operations\/transport\/wt-/);
-    // Every git call that touches refs or the index runs in the worktree too, so the caller's lane is untouched.
-    for (const a of calls.filter((x) => ['checkout', 'add', 'commit', 'push'].includes(x[0]))) {
-      expect(a.cwd).toMatch(/\/\.operations\/transport\/wt-/);
+  it('never touches the board checkout it was called with: no worktree, no checkout, only a temp index', () => {
+    // 2026-10-21: the worktree dance is gone from the ledger path. The caller's lane is untouched because nothing
+    // reads or writes its working tree, its index, or its branches: index work runs on a temp GIT_INDEX_FILE.
+    expect(calls.filter((x) => ['worktree', 'checkout', 'add', 'commit', 'reset', 'stash'].includes(x[0]))).toEqual([]);
+    for (const a of calls.filter((x) => ['read-tree', 'update-index', 'write-tree'].includes(x[0]))) {
+      expect(a.index, a.join(' ')).toBeTruthy();
+      expect(a.index.startsWith('/board')).toBe(false);
     }
   });
 

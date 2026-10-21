@@ -258,7 +258,13 @@ function pushBatch({ board, branch, entries, run, allowRef }) {
     const idx = boardEnv(board, { GIT_INDEX_FILE: join(tmp, 'index') });
     run(['read-tree', tip], { cwd: board, env: idx });
     for (const c of changes) {
-      const blob = String(run(['hash-object', '-w', '--stdin'], { cwd: board, env: idx, input: c.content })).trim();
+      // From a FILE, never stdin: a runner that spawns git with stdin ignored would silently hash an EMPTY blob
+      // (seen in a test seam) and the push would replace the whole ledger with nothing. `--no-filters`: the bytes
+      // are stored exactly as computed, whatever attributes apply to the temp path.
+      const src = join(tmp, `blob-${changes.indexOf(c)}`);
+      writeFileSync(src, c.content);
+      const blob = String(run(['hash-object', '-w', '--no-filters', '--', src], { cwd: board, env: idx })).trim();
+      if (!/^[0-9a-f]{40,64}$/.test(blob)) throw new Error(`verdict-ledger-outbox: hash-object returned no object id for ${c.path}`);
       run(['update-index', '--add', '--cacheinfo', `${c.mode},${blob},${c.path}`], { cwd: board, env: idx });
     }
     const tree = String(run(['write-tree'], { cwd: board, env: idx })).trim();
