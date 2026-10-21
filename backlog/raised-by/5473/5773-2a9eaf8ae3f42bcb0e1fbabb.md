@@ -1,0 +1,1 @@
+- Also raised by web-everything/web-everything#5773 (finding 3: `we:backlog/xn5h9sy-daemon-rebuild-planner-replays-a-pinned-base-overlay-an-appl.md:17` — Add an admission gate requiring each Acceptance guarantee to reference a planned test identifier, repository-qualified file, and observable assertions.)
