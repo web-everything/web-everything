@@ -127,6 +127,14 @@ import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOper
 import { classifyPr } from '../progress-board.mjs';
 import { ciHealOwed } from './ci-heal-rule.mjs';
 import { staleAcceptanceOwed, acceptStillUnsupersededOnSnapshot } from './rearm-review.mjs';
+
+/** #5771: keys are `pr@head#<accept evidence token>`; honoured only for the exact PR, head and proved accept, while it stands. */
+function releasedStaleAccept(keys, pr) {
+  if (!Array.isArray(keys)) return false;
+  const prefix = `${pr.number}@${String(pr.headRefOid ?? '').toLowerCase()}#`;
+  const key = keys.find(k => typeof k === 'string' && k.startsWith(prefix));
+  return !!key && acceptStillUnsupersededOnSnapshot(pr, key.slice(prefix.length));
+}
 import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
@@ -2728,8 +2736,7 @@ export function planReconcile({
     // then the ordinary review dispatcher. The write half compares recorded
     // fingerprints before re-arming; a read miss never revokes an acceptance.
     if (reviewLabelHeal !== 'off' && withPhase.check === 'green' && staleAcceptanceOwed(pr, { requireProof: false })
-        && !(Array.isArray(staleAcceptReleased) && staleAcceptReleased.includes(`${pr.number}@${String(pr.headRefOid ?? '').toLowerCase()}`)
-          && acceptStillUnsupersededOnSnapshot(pr))) {
+        && !releasedStaleAccept(staleAcceptReleased, pr)) {
       dispatch.push({ ...base, ...withPhase, kind: 'restore-review-label', variant: 'stale-accept',
         label: 'review:pending', why: 'head moved past its accept — verify coverage, then guarded re-arm hands a stale accept to independent review' });
       continue;

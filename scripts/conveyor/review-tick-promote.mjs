@@ -126,8 +126,8 @@ export function rearmStaleAcceptsThenReplan({ plan, rawPrs = null, repo, rearm, 
     try { result = rearm({ repo, pr, headSha }); } catch (e) { result = { ok: false, reason: oneLine(e) }; }
     // #5771: ONE coverage check. A refusal that PROVED the accept still covers the live head (`covers: true`) is not a
     // reason to keep holding the PR: the plan's row only nominated it, the guarded re-arm checked it. Release the hold.
-    const released = result?.ok !== true && result?.covers === true && String(result?.coveredHead ?? '').toLowerCase() === headSha.toLowerCase();
-    rearms.push({ pr, ok: result?.ok === true, ...(released ? { released: true } : {}),
+    const released = result?.ok !== true && result?.covers === true && typeof result?.acceptEvidence === 'string' && result.acceptEvidence !== '' && String(result?.coveredHead ?? '').toLowerCase() === headSha.toLowerCase();
+    rearms.push({ pr, ok: result?.ok === true, ...(released ? { released: true, evidence: result.acceptEvidence } : {}),
       why: result?.ok === true ? 're-armed review of the moved head'
         : released ? `acceptance verified to still cover the moved head — stale-accept hold released (${String(result?.reason ?? 'covers').slice(0, 120)})`
           : String(result?.reason ?? 're-arm not confirmed') });
@@ -135,7 +135,7 @@ export function rearmStaleAcceptsThenReplan({ plan, rawPrs = null, repo, rearm, 
   // Bound to the PROVED head: the re-plan suppresses the stale-accept branch only for `pr@head` keys of a proven cover, so the
   // planner itself emits the PR's normal rows (attempts/cap included - the red team needs them). A PR that moved again since
   // the proof does not match its key and keeps the row (a fresh obligation). If the re-plan fails the ORIGINAL plan stays: held.
-  const releasedKeys = rearms.filter((r) => r.released).map((r) => `${r.pr}@${rows.get(r.pr).toLowerCase()}`);
+  const releasedKeys = rearms.filter((r) => r.released).map((r) => `${r.pr}@${rows.get(r.pr).toLowerCase()}#${r.evidence}`);
   const rearmed = new Set(rearms.filter((r) => r.ok).map((r) => r.pr));
   if ((!rearmed.size && !releasedKeys.length) || typeof replan !== 'function') return { plan, rawPrs, rearms, replanError: null };
 
@@ -151,6 +151,16 @@ export function rearmStaleAcceptsThenReplan({ plan, rawPrs = null, repo, rearm, 
     // A FRESH read, never the old snapshot with a synthesized label swap: the real swap's exact label result is GitHub's.
     const next = replan(null, releasedKeys.length ? { staleAcceptReleased: releasedKeys } : undefined);
     if (!next || !Array.isArray(next.dispatch)) throw new Error('re-plan returned no dispatch list');
+    // Re-prove right after the re-plan (formal reviews and the full thread are re-read): a cover that does not hold AGAIN, for the
+    // same head and accept evidence, keeps the ORIGINAL (held) plan. This closes the proof -> re-plan window the planner cannot see.
+    for (const r of rearms.filter((x) => x.released)) {
+      const again = rearm({ repo, pr: r.pr, headSha: rows.get(r.pr) });
+      if (!(again?.ok !== true && again?.covers === true && again?.acceptEvidence === r.evidence
+          && String(again?.coveredHead ?? '').toLowerCase() === rows.get(r.pr).toLowerCase())) {
+        r.why = `${r.why} - then NOT confirmed after the re-plan, hold kept`; delete r.released;
+        return { plan, rawPrs: nextPrs ?? rawPrs, rearms, replanError: null };
+      }
+    }
     return { plan: next, rawPrs: nextPrs ?? rawPrs, rearms, replanError: null };
   } catch (e) {
     return { plan, rawPrs: nextPrs ?? rawPrs, rearms, replanError: oneLine(e) };
