@@ -82,6 +82,17 @@ describe('stale-state — observed liveness, no cleanup', () => {
     const { declaration } = fixture({ leases: [lease()], ahead: new Error('git failed') });
     expect((await invoke(declaration)).records[0].hasUnsafeWork).toBeNull();
   });
+  it('runs the ahead probe in a lane under lane Git hardening, never a bare process env', async () => {
+    const { run, read } = fixture({ leases: [lease()] });
+    vi.stubEnv('GIT_EXTERNAL_DIFF', 'echo inherited');
+    try { read(); } finally { vi.unstubAllEnvs(); }
+    const [, , opts] = run.mock.calls.find(([bin]) => bin === 'git');
+    const pins = Object.entries(opts.env).filter(([k]) => k.startsWith('GIT_CONFIG_KEY_')).map(([, v]) => v);
+    expect(pins).toEqual(expect.arrayContaining(['core.fsmonitor', 'core.hooksPath']));
+    expect(opts.env.GIT_EXTERNAL_DIFF).toBeUndefined();
+    expect(opts.env.GIT_CONFIG_NOSYSTEM).toBe('1');
+    expect(opts.env.GIT_OPTIONAL_LOCKS).toBe('0');
+  });
   it('enumerates claims and all runs, retaining missing and corrupt evidence', async () => {
     const { declaration } = fixture({
       claims: { '123-active.md': '---\nstatus: active\nclaimedBy: person\ndateStarted: 2026-09-14\n---\n',
