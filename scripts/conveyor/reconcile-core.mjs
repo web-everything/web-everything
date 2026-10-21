@@ -3156,7 +3156,9 @@ export function planReconcile({
       // An infra-cancelled re-run is bounded by ALL attempts (confirmed + rejected/refused), so a re-run the API keeps
       // rejecting falls through to ci-heal instead of being re-planned forever; ordinary timeouts keep confirmed-only.
       // (No observed budget stays `undefined`, which never authorizes a re-run.)
-      const retrySpent = pr.timeoutRetry?.infraCancelled && retryBudget?.confirmed !== undefined
+      // Live #5768 audit: under a gate-red retry grant, rejected re-runs count too, so a re-run the API keeps
+      // rejecting can never hold off the granted ci-heal (or its terminal hand-off) forever.
+      const retrySpent = (pr.timeoutRetry?.infraCancelled || gateRedRetryGrants.has(prNumber)) && retryBudget?.confirmed !== undefined
         ? retryBudget.confirmed + (retryBudget.rejected ?? 0) : retryBudget?.confirmed;
       if (retrySpent < (pr.timeoutRetry?.infraCancelled ? (pr.timeoutRetry.cap ?? 6) : 2) && pr.timeoutRetry?.eligible && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber) {
         dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', timeoutRetry: pr.timeoutRetry,
