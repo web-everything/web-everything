@@ -1,7 +1,7 @@
 // @vitest-environment node
 /** Batch IO ordering, refusal and durable retry boundaries using injected transports. */
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publishBatch, sealDueBatches, HOLD_LABEL, VERIFY_UNRUN_CAP, resolveAdoptDescendantHead } from '../card-batch-seal-io.mjs';
@@ -284,6 +284,29 @@ it('re-arms a capacity-paused seal only after the pause and with a free heavy sl
   expect(saved.verifyUnrun).toBeUndefined();
   expect(saved.verifyRetryAfter).toBeUndefined();
   expect(saved.sealedAt).toBe(500);
+});
+it('re-arm never races a running worker: a live batch lease blocks it and the pause is left untouched', async () => {
+  const f = fixture({ maxCards: 1 }); const spawn = vi.fn(fakeChild);
+  unrunPausedState(f, 10_000);
+  const lockPath = `${f.statePath}.lock`;
+  const held = JSON.stringify({ owner: 'seal:worker', expiresAt: 3_600_000, token: 'worker-token' });
+  writeFileSync(lockPath, held);
+  const before = readFileSync(f.statePath, 'utf8');
+  const free = vi.fn(async () => ({ freeCount: 1 }));
+  expect(await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: free })).toEqual([]);
+  expect(spawn).not.toHaveBeenCalled();
+  expect(readFileSync(f.statePath, 'utf8')).toBe(before);
+  expect(readFileSync(lockPath, 'utf8')).toBe(held);
+  // Once the worker's lease has expired the re-arm may proceed, and it releases its own lease afterwards.
+  expect(await sealDueBatches({ now: 3_600_001, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: free })).toEqual([f.statePath]);
+  expect(JSON.parse(readFileSync(f.statePath, 'utf8')).verifyRetryAfter).toBeUndefined();
+  expect(existsSync(lockPath)).toBe(false);
+});
+it('a successful re-arm releases the batch lease for the worker it launches', async () => {
+  const f = fixture({ maxCards: 1 });
+  unrunPausedState(f, 10_000);
+  await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn: vi.fn(fakeChild), readHeavyQueue: async () => ({ freeCount: 1 }) });
+  expect(existsSync(`${f.statePath}.lock`)).toBe(false);
 });
 it('a verify that RAN and failed still holds permanently', async () => {
   const f = fixture({ maxCards: 1 });
