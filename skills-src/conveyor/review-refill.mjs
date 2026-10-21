@@ -28,7 +28,11 @@
  *   Single-flight: `lock` is one mutex shared by the pass and the refill. The refill only TRY-acquires (busy =
  *   skip); the pass waits for it.
  *
- * THE HOOK in `skills-src/conveyor/review-daemon.mjs` (not applied yet: the file is held by open PRs). 6 small edits:
+ *   Ruling (operator, 2026-10-20): the daemon's own log wrapper may rotate its log files when ANY log line is written.
+ *   That is the daemon's logging, not a write by the refill. The refill writes nothing itself, silences the
+ *   cascade's own source line, and calls `liveReviewRoundBudget` exactly as the pass does (no extra logging added).
+ *
+ * THE HOOK in `skills-src/conveyor/review-daemon.mjs` (not applied yet: the file is held by open PRs). 4 small edits:
  *
  *   1. top of file:
  *        import { createReviewRefill } from './review-refill.mjs';
@@ -39,8 +43,8 @@
  *        `tickOnce: () => refill.guardPass(() => withReviewFetchTick(async () => {`   and its closing `}),` becomes `})),`
  *   4. in `tickOnce`, wrap the existing plan tap so the refill sees every repo's plan:
  *        `const onPlan = refill.tapPlan(sharing.reusePlan ? ({ repo, plan, rawPrs }) => plans.set(repo, { plan, rawPrs }) : null);`
- *   5. at the top of `onTick: (result) => {`:
- *        refill.notePass(result);
+ *   (There is no `onTick` edit: `guardPass` receives the pass's own result from `tickOnce` and captures the queue and
+ *   the idle-minutes comparison itself, before it releases the lock.)
  */
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -259,7 +263,13 @@ export function createReviewRefill({
   async function guardPass(fn) {
     const release = await lock.acquire('pass');
     planning = new Map(); // plans left by an earlier aborted pass are never trusted
-    try { return await fn(); } finally { planning = new Map(); release(); } // an aborted pass leaves nothing behind
+    try {
+      const out = await fn();
+      // The guarded function returns the pass's own result (dispatched, notStarted, skipped...). Capture the queue
+      // HERE, while the plans are still held, so a successful pass always leaves its queue behind.
+      try { notePass(out); } catch { /* doubt: no queue */ }
+      return out;
+    } finally { planning = new Map(); release(); } // an aborted pass leaves nothing behind
   }
 
   function start() {
