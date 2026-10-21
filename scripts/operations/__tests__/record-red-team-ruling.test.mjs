@@ -115,7 +115,7 @@ function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], i
     claim: (k) => { if (!gens.has(k)) { gens.set(k, { gen: 0, at: clock }); return { created: true, gen: 0, at: clock }; } return { created: false, ...gens.get(k) }; },
     reclaim: (k, g) => { if (gens.get(k).gen !== g) return false; gens.set(k, { gen: g + 1, at: clock }); return true; },
     spawned: (k) => receipts.has(k), markSpawned: (k) => { if (receiptFails) throw new Error('receipt write failed'); receipts.add(k); }, now: () => clock,
-    attempted: (k) => attempts.has(k), markAttempt: (k) => { if (attemptFails) throw new Error('disk full'); attempts.add(k); }, clearAttempt: (k) => attempts.delete(k),
+    attempted: (k) => attempts.has(k), markAttempt: (k) => { if (attemptFails) throw new Error('disk full'); if (attempts.has(k)) return false; attempts.add(k); return true; }, clearAttempt: (k) => attempts.delete(k),
     claimBreak: (k, job) => { if (!breakOwners.has(k)) breakOwners.set(k, job); return breakOwners.get(k); },
   };
   const sinks = createRecordRedTeamRulingSinks({
@@ -561,6 +561,30 @@ describe('audit round 5: at most one spawn per card job', () => {
   it('an attempt marker that cannot be written spawns nothing', () => {
     const f = fake({ attemptFails: true });
     expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/disk full/);
+    expect(f.cards).toHaveLength(0);
+  });
+});
+
+describe('audit round 6: the attempt marker is exclusive', () => {
+  it('two exact retries racing past the claim spawn once', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createFileClaims } = await import('../record-red-team-ruling-io.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'claims-'));
+    try {
+      const c = createFileClaims({ dir });
+      expect(c.markAttempt('j')).toBe(true);
+      expect(c.markAttempt('j')).toBe(false);
+      c.clearAttempt('j');
+      expect(c.markAttempt('j')).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('an invocation that loses the attempt race refuses without spawning', () => {
+    const f = fake();
+    const real = f.memClaims.markAttempt;
+    f.memClaims.markAttempt = (k) => { real(k); return real(k); }; // a rival took the attempt between the check and ours
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/may have started its landing job/);
     expect(f.cards).toHaveLength(0);
   });
 });

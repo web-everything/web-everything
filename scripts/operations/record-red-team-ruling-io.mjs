@@ -110,7 +110,12 @@ export function createFileClaims({ dir = join(automationStateRoot(), 'red-team-r
     },
     spawned(key) { return existsSync(join(dir, `${key}.spawned`)); },
     attempted(key) { return existsSync(join(dir, `${key}.attempt`)); },
-    markAttempt(key) { mkdirSync(dir, { recursive: true }); writeFileSync(join(dir, `${key}.attempt`), JSON.stringify({ at: nowMs() })); },
+    /** Exclusive (`wx`): exactly one invocation ever holds a job's attempt; false when another already does. */
+    markAttempt(key) {
+      mkdirSync(dir, { recursive: true });
+      try { writeFileSync(join(dir, `${key}.attempt`), JSON.stringify({ at: nowMs() }), { flag: 'wx' }); return true; }
+      catch (e) { if (e?.code === 'EEXIST') return false; throw e; }
+    },
     clearAttempt(key) { rmSync(join(dir, `${key}.attempt`), { force: true }); },
     markSpawned(key, info) { writeFileSync(join(dir, `${key}.spawned`), JSON.stringify({ ...info, at: nowMs() })); },
     now: nowMs,
@@ -240,11 +245,10 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
         // AT MOST ONCE: an attempt marker is written BEFORE the spawn and cleared only when the spawn reported that it
         // did not start. A marker with no receipt means a child MAY be running (a crash between the spawn and the
         // receipt), so a re-run refuses instead of spawning a second filing.
-        if (claims.attempted(p.jobKey)) {
+        if (claims.attempted(p.jobKey) || !claims.markAttempt(p.jobKey)) {
           throw new Error(`an earlier attempt of card job ${p.jobKey} may have started its landing job (no spawn receipt was recorded); nothing written. `
             + `Check the landing log for session ${session}; the job is owed, not lost`);
         }
-        claims.markAttempt(p.jobKey);
         card = fileCard(p.cardInput, session);
         if (!card?.ok) {
           claims.clearAttempt(p.jobKey); // the spawn itself reported no child
