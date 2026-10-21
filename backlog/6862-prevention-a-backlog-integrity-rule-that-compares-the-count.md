@@ -1,20 +1,21 @@
 ---
+bornAs: xuur550
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5230-prevention-add-a-check-standards-rule-that-fails-when-a-back.md"]
-dateOpened: "2026-10-14"
+scope: ["we:backlog/5749-drain-remove-the-unlocked-fallback-on-the-numbering-and-land.md"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Make the prevention-filer dedupe compare the guard's semantic intent, or have a human confirm eac… (from web-everything/web-everything#5275 review)
+# Prevention — A backlog-integrity rule that compares the count of test files named in the estimate with the sco… (from web-everything/web-everything#5433 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5230-prevention-add-a-check-standards-rule-that-fails-when-a-back.md:28` — Make the prevention-filer dedupe compare the guard's semantic intent, or have a human confirm each match before the 'Also raised by' line is written, instead of matching on title similarity alone.
+1. `we:backlog/5749-drain-remove-the-unlocked-fallback-on-the-numbering-and-land.md:4` — A backlog-integrity rule that compares the count of test files named in the estimate with the scope entries. This is low value, so it is not worth a gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5275@70b330778faf65e44b5c709a5356d32bb4b2317b
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5433@64c8a8ab652c6f7824a8681c4fe4f5d4e09ee024
 
 ## Acceptance
 

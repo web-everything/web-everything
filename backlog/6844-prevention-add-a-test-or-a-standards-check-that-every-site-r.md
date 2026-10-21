@@ -1,23 +1,21 @@
 ---
+bornAs: xmha8po
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/human-surface-repark.mjs", "we:skills-src/conveyor/__tests__/review-daemon.test.mjs", "we:scripts/conveyor/__tests__/human-surface-repark.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/operations/review-pr.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Check whether a re-park comment for this head already exists before posting. Add a sweep test wit… (from web-everything/web-everything#5273 review)
+# Prevention — Add a test (or a standards check) that every site registering reviewPrOperation for a saved run g… (from web-everything/web-everything#5441 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/human-surface-repark.mjs:82` — Check whether a re-park comment for this head already exists before posting. Add a sweep test with a throwing `setLabels` and two ticks.
-2. `we:scripts/conveyor/human-surface-repark.mjs:60` — Make the sweep read files through `readPinnedChangedFiles`, or add a parity test that the sweep and gate classify the same renamed-out-of-workflow fixture identically.
-3. `we:scripts/conveyor/human-surface-repark.mjs:58` — Build the sweep's change list with `readPinnedChangedFiles` (or `previous_filename` plus a truncation check). Add a test that a rename out of a human-only path still triggers re-park.
-4. `we:skills-src/conveyor/__tests__/review-daemon.test.mjs:823` — Add a deterministic assertion comparing the two mocks’ invocationCallOrder values, or record their calls in a shared sequence and assert re-park precedes reconciliation.
+1. `we:scripts/operations/review-pr.mjs:2373` — Add a test (or a standards check) that every site registering `reviewPrOperation` for a saved run goes through `reviewSeatOptionsForRun`. Fix: have review-loop-cli build the parked-run registration from `reviewSeatOptionsForRun(parked, ...)`, or extend `rosterMatches` to compare the optional seats and fall back deliberately.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5273@0e3ecc1534a1b71df837b4f3100a6871fd32c73d
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5441@de799ad4a9bd487848d98719645bcd445a62f4dd
 
 ## Acceptance
 

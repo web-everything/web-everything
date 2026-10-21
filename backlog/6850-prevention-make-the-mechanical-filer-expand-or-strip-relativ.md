@@ -1,20 +1,21 @@
 ---
+bornAs: xnpq284
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/skip-unrelated.mjs", "we:scripts/lib/daemon-rebuild/__tests__/skip-unrelated.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:backlog/6280-prevention-add-a-card-lint-rule-any-card-that-adds-a-layer-t.md"]
+dateOpened: "2026-10-18"
 tags: []
 ---
 
-# Prevention — A review lens or lane check that flags net-diff files outside the card's declared paths; no deter… (from web-everything/web-everything#5273 review)
+# Prevention — Make the mechanical filer expand or strip relative references ('same as the X finding') into the… (from web-everything/web-everything#5564 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/daemon-rebuild/skip-unrelated.mjs:148` — A review lens or lane check that flags net-diff files outside the card's declared paths; no deterministic gate is proposed.
+1. `we:backlog/6280-prevention-add-a-card-lint-rule-any-card-that-adds-a-layer-t.md:21` — Make the mechanical filer expand or strip relative references ('same as the X finding') into the full text, and verify that every 'already tracked → #N' target has a matching 'Also raised by' line in the same change. Add a dedupe step that merges guards of the same class.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5273@7cc8ce09336093feb742cb39c663279c5892b52e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5564@80942932800d9a44d23d2db561a6ff354676012d
 
 ## Acceptance
 

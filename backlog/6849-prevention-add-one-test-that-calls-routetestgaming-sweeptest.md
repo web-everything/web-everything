@@ -1,20 +1,23 @@
 ---
+bornAs: xno10o6
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/6280-prevention-add-a-card-lint-rule-any-card-that-adds-a-layer-t.md"]
-dateOpened: "2026-10-18"
+scope: ["we:scripts/conveyor/test-gaming-route.mjs", "we:scripts/conveyor/__tests__/test-gaming-route.test.mjs"]
+dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Make the mechanical filer expand or strip relative references ('same as the X finding') into the… (from web-everything/web-everything#5564 review)
+# Prevention — Add one test that calls routeTestGaming/sweepTestGamingRoutes with no enabled and the setting fal… (from web-everything/web-everything#5537 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/6280-prevention-add-a-card-lint-rule-any-card-that-adds-a-layer-t.md:21` — Make the mechanical filer expand or strip relative references ('same as the X finding') into the full text, and verify that every 'already tracked → #N' target has a matching 'Also raised by' line in the same change. Add a dedupe step that merges guards of the same class.
+1. `we:scripts/conveyor/test-gaming-route.mjs:94` — Add one test that calls routeTestGaming/sweepTestGamingRoutes with no `enabled` and the setting false (via env), asserting no writes.
+2. `we:scripts/conveyor/test-gaming-route.mjs:21` — Reject any reason whose `;`-separated findings are not all `tests-removed`, plus a mixed-kind test.
+3. `we:scripts/conveyor/test-gaming-route.mjs:62` — Add a shared helper that bounds and neutralizes any agent-authored string before it is re-posted to a PR comment or the feed. Back it with a lint or check:standards rule that flags raw interpolation of marker-extracted text into postComment.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5564@80942932800d9a44d23d2db561a6ff354676012d
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5537@010df4874ac89d8fa83c8c72cab05d7533286273
 
 ## Acceptance
 

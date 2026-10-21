@@ -1,20 +1,24 @@
 ---
+bornAs: xnjo9uq
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/4322-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md"]
-dateOpened: "2026-10-17"
+scope: ["we:scripts/conveyor/human-surface-repark.mjs", "we:skills-src/conveyor/__tests__/review-daemon.test.mjs", "we:scripts/conveyor/__tests__/human-surface-repark.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add the two named planned regressions and require a constraint-to-test assertion mapping whenever… (from web-everything/web-everything#5478 review)
+# Prevention — Check whether a re-park comment for this head already exists before posting. Add a sweep test wit… (from web-everything/web-everything#5273 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/4322-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md` — Add the two named planned regressions and require a constraint-to-test assertion mapping whenever preparation adds behavioral guarantees.
+1. `we:scripts/conveyor/human-surface-repark.mjs:82` — Check whether a re-park comment for this head already exists before posting. Add a sweep test with a throwing `setLabels` and two ticks.
+2. `we:scripts/conveyor/human-surface-repark.mjs:60` — Make the sweep read files through `readPinnedChangedFiles`, or add a parity test that the sweep and gate classify the same renamed-out-of-workflow fixture identically.
+3. `we:scripts/conveyor/human-surface-repark.mjs:58` — Build the sweep's change list with `readPinnedChangedFiles` (or `previous_filename` plus a truncation check). Add a test that a rename out of a human-only path still triggers re-park.
+4. `we:skills-src/conveyor/__tests__/review-daemon.test.mjs:823` — Add a deterministic assertion comparing the two mocks’ invocationCallOrder values, or record their calls in a shared sequence and assert re-park precedes reconciliation.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5478@e3efe4aed1c2306a5fa59036926f7b04449e8966
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5273@0e3ecc1534a1b71df837b4f3100a6871fd32c73d
 
 ## Acceptance
 

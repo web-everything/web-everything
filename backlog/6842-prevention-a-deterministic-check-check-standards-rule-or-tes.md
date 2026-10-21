@@ -1,23 +1,23 @@
 ---
+bornAs: x23h9ub
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/lib/card-batch-settings.mjs", "we:scripts/operations/__tests__/card-batch-seal-io.test.mjs", "we:scripts/lib/__tests__/card-batch-settings.test.mjs"]
+scope: ["we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/operations/red-team-gate-apply.mjs", "we:scripts/lib/__tests__/drain-merge-strategy.test.mjs", "we:scripts/operations/__tests__/red-team-gate-apply.test.mjs"]
 dateOpened: "2026-10-21"
 tags: []
 ---
 
-# Prevention — Add a table-driven test over the state combinations {sealFailure, verifyRetryAfter, seal} for sea… (from web-everything/web-everything#5800 review)
+# Prevention — A deterministic check (check:standards rule or test) that every call site of roundExtensionGrants… (from web-everything/web-everything#5758 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/card-batch-seal-io.mjs:323` — Add a table-driven test over the state combinations {sealFailure, verifyRetryAfter, seal} for sealDueBatches. A mutation-testing gate on the seal-io module would catch unguarded conditions of this kind.
-2. `we:scripts/operations/card-batch-seal-io.mjs:225` — Track a cumulative re-arm count (for example `verifyRearms`), escalate to sealFailure past a ceiling, and add a test that pins the ceiling.
-3. `we:scripts/lib/card-batch-settings.mjs:151` — Add a deterministic, parameterized precedence test covering each winning settings layer with distinct nondefault values, and run it in the existing test gate.
-4. `we:scripts/lib/card-batch-settings.mjs:150` — Add a deterministic precedence test matrix using distinct nondefault values for every layer, including a valid environment override.
+1. `we:scripts/lib/drain-merge-strategy.mjs:221` — A deterministic check (check:standards rule or test) that every call site of roundExtensionGrants, gateRoundGrants, readRedTeamDisposition and liveResultGateState in non-test code passes a standingRuling argument explicitly. Failing that, one wiring test per entry point.
+2. `we:scripts/operations/red-team-gate-apply.mjs:247` — One test per injectable that asserts the production default is wired. The PR's own `personalRoute` test is the model. Where cheap, add a lint rule that flags a new injectable default with no test that omits the injection.
+3. `we:scripts/lib/drain-merge-strategy.mjs:218` — Add a drain-merge-strategy test with an injected `readGrantScope` that asserts it is called and its result is forwarded to `redTeamEnqueueHold` and `syncRedTeamStatusLabels`. The same test pattern would cover the operator-queue enrich call.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5800@240061ecb1912ff1ef4c69535e5aa34503cf5f28
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5758@f67947e6d37da630e6760c9cab2d9e3141590df5
 
 ## Acceptance
 

@@ -1,22 +1,22 @@
 ---
+bornAs: xnu251a
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/test-gaming-route.mjs", "we:scripts/conveyor/__tests__/test-gaming-route.test.mjs"]
+scope: ["we:backlog/xo12t0v-prevention-add-a-check-standards-rule-that-fails-on-any-back.md"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Add one test that calls routeTestGaming/sweepTestGamingRoutes with no enabled and the setting fal… (from web-everything/web-everything#5537 review)
+# Prevention — Make the prevention filer's dedupe compare the check:standards rule subject (for example 'TODO in… (from web-everything/web-everything#5529 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:backlog/6225-prevention-add-a-check-standards-rule-that-fails-on-any-back.md:13` — Make the prevention filer's dedupe compare the check:standards rule subject (for example 'TODO in active card', 'Acceptance cites test file+name') instead of the exact wording, or have the filer fold sibling findings into one card per rule. Until then, the planned card-lint rules should be the single owner of these two rules.
 
-1. `we:scripts/conveyor/test-gaming-route.mjs:94` — Add one test that calls routeTestGaming/sweepTestGamingRoutes with no `enabled` and the setting false (via env), asserting no writes.
-2. `we:scripts/conveyor/test-gaming-route.mjs:21` — Reject any reason whose `;`-separated findings are not all `tests-removed`, plus a mixed-kind test.
-3. `we:scripts/conveyor/test-gaming-route.mjs:62` — Add a shared helper that bounds and neutralizes any agent-authored string before it is re-posted to a PR comment or the feed. Back it with a lint or check:standards rule that flags raw interpolation of marker-extracted text into postComment.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5473.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5537@010df4874ac89d8fa83c8c72cab05d7533286273
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5529@f027cc84ef3233044d0aa6065a6410af7e6e31cc
 
 ## Acceptance
 

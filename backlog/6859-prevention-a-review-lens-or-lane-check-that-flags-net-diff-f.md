@@ -1,20 +1,21 @@
 ---
+bornAs: xuhqh8y
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/6021-prevention-add-a-decision-table-test-for-decidedrainreviewga.md"]
+scope: ["we:scripts/lib/daemon-rebuild/skip-unrelated.mjs", "we:scripts/lib/daemon-rebuild/__tests__/skip-unrelated.test.mjs"]
 dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Have the prepare runner refuse to re-prepare, or add a check:standards rule that rejects pre-buil… (from web-everything/web-everything#5329 review)
+# Prevention — A review lens or lane check that flags net-diff files outside the card's declared paths; no deter… (from web-everything/web-everything#5273 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/6021-prevention-add-a-decision-table-test-for-decidedrainreviewga.md:28` — Have the prepare runner refuse to re-prepare, or add a check:standards rule that rejects pre-build wording in a card with status: resolved and dateResolved set, whenever the scope files already contain the cited predicate or test file.
+1. `we:scripts/lib/daemon-rebuild/skip-unrelated.mjs:148` — A review lens or lane check that flags net-diff files outside the card's declared paths; no deterministic gate is proposed.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5329@702760e7f6239666218dbe605bee1c38edc3fe25
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5273@7cc8ce09336093feb742cb39c663279c5892b52e
 
 ## Acceptance
 

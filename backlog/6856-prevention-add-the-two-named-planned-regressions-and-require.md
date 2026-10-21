@@ -1,21 +1,21 @@
 ---
+bornAs: xt7y6fp
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5967-decide-needs-a-human-before-review-and-reuse-a-same-head-rev.md"]
+scope: ["we:backlog/4322-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md"]
 dateOpened: "2026-10-17"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule that extracts every backticked test name from a card's Acceptance and… (from web-everything/web-everything#5558 review)
+# Prevention — Add the two named planned regressions and require a constraint-to-test assertion mapping whenever… (from web-everything/web-everything#5478 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5967-decide-needs-a-human-before-review-and-reuse-a-same-head-rev.md:19` — Add a check:standards rule that extracts every backticked test name from a card's Acceptance and fails if that name is not a bold name in its Test plan, or the reverse.
-2. `we:backlog/5967-decide-needs-a-human-before-review-and-reuse-a-same-head-rev.md:58` — Review lens or prepare-lint: every 'must call X before Y' sentence in Design needs a Test plan bullet that names the call and its order. This extends the existing prevention card 6042.
+1. `we:backlog/4322-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md` — Add the two named planned regressions and require a constraint-to-test assertion mapping whenever preparation adds behavioral guarantees.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5558@9528a353d97c65500df05768df32b6b4e1b1a4d4
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5478@e3efe4aed1c2306a5fa59036926f7b04449e8966
 
 ## Acceptance
 
