@@ -321,13 +321,13 @@ export async function provenMergedLanding(recorded, { repo, gh, git, remote = 'o
  * landing proof from scratch; nothing stored is evidence. No broad catch: only a clean "no" (identity mismatch, PR not
  * a matching MERGED one, a card not proven) is a refusal, and every other error propagates to the caller.
  */
-async function retireMergedMidSeal(recorded, input, { statePath, remote, gh, held: stillHeld, log, git }) {
+async function retireMergedMidSeal(recorded, input, { statePath, remote, gh, held: stillHeld, log, git, catFile }) {
   if (!Number.isSafeInteger(recorded.seq) || recorded.seq < 1 || !COMMIT_ID.test(String(recorded.headSha))
     || !Number.isSafeInteger(Number(recorded.pr)) || Number(recorded.pr) <= 0
     || recorded.repo && recorded.repo !== input.source.repo
     || recorded.kind && recorded.kind !== input.kind
     || recorded.batchRef !== `lane/card-batch-${input.kind}-${recorded.seq}`) return refuse('batch-sealed');
-  const missing = await provenMergedLanding(recorded, { repo: input.source.repo, gh, git, remote });
+  const missing = await provenMergedLanding(recorded, { repo: input.source.repo, gh, git, remote, catFile });
   if (missing.length) {
     log(`card-batch MERGED-mid-seal ${recorded.batchRef} PR ${recorded.pr}: but ${missing.length} card(s) not proven on main `
       + `(${missing.slice(0, 5).join(', ')}): kept held`);
@@ -344,13 +344,13 @@ async function retireMergedMidSeal(recorded, input, { statePath, remote, gh, hel
  * Retire a terminal sealed generation under the caller's admission lease; unreadable evidence stays held. */
 export async function retireTerminalBatch(recorded, input, {
   statePath, stateDir = dirname(statePath), remote = 'origin', gh = defaultGh,
-  held: stillHeld, log = line => process.stderr.write(`${line}\n`), git = null,
+  held: stillHeld, log = line => process.stderr.write(`${line}\n`), git = null, catFile = catFileBatch,
 }) {
   // A MERGED-mid-seal failure has its own path: the full proof on every attempt, and no catch-all (see below).
   if (recorded?.sealFailure?.terminalPrState === 'MERGED' && recorded.batchRef && recorded.sealedAt && recorded.pr
     && basename(dirname(statePath)) !== 'sealed') {
     return retireMergedMidSeal(recorded, input, { statePath, remote, gh, held: stillHeld, log,
-      git: git ?? recoveryGitIn(input.laneDir ?? ROOT) });
+      git: git ?? recoveryGitIn(input.laneDir ?? ROOT), catFile });
   }
   if ((!recorded?.sealFailure && recorded?.seal?.step !== 'label-on-green')
     || !recorded?.batchRef || !recorded.sealedAt || !recorded.pr

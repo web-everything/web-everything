@@ -751,7 +751,9 @@ describe('periodic terminal batch recovery with real Git', () => {
     }
     let drained = 0;
     let flushed = false;
+    // Pin filing ON: this asserts the drain after retirement, not the operator's live prevention.filingEnabled pause.
     const results = await reconcileCardBatches({ ...f.options, laneDir: f.laneDir, now: f.now(),
+      loadFilingSettings: () => ({ filingEnabled: true }),
       gh: async () => JSON.stringify({ number: 5272, headRefName: 'lane/card-batch-prevention-1', state: status }), log: () => {},
       drain: async (input, options) => {
         expect(input.drainPending).toBe(true);
