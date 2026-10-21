@@ -16,7 +16,7 @@
  *   The PR head is re-read right before the post; a moved head never gets the grant.
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { readHumanSurfaceNetFiles } from '../lib/human-surface-net-diff.mjs';
@@ -62,7 +62,17 @@ export function claimDir(env = process.env) { return join(resolveCoordinationRoo
 export function withPrLedger(slug, pr, fn, { dir = claimDir(), lock = withFileLock } = {}) {
   mkdirSync(dir, { recursive: true });
   const base = join(dir, createHash('sha256').update(`${slug}#${pr}`).digest('hex').slice(0, 32));
-  return lock(`${base}.lock`, () => {
+  let entered = false;
+  try {
+    return lock(`${base}.lock`, () => { entered = true; return readLedgerAndRun(); });
+  } catch (e) {
+    // Only OUR acquisition timing out marks the PR busy, with how long the holder has held it (gone = just released).
+    if (entered || !/^withFileLock: timed out/.test(String(e?.message))) throw e;
+    let lockAgeMs = Infinity;
+    try { lockAgeMs = Date.now() - statSync(`${base}.lock`).mtimeMs; } catch (s) { if (s?.code === 'ENOENT') lockAgeMs = 0; }
+    throw Object.assign(e, { code: 'LEDGER_BUSY', lockAgeMs });
+  }
+  function readLedgerAndRun() {
     let ledger = { seeded: false, baseline: 0, entries: [] };
     try {
       const raw = JSON.parse(readFileSync(`${base}.json`, 'utf8'));
@@ -71,8 +81,11 @@ export function withPrLedger(slug, pr, fn, { dir = claimDir(), lock = withFileLo
     } catch (e) { if (e?.code !== 'ENOENT') throw new Error(`auto-round-grant ledger unreadable for ${slug}#${pr}`); }
     const save = (next) => writeJsonAtomic(`${base}.json`, { repo: slug, pr, baseline: next.baseline, entries: next.entries });
     return fn({ ...ledger, save });
-  });
+  }
 }
+
+/** A busy PR lock defers a cap note only while its holder is plausibly still deciding; past this, the note alerts. */
+export const LEDGER_BUSY_DEFER_MS = 5 * 60_000;
 
 /** IO: the PR's state, head and comments (App identity). */
 export function readPrThread(repo, pr, { gh = ghApp, readComments = readCompletePrComments } = {}) {
@@ -91,7 +104,8 @@ export function postPrComment(repo, pr, body, { gh = ghApp } = {}) {
  * The hook. Returns null when the note is not one the ruling covers at all (no reads made), else one of:
  *   { action: 'granted', count, max, key }      — skip the needs-you event; the cap is raised
  *   { action: 'already-granted', key }          — skip it too: a stale note for a hit another worker's grant answered
- *   { action: 'deferred', why }                 — skip it this pass: another worker holds this PR's lock
+ *   { action: 'deferred', why }                 — skip it this pass: another worker holds this PR's lock (young
+ *                                                  hold only), or an operator grant landed after the note's snapshot
  *   { action: 'cap-reached', used, max, reason } — publish with this reason
  *   { action: 'skip', why }                      — publish unchanged
  *   { action: 'failed', why }                    — publish unchanged (reservation kept; a person decides)
@@ -119,6 +133,13 @@ export function autoRoundGrant({ repo, note, pr }, {
       let thread;
       try { thread = readThread(slug, note.prNumber); } catch (e) { return { action: 'skip', why: `thread unreadable: ${firstLine(e)}` }; }
       const comments = thread?.comments ?? [];
+      // An operator grant that landed after this note's snapshot means the note judged a cap that is no longer
+      // current: the next pass re-judges it on a snapshot that includes the grant (bounded: one pass). Both counts use
+      // the same scope-free reader, so they never disagree about what the snapshot already credited.
+      if (Array.isArray(pr?.comments) && countGrantedRoundExtensions(comments, { repo: slug, pr: note.prNumber })
+        > countGrantedRoundExtensions(pr.comments, { repo: slug, pr: note.prNumber })) {
+        return { action: 'deferred', why: 'an operator grant landed after this note was raised; the next pass re-judges the cap' };
+      }
       let entries = ledgerEntries;
       const recordsNow = countStandingRulingGrantRecords(comments, { repo: slug, pr: note.prNumber });
       const { episodes, unrecoverable } = standingRulingGrantEpisodes(comments, { repo: slug, pr: note.prNumber });
@@ -138,14 +159,16 @@ export function autoRoundGrant({ repo, note, pr }, {
         }
       }
       const seed = seeded ? baseline : 0;
-      const scope = scopeOf({ repo: slug, pr: { number: note.prNumber, headRefOid: thread?.headRefOid, comments }, ruling });
+      const scopeNow = () => scopeOf({ repo: slug, pr: { number: note.prNumber, headRefOid: thread?.headRefOid, comments }, ruling });
       if (entries.some((e) => e.key === key)) {
         // A stale note (another worker's snapshot) for a limit hit already answered by a grant the trusted reader
         // credits on the fresh thread is moot: never alert or park over it. A claim with no credited grant stays a skip.
-        const answered = roundExtensionGrants(comments, { repo: slug, pr: note.prNumber, standingRuling: scope })
+        // The scope reads run only when a record for this hit is on the thread at all.
+        const answered = episodes.includes(key) && roundExtensionGrants(comments, { repo: slug, pr: note.prNumber, standingRuling: scopeNow() })
           .some((g) => g.standingRuling && grantEpisode(comments[g.index]) === key);
         return answered ? { action: 'already-granted', key } : { action: 'skip', why: `already claimed: ${key}` };
       }
+      const scope = scopeNow();
       const onGitHub = countAutoRoundGrants(comments, { repo: slug, pr: note.prNumber, standingRuling: scope });
       // Conservative: every automation grant record on the thread NOW (verified or not), the ledger (seeded from
       // historical grants) plus every reservation since, and the verified count — the largest wins.
@@ -196,8 +219,9 @@ export function autoRoundGrant({ repo, note, pr }, {
     });
   } catch (e) {
     // Another worker holds this PR's lock: it is deciding this same PR right now, so this note waits for the next
-    // pass (never alert or park over a grant that may be landing). An unreadable ledger: never grant, alert as usual.
-    if (/^withFileLock: timed out/.test(String(e?.message))) return { action: 'deferred', why: `ledger: ${firstLine(e)}` };
+    // pass (never alert or park over a grant that may be landing) — but only while the hold is young. A lock held
+    // past LEDGER_BUSY_DEFER_MS (a hung holder, a reused pid) and an unreadable ledger never grant and alert as usual.
+    if (e?.code === 'LEDGER_BUSY' && e.lockAgeMs < LEDGER_BUSY_DEFER_MS) return { action: 'deferred', why: `ledger: ${firstLine(e)}` };
     return { action: 'skip', why: `ledger: ${firstLine(e)}` };
   }
 }

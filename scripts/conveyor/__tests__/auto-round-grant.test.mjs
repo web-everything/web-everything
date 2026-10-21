@@ -16,7 +16,7 @@ import {
   AUTO_GRANT_CHANNEL, autoGrantKey, countAutoRoundGrants, decideAutoGrant, isCardOnlyNetDiff,
   resolveAutoRoundGrantSettings, screenAutoGrantNote, STANDING_RULING,
 } from '../auto-round-grant.mjs';
-import { autoRoundGrant, claimDir, withPrLedger, redact, readPrThread, postPrComment, stuckAfterGrant, STUCK_AFTER_GRANT_MS } from '../auto-round-grant-io.mjs';
+import { autoRoundGrant, claimDir, LEDGER_BUSY_DEFER_MS, withPrLedger, redact, readPrThread, postPrComment, stuckAfterGrant, STUCK_AFTER_GRANT_MS } from '../auto-round-grant-io.mjs';
 import { buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, roundExtensionGrants, standingRulingGrantEpisodes } from '../round-extension-mark.mjs';
 import { buildStandingRulingBody, citedGrantHeads, pickStandingRuling, verifyStandingRuling } from '../standing-ruling-mark.mjs';
 import { enrichPrsWithStandingRulingGrants, headBelongsToPr, headIsCardOnly, readOperatorIssues, readStandingRuling, readUneditedCommentIds, standingRulingScope } from '../standing-ruling-io.mjs';
@@ -383,7 +383,7 @@ describe('per-PR cap: ledger seeded from existing grants + reservations', () => 
   it('idempotent per limit hit; a busy lock never grants', () => {
     const gh = fakeGh(); const d = deps(gh);
     expect(call(d).action).toBe('granted');
-    expect(call(d)).toMatchObject({ action: 'skip', why: expect.stringMatching(/^already claimed/) });
+    expect(call(d)).toEqual({ action: 'already-granted', key: `${WE}#5654@${HEAD}:review:8/7` });
     expect(gh.post).toHaveBeenCalledTimes(1);
     expect(autoGrantKey({ repo: 'we', note, head: HEAD })).toBe(`${WE}#5654@${HEAD}:review:8/7`);
     const busy = fakeGh();
@@ -424,7 +424,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
       return { state: gh.t.state, headRefOid: gh.t.head, comments: gh.t.comments };
     });
     expect(call(deps(gh, { ledger: worker(dir) }))).toMatchObject({ action: 'granted', count: 1 });
-    expect(inner).toEqual({ action: 'skip', why: expect.stringMatching(/^ledger: withFileLock: timed out/) });
+    expect(inner).toEqual({ action: 'deferred', why: expect.stringMatching(/^ledger: withFileLock: timed out/) });
     expect(innerReads).toBe(0); expect(innerGh.post).not.toHaveBeenCalled();
     // The lock is released afterwards: the next limit hit is decided normally.
     expect(call(deps(gh, { ledger: worker(dir) }), later)).toMatchObject({ action: 'granted', count: 2 });
@@ -456,6 +456,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     expect(call(deps(gh, { ledger: lateWriter }))).toEqual({ action: 'skip', why: `already claimed: ${key}` });
     expect(gh.post).not.toHaveBeenCalled();
   });
+  // The hold here is LEDGER_BUSY_DEFER_MS+ old, so the note is not deferred: it alerts as usual (never silently stuck).
   it('a slow holder that is still alive keeps its lock past the stale age: no read, no post', () => {
     const dir = tmpDir(); const gh = fakeGh();
     const lockFile = ledgerPath(dir).replace(/\.json$/, '.lock');
@@ -470,7 +471,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     const dir = tmpDir(); const gh = fakeGh(); let inner;
     gh.post.mockImplementationOnce((_r, _p, body) => { inner = call(deps(gh, { ledger: worker(dir) }), later); landed(gh, body); });
     expect(call(deps(gh, { ledger: worker(dir) }))).toMatchObject({ action: 'granted' });
-    expect(inner).toMatchObject({ action: 'skip', why: expect.stringMatching(/^ledger: withFileLock: timed out/) });
+    expect(inner).toMatchObject({ action: 'deferred', why: expect.stringMatching(/^ledger: withFileLock: timed out/) });
     expect(gh.post).toHaveBeenCalledTimes(1);
   });
   it('the reservation is on disk before the post; a crash at the post still holds the slot for the next worker', () => {
@@ -526,6 +527,26 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
       expect(call(deps(gh, { ledger: worker(dir) }), fixNote)).toMatchObject({ action: 'granted' });
       expect(b.out.autoGrants).toEqual([expect.objectContaining({ action: 'deferred' })]);
       expect(b.parkToHuman).not.toHaveBeenCalled(); expect(b.publish).not.toHaveBeenCalled(); expect(b.postComment).not.toHaveBeenCalled();
+    });
+    it('a lock held past the deferral bound (hung holder, reused pid) does not defer: the note alerts and parks', () => {
+      const dir = tmpDir(); const gh = fakeGh();
+      const lockFile = ledgerPath(dir).replace(/\.json$/, '.lock');
+      writeFileSync(lockFile, `${process.ppid}\n`);
+      const old = new Date(Date.now() - LEDGER_BUSY_DEFER_MS - 60_000); utimesSync(lockFile, old, old);
+      const b = daemon(deps(gh, { ledger: worker(dir, { timeoutMs: 150, pollMs: 10, staleMs: 3_600_000 }) }));
+      expect(b.out.autoGrants).toEqual([expect.objectContaining({ action: 'skip', why: expect.stringMatching(/^ledger: withFileLock: timed out/) })]);
+      expect(b.parkToHuman).toHaveBeenCalledTimes(1); expect(b.publish).toHaveBeenCalledTimes(1);
+    });
+    it('an operator grant posted after the snapshot defers the note one pass; the next snapshot re-judges it', () => {
+      const gh = fakeGh({ comments: [manualGrant()] });
+      const b = daemon(deps(gh));
+      expect(b.out.autoGrants).toEqual([expect.objectContaining({ action: 'deferred', why: expect.stringContaining('operator grant landed after') })]);
+      expect(b.parkToHuman).not.toHaveBeenCalled(); expect(b.publish).not.toHaveBeenCalled(); expect(gh.post).not.toHaveBeenCalled();
+      // Bounded: once the snapshot itself carries that grant, the note is judged as usual.
+      const seen = { notes: [fixNote], prsByNumber: new Map([[5654, { number: 5654, headRefOid: HEAD, labels: [], comments: [manualGrant()] }]]) };
+      const out = runReconcileNotesAllRepos({ repos: ['we'], tick: () => seen, dryRun: false, safety, publish: vi.fn(), postComment: () => ({ ok: true }),
+        parkToHuman: () => ({ ok: true }), stuckAfterGrant: () => null, autoRoundGrant: (a) => autoRoundGrant(a, deps(gh)) });
+      expect(out.autoGrants[0].action).not.toBe('deferred');
     });
     it('a claimed limit hit whose grant never landed (failed post) still alerts and parks', () => {
       const dir = tmpDir(); const gh = fakeGh();
@@ -583,7 +604,7 @@ describe('audit round 3 patches', () => {
     expect(call(d)).toMatchObject({ action: 'failed' });
     const later = { ...note, attempts: 9, cap: 8 };
     gh.t.comments.push(autoGrant({ episode: autoGrantKey({ repo: WE, note: later, head: HEAD }) }));
-    expect(call(d, later)).toMatchObject({ action: 'skip', why: expect.stringMatching(/^already claimed/) });
+    expect(call(d, later)).toMatchObject({ action: 'already-granted' });
     // A failed reservation and two externally posted grants consume all three slots.
     gh.t.comments.push(autoGrant());
     expect(call(d, { ...note, attempts: 10, cap: 9 })).toMatchObject({ action: 'cap-reached', used: 3 });
@@ -608,7 +629,7 @@ describe('audit round 3 patches', () => {
   it('(c) a historical grant for the same limit hit blocks a second one on a fresh ledger', () => {
     const key = `${WE}#5654@${HEAD}:review:8/7`;
     const gh = fakeGh({ comments: [autoGrant({ episode: key })] });
-    expect(call(deps(gh))).toMatchObject({ action: 'skip', why: `already claimed: ${key}` });
+    expect(call(deps(gh))).toEqual({ action: 'already-granted', key });
     expect(gh.post).not.toHaveBeenCalled();
   });
   it('(c) a historical record without a recoverable key fails closed', () => {
