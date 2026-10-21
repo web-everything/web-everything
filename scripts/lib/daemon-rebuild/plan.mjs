@@ -329,6 +329,7 @@ export async function planOverlayStacks({
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
+  noPin = new Set(),
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -579,7 +580,7 @@ export async function planRebuild({
         // content is exactly what already passed smoke here, and the build it lands in is still smoked as usual.
         // A ref with no adopted head (a brand-new registration) falls through to the plain drop below, as before.
         const adoptedTip = adoptedTips.get(ref);
-        if (adoptedTip && adoptedTip !== ovSha && !establishedRefs.has(ref)) {
+        if (adoptedTip && adoptedTip !== ovSha && !establishedRefs.has(ref) && !noPin.has(ref)) {
           const pmt = git(['merge-tree', '--write-tree', '--no-messages', cur, adoptedTip]);
           const ptree = String(pmt.stdout ?? '').split('\n')[0].trim();
           if (pmt.status === 0 && ptree) {
@@ -722,7 +723,7 @@ export async function planRebuild({
   if (lostBases.length > 0) {
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]),
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin,
     });
   }
 
@@ -769,6 +770,22 @@ export async function planRebuild({
           + ` with live overlay(s) ${collidesWith.map((c) => c.ref).join(', ')} — merge them into it`,
       },
     });
+  }
+
+  // overlay-pin vs the retry pass — a pin is taken in place, so the retry pass above never offers the NEW tip a second
+  // chance once later overlays applied. Plan once more with pinning off for the pinned refs (exactly the pre-pin rules)
+  // and take that plan only when it is no worse: every pinned ref now applies at its new tip, nothing the pinned plan
+  // applied is missing, and nothing live is lost. Otherwise the pins stand.
+  const pinnedRefs = decisions.filter((d) => d.pinned).map((d) => d.ref);
+  if (pinnedRefs.length > 0 && noPin.size === 0) {
+    const alt = await planRebuild({
+      git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
+      keepIndependent, noPin: new Set(pinnedRefs),
+    });
+    const altApplied = new Set((alt.applied ?? []).map((a) => a.ref));
+    if (alt.ok && (alt.establishedLost?.length ?? 0) === 0
+      && pinnedRefs.every((r) => (alt.applied ?? []).some((a) => a.ref === r && !a.pinnedFrom))
+      && applied.every((a) => altApplied.has(a.ref))) return alt;
   }
 
   const inputsKey = createHash('sha256')
