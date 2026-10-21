@@ -132,9 +132,9 @@ it.each([0, 37, 10_000])('tailOf bounds disk reads for a file of %i bytes', asyn
     const hook = join(root, 'preload.mjs');
     writeFileSync(log, 'x'.repeat(size));
     writeFileSync(hook, preload);
-    // Node's loader can use readSync too. Measure only the call after static imports have finished.
     const result = spawnSync(process.execPath, ['--import', hook, '--input-type=module', '-e',
       `import { tailOf } from ${JSON.stringify(url)};
+       // Module loading can itself call readSync; measure only the operation below.
        globalThis.sweepReads.length = 0;
        tailOf(${JSON.stringify(log)}, 4096); console.log(JSON.stringify(globalThis.sweepReads));`], { encoding: 'utf8', timeout: 10_000, env: childEnv() });
     expect(result.status, result.stderr).toBe(0);
@@ -150,9 +150,9 @@ it('parseLiveJobs finds a REAL running review-job process in the real `ps` outpu
   } finally { child.kill(); }
 });
 
-it('tailOf reads the end of a REAL log, throws for a missing one, and the newest skip row wins', async () => {
-  await withRealRepo(async ({ root }) => {
-    const log = join(root, 'daemon.log');
+it('tailOf reads a REAL external log without changing the checkout, throws for a missing one, and the newest skip row wins', async () => {
+  await withRealRepo(async ({ tmp, root }) => {
+    const log = join(tmp, 'daemon.log');
     const filler = 'x'.repeat(200);
     const row = (n) => `merge-ai-prs · skip-reasons: [{"num":${n},"repo":"o/r","kind":"red-team-pending","reason":"r"}]`;
     writeFileSync(log, `${row(1)}\n${Array.from({ length: 50 }, () => filler).join('\n')}\n${row(2)}\n${filler}\n`);
@@ -160,7 +160,7 @@ it('tailOf reads the end of a REAL log, throws for a missing one, and the newest
     const tail = tailOf(log, 4096);
     expect(tail.length).toBeLessThanOrEqual(4096);
     expect(parseDrainSkips(tail).rows.map((r) => r.num)).toEqual([2]);
-    expect(() => tailOf(join(root, 'absent.log'))).toThrow(/does not exist/);
+    expect(() => tailOf(join(tmp, 'absent.log'))).toThrow(/does not exist/);
     expect(snapshot(root)).toEqual(before);
   });
 });

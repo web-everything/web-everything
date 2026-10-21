@@ -1065,6 +1065,10 @@ successes deduplicate until an item leaves NEEDS YOU; queue errors preserve all 
 The operations IO fidelity gate requires the shared real-repo fixture even for filesystem
 state: the notifier test proves its external state path leaves that checkout clean.
 
+When spying on filesystem reads in a child process, reset observations after importing the
+module and immediately before calling the operation. Node's module loader can use the same
+filesystem API; including its startup reads makes bounded-read assertions runtime-dependent.
+
 A core file that dynamically imports its CLI cannot await that import at module scope when
 its CLI statically imports the core. A staged Node probe of that cycle exits 13 with unsettled
 top-level await. Defer the import with `.then(...)`, and test both entry paths as subprocesses.
