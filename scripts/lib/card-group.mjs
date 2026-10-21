@@ -172,7 +172,8 @@ export function readReferenceMap({ base, cwd, run = gitRun }) {
 // line output (`"k/caf\303\251.md"`), and a `*` in a name is a glob. Either would read a changed file as absent.
 const zNames = r => String(r.stdout ?? '').split('\0').filter(Boolean);
 const LITERAL = { GIT_LITERAL_PATHSPECS: '1' };
-const utf8 = new TextDecoder('utf-8', { fatal: true });
+// `ignoreBOM: true` KEEPS a leading BOM in the text (the default strips it), so adding or removing one is a change.
+const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 /** IO: make sure every sha is in the object DB; fetch by sha only (no ref, no FETCH_HEAD). */
 export function ensureCommits({ shas, cwd, run = gitRun }) {
@@ -700,7 +701,7 @@ export function createCardGrouping({
             let found = null;
             try { found = JSON.parse(gh(['pr', 'list', '--repo', localSlug, '--head', g.branch, '--state', 'all', '--json', 'number,state']))[0] ?? null; } catch { continue; }
             if (found) { mutate(s => { const x = s.groups.find(y => isLocalGroupId(y, g.id)); if (x) x.pr = found.number; }); say(`${tag}: adopted #${found.number}`); }
-            else if (now() - (g.createdAt ?? 0) > 15 * 60_000) { mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); }); say(`${tag}: no PR was opened — record dropped, sources released`); dissolved.push(g.id); }
+            else if (now() - (g.createdAt ?? 0) > 15 * 60_000) { mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); s.failed[sourceSetKey(g.sources)] = now(); }); say(`${tag}: no PR was opened — record dropped, sources released`); dissolved.push(g.id); }
             continue;
           }
           let pr;
@@ -757,7 +758,9 @@ export function createCardGrouping({
             catch (e) { say(`${tag}: closing combined PR failed (${firstLine(e)}) — sources stay held, retried`); continue; }
           }
           for (const s of g.sources) comment(s.num, `Card group #${g.pr} dissolved (${why}). This PR goes back to the normal drain path. (drain.group, card xym8nt4)`);
-          mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); });
+          // Memo the dissolved source set, so form() does not rebuild the same group for retryMin (a known dissolve
+          // cause would otherwise re-form, re-comment and re-open every pass). A moved source head is a new set.
+          mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); s.failed[sourceSetKey(g.sources)] = now(); });
           say(`${tag}: dissolved — ${why}`);
           dissolved.push(g.id);
         }

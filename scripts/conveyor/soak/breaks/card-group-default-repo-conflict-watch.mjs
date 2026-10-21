@@ -12,8 +12,10 @@ export default {
   fixedBy: { sha: 'e55ef4474f96748122b3afcd42ca6955afb631fd', where: 'lane/xym8nt4-card-group',
     paths: ['scripts/conveyor/parked-pr-conflict-watch.mjs'] },
   fixPresent(root) {
-    return readFileSync(join(root, this.fixedBy.paths[0]), 'utf8')
-      .includes('resolvedRepo ??= provider.currentRepo(); // group ownership');
+    // The original line, or its fail-closed successor (card-group-unresolved-repo-conflict-watch).
+    const text = readFileSync(join(root, this.fixedBy.paths[0]), 'utf8');
+    return text.includes('resolvedRepo ??= provider.currentRepo(); // group ownership')
+      || text.includes('resolvedRepo = provider.currentRepo() || null;');
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');

@@ -1404,8 +1404,15 @@ export function watchParkedPrConflicts({
   // the provider's `currentRepo()` exists exactly for this ("fires only when `--repo` was omitted", its own
   // docblock) and was simply never called here.
   let resolvedRepo = repo;
+  let resolveTried = false;
   for (const pr of Array.isArray(prs) ? prs : []) {
-    resolvedRepo ??= provider.currentRepo(); // group ownership needs the default repo before any routing
+    // Group ownership needs the default repo before any routing. Resolved once per sweep; an empty, null or failed
+    // resolution FAILS CLOSED: the PR is held this sweep (an empty repo would read every PR as "not a group member").
+    if (!resolvedRepo && !resolveTried) {
+      resolveTried = true;
+      try { resolvedRepo = provider.currentRepo() || null; } catch { resolvedRepo = null; }
+    }
+    if (!resolvedRepo) { process.stderr.write(`parked-pr-conflict-watch: #${pr?.number} held — repository unresolved, card-group membership unknown (fail closed)\n`); continue; }
     // xym8nt4 — a post-approval card group's sources and combined PR belong to the drain's grouping while the
     // group is open: it dissolves the group on a conflict and returns the sources to the normal path, where
     // this watch applies again. A send-back here would strip the combined PR's review instead.

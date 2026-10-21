@@ -21,7 +21,8 @@ export const SKIP_KINDS = Object.freeze([
 /** Map a drain reason string to a stable kind. Order matters: the most specific signal wins. */
 export function classifySkipReason(reason) {
   const r = String(reason ?? '');
-  if (/^grouped into | is reserved by open card group |^card-group state unreadable/.test(r)) return 'card-grouped';
+  // All four card-group hold reasons (we:scripts/lib/card-group.mjs#cardGroupHold).
+  if (/^grouped into | is reserved by open card group |^card-group state unreadable|^card-group repository identity missing/.test(r)) return 'card-grouped';
   if (/^red-main-hold\b/.test(r)) return 'red-main-hold'; // we:scripts/lib/red-main-hold.mjs — main is red, only the fix PR lands
   if (/mergeable=UNKNOWN|merge state UNKNOWN/i.test(r)) return 'unknown-mergeability';
   if (/mergeable=CONFLICTING|DIRTY/.test(r) && !/BEHIND⇒/.test(r)) return 'conflicting';

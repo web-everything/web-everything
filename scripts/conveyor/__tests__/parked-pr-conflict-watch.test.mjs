@@ -158,6 +158,25 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
     }
   });
 
+  it.each([
+    ['returns an empty string', () => ''],
+    ['returns null', () => null],
+    ['throws', () => { throw new Error('gh repo view: not a git repository'); }],
+  ])('xym8nt4: when the default repo cannot be resolved (currentRepo %s), every PR is held — fail closed, no effect', (_, currentRepo) => {
+    const provider = { currentRepo: vi.fn(currentRepo), ensureLabel: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
+    const postFinding = vi.fn(), postStandDown = vi.fn();
+    const inCardGroupFn = vi.fn(() => false);
+    const results = watchParkedPrConflicts({ repo: null, sameLineConflict: 'stand-down', provider, postFinding, postStandDown, inCardGroupFn,
+      listPrs: () => [REAL_1920_SNAPSHOT, { ...REAL_1920_SNAPSHOT, number: 1921 }] });
+    expect(results).toEqual([]);
+    for (const effect of [provider.ensureLabel, provider.setLabels, provider.postComment, postFinding, postStandDown])
+      expect(effect).not.toHaveBeenCalled();
+    // Group membership is never judged with an empty repository (that read always answers "not a member").
+    expect(inCardGroupFn).not.toHaveBeenCalled();
+    // One resolution attempt per sweep, not one per PR.
+    expect(provider.currentRepo).toHaveBeenCalledTimes(1);
+  });
+
   it('once the PR is rebased clean (as #1920 actually was, mid-investigation) the label self-clears', () => {
     const healed = { ...REAL_1920_SNAPSHOT, mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [...REAL_1920_SNAPSHOT.labels, { name: CONFLICT_LABEL }] };
     const calls = [];

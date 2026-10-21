@@ -215,6 +215,17 @@ describe('buildCombined + verifyUnion (real git)', () => {
       expect(sourceLanded({ ref: seeded, source: { num: 1, headSha: src }, cwd: r.cwd })).toMatchObject({ ok: false, reason: expect.stringMatching(/not valid UTF-8/) });
       expect(() => verifyUnion({ base: seeded, combined: seeded, sources: [{ num: 1, headSha: src }], cwd: r.cwd })).toThrow(/not valid UTF-8/);
     });
+    it.each([['removes', true], ['adds', false]])('a source that only %s a UTF-8 BOM has not landed while main lacks the change', (_, baseHasBom) => {
+      const r = repo();
+      const bom = Buffer.from([0xef, 0xbb, 0xbf]), body = Buffer.from(card([1, 2]));
+      // The repo's base already holds the card without a BOM.
+      const seeded = baseHasBom ? r.branch('seed', () => writeFileSync(join(r.cwd, CARD), Buffer.concat([bom, body]))) : r.base;
+      const src = (() => { git(r.cwd, 'checkout', '-q', '-b', 'bom', seeded); writeFileSync(join(r.cwd, CARD), baseHasBom ? body : Buffer.concat([bom, body])); git(r.cwd, 'add', '--', CARD); git(r.cwd, 'commit', '-qm', 'bom'); const s = git(r.cwd, 'rev-parse', 'HEAD'); git(r.cwd, 'checkout', '-q', 'main'); return s; })();
+      expect(sourceLanded({ ref: seeded, source: { num: 1, headSha: src }, cwd: r.cwd }).ok).toBe(false);
+      expect(sourceLanded({ ref: src, source: { num: 1, headSha: src }, cwd: r.cwd }).ok).toBe(true);
+      expect(verifyUnion({ base: seeded, combined: seeded, sources: [{ num: 1, headSha: src }], cwd: r.cwd }).ok).toBe(false);
+      expect(verifyUnion({ base: seeded, combined: src, sources: [{ num: 1, headSha: src }], cwd: r.cwd }).ok).toBe(true);
+    });
     it('two sources that set different modes on one file disagree', () => {
       const r = repo();
       git(r.cwd, 'config', 'core.fileMode', 'true');
@@ -457,6 +468,26 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(groups).toHaveLength(2);
       expect(groups[1]).toMatchObject({ repo: 'o/r', pr: 77 });
     }
+  });
+
+  it.each([
+    ['combined PR closed without merging', { state: 'CLOSED', labels: [] }],
+    ['combined PR sent back', { state: 'OPEN', labels: [{ name: 'review:changes' }] }],
+  ])('a group dissolved because its %s is not rebuilt by the next form (retry memo)', (_, combined) => {
+    const t = setup();
+    const statePath = join(tmp(), 's.json');
+    let pr77 = null;
+    const exec = (cmd, args) => (args[0] === 'pr' && args[1] === 'view' && args[2] === '77' && pr77 ? JSON.stringify(pr77) : t.exec(cmd, args));
+    const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec, settings, log: { write() {} }, prestage: () => ({ allowed: true }),
+      cardConflictSettings: cc, statePath, withLock: fn => ({ ran: true, result: fn() }), readQueueFiles: () => ({ entries: [] }) });
+    expect(g.form({ outcomes: t.outcomes, verdicts: t.verdicts }).formed).toMatchObject({ pr: 77 });
+    pr77 = combined;
+    expect(g.reconcile({ force: true })).toMatchObject({ dissolved: [expect.any(String)] });
+    expect(Object.keys(readGroupState(statePath).failed)).toEqual([`1@${t.heads[1]},2@${t.heads[2]}`]);
+    const creates = t.calls.filter(c => c.startsWith('pr create')).length;
+    expect(g.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/retry backoff/);
+    expect(t.calls.filter(c => c.startsWith('pr create'))).toHaveLength(creates);
+    expect(readGroupState(statePath).groups).toEqual([]);
   });
 
   it('refuses without the land mutex, and when a source is already queued at claim time', () => {
