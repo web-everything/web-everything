@@ -378,6 +378,33 @@ export function resolveOverlayStackMode(env = process.env, { settingsPath = OVER
   }
 }
 
+/** overlay-rebase-on-merge (2026-10-21) — what a rebuild does with an overlay that conflicts with a NEW main:
+ *  `off` = today (hold/drop as before), `shadow` = log what it WOULD do (`overlay-auto-rebase-shadow`), `on` = rebase past
+ *  a proven merged-PR old head (`overlay-auto-rebased`) or set the overlay aside (`overlay-set-aside`) and keep building.
+ *  Cascade key `overlay.autoRebase` (standard `shadow`); `WE_DAEMON_OVERLAY_AUTO_REBASE=off` is the kill switch. */
+export const OVERLAY_AUTO_REBASE_ENV = 'WE_DAEMON_OVERLAY_AUTO_REBASE';
+export const OVERLAY_AUTO_REBASE_MODES = Object.freeze(['off', 'shadow', 'on']);
+
+/** @returns {{mode:'off'|'shadow'|'on', source:string}} — never throws; an unreadable cascade reads as `shadow`. */
+export function resolveOverlayAutoRebase(env = process.env, { settingsPath = OVERLAY_SETTINGS_PATH } = {}) {
+  const ev = typeof env?.[OVERLAY_AUTO_REBASE_ENV] === 'string' ? env[OVERLAY_AUTO_REBASE_ENV].trim() : undefined;
+  if (ev === 'off') return { mode: 'off', source: `env ${OVERLAY_AUTO_REBASE_ENV}` }; // kill switch wins outright
+  try {
+    let tool;
+    try { tool = JSON.parse(readFileSync(settingsPath, 'utf8'))?.overlay; } catch { tool = undefined; }
+    const r = cascadePolicy('overlay', tool, {
+      env,
+      standard: { autoRebase: 'shadow' },
+      envValues: { autoRebase: ev || undefined },
+      valid: { autoRebase: (v) => OVERLAY_AUTO_REBASE_MODES.includes(v) },
+    });
+    const mode = r.value?.autoRebase;
+    return OVERLAY_AUTO_REBASE_MODES.includes(mode) ? { mode, source: r.sources?.autoRebase ?? 'standard' } : { mode: 'shadow', source: 'standard' };
+  } catch {
+    return { mode: 'shadow', source: 'standard' };
+  }
+}
+
 /** Both reads are one small JSON row / one URL line; anything bigger is not what we asked for. */
 const GH_MAX_BUFFER = 1024 * 1024;
 

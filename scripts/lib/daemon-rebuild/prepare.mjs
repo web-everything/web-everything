@@ -21,6 +21,7 @@ import {
 } from './local-state.mjs';
 import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
+  resolveOverlayAutoRebase,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
@@ -261,6 +262,7 @@ export async function prepareRebuild({
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
+    autoRebase: resolveOverlayAutoRebase(env),
   });
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
@@ -272,6 +274,10 @@ export async function prepareRebuild({
   // (`state.pinnedNotified`: ref → the new tip last reported) is pruned to the refs still pinned this plan.
   const pinnedBefore = state.pinnedNotified && typeof state.pinnedNotified === 'object' ? state.pinnedNotified : {};
   const pinnedNow = {};
+  // overlay-rebase-on-merge — its three verdicts are logged once per (kind, ref, overlay tip, main), not every tick.
+  const ONCE_KINDS = new Set(['overlay-auto-rebased', 'overlay-set-aside', 'overlay-auto-rebase-shadow']);
+  const onceBefore = state.onceNotified && typeof state.onceNotified === 'object' ? state.onceNotified : {};
+  const onceNow = {};
   for (const event of plan.alerts || []) {
     if (event.kind === 'overlay-pinned') {
       const { ref, pr, newTip, files } = event.detail;
@@ -279,6 +285,15 @@ export async function prepareRebuild({
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
       if (pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
       if (pinnedBefore[ref] === newTip) continue;
+    }
+    if (ONCE_KINDS.has(event.kind)) {
+      const key = `${event.kind}|${event.detail?.ref}`;
+      const val = `${event.detail?.sha}@${event.detail?.mainSha}`;
+      onceNow[key] = val;
+      if (event.kind === 'overlay-set-aside' && event.detail?.pr != null) {
+        markOverlayConflictWake(env, { pr: event.detail.pr, ref: event.detail.ref, files: event.detail.hunks, at: nowIso(), clone: root });
+      }
+      if (onceBefore[key] === val) continue;
     }
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
@@ -291,8 +306,9 @@ export async function prepareRebuild({
       markOverlayConflictWake(env, { pr, ref, files, collidesWith, at: nowIso(), clone: root });
     }
   }
-  if (plan.ok && JSON.stringify(pinnedBefore) !== JSON.stringify(pinnedNow)) {
+  if (plan.ok && (JSON.stringify(pinnedBefore) !== JSON.stringify(pinnedNow) || JSON.stringify(onceBefore) !== JSON.stringify(onceNow))) {
     state.pinnedNotified = Object.keys(pinnedNow).length ? pinnedNow : null;
+    state.onceNotified = Object.keys(onceNow).length ? onceNow : null;
     writeState();
   }
   for (const [pr, wake] of readOverlayConflictWakes(env, { maxAgeMs: Infinity })) {
@@ -356,6 +372,8 @@ export async function prepareRebuild({
       removeOverlay(root, d.ref, { env, why: d.reason });
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
+    } else if (d.action === 'drop' && onceNow[`overlay-set-aside|${d.ref}`]) {
+      // already reported (once) as overlay-set-aside — no per-tick repeat
     } else if (d.action === 'drop') {
       alert('overlay-conflict-dropped', {
         ref: d.ref, reason: d.reason, ...(d.files ? { files: d.files } : {}),

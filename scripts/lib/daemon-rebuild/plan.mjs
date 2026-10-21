@@ -6,6 +6,7 @@ import { verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV } from '
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { recordedEdgeSha } from './edge-fetch.mjs';
 import { createHash } from 'node:crypto';
+import { mergedPrOldHeads, tryAutoRebase, autoRebaseSuffix } from './auto-rebase.mjs';
 
 // ── pinned overlays — the self-destruct guard ───────────────────────────────────────────────────────────────
 
@@ -329,7 +330,7 @@ export async function planOverlayStacks({
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
-  noPin = new Set(),
+  noPin = new Set(), autoRebase = { mode: 'off', source: 'default' },
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -406,6 +407,7 @@ export async function planRebuild({
     }
   }
   const conflictFiles = new Map(); // ref → the files its conflict named (for the x5059uu alerts below)
+  const setAsideOnMain = new Map(); // overlay-rebase-on-merge (`on`): ref → why it conflicts with main and could not be rebased
   const toProcess = [
     ...listed.filter((o) => establishedRefs.has(o?.ref)), ...listed.filter((o) => !establishedRefs.has(o?.ref)),
   ];
@@ -608,6 +610,44 @@ export async function planRebuild({
             alerts.pop(); // the pin could not be minted: fall through to the plain drop (and its x9diisp hold)
           }
         }
+        // overlay-rebase-on-merge — the overlay conflicts with MAIN itself (a PR it carried an older copy of merged).
+        // Rebase it past a PROVEN merged-PR old head (auto-rebase.mjs); `shadow` only says what it would do. With no
+        // proof (or no clean result) `on` sets it aside below instead of letting x9diisp freeze the whole clone.
+        if (autoRebase.mode !== 'off' && git(['merge-tree', '--write-tree', '--no-messages', mainSha, ovSha]).status === 1) {
+          const { candidates, mergedPrs } = await mergedPrOldHeads({
+            git, mainSha, ovSha, headSha, conflictFiles: files, stateOf, prForcePushes,
+          });
+          const rb = candidates.length ? tryAutoRebase({ git, cur, ovSha, candidates }) : { ok: false };
+          const said = { ref, pr, sha: ovSha, mainSha, mergedPrs, hunks: files, mode: autoRebase.mode, source: autoRebase.source };
+          if (autoRebase.mode === 'shadow') {
+            alerts.push({
+              kind: 'overlay-auto-rebase-shadow',
+              detail: {
+                ...said, wouldDo: rb.ok ? 'auto-rebase' : 'set-aside', ...(rb.ok ? { base: rb.base } : {}),
+                message: `shadow: ${ref} conflicts with main on ${files.join(', ') || '?'} — would ${rb.ok ? `auto-rebase it past PR #${rb.base.pr} (${rb.base.evidence})` : 'set it aside (no merged-PR old head explains the conflict)'}; doing today's behaviour (overlay.autoRebase=shadow, ${autoRebase.source})`,
+              },
+            });
+          } else if (rb.ok) {
+            const message = `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur}${autoRebaseSuffix(rb.base)}`;
+            const ct = git(['commit-tree', rb.tree, '-p', cur, '-p', ovSha, '-m', message], { env: rebuildCommitEnv(git, cur, ovSha) });
+            const newSha = String(ct.stdout ?? '').trim();
+            if (ct.status === 0 && newSha) {
+              cur = newSha;
+              applied.push({ ref, pr, sha: ovSha, resolvedVia: 'auto-rebase', rebaseBase: rb.base.sha, mergedPr: rb.base.pr });
+              decisions.push({ ref, pr, action: 'apply', reason: 'applied-auto-rebased', sha: ovSha });
+              alerts.push({
+                kind: 'overlay-auto-rebased',
+                detail: {
+                  ...said, base: rb.base,
+                  message: `auto-rebased ${ref} past merged PR #${rb.base.pr} (${rb.base.evidence} ${rb.base.sha.slice(0, 10)}): main's side kept only for that PR's older content; every later overlay change kept`,
+                },
+              });
+              continue;
+            }
+          } else {
+            setAsideOnMain.set(ref, { ...said, tried: candidates.map((c) => ({ sha: c.sha, pr: c.pr, evidence: c.evidence })) });
+          }
+        }
         if (resolution) alerts.push({
           kind: 'overlay-conflict-unresolved',
           detail: { ref, pr, sha: ovSha, files: resolution.files, tried: resolution.tried },
@@ -721,7 +761,7 @@ export async function planRebuild({
   if (lostBases.length > 0) {
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin,
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, autoRebase,
     });
   }
 
@@ -740,6 +780,20 @@ export async function planRebuild({
       && carriedHeads.get(d.ref).every((sha) => git(['merge-base', '--is-ancestor', sha, cur]).status === 0);
     // An ESTABLISHED current tip always holds: another carrier preserving only an OLDER recorded tip says nothing
     // about the newer live changes. The carriedSurvives exception applies only to changed-tip newcomers.
+    // overlay-rebase-on-merge (`on`) — an overlay that conflicts with MAIN and that no merged-PR old head explains is SET
+    // ASIDE, loudly, instead of holding the whole clone (operator ruling 2026-10-21 15:05 ET): it stays registered, every
+    // other overlay keeps building, and the alert names its ref and files. A drop retried back in is not set aside.
+    const aside = setAsideOnMain.get(d.ref);
+    if (aside) {
+      alerts.push({
+        kind: 'overlay-set-aside',
+        detail: {
+          ...aside, live: establishedRefs.has(d.ref) || carriedRefs.has(d.ref),
+          message: `set aside ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''}: it conflicts with main on ${aside.hunks.join(', ') || '?'} and no merged-PR old head explains it — building everything else without it; rebase it onto main to bring it back`,
+        },
+      });
+      continue;
+    }
     if (establishedRefs.has(d.ref) || (carriedRefs.has(d.ref) && !carriedSurvives)) {
       establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: 'conflict', files });
       alerts.push({
@@ -778,7 +832,7 @@ export async function planRebuild({
   if (pinnedRefs.length > 0 && noPin.size === 0) {
     const alt = await planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent, noPin: new Set(pinnedRefs),
+      keepIndependent, noPin: new Set(pinnedRefs), autoRebase,
     });
     const altApplied = new Set((alt.applied ?? []).map((a) => a.ref));
     if (alt.ok && (alt.establishedLost?.length ?? 0) === 0
@@ -788,7 +842,7 @@ export async function planRebuild({
 
   const inputsKey = createHash('sha256')
     .update(JSON.stringify({ main: mainSha, overlays: applied.map((a) => a.resolvedVia
-      ? [a.ref, a.sha, a.resolvedVia, a.edgeSha ?? null] : [a.ref, a.sha]) }))
+      ? [a.ref, a.sha, a.resolvedVia, a.edgeSha ?? a.rebaseBase ?? null] : [a.ref, a.sha]) }))
     .digest('hex')
     .slice(0, 16);
 
