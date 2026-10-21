@@ -40,6 +40,7 @@ import {
   TRUST_PATH,
   SETTINGS_PATH,
   main,
+  gitIdentityStatus,
 } from '../bootstrap-session.mjs';
 
 const step = (steps, id) => steps.find((s) => s.id === id);
@@ -1205,5 +1206,51 @@ describe('main() — the installer orchestration', () => {
     expect(report(vmForcedLaptop)).toMatchObject({ host: 'laptop', writes: false });
     const laptopForcedVm = spyIo({ env: LAPTOP }); main(['--ephemeral', '--json'], laptopForcedVm);
     expect(report(laptopForcedVm)).toMatchObject({ host: 'ephemeral', writes: true });
+  });
+});
+
+// 2026-10-05..20: the global git config said `test` / `test@test.com` and every lane commit carried it. The
+// SessionStart report is where the operator already looks, so the identity is a step there, and a `drift` one.
+describe('git-identity step', () => {
+  const lists = { names: ['test'], emails: [], emailDomains: ['test.com'] };
+  const ident = (name, email) => () => ({ author: { name, email }, committer: { name, email } });
+
+  it('drift on the incident identity, with the fix line', () => {
+    const s = gitIdentityStatus({ read: ident('test', 'test@test.com'), lists });
+    expect(s).toMatchObject({ id: 'git-identity', status: 'drift' });
+    expect(s.detail).toMatch(/PLACEHOLDER/);
+    expect(s.detail).toMatch(/git config --global user\.name/);
+  });
+  it('drift on a missing identity', () => {
+    expect(gitIdentityStatus({ read: ident('', ''), lists }).detail).toMatch(/^MISSING/);
+  });
+  it('ok on a real identity, without printing the email', () => {
+    const s = gitIdentityStatus({ read: ident('Ada Lovelace', 'ada@analytical.engine'), lists });
+    expect(s).toEqual({ id: 'git-identity', status: 'ok', detail: 'author "Ada Lovelace" ok' });
+  });
+  it('a throwing reader is drift, never a crash', () => {
+    expect(gitIdentityStatus({ read: () => { throw new Error('boom'); }, lists }).status).toBe('drift');
+  });
+  it('no reader → skipped', () => {
+    expect(gitIdentityStatus({}).status).toBe('skipped');
+  });
+
+  it('main(): a placeholder identity reaches --check\'s exit code and the printed report', () => {
+    const run = (readGitIdentity, argv) => {
+      const io = {
+        lines: [],
+        readSettings: () => ({ permissions: { allow: [] }, outputStyle: 'x' }),
+        writeSettings: () => {}, readTrust: () => ({}), writeTrust: () => {},
+        installHook: () => 'registered', uninstallHook: () => 'removed',
+        runSkills: () => ({ ok: true, out: 'in sync' }), symlink: () => {},
+        exists: everythingButThePool, env: {}, out: (l) => io.lines.push(l), readGitIdentity,
+      };
+      return { io, code: main(argv, io) };
+    };
+    const bad = run(ident('test', 'test@test.com'), ['--check', '--json']);
+    expect(JSON.parse(bad.io.lines.join('\n')).steps.find((s) => s.id === 'git-identity').status).toBe('drift');
+    expect(bad.code).toBe(1);
+    const text = run(ident('test', 'test@test.com'), ['--check']);
+    expect(text.io.lines.some((l) => /drift\s+git-identity/.test(l))).toBe(true);
   });
 });

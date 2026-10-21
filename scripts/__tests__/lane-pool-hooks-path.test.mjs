@@ -1,0 +1,174 @@
+/**
+ * @file lane-pool-hooks-path.test.mjs — every lane points `core.hooksPath` at the tracked `.githooks`, so the
+ *   pre-commit guards (incl. the placeholder-author guard) run even when npm `prepare` never did. Audit finding:
+ *   `provision --no-install` skips npm, and a `--reference` clone does not inherit `core.hooksPath`.
+ *   Real throwaway origin + reference, private LANE_POOL_ROOT (same fixture shape as lane-pool-provision-dry-run).
+ */
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { spawnSync, execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { ensureLaneHooksPath, LANE_HOOKS_PATH } from '../lib/git-identity.mjs';
+
+const POOL_SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
+const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+
+describe('ensureLaneHooksPath (injected IO) — the EFFECTIVE value, every scope', () => {
+  const has = () => true;
+  const GET = ['config', '--show-scope', '--get', 'core.hooksPath'];
+  // A fake git whose config is a scope→value map, resolved worktree > local > global like real git.
+  const fakeGit = (cfg) => {
+    const calls = [];
+    const run = (args) => {
+      calls.push(args);
+      if (args.join(' ') === GET.join(' ')) {
+        for (const sc of ['worktree', 'local', 'global']) if (cfg[sc]) return `${sc}\t${cfg[sc]}\n`;
+        throw Object.assign(new Error('exit 1'), { status: 1 });
+      }
+      if (args[1] === '--local') { cfg.local = args[args.indexOf('core.hooksPath') + 1]; return ''; }
+      if (args[1] === '--worktree' && args[2] === '--unset-all') { delete cfg.worktree; return ''; }
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    return { run, calls, cfg };
+  };
+  it('sets it when unset, and logs', () => {
+    const g = fakeGit({});
+    const logs = [];
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run, log: (l) => logs.push(l) })).toMatchObject({ status: 'set', was: null });
+    expect(g.cfg.local).toBe(LANE_HOOKS_PATH);
+    expect(logs[0]).toMatch(/core\.hooksPath \(unset\) → \.githooks/);
+  });
+  it('is idempotent: effective .githooks → no write', () => {
+    const g = fakeGit({ local: '.githooks' });
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run }).status).toBe('ok');
+    expect(g.calls).toHaveLength(1);
+  });
+  it('a WORKTREE /dev/null override beating a correct local value is flagged and repaired', () => {
+    const g = fakeGit({ local: '.githooks', worktree: '/dev/null' });
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run, write: false })).toMatchObject({ status: 'override', scope: 'worktree' });
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run })).toMatchObject({ status: 'set', was: '/dev/null', scope: 'worktree' });
+    expect(g.cfg.worktree).toBeUndefined();
+  });
+  it('an override the repair cannot remove (a higher scope, e.g. command) → override, logged', () => {
+    const stubborn = { run: (args) => (args.join(' ') === GET.join(' ') ? 'command\t/dev/null\n' : ''), };
+    const logs = [];
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: stubborn.run, log: (l) => logs.push(l) })).toMatchObject({ status: 'override', scope: 'command' });
+    expect(logs[0]).toMatch(/still \/dev\/null/);
+  });
+  it('write:false only reports', () => {
+    const g = fakeGit({});
+    expect(ensureLaneHooksPath('/l', { exists: has, runnable: has, run: g.run, write: false }).status).toBe('unset');
+    expect(g.calls).toHaveLength(1);
+  });
+  it('a checkout that does not track .githooks/pre-commit is skipped', () => {
+    const untracked = () => { throw Object.assign(new Error('did not match any file'), { status: 1 }); };
+    expect(ensureLaneHooksPath('/l', { exists: () => false, run: untracked }).status).toBe('skipped');
+  });
+  it('a TRACKED pre-commit that is missing (deleted / dangling symlink) is an error, not skipped', () => {
+    const logs = [];
+    const result = ensureLaneHooksPath('/l', { exists: () => false, run: () => '.githooks/pre-commit\n', log: (l) => logs.push(l) });
+    expect(result).toMatchObject({ status: 'error' });
+    expect(result.detail).toMatch(/tracked but missing/);
+  });
+  it('a failing tracked-check (not exit 1) is an error, never skipped', () => {
+    const boom = () => { throw Object.assign(new Error('not a git repository'), { status: 128 }); };
+    expect(ensureLaneHooksPath('/l', { exists: () => false, run: boom, log: () => {} }).status).toBe('error');
+  });
+});
+
+describe('provision --no-install sets core.hooksPath in the lane (real git)', () => {
+  let base, originDir, referenceDir, env;
+  const runPool = (args) => {
+    const r = spawnSync('node', [POOL_SCRIPT, ...args], { encoding: 'utf8', cwd: referenceDir, env, timeout: 60_000, killSignal: 'SIGKILL' });
+    return { code: r.status ?? 1, err: String(r.stderr || '') };
+  };
+  const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=hookspath', '--branch=main', '--no-install'];
+
+  beforeAll(() => {
+    base = mkdtempSync(join(tmpdir(), 'lane-pool-hooks-path-'));
+    originDir = join(base, 'origin.git');
+    referenceDir = join(base, 'reference');
+    git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
+    git(['clone', '--quiet', originDir, referenceDir]);
+    git(['config', 'user.name', 'Fixture Author'], referenceDir);
+    git(['config', 'user.email', 'fixture@realcorp.io'], referenceDir);
+    mkdirSync(join(referenceDir, '.githooks'));
+    writeFileSync(join(referenceDir, '.githooks/pre-commit'), '#!/bin/sh\nexit 0\n');
+    chmodSync(join(referenceDir, '.githooks/pre-commit'), 0o755);
+    git(['add', '.githooks/pre-commit'], referenceDir);
+    git(['commit', '--quiet', '-m', 'v1'], referenceDir);
+    git(['push', '--quiet', 'origin', 'main'], referenceDir);
+    env = { ...process.env, LANE_POOL_ROOT: join(base, 'pool'), HOME: base };
+  });
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+
+  it('a fresh --reference clone gets .githooks, and a re-provision leaves it (idempotent)', () => {
+    const r = runPool(['provision', '--count=1', ...poolArgs()]);
+    expect(r.code).toBe(0);
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    expect(git(['config', '--local', '--get', 'core.hooksPath'], lane)).toBe('.githooks');
+    expect(r.err).toMatch(/core\.hooksPath \(unset\) → \.githooks/);
+    const again = runPool(['provision', '--count=1', ...poolArgs()]);
+    expect(again.code).toBe(0);
+    expect(again.err).not.toMatch(/core\.hooksPath .* → /);
+    expect(git(['config', '--local', '--get', 'core.hooksPath'], lane)).toBe('.githooks');
+  });
+
+  it('a real WORKTREE-scope core.hooksPath=/dev/null is reported by status and repaired by provision', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    git(['config', '--local', 'extensions.worktreeConfig', 'true'], lane);
+    git(['config', '--worktree', 'core.hooksPath', '/dev/null'], lane);
+    expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('/dev/null');
+    expect(runPool(['status', ...poolArgs()]).err).toMatch(/pre-commit guards are not verified in 1 lane\(s\) \(lane-1\)/);
+    expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('/dev/null'); // status wrote nothing
+    expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+    expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('.githooks');
+  });
+
+  it('status reports a lane whose hooksPath was unset, without writing', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    git(['config', '--local', '--unset', 'core.hooksPath'], lane);
+    const r = runPool(['status', ...poolArgs()]);
+    expect(r.err).toMatch(/pre-commit guards are not verified in 1 lane\(s\) \(lane-1\)/);
+    expect(() => git(['config', '--local', '--get', 'core.hooksPath'], lane)).toThrow();
+  });
+
+  it('repairs duplicate local hooksPath values instead of silently leaving guards disabled', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    git(['config', '--local', '--add', 'core.hooksPath', '/dev/null'], lane);
+    git(['config', '--local', '--add', 'core.hooksPath', '/other-hooks'], lane);
+    const r = runPool(['provision', '--count=1', ...poolArgs()]);
+    expect(r.code).toBe(0);
+    expect(git(['config', '--local', '--get-all', 'core.hooksPath'], lane)).toBe('.githooks');
+    expect(r.err).toMatch(/lane pre-commit guards now run/);
+  });
+
+  it('reports a real config lock failure without claiming that guards were repaired', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    git(['config', '--local', 'core.hooksPath', '/dev/null'], lane);
+    const lock = join(lane, '.git', 'config.lock');
+    writeFileSync(lock, 'held');
+    const logs = [];
+    try {
+      expect(ensureLaneHooksPath(lane, { log: (line) => logs.push(line) }).status).toBe('error');
+      expect(logs.join('\n')).toMatch(/core\.hooksPath could not be verified or repaired.*pre-commit guards/);
+      expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('/dev/null');
+    } finally {
+      rmSync(lock, { force: true });
+    }
+  });
+
+  it('status flags a lane whose hooksPath is correct but whose pre-commit git would ignore (not executable)', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    git(['config', '--local', '--replace-all', 'core.hooksPath', '.githooks'], lane);
+    chmodSync(join(lane, '.githooks/pre-commit'), 0o644);
+    try {
+      const r = runPool(['status', ...poolArgs()]);
+      expect(r.err).toMatch(/pre-commit is not executable/);
+      expect(r.err).toMatch(/pre-commit guards are not verified in 1 lane\(s\) \(lane-1\)/);
+    } finally {
+      chmodSync(join(lane, '.githooks/pre-commit'), 0o755);
+    }
+  });
+});
