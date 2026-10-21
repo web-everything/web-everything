@@ -72,18 +72,26 @@ export function laneDietConfigOps({ fetchValues = [], kv = {} } = {}) {
 
 /**
  * Read a lane's current config and apply {@link laneDietConfigOps}. `run(args)` runs git in the lane and
- * returns stdout. Only git's "key not set" answer (exit status 1) reads as unset; any other failure (a timeout,
- * a locked config) propagates, so a half-read config can never cause duplicate refspecs.
+ * returns stdout. Missing keys are absent from the listing; any read failure propagates, so a failed
+ * config read can never cause duplicate refspecs.
+ * `localConfig` may reuse an immediately preceding, unchanged local config listing (NUL-separated key/value
+ * records, as from `git config --local --null --list`). Otherwise all keys are read in one spawn.
  * @returns {string[][]} the ops applied
  */
-export function applyLaneDietConfig(run) {
-  const read = (args) => {
-    try { return String(run(args) ?? ''); } catch (e) { if (e && e.status === 1) return ''; throw e; }
-  };
-  const fetchValues = read(['config', '--local', '--get-all', 'remote.origin.fetch']).split('\n');
+export function applyLaneDietConfig(run, localConfig) {
+  if (localConfig === undefined) localConfig = String(run(['config', '--local', '--null', '--list']) ?? '');
+  const values = new Map();
+  for (const entry of localConfig.split('\0').filter(Boolean)) {
+    const separator = entry.indexOf('\n');
+    const key = separator < 0 ? entry : entry.slice(0, separator);
+    const value = separator < 0 ? '' : entry.slice(separator + 1);
+    if (!values.has(key)) values.set(key, []);
+    values.get(key).push(value);
+  }
+  const fetchValues = values.get('remote.origin.fetch') || [];
   const kv = {};
   for (const key of Object.keys(LANE_DIET_KV)) {
-    const v = read(['config', '--local', '--get-all', key]).trim();
+    const v = (values.get(key.toLowerCase()) || []).join('\n').trim();
     if (v) kv[key] = v; // several values read as "not exactly the diet value" → replaced below
   }
   const ops = laneDietConfigOps({ fetchValues, kv });

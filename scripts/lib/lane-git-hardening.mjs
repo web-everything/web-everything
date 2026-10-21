@@ -108,22 +108,30 @@ export function riskyLaneConfig(listOutput) {
 /**
  * Repair only lane-owned unsafe config before hand-out. Only exact `origin` is always retained; the
  * launch guard still refuses anything the scrub could not remove. Runner signature: (args, opts).
+ * `onLocalConfig` receives a reusable local listing only when no scrub changed it and no lane-owned
+ * include could have contributed entries (plain `git config --local --list` does not follow includes).
  */
 export function scrubRiskyLaneConfig(dir, {
   run = (args, opts) => execFileSync('git', args, { ...opts, encoding: 'utf8', env: laneGitHardeningEnv(), timeout: 30000, maxBuffer: 16 * 1024 * 1024 }),
   log = () => {},
+  onLocalConfig = () => {},
 } = {}) {
   const removed = [], kept = [];
   const opts = { cwd: dir };
   try {
     const parts = String(run([...LANE_CONFIG_LIST_ARGS], opts)).split('\0');
     const sections = new Set();
+    const localEntries = [];
+    let reusable = true;
     for (let i = 0; i + 1 < parts.length; i += 2) {
       const scope = parts[i], entry = parts[i + 1];
+      if (scope === 'local') localEntries.push(entry);
+      if ((scope === 'local' || scope === 'worktree') && /^include(?:\.path|if\.)/i.test(entry.split('\n')[0])) reusable = false;
       const [key] = riskyLaneConfig(`${scope}\0${entry}\0`);
       if (!key) continue;
       const remote = /^remote\.(.+)\.[^.]+$/i.exec(key);
       if (remote?.[1] === 'origin') { kept.push(key); continue; }
+      reusable = false;
       try {
         if (remote) {
           const section = `remote.${remote[1]}`, id = `${scope}:${section}`;
@@ -142,6 +150,7 @@ export function scrubRiskyLaneConfig(dir, {
         removed.push(key);
       } catch (e) { kept.push(`${key} (${String(e?.message ?? e).split('\n')[0]})`); }
     }
+    if (reusable) onLocalConfig(localEntries.map((entry) => `${entry}\0`).join(''));
   } catch (e) { kept.push(`config list failed (${String(e?.message ?? e).split('\n')[0]})`); }
   if (removed.length || kept.length) {
     try {

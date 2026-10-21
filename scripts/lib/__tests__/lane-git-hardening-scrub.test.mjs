@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { scrubRiskyLaneConfig, riskyLaneConfig, LANE_CONFIG_LIST_ARGS } from '../lane-git-hardening.mjs';
+import { applyLaneDietConfig } from '../lane-git-diet.mjs';
 
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
@@ -77,4 +78,42 @@ it('reports failed unsets as kept', () => {
     return git(args);
   };
   expect(scrubRiskyLaneConfig(dir, { run })).toEqual({ removed: [], kept: ['alias.x (write failed)'] });
+});
+
+it('shares the unchanged local config with the diet without extra reads', () => {
+  const { dir, git } = repo();
+  git(['remote', 'add', 'origin', join(tmpdir(), 'origin-checkout')]);
+  applyLaneDietConfig(git);
+  // Command and global scope values must not masquerade as local settings.
+  const run = vi.fn(args => git(args));
+  let snapshot;
+  scrubRiskyLaneConfig(dir, { run, onLocalConfig: text => { snapshot = text; } });
+  expect(snapshot).toBe(git(['config', '--local', '--null', '--list']));
+  expect(applyLaneDietConfig(run, snapshot)).toEqual([]);
+  expect(run).toHaveBeenCalledTimes(1);
+});
+
+it.each([
+  ['local\0alias.x\n!false\0', false],
+  ['local\0include.path\nmissing\0', false],
+  ['worktree\0includeif.gitdir:x.path\nmissing\0', false],
+  ['', true],
+])('only shares an unchanged listing without lane includes: %s', (listing, reusable) => {
+  const onLocalConfig = vi.fn();
+  scrubRiskyLaneConfig('unused', { run: () => listing, onLocalConfig });
+  expect(onLocalConfig).toHaveBeenCalledTimes(reusable ? 1 : 0);
+});
+
+it('does not share failed config reads or failed scrubs', () => {
+  for (const listing of [null, 'local\0alias.x\n!false\0']) {
+    const onLocalConfig = vi.fn();
+    scrubRiskyLaneConfig('unused', {
+      run: args => {
+        if (listing === null || args.includes('--unset-all')) throw new Error('failed');
+        return listing;
+      },
+      onLocalConfig,
+    });
+    expect(onLocalConfig).not.toHaveBeenCalled();
+  }
 });
