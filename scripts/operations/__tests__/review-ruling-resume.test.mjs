@@ -567,6 +567,8 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     { cleared: true, interrupted: false, failurePoint: REVIEW_EFFECTS.ADVISORY_LABEL, notApplied: true },
     { cleared: false, interrupted: true, failurePoint: REVIEW_EFFECTS.ADVISORY_LABEL, notApplied: true },
     { cleared: true, interrupted: false, failurePoint: REVIEW_EFFECTS.ADVISORY_NOTE, notApplied: false },
+    { cleared: true, interrupted: false, failurePoint: REVIEW_EFFECTS.ADVISORY_LABEL, notApplied: false },
+    { cleared: false, interrupted: true, failurePoint: REVIEW_EFFECTS.ADVISORY_LABEL, notApplied: false },
   ])('a successful final persist retry survives a later advisory failure (%j)', async ({ cleared, interrupted, failurePoint, notApplied }) => {
     const { declaration, registry } = setup();
     const store = createMemoryRunStore();
@@ -585,14 +587,19 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     const seen = [];
     const recovered = sinksWith({ seen, ruled: { value: cleared } });
     const persist = recovered[REVIEW_EFFECTS.MANDATORY_REFERRALS];
+    // Pending referrals alone deliberately produce no advisory label. Include a separate block ruling so
+    // label-failure cases exercise an actually declared label while preserving the pending referral.
     recovered[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async payload => ({ ...await persist(payload),
+      ...(!cleared && failurePoint === REVIEW_EFFECTS.ADVISORY_LABEL ? { blocked: ['blocked-k2'] } : {}),
       records: [{ repo: 'o/n', pr: 4361, head: HEAD_1, attempted: true, referrals: [{ key: 'k1' }], rulings: [] }] });
     let advisoryFailures = 0;
     const advisoryFails = { ...recovered, [failurePoint]: async () => {
       advisoryFailures += 1;
       throw Object.assign(new Error('advisory service unavailable'), { notApplied });
     } };
-    await runReviewLoopOnce({ ...args, sinks: advisoryFails, findResumableRun: () => 'r-1' });
+    const failed = await runReviewLoopOnce({ ...args, sinks: advisoryFails, findResumableRun: () => 'r-1' });
+    expect(failed).toMatchObject({ code: 1, stopped: 'effect-halted' });
+    expect(advisoryFailures).toBe(1);
     const run = store.read('r-1');
     expect(run.findings.referralVerdict.pendingReferrals).toEqual(cleared ? [] : ['k1']);
     expect(run.stepTimings.find(t => t.step === 'advise')?.finishedAt).toBeFalsy();
@@ -609,7 +616,8 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     expect(findResumableParkedRun({ ...pr, comments: [{ ...rearm, author: { login: 'chalbert' } }] }, [evidence], { repo: 'o/n' })).toBeNull();
     expect(findResumableParkedRun({ ...pr, headRefOid: HEAD_2 }, [evidence], { repo: 'o/n' })).toBeNull();
     // Another advisory outage must preserve the successful persist and all partial advisory effects.
-    await runReviewLoopOnce({ ...args, sinks: advisoryFails, findResumableRun });
+    const retried = await runReviewLoopOnce({ ...args, sinks: advisoryFails, findResumableRun });
+    expect(retried).toMatchObject({ code: 1, stopped: 'effect-halted' });
     expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ persistenceFailed: false, persistRetries: 3 });
     const done = await runReviewLoopOnce({ ...args, sinks: recovered, findResumableRun });
     if (!notApplied) {
@@ -621,7 +629,10 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
       expect(capped).toMatchObject({ code: 2, stopped: 'refused' });
       expect(capped.lines.join('\n')).toContain('unresolved advisory effect');
       expect(advisoryFailures).toBe(1); // Unknown non-idempotent outcomes are never automatically replayed.
-      expect(seen.filter(e => e.type === REVIEW_EFFECTS.ADVISORY_NOTE)).toHaveLength(0);
+      expect(done.lines.join('\n')).toContain('UNKNOWN outcome');
+      expect(seen.filter(e => e.type === failurePoint)).toHaveLength(0);
+      expect(seen.filter(e => e.type === REVIEW_EFFECTS.ADVISORY_NOTE))
+        .toHaveLength(failurePoint === REVIEW_EFFECTS.ADVISORY_LABEL ? 1 : 0);
       expect(store.read('must-not-be-minted')).toBeFalsy();
       expect(judge).toHaveBeenCalledTimes(judged);
       return;

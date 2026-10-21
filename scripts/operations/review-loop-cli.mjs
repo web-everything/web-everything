@@ -718,6 +718,18 @@ export async function runReviewLoopOnce({
     if (Object.keys(parsed.control.confirm).length) store.write(run);
   }
 
+  // An interrupted advisory can contain an unknown comment/label write. Keep the executor's replay fence,
+  // but report a normal halt instead of letting its pre-flight refusal escape this unattended invocation.
+  // The saved entries stay intact, and the resume counter above still bounds subsequent attempts.
+  const unresolvedAdvisory = reviewRunEvidence(run)?.resumeAdvise && run.effects?.find(e =>
+    e.step === 'advise' && e.stepIndex === run.pending?.stepIndex && e.status === 'pending' && !e.idempotent);
+  if (unresolvedAdvisory) {
+    const outcome = { run, stopped: 'effect-halted', applied: [], error: new Error(
+      `effect ${unresolvedAdvisory.key} (${unresolvedAdvisory.type}) has an UNKNOWN outcome; `
+      + 'it is not idempotent and cannot be replayed. Resolve the saved effect outcome by hand first.') };
+    return { ...renderOutcome({ outcome, json: parsed.control.json, declaration }), run, stopped: outcome.stopped };
+  }
+
   // THE ONE LINE THIS FILE ADDS TO THE DRIVE CALL: an UNATTENDED policy, and `attemptedBy: 'agent'` so a
   // reader of the run's own step-timing record can tell this pass apart from a human at a terminal — the same
   // distinction `applyPendingEffects`'s `attemptedBy` already threads for its effect rows.
