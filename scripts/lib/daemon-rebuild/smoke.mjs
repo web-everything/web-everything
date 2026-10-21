@@ -729,7 +729,11 @@ export async function smokeAndAdopt({
       });
       const failedNames = failedA.map((r) => r.name).join(',');
       let failed = planA2.reason ?? 'not planned';
-      if (planA2.ok) {
+      // x9diisp — setting the culprits aside must never also lose an overlay the running build carries (e.g. one a
+      // culprit's change had let apply in the retry pass): such a fallback is refused like prepare refuses it.
+      if (planA2.ok && planA2.establishedLost?.length > 0) {
+        failed = `established-overlay-conflict: ${planA2.establishedLost.map((l) => l.ref).join(', ')}`;
+      } else if (planA2.ok) {
         alert('overlay-set-aside-attributed', {
           culprits: culprits.map(({ ref, pr, matched }) => ({ ref, pr, matched })),
           files, kept: kept.map((ap) => ap.ref), target: planA2.finalSha,

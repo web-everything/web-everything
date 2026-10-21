@@ -13,7 +13,7 @@ const ENV = 'WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE';
 const lines = (value) => Array.isArray(value) ? value : String(value).split(/\r?\n/).filter(Boolean);
 const cardId = (path) => idFromName(basename(path, '.md'));
 const jitSubject = /^drain: JIT-number (.+) at land \(#2288\)$/;
-/** Identity allowlist comes only from already accepted main, never from the PR. */
+/** Read all accepted main drain history, never the PR: returning authors must not expire after 100 commits. */
 export function trustedDrainAuthors({ cwd = process.cwd(), exec = execFileSync } = {}) {
   try {
     // A recent-commit cutoff would revoke an established author when another drain

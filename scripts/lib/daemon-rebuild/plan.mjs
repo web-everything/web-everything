@@ -350,6 +350,55 @@ export async function planRebuild({
   };
   const listed = mainOnly ? [] : overlays;
   const establishedRefs = new Set(listed.filter(isEstablished).map((o) => o.ref));
+  // Application priority belongs to the proven TIP, but loss protection belongs to the carried OVERLAY.
+  // A docs-only fast-forward (or a force-push) must not turn a live hotfix into a disposable newcomer.
+  // Read only this running build's first-parent merges, never past builds from the reflog. Match ref AND PR
+  // so a branch reused by a different PR does not inherit the old overlay's hold. Do not truncate this walk:
+  // an early overlay in a large running stack needs the same protection as its last overlay.
+  const carriedRefs = new Set(establishedRefs);
+  const carriedHeads = new Map();
+  if (headSha && listed.some((o) => o?.ref && !establishedRefs.has(o.ref))) {
+    const prKey = (pr) => (pr == null || pr === '' ? null : Number(pr));
+    const registered = new Map(listed.filter((o) => o?.ref).map((o) => [o.ref, prKey(o.pr)]));
+    const recordedRefs = new Set();
+    const history = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', headSha, '--not', mainSha]);
+    if (history.status !== 0) {
+      // Unknown carried history cannot authorize dropping a conflicting registered overlay.
+      for (const ref of registered.keys()) carriedRefs.add(ref);
+    } else {
+      for (const line of String(history.stdout ?? '').split('\n')) {
+        const [parents, committer, ...subject] = line.split('\t');
+        const ps = parents.split(' ');
+        const hit = subject.join('\t').match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
+        if (!hit || committer !== REBUILD_COMMITTER || ps.length !== 2 || !OID.test(ps[1])) continue;
+        recordedRefs.add(hit[1]);
+        if (!registered.has(hit[1]) || registered.get(hit[1]) !== prKey(hit[2])) continue;
+        // A graduated old tip is already carried by main; only its new, unproven changes can be dropped now.
+        if (git(['merge-base', '--is-ancestor', ps[1], mainSha]).status === 0) continue;
+        carriedRefs.add(hit[1]);
+        carriedHeads.set(hit[1], [...(carriedHeads.get(hit[1]) ?? []), ps[1]]);
+      }
+      // A stack base may have entered the build only through its top, with no merge record of its own.
+      // Shared ancestry outside main proves a carried part of its old tip even after a docs-only advance.
+      // A recorded identity (including a different PR reusing that ref) takes precedence over this inference.
+      for (const ref of registered.keys()) {
+        if (carriedRefs.has(ref) || recordedRefs.has(ref)) continue;
+        const sha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
+        if (!sha) continue;
+        const bases = git(['merge-base', '--all', headSha, sha]);
+        if (bases.status !== 0) {
+          if (bases.status !== 1) carriedRefs.add(ref); // unreadable history, rather than unrelated histories
+          continue;
+        }
+        const liveBases = String(bases.stdout ?? '').split('\n').filter((s) => OID.test(s)
+          && git(['merge-base', '--is-ancestor', s, mainSha]).status !== 0);
+        if (liveBases.length > 0) {
+          carriedRefs.add(ref);
+          carriedHeads.set(ref, liveBases);
+        }
+      }
+    }
+  }
   const conflictFiles = new Map(); // ref → the files its conflict named (for the x5059uu alerts below)
   const toProcess = [
     ...listed.filter((o) => establishedRefs.has(o?.ref)), ...listed.filter((o) => !establishedRefs.has(o?.ref)),
@@ -636,10 +685,20 @@ export async function planRebuild({
   // x5059uu — say who lost, after the retry pass (a retried overlay is no longer dropped). A newcomer is PARKED: the
   // alert names its conflicting files and the established overlays they collide with, so its author can merge
   // those branches in. An established overlay that still drops (main itself moved onto it) is never silent.
+  // x9diisp (live 2026-10-20T11:51Z review clone) — the overlays the RUNNING build carries that this plan would build
+  // without because they conflict-dropped. `prepareRebuild` holds the clone on its last-good build instead of building
+  // (and later adopting) a tree that lost live hotfixes. A pinned overlay SKIPPED by xpinskip is not counted: that
+  // ruling deliberately builds without it (loudly, `pinned-overlay-conflict-skipped`) so the fleet keeps moving.
+  const establishedLost = [];
   for (const d of decisions) {
     if (d.action !== 'drop' || d.reason !== 'conflict') continue;
     const files = conflictFiles.get(d.ref) ?? [];
-    if (establishedRefs.has(d.ref)) {
+    const carriedSurvives = carriedHeads.has(d.ref)
+      && carriedHeads.get(d.ref).every((sha) => git(['merge-base', '--is-ancestor', sha, cur]).status === 0);
+    // An ESTABLISHED current tip always holds: another carrier preserving only an OLDER recorded tip says nothing
+    // about the newer live changes. The carriedSurvives exception applies only to changed-tip newcomers.
+    if (establishedRefs.has(d.ref) || (carriedRefs.has(d.ref) && !carriedSurvives)) {
+      establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: 'conflict', files });
       alerts.push({
         kind: 'established-overlay-dropped',
         detail: {
@@ -647,7 +706,9 @@ export async function planRebuild({
           message: `LIVE overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} is in the running build but conflicts on ${files.join(', ') || '?'} — this rebuild drops it; rebase its branch onto main`,
         },
       });
-      continue;
+      // A carried overlay's changed tip still gets newcomer conflict attribution below. It loses application
+      // priority, but prepare must hold rather than adopt a build without the previous tip's live changes.
+      if (establishedRefs.has(d.ref)) continue;
     }
     const collidesWith = applied
       .filter((a) => establishedRefs.has(a.ref))
@@ -673,6 +734,6 @@ export async function planRebuild({
     .slice(0, 16);
 
   return {
-    ok: true, mainSha, finalSha: cur, applied, decisions, alerts, inputsKey, upToDate: cur === headSha,
+    ok: true, mainSha, finalSha: cur, applied, decisions, alerts, inputsKey, upToDate: cur === headSha, establishedLost,
   };
 }
