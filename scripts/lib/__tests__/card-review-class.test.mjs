@@ -69,6 +69,12 @@ describe('card review class', () => {
     const honest = [`diff --git a/${A} b/${A}`, `--- a/${A}`, `+++ b/${A}`, '@@ -1,3 +1,3 @@', ' ---', ' kind: story', '-title: x', '+title: y', ''].join('\n');
     expect(cls(read([A], honest, { cardFrontmatter: { [A]: { old: 'kind: story\ntitle: x\nsize: 1', new: 'kind: story\ntitle: y\nsize: 1' } } }))).toBe('card');
   });
+  it('fourth-round audit: a bare CR hiding a field → full (diff and git reading)', () => {
+    expect(cls(read([A], newCard(A, ['type: story #\rkind: "deci\\u0073ion"'])))).toBe('full');
+    expect(cls(read([A], midEdit(A), { cardFrontmatter: { [A]: { old: 'kind: story', new: 'type: story #\rkind: x' } } }))).toBe('full');
+    expect(cls(read([A], newCard(A).replace(/\n/g, '\r\n')))).toBe('full');
+    expect(frontmatterText('---\nkind: story\r\n---\n')).toBe('kind: story\r');
+  });
   it('post-accept timing: the card-class red-team mode does not apply (skipCardOnly rule unchanged)', async () => {
     const { cardClassRedTeamMode } = await import('../review-red-team-policy.mjs');
     expect(cardClassRedTeamMode(read([A], newCard(A)), { WE_RED_TEAM_TIMING: 'post-accept' })).toBeNull();

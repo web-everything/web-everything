@@ -412,9 +412,10 @@ export function cardFrontmatterField({ exec, paths, base, rev } = {}) {
   return { cardFrontmatter: out };
 }
 
-/** The text between a first line of exactly `---` and the next line of exactly `---`, else `''`. PURE. */
+/** The text between a first line of exactly `---` and the next line of exactly `---`, else `''`. CRs are KEPT (the
+ *  classifier refuses them). PURE. */
 export function frontmatterText(text) {
-  const lines = String(text).replace(/\r/g, '').split('\n');
+  const lines = String(text).split('\n');
   if (lines[0] !== '---') return '';
   const end = lines.findIndex((l, i) => i > 0 && l === '---');
   return end < 0 ? '' : lines.slice(1, end).join('\n');

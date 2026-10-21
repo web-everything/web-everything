@@ -43,7 +43,10 @@ const anyMarker = (markers, text) => markers.some((re) => re.test(text));
 
 /** Split a unified diff into blocks, refusing (null) anything this predicate does not fully understand. */
 function parseBlocks(diffText) {
-  const text = diffText.replace(/\r/g, '');
+  // Any CR or Unicode line separator is refused, not stripped: YAML treats a bare CR as a line break, so stripping
+  // it could hide a field (`type: story #<CR>kind: decision`) from this predicate while the repo's parser sees it.
+  if (/[\r\u0085\u2028\u2029]/.test(diffText)) return null;
+  const text = diffText;
   if (!text.startsWith('diff --git ')) return null;
   const blocks = [];
   for (const part of text.split(/^(?=diff --git )/m)) {
@@ -119,7 +122,7 @@ function gitMatchesDiff(git, { lines }) {
 
 /** Is one frontmatter reading plain card metadata under `s`? Any parse doubt is `false`. */
 function plainCardSide(text, s) {
-  if (typeof text !== 'string' || !text.trim() || /<</.test(text) || anyMarker(s.markers, text)) return false;
+  if (typeof text !== 'string' || !text.trim() || /[\r\u0085\u2028\u2029]/.test(text) || /<</.test(text) || anyMarker(s.markers, text)) return false;
   let doc;
   try { doc = yaml.load(text); } catch { return false; }
   if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return false;
