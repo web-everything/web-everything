@@ -204,8 +204,15 @@ export function operatorHoldsFromPlan(plan) {
   for (const row of Array.isArray(plan?.refusals) ? plan.refusals : []) {
     const prNumber = Number(row?.prNumber);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue;
-    for (const kind of [row?.kind, row?.reviewRefusal?.kind]) {
-      if (OPERATOR_HOLD_KINDS.includes(kind)) seen.set(`${prNumber}|${kind}`, { prNumber, kind });
+    for (const refusal of [row, row?.reviewRefusal]) {
+      const kind = refusal?.kind;
+      if (!OPERATOR_HOLD_KINDS.includes(kind)) continue;
+      // A referral persist that failed with retries left is still owned by automation (it resumes on its own at the
+      // hold's `retryAt`), so it is not yet waiting on a person; only an exhausted budget is (live #5752).
+      const hold = refusal.referralHold;
+      if (kind === 'review-referrals-pending' && hold?.persistenceFailed === true && hold.exhausted === false
+        && Number.isFinite(hold.retryAt)) continue;
+      seen.set(`${prNumber}|${kind}`, { prNumber, kind });
     }
   }
   return [...seen.values()].sort((a, b) => a.prNumber - b.prNumber || a.kind.localeCompare(b.kind));

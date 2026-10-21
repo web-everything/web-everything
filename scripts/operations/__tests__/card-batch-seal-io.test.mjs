@@ -1,12 +1,15 @@
 // @vitest-environment node
 /** Batch IO ordering, refusal and durable retry boundaries using injected transports. */
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publishBatch, sealDueBatches, HOLD_LABEL, VERIFY_UNRUN_CAP, resolveAdoptDescendantHead } from '../card-batch-seal-io.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
+import { resolveVerifyRetryMinutes } from '../../lib/card-batch-settings.mjs';
+import { admissionLockRoot, admissionStatus, tryAcquireSlot } from '../../readiness/heavy-admission.mjs';
 const dirs = [];
+afterEach(() => vi.unstubAllEnvs());
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
 function fixture({ maxCards = 2, red = false, descendant = false, descendantMessages = 'Repair CI\n',
   descendantChanges = ':100644 100644 abc def M\0backlog/123-card.md\0' } = {}) {
@@ -241,15 +244,133 @@ it.each([
   ['unrun checks', { ok: false, failed: 0, unrun: 1, blocking: [{ why: 'did-not-run' }] }],
   ['an empty suite', { ok: false, failed: 0, unrun: 0, emptySuite: true, blocking: [] }],
   ['a did-not-run blocker', { ok: false, blocking: [{ why: 'did-not-run' }] }],
-])('treats a parsed verdict with %s as retryable, and holds only after the cap', async (_name, verdict) => {
+])('treats a parsed verdict with %s as retryable, and defers (never holds) after the cap', async (_name, verdict) => {
   const f = fixture({ maxCards: 1 });
   const exec = (cmd, args, options) => (args[1] === 'verify' ? JSON.stringify({ verdict }) : f.exec(cmd, args, options));
   for (let attempt = 1; attempt < VERIFY_UNRUN_CAP; attempt++) {
     await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('verify unrun');
     expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
   }
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('deferred');
+  const saved = JSON.parse(readFileSync(f.statePath, 'utf8'));
+  expect(saved.sealFailure).toBeUndefined();
+  expect(saved.batchRef).toBeDefined();
+  expect(Date.parse(saved.verifyRetryAfter)).toBe(1000 + 15 * 60_000);
+  // Every caller honours the pause until it passes.
+  const calls = f.calls.length;
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('deferred');
+  expect(f.calls.length).toBe(calls);
+  // Even after the pause passes, only the capacity-checked re-arm may clear it.
+  expect((await publishBatch(f.input, { ...f.opts, exec, clock: () => 10 * 60 * 60_000 })).action).toBe('deferred');
+  expect(f.calls.length).toBe(calls);
+});
+it('re-arm leaves a pause that was renewed after the scan', async () => {
+  const f = fixture({ maxCards: 1 }); const spawn = vi.fn(fakeChild);
+  unrunPausedState(f, 10_000);
+  const renewed = new Date(900_000).toISOString();
+  const racing = async () => { writeFileSync(f.statePath, JSON.stringify({ ...JSON.parse(readFileSync(f.statePath, 'utf8')), verifyRetryAfter: renewed })); return { freeCount: 1 }; };
+  expect(await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: racing })).toEqual([]);
+  expect(JSON.parse(readFileSync(f.statePath, 'utf8')).verifyRetryAfter).toBe(renewed);
+});
+const unrunPausedState = (f, retryAfter) => writeFileSync(f.statePath, JSON.stringify({ ...f.state, sealedAt: 500,
+  seal: { step: 'record-sealed' }, verifyUnrun: VERIFY_UNRUN_CAP, verifyRetryAfter: new Date(retryAfter).toISOString() }));
+it.each([
+  ['all expired', [0, 1, 2], true],
+  ['only fast slot expired', [2], true],
+  ['all live', [], false],
+])('default admission probe: %s', async (_name, expiredSlots, launches) => {
+  const f = fixture({ maxCards: 1 });
+  vi.stubEnv('LANE_POOL_ROOT', f.dir);
+  vi.stubEnv('WE_HEAVY_ADMISSION_CAP', '2');
+  vi.stubEnv('WE_HEAVY_ADMISSION_FAST_SLOTS', '1');
+  const lockRoot = admissionLockRoot(f.dir);
+  const now = 61 * 60_000;
+  for (let slot = 0; slot < 3; slot++) {
+    const acquiredAt = expiredSlots.includes(slot) ? 0 : now;
+    expect(tryAcquireSlot({ lockRoot, cap: 2, slots: [slot], owner: `holder-${slot}`, pid: process.pid,
+      nowMs: acquiredAt, nowIso: new Date(acquiredAt).toISOString() }).ok).toBe(true);
+  }
+  expect(admissionStatus({ lockRoot, cap: 2, fastSlots: 1, nowMs: now }).freeCount).toBe(0);
+  unrunPausedState(f, 10_000);
+  const spawn = vi.fn(fakeChild);
+  expect(await sealDueBatches({ now, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual(launches ? [f.statePath] : []);
+  expect(spawn).toHaveBeenCalledTimes(launches ? 1 : 0);
+  expect(f.read().verifyRetryAfter).toBe(launches ? undefined : new Date(10_000).toISOString());
+  const status = admissionStatus({ lockRoot, cap: 2, fastSlots: 1, nowMs: now });
+  expect(status.held.every(holder => holder.owner.startsWith('holder-'))).toBe(true);
+  expect(status.freeCount).toBe(launches ? 1 : 0);
+});
+it.each(['platform', 'repo', 'env'])('rejects an overflowing retry duration in the %s layer and retains the lower layer', layer => {
+  const layers = { now: 1000, platform: { batchVerifyRetryMinutes: 7 }, repo: { batchVerifyRetryMinutes: 9 } };
+  if (layer === 'platform') { layers.platform.batchVerifyRetryMinutes = 144000000000; delete layers.repo; }
+  if (layer === 'repo') layers.repo.batchVerifyRetryMinutes = 144000000000;
+  if (layer === 'env') layers.env = { WE_CARDS_BATCH_VERIFY_RETRY_MINUTES: '144000000000' };
+  expect(resolveVerifyRetryMinutes(layers)).toBe({ platform: 15, repo: 7, env: 9 }[layer]);
+});
+it.each([0, -1, 1.5, true, '7', Number.MAX_SAFE_INTEGER, Infinity])('retains a valid lower retry layer for invalid duration %s', value => {
+  expect(resolveVerifyRetryMinutes({ now: 1000, platform: { batchVerifyRetryMinutes: 7 },
+    repo: { batchVerifyRetryMinutes: value } })).toBe(7);
+});
+it('accepts the last representable whole-minute duration and rejects the next minute', () => {
+  const now = 1000;
+  const lastMinutes = Math.floor((8_640_000_000_000_000 - now) / 60_000);
+  expect(resolveVerifyRetryMinutes({ now, repo: { batchVerifyRetryMinutes: lastMinutes } })).toBe(lastMinutes);
+  expect(resolveVerifyRetryMinutes({ now, platform: { batchVerifyRetryMinutes: 7 },
+    repo: { batchVerifyRetryMinutes: lastMinutes + 1 } })).toBe(7);
+});
+it('records a durable pause on the third unrun verify despite an overflowing env setting', async () => {
+  const f = fixture({ maxCards: 1 });
+  vi.stubEnv('WE_CARDS_BATCH_VERIFY_RETRY_MINUTES', '144000000000');
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, verifyUnrun: VERIFY_UNRUN_CAP - 1 }));
+  const exec = (cmd, args, options) => args[1] === 'verify'
+    ? JSON.stringify({ verdict: { ok: false, unrun: 1 } }) : f.exec(cmd, args, options);
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('deferred');
+  expect(f.read()).toMatchObject({ verifyUnrun: VERIFY_UNRUN_CAP, verifyRetryAfter: new Date(1000 + 15 * 60_000).toISOString() });
+  expect(f.read().sealFailure).toBeUndefined();
+});
+it('re-arms a capacity-paused seal only after the pause and with a free heavy slot', async () => {
+  const f = fixture({ maxCards: 1 }); const spawn = vi.fn(fakeChild);
+  unrunPausedState(f, 10_000);
+  const free = vi.fn(async () => ({ freeCount: 1 }));
+  expect(await sealDueBatches({ now: 5000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: free })).toEqual([]);
+  expect(await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: async () => ({ freeCount: 0 }) })).toEqual([]);
+  expect(JSON.parse(readFileSync(f.statePath, 'utf8')).verifyUnrun).toBe(VERIFY_UNRUN_CAP);
+  expect(await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: async () => { throw new Error('unreadable'); } })).toEqual([]);
+  expect(await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: free })).toEqual([f.statePath]);
+  const saved = JSON.parse(readFileSync(f.statePath, 'utf8'));
+  expect(saved.verifyUnrun).toBeUndefined();
+  expect(saved.verifyRetryAfter).toBeUndefined();
+  expect(saved.sealedAt).toBe(500);
+});
+it('re-arm never races a running worker: a live batch lease blocks it and the pause is left untouched', async () => {
+  const f = fixture({ maxCards: 1 }); const spawn = vi.fn(fakeChild);
+  unrunPausedState(f, 10_000);
+  const lockPath = `${f.statePath}.lock`;
+  const held = JSON.stringify({ owner: 'seal:worker', expiresAt: 3_600_000, token: 'worker-token' });
+  writeFileSync(lockPath, held);
+  const before = readFileSync(f.statePath, 'utf8');
+  const free = vi.fn(async () => ({ freeCount: 1 }));
+  expect(await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: free })).toEqual([]);
+  expect(spawn).not.toHaveBeenCalled();
+  expect(readFileSync(f.statePath, 'utf8')).toBe(before);
+  expect(readFileSync(lockPath, 'utf8')).toBe(held);
+  // Once the worker's lease has expired the re-arm may proceed, and it releases its own lease afterwards.
+  expect(await sealDueBatches({ now: 3_600_001, stateDir: f.dir, policy: f.opts.policy, spawn, readHeavyQueue: free })).toEqual([f.statePath]);
+  expect(JSON.parse(readFileSync(f.statePath, 'utf8')).verifyRetryAfter).toBeUndefined();
+  expect(existsSync(lockPath)).toBe(false);
+});
+it('a successful re-arm releases the batch lease for the worker it launches', async () => {
+  const f = fixture({ maxCards: 1 });
+  unrunPausedState(f, 10_000);
+  await sealDueBatches({ now: 20_000, stateDir: f.dir, policy: f.opts.policy, spawn: vi.fn(fakeChild), readHeavyQueue: async () => ({ freeCount: 1 }) });
+  expect(existsSync(`${f.statePath}.lock`)).toBe(false);
+});
+it('a verify that RAN and failed still holds permanently', async () => {
+  const f = fixture({ maxCards: 1 });
+  const exec = (cmd, args, options) => (args[1] === 'verify' ? JSON.stringify({ verdict: { ok: false, failed: 2, blocking: [{ why: 'failed' }] } }) : f.exec(cmd, args, options));
   expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('held');
-  expect(f.read().sealFailure.reason).toContain(`${VERIFY_UNRUN_CAP} times`);
+  expect(f.read().sealFailure).toBeDefined();
+  expect(f.read().verifyRetryAfter).toBeUndefined();
 });
 it('still records a verdict that names a real failure as terminal at once, even alongside unrun checks', async () => {
   const f = fixture({ maxCards: 1 });
