@@ -73,7 +73,8 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
   const git = argv => String(exec('git', argv, { cwd: path, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
     env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }));
   try {
-    const status = git(['status', '--porcelain', '--untracked-files=all']);
+    // Override Git config and .gitmodules ignore settings: submodule work must remain visible.
+    const status = git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']);
     if (typeof status !== 'string') return unsafe('status unreadable');
     if (status.trim()) return unsafe('worktree has changes');
     if (hasHiddenIndexFlags(git)) return unsafe('index flags may hide worktree changes');

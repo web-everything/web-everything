@@ -123,7 +123,7 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
 
 describe('fresh per-lane safety check before any destructive action', () => {
   const commands = [
-    ['git', ['status', '--porcelain', '--untracked-files=all']],
+    ['git', ['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']],
     ['git', ['ls-files', '-v']],
     ['git', ['stash', 'list']],
     ['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']],
@@ -157,7 +157,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     const exec = git({ status: '', stash: '', 'rev-list': '0\n' });
     freshLaneSafety({ path: '/l', exec });
     expect(exec.mock.calls.map(([bin, argv]) => [bin, argv])).toEqual([
-      ['git', ['status', '--porcelain', '--untracked-files=all']],
+      ['git', ['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']],
       ['git', ['ls-files', '-v']],
       ['git', ['stash', 'list']],
       ['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']],
@@ -174,7 +174,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     // Deliberately return clean results for other argv so a missing flag cannot pass by triggering an exec error.
     const exec = vi.fn((bin, argv) => {
       const command = JSON.stringify([bin, argv]);
-      if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all']])) return status;
+      if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']])) return status;
       if (command === JSON.stringify(['git', ['ls-files', '-v']])) return 'H tracked.txt\n';
       if (command === JSON.stringify(['git', ['stash', 'list']])) return '';
       if (command === JSON.stringify(['git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']])) return count;
@@ -183,6 +183,23 @@ describe('fresh per-lane safety check before any destructive action', () => {
     });
     gitMocks.push(exec);
     expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({ hasUnsafeWork: true, reason });
+  });
+  it('refuses every destructive action when status would hide submodule changes without an explicit override', () => {
+    // Model Git hiding submodule dirt unless the command explicitly overrides ignore settings.
+    // The fallback is clean (not an error), so omission must fail by authorizing the action.
+    const exec = vi.fn((bin, argv) => {
+      if (argv[0] === 'status') return argv.includes('--ignore-submodules=none') ? ' M child\n' : '';
+      if (argv[0] === 'ls-files') return 'H child\n';
+      if (argv[0] === 'stash') return '';
+      if (argv[0] === 'rev-list') return '0\n';
+      throw new Error(`unexpected command: ${bin} ${argv.join(' ')}`);
+    });
+    gitMocks.push(exec);
+    for (const action of ['reclaim', 'reset', 'reuse', 'release-on-behalf']) {
+      expect(guardLaneAction({ path: '/l', action, exec, log: vi.fn() })).toMatchObject({
+        act: false, fresh: { hasUnsafeWork: true, reason: 'worktree has changes' },
+      });
+    }
   });
   it.each(['h', 'S', 's', 'M', '?'])(
     'refuses every destructive action when index tag %s hides work despite clean status', tag => {
