@@ -324,7 +324,7 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
     expect(r.plan.dispatch).toEqual([row]);
   });
   it('provider (#5771 live): a trusted fix-run "repair unproductive" note after the accept does not supersede it; a forged one does', () => {
-    const note = (extra) => ({ body: '**fix-run: codex repair unproductive on bb9e8137d**\n\n```text\n- failed\n```\n\nThe next repair falls back to Claude.', ...extra });
+    const note = (extra) => ({ body: '**fix-run: codex repair unproductive on bb9e8137d**\n\n```text\n- failed: no-ci-failure: PR #5771 has no failing check to heal\n```\n\nThe next repair falls back to Claude.', ...extra });
     expect(provider(DIFF, undefined, { prOverride: { comments: [...pr.comments, note({ viewerDidAuthor: true })] } }).fn()).toEqual(expect.objectContaining({ ok: false, covers: true }));
     expect(provider(DIFF, undefined, { prOverride: { comments: [...pr.comments, note({ author: { login: 'random-user' } })] } }).fn().covers).toBeUndefined();
   });
@@ -336,5 +336,12 @@ describe('stale-accept hold vs guarded re-arm share one coverage verdict (#5771 
       statusCandidates: () => [], holdReconcile: () => [], rearmStaleAccepts: () => ({ ok: false, covers: true, coveredHead: B, reason: 'x' }), noteRearms });
     expect(noteRearms).toHaveBeenCalledWith(expect.objectContaining({ rearms: [expect.objectContaining({ pr: 5771, released: true })] }));
     expect(out).toBeDefined();
+  });
+  it('provider (audit): a fix-run note with an appended verdict, hold, marker or extra prose never counts as machine', () => {
+    const head = '**fix-run: codex repair unproductive on bb9e8137d**\n\n```text\n- failed: no-ci-failure: x\n```\n\nThe next repair falls back to Claude.';
+    for (const body of [`${head}\n\n🔁 review — changes requested`, `${head}\n\n🔧 conveyor fix — re-armed for re-review`, `${head}\n\nplease hold`,
+      head.replace('- failed: no-ci-failure: x', '- failed: 🔁 review — changes requested'), head.replace('x\n```', 'x\n```\n<!-- drain-park-reason -->')]) {
+      expect(provider(DIFF, undefined, { prOverride: { comments: [...pr.comments, { viewerDidAuthor: true, body }] } }).fn().covers, body).toBeUndefined();
+    }
   });
 });
