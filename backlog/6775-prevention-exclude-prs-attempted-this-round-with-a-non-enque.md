@@ -1,20 +1,22 @@
 ---
+bornAs: xqzmc5d
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:reports/2026-10-15-assistant-session-optimisation.md"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Review lens: when a report adds a late operator note, re-read the steps it constrains. No determi… (from web-everything/web-everything#5386 review)
+# Prevention — Exclude PRs attempted this round with a non-enqueued outcome (or whose head signature is unchange… (from web-everything/web-everything#5316 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:reports/2026-10-15-assistant-session-optimisation.md:160` — Review lens: when a report adds a late operator note, re-read the steps it constrains. No deterministic gate fits.
+1. `we:scripts/lib/enqueue-on-event.mjs:660` — Exclude PRs attempted this round with a non-enqueued outcome (or whose head signature is unchanged since the last attempt) from the busy computation. Add a unit test where a skipped, wake-worthy PR yields the full interval.
+2. `we:scripts/merge-ai-prs.mjs:4946` — Extract the snapshot-or-live decision into a pure function in we:fast-drain-scope.mjs, taking injected readers, and unit-test its three branches. Alternatively, add a harness test for --only listing sources.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5386@c2946864bf9a808a34b4c9678d32f3facb5d2df0
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5316@fb0e957790a463c1fc9fe088229e22a1bcd2a03e
 
 ## Acceptance
 

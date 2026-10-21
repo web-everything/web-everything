@@ -1,4 +1,5 @@
 ---
+bornAs: xqes9kp
 kind: story
 size: 3
 parent: "4075"
@@ -12,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/6266-we-operator-override-slice-1-host-wide-store-and-operator-on.md:1` — A check:standards rule: when a card's body or acceptance names another card's module or export as a dependency, that card must appear in blockedBy, and the reverse edge must not form a dependency cycle. This extends the guard-floor and cycle lint in backlog/x3g7q2m.
+1. `we:backlog/6266-we-operator-override-slice-1-host-wide-store-and-operator-on.md:1` — A check:standards rule: when a card's body or acceptance names another card's module or export as a dependency, that card must appear in blockedBy, and the reverse edge must not form a dependency cycle. This extends the guard-floor and cycle lint in backlog/6311.
 2. `we:backlog/6264-we-operator-override-slice-2-cascade-layer-above-env-with-so.md:6` — A lint that every file an acceptance test must fix on failure is in the card's scope, or a single-source key registry owned by the slice that wires the resolvers.
 3. `we:backlog/6266-we-operator-override-slice-1-host-wide-store-and-operator-on.md:47` — File a card to enumerate host credential sources in the red-team checklist for authority cards. A lint cannot decide this, so it stays a review lens.
 4. `we:backlog/6267-we-drain-requests-a-red-team-re-run-when-a-run-left-no-usabl.md:17` — Add a 'path-safe identity' line to the card edge-case template, enforced by the x3g7q2m mapping lint.

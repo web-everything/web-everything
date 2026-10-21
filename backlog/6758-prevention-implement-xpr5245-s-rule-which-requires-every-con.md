@@ -1,20 +1,22 @@
 ---
+bornAs: xp6omtj
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/__tests__/sim/world.mjs"]
+scope: ["we:backlog/xg7whui-card-number-rename-after-land-batch.md", "we:backlog/x5qtv82-card-number-ledger-shadow.md"]
 dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add a lint or check:standards rule that flags an exported test-helper function with no importer o… (from web-everything/web-everything#5253 review)
+# Prevention — Implement xpr5245's rule, which requires every concrete test file named in Acceptance or Test pla… (from web-everything/web-everything#5245 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/__tests__/sim/world.mjs:167` — Add a lint or check:standards rule that flags an exported test-helper function with no importer other than its own test. Alternatively, test through `createWorld` rather than a parallel helper.
+1. `we:backlog/6126-card-number-rename-after-land-batch.md:6` — Implement xpr5245's rule, which requires every concrete test file named in Acceptance or Test plan to be covered by `scope`. The rule is filed in this PR but not yet captured as a gate.
+2. `we:backlog/6121-card-number-ledger-shadow.md:30` — Add a review-lens line to xpr5245: append-only ledger plans must state ref protection (no force-push or deletion on the ops branch), a monotonic check against the last verified tip or the checkpoint, and the history-walk method (`--first-parent` or reject merges). Pair it with a named rewind fixture.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5253@90e97d57f12803d389a1434bcf7cef41f1e1d7f8
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5245@a503a16bd5038546ec4c4249a5e24bf62c3f5486
 
 ## Acceptance
 

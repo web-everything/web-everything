@@ -1,21 +1,21 @@
 ---
+bornAs: xq74tyc
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/__tests__/fix-run.test.mjs", "we:scripts/operations/fix-run.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:reports/2026-10-15-assistant-session-optimisation.md"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add the two negative-branch tests to we:scripts/operations/__tests__/fix-run.test.mjs. Longer ter… (from web-everything/web-everything#5296 review)
+# Prevention — Review lens: when a report adds a late operator note, re-read the steps it constrains. No determi… (from web-everything/web-everything#5386 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/__tests__/fix-run.test.mjs:1240` — Add the two negative-branch tests to we:scripts/operations/__tests__/fix-run.test.mjs. Longer term, a review lens or checklist item: every policy-gated swallow needs a test for its disabled mode and a non-matching input.
-2. `we:scripts/operations/fix-run.mjs:602` — Add a deterministic runFixCli test selecting fail, throwing the exact refusal, and asserting a failure outcome with the pending record retained.
+1. `we:reports/2026-10-15-assistant-session-optimisation.md:160` — Review lens: when a report adds a late operator note, re-read the steps it constrains. No deterministic gate fits.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5296@56a4b94f2e6dcd1e6fb1b126d9000cf5167859fc
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5386@c2946864bf9a808a34b4c9678d32f3facb5d2df0
 
 ## Acceptance
 

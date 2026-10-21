@@ -1,21 +1,21 @@
 ---
+bornAs: xq4hjcg
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/__tests__/review-loop-cli.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Exclude PRs attempted this round with a non-enqueued outcome (or whose head signature is unchange… (from web-everything/web-everything#5316 review)
+# Prevention — Add a check:standards rule that fails when review-loop tests override acceptPolicy suite-wide (th… (from web-everything/web-everything#5393 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/enqueue-on-event.mjs:660` — Exclude PRs attempted this round with a non-enqueued outcome (or whose head signature is unchanged since the last attempt) from the busy computation. Add a unit test where a skipped, wake-worthy PR yields the full interval.
-2. `we:scripts/merge-ai-prs.mjs:4946` — Extract the snapshot-or-live decision into a pure function in we:fast-drain-scope.mjs, taking injected readers, and unit-test its three branches. Alternatively, add a harness test for --only listing sources.
+1. `we:scripts/operations/review-loop-cli.mjs:691` — Add a check:standards rule that fails when review-loop tests override acceptPolicy suite-wide (the xsgfmiv card), plus a default-policy test for each confirm-stop exit.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5316@fb0e957790a463c1fc9fe088229e22a1bcd2a03e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5393@56051319c07bc9fe9a9c8d41336389581fa20d0d
 
 ## Acceptance
 

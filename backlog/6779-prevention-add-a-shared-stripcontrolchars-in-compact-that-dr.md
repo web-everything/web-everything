@@ -1,22 +1,22 @@
 ---
+bornAs: xriya6i
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/health-smells-notify-list.mjs", "we:scripts/conveyor/main-ci-red-core.mjs", "we:scripts/conveyor/main-ci-red-io.mjs", "we:scripts/conveyor/__tests__/health-smells-notify-list.test.mjs", "we:scripts/conveyor/__tests__/main-ci-red-core.test.mjs", "we:scripts/conveyor/__tests__/main-ci-red-io.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/operations/operator-why.mjs", "we:scripts/operations/operator-controls.mjs", "we:scripts/operations/__tests__/operator-why.test.mjs", "we:scripts/operations/__tests__/operator-controls.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a test that every smell in NOTIFY_EVEN_IN_SHADOW whose id contains 'red-main' or 'main-ci-red… (from web-everything/web-everything#5281 review)
+# Prevention — Add a shared stripControlChars in compact() that drops C0/C1/ESC and U+2028/9, plus a regression… (from web-everything/web-everything#5169 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/health-smells-notify-list.mjs:58` — Add a test that every smell in NOTIFY_EVEN_IN_SHADOW whose id contains 'red-main' or 'main-ci-red' yields a main-red emergency from breakthroughEmergency. A deterministic gate beats a doc note.
-2. `we:scripts/conveyor/main-ci-red-core.mjs:805` — In the replay test, assert the full alert schedule (first alert time, then each gap equals EveryMin), so a spacing mismatch against the setting's name reddens.
-3. `we:scripts/conveyor/main-ci-red-io.mjs:232` — Give the new progress fields their own reader (or gate the supersede-by-pending behaviour on the stall setting), and add a combine-rule test with a PR that has an in-flight newer run.
+1. `we:scripts/operations/operator-why.mjs:10` — Add a shared `stripControlChars` in `compact()` that drops C0/C1/ESC and U+2028/9, plus a regression test with an ESC/OSC payload. A check-standards rule could flag raw `.line` interpolation into CLI screens.
+2. `we:scripts/operations/operator-controls.mjs:13` — Verify `gh api user --jq .login` equals `--actor` (case-insensitive) before any apply, as one shared guard for all controls. Record the unverified identity as such in the doc until that lands.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5281@751a45c91cc803f7dc9d3694a5f76366d611059e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5169@29d3d72f8e6129cf7339d9fe96af64c84c82343f
 
 ## Acceptance
 

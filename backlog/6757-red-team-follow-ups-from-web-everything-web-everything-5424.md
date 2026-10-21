@@ -1,4 +1,5 @@
 ---
+bornAs: xp6nvr4
 kind: story
 size: 2
 status: open

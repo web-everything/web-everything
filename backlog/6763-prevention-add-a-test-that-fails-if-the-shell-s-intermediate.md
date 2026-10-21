@@ -1,23 +1,23 @@
 ---
+bornAs: xpr309s
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
+scope: ["we:scripts/lib/merge-queue-adaptive-batching.mjs", "we:scripts/lib/__tests__/merge-queue-adaptive-batching.test.mjs"]
 dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Make the refusal branch require typeof json.reason === 'string', or check enqueueOutcomes/toMerge… (from web-everything/web-everything#5256 review)
+# Prevention — Add a test that fails if the shell's intermediateRunsToCancel call is wired to a parameter name t… (from web-everything/web-everything#5217 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/enqueue-on-event.mjs:181` — Make the refusal branch require `typeof json.reason === 'string'`, or check `enqueueOutcomes`/`toMerge` first. Add a summarizeFastDrain test fed the real result shape with `ok:false` and a recorded outcome.
-2. `we:scripts/lib/enqueue-on-event.mjs:520` — Count a miss only for `verified === false` or `kind` in {batching-deferred, merge-lock-held}. Prune `misses` against the candidate listing each catch-up. Add a test that a revalidation abort does not increment `misses()`.
-3. `we:scripts/merge-ai-prs.mjs:6545` — Add a source-contract test, in the style of we:drain-merge-strategy.test.mjs, asserting the `enqueueOutcomes.push` sites and the `enqueued === false` branch. Better, extract a pure `recordEnqueueOutcome(landLock)` helper and test it directly.
-4. `we:scripts/merge-ai-prs.mjs:6577` — Add a deterministic producer-to-summary regression gate that exercises deferred admission, held locks, and refused preparation, asserting the emitted JSON and non-enqueue summary; require it in CI.
+1. `we:scripts/lib/merge-queue-adaptive-batching.mjs:368` — Add a test that fails if the shell's `intermediateRunsToCancel` call is wired to a parameter name the function ignores. `intermediateRunsToCancel` could also throw on unknown keys. A review lens for description-versus-code drift would also catch the prose half.
+2. `we:scripts/lib/merge-queue-adaptive-batching.mjs:251` — Scope the dequeue effect to an explicit pendingDequeues list that is cleared on acknowledgement, or only re-derive for PRs whose recovery was never acknowledged. Add a test: PR in a failed group's recoveryRetired, re-added to the queue with no gate call, must not be dequeued. A lens note 'automated destructive mutations must be scoped to resources this process created' would also help.
+3. `we:scripts/lib/merge-queue-adaptive-batching.mjs:280` — Pass timeout to execFileSync in ioOptions (e.g. 30s) so lock hold time is bounded. Optionally move GitHub IO outside the transaction, or fail open on ELOCKTIMEOUT in gate. Add a lint or standards rule that execFileSync calls to gh must set a timeout.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5256@6548b76609a81b00ce7fcaa7aff6f90d7b6eaa07
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5217@cd633d5b9654ac5dec0b0efd6822c1659a4d2a29
 
 ## Acceptance
 

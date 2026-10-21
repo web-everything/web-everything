@@ -1,21 +1,22 @@
 ---
+bornAs: xq5byrp
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/operator-why.mjs", "we:scripts/operations/operator-controls.mjs", "we:scripts/operations/__tests__/operator-why.test.mjs", "we:scripts/operations/__tests__/operator-controls.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/operations/__tests__/fix-run.test.mjs", "we:scripts/operations/fix-run.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Add a shared stripControlChars in compact() that drops C0/C1/ESC and U+2028/9, plus a regression… (from web-everything/web-everything#5169 review)
+# Prevention — Add the two negative-branch tests to we:scripts/operations/__tests__/fix-run.test.mjs. Longer ter… (from web-everything/web-everything#5296 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/operator-why.mjs:10` — Add a shared `stripControlChars` in `compact()` that drops C0/C1/ESC and U+2028/9, plus a regression test with an ESC/OSC payload. A check-standards rule could flag raw `.line` interpolation into CLI screens.
-2. `we:scripts/operations/operator-controls.mjs:13` — Verify `gh api user --jq .login` equals `--actor` (case-insensitive) before any apply, as one shared guard for all controls. Record the unverified identity as such in the doc until that lands.
+1. `we:scripts/operations/__tests__/fix-run.test.mjs:1240` — Add the two negative-branch tests to we:scripts/operations/__tests__/fix-run.test.mjs. Longer term, a review lens or checklist item: every policy-gated swallow needs a test for its disabled mode and a non-matching input.
+2. `we:scripts/operations/fix-run.mjs:602` — Add a deterministic runFixCli test selecting fail, throwing the exact refusal, and asserting a failure outcome with the pending record retained.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5169@29d3d72f8e6129cf7339d9fe96af64c84c82343f
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5296@56a4b94f2e6dcd1e6fb1b126d9000cf5167859fc
 
 ## Acceptance
 

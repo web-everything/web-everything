@@ -1,4 +1,5 @@
 ---
+bornAs: xp9n2u7
 kind: story
 size: 2
 status: open

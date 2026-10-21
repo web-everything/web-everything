@@ -1,21 +1,22 @@
 ---
+bornAs: xr4hzfs
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/__tests__/sim/world.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/conveyor/pr-status-label.mjs", "we:scripts/conveyor/__tests__/pr-status-label.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a world-env test asserting that {...ambientWithSnapshot, ...createWorld().env} yields no snap… (from web-everything/web-everything#5272 review)
+# Prevention — Add a precedence table test that enumerates every status state against a DIRTY PR, so any change… (from web-everything/web-everything#5388 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/__tests__/sim/world.mjs:333` — Add a world-env test asserting that `{...ambientWithSnapshot, ...createWorld().env}` yields no snapshot value. More generally, any env-isolation comment in we:scripts/conveyor/__tests__/sim/world.mjs should point to a named test.
-2. `we:scripts/conveyor/__tests__/sim/world.mjs:189` — Doc note only: keep comments scoped to the changed line.
+1. `we:scripts/conveyor/pr-status-label.mjs:123` — Add a precedence table test that enumerates every status state against a DIRTY PR, so any change in which state wins is an explicit, reviewed assertion. File this as a backlog item.
+2. `we:scripts/conveyor/pr-status-label.mjs:123` — Extract a shared 'live repair state' helper used by both the ci-red and conflict branches, and test it with a takeoverUnjudged fixture. File this as a backlog item.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5272@17173a0157b50818b848557dd7f3c0a3e49c9ef0
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5388@ad08d607a0dddc7bf6bc2ee9867cbb0814d017de
 
 ## Acceptance
 
