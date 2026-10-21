@@ -6,8 +6,8 @@ parent: "5767"
 status: open
 scope: ["we:scripts/lib/daemon-jobs.mjs", "we:scripts/lib/__tests__/daemon-jobs.test.mjs", "we:scripts/lib/daemon-jobs-runtime.mjs", "we:scripts/lib/__tests__/daemon-jobs-runtime.test.mjs", "we:scripts/lib/daemon-item-tasks.mjs", "we:scripts/lib/__tests__/daemon-item-tasks.test.mjs", "we:scripts/operations/job-record.mjs", "we:scripts/operations/__tests__/job-record.test.mjs", "we:scripts/operations/daemon-jobs-proof/run-proof.mjs", "we:scripts/operations/daemon-jobs-proof/__tests__/run-proof.test.mjs", "we:scripts/operations/daemon-jobs-proof/demo-daemon.mjs", "we:scripts/operations/daemon-jobs-proof/__tests__/demo-daemon.test.mjs", "we:scripts/operations/daemon-jobs-proof/noop-job.mjs", "we:scripts/operations/daemon-jobs-proof/__tests__/noop-job.test.mjs", "we:scripts/lib/__tests__/daemon-item-tasks-proof.test.mjs"]
 dateOpened: "2026-10-10"
-preparedDate: "2026-10-19"
-preparedAgainstSha: "03ff962c10c047a30ec04854cae6c31a375bf57c"
+preparedDate: "2026-10-20"
+preparedAgainstSha: "eaad38ab2cee8eb1ccb774f7e74db98209cb922c"
 tags: []
 ---
 
@@ -141,3 +141,5 @@ Use the case names in Acceptance verbatim so review can select each guarantee. A
 - #5759/#5765 supply the fix-task planner, measured S1 GitHub budgets, real effect adapters, shadow parity and rollout. They must preserve the discovery-only PR snapshot boundary, complete live-thread reads for comment-dependent decisions, recorded-read coverage and fresh fences. They also supply production resource-kind mappings and policy overrides; this core accepts and validates those declarations without adding production settings files. #5763/#5764/#5755 reuse the same contract for their roles.
 - #5745/#5749 supply drain merge behavior and its server-side head precondition without changing the drain lease here. #5762 owns scheduler lease changes; #5766 owns blue-green transfer. Scheduler generation remains diagnostic for accepted tasks.
 - Raise acting concurrency above one only through the cascade after measurement (O14). A later adopter may refine conservative read coverage per effect using explicit dependency attribution; it may not bypass the accessor or leave a plan read unfenced.
+
+revalidated: The diff only replaces test keep-alives with runner-anchored helpers; the preparation’s runtime premises, scope, design and process-group compatibility proof plan remain applicable.
