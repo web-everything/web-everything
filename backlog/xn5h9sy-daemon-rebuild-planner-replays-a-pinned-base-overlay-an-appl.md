@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/plan.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/plan.mjs", "we:scripts/lib/__tests__/daemon-rebuild.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
@@ -14,6 +14,7 @@ we:scripts/lib/daemon-rebuild/plan.mjs replays a pinned base overlay even when a
 ## Acceptance
 
 - [A1] **Executable** — `npx vitest run scripts/lib/daemon-rebuild` with a new case: a pinned base whose tip is an ancestor of an applied top is skipped (logged with the containing top), not replayed. Fails before, passes after.
+- [A2] **Must refuse to skip** — named cases in we:scripts/lib/__tests__/daemon-rebuild.test.mjs: `E2 ancestry check fails` and `E2 ancestry check times out` (stubbed `git merge-base --is-ancestor` erroring and timing out) both replay the base as today; `E4 not a proven ancestor` (the base tip is not an ancestor of any applied top) replays it; `E6 containing top dropped` (the top is unregistered before the next rebuild) replays it.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
