@@ -1,4 +1,5 @@
 ---
+bornAs: xg8iu0w
 kind: story
 size: 3
 parent: "4075"
@@ -12,10 +13,10 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/x77cl1h-we-review-stringency-slice-2-settings-table-used-by-the-ruli.md:43` — Extend xio9qp2 A6 (handoff-concrete-values) so every ratified initial setting value, not only table and enum domains, needs a literal-value assertion.
-2. `we:backlog/x77cl1h-we-review-stringency-slice-2-settings-table-used-by-the-ruli.md:38` — Add a handoff-checklist item to xio9qp2 A9 (handoff-clock-contract) or A7: every 'pending X' guarantee must declare the outcome for each result of X, including failure or timeout.
-3. `we:backlog/x77cl1h-we-review-stringency-slice-2-settings-table-used-by-the-ruli.md:30` — Have the prepare checklist (xio9qp2 A3) ask, for each model-supplied field, who can actually know its value, and require a fixture showing the non-block outcomes remain reachable.
-4. `we:backlog/xsnny7x-we-review-stringency-slice-3-debt-register-kind-expedite-que.md:24` — Extend xio9qp2 A7 (`handoff-guarantee-trace`) so that each "confers no authority" or "is data" sentence needs an injected-text fixture id in the same acceptance line.
+1. `we:backlog/6233-we-review-stringency-slice-2-settings-table-used-by-the-ruli.md:43` — Extend xio9qp2 A6 (handoff-concrete-values) so every ratified initial setting value, not only table and enum domains, needs a literal-value assertion.
+2. `we:backlog/6233-we-review-stringency-slice-2-settings-table-used-by-the-ruli.md:38` — Add a handoff-checklist item to xio9qp2 A9 (handoff-clock-contract) or A7: every 'pending X' guarantee must declare the outcome for each result of X, including failure or timeout.
+3. `we:backlog/6233-we-review-stringency-slice-2-settings-table-used-by-the-ruli.md:30` — Have the prepare checklist (xio9qp2 A3) ask, for each model-supplied field, who can actually know its value, and require a fixture showing the non-block outcomes remain reachable.
+4. `we:backlog/6237-we-review-stringency-slice-3-debt-register-kind-expedite-que.md:24` — Extend xio9qp2 A7 (`handoff-guarantee-trace`) so that each "confers no authority" or "is data" sentence needs an injected-text fixture id in the same acceptance line.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5511@e7f4637426a0c3d878c337a535a5fb899390f1f0
 

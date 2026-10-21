@@ -1,21 +1,21 @@
 ---
+bornAs: xh39zuz
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/merge-gate-check.mjs", "we:scripts/lib/__tests__/merge-gate-ci.test.mjs", "we:scripts/__tests__/merge-gate-check.test.mjs"]
-dateOpened: "2026-10-17"
+scope: ["we:scripts/conveyor/__tests__/helpers/fake-gh.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a pin-failure case to the new describe block. Longer term, make the test helpers require one… (from web-everything/web-everything#5499 review)
+# Prevention — Record the holder's process start time (or boot id) next to the PID and compare both in processIs… (from web-everything/web-everything#5270 review)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/merge-gate-check.mjs:180` — Add a pin-failure case to the new describe block. Longer term, make the test helpers require one case per early-exit branch of a gatherer.
-2. `we:scripts/lib/__tests__/merge-gate-ci.test.mjs:402` — Add a table-driven test over `pinnedHeadOf` error shapes (fork, moved head, missing expected) for each non-labels authority. A broader guard would be a test-presence check that every `throw` branch inside `gatherPrFacts` is hit by some test.
+1. `we:scripts/conveyor/__tests__/helpers/fake-gh.mjs:298` — Record the holder's process start time (or boot id) next to the PID and compare both in processIsAlive. Alternatively, add a hard upper age cap that overrides the PID check. Cover it with a fake-gh-lock test in which the recorded PID is alive but its start time differs.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5499@44b92833a2b5c8cfa81ba82d59ebb7b5a5d98b79
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5270@acaf9f74ccb2cb8fda1a21b1ad319e4ea0dc1ee8
 
 ## Acceptance
 

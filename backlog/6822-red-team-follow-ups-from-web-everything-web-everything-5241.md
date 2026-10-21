@@ -1,20 +1,19 @@
 ---
+bornAs: xees7mw
 kind: story
-size: 3
-parent: "4075"
+size: 2
 status: open
-scope: ["we:scripts/lib/human-surface-net-diff.mjs", "we:scripts/lib/__tests__/human-surface-net-diff.test.mjs"]
-dateOpened: "2026-10-15"
+scope: ["we:scripts/lib/enqueue-on-event.mjs"]
+dateOpened: "2026-10-14"
 tags: []
 ---
 
-# Prevention — Make readHumanSurfaceNetFiles take baseRefName and return ok:false (fall back to the list) unless… (from web-everything/web-everything#5400 review)
+# Red-team follow-ups from web-everything/web-everything#5241 (head a68cb19fb)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5241 (reviewed head `a68cb19fb55ea02f6d1ac70769c667204cde4efd`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+1. `we:scripts/lib/enqueue-on-event.mjs:500` — (edge-case, degraded) Catch-up capacity ignores successful event drains and can overfill the queue.
 
-1. `we:scripts/lib/human-surface-net-diff.mjs:33` — Make readHumanSurfaceNetFiles take baseRefName and return ok:false (fall back to the list) unless it is 'main', with a test for a non-main base. Failing that, a lint or standards rule that net-diff readers must receive the PR base ref.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5400@ce00991eb19d349da1e8a2e25ca4c024e511416f
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #6120.
 
 ## Acceptance
 

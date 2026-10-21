@@ -1,20 +1,22 @@
 ---
+bornAs: xerg4pe
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/human-surface-repark.mjs", "we:scripts/conveyor/__tests__/human-surface-repark.test.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/operations/review-pr.mjs", "we:scripts/lib/review-seat-provider.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/lib/__tests__/review-seat-provider.test.mjs"]
+dateOpened: "2026-10-16"
 tags: []
 ---
 
-# Prevention — Add a shared fixture test that runs the same rename-away case through both the sweep and workflow… (from web-everything/web-everything#5273 review)
+# Prevention — Add a round-trip test (start with minNonClaudeSeats=2, then resume via advanceReviewPrToWriteUp)… (from web-everything/web-everything#5441 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/human-surface-repark.mjs:62` — Add a shared fixture test that runs the same rename-away case through both the sweep and `workflowEditHold`, so the two cannot drift. Better, have the sweep read changed files through `readPinnedChangedFiles` (`--no-renames`), the same reader the gate uses.
+1. `we:scripts/operations/review-pr.mjs:2374` — Add a round-trip test (start with minNonClaudeSeats=2, then resume via advanceReviewPrToWriteUp) and add a correctnessAdvisoryFromRun counterpart to codexAdvisoryFromRun. A deterministic guard would be a roster-equality assertion between the start and resume registrations for every settings combination.
+2. `we:scripts/lib/review-seat-provider.mjs:143` — Make shadowSeatStatus return 'off (no policy)' when shadowPolicy is absent. Give the legacy fixtures an explicit enabled shadowPolicy. Add a unit test pinning that an absent policy never samples.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5273@45c5481f1f537a9b31648bd4d3f9feef28f08197
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5441@454e87c072ee508452e5b63dec0957797d9bee1c
 
 ## Acceptance
 

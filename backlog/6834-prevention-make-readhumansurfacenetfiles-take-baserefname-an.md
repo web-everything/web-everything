@@ -1,21 +1,21 @@
 ---
+bornAs: xhu50r9
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
+scope: ["we:scripts/lib/human-surface-net-diff.mjs", "we:scripts/lib/__tests__/human-surface-net-diff.test.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Prevention — Add a test that delivers a mark mid-drain and asserts the PR is re-drained afterwards, or at leas… (from web-everything/web-everything#5277 review)
+# Prevention — Make readHumanSurfaceNetFiles take baseRefName and return ok:false (fall back to the list) unless… (from web-everything/web-everything#5400 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/enqueue-on-event.mjs:711` — Add a test that delivers a mark mid-drain and asserts the PR is re-drained afterwards, or at least that it stays in pending. A review-lens note on 'drop vs defer' for dedupe would also catch this class.
-2. `we:scripts/lib/enqueue-on-event.mjs:693` — Extend the backoff to any non-enqueued outcome this round, or require a retry cap or exponential busy interval. Add a test where the same PR is skipped on N consecutive busy rounds and the cadence relaxes.
+1. `we:scripts/lib/human-surface-net-diff.mjs:33` — Make readHumanSurfaceNetFiles take baseRefName and return ok:false (fall back to the list) unless it is 'main', with a test for a non-main base. Failing that, a lint or standards rule that net-diff readers must receive the PR base ref.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5277@f25321e3ea57624959859b8748fa877ae8e326dd
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5400@ce00991eb19d349da1e8a2e25ca4c024e511416f
 
 ## Acceptance
 

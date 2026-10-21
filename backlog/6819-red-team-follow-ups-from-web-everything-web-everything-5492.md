@@ -1,4 +1,5 @@
 ---
+bornAs: xdb3n0j
 kind: story
 size: 2
 status: open

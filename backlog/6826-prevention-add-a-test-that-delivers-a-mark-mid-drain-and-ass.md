@@ -1,18 +1,22 @@
 ---
+bornAs: xfpiro4
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/lib/enqueue-on-event.mjs"]
-dateOpened: "2026-10-14"
+scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
+dateOpened: "2026-10-15"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5241 (head a68cb19fb)
+# Prevention — Add a test that delivers a mark mid-drain and asserts the PR is re-drained afterwards, or at leas… (from web-everything/web-everything#5277 review)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5241 (reviewed head `a68cb19fb55ea02f6d1ac70769c667204cde4efd`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
-1. `we:scripts/lib/enqueue-on-event.mjs:500` — (edge-case, degraded) Catch-up capacity ignores successful event drains and can overfill the queue.
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #6120.
+1. `we:scripts/lib/enqueue-on-event.mjs:711` — Add a test that delivers a mark mid-drain and asserts the PR is re-drained afterwards, or at least that it stays in pending. A review-lens note on 'drop vs defer' for dedupe would also catch this class.
+2. `we:scripts/lib/enqueue-on-event.mjs:693` — Extend the backoff to any non-enqueued outcome this round, or require a retry cap or exponential busy interval. Add a test where the same PR is skipped on N consecutive busy rounds and the cadence relaxes.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5277@f25321e3ea57624959859b8748fa877ae8e326dd
 
 ## Acceptance
 
