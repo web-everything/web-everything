@@ -146,9 +146,12 @@ describe('matchReadyCandidate — superseded never drops a live overlay (fail cl
       carries: (sha) => sha === 't' || sha === 'p', // 1021c's live head is inside the candidate (1021d was built on it)
     });
     expect(ok.match).toBe('superseded');
+    // landed on the CURRENT main is no excuse: the record itself must contain it (Codex round 2)
     const left = matchReadyCandidate({
       ...base, ready: ready([]), liveApplied: [{ ref: 'lane/landed', sha: 'x' }], leftForMain: (ref) => ref === 'lane/landed',
     });
-    expect(left.match).toBe('superseded');
+    expect(left.adopt).toBeNull();
+    const inside = matchReadyCandidate({ ...base, ready: ready([]), liveApplied: [{ ref: 'lane/landed', sha: 'x' }], carries: () => true });
+    expect(inside.match).toBe('superseded');
   });
 });

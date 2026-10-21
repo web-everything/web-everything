@@ -75,11 +75,14 @@ export function matchReadyCandidate({
   if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
   if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
   // Live 2026-10-21 ~17:12 ET (review clone): a superseded build must never DROP an overlay the running build applies.
-  // Each one's applied sha must be an ancestor of the record's build unless it left because main now has it. Unknown live set (`liveApplied` not given) refuses: fail closed.
+  // Each one's applied sha must be an ancestor of the record's build. Unknown live set (`liveApplied` not given) refuses: fail closed.
   if (!Array.isArray(liveApplied)) return { adopt: null, reason: 'superseded-live-set-unknown' };
   // Carried means by CONTENT: the live applied sha is inside the record's build (the same ref at an OLDER head does
   // not count — Codex audit).
-  const omitted = liveApplied.filter((a) => a?.ref && !leftForMain(a.ref) && !(a.sha && carries(a.sha, ready.adopt.finalSha)));
+  // No exemption for "landed on main": the CURRENT main having it says nothing about the record's (possibly older)
+  // main — the record itself must contain it (Codex round 2). A squash-landed overlay just refuses superseded (fail closed).
+  void leftForMain;
+  const omitted = liveApplied.filter((a) => a?.ref && !(a.sha && carries(a.sha, ready.adopt.finalSha)));
   if (omitted.length > 0) {
     return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
   }
