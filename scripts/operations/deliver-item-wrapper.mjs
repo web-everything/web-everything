@@ -621,8 +621,11 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
           throw new Error('self-review builder did not complete its repair');
         }
         // The repair turn reports only what IT changed; keep every earlier turn's files so the park decision
-        // (statute / policy-core) and the PR body still see them.
-        report = { ...updated, filesTouched: [...new Set([...(report.filesTouched ?? []), ...(updated.filesTouched ?? [])])] };
+        // (statute / policy-core) and the PR body still see them. An earlier turn's needs-human-judgment is
+        // sticky too: a repair that reports `done` never clears the human park it asked for.
+        const judgment = report.outcome === 'needs-human-judgment' && updated.outcome !== 'needs-human-judgment'
+          ? { outcome: report.outcome, reason: report.reason } : {};
+        report = { ...updated, ...judgment, filesTouched: [...new Set([...(report.filesTouched ?? []), ...(updated.filesTouched ?? [])])] };
         commitBuildTurn({ lane: gate.lanePath, item, provider, phase: 'self-review' });
       },
       gate: () => runVerifyOperation(gate.lanePath).outcome === 'pass',
@@ -2557,17 +2560,17 @@ export function runConverge(
 export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'origin/main', strict = false } = {}) {
   try {
     // Hardened (the builder controls this lane's git config), commit against commit (no worktree filter runs),
-    // and `--no-renames` so a moved file lists both its old and new path, never a `{a => b}` form.
+    // `--no-renames` so a moved file lists both its old and new path, never a `{a => b}` form, and `-z` so a
+    // path with non-ASCII, quote or control bytes comes back raw, never C-quoted past the statute matcher.
     const opts = { env: laneGitHardeningEnv() };
-    const mergeBase = runFn('git', ['-C', lanePath, ...laneGitConfigArgs(), 'merge-base', 'HEAD', baseRef], opts).trim();
+    const mergeBase = runFn('git', ['-C', lanePath, ...laneGitConfigArgs(), '--no-replace-objects', 'merge-base', 'HEAD', baseRef], opts).trim();
     const numstat = runFn('git', ['-C', lanePath, ...laneGitConfigArgs(), '--no-replace-objects',
-      ...hardenLaneGitArgs(['diff', '--numstat', '--no-renames', mergeBase, 'HEAD', '--'])], opts);
+      ...hardenLaneGitArgs(['diff', '--numstat', '-z', '--no-renames', mergeBase, 'HEAD', '--'])], opts);
     const changedFiles = [];
     let diffLines = 0;
-    for (const line of numstat.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const [add, del, ...pathParts] = trimmed.split('\t');
+    for (const record of numstat.split('\0')) {
+      if (!record.trim()) continue;
+      const [add, del, ...pathParts] = record.split('\t');
       const path = pathParts.join('\t');
       if (path) changedFiles.push(path);
       const a = Number(add);

@@ -2380,7 +2380,7 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
   });
 
   it('parks review:human on a statute path in the lane\'s net diff even when the agent\'s report omits it', () => {
-    const runFn = (_bin, args) => (args.includes('merge-base') ? 'base\n' : '3\t1\tdocs/agent/platform-decisions.md\n');
+    const runFn = (_bin, args) => (args.includes('merge-base') ? 'base\n' : '3\t1\tdocs/agent/platform-decisions.md\0');
     const result = decideParkMode({
       report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { notes: [] } },
       filesTouched: ['a.mjs'], lanePath: '/lane',
@@ -2392,7 +2392,7 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
     const calls = [];
     const runFn = (_bin, args, opts) => {
       calls.push({ args, opts });
-      return args.includes('merge-base') ? 'base\n' : '0\t5\tdocs/agent/platform-decisions.md\n5\t0\tdocs/agent/moved.md\n';
+      return args.includes('merge-base') ? 'base\n' : '0\t5\tdocs/agent/platform-decisions.md\x005\t0\tdocs/agent/moved.md\0';
     };
     const result = decideParkMode({
       report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { notes: [] } },
@@ -2400,8 +2400,30 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
     }, { run: runFn });
     expect(result.label).toBe('review:human');
     const diff = calls.find(c => c.args.includes('--numstat'));
-    expect(diff.args).toEqual(expect.arrayContaining(['--no-renames', '--no-ext-diff', '--no-textconv', 'core.fsmonitor=false', 'base', 'HEAD']));
-    for (const c of calls) expect(c.opts.env).toEqual(laneGitHardeningEnv());
+    expect(diff.args).toEqual(expect.arrayContaining(['-z', '--no-renames', '--no-ext-diff', '--no-textconv', 'core.fsmonitor=false', 'base', 'HEAD']));
+    for (const c of calls) {
+      expect(c.opts.env).toEqual(laneGitHardeningEnv());
+      expect(c.args).toContain('--no-replace-objects');
+    }
+  });
+
+  // Without `-z`, git C-quotes a path with non-ASCII, `"` or control bytes (`"docs/agent/statute-\303\251.md"`),
+  // which no statute pattern matches. The mock answers exactly as git does for each argv.
+  it.each([
+    ['non-ASCII', 'docs/agent/statute-é.md', '"docs/agent/statute-\\303\\251.md"'],
+    ['a double quote', 'docs/agent/statute"draft.md', '"docs/agent/statute\\"draft.md"'],
+    ['a tab', 'docs/agent/statute\tnotes.md', '"docs/agent/statute\\tnotes.md"'],
+    ['a newline', 'docs/agent/statute\nnotes.md', '"docs/agent/statute\\nnotes.md"'],
+  ])('parks review:human on a statute path with %s in its name, which git would quote without -z', (_name, raw, quoted) => {
+    const runFn = (_bin, args) => {
+      if (args.includes('merge-base')) return 'base\n';
+      return args.includes('-z') ? `1\t0\t${raw}\0` : `1\t0\t${quoted}\n`;
+    };
+    const result = decideParkMode({
+      report: { outcome: 'done' }, convergeVerdict: { verdict: 'land', selfReview: { notes: [] } },
+      filesTouched: ['a.mjs'], lanePath: '/lane',
+    }, { run: runFn });
+    expect(result).toEqual({ mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' });
   });
 
   it('parks review:human when the lane\'s net diff cannot be read — an unreadable diff never clears the statute check', () => {
@@ -2435,7 +2457,7 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
   it('calls the REAL scoreEscalation for a clean small diff and labels ready-to-merge (label-on-green)', () => {
     const run = vi.fn((cmd, args) => {
       if (args.includes('merge-base')) return 'abc123\n';
-      if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\n';
+      if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\0';
       throw new Error(`unexpected: ${cmd} ${args}`);
     });
     const result = decideParkMode(
@@ -2450,7 +2472,7 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
   it('a LARGE real diff (>= the real 400-line threshold) escalates to review:pending via the real rubric, never silently clears', () => {
     const run = vi.fn((cmd, args) => {
       if (args.includes('merge-base')) return 'abc123\n';
-      if (args.includes('diff')) return '300\t200\treports/2026-09-09-big.md\n';
+      if (args.includes('diff')) return '300\t200\treports/2026-09-09-big.md\0';
       throw new Error(`unexpected: ${cmd} ${args}`);
     });
     const result = decideParkMode(
@@ -2466,7 +2488,7 @@ describe('decideParkMode (#3627 gap 4 — the real scoreEscalation rubric)', () 
   it('dismissed converge findings (from the real convergeVerdict.dismissed) escalate to review:pending via scoreEscalation', () => {
     const run = vi.fn((cmd, args) => {
       if (args.includes('merge-base')) return 'abc123\n';
-      if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\n';
+      if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\0';
       throw new Error(`unexpected: ${cmd} ${args}`);
     });
     const result = decideParkMode(
@@ -2499,7 +2521,7 @@ describe('decideParkMode (#3850 Fork 2 — the land-seam hold on a delegated exe
   const noVerdict = { verdict: 'land', dismissed: [] };
   const cleanRun = vi.fn((cmd, args) => {
     if (args.includes('merge-base')) return 'abc123\n';
-    if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\n';
+    if (args.includes('diff')) return '2\t1\treports/2026-09-09-note.md\0';
     throw new Error(`unexpected: ${cmd} ${args}`);
   });
 
@@ -2540,7 +2562,7 @@ describe('decideParkMode (#3850 Fork 2 — the land-seam hold on a delegated exe
   it('a non-Claude executor never DOWNGRADES the real scoreEscalation rubric\'s own review:pending — same label, real reason', () => {
     const bigRun = vi.fn((cmd, args) => {
       if (args.includes('merge-base')) return 'abc123\n';
-      if (args.includes('diff')) return '300\t200\treports/2026-09-09-big.md\n';
+      if (args.includes('diff')) return '300\t200\treports/2026-09-09-big.md\0';
       throw new Error(`unexpected: ${cmd} ${args}`);
     });
     const result = decideParkMode(
@@ -3639,6 +3661,22 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     expect(provider.spawn).toHaveBeenCalledTimes(2);
     expect(result.result).toBe('PR #4321 (review:human)');
     expect(readFileSync(join(lane, '.pr-body.md'), 'utf8')).toContain('- docs/agent/platform-decisions.md');
+  });
+
+  // Same class: the repair turn's report must not clear turn 1's own needs-human-judgment park either.
+  it('parks review:human when turn 1 asked for human judgment and the self-review repair reported done', async () => {
+    vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'true');
+    const provider = { spawn: vi.fn(), vendor: 'claude' };
+    tryReadDeliveryReport.mockImplementation(() => (provider.spawn.mock.calls.length > 1
+      ? { status: 'done', outcome: 'done', filesTouched: ['a.mjs'], reason: 'repaired' }
+      : { status: 'done', outcome: 'needs-human-judgment', filesTouched: ['b.mjs'], reason: 'a genuine taste call' }));
+    const reviewBuild = vi.fn().mockResolvedValueOnce(['a.mjs:1 defect']).mockResolvedValue([]);
+    const result = await deliverItem(
+      { item: '9999', lane: 7, scope: [], sessionSlug: 'conveyor-9999', attemptTag: '', runId: 'dispatch-lane-fixture', effectKey: 'dispatch:0:0' },
+      provider, { newSessionId: () => 'uuid-fixed', reviewBuild },
+    );
+    expect(provider.spawn).toHaveBeenCalledTimes(2);
+    expect(result.result).toBe('PR #4321 (review:human)');
   });
 
   it.each([
