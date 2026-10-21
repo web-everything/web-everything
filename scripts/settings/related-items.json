@@ -1,0 +1,10 @@
+{
+  "relatedItems": {
+    "$comment": "Repo override for the related-items check (operator 2026-10-21). enabled = the read-only `related-items` operation (kill switch). fileItem = what `file-item` does when an existing card scores >= threshold and the filing names none of them (--related/--parent) nor says why it is new (--new-because): off | warn (print and file anyway) | refuse. Warn-only first, until the threshold is calibrated on live filings (mechanical prevention filings go through file-item too). Cascade: standard default -> platform preference (relatedItems in scripts/lib/delivery-platform-preferences.json) -> this file -> env (WE_RELATED_ITEMS, WE_RELATED_ITEMS_FILE_ITEM, WE_RELATED_ITEMS_THRESHOLD). See scripts/lib/related-items-core.mjs.",
+    "enabled": true,
+    "fileItem": "warn",
+    "threshold": 0.5,
+    "statuses": ["open", "parked", "active"],
+    "resolvedWithinDays": 30
+  }
+}

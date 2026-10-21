@@ -105,8 +105,10 @@ import { createCloseItemsReader, createCloseItemsSinks, createReopenItemsReader,
 import { createResolveReader, createResolveSinks } from './resolve-io.mjs';
 import { scaffoldOperation, SCAFFOLD_OP } from './scaffold.mjs';
 import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
-import { fileItemOperation, FILE_ITEM_OP } from './file-item.mjs';
+import { fileItemOperation, FILE_ITEM_OP, finishFileItem } from './file-item.mjs';
 import { createFileItemReader, createFileItemSinks } from './file-item-io.mjs';
+import { relatedItemsOperation, RELATED_ITEMS_OP, finishRelatedItems } from './related-items.mjs';
+import { createRelatedItemsReader } from './related-items-io.mjs';
 import { openPrOperation, OPEN_PR_OP } from './open-pr.mjs';
 import { createOpenPrSinks, deriveLaneRef } from './open-pr-io.mjs';
 import { PARK_LABELS } from '../pr-land.mjs';
@@ -308,8 +310,16 @@ export const OPERATIONS = Object.freeze({
   // so filing an item has ONE declared call end to end instead of a card + a separately-remembered gesture.
   // Graduated from `origin/lane/mechanical-dispatcher` (#3548); see `file-item.mjs`'s own header.
   [FILE_ITEM_OP]: () => ({
-    declaration: fileItemOperation({ readScaffoldContext: createFileItemReader() }),
+    declaration: fileItemOperation({ readScaffoldContext: createFileItemReader(), readRelated: createRelatedItemsReader() }),
     sinks: createFileItemSinks(),
+    finish: finishFileItem,
+  }),
+  // 2026-10-21 — "which cards is this idea already about?", run before proposing or filing. Read-only (one
+  // `compute` step, no sinks); the backlog/settings read is bound here, and ONLY here.
+  [RELATED_ITEMS_OP]: () => ({
+    declaration: relatedItemsOperation({ readContext: createRelatedItemsReader() }),
+    sinks: {},
+    finish: finishRelatedItems,
   }),
   [SUGGEST_NEXT_OP]: () => ({
     declaration: suggestNextOperation({

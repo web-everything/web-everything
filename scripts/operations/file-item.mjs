@@ -64,10 +64,16 @@ import { BACKLOG_KINDS } from '../check-standards-rules.mjs';
 import { planScaffold, shapeScaffoldRead, SCAFFOLD_EFFECT } from './scaffold.mjs';
 import { setFrontmatterField } from '../backlog/frontmatter.mjs';
 import { validatePrepareCard } from '../conveyor/prepare-result.mjs';
+import { rankRelatedItems, planRelatedGate, relatedDigestNote, formatRelatedItemsPolicy } from '../lib/related-items-core.mjs';
 
 /** Validate before either filing effect; ordinary scaffold output stays byte-identical. An explicit card
  *  priority (P0..P4) for operator tasks is card #xqqmw6g, with the authority it needs. */
-export function planFileItem(read, input) {
+export function planFileItem(read, input, related = null) {
+  if (related?.refuse) throw new Error(related.lines.join('\n'));
+  input = withNewBecause(input);
+  // A filer who named a related card or said why this is new gets that recorded on the card, under the digest.
+  const note = relatedDigestNote(input);
+  if (note) input = { ...input, digest: `${String(input.digest ?? '').replace(/\s+$/, '')}${input.digest ? '\n\n' : ''}${note}` };
   const verdict = planScaffold(read, input);
   const policy = read.operatorTask;
   if (!input.operatorTask) return verdict;
@@ -85,6 +91,39 @@ export function planFileItem(read, input) {
 }
 
 export const FILE_ITEM_OP = 'file-item';
+
+/** The CLI spells the reason `--new-because`; the pure core reads `newBecause`. */
+const withNewBecause = (input = {}) => (input['new-because'] !== undefined && input.newBecause === undefined
+  ? { ...input, newBecause: input['new-because'] } : input);
+
+/**
+ * THE RELATED-CARD CHECK (operator 2026-10-21): before the card is written, rank the existing cards against the
+ * filing's title + digest (+ scope) with the same pure core as the read-only `related-items` operation. PURE over the
+ * injected context; `null` context (no reader bound) or any read failure means "not checked", never a refusal.
+ * @returns {ReturnType<typeof planRelatedGate> & {policy: string|null, error?: string}}
+ */
+export function planRelatedCheck(ctx, input) {
+  input = withNewBecause(input);
+  if (!ctx) return { ...planRelatedGate({ result: null, policy: null }), policy: null };
+  if (ctx.error) return { ...planRelatedGate({ result: null, policy: null }), policy: null, error: ctx.error };
+  const policyLine = formatRelatedItemsPolicy(ctx.policy);
+  const gateOff = !ctx.policy.enabled || ctx.policy.fileItem === 'off';
+  const result = gateOff ? null : rankRelatedItems({
+    query: { text: `${input.title ?? ''}\n${input.digest ?? ''}`, scope: input.scope },
+    cards: ctx.cards, policy: ctx.policy, today: ctx.today,
+  });
+  const gate = planRelatedGate({ result, policy: ctx.policy, input });
+  return { ...gate, lines: gate.lines.length ? [...gate.lines, `policy: ${policyLine}`] : [], policy: policyLine };
+}
+
+/** The CLI trailer: the default outcome lines, plus the related-card warning when the check found any. */
+export function finishFileItem({ run, code, lines, json = false }) {
+  const related = run?.findings?.related;
+  const extra = related?.lines ?? [];
+  // A refusal already carries these lines in its own error text; print them once.
+  if (json || !extra.length || related.refuse) return { code, lines };
+  return { code, lines: [...lines, '', ...extra] };
+}
 
 /** The second effect this operation can declare, beside `scaffold`'s own `scaffold.write`. */
 export const FILE_ITEM_QUEUE_EFFECT = 'file-item.queue-add';
@@ -135,7 +174,7 @@ export function planQueueing(verdict, input = {}) {
  * Build the declaration. Both readers/sinks are injected — `./file-item-io.mjs` supplies the real bindings,
  * reusing `we:scripts/operations/scaffold-io.mjs`'s own reader + write sink rather than re-deriving either.
  */
-export function fileItemOperation({ readScaffoldContext } = {}) {
+export function fileItemOperation({ readScaffoldContext, readRelated = null } = {}) {
   if (typeof readScaffoldContext !== 'function') {
     throw new TypeError(
       'file-item: needs a `readScaffoldContext()` reader — the io is INJECTED so the declaration stays '
@@ -162,6 +201,10 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       // over bare `scaffold`; a caller who wants scaffold-only behaviour passes `--queue=false` (or calls
       // `scaffold` directly, which this operation intentionally leaves reachable).
       queue: { type: 'string', required: false, default: 'true' },
+      // The related-card check (see `planRelatedCheck`): name the existing card this filing relates to, or say why
+      // it is new. Either one satisfies the check; both are recorded under the digest.
+      related: { type: 'string', required: false, default: '' },
+      'new-because': { type: 'string', required: false, default: '' },
     },
     verdictFrom: 'plan',
     // Both raw sequences this operation replaces end to end: filing (`backlog.mjs scaffold`) AND the
@@ -177,6 +220,19 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       },
     }),
 
+    // THE RELATED-CARD CHECK — before `plan`, so a refusal stops the filing before any card number is allocated.
+    // Only the bounded top matches are kept on the finding (never the whole card corpus).
+    related: compute({
+      reads: ['input.title', 'input.digest', 'input.scope', 'input.parent', 'input.related', 'input.new-because'],
+      fn: (view) => {
+        let ctx = null;
+        if (typeof readRelated === 'function') {
+          try { ctx = readRelated(); } catch (e) { ctx = { error: String(e?.message ?? e) }; }
+        }
+        return planRelatedCheck(ctx, view.input);
+      },
+    }),
+
     // THE SCAFFOLD VERDICT, extended only by operator filing admission — same allocation, same refusals,
     // same rendered content. This is the operation's `verdictFrom` target, so a caller reading `run.verdict`
     // sees exactly what a `scaffold` caller would (num/id/rel/abs/kind/status/content/digestFilled).
@@ -184,8 +240,9 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       reads: [
         'input.title', 'input.kind', 'input.type', 'input.workItem', 'input.size', 'input.slug',
         ...OPERATOR_TASK_READS, 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
+        'input.related', 'input.new-because', 'findings.related',
       ],
-      fn: (view) => planFileItem(view.findings.read, view.input),
+      fn: (view) => planFileItem(view.findings.read, view.input, view.findings.related),
     }),
 
     // THE QUEUEING DECISION, kept OFF the verdict deliberately: `verdictFrom: 'plan'` means every existing

@@ -24,6 +24,8 @@ the conveyor. A card that is filed and never cleared sits invisible to
 `state.queue`'s CLEARED (`buildQueued`) rows ONLY — an uncleared item, however ready, is never dispatched.
 Route every new filing through `file-item` instead:
 
+**Before proposing or filing, run `node scripts/operations/run.mjs related-items --text='<title and idea>' [--scope=we:…]`** and read its matches; `file-item` runs the same check and lists any card over the threshold (warn-only today, `we:scripts/settings/related-items.json`) — name it with `--related=<id>` (or `--parent=<id>`), or say why this is new with `--new-because='<reason>'`.
+
 ```
 node scripts/operations/run.mjs file-item --title="<title>" --kind=story --size=<fib> \
   --digest="<why this exists, we:-prefixed for every bare code path>" \

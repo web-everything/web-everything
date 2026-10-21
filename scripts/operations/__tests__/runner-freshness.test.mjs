@@ -99,6 +99,7 @@ describe('runner freshness policy', () => {
         "record-referral-ruling",
         "record-verdict",
         "refresh",
+        "related-items",
         "reopen-items",
         "resolve",
         "resource-status",
