@@ -105,8 +105,9 @@ export function resolveGhAuthPolicy({ daemon = false, platform = {}, tool = {}, 
 }
 
 /** Resolve the separate ghAuth namespace; existing github.* policy remains unchanged. */
-export function readGhAuthPolicy({ daemon = false, env = process.env, read = readSettings } = {}) {
+export function readGhAuthPolicy({ daemon = false, env = process.env, read = readSettings, readFile } = {}) {
   let tool = {};
   try { tool = read()?.ghAuth ?? {}; } catch { /* default */ }
-  return resolveGhAuthPolicy({ daemon, platform: platformPreference('ghAuth', { env }) ?? {}, tool, env });
+  const platform = platformPreference('ghAuth', readFile ? { env, readFile } : { env }) ?? {};
+  return resolveGhAuthPolicy({ daemon, platform, tool, env });
 }

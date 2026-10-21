@@ -1225,6 +1225,17 @@ require(${JSON.stringify(shim)});
       } finally { rmSync(o.root, { recursive: true, force: true }); }
     });
 
+    it('takes the platform preference from the checkout that owns the shim, not the writer', () => {
+      const o = owner(null);
+      try {
+        mkdirSync(join(o.root, 'scripts', 'lib'), { recursive: true });
+        writeFileSync(join(o.root, 'scripts', 'lib', 'delivery-platform-preferences.json'), JSON.stringify({ ghAuth: { personalFallback: 'allow' } }));
+        expect(policyOf(bake({}, o.ghThrottleCliPath))).toEqual({ personalFallback: 'allow', source: { personalFallback: 'platform' } });
+        rmSync(join(o.root, 'scripts', 'lib', 'delivery-platform-preferences.json'));
+        expect(policyOf(bake({}, o.ghThrottleCliPath))).toEqual({ personalFallback: 'refuse', source: { personalFallback: 'default' } });
+      } finally { rmSync(o.root, { recursive: true, force: true }); }
+    });
+
     it('does not bake the rendering process env by default', () => {
       const o = owner({ personalFallback: 'refuse' });
       vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'allow');

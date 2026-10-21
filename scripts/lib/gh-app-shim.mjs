@@ -85,7 +85,7 @@
 import { existsSync, writeFileSync, chmodSync, mkdirSync, readFileSync, renameSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { join, resolve, dirname, isAbsolute } from 'node:path';
+import { join, resolve, dirname, isAbsolute, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultCachePath, resolveGithubAppEnvConfig } from './github-app-auth-env.mjs';
 import {
@@ -168,15 +168,17 @@ export function checkoutShimDir({ ghThrottleCliPath = defaultGhThrottleCliPath()
 
 /**
  * The personal-fallback policy written into a shim. Many processes write one shim dir (it is keyed by
- * `ghThrottleCliPath`, usually the control clone's), so the policy must not depend on the writer: it comes from
- * the checkout that owns `ghThrottleCliPath` and the default platform file only. A caller's env
- * (WE_GH_AUTH_PERSONAL_FALLBACK, WE_PLATFORM_PREFERENCES_FILE) and the writer's own checkout settings never
+ * `ghThrottleCliPath`, usually the control clone's), so the policy must not depend on the writer: both its
+ * tool settings and its platform preference files come from the checkout that owns `ghThrottleCliPath`. A
+ * caller's env (WE_GH_AUTH_PERSONAL_FALLBACK, WE_PLATFORM_PREFERENCES_FILE) and the writer's own checkout never
  * reach it. The shim still reads WE_GH_AUTH_PERSONAL_FALLBACK from each caller at run time.
  */
-export function shimFallbackPolicy({ ghThrottleCliPath = defaultGhThrottleCliPath(), read } = {}) {
+export function shimFallbackPolicy({ ghThrottleCliPath = defaultGhThrottleCliPath() } = {}) {
   const scripts = dirname(dirname(resolve(ghThrottleCliPath)));
-  const readOwner = read ?? (() => readSettings({ dir: join(scripts, 'settings'), legacyPath: join(scripts, 'dispatch-settings.json') }));
-  return readGhAuthPolicy({ daemon: true, env: {}, read: readOwner });
+  return readGhAuthPolicy({ daemon: true, env: {},
+    read: () => readSettings({ dir: join(scripts, 'settings'), legacyPath: join(scripts, 'dispatch-settings.json') }),
+    // The platform files are named relative to the reading module; read the owner's files of the same names.
+    readFile: (path, encoding) => readFileSync(join(scripts, 'lib', basename(path)), encoding) });
 }
 
 /** The root every generated shim dir lives under — never a real `gh` (see {@link resolveRealGhBinary}). */
