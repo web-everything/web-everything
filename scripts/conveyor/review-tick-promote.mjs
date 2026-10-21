@@ -21,8 +21,20 @@
  */
 import { defaultListDrafts, runDraftPromotionStep } from './draft-promotion-loop.mjs';
 import { resolveDraftPromotionSettings } from './draft-promotion-rule.mjs';
+// The guarded stale-accept provider ships with the planner (#5628); main may not export it yet.
+import * as promoteDispatch from '../operations/promote-draft-pr-dispatch.mjs';
 
 const oneLine = (e) => String(e?.message ?? e).split('\n')[0];
+
+/** Use the existing guarded provider when installed; keep the PR held when it is unavailable. */
+export function rearmStaleAcceptanceGuarded({
+  repo, pr, headSha, rearm = promoteDispatch.defaultRearmStaleAcceptance,
+} = {}) {
+  if (typeof rearm !== 'function') {
+    return { ok: false, reason: 'guarded stale-accept re-arm is unavailable in this checkout' };
+  }
+  return rearm({ repoSlug: repo, prNumber: pr, headSha });
+}
 
 /**
  * The real promote effect: the fast promoter's guarded step, scoped to one repo and to the given PR numbers.

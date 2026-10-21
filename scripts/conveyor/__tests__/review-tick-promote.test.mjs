@@ -4,8 +4,11 @@
  * not promoted twice.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
-import { promoteDraftsGuarded, promoteDraftsThenReplan, rearmStaleAcceptsThenReplan } from '../review-tick-promote.mjs';
+import { promoteDraftsGuarded, promoteDraftsThenReplan, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../review-tick-promote.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -134,6 +137,23 @@ describe('promoteDraftsGuarded — the fast promoter\'s own guards decide (card 
 // LIVE 2026-10-21, PR #5771: an accepted PR whose head moved was planned a stale-accept `restore-review-label` row each
 // tick, but only a daemon whose plan never produced it executed rows, so review of the new head never went out.
 describe('review daemon: same-pass stale-accept re-arm + review (#5771)', () => {
+  it('boots in native Node without requiring the stale-accept provider export', () => {
+    // Vite can tolerate a missing named export; real daemon and smoke children use native ESM linking.
+    // Resolve a filesystem path first so Vite cannot rewrite the entry to an HTTP asset URL.
+    const entry = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), '../../../skills-src/conveyor/review-daemon.mjs')).href;
+    const out = execFileSync(process.execPath, ['--input-type=module', '-e',
+      `const daemon = await import(${JSON.stringify(entry)}); process.stdout.write(typeof daemon.runReviewTick);`,
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
+    expect(out).toBe('function');
+  });
+
+  it.each([{ ok: true }, { ok: false, reason: 'acceptance still covers the head' }])('preserves the guarded provider result (%j) and passes the planned repo, PR and head', (result) => {
+    const rearm = vi.fn(() => result);
+    expect(rearmStaleAcceptanceGuarded({ repo: REPO, pr: 5771, headSha: HEAD, rearm })).toBe(result);
+    expect(rearm).toHaveBeenCalledTimes(1);
+    expect(rearm).toHaveBeenCalledWith({ repoSlug: REPO, prNumber: 5771, headSha: HEAD });
+  });
+
   const accepted = (n, extra = {}) => ({
     number: n, state: 'OPEN', isDraft: false, headRefName: `lane/x-${n}`, headRefOid: HEAD, labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }],
     isCrossRepository: false, ...extra,
@@ -184,6 +204,16 @@ describe('review daemon: same-pass stale-accept re-arm + review (#5771)', () => 
     const { dispatch, noteRearms } = run({ rearmStaleAccepts: () => ({ ok: false, reason: 'acceptance still covers the head' }) });
     expect(dispatch).not.toHaveBeenCalled();
     expect(noteRearms).toHaveBeenCalledWith(expect.objectContaining({ rearms: [expect.objectContaining({ ok: false, why: 'acceptance still covers the head' })] }));
+  });
+
+  it('an unavailable guarded provider keeps the PR held and reports a refusal', () => {
+    const { dispatch, noteRearms } = run({
+      rearmStaleAccepts: (o) => rearmStaleAcceptanceGuarded({ ...o, rearm: null }),
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(noteRearms).toHaveBeenCalledWith(expect.objectContaining({
+      rearms: [{ pr: 5771, ok: false, why: 'guarded stale-accept re-arm is unavailable in this checkout' }],
+    }));
   });
 
   it('a throwing re-arm is a refusal, not a tick failure', () => {
