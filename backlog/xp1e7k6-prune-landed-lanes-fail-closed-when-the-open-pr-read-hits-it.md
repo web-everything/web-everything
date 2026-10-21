@@ -19,6 +19,8 @@ The prune keeps any lane branch an open PR targets (or heads), but its open-PR r
   - `open-PR read: a listing that returns exactly the limit is treated as truncated and every delete that pass is withheld`.
   - `open-PR read: a listing below the limit keeps today's behaviour (a branch no open PR heads or targets is deleted)`.
   - `open-PR read: a failed listing withholds every delete that pass` (today's fail-closed path, pinned).
+  - `open-PR read: a complete initial listing followed by a capped pre-delete re-read performs no ref delete` (the initial listing is below the limit and permits a candidate; the pre-delete re-read returns exactly the cap, potentially omitting a newly protected branch; assert zero ref-deletion calls).
+  - `open-PR read: a complete initial listing followed by a failed pre-delete re-read performs no ref delete` (assert zero ref-deletion calls, independently of the initial-read failure fixture).
 
 ## Non-goals
 
