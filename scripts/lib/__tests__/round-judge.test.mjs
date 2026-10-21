@@ -22,7 +22,7 @@ const cap = (head) => bot(`${redTeamGateMarker(PR, head, 'round-cap', 'abcdef012
 const review = (bullets) => bot(`🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via the declared \`review-pr\` operation.\n\n### Findings\n${bullets.join('\n')}\n`, at());
 const grantComment = (by = 1) => op(`➕ conveyor — review round extension granted\n\nOperator @chalbert granted +${by} auto-repair round(s) via claude-code-chat\n\n> r\n\n<!-- round-extension: ${JSON.stringify({ version: 1, repo: 'web-everything/web-everything', pr: PR, by, actor: 'chalbert', channel: 'claude-code-chat', reason: 'r', at: '2026-10-20T00:00:00.000Z' })} -->`, at());
 const REPO = 'web-everything/web-everything';
-const judge = (comments, extra = {}) => judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'red-team-cap', comments, ...extra });
+const judge = (comments, extra = {}) => judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'red-team-cap', comments, files: ['src/q.mjs'], ...extra });
 
 describe('verdict paths', () => {
   it('grant(+1): findings shrink and none is re-raised', () => {
@@ -135,6 +135,80 @@ describe('review-cap spent on mechanical re-pushes', () => {
   });
   it('a prose statute doc alone is not a guard file', () => {
     expect(isGuardPath('docs/agent/platform-decisions.md')).toBe(false);
+  });
+});
+
+describe('stricter after audit', () => {
+  it('a COVERAGE label never downgrades an explicit broken impact', () => {
+    expect(parseReviewFindings('- `a.mjs:1` — COVERAGE: no test _[impact if unfixed: broken]_')[0].impact).toBe('broken');
+  });
+  it('an open red-team break blocks card-the-rest at a review cap', () => {
+    const r = judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'review-cap', comments: [
+      review(['- `src/a.mjs:4` — COVERAGE: restart test cannot detect early cursor advance']),
+      rt(H(9), [['src/z.mjs', 1, 'reads another user data without authorization']]),
+    ] });
+    expect(r.verdict).not.toBe('card-the-rest');
+  });
+  it('no file evidence, or an uninspectable statute edit, means no grant', () => {
+    const shrinking = [rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke'], ['c.mjs', 3, 'three cccc broke']]), rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']])];
+    expect(judge(shrinking, { files: [] })).toMatchObject({ verdict: 'send-back', reasons: ['no-file-evidence-no-grant'] });
+    expect(judge(shrinking, { files: ['docs/agent/platform-decisions.md'] }).reasons[0]).toMatch(/statute-file-uncertain-no-grant/);
+    expect(judge(shrinking, { files: ['src/q.mjs'] }).verdict).toBe('grant');
+  });
+  it('a grant never takes the PR past 3 total', () => {
+    const r = judge([grantComment(), grantComment(),
+      rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke'], ['c.mjs', 3, 'three cccc broke'], ['d.mjs', 4, 'four dddd broke']]),
+      rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']])], { files: ['src/q.mjs'] });
+    expect(r).toMatchObject({ verdict: 'grant', k: 1 });
+  });
+  it('the mechanical-spend grant also respects the allowance and file evidence', () => {
+    const accepted = () => bot('✅ review — accepted\n\nRecorded by agent', at());
+    const repush = () => bot('🔧 conveyor fix — re-armed for re-review\n\nThe previously accepted PR was re-pushed', at());
+    const base = [repush(), accepted(), repush(), accepted()];
+    expect(judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'review-cap', comments: base, files: [] }).reasons).toEqual(['no-file-evidence-no-grant']);
+    expect(judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'review-cap', files: ['backlog/1.md'], comments: [grantComment(), grantComment(), grantComment(), ...base] }).verdict).toBe('escalate');
+  });
+});
+
+describe('not-real-verified', () => {
+  const hold = (...bullets) => bot(`review paused: head x was already reviewed\n\nWaiting on your ruling (block, card or not-real):\n${bullets.join('\n')}\n\n<!-- review-referral-hold: abcdef0123456789 -->`, at());
+  const refute = (ok) => (f) => (ok(f) ? { status: 'refuted', evidence: `t.test.mjs:1 covers ${f.line}` } : { status: 'inconclusive', evidence: null });
+  const run = (verify, bullets = ['- `src/a.mjs:5` — no test for alpha', '- `src/b.mjs:7` — no test for beta']) =>
+    judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'referral-hold', comments: [hold(...bullets)], files: ['src/a.mjs'], verify });
+  it('every open finding refuted with evidence -> not-real-verified, evidence in the proof and the line', () => {
+    const r = run(refute(() => true));
+    expect(r.verdict).toBe('not-real-verified');
+    expect(r.proof).toEqual(['src/a.mjs:5 -> t.test.mjs:1 covers 5', 'src/b.mjs:7 -> t.test.mjs:1 covers 7']);
+    expect(formatJudgeLine(PR, r)).toMatch(/^round-judge-shadow: #900 verdict=not-real-verified evidence=src\/a\.mjs:5 -> t\.test\.mjs:1 covers 5 \| src/);
+  });
+  it('one finding not refuted -> never not-real: send-back (first round), partial refutation noted', () => {
+    const r = run(refute((f) => f.line === 5));
+    expect(r.verdict).toBe('send-back');
+    expect(r.reasons).toContain('partially-refuted:1-of-2');
+  });
+  it('inconclusive everywhere -> send-back', () => {
+    expect(run(refute(() => false)).verdict).toBe('send-back');
+  });
+  it('a "refuted" result with no evidence is treated as inconclusive; a throwing checker too', () => {
+    expect(run(() => ({ status: 'refuted', evidence: null })).verdict).toBe('send-back');
+    expect(run(() => { throw new Error('x'); }).verdict).toBe('send-back');
+  });
+  it('no checker -> the normal flow', () => {
+    expect(run(undefined).verdict).toBe('send-back');
+  });
+  it('a schema-invalid not-real (no proof) fails closed', () => {
+    expect(validateVerdict({ verdict: 'not-real-verified', reasons: ['r'] }).ok).toBe(false);
+  });
+  it('a model can never loosen to not-real-verified', () => {
+    const r = run(refute(() => false), ['- `src/a.mjs:5` — alpha broke']);
+    const second = judgeRound({ pr: PR, repo: REPO, head: H(9), trigger: 'referral-hold', comments: [hold('- `src/a.mjs:5` — alpha broke')], llm: () => ({ verdict: 'not-real-verified', proof: ['x'], reasons: ['r'] }) });
+    expect(second.verdict).toBe(r.verdict);
+  });
+  it('detectRoundCap: a referral hold stands until a ruling is recorded', () => {
+    const h = hold('- `src/a.mjs:5` — x');
+    expect(detectRoundCap({ comments: [h], pr: PR, head: H(9) })).toMatchObject({ trigger: 'referral-hold' });
+    const ruled = bot('## Operator ruling on mandatory referrals\n\n1. **not-real** — x', at());
+    expect(detectRoundCap({ comments: [h, ruled], pr: PR, head: H(9) })).toBeNull();
   });
 });
 

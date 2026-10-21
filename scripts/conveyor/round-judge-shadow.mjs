@@ -13,13 +13,14 @@
  *   Log: `~/workspace/.operations/round-judge-shadow/YYYY-MM.jsonl` (override dir: `WE_ROUND_JUDGE_SHADOW_DIR`).
  *   One record per (PR, head, cap trigger, cap episode); a re-seen cap is skipped. Never throws into the caller.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine, logCascadeSources } from '../lib/policy-cascade.mjs';
 import { readConfirmedBreaks } from '../lib/red-team-gate.mjs';
 import { detectRoundCap, judgeRound, formatJudgeLine } from '../lib/round-judge.mjs';
+import { verifyFinding, makeGitRepo } from '../lib/round-judge-verify.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 
 export const ROUND_JUDGE_MODES = Object.freeze(['off', 'shadow', 'on']);
@@ -46,26 +47,41 @@ export function resolveRoundJudgeMode({ env = process.env, path = ROUND_JUDGE_SE
   return { mode, source, line: `${formatCascadeSourcesLine('rounds', resolved)}${source === 'env' ? ` · env ${ROUND_JUDGE_MODE_ENV}=${mode}` : ''}` };
 }
 
+const DIR_NAME = 'round-judge-shadow';
+/** The log dir. The env override is honoured only for a directory NAMED `round-judge-shadow`, so a stray value can never
+ *  redirect these writes somewhere else. */
 export function roundJudgeDir(env = process.env) {
-  return env?.[ROUND_JUDGE_DIR_ENV]?.trim() || join(homedir(), 'workspace', '.operations', 'round-judge-shadow');
+  const o = env?.[ROUND_JUDGE_DIR_ENV]?.trim();
+  if (o && basename(resolve(o)) === DIR_NAME) return resolve(o);
+  return join(homedir(), 'workspace', '.operations', DIR_NAME);
 }
 
 const monthFile = (dir, now) => join(dir, `${new Date(now).toISOString().slice(0, 7)}.jsonl`);
 
-function alreadyLogged(dir, key) {
+/** Keys already logged: this month's and last month's records, read once per process per dir (bounded to 5000 lines). */
+const seenByDir = new Map();
+function seenKeys(dir, now) {
+  let set = seenByDir.get(dir);
+  if (set) return set;
+  set = new Set();
   try {
-    const path = join(dir, 'seen-keys.jsonl');
-    if (!existsSync(path)) return false;
-    return readFileSync(path, 'utf8').split('\n').includes(key);
-  } catch { return false; }
+    const months = [new Date(now).toISOString().slice(0, 7), new Date(now - 32 * 864e5).toISOString().slice(0, 7)];
+    for (const m of months) {
+      let text = '';
+      try { text = readFileSync(join(dir, `${m}.jsonl`), 'utf8'); } catch { continue; }
+      for (const l of text.split('\n').slice(-5000)) { try { const k = JSON.parse(l)?.key; if (k) set.add(k); } catch { /* skip torn line */ } }
+    }
+  } catch { /* an unreadable log means "nothing seen yet" */ }
+  seenByDir.set(dir, set);
+  return set;
 }
 
-/** Last observed diff size for this PR, from our own earlier records (the thread carries no per-head diff size). */
+/** Test seam: forget the in-process dedup. @test-only-export-ok */
+export function resetRoundJudgeSeenForTest() { seenByDir.clear(); }
+
+/** Last observed diff size for this PR (the thread carries no per-head diff size). Best effort. */
 function lastSize(dir, pr) {
-  try {
-    const path = join(dir, 'last-size.json');
-    return JSON.parse(readFileSync(path, 'utf8'))?.[String(pr)] ?? null;
-  } catch { return null; }
+  try { return JSON.parse(readFileSync(join(dir, 'last-size.json'), 'utf8'))?.[String(pr)] ?? null; } catch { return null; }
 }
 function rememberSize(dir, pr, size) {
   if (!Number.isFinite(size)) return;
@@ -74,47 +90,64 @@ function rememberSize(dir, pr, size) {
     let all = {};
     try { all = JSON.parse(readFileSync(path, 'utf8')) ?? {}; } catch { all = {}; }
     all[String(pr)] = size;
-    appendFileAtomic(path, JSON.stringify(all));
+    const keep = Object.fromEntries(Object.entries(all).slice(-500));
+    const tmp = `${path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(keep));
+    renameSync(tmp, path);
   } catch { /* shadow bookkeeping only */ }
 }
-function appendFileAtomic(path, text) { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, text); renameSync(tmp, path); }
 
 /**
  * Look at one PR this tick. Returns the record written, or a `{skipped}` note. NEVER throws, never mutates the PR.
+ * Fails closed: an error after the cap is known writes (best effort) an `escalate` record naming the error.
  * @param {{pr:number, repo?:string, state:(string|null), subject:object, env?:object, now?:number, dir?:string,
- *   log?:(line:string)=>void, setting?:object}} o
+ *   log?:(line:string)=>void, setting?:object, repoRoot?:string, verifyRepo?:object}} o
+ *   `verifyRepo` replaces the read-only git adapter for the claim checker (tests); default reads the head from this clone.
  */
-export function observeRoundCap({ pr, repo = null, state = null, subject = {}, env = process.env, now = Date.now(), dir, log = (l) => console.error(l), setting } = {}) {
+export function observeRoundCap({ pr, repo = null, state = null, subject = {}, env = process.env, now = Date.now(), dir, log = (l) => console.error(l), setting, repoRoot, verifyRepo } = {}) {
+  let cap = null, cfg = null, outDir = null;
+  const write = (record) => {
+    mkdirSync(outDir, { recursive: true });
+    appendFileSync(monthFile(outDir, now), `${JSON.stringify(record)}\n`);
+    seenKeys(outDir, now).add(record.key);
+    try { log(`${record.line} (mode=${cfg.mode} source=${cfg.source})`); } catch { /* logging never breaks the tick */ }
+    return record;
+  };
   try {
     if (isUnderTest(env) && !dir && !env?.[ROUND_JUDGE_DIR_ENV]) return { skipped: 'under-test' };
-    const cfg = resolveRoundJudgeMode({ env });
+    cfg = resolveRoundJudgeMode({ env });
     if (cfg.mode === 'off') return { skipped: 'off', source: cfg.source };
+    outDir = dir ?? roundJudgeDir(env);
     const comments = Array.isArray(subject?.comments) ? subject.comments : [];
     const head = String(subject?.headRefOid ?? '').toLowerCase();
-    const cap = detectRoundCap({ comments, pr, head, state, repo });
+    cap = detectRoundCap({ comments, pr, head, state, repo });
     if (!cap) return { skipped: 'no-cap' };
-    const outDir = dir ?? roundJudgeDir(env);
-    if (alreadyLogged(outDir, cap.key)) return { skipped: 'already-logged', key: cap.key };
+    if (seenKeys(outDir, now).has(cap.key)) return { skipped: 'already-logged', key: cap.key };
 
     const files = Array.isArray(subject?.files) ? subject.files.map((f) => f?.path ?? f).filter(Boolean) : [];
     const size = Array.isArray(subject?.files) && subject.files.length && subject.files.every((f) => Number.isFinite(f?.additions))
       ? subject.files.reduce((n, f) => n + f.additions + (f.deletions ?? 0), 0)
       : (Number.isFinite(subject?.additions) ? subject.additions + (subject.deletions ?? 0) : null);
-    const prevSize = lastSize(outDir, pr);
-    const result = judgeRound({ pr, repo, head, trigger: cap.trigger, comments, files, diff: { size, prevSize },
-      setting: setting ?? readConfirmedBreaks({ env }).value });
+    const vrepo = verifyRepo ?? makeGitRepo({ head, cwd: repoRoot });
+    const result = judgeRound({ pr, repo, head, trigger: cap.trigger, comments, files, diff: { size, prevSize: lastSize(outDir, pr) },
+      setting: setting ?? readConfirmedBreaks({ env }).value, verify: (f) => verifyFinding(f, vrepo) });
 
     const line = formatJudgeLine(pr, result);
-    const record = { ts: new Date(now).toISOString(), pr: Number(pr), repo, head, trigger: cap.trigger, key: cap.key,
+    const record = write({ ts: new Date(now).toISOString(), pr: Number(pr), repo, head, trigger: cap.trigger, key: cap.key,
       mode: cfg.mode, modeSource: cfg.source, verdict: result.verdict, ...(result.k ? { k: result.k } : {}),
-      reasons: result.reasons, line, evidence: result.evidence };
-    mkdirSync(outDir, { recursive: true });
-    appendFileSync(monthFile(outDir, now), `${JSON.stringify(record)}\n`);
-    appendFileSync(join(outDir, 'seen-keys.jsonl'), `${cap.key}\n`);
+      ...(result.proof ? { proof: result.proof } : {}), reasons: result.reasons, line, evidence: result.evidence });
     rememberSize(outDir, pr, size);
-    try { log(`${line} (mode=${cfg.mode} source=${cfg.source})`); } catch { /* logging never breaks the tick */ }
     return record;
   } catch (e) {
-    return { skipped: 'error', error: String(e?.message ?? e).slice(0, 200) };
+    const error = String(e?.message ?? e).slice(0, 200);
+    if (cap && cfg && outDir) {
+      try {
+        const reasons = [`fail-closed: observer error (${error})`];
+        return write({ ts: new Date(now).toISOString(), pr: Number(pr), repo, head: String(subject?.headRefOid ?? ''), trigger: cap.trigger,
+          key: cap.key, mode: cfg.mode, modeSource: cfg.source, verdict: 'escalate', reasons,
+          line: formatJudgeLine(pr, { verdict: 'escalate', reasons }), evidence: { failClosed: true } });
+      } catch { /* nothing more a shadow observer can do */ }
+    }
+    return { skipped: 'error', error };
   }
 }

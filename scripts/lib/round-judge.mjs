@@ -23,10 +23,11 @@ import { parseRedTeamComment, breakClass, planRedTeamActions, CONFIRMED_BREAKS_D
   GATE_OUTCOMES } from './red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
-import { isTrustChainPath, isPolicyCorePath, isEngineTierPath, isPolicySpecPath } from './gate-config.mjs';
+import { verifyFinding } from './round-judge-verify.mjs';
+import { isTrustChainPath, isPolicyCorePath, isEngineTierPath, isPolicySpecPath, isStatutePath } from './gate-config.mjs';
 
-export const VERDICTS = Object.freeze(['grant', 'send-back', 'card-the-rest', 'suggest-split', 'escalate']);
-export const TRIGGERS = Object.freeze(['red-team-cap', 'review-cap']);
+export const VERDICTS = Object.freeze(['grant', 'send-back', 'card-the-rest', 'suggest-split', 'escalate', 'not-real-verified']);
+export const TRIGGERS = Object.freeze(['red-team-cap', 'review-cap', 'referral-hold']);
 /** Most grants the judge will recommend on one PR (matches the standing card-only grant cap of 3 per PR). */
 export const MAX_JUDGE_GRANTS = 3;
 /** Diff growth that reads as "keeps growing": at least this ratio AND this many lines since the prior observation. */
@@ -87,7 +88,8 @@ export function parseReviewFindings(body) {
     const impact = /_\[impact if unfixed: ([a-z]+)\]_/i.exec(m[3])?.[1]?.toLowerCase() ?? null;
     const coverage = /^COVERAGE\b/i.test(summary);
     out.push({ file: m[1], line: m[2] == null ? null : Number(m[2]), summary, confirmed: true,
-      impact: coverage || impact === 'degraded' || impact === 'cosmetic' ? 'degraded' : (impact ?? null),
+      // An explicit `broken` impact wins over a COVERAGE label: never downgrade a stated break.
+      impact: impact === 'broken' ? 'broken' : (coverage || impact === 'degraded' || impact === 'cosmetic' ? 'degraded' : (impact ?? null)),
       category: coverage ? 'coverage' : 'review' });
   }
   return out;
@@ -115,6 +117,11 @@ export function extractRounds(comments, pr) {
       return;
     }
     const head = body.trimStart();
+    if (/^review paused:/.test(head) && /Waiting on your ruling/.test(head)) {
+      const findings = parseReviewFindings(head.split('Waiting on your ruling')[1] ?? '');
+      if (findings.length) out.push({ source: 'referral', at: timeOf(c), i, rev: null, findings });
+      return;
+    }
     if (!head.startsWith(REVIEW_CHANGES_PREFIX)) return;
     if (/Recorded by (?:parked-pr-conflict|agent \(red-team gate\)|chalbert|auto-policy)/i.test(head.slice(0, 400))) return;
     const findings = parseReviewFindings(head);
@@ -126,6 +133,7 @@ export function extractRounds(comments, pr) {
 /**
  * Which cap the PR is at, from the thread and the status state. PURE.
  * red-team-cap: the gate's `round-cap` record for the LIVE head, with no later `sent-back` record for that head.
+ * referral-hold: the review paused for a ruling on mandatory referral findings and none was recorded after it.
  * review-cap: the status state is `at-round-limit`, or the conveyor's "auto-repair rounds exhausted" note stands
  * with no operator grant after it.
  * @returns {{trigger:('red-team-cap'|'review-cap'), at:number, key:string}|null}
@@ -139,6 +147,12 @@ export function detectRoundCap({ comments, pr, head, state = null, repo = null }
   if (cap) {
     const later = gates.some((x) => x.g.outcome === GATE_OUTCOMES.SENT_BACK && (timeOf(x.c) > timeOf(cap.c) || (timeOf(x.c) === timeOf(cap.c) && x.i > cap.i)));
     if (!later) return { trigger: 'red-team-cap', at: timeOf(cap.c), key: `${pr}:${live}:red-team-cap:${cap.g.result ?? ''}` };
+  }
+  // referral-hold: the review paused waiting for a block / card / not-real ruling, and none has been recorded since.
+  const hold = list.filter((c) => isTrustedMarkerAuthor(c) && /^review paused:/.test(bodyOf(c).trimStart()) && /Waiting on your ruling/.test(bodyOf(c))).at(-1);
+  if (hold && !list.some((c) => timeOf(c) > timeOf(hold) && /^## (?:Operator|Automatic policy) ruling on mandatory referrals/.test(bodyOf(c).trimStart()))) {
+    const h = /review-referral-hold: ([0-9a-f]{8,})/.exec(bodyOf(hold))?.[1] ?? String(timeOf(hold));
+    return { trigger: 'referral-hold', at: timeOf(hold), key: `${pr}:${live}:referral-hold:${h}` };
   }
   const grants = repo ? roundExtensionGrants(list, { repo, pr }) : [];
   const lastGrantAt = grants.reduce((m, g) => Math.max(m, timeOf(list[g.index])), 0);
@@ -170,6 +184,7 @@ export function validateVerdict(v) {
   const bad = (why) => ({ ok: false, why });
   if (!v || typeof v !== 'object') return bad('not an object');
   if (!VERDICTS.includes(v.verdict)) return bad(`verdict ${JSON.stringify(v.verdict)} is not one of ${VERDICTS.join('|')}`);
+  if (v.verdict === 'not-real-verified' && (!Array.isArray(v.proof) || !v.proof.length || v.proof.some((x) => typeof x !== 'string' || !x.trim()))) return bad('not-real-verified needs non-empty proof');
   if (v.verdict === 'grant') {
     if (!Number.isInteger(v.k) || v.k < 1 || v.k > MAX_JUDGE_GRANTS) return bad('grant needs an integer k in 1..3');
   } else if (v.k !== undefined && v.k !== null) return bad('k is only valid on grant');
@@ -181,8 +196,10 @@ const failClosed = (why, extra = {}) => ({ verdict: 'escalate', reasons: [`fail-
 
 /**
  * Judge one PR at a round cap. PURE; fail closed.
- * @param {{pr:number, repo?:string, head:string, trigger:'red-team-cap'|'review-cap', comments:object[], files?:string[],
- *   diff?:{size?:number|null, prevSize?:number|null}, setting?:object, llm?:(evidence:object)=>object}} o
+ * @param {{pr:number, repo?:string, head:string, trigger:'red-team-cap'|'review-cap'|'referral-hold', comments:object[], files?:string[],
+ *   diff?:{size?:number|null, prevSize?:number|null}, setting?:object, llm?:(evidence:object)=>object,
+ *   verify?:(finding:object)=>{status:string, evidence:(string|null)}}} o
+ *   `verify` is the deterministic claim checker (`round-judge-verify.mjs`); only a `refuted` result WITH evidence counts.
  *   `llm` is an optional tool-free, read-only second opinion supplied by a caller; its output is schema-validated and
  *   anything invalid, or any throw, is `escalate`. The judge never calls a model on its own.
  * @returns {{verdict:string, k?:number, reasons:string[], evidence:object}}
@@ -209,13 +226,13 @@ export function judgeRound(o) {
   }
 }
 
-const STRICT_ORDER = ['grant', 'card-the-rest', 'send-back', 'suggest-split', 'escalate'];
+const STRICT_ORDER = ['not-real-verified', 'grant', 'card-the-rest', 'send-back', 'suggest-split', 'escalate'];
 const strictness = (v) => STRICT_ORDER.indexOf(v);
 
-function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = [], diff = {}, setting = CONFIRMED_BREAKS_DEFAULTS }) {
+function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = [], diff = {}, setting = CONFIRMED_BREAKS_DEFAULTS, verify = null }) {
   if (!TRIGGERS.includes(trigger)) throw new Error(`unknown trigger ${JSON.stringify(trigger)}`);
   const rounds = extractRounds(comments, pr);
-  const sourceOf = trigger === 'red-team-cap' ? 'red-team' : 'review';
+  const sourceOf = { 'red-team-cap': 'red-team', 'review-cap': 'review', 'referral-hold': 'referral' }[trigger];
   const same = rounds.filter((r) => r.source === sourceOf);
   const latest = same.at(-1) ?? null;
   const prior = latest ? same.slice(0, -1) : [];
@@ -245,6 +262,21 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   const planKeys = { sendBack: new Set(plan.sendBack.map(keyOf)), card: new Set(plan.card.map(keyOf)) };
   const brokenOpen = annotated.filter((f) => f.cls === 'broken');
 
+  // Confirmed breaks still open in the OTHER sources' latest rounds (a red-team round counts only for the live head)
+  // must never be carded or granted over, whichever source tripped the cap.
+  const liveHead = String(head ?? '').toLowerCase();
+  const crossBroken = ['red-team', 'review', 'referral'].filter((src) => src !== sourceOf).flatMap((src) => {
+    const r = rounds.filter((x) => x.source === src && (src !== 'red-team' || !liveHead || x.rev === liveHead)).at(-1);
+    return r && (!latest || r.at >= latest.at - 7 * 864e5) ? open(r).filter((f) => classify(f) === 'broken') : [];
+  });
+
+  // Mechanical refutation (operator 2026-10-21, #5768): every open finding provably false on the live head.
+  const checks = typeof verify === 'function' && annotated.length
+    ? annotated.map((f) => { let r; try { r = verify(f); } catch { r = null; } return { f, r: r?.status === 'refuted' && r.evidence ? r : { status: 'inconclusive', evidence: null } }; })
+    : [];
+  const refuted = checks.filter((c) => c.r.status === 'refuted');
+  const proof = refuted.map((c) => `${c.f.file}:${c.f.line} -> ${c.r.evidence}`);
+
   const guardFiles = [...new Set([...fileList, ...annotated.map((f) => f.file).filter(Boolean)])].filter(isGuardPath);
   const weakening = brokenOpen.filter((f) => WEAKENING.test(f.summary));
 
@@ -268,11 +300,21 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
     repeated: repeated.length, unfixedAfterSendBacks: unfixedAfterSendBacks.length, newFiles,
     classes: Object.fromEntries(['broken', 'degraded', 'unconfirmed'].map((k) => [k, annotated.filter((f) => f.cls === k).length])),
     policy: { sendBack: plan.sendBack.length, card: plan.card.length, advisory: plan.advisory.length },
-    grantsSoFar, guardFiles, diff: { size, prevSize, growth, growthRatio: growthRatio == null ? null : Number(growthRatio.toFixed(2)) },
+    grantsSoFar, guardFiles, crossBroken: crossBroken.length, verified: checks.map((c) => ({ file: c.f.file, line: c.f.line, status: c.r.status, evidence: c.r.evidence })), diff: { size, prevSize, growth, growthRatio: growthRatio == null ? null : Number(growthRatio.toFixed(2)) },
     filesKnown: fileList.length > 0, mechanical: mechanicalSpend(comments),
   };
 
-  const done = (verdict, why, k) => ({ verdict, ...(verdict === 'grant' ? { k } : {}), reasons: [...why, ...reasons], evidence });
+  const done = (verdict, why, k, withProof) => ({ verdict, ...(verdict === 'grant' ? { k } : {}), ...(withProof ? { proof: withProof } : {}), reasons: [...why, ...reasons], evidence });
+  const statuteTouched = fileList.filter(isStatutePath);
+  // Grants need file evidence and no statute edit we cannot inspect (no hunks in a thread) and no cross-source break.
+  const noGrant = () => (!fileList.length ? 'no-file-evidence-no-grant'
+    : statuteTouched.length ? `statute-file-uncertain-no-grant:${statuteTouched[0]}`
+      : crossBroken.length ? `open-break-in-other-source-no-grant:${crossBroken[0].file}:${crossBroken[0].line}` : null);
+
+  if (annotated.length && refuted.length === annotated.length) {
+    return done('not-real-verified', [`all-${annotated.length}-findings-mechanically-refuted`, ...(guardFiles.length ? [`guard-file-touched-but-refuted:${guardFiles[0]}`] : [])], undefined, proof);
+  }
+  if (refuted.length) reasons.push(`partially-refuted:${refuted.length}-of-${annotated.length}`);
 
   if (guardFiles.length) return done('escalate', [`guard-file-touched:${guardFiles.slice(0, 3).join(',')}`]);
   if (unfixedAfterSendBacks.length) return done('escalate', [`same-finding-unfixed-after-${unfixedAfterSendBacks[0].priorAppearances}-send-backs:${unfixedAfterSendBacks[0].file}:${unfixedAfterSendBacks[0].line}`]);
@@ -280,6 +322,9 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   if (!latest && trigger === 'review-cap') {
     const m = mechanicalSpend(comments);
     if (m.latestAccepted && m.pushes >= 2) {
+      if (grantsSoFar >= MAX_JUDGE_GRANTS) return done('escalate', [`mechanical-cap-but-${grantsSoFar}-grants-already-spent`]);
+      const blocked = noGrant();
+      if (blocked) return done('send-back', [blocked]);
       const cardOnly = fileList.length > 0 && fileList.every((f) => /^backlog\//.test(f));
       return done('grant', [`cap-spent-on-${m.pushes}-mechanical-re-pushes`, 'latest-review-accepted', ...(cardOnly ? ['card-only'] : [])], 1);
     }
@@ -288,14 +333,16 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   if (diffGrowing) return done('suggest-split', [`diff-grew-${growth}-lines${growthRatio ? `-x${growthRatio.toFixed(2)}` : ''}`]);
   if (surfaceWidening) return done('suggest-split', [`finding-surface-widening:${newFiles.slice(0, 3).join(',')}`]);
 
-  if (annotated.length && !brokenOpen.length && annotated.every((f) => planKeys.card.has(keyOf(f)) || !planKeys.sendBack.has(keyOf(f)))) {
+  if (annotated.length && !brokenOpen.length && !crossBroken.length && annotated.every((f) => planKeys.card.has(keyOf(f)) || !planKeys.sendBack.has(keyOf(f)))) {
     return done('card-the-rest', ['only-coverage-or-degraded-findings-open', `cards=${plan.card.length}`]);
   }
-  if (!annotated.length) return done('card-the-rest', ['no-confirmed-findings-open']);
+  if (!annotated.length) return done(crossBroken.length ? 'send-back' : 'card-the-rest', [crossBroken.length ? 'open-break-in-other-source' : 'no-confirmed-findings-open']);
   if (trend === 'first-round') return done('send-back', ['first-round-nothing-to-compare']);
   if (trend === 'shrinking' && !repeated.length) {
     if (grantsSoFar >= MAX_JUDGE_GRANTS) return done('escalate', [`converging-but-${grantsSoFar}-grants-already-spent`]);
-    const k = annotated.length <= 2 && annotated.length * 2 <= prevOpen.length ? 2 : 1;
+    const blocked = noGrant();
+    if (blocked) return done('send-back', [blocked]);
+    const k = Math.min(MAX_JUDGE_GRANTS - grantsSoFar, annotated.length <= 2 && annotated.length * 2 <= prevOpen.length ? 2 : 1);
     return done('grant', [`findings-shrinking-${prevOpen.length}-to-${annotated.length}`, 'none-repeated'], k);
   }
   if (trend === 'repeating') return done('send-back', [`repeating-${repeated.length}-of-${annotated.length}-re-raised`]);
@@ -306,5 +353,6 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
 /** The one-line log form. PURE. */
 export function formatJudgeLine(pr, result) {
   const verdict = result.verdict === 'grant' ? `grant(+${result.k})` : result.verdict;
-  return `round-judge-shadow: #${pr} verdict=${verdict} reasons=${result.reasons.join(';')}`;
+  const ev = result.proof?.length ? ` evidence=${result.proof.join(' | ')}` : '';
+  return `round-judge-shadow: #${pr} verdict=${verdict}${ev} reasons=${result.reasons.join(';')}`;
 }

@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, existsSync, readdirSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { observeRoundCap, resolveRoundJudgeMode } from '../round-judge-shadow.mjs';
+import { observeRoundCap, resolveRoundJudgeMode, roundJudgeDir, resetRoundJudgeSeenForTest } from '../round-judge-shadow.mjs';
 import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 
 const HEAD = 'f'.repeat(40);
@@ -16,7 +16,7 @@ const subject = () => ({ headRefOid: HEAD, comments: [
 ] });
 const dirs = [];
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'rjs-')); dirs.push(d); return d; };
-afterEach(() => { while (dirs.length) rmSync(dirs.pop(), { recursive: true, force: true }); });
+afterEach(() => { resetRoundJudgeSeenForTest(); while (dirs.length) rmSync(dirs.pop(), { recursive: true, force: true }); });
 const settingsOf = (mode) => { const d = tmp(); const p = join(d, 's.json'); require_write(p, JSON.stringify({ rounds: { judge: { mode } } })); return p; };
 import { writeFileSync } from 'node:fs';
 const require_write = (p, s) => writeFileSync(p, s);
@@ -44,7 +44,7 @@ describe('observeRoundCap', () => {
   it('off writes nothing', () => {
     const dir = tmp();
     expect(observeRoundCap({ pr: 77, subject: subject(), env: { WE_ROUNDS_JUDGE_MODE: 'off' }, dir })).toMatchObject({ skipped: 'off' });
-    expect(existsSync(join(dir, 'seen-keys.jsonl'))).toBe(false);
+    expect(existsSync(join(dir, '2026-10.jsonl'))).toBe(false);
   });
   it('shadow logs one JSONL record with the line, source and evidence; a second look is skipped', () => {
     const dir = tmp(); const lines = [];
@@ -70,6 +70,37 @@ describe('observeRoundCap', () => {
     const rec = observeRoundCap({ pr: 77, subject: { ...subject(), files: files(700) }, env: env(), dir, now: Date.UTC(2026, 9, 21) });
     expect(rec.verdict).toBe('suggest-split');
   });
+  it('a restart does not re-log a known cap (dedup comes from the log itself)', () => {
+    const dir = tmp();
+    observeRoundCap({ pr: 77, subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21) });
+    resetRoundJudgeSeenForTest();
+    expect(observeRoundCap({ pr: 77, subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21) })).toMatchObject({ skipped: 'already-logged' });
+    expect(readFileSync(join(dir, '2026-10.jsonl'), 'utf8').trim().split('\n')).toHaveLength(1);
+  });
+  it('an error after the cap is known fails closed: an escalate record is logged', () => {
+    const dir = tmp();
+    const rec = observeRoundCap({ pr: 77, subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21), setting: new Proxy({}, { get() { throw new Error('boom'); } }) });
+    expect(rec).toMatchObject({ verdict: 'escalate' });
+    expect(rec.reasons[0]).toMatch(/fail-closed/);
+  });
+  it('logs a not-real-verified record with its evidence line (referral hold, claim refuted on the head)', () => {
+    const dir = tmp();
+    const hold = bot('review paused: head abc was already reviewed 1 time(s)\n\nWaiting on your ruling (block, card or not-real):\n- `src/x.mjs:5` — The retry backoff wiring in x has no test.\n\n<!-- review-referral-hold: deadbeefdeadbeef -->', '2026-10-20T02:00:00Z');
+    const verifyRepo = { read: (p) => (p === 'src/x.test.mjs' ? "describe('x', () => {\n  it('retry backoff is exercised', () => {})\n})" : null), tests: () => ['src/x.test.mjs'] };
+    const rec = observeRoundCap({ pr: 77, subject: { headRefOid: HEAD, comments: [hold] }, env: env(), dir, now: Date.UTC(2026, 9, 21), verifyRepo });
+    expect(rec).toMatchObject({ trigger: 'referral-hold', verdict: 'not-real-verified' });
+    expect(rec.line).toMatch(/^round-judge-shadow: #77 verdict=not-real-verified evidence=src\/x.mjs:5 -> src\/x.test.mjs:2 /);
+  });
+  it('an inconclusive check is send-back, never not-real', () => {
+    const dir = tmp();
+    const hold = bot('review paused: x\n\nWaiting on your ruling (block, card or not-real):\n- `src/x.mjs:5` — The retry backoff wiring in x has no test.\n\n<!-- review-referral-hold: deadbeefdeadbeef -->', '2026-10-20T02:00:00Z');
+    const rec = observeRoundCap({ pr: 77, subject: { headRefOid: HEAD, comments: [hold] }, env: env(), dir, now: Date.UTC(2026, 9, 21), verifyRepo: { read: () => null, tests: () => [] } });
+    expect(rec.verdict).toBe('send-back');
+  });
+  it('the dir override is honoured only for a directory named round-judge-shadow', () => {
+    expect(roundJudgeDir({ WE_ROUND_JUDGE_SHADOW_DIR: '/var/elsewhere' })).toMatch(/\.operations\/round-judge-shadow$/);
+    expect(roundJudgeDir({ WE_ROUND_JUDGE_SHADOW_DIR: '/var/x/round-judge-shadow' })).toBe('/var/x/round-judge-shadow');
+  });
   it('never throws: a hostile subject is a skipped/fail-closed note, not an exception', () => {
     const dir = tmp();
     const bad = { get comments() { throw new Error('boom'); }, headRefOid: HEAD };
@@ -82,6 +113,6 @@ describe('observeRoundCap', () => {
   it('writes only inside its dir', () => {
     const dir = tmp();
     observeRoundCap({ pr: 77, subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21) });
-    expect(readdirSync(dir).sort()).toEqual(['2026-10.jsonl', 'last-size.json', 'seen-keys.jsonl'].filter((f) => readdirSync(dir).includes(f)).sort());
+    expect(readdirSync(dir).sort()).toEqual(['2026-10.jsonl']);
   });
 });
