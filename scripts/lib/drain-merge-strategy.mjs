@@ -65,12 +65,14 @@ import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
 import { cardGroupHold as pureCardGroupHold, readGroupState, resolveCardGroupStatePath } from './card-group.mjs';
 import { existsSync } from 'node:fs';
 
+/** #5742: a renumbered head waits on its numbering ancestor's live red team: never requested again, never escaped. */
+export const NUMBERING_ALIAS_WAIT = 'post-accept red team pending on the numbering ancestor';
 /** Pure request recovery for historical rows that left no usable exact-head result. Never grants admission. */
 export function staleRedTeamRequestEligibility({ evidence = {}, repo, pr, head, labels = [], enabled = false, panelSeat = false, skipCardOnly = true,
   reviewAgents = null, reason = '', pending, now = 0, cooldownMin = 5, dryRun = false } = {}) {
   const refuse = reason => ({ eligible: false, reason });
   if (dryRun) return refuse('dry run');
-  if (reason?.includes('requiring send-back') || reason?.includes('saved red-team re-check incomplete'))
+  if (reason?.includes('requiring send-back') || reason?.includes('saved red-team re-check incomplete') || reason?.includes(NUMBERING_ALIAS_WAIT))
     return refuse(reason);
   if (evidence.inFlight || evidence.queued) return refuse('red team in flight or queued');
   if (evidence.noUsableResult !== true) return refuse('no missing usable result proven');
@@ -295,7 +297,6 @@ export function createDrainMergeStrategy({
   try { numberingRedTeam = numberingRedTeamSetting(); } catch (e) { say(`  ⚠ review.carryRedTeamAcrossNumbering unreadable (${firstLine(e)}) — exact-head red-team evidence only`); }
   let numberingRedTeamLogged = false;
   const numberingProofs = new Map(); // repo#pr@head → proven ancestors, nearest first (git proof only)
-  const lastAlias = new Map(); // repo#pr@head → { head, evidence } chosen by the latest hold decision
   // Read-only probes (recordedHold, yieldTargetHold) never run git; they reuse a proof this pass already made.
   // Unproven: recordedHold falls through (null) to the ordinary enqueue, whose clear answer is the only authority;
   // yieldTargetHold throws, which its caller reads as "cannot tell" and keeps today's yield.
@@ -307,11 +308,10 @@ export function createDrainMergeStrategy({
   };
   const threadNamesHead = (comments, head) => (Array.isArray(comments) ? comments : []).some((c) => {
     const body = String(c?.body ?? '');
-    return body.includes(head) && /red-team|review-verdict-carried/.test(body);
+    return body.toLowerCase().includes(String(head).toLowerCase()) && /red-team|review-verdict-carried/i.test(body);
   });
   const redTeamAliasFor = ({ repo, pr, head, comments, env: e = env, ...exactEvidence }) => {
     const key = `${repo}#${pr}@${head}`;
-    lastAlias.delete(key);
     if (!numberingRedTeamLogged) { numberingRedTeamLogged = true; say(`  policy · review.carryRedTeamAcrossNumbering=${numberingRedTeam.value} (${numberingRedTeam.source})`); }
     if (!numberingRedTeam.value || !/^[0-9a-f]{40}$/.test(String(head))) return null;
     // The hold's own input carries the exact head's evidence (every call site spreads it); never re-read it here.
@@ -327,29 +327,25 @@ export function createDrainMergeStrategy({
       const evidence = readRedTeamEvidenceAtHead({ repo, pr, head: ancestor, env: e });
       if (!hasRedTeamEvidence(evidence)) continue;
       say(`  merge-queue: #${pr} head ${String(head).slice(0, 9)} moved only by drain numbering over ${ancestor.slice(0, 9)} (${reason}); red-team evidence read from ${ancestor.slice(0, 9)} — no new red team or review`);
-      lastAlias.set(key, { head: ancestor, evidence });
-      return lastAlias.get(key);
+      return { head: ancestor, evidence };
     }
     return null;
   };
-  // A red team still queued or running on the ancestor is the one owed: never request a second for the renumbered
-  // head (`requested: true` keeps the gate waiting on it). Anything else (a finished but unusable result, stranded
-  // work) requests for the exact head as today, so recovery is never blocked.
-  const requestRedTeamAtHead = requestRedTeam;
-  if (typeof requestRedTeamAtHead === 'function') requestRedTeam = (o) => {
-    const alias = lastAlias.get(`${o.repo}#${o.pr}@${o.head}`);
-    const live = alias && (alias.evidence.inFlight || alias.evidence.queued || (alias.evidence.scheduled && !alias.evidence.recorded));
-    if (!live) return requestRedTeamAtHead(o);
-    say(`  merge-queue: #${o.pr} no red-team request for ${String(o.head).slice(0, 9)} — drain numbering over ${alias.head.slice(0, 9)}, whose red team is still running`);
-    return { requested: true, numberingAlias: alias.head };
-  };
+  // Only the exact head's plain scheduling gap is ever bridged: a break, a send-back or an incomplete re-check on the
+  // exact head always decides. Over the ancestor: clear → admit; held while the ancestor's red team is verified
+  // queued/running → NUMBERING_ALIAS_WAIT (no request, no escape); anything else → the exact-head reason, so the
+  // ordinary request/recovery path runs for the exact head exactly as today.
+  const EXACT_GAP = 'post-accept red team has no recorded result on the live head';
   const redTeamEnqueueHold = (o) => {
     const reason = redTeamEnqueueHoldAtHead(o);
-    if (!reason) return reason;
+    if (reason !== EXACT_GAP) return reason;
     const alias = redTeamAliasFor(o);
     if (!alias) return reason;
-    return redTeamEnqueueHoldAtHead({ ...o, requestPending: false, scheduled: false, inFlight: false, recorded: false, attempted: false,
+    const aliased = redTeamEnqueueHoldAtHead({ ...o, requestPending: false, scheduled: false, inFlight: false, recorded: false, attempted: false,
       queued: false, loopPayload: undefined, skipCardOnly: undefined, ...alias.evidence, head: alias.head });
+    if (!aliased) return null;
+    if (alias.evidence.inFlight || alias.evidence.queued) return `${NUMBERING_ALIAS_WAIT} ${alias.head.slice(0, 9)} (${aliased})`;
+    return reason;
   };
   /**
    * Read-modify-write of the shared follow-up state file: under the land lock, RE-READ the file (so an enqueue by
@@ -717,7 +713,7 @@ export function createDrainMergeStrategy({
           const pages = readThreadPages(c.repo, c.num);
           if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return null;
           const reason = enqueueRedTeamReason(c, headSha, evidence, pages.flat(), neverScheduled || (sameHead && pending.requestedAt != null));
-          if (!reason || reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete')) return { requested: false };
+          if (!reason || reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete') || reason.includes(NUMBERING_ALIAS_WAIT)) return { requested: false };
           if (!requestDue) {
             if (neverScheduled && sameHead && pending.requestedAt == null)
               log.write(`  merge-queue: #${c.num} red-team request cooldown: redTeamRequestCooldownMin=${cooldownMin} (${cooldownSource})\n`);
@@ -805,7 +801,7 @@ export function createDrainMergeStrategy({
       // Blocked only where enqueue's own path certainly stops: a send-back class reason, a request already made,
       // a saved/attempted/untrusted result, or the never-scheduled escape switched off. Any other held reason can
       // still reach that escape and enqueue, so it is unknown (keep the yield).
-      const stops = reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete')
+      const stops = reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete') || reason.includes(NUMBERING_ALIAS_WAIT)
         || requestFixed || evidence.untrustedSavedResult || evidence.recorded || evidence.attempted
         || safety.value.enqueueWhenRedTeamNeverScheduled === false;
       if (!stops) throw new Error('red-team hold may still take the never-scheduled enqueue escape');
@@ -882,7 +878,7 @@ export function createDrainMergeStrategy({
           priorityReserveStamp(c, headSha, true);
           const outcome = pendingOutcome(c, wait);
           // Historical rows can request recovery, but never waive the hold or use the enqueue escape.
-          if (reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete')) return outcome;
+          if (reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete') || reason.includes(NUMBERING_ALIAS_WAIT)) return outcome;
           if (!staleRequest.eligible && (evidence.untrustedSavedResult || (panelSeat && !neverScheduled) || (!neverScheduled && !outcome.healthSmell) || evidence.inFlight || evidence.queued || evidence.recorded || evidence.attempted)) return outcome;
           let requested = false;
           if (wait.requestedAt != null) return outcome;
