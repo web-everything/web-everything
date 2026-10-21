@@ -7,14 +7,24 @@ import { parseReviewedSha, findAcceptVerdictComment } from './review-escalation.
 import { latestAcceptRecord, isLaterVerdictBody } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { gateOutcomesForHead, parseRedTeamGateMarker, parseRedTeamComment, breakClass, RED_TEAM_COMMENT_MARKER,
-  liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId, redTeamCarryLinesMarker, unchangedCitedLines } from './red-team-gate.mjs';
+  liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId, redTeamCarryLinesMarker, parseRedTeamCarryLinesMarker, unchangedCitedLines } from './red-team-gate.mjs';
 import { parseVerdictCarriedMarker, buildVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 const HEX = /^[0-9a-f]{40}$/;
 
 // Only consume complete, known provenance shapes. A marker proves where a
 // record belongs; it does not make arbitrary surrounding text informational.
+/** The cited-line record's whole body (marker + one prose line). PURE; the carry recognizes exactly this shape. */
+export function carryLinesBody({ pr, from, to, result, unchanged }) {
+  const marker = redTeamCarryLinesMarker({ pr, from, to, result, unchanged });
+  const listed = parseRedTeamCarryLinesMarker(marker).unchanged;
+  return `${marker}\nRed-team cited lines unchanged across the carry: ${listed.length ? listed.map(i => `#${i}`).join(', ') : 'none'} (operator rulings on these breaks carry; the others are re-ruled).`;
+}
+
 export function informationalProvenance(body, sha, pr) {
   let rest = String(body ?? '').replace(/\r\n?|\u2028|\u2029/g, '\n').trim();
+  // The carry's own cited-line record for a carry ONTO this head: informational only in its exact rendered shape.
+  const citedRecord = parseRedTeamCarryLinesMarker(rest);
+  if (citedRecord) return citedRecord.to === sha && citedRecord.pr === Number(pr) && rest === carryLinesBody(citedRecord);
   const sameRecord = record => record?.rev === sha && record.pr === Number(pr);
   const gate = parseRedTeamGateMarker(rest);
   if (gate) {
@@ -181,8 +191,7 @@ export function attemptVerdictCarry(io, { pr, repo, expectHead = null } = {}) {
         try {
           const unchanged = unchangedCitedLines((prior.advisory.findings ?? []).filter(f => f.confirmed), { fromSha: prior.sha, toSha: evidence.headSha,
             readLine: (sha, file, line) => io.readCitedLine({ sha, file, line, repo }) });
-          io.postCarryComment({ pr, repo, body: `${redTeamCarryLinesMarker({ pr, from: prior.sha, to: evidence.headSha, result: decided.resultId, unchanged })}\n`
-            + `Red-team cited lines unchanged across the carry: ${unchanged.length ? unchanged.map(i => `#${i}`).join(', ') : 'none'} (operator rulings on these breaks carry; the others are re-ruled).` });
+          io.postCarryComment({ pr, repo, body: carryLinesBody({ pr, from: prior.sha, to: evidence.headSha, result: decided.resultId, unchanged }) });
         } catch (e) { log(`verdict-carry: PR #${pr} cited-line record not posted (${String(e?.message ?? e).slice(0, 200)}); operator red-team rulings will not carry`); }
       }
       log(`verdict-carry: PR #${pr} carried ${prior.sha} → ${evidence.headSha} (patch-id ${headPatchId}); no round consumed`);

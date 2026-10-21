@@ -145,4 +145,15 @@ describe('operator red-team rulings across a rebase (#5502 shape)', () => {
       body: redTeamCarryLinesMarker({ pr: P, from: accepted, to: rebased, result: rid, unchanged: [1, 2, 3] }) };
     expect(blocking(disp([...comments, ...posted, forged], rebased))).toEqual([1]);
   });
+  it('the cited-line record never blocks a LATER carry (a second rebase keeps the rulings)', async () => {
+    const { comments } = thread5502(accepted);
+    const first = carry(comments, rebased);
+    expect(first.out.carried).toBe(true);
+    const { informationalProvenance, carryLinesBody } = await import('../rebase-verdict-carry.mjs');
+    const rec = first.posted.find((c) => parseRedTeamCarryLinesMarker(c.body));
+    expect(informationalProvenance(rec.body, rebased, P)).toBe(true);
+    expect(informationalProvenance(`${rec.body}\nplease hold`, rebased, P)).toBe(false);
+    expect(informationalProvenance(rec.body, accepted, P)).toBe(false);
+    expect(carryLinesBody(parseRedTeamCarryLinesMarker(rec.body))).toBe(rec.body);
+  });
 });
