@@ -50,7 +50,8 @@ export function assertHumanOperator(identity, actor) {
 /** Is this comment written by a human operator account? PURE. */
 export function isHumanOperatorComment(c) {
   const login = String((typeof c === 'string' ? '' : (c?.author?.login ?? c?.user?.login)) ?? '').toLowerCase();
-  return isHuman(login, '') && OPERATOR_LOGINS.includes(login);
+  const a = typeof c === 'string' ? null : (c?.author ?? c?.user);
+  return isHuman(login, String(a?.type ?? '')) && a?.is_bot !== true && OPERATOR_LOGINS.includes(login);
 }
 
 /** Drop every `operator-*` gate record that a human operator did not author. All other comments pass. PURE. */
