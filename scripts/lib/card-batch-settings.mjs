@@ -163,6 +163,40 @@ export function loadVerifyRetryMinutes({ env = process.env, read = readFileSync,
   return resolveVerifyRetryMinutes({ platform: readCards(platformPath, read), repo, env, now });
 }
 
+/**
+ * `prevention.alsoRaised.route` — where an "also raised" note (a raised-by sidecar for an EXISTING open card) goes:
+ *   `batch` (standard) — into the rolling prevention batch PR, or the pending spool when the batch cannot take it now;
+ *   `single` — the kill switch: the old one-PR-per-filing path (`lane/<id>-prevention-card`).
+ * Cascade: standard → platform `prevention.alsoRaised.route` → repo `prevention.alsoRaised.route` → env
+ * `WE_PREVENTION_ALSO_RAISED_ROUTE`. An unknown value is ignored (reported in `invalid`); the layer below answers.
+ */
+export const ALSO_RAISED_ROUTES = Object.freeze(['batch', 'single']);
+export function resolveAlsoRaisedRoute({ platform, repo, env } = {}) {
+  let route = 'batch';
+  let source = 'standard';
+  const invalid = [];
+  const raw = env?.WE_PREVENTION_ALSO_RAISED_ROUTE;
+  for (const [name, value] of [['platform', platform?.alsoRaised?.route], ['repo', repo?.alsoRaised?.route],
+    ['env', raw === '' ? undefined : raw]]) {
+    if (value === undefined) continue;
+    if (!ALSO_RAISED_ROUTES.includes(value)) { invalid.push(`${name}.alsoRaised.route`); continue; }
+    route = value;
+    source = name;
+  }
+  return { route, source, invalid };
+}
+export function formatAlsoRaisedRoute({ route, source, invalid = [] }) {
+  return `prevention.alsoRaised.route=${route} (${source})${invalid.length ? `, ignored invalid: ${invalid.join(', ')}` : ''}`;
+}
+export function loadAlsoRaisedRoute({
+  env = process.env, read = readFileSync, platformPath = PLATFORM_PREFERENCES_PATH,
+  repo = (() => { try { return readSettings()?.prevention; } catch { return undefined; } })(),
+} = {}) {
+  let platform;
+  try { platform = JSON.parse(read(platformPath, 'utf8'))?.prevention; } catch { /* no preference */ }
+  return resolveAlsoRaisedRoute({ platform, repo, env });
+}
+
 /** The full policy with independent filing and prevention settings overlays. */
 export function effectiveCardBatchPolicy(settings = loadCardBatchSettings(), prevention = loadPreventionBatchSettings()) {
   return loadCardBatchPolicy({

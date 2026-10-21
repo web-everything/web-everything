@@ -122,7 +122,7 @@ function mutantProbe(f, replacements, probe) {
     expect(source.split(before)).toHaveLength(2);
     source = source.replace(before, after);
   }
-  for (const specifier of ['./card-batch.mjs', '../lib/automation-home.mjs']) {
+  for (const specifier of ['./card-batch.mjs', '../lib/automation-home.mjs', '../lib/card-batch-policy.mjs']) {
     source = source.replace(`'${specifier}'`, JSON.stringify(new URL(specifier, moduleURL).href));
   }
   const path = join(f.root, 'mutant.mjs');

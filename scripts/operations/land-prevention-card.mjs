@@ -87,13 +87,14 @@ import { machinePrTitle, preventionCardTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
-import { loadPreventionBatchSettings, formatPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
+import { loadPreventionBatchSettings, formatPreventionBatchSettings, loadAlsoRaisedRoute, formatAlsoRaisedRoute } from '../lib/card-batch-settings.mjs';
+import { raisedBySidecarId } from '../lib/card-batch-policy.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { FILE_ITEM_ROOT_ENV } from './file-item-io.mjs';
 import {
@@ -362,12 +363,15 @@ function spoolPrevention(entry, pendingDir) {
   } finally { rmSync(temporary, { force: true }); }
 }
 
+// A spooled entry is a top-level card or a canonical raised-by sidecar ("also raised" note) — nothing else.
+const isPendingPath = (rel) => /^backlog\/x?[a-z0-9]+-[^/]+\.md$/.test(String(rel ?? '')) || raisedBySidecarId(rel) !== null;
+
 // Restoring the prior working-tree bytes keeps recovery content out of the run's own commit.
 async function withRecoveryCard(lane, rel, content, admit) {
-  if (!/^backlog\/x?[a-z0-9]+-[^/]+\.md$/.test(rel)) throw new Error('invalid pending card path');
+  if (!isPendingPath(rel)) throw new Error('invalid pending card path');
   const path = join(lane, rel);
   const previous = existsSync(path) ? readFileSync(path) : null;
-  mkdirSync(join(lane, 'backlog'), { recursive: true });
+  mkdirSync(dirname(path), { recursive: true });
   try {
     writeFileSync(path, content);
     return await admit();
@@ -392,7 +396,7 @@ export async function drainPendingPrevention({ lane }, {
     const path = join(pendingDir, name);
     try {
       const entry = JSON.parse(readFileSync(path, 'utf8'));
-      if (!/^backlog\/x?[a-z0-9]+-[^/]+\.md$/.test(entry.rel)) throw new Error('invalid pending card path');
+      if (!isPendingPath(entry.rel)) throw new Error('invalid pending card path');
       if (String(exec('git', ['-C', lane, 'ls-tree', 'origin/main', '--', entry.rel], {})).trim()) {
         rmSync(path);
         continue;
@@ -407,6 +411,53 @@ export async function drainPendingPrevention({ lane }, {
       }
     } catch (error) { write(`land-prevention-card: pending ${name} retained — ${errorReason(error)}\n`); }
   }
+}
+
+/**
+ * Admit each lane-written raised-by sidecar into the rolling prevention batch. One the batch cannot take now (lease
+ * held, coordinator refusal, batching switched off) is SPOOLED for the next drain — never dropped, never its own PR.
+ * The sidecar is then removed from the lane so no later commit in this run carries it. Idempotent by
+ * `prevention-raised-by:<path>`: the path hashes the finding, so the same note is one batch member however often filed.
+ */
+export async function routeSidecarsToBatch({ lane, input, mentions }, {
+  batch = fileIntoBatch, loadBatchSettings = loadPreventionBatchSettings, wait = sleep,
+  readFile = (p) => readFileSync(p, 'utf8'), write = (line) => process.stdout.write(line),
+  pendingDir = pendingPreventionDir(),
+} = {}) {
+  const outcome = { batched: [], held: [] };
+  const source = { repo: CONSTELLATION_REPOS.we.slug, pr: input.retract?.pr ?? null, head: input.retract?.headSha ?? null };
+  let options = null;
+  for (const m of mentions) {
+    for (const rel of m.paths) {
+      const cardId = raisedBySidecarId(rel);
+      const idemKey = `prevention-raised-by:${rel}`;
+      const note = mentionTitle(input, m.items?.[0]);
+      const path = join(lane, rel);
+      let result;
+      try {
+        if (!cardId) throw new Error(`not a canonical raised-by sidecar: ${rel}`);
+        if (!options) {
+          const preventionSettings = loadBatchSettings();
+          options = { preventionSettings, retries: Math.ceil(preventionSettings.batchLeaseWaitMinutes * 60 / 30), pause: () => wait(30_000) };
+        }
+        result = await batch({ laneDir: lane, cardPath: rel, kind: 'prevention', actor: 'mechanical', idemKey,
+          source: { ...source, note } }, options);
+      } catch (error) { result = { batched: false, reason: `admission failed: ${errorReason(error)}` }; }
+      if (result?.batched) {
+        write(`land-prevention-card: batched also-raised ${rel} into ${result.batchRef}${result.deduped ? ' (already a member)' : ''}\n`);
+        outcome.batched.push({ rel, batchRef: result.batchRef });
+      } else {
+        const reason = result?.reason ?? 'admission returned no result';
+        // Spooled under its sidecar id; a spool write failure throws, so the caller fails loudly rather than drop it.
+        spoolPrevention({ cardId: cardId ?? `rb-invalid-${Date.now()}`, rel, content: readFile(path), idemKey,
+          source: { ...source, note }, num: null, title: note, spooledAt: new Date().toISOString(), reason }, pendingDir);
+        write(`land-prevention-card: held also-raised ${rel} for the next batch window — ${reason}\n`);
+        outcome.held.push({ rel, reason });
+      }
+      rmSync(path, { force: true });
+    }
+  }
+  return outcome;
 }
 
 /** Fold only open, single-added-card prevention heads; their PR metadata remains untouched. */
@@ -495,6 +546,7 @@ async function landPreventionCardImpl(input, {
   batch = fileIntoBatch,
   loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
   loadFilingSettings = loadPreventionBatchSettings,
+  loadAlsoRaisedRoute: loadRoute = loadAlsoRaisedRoute,
   sleep: wait = sleep,
   fileExists = existsSync,
   filerRoot = REPO_ROOT,
@@ -582,6 +634,17 @@ async function landPreventionCardImpl(input, {
     }
     const mentioned = []; // mentions appended to a card in THIS lane (landed by the PR below)
     const recorded = []; // every match now written somewhere (this lane, an open PR, or already on the card)
+    // WHERE AN "ALSO RAISED" NOTE GOES (operator 2026-10-21, PR #5818 leak): `batch` (standard) admits each raised-by
+    // sidecar into the rolling prevention batch, or spools it when the batch cannot take it now — never its own PR.
+    // `single` is the kill switch back to the one-PR-per-filing path below.
+    let alsoRaised = null;
+    if (plan && (plan.action === 'mention' || plan.action === 'partial')) {
+      try { alsoRaised = loadRoute(); } catch (error) {
+        alsoRaised = { route: 'batch', source: `standard (route settings unreadable: ${errorReason(error)})`, invalid: [] };
+      }
+      write(`land-prevention-card: ${formatAlsoRaisedRoute(alsoRaised)}\n`);
+    }
+    const sidecarsToBatch = alsoRaised?.route !== 'single';
     if (plan && (plan.action === 'mention' || plan.action === 'partial')) {
       for (const m of plan.mentions) {
         const asMatches = m.items.map((item) => ({ item, card: m.card }));
@@ -602,7 +665,7 @@ async function landPreventionCardImpl(input, {
             const path = join(lane, file.path);
             mkdirSync(resolve(path, '..'), { recursive: true });
             writeFile(path, file.content, 'utf8');
-            exec('git', ['-C', lane, 'add', '--', file.path], {});
+            if (!sidecarsToBatch) exec('git', ['-C', lane, 'add', '--', file.path], {});
             paths.push(file.path);
             known.add(key);
           }
@@ -620,6 +683,22 @@ async function landPreventionCardImpl(input, {
     }
     // A match whose mention could not be recorded anywhere is filed after all — never dropped.
     const filingInput = !plan || !recorded.length ? input : remainingAfter(input, recorded);
+
+    const sidecarOutcome = { batched: [], held: [] };
+    if (sidecarsToBatch && mentioned.length) {
+      const routed = await routeSidecarsToBatch({ lane, input, mentions: mentioned.splice(0) }, {
+        batch, loadBatchSettings, wait, readFile, write, pendingDir,
+      });
+      sidecarOutcome.batched.push(...routed.batched);
+      sidecarOutcome.held.push(...routed.held);
+    }
+    const withSidecars = (result) => (sidecarOutcome.batched.length || sidecarOutcome.held.length
+      ? { ...result, alsoRaised: sidecarOutcome, mentions: recorded.length } : result);
+    if (!filingInput && (sidecarOutcome.batched.length || sidecarOutcome.held.length)) {
+      const step = sidecarOutcome.held.length ? 'held' : 'batched';
+      return withSidecars({ ok: true, step, num: null, rel: null, pr: null, url: null,
+        reason: sidecarOutcome.held[0]?.reason ?? null, batchRef: sidecarOutcome.batched[0]?.batchRef ?? null });
+    }
 
     let num = null;
     let rel = null;
@@ -669,14 +748,14 @@ async function landPreventionCardImpl(input, {
       } catch (error) { result = { batched: false, reason: `admission failed: ${errorReason(error)}` }; }
       if (result?.batched) {
         write(`land-prevention-card: batched ${rel} into ${result.batchRef}\n`);
-        return { ok: true, step: 'batched', num, rel, pr: null, url: null, reason: null, batchRef: result.batchRef };
+        return withSidecars({ ok: true, step: 'batched', num, rel, pr: null, url: null, reason: null, batchRef: result.batchRef });
       }
       if (result?.disabled !== true) {
         const reason = result?.reason ?? 'admission returned no result';
         spoolPrevention({ cardId, rel, content: readFile(join(lane, rel)), idemKey, source, num,
           title: input.title, spooledAt: new Date().toISOString(), reason }, pendingDir);
         write(`land-prevention-card: held ${rel} for the next batch window — ${reason}\n`);
-        return { ok: true, step: 'held', num, rel, pr: null, url: null, reason };
+        return withSidecars({ ok: true, step: 'held', num, rel, pr: null, url: null, reason });
       }
     }
 
@@ -735,10 +814,10 @@ async function landPreventionCardImpl(input, {
       exec('gh', ['pr', 'edit', String(submit.pr), '--repo', CONSTELLATION_REPOS.we.slug, '--add-label', 'review:pending'], { cwd: lane });
     } catch (error) { write(`land-prevention-card: review:pending label failed (non-fatal) — ${errorReason(error)}\n`); }
     write(`land-prevention-card: landed — PR #${submit.pr} (${submit.url})\n`);
-    return {
+    return withSidecars({
       ok: true, step: 'done', num, rel, pr: submit.pr ?? null, url: submit.url ?? null, reason: null,
       ...(recorded.length ? { mentions: recorded.length } : {}),
-    };
+    });
   } catch (e) {
     return fail('unexpected', String(e?.message || e));
   } finally {

@@ -30,7 +30,7 @@ import { closeSync, openSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { admitCard, cardBatchStateDir } from './card-batch-io.mjs';
-import { bypassesBatch } from '../lib/card-batch-policy.mjs';
+import { bypassesBatch, raisedBySidecarId } from '../lib/card-batch-policy.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { effectiveCardBatchPolicy, formatCardBatchSettings, loadCardBatchSettings, formatPreventionBatchSettings, loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 
@@ -57,6 +57,11 @@ export function decideBatchFiling({ batch, actor = 'mechanical', priority, setti
 export function cardIdOf(cardPath) {
   const match = /^backlog\/([^/-]+)-[^/]+\.md$/.exec(String(cardPath ?? ''));
   return match ? match[1] : null;
+}
+
+/** PURE: the id a batch member is keyed by — a top-level card's id, or a raised-by sidecar's `rb-…` id. */
+export function batchMemberIdOf(path) {
+  return cardIdOf(path) ?? raisedBySidecarId(path);
 }
 
 const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 }).trim();
@@ -87,8 +92,8 @@ export async function fileIntoBatch({
   const policy = effectiveCardBatchPolicy(settings, preventionSettings);
   const decision = decideBatchFiling({ batch, actor, priority, settings, preventionSettings, policy, kind });
   if (!decision.batch) return { batched: false, reason: decision.reason, ...(kind === 'prevention' ? { disabled: true } : {}) };
-  const cardId = cardIdOf(cardPath);
-  if (!cardId) return { batched: false, reason: `not a top-level backlog card: ${cardPath}`, ...(kind === 'prevention' ? { disabled: true } : {}) };
+  const cardId = batchMemberIdOf(cardPath);
+  if (!cardId) return { batched: false, reason: `not a top-level backlog card or raised-by sidecar: ${cardPath}`, ...(kind === 'prevention' ? { disabled: true } : {}) };
   try {
     const repo = source.repo ?? CONSTELLATION_REPOS.we.slug;
     const base = baseSha ?? (() => {

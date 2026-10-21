@@ -14,14 +14,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // Exercise the enabled filer explicitly; the prototype's declared repo setting deliberately pauses it.
 beforeEach(() => vi.stubEnv('WE_PREVENTION_FILING_ENABLED', 'true'));
 afterEach(() => vi.unstubAllEnvs());
-import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync } from 'node:fs';
 import { readRaisedBy, raisedByFile } from '../../lib/raised-by.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   landPreventionCard as realLandPreventionCard, parseLandPreventionCardArgv, parseRunJsonTail, runLandPreventionCardCli,
   boundCardText, boundLandPreventionCardInput, CARD_TEXT_CAPS, buildLandingRetractionComment, postLandingRetraction,
-  runCardDedupe, foldOpenSingles,
+  runCardDedupe, foldOpenSingles, drainPendingPrevention,
 } from '../land-prevention-card.mjs';
 import {
   hasApprovalPreventionMarkerForHead, buildApprovalPreventionMarker, buildApprovalPreventionJobMarker,
@@ -290,14 +290,17 @@ describe('landPreventionCard — dedupe before filing', () => {
   });
   const cleanup = () => rmSync(lane, { recursive: true, force: true });
 
-  it('A1 duplicate creates one raise file and leaves the parent byte-identical', async () => {
+  const SINGLE = () => ({ route: 'single', source: 'test', invalid: [] });
+  const BATCH = () => ({ route: 'batch', source: 'test', invalid: [] });
+
+  it('A1 duplicate (route=single kill switch) creates one raise file and leaves the parent byte-identical', async () => {
     const acquire = setup();
     try {
       const { exec, calls } = scriptedExec([acquire, 'added-card', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const written = [];
       const batch = vi.fn();
       const result = await landPreventionCard(input(), {
-        exec, batch, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, dedupe,
+        exec, batch, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, dedupe, loadAlsoRaisedRoute: SINGLE,
         writeFile: (p, c, e) => { written.push({ p, c }); if (p.startsWith(lane)) writeFileSync(p, c, e); },
       });
       expect(batch).not.toHaveBeenCalled();
@@ -313,7 +316,7 @@ describe('landPreventionCard — dedupe before filing', () => {
       expect(calls[4].args.find((a) => a.startsWith('--ref='))).toBe('--ref=lane/prevention-card-test');
       const retry = scriptedExec([acquire, 'released']);
       const writeAgain = vi.fn();
-      const again = await landPreventionCard(input(), { exec: retry.exec, dedupe, write: () => {}, writeFile: writeAgain });
+      const again = await landPreventionCard(input(), { exec: retry.exec, dedupe, write: () => {}, writeFile: writeAgain, loadAlsoRaisedRoute: SINGLE });
       expect(again).toMatchObject({ ok: true, step: 'mentioned' });
       expect(writeAgain).not.toHaveBeenCalled();
       expect(readRaisedBy('4706', lane)).toHaveLength(1);
@@ -362,7 +365,7 @@ describe('landPreventionCard — dedupe before filing', () => {
     } finally { rmSync(stateDir, { recursive: true, force: true }); cleanup(); }
   });
 
-  it('a partial dedupe keeps the new card and lane-local mention together on the per-card path', async () => {
+  it('a partial dedupe (route=single) keeps the new card and lane-local mention together on the per-card path', async () => {
     const acquire = setup();
     try {
       const mixed = input();
@@ -372,7 +375,7 @@ describe('landPreventionCard — dedupe before filing', () => {
       const { exec, calls } = scriptedExec([acquire, 'mention-added', FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const batch = vi.fn(async () => ({ batched: true, batchRef: 'should-not-be-used' }));
       const result = await landPreventionCard(mixed, {
-        exec, batch, dedupe, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {},
+        exec, batch, dedupe, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, loadAlsoRaisedRoute: SINGLE,
         writeFile: (p, c, e) => { if (p.startsWith(lane)) writeFileSync(p, c, e); },
       });
       expect(result).toMatchObject({ ok: true, step: 'done', rel: 'backlog/9001-file-the-prevention.md', mentions: 1 });
@@ -382,6 +385,114 @@ describe('landPreventionCard — dedupe before filing', () => {
       expect(calls.some(({ args }) => args.includes('file-item'))).toBe(true);
       expect(calls.some(({ args }) => args.includes('open-pr'))).toBe(true);
     } finally { cleanup(); }
+  });
+
+  describe('also-raised notes go to the rolling batch, never their own PR (PR #5818 leak, 2026-10-21)', () => {
+    const SETTINGS = () => ({ batchFiling: true, batchWindowMinutes: 60, batchMaxCards: 25, batchLeaseWaitMinutes: 1, sources: {} });
+    const writeInLane = (p, c, e) => { if (p.startsWith(lane)) writeFileSync(p, c, e); };
+
+    it('an also-raised card goes to the batch: no commit, no verify, no PR, and the lane is left clean', async () => {
+      const acquire = setup();
+      try {
+        const { exec, calls } = scriptedExec([acquire, 'released']);
+        const batch = vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-33' }));
+        const lines = [];
+        const result = await landPreventionCard(input(), {
+          exec, batch, dedupe, write: (l) => lines.push(l), writeFile: writeInLane, loadAlsoRaisedRoute: BATCH,
+          loadPreventionBatchSettings: SETTINGS,
+        });
+        expect(result).toMatchObject({ ok: true, step: 'batched', pr: null, batchRef: 'lane/card-batch-prevention-33', mentions: 1 });
+        expect(batch).toHaveBeenCalledTimes(1);
+        const [admitted] = batch.mock.calls[0];
+        expect(admitted).toMatchObject({ laneDir: lane, kind: 'prevention', actor: 'mechanical' });
+        expect(admitted.cardPath).toMatch(/^backlog\/raised-by\/4706\/77-[a-f0-9]{24}\.md$/);
+        expect(admitted.idemKey).toBe(`prevention-raised-by:${admitted.cardPath}`);
+        expect(admitted.source.note).toMatch(/^Prevention — also raised: /);
+        expect(calls.map(({ cmd, args }) => `${cmd} ${args.slice(0, 2).join(' ')}`)).toEqual([
+          expect.stringMatching(/lane-pool\.mjs acquire$/), expect.stringMatching(/lane-pool\.mjs release$/),
+        ]);
+        expect(calls.some(({ args }) => args.includes('open-pr') || args.includes('commit') || args.includes('add'))).toBe(false);
+        expect(existsSync(join(lane, admitted.cardPath))).toBe(false);
+        expect(readFileSync(join(lane, REL), 'utf8')).toBe(cardText('open'));
+        expect(lines.join('')).toContain('prevention.alsoRaised.route=batch (test)');
+      } finally { cleanup(); }
+    });
+
+    it('dedup by idemKey: filing the same note twice reuses one key (real-coordinator dedupe: card-batch-io-real.test.mjs)', async () => {
+      const acquire = setup();
+      try {
+        const keys = [];
+        const members = new Map();
+        const batch = vi.fn(async ({ idemKey, cardPath }) => {
+          keys.push(idemKey);
+          const deduped = members.has(idemKey);
+          members.set(idemKey, cardPath);
+          return { batched: true, batchRef: 'lane/card-batch-prevention-33', deduped };
+        });
+        for (let i = 0; i < 2; i += 1) {
+          const { exec } = scriptedExec([acquire, 'released']);
+          const r = await landPreventionCard(input(), { exec, batch, dedupe, write: () => {}, writeFile: writeInLane,
+            loadAlsoRaisedRoute: BATCH, loadPreventionBatchSettings: SETTINGS });
+          expect(r).toMatchObject({ ok: true, step: 'batched' });
+        }
+        expect(keys).toHaveLength(2);
+        expect(keys[0]).toBe(keys[1]);
+        expect(members.size).toBe(1);
+      } finally { cleanup(); }
+    });
+
+    it('batch unavailable (lease held, or batching off) → the note is queued in the spool, never a PR; a later drain batches it', async () => {
+      for (const refusal of [
+        { batched: false, retryable: true, reason: 'coordinator refused: lease-held' },
+        { batched: false, disabled: true, reason: 'prevention.batchFiling is off (env)' },
+      ]) {
+        const acquire = setup();
+        const spool = mkdtempSync(join(tmpdir(), 'also-raised-spool-'));
+        try {
+          const { exec, calls } = scriptedExec([acquire, 'released']);
+          const result = await landPreventionCard(input(), {
+            exec, batch: async () => refusal, dedupe, write: () => {}, writeFile: writeInLane, pendingDir: spool,
+            loadAlsoRaisedRoute: BATCH, loadPreventionBatchSettings: SETTINGS,
+          });
+          expect(result).toMatchObject({ ok: true, step: 'held', pr: null, reason: refusal.reason });
+          expect(calls.some(({ args }) => args.includes('open-pr') || args.includes('commit'))).toBe(false);
+          const names = readdirSync(spool).filter((n) => n.endsWith('.json'));
+          expect(names).toHaveLength(1);
+          const entry = JSON.parse(readFileSync(join(spool, names[0]), 'utf8'));
+          expect(entry.rel).toMatch(/^backlog\/raised-by\/4706\//);
+          expect(entry.idemKey).toBe(`prevention-raised-by:${entry.rel}`);
+          expect(entry.content).toContain('approval-prevention-key:o/r#77@abc');
+          expect(existsSync(join(lane, entry.rel))).toBe(false);
+
+          // The next filer's drain admits the queued note with the SAME key, then clears the spool.
+          const drained = vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-33' }));
+          await drainPendingPrevention({ lane }, { pendingDir: spool, exec: () => '', batch: drained, write: () => {} });
+          expect(drained).toHaveBeenCalledWith(expect.objectContaining({ cardPath: entry.rel, idemKey: entry.idemKey }), {});
+          expect(readdirSync(spool).filter((n) => n.endsWith('.json'))).toEqual([]);
+          expect(existsSync(join(lane, entry.rel))).toBe(false);
+        } finally { rmSync(spool, { recursive: true, force: true }); cleanup(); }
+      }
+    });
+
+    it('a partial dedupe batches both the new card and the also-raised note — no PR', async () => {
+      const acquire = setup();
+      try {
+        const mixed = input();
+        mixed.digest = mixed.digest.replace('\n\nIdempotency key',
+          '\n\n2. `we:scripts/other-check.mjs:10` — Reject malformed flags before dispatch.\n\nIdempotency key');
+        mixed.scope += ',we:scripts/other-check.mjs';
+        const { exec, calls } = scriptedExec([acquire, FILE_ITEM_OK, 'released']);
+        const batch = vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-33' }));
+        const result = await landPreventionCard(mixed, { exec, batch, dedupe, write: () => {}, writeFile: writeInLane,
+          loadAlsoRaisedRoute: BATCH, loadPreventionBatchSettings: SETTINGS });
+        expect(result).toMatchObject({ ok: true, step: 'batched', rel: 'backlog/9001-file-the-prevention.md', pr: null });
+        expect(result.alsoRaised.batched).toHaveLength(1);
+        expect(batch.mock.calls.map(([i]) => i.cardPath)).toEqual([
+          expect.stringMatching(/^backlog\/raised-by\/4706\//), 'backlog/9001-file-the-prevention.md',
+        ]);
+        expect(calls.some(({ args }) => args.includes('open-pr'))).toBe(false);
+      } finally { cleanup(); }
+    });
   });
 
   it('a different target file is filed as today, and the open card is untouched', async () => {
