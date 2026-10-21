@@ -12,7 +12,7 @@ import { runReconcilePass as runReconcilePassWithTiming } from '../reconcile-pas
 const runReconcilePass = (options = {}) => runReconcilePassWithTiming({ ...options, env: { WE_REVIEW_START_AFTER: 'ci-green', WE_FIX_JOIN_CI_AND_REVIEW: 'false', ...options.env } });
 import { countFindings, planReconcile } from '../reconcile-core.mjs';
 import {
-  reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
+  classifyPausedReview, REFERRAL_REARM_COMMENT_MARKER, reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
   GH_LIST_COMMENT_CAP, findResumableParkedRun,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
@@ -1027,5 +1027,58 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
       expect(reviewRunEvidence(late)).toMatchObject({ parked: true, pending: [key] });
       expect(find(pr({ comments: thread([ruling]) }), [reviewRunEvidence(late)])).toEqual({ id: 'review-pr-parked', head });
     });
+  });
+});
+
+it('keeps the cycle-free referral matcher equal to the canonical re-arm marker', () => {
+  expect(REFERRAL_REARM_COMMENT_MARKER).toBe(REARM_COMMENT_MARKER);
+});
+
+describe('paused review ruling recovery', () => {
+  const subject = (ruled = false, extra = {}) => {
+    const r = record();
+    r.attempted = false; // The ledger intentionally ignores these; the gate still holds them.
+    if (ruled) r.rulings = [{ id: 'r1', key, reviewerId: r.reviewer.id, lens: r.reviewer.lens,
+      result: 'block', rationale: 'confirmed', evidence: ['diff'] }];
+    return pr({ comments: [comment(renderReferralRecord(r), at - 120_000)], ...extra });
+  };
+  it('raises unattempted pending findings and leaves the same-head hold in place', () => {
+    const p = subject();
+    expect(classifyPausedReview(p, mandatoryReferralState(p.comments, { repo, pr: p.number, head, body: p.body })))
+      .toMatchObject({ action: 'raise', findings: [{ key, summary: 'broken case' }] });
+    expect(decideSameHeadHold(p, [evidence({ attempted: false })], { repo })).not.toBeNull();
+  });
+  it('all-ruled same-head pauses raise a ruling item without a fresh wake', () => {
+    const p = subject(true), post = vi.fn(body => p.comments.push(comment(body, at + 1)));
+    const args = { repo, prNumber: p.number, hold: { ...hold(), kind: 'same-head' },
+      pr: p, comments: p.comments, dir: temp(), post, log: vi.fn() };
+    notifyReferralHold(args);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0][0]).not.toContain(REARM_COMMENT_MARKER);
+    expect(post.mock.calls[0][0]).toContain('Waiting on your ruling');
+    expect(post.mock.calls[0][0]).toContain('broken case');
+    expect(decideSameHeadHold(p, [evidence()], { repo })).not.toBeNull();
+    expect(classifyPausedReview(p, mandatoryReferralState(p.comments, { repo, pr: p.number, head, body: p.body })).action).toBe('raise');
+    p.comments.push(comment(`${REARM_COMMENT_MARKER}\n<!-- paused-review-auto-rearm: ${head} -->`, at + 2));
+    expect(decideSameHeadHold(p, [evidence()], { repo })).not.toBeNull();
+    notifyReferralHold({ ...args, dir: temp() });
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+  it('partly ruled stays paused and raises only the unruled referral', () => {
+    const p = subject(true), r = record();
+    const other = { ...original, summary: 'another broken case', file: 'src/case.ts', line: 12 };
+    const otherKey = referralFindingKey('judge', other);
+    r.runId = 'review-pr-other'; r.reviewer = mandatoryReferralReviewer(r.runId);
+    r.referrals = [{ key: otherKey, seat: 'judge', original: other, finding: normalizeFinding(other) }];
+    r.attempted = false;
+    p.comments.push(comment(renderReferralRecord(r), at - 100_000));
+    const decision = classifyPausedReview(p, mandatoryReferralState(p.comments, { repo, pr: p.number, head, body: p.body }));
+    expect(decision).toMatchObject({ action: 'raise', findings: [{ key: otherKey, file: 'src/case.ts', line: 12 }] });
+    expect(decision.findings).toHaveLength(1);
+    const post = vi.fn();
+    notifyReferralHold({ repo, prNumber: p.number, pr: p, comments: p.comments,
+      hold: decideSameHeadHold(p, [evidence()], { repo }), dir: temp(), post, log: vi.fn() });
+    expect(post.mock.calls.every(([body]) => !body.startsWith(REARM_COMMENT_MARKER))).toBe(true);
+    expect(decideSameHeadHold(p, [evidence()], { repo })).not.toBeNull();
   });
 });

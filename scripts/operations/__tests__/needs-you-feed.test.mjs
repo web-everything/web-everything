@@ -285,3 +285,35 @@ it('keeps round-cap operator notes in the feed while the cap still needs a perso
   expect(Array.from(itemsFromReport({ needsPerson: [{ repo: 'o/r', number: 5403, kind: 'round-cap-exhausted', detail: 'round cap exhausted' }] })))
     .toEqual([expect.objectContaining({ pr: 5403, kind: 'at-round-limit', reason: 'round cap exhausted' })]);
 });
+
+it('a silent same-head pause reaches the feed with unattempted referrals and deduplicates by head/kind', async () => {
+  const { rulingNeededRow } = await import('../operator-queue.mjs');
+  const { rulingNeeded } = await import('../../lib/ruling-ledger.mjs');
+  const { record, recordComment, H1, repo, SUMMARY } = await import('../../conveyor/__tests__/ruling-fixtures.mjs');
+  const rec = record({ head: H1, runId: 'run-1' }); rec.attempted = false;
+  const p = { number: 3794, headRefOid: H1, labels: [{ name: 'review:human' }], comments: [recordComment(rec, 5)] };
+  expect(rulingNeeded(p)).toBeNull();
+  const runs = [{ repo, pr: p.number, head: H1, startedAt: 1, completedAt: 2, rulings: [], parked: false }];
+  const row = rulingNeededRow(repo, p, { readRuns: () => runs });
+  expect(row).not.toBeNull();
+  const items = itemsFromReport({ rulingNeeded: [row, row] });
+  expect(items[0]).toMatchObject({ kind: 'ruling-needed', findings: [{ key: rec.referrals[0].key,
+    file: 'policy/pointer.md', line: 12, summary: SUMMARY }] });
+  const out = diffFeed([], items, at);
+  expect(out.lines).toHaveLength(1);
+  expect(parseFeedLine(out.lines[0]).findings).toEqual(items[0].findings);
+});
+
+
+it('a second pause with all referrals ruled still raises through the report source', async () => {
+  const { rulingNeededRow } = await import('../operator-queue.mjs');
+  const { REARM_COMMENT_MARKER } = await import('../../conveyor/rearm-review.mjs');
+  const { record, recordComment, H1, repo, BLOCK } = await import('../../conveyor/__tests__/ruling-fixtures.mjs');
+  const p = { number: 3794, headRefOid: H1, body: '<!-- authored-by-actor: author -->', createdAt: '2026-10-03T07:00:00Z',
+    comments: [recordComment(record({ head: H1, runId: 'run-1', rulings: [BLOCK] }), 5),
+    { body: `${REARM_COMMENT_MARKER}\n<!-- paused-review-auto-rearm: ${H1} -->`, author: { login: 'web-everything' }, createdAt: '2026-10-03T08:06:00Z' }] };
+  const runs = [{ repo, pr: p.number, head: H1, startedAt: Date.parse('2026-10-03T08:07:00Z'),
+    completedAt: Date.parse('2026-10-03T08:08:00Z'), rulings: [], parked: false }];
+  const row = rulingNeededRow(repo, p, { readRuns: () => runs });
+  expect(itemsFromReport({ rulingNeeded: [row] })[0]).toMatchObject({ kind: 'ruling-needed', findings: [{ key: record({ head: H1, runId: 'run-1' }).referrals[0].key }] });
+});

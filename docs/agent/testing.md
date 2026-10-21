@@ -1,5 +1,16 @@
 # Testing — Three-Tier Strategy
 
+## Paused review recovery
+
+The ruling ledger omits unattempted referrals and suppresses findings after an operator verdict.
+A same-head pause can therefore need a separate report source: `pausedReviewRulingNeeded`
+reads `liveReferralState` with the gate's PR body, creation time and readable-card rule, then
+uses review-run evidence to prove the pause. Its findings flow through the existing operator
+queue and needs-you feed. Partly ruled heads list only pending findings.
+All-ruled paused heads still raise for an operator ruling and list the findings in the pause notice.
+Focused tests cover hold/feed/daemon integration, historical receipt comments, and pending findings.
+No live GitHub writes are needed.
+
 ## Daemon entry boot smoke
 
 Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`

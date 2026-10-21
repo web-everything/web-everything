@@ -82,6 +82,8 @@ let needsPersonRow;
 try { ({ needsPersonRow } = await import('./operator-queue-needs-person.mjs')); } catch { /* optional in staged copies */ }
 
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
+let pausedReferrals = null;
+try { pausedReferrals = await import('../conveyor/review-referral-hold.mjs'); } catch { /* staged copies */ }
 let rulingLedger = null;
 let rulingLedgerError = null;
 try { rulingLedger = await import('../lib/ruling-ledger.mjs'); } catch (e) { rulingLedgerError = String(e?.message ?? e).split('\n')[0]; }
@@ -112,13 +114,14 @@ function queueChecks(pr) {
  * alert anywhere). Derived from the PR thread alone, for ANY open PR (the park is the signal, whatever the labels
  * say), so it shows until a ruling or a new head clears it. `findings` is one line each plus the file.
  */
-export function rulingNeededRow(repo, pr) {
-  const need = rulingLedger?.rulingNeeded(pr, rulingHumanAt === undefined ? {} : { humanAt: rulingHumanAt });
+export function rulingNeededRow(repo, pr, options = {}) {
+  const paused = pausedReferrals?.pausedReviewRulingNeeded(pr, { repo, ...options });
+  const need = paused ?? rulingLedger?.rulingNeeded(pr, rulingHumanAt === undefined ? {} : { humanAt: rulingHumanAt });
   if (!need) return null;
   return {
     repo, number: pr.number, title: pr.title, head: need.head,
     since: need.since === null ? null : new Date(need.since).toISOString(),
-    findings: need.findings.map((f) => ({ file: f.file, line: f.line, summary: f.summary, reason: f.reason })),
+    findings: need.findings.map((f) => ({ ...(paused ? { key: f.key } : {}), file: f.file, line: f.line, summary: f.summary, reason: f.reason })),
   };
 }
 

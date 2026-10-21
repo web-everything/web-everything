@@ -78,7 +78,7 @@ export function itemsFromReport(report) {
       const command = row.command || (field === 'ready' || field === 'rulingNeeded'
         ? `node scripts/operations/run.mjs review-pr --pr=${shellArg(pr)} --repo=${shellArg(row.repo)}` : undefined);
       items.push({ pr, repo: row.repo, head: row.head ?? row.headRefOid ?? '', kind, reason, title: row.title ?? '',
-        ...(row.pick ? { pick: row.pick } : {}), ...(command ? { command } : {}) });
+        ...(row.findings ? { findings: row.findings } : {}), ...(row.pick ? { pick: row.pick } : {}), ...(command ? { command } : {}) });
     }
   }
   items.incomplete = !!report.incomplete;
