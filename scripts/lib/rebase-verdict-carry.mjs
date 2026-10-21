@@ -110,6 +110,9 @@ function findCarriableVerdictFor({ comments, trusted, sha, headSha, pr }) {
     return !informationalProvenance(c?.body, sha, number);
   });
   const record = latestAcceptRecord(verdictComments);
+  // A body-derived hold anywhere after the accept counts on the UNFILTERED thread: neutral shapes are never a way to
+  // hide one (Codex re-audit #3, finding 1).
+  if (latestAcceptRecord(comments)?.laterBodyDerivedHold) return null;
   // The record judged must be the candidate's own: a later record left in place means holds after the candidate were not read.
   if (!HEX.test(sha ?? '') || sha === headSha || !record || record.sha !== sha || record.laterVerdict || record.laterBodyDerivedHold) return null;
   return { ...record, ...findAcceptVerdictComment(trusted, sha), sha,

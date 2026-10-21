@@ -111,6 +111,11 @@ describe('accept carry across an identical net change', () => {
     expect(findCarriableVerdict({ comments: [accept(accepted), advisory], headSha: rebased, pr: 7 })?.sha).toBe(accepted);
     expect(findCarriableVerdict({ comments: [accept(accepted), trusted(`${advisory.body}\nplease hold`)], headSha: rebased, pr: 7 })).toBeNull();
   });
+  it('a body-derived hold hidden inside a neutral shape still refuses (re-audit #3)', () => {
+    const hidden = [trusted(`<!-- we:red-team-advisory pr=7 rev=${accepted} -->\n### Post-accept red team — 1 possible break(s), 0 confirmed by Claude's re-check\n\n1. [not confirmed] (edge-case, degraded) \`a.txt:2\` — maybe\n   - Files read: manifest baseline mismatch`),
+      trusted(buildRearmComment({ actor: 'manifest baseline mismatch', decision: { rearmFrom: 'review:accepted', keepsHuman: false } }))];
+    for (const c of hidden) expect(findCarriableVerdict({ comments: [accept(accepted), redTeam(accepted), c], headSha: rebased, pr: 7 }), c.body).toBeNull();
+  });
   it('fails closed: no proof reader, setting off, a pushed head GitHub does not show yet, a refused restamp', () => {
     const comments = [accept(accepted), redTeam(accepted)];
     expect(attemptVerdictCarry(io(comments, rebased, { proveIdenticalNetPatch: undefined }), { pr: 7 }).carried).toBe(false);

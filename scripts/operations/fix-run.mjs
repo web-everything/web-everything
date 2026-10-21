@@ -109,9 +109,9 @@ export const defaultPendingRearm = (dir = pendingRearmDir()) => ({
   },
   // `conflictRound` survives a crash so a retried hand-back keeps its round class (a conflict round never carries
   // and never spends an ordinary round).
-  write(repo, pr, sha, now = Date.now(), { conflictRound = false } = {}) {
+  write(repo, pr, sha, now = Date.now(), { conflictRound = false, mainRef = null } = {}) {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now, ...(conflictRound ? { conflictRound: true } : {}) }), { mode: 0o600 });
+    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now, ...(conflictRound ? { conflictRound: true, ...(mainRef ? { mainRef } : {}) } : {}) }), { mode: 0o600 });
   },
   clear(repo, pr) { try { unlinkSync(join(dir, pendingKey(repo, pr))); } catch { /* already gone */ } },
 });
@@ -678,7 +678,7 @@ export async function runFixCli(argv = [], {
     const configBefore = laneConfig();
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
-    const rearm = async (head, { conflictRound = false } = {}) => {
+    const rearm = async (head, { conflictRound = false, mainRef = null } = {}) => {
       // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
       try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
       catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
@@ -698,7 +698,7 @@ export async function runFixCli(argv = [], {
       try {
         return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : []),
           // A conflict round records what it resolved against: the merge target, read in the lane that just fetched it.
-          ...(conflictRound ? ['--round=conflict', `--main-ref=${target || String(prHead.baseRefName ?? '').trim() || 'main'}`] : [])],
+          ...(conflictRound ? ['--round=conflict', `--main-ref=${mainRef || target || String(prHead.baseRefName ?? '').trim() || 'main'}`] : [])],
         { cwd: conflictRound ? lanePath : weRoot });
       } catch (e) {
         const policy = resolveRearmRefusalPolicy();
@@ -713,7 +713,7 @@ export async function runFixCli(argv = [], {
     // now, before spending a whole agent run on it.
     const pending = pendingRearm.read(launch.repo, pr);
     if (pending?.sha === before) {
-      await rearm(before, { conflictRound: pending.conflictRound === true });
+      await rearm(before, { conflictRound: pending.conflictRound === true, mainRef: typeof pending.mainRef === 'string' ? pending.mainRef : null });
       pendingRearm.clear(launch.repo, pr);
       const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
       outcome = 'pushed'; reason = 'finished an earlier push';
@@ -936,7 +936,7 @@ export async function runFixCli(argv = [], {
         throw new LauncherError('lane git config changed while the agent ran; refusing to push');
       }
       // Record the owed re-arm BEFORE the push (best effort): a crash anywhere after the push must not lose it.
-      try { pendingRearm.write(launch.repo, pr, after, undefined, { conflictRound }); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
+      try { pendingRearm.write(launch.repo, pr, after, undefined, { conflictRound, mainRef: target || null }); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
       run('git', [...HARDENED_GIT_ARGS, 'push', '--no-verify', 'origin', `HEAD:refs/heads/${ref}`], { cwd: lanePath, env: gitEnv }); // never --force
       const handBack = await rearm(after, { conflictRound });
       pendingRearm.clear(launch.repo, pr);

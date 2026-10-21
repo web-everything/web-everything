@@ -2375,7 +2375,10 @@ export function watchParkedPrConflicts({
           // rearm comment (one extra negotiation round) — rare, and better than losing the rearm.
           if (needsRearm) {
             let conflictRound = false;
-            try { conflictRound = isWatcherConflictBounce(listPrComments({ number: pr?.number, repo: resolvedRepo })); }
+            // Only for a repo this clone IS (its local origin/<base> is what the conflict receipt records): another repo
+            // keeps the ordinary round rather than stamping this clone's sha (Codex re-audit #3, finding 3).
+            const ownRepo = !resolvedRepo || repoKeyForSlug(resolvedRepo) === 'we';
+            try { conflictRound = ownRepo && isWatcherConflictBounce(listPrComments({ number: pr?.number, repo: resolvedRepo })); }
             catch { conflictRound = false; } // unreadable thread → an ordinary round (the fail-safe direction)
             try {
               postRearm({ pr, repo: resolvedRepo, conflictRound });

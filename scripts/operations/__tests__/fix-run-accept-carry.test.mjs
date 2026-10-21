@@ -69,14 +69,15 @@ describe('fix-run hand-back: carry, conflict round, or ordinary re-arm', () => {
   it('a retried hand-back keeps its conflict-round class (audit finding 2)', async () => {
     const m = mk(['aaa', 'bbb']);
     const store = {};
-    m.io.pendingRearm = { read: () => store.v ?? null, write: (_r, _p, sha, _n, extra = {}) => { store.v = { sha, at: 0, ...(extra.conflictRound ? { conflictRound: true } : {}) }; }, clear: () => {} };
+    m.io.pendingRearm = { read: () => store.v ?? null, write: (_r, _p, sha, _n, extra = {}) => { store.v = { sha, at: 0, ...(extra.conflictRound ? { conflictRound: true, mainRef: extra.mainRef } : {}) }; }, clear: () => {} };
     const failing = (cmd, args, opts) => { if (cmd === 'node' && String(args[0]).endsWith('rearm-review.mjs')) throw new Error('gh down'); return m.run(cmd, args, opts); };
     await runFixCli([...argv, '--merge-onto=lane/base'], { ...m.io, run: failing, readComments: async () => [] });
-    expect(store.v).toMatchObject({ sha: 'bbb', conflictRound: true });
+    expect(store.v).toMatchObject({ sha: 'bbb', conflictRound: true, mainRef: 'lane/base' });
     const m2 = mk(['bbb']);
     const carryVerdict = vi.fn(async () => ({ carried: true }));
     await runFixCli(argv, { ...m2.io, pendingRearm: m.io.pendingRearm, carryVerdict });
     expect(rearmCall(m2)).toContain('--round=conflict');
+    expect(rearmCall(m2)).toContain('--main-ref=lane/base'); // the retry keeps the target it resolved against
     expect(carryVerdict).not.toHaveBeenCalled();
   });
   it('conflict re-arm does not bump the review round: only the ordinary marker is counted as a round', () => {
