@@ -148,6 +148,18 @@ describe('planReconcile — the escalation path', () => {
     // cleared before the deadline is a clean success
     expect(planReconcile([entry()], { clones: [{ ...c, held: null }], now: NOW })[0].escalate).toBeNull();
   });
+  it('round 3: a late repaired outcome is still a wall-time overrun; another hold is not "cleared"; the stop-settled tick is watched', () => {
+    const late = entry({ deadlineAt: NOW - MIN });
+    const lateRepaired = { outcome: 'repaired', top: 'lane/x', recordedAt: new Date(NOW).toISOString() };
+    expect(planReconcile([late], { clones: [{ ...c, held: null }], now: NOW, outcomeFor: () => lateRepaired })[0].escalate).toBe('wall-time');
+    const timely = { ...lateRepaired, recordedAt: new Date(NOW - 2 * MIN).toISOString() };
+    expect(planReconcile([late], { clones: [{ ...c, held: null }], now: NOW, outcomeFor: () => timely })[0].escalate).toBeNull();
+    const smokeHeld = [{ ...c, held: { ...c.held, reason: 'smoke-rejected' } }];
+    expect(planReconcile([entry({ status: 'repaired', deadlineAt: NOW })], { clones: smokeHeld, now: NOW })[0]).toMatchObject({ escalate: 'hold-not-cleared' });
+    expect(planReconcile([entry({ status: 'repaired' })], { clones: smokeHeld, now: NOW })).toEqual([]);
+    const settledNow = entry({ status: 'cleared', stopSettledAt: NOW });
+    expect(planReconcile([settledNow], { clones: [], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) })[0].escalate).toBe('conflict-override-used');
+  });
   it('a settled entry whose stop is still pending is still watched for a conflict override (once)', () => {
     const settled = entry({ status: 'cleared', stopPending: true, endReason: 'the clone left this overlay hold' });
     const a = planReconcile([settled], { clones: [{ ...c, held: null }], now: NOW, overrideFor: () => ({ ref: 'lane/x' }) });

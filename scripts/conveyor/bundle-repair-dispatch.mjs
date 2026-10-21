@@ -245,7 +245,11 @@ export async function runBundleRepairs({
     const persist = () => { if (!dryRun && (ledger.length || existsSync(ledgerPath(dir)))) writeJsonAtomicSync(ledgerPath(dir), pruneLedger(ledger, { now, liveHoldIds: live() })); };
     const firstLine = (e) => String(e?.message || e).split('\n')[0];
     const tryStop = async (entry) => {
-      try { await stop(entry); delete entry.stopPending; delete entry.lastStopError; }
+      try {
+        await stop(entry);
+        if (entry.stopPending) entry.stopSettledAt = now; // still checked for an override this tick
+        delete entry.stopPending; delete entry.lastStopError;
+      }
       catch (e) { entry.stopPending = true; entry.lastStopError = firstLine(e); }
     };
     // An escalation is PENDING until the feed accepted it: a failed post is retried every tick, never lost.
@@ -265,7 +269,7 @@ export async function runBundleRepairs({
     // 1. reconcile
     const outcomes = new Map();
     const overrides = new Map();
-    for (const e of ledger.filter((x) => x.status === 'running' || x.status === 'repaired' || x.stopPending)) {
+    for (const e of ledger.filter((x) => x.status === 'running' || x.status === 'repaired' || x.stopPending || x.stopSettledAt === now)) {
       outcomes.set(e.holdId, readJson(outcomePath(dir, e.holdId), null));
       try { overrides.set(e.holdId, await overrideFor(e)); } catch { overrides.set(e.holdId, null); }
     }

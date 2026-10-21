@@ -149,8 +149,8 @@ export function planBundleRepairs({ clones = [], ledger = [], settings = BUNDLE_
  *   1. a registration by the bot carried a conflict override → escalate `conflict-override-used` (also for a settled
  *      entry whose stop is still pending — its session may still be running);
  *   2. the session recorded `escalate` → escalate with its reason (both outrank a cleared hold);
- *   3. the clone's hold is gone → `cleared` (escalating `wall-time` if the session overran without an outcome). A
- *      clone MISSING from the probe is unknown, not cleared;
+ *   3. the clone is held on nothing → `cleared` (escalating `wall-time` if the session overran without a timely
+ *      outcome). A clone MISSING from the probe, or moved into ANOTHER hold, is not cleared;
  *   4. the wall time is reached → escalate `wall-time` (`hold-not-cleared` when the session said repaired);
  *   5. the session recorded `repaired` → stop it; status `repaired` (still watched until the hold clears).
  * @param {Array<object>} ledger
@@ -163,8 +163,9 @@ export function planReconcile(ledger, { clones = [], now, outcomeFor = () => nul
   const out = [];
   for (const e of Array.isArray(ledger) ? ledger : []) {
     const watched = e.status === 'running' || e.status === 'repaired';
-    // A settled entry whose stop failed may still have a live session: keep watching it for a conflict override.
-    if (!watched && !e.stopPending) continue;
+    // A settled entry whose stop failed may still have a live session: keep watching it for a conflict override —
+    // including the tick its stop retry finally succeeded (`stopSettledAt === now`).
+    if (!watched && !e.stopPending && e.stopSettledAt !== now) continue;
     const sessionLive = e.status === 'running';
     const act = (status, escalate, detail, stop = sessionLive) => out.push({ holdId: e.holdId, stop, status, escalate, detail });
     const override = overrideFor(e);
@@ -178,9 +179,11 @@ export function planReconcile(ledger, { clones = [], now, outcomeFor = () => nul
     const pastDeadline = now >= e.deadlineAt;
     const saidRepaired = e.status === 'repaired' || (sessionLive && outcome?.outcome === 'repaired');
     const c = byKey.get(e.cloneKey);
-    // A clone missing from this tick's probe is UNKNOWN, never "cleared" — only the wall time applies to it.
-    if (c && !(isOverlayHold(c.held) && holdIdFor(c, c.held) === e.holdId)) {
-      if (sessionLive && !outcome && pastDeadline) act('cleared', 'wall-time', 'the hold cleared, but the session ran past its wall time without recording an outcome');
+    // CLEARED means the clone is held on NOTHING. A clone missing from this tick's probe is unknown, and a clone that
+    // moved into ANOTHER hold (a smoke failure, a new overlay conflict) is still held — only the wall time applies.
+    if (c && !c.held) {
+      const late = !outcome || !(Date.parse(outcome.recordedAt) <= e.deadlineAt);
+      if (sessionLive && pastDeadline && late) act('cleared', 'wall-time', 'the hold cleared, but the session ran past its wall time without recording an outcome in time');
       else act('cleared', null, 'the clone left this overlay hold');
       continue;
     }
