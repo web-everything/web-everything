@@ -12,6 +12,7 @@ import {
 
 const dirs = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop(), { recursive: true, force: true }); });
+const admit = vs => new Map(vs.map(v => [Number(v.num), v.listedHeadSha]));
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'card-group-test-')); dirs.push(d); return d; };
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } }).trim();
 const CARD = 'backlog/5360-prevention-card.md';
@@ -295,8 +296,8 @@ describe('createCardGrouping.form (fail closed)', () => {
     const outcomes = [1, 2].map(n => ({ num: n, kind: 'queue-file-overlap', reason: `#9 share ${CARD}` }));
     expect(g.form({ outcomes, verdicts }).reason).toMatch(/live re-check left fewer than 2/);
     // Dry run with an admission check: builds and proves, pushes nothing, writes no group.
-    const dry = createCardGrouping({ localSlug: 'o/r', cwd, run, exec, statePath: join(d, 's2.json'), settings, log: { write() {} }, dryRun: true, prestage: () => ({ allowed: true }), readQueueFiles: () => ({ entries: [] }) });
-    const r = dry.form({ outcomes, verdicts });
+    const dry = createCardGrouping({ localSlug: 'o/r', cwd, run, exec, statePath: join(d, 's2.json'), settings, log: { write() {} }, dryRun: true, prestage: () => ({ allowed: true }), readQueueFiles: () => ({ entries: [] }), liveGate: () => null });
+    const r = dry.form({ outcomes, verdicts, admitted: admit(verdicts) });
     expect(r.dryRun).toBe(true);
     expect(r.proof.ok).toBe(true);
     expect(existsSync(join(d, 's2.json'))).toBe(false);
@@ -321,7 +322,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     const calls = [];
     const exec = (cmd, args) => {
       calls.push(args.join(' '));
-      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ state: 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: Number(args[2]), state: 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
       if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/o/r/pull/77\n';
       if (args[0] === 'pr' && ['comment', 'close'].includes(args[1])) return '';
       throw new Error(`unexpected ${args.join(' ')}`);
@@ -336,30 +337,97 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     const t = setup();
     const d = tmp();
     const base = () => t.base;
-    const opts = { localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, base), exec: t.exec, settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc };
-    expect(createCardGrouping({ ...opts, statePath: join(d, 'a.json') }).form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/no queue file read wired/);
-    expect(createCardGrouping({ ...opts, statePath: join(d, 'a2.json'), readQueueFiles: () => ({ entries: [] }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/no land mutex/);
+    const opts = { localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, base), exec: t.exec, settings, log: { write() {} }, prestage: () => ({ allowed: true }), cardConflictSettings: cc, liveGate: () => null };
+    expect(createCardGrouping({ ...opts, statePath: join(d, 'a.json') }).form({ outcomes: t.outcomes, verdicts: t.verdicts, admitted: admit(t.verdicts) }).reason).toMatch(/no queue file read wired/);
+    expect(createCardGrouping({ ...opts, statePath: join(d, 'a2.json'), readQueueFiles: () => ({ entries: [] }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts, admitted: admit(t.verdicts) }).reason).toMatch(/no land mutex/);
     // A queued PR still sharing the card: wait, build nothing, memo nothing.
     const waiting = createCardGrouping({ ...opts, statePath: join(d, 'w.json'), withLock: fn => ({ ran: true, result: fn() }), readQueueFiles: () => ({ entries: [{ num: 99, files: [CARD] }] }) });
-    expect(waiting.form({ outcomes: t.outcomes, verdicts: t.verdicts })).toMatchObject({ waiting: true, reason: expect.stringMatching(/queued #99 still shares/) });
+    expect(waiting.form({ outcomes: t.outcomes, verdicts: t.verdicts, admitted: admit(t.verdicts) })).toMatchObject({ waiting: true, reason: expect.stringMatching(/queued #99 still shares/) });
     expect(existsSync(join(d, 'w.json'))).toBe(false);
     let locked = false;
     const withLock = fn => { locked = true; try { return { ran: true, result: fn() }; } finally { locked = false; } };
     const queued = createCardGrouping({ ...opts, statePath: join(d, 'b.json'), withLock, readQueueFiles: () => (locked ? { entries: [{ num: 2, files: [CARD] }] } : { entries: [] }) });
-    expect(queued.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/#2 is already in the merge queue/);
+    expect(queued.form({ outcomes: t.outcomes, verdicts: t.verdicts, admitted: admit(t.verdicts) }).reason).toMatch(/#2 is already in the merge queue/);
     expect(readGroupState(join(d, 'b.json')).groups ?? []).toEqual([]);
     const busy = createCardGrouping({ ...opts, statePath: join(d, 'c.json'), withLock: () => ({ ran: false }), readQueueFiles: () => ({ entries: [] }) });
-    expect(busy.form({ outcomes: t.outcomes, verdicts: t.verdicts }).reason).toMatch(/land mutex held/);
+    expect(busy.form({ outcomes: t.outcomes, verdicts: t.verdicts, admitted: admit(t.verdicts) }).reason).toMatch(/land mutex held/);
     // A clean claim records the group inside the lock and opens the PR.
     const ok = createCardGrouping({ ...opts, statePath: join(d, 'e.json'), withLock, readQueueFiles: () => ({ entries: [] }) });
-    const r = ok.form({ outcomes: t.outcomes, verdicts: t.verdicts });
+    const r = ok.form({ outcomes: t.outcomes, verdicts: t.verdicts, admitted: admit(t.verdicts) });
     expect(r.formed).toMatchObject({ pr: 77 });
     // overlap-yield holds are a waiting kind too (the git card-only check still decides).
     const t2 = setup();
     const y = createCardGrouping({ ...opts, cwd: t2.cwd, run: runIn(t2.cwd, () => t2.base), exec: t2.exec, statePath: join(d, 'y.json'), withLock, readQueueFiles: () => ({ entries: [] }) });
-    expect(y.form({ outcomes: [1, 2].map(n => ({ num: n, kind: 'overlap-yield', reason: 'overlap-yield:#9' })), verdicts: t2.verdicts }).formed).toMatchObject({ pr: 77 });
+    expect(y.form({ outcomes: [1, 2].map(n => ({ num: n, kind: 'overlap-yield', reason: 'overlap-yield:#9' })), verdicts: t2.verdicts, admitted: admit(t2.verdicts) }).formed).toMatchObject({ pr: 77 });
     expect(ok.holdFor({ num: 1 })).toMatchObject({ kind: 'card-grouped' });
     expect(t.calls.some(c => c.startsWith('pr create') && c.includes('review:pending'))).toBe(true);
+  });
+
+  it('group first: planner overlap-yield deferrals and early (pre-enqueue) candidates reach form; safety checks still decide', () => {
+    const d = tmp();
+    const withLock = fn => ({ ran: true, result: fn() });
+    const mk = (t, statePath, extra = {}) => createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => t.base), exec: t.exec, settings, log: { write() {} },
+      prestage: () => ({ allowed: true }), cardConflictSettings: cc, withLock, readQueueFiles: () => ({ entries: [] }), liveGate: () => null, statePath, ...extra });
+    // A PLANNER deferral (waitOn overlap-yield, never an enqueue outcome) is offered.
+    const t1 = setup();
+    expect(mk(t1, join(d, 'p.json')).form({ verdicts: t1.verdicts, admitted: admit(t1.verdicts), deferred: [1, 2].map(n => ({ num: n, waitOn: ['overlap-yield:#9'], overlapYield: { pr: 9, repo: null } })) }).formed).toMatchObject({ pr: 77 });
+    // A planner deferral on anything else (blockedBy), or mixed with another wait, or of another repo, is not.
+    const t2 = setup();
+    const g2 = mk(t2, join(d, 'q.json'));
+    expect(g2.form({ verdicts: t2.verdicts, admitted: admit(t2.verdicts), deferred: [1, 2].map(n => ({ num: n, waitOn: ['#123'] })) }).reason).toMatch(/0 card-only overlap deferral/);
+    expect(g2.form({ verdicts: t2.verdicts, admitted: admit(t2.verdicts), deferred: [1, 2].map(n => ({ num: n, waitOn: ['overlap-yield:#9', '#123'], overlapYield: { pr: 9, repo: null } })) }).reason).toMatch(/0 card-only overlap deferral/);
+    expect(g2.form({ verdicts: t2.verdicts, admitted: admit(t2.verdicts), deferred: [1, 2].map(n => ({ num: n, waitOn: ['overlap-yield:#9'], overlapYield: { pr: 9, repo: 'o/other' } })) }).reason).toMatch(/0 card-only overlap deferral/);
+    // Early candidates (the drain's pre-cascade offer) form a group before any single enqueue.
+    const t3 = setup();
+    expect(mk(t3, join(d, 'e.json')).form({ verdicts: t3.verdicts, admitted: admit(t3.verdicts), early: t3.verdicts }).formed).toMatchObject({ pr: 77 });
+    // Early offer does not bypass the label gate: a not-accepted sibling is left out, leaving < 2.
+    const t4 = setup();
+    const v4 = t4.verdicts.map(v => (v.num === 2 ? { ...v, prLabels: [{ name: 'ready-to-merge' }, { name: 'review:pending' }] } : v));
+    expect(mk(t4, join(d, 'f.json')).form({ verdicts: v4, early: v4, admitted: admit(v4) }).reason).toMatch(/fewer than 2 accepted card candidates/);
+    // Nor the red-team admission, nor the queue wait.
+    const t5 = setup();
+    expect(mk(t5, join(d, 'g.json'), { prestage: (c) => ({ allowed: c.num !== 2, reason: 'red team pending' }) }).form({ verdicts: t5.verdicts, admitted: admit(t5.verdicts), early: t5.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
+    const t6 = setup();
+    expect(mk(t6, join(d, 'h.json'), { readQueueFiles: () => ({ entries: [{ num: 99, files: [CARD] }] }) }).form({ verdicts: t6.verdicts, admitted: admit(t6.verdicts), early: t6.verdicts })).toMatchObject({ waiting: true });
+    // The live gate (production: the live fix claim) leaves a member out; unwired or throwing fails closed.
+    const t8 = setup();
+    expect(mk(t8, join(d, 'i.json'), { liveGate: pr => (Number(pr.number) === 2 ? 'fix claim held by x' : null) }).form({ verdicts: t8.verdicts, admitted: admit(t8.verdicts), early: t8.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
+    const t9 = setup();
+    expect(mk(t9, join(d, 'j.json'), { liveGate: null }).form({ verdicts: t9.verdicts, admitted: admit(t9.verdicts), early: t9.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
+    const t10 = setup();
+    expect(mk(t10, join(d, 'k.json'), { liveGate: () => { throw new Error('store down'); } }).form({ verdicts: t10.verdicts, admitted: admit(t10.verdicts), early: t10.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
+    // The drain's fresh single-path admission is required: no map, or a member admitted at another head, is left out.
+    const t11 = setup();
+    expect(mk(t11, join(d, 'l.json')).form({ verdicts: t11.verdicts, early: t11.verdicts }).reason).toMatch(/live re-check left fewer than 2/);
+    const t12 = setup();
+    expect(mk(t12, join(d, 'm.json')).form({ verdicts: t12.verdicts, early: t12.verdicts, admitted: new Map([[1, t12.a], [2, t12.a]]) }).reason).toMatch(/live re-check left fewer than 2/);
+    const t13 = setup();
+    expect(mk(t13, join(d, 'n.json')).form({ verdicts: t13.verdicts, early: t13.verdicts, admitted: new Map([[1, t13.a]]) }).reason).toMatch(/live re-check left fewer than 2/);
+    // An open group A reserving the card: new accepted PRs on it never form group B — before planning, and
+    // under the lock when A appeared meanwhile.
+    const groupA = { id: 'aaaa', repo: 'o/r', branch: 'lane/card-group-aaaa', pr: 60, sources: [{ num: 50, headSha: 'f'.repeat(40) }], files: [CARD] };
+    const t14 = setup();
+    const pa = join(d, 'r.json');
+    writeFileSync(pa, JSON.stringify({ groups: [groupA], failed: {} }));
+    expect(mk(t14, pa).form({ verdicts: t14.verdicts, early: t14.verdicts, admitted: admit(t14.verdicts) }).reason).toMatch(/no group of 2\+ sharing a card/);
+    expect(readGroupState(pa).groups.map(g => g.id)).toEqual(['aaaa']);
+    const t15 = setup();
+    const pb = join(d, 's2b.json');
+    const racing = fn => { writeFileSync(pb, JSON.stringify({ groups: [groupA], failed: {} })); return { ran: true, result: fn() }; };
+    expect(mk(t15, pb, { withLock: racing }).form({ verdicts: t15.verdicts, early: t15.verdicts, admitted: admit(t15.verdicts) }).reason).toMatch(/reserved by another open card group/);
+    expect(readGroupState(pb).groups.map(g => g.id)).toEqual(['aaaa']);
+    expect(t15.calls.some(c => c.startsWith('pr create'))).toBe(false);
+    // Dependency/manifest/couple-bearing candidates stay serial, and an unparseable item (0/NaN) fails closed.
+    for (const [name, extra] of [['blockedBy', { blockedBy: ['x123456'] }], ['stackParents', { stackParents: [7] }], ['item 0', { item: 0 }],
+      ['item NaN', { item: NaN }], ['manifest', { hasManifest: true }], ['couple carrier', { coupleCarrier: { num: 3 } }]]) {
+      const t = setup();
+      const vs = t.verdicts.map(v => (v.num === 2 ? { ...v, ...extra } : v));
+      expect(mk(t, join(d, `dep-${name}.json`)).form({ verdicts: vs, early: vs, admitted: admit(vs) }).reason, name).toMatch(/fewer than 2 accepted card candidates/);
+    }
+    // A PR already in a recorded group is never offered again.
+    const t7 = setup();
+    const sp = join(d, 'e.json');
+    expect(mk(t7, sp).form({ verdicts: t7.verdicts, admitted: admit(t7.verdicts), early: t7.verdicts }).reason).toMatch(/0 card-only overlap deferral/);
   });
 
   it('after the combined PR merged: closes a source only when its CURRENT head is on main, else releases it', () => {
@@ -391,5 +459,30 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     expect(calls.filter(c => c.startsWith('pr close'))).toEqual([expect.stringMatching(/^pr close 1 /)]);
     expect(calls.some(c => c.startsWith('pr comment 2 '))).toBe(true);
     expect(readGroupState(statePath).groups).toEqual([]);
+  });
+});
+
+describe('drain wiring: group first', () => {
+  it('the drain offers its candidates to form BEFORE the heal/rebase rebuilds and the cascade, and passes planner deferrals after', () => {
+    const src = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+    const early = src.indexOf('cardGrouping.form({ verdicts, early, admitted: await cardGroupAdmission(early) })');
+    expect(early).toBeGreaterThan(0);
+    // After the review gate (decision === 'merge' already judged), before the source hold and any single enqueue.
+    expect(early).toBeGreaterThan(src.indexOf('let remaining = verdicts.map('));
+    expect(early).toBeLessThan(src.indexOf('const grouped = cardGrouping.holdFor(c);'));
+    expect(early).toBeLessThan(src.indexOf('const memoHold = createHoldMemo('));
+    expect(src).toMatch(/liveGate: \(pr\) => \{ const who = attachLiveFixClaim\(/);
+    // The early pool is only what the planner marked ready, or deferred on overlap-yield alone.
+    expect(src).toContain('&& !v.prestagePendingCi && plannerReady(v));');
+    expect(src).toMatch(/d\.waitOn\.every\(w => String\(w\)\.startsWith\('overlap-yield:'\)\)/);
+    expect(src).toContain('cardGrouping.form({ outcomes: enqueueOutcomes, verdicts, deferred, admitted: await cardGroupAdmission(');
+    // Admission reuses the single path's own gates: the shared pre-enqueue hold (numbering etc.) and revalidateFresh.
+    const adm = src.slice(src.indexOf('const cardGroupAdmission = async'), src.indexOf('const cardGroupAdmission = async') + 2000);
+    expect(adm).toContain('await preEnqueueHold(c, { forGroup: true })');
+    expect(adm).toContain('await revalidateFresh(c.repo, c.num,');
+    expect(src).toContain('const earlyHold = c => memoHold(c, () => preEnqueueHold(c));');
+    const hold = src.slice(src.indexOf('const preEnqueueHold = async'), src.indexOf('const cardGroupAdmission = async'));
+    expect(hold).toMatch(/if \(numberingWithdrawalOwed\(c\.repo \|\| localSlug, c\.num\)\)\s*return \{ kind: 'numbering'/);
+    expect(hold).toContain('return mergeStrategy.recordedHold(');
   });
 });
