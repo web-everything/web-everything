@@ -17,7 +17,7 @@ PR #5793 advisory prevention: require production-binding assertions for every op
 - [A1] Add a standards check or executable inventory pairing each optional executor accepted by `we:skills-src/conveyor/review-daemon.mjs#runReviewTick` with a production-binding assertion. Preserve the assertions added for `promoteDrafts`, `rearmStaleAccepts`, and `noteRearms` in PR #5793. A missing or renamed binding must fail the wiring test.
 - [A2] After the provider from PR #5628 is present, add a named regression using the real `defaultRearmStaleAcceptance` with mocked external reads and writes: fresh live acceptance covering the head refuses and performs zero label mutations. Assert the fresh read occurred; do not mock the provider itself.
 - [A3] Add a named provider regression where the planned row is stale because another executor already rearmed the PR. Assert fresh state is read, refusal is returned, and zero label mutations occur. Include an accepted-to-pending transition between planning and execution.
-- [A4] Required CI selects the wiring and provider regressions. Run `npm run test:unit -- scripts/conveyor/__tests__/review-tick-promote.test.mjs scripts/operations/__tests__/promote-draft-pr-dispatch.test.mjs` and the affected standards check. The provider cases must fail if their refusal checks are reverted by the authorized verification harness.
+- [A4] Required CI selects the wiring and provider regressions. Use `npm run test:unit --` to run `we:scripts/conveyor/__tests__/review-tick-promote.test.mjs` and `we:scripts/operations/__tests__/promote-draft-pr-dispatch.test.mjs`, plus the affected standards check. The provider cases must fail if their refusal checks are reverted by the authorized verification harness.
 
 ## Dependency
 
