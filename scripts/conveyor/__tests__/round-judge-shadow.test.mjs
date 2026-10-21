@@ -1,0 +1,87 @@
+import { mkdtempSync, readFileSync, existsSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { observeRoundCap, resolveRoundJudgeMode } from '../round-judge-shadow.mjs';
+import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
+
+const HEAD = 'f'.repeat(40);
+const OLD = 'e'.repeat(40);
+const bot = (body, createdAt) => ({ author: { login: 'web-everything' }, body, createdAt });
+const rt = (head, file, summary, createdAt) => bot(`<!-- we:red-team-advisory pr=77 rev=${head} -->\n1. [**confirmed**] (failing-input, broken) \`${file}:5\` — ${summary}\n`, createdAt);
+const subject = () => ({ headRefOid: HEAD, comments: [
+  rt(OLD, 'a.mjs', 'alpha parser fails on empty input', '2026-10-20T00:00:00Z'),
+  rt(HEAD, 'b.mjs', 'beta cache keeps stale rows', '2026-10-20T01:00:00Z'),
+  bot(redTeamGateMarker(77, HEAD, 'round-cap', 'abcdef0123456789'), '2026-10-20T01:01:00Z'),
+] });
+const dirs = [];
+const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'rjs-')); dirs.push(d); return d; };
+afterEach(() => { while (dirs.length) rmSync(dirs.pop(), { recursive: true, force: true }); });
+const settingsOf = (mode) => { const d = tmp(); const p = join(d, 's.json'); require_write(p, JSON.stringify({ rounds: { judge: { mode } } })); return p; };
+import { writeFileSync } from 'node:fs';
+const require_write = (p, s) => writeFileSync(p, s);
+
+describe('resolveRoundJudgeMode', () => {
+  it('standard default is off when nothing sets it', () => {
+    expect(resolveRoundJudgeMode({ env: {}, path: '/nonexistent', platform: null })).toMatchObject({ mode: 'off', source: 'standard' });
+  });
+  it('the repo settings file turns it on, source tool', () => {
+    expect(resolveRoundJudgeMode({ env: {}, path: settingsOf('shadow'), platform: null })).toMatchObject({ mode: 'shadow', source: 'tool' });
+  });
+  it('env beats the file', () => {
+    expect(resolveRoundJudgeMode({ env: { WE_ROUNDS_JUDGE_MODE: 'off' }, path: settingsOf('shadow'), platform: null })).toMatchObject({ mode: 'off', source: 'env' });
+  });
+  it('an invalid value is ignored (falls to the lower layer)', () => {
+    expect(resolveRoundJudgeMode({ env: {}, path: settingsOf('loud'), platform: null })).toMatchObject({ mode: 'off', source: 'standard' });
+  });
+  it('the committed repo file is shadow', () => {
+    expect(resolveRoundJudgeMode({ env: {}, platform: null })).toMatchObject({ mode: 'shadow', source: 'tool' });
+  });
+});
+
+describe('observeRoundCap', () => {
+  const env = (extra = {}) => ({ WE_ROUNDS_JUDGE_MODE: 'shadow', ...extra });
+  it('off writes nothing', () => {
+    const dir = tmp();
+    expect(observeRoundCap({ pr: 77, subject: subject(), env: { WE_ROUNDS_JUDGE_MODE: 'off' }, dir })).toMatchObject({ skipped: 'off' });
+    expect(existsSync(join(dir, 'seen-keys.jsonl'))).toBe(false);
+  });
+  it('shadow logs one JSONL record with the line, source and evidence; a second look is skipped', () => {
+    const dir = tmp(); const lines = [];
+    const rec = observeRoundCap({ pr: 77, repo: 'web-everything/web-everything', subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21), log: (l) => lines.push(l) });
+    expect(rec).toMatchObject({ pr: 77, trigger: 'red-team-cap', mode: 'shadow', modeSource: 'env', verdict: 'send-back' });
+    const file = join(dir, '2026-10.jsonl');
+    const rows = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].line).toBe('round-judge-shadow: #77 verdict=send-back reasons=findings-changing-not-shrinking');
+    expect(rows[0].evidence).toMatchObject({ latestCount: 1, prevCount: 1, trend: 'changing' });
+    expect(lines[0]).toMatch(/^round-judge-shadow: #77 verdict=send-back .*source=env/);
+    expect(observeRoundCap({ pr: 77, subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21) })).toMatchObject({ skipped: 'already-logged' });
+    expect(readFileSync(file, 'utf8').trim().split('\n')).toHaveLength(1);
+  });
+  it('no cap -> nothing logged', () => {
+    const dir = tmp();
+    expect(observeRoundCap({ pr: 77, subject: { headRefOid: HEAD, comments: [] }, state: 'awaiting-review', env: env(), dir })).toMatchObject({ skipped: 'no-cap' });
+  });
+  it('remembers the diff size and uses growth on the next cap episode', () => {
+    const dir = tmp();
+    const files = (n) => [{ path: 'x.mjs', additions: n, deletions: 0 }];
+    observeRoundCap({ pr: 77, state: 'at-round-limit', subject: { headRefOid: OLD, comments: [], files: files(300) }, env: env(), dir, now: Date.UTC(2026, 9, 21) });
+    const rec = observeRoundCap({ pr: 77, subject: { ...subject(), files: files(700) }, env: env(), dir, now: Date.UTC(2026, 9, 21) });
+    expect(rec.verdict).toBe('suggest-split');
+  });
+  it('never throws: a hostile subject is a skipped/fail-closed note, not an exception', () => {
+    const dir = tmp();
+    const bad = { get comments() { throw new Error('boom'); }, headRefOid: HEAD };
+    expect(() => observeRoundCap({ pr: 77, subject: bad, env: env(), dir })).not.toThrow();
+    expect(observeRoundCap({ pr: 77, subject: bad, env: env(), dir })).toMatchObject({ skipped: 'error' });
+  });
+  it('under test with no dir it does not touch the real log', () => {
+    expect(observeRoundCap({ pr: 77, subject: subject(), env: { VITEST: 'true', WE_ROUNDS_JUDGE_MODE: 'shadow' } })).toMatchObject({ skipped: 'under-test' });
+  });
+  it('writes only inside its dir', () => {
+    const dir = tmp();
+    observeRoundCap({ pr: 77, subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21) });
+    expect(readdirSync(dir).sort()).toEqual(['2026-10.jsonl', 'last-size.json', 'seen-keys.jsonl'].filter((f) => readdirSync(dir).includes(f)).sort());
+  });
+});
