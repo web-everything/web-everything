@@ -319,7 +319,7 @@ export function deriveWaitingOn(pr, ctx) {
     return done('awaiting-ci', 'ci', moved('status:awaiting-ci', 'checking'), 'checks are running', actions.why, ['checks running']);
   }
 
-  const skip = drainSkips.find((s) => s.num === pr.number && (!s.repo || s.repo === pr.repo));
+  const skip = drainSkips.find((s) => s.num === pr.number && s.repo && s.repo === pr.repo);
   if (has('red-team:pending') || skip?.kind === 'red-team-pending') {
     return done('red-team-pending', 'red-team', moved('red-team:pending', 'ready-to-merge', 'review:accepted'), `post-accept red team has no result on this head${skip ? ` (drain: ${skip.reason})` : ''}`,
       actions.rerunReview, [has('red-team:pending') ? 'label red-team:pending' : null, skip ? 'drain skip red-team-pending' : null].filter(Boolean));
@@ -331,7 +331,7 @@ export function deriveWaitingOn(pr, ctx) {
     return done('awaiting-review', 'reviewer', moved('review:pending', 'status:awaiting-review', 'review-status:reviewing'), 'an independent review is owed', actions.rerunReview, ['review label']);
   }
 
-  const enqueued = sorted(pr.comments).filter((e) => ENQUEUE_RE.test(bodyOf(e.c)) && bodyOf(e.c).includes(head ?? '\0')).pop();
+  const enqueued = sorted(pr.comments).filter((e) => trusted(e) && ENQUEUE_RE.test(bodyOf(e.c)) && bodyOf(e.c).includes(head ?? '\0')).pop();
   if (has('ready-to-merge') || has('review:accepted')) {
     if (skip) {
       const actor = DRAIN_SKIP_ACTOR[skip.kind] ?? 'drain';
@@ -379,9 +379,10 @@ export function humanReviewHold(pr, now, { fixClaimLive = null } = {}) {
   return [...reasons];
 }
 
-/** The live jobs that cover this PR: ps processes naming it, plus an open fix claim. PURE. */
+/** The live jobs that cover this PR: ps processes naming its repo and number, plus an open fix claim. PURE. */
 export function jobsFor(pr, liveJobs, now) {
-  const mine = (liveJobs ?? []).filter((j) => Number(j.pr) === pr.number && (!j.repo || j.repo === pr.repo));
+  // A PR number alone cannot identify a repository; unknown-repo processes cannot prove activity here.
+  const mine = (liveJobs ?? []).filter((j) => Number(j.pr) === pr.number && j.repo && j.repo === pr.repo);
   const claim = openFixClaim(pr.comments, now);
   return claim ? [...mine, { kind: 'fix', source: 'fix-claim comment', pr: pr.number, at: claim.at }] : mine;
 }
