@@ -1,0 +1,4 @@
+{
+  "$comment": "heavy-admission gate. load = legacy host load average (standard); shadow = log the CPU idle / free memory / swap verdict beside it and obey load; resources = obey that verdict (hard ceilings stay: cpu idle < 15% or memory pressure > 2 defers; unreadable or stale snapshot falls back to load). Operator debug-mode OK 2026-10-20: macOS load counts disk waits, so load 30 at 70% idle refused every test run. Cascade: standard load -> platform heavyAdmission.gate -> this file -> WE_HEAVY_ADMISSION_GATE; the source is logged. The slot cap is unchanged.",
+  "heavyAdmission": { "gate": "resources" }
+}

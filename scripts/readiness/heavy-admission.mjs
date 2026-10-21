@@ -141,6 +141,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { shadowAdmission, readSnapshot } from '../lib/resource-admission.mjs';
 import { hostLoadAdmission } from '../lib/host-load.mjs';
+import { HEAVY_ADMISSION_GATES, resourceVerdict, shadowLine, effectiveVerdict } from '../lib/heavy-admission-resources.mjs';
 import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
@@ -218,6 +219,8 @@ const REAP_LOG = 'reaped.jsonl';
 export const ADMISSION_DEFERRED_EXIT = 75; // EX_TEMPFAIL: re-queue; the command did not run.
 export const ADMISSION_POLICY_STANDARD = Object.freeze({
   cap: DEFAULT_ADMISSION_CAP, fastSlots: 1, onTimeout: 'defer',
+  // gate: load = legacy host load average; shadow = log the CPU/memory/swap verdict, obey load; resources = obey it.
+  gate: 'load',
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
@@ -228,6 +231,7 @@ const ADMISSION_MAX_SLOTS = 256;
 const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min && v <= ADMISSION_MAX_SLOTS;
 const ADMISSION_VALID = {
   cap: admissionInt(1), fastSlots: admissionInt(0), onTimeout: (v) => v === 'defer' || v === 'run',
+  gate: (v) => HEAVY_ADMISSION_GATES.includes(v),
   'fastScale.maxSlots': (v) => v === null || admissionInt(0)(v),
   'fastScale.minShortWaiters': admissionInt(1),
   'fastScale.minShortShare': (v) => Number.isFinite(v) && v >= 0 && v <= 1,
@@ -237,16 +241,16 @@ const ADMISSION_VALID = {
   'priority.repairPatterns': validRepairPatterns,
 };
 const ADMISSION_ENV = {
-  cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
+  cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT', gate: 'WE_HEAVY_ADMISSION_GATE',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
 /** Leaves that only shape this caller's timeout response, never shared capacity or queue ordering. */
-const PER_CALLER_LEAVES = new Set(['onTimeout']);
+const PER_CALLER_LEAVES = new Set(['onTimeout', 'gate']);
 /** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
   if (leaf === 'priority.repairPatterns') { if (!s.startsWith('[')) return s ? [s] : NaN; try { return JSON.parse(s); } catch { return NaN; } }
-  if (leaf === 'onTimeout' || leaf === 'priority.mode') return s.toLowerCase();
+  if (leaf === 'onTimeout' || leaf === 'gate' || leaf === 'priority.mode') return s.toLowerCase();
   return s === '' ? NaN : Number(s);
 }
 const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -376,7 +380,7 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 }
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
-  const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode']
+  const values = ['cap', 'fastSlots', 'onTimeout', 'gate', 'fastScale.maxSlots', 'priority.mode']
     .map((leaf) => `${leaf}=${admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
@@ -1213,12 +1217,30 @@ export async function acquireSlotBlocking({
   let hostMaxWaitMs = DEFAULT_HOST_MAX_WAIT_MS;
   let hostWaitSource = 'standard';
   let hostLoadBypassed = false;
+  let lastShadowKey = null;
   try {
     for (;;) {
       const attempt = now();
-      const host = hostLoadBypassed ? { admitted: true } : hostAdmission({ env, interactive, log: (m) => {
+      let host = hostLoadBypassed ? { admitted: true } : hostAdmission({ env, interactive, log: (m) => {
         if (!hostPolicyLogged) { log(`${m}\n`); hostPolicyLogged = true; }
       } });
+      // heavyAdmission.gate: a second verdict from CPU idle / memory / swap (the shared resource snapshot). `shadow`
+      // logs it and obeys the load verdict; `resources` obeys it when readable. Unreadable or stale → the load verdict.
+      // The slot cap below is untouched, and an interactive or already-admitted caller never reaches this check.
+      const gate = policy.settings.gate ?? 'load';
+      if (gate !== 'load' && !hostLoadBypassed && !interactive && env[ADMISSION_HELD_ENV] !== '1') {
+        let res;
+        try { res = resourceVerdict({ snapshot: readResourceSnapshot(), nowMs: attempt }); }
+        catch (e) { res = { verdict: null, reason: `resource snapshot unreadable: ${String(e?.message ?? e).split('\n')[0]}`, sources: 'none' }; }
+        const legacy = host.admitted ? 'admit' : 'defer';
+        const key = `${gate}|${legacy}|${res.verdict}`;
+        if (key !== lastShadowKey) {
+          lastShadowKey = key;
+          try { log(shadowLine({ gate, gateSource: policy.sources?.gate ?? 'standard', legacy, legacyReason: host.reason, res }) + '\n'); } catch { /* logging never gates */ }
+        }
+        const v = effectiveVerdict({ gate, legacy, res });
+        if (v !== legacy) host = { admitted: v === 'admit', reason: `resources gate: ${res.reason}; legacy said ${legacy} (${host.reason})` };
+      }
       if (!host.admitted) {
         if (canDefer) {
           log(`heavy-command admission deferred: ${host.reason}\n`);
