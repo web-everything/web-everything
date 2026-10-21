@@ -14,7 +14,8 @@ const hold = (over = {}) => redTeamEnqueueHold({ scheduled: over.loopPayload !==
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });
 // The comment shapes review-set-label renders: `clear-human` (heading first, markers last), `restamp`, plain accept.
-const accept = (sha, cleared = false) => ({ ...bot, body: cleared
+const human = { author: { login: 'chalbert' } };
+const accept = (sha, cleared = false, who = cleared ? human : bot) => ({ ...who, body: cleared
   ? ['✅ review — `review:human` cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '', buildReviewedShaMarker(sha), buildClearedHumanMarker('operator')].join('\n')
   : ['✅ review — accepted', '', buildReviewedShaMarker(sha)].join('\n') });
 const restamp = sha => ({ ...bot, body: ['📌 review — acceptance re-stamped after a rebase (no new review)', '', buildReviewedShaMarker(sha), buildClearedHumanMarker('operator')].join('\n') });
@@ -65,6 +66,9 @@ describe('operator ruling at the round cap', () => {
     ['clearance before the result', [accept(head, true), clean(head, 'web-everything', broken), gate(head, 'round-cap')]],
     ['clearance before the round-cap record', [clean(head, 'web-everything', broken), accept(head, true), gate(head, 'round-cap')]],
     ['clearance on another head', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(prior, true)]],
+    ['a clear-human posted by automation (forged ruling)', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true, bot)]],
+    ['a bot-posted cleared-human marker reviving a superseded human clearance', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept(head), restamp(head)]],
+    ['a clear-human by an operator login typed Bot', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true, { author: { login: 'chalbert', type: 'Bot' } })]],
     ['untrusted clearance', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), { ...accept(head, true), author: { login: 'attacker' } }]],
     ['a later plain accept supersedes it', [clean(head, 'web-everything', broken), gate(head, 'round-cap'), accept(head, true), accept(head)]],
     ['no round-cap record (the gate never handed it over)', [clean(head, 'web-everything', broken), accept(head, true)]],
@@ -104,6 +108,12 @@ describe('operator ruling at the round cap', () => {
   it('a ruling on the prior head survives a proven carry (restamped clearance, carried round-cap and result)', () => {
     const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
     expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toBeNull();
+  });
+  it('a plain accept of the carried head supersedes the prior head ruling; a bot cleared-human marker cannot revive it', () => {
+    const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true)];
+    const carried = [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })];
+    expect(hold({ comments: carried })).toBeNull();
+    expect(hold({ comments: [...carried, accept(head), restamp(head)] })).toMatch(/requiring send-back/);
   });
   it('a ruling survives a chain of carries (H0 → H1 → head)', () => {
     const h0 = 'e'.repeat(40);
