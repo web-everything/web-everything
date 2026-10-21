@@ -72,10 +72,11 @@
  * pass in this repo (`runner.mjs`'s `makeCliMechanicalPasses`) — it never fails the review tick itself.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
-import { resolve } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
@@ -221,6 +222,32 @@ export function formatOperatorHoldsRecord({ repo, observedAt, intervalMs, holds 
 const ALWAYS_EXPLAINED_LABEL = 'review:human';
 
 /**
+ * The dispatch order for this tick's owed reviews. Pure, stable. Rank 0: a main-fix PR (the plan marks it
+ * `mainFix`); rank 1: a PR someone is blocked on (`review:human` or `ready-to-merge`); rank 2: the rest.
+ * Within a rank the oldest PR (lowest number) goes first. Only the plan's own review rows move: a red-team
+ * request row (`redTeamRequest` / `carriedAcceptHead`) keeps its slot, since the code that adds those rows already
+ * places them deliberately (the main-fix PR's red-team first).
+ * @param {Array<object>} reviews
+ * @param {{labelsByPr?:Map<number, Array<string|{name:string}>>, plan?:{dispatch?:Array<object>}}} [o]
+ */
+export function orderReviewsForDispatch(reviews, { labelsByPr = new Map(), plan = {} } = {}) {
+  const mainFixPrs = new Set((plan?.dispatch ?? []).filter((d) => d?.mainFix).map((d) => Number(d.prNumber)));
+  const rank = (d) => {
+    const n = Number(d?.prNumber);
+    if (d?.mainFix || mainFixPrs.has(n)) return 0;
+    const names = (labelsByPr.get(n) ?? []).map((l) => (typeof l === 'string' ? l : l?.name));
+    return names.includes('review:human') || names.includes('ready-to-merge') ? 1 : 2;
+  };
+  const movable = (d) => !d?.redTeamRequest && !d?.carriedAcceptHead;
+  const slots = reviews.map((d, i) => (movable(d) ? i : -1)).filter((i) => i >= 0);
+  const sorted = slots.map((i) => ({ d: reviews[i], i, r: rank(reviews[i]), n: Number(reviews[i]?.prNumber) }))
+    .sort((a, b) => a.r - b.r || (Number.isFinite(a.n) && Number.isFinite(b.n) ? a.n - b.n : 0) || a.i - b.i);
+  const out = [...reviews];
+  slots.forEach((slot, k) => { out[slot] = sorted[k].d; });
+  return out;
+}
+
+/**
  * Live-caught 2026-09-26 (WE PRs #2746–#2758 sat `review:pending` for ~an hour while every tick logged only
  * "N owed" — nothing said WHY each parked PR was skipped, so a correct `live-process` refusal (a stale fix /
  * ci-heal session still bound to the PR) looked exactly like a discovery bug). For every open PR carrying
@@ -228,10 +255,10 @@ const ALWAYS_EXPLAINED_LABEL = 'review:human';
  * plan — never re-derived. Pure. `prs` is the tick's own shared `gh pr list` read; `null` (the opt-out
  * no-shared-reads path) returns `[]`, since there is then no label list to scan.
  * @param {{prs:Array<object>|null, plan:{dispatch?:Array<object>, refusals?:Array<object>}, dispatchable:Array<object>,
- *   deferredForLanes?:Array<object>, paused?:boolean}} o
+ *   deferredForLanes?:Array<object>, paused?:boolean, deferReason?:string}} o
  * @returns {Array<{prNumber:number, labels:string[], reasons:string[]}>}
  */
-export function explainPendingNotDispatched({ prs, plan, dispatchable = [], deferredForLanes = [], paused = false }) {
+export function explainPendingNotDispatched({ prs, plan, dispatchable = [], deferredForLanes = [], paused = false, deferReason = null }) {
   if (!Array.isArray(prs)) return [];
   const labelName = (l) => (typeof l === 'string' ? l : l?.name);
   const sent = new Set(dispatchable.map((d) => Number(d.prNumber)));
@@ -252,7 +279,7 @@ export function explainPendingNotDispatched({ prs, plan, dispatchable = [], defe
     const held = (pr?.labels ?? []).map(labelName).filter((l) => EXPLAINED_HOLD_LABELS.includes(l));
     if (held.length === 0) continue;
     const reasons = [];
-    if (deferred.has(n)) reasons.push(paused ? 'review owed, but dispatch is paused (Claude login)' : 'review owed, but no acquirable lane this tick');
+    if (deferred.has(n)) reasons.push(deferReason ?? (paused ? 'review owed, but dispatch is paused (Claude login)' : 'review owed, but no acquirable lane this tick'));
     for (const d of (plan?.dispatch ?? [])) {
       if (Number(d?.prNumber) === n && d.kind !== 'review') reasons.push(`owed a ${d.kind}, not a review — ${d.why ?? ''}`.trim());
     }
@@ -344,6 +371,9 @@ export function runReviewTick({
   refreshScopeBloat = null,
   postRefreshMarker = null,
   acquirableLanes = () => Infinity,
+  // EMERGENCY 2026-10-20 — `{left:number}` shared by every repo of one daemon tick (see
+  // {@link liveReviewRoundBudget}); `null` (the default) never caps, so pure-function callers are unchanged.
+  liveReviewBudget = null,
   // Pool-exhaustion reporting: `{exhausted({repo, deferred}), recovered(repo)}` (see
   // `we:scripts/conveyor/pool-exhaustion.mjs`). `null` (the default) keeps every existing test byte-identical;
   // the real daemon wires a logger that says WHY the pool is empty once per episode, never a silent skip.
@@ -537,17 +567,15 @@ export function runReviewTick({
   // whole block): every review stays owed exactly like a lane-starved tick already does (`reviewsOwed` and
   // `statusCandidates` below are unaffected), so nothing here re-derives a second "was anything dispatched"
   // path — it is the SAME deferred-not-lost shape `deferredForLanes` already models, just for a different cause.
+  // 2026-10-20 — when this tick can dispatch fewer reviews than are owed, the scarce seats go in priority
+  // order (see orderReviewsForDispatch): main-fix first, then PRs a human or the merge queue waits on, oldest first.
+  reviews.splice(0, reviews.length, ...orderReviewsForDispatch(reviews, { labelsByPr, plan }));
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
-  const dispatchable = reviews.slice(0, Math.min(reviews.length, acquirable));
-  const deferredForLanes = paused ? 0 : reviews.length - dispatchable.length;
-  const deferredForAuth = paused ? reviews.length - dispatchable.length : 0;
-  if (poolExhaustion && !paused) {
-    try {
-      if (acquirable === 0 && deferredForLanes > 0) poolExhaustion.exhausted({ repo, lanePoolRepo: poolExhaustionLanePoolRepo(repo), deferred: deferredForLanes });
-      else if (acquirable > 0) poolExhaustion.recovered(repo);
-    } catch { /* reporting only — never fails the tick */ }
-  }
+  const remainingReviewCapacity = () => liveReviewBudget && Number.isFinite(liveReviewBudget.left)
+    ? Math.max(0, liveReviewBudget.left) : Infinity;
+  const dispatchable = [];
+  let occupiedLanes = 0;
   const dispatched = [];
   const failed = [];
   for (const row of plan.refusals ?? []) {
@@ -593,28 +621,63 @@ export function runReviewTick({
   // x26lw6u — NOT named `skipped`: `withSelfSync` already returns `{skipped: true}` for a whole skipped tick,
   // and `onTick` reads both shapes.
   const notStarted = [];
-  for (const [i, d] of dispatchable.entries()) {
+  for (const d of reviews) {
+    if (paused || occupiedLanes >= acquirable || remainingReviewCapacity() <= 0) break;
+    dispatchable.push(d);
+    // Reserve only this start. A confirmed refusal releases the seat for the next PR (including later
+    // repos). A throw may follow a successful spawn, so its reservation must remain until the next ps read.
+    const reserved = Number.isFinite(remainingReviewCapacity());
+    if (reserved) liveReviewBudget.left--;
     try {
       const subject = (Array.isArray(rawPrs) ? rawPrs : []).find(p => Number(p?.number) === Number(d.prNumber));
       const result = dispatch({ pr: d.prNumber, repo,
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
-        ...(Array.isArray(lanes) ? { preferLane: lanes[i] } : {}),
+        ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes] } : {}),
         escalationReason: parseEscalationReason(subject?.body ?? ''),
         scopePaths: (subject?.files ?? []).map(f => typeof f === 'string' ? f : f.path),
       });
       // x26lw6u — a job dispatch that declined to start (a live job already on this PR, or the lane cool-off)
       // did not advance the round, so it gets no round tag — same rule as a failed dispatch.
-      if (result?.skipped) { notStarted.push({ prNumber: d.prNumber, reason: result.skipped }); continue; }
+      if (result?.skipped) {
+        // A refusal that started nothing frees its seat. A live-job skip names a job that may have appeared after this
+        // tick's ps read: it refunds only when that job's pid was already counted (when in doubt, overcount).
+        const counted = liveReviewBudget?.countedJobPids;
+        const refundable = result.skipped !== 'live-job'
+          || (Number.isInteger(result.jobPid) && counted instanceof Set && counted.has(result.jobPid));
+        if (reserved && refundable) liveReviewBudget.left++;
+        notStarted.push({ prNumber: d.prNumber, reason: result.skipped });
+        continue;
+      }
       dispatched.push({
         prNumber: d.prNumber, agentId: result?.agentId ?? null,
         ...(result?.mode ? { mode: result.mode } : {}), ...(Number.isInteger(result?.jobPid) ? { jobPid: result.jobPid } : {}),
       });
+      occupiedLanes++;
     } catch (e) {
+      occupiedLanes++;
       failed.push({ prNumber: d.prNumber, error: String((e && e.message) || e).split('\n')[0] });
-      continue; // no round tag on a failed dispatch — the round did not actually advance
+      continue; // no round tag when the dispatch result is unknown
     }
     try { tagRound({ pr: d.prNumber, repo, round: (d.attempts ?? 0) + 1, currentLabels: labelsByPr.get(Number(d.prNumber)) }); }
     catch { /* cosmetic — a failed tag never fails the tick, see review-round-tag.mjs's own header */ }
+  }
+  // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
+  // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
+  const liveCap = remainingReviewCapacity();
+  const capBound = !paused && liveCap < acquirable - occupiedLanes;
+  const deferredTotal = reviews.length - dispatchable.length;
+  const deferredForCap = capBound ? deferredTotal : 0;
+  const deferredForLanes = paused || capBound ? 0 : deferredTotal;
+  const deferredForAuth = paused ? deferredTotal : 0;
+  const deferReason = paused ? 'review owed, but dispatch is paused (Claude login)'
+    : capBound ? `review owed, but held by the live-review cap (${liveReviewBudget?.reason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
+      : `review owed, but no acquirable lane this tick (${acquirable} acquirable)`;
+  if (deferredForCap && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${deferredForCap} owed review(s) queued — ${liveReviewBudget.reason}\n`);
+  if (poolExhaustion && !paused) {
+    try {
+      if (acquirable === 0 && deferredForLanes > 0) poolExhaustion.exhausted({ repo, lanePoolRepo: poolExhaustionLanePoolRepo(repo), deferred: deferredForLanes });
+      else if (acquirable > 0) poolExhaustion.recovered(repo);
+    } catch { /* reporting only — never fails the tick */ }
   }
   // A PR dispatched THIS tick is absent from the pre-dispatch `rawAgents` snapshot, yet its review job record
   // already exists (`dispatchReviewJob` writes it before returning) — reusing the snapshot would tag it "nothing
@@ -654,9 +717,10 @@ export function runReviewTick({
   return {
     reviewsOwed: reviews.length, dispatched, failed, notStarted, refusals: (plan.refusals ?? []).length,
     pendingNotDispatched: explainPendingNotDispatched({
-      prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused,
+      prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused, deferReason,
     }),
-    reconcileError: null, deferredForLanes, deferredForAuth, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
+    reconcileError: null, deferredForLanes, deferredForCap, deferredForCapReason: deferredForCap ? (liveReviewBudget?.reason ?? null) : null,
+    deferredForAuth, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
     ...(scopeBloatRefreshed.length ? { scopeBloatRefreshed } : {}),
@@ -745,6 +809,8 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   let reviewsOwed = 0;
   let refusals = 0;
   let deferredForLanes = 0;
+  let deferredForCap = 0;
+  let deferredForCapReason = null;
   let deferredForAuth = 0;
   const liveProcessPrs = [];
   const operatorHoldSnapshots = [];
@@ -763,6 +829,8 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
     reviewsOwed += result.reviewsOwed;
     refusals += result.refusals;
     deferredForLanes += result.deferredForLanes ?? 0;
+    deferredForCap += result.deferredForCap ?? 0;
+    if (result.deferredForCapReason) deferredForCapReason = result.deferredForCapReason;
     deferredForAuth += result.deferredForAuth ?? 0;
     for (const d of result.dispatched) dispatched.push({ ...d, repo });
     for (const k of (result.notStarted ?? [])) notStarted.push({ ...k, repo });
@@ -772,7 +840,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
     if (result.operatorHolds) operatorHoldSnapshots.push({ repo, ...result.operatorHolds });
   }
   return {
-    repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes,
+    repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes, deferredForCap, deferredForCapReason,
     deferredForAuth, authPaused: authGate.paused, authPauseReason: authGate.reason,
     holdReconcile: holdReconcileRemoved, holdReconcileFailed,
     operatorHoldSnapshots,
@@ -1068,6 +1136,181 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
   return names;
 }
 
+/**
+ * How many review rounds are live in a `ps -A -o pid=,ppid=,command=` listing. A line counts only when the script node RUNS
+ * is the review script itself — never when the name merely appears in an argument. Live-caught 2026-10-20: two
+ * `verify-lane.mjs` runs whose changed-file list named `review-job.mjs` counted as 2 of the 3 allowed rounds, so
+ * the daemon dispatched nothing with 1 real round live. A round is one job or one bare loop (a job runs a loop).
+ * Command-only lines are accepted conservatively: without ancestry every matching process is a round.
+ * @param {string[]} lines
+ * @param {{isScriptFile?: function(string): boolean}} options Optional absolute-path classifier. Ambiguous
+ *   or unreadable candidates throw; the live budget holds dispatch. Relative argv uses lexical conventions.
+ */
+export function countLiveReviewRounds(lines, { isScriptFile = null, countedJobPids = null } = {}) {
+  // Runtimes that run a script file, and the runtime flags that take their value as the NEXT word (a preload,
+  // a loader): those values are not the script. An unknown runtime still counts when its argv[0] is the script.
+  const RUNTIME = /(^|\/)(node|nodejs|bun|electron)(\.exe)?$/;
+  const VALUE_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--env-file',
+    '-C', '--conditions', '--title', '--input-type', '--experimental-config-file']);
+  const PRELOAD_FLAGS = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader']);
+  const word = (text) => {
+    const match = /^(?:"([^"]*)"|'([^']*)'|(\S+))\s*/.exec(text);
+    return match ? { value: match[1] ?? match[2] ?? match[3], rest: text.slice(match[0].length) } : { value: '', rest: '' };
+  };
+  const path = (text, { preload = false } = {}) => {
+    if (/^["']/.test(text)) return word(text);
+    const first = word(text);
+    // require() accepts JSON and native addons too. Use their suffix
+    // as a preload boundary so a relative preload cannot swallow the following review script.
+    const extension = preload ? '\\.(?:mjs|cjs|js|json|node)' : '\\.(?:mjs|cjs|js)';
+    // An extensionless require (including directory/index resolution), or a custom suffix, can precede
+    // a review entrypoint directly. Do not concatenate those two relative argv values into one path.
+    const unknownRelativePreload = preload && !first.value.startsWith('/') && !new RegExp(`${extension}$`).test(first.value);
+    if (unknownRelativePreload && /(?:^|\/)review-(?:job|loop-cli)\.mjs$/.test(word(first.rest).value)) return first;
+    // ps prints argv joined by spaces, without shell quoting. Retain the whole path up to its script
+    // extension instead of treating a checkout directory's first space as the end of the script.
+    // Flattened ps text can lose a path's boundaries, including extensionless prefixes and option-like
+    // directory fragments. Check every plausible absolute candidate before applying lexical conventions.
+    const candidates = [];
+    const mentionsReview = /review-(?:job|loop-cli)\.mjs(?:\s|$)/.test(text);
+    const boundary = text.search(/\s+(?=(?:--?[A-Za-z0-9]|\/|\.{1,2}\/))/);
+    const span = boundary < 0 ? text : text.slice(0, boundary);
+    if (unknownRelativePreload) {
+      const review = /(?:^|\s)(\S*review-(?:job|loop-cli)\.mjs)(?=\s|$)/.exec(span);
+      // Without a suffix before a spaced review path, flattened relative argv cannot distinguish
+      // a spaced preload from an extensionless preload followed by the actual review entrypoint.
+      if (review && !new RegExp(`${extension}(?=\\s|$)`).test(span.slice(0, review.index))) {
+        throw new Error('ambiguous preload path in process listing');
+      }
+    }
+    for (const match of text.matchAll(new RegExp(`${extension}(?=\\s|$)`, 'g'))) {
+      const candidate = text.slice(0, match.index + match[0].length);
+      // No script opened by these POSIX runtimes can exceed Linux's 4096-byte pathname bound (macOS is
+      // tighter). Long changed-file argv must not turn impossible concatenated paths into a cap hold.
+      if (Buffer.byteLength(candidate) >= 4096) break;
+      candidates.push(candidate);
+      // No review filename anywhere in this span: later argument boundaries cannot change its count.
+      if (!mentionsReview) break;
+    }
+    let resolved;
+    if (isScriptFile && mentionsReview && first.value.startsWith('/')) {
+      const files = [...new Set([first.value, ...candidates])].filter(candidate => isScriptFile(candidate));
+      if (files.length > 1) throw new Error('ambiguous script path in process listing');
+      [resolved] = files;
+      const lexicalCandidates = candidates.filter(candidate => candidate.length <= span.length);
+      if (!resolved && lexicalCandidates.length !== 1) throw new Error('ambiguous script path in process listing');
+    }
+    // Relative paths belong to the other process's cwd. Preserve the first complete script convention
+    // (including relative preload values), but never turn an ambiguous extensionless entrypoint into zero.
+    if (!first.value.includes('/') && !new RegExp(`${extension}$`).test(first.value)) {
+      if (isScriptFile && mentionsReview) throw new Error('ambiguous script path in process listing');
+      return first;
+    }
+    // Bare '-' / '--' may be directory fragments. A normal option or a rooted path starts a new argument
+    // in the lexical fallback; an existing absolute path above takes precedence over that convention.
+    const match = new RegExp(`^(.*?${extension})(?=\\s|$)`).exec(span);
+    const value = resolved ?? match?.[1] ?? first.value;
+    return { value, rest: text.slice(value.length).trimStart() };
+  };
+  const script = (command) => {
+    const runtime = word(command);
+    if (!RUNTIME.test(runtime.value)) {
+      // Only argv[0] can be a direct script; never consume a utility's arguments. Node shebang execution
+      // appears as interpreter + script in ps, so its spaced paths use the runtime branch below.
+      return runtime.value.split('/').pop();
+    }
+    let rest = runtime.rest;
+    while (rest) {
+      const t = word(rest);
+      if (t.value === '--') return path(t.rest).value.split('/').pop();
+      // Evaluation modes never execute a script from the remaining argv.
+      if (/^(?:-[ep]|--(?:eval|print)(?:=|$))/.test(t.value)) return '';
+      const equals = rest.indexOf('=');
+      if (equals > 0 && PRELOAD_FLAGS.has(rest.slice(0, equals))) {
+        rest = path(rest.slice(equals + 1), { preload: true }).rest;
+        continue;
+      }
+      if (VALUE_FLAGS.has(t.value)) {
+        rest = PRELOAD_FLAGS.has(t.value) && /^(?:\/|\.{1,2}\/)/.test(t.rest) ? path(t.rest, { preload: true }).rest : word(t.rest).rest;
+        continue;
+      }
+      if (t.value.startsWith('-')) { rest = t.rest; continue; }
+      return path(rest).value.split('/').pop();
+    }
+    return '';
+  };
+  const processes = lines.map((line) => {
+    const text = String(line).trim();
+    const ids = /^(\d+)\s+(\d+)\s+(.+)$/.exec(text);
+    return { pid: ids?.[1], ppid: ids?.[2], name: script(ids ? ids[3] : text) };
+  });
+  const byPid = new Map(processes.filter(p => p.pid).map(p => [p.pid, p]));
+  const jobAncestorOf = (process) => {
+    const seen = new Set([process.pid]);
+    let pid = process.ppid;
+    while (pid && !seen.has(pid)) {
+      seen.add(pid);
+      const parent = byPid.get(pid);
+      if (!parent) break;
+      if (parent.name === 'review-job.mjs') return parent.pid;
+      pid = parent.ppid;
+    }
+    return null;
+  };
+  const jobs = processes.filter(p => p.name === 'review-job.mjs');
+  const loops = processes.filter(p => p.name === 'review-loop-cli.mjs');
+  // A job's own loop is the same round, so each job absorbs AT MOST ONE descendant loop; any further loop under
+  // the same job is counted as its own round (when in doubt, overcount). Never below running HEAD's floor
+  // max(jobs, loops).
+  const absorbed = new Set();
+  let extraLoops = 0;
+  for (const loop of loops) {
+    const job = jobAncestorOf(loop);
+    if (job && !absorbed.has(job)) absorbed.add(job);
+    else extraLoops += 1;
+  }
+  const count = Math.max(jobs.length + extraLoops, jobs.length, loops.length);
+  if (countedJobPids) for (const job of jobs) if (job.pid) countedJobPids.add(Number(job.pid));
+  return count;
+}
+
+/** EMERGENCY 2026-10-20 — the host-wide cap on live review rounds, from the tool layer
+ *  (`scripts/settings/review-concurrency.json`, source logged by the cascade). Counts live `review-job.mjs` /
+ *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
+ *  review this tick). Revert condition: see the settings file's comment. */
+export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
+  toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
+  const raw = env?.WE_REVIEW_MAX_LIVE_ROUNDS;
+  const r = cascadePolicy('reviewConcurrency', tool && { maxLiveReviewRounds: tool.maxLiveReviewRounds }, {
+    env, standard: { maxLiveReviewRounds: null },
+    envValues: { maxLiveReviewRounds: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
+    valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1) },
+  });
+  const max = r.value.maxLiveReviewRounds;
+  if (max == null) return null;
+  const src = r.sources?.maxLiveReviewRounds ?? 'standard';
+  let lines;
+  try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }
+  let live;
+  const countedJobPids = new Set();
+  try {
+    live = countLiveReviewRounds(lines, { countedJobPids, isScriptFile: (path) => {
+      // Another process's relative paths must never be resolved against the daemon's cwd.
+      if (!path.startsWith('/')) return false;
+      try { return statSync(path).isFile(); }
+      catch (error) {
+        if (['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error?.code)) return false;
+        throw error;
+      }
+    } });
+  } catch {
+    return { left: 0, reason: `live review rounds unknown (ambiguous script path); maxLiveReviewRounds=${max} (${src})` };
+  }
+  return { left: Math.max(0, max - live), live, max, countedJobPids, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
+}
+
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
   reapSessions = defaultReapSessions,
@@ -1085,6 +1328,7 @@ export function buildCliDaemonEffects({
     return runReviewTickAllRepos({
       log: line => log.error(line),
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
+      liveReviewBudget: liveReviewRoundBudget(),
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
       refreshScopeBloat: refreshScopeBloatedPr,
       postRefreshMarker: defaultPostRebaseComment,
@@ -1201,7 +1445,7 @@ export function buildCliDaemonEffects({
       // A `withSelfSync`-skipped tick (`skippedTick`: `repos: []`) used to print as "tick () — 0 owed", which read
       // like discovery had watched NO repo. Say what actually happened.
       if (result?.skipped) { log.error(`review-daemon: tick skipped (${result.reason ?? 'unknown'}) — no repo was read this tick`); return; }
-      log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}`);
+      log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}${result.deferredForCap ? `, queued ${result.deferredForCap} (live-review cap: ${result.deferredForCapReason ?? 'maxLiveReviewRounds'})` : ''}`);
       // card x5kagse (epic #4075/#3383) — logged EVERY tick review dispatch stays paused, exact wording
       // required by the card and matched by the soak scenario/live-proof read.
       // One structured record per successfully planned repository; the health watch's `operator-hold-aged` smell reads
