@@ -461,7 +461,7 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/lib/review-ci-gate-io.mjs', 'scripts/operations/completion-cli.mjs', 'scripts/operations/completion-store.mjs',
   'scripts/conveyor/run-rating.mjs', 'scripts/operations/telemetry-store.mjs', 'scripts/conveyor/reconcile-core.mjs',
   // Verdict carry and red-team marker helpers are direct dependencies of review-job's acceptance path.
-  'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/drain-red-team-evidence.mjs',
+  'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/identical-net-patch.mjs', 'scripts/lib/pr-real-files.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/drain-red-team-evidence.mjs',
   'scripts/lib/red-team-status-labels.mjs',
   'scripts/lib/saved-red-team-provenance.mjs', 'scripts/lib/drain-saved-red-team.mjs',
   'scripts/lib/drain-red-team-requests.mjs',
