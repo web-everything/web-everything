@@ -321,5 +321,8 @@ describe('overlay-rebase-on-merge — an overlay that conflicts with a NEW main 
     const gone = await planRebuild({ ...base, adoptedHeads: [{ pr: 4242, sha: 'deadbeef'.repeat(5) }] });
     expect(gone.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
     expect(gone.alerts.map((a) => a.kind)).toContain('overlay-set-aside');
+    // a registered overlay whose tip cannot be resolved blocks too (Codex round 5)
+    const unresolved = await planRebuild({ ...base, overlays: [{ ref: 'lane/vanished', pr: 4343 }, ...base.overlays] });
+    expect(unresolved.decisions.find((d) => d.ref === 'lane/container')).toMatchObject({ action: 'drop', reason: 'conflict' });
   });
 });

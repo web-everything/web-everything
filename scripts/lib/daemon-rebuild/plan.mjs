@@ -618,7 +618,11 @@ export async function planRebuild({
             git, mainSha, ovSha, conflictFiles: files, stateOf, prForcePushes, adoptedHeads,
             otherHeads: [
               ...adoptedHeads.filter((h) => !h.proven),
-              ...listed.filter((o) => o?.ref && o.ref !== ref).map((o) => ({ pr: o.pr ?? -1, sha: verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) })),
+              // an unresolvable registered tip is kept as `unresolved` (blocks, fail closed) — never silently ignored
+              ...listed.filter((o) => o?.ref && o.ref !== ref).map((o) => {
+                const tip = verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`);
+                return tip ? { pr: o.pr ?? -1, sha: tip } : { pr: o.pr ?? -1, sha: null, unresolved: o.ref };
+              }),
             ],
           });
           const rb = candidates.length ? tryAutoRebase({ git, cur, ovSha, candidates }) : { ok: false };
