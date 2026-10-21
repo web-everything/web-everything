@@ -123,7 +123,7 @@ import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, 
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
-import { redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
+import { cardClassRedTeamMode } from '../lib/review-red-team-policy.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 
@@ -554,13 +554,17 @@ export function speculativeRedTeamWallMs(env = process.env) {
  * Never throws past its own `try` (the caller also contains it). Removes the pass's files when done.
  */
 /**
- * Card review class (prototype) — the panel seat's own card-only skip is a complete result, not missing
- * infrastructure, but ONLY when the head provably did not owe the seat (`redTeamPanelSeatOwed` false: a
- * card-class read under panel-seat timing). Any other skip on a panel-seat head still blocks on infra.
+ * Card review class (prototype) — how the panel red-team seat's result binds on this head:
+ *   `skip-complete` — mode `off` and the seat skipped as card-only: a complete result, not missing infra;
+ *   `advisory`      — mode `advisory`: the result is posted but never bounces the PR or blocks on infra;
+ *   `binding`       — anything else (not a card-class head, class off, mode `on`): today's rules.
+ * Derived from the read itself (`cardClassRedTeamMode`), so a missing or malformed read is always `binding`.
  */
-export function cardClassSkip(redTeam, loopPayload, env = process.env) {
-  return redTeam?.status === 'skipped' && redTeam.reason === 'red team skipped: card-only'
-    && !redTeamPanelSeatOwed(loopPayload, env);
+export function cardClassRedTeamBinding(redTeam, loopPayload, env = process.env) {
+  const mode = cardClassRedTeamMode(loopPayload?.findings?.read, env);
+  if (mode === 'off' && redTeam?.status === 'skipped' && redTeam.reason === 'red team skipped: card-only') return 'skip-complete';
+  if (mode === 'advisory') return 'advisory';
+  return 'binding';
 }
 
 export function settleSpeculativeRedTeam({ spec, accepted, out, input, panelSeat = false }, io) {
@@ -930,13 +934,17 @@ function runReviewArc({
       const plan = planRedTeamActions({ findings: (redTeam.findings ?? []).map((f, i) => ({
         index: i + 1, confirmed: f.confirmedByRecheck === true, impact: f.impactIfUnfixed,
       })) }, io.confirmedBreaksSetting?.() ?? readConfirmedBreaks().value);
-      if (panelAccepted && redTeam.status === 'ran' && typeof io.runRedTeamGate === 'function') {
+      // Card review class — decided before the gate so an advisory red team never runs the send-back gate.
+      const binding = cardClassRedTeamBinding(redTeam, seatsBox.input.loopPayload);
+      if (binding !== 'binding') seatsBox.panelResult.cardClassRedTeam = binding;
+      if (binding !== 'advisory' && panelAccepted && redTeam.status === 'ran' && typeof io.runRedTeamGate === 'function') {
         try { seatsBox.panelResult.redTeamGate = summarizeRedTeamGate(io.runRedTeamGate({ pr: planned.pr, repo: planned.repo })); }
         catch (e) { seatsBox.panelResult.redTeamGate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
       }
-      if (panelAccepted && (plan.sendBack.length || seatsBox.panelResult.redTeamGate?.sendBack)) {
+      if (binding === 'advisory') { /* card class, advisory red team: posted, never bounces or blocks */ }
+      else if (panelAccepted && (plan.sendBack.length || seatsBox.panelResult.redTeamGate?.sendBack)) {
         classified = { ...classified, verdict: 'changes', outcome: 'bounced' };
-      } else if (panelAccepted && !cardClassSkip(redTeam, seatsBox.input.loopPayload)
+      } else if (panelAccepted && binding !== 'skip-complete'
         && (redTeam.status !== 'ran' || !['ok', 'not-needed'].includes(redTeam.recheckStatus))) {
         classified = { ...classified, verdict: null, outcome: BLOCKED_ON_INFRA, label: 'panel red-team seat has no complete result' };
       }

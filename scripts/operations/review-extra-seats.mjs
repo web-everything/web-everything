@@ -74,7 +74,7 @@ import {
   findingCorroboratedBy, foldRedTeamVerdict, IMPACT_LEVELS, normalizeFinding,
 } from '../lib/jury-core.mjs';
 import { renameSourcePaths } from './review-pr.mjs';
-import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamOwedForPass, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
+import { EXTRA_SEATS_ENV, RED_TEAM_ENV, cardClassRedTeamMode, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamOwedForPass, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
 export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { verifySavedRedTeamProvenance } from '../lib/saved-red-team-provenance.mjs';
@@ -1449,7 +1449,9 @@ export async function speculateRedTeam({
     // The net path list names only rename/copy destinations. Include sources so
     // moving executable code into backlog/ cannot turn the probe off. Unknown
     // or empty destination lists and malformed source lists must still probe.
-    if (!redTeamPanelSeatOwed({ findings: { read } }, env) && settings.value.skipCardOnly && redTeamCardOnly(read)) {
+    // Card review class: `review.cardClass.redTeam: off` skips a card-class head outright; `advisory` runs it.
+    if (cardClassRedTeamMode(read, env) === 'off'
+      || (!redTeamPanelSeatOwed({ findings: { read } }, env) && cardClassRedTeamMode(read, env) !== 'advisory' && settings.value.skipCardOnly && redTeamCardOnly(read))) {
       io.log('red team skipped: card-only');
       return { status: 'skipped', reason: 'red team skipped: card-only' };
     }

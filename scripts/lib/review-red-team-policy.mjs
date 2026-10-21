@@ -1,6 +1,15 @@
-import { readRedTeamProbes, readRedTeamTiming } from './red-team-gate.mjs';
+import { readRedTeamTiming } from './red-team-gate.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { CARD_REVIEW_CLASS, cardReviewClass } from './card-review-class.mjs';
+import { resolveCardClassSettings } from './review-seat-settings.mjs';
+
+/**
+ * The card-class red-team mode for this read — `off` | `advisory` | `on` (`review.cardClass.redTeam`) — or `null`
+ * when the head is not in the card class (or the class is switched off), i.e. today's red-team rules apply.
+ */
+export function cardClassRedTeamMode(read, env = process.env, settings = resolveCardClassSettings({ env }).value) {
+  return cardReviewClass(read, settings).class === CARD_REVIEW_CLASS.CARD ? settings.redTeam : null;
+}
 /** Shared scheduling policy; importing it never loads a review dispatcher or CLI. */
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
@@ -73,14 +82,13 @@ export function redTeamOwedForPass(loopPayload) {
 
 /**
  * A pinned reviewed head owes the panel seat regardless of the panel verdict — except a head in the `card` review
- * class (`cardReviewClass`: provably card text, no decision or ratified card) while `skipCardOnly` is on, which
- * keeps the card-only skip the post-accept timing already had. A decision card, a ratified rule or anything not
- * provably card-only still owes it.
+ * class whose `review.cardClass.redTeam` mode is `off` (skipped) or `advisory` (runs, never owed or blocking).
+ * A decision card, a ratified rule, anything not provably card-only, or the class switched off still owes it.
  */
 export function redTeamPanelSeatOwed(loopPayload, env = process.env) {
   const read = loopPayload?.findings?.read;
   if (readRedTeamTiming({ env }).value.timing !== 'panel-seat' || !/^[a-f0-9]{40}$/i.test(read?.netBasis?.rev ?? '')) return false;
-  return !(readRedTeamProbes({ env }).value.skipCardOnly && cardReviewClass(read).class === CARD_REVIEW_CLASS.CARD);
+  return !['off', 'advisory'].includes(cardClassRedTeamMode(read, env));
 }
 
 /** Net diff includes rename/copy sources; unknown paths cannot justify skipping.

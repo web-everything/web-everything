@@ -1,4 +1,5 @@
 import { reviewSeatOptionsForRun } from '../review-pr.mjs';
+import { CARD_CLASS_STANDARD } from '../../lib/review-seat-settings.mjs';
 import { ADVISORY_NOTE_MARKER, countAdvisoryComments } from '../../conveyor/advisory-round-count.mjs';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -4861,12 +4862,13 @@ describe('card-only light review', () => {
     const CARD = 'backlog/1-card.md';
     const cardDiff = (front) => [`diff --git a/${CARD} b/${CARD}`, 'new file mode 100644', '--- /dev/null', `+++ b/${CARD}`,
       '@@ -0,0 +1,5 @@', '+---', ...front.map((l) => `+${l}`), '+---', '+body', ''].join('\n');
-    function cardRegistry({ front = ['kind: story'], coverageToCards = true } = {}) {
+    function cardRegistry({ front = ['kind: story'], coverageRoute = 'card-suggestion', settings } = {}) {
       const readPr = input => {
         const r = stubReader({ netRev: 'c'.repeat(40) })(input);
         return { ...r, net: { ...r.net, paths: [CARD] }, diff: { text: cardDiff(front), scored: true } };
       };
-      const declaration = reviewPrOperation({ readPr, cardOnlyLight: true, securitySeat: false, cardCoverageToCards: coverageToCards });
+      const cardClassSettings = settings === undefined ? { ...CARD_CLASS_STANDARD, coverageRoute } : settings;
+      const declaration = reviewPrOperation({ readPr, cardOnlyLight: true, securitySeat: false, cardClassSettings });
       const registry = createRegistry(); registry.register(declaration);
       return registry;
     }
@@ -4874,7 +4876,7 @@ describe('card-only light review', () => {
     const answer = (...findings) => ({ summary: 'card read', findings });
     it('card-only story: COVERAGE is deferred, the verdict accepts, and the mandate names the focus', () => {
       const { run, requests } = atConfirm({ registry: cardRegistry(), input: BASE_INPUT, answer: answer(finding('COVERAGE')) });
-      expect(run.findings.read.cardReview).toMatchObject({ class: 'card', coverageToCards: true });
+      expect(run.findings.read.cardReview).toMatchObject({ class: 'card', coverageRoute: 'card-suggestion', redTeam: 'off', lenses: ['correctness'] });
       expect(run.findings.reduce.verdict).toBe('accept');
       expect(run.findings.reduce.deferredAdvisory).toHaveLength(1);
       expect(run.findings.reduce.deferredAdvisory[0].deferred).toMatch(/card-review-class/);
@@ -4891,9 +4893,12 @@ describe('card-only light review', () => {
       expect(run.findings.reduce.verdict).toBe('changes');
       expect(requests.judge.mandate).not.toMatch(/CARD TEXT ONLY/);
     });
-    it('the setting off keeps today routing', () => {
-      const { run } = atConfirm({ registry: cardRegistry({ coverageToCards: false }), input: BASE_INPUT, answer: answer(finding('COVERAGE')) });
-      expect(run.findings.reduce.verdict).toBe('changes');
+    it('coverageRoute: referral, the kill switch, and no resolved settings all keep today routing', () => {
+      for (const registry of [cardRegistry({ coverageRoute: 'referral' }), cardRegistry({ settings: { ...CARD_CLASS_STANDARD, enabled: false } }), cardRegistry({ settings: null })]) {
+        const { run } = atConfirm({ registry, input: BASE_INPUT, answer: answer(finding('COVERAGE')) });
+        expect(run.findings.reduce.verdict).toBe('changes');
+        expect(run.findings.reduce.deferredAdvisory ?? []).toHaveLength(0);
+      }
     });
     it('a full-roster run (not the light lane) never records a card class', () => {
       const { run } = atConfirm({ registry: registryFor({}).registry, input: BASE_INPUT });

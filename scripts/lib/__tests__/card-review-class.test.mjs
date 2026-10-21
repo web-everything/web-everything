@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { cardReviewClass, isCardCoverageFinding, CARD_REVIEW_CLASS } from '../card-review-class.mjs';
 import { redTeamPanelSeatOwed, redTeamOwedOnHead } from '../review-red-team-policy.mjs';
-import { resolveCardOnlyReviewSettings } from '../review-seat-settings.mjs';
+import { CARD_CLASS_STANDARD, resolveCardClassSettings } from '../review-seat-settings.mjs';
 import { cardFrontmatterField, frontmatterText } from '../../operations/review-pr-io.mjs';
-import { cardClassSkip } from '../../operations/review-job.mjs';
+import { cardClassRedTeamBinding } from '../../operations/review-job.mjs';
+import { chooseSecuritySeat } from '../../operations/review-loop-cli.mjs';
 
 const REV = 'a'.repeat(40);
 const newCard = (path, front = ['title: x', 'kind: story'], body = ['body']) => [
@@ -35,11 +36,29 @@ describe('card review class', () => {
       expect(cls(read([A], newCard(A, front))), front.join(' / ')).toBe('full');
     }
   });
+  it('second-round audit escapes → full', () => {
+    for (const front of [['type: story', '<<: {kind: "deci\\u0073ion"}'], ['kind: "deci\\u0073ion"'], ['kind: story', '<<: {codifiedIn: x}'], ['kind: story', '"r\\u0061tified": x']]) {
+      expect(cls(read([A], newCard(A, front))), front.join(' / ')).toBe('full');
+    }
+    const p = 'backlog/raised-by/1/1-aaaaaaaaaaaaaaaaaaaaaaaa.md';
+    expect(cls(read([p], [`diff --git a/${p} b/${p}`, `--- a/${p}`, `+++ b/${p}`, '@@ -1 +1 @@', '-x', '+y', ''].join('\n')))).toBe('full');
+    // git says story, the diff shows an escaped decision
+    expect(cls(read([A], newCard(A, ['kind: "deci\\u0073ion"']), { cardFrontmatter: { [A]: { old: null, new: 'kind: story' } } }))).toBe('full');
+    // quoted header, mismatched +++, mode change, a crafted -0,0 hunk on a modified file
+    expect(cls(read([A], newCard(A).replace(`diff --git a/${A} b/${A}`, `diff --git "a/${A}" "b/${A}"`)))).toBe('full');
+    expect(cls(read([A], newCard(A).replace(`+++ b/${A}`, '+++ b/scripts/x.mjs')))).toBe('full');
+    expect(cls(read([A], newCard(A).replace('new file mode 100644', 'old mode 100644\nnew mode 100755')))).toBe('full');
+    const crafted = [`diff --git a/${A} b/${A}`, `--- a/${A}`, `+++ b/${A}`, '@@ -0,0 +1,3 @@', '+---', '+kind: story', '+---', ''].join('\n');
+    expect(cls(read([A], crafted))).toBe('full');
+    expect(cls(read([A], crafted, { cardFrontmatter: { [A]: { old: null, new: 'kind: story' } } }))).toBe('full');
+    expect(cls(read([A], [`diff --git a/${A} b/${A}`, 'old mode 100644', 'new mode 100755', ''].join('\n'), { cardFrontmatter: { [A]: { old: 'kind: story', new: 'kind: story' } } }))).toBe('full');
+    expect(isCardCoverageFinding({ category: 'COVERAGE/SECURITY' })).toBe(false);
+  });
   it('unknown, missing or non-string kind → full (allowlist, not denylist)', () => {
     for (const front of [['kind: proposal'], ['title: x'], ['kind: [story]'], ['kind: {a: 1}']]) expect(cls(read([A], newCard(A, front)))).toBe('full');
   });
   it('git-read frontmatter decides a mid-file edit; any disagreement with the diff can only make it full', () => {
-    expect(cardReviewClass(read([A], midEdit(A))).reason).toMatch(/frontmatter not read/);
+    expect(cardReviewClass(read([A], midEdit(A))).reason).toMatch(/frontmatter not proved/);
     expect(cls(read([A], midEdit(A), { cardFrontmatter: { [A]: { old: 'kind: decision', new: 'kind: story' } } }))).toBe('full');
     expect(cls(read([A], midEdit(A), { cardFrontmatter: { [A]: { old: 'kind: story', new: 'kind: story' } } }))).toBe('card');
     expect(cls(read([A], midEdit(A), { cardFrontmatter: { [A]: { old: '', new: 'kind: story' } } }))).toBe('full');
@@ -85,30 +104,67 @@ describe('panel-seat red team on the card class', () => {
     expect(redTeamPanelSeatOwed(payload(read(['docs/agent/platform-decisions.md'], codeFile('docs/agent/platform-decisions.md'))), PANEL)).toBe(true);
     expect(redTeamPanelSeatOwed(payload(read([A], newCard(A, ['kind: decision']))), PANEL)).toBe(true);
   });
-  it('skipCardOnly off keeps the seat owed; post-accept timing is unchanged (never panel-owed)', () => {
-    const r = payload(read([A], newCard(A)));
-    expect(redTeamPanelSeatOwed(r, { ...PANEL, WE_RED_TEAM_SKIP_CARD_ONLY: 'off' })).toBe(true);
-    expect(redTeamPanelSeatOwed(r, { WE_RED_TEAM_TIMING: 'post-accept' })).toBe(false);
+  it('post-accept timing is unchanged (never panel-owed)', () => {
+    expect(redTeamPanelSeatOwed(payload(read([A], newCard(A))), { WE_RED_TEAM_TIMING: 'post-accept' })).toBe(false);
   });
   it('a recorded or in-flight pass on a card head is still owed its result', () => {
     const r = read([A], newCard(A));
     expect(redTeamOwedOnHead({ read: r, evidence: { recorded: true } })).toBe(true);
     expect(redTeamOwedOnHead({ read: r, evidence: { inFlight: true } })).toBe(true);
   });
-  it('review-job: the card-only skip completes the panel seat only on a card-class head', () => {
+  it('review-job: the card-only skip completes the panel seat only on a card-class head in mode off', () => {
     const skip = { status: 'skipped', reason: 'red team skipped: card-only' };
-    expect(cardClassSkip(skip, payload(read([A], newCard(A))), PANEL)).toBe(true);
-    expect(cardClassSkip(skip, payload(read([A], newCard(A, ['kind: decision']))), PANEL)).toBe(false);
-    expect(cardClassSkip({ status: 'skipped', reason: 'other' }, payload(read([A], newCard(A))), PANEL)).toBe(false);
-    expect(cardClassSkip({ status: 'error' }, payload(read([A], newCard(A))), PANEL)).toBe(false);
+    expect(cardClassRedTeamBinding(skip, payload(read([A], newCard(A))), PANEL)).toBe('skip-complete');
+    expect(cardClassRedTeamBinding(skip, payload(read([A], newCard(A, ['kind: decision']))), PANEL)).toBe('binding');
+    expect(cardClassRedTeamBinding({ status: 'skipped', reason: 'other' }, payload(read([A], newCard(A))), PANEL)).toBe('binding');
+    expect(cardClassRedTeamBinding(skip, null, PANEL)).toBe('binding');
+    expect(cardClassRedTeamBinding(skip, payload(read([A], newCard(A))), { ...PANEL, WE_REVIEW_CARD_CLASS: 'off' })).toBe('binding');
+    expect(cardClassRedTeamBinding({ status: 'ran' }, payload(read([A], newCard(A))), { ...PANEL, WE_REVIEW_CARD_CLASS_RED_TEAM: 'advisory' })).toBe('advisory');
+    expect(cardClassRedTeamBinding({ status: 'ran' }, payload(read([A], newCard(A))), { ...PANEL, WE_REVIEW_CARD_CLASS_RED_TEAM: 'on' })).toBe('binding');
+  });
+  it('red-team mode on and the kill switch restore the panel seat on a card head', () => {
+    const r = payload(read([A], newCard(A)));
+    expect(redTeamPanelSeatOwed(r, { ...PANEL, WE_REVIEW_CARD_CLASS_RED_TEAM: 'on' })).toBe(true);
+    expect(redTeamPanelSeatOwed(r, { ...PANEL, WE_REVIEW_CARD_CLASS: 'off' })).toBe(true);
+    expect(redTeamPanelSeatOwed(r, { ...PANEL, WE_REVIEW_CARD_CLASS_RED_TEAM: 'advisory' })).toBe(false);
   });
 });
 
 describe('coverageToCards setting and the io frontmatter read', () => {
-  it('defaults on and the env can turn it off', () => {
-    const quiet = { readFile: () => '{}', log: () => {}, platform: {} };
-    expect(resolveCardOnlyReviewSettings({ env: {}, ...quiet }).value.coverageToCards).toBe(true);
-    expect(resolveCardOnlyReviewSettings({ env: { WE_REVIEW_CARD_ONLY_COVERAGE_TO_CARDS: 'off' }, ...quiet }).value.coverageToCards).toBe(false);
+  it('review.cardClass: standard = the proposal, every field settable per layer, invalid values ignored', () => {
+    const q = { readFile: () => '{}', platform: {}, log: () => {} };
+    const std = resolveCardClassSettings({ env: {}, ...q });
+    expect(std.value).toEqual({ ...CARD_CLASS_STANDARD });
+    expect(Object.values(std.sources).every((l) => l === 'standard')).toBe(true);
+    const tool = resolveCardClassSettings({ env: {}, readFile: () => JSON.stringify({ cardClass: { redTeam: 'advisory', kinds: ['story'] } }), platform: { coverageRoute: 'referral' }, log: () => {} });
+    expect(tool.value).toMatchObject({ redTeam: 'advisory', kinds: ['story'], coverageRoute: 'referral' });
+    expect(tool.sources).toMatchObject({ redTeam: 'tool', kinds: 'tool', coverageRoute: 'platform' });
+    const env = resolveCardClassSettings({ env: { WE_REVIEW_CARD_CLASS: 'off', WE_REVIEW_CARD_CLASS_LENSES: 'correctness,security',
+      WE_REVIEW_CARD_CLASS_KINDS: 'story,decision', WE_REVIEW_CARD_CLASS_LENSES_X: '', WE_REVIEW_CARD_CLASS_RED_TEAM: 'maybe',
+      WE_REVIEW_CARD_CLASS_PATH_PATTERNS: '["^backlog/1-"]', WE_REVIEW_CARD_CLASS_FULL_MARKER: '(' }, ...q });
+    expect(env.value).toMatchObject({ enabled: false, lenses: ['correctness', 'security'], kinds: CARD_CLASS_STANDARD.kinds, redTeam: 'off', cardPathPatterns: ['^backlog/1-'] });
+    expect(env.invalid.join(' ')).toMatch(/kinds.*redTeam.*fullMarker|kinds/);
+    expect(resolveCardClassSettings({ env: { WE_REVIEW_CARD_CLASS_LENSES: 'security' }, ...q }).value.lenses).toEqual(['correctness']);
+  });
+  it('settings drive the class: kill switch, narrowed paths, narrowed kinds, extra full keys and marker', () => {
+    const ok = read([A], newCard(A));
+    expect(cls(ok)).toBe('card');
+    expect(cardReviewClass(ok, { ...CARD_CLASS_STANDARD, enabled: false }).reason).toMatch(/enabled is off/);
+    expect(cardReviewClass(ok, { ...CARD_CLASS_STANDARD, cardPathPatterns: ['^backlog/9-'] }).class).toBe('full');
+    expect(cardReviewClass(ok, { ...CARD_CLASS_STANDARD, cardPathPatterns: ['.*'] }).class).toBe('card');
+    expect(cardReviewClass(read(['scripts/x.mjs'], codeFile('scripts/x.mjs')), { ...CARD_CLASS_STANDARD, cardPathPatterns: ['.*'] }).class).toBe('full');
+    expect(cardReviewClass(ok, { ...CARD_CLASS_STANDARD, kinds: ['task'] }).class).toBe('full');
+    expect(cardReviewClass(ok, { ...CARD_CLASS_STANDARD, kinds: ['story', 'decision'] }).class).toBe('card');
+    expect(cardReviewClass(read([A], newCard(A, ['kind: decision'])), { ...CARD_CLASS_STANDARD, kinds: ['story', 'decision'], fullMarker: 'zzz' }).class).toBe('full');
+    expect(cardReviewClass(read([A], newCard(A, ['kind: story', 'owner: x'])), { ...CARD_CLASS_STANDARD, fullKeys: ['owner'] }).class).toBe('full');
+    expect(cardReviewClass(ok, { ...CARD_CLASS_STANDARD, fullMarker: 'body' }).class).toBe('full');
+  });
+  it('lenses: security adds the security seat on the light lane; the kill switch drops it', () => {
+    const r = { readChangedFiles: () => ({ files: [A], source: 'git' }) };
+    const cardOnly = { lightLane: true, claudeSeat: false };
+    expect(chooseSecuritySeat(['--pr=5'], { ...r, cardOnly, cardClass: CARD_CLASS_STANDARD })).toMatchObject({ cardOnlyLight: true, securitySeat: false });
+    expect(chooseSecuritySeat(['--pr=5'], { ...r, cardOnly, cardClass: { ...CARD_CLASS_STANDARD, lenses: ['correctness', 'security'] } }).securitySeat).toBe(true);
+    expect(chooseSecuritySeat(['--pr=5'], { ...r, cardOnly, cardClass: { ...CARD_CLASS_STANDARD, enabled: false, lenses: ['correctness', 'security'] } }).securitySeat).toBe(false);
   });
   it('reads both sides at the pinned commits, only for a card-only diff; exact delimiters', () => {
     const B = 'b'.repeat(40);
