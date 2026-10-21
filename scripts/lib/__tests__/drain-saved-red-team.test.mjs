@@ -111,7 +111,8 @@ describe('saved red-team admission', () => {
     });
     // Main adds a generated digest to gate markers. `result=<hex>` can trip the opaque-token heuristic;
     // remove only this exact computed metadata field, while checking every finding and composed output.
-    const scrub = text => scrubPublish(text.replaceAll(` result=${resultId} -->`, ' -->'));
+    // The marker may also carry the send-back step's grant snapshot (`grants=`), which is the same kind of metadata.
+    const scrub = text => scrubPublish(text.replace(new RegExp(` result=${resultId}( grants=(none|[0-9a-f,]+))? -->`, 'g'), ' -->'));
     return { result, writes, scrub };
   }
   const publishableFinding = impactIfUnfixed => ({ confirmedByRecheck: true, impactIfUnfixed,
@@ -293,7 +294,9 @@ describe('saved round-cap break: RULING NEEDED and the clear-human ruling (PR #5
     expect(redTeamRulingNeeded(subject, setting, { readSaved })).toBeNull();
     expect(hold(env, { comments, confirmedBreaks: setting })).toBeNull();
   });
-  it('posting an already-ruled saved result with an identical result id does not reinstate the operator hold', async () => {
+  // unfreeze-review-top-1021: main's stricter operatorRuled wins over the stack's `named` exception — a ruling made
+  // before the saved result's comment is posted no longer covers that later copy; the operator rules again.
+  it('posting an already-ruled saved result after the ruling reinstates the operator hold (stricter rule wins)', async () => {
     const { env, comments, subject, readSaved } = await roundCapped();
     const { redTeamRulingNeeded, redTeamMarker, parseRedTeamComment } = await import('../red-team-gate.mjs');
     const posted = summary => ({ author: { login: 'web-everything' }, createdAt: '2026-10-17T10:05:00Z', body: [
@@ -303,8 +306,8 @@ describe('saved round-cap break: RULING NEEDED and the clear-human ruling (PR #5
     comments.push(cleared('2026-10-17T10:02:00Z'));
     for (const shape of [c => c, c => ({ user: { login: c.author.login }, created_at: c.createdAt, body: c.body })]) {
       const thread = [...comments, posted('two writers race')].map(shape);
-      expect(redTeamRulingNeeded({ ...subject, comments: thread }, setting, { readSaved })).toBeNull();
-      expect(hold(env, { comments: thread, confirmedBreaks: setting })).toBeNull();
+      expect(redTeamRulingNeeded({ ...subject, comments: thread }, setting, { readSaved })).not.toBeNull();
+      expect(hold(env, { comments: thread, confirmedBreaks: setting })).toMatch(/requiring send-back/);
       // A different result posted after the ruling is a new decision: it is not covered by the ruling.
       const other = [...comments, posted('a different break')].map(shape);
       expect(hold(env, { comments: other, confirmedBreaks: setting })).toMatch(/requiring send-back/);
