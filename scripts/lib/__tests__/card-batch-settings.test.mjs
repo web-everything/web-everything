@@ -61,8 +61,20 @@ describe('prevention.* batch settings cascade', () => {
   const standard = loadCardBatchPolicy().prevention;
   it('uses standard defaults without optional preferences', () => {
     const settings = loadPreventionBatchSettings({ env: {}, repo: {}, read: () => { throw new Error('missing'); } });
-    expect(settings).toEqual({ batchFiling: true, batchWindowMinutes: 120, batchMaxCards: 10, batchLeaseWaitMinutes: 15, filingEnabled: true,
-      sources: { batchFiling: 'standard', batchWindowMinutes: 'standard', batchMaxCards: 'standard', batchLeaseWaitMinutes: 'standard', filingEnabled: 'standard' }, invalid: [] });
+    expect(settings).toEqual({ batchFiling: true, batchWindowMinutes: 120, batchMaxCards: 10, batchLeaseWaitMinutes: 15, filingEnabled: true, drainCardsPerTick: 1,
+      sources: { batchFiling: 'standard', batchWindowMinutes: 'standard', batchMaxCards: 'standard', batchLeaseWaitMinutes: 'standard', filingEnabled: 'standard', drainCardsPerTick: 'standard' }, invalid: [] });
+  });
+  it('drainCardsPerTick: standard 1, repo then env override, invalid value ignored with the layer below answering', () => {
+    expect(resolvePreventionBatchSettings({ standard, env: {} })).toMatchObject({ drainCardsPerTick: 1, sources: { drainCardsPerTick: 'standard' } });
+    expect(resolvePreventionBatchSettings({ standard, repo: { drainCardsPerTick: 2 }, env: {} })).toMatchObject({ drainCardsPerTick: 2, sources: { drainCardsPerTick: 'repo' } });
+    expect(resolvePreventionBatchSettings({ standard, repo: { drainCardsPerTick: 2 }, env: { WE_PREVENTION_DRAIN_CARDS_PER_TICK: '3' } }))
+      .toMatchObject({ drainCardsPerTick: 3, sources: { drainCardsPerTick: 'env' } });
+    for (const bad of [0, -1, 1.5, '2', true]) {
+      expect(resolvePreventionBatchSettings({ standard, repo: { drainCardsPerTick: bad }, env: {} }))
+        .toMatchObject({ drainCardsPerTick: 1, sources: { drainCardsPerTick: 'standard' }, invalid: ['repo.drainCardsPerTick'] });
+    }
+    expect(resolvePreventionBatchSettings({ standard, repo: { drainCardsPerTick: 2 }, env: { WE_PREVENTION_DRAIN_CARDS_PER_TICK: 'many' } }))
+      .toMatchObject({ drainCardsPerTick: 2, sources: { drainCardsPerTick: 'repo' }, invalid: ['env.drainCardsPerTick'] });
   });
   it.each(['platform', 'repo', 'env'])('%s wins for each key', (layer) => {
     const layers = { standard, platform: { batchFiling: false, batchWindowMinutes: 30, batchMaxCards: 3, batchLeaseWaitMinutes: 3 } };
