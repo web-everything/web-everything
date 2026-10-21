@@ -211,7 +211,7 @@ describe('applyRedTeamGate', () => {
     };
 
     it.each(Object.keys(readerShapes))('a new send-back retains its enqueue hold through the %s reader after an earlier clearance', async shape => {
-      const clearance = { author: { login: 'web-everything' }, createdAt: '2026-10-18T12:00:00Z',
+      const clearance = { author: { login: 'chalbert' }, createdAt: '2026-10-18T12:00:00Z',
         body: ['✅ review — `review:human` cleared via the sanctioned path', '',
           'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
           buildReviewedShaMarker(HEAD), buildClearedHumanMarker('operator')].join('\n') };
@@ -280,7 +280,7 @@ describe('applyRedTeamGate', () => {
       const extension = { ...grant(), id: 'IC_grant' };
       const key = JSON.stringify([extension.id, extension.createdAt, extension.body]);
       const oldId = createHash('sha256').update(JSON.stringify([key, 1])).digest('hex').slice(0, 16);
-      const clearance = { author: { login: 'web-everything' },
+      const clearance = { author: { login: 'chalbert' },
         body: ['✅ review — `review:human` cleared via the sanctioned path', '',
           'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
           buildReviewedShaMarker(HEAD), buildClearedHumanMarker('operator')].join('\n') };
