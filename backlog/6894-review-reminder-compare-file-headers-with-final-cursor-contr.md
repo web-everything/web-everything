@@ -1,7 +1,8 @@
 ---
+bornAs: xkpzufw
 kind: story
 size: 1
-parent: "xvi6k7s"
+parent: "6895"
 status: open
 scope: ["we:skills-src/review/SKILL.md"]
 dateOpened: "2026-10-21"

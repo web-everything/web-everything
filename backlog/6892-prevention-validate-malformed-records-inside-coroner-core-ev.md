@@ -1,7 +1,8 @@
 ---
+bornAs: xaxyigg
 kind: story
 size: 1
-parent: "xvi6k7s"
+parent: "6895"
 status: open
 scope: ["we:scripts/operations/coroner-pr-postmortem.mjs", "we:scripts/operations/__tests__/coroner-pr-postmortem.test.mjs"]
 dateOpened: "2026-10-21"

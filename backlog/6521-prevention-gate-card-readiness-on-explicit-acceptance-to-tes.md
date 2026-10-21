@@ -12,7 +12,7 @@ tags: []
 # Prevention — Gate card readiness on explicit acceptance-to-test mappings, requiring separate observable assert… (from web-everything/web-everything#5649 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xf0q813-prevention-cards-stop-editing-the-shared-parent-card-the-par.md:18` — Gate card readiness on explicit acceptance-to-test mappings, requiring separate observable assertions for migration preservation and repeat-run stability.
+1. `we:backlog/6470-prevention-cards-stop-editing-the-shared-parent-card-the-par.md:18` — Gate card readiness on explicit acceptance-to-test mappings, requiring separate observable assertions for migration preservation and repeat-run stability.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5668, finding 2 → #5590.
 

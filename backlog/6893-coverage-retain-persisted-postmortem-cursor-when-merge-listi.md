@@ -1,7 +1,8 @@
 ---
+bornAs: xhum17l
 kind: story
 size: 1
-parent: "xvi6k7s"
+parent: "6895"
 status: open
 scope: ["we:scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs", "we:scripts/operations/__tests__/coroner-pr-postmortem.test.mjs"]
 dateOpened: "2026-10-21"
