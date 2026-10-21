@@ -284,6 +284,10 @@ export function listPeerHolderPids(fds, { selfPid = process.pid, platform = proc
   return peerHolderPids(text, { selfPid, fds });
 }
 
+// The worker runs THIS module's code as captured when it loaded, as a data: URL — never a fresh read from disk, so a
+// tree switch or edit while a gate runs cannot hand the watchdog different (or missing) code.
+let OWN_SOURCE_URL = null;
+try { OWN_SOURCE_URL = `data:text/javascript;base64,${readFileSync(new URL(import.meta.url)).toString('base64')}`; } catch { /* the fallback timer covers it */ }
 const WATCHDOG_SOURCE = `const { workerData, parentPort } = require('node:worker_threads');
 import(workerData.module).then((m) => m.runTreeWatchdog(workerData, parentPort));`;
 
@@ -303,8 +307,10 @@ export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, 
     port.postMessage('fired');
   }, Math.max(0, deadline - Date.now()));
   if (heartbeat) {
-    const fn = (await import(heartbeat.module))[heartbeat.exportName];
-    if (Atomics.load(flag, 0) === 0) beat = setInterval(() => { try { fn(heartbeat.args); } catch { /* best-effort */ } }, heartbeat.everyMs);
+    // The ceiling above is already armed and must survive a heartbeat module that fails to load.
+    let fn = null;
+    try { fn = (await import(heartbeat.module))[heartbeat.exportName]; } catch { /* no heartbeat; the ceiling still holds */ }
+    if (typeof fn === 'function' && Atomics.load(flag, 0) === 0) beat = setInterval(() => { try { fn(heartbeat.args); } catch { /* best-effort */ } }, heartbeat.everyMs);
   }
 }
 
@@ -315,24 +321,32 @@ export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, 
  * outputFds }`, see {@link killProcessTree}), sets `fired()`, and posts to `onFire` (which runs once the caller's loop
  * is free). `heartbeat` (`{ module, exportName, args, everyMs }`) is called on that thread until the ceiling, then
  * stops, so a caller still stuck after the kill no longer keeps its slot. If the worker cannot run, the same ceiling
- * falls back to a main-thread timer. Unref'd; `stop()` ends it.
+ * falls back to a main-thread timer, which a blocked main thread defeats — so that downgrade is logged through `warn`.
+ * Unref'd; `stop()` ends it.
  * @returns {{ fired: () => boolean, stop: () => void }}
  */
-export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null, onFire = () => {} }) {
+export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null, onFire = () => {},
+  warn = (m) => { try { process.stderr.write(m); } catch { /* logging only */ } }, moduleUrl = OWN_SOURCE_URL }) {
   const flag = new Int32Array(new SharedArrayBuffer(4));
   const deadline = Date.now() + timeoutMs;
   let fallback = null;
   let stopped = false;
   const fire = () => { if (!stopped && Atomics.load(flag, 0) === 0) { fireTreeKill({ pid, kill, flag }); onFire(); } };
+  const fallBack = (why) => {
+    if (stopped || fallback || Atomics.load(flag, 0) === 1) return;
+    warn(`⚠ tree watchdog: its thread failed (${String(why?.message ?? why).split('\n')[0]}) — the ceiling falls back to a main-thread timer, which a blocked event loop cannot run\n`);
+    fallback = setTimeout(fire, Math.max(0, deadline - Date.now()));
+    fallback.unref();
+  };
   let worker = null;
   try {
-    worker = new Worker(WATCHDOG_SOURCE, { eval: true, workerData: { module: import.meta.url, pid, deadline, kill, heartbeat, flag } });
+    if (!moduleUrl) throw new Error('own module source unavailable');
+    worker = new Worker(WATCHDOG_SOURCE, { eval: true, workerData: { module: moduleUrl, pid, deadline, kill, heartbeat, flag } });
     worker.on('message', (m) => { if (m === 'fired' && !stopped) onFire(); });
-    worker.on('error', () => { if (!stopped && !fallback) { fallback = setTimeout(fire, Math.max(0, deadline - Date.now())); fallback.unref(); } });
+    worker.on('error', fallBack);
     worker.unref();
-  } catch {
-    fallback = setTimeout(fire, timeoutMs);
-    fallback.unref();
+  } catch (e) {
+    fallBack(e);
   }
   return {
     fired: () => Atomics.load(flag, 0) === 1,

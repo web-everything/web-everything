@@ -68,6 +68,58 @@ describe('startTreeWatchdog (PR #5768)', () => {
     }
   });
 
+  it('keeps the ceiling on its thread when the heartbeat module fails to load (self-review A)', async () => {
+    const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
+    const exited = new Promise((r) => child.once('exit', (code, signal) => r(signal)));
+    const warned = [];
+    try {
+      const watchdog = startTreeWatchdog({ pid: child.pid, timeoutMs: 600, warn: (m) => warned.push(m),
+        heartbeat: { module: pathToFileURL(join(tmpdir(), 'no-such-heartbeat-module.mjs')).href, exportName: 'beat', args: {}, everyMs: 100 } });
+      const blockUntil = Date.now() + 1_500;
+      while (Date.now() < blockUntil) { /* a blocked event loop: no main-thread timer can run */ }
+      expect(watchdog.fired()).toBe(true);
+      expect(await exited).toBe('SIGKILL');
+      expect(warned).toEqual([]);
+      watchdog.stop();
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* gone */ }
+    }
+  });
+
+  it('runs the code captured at load (a data: URL), and logs a fallback to the main-thread timer', async () => {
+    const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
+    const exited = new Promise((r) => child.once('exit', (code, signal) => r(signal)));
+    const warned = [];
+    try {
+      const watchdog = startTreeWatchdog({ pid: child.pid, timeoutMs: 200, moduleUrl: null, warn: (m) => warned.push(m) });
+      expect(warned.join('')).toMatch(/falls back to a main-thread timer/);
+      expect(await exited).toBe('SIGKILL');
+      expect(watchdog.fired()).toBe(true);
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* gone */ }
+    }
+    // A copy of this module, loaded, then overwritten on disk: the watchdog must still run the loaded code.
+    const dir = mkdtempSync(join(tmpdir(), 'tree-watchdog-swap-'));
+    const copy = join(dir, 'bounded-child.mjs');
+    writeFileSync(copy, readFileSync(new URL('../bounded-child.mjs', import.meta.url)));
+    const loaded = await import(pathToFileURL(copy).href);
+    writeFileSync(copy, 'export const broken = true;\n');
+    const victim = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
+    const victimExited = new Promise((r) => victim.once('exit', (code, signal) => r(signal)));
+    const swapWarned = [];
+    try {
+      const watchdog = loaded.startTreeWatchdog({ pid: victim.pid, timeoutMs: 400, warn: (m) => swapWarned.push(m) });
+      const blockUntil = Date.now() + 1_200;
+      while (Date.now() < blockUntil) { /* a blocked event loop: only the watchdog thread can fire */ }
+      expect(watchdog.fired()).toBe(true);
+      expect(await victimExited).toBe('SIGKILL');
+      expect(swapWarned).toEqual([]);
+    } finally {
+      try { victim.kill('SIGKILL'); } catch { /* gone */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('stop() before the ceiling disarms it', async () => {
     const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
     try {
