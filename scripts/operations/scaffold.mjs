@@ -18,11 +18,9 @@
  * valid locus prefix is: that scan fired three times while cards were being filed on 2026-08-21, each time
  * fail-closed with nothing written, which is exactly the behaviour to preserve rather than reimplement.
  *
- * WHY THE ID ALLOCATION IS IN THE PURE PLAN AND NOT THE SINK. Under JIT numbering an item is born with a
- * collision-free HASH, never `max+1`, precisely so parallel lanes cannot race on a number. The allocation is
- * therefore a pure function of the EXISTING id set, which the reader supplies — so the plan can compute the
- * final filename, and the sink writes bytes it did not choose. That keeps the sink dumb, and it makes the
- * collision retry testable without a filesystem.
+ * The IO reader reserves a final numeric id under the shared allocator lock. The
+ * pure plan consumes that id, refuses collisions, and retains a hash as bornAs.
+ * If allocation is disabled or fails, the existing hash path remains available.
  *
  * THE LEGACY FLAG SHAPE IS PRESERVED DELIBERATELY. `--type`/`--workitem` predate the single `kind` axis
  * (#466/#487) and every skill and doc in the repo still passes them — including the 45 calls that motivated
@@ -36,7 +34,7 @@ import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { BACKLOG_KINDS } from '../check-standards-rules.mjs';
-import { nextHash } from '../backlog/id.mjs';
+import { nextHash, stampBornAs } from '../backlog/id.mjs';
 import { renderItem, sizeRefusal, parseSize } from '../backlog/scaffold.mjs';
 
 export const SCAFFOLD_OP = 'scaffold';
@@ -86,8 +84,7 @@ export function normalizeRef(ref) {
 /**
  * Shape the injected reader result. PURE.
  *
- * The reader supplies only the EXISTING id set and today's date — the two facts allocation needs. Anything
- * more would be the sink's business.
+ * The reader supplies the existing ids, date and optional reserved numeric id.
  */
 export function shapeScaffoldRead(raw) {
   if (!raw || typeof raw !== 'object') {
@@ -103,6 +100,8 @@ export function shapeScaffoldRead(raw) {
     existingIds: raw.existingIds.map(String),
     today: String(raw.today || ''),
     dir: String(raw.dir || ''),
+    ...(raw.bornAs ? { bornAs: String(raw.bornAs) } : {}),
+    ...(raw.allocatedId ? { allocatedId: String(raw.allocatedId) } : {}),
   };
 }
 
@@ -133,23 +132,17 @@ export function planScaffold(read, input = {}, { alloc = nextHash } = {}) {
 
   const slug = String(input.slug || '').trim() || slugFor(title);
 
-  // #2288 — a HASH, never `max+1`, so parallel lanes cannot race on a number. Retried ONCE against the
-  // augmented set, exactly as the CLI does; a second collision is astronomically unlikely and is refused
-  // rather than looped, because an allocator that cannot find a free id has a problem a retry will not fix.
-  //
-  // `alloc` IS INJECTABLE PURELY SO THE EXHAUSTION BRANCH IS REACHABLE. With the real `nextHash` a double
-  // collision is astronomically unlikely, which means that branch would otherwise be code nobody has ever
-  // executed — and an untested refusal is a refusal you are guessing about. The default is `nextHash`; only
-  // the test passes anything else.
-  const taken = new Set(read.existingIds);
-  let num = alloc(read.existingIds);
-  if (taken.has(num)) num = alloc([...read.existingIds, num]);
-  if (taken.has(num)) {
-    refuse('id-exhausted', `the id allocator returned a taken id twice (${num}) — refusing rather than looping`);
+  const key = (id) => /^\d+$/.test(id) ? String(Number(id)) : id;
+  const taken = new Set(read.existingIds.map(key));
+  let num = String(read.allocatedId || read.bornAs || alloc(read.existingIds));
+  if (!read.allocatedId && taken.has(key(num))) num = alloc([...read.existingIds, num]);
+  if (taken.has(key(num))) {
+    refuse('id-exhausted', `the id allocator returned a taken id (${num}) — refusing`);
   }
+  const bornAs = /^\d+$/.test(num) ? (read.bornAs || nextHash(read.existingIds)) : null;
 
   const name = `${num}-${slug}.md`;
-  const content = renderItem({
+  let content = renderItem({
     // Only the file-item reader supplies a session role, so a bare scaffold cannot file an operator task.
     ...operatorTaskFields(input, { role: read.sessionRole }),
     kind,
@@ -163,6 +156,8 @@ export function planScaffold(read, input = {}, { alloc = nextHash } = {}) {
     digest: input.digest || undefined,
     scaffoldedBy: input.session || undefined,
   });
+
+  if (bornAs) content = stampBornAs(content, bornAs);
 
   return {
     num,

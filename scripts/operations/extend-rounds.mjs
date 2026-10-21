@@ -1,9 +1,15 @@
-/** Operator-only audited round grant. --preview plans without posting; IO lives in extend-rounds-io.mjs. */
+/**
+ * Operator-only audited round grant. --preview plans without posting; IO lives in extend-rounds-io.mjs.
+ * `--by=<n>` means n MORE rounds from the round the PR is on now, even past the cap: fix dispatch and the red-team gate
+ * both anchor a grant at the round it was posted on (`reconcile-core.mjs#resolveRoundExtensionAnchor`,
+ * `red-team-gate.mjs#gateRoundCap`). After a proven grant the red-team gate re-runs on the PR, so a break it parked at
+ * the cap is sent back to the fixer when the grant covers the current round.
+ */
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import {
-  buildRoundExtensionComment, countGrantedRoundExtensions, MAX_TOTAL_ROUND_EXTENSIONS,
+  buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, MAX_TOTAL_ROUND_EXTENSIONS,
 } from '../conveyor/round-extension-mark.mjs';
 
 export const EXTEND_ROUNDS_OP = 'extend-rounds';
@@ -22,7 +28,8 @@ export function planRoundExtension(read, input) {
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo ?? '')) throw new Error('--repo must be <owner/repo>');
   if (!Number.isSafeInteger(pr) || pr <= 0) throw new Error('--pr must be a positive integer');
   if (read.state !== 'OPEN') throw new Error('the PR must be open to extend its rounds');
-  const granted = countGrantedRoundExtensions(read.comments, { repo, pr });
+  // Standing-ruling grants (automation-posted) count toward the ceiling conservatively, verified or not.
+  const granted = countGrantedRoundExtensions(read.comments, { repo, pr }) + countStandingRulingGrantRecords(read.comments, { repo, pr });
   if (granted + by > MAX_TOTAL_ROUND_EXTENSIONS) {
     throw new Error(`this PR already has ${granted} extra round(s); +${by} would pass the ${MAX_TOTAL_ROUND_EXTENSIONS}-round ceiling`);
   }

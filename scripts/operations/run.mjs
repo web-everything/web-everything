@@ -106,7 +106,7 @@ import { createResolveReader, createResolveSinks } from './resolve-io.mjs';
 import { scaffoldOperation, SCAFFOLD_OP } from './scaffold.mjs';
 import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
 import { fileItemOperation, FILE_ITEM_OP } from './file-item.mjs';
-import { createFileItemReader, createFileItemSinks } from './file-item-io.mjs';
+import { createFileItemReader, createFileItemSinks, fileItemRoot } from './file-item-io.mjs';
 import { openPrOperation, OPEN_PR_OP } from './open-pr.mjs';
 import { createOpenPrSinks, deriveLaneRef } from './open-pr-io.mjs';
 import { PARK_LABELS } from '../pr-land.mjs';
@@ -128,7 +128,7 @@ import { CONTROL_OPS, operatorControlOperation, finishOperatorControl } from './
 import { createOperatorControlsReader, createOperatorControlsSinks } from './operator-controls-io.mjs';
 // The operator's audited auto-repair round extension (cap + granted rounds, read by reconcile-core).
 import { extendRoundsOperation, EXTEND_ROUNDS_OP } from './extend-rounds.mjs';
-import { createExtendRoundsReader, createExtendRoundsSinks } from './extend-rounds-io.mjs';
+import { createExtendRoundsReader, createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 // #4979 — the sanctioned writer of an OPERATOR's block/card/not-real ruling on a PR's mandatory referrals.
 import { recordReferralRulingOperation, RECORD_REFERRAL_RULING_OP } from './record-referral-ruling.mjs';
 import { createRecordReferralRulingReader, createRecordReferralRulingSinks } from './record-referral-ruling-io.mjs';
@@ -268,7 +268,7 @@ export const OPERATIONS = Object.freeze({
   // read → plan → write: the operator's audited round extension, read back through the cap's own counter.
   [EXTEND_ROUNDS_OP]: () => ({
     declaration: extendRoundsOperation({ readExtensionContext: createExtendRoundsReader() }),
-    sinks: createExtendRoundsSinks(),
+    sinks: createExtendRoundsSinks({ regate: runRedTeamGateForPr }),
   }),
   // #4979 — read → plan → write: the operator's referral ruling, pinned to the live head, read back through the gate.
   [RECORD_REFERRAL_RULING_OP]: () => ({
@@ -307,10 +307,13 @@ export const OPERATIONS = Object.freeze({
   // wraps scaffold's own read/plan/write (unchanged) and adds the clear-for-build hand-off as a second effect,
   // so filing an item has ONE declared call end to end instead of a card + a separately-remembered gesture.
   // Graduated from `origin/lane/mechanical-dispatcher` (#3548); see `file-item.mjs`'s own header.
-  [FILE_ITEM_OP]: () => ({
-    declaration: fileItemOperation({ readScaffoldContext: createFileItemReader() }),
-    sinks: createFileItemSinks(),
-  }),
+  [FILE_ITEM_OP]: () => {
+    const root = fileItemRoot(); // WE_FILE_ITEM_ROOT, else this checkout — see file-item-io.mjs
+    return {
+      declaration: fileItemOperation({ readScaffoldContext: createFileItemReader({ root }) }),
+      sinks: createFileItemSinks({ root }),
+    };
+  },
   [SUGGEST_NEXT_OP]: () => ({
     declaration: suggestNextOperation({
       loadBoard: createBoardReader(),

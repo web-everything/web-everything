@@ -79,6 +79,7 @@ describe('review settings: scopedRereview on (card 5470)', () => {
 describe('referral live-head settings', () => {
   it.each([
     ['recheckCarriedReferrals', 'WE_REVIEW_RECHECK_CARRIED_REFERRALS'],
+    ['noFixerOnClearedRuled', 'WE_REVIEW_NO_FIXER_ON_CLEARED_RULED'],
     ['autoPolicyRespectsNotReal', 'WE_REVIEW_AUTO_POLICY_RESPECTS_NOT_REAL'],
   ])('%s defaults on and resolves values and sources through the cascade', (key, envKey) => {
     expect(resolveReviewSettings({ fileConfig: null, env: {} })[key]).toBe(true);

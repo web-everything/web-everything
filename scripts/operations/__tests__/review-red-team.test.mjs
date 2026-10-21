@@ -1,9 +1,12 @@
+import { beforeEach as beforeTimingFixture, afterEach as afterTimingFixture, vi as timingFixture } from 'vitest';
+beforeTimingFixture(() => timingFixture.stubEnv('WE_RED_TEAM_TIMING', 'post-accept'));
+afterTimingFixture(() => timingFixture.unstubAllEnvs());
 /**
  * x00g3tt — THE POST-ACCEPT RED TEAM: after Claude's review ACCEPTS, one non-Claude seat tries to break the change;
  * Claude re-checks its claims; a confirmed break is a miss for the accepting seat and the builder. No real codex,
  * agy, claude, git or GitHub process: every effect is a fake.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,6 +20,8 @@ import {
   reserveSeatCalls, RED_TEAM_ENV, EXTRA_SEATS_ENV, DAILY_CAP_ENV, PROVIDER_CAP_ENV, RED_TEAM_SEAT, RED_TEAM_MODELS,
   RED_TEAM_MISS_DISPATCH_KIND, ACCEPTING_SEAT_MODEL, DEFAULT_PROBE_INTERVAL_MS,
 } from '../review-extra-seats.mjs';
+import { provenanceRun } from '../../lib/__tests__/fixtures/saved-red-team-provenance.mjs';
+import { writeRun } from '../run-store.mjs';
 import { runReviewJob, summarizeRedTeam } from '../review-job.mjs';
 import { JUDGE_MODEL } from '../review-pr.mjs';
 import { REVIEW_SEAT_DISPATCH_KIND } from '../../lib/provider-routing.mjs';
@@ -32,6 +37,19 @@ vi.mock('../../lib/dispatch-routing-policy-io.mjs', async importOriginal => ({
 const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
 const REV = 'a'.repeat(40);
+
+// Saved-result reuse requires a completed review-job attestation of the exact snapshot.
+// Legacy publication tests attest their legacy snapshot before exercising its sanitizer.
+const provenanceRoots = [];
+afterEach(() => { for (const root of provenanceRoots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+function attestRows(rows) {
+  const root = mkdtempSync(join(tmpdir(), 'red-team-retry-provenance-'));
+  provenanceRoots.push(root);
+  const env = { WE_RED_TEAM_TIMING: 'post-accept', OPERATION_RUNS_DIR: join(root, 'runs'), CONVEYOR_STATE_ROOT: root };
+  const indexes = rows.flatMap((row, index) => row.dispatchKind === REVIEW_SEAT_DISPATCH_KIND && row.seat === 'red-team' ? [index] : []);
+  writeRun(provenanceRun({ env, rows, indexes, repo: REPO, pr: 5, head: REV }), env.OPERATION_RUNS_DIR);
+  return env;
+}
 
 const payload = (verdict, body = 'Claims: adds a guard.') => ({
   runId: 'review-pr-1', stopped: 'complete', verdict: { verdict },
@@ -91,7 +109,7 @@ function fakeIo(over = {}) {
 describe('x00g3tt — the red team fires on ACCEPT only', () => {
   it('an accepted PR gets exactly one red-team dispatch to a non-Claude provider', async () => {
     const { io, calls } = fakeIo();
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     const seats = calls.filter((c) => c[0] === 'seat');
     expect(seats).toHaveLength(1);
     expect(['codex', 'agy-claude', 'agy-gemini']).toContain(seats[0][1].provider);
@@ -116,7 +134,7 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
       // to quotaHoldOrProbe(...) too. Left un-swapped (soak break), codex reads as held and NOTHING is available.
       cliAvailable: (p) => p === 'codex',
     });
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(r.status).toBe('ran');
     const seats = calls.filter((c) => c[0] === 'seat');
     expect(seats).toHaveLength(1);
@@ -125,9 +143,18 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
 
   it.each(['changes', 'needs-human', null])('a %s verdict gets NO red-team dispatch', async (verdict) => {
     const { io, calls } = fakeIo();
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload(verdict), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload(verdict), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(r.status).toBe('not-owed');
     expect(calls.some((c) => ['seat', 'reserve', 'scratch'].includes(c[0]))).toBe(false);
+  });
+
+  it('a needs-human head the drain consumer stamped as live-accepted IS dispatched and posts (live gap #5549)', async () => {
+    const { io, calls } = fakeIo();
+    const p = payload('needs-human');
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: { ...p, acceptedPrHead: p.findings.read.netBasis.rev },
+      env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
+    expect(r.status).toBe('ran');
+    expect(calls.some((c) => c[0] === 'seat')).toBe(true);
   });
 
   it('its own kill switch, and the added-seats one, each turn it off before anything is read', async () => {
@@ -135,7 +162,7 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
     expect(redTeamEnabled({ [RED_TEAM_ENV]: '0' })).toBe(false);
     expect(redTeamEnabled({ [EXTRA_SEATS_ENV]: 'off' })).toBe(false);
     const { io, calls } = fakeIo({ readRecords: () => { throw new Error('must not read'); } });
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { [RED_TEAM_ENV]: '0' } }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept', [RED_TEAM_ENV]: '0' } }, io);
     expect(r.status).toBe('disabled');
     expect(calls).toEqual([]);
   });
@@ -144,7 +171,7 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
     const spentRow = (provider) => ({ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, provider, callId: `old-${provider}`, scoredAt: new Date(NOW).toISOString(), status: 'ok' });
     const spent = ['codex', 'agy-claude', 'agy-gemini'].map(spentRow);
     const { io, calls } = fakeIo({ readRecords: () => spent });
-    const env = { [PROVIDER_CAP_ENV.codex]: '1', [PROVIDER_CAP_ENV['agy-claude']]: '1', [PROVIDER_CAP_ENV['agy-gemini']]: '1' };
+    const env = { WE_RED_TEAM_TIMING: 'post-accept', [PROVIDER_CAP_ENV.codex]: '1', [PROVIDER_CAP_ENV['agy-claude']]: '1', [PROVIDER_CAP_ENV['agy-gemini']]: '1' };
     const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env }, io);
     expect(r).toMatchObject({ status: 'skipped', reason: expect.stringMatching(/daily-cap/) });
     expect(calls.some((c) => c[0] === 'seat')).toBe(false);
@@ -153,7 +180,7 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
   it('card xn2wf9t — codex AT ITS OWN CAP still runs the red team, falling back to an antigravity backend (never "no seat")', async () => {
     const spent = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, provider: 'codex', callId: 'old-1', scoredAt: new Date(NOW).toISOString(), status: 'ok' }];
     const { io, calls } = fakeIo({ readRecords: () => spent });
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { [PROVIDER_CAP_ENV.codex]: '1' } }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept', [PROVIDER_CAP_ENV.codex]: '1' } }, io);
     expect(r.status).toBe('ran');
     expect(['agy-claude', 'agy-gemini']).toContain(r.provider);
     const seats = calls.filter((c) => c[0] === 'seat');
@@ -162,18 +189,32 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
   });
 
   it('never runs twice for the same head once a clean row exists', async () => {
-    const prior = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team', pr: 5, rev: REV, status: 'ok' }];
+    const prior = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team', repo: REPO, pr: 5, rev: REV, status: 'ok' }];
     expect(redTeamAlreadyRan(prior, 5, REV)).toBe(true);
     expect(redTeamAlreadyRan(prior, 5, 'c'.repeat(40))).toBe(false);
     // The pass finished (its comment is up), so nothing is owed. When the comment is missing, see the resume tests.
+    const env = attestRows(prior);
     const { io, calls } = fakeIo({ readRecords: () => prior, listComments: () => [{ body: redTeamMarker(5, REV), author: { login: 'web-everything' } }] });
-    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io)).status).toBe('already-ran');
+    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env }, io)).status).toBe('already-ran');
     expect(calls.some((c) => c[0] === 'seat' || c[0] === 'post')).toBe(false);
+  });
+
+  it.each(['missing', 'tampered'])('never reuses saved evidence with %s provenance', async proof => {
+    const first = fakeIo();
+    await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, first.io);
+    const env = attestRows(first.rows);
+    if (proof === 'missing') rmSync(env.OPERATION_RUNS_DIR, { recursive: true, force: true });
+    else first.rows[0].changedFiles = ['changed-after-attestation.mjs'];
+    const again = fakeIo({ readRecords: () => first.rows });
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env }, again.io);
+    expect(result.status).toBe('ran');
+    expect(again.calls.filter(c => c[0] === 'seat')).toHaveLength(1);
+    expect(again.rows.some(row => row.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toBe(true);
   });
 
   it('skips a provider under a quota hold and a missing CLI, and says why when none is left', async () => {
     const { io } = fakeIo({ cliAvailable: () => false });
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(r).toMatchObject({ status: 'skipped', reason: expect.stringMatching(/CLI not found/) });
   });
 });
@@ -181,7 +222,7 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
 describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
   it('writes the red-team seat row plus one miss row per accepting seat and one for the builder', async () => {
     const { io, rows } = fakeIo();
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(r).toMatchObject({ confirmedMissCount: 1, foldedVerdict: 'changes', recheckStatus: 'ok', rowsWritten: 3 });
     const [seat, ...misses] = rows;
     expect(seat).toMatchObject({
@@ -204,7 +245,7 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
 
   it('a break Claude does NOT confirm records no miss, and the accept stands', async () => {
     const { io, rows, trials } = fakeIo({ runRecheck: async () => ({ checks: [{ index: 0, confirmed: false, reason: 'n is validated upstream' }] }) });
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(r).toMatchObject({ confirmedMissCount: 0, foldedVerdict: 'accept' });
     expect(rows).toHaveLength(1);
     expect(trials).toEqual([]);
@@ -212,7 +253,7 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
 
   it('a crashed re-check confirms nothing (a miss is never inferred)', async () => {
     const { io, rows } = fakeIo({ runRecheck: async () => { throw new Error('claude not logged in'); } });
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(r.recheckStatus).toBe('error');
     expect(r.comment.body).not.toContain('claude not logged in');
     expect(r.confirmedMissCount).toBe(0);
@@ -224,14 +265,14 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
       runSeat: seatSays([BREAK, HOLE]),
       runRecheck: async () => ({ checks: [{ index: 0, confirmed: true, reason: 'y' }, { index: 1, confirmed: true, reason: 'y' }] }),
     });
-    await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     const seats = rows.filter((x) => x.missRole === 'accepting-review').map((x) => [x.claudeSeat, x.missCount]);
     expect(seats).toEqual([['judge', 1], ['judgeSecurity', 1]]);
   });
 
   it('a clean pass skips the re-check and writes one row with the accept standing', async () => {
     const { io, rows, calls } = fakeIo({ runSeat: seatSays([]) });
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(r).toMatchObject({ foldedVerdict: 'accept', recheckStatus: 'not-needed' });
     expect(calls.some((c) => c[0] === 'recheck')).toBe(false);
     expect(rows).toHaveLength(1);
@@ -239,7 +280,7 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
 
   it('a timed-out red team records needs-human, posts nothing, confirms nothing', async () => {
     const { io, rows, calls } = fakeIo({ runSeat: async () => ({ report: null, timedOut: true }) });
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(r).toMatchObject({ foldedVerdict: 'needs-human', comment: { status: 'not-posted' } });
     expect(rows[0].status).toBe('timeout');
     expect(calls.some((c) => c[0] === 'post')).toBe(false);
@@ -248,7 +289,7 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
   it('a DELEGATED builder\'s confirmed miss also lands as its delegation trial (reworked, informative), once per PR', async () => {
     const body = `Claims: adds a guard.\n\n${buildDelegationMarker({ provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' })}`;
     const { io, trials, rows } = fakeIo();
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept', body), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept', body), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(r.delegationTrial).toBe('logged');
     expect(trials[0]).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix', outcome: 'reworked', informative: true, verifiedBy: 'independent-claude', pr: 5 });
     // #4034 follow-up (card 4034b) — the builder's REWORKED delegation trial is exactly the row #4034's
@@ -256,7 +297,7 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
     expect(trials[0].changedFiles).toEqual(['x.mjs']);
     expect(rows.at(-1)).toMatchObject({ missRole: 'builder', provider: 'codex', model: 'gpt-6-astra', taskType: 'red-team-miss:builder:bugfix' });
     const again = fakeIo({ readRecords: () => [{ dispatchKind: 'session-delegation', pr: 5, outcome: 'reworked' }] });
-    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept', body), env: {} }, again.io)).delegationTrial).toBe('already-logged');
+    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept', body), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, again.io)).delegationTrial).toBe('already-logged');
     expect(again.trials).toEqual([]);
   });
 
@@ -288,11 +329,12 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
     const prior = {
       dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: RED_TEAM_SEAT.seat, status: 'ok',
       provider: 'agy-gemini', model: RED_TEAM_MODELS['agy-gemini'].model, callId: 'call-1', rev: REV,
-      pr: 5, findings: [{ ...BREAK, confirmedByRecheck: true }], builder: { provider: 'claude', model: 'claude-opus-5.5', source: 'co-authored-by' },
+      repo: REPO, pr: 5, findings: [{ ...BREAK, confirmedByRecheck: true }], builder: { provider: 'claude', model: 'claude-opus-5.5', source: 'co-authored-by' },
       recheckStatus: 'ok', foldedVerdict: 'changes', changedFiles: ['prior/scope.mjs'],
     };
+    const env = attestRows([prior]);
     const { io, rows } = fakeIo({ readRecords: () => [prior] });
-    await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env }, io);
     const misses = rows.filter((r) => r.dispatchKind === RED_TEAM_MISS_DISPATCH_KIND);
     expect(misses.length).toBeGreaterThan(0);
     for (const m of misses) expect(m.changedFiles).toEqual(['prior/scope.mjs']);
@@ -302,7 +344,7 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
 describe('x00g3tt — the ONE advisory comment, deduped by a trusted marker', () => {
   it('posts once, starting with the marker, and reports advisory status', async () => {
     const { io, calls } = fakeIo();
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     const posts = calls.filter((c) => c[0] === 'post');
     expect(posts).toHaveLength(1);
     expect(posts[0][1].body.startsWith(redTeamMarker(5, REV))).toBe(true);
@@ -317,13 +359,13 @@ describe('x00g3tt — the ONE advisory comment, deduped by a trusted marker', ()
     expect(redTeamCommentPosted([{ body, author: { login: 'mallory' } }], 5, REV)).toBe(false);
     expect(redTeamCommentPosted([body], 5, REV)).toBe(false);
     const { io, calls } = fakeIo({ listComments: () => [{ body, author: { login: 'web-everything' } }] });
-    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io)).comment.status).toBe('deduped');
+    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io)).comment.status).toBe('deduped');
     expect(calls.some((c) => c[0] === 'post')).toBe(false);
   });
 
   it('replay (post:false) renders the comment and never lists or posts', async () => {
     const { io, calls } = fakeIo();
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {}, post: false }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' }, post: false }, io);
     expect(r.comment).toMatchObject({ status: 'not-posted', body: expect.stringContaining('Post-accept red team') });
     expect(calls.some((c) => c[0] === 'post' || c[0] === 'list')).toBe(false);
   });
@@ -336,15 +378,16 @@ describe('x00g3tt — the ONE advisory comment, deduped by a trusted marker', ()
 
 describe('x00g3tt — a clean seat row never strands an unfinished effect (PR #2735 review)', () => {
   const DELEGATED = `Claims: adds a guard.\n\n${buildDelegationMarker({ provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' })}`;
-  const run = (io, over = {}) => runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {}, ...over }, io);
+  const run = (io, over = {}) => runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' }, ...over }, io);
   const trustedMarker = () => [{ body: `${redTeamMarker(5, REV)}\nold`, author: { login: 'web-everything' } }];
 
   it('a failed comment post is retried on the next run, without re-running the model or spending a call', async () => {
     const first = fakeIo({ postComment: () => { throw new Error('gh: network unreachable'); } });
     expect((await run(first.io)).comment.status).toBe('error');
     const posted = [];
+    const env = attestRows(first.rows);
     const again = fakeIo({ readRecords: () => first.rows, postComment: (o) => posted.push(o) });
-    const r = await run(again.io);
+    const r = await run(again.io, { env });
     expect(r.status).toBe('resumed');
     expect(r.comment.status).toBe('posted');
     expect(posted).toHaveLength(1);
@@ -361,8 +404,9 @@ describe('x00g3tt — a clean seat row never strands an unfinished effect (PR #2
     first.io.append = (row) => { if (row.missRole === 'builder') throw new Error('store: EIO'); append(row); };
     const r1 = await run(first.io);
     expect(r1.rowsWritten).toBe(2);
+    const env = attestRows(first.rows);
     const again = fakeIo({ readRecords: () => first.rows, listComments: trustedMarker });
-    const r = await run(again.io);
+    const r = await run(again.io, { env });
     expect(r.status).toBe('resumed');
     expect(again.rows).toHaveLength(1);
     expect(again.rows[0]).toMatchObject({ dispatchKind: RED_TEAM_MISS_DISPATCH_KIND, missRole: 'builder', provider: 'claude', model: 'claude-opus-5.5', rev: REV, redTeamCallId: r1.callId });
@@ -372,8 +416,9 @@ describe('x00g3tt — a clean seat row never strands an unfinished effect (PR #2
   it('a delegation trial that failed to log is logged on the next run', async () => {
     const first = fakeIo({ logTrial: () => { throw new Error('store: EIO'); } });
     expect((await run(first.io, { loopPayload: payload('accept', DELEGATED) })).delegationTrial).toMatch(/^error/);
+    const env = attestRows(first.rows);
     const again = fakeIo({ readRecords: () => first.rows, listComments: trustedMarker });
-    const r = await run(again.io, { loopPayload: payload('accept', DELEGATED) });
+    const r = await run(again.io, { env, loopPayload: payload('accept', DELEGATED) });
     expect(r.delegationTrial).toBe('logged');
     expect(again.trials[0]).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix', outcome: 'reworked', pr: 5 });
     expect(again.rows).toEqual([]);
@@ -383,8 +428,9 @@ describe('x00g3tt — a clean seat row never strands an unfinished effect (PR #2
     const first = fakeIo();
     await run(first.io, { loopPayload: payload('accept', DELEGATED) });
     const records = [...first.rows, { dispatchKind: 'session-delegation', pr: 5, outcome: 'reworked' }];
+    const env = attestRows(records);
     const again = fakeIo({ readRecords: () => records, listComments: trustedMarker });
-    expect((await run(again.io, { loopPayload: payload('accept', DELEGATED) })).status).toBe('already-ran');
+    expect((await run(again.io, { env, loopPayload: payload('accept', DELEGATED) })).status).toBe('already-ran');
     expect(again.rows).toEqual([]);
     expect(again.trials).toEqual([]);
     expect(again.calls.some((c) => c[0] === 'post' || c[0] === 'seat')).toBe(false);
@@ -396,7 +442,7 @@ describe('x00g3tt — the replay never writes the shared store (PR #2735 review)
 
   it('record:false writes no evidence row and logs no delegation trial, even on a confirmed break', async () => {
     const { io, rows, trials } = fakeIo();
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept', DELEGATED), env: {}, post: false, record: false }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept', DELEGATED), env: { WE_RED_TEAM_TIMING: 'post-accept' }, post: false, record: false }, io);
     expect(r.confirmedMissCount).toBe(1);
     expect(rows).toEqual([]);
     expect(trials).toEqual([]);
@@ -407,7 +453,7 @@ describe('x00g3tt — the replay never writes the shared store (PR #2735 review)
   it('a replay payload is never recorded, whatever the caller passed', async () => {
     const { io, rows, trials } = fakeIo();
     const p = replayPayload({ view: { title: 't', body: DELEGATED, headRefOid: REV, files: [] }, diffText: 'diff --git a/x b/x\n+x\n' });
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: p, env: {}, post: false }, io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: p, env: { WE_RED_TEAM_TIMING: 'post-accept' }, post: false }, io);
     expect(r.status).toBe('ran');
     expect(rows).toEqual([]);
     expect(trials).toEqual([]);
@@ -415,9 +461,9 @@ describe('x00g3tt — the replay never writes the shared store (PR #2735 review)
 
   it('a replay does not mark the head as already-ran for the real post-accept run', async () => {
     const replay = fakeIo();
-    await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {}, post: false, record: false }, replay.io);
+    await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' }, post: false, record: false }, replay.io);
     const real = fakeIo({ readRecords: () => replay.rows });
-    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, real.io);
+    const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, real.io);
     expect(r.status).toBe('ran');
     expect(real.calls.some((c) => c[0] === 'post')).toBe(true);
   });
@@ -506,7 +552,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     vi.mocked(resolveOperationRoute).mockReturnValue({ provider, model: 'test-model', effort: 'high' });
     const spawnRecheck = vi.fn(async () => ({ value: { checks: [] } }));
     try {
-      const io = createRedTeamIo({ env: {}, spawnRecheck });
+      const io = createRedTeamIo({ env: { WE_RED_TEAM_TIMING: 'post-accept' }, spawnRecheck });
       const request = { pr: 5, lanePath: '/unused', rev: REV, readsRepo: true };
       await expect(io.runRecheck(request)).rejects.toThrow('repo re-check requires the Claude read-only tool allow-list');
       expect(spawnRecheck).not.toHaveBeenCalled();
@@ -533,7 +579,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
 
   it.each(unsafeFilesRead)('scrubs unsafe filesRead at the comment and evidence sinks: %j', async unsafe => {
     const { io, rows } = fakeIo({ runRecheck: async () => ({ checks: [{ index: 0, confirmed: false, reason: 'refuted', filesRead: [unsafe] }] }) });
-    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, io);
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(rows).toHaveLength(1);
     expect(rows[0].findings[0]).toMatchObject({ file: BREAK.file, filesRead: [], recheckOutcome: 'unverifiable' });
     expect(result.comment.body).not.toContain(unsafe);
@@ -548,15 +594,16 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
   it('scrubs filesRead when completing speculative evidence and retrying legacy rows', async () => {
     const first = fakeIo({ postComment: () => { throw new Error('offline'); } });
     const p = payload('accept');
-    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, first.io);
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, first.io);
     const unsafe = 'AKIA' + '1234567890ABCDEF';
     pass.findings[0] = { ...pass.findings[0], confirmedByRecheck: false, recheckOutcome: 'not confirmed', filesRead: [unsafe] };
     await completeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass }, first.io);
     expect(first.rows[0].findings[0]).toMatchObject({ filesRead: [], recheckOutcome: 'unverifiable' });
     first.rows[0].findings[0].filesRead = [unsafe];
     first.rows[0].findings[0].recheckOutcome = 'not confirmed';
+    const env = attestRows(first.rows);
     const again = fakeIo({ readRecords: () => first.rows });
-    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, again.io);
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env }, again.io);
     expect(result.comment.body).toContain('[unverifiable]');
     expect(result.comment.body).toContain('Files read: none');
     expect(result.comment.body).not.toContain(unsafe);
@@ -575,7 +622,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
   it.each(['summary', 'file', 'category', 'impactIfUnfixed', 'failure_scenario', 'recheckReason'])('scrubs model-controlled %s in rendered and stored findings', async field => {
     const { io, rows } = fakeIo();
     const p = payload('accept');
-    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, io);
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     const secret = 'AKIA' + '1234567890ABCDEF';
     pass.findings[0][field] = secret;
     pass.parsed[RED_TEAM_SEAT.key].findings[0][field] = secret;
@@ -592,8 +639,8 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     p.findings.read.netChangedFiles = ['backlog/123-card.md'];
     const { io, calls, rows } = fakeIo();
     const r = speculative
-      ? await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: p.findings.read, env: {} }, io)
-      : await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io);
+      ? await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: p.findings.read, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io)
+      : await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(r).toEqual({ status: 'skipped', reason: 'red team skipped: card-only' });
     expect(calls.every(c => c[0] === 'log')).toBe(true);
     expect(calls.some(c => c[1] === 'red team skipped: card-only')).toBe(true);
@@ -616,8 +663,8 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
       p.findings.read.netRenameSources = renameSources;
       const { io, calls, rows } = fakeIo();
       const result = speculative
-        ? await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: p.findings.read, env: {} }, io)
-        : await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io);
+        ? await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: p.findings.read, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io)
+        : await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
       expect(result.status).toBe(skipped ? 'skipped' : speculative ? 'speculated' : 'ran');
       expect(calls.some(c => c[0] === 'recheck')).toBe(!skipped);
       if (skipped) {
@@ -632,7 +679,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     const p = payload('accept');
     p.findings.read.netChangedFiles = files;
     const { io, calls } = fakeIo();
-    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io)).status).toBe('ran');
+    expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io)).status).toBe('ran');
     const request = calls.find(c => c[0] === 'recheck')[1];
     expect(request).toMatchObject({ lanePath: 'lane', rev: REV, readsRepo: true });
     expect(request.mandate).toMatch(/open the cited files and their callers/);
@@ -645,10 +692,10 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     p.findings.read.netChangedFiles = ['backlog/123-card.md'];
     p.findings.read.netRenameSources = ['scripts/x.mjs'];
     const { io, calls, rows } = fakeIo();
-    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, io);
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(pass.status).toBe('speculated');
     p.findings.read.netRenameSources = ['scripts/y.mjs'];
-    expect(await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass, env: {} }, io)).toMatchObject({ status: 'stale' });
+    expect(await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io)).toMatchObject({ status: 'stale' });
     expect(rows).toEqual([]);
     expect(calls.some(c => c[0] === 'post')).toBe(false);
   });
@@ -660,7 +707,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     });
     expect(p.findings.read.netRenameSources).toEqual(['scripts/x.mjs']);
     const { io, calls } = fakeIo();
-    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, io);
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(result.status).toBe('ran');
     expect(calls.some(c => c[0] === 'recheck')).toBe(true);
   });
@@ -670,7 +717,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     p.findings.read.netChangedFiles = ['backlog/123.md'];
     const { io, calls } = fakeIo();
     expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p,
-      env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false', WE_RED_TEAM_RECHECK_READS_REPO: '0' } }, io)).status).toBe('ran');
+      env: { WE_RED_TEAM_TIMING: 'post-accept', WE_RED_TEAM_SKIP_CARD_ONLY: 'false', WE_RED_TEAM_RECHECK_READS_REPO: '0' } }, io)).status).toBe('ran');
     expect(calls.find(c => c[0] === 'recheck')[1]).toMatchObject({ readsRepo: false, mandate: expect.stringContaining('tools are disabled') });
     expect(calls.find(c => c[0] === 'log')[1]).toMatch(/recheckReadsRepo=false.*env.*skipCardOnly=false.*env/);
   });
@@ -681,7 +728,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
       postComment: () => { throw new Error('offline'); },
     });
     const p = payload('accept');
-    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, first.io);
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, first.io);
     expect(pass.findings[0].recheckReason).toBe('reason withheld');
     // Completion also accepts passes persisted before the restricted reason vocabulary.
     pass.findings[0].recheckReason = secret;
@@ -690,8 +737,10 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     for (const value of evidenceStrings(first.rows)) expect(value).not.toContain(secret);
     expect(renderRedTeamComment({ pr: 5, rev: REV, findings: [{ ...BREAK, recheckReason: secret }], recheckStatus: 'ok', foldedVerdict: 'accept' })).not.toContain(secret);
     first.rows[0].findings[0].recheckReason = secret;
+    const env = attestRows(first.rows);
     const retry = fakeIo({ readRecords: () => first.rows });
-    const resumed = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, retry.io);
+    const resumed = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env }, retry.io);
+    expect(resumed.status).toBe('resumed');
     expect(resumed.comment.body).toContain('Re-check: reason withheld');
     expect(resumed.comment.body).not.toContain(secret);
   });
@@ -709,7 +758,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
       postComment: () => { throw new Error('offline'); },
     });
     const p = payload('accept');
-    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, first.io);
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, first.io);
     expect(pass.recheckStatus).toBe('error');
     pass.recheckStatus = `error: ${secret}`;
     const result = await completeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass }, first.io);
@@ -719,8 +768,10 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     for (const value of evidenceStrings(first.rows)) expect(value).not.toContain(secret);
     expect(renderRedTeamComment({ pr: 5, rev: REV, findings: [BREAK], recheckStatus: secret, foldedVerdict: 'accept' })).not.toContain(secret);
     first.rows[0].recheckStatus = `error: ${secret}`;
+    const env = attestRows(first.rows);
     const retry = fakeIo({ readRecords: () => first.rows });
-    const resumed = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, retry.io);
+    const resumed = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env }, retry.io);
+    expect(resumed.status).toBe('resumed');
     expect(resumed.comment.body).toContain('re-check error');
     expect(resumed.comment.body).not.toContain(secret);
   });
@@ -743,13 +794,15 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
   it.each([false, true])('persists unverifiable on comment retry, including legacy rows (legacy=%s)', async legacy => {
     const first = fakeIo({ runRecheck: async () => ({ checks: [{ index: 0, confirmed: false, reason: 'no context', filesRead: [] }] }),
       postComment: () => { throw new Error('offline'); } });
-    await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, first.io);
+    await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, first.io);
     if (legacy) {
       delete first.rows[0].findings[0].recheckOutcome;
       delete first.rows[0].findings[0].filesRead;
     }
+    const env = attestRows(first.rows);
     const again = fakeIo({ readRecords: () => first.rows });
-    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, again.io);
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env }, again.io);
+    expect(result.status).toBe('resumed');
     expect(result.comment.body).toContain('[unverifiable]');
     if (!legacy) expect(result.comment.body).toContain('Files read: none');
   });
@@ -768,7 +821,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
       const rev = git('rev-parse', 'HEAD');
       writeFileSync(join(root, 'caller.mjs'), 'export const guard = false;');
       git('commit', '--quiet', '-am', 'later unrelated head');
-      const io = createRedTeamIo({ env: {}, spawnRecheck: async opts => {
+      const io = createRedTeamIo({ env: { WE_RED_TEAM_TIMING: 'post-accept' }, spawnRecheck: async opts => {
         cwd = opts.cwd;
         assertLaneCwd(cwd, opts.allowedTools);
         expect(opts.allowedTools).toEqual(['Read', 'Glob', 'Grep']);
@@ -800,7 +853,7 @@ describe('red-team scheduling status', () => {
       return { report: report(provider, answer([])) };
     } });
     const p = payload('accept');
-    await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, io);
+    await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(redTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ status: 'finished', result: 'ran' }));
   });
   it('a card-only skip never schedules or publishes a pending status', async () => {
@@ -808,7 +861,7 @@ describe('red-team scheduling status', () => {
     const { io } = fakeIo({ redTeamStatus });
     const p = payload('accept');
     p.findings.read.netChangedFiles = ['backlog/123-card.md'];
-    const out = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, io);
+    const out = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, io);
     expect(out).toMatchObject({ status: 'skipped', reason: 'red team skipped: card-only' });
     expect(redTeamStatus).not.toHaveBeenCalled();
   });
