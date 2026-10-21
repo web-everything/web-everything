@@ -1115,6 +1115,26 @@ export function runReviewLabelCli({
   const onlyIfArg = argv.find((a) => a.startsWith('--only-if='));
   const onlyIf = onlyIfArg === undefined ? null : onlyIfArg.slice('--only-if='.length);
   const expectNoReadiness = argv.includes('--expect-no-readiness');
+  // #5492 rebuild slice 2 (design v2 W1/W2) — the HEAD THE JUDGE JUDGED, its judgment boundary, and its run id. All
+  // optional and additive. `--judged-head` pins the row to that head: a CLEARING target refuses before any write when
+  // the live head differs (the judgment never covered the new head); a HOLDING target still swaps its label (a hold
+  // must apply), but its row names the judged head, never the live one. `--seen` / `--run-id` ride to the row as is.
+  const flagValue = (name) => { const a = argv.find((x) => x.startsWith(`--${name}=`)); return a === undefined ? null : a.slice(name.length + 3); };
+  // A malformed binding flag REFUSES a clearing target (before any write: no clear on a bad pin) but is DROPPED, with a
+  // warning, for a holding one — a hold must never be lost to bad metadata. The pin and the boundary go together: an
+  // unpinned row carries no `seen` (its head is the live one, so it must not answer anything).
+  const targetClears = verdictClears(verdictForLabelTarget(to));
+  const binding = (name, re, why) => {
+    const v = flagValue(name);
+    if (v === null || re.test(v)) return v;
+    if (targetClears) fail(`invalid --${name} — ${why}`);
+    process.stderr.write(`review-set-label: ignoring invalid --${name} on a holding verdict (the hold still applies)\n`);
+    return null;
+  };
+  const judgedHead = to === 'restamp' ? null : binding('judged-head', /^[0-9a-f]{40}$/, 'expected a full 40-hex lowercase SHA');
+  const seenArg = judgedHead === null ? null : binding('seen', /^(?:empty|\d{1,9}:[A-Za-z0-9:._-]{8,128})$/, 'expected "empty" or "<n>:<row id>"');
+  const runIdArg = binding('run-id', /^[A-Za-z0-9:._-]{1,128}$/, 'expected 1-128 id characters');
+  if (to === 'restamp' && flagValue('judged-head') !== null) fail('invalid --judged-head — a restamp judges nothing; use --expect-head');
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — validate every input BEFORE any gh call (fail closed).
   const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
@@ -1289,6 +1309,9 @@ export function runReviewLabelCli({
   }
 
   if ((guardedRestamp || pinnedAccept || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if (judgedHead !== null && headSha !== judgedHead && targetClears) {
+    fail('live head differs from --judged-head; nothing written (the judgment does not cover the new head)', 1);
+  }
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -1779,6 +1802,12 @@ export function runReviewLabelCli({
     try { live = provider.readPrState(repo, pr).headRefOid; } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (live !== expectedHead) fail('live head differs from --expect-head; nothing written', 1);
   }
+  // #5492 rebuild slice 2 (W1) — the same re-read for a clearing verdict pinned with --judged-head.
+  if (judgedHead !== null && targetClears) {
+    let live = null;
+    try { live = provider.readPrState(repo, pr).headRefOid; } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
+    if (live !== judgedHead) fail('live head differs from --judged-head; nothing written (the judgment does not cover the new head)', 1);
+  }
 
   const ledgerVerdict = verdictForLabelTarget(to);
   let clearingLedgerMiss = false;
@@ -1795,6 +1824,9 @@ export function runReviewLabelCli({
       // for the two proven defects (#3046 gap divergence, `#3052` heading divergence, both open under
       // `#3054`) that make this digest unfit to FIND a record by, and fine to STORE beside one.
       headSha,
+      judgedHead,
+      seen: seenArg,
+      runId: runIdArg,
       reviewedDiff: normalizeDiffFingerprint(reviewedDiff),
       reviewedContribution: normalizeContributionFingerprint(reviewedDiff),
       declaredActor: actor,
@@ -1823,6 +1855,9 @@ export function runReviewLabelCli({
           at: appended.record?.at ?? new Date().toISOString(),
           approval: approvalKind,
           delegation: approvalDelegation,
+          // Only a PINNED approval names a head: an unpinned one stays headless, and a headless approval answers nothing.
+          ...(judgedHead !== null ? { judgedHead } : {}),
+          ...(seenArg !== null ? { seen: seenArg } : {}),
           declaredActor: actor,
           session: clearerId,
           channel: normalizeChannel(channelArg),
