@@ -217,7 +217,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
       ['git', ['ls-files', '--stage', '-z']],
       ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
       ['git', ['ls-files', '-v']],
-      ['git', ['stash', 'list']],
+      ['git', ['stash', 'list', '--no-show-signature']],
       ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']],
     ]);
     for (const [, , options] of exec.mock.calls) {
@@ -275,7 +275,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
       const command = JSON.stringify([bin, argv]);
       if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']])) return status;
       if (command === JSON.stringify(['git', ['ls-files', '-v']])) return 'H tracked.txt\n';
-      if (command === JSON.stringify(['git', ['stash', 'list']])) return '';
+      if (command === JSON.stringify(['git', ['stash', 'list', '--no-show-signature']])) return '';
       if (command === JSON.stringify(['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']])) return count;
       if (argv.includes('status')) return '';
       return '0\n';
@@ -378,7 +378,7 @@ describe('untrusted lane Git configuration', () => {
     const exec = vi.fn((bin, argv) => argv[0] === 'rev-list' ? '0\n' : '');
     expect(freshLaneSafety({ path: '/fixture/lane', exec }).hasUnsafeWork).toBe(false);
     expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([
-      [...LANE_CONFIG_LIST_ARGS], ['ls-files', '--stage', '-z'], [...DIRTY_PROBE_ARGS], ['ls-files', '-v'], ['stash', 'list'],
+      [...LANE_CONFIG_LIST_ARGS], ['ls-files', '--stage', '-z'], [...DIRTY_PROBE_ARGS], ['ls-files', '-v'], ['stash', 'list', '--no-show-signature'],
       ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin'],
     ]);
     for (const [, , { env }] of exec.mock.calls) {
