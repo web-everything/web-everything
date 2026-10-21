@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
-import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, createRedTeamGateIo, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
+import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, liveResultGateState, parseRedTeamComment, parseRedTeamGateMarker, readRedTeamDisposition, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
