@@ -87,7 +87,8 @@ import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
-import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
+import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
+import { defaultRearmStaleAcceptance } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // #5771: the daemon that plans a stale-accept re-arm executes it
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
@@ -481,6 +482,11 @@ export function runReviewTick({
   // existing caller unchanged; the real daemon wires `promoteDraftsGuarded`. `notePromotions` reports the rows.
   promoteDrafts = null,
   notePromotions = null,
+  // #5771 — `({repo, pr, headSha}) => {ok, reason}`: execute this pass's `restore-review-label` stale-accept rows through
+  // the guarded re-arm, then re-plan so the new head's review goes out THIS pass. `null` (the default) keeps every
+  // existing caller unchanged; the real daemon wires `defaultRearmStaleAcceptance`. `noteRearms` reports the rows.
+  rearmStaleAccepts = null,
+  noteRearms = null,
   onPlan = null,
   readRedTeamRequests = null,
   // `({repo, pr}) => {state}` — read only for a request whose PR is absent from the open listing, to expire a
@@ -611,6 +617,17 @@ export function runReviewTick({
     ({ plan, rawPrs } = out);
     replanError = out.replanError ?? null;
     if (out.promotions.length) { try { notePromotions?.({ repo, promotions: out.promotions, replanError: out.replanError }); } catch { /* report only */ } }
+  }
+  if (typeof rearmStaleAccepts === 'function') {
+    const out = rearmStaleAcceptsThenReplan({
+      plan, rawPrs, repo, rearm: rearmStaleAccepts,
+      replan: (prs) => (sharedReads && prs
+        ? reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => rawAgents })
+        : reconcile({ repo, defaultBranch })),
+    });
+    ({ plan, rawPrs } = out);
+    replanError = replanError ?? out.replanError ?? null;
+    if (out.rearms.length) { try { noteRearms?.({ repo, rearms: out.rearms, replanError: out.replanError }); } catch { /* report only */ } }
   }
   try { onPlan?.({ repo, plan, rawPrs }); } catch { /* observation never breaks a tick */ }
   // Captured at plan completion, never at log-read time. Only a plan that survived (re)planning is evidence.
@@ -1709,6 +1726,11 @@ export function buildCliDaemonEffects({
       refreshScopeBloat: refreshScopeBloatedPr,
       postRefreshMarker: defaultPostRebaseComment,
       promoteDrafts: promoteDraftsGuarded,
+      rearmStaleAccepts: ({ repo, pr, headSha }) => defaultRearmStaleAcceptance({ repoSlug: repo, prNumber: pr, headSha }),
+      noteRearms: ({ repo, rearms, replanError }) => {
+        for (const r of rearms) log.error(`review-daemon: ${repo}#${r.pr} stale-accept re-arm ${r.ok ? 'done' : 'refused'} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
+        if (replanError) log.error(`review-daemon: ${repo} post-re-arm re-plan failed (review goes out next pass): ${replanError}`);
+      },
       notePromotions: ({ repo, promotions, replanError }) => {
         for (const r of promotions) log.error(`review-daemon: ${repo}#${r.pr} same-pass promote ${r.action} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
         if (replanError) log.error(`review-daemon: ${repo} same-pass re-plan failed (review goes out next pass): ${replanError}`);
