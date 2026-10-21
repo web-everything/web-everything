@@ -1214,6 +1214,8 @@ export async function acquireSlotBlocking({
         if (!hostPolicyLogged) { log(`${m}\n`); hostPolicyLogged = true; }
       } });
       if (!host.admitted) {
+        // A slow rejected host check counts against the budget too (3rd audit): re-read the clock. Budget mode only.
+        if (canDefer && budgetMs > 0) attempt = now();
         const waited = attempt - startedAt;
         if (canDefer && budgetMs > 0 && waited < budgetMs) {
           // heavy-run-wait — re-check host load after a jittered sleep; the waiting marker keeps our queue position.
