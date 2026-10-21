@@ -155,7 +155,9 @@ import { parseMergeTree, manifestConflictDisposition, rebaseDropManifest } from 
 // best-effort macOS notify (never throws; a delivery failure must never break the sweep).
 import { planNoteComment, postNoteComment } from './reconcile-note-comment.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
-import { UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, countUnownedRebaseAggregateAttempts, countUnownedRebaseInfraFailures, shouldCountRebaseInfra, formatUnownedRebaseInfraMarker, UNOWNED_REBASE_ATTEMPT_CAP, loadUnownedRebaseSettings, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker } from './unowned-rebase-attempt-count.mjs';
+import { UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, countUnownedRebaseAggregateAttempts, countUnownedRebaseInfraFailures, shouldCountRebaseInfra, formatUnownedRebaseInfraMarker, UNOWNED_REBASE_ATTEMPT_CAP, loadUnownedRebaseSettings, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker, grantedRebaseCap } from './unowned-rebase-attempt-count.mjs';
+import { standingRulingScope } from './standing-ruling-io.mjs';
+import { ROUND_EXTENSION_MARKER } from './round-extension-mark.mjs';
 import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 // #4118 (c) — the SAME name-based, gh-agents-truth liveness check `review-status-tag.mjs` already uses, and for
 // the identical reason its own docblock states: staying independent of `reconcile-core.mjs#assessLiveness`'s
@@ -1492,6 +1494,8 @@ export function watchParkedPrConflicts({
   resolveRealFiles: readRealFiles = resolveRealFiles,
   cardConflictSettings = loadCardConflictSettings(),
   unownedRebaseSettings = loadUnownedRebaseSettings(),
+  // The verified standing-ruling scope for one PR's grant reader (null → automation-posted grants never count).
+  standingRulingFor = standingRulingScope,
   listAgents = defaultListAgents,
   now = Date.now(),
   queueScope = {},
@@ -1532,13 +1536,32 @@ export function watchParkedPrConflicts({
     try { provider.postComment(resolvedRepo, pr.number, formatUnownedRebaseInfraMarker(result, pr.headRefOid)); }
     catch { /* best-effort counter */ }
   };
-  const surfaceInfraCap = (entry, pr, comments, failures) => {
+  // Operator round grants (`extend-rounds`, and verified standing-ruling grants) reach these two caps too, each as
+  // "one more attempt from when it was posted" (`grantedRebaseCap`). Read only AT the base cap: below it a grant
+  // cannot change the decision, so the healthy path pays no standing-ruling read.
+  const grantedCap = (pr, comments, baseCap, used, count) => {
+    if (!(used >= baseCap)) return baseCap;
+    // Reuse the repo the caller supplied (the daemon always passes --repo); never a currentRepo() read here.
+    const grantRepo = resolvedRepo ?? repo;
+    if (grantRepo == null) return baseCap;
+    // No grant comment on the thread → nothing can raise the cap; skip the injected scope reader entirely.
+    if (!Array.isArray(comments) || !comments.some(c => typeof c?.body === 'string' && c.body.startsWith(ROUND_EXTENSION_MARKER))) return baseCap;
+    let standingRuling = null;
+    try { standingRuling = standingRulingFor({ repo: grantRepo, pr: { number: pr.number, comments } }) ?? null; }
+    catch { standingRuling = null; }
+    return grantedRebaseCap(baseCap, comments, count, { repo: grantRepo, pr: Number(pr.number), standingRuling }).cap;
+  };
+  const infraCountFor = pr => prefix => countUnownedRebaseInfraFailures(prefix, { ...unownedRebaseSettings.value, headSha: pr.headRefOid });
+  // The top's aggregate counter (content + infra, whole history, no cutoff): grants never loosen it beyond +by.
+  const attemptCount = prefix => countUnownedRebaseAggregateAttempts(prefix);
+  const surfaceInfraCap = (entry, pr, comments, failures, cap = infraRetryCap) => {
     entry.unownedRebaseInfraCapExhausted = true;
     entry.unownedRebaseInfraFailures = failures;
+    if (cap !== infraRetryCap) entry.unownedRebaseInfraCap = cap;
     const note = {
-      kind: 'round-cap-exhausted', prNumber: pr.number, attempts: failures, cap: infraRetryCap,
+      kind: 'round-cap-exhausted', prNumber: pr.number, attempts: failures, cap,
       capKind: 'unowned-mechanical-rebase-infra',
-      text: `PR #${pr.number}: unowned-mechanical-rebase-infra auto-repair rounds exhausted (${failures}/${infraRetryCap}) — a person must take it over`,
+      text: `PR #${pr.number}: unowned-mechanical-rebase-infra auto-repair rounds exhausted (${failures}/${cap}) — a person must take it over`,
     };
     const notePlan = planNoteComment(note, comments);
     if (!notePlan.alreadyPosted) {
@@ -1599,10 +1622,12 @@ export function watchParkedPrConflicts({
           results.push({ ...cardEntry, owner: 'fixer', routedTo: 'card-conflict-deferred (fix agent still live)' });
           continue;
         }
-        const infraFailures = countUnownedRebaseInfraFailures(comments, { ...unownedRebaseSettings.value, headSha: pr.headRefOid });
-        if (infraFailures >= infraRetryCap) {
-          surfaceInfraCap(cardInfraState, pr, comments, infraFailures);
-        } else if (countUnownedRebaseAggregateAttempts(comments) < UNOWNED_REBASE_ATTEMPT_CAP) {
+        const infraFailures = infraCountFor(pr)(comments);
+        const infraCap = grantedCap(pr, comments, infraRetryCap, infraFailures, infraCountFor(pr));
+        const cardAttempts = infraFailures >= infraCap ? 0 : attemptCount(comments);
+        if (infraFailures >= infraCap) {
+          surfaceInfraCap(cardInfraState, pr, comments, infraFailures, infraCap);
+        } else if (cardAttempts < grantedCap(pr, comments, UNOWNED_REBASE_ATTEMPT_CAP, cardAttempts, attemptCount)) {
           // Keep the conflict marker until rearm completes. A crash after push is recovered by the
           // newlyResolved branch, including a formerly accepted/queued or unowned card.
           provider.ensureLabel(resolvedRepo, CONFLICT_LABEL, CONFLICT_LABEL_META);
@@ -2128,18 +2153,23 @@ export function watchParkedPrConflicts({
             // Infrastructure failures also have their own (earlier-surfacing) budget, but never more runs than the
             // shared aggregate cap below allows.
             // Main's aggregate ceiling: content skips + infra failures share one cap over the whole history.
-            const attemptsSoFar = countUnownedRebaseAggregateAttempts(existingComments);
-            const infraFailures = countUnownedRebaseInfraFailures(existingComments, { ...unownedRebaseSettings.value, headSha: pr.headRefOid });
-            if (infraFailures >= infraRetryCap) {
+            // Operator round grants raise each cap only as "N more attempts from when the grant was posted".
+            const attemptsSoFar = attemptCount(existingComments);
+            const infraFailures = infraCountFor(pr)(existingComments);
+            const infraCap = grantedCap(pr, existingComments, infraRetryCap, infraFailures, infraCountFor(pr));
+            const attemptCap = infraFailures >= infraCap ? UNOWNED_REBASE_ATTEMPT_CAP
+              : grantedCap(pr, existingComments, UNOWNED_REBASE_ATTEMPT_CAP, attemptsSoFar, attemptCount);
+            if (infraFailures >= infraCap) {
               // A card-only unowned PR may already have surfaced this same snapshot above.
-              if (!entry.unownedRebaseInfraCapExhausted) surfaceInfraCap(entry, pr, existingComments, infraFailures);
-            } else if (attemptsSoFar >= UNOWNED_REBASE_ATTEMPT_CAP) {
+              if (!entry.unownedRebaseInfraCapExhausted) surfaceInfraCap(entry, pr, existingComments, infraFailures, infraCap);
+            } else if (attemptsSoFar >= attemptCap) {
               entry.unownedRebaseAttempts = attemptsSoFar;
               entry.unownedRebaseCapExhausted = true;
+              if (attemptCap !== UNOWNED_REBASE_ATTEMPT_CAP) entry.unownedRebaseAttemptCap = attemptCap;
               const note = {
-                kind: 'round-cap-exhausted', prNumber: pr?.number, attempts: attemptsSoFar, cap: UNOWNED_REBASE_ATTEMPT_CAP,
+                kind: 'round-cap-exhausted', prNumber: pr?.number, attempts: attemptsSoFar, cap: attemptCap,
                 capKind: 'unowned-mechanical-rebase',
-                text: `PR #${pr?.number}: unowned-mechanical-rebase auto-repair rounds exhausted (${attemptsSoFar}/${UNOWNED_REBASE_ATTEMPT_CAP}) — a person must take it over`,
+                text: `PR #${pr?.number}: unowned-mechanical-rebase auto-repair rounds exhausted (${attemptsSoFar}/${attemptCap}) — a person must take it over`,
               };
               const notePlan = planNoteComment(note, existingComments);
               if (!notePlan.alreadyPosted) {
