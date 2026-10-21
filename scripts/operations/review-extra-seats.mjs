@@ -56,6 +56,8 @@ import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '.
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
 import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { spawn, spawnSync } from 'node:child_process';
+import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
+import { readRun, writeRun } from './run-store.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync,
@@ -1825,6 +1827,25 @@ export function resolvedReplayPayload({ view, diffText, repo, cwd, run, enabled 
 
 // ── CLI ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
+/**
+ * The tail of a `run --background` seat process: record the seat timings the review job would have recorded had it
+ * stayed, then drop the loop file. Best effort and contained: a failure here is only a stderr line.
+ */
+export function finishBackgroundSeats({ result, runId, loopFile, io = { readRun, writeRun } }) {
+  try {
+    const rows = (Array.isArray(result?.seats) ? result.seats : []).filter((r) => r?.startedAt)
+      .map((r) => seatTiming({ ...r, verdict: r.seatVerdict ?? r.verdict ?? null }));
+    if (runId && rows.length) {
+      let run = io.readRun(runId);
+      for (const row of rows) run = withSeatTiming(run, row);
+      io.writeRun(run);
+    }
+  } catch (e) {
+    process.stderr.write(`review-extra-seats: seat timing write failed (${String(e?.message ?? e).slice(0, 200)})\n`);
+  }
+  try { if (loopFile) rmSync(loopFile, { force: true }); } catch { /* best effort */ }
+}
+
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
 if (IS_CLI) {
   const [sub, ...rest] = process.argv.slice(2);
@@ -1840,8 +1861,25 @@ if (IS_CLI) {
     process.stdout.write(`${JSON.stringify(result)}\n`);
   };
   if (sub === 'run' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
+    // `--background`: launched detached by the review job AFTER its verdict (so the job's review seat is free). The job
+    // no longer holds the result, so this process enforces the wall the job used to, records the seat timings the
+    // job used to record, and removes the loop file the job wrote. Nothing here can reach a verdict or label.
+    const background = rest.includes('--background');
+    if (background) {
+      const wall = setTimeout(() => { Promise.resolve(shutdownActiveSeats()).finally(() => process.exit(124)); },
+        resolveSeatTimeoutMs() + 5 * 60 * 1000);
+      wall.unref();
+    }
     runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() })
-      .then((result) => emit(result, renderSeatSummary));
+      .then((result) => {
+        emit(result, renderSeatSummary);
+        if (background) finishBackgroundSeats({ result, runId: flag('run-id'), loopFile: flag('loop-json') });
+      })
+      .catch((e) => {
+        process.stderr.write(`review-extra-seats: run failed: ${String(e?.message ?? e).slice(0, 300)}\n`);
+        if (background) finishBackgroundSeats({ result: null, runId: null, loopFile: flag('loop-json') });
+        process.exitCode = 1;
+      });
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
     runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post') })
       .then((result) => emit(result, renderRedTeamSummary));

@@ -276,7 +276,27 @@ export function laneCooloffActive(record, nowMs, cooloffMs = INFRA_RETRY_COOLOFF
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync } = {}) {
+export const EXTRA_SEATS_BACKGROUND_ENV = 'WE_REVIEW_EXTRA_SEATS_BACKGROUND';
+
+/** The advisory seats run detached after the verdict unless `WE_REVIEW_EXTRA_SEATS_BACKGROUND=0`. PURE. */
+export function backgroundExtraSeatsEnabled(env = process.env) {
+  return !/^(0|off|false|no)$/i.test(String(env?.[EXTRA_SEATS_BACKGROUND_ENV] ?? '').trim());
+}
+
+/** Detached, unref'd spawn whose stdout/stderr append to the job's own log; returns the child pid. */
+function defaultSpawnBackground({ argv, cwd, env, logPath }) {
+  const fd = openSync(logPath, 'a');
+  try {
+    const child = spawn(process.execPath, argv, { cwd, env, detached: true, stdio: ['ignore', fd, fd] });
+    child.unref();
+    return child.pid;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync,
+  spawnBackground = defaultSpawnBackground } = {}) {
   const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
     cwd: root,
     encoding: 'utf8',
@@ -361,9 +381,26 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     releaseLane: (slug) => node(['scripts/lane-pool.mjs', 'release', '--all-pools', `--session=${slug}`], { timeoutMs: 5 * 60 * 1000 }),
     // #4194 — the ADDED non-Claude seats, run in their own process AFTER the verdict is decided, under a hard wall.
     // Whatever happens in there comes back as a status; nothing here can throw into the arc.
-    runExtraSeats: ({ pr, repo, lanePath, loopPayload, slug }) => {
+    runExtraSeats: ({ pr, repo, lanePath, loopPayload, slug, runId = null }) => {
       if (!extraSeatsEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
       const loopFile = join(dir, `${slug}.loop.json`);
+      // Free the live-review seat at the verdict: the advisory seats run in their own detached process (own pid, not
+      // counted as a review round) and this job exits. `WE_REVIEW_EXTRA_SEATS_BACKGROUND=0` restores the inline run.
+      if (backgroundExtraSeatsEnabled(env)) {
+        try {
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(loopFile, JSON.stringify(loopPayload));
+          const pid = spawnBackground({
+            argv: ['scripts/operations/review-extra-seats.mjs', 'run', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`,
+              `--loop-json=${loopFile}`, '--background', ...(runId ? [`--run-id=${runId}`] : [])],
+            cwd: root, env, logPath: jobLogPath(slug, dir),
+          });
+          return { status: 'background', reason: `extra seats handed to a detached process${pid ? ` (pid ${pid})` : ''}; the job's review seat is free`, ...(pid ? { pid } : {}) };
+        } catch (e) {
+          try { rmSync(loopFile, { force: true }); } catch { /* best effort */ }
+          return { status: 'error', reason: `background launch failed: ${String(e?.message ?? e).slice(0, 250)}` };
+        }
+      }
       try {
         mkdirSync(dir, { recursive: true });
         writeFileSync(loopFile, JSON.stringify(loopPayload));
@@ -716,7 +753,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   if (seatsBox.input && typeof io.runExtraSeats === 'function') {
     let extraSeats;
     try {
-      extraSeats = io.runExtraSeats(seatsBox.input);
+      extraSeats = io.runExtraSeats({ ...seatsBox.input, runId: out.runId ?? null });
     } catch (e) {
       extraSeats = { status: 'error', reason: tail(e?.message ?? e, 300) };
     }
