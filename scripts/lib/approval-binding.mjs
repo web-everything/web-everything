@@ -39,15 +39,16 @@
  *   own switch (`review.humanClearanceCarryForward`).
  */
 import { cascadePolicy } from './policy-cascade.mjs';
+import { GH_ARGV, parseJsonLines } from './review-label-provider.mjs';
 import { readSettings } from './settings-files.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import {
-  parseReviewedShaMarker, parseReviewedDiff, parseReviewedContribution, parseOperatorClearance, clearanceBindsHead,
+  parseReviewedShaMarker, parseReviewedDiff, parseReviewedContribution, parseOperatorClearance, clearanceBindsHead, parseLatestHumanClearedSha,
 } from './review-escalation.mjs';
 
 export { clearanceBindsHead };
-import { compareCarryFingerprints } from './carry-equivalence.mjs';
-import { isNumberingTolerableLaterBody, resolveNumberingHumanClearanceSetting } from './numbering-carry.mjs';
+import { compareCarryFingerprints, ensureCommitReadable, liveCarryFingerprints, resolveCarryEquivalenceSetting, TRANSIENT_CARRY_PATHS } from './carry-equivalence.mjs';
+import { NUMBERING_SUBJECT_RE, MAX_NUMBERING_COMMITS, proveNumberingOnlyMove, isNumberingTolerableLaterBody, resolveNumberingHumanClearanceSetting } from './numbering-carry.mjs';
 import { resolveHumanClearanceCarrySetting } from './human-clearance-carry.mjs';
 import { laterReviewHold, isLaterVerdictBody } from './accept-carry-forward.mjs';
 
@@ -222,3 +223,161 @@ function evaluateClearance({
   return { covers: true, tier: 'numbering', base, reason: `numbering base ${base.slice(0, 9)} covered (${below.reason}); on top: ${proof.reason}` };
 }
 
+/**
+ * IO (read-only git): the contiguous run of drain numbering commits at the top of `liveHead` (single-parent, exact
+ * drain subject), proved commit-by-commit by numbering-carry's `proveNumberingOnlyMove` from the run's parent.
+ * @returns {{ok:boolean, base?:string, reason:string}}
+ */
+export function proveTopNumbering({ exec, liveHead, mainRef = 'origin/main', cwd, prove = proveNumberingOnlyMove } = {}) {
+  try {
+    if (typeof exec !== 'function' || !SHA40.test(String(liveHead ?? ''))) return { ok: false, reason: 'no git reader or head' };
+    const git = (args) => String(exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...(cwd ? { cwd } : {}) }) ?? '');
+    let at = liveHead;
+    let count = 0;
+    for (;;) {
+      const [sha, ...parents] = git(['rev-list', '-1', '--parents', at]).trim().split(/\s+/);
+      if (sha !== at || parents.length !== 1) break;
+      const subject = git(['log', '-1', '--format=%s', at]).replace(/\n$/, '');
+      if (!NUMBERING_SUBJECT_RE.test(subject)) break;
+      count += 1;
+      if (count > MAX_NUMBERING_COMMITS) return { ok: false, reason: `more than ${MAX_NUMBERING_COMMITS} numbering commits on top` };
+      at = parents[0];
+    }
+    if (!count) return { ok: false, reason: 'the live head is not a drain numbering commit' };
+    const proof = prove({ exec, fromSha: at, toSha: liveHead, mainRef, cwd });
+    return proof?.ok ? { ok: true, base: at, reason: proof.reason } : { ok: false, reason: proof?.reason || 'numbering proof refused' };
+  } catch (e) {
+    return { ok: false, reason: `numbering read failed: ${String(e?.message ?? e).split('\n')[0]}` };
+  }
+}
+
+/**
+ * IO: the trusted git-side injections for {@link clearanceCovers}. `readNetDiff(sha)` must be the pinned net-diff read
+ * (`merge-ai-prs.mjs#readNetDiffAtHead` — the same reader `review-set-label` stamps the clearance from) and return
+ * `{text, scored, rev}`; anything unscored, or a diff read at another commit, is unreadable.
+ */
+export function gitClearanceProofs({ exec, cwd, mainRef = 'origin/main', readNetDiff } = {}) {
+  const run = typeof exec === 'function' ? (cmd, args, opts) => exec(cmd, args, { ...(cwd ? { cwd } : {}), ...opts }) : null;
+  return {
+    fingerprintOf: (sha) => {
+      const net = typeof readNetDiff === 'function' ? readNetDiff(sha) : null;
+      if (!net?.scored || String(net.rev ?? '').toLowerCase() !== String(sha).toLowerCase()) return null;
+      const fp = liveCarryFingerprints(net.text);
+      return fp.diff || fp.contribution ? fp : null;
+    },
+    proveReplay: (fromSha, toSha) => (run ? proveTreeReplay({ exec: run, fromSha, toSha, mainRef }) : { ok: false, reason: 'no git reader' }),
+    numberingProof: (liveHead) => (run ? proveTopNumbering({ exec: run, liveHead, mainRef }) : { ok: false, reason: 'no git reader' }),
+  };
+}
+
+/**
+ * IO convenience for readers: the recorded clearance on `comments`, and whether it covers `liveHead`, under the
+ * resolved settings (logged once). `proofs` is {@link gitClearanceProofs} output (or a test double).
+ * @returns {{clearance:object|null, covers:boolean, tier?:string, reason:string}}
+ */
+export function readClearanceCoverage({ comments, liveHead, proofs = {}, settings = resolveClearanceBindingSettings(),
+  equivalence = 'contribution', reviews = undefined, log = (s) => process.stderr.write(s) } = {}) {
+  logClearanceBindingSettings(settings, log);
+  // bindTo=sha restores the parent behaviour exactly: only the LATEST accept-shaped record counts (a later plain accept
+  // hides an older clearance, `parseLatestHumanClearedSha`), and only at its own sha.
+  if ((settings?.bindTo?.value ?? 'fingerprint') !== 'fingerprint') {
+    const head = String(liveHead ?? '').toLowerCase();
+    const latest = parseLatestHumanClearedSha(comments);
+    const covers = !!latest && SHA40.test(head) && latest === head;
+    return { clearance: covers ? latestOperatorClearanceRecord(comments) : null, covers, liveHead: head,
+      ...(covers ? { tier: 'sha' } : {}), reason: covers ? 'the latest clearance names the live head' : `review.clearance.bindTo=${settings?.bindTo?.value}: sha binding only` };
+  }
+  const clearance = latestOperatorClearanceRecord(comments);
+  if (!clearance) return { clearance: null, covers: false, liveHead: String(liveHead ?? '').toLowerCase(), reason: 'no recorded operator clearance' };
+  const verdict = clearanceCovers({ clearance, liveHead, ...proofs, equivalence, reviews,
+    bindTo: settings?.bindTo?.value ?? 'fingerprint', normalizeNumbering: settings?.normalizeNumbering?.value !== false });
+  return { clearance, ...verdict };
+}
+
+/**
+ * IO (read-only git, one fetch of a missing object): the PR's net diff at `sha` vs its merge-base with `mainRef` — the
+ * exact command `merge-ai-prs.mjs#computeNetDiffText` runs on its merge-base basis (`git diff --no-ext-diff <base> <sha>`),
+ * so its fingerprints equal the ones `review-set-label` stamps. For readers that cannot load merge-ai-prs.mjs.
+ * @returns {{text:string, scored:boolean, rev:string|null, reason?:string}}
+ */
+export function gitNetDiffAt({ exec, sha, mainRef = 'origin/main' } = {}) {
+  const miss = (reason) => ({ text: '', scored: false, rev: null, reason });
+  try {
+    if (typeof exec !== 'function' || !SHA40.test(String(sha ?? '').toLowerCase())) return miss('no git reader or sha');
+    const readable = ensureCommitReadable({ exec, sha });
+    if (!readable.ok) return miss(readable.reason);
+    const git = (args) => String(exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) ?? '');
+    const base = git(['merge-base', '--end-of-options', mainRef, sha]).split('\n')[0].trim();
+    if (!SHA40.test(base)) return miss('merge-base unreadable');
+    const text = git(['-c', 'diff.relative=false', 'diff', '--no-ext-diff', '--no-relative', '--end-of-options', base, sha]);
+    return { text, scored: true, rev: String(sha).toLowerCase() };
+  } catch (e) { return miss(`net diff unreadable: ${String(e?.message ?? e).split('\n')[0]}`); }
+}
+
+/**
+ * IO: the whole coverage read for a reader with a git checkout of the repo (`cwd`, default the process's). Cheap when
+ * the sha rule already answers (no clearance, or it names the head): no git is run. Never throws.
+ */
+export function computeClearanceCoverage({ comments, liveHead, exec, cwd, mainRef = 'origin/main', readNetDiff = null,
+  settings, log, reviews = undefined } = {}) {
+  const head = String(liveHead ?? '').toLowerCase();
+  try {
+    const opts = { ...(settings ? { settings } : {}), ...(log ? { log } : {}), reviews };
+    const clearance = latestOperatorClearanceRecord(comments);
+    if (!clearance || clearance.sha === head || typeof exec !== 'function') return readClearanceCoverage({ comments, liveHead: head, ...opts });
+    const run = (cmd, args, o) => exec(cmd, args, { ...(cwd ? { cwd } : {}), ...o });
+    const reader = typeof readNetDiff === 'function' ? readNetDiff : (sha) => gitNetDiffAt({ exec: run, sha, mainRef });
+    return readClearanceCoverage({ comments, liveHead: head, proofs: gitClearanceProofs({ exec: run, mainRef, readNetDiff: reader }),
+      equivalence: resolveCarryEquivalenceSetting().value, ...opts });
+  } catch (e) {
+    return { clearance: null, covers: false, liveHead: head, reason: `clearance coverage unreadable: ${String(e?.message ?? e).split('\n')[0]}` };
+  }
+}
+
+/**
+ * IO: a lazy reader of a PR's formal reviews (the same `gh api …/reviews` read the label provider uses), for coverage
+ * callers that hold no review list. Throws on a miss; `clearanceCovers` turns that into "not covered".
+ */
+export function ghFormalReviewsReader({ exec, repo, pr } = {}) {
+  return () => {
+    if (typeof exec !== 'function' || !pr) throw new Error('no gh reader');
+    const out = exec('gh', GH_ARGV.readPrReviews(repo || '{owner}/{repo}', pr), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
+    const reviews = parseJsonLines(String(out ?? ''));
+    if (!Array.isArray(reviews)) throw new Error('formal reviews read returned no array');
+    return reviews;
+  };
+}
+
+/**
+ * IO (git): replay the cleared change onto the live head's merge-base with main and compare root trees with PLUMBING
+ * (`diff-tree -r -z --no-renames --ignore-submodules=none`, no relative/external/textconv), so no diff configuration or
+ * working directory can hide a changed path. Only the exact root `.lane-manifest.json` is ignored (the shared transient
+ * list). Any conflict, unreadable object or git failure refuses. `merge-tree --write-tree` writes only loose objects.
+ * @returns {{ok:boolean, reason:string}}
+ */
+export function proveTreeReplay({ exec, fromSha, toSha, mainRef = 'origin/main', transient = TRANSIENT_CARRY_PATHS } = {}) {
+  try {
+    if (typeof exec !== 'function' || !SHA40.test(String(fromSha ?? '')) || !SHA40.test(String(toSha ?? ''))) return { ok: false, reason: 'no git reader or head' };
+    const git = (args) => String(exec('git', ['-c', 'diff.relative=false', '-c', 'diff.noprefix=false', ...args],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) ?? '');
+    for (const sha of [fromSha, toSha]) { const r = ensureCommitReadable({ exec, sha }); if (!r.ok) return r; }
+    const oldBase = git(['merge-base', fromSha, mainRef]).trim();
+    const newBase = git(['merge-base', toSha, mainRef]).trim();
+    if (![oldBase, newBase].every((sha) => SHA40.test(sha))) return { ok: false, reason: 'replay merge bases unreadable' };
+    let output;
+    try { output = git(['merge-tree', '--write-tree', `--merge-base=${oldBase}`, newBase, fromSha]); } catch {
+      return { ok: false, reason: 'replaying the cleared change onto main conflicts' };
+    }
+    const tree = output.split('\n')[0].trim();
+    if (!SHA40.test(tree)) return { ok: false, reason: 'replay tree unreadable' };
+    const liveTree = git(['rev-parse', '--verify', `${toSha}^{tree}`]).trim();
+    if (!SHA40.test(liveTree)) return { ok: false, reason: 'live tree unreadable' };
+    if (tree === liveTree) return { ok: true, reason: `replay of ${fromSha.slice(0, 9)} onto main ${newBase.slice(0, 9)} reproduces ${toSha.slice(0, 9)} exactly` };
+    const raw = git(['diff-tree', '-r', '-z', '--no-renames', '--no-relative', '--ignore-submodules=none', '--name-only', tree, liveTree]);
+    const paths = raw.split('\0').filter((p) => p && !transient.includes(p));
+    if (paths.length || !raw.length) return { ok: false, reason: `the live head differs from the cleared change replayed onto main${paths.length ? ` in: ${paths.slice(0, 3).join(', ')}` : ''}` };
+    return { ok: true, reason: `replay of ${fromSha.slice(0, 9)} onto main ${newBase.slice(0, 9)} reproduces ${toSha.slice(0, 9)} (transient ignored: ${transient.join(', ')})` };
+  } catch (e) {
+    return { ok: false, reason: `replay proof failed: ${String(e?.message ?? e).split('\n')[0]}` };
+  }
+}
