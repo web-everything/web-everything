@@ -36,7 +36,7 @@ import { dirname, basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { mintInstallationToken, getInstallationInfo, readPrivateKeyRef, canReadPrivateKeyRef } from './github-app-token.mjs';
 import { readDeliveryIdentity, resolveRequestedRole, buildIdentityChain, ROLE_ENV, LEGACY_ROLE, shimRoleTable } from './github-app-identity.mjs';
-import { readGithubAuthPolicy } from './github-auth-policy.mjs';
+import { readGithubAuthPolicy, isDaemonCaller } from './github-auth-policy.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { installationMap, ownerOfSlug, remapLegacyInstallationId, installationCachePath } from './github-app-installations.mjs';
 
@@ -386,7 +386,9 @@ export async function ensureFreshGithubAppEnv({
   extraInstallations = true,
   perOwner = false,
   installShim = defaultInstallOwnerShim,
-  daemon = false,
+  // A caller that forgot `daemon` still gets the refusal shim when its env carries a daemon marker
+  // (launchd `XPC_SERVICE_NAME=com.we.*|com.plateau.*`, or `WE_GH_DAEMON_CALLER`).
+  daemon = isDaemonCaller(env),
   caller = defaultAuthCaller(process.argv, env),
   policy,
   canReadKey = mint === mintInstallationToken ? defaultCanReadKey : () => true,

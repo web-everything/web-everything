@@ -91,7 +91,7 @@ import { defaultCachePath, resolveGithubAppEnvConfig } from './github-app-auth-e
 import {
   OWNER_INSTALLATIONS, MOVED_REPO_OWNERS, canonicalOwner, installationMap, installationForOwner, ownerOfSlug, ownerFromRemoteUrl, ownerFromGhArgv, installationCachePath,
 } from './github-app-installations.mjs';
-import { readGhAuthPolicy } from './github-auth-policy.mjs';
+import { readGhAuthPolicy, isDaemonCaller } from './github-auth-policy.mjs';
 import { readSettings, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 import { primaryCheckout } from '../bootstrap-session.mjs';
 import { DEFAULT_CALLER_ROLES, roleForCaller, readDeliveryIdentity, shimRoleTable, ROLE_ENV } from './github-app-identity.mjs';
@@ -440,11 +440,8 @@ export function shimCallerScriptFromCommand(command) {
   return null;
 }
 
-/** PURE, inlined into the standalone shim. */
-export function isDaemonCaller(env = {}) {
-  return Boolean(env.WE_GH_DAEMON_CALLER)
-    || /^(com\.we\.|com\.plateau\.)/.test(String(env.XPC_SERVICE_NAME || ''));
-}
+// isDaemonCaller lives in github-auth-policy.mjs (github-app-auth-env.mjs needs it too); inlined into the shim below.
+export { isDaemonCaller };
 
 /** Use the same stable checkout selection as the throttle CLI. */
 export function defaultGithubAppRefreshCliPath(options) {

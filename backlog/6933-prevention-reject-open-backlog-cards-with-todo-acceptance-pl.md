@@ -15,7 +15,7 @@ PR #5729 advisory found daemon follow-up cards without executable acceptance. Ad
 ## Acceptance
 
 - [A1] **Executable** — Add `rejects open acceptance TODO placeholders`, parameterized for open/non-open status, CRLF, multiple criteria, quoted historical examples, Acceptance/Done when headings, and the next peer heading. The open placeholder fixture must fail against the current rule set and pass once the lint lands. Run `npm run test:unit -- <suite>` from the WE checkout, using the repository-relative path for suite `we:scripts/__tests__/check-standards-rules-backlog-integrity.test.mjs`.
-- [A2] **Executable** — Run scoped `npm run check:standards -- --files=<fixture-card>` with a malformed open card and then a completed card; assert a named error for the former and no placeholder error for the latter.
+- [A2] **Executable** — Add `scoped standards CLI rejects unfinished open acceptance` in the same suite: it runs the scoped standards CLI (`npm run check:standards -- --files=<fixture-card>`) on a malformed open card and then on a completed card, and asserts a named placeholder error for the former and no placeholder error for the latter.
 
 ## Non-goals
 

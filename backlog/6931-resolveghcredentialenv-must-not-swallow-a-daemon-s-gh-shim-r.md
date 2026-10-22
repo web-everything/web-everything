@@ -23,16 +23,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Changing the shim builder's own refusal, the org-aware/legacy shim contents, or the dispatch-path consumers (fixed separately in PR #5729's dispatch round).
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — n/a: only PATH entries and daemon markers are compared; nothing is parsed or executed.
+2. **Truncated reads** — n/a: no file or command output is read.
+3. **Shared state files** — The shared shim dir is written through `ensureGhShim` as before, once per open-pr run.
+4. **Fail closed** — A daemon builder throw or empty result refuses (`gh-auth-guard-unavailable`) before pre-PR review, dup scan or pr-land spawn.
+5. **Identity scoping** — Explicit `WE_GH_DAEMON_CALLER` and XPC-only `com.we.*`/`com.plateau.*` markers both count as daemon; interactive callers keep the fallback.
+6. **State over time** — Shim dir absent, later, or already first on PATH all end with the guard first, exactly once; an org-aware shim already first stays first.
+7. **Who wrote it** — The test drives the real land runner wiring (`createPrLandRunner`), not only the isolated helper.

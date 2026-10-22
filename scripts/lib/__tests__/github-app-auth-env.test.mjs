@@ -6,9 +6,10 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import {
   resolveGithubAppEnvConfig, isCacheFresh, ensureFreshGithubAppEnv, withGithubAppAuth,
   REFRESH_BUFFER_MS, defaultCachePath, findInstallationGaps, CACHE_VERSION, REQUIRED_APP_PERMISSIONS, REQUIRED_APP_REPOS,
@@ -769,5 +770,53 @@ describe('defaultInstallOwnerShim PATH precedence', () => {
     const once = env.PATH;
     await defaultInstallOwnerShim(env, opts);
     expect(env.PATH).toBe(once); // idempotent across ticks
+  });
+});
+
+// PR #5729 send-back — a daemon that forgets `daemon: true` (the drain did) still gets the refusal shim.
+describe('daemon mode defaults from the env markers', () => {
+  it('an XPC-only drain (com.plateau.drain-daemon, auth=app, no App identity) installs the refusal shim and gh auth token is refused', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'drain-gh-guard-'));
+    try {
+      const bin = join(work, 'bin');
+      mkdirSync(bin);
+      const invoked = join(work, 'gh-invoked');
+      writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho called >> '${invoked}'\necho fixture-personal-token\n`, { mode: 0o755 });
+      // node's own dir on PATH: the shim is a node script, and without it the shell's exit 127 would fake a refusal.
+      const env = { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, XPC_SERVICE_NAME: 'com.plateau.drain-daemon', GH_TOKEN: 'fixture-personal' };
+      // The real installer and shim, kept in the fixture dir; the owning checkout is absent, so policy is the daemon default.
+      const installShim = vi.fn((e, o) => defaultInstallOwnerShim(e, { ...o, dir: join(work, 'shim'), ghThrottleCliPath: join(work, 'scripts', 'lib', 'gh-throttle.mjs') }));
+      await ensureFreshGithubAppEnv({
+        ...NOOP_STATUS, env, caller: 'merge-ai-prs.mjs', identity: {}, policy: { auth: 'app' },
+        cachePath: join(work, 'cache.json'), installShim, log: { error() {} },
+      });
+      expect(installShim).toHaveBeenCalledTimes(1);
+      expect(env.PATH.split(':')[0]).toBe(join(work, 'shim'));
+      const r = spawnSync('gh', ['auth', 'token'], { env, encoding: 'utf8', timeout: 20000 });
+      expect(r.status).toBe(1);
+      expect(r.stdout).not.toContain('fixture-personal-token');
+      expect(existsSync(invoked)).toBe(false);
+    } finally { rmSync(work, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['explicit WE_GH_DAEMON_CALLER', { WE_GH_DAEMON_CALLER: 'drain' }, true],
+    ['XPC com.we.*', { XPC_SERVICE_NAME: 'com.we.pass-daemon' }, true],
+    ['XPC com.plateau.*', { XPC_SERVICE_NAME: 'com.plateau.drain-daemon' }, true],
+    ['no marker', {}, false],
+    ['a non-daemon XPC service', { XPC_SERVICE_NAME: 'application.com.apple.Terminal' }, false],
+  ])('with `daemon` omitted: %s', async (_name, marker, daemon) => {
+    const installShim = vi.fn(async () => ({ ok: false }));
+    const run = ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env: { PATH: '/usr/bin', ...marker }, caller: 'marker-test', identity: {}, policy: { auth: 'app' },
+      cachePath: '/fixture/missing-cache.json', installShim, log: { error() {} },
+    });
+    if (daemon) {
+      await expect(run).rejects.toThrow('refusing to run daemon without the gh auth guard');
+      expect(installShim).toHaveBeenCalledTimes(1);
+    } else {
+      await run;
+      expect(installShim).not.toHaveBeenCalled();
+    }
   });
 });

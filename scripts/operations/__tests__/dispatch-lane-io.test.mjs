@@ -1,6 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { createHash } from 'node:crypto';
-import { createTickReader, createDispatchSinks, reserveBuildLane } from '../dispatch-lane-io.mjs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
+import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 
 describe('the tick reader handoff', () => {
@@ -166,5 +170,79 @@ describe('x87v3ed — the build launch reserves its lane first', () => {
     });
     await expect(sinks[DISPATCH_EFFECT](payload, {})).rejects.toThrow();
     expect(released).toEqual([{ reserved: true, lane: 2, session: 'conveyor-5189' }]);
+  });
+});
+
+// PR #5729 — a daemon's gh refusal shim is its auth boundary: a dispatch that cannot install it never starts.
+describe('PR #5729 — daemon dispatch fails closed without the gh refusal shim', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const DAEMONS = [['explicit', { WE_GH_DAEMON_CALLER: 'review-daemon' }], ['XPC-only', { XPC_SERVICE_NAME: 'com.we.review-daemon' }]];
+  const payload = { num: '5189', launchKind: 'build', lane: 2, sessionSlug: 'conveyor-5189', scope: ['we:scripts/a.mjs'], prompt: 'brief' };
+  // A real gh on PATH (records any call) and a HOME whose `.claude` is read-only, so the shim-dir mkdir is EACCES.
+  function unwritableShimHome(marker) {
+    const dir = mkdtempSync(join(tmpdir(), 'dispatch-gh-guard-'));
+    const bin = join(dir, 'bin');
+    const claude = join(dir, 'home', '.claude');
+    mkdirSync(bin);
+    mkdirSync(claude, { recursive: true });
+    const invoked = join(dir, 'gh-invoked');
+    writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho called >> '${invoked}'\n`, { mode: 0o755 });
+    chmodSync(claude, 0o500);
+    vi.stubEnv('HOME', join(dir, 'home'));
+    vi.stubEnv('PATH', bin);
+    vi.stubEnv('WE_GH_DAEMON_CALLER', marker.WE_GH_DAEMON_CALLER ?? '');
+    vi.stubEnv('XPC_SERVICE_NAME', marker.XPC_SERVICE_NAME ?? '');
+    return { invoked, cleanup: () => { chmodSync(claude, 0o700); rmSync(dir, { recursive: true, force: true }); } };
+  }
+  const sinksWith = (provider) => createDispatchSinks({
+    root: '/Users/op/workspace/webeverything', mintSessionId: () => 'sess-1', now: () => new Date('2026-10-22T00:00:00Z'),
+    sessionCwdFor: () => '/tmp/scratch', ensureSessionCwd: (d) => d, resolveSettingsEnv: resolveDispatchSettingsEnv,
+    resolveLaneGrant: () => ({}), grantLanePermission: () => {}, ensureWorktreeIsolation: () => {},
+    reserveLane: () => ({ reserved: false }), releaseLane: () => {}, provider,
+  });
+
+  it.each(DAEMONS)('daemon dispatch refuses an unwritable shim dir before invoking the provider (%s)', async (_kind, marker) => {
+    const f = unwritableShimHome(marker);
+    try {
+      const provider = vi.fn(async () => 'handle-1');
+      const err = await sinksWith(provider)[DISPATCH_EFFECT](payload, {}).then(() => null, (e) => e);
+      expect(err?.message).toMatch(/dispatch refused: gh-shim: refusing daemon dispatch without the gh auth guard/);
+      expect(err?.notApplied).toBe(true); // definitely not started: retryable, never an UNKNOWN in-flight entry
+      expect(provider).not.toHaveBeenCalled();
+      expect(existsSync(f.invoked)).toBe(false);
+    } finally { f.cleanup(); }
+  });
+
+  it('an interactive dispatch keeps the best-effort fallback: the provider runs without shim settings', async () => {
+    const f = unwritableShimHome({});
+    try {
+      const provider = vi.fn(async () => 'handle-1');
+      await sinksWith(provider)[DISPATCH_EFFECT](payload, {});
+      expect(provider).toHaveBeenCalledTimes(1);
+      expect(provider.mock.calls[0][0].settingsEnv).toEqual(DISPATCH_BASH_TIMEOUT_ENV);
+    } finally { f.cleanup(); }
+  });
+
+  it.each(DAEMONS)('the prevention landing job refuses to spawn without the guard (%s)', (_kind, marker) => {
+    vi.stubEnv('WE_GH_DAEMON_CALLER', marker.WE_GH_DAEMON_CALLER ?? '');
+    vi.stubEnv('XPC_SERVICE_NAME', marker.XPC_SERVICE_NAME ?? '');
+    const spawnDetached = vi.fn(() => ({ pid: 4242 }));
+    const r = spawnPreventionLandingJob({ title: 't', kind: 'story', size: 1, digest: 'd', scope: 'we:x', queue: true }, {
+      spawnDetached, logPathFor: () => '/dev/null',
+      resolveSettingsEnv: () => { throw new Error('gh-shim: refusing daemon dispatch without the gh auth guard'); },
+    });
+    expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/refusing to spawn without the gh auth guard/) });
+    expect(spawnDetached).not.toHaveBeenCalled();
+  });
+
+  it('the prevention landing job stays fail-soft for an interactive caller', () => {
+    vi.stubEnv('WE_GH_DAEMON_CALLER', '');
+    vi.stubEnv('XPC_SERVICE_NAME', '');
+    const spawnDetached = vi.fn(() => ({ pid: 4242 }));
+    const r = spawnPreventionLandingJob({ title: 't', kind: 'story', size: 1, digest: 'd', scope: 'we:x', queue: true }, {
+      spawnDetached, logPathFor: () => '/dev/null', resolveSettingsEnv: () => { throw new Error('boom'); },
+    });
+    expect(r.ok).toBe(true);
+    expect(spawnDetached.mock.calls[0][1].settingsEnv).toBeNull();
   });
 });

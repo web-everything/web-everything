@@ -27,6 +27,12 @@
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
 
+/** PURE, inlined into the standalone gh shim (`gh-app-shim.mjs`). The one test for "this process is a daemon". */
+export function isDaemonCaller(env = {}) {
+  return Boolean(env.WE_GH_DAEMON_CALLER)
+    || /^(com\.we\.|com\.plateau\.)/.test(String(env.XPC_SERVICE_NAME || ''));
+}
+
 export const GITHUB_AUTH_MODES = Object.freeze(['app', 'personal']);
 export const GITHUB_AUTH_DEFAULTS = Object.freeze({ auth: 'app', personalExceptions: Object.freeze({}) });
 export const GITHUB_AUTH_ENV = 'WE_GITHUB_AUTH';

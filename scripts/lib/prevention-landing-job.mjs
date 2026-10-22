@@ -27,7 +27,7 @@
  */
 import { join } from 'node:path';
 import { defaultSpawnDetached, REPO_ROOT } from '../operations/detached-dispatch.mjs';
-import { buildGhShimSettingsEnv } from './gh-app-shim.mjs';
+import { buildGhShimSettingsEnv, isDaemonCaller } from './gh-app-shim.mjs';
 import { automationStateRoot } from './automation-home.mjs';
 
 /** The detached job every caller spawns — resolved by SCRIPT LOCATION, never `cwd` (which for every caller of
@@ -80,9 +80,13 @@ export function spawnPreventionLandingJob(input, {
   resolveSettingsEnv = () => buildGhShimSettingsEnv(),
   sessionPrefix = 'prevention-card',
 } = {}) {
-  // Resolver failure → `null` (the spawn still goes out, as it did before), never a thrown filing.
+  // Resolver failure → `null` (the spawn still goes out, as it did before), never a thrown filing — except for a
+  // daemon (PR #5729): its gh-guard refusal means no landing job is spawned without the shim.
   let settingsEnv = null;
-  try { settingsEnv = resolveSettingsEnv() || null; } catch { settingsEnv = null; }
+  try { settingsEnv = resolveSettingsEnv() || null; } catch (e) {
+    if (isDaemonCaller(process.env)) return { ok: false, num: null, rel: null, error: `land-prevention-card: refusing to spawn without the gh auth guard — ${String(e?.message || e)}` };
+    settingsEnv = null;
+  }
   const sessionSlug = `${sessionPrefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const argv = [
     runScript,
