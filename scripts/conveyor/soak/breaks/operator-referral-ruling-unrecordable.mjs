@@ -30,7 +30,8 @@ const CARD_FILE = 'backlog/5999-soak-follow-up-card.md';
 
 function cli(w, args) {
   try {
-    return { ok: true, out: execFileSync(process.execPath, args, { cwd: w.simCloneRoot, env: { ...process.env, ...w.env },
+    // These two commands are the operator's actions; daemon ticks retain the world's automation identity.
+    return { ok: true, out: execFileSync(process.execPath, args, { cwd: w.simCloneRoot, env: { ...process.env, ...w.env, FAKE_GH_ACTOR: 'chalbert' },
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 }) };
   } catch (e) {
     return { ok: false, out: `${e.stdout ?? ''}${e.stderr ?? ''}`.split('\n').filter(Boolean).slice(-3).join(' | ') || String(e.message) };

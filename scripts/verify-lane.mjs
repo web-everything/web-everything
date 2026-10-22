@@ -17,17 +17,12 @@
  *
  * The pure decision half (marker shape + the gate decision `pr-land` calls) lives in `scripts/lib/lane-verify.mjs`.
  *
- * THE DEFAULT GATE IS DIFF-DRIVEN (#3372). Rather than an unconditional `npm run test:unit`, the default gate
- * decides off the lane's actual `git diff` against `origin/main` via `scripts/readiness/test-selection.mjs`
- * (#2681), using its LOCAL policy (xpnhz4o, `decideLocalSelection`): the working-tree diff runs only
- * `npx vitest related <changed files + tests naming them>` (including shared helpers). A config/setup/dependency
- * change, a deleted source file, or an empty/unresolvable diff now requires an explicit affected-test gate;
- * the gate prints which of the two it chose, and why, before it starts. CI still runs the full suite.
- * See `scripts/lib/verify-lane-gate.mjs` for the decision core and why defaulting the shrink at THIS call site
- * does not conflict with #2681's own "not defaulted [on the CI merge gate]" DoD.
+ * The default build.finalGate is full: the whole unit tier plus standards, through heavy admission.
+ * Set build.finalGate=related to retain the diff-driven selection in lib/verify-lane-gate.mjs.
+ * Explicit --gate commands retain precedence. Settings and their sources are logged through policy-cascade.
  *
  * Usage:
- *   node scripts/verify-lane.mjs                      # run the default gate (diff-driven selection + check:standards; #3372) foreground, record green/red for HEAD
+ *   node scripts/verify-lane.mjs                      # run the default full gate (whole unit tier + check:standards) foreground, record green/red for HEAD
  *   node scripts/verify-lane.mjs --gate="npm run test:unit"   # override the suite command (skips diff-driven selection entirely)
  *   node scripts/verify-lane.mjs --repo=~/workspace/.lanes/web-everything/lane-3   # verify a specific lane clone
  *   node scripts/verify-lane.mjs run                  # xpnhz4o — run the SAME default gate foreground, but record NO marker (the fix/ci-heal gate)
@@ -60,6 +55,7 @@
  * accepted; 2 = red (suites failed — marker recorded red) / `check` verdict not-ok; 3 = usage / git error (no
  * marker written) / `request` refused because no verify daemon is alive / `reset` refused because a FOREIGN lease is live (own live lease no longer refuses, #3378).
  */
+import { resolveBuildPolicy } from './lib/build-policy.mjs';
 import { redFirstWarning } from './lib/tests-first-policy.mjs';
 import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mjs';
@@ -350,6 +346,29 @@ const SELECTED_TEST_COMMAND = /^npx vitest (?:related|run) /;
 // `run` is the fix / ci-heal reproduce-and-confirm gate (`gateFor`): a card-only PR is CI-red exactly when CI's full
 // check:standards fails on a card, so `run` must execute the real gate. Only the marker-producing modes skip.
 const ALLOW_CARD_ONLY_SKIP = MODE !== 'run';
+resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
+// The DEFAULT gate under the build policy. `build.finalGate=full` runs the whole unit tier plus standards, but it is
+// still the default gate, not an explicit `--gate`: its green feeds the ledger, and the marker keeps the diff's
+// changed files for red-cause attribution. It runs no selected-test half (`testCommand`), so no phase, scan or
+// isolated retry built for a selection applies. Any other policy keeps the diff-driven selection.
+function resolveBuildDefaultGate(env) {
+  if (resolveBuildPolicy({ env }).finalGate !== 'full') {
+    return resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
+  }
+  const scripts = readCheckoutScripts();
+  const tests = !scripts || scripts.includes('test:unit') ? 'npm run test:unit' : 'npm test';
+  const command = tests + (!scripts || scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+  let changedFiles = null;
+  try {
+    // Untracked lane litter is not the change's own (the same rule as the diff selection).
+    const diff = localChangedSet({ runGit: git });
+    const untracked = new Set(diff?.untrackedFiles ?? []);
+    changedFiles = diff ? diff.changedFiles.filter((p) => !untracked.has(p) || !isAllowlistedLitterPath(p)) : null;
+  } catch { /* unknown diff: no attribution */ }
+  const reason = 'build.finalGate=full — the whole unit tier plus standards';
+  return { command, gateReasons: [reason], decision: { mode: 'full', reasons: [reason], changedFiles,
+    selectionMode: { mode: 'pr', reason: 'build.finalGate=full' } } };
+}
 let GATE;
 let resolvedGate;
 if (typeof flags.gate === 'string') {
@@ -379,7 +398,7 @@ if (typeof flags.gate === 'string') {
     }
   }
 } else {
-  const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
+  const resolved = resolveBuildDefaultGate(process.env);
   if (resolved.decision.mode === 'blocked') emit({ sha: headSha, status: 'selection-required', reason: 'local-selection-bound', ok: false, redCause: 'refused', redCauseFiles: [], detail: describeGate(resolved) }, 3);
   GATE = resolved.command;
   resolvedGate = resolved;
@@ -393,7 +412,7 @@ if (typeof flags.gate === 'string') {
 let admissionFallback = null;
 if (!resolvedGate && typeof flags.gate === 'string') {
   try {
-    const resolveUnder = (env) => resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
+    const resolveUnder = resolveBuildDefaultGate;
     const resolved = resolveUnder(process.env);
     if (resolved.command === GATE) resolvedGate = resolved;
     // The requester (an agent session, often on an older lane base) resolves its default gate under ITS settings,
@@ -401,9 +420,17 @@ if (!resolvedGate && typeof flags.gate === 'string') {
     // and (#66) the related-test mode or timeout factor. If the stamped command is exactly what some declared
     // variant resolves to for this same diff, it is still the default gate: run the requester's selection with
     // OUR standards policy, and keep `GATE` (the marker's `suites`) as requested so the cache key still matches.
+    // The requester may also resolve the other `build.finalGate` (its own env, or a lane base from before the
+    // setting): a stamped selection under our `full`, or a stamped full gate under our `related`, is still a default.
     else if (MODE === 'verify' && typeof flags['run-id'] === 'string') {
-      resolvedGate = matchRequestedDefaultGate({ gate: GATE, env: process.env, resolved, resolveUnder,
-        variants: verifySetting('matchRequestVariants', process.env) }) ?? undefined;
+      const variants = verifySetting('matchRequestVariants', process.env);
+      const ours = resolveBuildPolicy({ env: process.env }).finalGate === 'full' ? 'full' : 'related';
+      for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {
+        const env = finalGate === ours ? process.env : { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
+        const base = finalGate === ours ? resolved : resolveUnder(env);
+        resolvedGate = (base.command === GATE ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
+        if (resolvedGate) break;
+      }
     }
   } catch { /* Unknown selection cannot authorize a retry. */ }
   // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into

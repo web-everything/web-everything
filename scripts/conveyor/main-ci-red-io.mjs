@@ -289,8 +289,16 @@ async function defaultGates() {
   return { killed, fixGate };
 }
 
-/** Start the owner session through the declared dispatch-lane sink. */
-export async function defaultDispatchOwner({ prompt, sessionSlug }) {
+/**
+ * The ci-heal owner session OPENS a repair PR, so it must play the worker App role. health-watch runs as the
+ * read-only `observer`, so the session gets an explicit worker env on every identity channel (settings file,
+ * spawn env, wrapper env) through the sink's `spawnEnv`. process.env is never mutated: concurrent health-watch
+ * work and overlapping dispatches keep their own role.
+ */
+export const ownerSpawnEnv = (env = process.env) => ({ ...env, WE_GITHUB_APP_ROLE: 'worker' });
+
+/** Start the owner session through the declared dispatch-lane sink. `sinkOptions` is a test seam; production passes none. */
+export async function defaultDispatchOwner({ prompt, sessionSlug }, sinkOptions = {}) {
   const io = await import('../operations/dispatch-lane-io.mjs');
   const { DISPATCH_EFFECT } = await import('../operations/dispatch-lane.mjs');
   const { dispatchModesFromEnv } = await import('../operations/dispatch-provider-registry.mjs');
@@ -298,7 +306,7 @@ export async function defaultDispatchOwner({ prompt, sessionSlug }) {
   const route = routeAvailableCiHeal({ scope: [], reason: 'main-red' });
   if (route?.outcome === 'refused') return { held: true, reason: route.refusal ?? 'route refused' };
   // A main fix has no PR: force the `claude --bg` brief path (the mechanical ci-heal wrapper needs a PR) and no probation worker.
-  const sinks = io.createDispatchSinks({ root: io.REPO_ROOT, modes: { ...dispatchModesFromEnv(), 'ci-heal': 'agent' }, extraArgs: io.agentArgsFromEnv() });
+  const sinks = io.createDispatchSinks({ root: io.REPO_ROOT, modes: { ...dispatchModesFromEnv(), 'ci-heal': 'agent' }, extraArgs: io.agentArgsFromEnv(), spawnEnv: ownerSpawnEnv(), ...sinkOptions });
   const out = await sinks[DISPATCH_EFFECT]({
     launchKind: 'ci-heal', prompt, sessionSlug, lane: null, scope: [], pr: null, reason: 'main-red', repo: 'we',
     probationWorker: null, routing: route ? { ...route, probationWorker: null } : null,
