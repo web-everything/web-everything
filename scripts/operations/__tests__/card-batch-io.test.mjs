@@ -95,8 +95,13 @@ function recoveryEvidence(f, sealed, scenario) {
   if (scenario === 'non-card path') metadata.cardPath = 'config.json';
   if (scenario === 'nested backlog path') metadata.cardPath = 'backlog/nested/5192-card.md';
   if (scenario === 'card prefix mismatch') metadata.cardPath = 'backlog/5193-card.md';
+  // A sidecar-style `rb-…` id must never vouch for an ordinary top-level path (Codex audit, 2026-10-21).
+  if (scenario === 'sidecar id on a card path') {
+    member.cardId = metadata.cardId = 'rb-5192-1-aaaaaaaaaaaaaaaaaaaaaaaa';
+    metadata.cardPath = 'backlog/rb-5192-1-aaaaaaaaaaaaaaaaaaaaaaaa-oops.md';
+  }
   git(f.remote, ['read-tree', f.baseSha]);
-  const path = ['non-card path', 'nested backlog path', 'card prefix mismatch'].includes(scenario) ? metadata.cardPath : originalPath;
+  const path = ['non-card path', 'nested backlog path', 'card prefix mismatch', 'sidecar id on a card path'].includes(scenario) ? metadata.cardPath : originalPath;
   const content = scenario === 'non-UTF8 bytes' ? Buffer.from([0xff])
     : scenario === 'oversized output' ? Buffer.alloc(16 * 1024 * 1024 + 1, 'x') : Buffer.from('committed evidence\n');
   const blob = git(f.remote, ['hash-object', '-w', '--stdin'], { input: content }).trim();
@@ -122,7 +127,7 @@ function mutantProbe(f, replacements, probe) {
     expect(source.split(before)).toHaveLength(2);
     source = source.replace(before, after);
   }
-  for (const specifier of ['./card-batch.mjs', '../lib/automation-home.mjs']) {
+  for (const specifier of ['./card-batch.mjs', '../lib/automation-home.mjs', '../lib/card-batch-policy.mjs']) {
     source = source.replace(`'${specifier}'`, JSON.stringify(new URL(specifier, moduleURL).href));
   }
   const path = join(f.root, 'mutant.mjs');
@@ -219,6 +224,19 @@ describe('durable card batch IO', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('closed recovery respools an also-raised sidecar member under its rb- id (never dropped)', async () => {
+    const f = fixture();
+    const rel = 'backlog/raised-by/5192/77-bbbbbbbbbbbbbbbbbbbbbbbb.md';
+    mkdirSync(join(f.laneDir, 'backlog/raised-by/5192'), { recursive: true });
+    writeFileSync(join(f.laneDir, rel), '- Also raised by o/r#77 (finding 1: `we:x.mjs:1` — note)\n');
+    const sidecar = { ...f.card(), cardPath: rel, cardId: 'rb-5192-77-bbbbbbbbbbbbbbbbbbbbbbbb', idemKey: `prevention-raised-by:${rel}` };
+    expect((await admitCard(sidecar, f.options)).action).toBe('admit');
+    writeFileSync(f.statePath, JSON.stringify({ ...f.state(), sealedAt: new Date(f.now()).toISOString(), pr: 5272, seal: { step: 'label-on-green' } }));
+    expect((await admitCard(f.card('5193'), { ...f.options, gh: async () => '{"number":5272,"headRefName":"lane/card-batch-prevention-1","state":"CLOSED"}', log: () => {} })).action).toBe('admit');
+    expect(JSON.parse(readFileSync(join(f.stateDir, `pending-prevention/${sidecar.cardId}.json`), 'utf8')))
+      .toMatchObject({ cardId: sidecar.cardId, rel, idemKey: sidecar.idemKey });
+  });
+
   it('closed recovery preserves committed content after worktree edits', async () => {
     const f = fixture();
     const first = f.card();
@@ -234,7 +252,7 @@ describe('durable card batch IO', () => {
     'extra changed file', 'symlink', 'executable', 'repo mismatch', 'cardPath mismatch',
     'non-UTF8 bytes', 'duplicate marker', 'invalid marker', 'missing marker',
     'non-card path', 'nested backlog path', 'card prefix mismatch', 'cardId mismatch',
-    'idemKey mismatch', 'kind mismatch', 'batchRef mismatch', 'oversized output',
+    'idemKey mismatch', 'kind mismatch', 'batchRef mismatch', 'oversized output', 'sidecar id on a card path',
   ])('closed recovery refuses invalid evidence: %s', async scenario => {
     const f = fixture();
     await admitCard(f.card(), f.options);

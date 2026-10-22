@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { setImmediate } from 'node:timers/promises';
 import { mergeMembers, planAdmit } from './card-batch.mjs';
 import { automationStateRoot } from '../lib/automation-home.mjs';
+import { raisedBySidecarId } from '../lib/card-batch-policy.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 /**
@@ -136,7 +137,7 @@ export function retireBatch(statePath, state, { repo, kind, held, terminalPrStat
 }
 
 /** Recover closed batch members from their immutable coordinator commits, never from worktree text.
- * Must refuse on unreadable evidence. Docs/config/data outside top-level cards remain ineligible.
+ * Must refuse on unreadable evidence. Docs/config/data outside top-level cards and raised-by sidecars remain ineligible.
  * No receive endpoint is added: bounded gh/git output, a timed lookup and the lease bound recovery triggers.
  */
 function respoolClosed(state, input, stateDir, remote, held) {
@@ -146,7 +147,7 @@ function respoolClosed(state, input, stateDir, remote, held) {
   const main = git(['rev-parse', 'FETCH_HEAD^{commit}']).trim();
   git(['fetch', '--no-tags', remote, `refs/heads/${state.batchRef}`]);
   const entries = state.members.map(member => {
-    if (!COMMIT_ID.test(member.commitSha) || !/^[a-z0-9]+$/.test(member.cardId)
+    if (!COMMIT_ID.test(member.commitSha) || !/^(?:[a-z0-9]+|rb-[a-z0-9]+-\d+-[a-f0-9]{24})$/.test(member.cardId)
       || member.source?.repo !== input.source.repo) throw new Error('invalid member identity');
     const lines = git(['show', '-s', '--format=%B', member.commitSha]).split('\n').filter(line => line.startsWith(MARKER));
     if (lines.length !== 1) throw new Error('invalid member evidence');
@@ -156,8 +157,10 @@ function respoolClosed(state, input, stateDir, remote, held) {
     if (changed.length !== 3 || changed[0] !== 'A' || changed[1] !== data.cardPath) throw new Error('invalid card change');
     if (data.cardId !== member.cardId || data.idemKey !== member.idemKey || data.kind !== input.kind
       || data.source?.repo !== input.source.repo || data.batchRef !== state.batchRef
-      || !/^backlog\/[a-z0-9]+-[a-z0-9-]+\.md$/.test(data.cardPath)
-      || !data.cardPath.startsWith(`backlog/${member.cardId}-`)) throw new Error('invalid member evidence');
+      // A raised-by sidecar ("also raised" note) is keyed by its own `rb-…` id; a card by its `<id>-` prefix.
+      || (raisedBySidecarId(data.cardPath) ? raisedBySidecarId(data.cardPath) !== member.cardId
+        : (!/^[a-z0-9]+$/.test(member.cardId) || !/^backlog\/[a-z0-9]+-[a-z0-9-]+\.md$/.test(data.cardPath)
+          || !data.cardPath.startsWith(`backlog/${member.cardId}-`)))) throw new Error('invalid member evidence');
     if (git(['ls-tree', main, '--', data.cardPath]).trim()) return null;
     if (!git(['ls-tree', member.commitSha, '--', data.cardPath]).startsWith('100644 blob ')) throw new Error('invalid card mode');
     const bytes = git(['show', `${member.commitSha}:${data.cardPath}`], { encoding: 'buffer' });

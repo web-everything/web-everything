@@ -6,6 +6,10 @@
     "batchFiling": true,
     "batchWindowMinutes": 60,
     "batchMaxCards": 25,
-    "batchLeaseWaitMinutes": 15
+    "batchLeaseWaitMinutes": 15,
+    "alsoRaised": {
+      "$comment": "route: where an 'also raised' note (a raised-by sidecar for an existing open card) goes. batch (standard) = into the rolling prevention batch PR, or the pending spool when the batch cannot take it now; single = kill switch, one PR per filing (lane/<id>-prevention-card). Cascade: standard batch -> platform prevention.alsoRaised.route -> repo (here) -> env WE_PREVENTION_ALSO_RAISED_ROUTE=batch|single. The filer logs the winning value and its source.",
+      "route": "batch"
+    }
   }
 }
