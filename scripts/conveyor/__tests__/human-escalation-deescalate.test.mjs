@@ -166,6 +166,13 @@ describe('planHumanDeescalation', () => {
     const items = [added(BOT, -900_000), { ...added('chalbert', -300_000), change: 'removed' }, added()];
     expect(plan({ timeline: { status: 'ok', items }, pr: { comments: [held, pendingRecord()] } }).action).toBe('deescalate');
   });
+  it('a review:human event with no readable actor → kept; only the operator\'s removal answers earlier causes', () => {
+    const held = bot(`Card extraction held for a person: x.\n\n${buildHumanEscalationMarker({ kind: K.CARD_EXTRACTION_HELD })}\n`, -600_000);
+    const nullActor = [added(BOT, -900_000), { ...added(BOT, -300_000), change: 'removed', actor: null }, added()];
+    expect(plan({ timeline: { status: 'ok', items: nullActor }, pr: { comments: [held, pendingRecord()] } }).reason).toMatch(/no readable actor/);
+    const other = [added(BOT, -900_000), { ...added('someone-else', -300_000), change: 'removed' }, added()];
+    expect(plan({ timeline: { status: 'ok', items: other }, pr: { comments: [held, pendingRecord()] } }).action).toBe('keep');
+  });
   it('an added=no record never explains an add, even of a clearable kind', () => {
     const noop = bot(`Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: x.\n\n${buildHumanEscalationMarker({ kind: K.REFERRAL_LEDGER_SYNC_FAILED, head: HEAD, added: false })}`, 20_000);
     expect(plan({ pr: { comments: [noop] } }).reason).toMatch(/no escalation record/);

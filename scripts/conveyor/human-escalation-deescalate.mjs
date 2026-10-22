@@ -182,6 +182,8 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   if (timeline?.status !== 'ok' || !Array.isArray(timeline.items)) return keep(`label timeline unreadable (${timeline?.reason ?? 'no read'})`);
   if (!timeline.items.every(i => i && typeof i.label === 'string' && ['added', 'removed'].includes(i.change) && Number.isFinite(time(i.createdAt))))
     return keep('label timeline has a malformed event');
+  if (timeline.items.some(i => i.label === REVIEW_LABELS.human && (typeof i.actor !== 'string' || !i.actor)))
+    return keep('a review:human label event has no readable actor');
   const last = timeline.items.filter(i => i.label === REVIEW_LABELS.human).at(-1);
   if (!last || last.change !== 'added') return keep('label timeline does not end in a review:human add');
   if (!isAutomationLogin(last.actor)) return keep(`review:human added by ${last.actor ?? 'an unknown actor'} (hand or unproven label)`);
@@ -196,7 +198,9 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   if (escalations.some(e => !Number.isFinite(time(e.createdAt)))) return keep('an escalation record has no readable time');
   // Every escalation recorded since the operator last took the label off counts (all time if never): a cause
   // recorded long before this add (a hold whose own label write came later, a resumed writer) still holds.
-  const handRemoval = timeline.items.filter(i => i.label === REVIEW_LABELS.human && i.change === 'removed' && !isAutomationLogin(i.actor)).at(-1);
+  // Only the OPERATOR's own removal answers earlier causes; an unknown or other actor never does.
+  const handRemoval = timeline.items.filter(i => i.label === REVIEW_LABELS.human && i.change === 'removed'
+    && OPERATOR_LOGINS.includes(login(i.actor))).at(-1);
   const windowStart = handRemoval ? time(handRemoval.createdAt) : -Infinity;
   // A record from an earlier label lifecycle (before the last removal) never explains this add.
   const lastLabel = timeline.items.lastIndexOf(last);
