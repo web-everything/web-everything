@@ -46,14 +46,15 @@ export const GIT_RUN_TIMEOUT_MS = Number.isFinite(envTimeoutMs) && envTimeoutMs 
  * The canonical git runner. `spawnSync` (NOT execFileSync) so a non-zero exit — `merge-tree` on conflict is
  * exit 1, expected — is RETURNED, not thrown.
  *   `opts.env`      merged over `process.env` (carries `GIT_INDEX_FILE` for the temp-index pattern).
+ *   `opts.inheritEnv` false uses the exact supplied environment (credential-pinned recovery pushes).
  *   `opts.input`    stdin — required by `git hash-object --stdin`. Dropping this is exactly #2923.
  *   `opts.cwd`      run in a SIBLING clone instead of `process.cwd()` (#2263).
  *   `opts.encoding` `'buffer'` returns `stdout` as raw bytes (never utf8-decoded) — required to read blob
  *                   content byte-exact so non-UTF-8 blobs are detected, not lossily coerced to U+FFFD.
  *   `opts.timeoutMs` maximum runtime in milliseconds (defaults to `GIT_RUN_TIMEOUT_MS`).
  */
-export function gitRun(cmd, args, { env, input, cwd, encoding = 'utf8', timeoutMs = GIT_RUN_TIMEOUT_MS } = {}) {
-  const r = spawnSync(cmd, args, { encoding, input, timeout: timeoutMs, killSignal: 'SIGKILL', env: env ? { ...process.env, ...env } : process.env, ...(cwd ? { cwd } : {}) });
+export function gitRun(cmd, args, { env, input, cwd, encoding = 'utf8', inheritEnv = true, timeoutMs = GIT_RUN_TIMEOUT_MS } = {}) {
+  const r = spawnSync(cmd, args, { encoding, input, timeout: timeoutMs, killSignal: 'SIGKILL', env: inheritEnv ? (env ? { ...process.env, ...env } : process.env) : env, ...(cwd ? { cwd } : {}) });
   const empty = encoding === 'buffer' ? Buffer.alloc(0) : '';
   const timedOut = r.error?.code === 'ETIMEDOUT' || (r.signal && r.status == null);
   const stderr = r.stderr == null ? '' : String(r.stderr);

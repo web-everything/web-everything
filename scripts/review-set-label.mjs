@@ -1,10 +1,11 @@
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
 import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
+import { savedRedTeamFallback } from './lib/drain-saved-red-team.mjs';
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
-import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
+import { readReviewRunEvidence, readReviewRunHeads, REVIEW_RUN_STORE_MISSING } from './conveyor/review-referral-hold.mjs';
 /**
  * review-set-label.mjs — swap a PR's review label, INVARIANT-2 guarded (#2470, increment 2 of 2). Also the
  * SINGLE HOME of the shared review-label CLI harness (#2644): a PURE `decideSetLabel` decides the swap for a
@@ -954,10 +955,10 @@ export function runApprovalPreventionFiling({
       // Where a landing job that fails after spawning posts its retraction (`fileApprovalPreventionCard`).
       retractTo: { repo, pr, headSha },
     });
-  if (!filed.ok) {
+  if (filed.skipped || !filed.ok) {
     process.stderr.write(
       `review-set-label: approval-time prevention filing for ${subject} FAILED (the approval above already `
-      + `landed and is UNAFFECTED) — ${filed.error}\n`,
+      + `landed and is UNAFFECTED) — ${filed.error ?? filed.reason}\n`,
     );
     return;
   }
@@ -989,10 +990,10 @@ export function runApprovalPreventionFiling({
  * standing-ruling scope (PR #5758), so an automatic grant that reopened the send-back counts exactly as it does in the
  * gate: the fixer then owns the break and there is no ruling to clear. Unreadable scope = no automatic credit.
  */
-export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting, readGrantScope = standingRulingScope }) {
+export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting, readGrantScope = standingRulingScope, readSaved = null }) {
   let standingRuling = null;
   try { standingRuling = readGrantScope({ repo, pr: { number: Number(pr), headRefOid: headSha, comments } }) ?? null; } catch { standingRuling = null; }
-  return redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels, comments }, setting, { repo, standingRuling }) !== null;
+  return redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels, comments }, setting, { repo, standingRuling, readSaved }) !== null;
 }
 
 /**
@@ -1431,7 +1432,13 @@ export function runReviewLabelCli({
   };
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
-    && redTeamRulingHeld({ repo, pr, headSha, labels: currentLabels, comments: fullThread(), setting: readConfirmedBreaks().value, readGrantScope });
+    && redTeamRulingHeld({ repo, pr, headSha, labels: currentLabels, comments: fullThread(), setting: readConfirmedBreaks().value, readGrantScope,
+      // The gate holds a break decided on saved evidence when its comment was withheld; the ruling clears that too.
+      readSaved: () => {
+        try { return savedRedTeamFallback({ repo, pr, head: headSha })(); }
+        catch (e) { return fail(`saved red-team evidence unreadable — nothing was changed: ${e.message}`, 1); }
+      },
+    });
   let decision = decideSetLabel({
     to,
     currentLabels,
@@ -2535,7 +2542,8 @@ export function referralEvidenceCarry({ runs = [], repo, pr, head, readNetDiff =
   const mine = (Array.isArray(runs) ? runs : []).filter(r => r && r.repo === repo && r.pr === Number(pr));
   if (mine.some(r => r.head === head)) return null;
   const prior = [...mine].sort((a, b) => b.completedAt - a.completedAt)[0];
-  if (!prior || prior.persistenceFailed || prior.parked || (prior.pending ?? []).length) return null;
+  // PR #5520 — a run under a chosen id (`custom`) never stands in as the clean review, here or on the head it reviewed.
+  if (!prior || prior.custom || prior.persistenceFailed || prior.parked || (prior.pending ?? []).length) return null;
   let before, after;
   try { before = readNetDiff(prior.head); after = readNetDiff(head); } catch { return null; }
   if (!before?.scored || !after?.scored) return null;
@@ -2555,13 +2563,19 @@ export function renderReferralCarryRecord(carry) {
 }
 
 export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable,
-  env = process.env, readRuns = readReviewRunEvidence, readNetDiff = readNetDiffAtSha, carry = true } = {}) {
+  env = process.env, readRuns = readReviewRunEvidence,
+  // An injected `readRuns` is its own run store: its runs carry `head` too, so it answers this read as well.
+  readRunHeads = readRuns === readReviewRunEvidence ? readReviewRunHeads : readRuns,
+  readNetDiff = readNetDiffAtSha, carry = true } = {}) {
   const context = referralLiveContext(state, { repo, pr, cardReadable,
     seatDisabled: seat => referralSeatDisabled(seat, env) });
   const result = mandatoryReferralState(state.comments, context);
   const head = state.headRefOid;
   const mine = r => r.repo === repo && r.pr === Number(pr) && r.head === head;
   const current = repo && pr ? result.records.filter(mine) : [];
+  // PR #5520 operator send-back — a run under a chosen `--run-id` is tagged `custom` (only the id `newRunId` mints is
+  // trusted). It is still this head's newest review when it is newest, so the lost-referral check below applies to
+  // it, but it never counts as the completed clean review that clears the hold.
   const last = repo && pr ? readRuns().filter(r => r.repo === repo && r.pr === Number(pr) && r.head === head)
     .sort((a, b) => b.completedAt - a.completedAt)[0] : undefined;
   // The newest review of this head failed to persist its referrals: only a record written at or after that
@@ -2582,7 +2596,7 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
   // Old heads' holds are not carried onto a new head — but only because that head's own review took their place.
   // With no record for this head, that review must be PROVEN complete and clean by a run record; the absence of a
   // failure marker is not evidence (the run store is local and can be missing, pruned or on another machine).
-  if (!current.length && !(last && !last.persistenceFailed && !last.parked && !last.pending.length)) {
+  if (!current.length && !(last && !last.custom && !last.persistenceFailed && !last.parked && !last.pending.length)) {
     const older = result.records.filter(r => r.head !== head && (!repo || !pr || (r.repo === repo && r.pr === Number(pr))));
     const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head, records: result.records, operatorRulings: result.operatorRulings }); return [...s.pending, ...s.blocked]; });
     if (held.length) {
@@ -2595,13 +2609,28 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
       // #4708 — a head move that changed nothing (the drain's rebase; strict net diff byte-identical) carries the
       // latest earlier head's completed CLEAN review as this head's evidence. Not a pass: that head's own verdict is
       // re-evaluated live (its records, rulings and persistence check), so a hold standing on it still refuses.
-      const carried = carry ? referralEvidenceCarry({ runs: readRuns(), repo, pr, head, readNetDiff }) : null;
+      // PR #5520 — `readRuns` holds only runs that finished `advise`. A run that reviewed this head and never finished
+      // (a failed publication effect, a crash) still reviewed it, so no carry may stand in for it.
+      // A missing store is not proof that nobody reviewed this head: it gets its own code, which no carry overrides.
+      let storeMissing = false;
+      const reviewed = Boolean(last) || (() => {
+        try { return readRunHeads().some(mine); }
+        catch (e) { if (e?.code !== REVIEW_RUN_STORE_MISSING) throw e; storeMissing = true; return false; }
+      })();
+      const carryRuns = carry && !reviewed && !storeMissing ? readRuns() : [];
+      const carried = carryRuns.length ? referralEvidenceCarry({ runs: carryRuns, repo, pr, head, readNetDiff }) : null;
       if (carried) {
         const verdict = assertMandatoryReferralsCleared({ ...state, headRefOid: carried.fromHead },
-          { repo, pr, cardReadable, env, readRuns, readNetDiff, carry: false });
+          { repo, pr, cardReadable, env, readRuns, readRunHeads, readNetDiff, carry: false });
         return { ...verdict, carry: carried };
       }
-      throw new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`);
+      // Numbering may supply evidence only for a head nobody reviewed. A parked, pending or
+      // unfinished run shares this message, but must never be overridden by that carry.
+      throw Object.assign(new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`), {
+        // A run may have appeared on the carry's fresh read after `last` was read.
+        code: storeMissing ? 'MANDATORY_REFERRAL_RUN_STORE_MISSING'
+          : reviewed || carryRuns.some(mine) ? 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' : 'MANDATORY_REFERRAL_NO_REVIEW_RUN',
+      });
     }
   }
   if (result.pending.length || result.blocked.length) {

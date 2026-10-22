@@ -448,6 +448,7 @@ describe('matchReadyCandidate — pure', () => {
     treeOf: () => 'T2',
     stillWanted: () => true,
     verifyBuilt: () => true,
+    liveApplied: [], // the running build H applies no overlay (the live-retention rule has nothing to keep)
     nowMs: 1_000_000 + 60_000,
     maxAgeMs: 3_600_000,
     ...over,

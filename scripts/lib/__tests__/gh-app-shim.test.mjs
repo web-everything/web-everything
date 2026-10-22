@@ -25,7 +25,7 @@ import { attributeSpend } from '../gh-spend.mjs';
 import {
   defaultShimDir, shimGhPath, resolveRealGhBinary, renderGhShimScript, ensureGhShim, ghShimPathOverride,
   buildGhShimSettingsEnv, looksLikeAppTokenAuthFailure, ensureSettingsFileEnv, ensureSettingsFilePermissions, sanitizeSpawnEnv,
-  defaultGhThrottleCliPath, checkoutShimDir, shimCallerScriptFromCommand,
+  defaultGhThrottleCliPath, checkoutShimDir, shimCallerScriptFromCommand, isDaemonCaller, defaultGithubAppRefreshCliPath,
 } from '../gh-app-shim.mjs';
 
 const CONFIGURED_ENV = {
@@ -969,5 +969,168 @@ process.exitCode = ${mode === 'failure' ? 7 : 0};
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('daemon personal-auth fallback guard', () => {
+  it.each([
+    [{}, false], [{ WE_GH_DAEMON_CALLER: '' }, false],
+    [{ WE_GH_DAEMON_CALLER: 'review' }, true],
+    [{ XPC_SERVICE_NAME: 'com.we.review' }, true],
+    [{ XPC_SERVICE_NAME: 'com.plateau.worker' }, true],
+    [{ XPC_SERVICE_NAME: 'com.other.worker' }, false],
+  ])('detects daemon markers %j', (env, expected) => {
+    expect(isDaemonCaller(env)).toBe(expected);
+  });
+
+  it('resolves refresh in the same stable checkout as throttle', () => {
+    const options = { root: '/w/.lanes/web-everything/lane-12', env: { WE_CONTROL_CLONE: '/srv/control' }, exists: () => true, realpath: (p) => p };
+    expect(defaultGithubAppRefreshCliPath(options)).toBe(defaultGhThrottleCliPath(options).replace('gh-throttle.mjs', 'github-app-refresh-cli.mjs'));
+  });
+
+  function fixture({ refresh = 'missing', fresh = false, reject = false, policy } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-daemon-refuse-'));
+    const gh = join(dir, 'real-gh');
+    const invoked = join(dir, 'invoked');
+    const cache = join(dir, 'worker.123.json');
+    const cacheBase = join(dir, 'worker.json');
+    const shim = join(dir, 'shim.cjs');
+    const refreshCliPath = join(dir, 'refresh.cjs');
+    const calls = join(dir, 'refresh-calls');
+    // Only synthetic fixture credentials are used by the fake CLI.
+    const entry = { v: 2, installationId: '123', appId: '2', token: 'fixture-role', expiresAt: new Date(Date.now() + (fresh ? 3600e3 : 60e3)).toISOString() };
+    writeFileSync(cache, JSON.stringify(entry));
+    writeFileSync(gh, `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(invoked)}, 'called\\n');\n${reject ? "process.stderr.write('HTTP 401: Bad credentials'); process.exitCode = 1;" : "process.stdout.write(process.env.GH_TOKEN === 'fixture-role' ? 'role' : 'personal');"}\n`);
+    chmodSync(gh, 0o755);
+    if (refresh !== 'missing') writeFileSync(refreshCliPath, `require('node:fs').appendFileSync(${JSON.stringify(calls)}, 'once\\n');\n${refresh === 'success' ? `require('node:fs').writeFileSync(${JSON.stringify(cache)}, ${JSON.stringify(JSON.stringify({ ...entry, expiresAt: new Date(Date.now() + 3600e3).toISOString() }))});` : 'process.exitCode = 1;'}\n`);
+    writeFileSync(shim, renderGhShimScript({ realGhPath: gh, cachePath: join(dir, 'legacy.json'), ghThrottleCliPath: join(dir, 'missing-throttle'), refreshCliPath,
+      roleTable: { worker: { cachePath: cacheBase, installations: { 'web-everything': '123' } } },
+      personalFallbackPolicy: policy ?? { personalFallback: 'refuse', source: { personalFallback: 'default' } },
+    }));
+    const run = (extra = {}) => spawnSync(process.execPath, [shim, 'pr', 'list', '-R', 'chalbert/web-everything'], {
+      cwd: dir, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: dir, WE_GH_DAEMON_CALLER: 'test-daemon', ...extra },
+    });
+    return { dir, cache, run, invoked, calls };
+  }
+
+  it.each(['missing', 'failure'])('refuses stale caches when refresh is %s, without invoking gh', (refresh) => {
+    const f = fixture({ refresh });
+    try {
+      const r = f.run();
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('REFUSING personal-auth fallback for daemon caller "test-daemon" (role worker, owner web-everything)');
+      expect(r.stderr).toContain('source: default');
+      expect(existsSync(f.invoked)).toBe(false);
+      if (refresh === 'failure') expect(readFileSync(f.calls, 'utf8')).toBe('once\n');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it('refreshes once on demand and re-reads the worker installation cache', () => {
+    const f = fixture({ refresh: 'success' });
+    try {
+      const r = f.run();
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toBe('role');
+      expect(r.stderr).not.toContain('personal-auth');
+      expect(r.stderr).not.toContain('personal auth');
+      expect(readFileSync(f.calls, 'utf8')).toBe('once\n');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it('preserves interactive fallback and does not mint', () => {
+    const f = fixture({ refresh: 'success' });
+    try {
+      const r = f.run({ WE_GH_DAEMON_CALLER: '' });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toBe('personal');
+      expect(r.stderr).toContain('using personal auth for this call');
+      expect(existsSync(f.calls)).toBe(false);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it('invalidates a rejected App cache and refuses the inherited-auth retry', () => {
+    const f = fixture({ fresh: true, reject: true });
+    try {
+      const r = f.run();
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('REFUSING');
+      expect(r.stderr).toContain('App token rejected');
+      expect(readFileSync(f.invoked, 'utf8')).toBe('called\n');
+      expect(existsSync(f.cache)).toBe(false);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { GH_TOKEN: 'fixture-personal' },
+    { GH_TOKEN: 'fixture-personal', WE_GH_AUTH_TOKEN_HASH: 'wrong-hash' },
+    { WE_GH_DAEMON_CALLER: '', XPC_SERVICE_NAME: 'com.we.review' },
+    { WE_GH_DAEMON_CALLER: '', XPC_SERVICE_NAME: 'com.plateau.worker' },
+  ])('refuses untrusted inherited auth or launchd-only daemon %j', (extra) => {
+    const f = fixture();
+    try {
+      const r = f.run(extra);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('REFUSING');
+      expect(existsSync(f.invoked)).toBe(false);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses an owner with no configured installation', () => {
+    const f = fixture({ fresh: true });
+    try {
+      const r = f.run({ GH_REPO: 'unmapped/repo' });
+      // The explicit -R remains authoritative; rewrite only this fixture invocation for an unmapped owner.
+      const shim = join(f.dir, 'shim.cjs');
+      const unknown = spawnSync(process.execPath, [shim, 'pr', 'list', '-R', 'unmapped/repo'], {
+        cwd: f.dir, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: f.dir, WE_GH_DAEMON_CALLER: 'test-daemon' },
+      });
+      expect(r.status, r.stderr).toBe(0);
+      expect(unknown.status).toBe(1);
+      expect(unknown.stderr).toContain('owner unmapped');
+      expect(unknown.stderr).toContain('no installation for owner unmapped');
+      expect(readFileSync(f.invoked, 'utf8')).toBe('called\n');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it('delivers the daemon marker in dispatched shim settings', () => {
+    const env = buildGhShimSettingsEnv({ env: { ...CONFIGURED_ENV, WE_GH_DAEMON_CALLER: 'review-daemon' },
+      dir: '/fixture/shim', pathEnv: '/bin', exists: () => true, writeFile() {}, chmod() {}, mkdir() {},
+    });
+    expect(env.WE_GH_DAEMON_CALLER).toBe('review-daemon');
+  });
+
+  it('refresh CLI emits just a safe one-line failure with no configured App', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-refresh-cli-'));
+    try {
+      const r = spawnSync(process.execPath, [join(process.cwd(), 'scripts/lib/github-app-refresh-cli.mjs'), '--role=worker'], {
+        encoding: 'utf8', env: { PATH: process.env.PATH, HOME: dir, WE_DELIVERY_IDENTITY: 'none', WE_POLICY_CASCADE_LOG: '1' },
+      });
+      expect(r.status).toBe(1);
+      expect(r.stdout).toBe('applied=false reason=not-configured role=unknown\n');
+      expect(r.stderr).toBe('');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('honors a runtime allow override and reports its source', () => {
+    const f = fixture();
+    try {
+      const r = f.run({ WE_GH_AUTH_PERSONAL_FALLBACK: 'allow' });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toBe('personal');
+      expect(r.stderr).toContain('personal-auth fallback allowed');
+      expect(r.stderr).toContain('ghAuth.personalFallback=allow (source: env)');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it('passes through a daemon-minted inherited App token with matching provenance', async () => {
+    const { createHash } = await import('node:crypto');
+    const f = fixture();
+    try {
+      const r = f.run({ GH_TOKEN: 'fixture-role', WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update('fixture-role').digest('hex') });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toBe('role');
+      expect(r.stderr).not.toContain('REFUSING');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 });

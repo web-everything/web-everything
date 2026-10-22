@@ -27,7 +27,11 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Enabled production-wiring cases must not depend on the prototype's committed filing pause.
+beforeEach(() => vi.stubEnv('WE_PREVENTION_FILING_ENABLED', 'true'));
+afterEach(() => vi.unstubAllEnvs());
 
 import { createRegistry } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
@@ -374,6 +378,21 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
   const stubFileItem = (num = 9001, rel = 'backlog/9001-file-the-guard.md') => async () => ({
     code: 0,
     lines: [JSON.stringify({ verdict: { num, rel, kind: 'story', status: 'open' } })],
+  });
+
+  it('a paused prevention filer holds the run with a non-success exit and no acceptance or false filing receipt', async () => {
+    const { declaration, registry } = registryFor({});
+    const seen = [];
+    const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(),
+      sinks: recordingSinks(seen), makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'r-paused',
+      findFiledPrevention: () => null,
+      fileItem: async () => ({ code: 0, lines: [JSON.stringify({ skipped: true, reason: 'filing paused' })] }),
+    });
+    expect(out.code).toBe(1);
+    expect(out.stopped).toBe('confirm');
+    expect(out.run.findings.confirm).not.toBe('accept');
+    expect(seen.map(s => s.type)).not.toContain(REVIEW_EFFECTS.LABEL);
+    expect(out.lines.join('\n')).toContain('filing paused');
   });
 
   it('files ONE backlog card via file-item, then completes the run as an accept — no learnings-pool notice at all', async () => {

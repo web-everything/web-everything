@@ -46,6 +46,7 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
+import { reconcileCardBatches, resolveReconcileIntervalMin } from '../operations/card-batch-reconcile.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
@@ -69,6 +70,7 @@ import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns 
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runDailyReadinessCheck, ledgerReadinessHistoryPath } from '../lib/ledger-readiness-daily.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
+import { runBundleRepairs } from './bundle-repair-dispatch.mjs';
 import {
   planFileRequests, recordRequested, readLedgerStrict, writeLedger, spliceFilingSection, withLedgerLock,
 } from './health-file-request.mjs';
@@ -658,8 +660,8 @@ export function probeLaneJournal({ poolRoot, now = Date.now(), windowMs = 24 * 6
   return out;
 }
 
-function run(cmd, args, { timeoutMs = CHILD_TIMEOUT_MS, cwd = REPO_ROOT } = {}) {
-  return execFileSync(cmd, args, { cwd, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+function run(cmd, args, { timeoutMs = CHILD_TIMEOUT_MS, cwd = REPO_ROOT, env = process.env, stderr = 'pipe' } = {}) {
+  return execFileSync(cmd, args, { cwd, env, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', stderr] });
 }
 
 /** `machine-overload`'s own process snapshot: every live process, BSD/macOS `ps` column order
@@ -989,8 +991,13 @@ export function probeBgIsolationStalls(agents, { readInfo = readBgIsolationStall
  * other child call in this file.
  * @returns {{observedAt:string, records:Array<object>, gaps:string[]}}
  */
-export function probeStaleState({ exec = run, timeoutMs = 90_000, repoRoot = REPO_ROOT } = {}) {
-  const out = exec(process.execPath, [join(repoRoot, 'scripts/operations/run.mjs'), 'stale-state', '--json'], { timeoutMs, cwd: repoRoot });
+export function probeStaleState({ exec = run, timeoutMs = 90_000, repoRoot = REPO_ROOT, laneScanDir = healthDir(), laneScanWrite = true } = {}) {
+  const out = exec(process.execPath, [join(repoRoot, 'scripts/operations/run.mjs'), 'stale-state', '--json'], {
+    timeoutMs, cwd: repoRoot, stderr: 'inherit', env: { ...process.env,
+      WE_HEALTH_WATCH_LANE_SCAN: '1', WE_HEALTH_WATCH_LANE_SCAN_DIR: laneScanDir || '',
+      WE_HEALTH_WATCH_LANE_SCAN_WRITE: laneScanWrite ? '1' : '0',
+    },
+  });
   return JSON.parse(out).verdict;
 }
 
@@ -1020,7 +1027,7 @@ export { GH_GROUP_PROBE_NAMES };
  * checkout itself (backlog, review jobs, the stale-state CLI) must name the real clone, never the snapshot.
  * @returns {{probes: object, errors: Record<string, string>}}
  */
-export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false } = {}) {
+export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false, laneScanDir = healthDir(), laneScanWrite = true } = {}) {
   const probes = {};
   const errors = {};
   const attempt = (name, fn) => {
@@ -1051,7 +1058,7 @@ export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skip
   if (agents && !skipBuildSessions) probes.buildSessions = attempt('buildSessions', () => probeBuildSessions(agents, { nowMs: now, prs: prs || [] }));
   // stale-claim's two probes ride the same 'gh' cadence (both are gh/git-heavy reads); independent of the
   // prs/agents pairing above — one failing never blocks the other.
-  const staleState = attempt('staleState', () => probeStaleState({ repoRoot: sourceRoot }));
+  const staleState = attempt('staleState', () => probeStaleState({ repoRoot: sourceRoot, laneScanDir, laneScanWrite }));
   if (staleState) probes.staleState = staleState;
   const mergedPrs = attempt('mergedPrs', () => probeMergedPrs({ repoRoot: sourceRoot }));
   if (mergedPrs) probes.mergedPrs = mergedPrs;
@@ -1110,6 +1117,15 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
 
   if (sweepAllowed && config.tmpSweepEnabled) attempt('reviewTmp', () => sweepReviewTmp({ tmpRoot: flags['tmp-sweep-root'] || tmpdir(), config, now, dryRun: !!flags['dry-run'] }));
 
+  const cardBatchReconcile = !flags['state-root'] && !flags['dry-run']
+    && cadenceDue(prev.cardBatchReconcile?.completedAt, now, resolveReconcileIntervalMin() * 60_000)
+    ? await attempt('cardBatchReconcile', async () => {
+      const results = await reconcileCardBatches({ now });
+      const failures = results.filter(result => result.action === 'error');
+      if (failures.length) throw new Error(failures.map(result => result.reason).join('; '));
+      return { completedAt: now };
+    }) : null;
+
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
   const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);
@@ -1132,9 +1148,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   if (nightlyCoronerTickAllowed(flags, coronerSettings.value)) {
     const coroner = await attempt('nightlyCoronerJob', async () => {
       const out = await (deps.runNightlyCoronerJob ?? runNightlyCoronerJob)({ now, config: coronerSettings.value, settings: coronerSettings, dir });
-      // A terminal job failure already has its own event and health subject. Only supervisor/config
-      // errors count toward the probe streak; reading a failed job successfully is a healthy probe.
-      const errors = coronerSettings.errors;
+      const errors = [...coronerSettings.errors, ...(out.failures ?? [])];
       if (errors.length) probeErrors.nightlyCoronerJob = scrubText(errors.join('; '));
       return out;
     });
@@ -1295,6 +1309,9 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // `ghProbes` job switch on, it runs as a detached durable job (we:scripts/conveyor/health-watch-job.mjs) and
   // this tick only consumes a finished job's result; otherwise it runs inline, exactly as before. A dry run or a
   // fixture tick never touches the host job store (a test supplies its own store through `deps.ghJobs`).
+  // Fixtures without a state root and bare dry runs must never write the host cache.
+  const laneScanDir = flags['state-root'] ? dir : (fixtureTick || flags['dry-run'] || Object.keys(flags).some(key => key.endsWith('-fixture'))) ? null : dir;
+  const laneScanWrite = !!laneScanDir;
   const jobsAllowed = (!fixtureTick || !!deps.ghJobs) && !flags['dry-run'] && !flags['no-gh'];
   const ghJobsOn = jobsAllowed && resolveHealthJobSwitches(config).ghProbes;
   // Switched off with job state left behind (a rollback): still reconcile — reattach, consume, never queue — so an
@@ -1304,7 +1321,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   if (ghJobsOn || reconcileOnly) {
     const out = await attempt('ghJob', () => runGhProbeJobs({
       ...(deps.ghJobs || {}), now, due: ghJobsOn && ghDue, state: prev.jobs, drain: reconcileOnly,
-      input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'] },
+      input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite },
     }));
     if (out) {
       jobsState = reconcileOnly && !out.summary.remaining ? undefined : out.state;
@@ -1319,7 +1336,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     }
   }
   if (!ghJobsOn && ghDue && !ghFromJob) {
-    const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'] });
+    const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite });
     Object.assign(probes, got.probes);
     Object.assign(probeErrors, got.errors);
     if (got.probes.prs && got.probes.agents) ghCache.at = now;
@@ -1377,6 +1394,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       }, { now }));
     }
   }
+  if (cardBatchReconcile) state.cardBatchReconcile = cardBatchReconcile;
+  else if (prev.cardBatchReconcile) state.cardBatchReconcile = prev.cardBatchReconcile;
   if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };
   else if (prev.tmpSweep) state.tmpSweep = prev.tmpSweep;
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);
@@ -1444,6 +1463,16 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
         closedEpisodes: result.transitions.filter((t) => t.type === 'closed').map((t) => t.episode),
       });
     } catch (e) { probeErrors.investigate = scrubText(String(e?.message || e).split('\n')[0]); }
+  }
+
+  // Bundle repair (prototype, 2026-10-21) — a daemon clone held on its last-good build by an overlay conflict gets ONE
+  // supervised repair session (or, in shadow, the brief it would launch). Off unless `bundleRepair.enabled`; its own
+  // failure is a probe error, never a failed tick. A fixture tick never touches it unless a test supplies the seam.
+  let bundleRepair = null;
+  if (!flags['no-bundle-repair'] && (!flags['state-root'] || deps.runBundleRepairs) && Array.isArray(probes.selfSync)) {
+    try {
+      bundleRepair = await (deps.runBundleRepairs ?? runBundleRepairs)({ dir, selfSync: probes.selfSync, now, dryRun: !!flags['dry-run'] });
+    } catch (e) { probeErrors.bundleRepair = scrubText(String(e?.message || e).split('\n')[0]); }
   }
 
   // #4079 — filing requests (slice 5): plan which open episodes get a NEW filing request this tick and append
@@ -1573,7 +1602,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   return scrubDeep({
     now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs, ghJob,
     claudeJobsArchive: claudeJobsArchive ?? null, tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
-    plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
+    plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, bundleRepair, reports: written,
     section: renderHealthSection(state, { now, reportDir }),
     skipped: result.evaluations.filter((e) => !e.results).map((e) => ({ smell: e.smell.id, missing: e.skipped, error: e.error })),
   });

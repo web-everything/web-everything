@@ -30,6 +30,7 @@ import { closeSync, openSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { admitCard, cardBatchStateDir, sealJobEnv } from './card-batch-io.mjs';
+import { STEP_MIN_MS, budgetError, isBudgetError } from '../lib/tick-deadline.mjs';
 import { bypassesBatch } from '../lib/card-batch-policy.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { effectiveCardBatchPolicy, formatCardBatchSettings, loadCardBatchSettings, formatPreventionBatchSettings, loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
@@ -59,7 +60,7 @@ export function cardIdOf(cardPath) {
   return match ? match[1] : null;
 }
 
-const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 }).trim();
+const git = (cwd, args, timeout) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, ...(timeout ? { timeout, killSignal: 'SIGKILL' } : {}) }).trim();
 
 /** Start the detached seal worker: it opens/refreshes the batch PR and seals at the count limit. Never waits. */
 export function launchSealJob(statePath, { spawn = spawnChild, open = openSync } = {}) {
@@ -82,6 +83,9 @@ export async function fileIntoBatch({
 }, {
   settings = loadCardBatchSettings(), preventionSettings = loadPreventionBatchSettings(), admit = admitCard, launch = launchSealJob, stateDir = cardBatchStateDir(),
   baseSha, log = (line) => console.error(line), retries = 5, pause = (ms) => new Promise((done) => setTimeout(done, ms)),
+  // In-tick callers pass `deadline` ({left()}): the lease wait, the fetch and every git call in the admission are capped at the time
+  // left, and a card the remaining time cannot cover is refused as retryable (the caller keeps it in the spool / owed).
+  deadline,
 } = {}) {
   log(kind === 'prevention' ? formatPreventionBatchSettings(preventionSettings) : formatCardBatchSettings(settings));
   const policy = effectiveCardBatchPolicy(settings, preventionSettings);
@@ -89,11 +93,15 @@ export async function fileIntoBatch({
   if (!decision.batch) return { batched: false, reason: decision.reason, ...(kind === 'prevention' ? { disabled: true } : {}) };
   const cardId = cardIdOf(cardPath);
   if (!cardId) return { batched: false, reason: `not a top-level backlog card: ${cardPath}`, ...(kind === 'prevention' ? { disabled: true } : {}) };
+  // Checked before ANY git call (fetch / rev-parse included): an expired budget starts nothing.
+  if (deadline && deadline.left() < STEP_MIN_MS.admit) return { batched: false, retryable: true, reason: 'tick budget exhausted before admission' };
   try {
     const repo = source.repo ?? CONSTELLATION_REPOS.we.slug;
     const base = baseSha ?? (() => {
-      try { git(laneDir, ['fetch', '--no-tags', '-q', 'origin', 'main']); } catch { /* fall back to the lane's last fetch */ }
-      return git(laneDir, ['rev-parse', 'origin/main^{commit}']);
+      // In-tick each call is refused once the budget is gone (no fresh floor), capped at the time left, and killed with SIGKILL.
+      const cap = (max) => { if (!deadline) return undefined; if (deadline.left() < 1_000) throw budgetError('git'); return Math.min(max, deadline.left()); };
+      try { git(laneDir, ['fetch', '--no-tags', '-q', 'origin', 'main'], cap(30_000)); } catch (error) { if (isBudgetError(error)) throw error; /* else fall back to the lane's last fetch */ }
+      return git(laneDir, ['rev-parse', 'origin/main^{commit}'], cap(Infinity));
     })();
     const input = {
       kind, cardPath, cardId, idemKey: idemKey ?? `card:${cardId}`, baseSha: base, laneDir,
@@ -102,10 +110,16 @@ export async function fileIntoBatch({
     // Concurrent filers serialize on the coordinator's lease. An admission or body refresh holds it for seconds,
     // so a contended filer tries again a bounded number of times. A long hold (a seal running verify) outlasts
     // these attempts, and the caller decides how to retain the refused card (prevention filers spool it).
-    let result = await admit(input, { stateDir, policy });
+    if (deadline && deadline.left() < STEP_MIN_MS.admit) return { batched: false, retryable: true, reason: 'tick budget exhausted before admission' };
+    const admitOptions = { stateDir, policy, ...(deadline ? { deadline } : {}) };
+    let result = await admit(input, admitOptions);
     for (let attempt = 1; attempt <= retries && result.action === 'refuse' && RETRYABLE.has(result.reason); attempt += 1) {
+      // The lease wait is min(configured, time left): no further attempt once another one cannot fit.
+      // The gap itself must fit too, so no sleep can run past the deadline however many retries are configured.
+      if (deadline && deadline.left() < STEP_MIN_MS.admit + 2_000 * attempt + 1_000) break;
       await pause(2_000 * attempt);
-      result = await admit(input, { stateDir, policy });
+      if (deadline && deadline.left() < STEP_MIN_MS.admit) break;
+      result = await admit(input, admitOptions);
     }
     if (result.action === 'refuse') return { batched: false, reason: `coordinator refused: ${result.reason}`, ...(kind === 'prevention' ? { retryable: true } : {}) };
     const statePath = join(stateDir, `${repo.replaceAll('/', '-')}-${kind}.json`);
