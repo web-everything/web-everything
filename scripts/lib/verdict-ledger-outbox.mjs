@@ -425,7 +425,9 @@ function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined, d
   if (dedupeAlso && (!ALLOWED_LEDGER_BRANCHES.includes(dedupeAlso) || dedupeAlso === branch)) throw new Error(`verdict-ledger-outbox: bad dedupe ref ${dedupeAlso}`);
   if (fence && (fence.branch === branch || !ALLOWED_LEDGER_BRANCHES.includes(fence.branch))) throw new Error(`verdict-ledger-outbox: bad fence ref ${fence.branch}`);
   const fetchArgs = dedupeAlso
-    ? ['fetch', '--quiet', '--prune', 'origin', trackingRefspec(branch), ledgerFetchRefspec(dedupeAlso)]
+    // `--no-prune` (after the remote, overriding any `fetch.prune` config): a ledger-only ref deleted on the remote keeps
+    // its last fetched copy here, so its rows are still deduped against and absorbed, never silently dropped (round 5).
+    ? ['fetch', '--quiet', 'origin', '--no-prune', trackingRefspec(branch), ledgerFetchRefspec(dedupeAlso)]
     : fence ? ['fetch', '--quiet', 'origin', trackingRefspec(branch), trackingRefspec(fence.branch)]
       : ['fetch', '--quiet', 'origin', trackingRefspec(branch)];
   retryTransientGit(() => run(fetchArgs, { cwd: board, env }), sleep ? { sleep } : {});

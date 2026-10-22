@@ -15,7 +15,7 @@ import {
   ledgerPushRefFor, ledgerFetchRefspec, LEGACY_LEDGER_BRANCH, DEFAULT_LEDGER_ONLY_BRANCH, LEDGER_REF_ENV, LEDGER_CUTOVER_ENV,
   LEDGER_RETIRED_OLD_TREE_ENV,
 } from '../verdict-ledger-ref.mjs';
-import { appendLedgerRows, readLedgerFromGit, ledgerGitPath } from '../verdict-ledger-io.mjs';
+import { appendLedgerRows, readLedgerFromGit, ledgerGitPath, createGitLedgerStore } from '../verdict-ledger-io.mjs';
 import { buildVerdictRecord } from '../verdict-ledger.mjs';
 import { planMigration, applyMigration, CANDIDATE_REF } from '../../verdict-ledger-migrate.mjs';
 import { withBareOrigin, git } from '../../operations/__tests__/helpers/real-repo.mjs';
@@ -250,6 +250,33 @@ describe('real git: dual read + writer switch + migration', () => {
       expect(read(ctx, cfg({ cutover: 'on' })).status).toBe('unreadable');
       expect(() => append(ctx, [3], cfg({ cutover: 'on' }))).toThrow();
       expect(originHas(ctx, NEW)).toBe(false); // a writer never re-creates it
+    });
+  });
+
+  it('cutover off: a ledger-only ref deleted on the remote keeps its rows (no prune): writers absorb them, readers still see them (round 5)', async () => {
+    await withBareOrigin(async (ctx) => {
+      seedLegacy(ctx);
+      append(ctx, [1]);
+      migrate(ctx);
+      append(ctx, [2], cfg({ cutover: 'on' }));
+      expect(read(ctx).status).toBe('ok'); // a local copy of the ledger-only ref now exists
+      git(['update-ref', '-d', `refs/heads/${NEW}`], { cwd: ctx.origin });
+      git(['config', 'fetch.prune', 'true'], { cwd: ctx.clone }); // a configured prune must not win either
+      append(ctx, [3]);
+      expect(onOrigin(ctx, OLD)).toEqual([1, 2, 3]);
+      expect(prsOf(read(ctx).text)).toEqual([1, 2, 3]);
+    });
+  });
+
+  it('a numeric store cursor is refused on a two-ref union read, honoured on a single-ref read (round 5)', async () => {
+    await withBareOrigin(async (ctx) => {
+      seedLegacy(ctx);
+      append(ctx, [1, 2]);
+      const store = createGitLedgerStore({ readRows: (o) => readLedgerFromGit({ ...o, settings: cfg(), env: {}, log: quiet }) });
+      expect(await store.read({ board: ctx.clone, repo: REPO, from: 1 })).toMatchObject({ status: 'ok', rows: [expect.objectContaining({ pr: 2 })] });
+      migrate(ctx);
+      expect(await store.read({ board: ctx.clone, repo: REPO, from: 1 })).toMatchObject({ status: 'unreadable', reason: 'cursor-unsupported-on-union' });
+      expect((await store.read({ board: ctx.clone, repo: REPO })).status).toBe('ok');
     });
   });
 

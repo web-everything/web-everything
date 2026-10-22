@@ -179,9 +179,10 @@ export function readLedgerFromGit({
   let oldText;
   let newText;
   try {
-    // No `--prune`: a ledger-only ref deleted on the remote stays readable from its last fetched copy (its rows stay
-    // visible), while every WRITE fetches its target by an exact refspec and so fails instead of re-creating it.
-    retryTransientGit(() => run(['fetch', '--quiet', 'origin', ledgerFetchRefspec(LEGACY_LEDGER_BRANCH), ledgerFetchRefspec(newRef, { required: plan.requireNew })], { cwd: board }));
+    // `--no-prune` (after the remote, so it also overrides a `fetch.prune` config): a ledger-only ref deleted on the
+    // remote stays readable from its last fetched copy (its rows stay visible) while writers do not write it; with
+    // cutover on it is fetched EXACTLY, so its absence is unreadable. A write never re-creates it.
+    retryTransientGit(() => run(['fetch', '--quiet', 'origin', '--no-prune', ledgerFetchRefspec(LEGACY_LEDGER_BRANCH), ledgerFetchRefspec(newRef, { required: plan.requireNew })], { cwd: board }));
     newTip = trackingTip(run, board, newRef);
     if (!newTip && plan.requireNew) {
       return { status: 'unreadable', reason: 'required-ledger-ref-absent', error: `${newRef} is the ledger write ref (cutover on) but does not exist on origin` };
@@ -338,6 +339,11 @@ export function createGitLedgerStore({ appendRows = appendLedgerRows, readRows =
         const { repo, from = 0, ...rest } = range;
         const r = await readRows({ ...rest, repo });
         if (r.status !== 'ok') return { status: 'unreadable', reason: r.reason, error: r.error };
+        // A UNION read (two ledger refs, `we:scripts/lib/verdict-ledger-ref.mjs`) is grouped per PR, so its row positions
+        // are not stable across reads: a numeric cursor could skip or repeat rows. Refused, never approximated (round 5).
+        if (from > 0 && Array.isArray(r.refs) && r.refs.filter((x) => x.status === 'read').length > 1) {
+          return { status: 'unreadable', reason: 'cursor-unsupported-on-union', error: 'a numeric `from` cursor cannot address a two-ref union read' };
+        }
         return { status: 'ok', rows: parseLedgerEvents(r.text).filter((x) => x.repo === repo).slice(from) };
       } catch (e) {
         return { status: 'unreadable', reason: 'transport-read-failed', error: String(e?.message ?? e).split('\n')[0].slice(0, 300) };
