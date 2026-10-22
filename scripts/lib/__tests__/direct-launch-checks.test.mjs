@@ -131,6 +131,9 @@ describe('realChecksIo with a fake command runner', () => {
     { exitCode: 0, timedOut: true, lastMessage: 'NOT WEAKENED' },
     { exitCode: 1, timedOut: false, lastMessage: 'NOT WEAKENED' },
     { timedOut: false },
+    { timedOut: false, lastMessage: 'NOT WEAKENED' },
+    { exitCode: 0, lastMessage: 'NOT WEAKENED' },
+    { lastMessage: 'NOT WEAKENED' },
   ])('rejects incomplete or failed audit reports: %j', report => {
     const { runAudit } = realChecksIo({ run: () => JSON.stringify(report) });
     const { io, calls } = fixture({ runAudit });
@@ -140,8 +143,7 @@ describe('realChecksIo with a fake command runner', () => {
 
   it.each([
     { exitCode: 0, timedOut: false, lastMessage: 'NOT WEAKENED' },
-    { lastMessage: 'NOT WEAKENED' },
-  ])('accepts successful and legacy message-only audit reports: %j', report => {
+  ])('accepts successful audit reports: %j', report => {
     const { runAudit } = realChecksIo({ run: () => JSON.stringify(report) });
     const { io } = fixture({ runAudit });
     expect(runPostRunChecks(options, io).accepted).toBe(true);

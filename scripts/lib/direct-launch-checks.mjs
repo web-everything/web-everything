@@ -86,7 +86,7 @@ export function realChecksIo({ preexisting = [], run = (file, args, dir, timeout
     },
     runAudit: (argv, dir) => {
       const report = JSON.parse(run(process.execPath, argv, dir));
-      if (!report || report.timedOut === true || (report.exitCode !== 0 && !(report.exitCode === undefined && report.lastMessage))) {
+      if (!report || report.exitCode !== 0 || report.timedOut !== false) {
         throw new Error('audit did not complete successfully');
       }
       return report.lastMessage;
