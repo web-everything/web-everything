@@ -164,7 +164,7 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // this file already imports (`lease-reaper.mjs`, `lib/lane-litter.mjs`, …), so this is not the "unsafe to
 // import" shape `we:scripts/operations/operator-queue.mjs`'s own header warns about (that warning is about
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
-import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, lanePreservedFileChecker } from './lane-whois.mjs';
+import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
 import {
   salvageLane, removeLitterWorktrees, listLitterWorktrees, laneLivenessGate,
@@ -4022,27 +4022,48 @@ function cmdTrim(repo) {
 // PER LANE once it already trusts that verdict; it never re-derives the card/PR/holder axes itself. What it
 // DOES re-derive, unconditionally, every call: the PRESERVATION proof, because that is the one axis a caller's
 // scan can go stale on between computing the verdict and this call actually running (a fresh commit, a
-// deleted remote branch) — {@link laneReclaimPreservationProof} reuses `lane-whois.mjs`'s own exported
-// preservation primitives verbatim, never a second implementation of "is this blob identical to origin, or is
-// this commit pushed/patch-equivalent somewhere".
+// deleted remote branch) — {@link laneReclaimPreservationProof} restricts the shared patch/blob predicates
+// to live remote SHAs; a tracking ref alone cannot establish preservation after an excluded ops fetch.
 //
 // CLAIM DISCIPLINE mirrors `claimLaneForRemoval` above (the SAME O_EXCL lease-marker take `trim` uses): claim,
 // re-check UNDER the hold (a race between the read above and the claim itself), then act — never reset a lane
 // out from under a lease that appeared in that window. A lost race hands the lane back exactly as found.
 
-/** Re-derive whether lane `dir`'s current uncommitted/ahead content is STILL provably preserved, right now —
- *  never trusts a caller's (possibly stale) verdict. PURE-ish IO: every read is the same read `lane-whois.mjs`
- *  itself would make; nothing here mutates. */
+/** Re-derive preservation from a fresh origin snapshot on BOTH passes, including under the claim.
+ *  No fetch or ref mutation: unavailable remote objects and failed reads leave work unproven. */
 function laneReclaimPreservationProof(dir, branch) {
   const branchRef = `origin/${branch}`;
   const { trackedModifiedPaths, untrackedPaths } = gitStatusSummary(dir);
   const dirtyPaths = [...trackedModifiedPaths, ...untrackedPaths];
   const commits = aheadCommits(dir, branchRef);
-  const commitPreserved = aheadCommitsPreserved(dir, branchRef, commits);
-  // The SAME bounded predicate `lane-whois.mjs#whoisForLane` uses — heavy-dirty skip plus its lane-wide
-  // fallback-spawn budget (PR #2641 review: this copy used to run the fallback unbounded, files × refs).
-  // Unproven past the budget is conservative (a lane simply left un-reclaimed, never wrongly reclaimed).
-  const provenFile = lanePreservedFileChecker(dir, branchRef, dirtyPaths);
+  const remoteShas = dirtyPaths.length || commits.length ? liveRemoteShas(dir) : new Set();
+  const branchSha = tryGit(['rev-parse', '--verify', '--quiet', branchRef], dir);
+  const liveBranch = remoteShas.has(branchSha) ? branchSha : null;
+  // Disable whois's tracking-ref containment fallback; retain its patch-equivalence proof only
+  // against an immutable SHA that origin still advertises. Ops refs, aliases, custom mappings,
+  // and refs for other remotes cannot smuggle an old tip into either proof.
+  const commitPreserved = liveBranch ? aheadCommitsPreserved(dir, liveBranch, commits, 0) : new Map();
+  let containsBudget = Number(process.env.WE_LANE_WHOIS_MAX_CONTAINS_PROBES) || 15;
+  for (const { sha } of commits) {
+    if (commitPreserved.get(sha)) continue;
+    if (remoteShas.has(sha)) { commitPreserved.set(sha, true); continue; }
+    if (!remoteShas.size || containsBudget-- <= 0) continue;
+    const missing = tryGit(['rev-list', '--ignore-missing', '--max-count=1', sha, '--not', ...remoteShas], dir);
+    commitPreserved.set(sha, missing !== null && missing.trim() === '');
+  }
+  // Keep whois's heavy-dirty cutoff and lane-wide fallback budget, but show only live SHAs.
+  const maxRefs = Number(process.env.WE_LANE_WHOIS_MAX_REFS) || 20;
+  const otherRefs = dirtyPaths.length <= 25 ? [...remoteShas].filter((sha) => sha !== liveBranch).slice(0, maxRefs) : [];
+  let fallbackBudget = Number(process.env.WE_LANE_WHOIS_MAX_FALLBACK_SHOWS) || 40;
+  const provenFile = (path) => {
+    let local;
+    try { local = readFileSync(join(dir, path), 'utf8'); } catch { return false; }
+    const refs = otherRefs.slice(0, Math.max(0, fallbackBudget));
+    fallbackBudget -= refs.length;
+    // When the base is stale, consume the first bounded fallback as the predicate's primary ref.
+    const primary = liveBranch || refs.shift();
+    return !!primary && filePreservedInMain(dir, path, primary, local, refs);
+  };
   const unpreservedFiles = dirtyPaths.filter((p) => !provenFile(p));
   const unpreservedCommits = commits.filter((c) => !commitPreserved.get(c.sha));
   const preserved = unpreservedFiles.length === 0 && unpreservedCommits.length === 0;
