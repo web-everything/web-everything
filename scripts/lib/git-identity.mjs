@@ -18,6 +18,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
+import { LANE_GIT_CONFIG_PINS, hardenLaneGitArgs } from './lane-git-hardening.mjs';
 
 /** The cascade key (platform preference / `scripts/settings/*.json` block). */
 export const GIT_IDENTITY_POLICY = 'gitIdentityPlaceholders';
@@ -203,6 +204,24 @@ export function withoutGitConfigEnv(env = process.env) {
   return out;
 }
 
+/** The hooks-path verification's env: no inherited config overrides (see above), no inherited external diff or pager. */
+function hooksVerifyEnv(env) {
+  const out = withoutGitConfigEnv(env);
+  delete out.GIT_EXTERNAL_DIFF;
+  return { ...out, GIT_PAGER: 'cat', PAGER: 'cat' };
+}
+
+/**
+ * The git argv for the hooks-path verification: every lane-hardening pin (`scripts/lib/lane-git-hardening.mjs`) as a
+ * `-c` flag, plus `--no-pager` and its argument rewrites, so a lane's own `.git/config` (`core.fsmonitor`, which
+ * `ls-files` runs; `diff.external`; `core.pager`) never runs code (red-team finding, PR #5775). `core.hooksPath` alone
+ * stays unpinned: it is the value under test, and `config` / `ls-files` run no hooks. Pure.
+ */
+export function laneHooksGitArgs(args) {
+  const pins = LANE_GIT_CONFIG_PINS.filter(([k]) => k !== 'core.hooksPath').flatMap(([k, v]) => ['-c', `${k}=${v}`]);
+  return ['--no-pager', ...pins, ...hardenLaneGitArgs(args)];
+}
+
 /** Would git actually run this hook? Git checks `access(X_OK)` and silently skips a hook that fails it; a shell hook
  * must also be readable, and a directory is never a hook. (On Windows X_OK is an existence check, as in git.) */
 export function hookRunnable(path) {
@@ -241,7 +260,7 @@ export function ensureLaneHooksPath(dir, {
   write = true,
   exists = existsSync,
   runnable = hookRunnable,
-  run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024, env: withoutGitConfigEnv(process.env) }),
+  run = (args) => execFileSync('git', laneHooksGitArgs(args), { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024, env: hooksVerifyEnv(process.env) }),
   log = defaultWarn,
 } = {}) {
   try {

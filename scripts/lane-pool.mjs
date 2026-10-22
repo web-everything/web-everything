@@ -387,7 +387,7 @@ function writeLaneEnv(repo, n) {
   // Rides every provision/refresh/acquire call site: point the lane at the tracked hooks so the pre-commit guards
   // (incl. the placeholder-author guard) run even when npm `prepare` never did (`--no-install`, `--reference` clone).
   // Default runner on purpose: NOT laneGitHardeningEnv, which pins core.hooksPath=/dev/null and would hide the value
-  // an agent's own commit resolves. `git config` reads/writes execute nothing.
+  // an agent's own commit resolves. It carries every OTHER hardening pin (laneHooksGitArgs), so lane config runs nothing.
   const hooks = ensureLaneHooksPath(laneDir(repo, n), { log });
   if (!['ok', 'set', 'skipped'].includes(hooks.status)) {
     // Throw so acquire's existing refused-claim handler restores/releases the lease before trying again.

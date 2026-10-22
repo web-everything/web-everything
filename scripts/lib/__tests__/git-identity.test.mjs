@@ -2,7 +2,7 @@
  * @file git-identity.test.mjs — the placeholder-author check every surface shares (bootstrap, lane-pool, guard).
  *   Incident: 2026-10-05..20 the global git config said `test` / `test@test.com` and nothing flagged it.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
 import { resolve, join, dirname, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process';
 import { runInNewContext } from 'node:vm';
 import {
   checkGitIdentity, identityVerdict, parseIdent, readGitIdentity, resolveGitIdentityPlaceholders, BUILTIN_PLACEHOLDERS,
-  laneIdentityReport, ensureLaneHooksPath, hookRunnable, invokedAsScript,
+  laneIdentityReport, ensureLaneHooksPath, hookRunnable, invokedAsScript, laneHooksGitArgs,
 } from '../git-identity.mjs';
 
 describe('hook repair failures cannot silently disable commit guards', () => {
@@ -207,6 +207,76 @@ describe('hook repair failures cannot silently disable commit guards', () => {
       writeFileSync: () => { writes++; }, join: (...parts) => parts.join('/'),
     });
     expect(writes).toBe(1);
+  });
+});
+
+describe('hooks-path verification never runs lane-controlled git config commands (red-team finding, PR #5775)', () => {
+  // The DEFAULT runner on purpose: the verification's own git calls are the ones under test.
+  const lanes = (fn) => {
+    const base = mkdtempSync(join(tmpdir(), 'identity-hooks-hardening-'));
+    const marker = join(base, 'marker-ran');
+    const script = join(base, 'marker.sh');
+    writeFileSync(script, `#!/bin/sh\necho "$0 $*" >> "${marker}"\n`);
+    chmodSync(script, 0o755);
+    writeFileSync(join(base, 'global-config'), '');
+    vi.stubEnv('HOME', base);
+    vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+    vi.stubEnv('GIT_CONFIG_GLOBAL', join(base, 'global-config'));
+    const make = (name, poisoned, setup) => {
+      const dir = join(base, name);
+      mkdirSync(dir);
+      const run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      run(['init', '-q']);
+      writeFileSync(join(dir, 'file'), 'x\n');
+      run(['add', 'file']);
+      setup(dir, run);
+      if (poisoned) {
+        run(['config', '--local', 'core.fsmonitor', script]);
+        run(['config', '--local', 'diff.external', script]);
+        run(['config', '--local', 'core.pager', script]);
+      }
+      return dir;
+    };
+    try {
+      fn({ marker, make });
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(base, { recursive: true, force: true });
+    }
+  };
+  const hook = (dir, mode = 0o755) => {
+    mkdirSync(join(dir, '.githooks'), { recursive: true });
+    writeFileSync(join(dir, '.githooks/pre-commit'), '#!/bin/sh\n');
+    chmodSync(join(dir, '.githooks/pre-commit'), mode);
+  };
+  const scenarios = {
+    'tracked but missing hook (ls-files)': (dir, run) => { hook(dir); run(['add', '.githooks/pre-commit']); rmSync(join(dir, '.githooks/pre-commit')); },
+    'untracked, absent hook (ls-files)': () => {},
+    'hook present, hooksPath unset (config read + write)': (dir) => hook(dir),
+    'hook present, worktree override (config read + write + unset)': (dir, run) => {
+      hook(dir);
+      run(['config', 'extensions.worktreeConfig', 'true']);
+      run(['config', '--worktree', 'core.hooksPath', '/dev/null']);
+    },
+  };
+  it('pins every lane-hardening key except the core.hooksPath under test', () => {
+    const args = laneHooksGitArgs(['ls-files', '--error-unmatch', '--', '.githooks/pre-commit']);
+    expect(args).toEqual(expect.arrayContaining(['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null']));
+    expect(args.some((a) => a.startsWith('core.hooksPath='))).toBe(false);
+    expect(args.slice(-4)).toEqual(['ls-files', '--error-unmatch', '--', '.githooks/pre-commit']);
+  });
+  it.each(Object.keys(scenarios))('%s: same verdict as a clean lane, and the marker never runs', (name) => {
+    lanes(({ marker, make }) => {
+      const clean = make('clean', false, scenarios[name]);
+      const poisoned = make('poisoned', true, scenarios[name]);
+      const strip = (r) => ({ ...r, detail: r.detail?.replaceAll(poisoned, clean) });
+      for (const write of [false, true, false]) {
+        const want = ensureLaneHooksPath(clean, { write, log: () => {} });
+        expect(strip(ensureLaneHooksPath(poisoned, { write, log: () => {} }))).toEqual(want);
+      }
+      expect(readGitIdentity(poisoned)).toEqual(readGitIdentity(clean));
+      expect(existsSync(marker) ? readFileSync(marker, 'utf8') : '').toBe('');
+    });
   });
 });
 
