@@ -127,7 +127,7 @@ describe('runFixCli', () => {
         posted.push(readFileSync(args.at(-1), 'utf8'));
       }
       const result = baseRun(cmd, args, opts);
-      if (cmd === 'gh' && args.includes('view')) return JSON.stringify({ title: 'T', body: 'B', baseRefName });
+      if (cmd === 'gh' && args.includes('view')) return JSON.stringify({ title: 'T', body: 'B', baseRefName, headRefOid: 'b'.repeat(40) });
       if (cmd === 'git' && args.includes('merge-base')) return mergeBase;
       if (cmd === 'git' && args.includes('diff') && args.includes('--name-only')) {
         if (diffError) throw new Error('unreadable diff');
