@@ -13,7 +13,7 @@ it('logs direct-launch provider provenance once without changing any route field
   const withoutLog = resolveDispatchRoute(dispatch, options);
   const withLog = resolveDispatchRoute(dispatch, { ...options, log });
   expect(log).toHaveBeenCalledTimes(1);
-  expect(log).toHaveBeenCalledWith('direct launch build: provider claude (directLaunch.build.provider, source env)');
+  expect(log).toHaveBeenCalledWith('direct launch build: provider claude (preference directLaunch.build.provider, source env)');
   expect(withLog).toEqual(withoutLog);
   expect(withLog).toEqual(decideDispatchRoute(dispatch, { ...options, availability: {} }));
 });
@@ -23,4 +23,14 @@ it('keeps the default logger silent under the test runner', () => {
   const error = vi.spyOn(console, 'error').mockImplementation(() => {});
   resolveDispatchRoute({ kind: 'build', size: 3 }, { routingPolicy: DEFAULT_ROUTING_POLICY });
   expect(error).not.toHaveBeenCalled();
+});
+
+
+it('returns the selected route even when the preference logger throws', () => {
+  const dispatch = { kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] };
+  const options = { routingPolicy: DEFAULT_ROUTING_POLICY, scorecards: [], now: 0 };
+  const expected = resolveDispatchRoute(dispatch, { ...options, log: () => {} });
+  const log = vi.fn(() => { throw new Error('logger unavailable'); });
+  expect(resolveDispatchRoute(dispatch, { ...options, log })).toEqual(expected);
+  expect(log).toHaveBeenCalledTimes(1);
 });

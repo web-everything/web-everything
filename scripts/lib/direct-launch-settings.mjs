@@ -44,7 +44,7 @@ export const formatDirectLaunchLog = ({ kind, provider, reason, source }) =>
 /** Report the preference and its provenance without changing the caller's routing decision. */
 export function directLaunchLogLine(options = {}) {
   const { kind, provider, gemini } = resolveDirectLaunchSetting(options);
-  let reason = provider.source === 'default' ? 'built-in default' : `directLaunch.${kind}.provider`;
+  let reason = provider.source === 'default' ? 'preference built-in default' : `preference directLaunch.${kind}.provider`;
   if (provider.value === 'antigravity-gemini') reason += `, gemini mode ${gemini.mode.value} max ${gemini.maxConcurrent.value}`;
   return formatDirectLaunchLog({ kind, provider: provider.value, reason, source: provider.source });
 }

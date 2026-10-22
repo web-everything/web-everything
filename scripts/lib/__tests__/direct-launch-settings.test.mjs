@@ -108,16 +108,16 @@ describe('direct-launch logs', () => {
 
   it('names the built-in default when no layer sets a provider', () => {
     expect(directLaunchLogLine({ kind: 'ci-heal', env: {}, platform: {}, repo: {} }))
-      .toBe('direct launch ci-heal: provider codex (built-in default, source default)');
+      .toBe('direct launch ci-heal: provider codex (preference built-in default, source default)');
   });
 
   it('names the setting and includes Gemini mode and max inside the reason', () => {
     expect(directLaunchLogLine({ kind: 'build', env: {}, platform: {}, repo: layer('antigravity-gemini', 'open', 16) }))
-      .toBe('direct launch build: provider antigravity-gemini (directLaunch.build.provider, gemini mode open max 16, source repo)');
+      .toBe('direct launch build: provider antigravity-gemini (preference directLaunch.build.provider, gemini mode open max 16, source repo)');
   });
 
   it('reports Gemini defaults when only its provider is set', () => {
     expect(directLaunchLogLine({ kind: 'build', env: environment('antigravity-gemini'), platform: {}, repo: {} }))
-      .toBe('direct launch build: provider antigravity-gemini (directLaunch.build.provider, gemini mode trial max 1, source env)');
+      .toBe('direct launch build: provider antigravity-gemini (preference directLaunch.build.provider, gemini mode trial max 1, source env)');
   });
 });
