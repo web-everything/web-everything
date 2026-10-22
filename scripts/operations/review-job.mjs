@@ -93,7 +93,7 @@ import { proveIdenticalNetPatch } from '../lib/identical-net-patch.mjs';
 import { readRedTeamTiming, readRedTeamProbes, readConfirmedBreaks, planRedTeamActions, redTeamForHead } from '../lib/red-team-gate.mjs';
 import { savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
-import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { readStore } from '../conveyor/run-scorecard-store.mjs';
 
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';

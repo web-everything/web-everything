@@ -135,13 +135,21 @@ describe('red-team-only review job', () => {
         // Mirror the production synchronous job hook's child-process boundary, while running the REAL
         // runRedTeam -> speculateRedTeam -> resumeRedTeam path with only external effects injected.
         const source = `
-          import { readFileSync } from 'node:fs';
+          import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+          import { tmpdir } from 'node:os';
+          import { join } from 'node:path';
           import { runRedTeam } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
+          import { writeRun } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../run-store.mjs')).href)};
+          import { provenanceRun } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../lib/__tests__/fixtures/saved-red-team-provenance.mjs')).href)};
           const { input, prior, saved, failComment } = JSON.parse(readFileSync(0, 'utf8'));
           const comments = saved?.comments ?? [], rows = saved?.rows ?? [];
           const calls = { model: 0, recheck: 0, reserve: 0, provider: 0 };
           const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
-          const result = await runRedTeam({ ...input, resumeOnly: input.redTeamMode === 'resume', env: {} }, {
+          const root = mkdtempSync(join(tmpdir(), 'red-team-recovery-'));
+          const env = { CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: join(root, 'runs') };
+          writeRun(provenanceRun({ env, rows: [prior] }), env.OPERATION_RUNS_DIR);
+          let result;
+          try { result = await runRedTeam({ ...input, resumeOnly: input.redTeamMode === 'resume', env }, {
             now: () => 1_000, log: () => {}, readRecords: () => [prior, ...rows],
             cliAvailable: forbid('provider'), reserveCalls: forbid('reserve'),
             runSeat: forbid('model'), runRecheck: forbid('recheck'),
@@ -151,7 +159,7 @@ describe('red-team-only review job', () => {
               comments.push({ body, author: { login: 'web-everything' } });
             },
             append: row => rows.push(row),
-          });
+          }); } finally { rmSync(root, { recursive: true, force: true }); }
           process.stdout.write(JSON.stringify({ result, comments, rows, calls }));
         `;
         observed = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
@@ -176,8 +184,9 @@ describe('red-team-only review job', () => {
       expect(observed.result).toMatchObject({ status: 'resumed', comment: { status: 'error' }, rowsWritten: 2 });
       expect(observed.calls).toEqual({ model: 0, recheck: 0, reserve: 0, provider: 0 });
       expect(observed.comments).toEqual([]);
-      // Persist the production hook's string result, then retry at the cooldown boundary.
-      expect(status).toEqual({ status: 'finished', result: 'resumed' });
+      // Persist the production hook's result object, then retry at the cooldown boundary.
+      expect(status).toEqual({ status: 'finished', result: { status: 'resumed',
+        reason: `retried (still failing) what the clean pass for #${pr} at ${head.slice(0, 12)} left undone — 2 row(s) written, delegation trial not-delegated, comment error` } });
       expect(recover(1_001).dispatched).toEqual([]);
       expect(recover(1_801_000).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'resume' }]);
       expect(job).toMatchObject({ outcome: 'red-team-only', redTeam: { status: 'resumed' } });
