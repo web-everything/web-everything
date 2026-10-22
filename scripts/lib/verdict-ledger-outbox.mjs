@@ -54,7 +54,7 @@ import { retryTransientGit } from './git-fetch-retry.mjs';
 import { assertPushRef, trackingRefspec, withGitError, worktreeGitEnv } from './git-transport-branch.mjs';
 import { parseLedgerEvents, ledgerEventId } from './verdict-ledger.mjs';
 import { ledgerGitPath } from './verdict-ledger-path.mjs';
-import { LEGACY_LEDGER_BRANCH, resolveLedgerRefSettings, ledgerPushRefFor } from './verdict-ledger-ref.mjs';
+import { LEGACY_LEDGER_BRANCH, ALLOWED_LEDGER_BRANCHES, resolveLedgerRefSettings, ledgerWritePlan, ledgerPushRefFor } from './verdict-ledger-ref.mjs';
 import { workspaceFor } from './lane-pool-paths.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -414,13 +414,23 @@ function readBlobAt(run, board, tip, path, env) {
  * A failure of the PUSH command itself carries `phase: 'publish'` and the `commit`, so the caller can reconcile:
  * a push can land on the remote and still report failure (a dropped connection after the remote accepted it).
  */
-function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined }) {
+function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined, dedupeAlso = null }) {
   const ref = assertPushRef(branch, allowRef);
   const env = boardEnv(board);
   assertSingleDestination({ board, run, env });
   retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board, env }), sleep ? { sleep } : {});
   const tip = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}^{commit}`], { cwd: board, env })).trim();
   if (!/^[0-9a-f]{40,64}$/.test(tip)) throw new Error(`verdict-ledger-outbox: origin/${branch} did not resolve to a commit`);
+  // THE OTHER LEDGER REF during a cutover (`we:scripts/lib/verdict-ledger-ref.mjs#ledgerWritePlan`, audit 2026-10-21
+  // finding 3): a row already published THERE is never appended HERE, where it would land after newer rows and
+  // supersede them in the union. Unreadable -> this attempt fails before anything is pushed.
+  let otherTip = null;
+  if (dedupeAlso) {
+    if (!ALLOWED_LEDGER_BRANCHES.includes(dedupeAlso) || dedupeAlso === branch) throw new Error(`verdict-ledger-outbox: bad dedupe ref ${dedupeAlso}`);
+    retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(dedupeAlso)], { cwd: board, env }), sleep ? { sleep } : {});
+    otherTip = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${dedupeAlso}^{commit}`], { cwd: board, env })).trim();
+    if (!/^[0-9a-f]{40,64}$/.test(otherTip)) throw new Error(`verdict-ledger-outbox: origin/${dedupeAlso} did not resolve to a commit`);
+  }
 
   const byPath = new Map();
   for (const e of entries) {
@@ -432,6 +442,7 @@ function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined })
   for (const [path, group] of byPath) {
     const { text: base, mode } = readBlobAt(run, board, tip, path, env);
     const seen = new Set(parseLedgerEvents(base).map(ledgerEventId));
+    if (otherTip) for (const ev of parseLedgerEvents(readBlobAt(run, board, otherTip, path, env).text)) seen.add(ledgerEventId(ev));
     const fresh = [];
     for (const { name, entry } of group) {
       let rows = 0;
@@ -530,7 +541,7 @@ function flushHeld(o) {
   }
 }
 
-function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, random, log, budgetMs, onRetry, removeEntry, allowRef, originKey, results, inMemory = [] }) {
+function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, random, log, budgetMs, onRetry, removeEntry, allowRef, originKey, results, inMemory = [], dedupeAlso = null }) {
   // ONE absolute deadline bounds every git call and every retry (audit round 4): no call starts once it has passed,
   // and none may run past it.
   const hardDeadline = Date.now() + budgetMs;
@@ -584,7 +595,7 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
       }
       attempts += 1;
       try {
-        landed = pushBatch({ board, branch, entries, run, allowRef, sleep: clampedSleep });
+        landed = pushBatch({ board, branch, entries, run, allowRef, sleep: clampedSleep, dedupeAlso });
         break;
       } catch (e) {
         errors.push(e);
@@ -657,6 +668,7 @@ function common(o) {
     onRetry: o.onRetry ?? null,
     removeEntry: o.removeEntry ?? defaultRemove,
     allowRef: o.allowRef ?? null,
+    dedupeAlso: o.dedupeAlso ?? null,
   };
 }
 
@@ -720,10 +732,11 @@ export function flushBoardLedgerOutbox({ board, env = process.env, log: rawLog =
     // The flusher pushes to the CURRENT write ref (`we:scripts/lib/verdict-ledger-ref.mjs`), whatever ref was current
     // when an entry was queued: the current readers always read the current write ref, so that is where a queued row
     // is guaranteed to be seen (during a cutover the readers union both refs anyway).
-    const branch = resolveLedgerRefSettings({ repo: repoLayer, env }).writeBranch;
+    // During a cutover it also dedupes against the other ref, so an entry that already landed there is never replayed.
+    const { branch, dedupeAlso } = ledgerWritePlan(resolveLedgerRefSettings({ repo: repoLayer, env }));
     dir = outboxDirFor({ board, env, ...(run ? { run } : {}) });
     if (!listOutboxEntries(dir).length) return { ok: true, flushed: 0, pushed: false, attempts: 0, dir };
-    return { ...flushLedgerOutbox({ board, dir, settings, log, run, branch, allowRef: ledgerPushRefFor(branch) }), dir };
+    return { ...flushLedgerOutbox({ board, dir, settings, log, run, branch, allowRef: ledgerPushRefFor(branch), dedupeAlso }), dir };
   } catch (e) {
     const msg = `ledger-write-miss: verdict-ledger outbox backstop for ${board} failed: ${String(e?.message ?? e).split('\n')[0]}`;
     log(msg);
@@ -941,7 +954,7 @@ export function appendDirect(o) {
   const { run, clampedSleep } = deadlineBound(c.run, c.sleep, directDeadline, c.budgetMs);
   for (let attempt = 1; ; attempt += 1) {
     try {
-      const out = pushBatch({ board: c.board, branch: c.branch, entries: [{ name: 'direct', entry }], run, allowRef: c.allowRef, sleep: clampedSleep });
+      const out = pushBatch({ board: c.board, branch: c.branch, entries: [{ name: 'direct', entry }], run, allowRef: c.allowRef, sleep: clampedSleep, dedupeAlso: c.dedupeAlso });
       const mine = out.counts.get('direct');
       return { status: 'appended', attempts: attempt, rows: mine.rows, duplicates: mine.duplicates };
     } catch (e) {

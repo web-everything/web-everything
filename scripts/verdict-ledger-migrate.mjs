@@ -148,7 +148,9 @@ export function planMigration({ board = process.cwd(), from = LEGACY_LEDGER_BRAN
   retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(to)], { cwd: board }));
   const target = sha(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${to}^{commit}`], { cwd: board }), `origin/${to}`);
   report.target = target;
-  if (target === candidate) { report.state = 'identical'; return report; }
+  // RETIRABLE: every row of the old ref's ledger is on the target. Pinning `verdictLedger.retiredOldTree` to this tree
+  // id is then what lets readers stop reading the old ref (fenced: a later write to the old ref holds every read).
+  if (target === candidate) { report.state = 'identical'; report.retirableOldTree = ledgerTree; return report; }
   report.state = 'diverged';
   // Rows on one ref only, per ledger file — what the kill-switch rule waits on before dualRead may go off.
   const targetFiles = ledgerFiles(run, board, target);
@@ -158,6 +160,7 @@ export function planMigration({ board = process.cwd(), from = LEGACY_LEDGER_BRAN
     return f ? String(run(['cat-file', 'blob', f.oid], { cwd: board })) : '';
   };
   report.rowDelta = paths.map((p) => ({ path: p, ...compareLedgerTexts(blob(tip, p), blob(target, p), { idOf: ledgerEventId }) }));
+  if (report.rowDelta.every((d) => d.oldOnly === 0)) report.retirableOldTree = ledgerTree;
   const extra = String(run(['ls-tree', '--name-only', target], { cwd: board })).split('\n').filter((n) => n && n !== LEDGER_DIR);
   if (extra.length) report.targetExtraEntries = extra;
   return report;
@@ -189,6 +192,7 @@ export function formatReport(r) {
   if (r.old.fetchDiskBytes != null) lines.push(`  fresh fetch of the ref (reachable objects on disk): old ${kb(r.old.fetchDiskBytes)} -> new ${kb(r.new.fetchDiskBytes)}`);
   lines.push(`  target ${r.to}: ${r.state}${r.target ? ` @${r.target.slice(0, 12)}` : ''}${r.applied ? ' (pushed)' : r.applied === false ? ` (${r.why})` : ' (dry run: nothing pushed)'}`);
   for (const d of r.rowDelta ?? []) lines.push(`    ${d.path}: ${d.both} on both, ${d.oldOnly} only on ${r.from}, ${d.newOnly} only on ${r.to}`);
+  if (r.retirableOldTree) lines.push(`  old ref retirable: every old row is on ${r.to}; pin verdictLedger.retiredOldTree=${r.retirableOldTree} to stop reading it`);
   if (r.targetExtraEntries) lines.push(`    WARNING: ${r.to} carries non-ledger entries: ${r.targetExtraEntries.join(', ')}`);
   return lines.join('\n');
 }

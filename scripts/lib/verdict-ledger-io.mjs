@@ -32,13 +32,15 @@ import { readSettings } from './settings-files.mjs';
 import {
   assertPushRef,
   readFromTransportBranch,
+  trackingRefspec,
 } from './git-transport-branch.mjs';
 import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows } from './verdict-ledger.mjs';
 import { registerLedgerStore } from './verdict-ledger-store.mjs';
 import { LEDGER_DIR, ledgerGitPath } from './verdict-ledger-path.mjs';
 import { appendDirect, appendViaOutbox, outboxDirFor, resolveOutboxSettings, formatOutboxSettings, OutboxFlushError } from './verdict-ledger-outbox.mjs';
 import {
-  LEGACY_LEDGER_BRANCH, resolveLedgerRefSettings, formatLedgerRefSettings, ledgerReadPlan, ledgerPushRefFor, unionLedgerTexts,
+  LEGACY_LEDGER_BRANCH, resolveLedgerRefSettings, formatLedgerRefSettings, ledgerReadPlan, ledgerWritePlan, ledgerPushRefFor,
+  unionLedgerTexts,
 } from './verdict-ledger-ref.mjs';
 
 /** The LEGACY ledger ref (and still the default for reads and writes: see `we:scripts/lib/verdict-ledger-ref.mjs`). */
@@ -169,6 +171,19 @@ export function readLedgerFromGit({
     } catch (e) {
       return { status: 'unreadable', reason: readFailureReason(e), error: String(e?.message ?? e) };
     }
+    // THE FENCE (cutover on, old ref retired by pin): the old ref's ledger tree must still be the pinned one. A writer
+    // that never switched would otherwise append rows no reader sees. Tree id only: no blob is read.
+    if (plan.fence) {
+      try {
+        run(['fetch', '--quiet', 'origin', trackingRefspec(plan.fence.branch)], { cwd: board });
+        const tree = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${plan.fence.branch}:${LEDGER_DIR}`], { cwd: board })).trim();
+        if (tree !== plan.fence.tree) {
+          return { status: 'unreadable', reason: 'retired-ref-moved', error: `${plan.fence.branch}:${LEDGER_DIR} is ${tree || '(missing)'}, not the retired ${plan.fence.tree}: a writer still writes the old ref` };
+        }
+      } catch (e) {
+        return { status: 'unreadable', reason: 'retired-ref-moved', error: `fence check of ${plan.fence.branch} failed: ${String(e?.message ?? e)}` };
+      }
+    }
     const text = files[path] ?? '';
     return { status: 'ok', records: parseVerdictLog(text), text };
   }
@@ -202,6 +217,7 @@ export function readLedgerFromGit({
   }
   const [newRef, oldRef] = got; // plan order: [ledger-only ref, old ref]
   const merged = unionLedgerTexts(oldRef.text ?? '', newRef.text ?? '', { idOf: ledgerEventId });
+  if (!merged.ok) return { status: 'unreadable', reason: `union-${merged.reason}`, error: merged.error };
   return {
     status: 'ok', records: parseVerdictLog(merged.text), text: merged.text,
     refs: got.map(({ branch: b, status }) => ({ branch: b, status })),
@@ -239,12 +255,13 @@ export function appendLedgerRows({
   // WHICH REF: an explicit `branch` wins; otherwise the ledger-ref cascade (cutover off = the old ref, as before).
   // Either way it must be an allow-listed ledger ref, checked before any record is serialized or any git call.
   const { settings: refSettingsLayer, env: refEnv = process.env, log: refLog } = seams;
+  let dedupeAlso = null;
   if (branch === undefined) {
     let repoLayer;
     try { repoLayer = refSettingsLayer ?? readSettings(); } catch { repoLayer = {}; }
     const refs = resolveLedgerRefSettings({ repo: repoLayer, env: refEnv });
     logOnce(formatLedgerRefSettings(refs), refLog ?? defaultLog);
-    branch = refs.writeBranch;
+    ({ branch, dedupeAlso } = ledgerWritePlan(refs));
   }
   const pushRef = ledgerPushRefFor(branch);
   assertPushRef(branch, pushRef); // a wrong ref writes nothing
@@ -266,7 +283,7 @@ export function appendLedgerRows({
     try {
       const dir = outboxDir ?? outboxDirFor({ board, env, ...(gitRun ? { run: gitRun } : {}) });
       return appendViaOutbox({
-        board, branch, dir, repo, path, lines, ids, message, settings: cascade, allowRef: pushRef,
+        board, branch, dir, repo, path, lines, ids, message, settings: cascade, allowRef: pushRef, dedupeAlso,
         run: gitRun ?? transport.run, now: transport.now, sleep, random, log, onRetry, removeEntry,
       });
     } catch (e) {
@@ -279,7 +296,7 @@ export function appendLedgerRows({
   // call's rows only. Still computed against the tip it races, still never forced, still loud on exhaustion.
   try {
     return appendDirect({
-      board, branch, repo, path, lines, ids, message, attempts, allowRef: pushRef, settings: cascade,
+      board, branch, repo, path, lines, ids, message, attempts, allowRef: pushRef, settings: cascade, dedupeAlso,
       run: transport.run ?? gitRun, sleep, random, log, onRetry,
     });
   } catch (e) {

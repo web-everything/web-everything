@@ -10,8 +10,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  resolveLedgerRefSettings, formatLedgerRefSettings, ledgerReadPlan, unionLedgerTexts, compareLedgerTexts, ledgerPushRefFor,
-  LEGACY_LEDGER_BRANCH, DEFAULT_LEDGER_ONLY_BRANCH, LEDGER_REF_ENV, LEDGER_CUTOVER_ENV, LEDGER_DUAL_READ_ENV,
+  resolveLedgerRefSettings, formatLedgerRefSettings, ledgerReadPlan, ledgerWritePlan, unionLedgerTexts, compareLedgerTexts,
+  ledgerPushRefFor, LEGACY_LEDGER_BRANCH, DEFAULT_LEDGER_ONLY_BRANCH, LEDGER_REF_ENV, LEDGER_CUTOVER_ENV, LEDGER_DUAL_READ_ENV,
 } from '../verdict-ledger-ref.mjs';
 import { appendLedgerRows, readLedgerFromGit, ledgerGitPath } from '../verdict-ledger-io.mjs';
 import { buildVerdictRecord } from '../verdict-ledger.mjs';
@@ -50,14 +50,15 @@ describe('ledger-ref settings: a cascade, defaults = today, logged with sources'
   it('defaults: old ref for reads and writes, ledger-only ref named, nothing dual', () => {
     const s = resolveLedgerRefSettings({ repo: {}, env: {} });
     expect(s).toMatchObject({ ref: NEW, cutover: 'off', dualRead: false, writeBranch: OLD });
-    expect(s.sources).toEqual({ ref: 'standard', cutover: 'standard', dualRead: 'standard' });
-    expect(ledgerReadPlan(s)).toEqual({ branches: [OLD], union: false, required: [] });
+    expect(s.sources).toEqual({ ref: 'standard', cutover: 'standard', dualRead: 'standard', retiredOldTree: 'standard' });
+    expect(ledgerReadPlan(s)).toEqual({ branches: [OLD], union: false, required: [], fence: null });
+    expect(ledgerWritePlan(s)).toEqual({ branch: OLD, dedupeAlso: null });
     expect(formatLedgerRefSettings(s)).toMatch(/cutover=off \(standard\).*writes -> ops\/review-requests; reads -> ops\/review-requests$/);
   });
 
   it('repo then env layers; env wins; invalid values ignored and named', () => {
-    const s = resolveLedgerRefSettings({ repo: cfg({ cutover: 'on', dualRead: true }), env: { [LEDGER_DUAL_READ_ENV]: 'false' } });
-    expect(s).toMatchObject({ cutover: 'on', dualRead: false, writeBranch: NEW, sources: { cutover: 'repo', dualRead: 'env' } });
+    const s = resolveLedgerRefSettings({ repo: cfg({ cutover: 'on', dualRead: false }), env: { [LEDGER_DUAL_READ_ENV]: 'true' } });
+    expect(s).toMatchObject({ cutover: 'on', dualRead: true, writeBranch: NEW, sources: { cutover: 'repo', dualRead: 'env' } });
     const bad = resolveLedgerRefSettings({ repo: cfg({ cutover: 'maybe', ref: 'main' }), env: { [LEDGER_REF_ENV]: 'refs/heads/main', [LEDGER_CUTOVER_ENV]: 'sideways' } });
     expect(bad).toMatchObject({ ref: NEW, cutover: 'off', writeBranch: OLD });
     expect(bad.invalid).toEqual(['repo.verdictLedger.ref', 'repo.verdictLedger.cutover', `env.${LEDGER_REF_ENV}`, `env.${LEDGER_CUTOVER_ENV}`]);
@@ -69,21 +70,35 @@ describe('ledger-ref settings: a cascade, defaults = today, logged with sources'
     expect(ledgerPushRefFor(NEW)).toBe(`refs/heads/${NEW}`);
   });
 
-  it('read plan matrix', () => {
-    const p = (cutover, dualRead) => ledgerReadPlan({ ref: NEW, cutover, dualRead });
-    expect(p('off', false)).toEqual({ branches: [OLD], union: false, required: [] });
-    expect(p('on', false)).toEqual({ branches: [NEW], union: false, required: [NEW] });
-    expect(p('off', true)).toEqual({ branches: [NEW, OLD], union: true, required: [] });
-    expect(p('on', true)).toEqual({ branches: [NEW, OLD], union: true, required: [NEW] });
+  it('read/write plan matrix: no combination hides a ref that can hold rows (audit finding 1)', () => {
+    const r = (v) => resolveLedgerRefSettings({ repo: cfg(v), env: {} });
+    const PIN = 'a'.repeat(40);
+    expect(ledgerReadPlan(r({ cutover: 'off', dualRead: true }))).toEqual({ branches: [NEW, OLD], union: true, required: [], fence: null });
+    // cutover on with dualRead=false but NO pin: overridden to the union, and the override is named
+    const onNoPin = r({ cutover: 'on', dualRead: false });
+    expect(onNoPin.overridden).toEqual([expect.stringMatching(/dualRead=true/)]);
+    expect(ledgerReadPlan(onNoPin)).toEqual({ branches: [NEW, OLD], union: true, required: [NEW], fence: null });
+    expect(ledgerWritePlan(onNoPin)).toEqual({ branch: NEW, dedupeAlso: OLD });
+    // cutover on + pin: the new ref only, fenced by the pinned old tree
+    const fin = r({ cutover: 'on', dualRead: false, retiredOldTree: PIN });
+    expect(ledgerReadPlan(fin)).toEqual({ branches: [NEW], union: false, required: [NEW], fence: { branch: OLD, tree: PIN } });
+    expect(ledgerWritePlan(fin)).toEqual({ branch: NEW, dedupeAlso: null });
+    // rollback: old ref written, both read, both required, deduped against the new ref
+    const rb = r({ cutover: 'rollback', dualRead: false });
+    expect(rb.dualRead).toBe(true);
+    expect(ledgerReadPlan(rb)).toEqual({ branches: [NEW, OLD], union: true, required: [NEW, OLD], fence: null });
+    expect(ledgerWritePlan(rb)).toEqual({ branch: OLD, dedupeAlso: NEW });
+    expect(r({ retiredOldTree: 'nothex' }).invalid).toEqual(['repo.verdictLedger.retiredOldTree']);
   });
 });
 
 describe('unionLedgerTexts: no row lost, none duplicated', () => {
   const l = (id, pr, sec = 0) => JSON.stringify({ id, pr, at: `2026-10-21T12:00:${String(sec).padStart(2, '0')}.000Z` });
-  it('shared rows once, new-only rows merged in by time, malformed lines pass through', () => {
+  it('shared rows once (anchors), new-only rows merged in by time, malformed lines pass through', () => {
     const oldT = [l('a', 1, 1), l('b', 2, 2), 'not json', l('s', 9, 5)].join('\n');
     const newT = [l('a', 1, 1), l('b', 2, 2), 'not json', l('c', 3, 4)].join('\n');
     const u = unionLedgerTexts(oldT, newT);
+    expect(u.ok).toBe(true);
     expect(u.text.split('\n').filter(Boolean)).toEqual([l('a', 1, 1), l('b', 2, 2), 'not json', l('c', 3, 4), l('s', 9, 5)]);
     expect(u).toMatchObject({ oldRows: 4, newOnly: 1, duplicates: 3 });
     expect(compareLedgerTexts(oldT, newT)).toEqual({ oldOnly: 1, newOnly: 1, both: 3 });
@@ -97,6 +112,23 @@ describe('unionLedgerTexts: no row lost, none duplicated', () => {
     const x1 = JSON.stringify({ id: 'x1', at: '2026-10-21T12:00:09.000Z' });
     const x2 = JSON.stringify({ id: 'x2', at: '2026-10-21T12:00:01.000Z' });
     expect(unionLedgerTexts(`${x1}\n${x2}\n`, '').text).toBe(`${x1}\n${x2}\n`);
+  });
+  it('AUDIT REPRO: a hold appended AFTER a shared accept stays after it, whatever its timestamp (finding 2)', () => {
+    const accept = JSON.stringify({ id: 'A', pr: 7, verdict: 'accepted', at: '2026-10-21T13:00:00.000Z' });
+    const hold = JSON.stringify({ id: 'H', pr: 7, verdict: 'changes', at: '2026-10-21T12:00:00.000Z' });
+    const u = unionLedgerTexts(`${accept}\n`, `${accept}\n${hold}\n`);
+    expect(u.ok).toBe(true);
+    expect(u.text.split('\n').filter(Boolean)).toEqual([accept, hold]);
+  });
+  it('refuses rather than guesses: different order of shared rows, a same-id row with other bytes, a same-time same-PR pair', () => {
+    const a = JSON.stringify({ id: 'a', pr: 1, at: '2026-10-21T12:00:01.000Z' });
+    const b = JSON.stringify({ id: 'b', pr: 2, at: '2026-10-21T12:00:02.000Z' });
+    expect(unionLedgerTexts(`${a}\n${b}\n`, `${b}\n${a}\n`)).toMatchObject({ ok: false, reason: 'order-conflict' });
+    const corrupt = JSON.stringify({ id: 'a', pr: 1, verdict: 'nonsense' });
+    expect(unionLedgerTexts(`${a}\n`, `${corrupt}\n`)).toMatchObject({ ok: false, reason: 'conflicting-row' });
+    const x = JSON.stringify({ id: 'x', pr: 5, verdict: 'accepted', at: '2026-10-21T12:00:09.000Z' });
+    const y = JSON.stringify({ id: 'y', pr: 5, verdict: 'changes', at: '2026-10-21T12:00:09.000Z' });
+    expect(unionLedgerTexts(`${x}\n`, `${y}\n`)).toMatchObject({ ok: false, reason: 'ambiguous-order' });
   });
   it('empty sides', () => {
     expect(unionLedgerTexts('', '').text).toBe('');
@@ -164,23 +196,31 @@ describe('real git: dual read + writer switch + migration', () => {
       const oldTipWithStraggler = originTip(ctx, OLD);
       append(ctx, [5, 6], cfg({ cutover: 'on', dualRead: true }));
       append(ctx, [3], cfg({ cutover: 'on', dualRead: true })); // a replay of a row already on both: no duplicate
+      append(ctx, [4], cfg({ cutover: 'on', dualRead: true })); // a replay of the straggler: deduped against the OLD ref
       expect(originTip(ctx, OLD)).toBe(oldTipWithStraggler); // the switched writer never touched the old ref
       expect(prsOf(ctx.showOnOrigin(NEW, PATH))).toEqual([1, 2, 3, 5, 6]);
       const u = read(ctx, cfg({ cutover: 'on', dualRead: true }));
       expect(u.status).toBe('ok');
-      expect(prsOf(u.text).sort()).toEqual([1, 2, 3, 4, 5, 6]);
-      expect(new Set(prsOf(u.text)).size).toBe(prsOf(u.text).length);
-      // Reading only the new ref would miss the straggler: that is why dualRead stays on until the delta is zero.
-      expect(prsOf(read(ctx, cfg({ cutover: 'on' })).text)).toEqual([1, 2, 3, 5, 6]);
+      expect(prsOf(u.text)).toEqual([1, 2, 3, 4, 5, 6]);
+      // cutover on WITHOUT a pin still reads both (dualRead=false is overridden): the straggler is never hidden.
+      expect(prsOf(read(ctx, cfg({ cutover: 'on', dualRead: false })).text)).toEqual([1, 2, 3, 4, 5, 6]);
+      // A pin taken BEFORE the straggler wrote: the fence sees the old ref moved and holds the read.
+      const fenced = read(ctx, cfg({ cutover: 'on', dualRead: false, retiredOldTree: m.ledgerTree }));
+      expect(fenced).toMatchObject({ status: 'unreadable', reason: 'retired-ref-moved' });
       // The migration report names that delta and pushes nothing over a present target.
       const again = applyMigration({ board: ctx.clone, to: NEW, run: realGit, measure: false });
       expect(again).toMatchObject({ applied: false, state: 'diverged' });
       expect(again.rowDelta.find((d) => d.path === PATH)).toMatchObject({ oldOnly: 1, newOnly: 2, both: 3 });
       expect(prsOf(ctx.showOnOrigin(NEW, PATH))).toEqual([1, 2, 3, 5, 6]);
-      // Kill switch: cutover off + dualRead on. Writers return to the old ref; nothing written to the new ref vanishes.
-      append(ctx, [7], cfg({ cutover: 'off', dualRead: true }));
-      const k = read(ctx, cfg({ cutover: 'off', dualRead: true }));
-      expect(prsOf(k.text).sort()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+      // Kill switch: cutover rollback. Writers return to the old ref; nothing written to the new ref vanishes; and a
+      // replay of a row that already landed on the NEW ref is not appended to the old one (audit finding 3).
+      const oldBeforeRollback = prsOf(ctx.showOnOrigin(OLD, PATH));
+      append(ctx, [5], cfg({ cutover: 'rollback' }));
+      expect(prsOf(ctx.showOnOrigin(OLD, PATH))).toEqual(oldBeforeRollback);
+      append(ctx, [7], cfg({ cutover: 'rollback' }));
+      const k = read(ctx, cfg({ cutover: 'rollback' }));
+      expect(k.status).toBe('ok');
+      expect(prsOf(k.text)).toEqual([1, 2, 3, 4, 5, 6, 7]);
       // The old ref was only ever appended to by the old-ref writers: its history is a fast-forward of the start.
       git(['merge-base', '--is-ancestor', oldTipAfterMigration, OLD], { cwd: ctx.origin });
     });
