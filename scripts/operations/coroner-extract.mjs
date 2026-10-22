@@ -29,6 +29,7 @@ import { LOG_TIMESTAMP_RE, expandRepeatedLines, stripLogTimestamp } from '../lib
 import { collectChangeRequests } from './coroner-rounds.mjs';
 import { redact, buildFrictions, claudeFriction, collectAgyFrictions, collectCodexFrictions, collectDispatchRuns, summarizeBuildOutcomes } from './coroner-transcripts.mjs';
 import { parseSelectionLine } from '../lib/verify-selection-log.mjs';
+import { collectOrchestratorSessions } from './coroner-orchestrator.mjs';
 
 const MiB = 1024 * 1024;
 const MAX_LINE = 256 * 1024;
@@ -892,8 +893,9 @@ export function formatHuman(metrics) {
   return lines.join('\n');
 }
 
-export function runCoroner(argv, { env = process.env, home = homedir(), now = new Date().toISOString(), io = fs, gh = null } = {}) {
-  const { values } = parseArgs({ args: argv, options: { since: { type: 'string' }, until: { type: 'string' }, json: { type: 'boolean' }, state: { type: 'string' }, 'no-save': { type: 'boolean' } } });
+export function runCoroner(argv, { env = process.env, home = homedir(), now = new Date().toISOString(), io = fs, gh = null, deferSave = false } = {}) {
+  const { values } = parseArgs({ args: argv, options: { since: { type: 'string' }, until: { type: 'string' }, json: { type: 'boolean' }, state: { type: 'string' }, 'no-save': { type: 'boolean' }, 'orchestrator-session': { type: 'string' }, 'no-orchestrator': { type: 'boolean' } } });
+  if (values['orchestrator-session'] !== undefined && !/^[\w-]+$/.test(values['orchestrator-session'])) throw new Error('invalid orchestrator session id');
   const statePath = values.state || env.WE_CORONER_STATE || join(home, 'workspace/.operations/state/coroner-last.json');
   let since = values.since;
   if (since === 'last') {
@@ -906,21 +908,40 @@ export function runCoroner(argv, { env = process.env, home = homedir(), now = ne
   const window = { since: new Date(since).toISOString(), until: new Date(until).toISOString() };
   const metrics = extractMetrics(collectInputs(window, { env, home, io, gh }));
   const output = values.json ? JSON.stringify(metrics) : formatHuman(metrics);
-  if (!values['no-save']) {
+  const saveState = () => {
+    if (values['no-save']) return;
     io.mkdirSync(dirname(statePath), { recursive: true });
     const tmp = `${statePath}.${randomUUID()}.tmp`;
     try { io.writeFileSync(tmp, JSON.stringify({ lastEnd: window.until }) + '\n', { flag: 'wx' }); io.renameSync(tmp, statePath); }
     finally { try { io.unlinkSync(tmp); } catch { /* Already renamed. */ } }
-  }
-  return { metrics, output };
+  };
+  if (!deferSave) saveState();
+  return { metrics, output, saveState, orchestratorOptions: { sessionId: values['orchestrator-session'], disabled: values['no-orchestrator'] || !!env.WE_CORONER_NO_ORCH, json: values.json } };
 }
+export async function runCoronerWithOrchestrator(argv, options = {}) {
+  const result = runCoroner(argv, { ...options, deferSave: true });
+  const { metrics, orchestratorOptions } = result;
+  if (!orchestratorOptions.disabled) {
+    try {
+      metrics.orchestrator = await collectOrchestratorSessions(metrics.window, { ...options, sessionId: orchestratorOptions.sessionId });
+    } catch (error) {
+      metrics.orchestrator = { error: redact(String(error.message ?? error)).replace(/\s+/g, ' ').slice(0, 160) };
+    }
+    result.output = orchestratorOptions.json ? JSON.stringify(metrics) : formatHuman(metrics);
+  }
+  if (!metrics.orchestrator?.error) result.saveState();
+  return result;
+}
+
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   // A consumer such as head may close the pipe after its requested prefix.
   process.stdout.on('error', (error) => { if (error.code !== 'EPIPE') { process.stderr.write(`${error.message}\n`); process.exitCode = 1; } });
   try {
-    const { output, metrics } = runCoroner(process.argv.slice(2), { gh: process.env.WE_CORONER_NO_CI ? null : makeGh() });
+    const gh = process.env.WE_CORONER_NO_CI ? null : makeGh();
+    const { output, metrics } = await runCoronerWithOrchestrator(process.argv.slice(2), { gh });
     process.stdout.write(output + '\n');
+    if (metrics.orchestrator?.partial || metrics.orchestrator?.error) process.stderr.write('coroner: warning: orchestrator collection is incomplete; transcript evidence may be missing\n');
     for (const warning of metrics.sources.warnings ?? []) process.stderr.write(`coroner: ${warning.kind} ${warning.daemon} ${warning.file}${warning.lastWriteAt ? ` last write ${warning.lastWriteAt}` : ''}\n`);
   }
   catch (error) { process.stderr.write(`${error.message}\n`); process.exitCode = 1; }

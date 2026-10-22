@@ -1633,6 +1633,15 @@ budget exhaustion. GitHub calls use the shared throttle in both synchronous and 
 
 ### Nightly coroner health job
 
+Orchestrator regressions live in `scripts/operations/__tests__/coroner-orchestrator.test.mjs`
+and use redacted rows and temporary directories. Worker wrong-premise evidence comes only from
+user `<task-notification>` results or `tool_result` blocks linked to Agent/Task calls; assistant
+brief quotes and duplicate `queue-operation` rows are excluded. Notifications are never operator
+corrections. Neither are `isMeta: true` rows or loop prompts beginning with a marker in the exported
+`SCHEDULED_PROMPT_MARKERS` list (currently `PR movement sweep`). Add known loop prefixes there
+with a regression rather than filtering ordinary user corrections by topic. Digest matching uses
+the full correction before quote truncation and normalizes curly punctuation on both sides.
+
 `nightly-coroner` is a detached health-watch job, independent of chat sessions and accounts.
 `coroner.nightly.at` defaults to `22:17` in `America/New_York`; `coroner.nightly.enabled` defaults true.
 Both resolve through standard → platform `coroner.nightly` → `scripts/settings/coroner.json`
