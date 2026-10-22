@@ -341,12 +341,16 @@ function resolveRepo() {
   // derivation. It is the pool selector for the READ / RELEASE ops (status / list / path / release) that need
   // only `poolDir` — e.g. the main session releasing a cross-locus couple's lingering lease in the `plateau-app`
   // pool from the WE checkout, without needing a plateau-app checkout path. When `--pool` names the pool an
-  // undeterminable origin URL is NOT fatal (these ops never clone). `acquire`/`provision`/`refresh` still need a
-  // real origin, and hit the same guard at use (`cloneLane` throws on a null origin) — so the fail just moves
-  // from resolve-time to the op that actually needs it, keeping the read/release selector usable without one.
+  // undeterminable origin URL is NOT fatal for metadata-only operations. Operations that clone, fetch,
+  // or prove preservation need a canonical origin at startup; a lane-controlled remote is no fallback.
   const explicitPool = typeof flags.pool === 'string' && flags.pool ? flags.pool : null;
   if (!originUrl && !explicitPool) {
     fail(`could not determine an origin URL — pass --origin=<url> (looked in ${topLevel})`);
+  }
+  const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
+    || (cmd === 'list' && flags.acquirable);
+  if (!originUrl && needsOrigin) {
+    fail(`${cmd} requires a canonical origin for pool ${explicitPool} — pass --origin=<url> (looked in ${topLevel})`);
   }
   const name = explicitPool || flags.name || basename(originUrl).replace(/\.git$/, '');
   // Default integration branch: the reference's origin/HEAD if known, else `main`.
@@ -1190,12 +1194,15 @@ function liveRemoteShasProbe(repo) {
     // No lane config, including worktree config or includes, may affect a live proof. A literal
     // URL alone is insufficient: url.*.insteadOf can rewrite it to an executable remote helper.
     probeDir = mkdtempSync(join(tmpdir(), 'lane-remote-probe-'));
-    const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CEILING_DIRECTORIES: dirname(probeDir) });
+    const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CEILING_DIRECTORIES: dirname(probeDir) }, { remoteProbe: true });
     for (const key of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
       'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS']) delete env[key];
     // Explicit local pool origins are supported too. Permit file transport only for that canonical
     // path, in this isolated process; lane protocol settings never participate in this decision.
+    // GIT_ALLOW_PROTOCOL overrides even per-protocol inherited config and a parent's wider allowlist.
+    env.GIT_ALLOW_PROTOCOL = 'https:ssh';
     if (remote.startsWith('/') || remote.startsWith('file://')) {
+      env.GIT_ALLOW_PROTOCOL += ':file';
       const i = Number(env.GIT_CONFIG_COUNT);
       env[`GIT_CONFIG_KEY_${i}`] = 'protocol.file.allow';
       env[`GIT_CONFIG_VALUE_${i}`] = 'always';

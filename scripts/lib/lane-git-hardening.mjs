@@ -22,6 +22,11 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.attributesFile', '/dev/null'],
   ['core.sshCommand', 'ssh'],
   ['commit.gpgsign', 'false'],
+]);
+
+// Remote proofs use a restricted transport policy. Ordinary hardened callers also fetch/clone
+// from local and HTTP origins, so changing their transport policy here would break those callers.
+const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
   ['protocol.allow', 'never'],
   ['protocol.https.allow', 'always'],
   ['protocol.ssh.allow', 'always'],
@@ -34,18 +39,20 @@ export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => 
  * `env` with the pins appended to git's environment config list. An existing `GIT_CONFIG_COUNT` is preserved (the pins
  * come AFTER its entries, so they win). `GIT_EXTERNAL_DIFF` is dropped: an inherited one would run on every `git diff`.
  * @param {Record<string,string|undefined>} env
+ * @param {{remoteProbe?: boolean}} options Restrict transports only for an isolated remote proof.
  * @returns {Record<string,string|undefined>}
  */
-export function laneGitHardeningEnv(env = process.env) {
+export function laneGitHardeningEnv(env = process.env, { remoteProbe = false } = {}) {
   const out = { ...env };
   delete out.GIT_EXTERNAL_DIFF;
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
-  LANE_GIT_CONFIG_PINS.forEach(([k, v], i) => {
+  const pins = remoteProbe ? [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS] : LANE_GIT_CONFIG_PINS;
+  pins.forEach(([k, v], i) => {
     out[`GIT_CONFIG_KEY_${start + i}`] = k;
     out[`GIT_CONFIG_VALUE_${start + i}`] = v;
   });
-  out.GIT_CONFIG_COUNT = String(start + LANE_GIT_CONFIG_PINS.length);
+  out.GIT_CONFIG_COUNT = String(start + pins.length);
   return out;
 }
 
