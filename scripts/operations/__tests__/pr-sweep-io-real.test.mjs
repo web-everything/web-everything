@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, wr
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseDrainSkips, parseLiveJobs, tailOf } from '../pr-sweep-io.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
@@ -167,16 +167,65 @@ it('tailOf reads a REAL external log without changing the checkout, throws for a
 
 describe('stand-down lapse enrichment in the reader', async () => {
   const { createPrSweepReader } = await import('../pr-sweep-io.mjs');
-  const { STAND_DOWN_MARKER } = await import('../../conveyor/stand-down.mjs');
+  const { assessPrSweep } = await import('../pr-sweep-core.mjs');
+  const { STAND_DOWN_MARKER, buildStandDownComment } = await import('../../conveyor/stand-down.mjs');
   const { AUTOMATION_LOGINS } = await import('../../lib/marker-authorship.mjs');
   const head = 'd'.repeat(40);
+  const now = Date.parse('2026-10-21T13:00:00Z');
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    vi.stubEnv('WE_FIX_STAND_DOWN_HOLDS_ACROSS_HEADS', 'false');
+  });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
   const gh = (thread) => (_b, args) => {
-    if (args[1] === 'list') return JSON.stringify([{ number: 7, state: 'OPEN', headRefOid: head, updatedAt: '2026-10-21T10:00:00Z', labels: [] }]);
+    if (args[1] === 'list') return JSON.stringify([{ number: 7, state: 'OPEN', headRefOid: head, updatedAt: '2026-10-21T10:00:00Z', labels: [{ name: 'review:changes' }] }]);
     if (args.includes('commits')) return JSON.stringify({ commits: [{ oid: head, committedDate: '2026-10-21T12:00:00Z' }] });
     if (String(args.at(-1)).includes('/comments')) return JSON.stringify([thread]);
     return JSON.stringify([[]]);
   };
   const make = (thread, lapseContext) => createPrSweepReader({ run: gh(thread), ps: () => '', readText: () => '', settings: () => ({ prSweep: { repos: ['web-everything/web-everything'] } }), lapseContext });
+  const sd = (reason, fromHead) => ({ id: 2, user: { login: AUTOMATION_LOGINS[0] }, created_at: '2026-10-21T11:00:00Z',
+    body: buildStandDownComment({ reason, head: fromHead, detail: 'repair stopped' }) });
+  const classified = (read) => assessPrSweep({ ...read, standDownLapse: 'off' }).prs[0];
+  it.each(['e'.repeat(40), undefined])('reader annotates a stand-down lapsed on a new head (previous head %s)', (fromHead) => {
+    // Even a ledger outage must not suppress a lapse proven by the commit date/head.
+    const read = make([sd('gate-red', fromHead)], () => { throw new Error('ledger gone'); })({});
+    expect(read.unreadable).toEqual([]);
+    expect(read.prs[0].comments[0].standDownLapsed).toEqual({ fromHead: fromHead ?? null, toHead: head });
+    expect(classified(read)).toMatchObject({ waitingOn: 'fixing', stalled: true });
+    const held = { ...read, prs: [{ ...read.prs[0], comments: read.prs[0].comments.map(({ standDownLapsed, ...c }) => c) }] };
+    expect(classified(held).waitingOn).toBe('system:fix-stood-down');
+  });
+  const redMainContext = () => ({
+    rows: ['10:10:00', '10:20:00', '10:30:00', '10:40:00'].map((time, i) => ({
+      v: 1, repo: 'we', pr: 7, head, at: `2026-10-21T${time}Z`, kind: i === 3 ? 'park' : 'fix',
+      session: `repair-${i}`, reason: 'budget',
+    })),
+    config: { hold: true, maxSessions: 3, windowHours: 6, rearmAfterMinutes: 120, redMainDiscount: 'on',
+      redMainWindows: [{ start: '2026-10-21T10:00:00Z', end: '2026-10-21T12:00:00Z' }] },
+  });
+  it('reader annotates a fix-loop stand-down whose attempts all ran while main was red', () => {
+    const read = make([sd('fix-loop-exhausted', head)], redMainContext)({});
+    expect(read.unreadable).toEqual([]);
+    expect(read.prs[0].standDownLapses).toEqual([{ fromHead: head, toHead: head, reason: 'fix-loop-exhausted', lapse: 'red-main-only' }]);
+    expect(read.prs[0].comments[0].standDownLapsed).toEqual({ fromHead: head, toHead: head });
+    expect(classified(read)).toMatchObject({ waitingOn: 'fixing', stalled: true });
+    const held = { ...read, prs: [{ ...read.prs[0], comments: read.prs[0].comments.map(({ standDownLapsed, ...c }) => c) }] };
+    expect(classified(held).waitingOn).toBe('system:fix-stood-down');
+  });
+  it.each(['repository', 'PR', 'head', 'discount off', 'main still red', 'no park'])
+  ('reader keeps a fix-loop stand-down terminal with invalid lapse evidence: %s', (variant) => {
+    const context = redMainContext();
+    if (variant === 'repository') context.rows.forEach((r) => { r.repo = 'plateau-app'; });
+    if (variant === 'PR') context.rows.forEach((r) => { r.pr = 8; });
+    if (variant === 'head') context.rows.forEach((r) => { r.head = 'e'.repeat(40); });
+    if (variant === 'discount off') context.config.redMainDiscount = 'off';
+    if (variant === 'main still red') context.config.redMainWindows[0].end = null;
+    if (variant === 'no park') context.rows = context.rows.filter((r) => r.kind !== 'park');
+    const read = make([sd('fix-loop-exhausted', head)], () => context)({});
+    expect(read.prs[0].comments[0].standDownLapsed).toBeUndefined();
+    expect(classified(read)).toMatchObject({ waitingOn: 'system:fix-stood-down', stalled: true });
+  });
   it('keeps the comment url and reads the ledger only for a thread with a stand-down', () => {
     let reads = 0;
     const plain = make([{ id: 1, html_url: 'https://x/1', user: { login: 'a' }, body: 'hi', created_at: '2026-10-21T11:00:00Z' }], () => { reads += 1; return { rows: [], config: {} }; })({});

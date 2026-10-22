@@ -17,7 +17,7 @@ Operator approved filing 2026-10-20 ("ok").
 - Do the expensive full pass when the host is idle: the quiet-hours window (default 22:00-07:00 America/New_York, already modelled by `we:scripts/lib/quiet-hours.mjs`) and daytime idle gaps (load and free memory under threshold).
 - Each full pass publishes a **versioned index with a watermark** (the last write sequence or manifest entry it covered).
 - Daytime readers use **index + delta since the watermark**. On ANY mismatch (unknown version, gap in the write sequence, manifest disagreement, index missing or older than its maximum age) they fall back to today's full read.
-- **Fail closed. Never skip by metadata.** No reader may skip a file because its stat identity (size, mtime, inode) looks unchanged. Four earlier run-store caches that did this were rejected by the Codex guard audit as WEAKENED (see x5wqxb3). Completeness must be provable from a writer-owned sequence or manifest, not inferred from file metadata.
+- **Fail closed. Never skip by metadata.** No reader may skip a file because its stat identity (size, mtime, inode) looks unchanged. Four earlier run-store caches that did this were rejected by the Codex guard audit as WEAKENED (see 6786). Completeness must be provable from a writer-owned sequence or manifest, not inferred from file metadata.
 
 ## Scheduler
 
@@ -34,12 +34,12 @@ Each slice records its measure-before baseline FIRST (see last section), then sh
 
 ### 1. Review run store: nightly index + archive/compress old runs
 
-- Problem: the shared run store (`runsDir()` in `we:scripts/operations/run-store.mjs`) holds about 144,551 run files, about 30 GB. The daytime red-team evidence read parses all ~6.5k `review-pr-*` runs (~1.57 GB) at about 9.1 s per call (measured in x5wqxb3).
+- Problem: the shared run store (`runsDir()` in `we:scripts/operations/run-store.mjs`) holds about 144,551 run files, about 30 GB. The daytime red-team evidence read parses all ~6.5k `review-pr-*` runs (~1.57 GB) at about 9.1 s per call (measured in 6786).
 - Nightly: build the per-op / per-PR index; archive and compress finished runs older than N days into a compacted archive the index still covers.
 - Reader: index + files written after the watermark. Completeness is provable from a writer-owned write sequence or manifest. Any gap means full read.
 - Mode: **prototype**, shadow-compare (index answer vs full read, logged, full read still wins) before any reader switches.
 - Predicted scope: `we:scripts/operations/run-store.mjs`, a new index/archive module under `we:scripts/lib/`, the three evidence readers named in xwu9oxh, tests.
-- Links, do not duplicate: this is the nightly/idle half of **xwu9oxh slice S4** (run-store retention) and builds on the writer-owned identity index of **x5wqxb3**. Whichever lands first owns the index format; this slice only adds the window scheduling and archive pass.
+- Links, do not duplicate: this is the nightly/idle half of **xwu9oxh slice S4** (run-store retention) and builds on the writer-owned identity index of **6786**. Whichever lands first owns the index format; this slice only adds the window scheduling and archive pass.
 
 ### 2. Git upkeep on lanes + daemon clones
 

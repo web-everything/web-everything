@@ -20,6 +20,13 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 export const NEVER_AUTOMATIC = Object.freeze(['not-real', 'clear-human', 'accept', 'supersede']);
 export const POLICY_ACTOR = 'auto-policy';
 
+/** Last line of defence for classifier outputs. Pure; the fallback command belongs to the operator. */
+export function demoteNeverAutomatic(item, operatorCommand) {
+  return item.lane !== 'operator' && NEVER_AUTOMATIC.includes(item.action)
+    ? { ...item, lane: 'operator', reason: `fail-closed: ${item.action} is never automatic`, command: operatorCommand }
+    : item;
+}
+
 /**
  * Every policy this classifier applies, as a SETTING (operator standing rule 2026-10-21 14:45 ET: no policy is a
  * constant). The sweep resolves them through the `prStallSweep` cascade and passes them in; these are the standard
@@ -174,7 +181,8 @@ function classifyUnsafe(o = {}) {
   const out = (lane, action, reason, extra = {}) => {
     const r = { lane, action, reason, key, command: null, evidence, ...extra };
     // The last line of defence: no automatic lane may produce an action reserved for a person.
-    if (lane !== 'operator' && NEVER_AUTOMATIC.includes(action)) return { ...r, lane: 'operator', reason: `fail-closed: ${action} is never automatic` };
+    const safe = demoteNeverAutomatic(r, fill(row.next?.command));
+    if (safe !== r) return safe;
     // Settings may only send an automatic item to a person: a state forced to the operator, or an action switched off.
     const toPerson = (why) => ({ ...r, lane: 'operator', reason: `${why}; ${reason}`, command: fill(row.next?.command) });
     if (lane !== 'operator' && cfg.stateLanes[state] === 'operator') return toPerson(`setting stateLanes.${state}=operator`);

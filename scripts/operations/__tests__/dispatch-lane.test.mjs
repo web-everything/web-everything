@@ -16,6 +16,7 @@ import { applyTestsFirstPolicy } from '../../lib/tests-first-policy.mjs';
  * exactly (it is the contract with the `claude` CLI), and no `claude` process is ever started by the suite.
  */
 
+import { renderBuildRequirements } from '../../lib/build-policy.mjs';
 import { afterAll, beforeAll, describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -2298,7 +2299,7 @@ describe('#3165: the planner\'s prepare lists reach the spawner', () => {
    *  the KIND'S OWN required set (not `fillBrief`'s build-shaped default), so a name only one kind's brief
    *  carries — `DELIVERY_BASE` since #3637 — is never demanded of a kind that has no such token. */
   function expectedPrompt(kind, values) {
-    return fillBrief(applyTestsFirstPolicy(readFileSync(briefPath(REPO_ROOT, kind), 'utf8')), values, BRIEF_REQUIRED_BY_KIND[kind]).prompt;
+    return fillBrief(applyTestsFirstPolicy(readFileSync(briefPath(REPO_ROOT, kind), 'utf8')) + (['build', 'fix', 'ci-heal'].includes(kind) ? '\n\n' + renderBuildRequirements() : ''), values, BRIEF_REQUIRED_BY_KIND[kind]).prompt;
   }
 
   // ── criterion 1 ──────────────────────────────────────────────────────────────────────────────────────────
@@ -2359,7 +2360,7 @@ describe('#3165: the planner\'s prepare lists reach the spawner', () => {
   });
 
   // ── criterion 3 ──────────────────────────────────────────────────────────────────────────────────────────
-  it('a BUILD is byte-identical to before — the same brief, the same slug, the same argv', async () => {
+  it('a BUILD carries configured safeguards with the same slug and argv', async () => {
     // The additive claim, TESTED rather than asserted in a comment. If any of these three moved, every caller
     // that predates #3165 changed behaviour, and the card's "it can land before anything that depends on it"
     // stops being true.
@@ -2625,7 +2626,7 @@ describe('#3332: the planner\'s fix and CI-heal lists reach the spawner', () => 
    *  `ci-heal` need `REPO_AWARE_VALUE_PATTERNS` (#3960: `GATE_COMMAND`/`ATTRIBUTION` legitimately carry a space). */
   function expectedPrompt(kind, values) {
     return fillBrief(
-      readFileSync(briefPath(REPO_ROOT, kind), 'utf8'), values, BRIEF_REQUIRED_BY_KIND[kind],
+      applyTestsFirstPolicy(readFileSync(briefPath(REPO_ROOT, kind), 'utf8')) + '\n\n' + renderBuildRequirements(), values, BRIEF_REQUIRED_BY_KIND[kind],
       undefined, kind === 'fix' || kind === 'ci-heal' ? REPO_AWARE_VALUE_PATTERNS : undefined,
     ).prompt;
   }
