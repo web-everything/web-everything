@@ -336,6 +336,15 @@ describe('hasAwaitVerifyRecordStrict — only a clean "no such file" is absent',
   it('present (unknown) when a record file is corrupt', () => {
     expect(hasAwaitVerifyRecordStrict(dir, session, { dir, readFileSyncFn: () => '{not json' })).toBe(true);
   });
+  it('present (unknown) when the lane .git cannot be stat-ed (EACCES)', () => {
+    const eaccesStat = () => { const e = new Error('EACCES'); e.code = 'EACCES'; throw e; };
+    expect(hasAwaitVerifyRecordStrict(dir, session, { dir, statFn: eaccesStat, readFileSyncFn: enoent })).toBe(true);
+  });
+  it('a worktree .git pointer file is not mistaken for a corrupt record', () => {
+    const statFn = () => ({ isDirectory: () => false, isFile: () => true });
+    const readFileSyncFn = (p) => (String(p).endsWith('.git') ? 'gitdir: /x/.git/worktrees/w\n' : enoent());
+    expect(hasAwaitVerifyRecordStrict('/lane', session, { dir, statFn, readFileSyncFn })).toBe(false);
+  });
   it('present when a record parses', () => {
     expect(hasAwaitVerifyRecordStrict(dir, session, { dir, readFileSyncFn: () => '{"pr":5758}' })).toBe(true);
   });

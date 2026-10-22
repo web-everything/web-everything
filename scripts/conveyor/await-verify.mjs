@@ -157,16 +157,19 @@ export function readAwaitVerifyRecordForSession(cwd, session, { dir = awaitVerif
  * STRICT presence: does this session hold ANY await record, or might it (a record file that exists but could not be
  * read or parsed)? Only a clean "no such file" counts as absent. For callers deciding whether a session may be stopped.
  */
-export function hasAwaitVerifyRecordStrict(cwd, session, { readFileSyncFn = readFileSync, ...opts } = {}) {
+export function hasAwaitVerifyRecordStrict(cwd, session, { readFileSyncFn = readFileSync, statFn = statSync, ...opts } = {}) {
   let unknown = false;
+  const absent = (e) => e?.code === 'ENOENT' || e?.code === 'ENOTDIR';
+  const strictStat = (path) => { try { return statFn(path); } catch (e) { if (!absent(e)) unknown = true; throw e; } };
   const strictRead = (path, enc) => {
     let text;
-    try { text = readFileSyncFn(path, enc); } catch (e) { if (e?.code !== 'ENOENT' && e?.code !== 'ENOTDIR') unknown = true; throw e; }
-    try { if (!isObject(JSON.parse(text))) unknown = true; } catch { unknown = true; }
+    try { text = readFileSyncFn(path, enc); } catch (e) { if (!absent(e)) unknown = true; throw e; }
+    // Only a record file must parse; the worktree `.git` pointer (`gitdir: ...`) is read as text by the resolver.
+    if (String(path).endsWith('.json') || String(path).endsWith(AWAIT_VERIFY_FILE)) { try { if (!isObject(JSON.parse(text))) unknown = true; } catch { unknown = true; } }
     return text;
   };
   let record = null;
-  try { record = readAwaitVerifyRecordForSession(cwd, session, { ...opts, readFileSyncFn: strictRead }); } catch { return true; }
+  try { record = readAwaitVerifyRecordForSession(cwd, session, { ...opts, statFn: strictStat, readFileSyncFn: strictRead }); } catch { return true; }
   return Boolean(record) || unknown;
 }
 /** Every parseable store record with its key; unreadable entries are skipped. */

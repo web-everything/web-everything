@@ -367,11 +367,14 @@ A settled status → act on it as listed below. `timeout` → `request` ONCE mor
 `--attempt`, and end your turn. A second `timeout` for the same sha → stand down with a clear reason, not a third wait:
 
 ```bash
+node {{WE_ROOT}}/scripts/conveyor/await-verify.mjs clear --who={{SESSION_SLUG}}
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-infra --cause="verify-wait-timeout: <sha> did not settle within two bounded waits"
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
 
-This exit releases the claim but leaves `review:changes`, so the unverified head is never handed back or landed.
+Clear your await record FIRST (run from your lane), so a verdict that lands later can never resume you after another
+fixer took the PR. This exit releases the claim but leaves `review:changes`, so the unverified head is never handed
+back or landed.
 
 A dispatched agent cannot run the gate itself: `we:scripts/guard-bash.mjs` denies any `verify-lane.mjs` invocation
 except `request` / `check` / `reset` (#3105) — including a bare `run --repo=.` and `run` wrapped in
