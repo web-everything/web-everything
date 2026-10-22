@@ -812,6 +812,37 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(readGroupState(statePath).groups.map(g => g.id)).toEqual(['other']);
       expect(t.calls.some(c => c.startsWith('pr create'))).toBe(false);
     });
+
+    it('two concurrent passes planning disjoint pairs on the same card: only one group forms, the other waits', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]), 3: card([1, 2, 12]), 4: card([1, 2, 13]) });
+      const statePath = join(tmp(), 's.json');
+      const only = nums => t.outcomes.filter(o => nums.includes(o.num));
+      const passA = createCardGrouping({ ...t.opts, statePath, withLock: fn => ({ ran: true, result: fn() }) });
+      let a;
+      // Pass B planned {3,4} before A claimed; A claims {1,2} on the same card between B's pre-check and B's claim.
+      const withLock = fn => { a = passA.form({ outcomes: only([1, 2]), verdicts: t.verdicts }); return { ran: true, result: fn() }; };
+      const b = createCardGrouping({ ...t.opts, statePath, withLock }).form({ outcomes: only([3, 4]), verdicts: t.verdicts });
+      expect(a.formed).toBeDefined();
+      expect(b.formed).toBeUndefined();
+      expect(b.reason).toMatch(/claim refused: backlog\/5360-prevention-card\.md is reserved by open card group/);
+      const st = readGroupState(statePath);
+      expect(st.groups.map(g => g.sources.map(s => s.num))).toEqual([[1, 2]]);
+      // Waiting, not failed: no retry-backoff memo for {3,4}, and the next pass leaves them out while the card is reserved.
+      expect(Object.keys(st.failed)).toEqual([]);
+      const next = createCardGrouping({ ...t.opts, statePath, withLock: fn => ({ ran: true, result: fn() }) }).form({ outcomes: only([3, 4]), verdicts: t.verdicts });
+      expect(next.formed).toBeUndefined();
+      expect(readGroupState(statePath).groups).toHaveLength(1);
+    });
+
+    it('a claim refuses (fail closed) while an open group has no recorded file list', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json');
+      const other = { id: 'other', repo: 'o/r', pr: 5, branch: 'lane/card-group-other', sources: [{ num: 8, headSha: 'd'.repeat(40) }, { num: 9, headSha: 'e'.repeat(40) }] };
+      const withLock = fn => { writeFileSync(statePath, JSON.stringify({ groups: [other], failed: {} })); return { ran: true, result: fn() }; };
+      const r = createCardGrouping({ ...t.opts, statePath, withLock }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.reason).toMatch(/claim refused: open card group #5 has no file list/);
+      expect(readGroupState(statePath).groups.map(g => g.id)).toEqual(['other']);
+    });
   });
 
   describe('form: leave-out of a source the build or the proof pins a failure on', () => {
@@ -1073,6 +1104,9 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       ['sent back: review:human', { combined: { state: 'OPEN', labels: [{ name: 'review:human' }] } }, /combined PR sent back \(review:human\)/, true],
       ['required check failed', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] } }, /combined PR failed the required check/, true],
       ['required check timed out (status context)', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ context: 'test', state: 'TIMED_OUT' }] } }, /combined PR failed the required check/, true],
+      ['the latest required run failed after an older success', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [
+        { name: 'test', conclusion: 'FAILURE', startedAt: '2026-10-21T10:06:00Z', completedAt: '2026-10-21T10:20:00Z' },
+        { name: 'test', conclusion: 'SUCCESS', startedAt: '2026-10-21T10:00:00Z', completedAt: '2026-10-21T10:05:00Z' }] } }, /combined PR failed the required check/, true],
       ['source head moved', { sources: { 2: { headRefOid: 'c'.repeat(40) } } }, /source #2 changed \(head moved\)/, true],
       ['source lost its approval', { sources: { 1: { labels: [{ name: 'ready-to-merge' }] } } }, /source #1 changed \(not review:accepted\)/, true],
       ['source sent back', { sources: { 2: { labels: [...accepted, { name: 'review:human' }] } } }, /source #2 changed \(holds review:human\)/, true],
@@ -1095,6 +1129,15 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       ['the combined PR is waiting for review (ready-to-merge + review:pending)', {}],
       ['a check that is not required failed', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [{ name: 'lint', conclusion: 'FAILURE' }] } }],
       ['the required check is still running', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS', conclusion: '' }] } }],
+      ['an older CANCELLED required run is superseded by a newer SUCCESS', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [
+        { name: 'test', conclusion: 'SUCCESS', startedAt: '2026-10-21T10:04:00Z', completedAt: '2026-10-21T10:20:00Z' },
+        { name: 'test', conclusion: 'CANCELLED', startedAt: '2026-10-21T10:00:00Z', completedAt: '2026-10-21T10:05:00Z' }] } }],
+      ['an older FAILURE status context is superseded by a newer SUCCESS', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [
+        { context: 'test', state: 'FAILURE', startedAt: '2026-10-21T10:00:00Z' },
+        { context: 'test', state: 'SUCCESS', startedAt: '2026-10-21T10:30:00Z' }] } }],
+      ['a failed required run is re-running (gh zero completedAt on the rerun)', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [
+        { name: 'test', conclusion: 'FAILURE', startedAt: '2026-10-21T10:00:00Z', completedAt: '2026-10-21T10:05:00Z' },
+        { name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-21T10:10:00Z', completedAt: '0001-01-01T00:00:00Z' }] } }],
       ['a source read fails (fail closed: held)', { readFails: [2] }],
       ['closing the combined PR fails (held, retried)', { combined: { state: 'OPEN', labels: [{ name: 'review:changes' }] }, closeFails: true }],
       ['the combined PR read fails', { combined: 'throw' }],

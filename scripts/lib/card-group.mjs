@@ -662,8 +662,19 @@ export function createCardGrouping({
     const sha = String(r.stdout ?? '').split(/\s/)[0];
     return r.status === 0 && SHA.test(sha) ? sha : null;
   };
-  const requiredFailed = pr => (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [])
-    .some(c => (c?.name === 'test' || c?.context === 'test') && ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'].includes(String(c?.conclusion || c?.state || '').toUpperCase()));
+  // Only the LATEST run of the required check counts: a superseded failure (a cancelled run, then a green rerun)
+  // must never close a currently green combined PR. A run is ordered by its completion, else its start; gh reports
+  // an unfinished run's completedAt as year 0001, which is no time at all. Ties keep the later rollup row.
+  const runAt = c => {
+    for (const v of [c?.completedAt, c?.startedAt]) { const t = Date.parse(v ?? ''); if (Number.isFinite(t) && t > 0) return t; }
+    return -Infinity;
+  };
+  const requiredFailed = pr => {
+    const runs = (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []).filter(c => c?.name === 'test' || c?.context === 'test');
+    if (!runs.length) return false;
+    const latest = runs.reduce((a, b) => (runAt(b) >= runAt(a) ? b : a));
+    return ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'].includes(String(latest?.conclusion || latest?.state || '').toUpperCase());
+  };
 
   const api = {
     setting,
@@ -937,13 +948,24 @@ export function createCardGrouping({
             const bad = liveEligible(pr, x.headSha);
             if (bad) return { ok: false, reason: `#${x.num} ${bad}` };
           }
+          // A concurrent pass may have claimed a group meanwhile. Two open groups on one card would each hold the
+          // other's combined PR for good (cardGroupHold), so a card an open group reserves refuses the claim too; it
+          // is released when that group dissolves or lands. An open group with no file list cannot be judged: refuse.
           const claimed = mutate(s => {
-            const taken = new Set(s.groups.filter(isLocalGroup).flatMap(g => g.sources.map(y => Number(y.num))));
-            if (record.sources.some(y => taken.has(y.num))) return false;
+            const open = s.groups.filter(isLocalGroup);
+            const taken = new Set(open.flatMap(g => g.sources.map(y => Number(y.num))));
+            if (record.sources.some(y => taken.has(y.num))) return 'a source joined another group meanwhile';
+            for (const g of open) {
+              const where = g.pr ? `#${g.pr}` : g.id;
+              if (!Array.isArray(g.files)) return `open card group ${where} has no file list (fail closed)`;
+              const hit = record.files.find(f => g.files.includes(f));
+              if (hit) return `${hit} is reserved by open card group ${where} — waiting until it clears`;
+            }
             s.groups.push(record);
             return true;
           });
-          if (!claimed?.ok || claimed.result !== true) return { ok: false, reason: 'a source joined another group meanwhile' };
+          if (!claimed?.ok) return { ok: false, reason: `card-group state ${claimed?.reason ?? 'update failed'}` };
+          if (claimed.result !== true) return { ok: false, reason: claimed.result };
           return { ok: true };
         });
         if (lock?.ran === false) return { reason: 'land mutex held — retried next pass' };
