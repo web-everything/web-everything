@@ -728,6 +728,9 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
       // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
       if (typeof io.runRedTeamGate === 'function') {
+        // Card 6212 — the pass's own process wrote `finished`; on a round-1 `changes` review the fixer must keep
+        // waiting until the gate has published the fix list, so the job holds the status until the end of the gate.
+        if (round1Changes) io.redTeamStatus?.({ ...seatsBox.input, status: 'running' });
         let gate;
         try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
         io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);

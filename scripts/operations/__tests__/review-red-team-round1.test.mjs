@@ -109,7 +109,8 @@ describe('runReviewJob under redTeam.timing', () => {
   it('round1 + changes: the pass starts beside the panel (even with review.speculativeRedTeam off), is FINISHED, gated, and settled before the added seats', () => {
     const { io, calls } = jobIo({ verdict: 'changes' });
     const out = runReviewJob({ pr: 7, repo: REPO }, io);
-    expect(kinds(calls)).toEqual(['start', 'loop', 'status:queued', 'await', 'finish', 'cleanup', 'gate', 'status:finished', 'extra-seats']);
+    // `running` again before the gate: the fixer keeps waiting until the gate has published the fix list.
+    expect(kinds(calls)).toEqual(['start', 'loop', 'status:queued', 'await', 'finish', 'cleanup', 'status:running', 'gate', 'status:finished', 'extra-seats']);
     expect(calls.find((c) => c[0] === 'finish')).toEqual(['finish', 'changes', true]);
     expect(calls.some((c) => c[0] === 'discard-row')).toBe(false);
     expect(out.redTeamTiming).toEqual({ timing: 'round1', round: 'changes' });
@@ -250,9 +251,15 @@ describe('citedLinesFingerprint + suppressPreviouslyRuled', () => {
     expect(citedLinesFingerprint({ file: 'x.mjs', line: 10, text: FILE.replace('1 / n', '1 / (n || 1)') })).not.toBe(at1);
     expect(citedLinesFingerprint({ file: 'x.mjs', line: null, text: FILE })).toBeNull();
     expect(citedLinesFingerprint({ file: 'x.mjs', line: 4, text: null })).toBeNull();
-    const plan = { sendBack: [{ index: 1 }, { index: 2 }], card: [{ index: 3 }], advisory: [] };
-    const out = suppressPreviouslyRuled({ plan, fingerprintOf: (f) => (f.index === 2 ? null : `fp${f.index}`), ruled: [{ rev: H1, fingerprint: 'fp1' }, { rev: H1, fingerprint: 'fp3' }] });
-    expect(out.sendBack.map((f) => f.index)).toEqual([2]);
+    // Anchored: two different lines of a short file never share a fingerprint, even though their excerpts are equal.
+    expect(citedLinesFingerprint({ file: 'x.mjs', line: 1, text: 'a\nb' })).not.toBe(citedLinesFingerprint({ file: 'x.mjs', line: 2, text: 'a\nb' }));
+    const g = (index, o = {}) => ({ index, file: 'x.mjs', category: 'edge-case', impact: 'broken', summary: `zero divisor crashes parse ${index}`, ...o });
+    const plan = { sendBack: [g(1), g(2), g(4, { impact: 'broken', summary: 'unrelated null deref' })], card: [g(3, { impact: 'degraded' })], advisory: [] };
+    const ruled = [{ rev: H1, fingerprint: 'fp1', finding: g(1) }, { rev: H1, fingerprint: 'fp3', finding: g(3, { impact: 'degraded' }) },
+      { rev: H1, fingerprint: 'fp4', finding: g(4, { impact: 'degraded', summary: 'formatting nit' }) }];
+    const out = suppressPreviouslyRuled({ plan, fingerprintOf: (f) => (f.index === 2 ? null : `fp${f.index}`), ruled });
+    // #2 has no fingerprint; #4 cites the ruled location but is a DIFFERENT break (class and summary differ).
+    expect(out.sendBack.map((f) => f.index)).toEqual([2, 4]);
     expect(out.card).toEqual([]);
     expect(out.advisory.map((f) => f.index)).toEqual([1, 3]);
     expect(out.priorRuled.map((x) => x.rev)).toEqual([H1, H1]);
@@ -304,6 +311,8 @@ describe('the red-team gate under round1', () => {
     expect(sent[1]).toContain('Fix list');
     expect(sent[1]).toContain('sent back on H1');
     expect(calls.some((c) => c[0] === 'card' || c[0] === 'sendBack')).toBe(false);
+    // The fixer is signalled only after the record with the fix list is posted.
+    expect(calls.findIndex((c) => c[0] === 'signal')).toBeGreaterThan(calls.findIndex((c) => c[0] === 'comment' && c[1].includes('outcome=sent-back')));
     // The drain reads the carded-again break as released, the sent-back one as owned by the fixer.
     const d = readRedTeamDisposition({ comments, pr: 4722, head: H2, setting: CONFIRMED_BREAKS_DEFAULTS });
     expect(d.sendBack.map((f) => f.summary)).toEqual(['sent back on H1']);
@@ -313,8 +322,20 @@ describe('the red-team gate under round1', () => {
     expect(again.calls.some((c) => c[0] === 'comment')).toBe(false);
     // And the fixer's context pack stages both the review's ask and the red team's fix list.
     const changes = bot('🔁 review — changes requested\n\n1. a panel finding', '2026-10-21T20:20:00Z');
-    const pack = extractFindings([changes, ...comments], { labels: ['review:changes'], isTrusted: () => true });
+    const pack = extractFindings([changes, ...comments], { labels: ['review:changes'], isTrusted: () => true, headSha: H2 });
     expect(pack.findings.map((f) => f.kind)).toEqual(['changes', 'red-team']);
+    // A fix list about another head is stale and never staged; no known head stages none.
+    expect(extractFindings([changes, ...comments], { labels: ['review:changes'], isTrusted: () => true, headSha: H1 }).findings.map((f) => f.kind)).toEqual(['changes']);
+    expect(extractFindings([changes, ...comments], { labels: ['review:changes'], isTrusted: () => true }).findings.map((f) => f.kind)).toEqual(['changes']);
+  });
+
+  it('a NEW break at the location of a ruled one is raised (the audit probe: carded nit, then a real division by zero there)', async () => {
+    const comments = earlier();
+    comments.push(rtComment(H2, [F({ impactIfUnfixed: 'broken', line: 9, summary: 'division by zero when n is 0' })], '2026-10-21T20:30:00Z'));
+    const { io } = gateIo({ comments, files: { [`${H1}:scripts/x.mjs`]: FILE, [`${H2}:scripts/x.mjs`]: FILE } });
+    const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(r.plan.sendBack.map((f) => f.summary)).toEqual(['division by zero when n is 0']);
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: H2, setting: CONFIRMED_BREAKS_DEFAULTS }).sendBack).toHaveLength(1);
   });
 
   it('cited lines that changed are raised again; an unreadable file is raised again (fail closed); post-accept never suppresses', async () => {

@@ -170,7 +170,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
         };
         const fp = (f, sha) => citedLinesFingerprint({ file: f.file, line: f.line, text: f.file ? textAt(sha, f.file) : null });
         const suppressed = suppressPreviouslyRuled({ plan, fingerprintOf: (f) => fp(f, head),
-          ruled: ruled.map(({ rev, finding }) => ({ rev, fingerprint: fp(finding, rev) })) });
+          ruled: ruled.map(({ rev, finding }) => ({ rev, finding, fingerprint: fp(finding, rev) })) });
         if (suppressed.priorRuled.length) {
           plan = { sendBack: suppressed.sendBack, card: suppressed.card, advisory: suppressed.advisory };
           if (!dryRun && !recorded.has(GATE_OUTCOMES.PRIOR_RULING)) {
@@ -221,8 +221,8 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     if (sendPending) {
       if (outcome === GATE_OUTCOMES.SENT_BACK) {
         if (labels.includes('review:changes')) {
+          // Signalled only after the record below is posted: it carries the fix list the fixer's pack stages (card 6212).
           sendBackResult = { ok: true, already: true };
-          io.signalFix?.({ repo, pr, label: 'review:changes' });
         }
         else {
           // The writer cannot pin a head for `--to=changes`: re-read it right before the write (see the header).
@@ -238,6 +238,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
       // The label is written but its record is not: without it the operator queue never learns the fixer owns the break.
       // Retry-safe: the next run sees review:changes, takes the `already` path (no second label write) and records.
       if (marker !== 'posted') return { status: 'send-back-record-failed', head, round, outcome, plan, sendBack: sendBackResult, marker, error: marker };
+      if (sendBackResult?.already) io.signalFix?.({ repo, pr, label: 'review:changes' });
     }
     let cardResult = null;
     let cardMarker = null;

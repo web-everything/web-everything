@@ -112,26 +112,56 @@ export function citedLinesFingerprint({ file, line, text }) {
   if (!file || !Number.isInteger(line) || line < 1 || typeof text !== 'string') return null;
   const lines = text.replace(/\r\n/g, '\n').split('\n');
   if (line > lines.length) return null;
-  const excerpt = lines.slice(Math.max(0, line - 1 - CITED_CONTEXT_LINES), line + CITED_CONTEXT_LINES).join('\n');
-  return createHash('sha256').update(`${file}\n${excerpt}`).digest('hex');
+  const start = Math.max(0, line - 1 - CITED_CONTEXT_LINES);
+  const excerpt = lines.slice(start, line + CITED_CONTEXT_LINES).join('\n');
+  // Anchored: the cited line's position inside the excerpt is part of it, so two different lines of a short file
+  // (whose clipped excerpts are the same text) never share a fingerprint.
+  return createHash('sha256').update(JSON.stringify([file, line - 1 - start, excerpt])).digest('hex');
+}
+
+/** The words a summary is compared on: lower-case runs of 4+ letters/digits. PURE. */
+function summaryWords(s) {
+  return new Set(String(s ?? '').toLowerCase().match(/[a-z0-9_]{4,}/g) ?? []);
+}
+
+/** Minimum share of shared summary words (Jaccard) for two reports to be the same break. */
+export const SAME_BREAK_MIN_SIMILARITY = 0.4;
+
+/**
+ * Are two red-team findings THE SAME BREAK (beyond citing the same code)? Same file, same category, same impact class
+ * (a confirmed finding with no stated impact counts as `broken`, as the gate does), and summaries that share at least
+ * {@link SAME_BREAK_MIN_SIMILARITY} of their words. A new break at an old location is never an old ruling's. PURE.
+ */
+export function sameBreak(a, b) {
+  if (!a || !b || !a.file || a.file !== b.file) return false;
+  if (String(a.category ?? '') !== String(b.category ?? '')) return false;
+  const cls = (f) => (f.impact === 'degraded' || f.impact === 'cosmetic' ? 'degraded' : 'broken');
+  if (cls(a) !== cls(b)) return false;
+  const wa = summaryWords(a.summary), wb = summaryWords(b.summary);
+  if (!wa.size || !wb.size) return false;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared += 1;
+  return shared / (wa.size + wb.size - shared) >= SAME_BREAK_MIN_SIMILARITY;
 }
 
 /**
- * Take out of `plan.sendBack` / `plan.card` every confirmed live-head finding that matches a break already RULED on
- * an earlier head (released by a recorded card / advisory action, or by the operator's ruling) whose cited lines are
- * unchanged (same {@link citedLinesFingerprint}). Those move to `advisory` and are listed in `priorRuled`. PURE.
+ * Take out of `plan.sendBack` / `plan.card` every confirmed live-head finding that is THE SAME BREAK ({@link sameBreak})
+ * as one already RULED on an earlier head (released by a recorded card / advisory action, or by the operator's ruling)
+ * AND whose cited lines are unchanged (same {@link citedLinesFingerprint}). Those move to `advisory` and are listed in
+ * `priorRuled`. `ruled` entries are `{rev, fingerprint, finding}`. PURE.
  * Fail closed: a finding with no fingerprint (no file/line, unreadable file) is never taken out.
  * @param {{plan:{sendBack:object[], card:object[], advisory:object[]}, fingerprintOf:(f:object)=>(string|null),
  *   ruled:Array<{rev:string, fingerprint:(string|null)}>}} o
  */
 export function suppressPreviouslyRuled({ plan, fingerprintOf, ruled = [] }) {
-  const known = new Map(ruled.filter((r) => r?.fingerprint).map((r) => [r.fingerprint, r.rev]));
+  const known = ruled.filter((r) => r?.fingerprint && r.finding);
   const out = { sendBack: [], card: [], advisory: [...(plan?.advisory ?? [])], priorRuled: [] };
   for (const bucket of ['sendBack', 'card']) {
     for (const f of plan?.[bucket] ?? []) {
       let fp = null;
-      try { fp = known.size ? fingerprintOf(f) : null; } catch { fp = null; }
-      if (fp && known.has(fp)) { out.advisory.push(f); out.priorRuled.push({ finding: f, rev: known.get(fp) }); }
+      try { fp = known.length ? fingerprintOf(f) : null; } catch { fp = null; }
+      const hit = fp ? known.find((r) => r.fingerprint === fp && sameBreak(f, r.finding)) : null;
+      if (hit) { out.advisory.push(f); out.priorRuled.push({ finding: f, rev: hit.rev }); }
       else out[bucket].push(f);
     }
   }

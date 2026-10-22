@@ -110,7 +110,7 @@ const CHANGES_RE = /^\s*🔁\s*(?:human\s+)?review\s+—\s+changes requested/u;
 const ADVISORY_RE = /^\s*\*{0,2}⚠️\s*THIS IS AN ADVISORY REVIEW/u;
 // Card 6212 — the red-team gate's `sent-back` record that carries a fix list (the PR was already under review:changes:
 // a round-1 red team beside the panel). It is part of the same round's ask.
-const RED_TEAM_FIX_LIST_RE = /^\s*<!-- we:red-team-gate pr=\d+ rev=[0-9a-f]{40} outcome=sent-back[^\n]*-->[\s\S]*\nFix list — /u;
+const RED_TEAM_FIX_LIST_RE = /^\s*<!-- we:red-team-gate pr=\d+ rev=([0-9a-f]{40}) outcome=sent-back[^\n]*-->[\s\S]*\nFix list — /u;
 const REF_RE = /(?<![\w@./-])([\w@.-][\w@.\-/]*\.[A-Za-z0-9]{1,8}):(\d{1,6})(?:-(\d{1,6}))?/g;
 const JSON_REF_RE = /"([\w@.-][\w@.\-/]*\.[A-Za-z0-9]{1,8})",\s*(\d{1,6})/g;
 
@@ -120,7 +120,7 @@ const JSON_REF_RE = /"([\w@.-][\w@.\-/]*\.[A-Za-z0-9]{1,8})",\s*(\d{1,6})/g;
  * @param {Array<{body?:string, createdAt?:string, author?:{login?:string}}>} comments
  * @returns {{findings:Array<{kind:'changes'|'advisory', body:string, createdAt:string|null}>, advisory:boolean}}
  */
-export function extractFindings(comments = [], { labels = null, isTrusted = () => true } = {}) {
+export function extractFindings(comments = [], { labels = null, isTrusted = () => true, headSha = null } = {}) {
   // The brief's own mode rule: `review:changes` on the PR = ordinary mode (the changes-requested comment is the ask);
   // no `review:changes` but `advisory:changes` = advisory-fix mode (the advisory review is the ask).
   const names = Array.isArray(labels) ? labels.map((l) => (typeof l === 'string' ? l : l?.name)) : null;
@@ -133,7 +133,8 @@ export function extractFindings(comments = [], { labels = null, isTrusted = () =
     if (!isTrusted(c)) return; // a look-alike comment from anyone else is never staged as the ask
     if (CHANGES_RE.test(body)) changes = { i, c };
     else if (ADVISORY_RE.test(body)) advisory = { i, c };
-    else if (RED_TEAM_FIX_LIST_RE.test(body)) redTeam = { i, c };
+    // Only the fix list for the PR's CURRENT head: a list about an earlier head is stale (no head known = none staged).
+    else if (headSha && RED_TEAM_FIX_LIST_RE.exec(body)?.[1] === String(headSha).toLowerCase()) redTeam = { i, c };
   });
   if (mode === 'changes') advisory = null;
   if (mode === 'advisory' && advisory) changes = null;
@@ -406,7 +407,7 @@ const GH_OPTS = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 
 export function readFixPackInputs({ repoSlug, pr, exec, maxRefs = 4, readComments = readCompletePrComments, isTrusted = isTrustedMarkerAuthor }) {
   const pv = JSON.parse(String(exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'files,headRefOid,labels'], GH_OPTS)));
   const comments = readComments(pr, { repo: repoSlug, exec });
-  const { findings, advisory } = extractFindings(comments ?? [], { labels: pv.labels ?? null, isTrusted });
+  const { findings, advisory } = extractFindings(comments ?? [], { labels: pv.labels ?? null, isTrusted, headSha: pv.headRefOid ?? null });
   const files = (pv.files ?? []).map((f) => ({ path: f.path, additions: f.additions, deletions: f.deletions }));
   const refs = extractFileRefs(findings.map((f) => f.body).join('\n'), { changedPaths: files.map((f) => f.path), max: maxRefs });
   const cache = new Map();
