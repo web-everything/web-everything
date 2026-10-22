@@ -32,7 +32,6 @@ import { readSettings } from './settings-files.mjs';
 import {
   assertPushRef,
   readFromTransportBranch,
-  trackingRefspec,
 } from './git-transport-branch.mjs';
 import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows } from './verdict-ledger.mjs';
 import { registerLedgerStore } from './verdict-ledger-store.mjs';
@@ -40,8 +39,9 @@ import { LEDGER_DIR, ledgerGitPath } from './verdict-ledger-path.mjs';
 import { appendDirect, appendViaOutbox, outboxDirFor, resolveOutboxSettings, formatOutboxSettings, OutboxFlushError } from './verdict-ledger-outbox.mjs';
 import {
   LEGACY_LEDGER_BRANCH, resolveLedgerRefSettings, formatLedgerRefSettings, ledgerReadPlan, ledgerWritePlan, ledgerPushRefFor,
-  unionLedgerTexts,
+  ledgerFetchRefspec, unionLedgerTexts,
 } from './verdict-ledger-ref.mjs';
+import { retryTransientGit } from './git-fetch-retry.mjs';
 
 /** The LEGACY ledger ref (and still the default for reads and writes: see `we:scripts/lib/verdict-ledger-ref.mjs`). */
 export const LEDGER_TRANSPORT_BRANCH = LEGACY_LEDGER_BRANCH;
@@ -135,10 +135,10 @@ export class LedgerAppendExhaustedError extends Error {
  * Read one repo's ledger from the git transport.
  * NEVER THROWS. `unreadable` means "we do not know"; callers must hold, never treat it as empty.
  *
- * WHICH REF: an explicit `branch` reads exactly that ref (unit seams, tools). Otherwise the ledger-ref cascade decides
- * (`we:scripts/lib/verdict-ledger-ref.mjs`): by default the old ref only, exactly as before; with `dualRead` the UNION
- * of the ledger-only ref and the old ref, where an absent ref adds nothing and an existing-but-unreadable one makes the
- * whole read `unreadable`.
+ * WHICH REF: an explicit `branch` reads exactly that ref (unit seams, tools). Otherwise (`we:scripts/lib/verdict-ledger-ref.mjs`)
+ * ONE fetch brings the old ref and, through a glob, the ledger-only ref if it exists. No ledger-only ref: today's read
+ * of the old ref. Ledger-only ref present: the UNION of both (fail closed when it cannot be formed). Cutover on with a
+ * retired old ref: the ledger-only ref alone, fenced on the old ref's pinned ledger tree.
  *
  * @returns {{status: 'ok', records: object[], text: string, refs?: object[]} | {status: 'unreadable', reason: string, error: string}}
  */
@@ -148,11 +148,10 @@ export function readLedgerFromGit({
   const path = ledgerGitPath(repo);
   let repoSettings;
   try { repoSettings = settings ?? readSettings(); } catch { repoSettings = {}; }
-  let plan = { branches: [branch], union: false };
+  let refs = null;
   if (branch === undefined) {
-    const refs = resolveLedgerRefSettings({ repo: repoSettings, env });
+    refs = resolveLedgerRefSettings({ repo: repoSettings, env });
     logOnce(formatLedgerRefSettings(refs), log);
-    plan = ledgerReadPlan(refs);
   }
   try {
     // An injected `run` keeps full control (unit seams). The default sizes the blob read to the blob (see header).
@@ -164,64 +163,63 @@ export function readLedgerFromGit({
   } catch (e) {
     return { status: 'unreadable', reason: 'transport-read-failed', error: String(e?.message ?? e) };
   }
-  if (!plan.union) {
+  if (!refs) {
     let files;
     try {
-      files = readFromTransportBranch({ board, branch: plan.branches[0], paths: [path], run });
+      files = readFromTransportBranch({ board, branch, paths: [path], run });
     } catch (e) {
       return { status: 'unreadable', reason: readFailureReason(e), error: String(e?.message ?? e) };
-    }
-    // THE FENCE (cutover on, old ref retired by pin): the old ref's ledger tree must still be the pinned one. A writer
-    // that never switched would otherwise append rows no reader sees. Tree id only: no blob is read.
-    if (plan.fence) {
-      try {
-        run(['fetch', '--quiet', 'origin', trackingRefspec(plan.fence.branch)], { cwd: board });
-        const tree = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${plan.fence.branch}:${LEDGER_DIR}`], { cwd: board })).trim();
-        if (tree !== plan.fence.tree) {
-          return { status: 'unreadable', reason: 'retired-ref-moved', error: `${plan.fence.branch}:${LEDGER_DIR} is ${tree || '(missing)'}, not the retired ${plan.fence.tree}: a writer still writes the old ref` };
-        }
-      } catch (e) {
-        return { status: 'unreadable', reason: 'retired-ref-moved', error: `fence check of ${plan.fence.branch} failed: ${String(e?.message ?? e)}` };
-      }
     }
     const text = files[path] ?? '';
     return { status: 'ok', records: parseVerdictLog(text), text };
   }
-  // DUAL READ. Each ref is probed first: a definitive empty `ls-remote` is ABSENT (skipped); anything else is read,
-  // and a read that fails fails the whole union. Never a partial answer.
-  const got = [];
-  for (const b of plan.branches) {
-    let present;
-    try {
-      present = Boolean(String(run(['ls-remote', '--heads', 'origin', `refs/heads/${b}`], { cwd: board })).trim());
-    } catch (e) {
-      return { status: 'unreadable', reason: 'transport-read-failed', error: `ls-remote ${b}: ${String(e?.message ?? e)}` };
+  const plan = ledgerReadPlan(refs);
+  const newRef = plan.newRef;
+  let newTip;
+  let oldText;
+  let newText;
+  try {
+    retryTransientGit(() => run(['fetch', '--quiet', '--prune', 'origin', ledgerFetchRefspec(LEGACY_LEDGER_BRANCH), ledgerFetchRefspec(newRef)], { cwd: board }));
+    newTip = trackingTip(run, board, newRef);
+    if (!newTip && plan.requireNew) {
+      return { status: 'unreadable', reason: 'required-ledger-ref-absent', error: `${newRef} is the ledger write ref (cutover on) but does not exist on origin` };
     }
-    if (!present) {
-      if (plan.required?.includes(b)) {
-        return { status: 'unreadable', reason: 'required-ledger-ref-absent', error: `${b} is the ledger write ref (cutover on) but does not exist on origin` };
+    if (plan.fence) {
+      // THE FENCE: the old ref's ledger tree must still be the pinned one, or a writer that never switched appended
+      // rows no reader would see. Tree id only: no blob is read.
+      const tree = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${plan.fence.branch}:${LEDGER_DIR}`], { cwd: board })).trim();
+      if (tree !== plan.fence.tree) {
+        return { status: 'unreadable', reason: 'retired-ref-moved', error: `${plan.fence.branch}:${LEDGER_DIR} is ${tree || '(missing)'}, not the retired ${plan.fence.tree}: a writer still writes the old ref` };
       }
-      got.push({ branch: b, status: 'absent' });
-      continue;
+      newText = readAt(run, board, `origin/${newRef}`, path);
+      return { status: 'ok', records: parseVerdictLog(newText), text: newText, refs: [{ branch: newRef, status: 'read' }, { branch: LEGACY_LEDGER_BRANCH, status: 'fenced' }] };
     }
-    try {
-      const files = readFromTransportBranch({ board, branch: b, paths: [path], run });
-      got.push({ branch: b, status: 'read', text: files[path] ?? '' });
-    } catch (e) {
-      return { status: 'unreadable', reason: readFailureReason(e), error: `${b}: ${String(e?.message ?? e)}` };
-    }
+    oldText = readAt(run, board, `origin/${LEGACY_LEDGER_BRANCH}`, path);
+    if (newTip) newText = readAt(run, board, `origin/${newRef}`, path);
+  } catch (e) {
+    return { status: 'unreadable', reason: readFailureReason(e), error: String(e?.message ?? e) };
   }
-  const read = got.filter((g) => g.status === 'read');
-  if (!read.length) {
-    return { status: 'unreadable', reason: 'no-ledger-ref', error: `none of ${plan.branches.join(', ')} exists on origin` };
-  }
-  const [newRef, oldRef] = got; // plan order: [ledger-only ref, old ref]
-  const merged = unionLedgerTexts(oldRef.text ?? '', newRef.text ?? '', { idOf: ledgerEventId });
+  if (!newTip) return { status: 'ok', records: parseVerdictLog(oldText), text: oldText };
+  const merged = unionLedgerTexts(oldText, newText, { idOf: ledgerEventId });
   if (!merged.ok) return { status: 'unreadable', reason: `union-${merged.reason}`, error: merged.error };
   return {
     status: 'ok', records: parseVerdictLog(merged.text), text: merged.text,
-    refs: got.map(({ branch: b, status }) => ({ branch: b, status })),
+    refs: [{ branch: newRef, status: 'read' }, { branch: LEGACY_LEDGER_BRANCH, status: 'read' }],
   };
+}
+
+/** The remote-tracking tip of `branch` after a fetch, or null when the fetch proved it absent. Exact name only. */
+function trackingTip(run, board, branch) {
+  const ref = `refs/remotes/origin/${branch}`;
+  const line = String(run(['for-each-ref', '--format=%(refname) %(objectname)', ref], { cwd: board }))
+    .split('\n').map((l) => l.trim()).find((l) => l.startsWith(`${ref} `));
+  return line ? line.slice(ref.length + 1) : null;
+}
+
+/** One file at a fetched rev: its text, or '' when the path is not on it (a true answer about a tip we did read). */
+function readAt(run, board, rev, path) {
+  const listed = String(run(['ls-tree', '--name-only', rev, '--', path], { cwd: board })).trim();
+  return listed ? String(run(['show', `${rev}:${path}`], { cwd: board })) : '';
 }
 
 function readFailureReason(e) { return e?.code === READ_CAP_CODE ? 'ledger-exceeds-read-cap' : 'transport-read-failed'; }

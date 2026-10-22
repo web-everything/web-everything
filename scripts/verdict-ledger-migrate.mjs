@@ -30,7 +30,7 @@ import { trackingRefspec, assertPushRef } from './lib/git-transport-branch.mjs';
 import { retryTransientGit } from './lib/git-fetch-retry.mjs';
 import { readSettings } from './lib/settings-files.mjs';
 import {
-  LEGACY_LEDGER_BRANCH, resolveLedgerRefSettings, formatLedgerRefSettings, ledgerPushRefFor, compareLedgerTexts,
+  LEGACY_LEDGER_BRANCH, resolveLedgerRefSettings, formatLedgerRefSettings, ledgerPushRefFor, compareLedgerTexts, unionLedgerTexts,
 } from './lib/verdict-ledger-ref.mjs';
 import { ledgerEventId } from './lib/verdict-ledger.mjs';
 import { LEDGER_DIR } from './lib/verdict-ledger-path.mjs';
@@ -159,8 +159,15 @@ export function planMigration({ board = process.cwd(), from = LEGACY_LEDGER_BRAN
     const f = (commit === tip ? oldFiles : targetFiles).find((x) => x.path === p);
     return f ? String(run(['cat-file', 'blob', f.oid], { cwd: board })) : '';
   };
-  report.rowDelta = paths.map((p) => ({ path: p, ...compareLedgerTexts(blob(tip, p), blob(target, p), { idOf: ledgerEventId }) }));
-  if (report.rowDelta.every((d) => d.oldOnly === 0)) report.retirableOldTree = ledgerTree;
+  report.rowDelta = paths.map((p) => {
+    const o = blob(tip, p);
+    const n = blob(target, p);
+    const u = unionLedgerTexts(o, n, { idOf: ledgerEventId });
+    return { path: p, ...compareLedgerTexts(o, n, { idOf: ledgerEventId }), union: u.ok ? 'ok' : u.reason };
+  });
+  // Retirable only when EVERY file's union forms cleanly (content, ownership and order all agree) and the old ref adds
+  // no row to it (audit 2026-10-21 finding 5: id membership alone is not enough).
+  if (report.rowDelta.every((d) => d.oldOnly === 0 && d.union === 'ok')) report.retirableOldTree = ledgerTree;
   const extra = String(run(['ls-tree', '--name-only', target], { cwd: board })).split('\n').filter((n) => n && n !== LEDGER_DIR);
   if (extra.length) report.targetExtraEntries = extra;
   return report;
@@ -191,7 +198,7 @@ export function formatReport(r) {
   if (r.old.perWrite) lines.push(`  per write (temp-index read-tree + write-tree): old ${r.old.perWrite.medianMs} ms, index ${kb(r.old.perWrite.indexBytes)}  ->  new ${r.new.perWrite.medianMs} ms, index ${kb(r.new.perWrite.indexBytes)}`);
   if (r.old.fetchDiskBytes != null) lines.push(`  fresh fetch of the ref (reachable objects on disk): old ${kb(r.old.fetchDiskBytes)} -> new ${kb(r.new.fetchDiskBytes)}`);
   lines.push(`  target ${r.to}: ${r.state}${r.target ? ` @${r.target.slice(0, 12)}` : ''}${r.applied ? ' (pushed)' : r.applied === false ? ` (${r.why})` : ' (dry run: nothing pushed)'}`);
-  for (const d of r.rowDelta ?? []) lines.push(`    ${d.path}: ${d.both} on both, ${d.oldOnly} only on ${r.from}, ${d.newOnly} only on ${r.to}`);
+  for (const d of r.rowDelta ?? []) lines.push(`    ${d.path}: ${d.both} on both, ${d.oldOnly} only on ${r.from}, ${d.newOnly} only on ${r.to}; union ${d.union}`);
   if (r.retirableOldTree) lines.push(`  old ref retirable: every old row is on ${r.to}; pin verdictLedger.retiredOldTree=${r.retirableOldTree} to stop reading it`);
   if (r.targetExtraEntries) lines.push(`    WARNING: ${r.to} carries non-ledger entries: ${r.targetExtraEntries.join(', ')}`);
   return lines.join('\n');

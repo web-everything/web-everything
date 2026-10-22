@@ -54,7 +54,7 @@ import { retryTransientGit } from './git-fetch-retry.mjs';
 import { assertPushRef, trackingRefspec, withGitError, worktreeGitEnv } from './git-transport-branch.mjs';
 import { parseLedgerEvents, ledgerEventId } from './verdict-ledger.mjs';
 import { ledgerGitPath } from './verdict-ledger-path.mjs';
-import { LEGACY_LEDGER_BRANCH, ALLOWED_LEDGER_BRANCHES, resolveLedgerRefSettings, ledgerWritePlan, ledgerPushRefFor } from './verdict-ledger-ref.mjs';
+import { LEGACY_LEDGER_BRANCH, ALLOWED_LEDGER_BRANCHES, resolveLedgerRefSettings, ledgerWritePlan, ledgerPushRefFor, ledgerFetchRefspec } from './verdict-ledger-ref.mjs';
 import { workspaceFor } from './lane-pool-paths.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -418,20 +418,25 @@ function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined, d
   const ref = assertPushRef(branch, allowRef);
   const env = boardEnv(board);
   assertSingleDestination({ board, run, env });
-  retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board, env }), sleep ? { sleep } : {});
+  // THE OTHER LEDGER REF (`we:scripts/lib/verdict-ledger-ref.mjs#ledgerWritePlan`, audit 2026-10-21): fetched in the SAME
+  // fetch (the ledger-only ref through a glob, so its absence is not an error); while it exists, a row already published
+  // THERE is never appended HERE. The target keeps its exact refspec: an absent target fails the fetch, so a writer can
+  // never create a ref. Unreadable other ref -> this attempt fails before anything is pushed.
+  if (dedupeAlso && (!ALLOWED_LEDGER_BRANCHES.includes(dedupeAlso) || dedupeAlso === branch)) throw new Error(`verdict-ledger-outbox: bad dedupe ref ${dedupeAlso}`);
+  const fetchArgs = dedupeAlso
+    ? ['fetch', '--quiet', '--prune', 'origin', trackingRefspec(branch), ledgerFetchRefspec(dedupeAlso)]
+    : ['fetch', '--quiet', 'origin', trackingRefspec(branch)];
+  retryTransientGit(() => run(fetchArgs, { cwd: board, env }), sleep ? { sleep } : {});
   const tip = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}^{commit}`], { cwd: board, env })).trim();
   if (!/^[0-9a-f]{40,64}$/.test(tip)) throw new Error(`verdict-ledger-outbox: origin/${branch} did not resolve to a commit`);
-  // THE OTHER LEDGER REF during a cutover (`we:scripts/lib/verdict-ledger-ref.mjs#ledgerWritePlan`, audit 2026-10-21
-  // finding 3): a row already published THERE is never appended HERE, where it would land after newer rows and
-  // supersede them in the union. Unreadable -> this attempt fails before anything is pushed.
   let otherTip = null;
   if (dedupeAlso) {
-    if (!ALLOWED_LEDGER_BRANCHES.includes(dedupeAlso) || dedupeAlso === branch) throw new Error(`verdict-ledger-outbox: bad dedupe ref ${dedupeAlso}`);
-    retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(dedupeAlso)], { cwd: board, env }), sleep ? { sleep } : {});
-    otherTip = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${dedupeAlso}^{commit}`], { cwd: board, env })).trim();
-    if (!/^[0-9a-f]{40,64}$/.test(otherTip)) throw new Error(`verdict-ledger-outbox: origin/${dedupeAlso} did not resolve to a commit`);
+    const other = `refs/remotes/origin/${dedupeAlso}`;
+    const line = String(run(['for-each-ref', '--format=%(refname) %(objectname)', other], { cwd: board, env }))
+      .split(/\r?\n/).map((l) => l.trim()).find((l) => l.startsWith(`${other} `));
+    otherTip = line ? line.slice(other.length + 1) : null;
+    if (otherTip && !/^[0-9a-f]{40,64}$/.test(otherTip)) throw new Error(`verdict-ledger-outbox: origin/${dedupeAlso} did not resolve to a commit`);
   }
-
   const byPath = new Map();
   for (const e of entries) {
     if (!byPath.has(e.entry.path)) byPath.set(e.entry.path, []);
@@ -442,7 +447,20 @@ function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined, d
   for (const [path, group] of byPath) {
     const { text: base, mode } = readBlobAt(run, board, tip, path, env);
     const seen = new Set(parseLedgerEvents(base).map(ledgerEventId));
-    if (otherTip) for (const ev of parseLedgerEvents(readBlobAt(run, board, otherTip, path, env).text)) seen.add(ledgerEventId(ev));
+    // ABSORB: rows only the other ref holds are appended FIRST, byte for byte, in that ref's order. That makes them
+    // shared (the union's anchors) before this writer adds anything for the same PR, so a PR is never left with rows
+    // written on both refs since they diverged (which the union refuses to order), and the target ends a superset.
+    const absorbed = [];
+    if (otherTip) {
+      for (const line of readBlobAt(run, board, otherTip, path, env).text.split('\n')) {
+        if (!line.trim()) continue;
+        let id;
+        try { id = ledgerEventId(JSON.parse(line)); } catch { continue; } // a malformed row is never copied
+        if (seen.has(id)) continue;
+        seen.add(id);
+        absorbed.push(line);
+      }
+    }
     const fresh = [];
     for (const { name, entry } of group) {
       let rows = 0;
@@ -454,7 +472,8 @@ function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined, d
       });
       counts.set(name, { rows, duplicates: entry.lines.length - rows });
     }
-    if (fresh.length) changes.push({ path, mode, base, content: `${base}${base && !base.endsWith('\n') ? '\n' : ''}${fresh.join('\n')}\n` });
+    const added = [...absorbed, ...fresh];
+    if (added.length) changes.push({ path, mode, base, absorbed: absorbed.length, content: `${base}${base && !base.endsWith('\n') ? '\n' : ''}${added.join('\n')}\n` });
   }
   if (!changes.length) return { pushed: false, counts };
 

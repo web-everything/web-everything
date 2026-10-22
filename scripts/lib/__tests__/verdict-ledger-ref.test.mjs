@@ -1,8 +1,9 @@
 /**
  * @file verdict-ledger-ref.test.mjs - the cutover of the verdict ledger from `ops/review-requests` (a full repo tree)
- *   to the ledger-only orphan ref `ops/verdict-ledger`: settings cascade, dual read, writer switch, the migration's
- *   idempotence, and CI reader parity. Never weakened: no row lost or duplicated; a read fails closed when no ref can be
- *   read (or an existing one cannot); the old ref is never written by the migration or by a switched writer.
+ *   to the ledger-only orphan ref `ops/verdict-ledger`: settings cascade, dual read (automatic once the new ref
+ *   exists), writer switch (with cross-ref dedupe and absorb), the migration's idempotence, and CI reader parity.
+ *   Never weakened: no row lost or duplicated; a read fails closed when it cannot be formed; the old ref is never written
+ *   by the migration or by a switched writer.
  */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
@@ -11,7 +12,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   resolveLedgerRefSettings, formatLedgerRefSettings, ledgerReadPlan, ledgerWritePlan, unionLedgerTexts, compareLedgerTexts,
-  ledgerPushRefFor, LEGACY_LEDGER_BRANCH, DEFAULT_LEDGER_ONLY_BRANCH, LEDGER_REF_ENV, LEDGER_CUTOVER_ENV, LEDGER_DUAL_READ_ENV,
+  ledgerPushRefFor, ledgerFetchRefspec, LEGACY_LEDGER_BRANCH, DEFAULT_LEDGER_ONLY_BRANCH, LEDGER_REF_ENV, LEDGER_CUTOVER_ENV,
+  LEDGER_RETIRED_OLD_TREE_ENV,
 } from '../verdict-ledger-ref.mjs';
 import { appendLedgerRows, readLedgerFromGit, ledgerGitPath } from '../verdict-ledger-io.mjs';
 import { buildVerdictRecord } from '../verdict-ledger.mjs';
@@ -30,13 +32,15 @@ const cfg = (verdictLedger = {}) => ({ verdictLedger });
 const prsOf = (text) => String(text).split('\n').filter(Boolean).map((l) => JSON.parse(l).pr);
 const originTip = (ctx, b) => git(['rev-parse', `refs/heads/${b}`], { cwd: ctx.origin }).trim();
 const originHas = (ctx, b) => ctx.originBranches().includes(b);
+const onOrigin = (ctx, b) => prsOf(ctx.showOnOrigin(b, PATH));
 
 /** Append through the real io-shell, direct path (no outbox), with the given ledger-ref settings. */
-const append = (ctx, prs, settings = cfg()) => appendLedgerRows({
-  board: ctx.clone, repo: REPO, records: prs.map((p) => row(p)), outbox: false, gitRun: realGit, settings, env: {}, log: quiet,
-  sleep: () => {},
+const append = (ctx, records, settings = cfg(), extra = {}) => appendLedgerRows({
+  board: ctx.clone, repo: REPO, records: records.map((r) => (typeof r === 'number' ? row(r) : r)), outbox: false, gitRun: realGit,
+  settings, env: {}, log: quiet, sleep: () => {}, ...extra,
 });
 const read = (ctx, settings = cfg(), extra = {}) => readLedgerFromGit({ board: ctx.clone, repo: REPO, settings, env: {}, log: quiet, ...extra });
+const migrate = (ctx) => applyMigration({ board: ctx.clone, to: NEW, run: realGit, measure: false });
 
 /** The old ref as it is live: a full repo tree beside the ledger. */
 function seedLegacy(ctx) {
@@ -47,198 +51,187 @@ function seedLegacy(ctx) {
 }
 
 describe('ledger-ref settings: a cascade, defaults = today, logged with sources', () => {
-  it('defaults: old ref for reads and writes, ledger-only ref named, nothing dual', () => {
+  it('defaults: writes the old ref; reads the old ref plus the new one only if it exists; no pin', () => {
     const s = resolveLedgerRefSettings({ repo: {}, env: {} });
-    expect(s).toMatchObject({ ref: NEW, cutover: 'off', dualRead: false, writeBranch: OLD });
-    expect(s.sources).toEqual({ ref: 'standard', cutover: 'standard', dualRead: 'standard', retiredOldTree: 'standard' });
-    expect(ledgerReadPlan(s)).toEqual({ branches: [OLD], union: false, required: [], fence: null });
-    expect(ledgerWritePlan(s)).toEqual({ branch: OLD, dedupeAlso: null });
-    expect(formatLedgerRefSettings(s)).toMatch(/cutover=off \(standard\).*writes -> ops\/review-requests; reads -> ops\/review-requests$/);
+    expect(s).toMatchObject({ ref: NEW, cutover: 'off', retiredOldTree: null, writeBranch: OLD });
+    expect(s.sources).toEqual({ ref: 'standard', cutover: 'standard', retiredOldTree: 'standard' });
+    expect(ledgerReadPlan(s)).toEqual({ newRef: NEW, requireNew: false, fence: null });
+    expect(ledgerWritePlan(s)).toEqual({ branch: OLD, dedupeAlso: NEW });
+    expect(formatLedgerRefSettings(s)).toMatch(/cutover=off \(standard\).*writes -> ops\/review-requests; reads -> ops\/review-requests, plus ops\/verdict-ledger whenever it exists$/);
   });
 
-  it('repo then env layers; env wins; invalid values ignored and named', () => {
-    const s = resolveLedgerRefSettings({ repo: cfg({ cutover: 'on', dualRead: false }), env: { [LEDGER_DUAL_READ_ENV]: 'true' } });
-    expect(s).toMatchObject({ cutover: 'on', dualRead: true, writeBranch: NEW, sources: { cutover: 'repo', dualRead: 'env' } });
-    const bad = resolveLedgerRefSettings({ repo: cfg({ cutover: 'maybe', ref: 'main' }), env: { [LEDGER_REF_ENV]: 'refs/heads/main', [LEDGER_CUTOVER_ENV]: 'sideways' } });
+  it('repo then env layers; env wins; invalid values ignored and named; a pin is ignored unless cutover is on', () => {
+    const PIN = 'a'.repeat(40);
+    const s = resolveLedgerRefSettings({ repo: cfg({ cutover: 'off', retiredOldTree: PIN }), env: { [LEDGER_CUTOVER_ENV]: 'on' } });
+    expect(s).toMatchObject({ cutover: 'on', retiredOldTree: PIN, writeBranch: NEW, sources: { cutover: 'env', retiredOldTree: 'repo' } });
+    expect(ledgerReadPlan(s)).toEqual({ newRef: NEW, requireNew: true, fence: { branch: OLD, tree: PIN } });
+    expect(ledgerWritePlan(s)).toEqual({ branch: NEW, dedupeAlso: null });
+    const offPin = resolveLedgerRefSettings({ repo: cfg({ retiredOldTree: PIN }), env: {} });
+    expect(offPin.retiredOldTree).toBe(null);
+    expect(offPin.overridden).toEqual([expect.stringMatching(/retiredOldTree ignored/)]);
+    const bad = resolveLedgerRefSettings({ repo: cfg({ cutover: 'maybe', ref: 'main', retiredOldTree: 'x' }), env: { [LEDGER_REF_ENV]: 'refs/heads/main', [LEDGER_CUTOVER_ENV]: 'sideways', [LEDGER_RETIRED_OLD_TREE_ENV]: 'zz' } });
     expect(bad).toMatchObject({ ref: NEW, cutover: 'off', writeBranch: OLD });
-    expect(bad.invalid).toEqual(['repo.verdictLedger.ref', 'repo.verdictLedger.cutover', `env.${LEDGER_REF_ENV}`, `env.${LEDGER_CUTOVER_ENV}`]);
+    expect(bad.invalid).toEqual(['repo.verdictLedger.ref', 'repo.verdictLedger.cutover', 'repo.verdictLedger.retiredOldTree', `env.${LEDGER_REF_ENV}`, `env.${LEDGER_CUTOVER_ENV}`, `env.${LEDGER_RETIRED_OLD_TREE_ENV}`]);
   });
 
-  it('a setting can never aim a ledger push outside the allow-list (not main, not the old ref as "new")', () => {
+  it('cutover on without a pin reads the union and dedupes against the old ref', () => {
+    const s = resolveLedgerRefSettings({ repo: cfg({ cutover: 'on' }), env: {} });
+    expect(ledgerReadPlan(s)).toEqual({ newRef: NEW, requireNew: true, fence: null });
+    expect(ledgerWritePlan(s)).toEqual({ branch: NEW, dedupeAlso: OLD });
+  });
+
+  it('a setting can never aim a ledger push outside the allow-list; the new ref is fetched by a glob, the old exactly', () => {
     expect(() => ledgerPushRefFor('main')).toThrow(/not a ledger ref/);
     expect(resolveLedgerRefSettings({ repo: cfg({ ref: OLD }), env: {} }).invalid).toEqual(['repo.verdictLedger.ref']);
     expect(ledgerPushRefFor(NEW)).toBe(`refs/heads/${NEW}`);
-  });
-
-  it('read/write plan matrix: no combination hides a ref that can hold rows (audit finding 1)', () => {
-    const r = (v) => resolveLedgerRefSettings({ repo: cfg(v), env: {} });
-    const PIN = 'a'.repeat(40);
-    expect(ledgerReadPlan(r({ cutover: 'off', dualRead: true }))).toEqual({ branches: [NEW, OLD], union: true, required: [], fence: null });
-    // cutover on with dualRead=false but NO pin: overridden to the union, and the override is named
-    const onNoPin = r({ cutover: 'on', dualRead: false });
-    expect(onNoPin.overridden).toEqual([expect.stringMatching(/dualRead=true/)]);
-    expect(ledgerReadPlan(onNoPin)).toEqual({ branches: [NEW, OLD], union: true, required: [NEW], fence: null });
-    expect(ledgerWritePlan(onNoPin)).toEqual({ branch: NEW, dedupeAlso: OLD });
-    // cutover on + pin: the new ref only, fenced by the pinned old tree
-    const fin = r({ cutover: 'on', dualRead: false, retiredOldTree: PIN });
-    expect(ledgerReadPlan(fin)).toEqual({ branches: [NEW], union: false, required: [NEW], fence: { branch: OLD, tree: PIN } });
-    expect(ledgerWritePlan(fin)).toEqual({ branch: NEW, dedupeAlso: null });
-    // rollback: old ref written, both read, both required, deduped against the new ref
-    const rb = r({ cutover: 'rollback', dualRead: false });
-    expect(rb.dualRead).toBe(true);
-    expect(ledgerReadPlan(rb)).toEqual({ branches: [NEW, OLD], union: true, required: [NEW, OLD], fence: null });
-    expect(ledgerWritePlan(rb)).toEqual({ branch: OLD, dedupeAlso: NEW });
-    expect(r({ retiredOldTree: 'nothex' }).invalid).toEqual(['repo.verdictLedger.retiredOldTree']);
+    expect(ledgerFetchRefspec(OLD)).toBe(`+refs/heads/${OLD}:refs/remotes/origin/${OLD}`);
+    expect(ledgerFetchRefspec(NEW)).toBe(`+refs/heads/${NEW}*:refs/remotes/origin/${NEW}*`);
   });
 });
 
-describe('unionLedgerTexts: no row lost, none duplicated', () => {
-  const l = (id, pr, sec = 0) => JSON.stringify({ id, pr, at: `2026-10-21T12:00:${String(sec).padStart(2, '0')}.000Z` });
-  it('shared rows once (anchors), new-only rows merged in by time, malformed lines pass through', () => {
-    const oldT = [l('a', 1, 1), l('b', 2, 2), 'not json', l('s', 9, 5)].join('\n');
-    const newT = [l('a', 1, 1), l('b', 2, 2), 'not json', l('c', 3, 4)].join('\n');
+describe('unionLedgerTexts: per-PR ownership, never a guessed order', () => {
+  const r = (id, pr, verdict = 'accepted', sec = 0) => JSON.stringify({ id, pr, verdict, at: `2026-10-21T12:00:${String(sec).padStart(2, '0')}.000Z` });
+  it('shared rows once; each PR reads exactly its owning ref\'s own sequence; malformed lines pass through', () => {
+    const oldT = [r('a', 1), r('b', 2), 'not json', r('s', 9)].join('\n');
+    const newT = [r('a', 1), r('b', 2), 'not json', r('c', 3), r('d', 1, 'changes')].join('\n');
     const u = unionLedgerTexts(oldT, newT);
     expect(u.ok).toBe(true);
-    expect(u.text.split('\n').filter(Boolean)).toEqual([l('a', 1, 1), l('b', 2, 2), 'not json', l('c', 3, 4), l('s', 9, 5)]);
-    expect(u).toMatchObject({ oldRows: 4, newOnly: 1, duplicates: 3 });
-    expect(compareLedgerTexts(oldT, newT)).toEqual({ oldOnly: 1, newOnly: 1, both: 3 });
+    // PR 2, 9 and the malformed group are old-owned (old order); PR 1 and 3 are new-owned (new order).
+    expect(u.text.split('\n').filter(Boolean)).toEqual([r('b', 2), 'not json', r('s', 9), r('a', 1), r('c', 3), r('d', 1, 'changes')]);
+    expect(u).toMatchObject({ oldOnly: 1, newOnly: 2, newOwned: 2 });
+    expect(compareLedgerTexts(oldT, newT)).toEqual({ oldOnly: 1, newOnly: 2, both: 3 });
   });
-  it('ROLLBACK ORDER: a newer hold on the old ref is never superseded by an older accept that only the new ref holds', () => {
-    const accept = JSON.stringify({ id: 'n1', pr: 7, verdict: 'accepted', at: '2026-10-21T12:00:00.000Z' });
-    const hold = JSON.stringify({ id: 'o1', pr: 7, verdict: 'changes', at: '2026-10-21T13:00:00.000Z' });
-    const u = unionLedgerTexts(`${hold}\n`, `${accept}\n`).text.split('\n').filter(Boolean);
-    expect(u.at(-1)).toBe(hold);
-    // and each side's own order is never changed, even when its times are out of order
-    const x1 = JSON.stringify({ id: 'x1', at: '2026-10-21T12:00:09.000Z' });
-    const x2 = JSON.stringify({ id: 'x2', at: '2026-10-21T12:00:01.000Z' });
-    expect(unionLedgerTexts(`${x1}\n${x2}\n`, '').text).toBe(`${x1}\n${x2}\n`);
-  });
-  it('AUDIT REPRO: a hold appended AFTER a shared accept stays after it, whatever its timestamp (finding 2)', () => {
-    const accept = JSON.stringify({ id: 'A', pr: 7, verdict: 'accepted', at: '2026-10-21T13:00:00.000Z' });
-    const hold = JSON.stringify({ id: 'H', pr: 7, verdict: 'changes', at: '2026-10-21T12:00:00.000Z' });
+  it('AUDIT REPRO 1: a hold appended AFTER a shared accept stays after it, whatever its timestamp', () => {
+    const accept = r('A', 7, 'accepted', 13);
+    const hold = r('H', 7, 'changes', 12);
     const u = unionLedgerTexts(`${accept}\n`, `${accept}\n${hold}\n`);
     expect(u.ok).toBe(true);
     expect(u.text.split('\n').filter(Boolean)).toEqual([accept, hold]);
   });
-  it('refuses rather than guesses: different order of shared rows, a same-id row with other bytes, a same-time same-PR pair', () => {
-    const a = JSON.stringify({ id: 'a', pr: 1, at: '2026-10-21T12:00:01.000Z' });
-    const b = JSON.stringify({ id: 'b', pr: 2, at: '2026-10-21T12:00:02.000Z' });
-    expect(unionLedgerTexts(`${a}\n${b}\n`, `${b}\n${a}\n`)).toMatchObject({ ok: false, reason: 'order-conflict' });
-    const corrupt = JSON.stringify({ id: 'a', pr: 1, verdict: 'nonsense' });
-    expect(unionLedgerTexts(`${a}\n`, `${corrupt}\n`)).toMatchObject({ ok: false, reason: 'conflicting-row' });
-    const x = JSON.stringify({ id: 'x', pr: 5, verdict: 'accepted', at: '2026-10-21T12:00:09.000Z' });
-    const y = JSON.stringify({ id: 'y', pr: 5, verdict: 'changes', at: '2026-10-21T12:00:09.000Z' });
-    expect(unionLedgerTexts(`${x}\n`, `${y}\n`)).toMatchObject({ ok: false, reason: 'ambiguous-order' });
+  it('AUDIT REPRO 2: rows for one PR written on BOTH refs since they diverged are refused, not time-merged', () => {
+    const u = unionLedgerTexts([r('o', 3, 'accepted', 30), r('acc', 7, 'accepted', 10)].join('\n'), r('hold', 7, 'changes', 20));
+    expect(u).toMatchObject({ ok: false, reason: 'ambiguous-order' });
+  });
+  it('AUDIT REPRO 3: a repeated id with other bytes, on either ref, is refused; a different shared order is refused', () => {
+    expect(unionLedgerTexts(r('X', 7), [r('X', 7), r('X', 7, 'changes')].join('\n'))).toMatchObject({ ok: false, reason: 'conflicting-row' });
+    expect(unionLedgerTexts([r('X', 7), r('X', 7, 'changes')].join('\n'), '')).toMatchObject({ ok: false, reason: 'conflicting-row' });
+    expect(unionLedgerTexts(r('a', 1), JSON.stringify({ id: 'a', pr: 1, verdict: 'nonsense' }))).toMatchObject({ ok: false, reason: 'conflicting-row' });
+    expect(unionLedgerTexts([r('a', 1), r('b', 1)].join('\n'), [r('b', 1), r('a', 1)].join('\n'))).toMatchObject({ ok: false, reason: 'order-conflict' });
   });
   it('empty sides', () => {
     expect(unionLedgerTexts('', '').text).toBe('');
-    expect(unionLedgerTexts('', `${l('x', 1)}\n`).text).toBe(`${l('x', 1)}\n`);
+    expect(unionLedgerTexts('', `${r('x', 1)}\n`).text).toBe(`${r('x', 1)}\n`);
   });
 });
 
 describe('real git: dual read + writer switch + migration', () => {
-  it('DEFAULT (cutover off, dualRead off) is today: writes and reads the old ref only, never probes the new one', async () => {
+  it('DEFAULT before the migration is today: writes and reads the old ref only, never creates the new one', async () => {
     await withBareOrigin(async (ctx) => {
       seedLegacy(ctx);
       append(ctx, [1, 2]);
-      const calls = [];
-      const r = read(ctx, cfg(), { run: (a, o) => { calls.push(a); return realGit(a, o); } });
+      const r = read(ctx);
       expect(r.status).toBe('ok');
       expect(prsOf(r.text)).toEqual([1, 2]);
-      expect(calls.some((a) => a.join(' ').includes(NEW))).toBe(false);
+      expect(r.text).toBe(read(ctx, cfg(), { branch: OLD }).text);
       expect(originHas(ctx, NEW)).toBe(false);
     });
   });
 
-  it('dual read with the new ref ABSENT falls back to the old ref; both absent is unreadable (fail closed)', async () => {
+  it('no old ref and no new ref: unreadable (fail closed), as today', async () => {
     await withBareOrigin(async (ctx) => {
-      const none = read(ctx, cfg({ dualRead: true }));
-      expect(none).toMatchObject({ status: 'unreadable', reason: 'no-ledger-ref' });
-      seedLegacy(ctx);
-      append(ctx, [1]);
-      const r = read(ctx, cfg({ dualRead: true }));
-      expect(r.status).toBe('ok');
-      expect(prsOf(r.text)).toEqual([1]);
-      expect(r.refs).toEqual([{ branch: NEW, status: 'absent' }, { branch: OLD, status: 'read' }]);
+      expect(read(ctx).status).toBe('unreadable');
     });
   });
 
-  it('cutover on before the migration: the write FAILS LOUDLY and never creates the new ref; reads are unreadable', async () => {
+  it('cutover on before the migration: the write FAILS LOUDLY and never creates the new ref; reads hold', async () => {
     await withBareOrigin(async (ctx) => {
       seedLegacy(ctx);
       append(ctx, [1]);
       expect(() => append(ctx, [2], cfg({ cutover: 'on' }))).toThrow();
       expect(originHas(ctx, NEW)).toBe(false);
-      expect(read(ctx, cfg({ cutover: 'on' })).status).toBe('unreadable');
-      // Dual read does NOT fall back to the old ref here: with cutover on, a missing write ref holds the read.
-      expect(read(ctx, cfg({ cutover: 'on', dualRead: true }))).toMatchObject({ status: 'unreadable', reason: 'required-ledger-ref-absent' });
+      expect(read(ctx, cfg({ cutover: 'on' }))).toMatchObject({ status: 'unreadable', reason: 'required-ledger-ref-absent' });
+      expect(read(ctx).status).toBe('ok'); // writers still on the old ref: today's read
     });
   });
 
-  it('FULL CUTOVER: migrate, switch writers, straggler on the old ref, union holds every row exactly once, old ref only ever read', async () => {
+  it('FULL CUTOVER: migrate, straggler, switch, absorb, dedupe, retire, fence, roll back — every row exactly once', async () => {
     await withBareOrigin(async (ctx) => {
       seedLegacy(ctx);
       append(ctx, [1, 2, 3]);
       const before = read(ctx);
-      // Migrate (create-only push of the orphan root).
-      const m = applyMigration({ board: ctx.clone, to: NEW, run: realGit, measure: false });
+      const m = migrate(ctx);
       expect(m).toMatchObject({ applied: true, state: 'created', parity: true });
-      const oldTipAfterMigration = originTip(ctx, OLD);
       // The new ref is a ROOT commit whose tree is ONLY verdict-ledger/, with the old blob byte for byte.
       expect(git(['rev-list', '--parents', '-n1', NEW], { cwd: ctx.origin }).trim().split(' ')).toHaveLength(1);
       expect(git(['ls-tree', '--name-only', NEW], { cwd: ctx.origin }).trim()).toBe('verdict-ledger');
       expect(ctx.showOnOrigin(NEW, PATH)).toBe(ctx.showOnOrigin(OLD, PATH));
-      // CI-parity: a dual read right after the migration equals the legacy read exactly.
-      const dual0 = read(ctx, cfg({ dualRead: true }));
-      expect(dual0.text).toBe(before.text);
-      // A not-yet-switched writer appends to the OLD ref (straggler); switched writers append to the NEW ref.
+      // With DEFAULT settings the read is now the union, automatically, and equals the legacy read.
+      expect(read(ctx)).toMatchObject({ status: 'ok', text: before.text });
+      // A not-yet-switched writer appends to the OLD ref (a straggler).
       append(ctx, [4]);
-      const oldTipWithStraggler = originTip(ctx, OLD);
-      append(ctx, [5, 6], cfg({ cutover: 'on', dualRead: true }));
-      append(ctx, [3], cfg({ cutover: 'on', dualRead: true })); // a replay of a row already on both: no duplicate
-      append(ctx, [4], cfg({ cutover: 'on', dualRead: true })); // a replay of the straggler: deduped against the OLD ref
-      expect(originTip(ctx, OLD)).toBe(oldTipWithStraggler); // the switched writer never touched the old ref
-      expect(prsOf(ctx.showOnOrigin(NEW, PATH))).toEqual([1, 2, 3, 5, 6]);
-      const u = read(ctx, cfg({ cutover: 'on', dualRead: true }));
+      const oldWithStraggler = originTip(ctx, OLD);
+      // Switched writers: the first one ABSORBS the straggler into the new ref, then appends its own rows.
+      append(ctx, [5, 6], cfg({ cutover: 'on' }));
+      append(ctx, [3, 4], cfg({ cutover: 'on' })); // replays of rows already on a ref: no duplicate anywhere
+      expect(originTip(ctx, OLD)).toBe(oldWithStraggler); // a switched writer never touches the old ref
+      expect(onOrigin(ctx, NEW)).toEqual([1, 2, 3, 4, 5, 6]);
+      const u = read(ctx, cfg({ cutover: 'on' }));
       expect(u.status).toBe('ok');
-      expect(prsOf(u.text)).toEqual([1, 2, 3, 4, 5, 6]);
-      // cutover on WITHOUT a pin still reads both (dualRead=false is overridden): the straggler is never hidden.
-      expect(prsOf(read(ctx, cfg({ cutover: 'on', dualRead: false })).text)).toEqual([1, 2, 3, 4, 5, 6]);
-      // A pin taken BEFORE the straggler wrote: the fence sees the old ref moved and holds the read.
-      const fenced = read(ctx, cfg({ cutover: 'on', dualRead: false, retiredOldTree: m.ledgerTree }));
-      expect(fenced).toMatchObject({ status: 'unreadable', reason: 'retired-ref-moved' });
-      // The migration report names that delta and pushes nothing over a present target.
-      const again = applyMigration({ board: ctx.clone, to: NEW, run: realGit, measure: false });
-      expect(again).toMatchObject({ applied: false, state: 'diverged' });
-      expect(again.rowDelta.find((d) => d.path === PATH)).toMatchObject({ oldOnly: 1, newOnly: 2, both: 3 });
-      expect(prsOf(ctx.showOnOrigin(NEW, PATH))).toEqual([1, 2, 3, 5, 6]);
-      // Kill switch: cutover rollback. Writers return to the old ref; nothing written to the new ref vanishes; and a
-      // replay of a row that already landed on the NEW ref is not appended to the old one (audit finding 3).
-      const oldBeforeRollback = prsOf(ctx.showOnOrigin(OLD, PATH));
-      append(ctx, [5], cfg({ cutover: 'rollback' }));
-      expect(prsOf(ctx.showOnOrigin(OLD, PATH))).toEqual(oldBeforeRollback);
-      append(ctx, [7], cfg({ cutover: 'rollback' }));
-      const k = read(ctx, cfg({ cutover: 'rollback' }));
+      expect(prsOf(u.text).sort()).toEqual([1, 2, 3, 4, 5, 6]);
+      // The migration report: the old ref adds nothing and the union forms cleanly -> retirable; nothing pushed.
+      const rep = migrate(ctx);
+      expect(rep).toMatchObject({ applied: false, state: 'diverged' });
+      expect(rep.rowDelta.find((d) => d.path === PATH)).toMatchObject({ oldOnly: 0, newOnly: 2, both: 4, union: 'ok' });
+      expect(rep.retirableOldTree).toBe(git(['rev-parse', `${OLD}:verdict-ledger`], { cwd: ctx.origin }).trim());
+      const retired = cfg({ cutover: 'on', retiredOldTree: rep.retirableOldTree });
+      expect(read(ctx, retired)).toMatchObject({ status: 'ok' });
+      expect(prsOf(read(ctx, retired).text)).toEqual([1, 2, 3, 4, 5, 6]);
+      // A straggler AFTER the pin moves the old ref's ledger tree: the fenced read holds instead of hiding it.
+      append(ctx, [8]); // off-mode writer: also absorbs the new-only rows 5, 6 into the old ref first
+      expect(onOrigin(ctx, OLD)).toEqual([1, 2, 3, 4, 5, 6, 8]);
+      expect(read(ctx, retired)).toMatchObject({ status: 'unreadable', reason: 'retired-ref-moved' });
+      // Kill switch = cutover off: readers keep the union, nothing written to the new ref vanishes; a replay of a
+      // row that already landed on the new ref is not appended to the old one again.
+      append(ctx, [5]);
+      expect(onOrigin(ctx, OLD)).toEqual([1, 2, 3, 4, 5, 6, 8]);
+      const k = read(ctx);
       expect(k.status).toBe('ok');
-      expect(prsOf(k.text)).toEqual([1, 2, 3, 4, 5, 6, 7]);
-      // The old ref was only ever appended to by the old-ref writers: its history is a fast-forward of the start.
-      git(['merge-base', '--is-ancestor', oldTipAfterMigration, OLD], { cwd: ctx.origin });
+      expect(prsOf(k.text).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 8]);
+      expect(new Set(prsOf(k.text)).size).toBe(7);
     });
   });
 
-  it('dual read FAILS CLOSED when the new ref exists but cannot be read (no partial answer)', async () => {
+  it('a PR written on both refs since they diverged holds every read, and the next write absorbs it back to readable', async () => {
     await withBareOrigin(async (ctx) => {
       seedLegacy(ctx);
       append(ctx, [1]);
-      applyMigration({ board: ctx.clone, to: NEW, run: realGit, measure: false });
+      migrate(ctx);
+      const accept = row(9, 'accepted');
+      const hold = buildVerdictRecord({ repo: REPO, pr: 9, verdict: 'changes', at: '2026-10-21T12:00:30.000Z', source: 'test' });
+      append(ctx, [accept], cfg({ cutover: 'on' }));
+      // A writer that bypasses the plan (explicit branch: an older build) writes the same PR to the old ref.
+      append(ctx, [hold], cfg(), { branch: OLD });
+      expect(read(ctx, cfg({ cutover: 'on' }))).toMatchObject({ status: 'unreadable', reason: 'union-ambiguous-order' });
+      append(ctx, [10], cfg({ cutover: 'on' })); // absorbs the old-only hold, in the order the push saw it
+      const r = read(ctx, cfg({ cutover: 'on' }));
+      expect(r.status).toBe('ok');
+      const nine = r.text.split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((x) => x.pr === 9);
+      expect(nine.map((x) => x.verdict)).toEqual(['accepted', 'changes']);
+    });
+  });
+
+  it('the union FAILS CLOSED when the new ref exists but the fetch or a read cannot complete', async () => {
+    await withBareOrigin(async (ctx) => {
+      seedLegacy(ctx);
+      append(ctx, [1]);
+      migrate(ctx);
       const run = (a, o) => {
-        if (a[0] === 'fetch' && a.join(' ').includes(NEW)) { const e = new Error('fatal: unable to access'); e.stderr = 'fatal: unable to access'; throw e; }
+        if (a[0] === 'fetch') { const e = new Error('fatal: unable to access'); e.stderr = 'fatal: unable to access'; throw e; }
         return realGit(a, o);
       };
-      const r = read(ctx, cfg({ dualRead: true }), { run });
-      expect(r.status).toBe('unreadable');
-      const lsFail = (a, o) => { if (a[0] === 'ls-remote') throw new Error('network down'); return realGit(a, o); };
-      expect(read(ctx, cfg({ dualRead: true }), { run: lsFail }).status).toBe('unreadable');
+      expect(read(ctx, cfg(), { run }).status).toBe('unreadable');
+      const showFails = (a, o) => { if (a[0] === 'show' && a[1].includes(NEW)) throw new Error('read failed'); return realGit(a, o); };
+      expect(read(ctx, cfg(), { run: showFails }).status).toBe('unreadable');
     });
   });
 
@@ -255,10 +248,9 @@ describe('real git: dual read + writer switch + migration', () => {
       expect(a.new.files).toBe(1);
       expect(git(['rev-parse', CANDIDATE_REF], { cwd: ctx.clone }).trim()).toBe(a.candidate);
       expect(originHas(ctx, NEW)).toBe(false); // dry run: nothing pushed
-      const c = applyMigration({ board: ctx.clone, to: NEW, run: realGit, measure: false });
-      expect(c).toMatchObject({ applied: true, candidate: a.candidate });
-      const d = applyMigration({ board: ctx.clone, to: NEW, run: realGit, measure: false });
-      expect(d).toMatchObject({ applied: false, state: 'identical' });
+      expect(migrate(ctx)).toMatchObject({ applied: true, candidate: a.candidate });
+      const d = migrate(ctx);
+      expect(d).toMatchObject({ applied: false, state: 'identical', retirableOldTree: a.ledgerTree });
       expect(originTip(ctx, NEW)).toBe(a.candidate);
       expect(originTip(ctx, OLD)).toBe(oldTip); // the migration never writes the old ref
     });
@@ -272,25 +264,23 @@ describe('real git: dual read + writer switch + migration', () => {
 
 describe('CI reader parity: the workflows feed the same cascade', () => {
   for (const wf of ['apply-review-request.yml', 'merge-gate.yml']) {
-    it(`${wf} passes the three ledger-ref variables into the step that reads/writes the ledger`, () => {
+    it(`${wf} passes the ledger-ref variables into the step that reads/writes the ledger`, () => {
       const text = readFileSync(join(ROOT, '.github', 'workflows', wf), 'utf8');
-      for (const [envName, varName] of [[LEDGER_REF_ENV, 'VERDICT_LEDGER_REF'], [LEDGER_CUTOVER_ENV, 'VERDICT_LEDGER_CUTOVER'], [LEDGER_DUAL_READ_ENV, 'VERDICT_LEDGER_DUAL_READ']]) {
+      for (const [envName, varName] of [[LEDGER_REF_ENV, 'VERDICT_LEDGER_REF'], [LEDGER_CUTOVER_ENV, 'VERDICT_LEDGER_CUTOVER'], [LEDGER_RETIRED_OLD_TREE_ENV, 'VERDICT_LEDGER_RETIRED_OLD_TREE']]) {
         expect(text).toContain(`${envName}: \${{ vars.${varName} }}`);
       }
     });
   }
 
   it('an unset repo variable (empty string) changes nothing', () => {
-    const s = resolveLedgerRefSettings({ repo: {}, env: { [LEDGER_REF_ENV]: '', [LEDGER_CUTOVER_ENV]: '', [LEDGER_DUAL_READ_ENV]: '' } });
-    expect(s).toMatchObject({ cutover: 'off', dualRead: false, writeBranch: OLD, invalid: [] });
+    const s = resolveLedgerRefSettings({ repo: {}, env: { [LEDGER_REF_ENV]: '', [LEDGER_CUTOVER_ENV]: '', [LEDGER_RETIRED_OLD_TREE_ENV]: '' } });
+    expect(s).toMatchObject({ cutover: 'off', retiredOldTree: null, writeBranch: OLD, invalid: [] });
   });
 
-  it('the merge-gate read shape (exec seam, strict byte-count check) reads the union exactly like the legacy read', async () => {
+  it('the merge-gate read shape (exec seam, strict byte-count check) reads the same rows before and after the cutover', async () => {
     await withBareOrigin(async (ctx) => {
       seedLegacy(ctx);
       append(ctx, [1, 2]);
-      applyMigration({ board: ctx.clone, to: NEW, run: realGit, measure: false });
-      append(ctx, [3], cfg({ cutover: 'on' }));
       // The same exec wrapper merge-gate-check.mjs passes (blob size declared, byte count verified).
       const gateRead = (settings) => {
         let blobSize;
@@ -302,7 +292,9 @@ describe('CI reader parity: the workflows feed the same cascade', () => {
         } });
       };
       const legacy = gateRead(cfg());
-      const dual = gateRead(cfg({ cutover: 'on', dualRead: true }));
+      migrate(ctx);
+      append(ctx, [3], cfg({ cutover: 'on' }));
+      const dual = gateRead(cfg({ cutover: 'on' }));
       expect(prsOf(legacy.text)).toEqual([1, 2]);
       expect(prsOf(dual.text)).toEqual([1, 2, 3]);
       expect(dual.text.startsWith(legacy.text)).toBe(true);

@@ -129,11 +129,11 @@ jobs:
           DISPATCH_PRS: ${{ inputs.prs }}
           MERGE_GATE_MODE: ${{ vars.MERGE_GATE_MODE }}
           # THE LEDGER REF (`we:scripts/lib/verdict-ledger-ref.mjs`). The canonical switch is the checked-in repo setting
-          # `verdictLedger.{ref,cutover,dualRead}` on main, which this job already reads; these repo variables are the
+          # `verdictLedger.{ref,cutover,retiredOldTree}` on main, which this job already reads; these repo variables are the
           # CI-side override (and kill switch) of the same cascade. Unset variables arrive empty and change nothing.
           WE_VERDICT_LEDGER_REF: ${{ vars.VERDICT_LEDGER_REF }}
           WE_VERDICT_LEDGER_CUTOVER: ${{ vars.VERDICT_LEDGER_CUTOVER }}
-          WE_VERDICT_LEDGER_DUAL_READ: ${{ vars.VERDICT_LEDGER_DUAL_READ }}
+          WE_VERDICT_LEDGER_RETIRED_OLD_TREE: ${{ vars.VERDICT_LEDGER_RETIRED_OLD_TREE }}
         run: |
           if [ ! -f scripts/merge-gate-check.mjs ]; then
             if [ -f .github/workflows/merge-gate.yml ]; then
