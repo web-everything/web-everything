@@ -189,6 +189,38 @@ export function readRedTeamProbes({ env = process.env, path = RED_TEAM_SETTINGS_
   return resolved;
 }
 
+/**
+ * What the drain does when an owed post-accept red team has no result on the live head at its wait deadline
+ * (`drain.redTeamPendingMaxMin`). Every value HOLDS the PR: `hold` publishes the operator note; `requeue-then-hold`
+ * (standard) first re-requests the red team once for that head, and holds with the note if that also produces no
+ * result. No file or platform value can restore merge-without-result: `merge-without-result` is accepted ONLY from the
+ * operator's own env (`WE_RED_TEAM_DEADLINE_ACTION`) together with a named `WE_RED_TEAM_DEADLINE_OVERRIDE_BY`, and the
+ * drain logs it as an operator override on every use. Anywhere else it is invalid and the lower layer stands.
+ */
+export const RED_TEAM_DEADLINE_ACTIONS = Object.freeze(['hold', 'requeue-then-hold']);
+export const RED_TEAM_DEADLINE_OVERRIDE = 'merge-without-result';
+export const RED_TEAM_DEADLINE_ENV = 'WE_RED_TEAM_DEADLINE_ACTION';
+export const RED_TEAM_DEADLINE_OVERRIDE_BY_ENV = 'WE_RED_TEAM_DEADLINE_OVERRIDE_BY';
+export function resolveRedTeamDeadlineAction({ file = {}, platform, env = {} } = {}) {
+  const raw = env[RED_TEAM_DEADLINE_ENV];
+  const envAction = raw === undefined || raw === '' ? undefined : String(raw).trim().toLowerCase();
+  const overrideBy = String(env[RED_TEAM_DEADLINE_OVERRIDE_BY_ENV] ?? '').trim().slice(0, 100);
+  const operatorOverride = envAction === RED_TEAM_DEADLINE_OVERRIDE && overrideBy !== '';
+  const pick = o => (o?.deadlineAction === undefined ? {} : { deadlineAction: o.deadlineAction });
+  const resolved = resolveCascade({ standard: { deadlineAction: 'requeue-then-hold' }, platform: pick(platform), tool: pick(file?.redTeam),
+    envValues: { deadlineAction: operatorOverride ? undefined : envAction }, valid: v => RED_TEAM_DEADLINE_ACTIONS.includes(v) });
+  if (!operatorOverride) return { ...resolved, operatorOverride: null };
+  return { ...resolved, value: { deadlineAction: RED_TEAM_DEADLINE_OVERRIDE }, sources: { deadlineAction: 'env' },
+    leafValues: { deadlineAction: RED_TEAM_DEADLINE_OVERRIDE }, operatorOverride: { by: overrideBy } };
+}
+export function readRedTeamDeadlineAction({ env = process.env, path = RED_TEAM_SETTINGS_FILE, log = () => {} } = {}) {
+  let file = {};
+  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
+  const resolved = resolveRedTeamDeadlineAction({ file, platform: platformPreference('redTeam', { env }), env });
+  log(formatCascadeSourcesLine('redTeam', resolved));
+  return resolved;
+}
+
 // ── The decision ────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** A finding's class. Fail closed: confirmed with no stated (or an unknown) impact is `broken`. PURE. */

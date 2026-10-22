@@ -319,10 +319,17 @@ describe('drain policy cascade', () => {
     expect(r.value).toMatchObject({ waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true });
     expect(r.sources).toMatchObject({ waitForRedTeamBeforeEnqueue: 'standard', dequeueOnSendBack: 'standard' });
     expect(lines.join('')).toContain('dequeueOnSendBack=true (standard)');
-    expect(r.value).toMatchObject({ redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45, enqueueWhenRedTeamNeverScheduled: true });
-    expect(lines.join('')).toContain('enqueueWhenRedTeamNeverScheduled=true (standard)');
+    expect(r.value).toMatchObject({ redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 });
+    // Retired: no standard value lets a deadline enqueue an owed head without a red-team result.
+    expect(r.value.enqueueWhenRedTeamNeverScheduled).toBeUndefined();
+    expect(lines.join('')).not.toContain('enqueueWhenRedTeamNeverScheduled');
     expect(lines.join('')).toContain('redTeamPendingBackoffSec=300 (standard)');
     expect(lines.join('')).toContain('redTeamPendingMaxMin=45 (standard)');
+  });
+  it('names a leftover enqueueWhenRedTeamNeverScheduled (env or setting) as retired and ignored', () => {
+    const lines = [];
+    readDrainQueueSafety({ env: { WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED: 'true' }, tool: { enqueueWhenRedTeamNeverScheduled: true }, platform: {}, log: l => lines.push(l) });
+    expect(lines.join('')).toContain('env WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED and drain.enqueueWhenRedTeamNeverScheduled setting is retired and ignored');
   });
   it('resolves pending timing and provenance independently, rejecting invalid timings', () => {
     const r = readDrainQueueSafety({ env: { WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC: '600', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: 'NaN' },
