@@ -31,6 +31,8 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
+import { liveBuilderSlotRows } from '../../scripts/lib/builder-slots.mjs';
+import { readBuilderSlotSettings } from '../../scripts/lib/builder-slots-settings.mjs';
 import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/build-dispatch-policy.mjs';
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
@@ -771,6 +773,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }
   // Card 87 — a fix borrowing a builder slot occupies it (no build may be started over it).
   try { inFlight.push(...(effects.listBorrowedFixes?.() ?? [])); } catch { /* an unreadable claim set never blocks the tick */ }
+  try { inFlight.push(...(effects.listBuilderSlots?.() ?? [])); } catch { /* an unreadable slot store never blocks the tick */ }
 
   const spawn = Array.isArray(d.spawnBuilds) ? d.spawnBuilds : [];
   // #4349 — a held item (a recent non-PR terminal-outcome cooldown) is dropped from candidates entirely, same
@@ -2712,6 +2715,7 @@ export function cliEffects() {
     listClaims: ({ ignoreExpiry = false } = {}) => listBuildDispatchClaims({ ignoreExpiry }),
     listFixClaims: () => liveFixInFlight(),
     listBorrowedFixes: () => liveBorrowedFixInFlight(),
+    listBuilderSlots: () => liveBuilderSlotRows({ settings: readBuilderSlotSettings() }),
     releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num }),
     acquireClaim: ({ num, scope, groupLead }) => acquireBuildDispatchClaim({ num, scope, groupLead }),
     listRunStoreInFlight: () => [],
@@ -2897,6 +2901,7 @@ async function dryRun(flags) {
     ...listBuildDispatchClaims().map((c) => ({ num: normNum(c.meta.num), scope: c.meta.scope || [], source: `claim ${c.owner}` })),
     ...runStoreRows,
     ...liveBorrowedFixInFlight(),
+    ...(() => { try { return effects.listBuilderSlots(); } catch { return []; } })(),
   ];
   // xovjhwh — the SAME shared derivation `runBuildDispatchTick` calls internally for `tick.plan` (unavailable
   // here since it is local to that function's own call); recomputed from the same two rows this dry-run already
