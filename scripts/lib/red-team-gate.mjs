@@ -511,6 +511,8 @@ function operatorRuled(records, pr, head) {
 const INDEX_LIST = '\\((#\\d+(?:, #\\d+)*)\\)';
 const GATE_ACTION_LINES = [
   ['card', new RegExp(`^- \\d+ finding\\(s\\) filed as a follow-up card ${INDEX_LIST}(?: — landing job [^\\n]*)?\\.$`)],
+  // OPERATOR-ONLY (`record-red-team-ruling --card=<ref>`): it counts (as `card`) only inside an `operator-*` record a human operator authored, whatever wraps it.
+  ['operator-card', new RegExp(`^- \\d+ finding\\(s\\) carded by the operator to \`[^\`\\n]+\` ${INDEX_LIST}\\.$`)],
   ['advisory', new RegExp(`^- \\d+ finding\\(s\\) left advisory ${INDEX_LIST}\\.$`)],
   ['send-back', new RegExp(`^- \\d+ confirmed break\\(s\\) sent back to the fixer ${INDEX_LIST}(?: — the PR was already under review:changes)?\\.$`)],
   ['held', new RegExp(`^- \\d+ confirmed break\\(s\\) NOT sent back: [^\\n]*?(?: ${INDEX_LIST})?\\.$`)],
@@ -538,7 +540,8 @@ function gateActionLines(body) {
  * Every gate decision (per-finding actions, the send-back outcome, the round-cap hand-over) applies only to the result
  * it decides ({@link gateRecordsFor}), so a record for an earlier same-head result never releases a newer one's
  * finding. A carried result also keeps the actions bound to the result it was carried from (the same findings,
- * re-keyed); the newer head's own records win. An operator ruling releases only what the gate handed over (`held`).
+ * re-keyed); the newer head's own records win. Operator card actions never carry: only a direct record on the live
+ * head releases its named result. An operator ruling releases only what the gate handed over (`held`).
  */
 export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null } = {}) {
   const live = String(head ?? '').toLowerCase();
@@ -559,7 +562,15 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     const { supersededCaps } = resolveSendBackStep(gates, grants);
     const own = new Map();
     for (const r of gates) {
-      for (const { action, indices } of gateActionLines(recordBody(r))) {
+      for (const line of gateActionLines(recordBody(r))) {
+        const { indices } = line;
+        let { action } = line;
+        if (action === 'operator-card') {
+          // Operator card releases bind to the exact head/result; verdict carries cannot inherit them.
+          if (!first || r.from || r.gate.result !== want) continue;
+          if (!r.gate.outcome.startsWith('operator-') || !isHumanOperatorComment(r.c)) continue;
+          action = 'card';
+        }
         // Only a human operator may release a break held at the round cap; automation lines release only what the gate itself decided.
         // This is applied per action line (not by dropping the forged comment, which would also drop its restrictive `held` lines).
         if (RELEASING_ACTIONS.has(action) && !AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome) && !isHumanOperatorComment(r.c)) continue;
