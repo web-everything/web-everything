@@ -6,6 +6,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -19,20 +20,22 @@ import { ledgerGitPath } from '../verdict-ledger-path.mjs';
 import { buildLedgerEvent, checkLedgerAppendRows, parseLedgerEvents } from '../verdict-ledger.mjs';
 import { lockDirFor, readLockEntry } from '../../readiness/file-locks.mjs';
 
-// Keep named imports callable through stable wrappers: copying a namespace must not detach
-// production calls from spies. The default export is a private, mutable copy of the guarded fs.
-vi.mock('node:fs', async importOriginal => {
-  const fs = { ...await importOriginal() };
-  const forwarded = Object.fromEntries([
-    'openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'readFileSync', 'renameSync', 'readdirSync',
-  ].map(method => [method, (...args) => fs[method](...args)]));
-  return { ...fs, ...forwarded, default: fs };
-});
+// Node's named builtin exports must be synchronized after replacing a default-export
+// method. Spy on the guarded native fs so faults also reach already-loaded ESM consumers.
+function spyOnFs(method) {
+  const spy = vi.spyOn(fs, method);
+  syncBuiltinESMExports();
+  return spy;
+}
 
 const REPO = 'web-everything/web-everything';
 const scratch = [];
 const outbox = () => { const dir = mkdtempSync(join(tmpdir(), 'ob-regression-')); scratch.push(dir); return dir; };
-afterEach(() => { vi.restoreAllMocks(); for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+  for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 const holdEntry = (extra = {}) => {
   const check = checkLedgerAppendRows([buildLedgerEvent({
@@ -104,7 +107,7 @@ describe('outbox validation and recovery', () => {
     const bytes = readFileSync(join(dir, name), 'utf8');
     const error = ioError();
     const log = vi.fn();
-    vi.spyOn(fs, 'readFileSync').mockImplementationOnce(() => { throw error; });
+    spyOnFs('readFileSync').mockImplementationOnce(() => { throw error; });
     expect(readEntry(dir, name, log)).toEqual({ io: error });
     expect(readdirSync(dir)).toEqual([name]);
     expect(readFileSync(join(dir, name), 'utf8')).toBe(bytes);
@@ -125,7 +128,7 @@ describe('outbox validation and recovery', () => {
     const name = '000000000000001-1-abcdef.json';
     writeFileSync(join(dir, name), '{');
     const error = ioError();
-    vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => { throw error; });
+    spyOnFs('renameSync').mockImplementationOnce(() => { throw error; });
     const log = vi.fn();
     expect(readEntry(dir, name, log)).toEqual({ io: error });
     expect(readFileSync(join(dir, name), 'utf8')).toBe('{');
@@ -294,13 +297,13 @@ describe('outbox publication', () => {
     const dir = outbox();
     const realWrite = fs.writeFileSync;
     if (fault === 'short write') {
-      vi.spyOn(fs, 'writeFileSync').mockImplementationOnce((fd, text) => realWrite(fd, text.slice(0, -2)));
+      spyOnFs('writeFileSync').mockImplementationOnce((fd, text) => realWrite(fd, text.slice(0, -2)));
     } else {
       const realRead = fs.readFileSync;
       // Still valid JSON with the same payload and checksum: only byte comparison detects this.
-      vi.spyOn(fs, 'readFileSync').mockImplementationOnce((...args) => `${realRead(...args)} `);
+      spyOnFs('readFileSync').mockImplementationOnce((...args) => `${realRead(...args)} `);
     }
-    const rename = vi.spyOn(fs, 'renameSync');
+    const rename = spyOnFs('renameSync');
     expect(() => enqueueOutboxEntry(dir, holdEntry())).toThrow(/read-back differs/);
     expect(rename).not.toHaveBeenCalled();
     expect(readdirSync(dir)).toEqual([]);
@@ -313,7 +316,7 @@ describe('outbox publication', () => {
     const paths = new Map();
     for (const method of ['openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'readFileSync', 'renameSync']) {
       const real = fs[method];
-      vi.spyOn(fs, method).mockImplementation((...args) => {
+      spyOnFs(method).mockImplementation((...args) => {
         calls.push([method, paths.get(args[0]) ?? args[0]]);
         const result = real(...args);
         if (method === 'openSync') paths.set(result, args[0]);
@@ -346,9 +349,9 @@ describe('outbox publication', () => {
   it('fails before publication on file fsync failure, closes the descriptor and cleans up', () => {
     const dir = outbox();
     const error = ioError();
-    const close = vi.spyOn(fs, 'closeSync');
-    const rename = vi.spyOn(fs, 'renameSync');
-    vi.spyOn(fs, 'fsyncSync').mockImplementationOnce(() => { throw error; });
+    const close = spyOnFs('closeSync');
+    const rename = spyOnFs('renameSync');
+    spyOnFs('fsyncSync').mockImplementationOnce(() => { throw error; });
     expect(() => enqueueOutboxEntry(dir, holdEntry())).toThrow(error);
     expect(close).toHaveBeenCalledTimes(1);
     expect(rename).not.toHaveBeenCalled();
@@ -358,9 +361,9 @@ describe('outbox publication', () => {
   it('does not publish if syncing a newly created directory fails', () => {
     const dir = join(outbox(), 'nested', 'outbox');
     const error = ioError();
-    const close = vi.spyOn(fs, 'closeSync');
-    const rename = vi.spyOn(fs, 'renameSync');
-    vi.spyOn(fs, 'fsyncSync').mockImplementationOnce(() => { throw error; });
+    const close = spyOnFs('closeSync');
+    const rename = spyOnFs('renameSync');
+    spyOnFs('fsyncSync').mockImplementationOnce(() => { throw error; });
     expect(() => enqueueOutboxEntry(dir, holdEntry())).toThrow(error);
     expect(close).toHaveBeenCalledTimes(1);
     expect(rename).not.toHaveBeenCalled();
@@ -370,7 +373,7 @@ describe('outbox publication', () => {
   it.each(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EISDIR', 'EBADF'])('tolerates unsupported directory fsync %s', (code) => {
     const dir = outbox();
     const realSync = fs.fsyncSync;
-    vi.spyOn(fs, 'fsyncSync').mockImplementationOnce(realSync).mockImplementationOnce(() => {
+    spyOnFs('fsyncSync').mockImplementationOnce(realSync).mockImplementationOnce(() => {
       throw Object.assign(new Error('unsupported'), { code });
     });
     const log = vi.fn();
@@ -382,7 +385,7 @@ describe('outbox publication', () => {
   it.each([false, true])('returns the published name on directory fsync failure (throwing logger: %s)', (throwing) => {
     const dir = outbox();
     const realSync = fs.fsyncSync;
-    vi.spyOn(fs, 'fsyncSync').mockImplementationOnce(realSync).mockImplementationOnce(() => { throw ioError(); });
+    spyOnFs('fsyncSync').mockImplementationOnce(realSync).mockImplementationOnce(() => { throw ioError(); });
     const log = vi.fn(() => { if (throwing) throw new Error('sink failed'); });
     const name = enqueueOutboxEntry(dir, holdEntry(), { log });
     expect(listOutboxEntries(dir)).toEqual([name]);
@@ -435,7 +438,7 @@ describe('outbox stale diagnostics', () => {
 
   it.each([false, true])('treats inspection failure as stale, without throwing (throwing logger: %s)', (throwing) => {
     const dir = outbox();
-    vi.spyOn(fs, 'readdirSync').mockImplementationOnce(() => { throw ioError(); });
+    spyOnFs('readdirSync').mockImplementationOnce(() => { throw ioError(); });
     const log = vi.fn(() => { if (throwing) throw new Error('sink failed'); });
     expect(reportIfStale({ dir, now: () => 1_000_000, staleMs: 1, log }, 'retry later')).toBe(true);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('cannot be inspected (injected I/O failure); retry later'));
@@ -465,13 +468,14 @@ describe('outbox never-throw helpers', () => {
   it('treats heartbeat I/O failure as lost ownership and leaves the lock for its lease', () => {
     const dir = outbox();
     const owner = tryLock(dir, 120_000);
-    const write = vi.spyOn(fs, 'writeFileSync').mockImplementation(() => { throw ioError(); });
+    const write = spyOnFs('writeFileSync').mockImplementation(() => { throw ioError(); });
     const log = vi.fn();
     expect(stillOwn(dir, owner)).toBe(false);
     expect(() => unlock(dir, owner, log)).not.toThrow();
     expect(readLockEntry(outboxLockRoot(dir), OUTBOX_LOCK_PATH)?.owner).toBe(owner);
     expect(log).not.toHaveBeenCalled();
     write.mockRestore();
+    syncBuiltinESMExports();
   });
 
   it('safeLog and defaultLog swallow diagnostic sink failures', () => {
@@ -491,7 +495,7 @@ describe('outbox never-throw helpers', () => {
   it.each([false, true])('unlock leaves a failed release to its lease without throwing (throwing logger: %s)', (throwing) => {
     const dir = outbox();
     const owner = tryLock(dir, 120_000);
-    vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => { throw ioError(); });
+    spyOnFs('renameSync').mockImplementationOnce(() => { throw ioError(); });
     const log = vi.fn(() => { if (throwing) throw new Error('sink failed'); });
     expect(() => unlock(dir, owner, log)).not.toThrow();
     expect(log).toHaveBeenCalledWith(expect.stringContaining('releasing the flusher lock'));
