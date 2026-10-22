@@ -917,12 +917,14 @@ export function createDrainMergeStrategy({
           const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
           const source = deadline.sources?.deadlineAction ?? 'standard';
           const missing = !evidence.inFlight && !evidence.queued && !evidence.recorded;
+          // Why the last re-request was not posted (card 6267): named in the operator note instead of a generic reason.
+          let requestFailed = null;
           const deadlineHold = () => {
             // Before the deadline, or inside the one re-request's own full wait, the plain hold is the whole answer.
             if (!outcome.healthSmell || (wait.requestedAt != null && now() - wait.requestedAt < maxMin * 60_000)) return outcome;
             const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
               : evidence.attempted || evidence.untrustedSavedResult ? 'run left no usable result'
-                : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
+                : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : requestFailed ? `red-team re-request not posted: ${requestFailed}` : 'no red-team request path')
               : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
             const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
             if (wait.deadlineHeldAt == null) {
@@ -950,8 +952,11 @@ export function createDrainMergeStrategy({
             wait.requestAttemptedAt = now();
             writeState(statePath, before);
             log.write(`  merge-queue: requesting red team for #${c.num} on ${headSha}: redTeamRequestCooldownMin=${cooldownMin} (${cooldownSource})\n`);
-            try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
-            catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
+            try {
+              const r = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload });
+              requested = r?.requested === true;
+              if (!requested) requestFailed = String(r?.reason ?? 'not requested').slice(0, 200);
+            } catch (e) { requestFailed = firstLine(e); log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
           }
           if (requested) {
             wait.requestedAt = now();

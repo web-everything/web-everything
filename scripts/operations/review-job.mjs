@@ -5,6 +5,8 @@ import { isCompletedReviewPr } from './review-pr-completion.mjs';
 import { formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
+import { redTeamRequestDir } from '../lib/red-team-rerequest.mjs';
+import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
@@ -327,6 +329,17 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { ok: r.status === 0, reason: String(r.stderr || r.stdout || r.error || `exit ${r.status}`) };
     },
     postCarryComment: ({ pr, repo, body }) => execRead('gh', ['pr', 'comment', String(pr), `--repo=${repo}`, '--body', body], { cwd: root, env }),
+    // Card 6267 — the drain's red-team re-request file (data only: parsed, never executed) and the live head it is checked against.
+    readRedTeamRequest: (path) => {
+      const dir = resolve(redTeamRequestDir(env));
+      if (!resolve(path).startsWith(`${dir}/`)) throw new Error(`request path outside ${dir}`);
+      return JSON.parse(readFileSync(path, 'utf8'));
+    },
+    recordRedTeamRequestOutcome: (path, outcome) => {
+      const prev = JSON.parse(readFileSync(path, 'utf8'));
+      writeJsonAtomic(path, { ...prev, outcome: { ...outcome, at: new Date().toISOString() } });
+    },
+    readLiveHead: ({ pr, repo }) => JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env })).headRefOid,
     now: () => Date.now(),
     newActorId: () => randomUUID(),
     readPrevCompletion: (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
@@ -967,6 +980,63 @@ function runReviewArc({
   }
 }
 
+/**
+ * Card 6267 — the RED-TEAM-ONLY job the drain's re-request starts (`review-job.mjs red-team`). It runs the post-accept
+ * red team, then the red-team gate, on the review read ALREADY recorded for `head`, and writes the ordinary red-team
+ * status the drain reads. It runs no panel, sets no review label itself and posts no re-arm comment. It refuses when the
+ * request does not match `repo#pr@head` or the PR head has moved. Its outcome is written back onto the request file.
+ */
+export function runRedTeamOnlyJob({ pr, repo, head, requestPath, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, pid = process.pid } = {}, io = createReviewJobIo()) {
+  const planned = planReviewDispatch({ pr, repo });
+  const slug = `${planned.sessionSlug}-red-team`;
+  const h = String(head ?? '').toLowerCase();
+  const finish = (fields) => {
+    const out = { mode: 'red-team-only', pr: planned.pr, repo: planned.repo, head: h, sessionSlug: slug, ...fields };
+    try { io.recordRedTeamRequestOutcome?.(requestPath, out); } catch (e) { io.log(`review-job ${slug}: request outcome not written (${tail(e?.message ?? e, 200)})`); }
+    io.log(`review-job ${slug}: red-team-only — ${out.outcome}${out.reason ? ` (${out.reason})` : ''}`);
+    return out;
+  };
+  let req;
+  try { req = io.readRedTeamRequest(requestPath); } catch (e) { return finish({ outcome: 'refused', reason: `request unreadable: ${tail(e?.message ?? e, 200)}` }); }
+  const judged = String(req?.loopPayload?.findings?.read?.netBasis?.rev ?? '').toLowerCase();
+  if (req?.repo !== planned.repo || Number(req?.pr) !== planned.pr || String(req?.head ?? '').toLowerCase() !== h || judged !== h) {
+    return finish({ outcome: 'refused', reason: 'request does not match this repo, PR and head' });
+  }
+  let live;
+  try { live = String(io.readLiveHead({ pr: planned.pr, repo: planned.repo }) ?? '').toLowerCase(); }
+  catch (e) { return finish({ outcome: 'refused', reason: `live head unreadable: ${tail(e?.message ?? e, 200)}` }); }
+  if (live !== h) return finish({ outcome: 'head-moved', reason: `PR head is ${live.slice(0, 12) || '-'}, request was for ${h.slice(0, 12)}` });
+  const claim = io.claim(slug, { slug, pr: planned.pr, repo: planned.repo, pid, startedAt: new Date(io.now()).toISOString(), cwd: io.root });
+  if (!claim.ok) return finish({ outcome: 'refused-live-job', reason: `pid ${claim.heldBy} holds this slot` });
+  let lanePath = null;
+  try {
+    const actorId = io.newActorId();
+    const acq = io.acquireLane({ laneRepo: planned.laneRepo, slug, actorId, waitMs: laneWaitMs });
+    if (!acq?.lanePath) return finish({ outcome: 'no-lane', reason: acq?.error || 'pool full' });
+    lanePath = acq.lanePath;
+    // The lane wait can be long: re-check the head right before the run, so a moved head never gets an old-head pass.
+    const again = String(io.readLiveHead({ pr: planned.pr, repo: planned.repo }) ?? '').toLowerCase();
+    if (again !== h) return finish({ outcome: 'head-moved', reason: `PR head moved to ${again.slice(0, 12) || '-'} while waiting for a lane` });
+    const input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload: req.loopPayload, slug };
+    io.redTeamStatus?.({ ...input, status: 'queued' });
+    let redTeam;
+    try { redTeam = io.runRedTeam(input); } catch (e) { redTeam = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
+    let gate = null;
+    if (typeof io.runRedTeamGate === 'function') {
+      try { gate = io.runRedTeamGate({ pr: planned.pr, repo: planned.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
+    }
+    // Only a run that RAN may record `ran`; any other runner status (skipped, disabled, prior-row, error, none) records
+    // `error`, which the drain reads as scheduled-without-a-result and keeps holding. This job never releases a hold.
+    io.redTeamStatus?.({ ...input, status: 'finished', result: redTeam?.status === 'ran' ? 'ran' : 'error' });
+    return finish({ outcome: 'ran', redTeam: summarizeRedTeam(redTeam), redTeamGate: { status: gate?.status ?? null, outcome: gate?.outcome ?? null } });
+  } catch (e) {
+    return finish({ outcome: BLOCKED_ON_INFRA, reason: tail(e?.message ?? e, 300) });
+  } finally {
+    if (lanePath) { try { io.releaseLane(slug); } catch { /* lane pool reaper */ } }
+    try { io.unclaim(slug, pid); } catch { /* pruned by pid */ }
+  }
+}
+
 // ── THE DISPATCH (what the daemon calls) ───────────────────────────────────────────────────────────────────────
 
 /**
@@ -1160,8 +1230,17 @@ if (IS_CLI) {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
   };
-  if (sub !== 'run') {
-    writeLineSync(2, 'usage: review-job.mjs run --pr=<n> --repo=<owner/repo>');
+  if (sub === 'red-team') {
+    try {
+      const out = runRedTeamOnlyJob({ pr: flag('pr'), repo: flag('repo'), head: flag('head'), requestPath: flag('request') });
+      writeAllSync(1, `${JSON.stringify(out)}\n`);
+      process.exitCode = out.outcome === 'ran' ? 0 : 75;
+    } catch (e) {
+      writeLineSync(2, `review-job: error: ${String(e?.message ?? e)}`);
+      process.exitCode = 1;
+    }
+  } else if (sub !== 'run') {
+    writeLineSync(2, 'usage: review-job.mjs run --pr=<n> --repo=<owner/repo> | red-team --pr=<n> --repo=<owner/repo> --head=<sha> --request=<file>');
     process.exitCode = 2;
   } else {
     // No signal handler: the arc is synchronous, so a handler could not run before the in-flight child returns

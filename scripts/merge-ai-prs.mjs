@@ -197,6 +197,7 @@ import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequi
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { requestDrainRedTeam, createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
+import { requestRedTeamRerun } from './lib/red-team-rerequest.mjs'; // card 6267 — the drain's one red-team re-request per head
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
@@ -267,6 +268,16 @@ const flags = parseArgvFlags(argv); // #2859 — single source: scripts/lib/reco
  * @param {string} name - the flag name WITHOUT the leading `--`
  * @returns {Array<true|string>}
  */
+/**
+ * Card 6267 — the drain's `requestRedTeam` hook, passed at EVERY `createDrainMergeStrategy` call site: posts one
+ * head-bound red-team re-request and starts one detached red-team-only job (`review-job.mjs red-team`). A dry run
+ * posts nothing. The request never counts as a result; the strategy keeps the PR held until a real one exists.
+ */
+export function drainRequestRedTeam({ dryRun = false, request = requestRedTeamRerun } = {}) {
+  if (dryRun) return null;
+  return input => request({ ...input, reason: 'drain: no red-team result on this head past the wait deadline' });
+}
+
 export function collectFlagOccurrences(argv, name) {
   const out = [];
   const prefix = `--${name}`;
@@ -7719,7 +7730,7 @@ async function runCli() {
   const readDrainFreezePass = async () => {
     const cached = freezeBeforePass;
     freezeBeforePass = null;
-    const strategy = createDrainMergeStrategy({ dryRun: DRY_RUN, quiet: true, isLocalRepo, localSlug });
+    const strategy = createDrainMergeStrategy({ dryRun: DRY_RUN, quiet: true, isLocalRepo, localSlug, requestRedTeam: drainRequestRedTeam({ dryRun: DRY_RUN }) });
     return prepareDrainFreeze({ local: readFreeze(), ...(cached ? { shared: cached.shared, settings: cached.settings, logSettings: false } : {}),
       repo: localSlug, branch: defaultBranchOf(null), enqueues: strategy.enqueues(null), dryRun: DRY_RUN });
   };

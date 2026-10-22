@@ -2674,3 +2674,84 @@ describe('#5742: a head moved only by the drain numbering commit reads red-team 
     } finally { rmSync(t.cwd, { recursive: true, force: true }); }
   });
 });
+
+describe('the wired red-team re-request (card 6267): a request is never a result', () => {
+  const ACCEPTED = ['review:accepted', 'ready-to-merge'];
+  const enqueuedAny = h => h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')));
+  const payload = { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: HEAD } } } };
+  const clean = { user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
+  const setup = async ({ spawnJob }) => {
+    const { requestRedTeamRerun, listRedTeamRequests } = await import('../red-team-rerequest.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'rt-rereq-'));
+    const policy = { value: { enabled: true, maxRequestsPerHead: 1 }, sources: {} };
+    const requestRedTeam = input => requestRedTeamRerun(input, { env: {}, policy, dir, spawnJob, log: () => {} });
+    return { dir, requestRedTeam, list: () => listRedTeamRequests({ repo: LOCAL, pr: 5283, head: HEAD, dir }) };
+  };
+
+  it('hold → one request posted → result arrives → merges on that exact head', async () => {
+    const spawned = [];
+    const { dir, requestRedTeam, list } = await setup({ spawnJob: o => { spawned.push(o); return 4242; } });
+    const clock = { t: 1000 };
+    const notes = [];
+    const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t, requestRedTeam, publishNeedsYou: n => notes.push(n),
+      evidence: { loopPayload: payload, inFlight: false, recorded: false, scheduled: true } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false });
+    clock.t += 45 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true, redTeamRequested: true });
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0].argv).toEqual(expect.arrayContaining(['red-team', '--pr=5283', `--repo=${LOCAL}`, `--head=${HEAD}`]));
+    expect(list()).toHaveLength(1);
+    const req = JSON.parse(readFileSync(list()[0].path, 'utf8'));
+    expect(req).toMatchObject({ repo: LOCAL, pr: 5283, head: HEAD, requestedBy: 'drain', attempt: 1 });
+    // Later passes while the re-run is queued: still held, quiet, and never a second request.
+    clock.t += 10 * 60_000;
+    const queued = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t, initial: h.state(), requestRedTeam, publishNeedsYou: n => notes.push(n),
+      evidence: { loopPayload: payload, queued: true, inFlight: false, recorded: false, scheduled: true } });
+    expect(queued.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true });
+    expect(spawned).toHaveLength(1);
+    expect(notes).toHaveLength(0);
+    expect(enqueuedAny(h) || enqueuedAny(queued)).toBe(false);
+    // The real result arrives for this head: the drain enqueues.
+    const after = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t + 60_000, initial: queued.state(), liveComments: [clean], requestRedTeam,
+      evidence: { loopPayload: payload, inFlight: false, recorded: true, scheduled: true } });
+    expect(after.s.enqueue({ num: 5283 }, HEAD, { comments: [clean] })).toMatchObject({ enqueued: true });
+    expect(spawned).toHaveLength(1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('request write/start fails → still held, operator alerted with the reason, retried at the next recheck', async () => {
+    let fail = true;
+    const spawned = [];
+    const { dir, requestRedTeam, list } = await setup({ spawnJob: o => { if (fail) throw new Error('EACCES spawn'); spawned.push(o); return 99; } });
+    const clock = { t: 1000 };
+    const notes = [];
+    const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t, requestRedTeam, publishNeedsYou: n => notes.push(n),
+      evidence: { loopPayload: payload, inFlight: false, recorded: false, scheduled: true } });
+    h.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    clock.t += 45 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true, deadlineHeld: true,
+      reason: expect.stringContaining('red-team re-request not posted') });
+    expect(notes).toEqual([expect.objectContaining({ kind: 'red-team-deadline-held', reason: expect.stringContaining('EACCES spawn') })]);
+    expect(list()).toHaveLength(0); // the failed reservation was released
+    expect(h.state().redTeamPending['cwd#5283'].requestedAt).toBeUndefined();
+    fail = false;
+    clock.t += 300_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, redTeamRequested: true });
+    expect(spawned).toHaveLength(1);
+    expect(enqueuedAny(h)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a throwing requestRedTeam is caught: held with the note, never enqueued', () => {
+    const clock = { t: 1000 };
+    const notes = [];
+    const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t, publishNeedsYou: n => notes.push(n),
+      requestRedTeam: () => { throw new Error('disk full'); } });
+    h.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    clock.t += 45 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(h.logs.join('')).toContain('red-team request failed #5283: disk full');
+    expect(notes).toHaveLength(1);
+    expect(enqueuedAny(h)).toBe(false);
+  });
+});
