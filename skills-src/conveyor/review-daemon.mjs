@@ -89,7 +89,8 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // report → release, no Claude wrapper session); `WE_REVIEW_DISPATCH_MODE=session` keeps the old `claude --bg`
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
 import { parseEscalationReason } from '../../scripts/review-detail.mjs';
-import { dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
+import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
+import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
@@ -368,6 +369,7 @@ export function runReviewTick({
   defaultBranch = 'main',
   reconcile = runReconcilePass,
   dispatch = dispatchReviewByMode,
+  redTeamOnSkip = null,
   tagRound = tagReviewRound,
   tagStatus = tagReviewStatus,
   statusCandidates = selectStatusCandidates,
@@ -684,6 +686,13 @@ export function runReviewTick({
     try { tagRound({ pr: d.prNumber, repo, round: (d.attempts ?? 0) + 1, currentLabels: labelsByPr.get(Number(d.prNumber)) }); }
     catch { /* cosmetic — a failed tag never fails the tick, see review-round-tag.mjs's own header */ }
   }
+  let redTeamOnSkipResult;
+  if (!paused && typeof redTeamOnSkip === 'function') {
+    try {
+      redTeamOnSkipResult = redTeamOnSkip({ repo, plan, rawPrs,
+        capacity: { lanes: Math.max(0, acquirable - occupiedLanes), budget: liveReviewBudget }, paused });
+    } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
+  }
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
   const liveCap = remainingReviewCapacity();
@@ -705,7 +714,7 @@ export function runReviewTick({
   // A PR dispatched THIS tick is absent from the pre-dispatch `rawAgents` snapshot, yet its review job record
   // already exists (`dispatchReviewJob` writes it before returning) — reusing the snapshot would tag it "nothing
   // live" and strip its `review-status:reviewing` until the next tick. Those PRs read fresh (`undefined`).
-  const dispatchedThisTick = new Set(dispatched.map((d) => Number(d.prNumber)));
+  const dispatchedThisTick = new Set([...dispatched, ...(redTeamOnSkipResult?.dispatched ?? [])].map((d) => Number(d.prNumber)));
   // Waiting stacks can have only a surfaced note; they still need their draft status label.
   // Every PR of this tick's shared listing is tagged too: the `status:*` label is ONE per open PR, so a PR the plan
   // gave no row this tick (accepted, parked with a person) still gets its label set and any stale one removed. The
@@ -738,6 +747,7 @@ export function runReviewTick({
     }
   }
   return {
+    ...(redTeamOnSkipResult !== undefined ? { redTeamOnSkip: redTeamOnSkipResult } : {}),
     reviewsOwed: reviews.length, dispatched, failed, notStarted, refusals: (plan.refusals ?? []).length,
     pendingNotDispatched: explainPendingNotDispatched({
       prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused, deferReason,
@@ -1528,6 +1538,7 @@ export function buildCliDaemonEffects({
       log: line => log.error(line),
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
       liveReviewBudget: liveReviewRoundBudget(),
+      redTeamOnSkip: o => runRedTeamOnSkip({ ...o, dispatch: d => dispatchReviewJob(d), log: line => log.error(line) }),
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
       refreshScopeBloat: refreshScopeBloatedPr,
       postRefreshMarker: defaultPostRebaseComment,
