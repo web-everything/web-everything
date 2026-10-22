@@ -131,6 +131,18 @@ describe('planHumanDeescalation', () => {
     expect(plan({ timeline: { status: 'ok', items: [added('someone-else')] } }).action).toBe('keep');
     expect(plan({ timeline: { status: 'ok', items: [added(), { ...added(), change: 'removed', createdAt: at(1000) }, added('chalbert', 2000)] } }).action).toBe('keep');
   });
+  it('a hand add EVER on this PR → kept, even when an automation write restored it later (the label mirror)', () => {
+    const items = [added('chalbert', -7_200_000), { ...added('chalbert', -3_600_000), change: 'removed' }, added()];
+    expect(plan({ timeline: { status: 'ok', items } }).reason).toMatch(/hand-added by chalbert/);
+  });
+  it('an unreadable comment anywhere in the thread → kept', () => {
+    expect(plan({ pr: { comments: [pendingRecord(), { author: { login: BOT }, body: null, createdAt: at(30_000) }] } }).reason).toMatch(/comment is unreadable/);
+  });
+  it('a diff-judged human category active (broad) with no hunks read → kept; narrow judges on names', () => {
+    expect(plan({ surfaces: 'broad' }).reason).toMatch(/diff-judged human category/);
+    expect(plan({ surfaces: 'narrow' }).action).toBe('deescalate');
+    expect(plan({ surfaces: 'not-a-preset' }).reason).toMatch(/setting unreadable/);
+  });
   it('decision card in the net diff → kept; unreadable card read → kept', () => {
     expect(plan({ decisionCards: { ok: true, files: ['backlog/x1-decide.md'] } }).reason).toMatch(/decision card/);
     expect(plan({ decisionCards: { ok: false, reason: 'card read failed' } }).action).toBe('keep');
@@ -248,6 +260,23 @@ describe('sweepHumanDeescalation (apply)', () => {
       .mockReturnValueOnce({ state: 'OPEN', headRefOid: 'b'.repeat(40), labels: [{ name: 'review:human' }], body: '', comments: [] });
     expect(sweepHumanDeescalation(opts)[0]).toMatchObject({ action: 'keep' });
     expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('a push during the comment/timeline read (second state read) keeps the hold', () => {
+    const { provider, opts } = io();
+    const st = h => ({ state: 'OPEN', headRefOid: h, labels: [{ name: 'review:human' }], body: '', comments: [] });
+    provider.readPrState.mockReturnValueOnce(st(HEAD)).mockReturnValueOnce(st(HEAD)).mockReturnValueOnce(st(HEAD)).mockReturnValueOnce(st('c'.repeat(40)));
+    expect(sweepHumanDeescalation(opts)[0]).toMatchObject({ action: 'keep' });
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('a head that moved under the write gets review:human straight back', () => {
+    const { provider, opts } = io();
+    const st = (h, labels) => ({ state: 'OPEN', headRefOid: h, labels, body: '', comments: [] });
+    for (let i = 0; i < 4; i++) provider.readPrState.mockReturnValueOnce(st(HEAD, [{ name: 'review:human' }]));
+    provider.readPrState.mockReturnValueOnce(st('d'.repeat(40), [{ name: 'review:pending' }]));
+    expect(sweepHumanDeescalation(opts)[0]).toMatchObject({ action: 'keep', reason: expect.stringMatching(/restored/) });
+    expect(provider.setLabels.mock.calls.map(c => c[2])).toEqual([
+      { add: 'review:pending', remove: ['review:human'] }, { add: 'review:human', remove: ['review:pending'] }]);
+    expect(opts.log).not.toHaveBeenCalled();
   });
   it('a throwing read keeps the hold and never stops the sweep; disabled writes nothing', () => {
     const { provider, opts } = io({ readTimeline: () => { throw new Error('gh down'); } });

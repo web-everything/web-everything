@@ -11,7 +11,8 @@
  *
  * THE RULE. `review:human` comes off only when ALL of these hold (any unreadable or malformed input → kept):
  *   1. WHO. The latest `review:human` label event is an ADD by a conveyor automation login (never the operator's
- *      login, never another account): a hand label is never lifted.
+ *      login, never another account), and no hand add of `review:human` appears anywhere on the PR's timeline (the
+ *      label mirror can restore a ledgered hand label under its own login): a hand label is never lifted.
  *   2. WHY. A trusted escalation record (`we:scripts/lib/human-escalation-marker.mjs`) posted BY THAT SAME LOGIN sits
  *      at the add (180 s before to 300 s after; a legacy referral record only before). Every escalation recorded
  *      since is of a kind the setting enables (only kinds with a clearing proof can be enabled), and is cleared:
@@ -26,9 +27,12 @@
  *   4. NO HUMAN-ONLY CHANGE. The net file set (fresh fetch vs origin/main) plus the PR body's disclosed deviation
  *      score humanRequired false (the shape rule); no human-only surface is touched (permission surfaces judged
  *      without hunks, so any touch keeps it); no decision card (`backlog/*.md` whose front matter parses to
- *      `kind: decision`) is in the net diff.
- * The apply path re-reads the labels, comments and timeline after the decision and re-plans; only a second
- * de-escalate verdict on the same head writes. When lifted: `review:human` comes off, `review:pending` goes on unless
+ *      `kind: decision`) is in the net diff; and no human category judged from diff hunks (statute, marked
+ *      invariant, gate-self — the broad preset) is active, since this pass scores file names only.
+ *   Every comment must be readable (an unreadable one could hold a later escalation record).
+ * The apply path re-reads the labels, comments and timeline after the decision and re-plans (each plan reads the PR
+ * state before and after the thread); only a second de-escalate verdict on the same head writes, and a head that
+ * moved under the write gets `review:human` straight back. When lifted: `review:human` comes off, `review:pending` goes on unless
  * `review:changes` stands (a review of the live head is still owed), a durable comment records it, and the log line
  * is `review-human de-escalated {"pr":…,"head":…,"reason":…}`.
  *
@@ -51,7 +55,7 @@ import { normOnOff, REVIEW_SETTINGS_FILE } from '../lib/review-seat-settings.mjs
 import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { HUMAN_ESCALATION_KINDS, REFERRAL_CLEARABLE_KINDS, CLEARABLE_ESCALATION_KINDS, readHumanEscalations } from '../lib/human-escalation-marker.mjs';
 import { REVIEW_LABELS, hasReviewLabel, scoreEscalation, parseDeviationDisclosure } from '../lib/review-escalation.mjs';
-import { sensitiveSurfaceHits, resolveHumanReviewSurfaces } from '../lib/human-review-surfaces.mjs';
+import { sensitiveSurfaceHits, resolveHumanReviewSurfaces, normalizeHumanSurfaces } from '../lib/human-review-surfaces.mjs';
 import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { roundExtensionGrants } from './round-extension-mark.mjs';
@@ -70,6 +74,8 @@ export const ATTRIBUTION_BEFORE_MS = 180_000;
 export const ATTRIBUTION_AFTER_MS = 300_000;
 export const DEESCALATED_MARKER_RE = /<!-- we:human-deescalated pr=\d+ head=[0-9a-f]{40} kinds=[a-z0-9,-]+ -->/;
 const PARK_MARKER_RE = /<!-- (?:human-surface-repark|mechanical-hold-handoff): ([0-9a-f]{40}) -->/gi;
+/** Human-surface categories `scoreEscalation` judges from diff hunks, not from file names alone. */
+const HUNK_JUDGED_CATEGORIES = Object.freeze(['statute', 'marked-invariant', 'gate-self']);
 /** Labels whose presence alone keeps the hold. */
 const HOLDING_LABELS = Object.freeze([REVIEW_LABELS.accepted, REVIEW_LABELS.heldMechanical, REVIEW_LABELS.awaitingAdvisory,
   'advisory:ruling-needed', 'red-team:blocked']);
@@ -146,7 +152,7 @@ function kindCleared(kind, esc, { comments, referral, repo, pr, head }) {
  *   repo:string, scoreFiles?:Function}} o
  */
 export function planHumanDeescalation({ pr, timeline, net, decisionCards, referral, settings, surfaces = 'narrow', repo,
-  scoreFiles = (files, deviation) => scoreEscalation({ changedFiles: files, deviation }) } = {}) {
+  scoreFiles = (files, deviation, humanSurfaces) => scoreEscalation({ changedFiles: files, deviation, humanSurfaces }) } = {}) {
   const labels = names(pr?.labels);
   if (!hasReviewLabel(labels, REVIEW_LABELS.human)) return keep('no review:human');
   if (!settings?.enabled) return keep('de-escalation disabled (setting)');
@@ -154,6 +160,8 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   if (!/^[0-9a-f]{40}$/.test(head)) return keep('live head unreadable');
   const comments = pr?.comments;
   if (!Array.isArray(comments)) return keep('comments unreadable');
+  // One unreadable comment could be the record of a later, non-clearable escalation: hold.
+  if (!comments.every(c => c && typeof c === 'object' && typeof c.body === 'string')) return keep('a comment is unreadable');
   if (typeof pr?.body !== 'string') return keep('PR body unreadable');
   const holding = HOLDING_LABELS.find(l => hasReviewLabel(labels, l));
   if (holding) return keep(`${holding} stands`);
@@ -165,6 +173,10 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   const last = timeline.items.filter(i => i.label === REVIEW_LABELS.human).at(-1);
   if (!last || last.change !== 'added') return keep('label timeline does not end in a review:human add');
   if (!isAutomationLogin(last.actor)) return keep(`review:human added by ${last.actor ?? 'an unknown actor'} (hand or unproven label)`);
+  // A hand add ever on this PR may be the hold an automation write later restored (the label mirror re-adds a
+  // ledgered hand label under its own login): never lift it.
+  const handAdd = timeline.items.find(i => i.label === REVIEW_LABELS.human && i.change === 'added' && !isAutomationLogin(i.actor));
+  if (handAdd) return keep(`review:human was hand-added by ${handAdd.actor ?? 'an unknown actor'} on this PR`);
   const addAt = time(last.createdAt);
 
   // 2. WHY it went on, and whether every recorded cause is cleared.
@@ -202,8 +214,15 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   if (!net?.ok || !Array.isArray(net.files) || !net.files.length || !net.files.every(f => typeof f === 'string' && f))
     return keep(`net file set unreadable (${net?.reason ?? 'no read'})`);
   let score;
-  try { score = scoreFiles(net.files, parseDeviationDisclosure(pr.body)); } catch (e) { return keep(`shape score failed: ${errorText(e)}`); }
+  let categories;
+  try { categories = normalizeHumanSurfaces(surfaces).categories; } catch (e) { return keep(`human-surface setting unreadable: ${errorText(e)}`); }
+  if (!Array.isArray(categories)) return keep('human-surface setting unreadable');
+  try { score = scoreFiles(net.files, parseDeviationDisclosure(pr.body), surfaces); } catch (e) { return keep(`shape score failed: ${errorText(e)}`); }
   if (score?.humanRequired !== false) return keep(`net diff requires a human (${(score?.reasons ?? []).join('; ') || 'shape rule'})`);
+  // The score runs on file names only. A human category judged from the diff text (statute anchors, marked
+  // invariants) cannot be ruled out without it: hold whenever such a category is active and hunks were not read.
+  if (HUNK_JUDGED_CATEGORIES.some(c => categories.includes(c)) && (score?.signals?.hunksUnavailable?.length ?? 1) > 0)
+    return keep(`a diff-judged human category (${HUNK_JUDGED_CATEGORIES.filter(c => categories.includes(c)).join(', ')}) is active and the hunks were not read`);
   let hits;
   try { hits = sensitiveSurfaceHits(net.files, () => undefined, surfaces); } catch (e) { return keep(`human-surface check failed: ${errorText(e)}`); }
   if (!Array.isArray(hits)) return keep('human-surface check unreadable');
@@ -273,10 +292,17 @@ export function sweepHumanDeescalation({
       // One complete live read → one plan. Net files and cards are bound to the head and reused by the re-plan.
       let net = null, decisionCards = null;
       const planFromLive = () => {
-        const state = provider.readPrState(resolvedRepo, num);
-        if (state?.state !== 'OPEN') return { state, plan: keep('not open') };
+        // The state is read before AND after the comments and timeline: a push or a label move during those reads
+        // is caught by the second state read instead of judging a head the thread was not read for.
+        const before = provider.readPrState(resolvedRepo, num);
+        if (before?.state !== 'OPEN') return { state: before, plan: keep('not open') };
         const comments = readComments(num, { repo: resolvedRepo });
         const timeline = readTimeline({ repo: resolvedRepo, pr: num });
+        const state = provider.readPrState(resolvedRepo, num);
+        if (state?.state !== 'OPEN') return { state, plan: keep('not open') };
+        const sortedNames = st => JSON.stringify(names(st?.labels).sort());
+        if (state.headRefOid !== before.headRefOid || sortedNames(state) !== sortedNames(before) || state.body !== before.body)
+          return { state, plan: keep('state moved during the read') };
         if (!net || net.head !== state.headRefOid) {
           net = { head: state.headRefOid, ...readNetFiles({ repo: resolvedRepo, number: num, headRefOid: state.headRefOid }) };
           decisionCards = net.ok && Array.isArray(net.files)
@@ -300,8 +326,18 @@ export function sweepHumanDeescalation({
         continue;
       }
       const freshLabels = names(second.state.labels);
-      provider.setLabels(resolvedRepo, num, { ...(hasReviewLabel(freshLabels, REVIEW_LABELS.changes) || hasReviewLabel(freshLabels, REVIEW_LABELS.pending)
-        ? {} : { add: REVIEW_LABELS.pending }), remove: [REVIEW_LABELS.human] });
+      const addPending = !(hasReviewLabel(freshLabels, REVIEW_LABELS.changes) || hasReviewLabel(freshLabels, REVIEW_LABELS.pending));
+      provider.setLabels(resolvedRepo, num, { ...(addPending ? { add: REVIEW_LABELS.pending } : {}), remove: [REVIEW_LABELS.human] });
+      // GitHub has no conditional label write. Read once more: a head that moved under the write is a diff nobody
+      // judged, so the hold goes straight back (and an unreadable re-read restores it too).
+      let after = null;
+      try { after = provider.readPrState(resolvedRepo, num); } catch { after = null; }
+      if (after?.headRefOid !== second.state.headRefOid) {
+        provider.setLabels(resolvedRepo, num, { add: REVIEW_LABELS.human,
+          remove: addPending && hasReviewLabel(names(after?.labels), REVIEW_LABELS.pending) ? [REVIEW_LABELS.pending] : [] });
+        Object.assign(entry, { action: 'keep', reason: 'head moved during the write; review:human restored' });
+        continue;
+      }
       entry.action = 'deescalated';
       log(`review-human de-escalated ${JSON.stringify({ pr: num, head: second.plan.head, reason: second.plan.reason })}`);
       try { provider.postComment(resolvedRepo, num, buildDeescalatedComment({ pr: num, head: second.plan.head, kinds: second.plan.kinds, reason: second.plan.reason })); }
