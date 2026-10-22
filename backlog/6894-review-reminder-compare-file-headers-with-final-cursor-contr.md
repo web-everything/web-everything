@@ -20,7 +20,7 @@ Add a concise reminder to the applicable prose-accuracy review guidance in we:sk
 The review guidance includes the reminder and explains that prose accuracy requires judgment; it does not demand a source-shape test.
 
 ## Test plan
-Manually review the reminder against the PR #5502 example; run scoped standards checks for the changed guidance.
+Named manual verification case: **review reminder distinguishes per-item receipts from batch-end cursor advancement**. Review the reminder against the PR #5502 example and confirm it directs the reviewer to compare the header with both the successful batch-end cursor update and cursor-retaining error paths, using judgment rather than a source-shape test. Run scoped standards checks for the changed guidance.
 
 ## Edge cases this change must handle
 Untrusted text, truncated reads, shared state, identity scoping and who wrote it: n/a, review guidance only. Fail closed: do not claim a deterministic prose gate. State over time: reread headers after final control-flow edits.

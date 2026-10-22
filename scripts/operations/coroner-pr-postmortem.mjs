@@ -374,7 +374,10 @@ function collectCompletePrTimeline(repo, pr, { gh, comments, env }) {
   },null);
   if (completeness.card === 'incomplete') { scope = null; prepares.length = 0; }
   const files = ghPages(`${root}/pulls/${pr}/files?per_page=100`,gh);
-  if (files.length < p.changed_files) {
+  if (!Number.isSafeInteger(p.changed_files) || p.changed_files < 0) {
+    completeness.core = 'incomplete';
+    warnings.push('PR changed_files count unavailable or invalid; file list completeness and scope verdict are unknown.');
+  } else if (files.length < p.changed_files) {
     completeness.core = 'incomplete';
     warnings.push(`PR file list incomplete: collected ${files.length} of ${p.changed_files} changed files; scope verdict is unknown.`);
   }

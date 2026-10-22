@@ -25,7 +25,7 @@ function collectorGh(overrides = {}) {
   return args => {
     const path = args.at(-1);
     for (const [match, response] of Object.entries(overrides)) if (match === '/pulls/1' ? path.endsWith(match) : path.includes(match)) return typeof response === 'function' ? response(path) : response;
-    if (path.endsWith('/pulls/1')) return { merged_at:at(600), created_at:at(0), head:{ref:'lane/no-card'}, base:{sha:'z'} };
+    if (path.endsWith('/pulls/1')) return { merged_at:at(600), created_at:at(0), changed_files:0, head:{ref:'lane/no-card'}, base:{sha:'z'} };
     if (path.includes('/commits?')) return [fixture().commits];
     if (path.includes('/check-runs?')) return [{check_runs:fixture().checks}];
     if (path.includes('/contents/')) throw Error('optional data unavailable');
@@ -79,13 +79,30 @@ describe('per PR postmortem', () => {
     expect(report.scope).toMatchObject({status:'unknown',outside:null});
     expect(report.causes.some(c => c.cause === 'scope-creep')).toBe(false);
   });
-  it('retains scope verdicts when the file list matches changed_files', () => {
+  it.each([
+    ['missing',undefined], ['null',null], ['numeric string','3000'], ['non-numeric string','invalid'],
+    ['NaN',NaN], ['infinity',Infinity], ['fractional',0.5], ['negative',-1], ['unsafe integer',Number.MAX_SAFE_INTEGER+1],
+  ])('marks %s changed_files incomplete and suppresses scope verdicts', (_name,changedFiles) => {
+    const p = {merged_at:at(600),created_at:at(0),head:{ref:'lane/no-card'},base:{sha:'z'}};
+    if (changedFiles !== undefined) p.changed_files = changedFiles;
     const raw = collectWith(collectorGh({
-      '/pulls/1': {merged_at:at(600),created_at:at(0),changed_files:1,head:{ref:'lane/no-card'},base:{sha:'z'}},
-      '/files?': [[{filename:'outside.js'}]],
+      '/pulls/1': p,
+      '/files?': [Array.from({length:3000},(_,i) => ({filename:`outside/${i}.js`}))],
+    }));
+    const report = buildPostmortem({...raw,scope:['src/**']});
+    expect(raw.completeness.core).toBe('incomplete');
+    expect(raw.warnings).toContain('PR changed_files count unavailable or invalid; file list completeness and scope verdict are unknown.');
+    expect(report.scope).toMatchObject({status:'unknown',outside:null});
+    expect(report.causes.some(c => c.cause === 'scope-creep')).toBe(false);
+  });
+  it.each([0,1])('retains scope verdicts when the file list matches changed_files: %i', count => {
+    const files = count ? [{filename:'outside.js'}] : [];
+    const raw = collectWith(collectorGh({
+      '/pulls/1': {merged_at:at(600),created_at:at(0),changed_files:count,head:{ref:'lane/no-card'},base:{sha:'z'}},
+      '/files?': [files],
     }));
     expect(raw.completeness.core).toBe('complete');
-    expect(buildPostmortem({...raw,scope:['src/**']}).scope).toMatchObject({status:'observed',outside:['outside.js']});
+    expect(buildPostmortem({...raw,scope:['src/**']}).scope).toMatchObject({status:'observed',outside:files.map(f => f.filename)});
   });
   it.each([3000,2000])('rounds phase duration once after summing %i ms intervals', duration => {
     const stamp = ms => new Date(Date.parse(at(0))+ms).toISOString();
