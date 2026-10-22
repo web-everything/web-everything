@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, symlinkSync, utimesSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -286,23 +286,43 @@ describe('real git: cleanup CLI', () => {
     child.stderr.on('data', (c) => { stderr += c; });
     const exited = new Promise((done) => child.on('close', done));
     try {
+      const deadline = Date.now() + 30_000;
       while (!existsSync(join(signals, 'ready'))) {
-        if (child.exitCode !== null) throw new Error(`CLI exited before pausing: ${stderr}`);
+        if (child.exitCode !== null || child.signalCode !== null) throw new Error(`CLI exited before pausing: ${stderr}`);
+        if (Date.now() > deadline) throw new Error('CLI never reached the pause');
         await new Promise((r) => setTimeout(r, 20));
       }
       change();
-    } finally {
-      writeFileSync(join(signals, 'go'), '');
+    } catch (err) {
+      child.kill('SIGKILL'); // never let a half-planted run go on to --apply
+      await exited;
+      throw err;
     }
+    writeFileSync(join(signals, 'go'), '');
     expect(await exited, stderr).toBe(0);
     rmSync(signals, { recursive: true, force: true });
     return JSON.parse(stdout);
   };
 
+  // Every input of the under-claim recheck, planted after the startup check passed.
   it.each([
     ['git lock', (dir) => writeFileSync(join(dir, '.git', 'index.lock'), ''), 'git lock present (index.lock)'],
     ['gc.recentObjectsHook', (dir, other, ran) => hook(dir, ran), 'gc.recentObjectsHook configured (gc would run it)'],
+    ['GC repack filter', (dir) => git(dir, 'config', 'gc.repackFilter', 'blob:none'), /^GC repack filtering configured/],
     ['redirected common dir', (dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
+    ['symlinked .git/info', (dir, other) => {
+      rmSync(join(dir, '.git', 'info'), { recursive: true, force: true });
+      symlinkSync(join(other, '.git', 'info'), join(dir, '.git', 'info'));
+    }, 'symlinked git paths (info)'],
+    ['redirected object store', (dir, other) => {
+      rmSync(join(dir, '.git', 'objects'), { recursive: true, force: true });
+      symlinkSync(join(other, '.git', 'objects'), join(dir, '.git', 'objects'));
+    }, /^object store is redirected/],
+    ['redirected .git', (dir, other) => {
+      const moved = join(other, 'moved-git');
+      renameSync(join(dir, '.git'), moved);
+      symlinkSync(moved, join(dir, '.git'));
+    }, /^\.git is not the lane's own directory/],
   ])('the under-claim recheck refuses a %s that appears after the startup check', async (_, plant, reason) => {
     const dir = lane(16);
     const other = join(root, 'recheck-other');
@@ -338,13 +358,21 @@ describe('real git: cleanup CLI', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 
-  it('unclaim removes only a marker that is still ours', async () => {
+  it.each([true, false])('a claim taken over after it was made stops all writes; unclaim leaves the new marker (marker rewritten: %s)', async (rewritten) => {
     const dir = lane(18);
     git(root, 'clone', '-q', up, dir);
+    const configBefore = readFileSync(join(dir, '.git', 'config'), 'utf8');
+    const countsBefore = git(dir, 'count-objects', '-v');
+    const marker = join(dir, '.git', '.lane-lease');
     const foreign = JSON.stringify({ holder: 'someone-else', session: 'someone-else', purpose: 'busy', acquiredAt: new Date().toISOString() });
     try {
-      await runPaused(18, 'after-claim', () => writeFileSync(join(dir, '.git', '.lane-lease'), foreign));
-      expect(readFileSync(join(dir, '.git', '.lane-lease'), 'utf8')).toBe(foreign);
+      const out = await runPaused(18, 'after-claim', () => (rewritten ? writeFileSync(marker, foreign) : rmSync(marker)));
+      expect(out.rows[0].skipped).toBe('claim lost (lease marker is no longer ours)');
+      expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).toBe(configBefore);
+      expect(git(dir, 'count-objects', '-v')).toBe(countsBefore);
+      expect(hasOpsRef(dir)).toBe(true);
+      if (rewritten) expect(readFileSync(marker, 'utf8')).toBe(foreign);
+      else expect(existsSync(marker)).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 

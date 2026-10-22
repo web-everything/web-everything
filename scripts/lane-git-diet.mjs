@@ -12,7 +12,8 @@
  * marker, no git lock file, no other repository borrowing its objects (alternates under --scan-root/* and the pool
  * root, following alternate chains), and no `gc.recentObjectsHook` or GC repack filtering. Per eligible lane, on --apply:
  *   0. CLAIM the lane: write its lease marker with O_EXCL (the same move as `lane-pool trim`), so a concurrent
- *      acquirer sees a live lease and moves on, and we never act on a lane someone else just took;
+ *      acquirer sees a live lease and moves on, and we never act on a lane someone else just took; before any write
+ *      the marker is re-read (still ours?) and every eligibility input is re-checked;
  *   1. apply the diet config (negative `^refs/heads/ops/*` refspec + unpackLimit=1);
  *   2. delete the stale `refs/remotes/origin/ops/*` tracking refs (readers re-fetch them explicitly by name);
  *   3. `git gc --prune=<1.hour.ago>` with reflog expiry and worktree pruning OFF: only objects unreachable from every
@@ -176,6 +177,8 @@ for (const n of lanes) {
     if (!holder) { rows.push({ lane: n, skipped: 'lost the claim race (someone took the lane)' }); continue; }
     try {
       testPause('after-claim');
+      // Re-read ownership before any write: a marker rewritten or removed by another holder means the claim is lost.
+      if (readLease(dir)?.holder !== holder) { rows.push({ lane: n, skipped: 'claim lost (lease marker is no longer ours)' }); continue; }
       const recheck = cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), symlinkedGitPaths: symlinkedGitPaths(dir), lease: null, nowMs: Date.now(), locks: locksIn(dir), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir) });
       if (!recheck.ok) { rows.push({ lane: n, skipped: recheck.reason }); continue; }
       const before = duBytes(join(dir, '.git'));
