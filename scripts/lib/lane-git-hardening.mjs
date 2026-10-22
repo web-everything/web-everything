@@ -32,10 +32,11 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.alternateRefsCommand', 'true'],
 ]);
 
-// Remote proofs use a restricted transport policy. Ordinary hardened callers also fetch/clone
-// from local and HTTP origins, so changing their transport policy here would break those callers.
+// Remote proofs support HTTP(S), SSH and explicit local origins (enabled by the probe).
+// Git/FTP/helper transports remain refused. Ordinary fetch/clone callers retain their own policy.
 const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
   ['protocol.allow', 'never'],
+  ['protocol.http.allow', 'always'],
   ['protocol.https.allow', 'always'],
   ['protocol.ssh.allow', 'always'],
 ]);

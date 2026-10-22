@@ -49,7 +49,7 @@ it('read-only regression: ordinary hardened callers retain their transport polic
   expect(laneGitConfigArgs().some(arg => arg.startsWith('protocol.'))).toBe(false);
 });
 
-it.each(['https://example.com/pool.git', 'ssh://example.com/pool.git', 'git@example.com:pool.git',
+it.each(['http://example.com/pool.git', 'https://example.com/pool.git', 'ssh://example.com/pool.git', 'git@example.com:pool.git',
   '/canonical/pool.git', 'file:///canonical/pool.git', './canonical/pool.git'])(
   'remote probe isolates lane config and uses the canonical pool URL %s', (originUrl) => {
   const source = /function liveRemoteShasProbe\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
@@ -61,8 +61,9 @@ it.each(['https://example.com/pool.git', 'ssh://example.com/pool.git', 'git@exam
     (...args) => { calls.push(args); return 'abc refs/heads/trunk'; },
     () => '/isolated/probe', () => '/isolated', join, () => '/isolated',
     (dir) => removed.push(dir), laneGitHardeningEnv, { env: { ...inherited,
-      GIT_ALLOW_PROTOCOL: 'ext:file:http', GIT_CONFIG_COUNT: '1',
+      GIT_ALLOW_PROTOCOL: 'ext:file:http', GIT_CONFIG_COUNT: '2',
       GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'always',
+      GIT_CONFIG_KEY_1: 'protocol.http.allow', GIT_CONFIG_VALUE_1: 'never',
     } }, resolve,
   );
   const repo = { originUrl };
@@ -77,9 +78,10 @@ it.each(['https://example.com/pool.git', 'ssh://example.com/pool.git', 'git@exam
   const localOrigin = originUrl.startsWith('/') || originUrl.startsWith('.') || originUrl.startsWith('file:');
   expect(config['protocol.file.allow']).toBe(localOrigin ? 'always' : undefined);
   expect(config['protocol.allow']).toBe('never');
+  expect(config['protocol.http.allow']).toBe('always');
   expect(config['protocol.https.allow']).toBe('always');
   expect(config['protocol.ssh.allow']).toBe('always');
-  expect(options.env.GIT_ALLOW_PROTOCOL).toBe(localOrigin ? 'https:ssh:file' : 'https:ssh');
+  expect(options.env.GIT_ALLOW_PROTOCOL).toBe(localOrigin ? 'http:https:ssh:file' : 'http:https:ssh');
   expect(options.timeout).toBe(20000);
   expect(removed).toEqual(['/isolated/probe']);
 });
@@ -99,6 +101,26 @@ it.each(['missing origin', 'failed Git read', 'failed isolation'])(
   expect(calls).toHaveLength(failure === 'failed Git read' ? 1 : 0);
   expect(removed).toEqual(failure === 'failed Git read' ? ['/isolated/probe'] : []);
 });
+
+// Provisioning delegates URLs to Git, but preservation proofs deliberately support only
+// HTTP(S), SSH and explicit local origins. Pin rejection of the other built-in/helper transports.
+it.each(['git://127.0.0.1:9/pool', 'ftp://127.0.0.1:9/pool', 'ftps://127.0.0.1:9/pool',
+  'ext::false', 'custom::pool'])(
+  'remote probe deliberately declines unsupported canonical transport %s', originUrl => {
+    const source = /function liveRemoteShasProbe\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
+    let result;
+    const probe = new Function('tryGit', 'mkdtempSync', 'tmpdir', 'join', 'dirname', 'rmSync', 'laneGitHardeningEnv', 'resolve',
+      `${source}; return liveRemoteShasProbe;`)(
+      (args, cwd, options) => {
+        result = spawnSync('git', args, { ...options, cwd, encoding: 'utf8' });
+        return result.status === 0 ? result.stdout : null;
+      }, mkdtempSync, tmpdir, join, path => resolve(path, '..'), rmSync, laneGitHardeningEnv, resolve,
+    );
+    expect(probe({ originUrl })).toEqual({ ok: false, shas: new Set() });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('not allowed');
+  },
+);
 
 it('remote probe protocol pins override inherited permissive defaults', () => {
   const env = laneGitHardeningEnv({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'always' }, { remoteProbe: true });
@@ -212,12 +234,18 @@ const customFetchCases = [
   ['missing config', null],
   ['empty config', []],
 ];
-it.each(customFetchCases)('local remote proof rejects %s', (_name, fetchValues) => {
-  const tryGit = (args) => args[0] === 'config'
-    ? fetchValues?.join('\n') ?? null
-    : 'unique refs/remotes/origin/saved \nunique refs/remotes/origin/archive/review-requests ';
+it.each(customFetchCases.flatMap(([name, fetchValues]) =>
+  ['config', 'snapshot'].map(path => ({ name, fetchValues, path }))))('local remote proof rejects $name ($path path)', ({ fetchValues, path }) => {
+  const tryGit = (args) => {
+    if (args[0] === 'config') {
+      if (path === 'snapshot') throw new Error('snapshot must not reread config');
+      return fetchValues?.join('\n') ?? null;
+    }
+    return 'unique refs/remotes/origin/saved \nunique refs/remotes/origin/archive/review-requests ';
+  };
   const localRemoteShas = new Function('tryGit', `${proofSource}; return localRemoteShas;`)(tryGit);
-  expect([...localRemoteShas('/unused')]).toEqual([]);
+  // Missing config has no values to capture; a supplied snapshot is always an array.
+  expect([...localRemoteShas('/unused', path === 'snapshot' ? fetchValues ?? [] : undefined)]).toEqual([]);
 });
 it.each([[defaultFetch], [defaultFetch, excludedOps], [defaultFetch, excludedOps, defaultFetch]])(
   'local remote proof retains standard direct refs and excludes symbolic and ops refs (%j)', (...fetchValues) => {

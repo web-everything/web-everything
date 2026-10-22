@@ -1078,13 +1078,14 @@ export function findDuplicateKeysPerScope(raw) {
   while (i < n) {
     const c = raw[i];
     if (c === '"') {
-      // read a JSON string, honoring backslash escapes; s is the decoded-enough key/value text
-      let j = i + 1, s = '';
+      // Decode keys exactly as JSON.parse does, including Unicode escape spellings.
+      let j = i + 1;
       while (j < n) {
-        if (raw[j] === '\\') { s += raw[j + 1] ?? ''; j += 2; continue; }
+        if (raw[j] === '\\') { j += 2; continue; }
         if (raw[j] === '"') break;
-        s += raw[j]; j++;
+        j++;
       }
+      const s = JSON.parse(raw.slice(i, j + 1));
       i = j + 1;
       const top = frames[frames.length - 1];
       if (top && top.isObject && top.expectKey) {

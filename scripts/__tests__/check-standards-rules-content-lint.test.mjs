@@ -24,6 +24,7 @@ import {
 } from '../check-standards-rules.mjs';
 import { require, ROOT, SRC } from './fixtures/check-standards-rules-fixtures.mjs';
 import { renderItem } from '../backlog/scaffold.mjs';
+import { createSectionGate } from '../lib/standards-sections.mjs';
 
 describe('module-resolution exports-lock (#274/#271)', () => {
   it('isExportsSafeTarget: URL / node_modules / bare specifier are safe', () => {
@@ -210,6 +211,18 @@ describe('findBadBodyLinks — leaked authoring syntax in a backlog body', () =>
 });
 
 describe('findDuplicateKeysPerScope — the #2149 Fork 1 dup-key merge gate for keyed manifests', () => {
+  it('test timings contain no duplicate keys within any suite', () => {
+    const source = 'scripts/ci/test-timings.json';
+    expect(validateNoDuplicateManifestKeys(readFileSync(join(ROOT, source), 'utf8'), source)).toEqual([]);
+  });
+  it('test timings select the duplicate-key standards check in a scoped run', () => {
+    expect(createSectionGate({ scoped: true, touched: ['scripts/ci/test-timings.json'] }).shouldRun('9c')).toBe(true);
+  });
+  it('recognizes escaped spellings of the same JSON key', () => {
+    expect(findDuplicateKeysPerScope(String.raw`{"soak":{"a":1,"\u0061":2}}`)).toEqual(['a']);
+    expect(findDuplicateKeysPerScope(String.raw`{"soak":{"a/b":1,"a\/b":2}}`)).toEqual(['a/b']);
+    expect(findDuplicateKeysPerScope(String.raw`{"soak":{"a\\b":1,"a\u005cb":2}}`)).toEqual(['a\\b']);
+  });
   it('flags two same-name keys in one object scope (the clean-but-wrong merge class)', () => {
     // Two lanes both add a "wrangler" dep at different offsets → git line-merges CLEAN into this:
     const raw = '{ "dependencies": { "wrangler": "^3.1.0", "vite": "^5.0.0", "wrangler": "^3.2.0" } }';
