@@ -10,6 +10,7 @@ import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-ha
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
+import * as directLaunchSettings from '../../lib/direct-launch-settings.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
 import { childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
@@ -108,6 +109,22 @@ describe('runFixCli', () => {
     };
     return { calls, envs, run, spawn, owed, pendingRearm, io: { recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  it('continues repair when directLaunchLogLine throws', async () => {
+    const m = mk(['aaa', 'aaa']);
+    const logLine = vi.spyOn(directLaunchSettings, 'directLaunchLogLine').mockImplementationOnce(() => {
+      throw new Error('settings unavailable');
+    });
+    try {
+      const { code, result } = await runFixCli(argv, m.io);
+      expect(logLine).toHaveBeenCalledWith({ kind: 'fix' });
+      expect(code).toBe(0);
+      expect(result).toMatch(/no-change/);
+      expect(m.spawn).toHaveBeenCalledTimes(1);
+      expect(m.calls.at(-1)).toContain('release');
+    } finally {
+      logLine.mockRestore();
+    }
+  });
   it.each([undefined, '42', '0'])('passes the acquire wait policy (%s)', async value => {
     if (value === undefined) vi.stubEnv('WE_FIX_RUN_ACQUIRE_WAIT_MS', '');
     else vi.stubEnv('WE_FIX_RUN_ACQUIRE_WAIT_MS', value);

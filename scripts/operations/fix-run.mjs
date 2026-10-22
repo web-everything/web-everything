@@ -577,7 +577,10 @@ export async function runFixCli(argv = [], {
   }
   const { pr, sessionSlug, ref } = launch;
   write(`fix-run: starting borrowed repair of PR #${pr} (session ${sessionSlug}, provider ${launch.provider}) - pid ${process.pid}\n`);
-  write(`${directLaunchLogLine({ kind: 'fix' })}\n`);
+  // Settings logging must not interrupt the repair.
+  try {
+    write(`${directLaunchLogLine({ kind: 'fix' })}\n`);
+  } catch {}
   try {
     const brief = readPrompt(launch.promptFile);
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
