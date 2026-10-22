@@ -48,6 +48,41 @@
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 /**
+ * we:scripts/conveyor/conflict-fix-round-count.mjs#CONFLICT_FIX_ROUND_CAP — the durable cap a MECHANICAL
+ * conflict-resolution round binds on (#xkmu3gv). Mirrors {@link CI_HEAL_ROUND_CAP} exactly: its OWN, smaller
+ * cap, counted by `we:scripts/conveyor/conflict-fix-round-count.mjs#countStaleConflictFixRounds` (2026-09-27:
+ * counts only rounds against the CURRENT target, see {@link CONFLICT_FIX_ABSOLUTE_CEILING}'s own docblock for
+ * why a plain per-marker count was wrong) — never `roundCap`'s shared rearm/advisory counters, and never
+ * reduced by however many ordinary negotiation rounds a
+ * PR has already spent (CONFIRMED LIVE: `web-everything/web-everything#2549` was already at 5 of 5 ordinary rounds
+ * when PR #2577's routing rule newly offered it a conflict fix, and the shared cap refused it before the fixer
+ * ever ran — see that leaf's own header for the full incident). A PR that ALSO exhausts three
+ * conflict-resolution rounds still needs a person, exactly as an exhausted `roundCap` does.
+ */
+export const CONFLICT_FIX_ROUND_CAP = 3;
+
+/**
+ * we:scripts/conveyor/conflict-fix-round-count.mjs#CONFLICT_FIX_ABSOLUTE_CEILING — PR #2787 live incident (2026-09-27):
+ * `main` moving fast made THREE mechanical conflict-resolution rounds each genuinely SUCCEED (each posted its
+ * own {@link CONFLICT_FIX_COMMENT_MARKER}) against three DIFFERENT targets in a row (a stacked base rebased
+ * twice, then the base itself landed and the PR retargeted to `main`) — `countConflictFixComments` could not
+ * tell "the same conflict still unresolved" apart from "a fresh conflict against newer work", so
+ * {@link CONFLICT_FIX_ROUND_CAP} (3) was spent on three CLEAN repairs and the fourth, genuinely first-ever
+ * main-base conflict was refused `cap-exhausted` before a fixer ever tried it.
+ * {@link countStaleConflictFixRounds} now counts against `CONFLICT_FIX_ROUND_CAP` only the rounds that resolved
+ * the SAME target this PR is STILL conflicting against (same ref, same sha where known) — a round against a
+ * ref/sha that has since moved on doesn't count, because the mechanism worked; the PR just kept getting new
+ * work under it. That alone would let a PR whose target genuinely never stops moving retry FOREVER, though
+ * (every round would look "fresh" by construction) — this is the hard ceiling that still catches THAT true
+ * loop: the RAW total of conflict-fix rounds ever run (`countStaleConflictFixRounds`'s own `total`), regardless
+ * of staleness, still refuses `cap-exhausted` once it reaches this bound. 3x the per-target cap — generous
+ * enough that a PR legitimately outrunning a fast-moving target for a while is not punished for it, but still
+ * finite: a PR that needed this many rounds, of ANY kind, is exactly the "a person must take it over" case
+ * {@link CONFLICT_FIX_ROUND_CAP} already exists to name.
+ */
+export const CONFLICT_FIX_ABSOLUTE_CEILING = CONFLICT_FIX_ROUND_CAP * 3;
+
+/**
  * we:scripts/conveyor/conflict-fix-round-count.mjs#CONFLICT_FIX_COMMENT_MARKER — the stable FIRST LINE of the
  * durable comment a completed mechanical conflict-resolution round posts. Single-sourced HERE:
  * `we:scripts/conveyor/rearm-review.mjs` (`--round=conflict`) POSTS a comment starting with it, and
@@ -129,7 +164,7 @@ export function parseConflictFixTarget(body, defaultRef) {
  *
  * THAT ALONE COULD RETRY FOREVER for a target that truly never stops moving (every round would look "fresh" by
  * construction, no matter how many actually ran) — `total` is the hard ceiling's own input
- * ({@link CONFLICT_FIX_ABSOLUTE_CEILING} in `reconcile-core.mjs`): the RAW count of every completed round ever,
+ * ({@link CONFLICT_FIX_ABSOLUTE_CEILING}): the RAW count of every completed round ever,
  * regardless of staleness, so a PR that needed an unreasonable number of rounds of ANY kind still escalates to
  * a person.
  *

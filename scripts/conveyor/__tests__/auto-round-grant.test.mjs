@@ -23,6 +23,7 @@ import { enrichPrsWithStandingRulingGrants, headBelongsToPr, headIsCardOnly, rea
 import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
 import { planRoundExtension } from '../../operations/extend-rounds.mjs';
 import { gateRoundCap } from '../../lib/red-team-gate.mjs';
+import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 import { runReconcileNotesAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
 // The real transport, mocked only to read the options every default App-identity call passes (no test reaches GitHub).
@@ -317,6 +318,34 @@ describe('card-only is judged on the NET diff', () => {
 });
 
 describe('the grant', () => {
+  it.each([
+    ['conflict-fix', 9, 'skip'],
+    ['stacked-rebase', 9, 'skip'],
+    ['stale-base-rebase', 9, 'skip'],
+    ['conflict-fix', 8, 'granted'],
+    ['stacked-rebase', 8, 'granted'],
+    ['stale-base-rebase', 8, 'granted'],
+    ['fix', 9, 'granted'],
+  ])('%s cap with %i trusted conflict rounds on the fresh thread returns %s', (capKind, rounds, action) => {
+    const gh = fakeGh({ comments: Array.from({ length: rounds }, () => ({
+      author: { login: 'web-everything[bot]' }, body: CONFLICT_FIX_COMMENT_MARKER,
+    })) });
+    const ledger = tmpLedger();
+    const out = autoRoundGrant({ repo: 'we', note: { ...note, capKind, attempts: rounds, cap: 3 },
+      pr: { headRefOid: HEAD, comments: [] } }, deps(gh, { ledger }));
+    expect(out.action).toBe(action);
+    if (action === 'skip') {
+      expect(out.why).toMatch(/hard ceiling.*cannot be lifted by a round grant/i);
+      expect(gh.post).not.toHaveBeenCalled();
+      ledger(WE, note.prNumber, ({ seeded, entries }) => {
+        expect(seeded).toBe(false);
+        expect(entries).toEqual([]);
+      });
+    } else {
+      expect(gh.post).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it('posts an App comment citing the ruling and its head, which the trusted reader then counts', () => {
     const gh = fakeGh();
     expect(call(deps(gh))).toMatchObject({ action: 'granted', count: 1, max: 3 });

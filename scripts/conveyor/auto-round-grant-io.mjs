@@ -31,6 +31,7 @@ import { isAutomationAuthored, isOperatorAuthored } from '../lib/marker-authorsh
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { ghApp, readStandingRuling, standingRulingScope, redact } from './standing-ruling-io.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { countStaleConflictFixRounds, CONFLICT_FIX_ABSOLUTE_CEILING } from './conflict-fix-round-count.mjs';
 import {
   AUTO_GRANT_ABSOLUTE_MAX, AUTO_GRANT_CHANNEL, autoGrantKey, autoGrantReason, capReachedReason,
   countAutoRoundGrants, decideAutoGrant, formatAutoRoundGrantSettings, resolveAutoRoundGrantSettings, screenAutoGrantNote,
@@ -133,6 +134,11 @@ export function autoRoundGrant({ repo, note, pr }, {
       let thread;
       try { thread = readThread(slug, note.prNumber); } catch (e) { return { action: 'skip', why: `thread unreadable: ${firstLine(e)}` }; }
       const comments = thread?.comments ?? [];
+      // Reconcile's durable conflict total is a hard stop independent of any per-target round grant.
+      if (['conflict-fix', 'stacked-rebase', 'stale-base-rebase'].includes(note.capKind)
+        && countStaleConflictFixRounds(comments).total >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+        return { action: 'skip', why: `the conflict-fix hard ceiling of ${CONFLICT_FIX_ABSOLUTE_CEILING} cannot be lifted by a round grant` };
+      }
       // An operator grant that landed after this note's snapshot means the note judged a cap that is no longer
       // current: the next pass re-judges it on a snapshot that includes the grant (bounded: one pass). Both counts use
       // the same scope-free reader, so they never disagree about what the snapshot already credited.
