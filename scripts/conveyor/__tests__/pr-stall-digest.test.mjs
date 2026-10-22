@@ -3,19 +3,20 @@
  *   repo#pr@head:state and against what the feed already published, self-clearing, quiet hours through gateAlert, a
  *   retried failed alert, and never suppressed on a failed read.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { publishStalledDigest, pasteReady, feedItem } from '../pr-stall-digest.mjs';
 import { replay, unacknowledged, sidecarsOf } from '../../operations/needs-you-feed.mjs';
 import { gateAlert } from '../../lib/quiet-hours-io.mjs';
+import * as atomicJson from '../../lib/atomic-json-file.mjs';
 
 const REPO = 'web-everything/web-everything';
 const H = 'a'.repeat(40);
 const NOW = Date.parse('2026-10-21T18:00:00Z');
 const roots = [];
-afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
 function setup() {
   const root = mkdtempSync(join(tmpdir(), 'stall-digest-')); roots.push(root);
   return { feedPath: join(root, 'needs-you-events.jsonl'), stateDir: join(root, 'pr-stall-sweep') };
@@ -116,7 +117,7 @@ describe('never suppressed', () => {
     expect(f.command).toBe(`gh pr view 1 --repo ${REPO} --comments`); expect(f.template).toMatch(/<block\|not-real>/);
   });
   it('an item with no evidence gets one factual line', () => expect(feedItem(op(1, undefined, { evidence: [] })).evidence).toHaveLength(1));
-  it('an alert whose state save fails after publishing is still owed', () => {
+  it('an undelivered alert remains owed until notification succeeds', () => {
     const ctx = setup(); const out = [];
     run(ctx, [op(1)], { notify: () => ({ ok: false }) });
     const own = JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8'));
@@ -124,6 +125,53 @@ describe('never suppressed', () => {
     run(ctx, [op(1)], { notify: (n) => { out.push(n); return { ok: true }; } });
     expect(out).toHaveLength(1);
     expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).unnotified).toEqual([]);
+  });
+  it.each([
+    { boundary: 'before feed publication', failAt: 1 },
+    { boundary: 'after feed publication', failAt: 2 },
+    { boundary: 'after successful notification', failAt: 3 },
+  ])('a digest-state write that fails $boundary cannot drop an alert', ({ failAt }) => {
+    const ctx = setup(); const mine = join(ctx.stateDir, 'digest-state.json');
+    const alertId = `${REPO}#1@${H}:ruling-needed:dispute`;
+    const key = `${REPO}#1@${H}:stalled`;
+    const realWrite = atomicJson.writeJsonAtomic;
+    let writes = 0; let failures = 0;
+    const write = vi.spyOn(atomicJson, 'writeJsonAtomic').mockImplementation((path, data, options) => {
+      if (path === mine && ++writes === failAt) {
+        failures++;
+        throw new Error('injected digest-state write failure');
+      }
+      return realWrite(path, data, options);
+    });
+    // Before confirmation, also leave delivery unsuccessful so recovery must use the durable owed record.
+    // At confirmation, delivery succeeded: a failed save may repeat that alert, but must never lose it.
+    const firstNotify = vi.fn(() => ({ ok: failAt === 3 }));
+    const failed = run(ctx, [op(1)], { notify: firstNotify });
+    expect(failures).toBe(1);
+    expect(writes).toBe(failAt);
+    expect(failed.errors.join(' ')).toContain('injected digest-state write failure');
+    expect(firstNotify).toHaveBeenCalledOnce();
+    expect(failed.notified).toBe(failAt === 3);
+    if (failAt === 1) {
+      // Write-ahead guarantee: a failed owed-record save must prevent BOTH feed writes.
+      expect(existsSync(ctx.feedPath)).toBe(false);
+      expect(existsSync(sidecarsOf(ctx.feedPath).state)).toBe(false);
+      expect(existsSync(mine)).toBe(false);
+    } else {
+      expect(replay({ path: ctx.feedPath })).toHaveLength(1);
+      expect(JSON.parse(readFileSync(sidecarsOf(ctx.feedPath).state, 'utf8')).openKeys).toEqual([key]);
+      expect(JSON.parse(readFileSync(mine, 'utf8')).unnotified).toEqual([alertId]);
+    }
+    write.mockRestore();
+    // A new invocation recovers using only the persisted files, including an already-open feed item.
+    const { out, notify } = sent();
+    const recovered = run(ctx, [op(1)], { notify });
+    expect(recovered.errors).toEqual([]);
+    expect(recovered.notified).toBe(true);
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(readFileSync(mine, 'utf8')).unnotified).toEqual([]);
+    run(ctx, [op(1)], { notify });
+    expect(out).toHaveLength(1);
   });
   it('a feed append that fails is published on a later pass', () => {
     const ctx = setup(); const { out, notify } = sent();

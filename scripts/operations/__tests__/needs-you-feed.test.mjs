@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, assertProducerCheckout, monitorCommand, main } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
@@ -351,17 +351,22 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
 });
 
 describe('stall sweep coexistence', () => {
-  it('a new queue item for a PR head with an open stalled item is not published twice; an open one is never cleared by it', async () => {
-    const { mkdtempSync, writeFileSync, mkdirSync } = await import('node:fs');
-    const { join: j } = await import('node:path'); const { tmpdir: t } = await import('node:os');
-    const { runOnce, sidecarsOf, replay } = await import('../needs-you-feed.mjs');
-    const root = mkdtempSync(j(t(), 'nyf-stalled-')); const path = j(root, 'needs-you-events.jsonl');
+  it.each([
+    { name: 'a new queue item for a head with an open stalled item is not published twice', queueOpen: false },
+    { name: 'an already-open queue item is retained when the same head also has an open stalled item', queueOpen: true },
+  ])('$name', async ({ queueOpen }) => {
+    const path = join(temp(), 'needs-you-events.jsonl');
     const head = 'a'.repeat(40); const repo = 'web-everything/web-everything';
-    mkdirSync(root, { recursive: true });
-    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [`${repo}#5@${head}:stalled`] }));
+    const stalledKey = `${repo}#5@${head}:stalled`;
+    const queueKey = `${repo}#5@${head}:ruling-needed`;
+    const openKeys = [stalledKey, ...(queueOpen ? [queueKey] : [])];
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys }));
     const report = { ready: [], rulingNeeded: [{ repo, number: 5, head, reason: 'parked' }] };
     const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
-    await runOnce({ exec: async () => JSON.stringify(report), settings, liveGate: false, log: () => {} });
+    const result = await runOnce({ exec: async () => JSON.stringify(report), settings, liveGate: false, log: () => {} });
+    expect(result.lines).toEqual([]);
+    expect(result.openKeys).toEqual(openKeys);
+    expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual(openKeys);
     expect(replay({ path })).toEqual([]);
   });
 });
