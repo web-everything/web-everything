@@ -556,7 +556,8 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
 /** The send-back body for {@link decideReferralHoldAutoResolve}'s `send-back`: the same words a block ruling's own
  *  follow-up posts (`record-referral-ruling.mjs#planRulingFollowUp`), naming every blocked finding. PURE. */
 export function referralHoldSendBackBody({ head, blocked }) {
-  const prose = s => String(s ?? '').replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').replace(/\s+/g, ' ').trim();
+  // Escape HTML text rather than recognizing individual comment delimiters (including alternate endings).
+  const prose = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\s+/g, ' ').trim();
   const actor = b => String(b.actor).toLowerCase();
   const byPolicy = blocked.every(b => actor(b) === AUTO_POLICY_ACTOR);
   const byOperator = blocked.every(b => actor(b) !== AUTO_POLICY_ACTOR && actor(b) !== 'reviewer');

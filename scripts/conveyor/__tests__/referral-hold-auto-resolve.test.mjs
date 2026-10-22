@@ -189,6 +189,22 @@ describe('send-back: a block ruling on the live head owes a fix, never a ruling'
   });
 });
 
+describe('send-back prose is rendered as HTML text', () => {
+  it.each([
+    ['ordinary prose', '  Fix\n this\t finding.  ', 'Fix this finding.'],
+    ['standard comment', '<!-- hidden -->', '&lt;!-- hidden --&gt;'],
+    ['alternate comment ending', '<!-- hidden --!> visible', '&lt;!-- hidden --!&gt; visible'],
+    ['standalone alternate comment ending', '--!>', '--!&gt;'],
+    ['abrupt comment ending', '<!--> visible', '&lt;!--&gt; visible'],
+    ['HTML and entities', '<b>Fix & verify &lt;input&gt;</b>', '&lt;b&gt;Fix &amp; verify &amp;lt;input&amp;gt;&lt;/b&gt;'],
+  ])('escapes %s in both the summary and rationale', (_name, input, escaped) => {
+    const body = referralHoldSendBackBody({ head: FX[5775].headRefOid,
+      blocked: [{ file: 'example.mjs', line: 7, actor: 'reviewer', summary: input, rationale: input }] });
+    expect(body).toContain(`1. \`example.mjs:7\` (reviewer) — ${escaped}\n   Rationale: ${escaped}`);
+    expect(body).not.toMatch(/[<>]/);
+  });
+});
+
 describe('fail closed: anything unproven keeps the pause, and says why', () => {
   const fx = FX[5775];
   const pr = asPr(fx);
