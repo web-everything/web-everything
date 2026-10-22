@@ -434,14 +434,14 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
         kill: () => {},
       };
     };
-    await antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn });
+    await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn });
     // UNTRANSFORMED — byte for byte the same shape, no requireAllProperties-equivalent applied (#3633 probe 3).
     expect(schemaFileSeenDuringSpawn).toEqual(SHAPE);
   });
 
   it('closes stdin via .end() with a single stream-json `user` event carrying the mandate + input', async () => {
     const { fn, seen } = fakeSpawn({ stdout: resultJsonl(OK_RESULT) });
-    await antigravityJudgeSpawn({ mandate: 'BE TERSE', input: 'THE-DIFF', shape: SHAPE, spawnFn: fn });
+    await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'BE TERSE', input: 'THE-DIFF', shape: SHAPE, spawnFn: fn });
     expect(seen.stdin).toContain('BE TERSE');
     expect(seen.stdin).toContain('THE-DIFF');
     expect(seen.argv.join(' ')).not.toContain('THE-DIFF'); // rode stdin, not argv
@@ -452,7 +452,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
 
   it('returns the conversation_id as sessionId, costUsd 0, and the structured_output value', async () => {
     const { fn } = fakeSpawn({ stdout: resultJsonl(OK_RESULT) });
-    const r = await antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn });
+    const r = await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn });
     expect(r.sessionId).toBe('sess-1');
     expect(r.costUsd).toBe(0);
     expect(r.value).toEqual({ verdict: 'accept', finding: 'ok' });
@@ -469,7 +469,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
     const { fn } = fakeSpawn({ stdout: resultJsonl(OK_RESULT) });
     let seen = null;
     const spy = (o) => { seen = o; return null; };
-    const r = await antigravityJudgeSpawn({
+    const r = await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {},
       mandate: 'm', input: 'i', shape: SHAPE, model: 'gemini-3.1-pro', effort: 'low', spawnFn: fn, recordScorecard: spy,
       transcriptDir: mkdtempSync(join(tmpdir(), 'agy-scorecard-test-')),
     });
@@ -489,7 +489,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
       denied_actions: [{ action: 'command', display_name: 'RunCommand' }],
     };
     const { fn } = fakeSpawn({ stdout: resultJsonl(deniedResult) });
-    await expect(antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn }))
+    await expect(antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn }))
       .rejects.toThrow(AntigravityToolDeniedError);
   });
 
@@ -497,14 +497,14 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
     const { fn } = fakeSpawn({ stdout: resultJsonl(OK_RESULT) });
     let called = false;
     const spy = (...a) => { called = true; return fn(...a); };
-    await expect(antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, allowedTools: ['Read'], spawnFn: spy }))
+    await expect(antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, allowedTools: ['Read'], spawnFn: spy }))
       .rejects.toThrow(/no configurable tool allow-list/);
     expect(called).toBe(false);
   });
 
   it('never passes --dangerously-skip-permissions or --sandbox in the real spawned argv', async () => {
     const { fn, seen } = fakeSpawn({ stdout: resultJsonl(OK_RESULT) });
-    await antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn });
+    await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn });
     expect(seen.argv).not.toContain('--dangerously-skip-permissions');
     expect(seen.argv).not.toContain('--sandbox');
   });
@@ -521,7 +521,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
         kill: () => {},
       };
     };
-    await antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn });
+    await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn });
     expect(existsSync(workDirSeen)).toBe(false);
   });
 
@@ -534,7 +534,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
       const dir = mkdtempSync(join(tmpdir(), 'antigravity-judge-transcript-integration-'));
       try {
         const { fn } = fakeSpawn({ stdout: resultJsonl(OK_RESULT) });
-        const r = await antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, transcriptDir: dir });
+        const r = await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, transcriptDir: dir });
         expect(r.transcriptFile).toBe(join(dir, 'antigravity-judge-sess-1.jsonl'));
         // THE EXACT SAME BYTES the outcome was parsed from — not a paraphrase, not a summary.
         expect(readFileSync(r.transcriptFile, 'utf8')).toBe(resultJsonl(OK_RESULT));
@@ -549,7 +549,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
       const { fn } = fakeSpawn({ stdout: resultJsonl(OK_RESULT) });
       const calls = [];
       const persistTranscript = (o) => { calls.push(o); return '/fake/transcript/path.jsonl'; };
-      const r = await antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, persistTranscript });
+      const r = await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, persistTranscript });
       expect(calls).toHaveLength(1);
       expect(calls[0].sessionId).toBe('sess-1');
       expect(calls[0].stdout).toBe(resultJsonl(OK_RESULT));
@@ -564,7 +564,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
       const { fn } = fakeSpawn({ stdout: errorJsonl });
       const calls = [];
       const persistTranscript = (o) => { calls.push(o); return '/fake/failed.jsonl'; };
-      await expect(antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, persistTranscript }))
+      await expect(antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, persistTranscript }))
         .rejects.toThrow(/the juror failed/);
       expect(calls).toHaveLength(1); // persisted BEFORE the parse threw, not skipped because of the throw
       expect(calls[0].sessionId).toBe('sess-failed');
@@ -578,7 +578,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
       const { fn } = fakeSpawn({ stdout: resultJsonl(deniedResult) });
       const calls = [];
       const persistTranscript = (o) => { calls.push(o); return '/fake/denied.jsonl'; };
-      await expect(antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, persistTranscript }))
+      await expect(antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, persistTranscript }))
         .rejects.toThrow(AntigravityToolDeniedError);
       expect(calls).toHaveLength(1);
       expect(calls[0].sessionId).toBe('sess-denied');
@@ -587,7 +587,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
     it('a transcript-write failure never crashes an otherwise-successful judge call — best effort only', async () => {
       const { fn } = fakeSpawn({ stdout: resultJsonl(OK_RESULT) });
       const persistTranscript = () => null; // simulates a disk-write failure
-      const r = await antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, persistTranscript });
+      const r = await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, persistTranscript });
       expect(r.value).toEqual({ verdict: 'accept', finding: 'ok' });
       expect(r.transcriptFile).toBeNull();
     });
@@ -598,7 +598,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
     // strictly "read the same bytes onto disk", not a new capability.
     it('still never passes --dangerously-skip-permissions or --sandbox, and still refuses a tool-bearing request, with the new transcript params present', async () => {
       const { fn, seen } = fakeSpawn({ stdout: resultJsonl(OK_RESULT) });
-      await antigravityJudgeSpawn({
+      await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {},
         mandate: 'm', input: 'i', shape: SHAPE, spawnFn: fn, transcriptDir: '/tmp/whatever-agy-transcripts',
       });
       expect(seen.argv).not.toContain('--dangerously-skip-permissions');
@@ -606,7 +606,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
 
       let called = false;
       const spy = (...a) => { called = true; return fn(...a); };
-      await expect(antigravityJudgeSpawn({
+      await expect(antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {},
         mandate: 'm', input: 'i', shape: SHAPE, allowedTools: ['Read'], spawnFn: spy, transcriptDir: '/tmp/whatever-agy-transcripts',
       })).rejects.toThrow(/no configurable tool allow-list/);
       expect(called).toBe(false); // refused BEFORE the spawn that would have persisted anything
@@ -625,7 +625,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
     }
 
     it('throws JudgeTimeoutError when the kill leaves nothing parseable', async () => {
-      await expect(antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, timeoutMs: 5, spawnFn: neverEndingSpawn() }))
+      await expect(antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, timeoutMs: 5, spawnFn: neverEndingSpawn() }))
         .rejects.toThrow(JudgeTimeoutError);
     });
 
@@ -638,7 +638,7 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
         on: () => {},
         kill: () => {},
       });
-      const r = await antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, timeoutMs: 5, spawnFn: fn });
+      const r = await antigravityJudgeSpawn({ readHold: () => null, saveHold: () => {}, mandate: 'm', input: 'i', shape: SHAPE, timeoutMs: 5, spawnFn: fn });
       expect(r.timedOut).toBe(true);
       expect(r.value).toEqual({ verdict: 'accept', finding: 'recovered' });
     });

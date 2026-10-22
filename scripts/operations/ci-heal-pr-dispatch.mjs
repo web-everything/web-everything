@@ -37,7 +37,7 @@
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { pollHealAttempts } from './probation-heal-run.mjs';
-import { readAgyHold } from '../lib/antigravity-run-evidence.mjs';
+import { readAgyHoldReprobing } from '../lib/agy-quota-hold.mjs';
 import { providerQuotaHold } from '../lib/provider-quota-hold.mjs';
 import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 
@@ -172,7 +172,7 @@ export function withOwedMainRuleSection(prompt, planned) {
 }
 
 /** Read current holds once at the CI-heal boundary. A read error is a visible refusal. */
-export function routeAvailableCiHeal(p, { readHolds = readAgyHold, readScores = readHealQuotaScores, now = Date.now() } = {}) {
+export function routeAvailableCiHeal(p, { readHolds = readAgyHoldReprobing, readScores = readHealQuotaScores, now = Date.now() } = {}) {
   try {
     const scorecards = readScores();
     if (!Array.isArray(scorecards)) throw new Error('quota scorecards unreadable');

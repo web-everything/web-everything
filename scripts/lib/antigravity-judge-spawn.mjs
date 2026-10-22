@@ -133,7 +133,8 @@
  * `markdown-it`/ephemeral-clone-CLI-test regression that discipline exists to prevent).
  */
 
-import { agyRunEvidence, readAgyHold, saveAgyHold, agyEvidenceError } from './antigravity-run-evidence.mjs';
+import { agyRunEvidence, saveAgyHold, agyEvidenceError } from './antigravity-run-evidence.mjs';
+import { readAgyHoldReprobing } from './agy-quota-hold.mjs';
 import { spawn as nodeSpawn } from 'node:child_process';
 import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync,
@@ -654,7 +655,7 @@ export async function antigravityJudgeSpawn({
   persistTranscript = persistAntigravityJudgeTranscript,
   // #3383 mechanical-dispatcher Gap 1 fix — see the call site below, right after `transcriptFile` is known.
   recordScorecard = recordAntigravityRunScorecard,
-  readHold = readAgyHold, saveHold = saveAgyHold,
+  readHold = readAgyHoldReprobing, saveHold = saveAgyHold,
   // Card 84 — `'read-cwd'` lets the juror read inside `cwd` (an agy review-seat juror's own checkout). Still no
   // `--dangerously-skip-permissions`, so shell and writes stay denied. `role` labels the scorecard row.
   toolPolicy = 'none',
