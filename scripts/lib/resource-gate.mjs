@@ -1,3 +1,4 @@
+import { yieldToWaitingSendBack } from '../conveyor/fix-waiting-priority.mjs';
 import { resolveHandoffSettings } from './handoff-settings.mjs';
 /**
  * @file we:scripts/lib/resource-gate.mjs
@@ -200,13 +201,18 @@ export function cutoverDecision({ gate, kind, legacy = { admit: true }, mode = '
  * `settings` defaults to the cascade; `legacyGate`, `shadow`, `admitFn` are test seams.
  */
 export function gateLaunch({ kind = 'fix', gate, env = process.env, settings, legacyGate = gateHost, nowMs = Date.now(), root,
-  shadow, admitFn, log, sample, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length } = {}) {
+  shadow, admitFn, log, readWaiting, sample, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length } = {}) {
   let legacy;
   try { legacy = legacyGate({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); } catch { legacy = { admit: true }; }
   let mode = 'enforce';
   try { mode = (settings ?? loadResourceGateSettings({ env }).settings).cutover; } catch { /* the standard */ }
-  return cutoverDecision({ gate: gate ?? `launch.${kind}`, kind, legacy, mode, env, nowMs, root,
+  const result = cutoverDecision({ gate: gate ?? `launch.${kind}`, kind, legacy, mode, env, nowMs, root,
     ...(shadow ? { shadow } : {}), ...(admitFn ? { admitFn } : {}), ...(log ? { log } : {}) });
+  const ordered = yieldToWaitingSendBack(result, { kind, env, nowMs, ...(readWaiting ? { readWaiting } : {}) });
+  if (ordered !== result) {
+    try { (log ?? (line => process.stderr.write(line)))(`resource-gate gate=${gate ?? `launch.${kind}`} kind=${kind} ${ordered.why}\n`); } catch { /* best effort */ }
+  }
+  return ordered;
 }
 
 /**

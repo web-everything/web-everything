@@ -1991,3 +1991,40 @@ ON. They resolve through the shared policy cascade: standard → platform → re
 with each source logged. Dispatch strips disabled brief sections. The verify step's first-commit
 check applies to build lane branches and delivery leases on local `main`, and warns if no test was added or updated; this advisory
 cannot prove a red run. Git-read errors are reported as unknown rather than evidence of compliance.
+
+### Previewing host-busy fix waits
+
+`node scripts/conveyor/reconcile-fix-dispatch.mjs --dry-run --repo=we` works from a lane.
+It reads the live planner and the existing resource throttle, prints proposed
+`fix-waiting:host-busy` label changes and overdue alerts, and never launches a fixer,
+changes labels, sends notifications, or saves waiting episodes. A proposed clear is
+conditional on the previewed launch; the live dispatcher clears only after a successful
+fresh launch or resume. Preview reads skip the planner's cache and journal writes and
+checkout auto-sync. Other dispatch gates still apply after resource admission.
+
+The alert limit is `fixWaiting.hostBusyAlertMinutes` (default 30), resolved through the
+policy cascade and logged with its source on every pass. Tool overrides belong in
+`we:scripts/settings/fix-waiting.json`; the env override is
+`WE_FIX_WAITING_HOST_BUSY_ALERT_MINUTES`. Episode files live beside the PR-limit state
+in `~/.claude/conveyor/`, using its directory resolver. Tests inject a temporary path
+and label/notification providers; never use the operator's live episode store in tests.
+
+Dispatcher fixtures must inject `fetchItemlessDiffPaths` even for a named backlog item:
+the planner checks that item's presence in the PR diff before reaching admission.
+Also fake `resolveFallbackScope`, `resolveCardScopeAtRef`, claims, comments, resume
+attempts and lane selection when exercising their paths. Preview tests must inject
+`readClaim` separately; the dispatcher's claim-list fakes do not cover that reader.
+
+## Send-back admission priority
+
+`fix-waiting-priority.mjs` reads the fix dispatcher's existing host-wait episodes without
+GitHub IO. Build/graduation launch gates only add deferrals after resource admission;
+fix/ci-heal gates and resource floors retain their existing behavior. A waiting record
+expires after three dispatcher intervals (six minutes by default), including if the daemon dies.
+Confirmed send-back launches retain session evidence for at most 24 hours for heavy-command
+classification, without continuing to block launches. Both freshness settings resolve through
+`fixWaiting` in the policy cascade and name their sources in priority reasons.
+`heavyAdmission.priority.mode` controls queue ordering: P0 red-main repair, P1 send-back fixer,
+then normal P3. P1 keeps its existing slot eligibility, and running holders are never preempted.
+The focused suites are `fix-waiting-priority.test.mjs` and `heavy-send-back-priority.test.mjs`;
+run them through heavy admission when host capacity permits.

@@ -123,13 +123,14 @@ export function repairPatternMatches(pattern, value, deadlineMs = Infinity) {
 
 /**
  * The admission class of one waiter. PURE. A red-main repair — any identity field matching a repair pattern — is
- * classed by the delivery-priority rule as the owner of the open main-red episode's fix (P0); everything else is
- * P3 (normal). Mode `off` makes every waiter P3 (today's FCFS).
+ * classed by the delivery-priority rule as the owner of the open main-red episode's fix (P0); a matching
+ * send-back fixer is P1, and everything else is P3 (normal). Mode `off` makes every waiter P3 (today's FCFS).
  * @param {{purpose?:string|null, session?:string|null, holder?:string|null, envSession?:string|null}} identity
  * @param {{mode:'enforce'|'off', repairPatterns:string[]}} priority
+ * @param {{sendBackFixes?:Array<{session:string, pr:number, repo:string, freshness:string}>}} evidence
  * @returns {{class:string, reason:string, matched:{field:string, value:string, pattern:string}|null}}
  */
-export function classifyWaiterPriority(identity, priority) {
+export function classifyWaiterPriority(identity, priority, { sendBackFixes = [] } = {}) {
   const normal = (reason) => ({ class: 'P3', reason, matched: null });
   if (priority?.mode !== 'enforce') return normal('priority off');
   const patterns = validRepairPatterns(priority.repairPatterns) ? priority.repairPatterns : DEFAULT_REPAIR_PATTERNS;
@@ -141,6 +142,14 @@ export function classifyWaiterPriority(identity, priority) {
     if (pattern === undefined) continue;
     const d = deliveryPriority({ incident: { open: true, owner: true } }, { mode: 'enforce' }, 0);
     return { class: d.class, reason: `red-main repair: ${d.reasons.join('; ')}`, matched: { field, value, pattern } };
+  }
+  for (const field of IDENTITY_FIELDS) {
+    const value = identity?.[field];
+    if (typeof value !== 'string' || value.length > MAX_REPAIR_MATCH_VALUE_LENGTH) continue;
+    const row = sendBackFixes.find(row => value === row.session
+      || (value.startsWith(`${row.session}-lane-`) && /^\d+-[a-z0-9]+$/.test(value.slice(row.session.length + 6))));
+    if (row) return { class: 'P1', reason: `send-back fix #${row.pr} (${row.repo}; ${row.freshness})`,
+      matched: { field, value, pattern: row.session } };
   }
   return normal('normal');
 }
