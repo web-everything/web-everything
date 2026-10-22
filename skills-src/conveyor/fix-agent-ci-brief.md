@@ -373,7 +373,8 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 ```
 
 Clear your await record FIRST (run from your lane), so a verdict that lands later can never resume you after another
-fixer took the PR. This exit releases the claim but leaves `review:changes`, so the unverified head is never handed
+fixer took the PR. If `clear` exits non-zero (a record is still present), do NOT run the next two lines: end your turn
+with `verify-wait-timeout: await record not cleared` and leave the claim held. This exit releases the claim but leaves `review:changes`, so the unverified head is never handed
 back or landed.
 
 A dispatched agent cannot run the gate itself: `we:scripts/guard-bash.mjs` denies any `verify-lane.mjs` invocation

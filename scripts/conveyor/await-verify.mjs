@@ -314,7 +314,11 @@ export function main(argv = process.argv.slice(2), {
       if (foreignRecord(key, callerLane())) { err(`refusing to clear ${key}: its record belongs to another lane`); return 2; }
       const lane = clear(cwd);
       const store = clearStore(key);
-      out(JSON.stringify({ cleared: lane.cleared || store.cleared }));
+      // A clear is only "done" when NEITHER record is left: a caller about to release its claim (the fixer's
+      // verify-wait-timeout exit) must never leave a record that a later verdict could resume it from.
+      const remaining = [read(cwd) ? 'lane' : null, key && readStore(key) ? 'store' : null].filter(Boolean);
+      out(JSON.stringify({ cleared: lane.cleared || store.cleared, ...(remaining.length ? { remaining } : {}) }));
+      if (remaining.length) { err(`await-verify clear: ${remaining.join(' and ')} record still present — do not release the claim`); return 3; }
       return 0;
     }
     if (command === 'self-review') return selfReviewCommand({

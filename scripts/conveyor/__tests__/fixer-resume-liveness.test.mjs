@@ -349,3 +349,27 @@ describe('hasAwaitVerifyRecordStrict — only a clean "no such file" is absent',
     expect(hasAwaitVerifyRecordStrict(dir, session, { dir, readFileSyncFn: () => '{"pr":5758}' })).toBe(true);
   });
 });
+
+describe('await-verify clear — the timeout exit only releases once no record is left', () => {
+  it('exits 3 and names the store record when its delete failed but the lane delete succeeded', async () => {
+    const { main } = await import('../await-verify.mjs');
+    const outs = []; const errs = [];
+    const code = main(['clear', '--who=fix-5758', '--cwd=/lane'], {
+      env: { CLAUDE_CODE_SESSION_ID: 'ddac038c-bcfe-4cd0-9d51-c983476b47b1' },
+      exec: () => '/lane\n', clear: () => ({ cleared: true }), clearStore: () => ({ cleared: false }),
+      read: () => null, readStore: () => ({ pr: 5758 }), out: (l) => outs.push(l), err: (l) => errs.push(l),
+    });
+    expect(code).toBe(3);
+    expect(JSON.parse(outs[0])).toEqual({ cleared: true, remaining: ['store'] });
+    expect(errs.join('\n')).toMatch(/do not release the claim/);
+  });
+  it('exits 0 when both are gone', async () => {
+    const { main } = await import('../await-verify.mjs');
+    const code = main(['clear', '--who=fix-5758', '--cwd=/lane'], {
+      env: { CLAUDE_CODE_SESSION_ID: 'ddac038c-bcfe-4cd0-9d51-c983476b47b1' },
+      exec: () => '/lane\n', clear: () => ({ cleared: true }), clearStore: () => ({ cleared: true }),
+      read: () => null, readStore: () => null, out: () => {}, err: () => {},
+    });
+    expect(code).toBe(0);
+  });
+});
