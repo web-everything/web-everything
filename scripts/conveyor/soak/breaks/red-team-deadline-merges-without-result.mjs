@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const HEAD = 'b'.repeat(40), BASE = 'e'.repeat(40);
-const REPO = 'web-everything/web-everything', PR = 5283;
+const PR = 5283;
 const WAIT = 45 * 60_000;
 
 export default {
@@ -31,7 +31,9 @@ export default {
     const violations = [];
     const check = (ok, message) => { if (!ok) violations.push(message); };
     const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
+    let REPO;
     try {
+      ({ CONSTELLATION_REPOS: { we: { slug: REPO } } } = await load('scripts/lib/constellation-repos.mjs'));
       const { createDrainMergeStrategy } = await load('scripts/lib/drain-merge-strategy.mjs');
       const { resolveMergeDeliveryPolicy } = await load('scripts/lib/merge-delivery-policy.mjs');
       const gate = await load('scripts/lib/red-team-gate.mjs');
