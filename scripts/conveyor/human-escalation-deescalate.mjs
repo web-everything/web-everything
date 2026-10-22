@@ -13,9 +13,10 @@
  *   1. WHO. The latest `review:human` label event is an ADD by a conveyor automation login (never the operator's
  *      login, never another account), and no hand add of `review:human` appears anywhere on the PR's timeline (the
  *      label mirror can restore a ledgered hand label under its own login): a hand label is never lifted.
- *   2. WHY. A trusted escalation record (`we:scripts/lib/human-escalation-marker.mjs`) posted BY THAT SAME LOGIN sits
- *      at the add (180 s before to 300 s after; a legacy referral record only before). Every escalation recorded
- *      since is of a kind the setting enables (only kinds with a clearing proof can be enabled), and is cleared:
+ *   2. WHY. A trusted escalation record (`we:scripts/lib/human-escalation-marker.mjs`) posted BY THAT SAME LOGIN
+ *      right after the add (5 s skew before, 300 s after: every clearable writer labels first, then records). Every
+ *      escalation recorded from 180 s before the add on is of a kind the setting enables (only kinds with a clearing
+ *      proof can be enabled), and is cleared:
  *        - referral kinds: the live head carries at least one trusted mandatory referral record, and the gate's own
  *          reader shows nothing pending, blocked or malformed on it (a moved head with no record of its own keeps it);
  *        - round-cap: an operator round-extension grant was posted after the latest round-cap record.
@@ -71,9 +72,14 @@ import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 
 export const DEESCALATE_KINDS_STANDARD = CLEARABLE_ESCALATION_KINDS;
 const KNOWN = new Set(Object.values(HUMAN_ESCALATION_KINDS));
-/** A marker is posted right after its label write; a legacy referral record comes just before the park. */
-export const ATTRIBUTION_BEFORE_MS = 180_000;
+/**
+ * Every clearable writer posts its record right AFTER its own label write, so only a record in
+ * [add − clock skew, add + 300 s] explains the add. Escalations recorded from 180 s before the add on are all
+ * counted (a writer that posts first, such as the card-extraction hold, must still be seen and hold).
+ */
+export const ATTRIBUTION_SKEW_MS = 5_000;
 export const ATTRIBUTION_AFTER_MS = 300_000;
+export const SINCE_BEFORE_MS = 180_000;
 export const DEESCALATED_MARKER_RE = /<!-- we:human-deescalated pr=\d+ head=[0-9a-f]{40} kinds=[a-z0-9,-]+ -->/;
 const PARK_MARKER_RE = /<!-- (?:human-surface-repark|mechanical-hold-handoff): ([0-9a-f]{40}) -->/gi;
 /** Labels whose presence alone keeps the hold. */
@@ -182,9 +188,9 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   // 2. WHY it went on, and whether every recorded cause is cleared.
   const escalations = readHumanEscalations(comments, { inferLegacy: settings.inferLegacy === true });
   if (escalations.some(e => !Number.isFinite(time(e.createdAt)))) return keep('an escalation record has no readable time');
-  const windowStart = addAt - ATTRIBUTION_BEFORE_MS;
+  const windowStart = addAt - SINCE_BEFORE_MS;
   const explains = e => { const t = time(e.createdAt);
-    return login(e.author) === login(last.actor) && t >= windowStart && t <= addAt + (e.recordOnly ? 0 : ATTRIBUTION_AFTER_MS); };
+    return login(e.author) === login(last.actor) && t >= addAt - ATTRIBUTION_SKEW_MS && t <= addAt + ATTRIBUTION_AFTER_MS; };
   if (!escalations.some(explains)) return keep('no escalation record by the labelling login at the review:human add');
   const since = escalations.filter(e => time(e.createdAt) >= windowStart);
   const kinds = [...new Set(since.map(e => e.kind))];
@@ -222,11 +228,17 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   if (!Array.isArray(categories)) return keep('human-surface setting unreadable');
   try { score = scoreFiles(net.files, parseDeviationDisclosure(pr.body), surfaces, net.diffHunks); } catch (e) { return keep(`shape score failed: ${errorText(e)}`); }
   if (score?.humanRequired !== false) return keep(`net diff requires a human (${(score?.reasons ?? []).join('; ') || 'shape rule'})`);
+  // Every net file must have a TEXT hunk: a binary section (git calls a file with a NUL binary, even a script),
+  // a mode-only change or an empty add carries content no trigger could read.
+  const hunksOf = fileHunksResolver(net.diffHunks);
+  const opaque = net.files.filter(f => { const section = hunksOf(f);
+    return typeof section !== 'string' || !/^@@ /m.test(section) || /^(?:Binary files .* differ|GIT binary patch)$/m.test(section); });
+  if (opaque.length) return keep(`no readable text hunk for ${opaque.slice(0, 3).join(', ')}${opaque.length > 3 ? ', …' : ''}`);
   // A file the diff text has no section for (binary, mode-only, an unmatched spelling) was not judged: hold.
   if (!Array.isArray(score?.signals?.hunksUnavailable ?? []) || (score?.signals?.hunksUnavailable ?? []).length)
     return keep(`hunks unavailable for ${(score?.signals?.hunksUnavailable ?? ['?']).slice(0, 3).join(', ')}`);
   let hits;
-  try { hits = sensitiveSurfaceHits(net.files, fileHunksResolver(net.diffHunks), surfaces); } catch (e) { return keep(`human-surface check failed: ${errorText(e)}`); }
+  try { hits = sensitiveSurfaceHits(net.files, hunksOf, surfaces); } catch (e) { return keep(`human-surface check failed: ${errorText(e)}`); }
   if (!Array.isArray(hits)) return keep('human-surface check unreadable');
   if (hits.length) return keep(`human-only surface touched (${[...new Set(hits.map(h => h.category))].join(', ')})`);
   if (!decisionCards?.ok || !Array.isArray(decisionCards.files)) return keep(`decision-card read failed (${decisionCards?.reason ?? 'no read'})`);

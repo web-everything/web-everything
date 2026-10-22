@@ -12,6 +12,7 @@ import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 
 // The automation login the test run resolves (the per-role App identity is pinned to none in tests).
 const BOT = AUTOMATION_LOGINS.find(l => !l.endsWith('[bot]'));
+const login = l => l.toLowerCase().replace(/\[bot\]$/, '');
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
 const T0 = Date.parse('2026-10-21T18:38:25Z');
@@ -102,16 +103,16 @@ describe('planHumanDeescalation', () => {
     const ledger = bot(`Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: append refused.\n\n${buildHumanEscalationMarker({ kind: K.REFERRAL_LEDGER_SYNC_FAILED, head: HEAD })}`, 10_000);
     expect(plan({ pr: { comments: [ledger] } }).action).toBe('deescalate');
   });
-  it('legacy: a referral record by the labelling login just before the add is the recorded reason (the live #5805 shape)', () => {
-    const record = bot('Mandatory review owner: d4c5 (correctness).\n...', -33_000);
-    expect(plan({ pr: { comments: [record] } }).action).toBe('deescalate');
-    expect(plan({ settings: { ...settings, inferLegacy: false }, pr: { comments: [record] } }).reason).toMatch(/no escalation record/);
-    // Posted by another automation login than the one that labelled: it does not explain the add.
-    const other = AUTOMATION_LOGINS.find(l => l !== BOT && !l.endsWith('[bot]'));
-    if (other) expect(plan({ pr: { comments: [bot('Mandatory review owner: d4c5.', -33_000, other)] } }).action).toBe('keep');
-    expect(plan({ pr: { comments: [operator('Mandatory review owner: d4c5.', -33_000)] } }).action).toBe('keep');
-    // A record AFTER the add never explains it.
-    expect(plan({ pr: { comments: [bot('Mandatory review owner: d4c5.', 10_000)] } }).action).toBe('keep');
+  it('legacy park comment by the labelling login right after the add explains it; a referral record never does', () => {
+    const ledger = bot('Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: append refused.', 2_000);
+    expect(plan({ pr: { comments: [ledger] } }).action).toBe('deescalate');
+    expect(plan({ settings: { ...settings, inferLegacy: false }, pr: { comments: [ledger] } }).reason).toMatch(/no escalation record/);
+    // Posted by another login than the one that labelled, or before the add: it does not explain the add.
+    const other = AUTOMATION_LOGINS.find(l => login(l) !== login(BOT));
+    if (other) expect(plan({ pr: { comments: [bot(ledger.body, 2_000, other)] } }).action).toBe('keep');
+    expect(plan({ pr: { comments: [bot(ledger.body, -60_000)] } }).action).toBe('keep');
+    // A settled referral record a minute before an unrelated add (an orphan park whose own record failed): kept.
+    expect(plan({ pr: { comments: [bot('Mandatory review owner: d4c5 (correctness).', -60_000)] } }).reason).toMatch(/no escalation record/);
   });
   it('permission-change PR → kept', () => {
     for (const file of ['.github/workflows/ci.yml', '.claude/settings.json', 'scripts/bootstrap-session.mjs']) {
@@ -121,9 +122,16 @@ describe('planHumanDeescalation', () => {
     expect(plan({ net: netOf(['scripts/conveyor/new-worker.mjs'], "+const opts = { approval_policy: 'never' };") }).action).toBe('keep');
     expect(plan({ net: netOf(['scripts/conveyor/new-worker.mjs'], '+const opts = { retries: 2 };') }).action).toBe('deescalate');
   });
+  it('a binary, mode-only or empty section (no text hunk) → kept', () => {
+    const f = 'scripts/conveyor/foo.mjs';
+    const binary = `diff --git a/${f} b/${f}\nindex 1111111..2222222 100644\nBinary files a/${f} and b/${f} differ`;
+    expect(plan({ net: { ok: true, files: [f], diffHunks: binary } }).reason).toMatch(/no readable text hunk/);
+    const mode = `diff --git a/${f} b/${f}\nold mode 100644\nnew mode 100755`;
+    expect(plan({ net: { ok: true, files: [f], diffHunks: mode } }).action).toBe('keep');
+  });
   it('net diff text unreadable, or a file with no diff section → kept', () => {
     expect(plan({ net: { ok: true, files: ['scripts/conveyor/foo.mjs'] } }).reason).toMatch(/net diff text unreadable/);
-    expect(plan({ net: { ok: true, files: ['scripts/conveyor/foo.mjs', 'scripts/conveyor/bar.mjs'], diffHunks: diffOf(['scripts/conveyor/foo.mjs']) } }).reason).toMatch(/hunks unavailable/);
+    expect(plan({ net: { ok: true, files: ['scripts/conveyor/foo.mjs', 'scripts/conveyor/bar.mjs'], diffHunks: diffOf(["scripts/conveyor/foo.mjs"]) } }).reason).toMatch(/hunks unavailable|no readable text hunk/);
   });
   it('a net diff (or a disclosed deviation) the shape rule sends to a human → kept', () => {
     const human = planHumanDeescalation({ ...base(), scoreFiles: () => ({ humanRequired: true, reasons: ['gate-self'] }) });

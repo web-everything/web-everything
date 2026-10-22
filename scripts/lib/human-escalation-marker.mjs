@@ -84,15 +84,14 @@ export function referralFailureKind(message) {
 const NOTE_ROUND_CAP_RE = /^<!-- conveyor-note-key: round-cap-exhausted:\d+:PR #\d+: fix auto-repair rounds exhausted /m;
 const NOTE_COMMENT_HEAD = '🔔 conveyor — needs your decision';
 const REFERRAL_PARK_PREFIX = 'Mandatory referral review parked to review:human:';
-const REFERRAL_RECORD_PREFIX = 'Mandatory review owner:';
 const loginOf = c => String(c?.author?.login ?? c?.user?.login ?? '').toLowerCase().replace(/\[bot\]$/, '');
 
 /**
  * Every recorded escalation in a thread, oldest first: `{index, createdAt, kind, head, legacy, author}`. Only trusted
  * authors count. A marker that is not its writer's own (not the last line under a known first line), or an unknown
- * kind, is returned as `kind: 'unknown'` (never de-escalates). `inferLegacy` also reads the three shapes written
- * before the marker existed (the referral park comment, the fix round-cap note, the mandatory referral record a
- * pending park follows); they are marked `legacy: true`.
+ * kind, is returned as `kind: 'unknown'` (never de-escalates). `inferLegacy` also reads the two shapes written
+ * before the marker existed, each posted by the writer right after its own label write (the referral park comment,
+ * the fix round-cap note); they are marked `legacy: true`.
  */
 export function readHumanEscalations(comments, { inferLegacy = false } = {}) {
   const out = [];
@@ -120,9 +119,9 @@ export function readHumanEscalations(comments, { inferLegacy = false } = {}) {
         head: null, legacy: true });
     } else if (start.startsWith(NOTE_COMMENT_HEAD) && NOTE_ROUND_CAP_RE.test(body)) {
       out.push({ ...base, kind: HUMAN_ESCALATION_KINDS.ROUND_CAP, head: null, legacy: true });
-    } else if (start.startsWith(REFERRAL_RECORD_PREFIX)) {
-      out.push({ ...base, kind: HUMAN_ESCALATION_KINDS.REFERRAL_PENDING, head: null, legacy: true, recordOnly: true });
     }
+    // A mandatory referral record is NOT read as an escalation record: it is posted on every review, so its
+    // proximity to a label add proves nothing about why the label went on (audit round 4).
   });
   return out;
 }
