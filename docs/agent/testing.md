@@ -316,7 +316,7 @@ head-bound clearance ceremony, including proven identical-contribution carries.
 Persist red-team backoff independently of whether the scheduler currently owes a pass.
 The observed comments and live reviews wake a pending head when their evidence changes;
 otherwise a recorded break waits until its retry deadline, including after the health-smell
-age. Only missing-result scheduling gaps retain the maximum-age scheduling fallback.
+age. Missing-result scheduling gaps remain held at the maximum age and escalate through the deadline policy.
 
 ## Heavy admission in a restricted filesystem
 
@@ -1720,11 +1720,15 @@ lookalikes. Persist red-team pending age and retry time per PR/head in queue sta
 through follow-up writes. `drain.redTeamPendingBackoffSec` defaults to 300; a newly observed comment
 can wake the head early. `drain.redTeamPendingMaxMin` defaults to 45; even during backoff, an accepted
 head past that age must log a named health smell and recheck complete comments and run evidence.
-A recorded or live pass still waits. With neither, request through an available review dispatch hook;
-if unavailable, `drain.enqueueWhenRedTeamNeverScheduled` (default true) permits enqueue with a loud
-“red team never scheduled” note and its source. The current drain has no standalone red-team request
-queue, so it uses the fallback. Test restarts, head resets, request/fallback, policy provenance and
-comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
+Past the deadline the PR stays HELD: it never enqueues without a red-team result. `redTeam.deadlineAction`
+(`requeue-then-hold` standard, or `hold`; env `WE_RED_TEAM_DEADLINE_ACTION`, source logged) decides whether a
+missing pass is first re-requested once through an available review dispatch hook (its own full wait), then the
+drain logs the hold and publishes one `red-team-deadline-held` needs-you note per repo/PR/head. A recorded or live
+pass also holds with the note. Release needs a result on that head, a proven-identical carry, an operator ruling
+through the red-team ruling path, or a card-only diff. The retired `drain.enqueueWhenRedTeamNeverScheduled` is
+ignored; only the operator's env `WE_RED_TEAM_DEADLINE_ACTION=merge-without-result` with a named
+`WE_RED_TEAM_DEADLINE_OVERRIDE_BY` enqueues without a result, logged on every use. Test restarts, head resets,
+request-once (a refused or throwing hook is tried once per head, then holds), note dedupe and failed publication, policy provenance and comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
 in the shared operations sidecar. Store the host, PID namespace (where available) and process birth time with the pid: a live pid
 with a different birth time is a reused process, not an active red team. An unavailable birth-time
 probe preserves the conservative liveness result. Normalize the birth-time probe to UTC and the C
