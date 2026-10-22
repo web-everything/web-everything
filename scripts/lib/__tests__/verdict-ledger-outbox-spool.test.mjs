@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
-import * as fs from 'node:fs';
+import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -19,8 +19,15 @@ import { ledgerGitPath } from '../verdict-ledger-path.mjs';
 import { buildLedgerEvent, checkLedgerAppendRows, parseLedgerEvents } from '../verdict-ledger.mjs';
 import { lockDirFor, readLockEntry } from '../../readiness/file-locks.mjs';
 
-// Preserve real filesystem operations while allowing deterministic, scoped faults in named imports.
-vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
+// Keep named imports callable through stable wrappers: copying a namespace must not detach
+// production calls from spies. The default export is a private, mutable copy of the guarded fs.
+vi.mock('node:fs', async importOriginal => {
+  const fs = { ...await importOriginal() };
+  const forwarded = Object.fromEntries([
+    'openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'readFileSync', 'renameSync', 'readdirSync',
+  ].map(method => [method, (...args) => fs[method](...args)]));
+  return { ...fs, ...forwarded, default: fs };
+});
 
 const REPO = 'web-everything/web-everything';
 const scratch = [];
