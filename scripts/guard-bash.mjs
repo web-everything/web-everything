@@ -173,7 +173,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readdirSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
-import { LEASE_FILENAME, isLeaseStale, isForeignLease, laneMarkedSlug, assertedLaneSlug, requiredAssertionSlug } from './lib/lane-lease.mjs';
+import { LEASE_FILENAME, isLeaseStale, isForeignLease, laneMarkedSlug, assertedLaneSlug, requiredAssertionSlug, laneDestructiveOpVerdict, LANE_OP_PROOF_RULE } from './lib/lane-lease.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { usageReportSecretDir, USAGE_REPORT_KEYCHAIN_SERVICE } from './lib/usage-report-secret-paths.mjs';
 import { classifySession } from './operations/session-role.mjs';
@@ -2574,6 +2574,150 @@ export function hasDestructiveLaneOp(command) {
   return segments.some((seg) => isDestructiveLaneGitOp(seg.trim()));
 }
 
+// ── lane-lease-occupant (2026-10-22) — WHICH lane each destructive op runs in, per segment ───────────────────
+// The lease arms above key on ONE cwd: the reported cwd with the command's FIRST `cd` applied
+// (`resolveEffectiveCwd`). Live incident 2026-10-22 ~05:52 ET: `cd …/lane-21 && … ; cd ../lane-7 && … ;
+// LANE_SESSION=<stale slug> git reset --hard …` was judged against lane-21 (the first `cd`), and the reset ran in
+// lane-7 on another session's tree. This tracker follows every `cd` in order and gives each destructive segment the
+// directory (or directories) it can actually run in, `git -C` included. A `cd` inside a subshell/group or a
+// re-executed string ADDS a candidate instead of replacing one (its effect may or may not outlive the group), so a
+// destructive op is checked against every lane it could touch. A target this cannot read statically is `null`.
+
+/** One `cd` statement's target: `undefined` = not a cd; `null` = a cd whose target cannot be read statically. */
+function laneCdTarget(stmt, vars, home) {
+  const m = stmt.match(/^cd(?:\s+([\s\S]*))?$/);
+  if (!m) return undefined;
+  const rest = (m[1] || '').trim();
+  if (!rest) return typeof home === 'string' && home.startsWith('/') ? home : null;   // bare `cd` → $HOME
+  if (rest.startsWith('-')) return null;                                                // `cd -`, `cd -P …`
+  const v = rest.split(/\s+/)[0].replace(/^(['"])(.*)\1$/, '$2').match(/^\$\{?([A-Za-z_]\w*)\}?$/);
+  if (v && v[1] !== 'HOME') return typeof vars[v[1]] === 'string' ? vars[v[1]] : null;
+  let t = null;
+  try { t = expandCdTarget(rest, home); } catch { t = null; }
+  return t && !/[`$*?[]/.test(t) ? t : null;
+}
+
+/** A destructive git segment's `-C` / `--work-tree` steering: `undefined` = none, `null` = unreadable, else the
+ *  (possibly relative) path. Multiple `-C`s compose the way git composes them. */
+function laneGitDirArg(stmt, resolvePath) {
+  const c = canonicalCommand(stmt);
+  const words = headWords(c);
+  if (!words.length || words[0].text !== 'git') return undefined;
+  let dir;
+  for (let i = 1; i < words.length; i++) {
+    const t = words[i].text;
+    if (t === '-C') {
+      const next = words[i + 1];
+      if (!next || /[`$*?[]/.test(next.text)) return null;
+      dir = dir === undefined || next.text.startsWith('/') ? next.text : resolvePath(dir, next.text);
+      i += 1;
+      continue;
+    }
+    if (t === '--work-tree' || t === '--git-dir' || t.startsWith('--work-tree=') || t.startsWith('--git-dir=')) return null;
+    if (t === '-c' || t === '--namespace') { i += 1; continue; }
+    if (t.startsWith('-')) continue;
+    break;
+  }
+  return dir;
+}
+
+/**
+ * Every destructive git op in `command` with the directories it can run in. Pure.
+ * @returns {Array<{segment:string, dirs:Array<string|null>}>}  `null` in `dirs` = a directory this cannot read.
+ */
+export function destructiveLaneTargets(command, reportedCwd, { resolvePath = resolve, home = process.env.HOME ?? null, realpath = (p) => p } = {}) {
+  const cmd = stripHeredocBodies(String(command || ''));
+  if (!cmd) return [];
+  const parsed = parseSegments(cmd);
+  if (parsed.unterminated) return [];                 // `decide` already denies an unparseable command outright
+  const uniq = (xs) => [...new Set(xs)];
+  const norm = (p) => (typeof p === 'string' ? realpath(p) : null);
+  const out = [];
+  const vars = Object.create(null);
+  const seen = new Set([norm(reportedCwd ?? null)]);
+  let budget = 64;
+  const walk = (segments, start, child, depth) => {
+    let cur = start.slice();
+    for (const raw of segments) {
+      const trimmed = String(raw).trim();
+      if (!trimmed) continue;
+      const grouped = /^[({]/.test(trimmed);
+      const stmt = trimmed.replace(/^[({]\s*/, '').replace(/\s*[)}]$/, '').trim();
+      const asg = stmt.match(/^(?:export\s+)?([A-Za-z_]\w*)=(\S*)$/);
+      if (asg) {
+        const val = asg[2].replace(/^(['"])(.*)\1$/, '$2');
+        vars[asg[1]] = /[`$(*?]/.test(val) ? null : val;   // a computed value is UNKNOWN, never a stale literal
+        continue;
+      }
+      const target = laneCdTarget(stmt, vars, home);
+      if (target !== undefined) {
+        const next = uniq(cur.map((c) => (target === null ? null
+          : target.startsWith('/') ? norm(target) : (c ? norm(resolvePath(c, target)) : null))));
+        cur = child || grouped ? uniq([...cur, ...next]) : next;
+        for (const d of next) seen.add(d);
+        continue;
+      }
+      if (isDestructiveLaneGitOp(stmt)) {
+        const g = laneGitDirArg(stmt, resolvePath);
+        const dirs = g === undefined ? cur
+          : cur.map((c) => (g === null ? null : g.startsWith('/') ? norm(g) : (c ? norm(resolvePath(c, g)) : null)));
+        out.push({ segment: trimmed, dirs: uniq(dirs) });
+      }
+      if (depth < 3) {
+        for (const n of nestedCommandStrings(raw)) {
+          if (budget-- <= 0) break;
+          walk(parseSegments(n).segments, cur, true, depth + 1);
+        }
+      }
+    }
+    return cur;
+  };
+  walk(parsed.segments, [norm(reportedCwd ?? null)], false, 0);
+  // A `$( … )` body or a leading `( … )` group can hold separators the top-level split cut through; walk them
+  // whole too, from every directory the command has visited (the group may run after any of them).
+  const wholeNested = [...substitutionBodies(cmd)];
+  const g = leadingGroupBody(cmd);
+  if (g !== null) wholeNested.push(g);
+  for (const n of wholeNested) {
+    if (budget-- <= 0) break;
+    walk(parseSegments(n).segments, [...seen], true, 1);
+  }
+  return out;
+}
+
+/**
+ * lane-lease-occupant — the whole-command lane-proof arm. Every destructive git op that can run in a lane must
+ * assert that lane's CURRENT holder slug on a LIVE lease (`laneDestructiveOpVerdict`, lane-lease.mjs). Pure: the CLI
+ * supplies `ctx.laneLeaseFacts = { byRoot: { <laneRoot>: lease|null }, nowMs }` and `ctx.laneTargets` (from
+ * `destructiveLaneTargets`); without those facts (unit tests of other arms, the golden corpus) it does nothing.
+ * A destructive op whose directory cannot be read is refused when the command or cwd involves a lane.
+ */
+export function laneOccupantReason(command, ctx = {}) {
+  const facts = ctx.laneLeaseFacts;
+  if (!facts || typeof facts !== 'object') return null;
+  const targets = Array.isArray(ctx.laneTargets) ? ctx.laneTargets : destructiveLaneTargets(command, ctx.reportedCwd ?? null);
+  const laneish = /\/\.lanes\/|(?:^|[\s/'"=])lane-\d+(?:[\s/'"]|$)/.test(String(command || '')) || isLaneCwd(ctx.reportedCwd);
+  for (const t of targets) {
+    const asserted = assertedLaneSlug(t.segment);
+    const clobberOk = /\bLANE_CLOBBER_OK=1\b/.test(t.segment);
+    for (const d of t.dirs) {
+      if (d === null) {
+        if (laneish) return `${LANE_OP_PROOF_RULE}: this command runs a destructive git op (\`${t.segment.slice(0, 120)}\`) in a directory this guard cannot read statically (a \`cd\`/\`-C\` target built from a variable, substitution or \`cd -\`), and the command involves a lane clone — so it cannot prove which lane it would clobber. Spell the lane path literally (\`cd /abs/.lanes/<pool>/lane-N && LANE_SESSION=<your slug> git …\`).`;
+        continue;
+      }
+      const root = laneRootFromCwd(d);
+      if (!root) continue;
+      const lane = root.replace(/^.*\/\.lanes\//, '');
+      const v = laneDestructiveOpVerdict({
+        lease: Object.hasOwn(facts.byRoot || {}, root) ? facts.byRoot[root] : null,
+        assertedSlug: asserted, clobberOk, nowMs: facts.nowMs, lane,
+      });
+      if (!v.allowed) return `${v.reason} (segment: \`${t.segment.slice(0, 160)}\`)`;
+    }
+  }
+  return null;
+}
+
 // #5957 — the `cd` target is expanded quote-aware, so a home spelling (`~`, `~/x`, `$HOME`, `${HOME}`, the
 // double-quoted forms) lands on the SAME path as its absolute spelling and so reaches the same daemon-clone /
 // lane-lease guards. Quoting is kept until expansion is done: a quoted `~` and a single-quoted `$HOME` are
@@ -4687,6 +4831,10 @@ export function decide(command, ctx = {}) {
   // compound whose head word is `while`/`find`). Whole-command, same shape as the two checks above it.
   const addEnum = gitAddEnumerationReason(command);
   if (addEnum) return addEnum;
+  // lane-lease-occupant — whole-command, because WHICH lane a destructive op runs in depends on every `cd` before
+  // it, in other segments. Needs the CLI's lease facts; a no-op without them.
+  const occupant = laneOccupantReason(command, ctx);
+  if (occupant) return occupant;
   // #2994 — QUOTE-AWARE split: tokenize quotes first, cut only on UNQUOTED separators.
   const parsed = parseSegments(command);
   // #2994 review r3 — FAIL CLOSED on a command the parser cannot represent. Every loosening signature this
@@ -4823,6 +4971,9 @@ if (IS_CLI) {
   let daemonRoots = [];
   let hookSessionId = null;
   let orchestratorSettings = {};
+  let laneTargets = null;
+  let laneLeaseFacts = null;
+  let reportedCwd = null;
   try {
     const ev = JSON.parse(readFileSync(0, 'utf8'));
     cmd = (ev.tool_input || {}).command || '';
@@ -4873,6 +5024,18 @@ if (IS_CLI) {
     // #2367/#2413 — only pay for the lease read when it could possibly matter: a lane cwd about to run
     // something that LOOKS like a destructive git op. Every other Bash call skips it entirely.
     if (!primaryCwd && isLaneCwd(cwd) && hasDestructiveLaneOp(cmd)) ({ markedLeaseSlug, contestedHolderSlug, foreignLiveLease } = laneLeaseGuardCtx(cwd, mySessionId));
+    // lane-lease-occupant — per-segment lane targets (every `cd`, `git -C`), and the lease of each lane they reach.
+    // Not gated on the first-`cd` cwd: that single reading is exactly what the 2026-10-22 reset slipped past.
+    if (hasDestructiveLaneOp(cmd)) {
+      reportedCwd = rp(ev.cwd || process.cwd());
+      laneTargets = destructiveLaneTargets(cmd, reportedCwd, { realpath: rp });
+      const byRoot = {};
+      for (const t of laneTargets) for (const d of t.dirs) {
+        const root = d && laneRootFromCwd(d);
+        if (root && !Object.hasOwn(byRoot, root)) byRoot[root] = readLaneLease(root);
+      }
+      laneLeaseFacts = { byRoot, nowMs: Date.now() };
+    }
   } catch { process.exit(0); }
   // fix procedure — only pay for the claim-store read when the command could be a `git push` (a bare one names
   // no lane ref, so the gate cannot key on `lane/`). Loaded lazily so every other Bash call keeps this hook's
@@ -4881,8 +5044,26 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
+  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes, laneTargets, laneLeaseFacts, reportedCwd };
   const r = decide(cmd, guardCtx);
+  // lane-lease-occupant — lease liveness follows the OCCUPANT: an allowed call in a lane renews that lane's lease when
+  // this session is its declared occupant or the call asserts the lease's own slug (throttled; a stale lease is never
+  // revived). Dynamic import so a Bash call outside any lane pays nothing. Never wedges the hook.
+  if (!r) {
+    try {
+      const roots = new Map();
+      const effRoot = effectiveCwd ? laneRootFromCwd(effectiveCwd) : null;
+      if (effRoot) roots.set(effRoot, assertedLaneSlug(cmd));
+      for (const t of laneTargets || []) for (const d of t.dirs) {
+        const root = d && laneRootFromCwd(d);
+        if (root) roots.set(root, assertedLaneSlug(t.segment) || roots.get(root) || null);
+      }
+      if (roots.size) {
+        const { renewLeaseOnUse } = await import('./lib/lane-lease-renew.mjs');
+        for (const [root, slug] of roots) renewLeaseOnUse({ laneRoot: root, mySessionId: hookSessionId, assertedSlug: slug });
+      }
+    } catch { /* a heartbeat fault never blocks a command */ }
+  }
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed
     // OUTSIDE `decide` (which stays byte-stable for the golden corpus) and wrapped in its own try/catch: an
