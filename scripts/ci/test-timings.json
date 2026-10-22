@@ -1034,6 +1034,11 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/argon-feature-dispatch.soak.test.mjs": 2.31,
+  "scripts/conveyor/soak/breaks/refresh-config-before-healing.soak.test.mjs": 0.01,
+  "scripts/conveyor/soak/breaks/review-timing-optional-red-drops-reviewer-liveness.soak.test.mjs": 7.26,
+  "scripts/conveyor/soak/breaks/review-timing-refused-review-strands-heal.soak.test.mjs": 7.26,
+  "scripts/conveyor/soak/breaks/ruleset-only-empty-classic-disables-recovery.soak.test.mjs": 8.21,
   "scripts/conveyor/soak/breaks/agy-juror-shared-checkout-reset.soak.test.mjs": 1.85,
   "scripts/conveyor/soak/breaks/already-done-burst-unattributed.soak.test.mjs": 0.49,
   "scripts/conveyor/soak/breaks/already-done-recheck-burst-no-cooldown.soak.test.mjs": 1.68,
@@ -1127,6 +1132,7 @@
   "scripts/conveyor/soak/breaks/rebuild-finalize-starved.soak.test.mjs": 12.44,
   "scripts/conveyor/soak/breaks/rebuild-smoke-off-lock.soak.test.mjs": 13.44,
   "scripts/conveyor/soak/breaks/reclaim-skips-liveness-gate-when-preserved.soak.test.mjs": 10.1,
+  "scripts/conveyor/soak/breaks/refresh-config-before-healing.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/resource-sampler-two-writers-and-stale-config.soak.test.mjs": 1.16,
   "scripts/conveyor/soak/breaks/review-dispatch-stalls-on-unrelated-clone-lag.soak.test.mjs": 0.96,
   "scripts/conveyor/soak/breaks/review-gate-conflict-suppresses-ci-heal.soak.test.mjs": 38.52,

@@ -22,6 +22,9 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.attributesFile', '/dev/null'],
   ['core.sshCommand', 'ssh'],
   ['commit.gpgsign', 'false'],
+  ['protocol.allow', 'never'],
+  ['protocol.https.allow', 'always'],
+  ['protocol.ssh.allow', 'always'],
 ]);
 
 /** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line. */
@@ -108,15 +111,19 @@ export function riskyLaneConfig(listOutput) {
 /**
  * Repair only lane-owned unsafe config before hand-out. Only exact `origin` is always retained; the
  * launch guard still refuses anything the scrub could not remove. Runner signature: (args, opts).
+ * `onConfig` receives the successful scoped listing so callers can reuse settings the scrub never changes.
  */
 export function scrubRiskyLaneConfig(dir, {
   run = (args, opts) => execFileSync('git', args, { ...opts, encoding: 'utf8', env: laneGitHardeningEnv(), timeout: 30000, maxBuffer: 16 * 1024 * 1024 }),
   log = () => {},
+  onConfig = () => {},
 } = {}) {
   const removed = [], kept = [];
   const opts = { cwd: dir };
   try {
-    const parts = String(run([...LANE_CONFIG_LIST_ARGS], opts)).split('\0');
+    const output = String(run([...LANE_CONFIG_LIST_ARGS], opts));
+    onConfig(output);
+    const parts = output.split('\0');
     const sections = new Set();
     for (let i = 0; i + 1 < parts.length; i += 2) {
       const scope = parts[i], entry = parts[i + 1];

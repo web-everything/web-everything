@@ -73,11 +73,11 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
-import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
-import { homedir, hostname } from 'node:os';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { join, basename, resolve, dirname, sep } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
 import { readGit } from './lib/proc-read.mjs';
@@ -164,7 +164,7 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // this file already imports (`lease-reaper.mjs`, `lib/lane-litter.mjs`, …), so this is not the "unsafe to
 // import" shape `we:scripts/operations/operator-queue.mjs`'s own header warns about (that warning is about
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
-import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, lanePreservedFileChecker } from './lane-whois.mjs';
+import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
 import {
   salvageLane, removeLitterWorktrees, listLitterWorktrees, laneLivenessGate,
@@ -180,6 +180,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 // xbdixjc — the lane hold rule: every release/reset/remove/reclaim below asks it (pure rule in lane-lease.mjs).
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
+import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
 import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
@@ -274,8 +275,23 @@ const tryGit = (args, cwd, opts = {}) => {
 // throws immediately, unretried, exactly as before.
 const FETCH_LOCK_RETRY_ATTEMPTS = 4;
 const FETCH_LOCK_RETRY_BASE_MS = 250;
-function fetchOriginPruneWithRetry(dir) {
-  return retryTransientGit(() => git(['fetch', 'origin', '--prune', '--quiet'], dir, { timeout: NETWORK_GIT_TIMEOUT_MS }), { attempts: FETCH_LOCK_RETRY_ATTEMPTS, baseMs: FETCH_LOCK_RETRY_BASE_MS });
+// lane-git-diet — before EVERY lane fetch, make sure the lane's local config excludes `ops/*` from the default
+// fetch and keeps fetched objects packed (see ./lib/lane-git-diet.mjs: the ~10 MB verdict-ledger blob landed loose
+// in every lane on every fetch). Idempotent; a config failure never blocks the fetch itself.
+function ensureLaneDietConfig(dir, current) {
+  try {
+    const ops = applyLaneDietConfig((args) => git(args, dir, { timeout: LOCAL_GIT_TIMEOUT_MS }), current);
+    // Only an unchanged scrub snapshot can describe the mapping used by the following fetch.
+    // Config repairs (including removed includes) and recovery retries require a fresh proof read.
+    return ops.length === 0 ? current?.effectiveFetchValues : undefined;
+  } catch (e) {
+    log(`  ⚠ ${dir}: lane git-diet config not applied (${String(e && e.message ? e.message : e).split('\n')[0]})`);
+  }
+}
+function fetchOriginPruneWithRetry(dir, dietConfig) {
+  const fetchSpecs = ensureLaneDietConfig(dir, dietConfig);
+  retryTransientGit(() => git(['fetch', 'origin', '--prune', '--quiet'], dir, { timeout: NETWORK_GIT_TIMEOUT_MS }), { attempts: FETCH_LOCK_RETRY_ATTEMPTS, baseMs: FETCH_LOCK_RETRY_BASE_MS });
+  return fetchSpecs;
 }
 
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
@@ -845,6 +861,12 @@ function cloneLane(repo, n) {
   log(`  clone lane-${n} ← ${repo.originUrl} ${ref.length ? `(--reference ${repo.referencePath})` : '(no --reference: shallow)'} …`);
   gitQuiet(['clone', '--quiet', '-c', 'gc.auto=0', ...ref, repo.originUrl, dest]);
   gitQuiet(['config', '--local', 'gc.auto', '0'], dest);
+  // lane-git-diet — `git clone` ignores a negative refspec on its initial fetch, so the fresh clone still carries
+  // `origin/ops/*`. Apply the diet config and drop those tracking refs now (readers fetch them by name on demand).
+  ensureLaneDietConfig(dest);
+  for (const ref of (tryGit(['for-each-ref', '--format=%(refname)', 'refs/remotes/origin/ops/'], dest) || '').split('\n').filter(Boolean)) {
+    tryGit(['update-ref', '--no-deref', '-d', ref], dest);
+  }
   // Pin a stable local default branch so refresh's hard-reset target is unambiguous.
   tryGit(['checkout', '--quiet', '-B', repo.branch, `origin/${repo.branch}`], dest);
 }
@@ -868,10 +890,10 @@ function healSharedStoreFor(repo, err) {
     return false;
   }
 }
-function fetchOriginHealing(repo, n, { allowReclone = false } = {}) {
+function fetchOriginHealing(repo, n, { allowReclone = false, dietConfig } = {}) {
   const dir = laneDir(repo, n);
   try {
-    return fetchOriginPruneWithRetry(dir);
+    return fetchOriginPruneWithRetry(dir, dietConfig);
   } catch (e) {
     // xsxu243 — a commit-graph error may live in the SHARED reference store (read through objects/info/alternates), where
     // no per-lane repair can reach it: regenerate that derived cache once (locked, logged), then retry before any lane-level heal.
@@ -1158,28 +1180,76 @@ function effectiveDirtyOrAhead(dir, branch, getRemoteShas) {
  * lanes chasing a headroom that a live probe would never have needed. Any caller that must react differently
  * to "we don't know" than to "we checked and there is genuinely nothing" needs `ok`, not just `shas`.
  */
-function liveRemoteShasProbe(dir, remote = 'origin') {
-  const out = tryGit(['ls-remote', '--heads', remote], dir, { timeout: 20_000 });
-  if (out === null) return { ok: false, shas: new Set() };
-  return { ok: true, shas: new Set(out.split('\n').filter(Boolean).map((l) => l.split(/\s+/)[0]).filter(Boolean)) };
+function liveRemoteShasProbe(repo) {
+  if (!repo.originUrl) return { ok: false, shas: new Set() };
+  // Clone resolves a local path against the invoking cwd. Keep that meaning after isolation;
+  // URLs and scp-style SSH addresses contain a colon before the first slash and stay literal.
+  const remote = /^[^/]*:/.test(repo.originUrl) ? repo.originUrl : resolve(repo.originUrl);
+  let probeDir;
+  try {
+    // No lane config, including worktree config or includes, may affect a live proof. A literal
+    // URL alone is insufficient: url.*.insteadOf can rewrite it to an executable remote helper.
+    probeDir = mkdtempSync(join(tmpdir(), 'lane-remote-probe-'));
+    const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CEILING_DIRECTORIES: dirname(probeDir) });
+    for (const key of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
+      'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS']) delete env[key];
+    // Explicit local pool origins are supported too. Permit file transport only for that canonical
+    // path, in this isolated process; lane protocol settings never participate in this decision.
+    if (remote.startsWith('/') || remote.startsWith('file://')) {
+      const i = Number(env.GIT_CONFIG_COUNT);
+      env[`GIT_CONFIG_KEY_${i}`] = 'protocol.file.allow';
+      env[`GIT_CONFIG_VALUE_${i}`] = 'always';
+      env.GIT_CONFIG_COUNT = String(i + 1);
+    }
+    const out = tryGit(['ls-remote', '--heads', '--', remote], probeDir, { timeout: 20_000, env });
+    if (out === null) return { ok: false, shas: new Set() };
+    return { ok: true, shas: new Set(out.split('\n').filter(Boolean).map((l) => l.split(/\s+/)[0]).filter(Boolean)) };
+  } catch {
+    return { ok: false, shas: new Set() };
+  } finally {
+    if (probeDir) rmSync(probeDir, { recursive: true, force: true });
+  }
 }
 
 /** Live remote tip SHAs (one network call, `timeout` guarded like the adjacent `gh` call — #2920). Returns
  *  an EMPTY set on any failure/timeout, so callers fail closed. Thin wrapper over `liveRemoteShasProbe` —
  *  every caller that only ever needs "what's out there" (never "did the probe itself fail") keeps this. */
-function liveRemoteShas(dir) {
-  return liveRemoteShasProbe(dir).shas;
+function liveRemoteShas(repo) {
+  return liveRemoteShasProbe(repo).shas;
 }
 
-/** #2924 — the LOCAL equivalent of `liveRemoteShas`, network-free. Sound ONLY immediately after a fetch: a
- *  local `refs/remotes/origin/*` tip is exactly as fresh as the remote it was just fetched from, unlike the
+/** #2924 — the LOCAL equivalent of `liveRemoteShas`, network-free. Sound ONLY immediately after a fetch: an
+ *  eligible direct tracking tip under the standard fetch mapping is as fresh as that fetch, unlike the
  *  stale-cache case `aheadIsProvablyPushed`'s own docblock warns against (a ref deleted on origin AFTER
  *  landing, whose local remote-tracking ref lingers). Used to re-verify containment right before the
  *  destructive reset, on data no older than the fetch that immediately precedes it — no second network call. */
-function localRemoteShas(dir) {
-  const out = tryGit(['for-each-ref', '--format=%(objectname)', 'refs/remotes/origin'], dir);
+function localRemoteShas(dir, fetchedSpecs) {
+  // A destination's name alone cannot prove that fetch refreshed it: a custom mapping can
+  // populate origin/saved from an excluded ops source. Only the standard lane mapping has
+  // the freshness semantics below. Fail closed for other positives or negatives (including
+  // restricted fetches), rather than treating their possibly stale destinations as proofs.
+  // A successful acquire fetch may supply its immediately preceding, unchanged scrub snapshot.
+  const fetchConfig = fetchedSpecs === undefined ? tryGit(['config', '--get-all', 'remote.origin.fetch'], dir) : null;
+  if (fetchedSpecs === undefined && fetchConfig === null) return new Set();
+  const fetchSpecs = fetchedSpecs ?? fetchConfig.split('\n');
+  const standardFetch = '+refs/heads/*:refs/remotes/origin/*';
+  if (!fetchSpecs.includes(standardFetch) || fetchSpecs.some((spec) =>
+    spec !== standardFetch && spec !== '^refs/heads/ops/*')) return new Set();
+  // lane-git-diet — `refs/remotes/origin/ops/*` is excluded from the default fetch (negative refspec), so an ops
+  // tracking ref a reader fetched by name earlier is NOT refreshed by the fetch this relies on. Leave it out of the
+  // "fresh after fetch" set: fewer proofs only ever makes a reset MORE conservative. Symbolic refs are not
+  // independently refreshed either: an innocent-looking alias (including origin/HEAD or a multi-hop alias)
+  // can resolve to an excluded ops ref or a ref outside origin. With the standard mapping verified,
+  // only direct non-ops tracking refs are proofs.
+  const out = tryGit(['for-each-ref', '--format=%(objectname) %(refname) %(symref)', 'refs/remotes/origin/'], dir);
   if (out === null) return new Set();
-  return new Set(out.split('\n').filter(Boolean));
+  const shas = new Set();
+  for (const line of out.split('\n').filter(Boolean)) {
+    const [sha, ref, symref] = line.split(' ');
+    if (symref || ref.startsWith('refs/remotes/origin/ops/')) continue;
+    shas.add(sha);
+  }
+  return shas;
 }
 
 // Returns { skipped: boolean, dirty, uncommitted, ahead } so callers can tell an actually-reset lane
@@ -1320,7 +1390,7 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
       // #4025 — record an outright probe FAILURE on the box itself (never on the returned Set, which stays
       // "no SHAs" either way) so a caller deciding whether to GROW the pool (`cmdProvision`'s `--acquirable`
       // branch) can tell "genuinely nothing pushed" from "we couldn't check" and refuse to grow on the latter.
-      const probe = liveRemoteShasProbe(dir);
+      const probe = liveRemoteShasProbe(repo);
       remoteShasBox.value = probe.shas;
       if (!probe.ok) remoteShasBox.failed = true;
     }
@@ -1873,19 +1943,31 @@ function logReclaimedAheadCommits(dir, branch, n) {
 const acquireResetSnapshots = new Map();
 
 function scrubClaimedLaneConfig(dir, reason) {
-  const { removed, kept } = scrubRiskyLaneConfig(dir, { log });
+  let dietConfig;
+  // Reuse an unchanged scrub read for the next fetch. Removing an include can also remove diet settings.
+  const { removed, kept } = scrubRiskyLaneConfig(dir, { log, onConfig: (output) => { dietConfig = laneDietConfigState(output); } });
   if (removed.length) journalLaneEvent(dir, { action: 'config-scrub', removed, kept, reason });
+  return removed.length ? undefined : dietConfig;
 }
 
 function provisionClaimedLane(repo, chosen, targetWasReserved) {
   const dir = laneDir(repo, chosen);
-  scrubClaimedLaneConfig(dir, 'before acquire hand-out');
+  const dietConfig = scrubClaimedLaneConfig(dir, 'before acquire hand-out');
   if (!flags['no-reset'] && !targetWasReserved) {
     // xj1vryw — this process just WON the lane's lease, so it may repair it: a corrupt clone (broken index, missing
     // object, dangling ref) is healed or quarantined + re-provisioned here, so acquire hands out a healthy lane.
     // LAZY on purpose: the health probe costs ~6 git spawns, so a healthy lane (the common case) never pays for it —
     // it runs only once the fetch or the pre-reset checks below actually fail with a corruption-shaped error.
-    fetchOriginHealing(repo, chosen, { allowReclone: true });
+    const fetchForReset = (config) => {
+      try {
+        return fetchOriginHealing(repo, chosen, { allowReclone: true, dietConfig: config });
+      } catch (e) {
+        // A missing explicitly mapped ref can abort fetch before the containment re-check.
+        // Preserve the cause and refuse the reset just as when fresh refs provide no proof.
+        throw new Error(`lane-${chosen} is no longer provably safe to reset: origin fetch failed (${msgOf(e).trim()})`, { cause: e });
+      }
+    };
+    let fetchedSpecs = fetchForReset(dietConfig);
     const repairUnhealthyClone = () => {
       let health = diagnoseLane(dir);
       if (!health.ok) {
@@ -1894,7 +1976,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
         health = diagnoseLane(dir);
         if (!health.ok) recloneLane(repo, chosen, health.problems.join('; '));
       }
-      fetchOriginHealing(repo, chosen, { allowReclone: true });
+      fetchedSpecs = fetchForReset();
     };
     const resetToBase = () => {
     // #2924 — re-verify containment on FRESH post-fetch remote-tracking refs, immediately before the
@@ -1902,7 +1984,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     // check, or nothing at all before #3390's own explicit-lane guard — is up to ~30s stale by the time this line runs
     // (the merge-base fan-out, the O_EXCL claim, the fetch just above). A `lane/*` ref deleted or force-pushed
     // on origin inside that window means the earlier proof no longer holds. Network-free: the fetch above
-    // already refreshed every remote-tracking ref, so `localRemoteShas` answers from local state alone.
+    // refreshed eligible tracking refs; `localRemoteShas` checks the mapping before using local state.
     if (!flags.force) {
       const { uncommitted, ahead } = laneDirtyOrAhead(dir, repo.branch);
       // #3383 — re-apply the SAME litter relaxation auto-pick's earlier cached-scan candidate check already
@@ -1910,7 +1992,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
       // without this, a litter-only-dirty lane picked exactly because it looked acquirable would immediately
       // fail this re-verify, one line later, on the identical litter it was already cleared for.
       const dirty = litterAdjustedDirty(dir, uncommitted > 0);
-      const provablyPushed = ahead === 0 || aheadIsProvablyPushed(dir, localRemoteShas(dir), repo.branch);
+      const provablyPushed = ahead === 0 || aheadIsProvablyPushed(dir, localRemoteShas(dir, fetchedSpecs), repo.branch);
       if (dirty || !provablyPushed) {
         // #3407 — THROWS (was `fail()`, uncatchable) so a caller can restore/drop this claim's lease — and, on
         // auto-pick, fall through to the next candidate — before the process actually exits.
@@ -2329,10 +2411,7 @@ function cmdAcquire(repo) {
         // same process cwd the clone uses) — never from inside an existing lane: a vanished/corrupted `lanes[0]`
         // (#xixn30q) would fail the probe for a purely LOCAL reason and stickily disable growth against a fully
         // reachable origin.
-        const remoteProbeFailed = !(repo.originUrl
-          ? liveRemoteShasProbe(process.cwd(), repo.originUrl)
-          : liveRemoteShasProbe(repo.referencePath)
-        ).ok;
+        const remoteProbeFailed = !liveRemoteShasProbe(repo).ok;
         const added = growPoolOnEmpty(repo, lanes, remoteProbeFailed);
         if (added > 0) {
           excluded.clear();
@@ -3694,7 +3773,7 @@ function laneRemovalEligibility(repo, n, { remoteShasBox, nowMs, ttlMs, deadReas
   }
   const getRemoteShas = () => {
     if (!remoteShasBox) return new Set();
-    if (remoteShasBox.value === null) remoteShasBox.value = liveRemoteShas(dir);
+    if (remoteShasBox.value === null) remoteShasBox.value = liveRemoteShas(repo);
     return remoteShasBox.value;
   };
   const held = laneHoldRefuses(dir, 'remove'); // xbdixjc
@@ -3765,7 +3844,7 @@ function claimLaneForRemoval(repo, n, evaluatedLease, remoteShasBox) {
     return { keep: TRIM_REACQUIRED };
   }
   const getRemoteShas = () => {
-    if (remoteShasBox.value === null) remoteShasBox.value = liveRemoteShas(dir);
+    if (remoteShasBox.value === null) remoteShasBox.value = liveRemoteShas(repo);
     return remoteShasBox.value;
   };
   const { dirty, ahead } = effectiveDirtyOrAhead(dir, repo.branch, getRemoteShas);
@@ -3965,27 +4044,48 @@ function cmdTrim(repo) {
 // PER LANE once it already trusts that verdict; it never re-derives the card/PR/holder axes itself. What it
 // DOES re-derive, unconditionally, every call: the PRESERVATION proof, because that is the one axis a caller's
 // scan can go stale on between computing the verdict and this call actually running (a fresh commit, a
-// deleted remote branch) — {@link laneReclaimPreservationProof} reuses `lane-whois.mjs`'s own exported
-// preservation primitives verbatim, never a second implementation of "is this blob identical to origin, or is
-// this commit pushed/patch-equivalent somewhere".
+// deleted remote branch) — {@link laneReclaimPreservationProof} restricts the shared patch/blob predicates
+// to live remote SHAs; a tracking ref alone cannot establish preservation after an excluded ops fetch.
 //
 // CLAIM DISCIPLINE mirrors `claimLaneForRemoval` above (the SAME O_EXCL lease-marker take `trim` uses): claim,
 // re-check UNDER the hold (a race between the read above and the claim itself), then act — never reset a lane
 // out from under a lease that appeared in that window. A lost race hands the lane back exactly as found.
 
-/** Re-derive whether lane `dir`'s current uncommitted/ahead content is STILL provably preserved, right now —
- *  never trusts a caller's (possibly stale) verdict. PURE-ish IO: every read is the same read `lane-whois.mjs`
- *  itself would make; nothing here mutates. */
-function laneReclaimPreservationProof(dir, branch) {
+/** Re-derive preservation from a fresh origin snapshot on BOTH passes, including under the claim.
+ *  No fetch or ref mutation: unavailable remote objects and failed reads leave work unproven. */
+function laneReclaimPreservationProof(dir, branch, repo) {
   const branchRef = `origin/${branch}`;
   const { trackedModifiedPaths, untrackedPaths } = gitStatusSummary(dir);
   const dirtyPaths = [...trackedModifiedPaths, ...untrackedPaths];
   const commits = aheadCommits(dir, branchRef);
-  const commitPreserved = aheadCommitsPreserved(dir, branchRef, commits);
-  // The SAME bounded predicate `lane-whois.mjs#whoisForLane` uses — heavy-dirty skip plus its lane-wide
-  // fallback-spawn budget (PR #2641 review: this copy used to run the fallback unbounded, files × refs).
-  // Unproven past the budget is conservative (a lane simply left un-reclaimed, never wrongly reclaimed).
-  const provenFile = lanePreservedFileChecker(dir, branchRef, dirtyPaths);
+  const remoteShas = dirtyPaths.length || commits.length ? liveRemoteShas(repo) : new Set();
+  const branchSha = tryGit(['rev-parse', '--verify', '--quiet', branchRef], dir);
+  const liveBranch = remoteShas.has(branchSha) ? branchSha : null;
+  // Disable whois's tracking-ref containment fallback; retain its patch-equivalence proof only
+  // against an immutable SHA that origin still advertises. Ops refs, aliases, custom mappings,
+  // and refs for other remotes cannot smuggle an old tip into either proof.
+  const commitPreserved = liveBranch ? aheadCommitsPreserved(dir, liveBranch, commits, 0) : new Map();
+  let containsBudget = Number(process.env.WE_LANE_WHOIS_MAX_CONTAINS_PROBES) || 15;
+  for (const { sha } of commits) {
+    if (commitPreserved.get(sha)) continue;
+    if (remoteShas.has(sha)) { commitPreserved.set(sha, true); continue; }
+    if (!remoteShas.size || containsBudget-- <= 0) continue;
+    const missing = tryGit(['rev-list', '--ignore-missing', '--max-count=1', sha, '--not', ...remoteShas], dir);
+    commitPreserved.set(sha, missing !== null && missing.trim() === '');
+  }
+  // Keep whois's heavy-dirty cutoff and lane-wide fallback budget, but show only live SHAs.
+  const maxRefs = Number(process.env.WE_LANE_WHOIS_MAX_REFS) || 20;
+  const otherRefs = dirtyPaths.length <= 25 ? [...remoteShas].filter((sha) => sha !== liveBranch).slice(0, maxRefs) : [];
+  let fallbackBudget = Number(process.env.WE_LANE_WHOIS_MAX_FALLBACK_SHOWS) || 40;
+  const provenFile = (path) => {
+    let local;
+    try { local = readFileSync(join(dir, path), 'utf8'); } catch { return false; }
+    const refs = otherRefs.slice(0, Math.max(0, fallbackBudget));
+    fallbackBudget -= refs.length;
+    // When the base is stale, consume the first bounded fallback as the predicate's primary ref.
+    const primary = liveBranch || refs.shift();
+    return !!primary && filePreservedInMain(dir, path, primary, local, refs);
+  };
   const unpreservedFiles = dirtyPaths.filter((p) => !provenFile(p));
   const unpreservedCommits = commits.filter((c) => !commitPreserved.get(c.sha));
   const preserved = unpreservedFiles.length === 0 && unpreservedCommits.length === 0;
@@ -4055,7 +4155,7 @@ function cmdReclaim(repo) {
     if (flags.json) process.stdout.write(`${JSON.stringify({ lane: n, path: dir, dryRun, reclaimed: false, kept: true, keptReason: held.reason, hold: held.hold }, null, 2)}\n`);
     return;
   }
-  const proof = laneReclaimPreservationProof(dir, repo.branch);
+  const proof = laneReclaimPreservationProof(dir, repo.branch, repo);
   // SNAPSHOT-THEN-RECLAIM (`--salvage`): content that is NOT provably on a remote ref is saved durably first
   // (bundle + patch + refs/salvage/*, indexed) and only then reset — see `we:scripts/lib/lane-salvage.mjs`.
   // Its own liveness gate (no live owner session, no process cwd inside the lane, quiet period) runs here,
@@ -4128,7 +4228,7 @@ function cmdReclaim(repo) {
     fail(`lane-${n}: a lease appeared between the read above and the claim attempt — not reclaimed, safe to retry`);
   }
   // Re-check UNDER the hold — closes the race window between the first read above and this claim.
-  const reproof = laneReclaimPreservationProof(dir, repo.branch);
+  const reproof = laneReclaimPreservationProof(dir, repo.branch, repo);
   // #4139 — `--override` forgives ONLY the specific unpreserved content this call's INITIAL proof already
   // named and logged above (what the operator actually looked at before typing `--override`). If anything NEW
   // and unpreserved raced in during the tiny window between that look and this claim, it was never reviewed by
