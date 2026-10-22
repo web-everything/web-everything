@@ -97,7 +97,8 @@ const TIMELINE_MAX_PAGES = 5;
 export async function readLabelTimeline(options) { return readLabelTimelineSync(options); }
 
 /** The same read, synchronous (its `gh` reads already are), for callers inside a sync tick. */
-export function readLabelTimelineSync({ repo, pr, read = readGh, maxPages = TIMELINE_MAX_PAGES } = {}) {
+// `strict`: a node that is not a well-formed label event makes the whole read `unreadable` (never a silent drop).
+export function readLabelTimelineSync({ repo, pr, read = readGh, maxPages = TIMELINE_MAX_PAGES, strict = false } = {}) {
   try {
     if (!REPO_RE.test(String(repo)) || !Number.isInteger(Number(pr))) return { status: 'unreadable', reason: 'bad-target' };
     const [owner, name] = repo.split('/');
@@ -110,6 +111,8 @@ export function readLabelTimelineSync({ repo, pr, read = readGh, maxPages = TIME
         nodes { __typename ... on LabeledEvent { ${actor} } ... on UnlabeledEvent { ${actor} } } } } } }`;
       const tl = JSON.parse(String(read(['api', 'graphql', '-f', `query=${query}`]))).data?.repository?.pullRequest?.timelineItems;
       if (!tl || !Array.isArray(tl.nodes)) return { status: 'unreadable', reason: 'no-timeline' };
+      if (strict && !tl.nodes.every((n) => n?.label?.name && Number.isFinite(Date.parse(n.createdAt ?? ''))
+        && (n.__typename === 'LabeledEvent' || n.__typename === 'UnlabeledEvent'))) return { status: 'unreadable', reason: 'malformed-node' };
       // `last` pages arrive newest first; prepend each older page without reversing its connection order.
       // Equal createdAt values must retain that order across page boundaries as well as within a page.
       items.unshift(...tl.nodes.filter((n) => n?.label?.name && n.createdAt && (n.__typename === 'LabeledEvent' || n.__typename === 'UnlabeledEvent'))

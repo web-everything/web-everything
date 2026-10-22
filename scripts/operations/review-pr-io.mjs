@@ -12,7 +12,7 @@ import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryRef
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
-import { HUMAN_ESCALATION_KINDS, buildHumanEscalationComment, buildHumanEscalationMarker } from '../lib/human-escalation-marker.mjs';
+import { HUMAN_ESCALATION_KINDS, buildHumanEscalationComment, buildHumanEscalationMarker, referralFailureKind } from '../lib/human-escalation-marker.mjs';
 import { buildReviewJudgeRequest } from './review-pr.mjs';
 import { referralSeatDisabled } from './review-seat-policy.mjs';
 export { referralSeatDisabled } from './review-seat-policy.mjs';
@@ -1517,10 +1517,13 @@ export function createReviewPrSinks({
         try { live = labelProvider.readPrState(read.repo, read.pr); }
         catch (readError) { out(`Could not refresh referral park labels: ${readError.message}`); }
         if (!live) live = { labels: read.labels ?? [] };
-        park(live, HUMAN_ESCALATION_KINDS.REFERRAL_PERSISTENCE_FAILED, { marked: false });
+        // Only a verdict-ledger mirror failure leaves the thread whole (thread-clearable); any other failure may
+        // have lost the finding itself, so its record kind never de-escalates.
+        const kind = referralFailureKind(error.message ?? error);
+        park(live, kind, { marked: false });
         const reason = String(error.message ?? error).replace(/\s+/g, ' ').slice(0, 400);
         const message = `Mandatory referral review parked to review:human: ${reason}.\n\n${buildHumanEscalationMarker({
-          kind: HUMAN_ESCALATION_KINDS.REFERRAL_PERSISTENCE_FAILED, head: live?.headRefOid ?? read.netBasis?.rev })}`;
+          kind, head: live?.headRefOid ?? read.netBasis?.rev })}`;
         try { labelProvider.postComment(read.repo, read.pr, message); }
         catch (commentError) { out(`Could not post referral park reason: ${commentError.message}`); }
         out(message);

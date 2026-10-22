@@ -4,7 +4,7 @@ import {
   DEESCALATE_KINDS_STANDARD, DEESCALATED_MARKER_RE,
 } from '../human-escalation-deescalate.mjs';
 import {
-  HUMAN_ESCALATION_KINDS as K, buildHumanEscalationMarker, buildHumanEscalationComment, readHumanEscalations,
+  HUMAN_ESCALATION_KINDS as K, buildHumanEscalationMarker, buildHumanEscalationComment, readHumanEscalations, referralFailureKind,
 } from '../../lib/human-escalation-marker.mjs';
 import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { buildOrphanGuardComment } from '../orphan-fix-round.mjs';
@@ -12,28 +12,30 @@ import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 
 // The automation login the test run resolves (the per-role App identity is pinned to none in tests).
 const BOT = AUTOMATION_LOGINS.find(l => !l.endsWith('[bot]'));
-
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
 const T0 = Date.parse('2026-10-21T18:38:25Z');
 const at = ms => new Date(T0 + ms).toISOString();
-const bot = (body, ms = 0) => ({ author: { login: BOT }, body, createdAt: at(ms) });
+const bot = (body, ms = 0, login = BOT) => ({ author: { login }, body, createdAt: at(ms) });
 const operator = (body, ms = 0) => ({ author: { login: 'chalbert' }, body, createdAt: at(ms) });
 const stranger = (body, ms = 0) => ({ author: { login: 'someone-else' }, body, createdAt: at(ms) });
 const added = (actor = BOT, ms = 0, label = 'review:human') => ({ label, change: 'added', actor, actorType: actor === 'chalbert' ? 'User' : 'Bot', createdAt: at(ms) });
 const settings = { enabled: true, kinds: [...DEESCALATE_KINDS_STANDARD], inferLegacy: true };
-const cleanReferral = { pending: [], blocked: [] };
+// A clean live-head referral state: the gate's reader shows a record for the live head and nothing held.
+const cleanReferral = { pending: [], blocked: [], malformed: false, records: [{ head: HEAD }] };
 const grant = ms => operator(buildRoundExtensionComment({ repo: REPO, pr: 5805, by: 2, actor: 'chalbert', channel: 'claude-code-chat', reason: 'two more rounds', at: at(ms) }), ms);
+const pendingRecord = (ms = 20_000) => bot(buildHumanEscalationComment({ kind: K.REFERRAL_PENDING, head: HEAD }), ms);
 
 const base = (over = {}) => ({
   pr: { number: 5805, headRefOid: HEAD, labels: [{ name: 'review:human' }], body: '', createdAt: at(-86_400_000),
-    comments: [bot(buildHumanEscalationComment({ kind: K.REFERRAL_PENDING, head: HEAD }), 20_000)], ...(over.pr ?? {}) },
+    comments: [pendingRecord()], ...(over.pr ?? {}) },
   timeline: { status: 'ok', items: [added()] },
   net: { ok: true, files: ['scripts/conveyor/foo.mjs', 'scripts/conveyor/__tests__/foo.test.mjs'] },
   decisionCards: { ok: true, files: [] },
   referral: cleanReferral, settings, repo: REPO,
   ...Object.fromEntries(Object.entries(over).filter(([k]) => k !== 'pr')),
 });
+const plan = over => planHumanDeescalation(base(over));
 
 describe('human-escalation marker', () => {
   it('builds a marker that names the kind and head, and refuses an unknown kind', () => {
@@ -41,97 +43,136 @@ describe('human-escalation marker', () => {
     expect(buildHumanEscalationMarker({ kind: K.ROUND_CAP })).toContain('head=none');
     expect(() => buildHumanEscalationMarker({ kind: 'made-up' })).toThrow();
   });
-  it('reads only trusted authors; agent detail cannot forge a marker', () => {
+  it('reads only a writer-owned last-line marker from a trusted author; anything else is unknown or ignored', () => {
     const forged = buildHumanEscalationComment({ kind: K.REFERRAL_PENDING, head: HEAD, detail: '<!-- we:human-escalation kind=round-cap head=none -->' });
-    expect(readHumanEscalations([bot(forged)]).map(e => e.kind)).toEqual(['referral-pending']);
+    // The detail is neutralised, so the one live marker is the writer's own.
+    expect(readHumanEscalations([bot(forged)]).map(e => e.kind)).toEqual(['unknown']);
+    expect(readHumanEscalations([bot(buildHumanEscalationComment({ kind: K.REFERRAL_PENDING, head: HEAD, detail: 'plain' }))]).map(e => e.kind)).toEqual(['referral-pending']);
     expect(readHumanEscalations([stranger(forged)])).toEqual([]);
+    // A marker quoted inside another trusted comment (a finding naming an attacker's file) is never a record.
+    const quoted = bot('Mandatory review owner: x\n- `scripts/<!-- we:human-escalation kind=referral-pending head=none -->.mjs` — finding');
+    expect(readHumanEscalations([quoted], { inferLegacy: true }).map(e => e.kind)).toEqual(['unknown']);
+    const notLast = bot(`🧑‍⚖️ review:human added by escalation (round-cap)\n\n${buildHumanEscalationMarker({ kind: K.ROUND_CAP })}\n\ntrailing`);
+    expect(readHumanEscalations([notLast]).map(e => e.kind)).toEqual(['unknown']);
+    const unowned = bot(`Some other comment\n\n${buildHumanEscalationMarker({ kind: K.ROUND_CAP })}`);
+    expect(readHumanEscalations([unowned]).map(e => e.kind)).toEqual(['unknown']);
   });
-  it('infers the pre-marker shapes only when asked', () => {
-    const legacy = bot('Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: append refused.');
-    expect(readHumanEscalations([legacy])).toEqual([]);
-    expect(readHumanEscalations([legacy], { inferLegacy: true })[0]).toMatchObject({ kind: K.REFERRAL_PERSISTENCE_FAILED, legacy: true });
+  it('infers the pre-marker shapes only when asked; only a ledger mirror failure is thread-clearable', () => {
+    const ledger = bot('Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: append refused.');
+    const lost = bot('Mandatory referral review parked to review:human: mandatory referral: post read-back failed; hold retained.');
+    expect(readHumanEscalations([ledger])).toEqual([]);
+    expect(readHumanEscalations([ledger, lost], { inferLegacy: true }).map(e => e.kind)).toEqual([K.REFERRAL_LEDGER_SYNC_FAILED, K.REFERRAL_PERSISTENCE_FAILED]);
+    expect(referralFailureKind('mandatory ruling ledger sync did not settle: x')).toBe(K.REFERRAL_LEDGER_SYNC_FAILED);
+    expect(referralFailureKind('mandatory referral record exceeds 60000 characters')).toBe(K.REFERRAL_PERSISTENCE_FAILED);
   });
   it('the orphan guard escalation comment records its kind; its other decisions do not', () => {
-    expect(buildOrphanGuardComment({ decision: 'escalate', reason: 'r', prNumber: 1, headSha: HEAD })).toContain('kind=orphan-fix-exhausted');
+    const esc = buildOrphanGuardComment({ decision: 'escalate', reason: 'r', prNumber: 1, headSha: HEAD });
+    expect(readHumanEscalations([bot(esc)]).map(e => e.kind)).toEqual([K.ORPHAN_FIX_EXHAUSTED]);
     expect(buildOrphanGuardComment({ decision: 'rearm', reason: 'r', prNumber: 1, headSha: HEAD })).not.toContain('we:human-escalation');
   });
 });
 
 describe('planHumanDeescalation', () => {
+  const roundCap = (ms = 10_000) => bot(buildHumanEscalationComment({ kind: K.ROUND_CAP, head: HEAD }), ms);
   it('round-cap escalation + a later operator round grant → de-escalated', () => {
-    const plan = planHumanDeescalation(base({ pr: { comments: [bot(buildHumanEscalationComment({ kind: K.ROUND_CAP, head: HEAD }), 10_000), grant(3_600_000)] } }));
-    expect(plan).toMatchObject({ action: 'deescalate', kinds: ['round-cap'], head: HEAD });
+    expect(plan({ pr: { comments: [roundCap(), grant(3_600_000)] } })).toMatchObject({ action: 'deescalate', kinds: ['round-cap'], head: HEAD });
   });
-  it('round-cap with no grant after it → kept', () => {
-    const plan = planHumanDeescalation(base({ pr: { comments: [grant(-3_600_000), bot(buildHumanEscalationComment({ kind: K.ROUND_CAP, head: HEAD }), 10_000)] } }));
-    expect(plan).toMatchObject({ action: 'keep' });
-    expect(plan.reason).toMatch(/no round grant/);
+  it('round-cap with no grant after it → kept; round-cap + grant but an unclean referral state → kept', () => {
+    expect(plan({ pr: { comments: [grant(-3_600_000), roundCap()] } }).reason).toMatch(/no round grant/);
+    const comments = [roundCap(), grant(3_600_000)];
+    expect(plan({ pr: { comments }, referral: { ...cleanReferral, malformed: true, pending: ['malformed-referral-record'] } }).action).toBe('keep');
+    expect(plan({ pr: { comments }, referral: { ...cleanReferral, pending: ['k'] } }).action).toBe('keep');
+    expect(plan({ pr: { comments }, referral: null }).action).toBe('keep');
   });
-  it('referral escalation with no pending/blocked referral on the live head → de-escalated; still pending → kept', () => {
-    expect(planHumanDeescalation(base()).action).toBe('deescalate');
-    expect(planHumanDeescalation(base({ referral: { pending: ['k'], blocked: [] } })).reason).toMatch(/still pending/);
+  it('referral escalation, live head carries a fully ruled record → de-escalated; still pending → kept', () => {
+    expect(plan().action).toBe('deescalate');
+    expect(plan({ referral: { ...cleanReferral, pending: ['k'] } }).reason).toMatch(/still pending/);
   });
-  it('legacy: a referral record just before the bot add is the recorded reason (the live #5805 shape)', () => {
-    const plan = planHumanDeescalation(base({ pr: { comments: [bot('Mandatory review owner: d4c5 (correctness).\n...', -33_000)] } }));
-    expect(plan.action).toBe('deescalate');
-    expect(planHumanDeescalation(base({ settings: { ...settings, inferLegacy: false },
-      pr: { comments: [bot('Mandatory review owner: d4c5 (correctness).', -33_000)] } })).reason).toMatch(/no recorded escalation/);
+  it('a moved head with no referral record of its own → kept (old-head records prove nothing)', () => {
+    expect(plan({ referral: { ...cleanReferral, records: [{ head: 'b'.repeat(40) }] } }).reason).toMatch(/no mandatory referral record on the live head/);
+  });
+  it('a persistence failure that may have lost the finding, and an overflow, never de-escalate', () => {
+    for (const kind of [K.REFERRAL_PERSISTENCE_FAILED, K.REFERRAL_OVERFLOW]) {
+      const c = bot(`Mandatory referral review parked to review:human: x.\n\n${buildHumanEscalationMarker({ kind, head: HEAD })}`, 10_000);
+      expect(plan({ pr: { comments: [c] }, settings: { ...settings, kinds: [...settings.kinds, kind] } }).action, kind).toBe('keep');
+    }
+    const ledger = bot(`Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: append refused.\n\n${buildHumanEscalationMarker({ kind: K.REFERRAL_LEDGER_SYNC_FAILED, head: HEAD })}`, 10_000);
+    expect(plan({ pr: { comments: [ledger] } }).action).toBe('deescalate');
+  });
+  it('legacy: a referral record by the labelling login just before the add is the recorded reason (the live #5805 shape)', () => {
+    const record = bot('Mandatory review owner: d4c5 (correctness).\n...', -33_000);
+    expect(plan({ pr: { comments: [record] } }).action).toBe('deescalate');
+    expect(plan({ settings: { ...settings, inferLegacy: false }, pr: { comments: [record] } }).reason).toMatch(/no escalation record/);
+    // Posted by another automation login than the one that labelled: it does not explain the add.
+    const other = AUTOMATION_LOGINS.find(l => l !== BOT && !l.endsWith('[bot]'));
+    if (other) expect(plan({ pr: { comments: [bot('Mandatory review owner: d4c5.', -33_000, other)] } }).action).toBe('keep');
+    expect(plan({ pr: { comments: [operator('Mandatory review owner: d4c5.', -33_000)] } }).action).toBe('keep');
+    // A record AFTER the add never explains it.
+    expect(plan({ pr: { comments: [bot('Mandatory review owner: d4c5.', 10_000)] } }).action).toBe('keep');
   });
   it('permission-change PR → kept', () => {
     for (const file of ['.github/workflows/ci.yml', '.claude/settings.json', 'scripts/bootstrap-session.mjs']) {
-      const plan = planHumanDeescalation(base({ net: { ok: true, files: ['scripts/conveyor/foo.mjs', file] } }));
-      expect(plan.action, file).toBe('keep');
+      expect(plan({ net: { ok: true, files: ['scripts/conveyor/foo.mjs', file] } }).action, file).toBe('keep');
     }
   });
-  it('a net diff the shape rule sends to a human → kept', () => {
-    // The shape rule (review-core-cli shape → scoreEscalation) is the authority; a gate-self/statute preset forces human.
+  it('a net diff (or a disclosed deviation) the shape rule sends to a human → kept', () => {
     const human = planHumanDeescalation({ ...base(), scoreFiles: () => ({ humanRequired: true, reasons: ['gate-self'] }) });
-    expect(human).toMatchObject({ action: 'keep' });
     expect(human.reason).toMatch(/requires a human \(gate-self\)/);
     expect(planHumanDeescalation({ ...base(), scoreFiles: () => ({}) }).action).toBe('keep');
     expect(planHumanDeescalation({ ...base(), scoreFiles: () => { throw new Error('x'); } }).action).toBe('keep');
+    const deviation = vi.fn(() => ({ humanRequired: false }));
+    planHumanDeescalation({ ...base({ pr: { body: 'Deviation: skipped the soak gate on purpose' } }), scoreFiles: deviation });
+    expect(deviation.mock.calls[0][1]).toMatch(/skipped the soak gate/);
+    expect(plan({ pr: { body: 'Deviation: skipped the soak gate on purpose' } }).action).toBe('keep');
+    expect(plan({ pr: { body: null } }).reason).toMatch(/body unreadable/);
   });
   it('hand label → kept (operator login, or any non-automation account)', () => {
-    expect(planHumanDeescalation(base({ timeline: { status: 'ok', items: [added('chalbert')] } })).reason).toMatch(/hand or unproven/);
-    expect(planHumanDeescalation(base({ timeline: { status: 'ok', items: [added('someone-else')] } })).action).toBe('keep');
-    // A hand re-add after the escalation's own add: the latest add is the hand one.
-    expect(planHumanDeescalation(base({ timeline: { status: 'ok', items: [added(), { ...added(), change: 'removed', createdAt: at(1000) }, added('chalbert', 2000)] } })).action).toBe('keep');
+    expect(plan({ timeline: { status: 'ok', items: [added('chalbert')] } }).reason).toMatch(/hand or unproven/);
+    expect(plan({ timeline: { status: 'ok', items: [added('someone-else')] } }).action).toBe('keep');
+    expect(plan({ timeline: { status: 'ok', items: [added(), { ...added(), change: 'removed', createdAt: at(1000) }, added('chalbert', 2000)] } }).action).toBe('keep');
   });
   it('decision card in the net diff → kept; unreadable card read → kept', () => {
-    expect(planHumanDeescalation(base({ decisionCards: { ok: true, files: ['backlog/x1-decide.md'] } })).reason).toMatch(/decision card/);
-    expect(planHumanDeescalation(base({ decisionCards: { ok: false, reason: 'card read failed' } })).action).toBe('keep');
+    expect(plan({ decisionCards: { ok: true, files: ['backlog/x1-decide.md'] } }).reason).toMatch(/decision card/);
+    expect(plan({ decisionCards: { ok: false, reason: 'card read failed' } }).action).toBe('keep');
   });
-  it('unreadable inputs → kept', () => {
-    expect(planHumanDeescalation(base({ timeline: { status: 'unreadable', reason: 'truncated-timeline' } })).action).toBe('keep');
-    expect(planHumanDeescalation(base({ net: { ok: false, reason: 'fetch failed' } })).action).toBe('keep');
-    expect(planHumanDeescalation(base({ net: { ok: true, files: [] } })).action).toBe('keep');
-    expect(planHumanDeescalation(base({ referral: null })).action).toBe('keep');
-    expect(planHumanDeescalation(base({ pr: { comments: null } })).action).toBe('keep');
-    expect(planHumanDeescalation(base({ pr: { headRefOid: '' } })).action).toBe('keep');
-    expect(planHumanDeescalation(base({ timeline: { status: 'ok', items: [{ ...added(), createdAt: 'nope' }] } })).action).toBe('keep');
+  it('unreadable or malformed inputs → kept', () => {
+    expect(plan({ timeline: { status: 'unreadable', reason: 'truncated-timeline' } }).action).toBe('keep');
+    expect(plan({ timeline: { status: 'ok', items: [added(), null] } }).action).toBe('keep');
+    expect(plan({ timeline: { status: 'ok', items: [{ ...added(), createdAt: 'nope' }] } }).action).toBe('keep');
+    expect(plan({ net: { ok: false, reason: 'fetch failed' } }).action).toBe('keep');
+    expect(plan({ net: { ok: true, files: [] } }).action).toBe('keep');
+    expect(plan({ referral: null }).action).toBe('keep');
+    expect(plan({ referral: { pending: [], blocked: [] } }).action).toBe('keep');
+    expect(plan({ pr: { comments: null } }).action).toBe('keep');
+    expect(plan({ pr: { headRefOid: '' } }).action).toBe('keep');
+    // A later escalation with no readable time cannot be placed: hold.
+    expect(plan({ pr: { comments: [pendingRecord(), { ...pendingRecord(), createdAt: 'bad' }] } }).reason).toMatch(/no readable time/);
   });
   it('no recorded reason at the add (a rule-required or unstamped park) → kept, even if a later escalation is cleared', () => {
-    const late = bot(buildHumanEscalationComment({ kind: K.REFERRAL_PENDING, head: HEAD }), 3_600_000);
-    expect(planHumanDeescalation(base({ pr: { comments: [late] } })).reason).toMatch(/no recorded escalation/);
+    expect(plan({ pr: { comments: [pendingRecord(3_600_000)] } }).reason).toMatch(/no escalation record/);
   });
   it('a kind outside the setting, or a non-clearable kind, since the add → kept', () => {
-    const orphan = bot(`x\n\n${buildHumanEscalationMarker({ kind: K.ORPHAN_FIX_EXHAUSTED, head: HEAD })}`, 10_000);
-    expect(planHumanDeescalation(base({ pr: { comments: [orphan] } })).reason).toMatch(/does not de-escalate/);
-    expect(planHumanDeescalation(base({ settings: { ...settings, kinds: [K.ROUND_CAP] } })).reason).toMatch(/does not de-escalate/);
-    const unknown = bot('<!-- we:human-escalation kind=future-kind head=none -->', 10_000);
-    expect(planHumanDeescalation(base({ pr: { comments: [unknown] } })).action).toBe('keep');
+    const orphan = bot(buildOrphanGuardComment({ decision: 'escalate', reason: 'r', prNumber: 5805, headSha: HEAD }), 10_000);
+    expect(plan({ pr: { comments: [pendingRecord(), orphan] } }).reason).toMatch(/does not de-escalate/);
+    expect(plan({ settings: { ...settings, kinds: [K.ROUND_CAP] } }).reason).toMatch(/does not de-escalate/);
+    expect(plan({ pr: { comments: [pendingRecord(), bot('🧑‍⚖️ review:human added by escalation\n\n<!-- we:human-escalation kind=future-kind head=none -->', 10_000)] } }).action).toBe('keep');
   });
-  it('other human-required holds → kept (park marker, ruling-needed, red-team block, blocked referral, operator send-back)', () => {
-    const marker = bot(`<!-- human-surface-repark: ${HEAD} -->`, 5000);
-    const esc = bot(buildHumanEscalationComment({ kind: K.REFERRAL_PENDING, head: HEAD }), 20_000);
-    expect(planHumanDeescalation(base({ pr: { comments: [esc, marker] } })).action).toBe('keep');
-    expect(planHumanDeescalation(base({ pr: { labels: ['review:human', 'advisory:ruling-needed'] } })).action).toBe('keep');
-    expect(planHumanDeescalation(base({ pr: { labels: ['review:human', 'red-team:blocked'] } })).action).toBe('keep');
-    expect(planHumanDeescalation(base({ referral: { pending: [], blocked: ['k'] } })).action).toBe('keep');
-    expect(planHumanDeescalation(base({ timeline: { status: 'ok', items: [added(), added(BOT, 30_000, 'review:awaiting-advisory')] } })).reason).toMatch(/awaiting-advisory/);
+  it('other holds → kept (accepted, mechanical, awaiting-advisory now or since, ruling-needed, red-team block, park marker, blocked referral, send-back)', () => {
+    for (const label of ['review:accepted', 'review:held-mechanical', 'review:awaiting-advisory', 'advisory:ruling-needed', 'red-team:blocked']) {
+      expect(plan({ pr: { labels: ['review:human', label] } }).reason, label).toMatch(/stands/);
+    }
+    // The drain parked for its own reason an hour later while the label stood: its awaiting-advisory add holds.
+    expect(plan({ timeline: { status: 'ok', items: [added(), added(BOT, 3_600_000, 'review:awaiting-advisory'),
+      { ...added(BOT, 3_700_000, 'review:awaiting-advisory'), change: 'removed' }] } }).reason).toMatch(/awaiting-advisory/);
+    expect(plan({ pr: { comments: [pendingRecord(), bot(`<!-- human-surface-repark: ${HEAD} -->`, 5000)] } }).action).toBe('keep');
+    expect(plan({ referral: { ...cleanReferral, blocked: ['k'] } }).action).toBe('keep');
+  });
+  it('an open operator send-back → kept', () => {
+    const sendBack = operator('🔁 review — changes requested\n\nRecorded by chalbert via /review.\n\n1. fix the thing', 30_000);
+    expect(planHumanDeescalation({ ...base({ pr: { comments: [pendingRecord(), sendBack] } }) }).action).toBe('keep');
   });
   it('disabled (kill switch) → kept', () => {
-    expect(planHumanDeescalation(base({ settings: { ...settings, enabled: false } })).reason).toMatch(/disabled/);
+    expect(plan({ settings: { ...settings, enabled: false } }).reason).toMatch(/disabled/);
   });
 });
 
@@ -140,6 +181,7 @@ describe('resolveDeescalateSettings', () => {
   it('standard on, every clearable kind, legacy inference on', () => {
     const s = resolveDeescalateSettings({ env: {}, readFile: none, platform: null, log: () => {} });
     expect(s).toMatchObject({ enabled: true, inferLegacy: true, kinds: [...DEESCALATE_KINDS_STANDARD] });
+    expect(DEESCALATE_KINDS_STANDARD).not.toContain(K.REFERRAL_PERSISTENCE_FAILED);
     expect(s.sources.humanDeescalateEnabled).toBe('standard');
   });
   it('env kill switch wins and is sourced; an unclearable kind in a layer is refused', () => {
@@ -147,16 +189,23 @@ describe('resolveDeescalateSettings', () => {
     expect(s.enabled).toBe(false);
     expect(s.sources.humanDeescalateEnabled).toBe('env');
     expect(s.kinds).toEqual([...DEESCALATE_KINDS_STANDARD]);
+    const file = () => JSON.stringify({ humanDeescalateKinds: ['round-cap', 'referral-overflow'] });
+    expect(resolveDeescalateSettings({ env: {}, readFile: file, platform: null, log: () => {} }).kinds).not.toContain('referral-overflow');
   });
 });
 
 describe('readDecisionCards', () => {
-  it('names decision cards at the head and fails closed on a read error', () => {
-    const git = vi.fn((dir, args) => (args[1].endsWith('d.md') ? '---\nkind: decision\nstatus: open\n---\nbody' : '---\nkind: story\n---\n'));
-    expect(readDecisionCards({ repo: REPO, head: HEAD, files: ['backlog/d.md', 'backlog/s.md', 'scripts/x.mjs'] }, { git, gitDirFor: () => '/r' }))
-      .toEqual({ ok: true, files: ['backlog/d.md'] });
+  const card = kind => `---\n${kind}\nstatus: open\n---\nbody`;
+  it('names decision cards by parsed front matter (a YAML comment does not hide it); fails closed on any read problem', () => {
+    const blobs = { 'backlog/d.md': card('kind: decision # operator ruling'), 'backlog/q.md': card("kind: 'decision'"), 'backlog/s.md': card('kind: story') };
+    const git = vi.fn((dir, args) => blobs[args[1].split(':')[1]]);
+    expect(readDecisionCards({ repo: REPO, head: HEAD, files: ['backlog/d.md', 'backlog/q.md', 'backlog/s.md', 'scripts/x.mjs'] }, { git, gitDirFor: () => '/r' }))
+      .toEqual({ ok: true, files: ['backlog/d.md', 'backlog/q.md'] });
     expect(readDecisionCards({ repo: REPO, head: HEAD, files: ['backlog/d.md'] }, { git: () => { throw new Error('gone'); }, gitDirFor: () => '/r' }).ok).toBe(false);
     expect(readDecisionCards({ repo: REPO, head: HEAD, files: ['backlog/d.md'] }, { git, gitDirFor: () => null }).ok).toBe(false);
+    expect(readDecisionCards({ repo: REPO, head: HEAD, files: ['backlog/b.md'] }, { git: () => '---\nkind: [unclosed\n---\n', gitDirFor: () => '/r' }).ok).toBe(false);
+    expect(readDecisionCards({ repo: REPO, head: HEAD, files: ['backlog/n.md'] }, { git: () => 'no front matter', gitDirFor: () => '/r' }).ok).toBe(false);
+    expect(readDecisionCards({ repo: REPO, head: HEAD, files: ['scripts/x.mjs'] }, { git, gitDirFor: () => null })).toEqual({ ok: true, files: [] });
   });
 });
 
@@ -167,16 +216,18 @@ describe('sweepHumanDeescalation (apply)', () => {
     const provider = { currentRepo: () => REPO, readPrState: vi.fn(() => state), setLabels: vi.fn(), postComment: vi.fn() };
     return { provider, opts: { repo: REPO, apply: true, settings, provider,
       listPrs: () => [{ number: 5805, labels: [{ name: 'review:human' }] }, { number: 9, labels: [{ name: 'review:pending' }] }],
-      readComments: () => b.pr.comments, readTimeline: () => b.timeline, readNetFiles: () => b.net, readCards: () => b.decisionCards,
+      readComments: () => b.pr.comments, readTimeline: vi.fn(() => b.timeline), readNetFiles: vi.fn(() => b.net), readCards: () => b.decisionCards,
       resolveSurfaces: () => 'narrow', readReferral: () => cleanReferral, log: vi.fn(), ...over } };
   };
-  it('removes review:human, re-arms review:pending, records and logs it', () => {
+  it('removes review:human, re-arms review:pending, records and logs it; the net read is not repeated for the same head', () => {
     const { provider, opts } = io();
     const rows = sweepHumanDeescalation(opts);
     expect(rows).toEqual([expect.objectContaining({ num: 5805, action: 'deescalated' })]);
     expect(provider.setLabels).toHaveBeenCalledWith(REPO, 5805, { add: 'review:pending', remove: ['review:human'] });
     expect(provider.postComment.mock.calls[0][2]).toMatch(DEESCALATED_MARKER_RE);
     expect(opts.log.mock.calls[0][0]).toMatch(/^review-human de-escalated \{"pr":5805,"head":"a{40}","reason":/);
+    expect(opts.readTimeline).toHaveBeenCalledTimes(2);
+    expect(opts.readNetFiles).toHaveBeenCalledTimes(1);
   });
   it('report mode writes nothing', () => {
     const { provider, opts } = io({ apply: false });
@@ -184,11 +235,18 @@ describe('sweepHumanDeescalation (apply)', () => {
     expect(provider.setLabels).not.toHaveBeenCalled();
     expect(provider.postComment).not.toHaveBeenCalled();
   });
+  it('a hand re-add between the first read and the write keeps the hold (the timeline is re-read)', () => {
+    const { provider, opts } = io();
+    opts.readTimeline.mockReturnValueOnce({ status: 'ok', items: [added()] })
+      .mockReturnValueOnce({ status: 'ok', items: [added(), { ...added(), change: 'removed', createdAt: at(1000) }, added('chalbert', 2000)] });
+    expect(sweepHumanDeescalation(opts)[0]).toMatchObject({ action: 'keep' });
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
   it('a moved head between read and write keeps the hold', () => {
     const { provider, opts } = io();
-    provider.readPrState.mockReturnValueOnce({ state: 'OPEN', headRefOid: HEAD, labels: [{ name: 'review:human' }], comments: [] })
-      .mockReturnValueOnce({ state: 'OPEN', headRefOid: 'b'.repeat(40), labels: [{ name: 'review:human' }], comments: [] });
-    expect(sweepHumanDeescalation(opts)[0]).toMatchObject({ action: 'keep', reason: 'state moved during the read' });
+    provider.readPrState.mockReturnValueOnce({ state: 'OPEN', headRefOid: HEAD, labels: [{ name: 'review:human' }], body: '', comments: [] })
+      .mockReturnValueOnce({ state: 'OPEN', headRefOid: 'b'.repeat(40), labels: [{ name: 'review:human' }], body: '', comments: [] });
+    expect(sweepHumanDeescalation(opts)[0]).toMatchObject({ action: 'keep' });
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
   it('a throwing read keeps the hold and never stops the sweep; disabled writes nothing', () => {
@@ -199,10 +257,9 @@ describe('sweepHumanDeescalation (apply)', () => {
     expect(sweepHumanDeescalation(off.opts)[0].reason).toMatch(/disabled/);
     expect(off.provider.readPrState).not.toHaveBeenCalled();
   });
-  it('keeps any other review label instead of adding review:pending', () => {
+  it('keeps review:changes as the only review label instead of adding review:pending', () => {
     const { provider, opts } = io();
-    const s = { state: 'OPEN', headRefOid: HEAD, labels: [{ name: 'review:human' }, { name: 'review:changes' }], comments: [] };
-    provider.readPrState.mockReturnValue(s);
+    provider.readPrState.mockReturnValue({ state: 'OPEN', headRefOid: HEAD, labels: [{ name: 'review:human' }, { name: 'review:changes' }], body: '', comments: [] });
     sweepHumanDeescalation(opts);
     expect(provider.setLabels).toHaveBeenCalledWith(REPO, 5805, { remove: ['review:human'] });
   });
