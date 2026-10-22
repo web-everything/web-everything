@@ -32,7 +32,13 @@ export default {
       if (!published) violations.push('the exhausted hold did not publish');
       const ordinary = { repo, number: 99, head, reason: 'ready' };
       const poll = report => runOnce({ checkoutRoot: join(dir, 'workspace/.lanes/we/lane-1'),
-        env: { WE_NEEDS_YOU_FEED: path }, now: now + 1, log: () => {}, exec: () => JSON.stringify(report) });
+        env: { WE_NEEDS_YOU_FEED: path }, now: now + 1, log: () => {}, exec: () => JSON.stringify(report),
+        gh: async (_file, args) => {
+          if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: head, labels: [] });
+          if (args[0] === 'api') return '[[]]';
+          violations.push(`unexpected live-gate read: ${args.join(' ')}`);
+          throw new Error('unexpected live-gate read');
+        } });
       await poll({ ready: [ordinary] });
       await poll({ ready: [] });
       await poll({ ready: [] });

@@ -66,6 +66,7 @@
  * infra-blocked recovery / the lease-reaper / the session-reaper / the hiccup sink — best-effort, never gating
  * the tick.
  */
+import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { repeatedFindingPlan, resolveFixSafety } from './repeated-finding-reset.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readDeclaredSettings } from '../lib/settings-files.mjs';
@@ -216,6 +217,11 @@ export const FIX_STALE_GUARD_OPTS = Object.freeze({ label: FIX_DISPATCH_STALE_LA
  *  tick-core-driven fix dispatch fills, read fresh per dispatch so an edit takes effect with no restart. */
 export function fixBriefPath(root = REPO_ROOT) {
   return join(root, 'skills-src', 'conveyor', 'fix-agent-brief.md');
+}
+
+/** The fix brief `dispatchFix` sends by default: the template, its context pack, then the build requirements once. */
+export function readFixBriefTemplate(root = REPO_ROOT, pack = (template) => template) {
+  return appendBuildRequirements(pack(readFileSync(fixBriefPath(root), 'utf8')), { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
 }
 
 /** we:scripts/conveyor/reconcile-fix-dispatch.mjs#RESUME_CONFIRM_MAX_ATTEMPTS — hardening (2) from the
@@ -1382,7 +1388,7 @@ export function dispatchFix(planned, {
   // Fixer context pack (`fix.contextPack`, `fix.localTests`) — the template arrives with the finding verbatim, the code
   // at each named line, the PR's file list and the proof-only tests rule in front, and the sections the pack makes
   // redundant trimmed (we:scripts/conveyor/fix-context-pack.mjs). A test that injects `readBrief` gets its own text.
-  readBrief = (r) => packFixBrief(readFileSync(fixBriefPath(r), 'utf8')),
+  readBrief = (r) => readFixBriefTemplate(r, packFixBrief),
   packFixBrief = (template) => briefWithContextPack(template, { kind: 'fix', repo, toSlug: ghRepoSlug, pr: planned.pr, exec: execFileSyncThrottled }),
   mintSessionId = () => randomUUID(),
   spawnAgent = defaultSpawnAgent,

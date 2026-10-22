@@ -477,9 +477,10 @@ describe('audit round 2', () => {
   const d = (comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
   it('block after a clear-human ceremony re-holds the break (the ceremony no longer covers it), and the sink proves it', async () => {
     const { buildReviewedShaMarker, buildClearedHumanMarker } = await import('../../lib/review-escalation.mjs');
-    const clearance = bot(['✅ review — `review:human` cleared via the sanctioned path', '',
+    // main #5803: only a human operator's own clear-human comment is a ruling, so the ceremony is posted by the operator login.
+    const clearance = { ...bot(['✅ review — `review:human` cleared via the sanctioned path', '',
       'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
-      buildReviewedShaMarker(HEAD), buildClearedHumanMarker('operator')].join('\n'), '2026-10-20T23:50:00Z');
+      buildReviewedShaMarker(HEAD), buildClearedHumanMarker('operator')].join('\n'), '2026-10-20T23:50:00Z'), author: { login: 'chalbert' } };
     const f = fake({ initial: thread([clearance]) });
     expect(d(f.comments).held).toEqual([]); // the ceremony ruled on the cap
     const b = planRedTeamRuling(read({ comments: f.comments }), input({ ruling: 'block' }));

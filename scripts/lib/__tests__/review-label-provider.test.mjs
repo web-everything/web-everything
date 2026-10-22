@@ -19,6 +19,34 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, PR_STATE_FIELDS, createGhProvider, writeOrder, clampLabelDescription, GITHUB_LABEL_DESCRIPTION_MAX } from '../review-label-provider.mjs';
 
+describe('posting identity', () => {
+  it('reads the identity through the same transport as the comment writer', () => {
+    const calls = [];
+    const provider = createGhProvider({
+      exec: (args, opts) => { calls.push({ args, opts }); return JSON.stringify({ login: 'chalbert', type: 'User', is_bot: false }); },
+      writeFile: () => {}, removeFile: () => {},
+    });
+    expect(provider.readPostingIdentity('o/n')).toEqual({ login: 'chalbert', type: 'User', is_bot: false });
+    provider.postComment('o/n', 7, 'clearance');
+    expect(calls[0].args).toEqual(['api', 'user']);
+    expect(calls[1].args.slice(0, 2)).toEqual(['pr', 'comment']);
+    expect(calls[0].opts.env.GH_REPO).toBe('o/n');
+    expect(Object.hasOwn(calls[0].opts.env, 'GH_TOKEN')).toBe(Object.hasOwn(process.env, 'GH_TOKEN'));
+    expect(Object.hasOwn(calls[1].opts, 'env')).toBe(false);
+  });
+  it('disables personal read routing at the outer throttle and nested App shim', () => {
+    let options;
+    const provider = createGhProvider({ exec: (_args, opts) => { options = opts; return '{"login":"web-everything"}'; } });
+    expect(provider.readPostingIdentity('web-everything/web-everything')).toEqual({ login: 'web-everything' });
+    expect(options.throttle.personalRoute).toBe(false);
+    expect(options.env.WE_GH_THROTTLE_PERSONAL_ROUTE).toBe('0');
+  });
+  it('propagates unreadable identity metadata', () => {
+    expect(() => createGhProvider({ exec: () => 'not JSON' }).readPostingIdentity('o/n')).toThrow();
+    expect(() => createGhProvider({ exec: () => { throw new Error('unauthenticated'); } }).readPostingIdentity('o/n')).toThrow('unauthenticated');
+  });
+});
+
 describe('label provider import boundary', () => {
   it('loads without importing the fix-procedure CLI that lazily loads this provider', () => {
     // A fresh Node process exercises native ESM linking, which Vitest's transformed imports do not.

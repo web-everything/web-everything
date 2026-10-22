@@ -40,6 +40,7 @@
  *                                                                              `requiredChecks`)
  *   - `label create NAME [--repo R] [--color C] [--description D] [--force]`
  *   - `api [--method M | -X M] [--paginate] [-F k=v]... PATH [--jq Q]` for:
+ *       `user` (the same FAKE_GH_ACTOR that posts comments),
  *       `repos/{o}/{r}`, `repos/{o}/{r}/pulls/{n}`, `repos/{o}/{r}/pulls/{n}/files`,
  *       `repos/{o}/{r}/issues/{n}/events`, `repos/{o}/{r}/issues/{n}/timeline`,
  *       `repos/{o}/{r}/issues/{n}/comments`, `repos/{o}/{r}/compare/{a}...{b}`,
@@ -478,6 +479,7 @@ function handleApi(store, rest) {
     if (path && path.includes('{owner}/{repo}')) path = path.replace('{owner}/{repo}', resolveRepoSlug(store, null));
     if (method !== 'GET') return { stderr: `fake-gh: unsupported api --method ${method}\n`, exitCode: 1 };
     if (!path) return { stderr: 'fake-gh: api: no path given\n', exitCode: 1 };
+    if (path === 'user') return jsonResult({ login: ACTOR, type: ACTOR.includes('[bot]') ? 'Bot' : 'User' }, jq);
     if (path === 'graphql') return handleOpenPrPage(store, rest);
 
     let m;
