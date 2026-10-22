@@ -29,7 +29,7 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { isHumanOperatorComment } from './operator-identity.mjs';
 
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
-import { parseLatestHumanClearedSha, REVIEWED_SHA_MARKER } from './review-escalation.mjs';
+import { parseLatestHumanClearedSha, REVIEWED_SHA_MARKER, clearanceBindsHead } from './review-escalation.mjs';
 import { commentCreatedAt, roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
 
 // ── The comment the producer writes ─────────────────────────────────────────────────────────────────────────────
@@ -350,8 +350,8 @@ export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { re
 
 
 /** Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE. */
-export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { repo = pr?.repo ?? null, standingRuling = pr?.standingRuling ?? null } = {}) {
-  const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, repo, standingRuling });
+export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { repo = pr?.repo ?? null, standingRuling = pr?.standingRuling ?? null, clearanceCoverage = null } = {}) {
+  const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, repo, standingRuling, clearanceCoverage });
   if (!disposition.held.length) return null;
   const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
   if (labels.includes('review:changes')) return null;
@@ -465,9 +465,17 @@ function firstReviewIndex(records, pr, head) {
  * head. A carried result defers to the ruling on the head it was carried from, read from the thread before the carry.
  * PURE.
  */
-function operatorRuled(records, pr, head) {
+function operatorRuled(records, pr, head, coverageOf = null) {
   const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
-  if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
+  // approval-binding (2026-10-21): the operator's clearance binds this head by sha, or by a trusted git proof that the
+  // net change is the one cleared (read lazily, only when the sha rule fails). The ruling itself must still be found
+  // on the carry chain below — coverage never stands in for the ceremony comment after the cap.
+  const clearedSha = parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c));
+  if (clearedSha !== head) {
+    let coverage = null;
+    try { coverage = typeof coverageOf === 'function' ? coverageOf(head) : coverageOf; } catch { coverage = null; }
+    if (!clearanceBindsHead({ humanClearedSha: clearedSha, headSha: head, coverage })) return false;
+  }
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
   const rulingHeads = new Set();
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
@@ -540,7 +548,7 @@ function gateActionLines(body) {
  * finding. A carried result also keeps the actions bound to the result it was carried from (the same findings,
  * re-keyed); the newer head's own records win. An operator ruling releases only what the gate handed over (`held`).
  */
-export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null } = {}) {
+export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, clearanceCoverage = null } = {}) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const result = latestResult(records, pr, live)?.parsed ?? null;
@@ -580,7 +588,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   // Audited grants unseen by the cap decision let a later send-back stand, even if the cap POST arrives last.
   // Without a repo there is no grant credit and the cap keeps winning.
   const outcome = sendBackStepState(liveGates, grants).outcome;
-  const ruled = operatorRuled(records, pr, live);
+  const ruled = operatorRuled(records, pr, live, clearanceCoverage);
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {
     const recorded = actions.get(f.index);

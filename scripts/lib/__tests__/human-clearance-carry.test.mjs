@@ -360,10 +360,26 @@ describe('drain gate: what does NOT carry', () => {
     expect(gate.carriedClearance).toBeUndefined();
     expect(posted).toHaveLength(0);
   });
-  it('a non-mechanical push (author commit on top) re-parks, even with an identical diff', () => {
+  // approval-binding (operator 2026-10-21): a clearance binds the net-change fingerprint, but only with the replay proof
+  // (the cleared change replayed onto the head's base reproduces its tree). This fixture's git cannot replay, so an
+  // identical fingerprint alone does not cover the non-mechanical push: it re-parks (fail closed). The real-git covered
+  // cases live in approval-binding.test.mjs. The sha kill switch re-parks it too.
+  it('a non-mechanical push re-parks when the replay proof is unavailable, even with an identical diff', () => {
     const { gate, posted } = base({ parents: { ...pr4722Graph, [PR4722.head]: [PR4722.r1] } });
     expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human });
+    expect(gate.carriedClearance).toBeUndefined();
     expect(posted).toHaveLength(0);
+  });
+  it('review.clearance.bindTo=sha: the same non-mechanical push re-parks, even with an identical diff', () => {
+    const saved = process.env.WE_REVIEW_CLEARANCE_BIND_TO;
+    process.env.WE_REVIEW_CLEARANCE_BIND_TO = 'sha';
+    try {
+      const { gate, posted } = base({ parents: { ...pr4722Graph, [PR4722.head]: [PR4722.r1] } });
+      expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human });
+      expect(posted).toHaveLength(0);
+    } finally {
+      if (saved === undefined) delete process.env.WE_REVIEW_CLEARANCE_BIND_TO; else process.env.WE_REVIEW_CLEARANCE_BIND_TO = saved;
+    }
   });
   it.each([
     ['the branch moved on after headRefOid was read', { tip: PR4722.main2 }],

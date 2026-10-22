@@ -3,7 +3,9 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sensitiveSurfaceHits, resolveHumanReviewSurfaces } from '../lib/human-review-surfaces.mjs';
-import { REVIEW_LABELS, hasReviewLabel, parseLatestHumanClearedSha, decideParkToHuman } from '../lib/review-escalation.mjs';
+import { REVIEW_LABELS, hasReviewLabel, parseLatestHumanClearedSha, decideParkToHuman, clearanceBindsHead } from '../lib/review-escalation.mjs';
+import { computeClearanceCoverage, latestOperatorClearanceRecord, ghFormalReviewsReader } from '../lib/approval-binding.mjs';
+import { execFileSync } from 'node:child_process';
 import { createGhProvider, parseJsonLines } from '../lib/review-label-provider.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { restoreClearanceOverRacedPark } from '../review-set-label.mjs';
@@ -57,7 +59,9 @@ export function raceLostParkProven(comments, head) {
 const commentKey = c => c?.id ?? JSON.stringify([c?.body, c?.createdAt, c?.author?.login]);
 
 /** Pure decision over a live head and its complete comment thread. */
-export function planHumanSurfaceRepark({ currentLabels = [], files = [], headSha, comments = [], surfaces = 'narrow', netFailure } = {}) {
+// `clearanceCoverage` (approval-binding): a coverage verdict or a lazy `() => verdict`, read only when no clearance is the
+// latest accept — a fresh plain accept stamped over an operator clearance of this same content must not re-park (#5485).
+export function planHumanSurfaceRepark({ currentLabels = [], files = [], headSha, comments = [], surfaces = 'narrow', netFailure, clearanceCoverage = null } = {}) {
   if (!candidate(currentLabels)) return { repark: false, reason: 'not an accepted PR without a hold' };
   const hits = sensitiveSurfaceHits(files, () => undefined, surfaces).filter(hit => hit.category !== 'permission');
   if (!hits.length && !netFailure) return { repark: false, reason: 'no human-only surface' };
@@ -66,6 +70,11 @@ export function planHumanSurfaceRepark({ currentLabels = [], files = [], headSha
     return { repark: false, reason: cleared.toLowerCase() === String(headSha).toLowerCase()
       ? 'human clearance at the live head'
       : 'older human clearance — left to the accept carry-forward / drain' };
+  }
+  if (latestOperatorClearanceRecord(comments)) {
+    let coverage = null;
+    try { coverage = typeof clearanceCoverage === 'function' ? clearanceCoverage() : clearanceCoverage; } catch { coverage = null; }
+    if (clearanceBindsHead({ headSha, coverage })) return { repark: false, reason: `human clearance covers the live head (${coverage.tier}): ${coverage.reason}` };
   }
   return { repark: true, hits, decision: decideParkToHuman({ currentLabels, keepHumanClearance: false }) };
 }
@@ -94,6 +103,7 @@ export function sweepHumanSurfaceRepark({
   readComments = readCompletePrComments, resolveSurfaces = resolveHumanReviewSurfaces, dryRun = false,
   readLabelEvents = defaultReadLabelEvents,
   readNetFiles = readHumanSurfaceNetFiles, resolveNetSetting = resolveHumanSurfaceNetSetting,
+  readCoverage = null,
 } = {}) {
   const results = [];
   let resolvedRepo = repo;
@@ -163,7 +173,8 @@ export function sweepHumanSurfaceRepark({
       results.push({ num, skipped: `live re-read failed: ${errorText(e)}` });
       continue;
     }
-    const plan = planHumanSurfaceRepark({ currentLabels: state.labels, files, headSha: state.headRefOid, comments, surfaces, netFailure });
+    const plan = planHumanSurfaceRepark({ currentLabels: state.labels, files, headSha: state.headRefOid, comments, surfaces, netFailure,
+      clearanceCoverage: typeof readCoverage === 'function' ? () => readCoverage({ repo: resolvedRepo, pr: num, comments, headSha: state.headRefOid }) : null });
     if (!plan.repark) continue;
     const entry = { num, repark: dryRun ? 'would-repark' : 'reparked', head: state.headRefOid, files: [...new Set(plan.hits.map(hit => hit.file))] };
     if (!dryRun) {
@@ -276,7 +287,10 @@ if (IS_CLI) {
   } else {
     try {
       const repo = argv.find(arg => arg.startsWith('--repo='))?.slice(7) || null;
-      writeAllSync(1, `${JSON.stringify(sweepHumanSurfaceRepark({ repo, dryRun: argv.includes('--dry-run') }))}\n`);
+      // approval-binding: read-only git in this checkout (the PR's repo when it is local; otherwise no proof, fail closed).
+      const readCoverage = ({ repo: slug, pr, comments, headSha }) => computeClearanceCoverage({ comments, liveHead: headSha, exec: execFileSync,
+        reviews: ghFormalReviewsReader({ exec: execFileSync, repo: slug, pr }) });
+      writeAllSync(1, `${JSON.stringify(sweepHumanSurfaceRepark({ repo, dryRun: argv.includes('--dry-run'), readCoverage }))}\n`);
     } catch (e) {
       writeLineSync(2, `error: ${errorText(e)}`);
       process.exitCode = 1;
