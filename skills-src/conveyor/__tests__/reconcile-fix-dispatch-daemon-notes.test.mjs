@@ -203,7 +203,7 @@ describe('exhausted fix parking', () => {
       labels: labels.map((name) => ({ name })),
       comments: alreadyPosted ? [{ body: buildNoteComment(note), author: { login: 'web-everything' } }] : [],
     }]]) });
-    const out = runReconcileNotesAllRepos({ repos: ['we'], tick, parkToHuman, postComment, dryRun });
+    const out = runReconcileNotesAllRepos({ repos: ['we'], tick, parkToHuman, postComment, dryRun, autoRoundGrant: () => null });
     expect(parkToHuman).toHaveBeenCalledTimes(calls);
     if (calls) {
       expect(parkToHuman).toHaveBeenCalledWith(expect.objectContaining({
@@ -219,7 +219,7 @@ it.each([false, true])('records parking failure (throws=%s) without losing the n
   const parkToHuman = () => { if (throws) throw new Error('label failure'); return { ok: false, error: 'label failure' }; };
   const tick = () => ({ notes: [{ kind: 'round-cap-exhausted', prNumber: 20, capKind: 'fix', parkToHuman: true }],
     prsByNumber: new Map([[20, { labels: [], comments: [] }]]) });
-  const out = runReconcileNotesAllRepos({ repos: ['we'], tick, parkToHuman, postComment: () => ({ ok: true }), dryRun: false });
+  const out = runReconcileNotesAllRepos({ repos: ['we'], tick, parkToHuman, postComment: () => ({ ok: true }), dryRun: false, autoRoundGrant: () => null });
   expect(out.comments[0]).toMatchObject({ parked: false, parkError: 'label failure', posted: true });
 });
 
@@ -257,7 +257,7 @@ it('publishes a cap immediately even when its durable note was already posted', 
   const publish = vi.fn();
   const note = { kind: 'round-cap-exhausted', prNumber: 5403, attempts: 5, cap: 5, capKind: 'fix', text: 'round cap exhausted' };
   const pr = { number: 5403, headRefOid: 'a'.repeat(40), comments: [{ author: { login: 'web-everything' }, body: buildNoteComment(note) }] };
-  runReconcileNotesAllRepos({ repos: ['we'], dryRun: false, publish,
+  runReconcileNotesAllRepos({ repos: ['we'], dryRun: false, publish, autoRoundGrant: () => null,
     tick: () => ({ notes: [note], prsByNumber: new Map([[5403, pr]]) }),
     safety: { value: { alertAtRoundCap: true }, sources: { alertAtRoundCap: 'test' } }, postComment: () => { throw Error('already posted'); } });
   expect(publish).toHaveBeenCalledWith(expect.objectContaining({ pr: 5403, kind: 'at-round-limit', head: pr.headRefOid }));

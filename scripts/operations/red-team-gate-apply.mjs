@@ -50,6 +50,7 @@ import { spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
 import { readReviewRound, readReviewRoundAsOf } from './review-pr-io.mjs';
 import { appendLedgerEvents } from './record-referral-ruling-io.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(THIS_FILE), '..', '..');
@@ -131,9 +132,13 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
   try {
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
+    // The verified standing-ruling scope, so an automatic grant counts here exactly as fix dispatch counts it (PR #5758).
+    // An unreadable scope credits no automatic grant (fail closed); operator grants still count.
+    let standingRuling = null;
+    try { standingRuling = io.readGrantScope?.({ repo, pr, head, comments: view?.comments }) ?? null; } catch { standingRuling = null; }
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    const { result: parsed, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo);
+    const { result: parsed, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo, standingRuling);
     if (!parsed) return { status: 'no-red-team-on-head', head };
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
@@ -149,7 +154,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     const round = sendPending ? io.readRound({ repo, pr, head }) : null;
     // The operator's audited grants raise the cap with the same grant-time anchor fix dispatch uses. The anchor counts
     // this head like `readRound` does when the thread shows its review before the grant (thread order, not clocks).
-    const grants = sendPending ? gateRoundGrants(view?.comments, pr, repo) : [];
+    const grants = sendPending ? gateRoundGrants(view?.comments, pr, repo, standingRuling) : [];
     const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at, g) => {
       const reviewed = Number.isInteger(headReviewIndex) && Number.isInteger(g?.index) && headReviewIndex < g.index;
       try { return io.readRoundAsOf?.({ repo, pr, at, head: reviewed ? head : null }) ?? null; } catch { return null; }
@@ -239,6 +244,8 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
       ...JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,labels'])),
       comments: readCompletePrComments(Number(pr), { repo }),
     }),
+    // Fresh per run on the App identity: a closed or edited ruling stops crediting automatic grants at the next run.
+    readGrantScope: ({ repo, pr, head, comments }) => standingRulingScope({ repo, pr: { number: Number(pr), headRefOid: head, comments } }),
     readSetting: () => readConfirmedBreaks({ env }),
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
     readRoundAsOf: ({ repo, pr, at, head }) => readReviewRoundAsOf({ repo, pr, at, head }),

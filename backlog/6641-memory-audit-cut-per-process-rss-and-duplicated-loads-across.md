@@ -96,7 +96,7 @@ Rules shared by every service:
 
 | Service | Owns | Replaces (who stops loading it) | Est. saving | Freshness / invalidation |
 |---|---|---|---|---|
-| Review run store service (first; ties to x5wqxb3) | Index of review-pr runs by repo/PR/head (id, completed, verdict, saved red-team proof ref), served from S1's index | review-job, review-extra-seats, red-team-gate-apply, review-set-label, advisory-label-sweep, drain-merge-strategy (review-daemon, drain) | 6–9 GB peak (largest duplicated load) | writeRun bumps generation and notifies; directory-watch backup; rebuild from disk on start |
+| Review run store service (first; ties to 6786) | Index of review-pr runs by repo/PR/head (id, completed, verdict, saved red-team proof ref), served from S1's index | review-job, review-extra-seats, red-team-gate-apply, review-set-label, advisory-label-sweep, drain-merge-strategy (review-daemon, drain) | 6–9 GB peak (largest duplicated load) | writeRun bumps generation and notifies; directory-watch backup; rebuild from disk on start |
 | Scorecard service | Scorecard rows indexed by repo/PR/rev/seat, plus seat-cap usage counts | 24 reader modules across review stack and daemons | 1–2 GB | appendScorecard notifies; mtime check on each answer |
 | PR store service (card xdk2pq6) | Open PRs: number, head sha, base, labels, mergeable, check rollup | Per-daemon `gh` list calls and the per-call gh-throttle Node processes | ~0.4–0.6 GB plus GitHub rate-limit relief | pr-events plus timer reconcile, per card xdk2pq6; holds still read live |
 | Backlog index service | Card number → path, title, status, scope, kind | Processes that scan we:backlog/ (about 6,500 cards) to find one card or a scope overlap | small today (reads are streamed), mostly CPU and IO | git HEAD change or file watch on we:backlog/ |
@@ -108,7 +108,7 @@ First slice is the review run store, because it is the biggest duplicated load: 
 
 - Memory-aware admission cap (in flight by another agent) owns S5, the concurrency bound.
 - Keep-alive leak fix (in flight by another agent) may explain part of the long-lived daemon RSS in S6.
-- x5wqxb3: review run store epic; S1 and the run store service should land under or alongside it.
+- 6786: review run store epic; S1 and the run store service should land under or alongside it.
 - xdk2pq6 (card 6520): host-wide PR store; the PR store service above IS that card.
 - 3608 / 3611: heavy-command usage sampling and capacity control.
 

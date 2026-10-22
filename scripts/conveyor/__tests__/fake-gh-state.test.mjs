@@ -76,6 +76,15 @@ function ghExecAsync(gh, args, cwd) {
 }
 
 describe('fake-gh generation 2 — stateful fake GitHub (#3383)', () => {
+  it('api user reports the same actor that posts comments', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-identity-');
+    const gh = makeGithub(originPath);
+    for (const actor of ['chalbert', 'automation[bot]']) {
+      const env = { ...process.env, ...gh.env, FAKE_GH_ACTOR: actor };
+      const identity = JSON.parse(execFileSync('gh', ['api', 'user'], { cwd: clonePath, encoding: 'utf8', env }));
+      expect(identity).toEqual({ login: actor, type: actor.includes('[bot]') ? 'Bot' : 'User' });
+    }
+  });
   it('open/list/view produce realistic GitHub shapes', () => {
     const { originPath, clonePath } = makeOrigin('fake-gh-open-');
     const gh = makeGithub(originPath);

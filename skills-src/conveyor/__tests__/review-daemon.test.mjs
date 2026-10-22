@@ -2333,6 +2333,18 @@ describe('operator-hold snapshots (card 5653)', () => {
     expect(OPERATOR_HOLD_KINDS).toHaveLength(4);
   });
 
+  // Live #5752: a failed referral persist with retries left resumes on its own; it waits on a person only once exhausted.
+  it('leaves out a referral persist failure that still has retries, and reports it once they are exhausted', () => {
+    const retrying = { persistenceFailed: true, exhausted: false, retryAt: 2_000 };
+    const exhausted = { persistenceFailed: true, exhausted: true, retryAt: null };
+    expect(operatorHoldsFromPlan({ refusals: [
+      { kind: 'review-referrals-pending', prNumber: 1, referralHold: retrying },
+      { kind: 'owed-ci-rerun', prNumber: 2, reviewRefusal: { kind: 'review-referrals-pending', referralHold: retrying } },
+      { kind: 'review-referrals-pending', prNumber: 3, referralHold: exhausted },
+      { kind: 'review-referrals-pending', prNumber: 4, referralHold: { persistenceFailed: false, exhausted: false, retryAt: null } },
+    ] })).toEqual([{ prNumber: 3, kind: 'review-referrals-pending' }, { prNumber: 4, kind: 'review-referrals-pending' }]);
+  });
+
   it('a successful tick carries the snapshot taken at plan completion, empty list included, without changing dispatch', () => {
     const plan = { dispatch: [], refusals: [{ kind: 'stood-down', prNumber: 5 }] };
     const out = runReviewTick({ ...base, repo: WE, reconcile: () => plan });

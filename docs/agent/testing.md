@@ -1760,6 +1760,78 @@ For each confirmed cause, name a prevention, rank by frequency and mark NEW or C
 coroner's existing held-card checks. Daily summaries carry cause/lens/seat/PR-type counts plus the
 separate shadow count and read completeness.
 
+### Build completion safeguards
+
+Builder, fixer and Codex briefs quote `reviewer-expectations.md` inside a data fence (it is derived
+from untrusted PR and CI text). The coroner proposes its concrete examples from recurring findings by PR. `scripts/settings/build.json` overrides the platform's `build` block:
+`finalGate` defaults to `full` (whole unit tier plus standards through heavy admission), with `related`
+and `none` escape settings; `selfReview.enabled` defaults true and `selfReview.maxRounds` defaults 2
+(0–10). `reviewerExpectations.enabled` defaults true. Sources use the shared policy-cascade formatter.
+Environment overrides are `WE_BUILD_FINAL_GATE`, `WE_BUILD_SELF_REVIEW_ENABLED`,
+`WE_BUILD_SELF_REVIEW_MAX_ROUNDS`, and `WE_BUILD_REVIEWER_EXPECTATIONS_ENABLED`.
+
+A green build gets one cheap correctness/security review of its net diff. Each repair resumes the
+original builder and re-runs the gate; at most `maxRounds` repairs occur, with a final observation
+and remaining notes carried into the PR body. The cheap self-check opens to independent review,
+never directly to acceptance. An unavailable review or red repair gate stops publication; neither is a clear verdict. Disabling self-review keeps the existing
+conveyor converge path; Codex skips the extra review. `finalGate=none` keeps Codex ungated and
+leaves conveyor's existing verification selection in place; `related` requests diff selection.
+Codex `--ephemeral` requires self-review disabled, since an ephemeral builder cannot be resumed.
+The self-review adapter accepts at most 512 KiB of UTF-8 diff text. An oversized diff skips the
+cheap review and repairs, then opens with an explicit incomplete-review note requiring human
+review of the full diff. It is never reported as clear. Unknown input and failed reviewers still
+stop publication. `build-safeguards.test.mjs` covers oversized ASCII and multibyte diffs, the exact
+byte boundary, and **rejects nonzero reviewer exit with clear findings** / **rejects timed-out
+reviewer with clear findings**. The unit gate includes these deterministic adapter tests.
+Codex repairs reuse the fresh run's routed model, effort, sandbox, cwd, writable roots, network and
+temporary-directory configuration. JSONL logs append across repairs; completion reports include
+all turns and the latest final message. **uses full by default and resumes the original builder
+within the cap** defends the production wiring, and **builds fresh and resumed argv with identical
+routed configuration and directory grants** pins configuration parity.
+
+The delivery wrapper's publication guarantees are defended where it publishes: **opens no PR and
+settles a failure when the self-review is unavailable** / **…when the repair gate is red**. A diff
+that overflows the bounded read gets the same incomplete-review note as an oversized one (**publishes
+the incomplete note when the net diff overflows the bounded read, and reads it hardened**). The
+builder can write its lane's git config, so every self-review diff read uses the shared lane pins
+(`lane-git-hardening.mjs`) with external diff drivers and textconv off (**never runs a
+builder-planted external diff, textconv or fsmonitor command**). A clean filter cannot be switched
+off, so Codex's worktree read refuses a checkout that defines one (**refuses a checkout that defines
+a filter driver before any worktree read runs it**). The reviewer verdict may be bare or in exactly
+one fenced block, with prose around either; anything else is invalid, including a second `findings`
+object outside the chosen fence (**rejects mixed fenced and unfenced verdicts** and its variants).
+Notes reach the PR body as a
+code block, with `<`, `>`, `@`, `#`, `GH-` and `://` swapped for look-alikes: no links, images,
+issue references, mentions or machine markers. A blank or malformed `WE_BUILD_*` value is unset and
+never turns a safeguard off (**%s=%j keeps the standard default**). With default settings a
+Claude-executed delivery self-reviews once instead of running converge and parks `review:pending`
+(**with default build settings, a Claude-executed delivery self-reviews once, skips converge and parks
+review:pending**). That park replaces only the label-on-green fallthrough: a label the escalation score
+asks for still wins (**with self-review on, %s parks at least as strictly as without it**), and an
+incomplete self-review parks `review:human`. Codex repair-turn failures and a red repair gate reject the
+build (**a real codexDirectTask rejects when %s**). A review run never self-reviews, resumes or gates itself (**a review run never
+self-reviews, resumes or gates itself**).
+
+`finalGate` changes the default of every `verify-lane.mjs` mode, including `request` and the
+dispatched verify child, so a lane's marker means the same gate however it was requested. Only
+`full` replaces the default selection; an explicit `--gate` always wins (**finalGate=%s runs the
+whole unit tier only when full**). The full gate is still the default gate: its clean green feeds the
+green ledger and the marker keeps the diff's changed files (**a default verify under finalGate=full
+records the green ledger and the changed files**). Codex resolves its gate from the same policy
+(**a real codexDirectTask with WE_BUILD_FINAL_GATE %s runs the policy gate**); `full` and `related`
+need `scripts/verify-lane.mjs`, so a sibling-repo `--dir` without it gets the named failed outcome
+`gate-unavailable` (**%s gate in a checkout without verify-lane is a named unavailable failure**),
+refused before any Codex spend (**refuses --gate=%s in a checkout without verify-lane before any Codex
+spend**), and must pass `--gate=standards` or `--gate=none`; a plateau-app worker brief does that
+itself. A dispatched verify child also recognizes a default gate the requester stamped under the
+other `finalGate` (**a child under finalGate=%2$s recognizes a default gate stamped under %1$s**). Briefs that append the checklist (fix, ci-heal, the dispatch
+tick, the delivery v2 brief and its resume prompts, Codex) do it through `appendBuildRequirements`,
+which appends it once and never to a brief that already has it (**brief composers carry the
+checklist exactly once**); `worker-brief.mjs` places it inside its own template. Codex callers opt out of self-review with
+`--no-self-review` (or `selfReview: false`). With `--json`, a completed run exits 0 and the report
+carries its result, so machine callers keep their contract; text mode exits 1 on a failed run or red
+gate.
+
 ### Review seat timing
 
 Review-pr run records retain `seatTimings` per attempt: seat, lens, provider, model,

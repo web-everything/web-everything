@@ -57,6 +57,14 @@ export const gitIn = cwd => (args, options = {}) => execFileSync('git', args, {
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
 });
 
+/**
+ * The seal worker WRITES to the PR (body, hold label, ready/undo), so it must play the worker App role. A read-only
+ * caller (health-watch is the `observer` role, and its auth setup exports WE_GITHUB_APP_ROLE=observer) would otherwise
+ * hand its role to the detached child through the inherited env, and every write fails "Resource not accessible by
+ * integration" forever (live 2026-10-21: #5790 stuck draft-withdrawn, #5794 stuck at record-sealed).
+ */
+export const sealJobEnv = (env = process.env) => ({ ...env, WE_GITHUB_APP_ROLE: 'worker' });
+
 /** A token prevents a finishing, expired producer from releasing its successor's lease. */
 export function acquireLease(path, owner, now, leaseMs, hook) {
   const lease = { owner, expiresAt: now + leaseMs, token: randomUUID() };

@@ -62,9 +62,12 @@ export function parseLiveJobs(psText, now = null) {
   const jobs = [];
   for (const line of String(psText ?? '').split('\n')) {
     const script = /\b(review-job|review-extra-seats|fix-run|ci-heal|deliver-item-run|red-team-gate-apply)\b[^\s]*\.mjs/.exec(line);
-    const pr = /--pr[= ](\d+)/.exec(line);
+    // Launchers can use the last duplicate flag. No ambiguous identity can prove activity for a PR.
+    const flags = [...line.matchAll(/(?:^|\s)--(pr|repo)(?==|\s|$)/g)].map((m) => m[1]);
+    if (flags.filter((f) => f === 'pr').length !== 1 || flags.filter((f) => f === 'repo').length > 1) continue;
+    const pr = /(?:^|\s)--pr(?:=|\s+)(\d+)(?=\s|$)/.exec(line);
     if (!script || !pr) continue;
-    const repo = /--repo[= ]([\w.-]+\/[\w.-]+)/.exec(line);
+    const repo = /(?:^|\s)--repo(?:=|\s+)([\w.-]+\/[\w.-]+)(?=\s|$)/.exec(line);
     const age = etimeSeconds(line.trim().split(/\s+/)[1]);
     jobs.push({ kind: script[1], pr: Number(pr[1]), repo: repo?.[1] ?? null, source: 'ps', ...(Number.isFinite(now) && age !== null ? { startedAt: now - age * 1000 } : {}) });
   }

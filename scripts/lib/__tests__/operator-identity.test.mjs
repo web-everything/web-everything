@@ -23,4 +23,18 @@ describe('operatorBoundComments', () => {
     expect(isHumanOperatorComment({ author: { login: 'chalbert[bot]' } })).toBe(false);
     expect(isHumanOperatorComment('text')).toBe(false);
   });
+  it.each([
+    ['an allowlisted is_bot author without a Bot type', { author: { login: 'chalbert', is_bot: true } }],
+    ['an allowlisted Bot author', { author: { login: 'chalbert', type: 'Bot' } }],
+    ['an allowlisted REST Bot user', { user: { login: 'chalbert', type: 'Bot' } }],
+    ['an allowlisted REST is_bot user without a Bot type', { user: { login: 'chalbert', is_bot: true } }],
+    ['a bot suffix', { author: { login: 'chalbert[bot]' } }],
+    ['a non-operator login', { author: { login: 'web-everything' } }],
+    ['a string without author metadata', 'text'],
+  ])('rejects %s', (_name, comment) => {
+    expect(isHumanOperatorComment(comment)).toBe(false);
+  });
+  it.each(['author', 'user'])('accepts an allowlisted human through %s', key => {
+    expect(isHumanOperatorComment({ [key]: { login: 'ChAlBeRt', type: 'User', is_bot: false } })).toBe(true);
+  });
 });
