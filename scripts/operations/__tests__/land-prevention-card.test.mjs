@@ -9,7 +9,11 @@
  * Every subprocess call is a scripted stub (`exec`) — no real `node`, `git`, `lane-pool.mjs` or `gh` runs
  * here, matching the no-fs/no-subprocess convention every sibling operation test already uses.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Exercise the enabled filer explicitly; the prototype's declared repo setting deliberately pauses it.
+beforeEach(() => vi.stubEnv('WE_PREVENTION_FILING_ENABLED', 'true'));
+afterEach(() => vi.unstubAllEnvs());
 import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { readRaisedBy, raisedByFile } from '../../lib/raised-by.mjs';
 import { tmpdir } from 'node:os';

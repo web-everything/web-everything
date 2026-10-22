@@ -1,10 +1,11 @@
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
+import { savedRedTeamFallback } from './lib/drain-saved-red-team.mjs';
 import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
-import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
+import { readReviewRunEvidence, readReviewRunHeads, REVIEW_RUN_STORE_MISSING } from './conveyor/review-referral-hold.mjs';
 /**
  * review-set-label.mjs — swap a PR's review label, INVARIANT-2 guarded (#2470, increment 2 of 2). Also the
  * SINGLE HOME of the shared review-label CLI harness (#2644): a PURE `decideSetLabel` decides the swap for a
@@ -121,6 +122,7 @@ import {
 // `runReviewLabelCli` for why that distinction is the whole point). Imported from the CLI that owns it, the same
 // way `we:scripts/fetch-parked.mjs` already does — it is the single home of the #2450 net-diff basis.
 import { readNetDiffAtHead } from './merge-ai-prs.mjs';
+import { computeClearanceCoverage, latestOperatorClearanceRecord } from './lib/approval-binding.mjs'; // 2026-10-21
 import { parseDelegationMarker } from './lib/delegation-marker.mjs';
 import { readStore } from './conveyor/run-scorecard-store.mjs';
 import { logDelegationTrial } from './conveyor/log-delegation-trial.mjs';
@@ -954,10 +956,11 @@ export function runApprovalPreventionFiling({
       // Where a landing job that fails after spawning posts its retraction (`fileApprovalPreventionCard`).
       retractTo: { repo, pr, headSha },
     });
-  if (!filed.ok) {
+  const owed = filed.step === 'paused' && filed.skipped === true;
+  if (!owed && (filed.skipped || !filed.ok)) {
     process.stderr.write(
       `review-set-label: approval-time prevention filing for ${subject} FAILED (the approval above already `
-      + `landed and is UNAFFECTED) — ${filed.error}\n`,
+      + `landed and is UNAFFECTED) — ${filed.error ?? filed.reason}\n`,
     );
     return;
   }
@@ -966,19 +969,19 @@ export function runApprovalPreventionFiling({
   // already reached this checkout); the ordinary path spawns a detached landing job (see
   // `fileApprovalPreventionCard`) and knows only that job's `pid:<n>` handle at comment-post time. Either
   // phrasing records a real, checkable fact — never a guess at a number that does not exist yet.
-  const landedDesc = filed.rel
+  const landedDesc = owed ? 'recorded, owed; filing paused and will resume automatically' : filed.rel
     ? `${filed.rel} (#${filed.num ?? '?'})`
     : `queued for landing via a lane (tracking ${filed.handle ?? 'an untracked job'})`;
   // The job marker lets a landing job that later FAILS retract exactly this marker (see
   // `buildApprovalPreventionJobMarker`), so the next approval on this head files again.
   const jobMarker = filed.session ? buildApprovalPreventionJobMarker(filed.session) : '';
-  const noteBody = `${marker}${jobMarker ? ` ${jobMarker}` : ''}\nFiled the prevention guard(s) owed by ${subject}'s independent review, `
+  const noteBody = `${marker}${jobMarker ? ` ${jobMarker}` : ''}\n${owed ? 'Recorded the prevention filing' : 'Filed the prevention guard(s)'} owed by ${subject}'s independent review, `
     + `mechanically, on approval (operator rule, 2026-09-27) — ${landedDesc}.`;
   try {
     provider.postComment(repo, pr, noteBody);
   } catch (e) {
     process.stderr.write(
-      `review-set-label: ${subject}'s approval-time prevention card ${filed.rel ?? filed.handle ?? filed.num} filed OK, but its `
+      `review-set-label: ${subject}'s approval-time prevention ${owed ? 'filing recorded as owed' : `card ${filed.rel ?? filed.handle ?? filed.num} filed OK`}, but its `
       + `marker comment failed to post (a LATER run may attempt to re-file) — ${ghErr(e, String(e))}\n`,
     );
   }
@@ -989,10 +992,10 @@ export function runApprovalPreventionFiling({
  * standing-ruling scope (PR #5758), so an automatic grant that reopened the send-back counts exactly as it does in the
  * gate: the fixer then owns the break and there is no ruling to clear. Unreadable scope = no automatic credit.
  */
-export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting, readGrantScope = standingRulingScope }) {
+export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting, readGrantScope = standingRulingScope, readSaved = null, clearanceCoverage = null }) {
   let standingRuling = null;
   try { standingRuling = readGrantScope({ repo, pr: { number: Number(pr), headRefOid: headSha, comments } }) ?? null; } catch { standingRuling = null; }
-  return redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels, comments }, setting, { repo, standingRuling }) !== null;
+  return redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels, comments }, setting, { repo, standingRuling, readSaved, clearanceCoverage }) !== null;
 }
 
 /**
@@ -1129,6 +1132,26 @@ export function runReviewLabelCli({
   const onlyIfArg = argv.find((a) => a.startsWith('--only-if='));
   const onlyIf = onlyIfArg === undefined ? null : onlyIfArg.slice('--only-if='.length);
   const expectNoReadiness = argv.includes('--expect-no-readiness');
+  // #5492 rebuild slice 2 (design v2 W1/W2) — the HEAD THE JUDGE JUDGED, its judgment boundary, and its run id. All
+  // optional and additive. `--judged-head` pins the row to that head: a CLEARING target refuses before any write when
+  // the live head differs (the judgment never covered the new head); a HOLDING target still swaps its label (a hold
+  // must apply), but its row names the judged head, never the live one. `--seen` / `--run-id` ride to the row as is.
+  const flagValue = (name) => { const a = argv.find((x) => x.startsWith(`--${name}=`)); return a === undefined ? null : a.slice(name.length + 3); };
+  // A malformed binding flag REFUSES a clearing target (before any write: no clear on a bad pin) but is DROPPED, with a
+  // warning, for a holding one — a hold must never be lost to bad metadata. The pin and the boundary go together: an
+  // unpinned row carries no `seen` (its head is the live one, so it must not answer anything).
+  const targetClears = verdictClears(verdictForLabelTarget(to));
+  const binding = (name, re, why) => {
+    const v = flagValue(name);
+    if (v === null || re.test(v)) return v;
+    if (targetClears) fail(`invalid --${name} — ${why}`);
+    process.stderr.write(`review-set-label: ignoring invalid --${name} on a holding verdict (the hold still applies)\n`);
+    return null;
+  };
+  const judgedHead = to === 'restamp' ? null : binding('judged-head', /^[0-9a-f]{40}$/, 'expected a full 40-hex lowercase SHA');
+  const seenArg = judgedHead === null ? null : binding('seen', /^(?:empty|\d{1,9}:[A-Za-z0-9:._-]{8,128})$/, 'expected "empty" or "<n>:<row id>"');
+  const runIdArg = binding('run-id', /^[A-Za-z0-9:._-]{1,128}$/, 'expected 1-128 id characters');
+  if (to === 'restamp' && flagValue('judged-head') !== null) fail('invalid --judged-head — a restamp judges nothing; use --expect-head');
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — validate every input BEFORE any gh call (fail closed).
   const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
@@ -1312,6 +1335,9 @@ export function runReviewLabelCli({
   }
 
   if ((guardedRestamp || pinnedAccept || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if (judgedHead !== null && headSha !== judgedHead && targetClears) {
+    fail('live head differs from --judged-head; nothing written (the judgment does not cover the new head)', 1);
+  }
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -1431,7 +1457,15 @@ export function runReviewLabelCli({
   };
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
-    && redTeamRulingHeld({ repo, pr, headSha, labels: currentLabels, comments: fullThread(), setting: readConfirmedBreaks().value, readGrantScope });
+    && ((thread) => redTeamRulingHeld({ repo, pr, headSha, labels: currentLabels, comments: thread, setting: readConfirmedBreaks().value, readGrantScope,
+      // The gate holds a break decided on saved evidence when its comment was withheld; the ruling clears that too.
+      readSaved: () => {
+        try { return savedRedTeamFallback({ repo, pr, head: headSha })(); }
+        catch (e) { return fail(`saved red-team evidence unreadable — nothing was changed: ${e.message}`, 1); }
+      },
+      // approval-binding: an earlier ruling still counts on a head git proves carries the same net change.
+      clearanceCoverage: (head) => computeClearanceCoverage({ comments: thread, liveHead: head, exec: execFileSyncThrottled,
+        reviews: () => provider.readPrReviews(repo, pr) }) }))(fullThread());
   let decision = decideSetLabel({
     to,
     currentLabels,
@@ -1566,6 +1600,28 @@ export function runReviewLabelCli({
       headDiff: diffScored ? normalizeDiffFingerprint(reviewedDiff) : null,
     });
     if (proofReadMissed && humanCarry.action === 'review-owed') humanCarry.retryable = true;
+    // approval-binding (2026-10-21): the record is not (or no longer) a carryable human clearance — a fresh plain accept
+    // stamped over it (#5485), or the drain's own numbering changed the fingerprint (#5742/#5530) — yet trusted git proves
+    // the operator's recorded clearance covers this head. Then the clearance carries. Never over a later verdict, a
+    // body-derived hold, unreadable reviews or a read miss: those stay the normal gates' (and the operator's) call.
+    if (diffScored && record && !record.laterVerdict && !record.laterBodyDerivedHold && !record.reviewsUnreadable
+      && !humanCarry.retryable && ['review-owed', 'carry'].includes(humanCarry.action) && !(humanCarry.action === 'carry' && humanCarry.human === true)
+      && latestOperatorClearanceRecord(thread.comments)) {
+      const head = String(headSha).toLowerCase();
+      // The COMPLETE thread and the formal reviews, always (a hold past comment 100 must not be crossed), re-judged on
+      // that same evidence: the accept record and the coverage both.
+      const full = readCarryEvidence();
+      const fullRecord = Array.isArray(full.comments) ? latestAcceptRecord(full.comments, full.reviews) : null;
+      const coverage = !fullRecord || fullRecord.laterVerdict || fullRecord.laterBodyDerivedHold || fullRecord.reviewsUnreadable
+        || !Array.isArray(full.reviews) ? { covers: false }
+        : computeClearanceCoverage({ comments: full.comments, liveHead: head, exec: execFileSyncThrottled, reviews: full.reviews,
+          readNetDiff: (sha) => (String(sha).toLowerCase() === head ? { text: reviewedDiff, scored: true, rev: head }
+            : readNetDiffAtHead({ exec: execFileSyncThrottled, headSha: sha, headRef: sha })) });
+      if (coverage.covers && coverage.clearance && coverage.liveHead === head && coverage.clearance.sha !== head) {
+        humanCarry = { action: 'carry', human: true, from: coverage.clearance.sha, to: head,
+          reason: `the operator clearance at ${coverage.clearance.sha.slice(0, 9)} covers the live head (approval-binding ${coverage.tier}: ${coverage.reason})` };
+      }
+    }
     // PR #4631 round 10 (self-review, crash between writes): a lift posts its record (a `cleared-human` comment naming the
     // LIVE head) before its label swap; a swap that then fails leaves the drain label under a clearance that already names
     // this exact head. That is not a refusal — the operator's verdict covers these bytes — so it lifts, provided nothing
@@ -1795,6 +1851,12 @@ export function runReviewLabelCli({
     try { live = provider.readPrState(repo, pr).headRefOid; } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (live !== expectedHead) fail('live head differs from --expect-head; nothing written', 1);
   }
+  // #5492 rebuild slice 2 (W1) — the same re-read for a clearing verdict pinned with --judged-head.
+  if (judgedHead !== null && targetClears) {
+    let live = null;
+    try { live = provider.readPrState(repo, pr).headRefOid; } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
+    if (live !== judgedHead) fail('live head differs from --judged-head; nothing written (the judgment does not cover the new head)', 1);
+  }
 
   const ledgerVerdict = verdictForLabelTarget(to);
   let clearingLedgerMiss = false;
@@ -1811,6 +1873,9 @@ export function runReviewLabelCli({
       // for the two proven defects (#3046 gap divergence, `#3052` heading divergence, both open under
       // `#3054`) that make this digest unfit to FIND a record by, and fine to STORE beside one.
       headSha,
+      judgedHead,
+      seen: seenArg,
+      runId: runIdArg,
       reviewedDiff: normalizeDiffFingerprint(reviewedDiff),
       reviewedContribution: normalizeContributionFingerprint(reviewedDiff),
       declaredActor: actor,
@@ -1839,6 +1904,9 @@ export function runReviewLabelCli({
           at: appended.record?.at ?? new Date().toISOString(),
           approval: approvalKind,
           delegation: approvalDelegation,
+          // Only a PINNED approval names a head: an unpinned one stays headless, and a headless approval answers nothing.
+          ...(judgedHead !== null ? { judgedHead } : {}),
+          ...(seenArg !== null ? { seen: seenArg } : {}),
           declaredActor: actor,
           session: clearerId,
           channel: normalizeChannel(channelArg),
@@ -2535,7 +2603,8 @@ export function referralEvidenceCarry({ runs = [], repo, pr, head, readNetDiff =
   const mine = (Array.isArray(runs) ? runs : []).filter(r => r && r.repo === repo && r.pr === Number(pr));
   if (mine.some(r => r.head === head)) return null;
   const prior = [...mine].sort((a, b) => b.completedAt - a.completedAt)[0];
-  if (!prior || prior.persistenceFailed || prior.parked || (prior.pending ?? []).length) return null;
+  // PR #5520 — a run under a chosen id (`custom`) never stands in as the clean review, here or on the head it reviewed.
+  if (!prior || prior.custom || prior.persistenceFailed || prior.parked || (prior.pending ?? []).length) return null;
   let before, after;
   try { before = readNetDiff(prior.head); after = readNetDiff(head); } catch { return null; }
   if (!before?.scored || !after?.scored) return null;
@@ -2555,13 +2624,19 @@ export function renderReferralCarryRecord(carry) {
 }
 
 export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable,
-  env = process.env, readRuns = readReviewRunEvidence, readNetDiff = readNetDiffAtSha, carry = true } = {}) {
+  env = process.env, readRuns = readReviewRunEvidence,
+  // An injected `readRuns` is its own run store: its runs carry `head` too, so it answers this read as well.
+  readRunHeads = readRuns === readReviewRunEvidence ? readReviewRunHeads : readRuns,
+  readNetDiff = readNetDiffAtSha, carry = true } = {}) {
   const context = referralLiveContext(state, { repo, pr, cardReadable,
     seatDisabled: seat => referralSeatDisabled(seat, env) });
   const result = mandatoryReferralState(state.comments, context);
   const head = state.headRefOid;
   const mine = r => r.repo === repo && r.pr === Number(pr) && r.head === head;
   const current = repo && pr ? result.records.filter(mine) : [];
+  // PR #5520 operator send-back — a run under a chosen `--run-id` is tagged `custom` (only the id `newRunId` mints is
+  // trusted). It is still this head's newest review when it is newest, so the lost-referral check below applies to
+  // it, but it never counts as the completed clean review that clears the hold.
   const last = repo && pr ? readRuns().filter(r => r.repo === repo && r.pr === Number(pr) && r.head === head)
     .sort((a, b) => b.completedAt - a.completedAt)[0] : undefined;
   // The newest review of this head failed to persist its referrals: only a record written at or after that
@@ -2582,7 +2657,7 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
   // Old heads' holds are not carried onto a new head — but only because that head's own review took their place.
   // With no record for this head, that review must be PROVEN complete and clean by a run record; the absence of a
   // failure marker is not evidence (the run store is local and can be missing, pruned or on another machine).
-  if (!current.length && !(last && !last.persistenceFailed && !last.parked && !last.pending.length)) {
+  if (!current.length && !(last && !last.custom && !last.persistenceFailed && !last.parked && !last.pending.length)) {
     const older = result.records.filter(r => r.head !== head && (!repo || !pr || (r.repo === repo && r.pr === Number(pr))));
     const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head, records: result.records, operatorRulings: result.operatorRulings }); return [...s.pending, ...s.blocked]; });
     if (held.length) {
@@ -2595,13 +2670,28 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
       // #4708 — a head move that changed nothing (the drain's rebase; strict net diff byte-identical) carries the
       // latest earlier head's completed CLEAN review as this head's evidence. Not a pass: that head's own verdict is
       // re-evaluated live (its records, rulings and persistence check), so a hold standing on it still refuses.
-      const carried = carry ? referralEvidenceCarry({ runs: readRuns(), repo, pr, head, readNetDiff }) : null;
+      // PR #5520 — `readRuns` holds only runs that finished `advise`. A run that reviewed this head and never finished
+      // (a failed publication effect, a crash) still reviewed it, so no carry may stand in for it.
+      // A missing store is not proof that nobody reviewed this head: it gets its own code, which no carry overrides.
+      let storeMissing = false;
+      const reviewed = Boolean(last) || (() => {
+        try { return readRunHeads().some(mine); }
+        catch (e) { if (e?.code !== REVIEW_RUN_STORE_MISSING) throw e; storeMissing = true; return false; }
+      })();
+      const carryRuns = carry && !reviewed && !storeMissing ? readRuns() : [];
+      const carried = carryRuns.length ? referralEvidenceCarry({ runs: carryRuns, repo, pr, head, readNetDiff }) : null;
       if (carried) {
         const verdict = assertMandatoryReferralsCleared({ ...state, headRefOid: carried.fromHead },
-          { repo, pr, cardReadable, env, readRuns, readNetDiff, carry: false });
+          { repo, pr, cardReadable, env, readRuns, readRunHeads, readNetDiff, carry: false });
         return { ...verdict, carry: carried };
       }
-      throw new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`);
+      // Numbering may supply evidence only for a head nobody reviewed. A parked, pending or
+      // unfinished run shares this message, but must never be overridden by that carry.
+      throw Object.assign(new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`), {
+        // A run may have appeared on the carry's fresh read after `last` was read.
+        code: storeMissing ? 'MANDATORY_REFERRAL_RUN_STORE_MISSING'
+          : reviewed || carryRuns.some(mine) ? 'MANDATORY_REFERRAL_UNFINISHED_REVIEW_RUN' : 'MANDATORY_REFERRAL_NO_REVIEW_RUN',
+      });
     }
   }
   if (result.pending.length || result.blocked.length) {

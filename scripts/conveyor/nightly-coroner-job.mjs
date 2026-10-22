@@ -20,7 +20,7 @@ import { prSweepTickAllowed } from './pr-sweep-job.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const clocks = new Map();
-export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 3, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3, runTimeoutMin: 30 });
+export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 1, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3, runTimeoutMin: 30 });
 const positiveInt = (v) => Number.isSafeInteger(v) && v > 0;
 const validTime = (v) => typeof v === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(v);
 export function resolveNightlyCoronerSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
@@ -34,7 +34,7 @@ export function resolveNightlyCoronerSettings({ config = {}, env = process.env, 
   if (enabled !== undefined) envValues.enabled = ['1', 'true'].includes(enabled) ? true : ['0', 'false'].includes(enabled) ? false : enabled;
   const out = cascadePolicy('coroner.nightly', { ...tool, ...config.coroner?.nightly }, {
     standard: NIGHTLY_DEFAULTS, platform: platform.prefs.coroner?.nightly ?? {}, envValues,
-    valid: { enabled: (v) => typeof v === 'boolean', at: validTime, laneWaitMs: positiveInt, attempts: positiveInt, retryBackoffMin: positiveInt, deadlineEt: validTime, alertAfterProbeFailures: positiveInt, runTimeoutMin: positiveInt }, env,
+    valid: { enabled: (v) => typeof v === 'boolean', at: validTime, laneWaitMs: positiveInt, attempts: v => positiveInt(v) && v <= NIGHTLY_DEFAULTS.attempts, retryBackoffMin: positiveInt, deadlineEt: validTime, alertAfterProbeFailures: positiveInt, runTimeoutMin: positiveInt }, env,
   });
   log(formatCascadeSourcesLine('coroner.nightly', out));
   return { ...out, errors: [...errors, ...platform.errors, ...out.invalid] };
@@ -103,10 +103,17 @@ export async function runNightlyCoronerJob({ now, config, settings, dir, env = p
   evict = evictToTrash, codeSha, snapshot, log = console.error, warmGate = {}, statusFeed = feedPath(),
   sweepLanes = (session) => sweepCoronerLeases(ROOT, sourceRoot, session) } = {}) {
   config = { ...NIGHTLY_DEFAULTS, ...config };
+  if (!positiveInt(config.attempts) || config.attempts > NIGHTLY_DEFAULTS.attempts) config.attempts = NIGHTLY_DEFAULTS.attempts;
   mkdirSync(store.dir, { recursive: true });
   const { records, corrupt = [] } = store.list();
   if (corrupt.length) throw new Error(`nightly-coroner: corrupt job records: ${corrupt.join(', ')}`);
   const mine = records.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind);
+  // Persisted jobs from an earlier configuration must not retain a larger retry allowance.
+  for (const record of mine) {
+    if (record.job.maxAttempts !== NIGHTLY_DEFAULTS.attempts) store.update(record.id, current => ({
+      ...current, job: { ...current.job, maxAttempts: NIGHTLY_DEFAULTS.attempts },
+    }));
+  }
   const night = coronerNightDue(now, config);
   const id = night && `nightly-coroner-${night}`;
   let enqueued = null;
@@ -145,12 +152,11 @@ export async function runNightlyCoronerJob({ now, config, settings, dir, env = p
   const current = store.list().records;
   try { evict({ jobsDir: store.dir, referenced: current.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys ?? []) }); }
   catch (e) { log(`nightly-coroner eviction: ${e.message}`); }
-  // Every failed night gets its one feed event, stamped on its record so it is never re-sent — including a night that
-  // a restart past the next boundary fails, which is no longer current. Only the currently due night, or a past-deadline
-  // record still not settled (a stop that failed wedges it and blocks every later night's enqueue), owns an active alert;
-  // advancing to the next night closes a settled night's health episode without deleting its record or feed event.
-  const failed = current.filter((r) => r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind && r.job.status !== 'succeeded' &&
-    (r.job.status === 'failed' || now >= coronerDeadline(r.input.night, r.input.nightly?.deadlineEt ?? config.deadlineEt)))
+  // Every failed record stays visible until it succeeds, including earlier nights and other kinds.
+  // Only nightly records use the ET deadline. Feed publication is stamped once per record.
+  const failed = current.filter((r) => r.job.status === 'failed' ||
+    (r.job.kind === HEALTH_NIGHTLY_CORONER_KIND.kind && r.job.status !== 'succeeded' &&
+      now >= coronerDeadline(r.input.night, r.input.nightly?.deadlineEt ?? config.deadlineEt)))
     .map((r) => ({ record: r, failure: { id: r.id, error: r.job.error ?? 'not completed', attempts: r.job.attempts, maxAttempts: r.job.maxAttempts,
       reason: r.job.status === 'failed' ? 'attempts exhausted or launch failed' : 'ET deadline missed' } }));
   for (const { record, failure } of failed.filter(({ record: r }) => !r.failurePublishedAt)) {
@@ -160,8 +166,7 @@ export async function runNightlyCoronerJob({ now, config, settings, dir, env = p
     try { store.update(record.id, (f) => (f.failurePublishedAt ? null : { ...f, failurePublishedAt: new Date().toISOString() })); }
     catch (e) { log(`nightly-coroner failure stamp (${record.id}): ${e.message}`); }
   }
-  const failures = failed.filter(({ record: r }) => r.input.night === night || !TERMINAL_JOB_STATUSES.includes(r.job.status))
-    .map(({ failure }) => failure);
+  const failures = failed.map(({ failure }) => failure);
   // Retain the small daily records as the durable once-per-night ledger, independent of health state.json.
   return { enqueued, alerts: failures, failures: failures.map((r) => `${r.id}: ${r.error}; ${r.attempts}/${r.maxAttempts} attempts; ${r.reason}`) };
 }

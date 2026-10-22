@@ -167,6 +167,15 @@ describe('operator ruling at the round cap', () => {
       accept('f'.repeat(40)), restamp(head), carry({ findings: broken, gates: ['round-cap'] })];
     expect(hold({ comments })).toBeNull();
   });
+  it('a superseded ruling stays superseded when a bot restamp carries it to a new head', () => {
+    const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true), accept(prior)];
+    expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
+  });
+  it('an abbreviated reviewed-sha plain accept also keeps a superseded ruling superseded', () => {
+    const abbrev = { ...bot, body: ['\u2705 review \u2014 accepted', '', buildReviewedShaMarker(prior.slice(0, 7))].join('\n') };
+    const ruledOnPrior = [clean(prior, 'web-everything', broken), gate(prior, 'round-cap'), accept(prior, true), abbrev];
+    expect(hold({ comments: [...ruledOnPrior, restamp(head), carry({ findings: broken, gates: ['round-cap'] })] })).toMatch(/requiring send-back/);
+  });
   it('a ruling survives a chain of carries (H0 → H1 → head)', () => {
     const h0 = 'e'.repeat(40);
     const ruledOnH0 = [clean(h0, 'web-everything', broken), gate(h0, 'round-cap'), accept(h0, true)];
@@ -304,11 +313,38 @@ describe('durable head-bound red-team admission', () => {
   it('exempts a card-only head only while the producer skips it; a started pass is always awaited', () => {
     const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: { netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
     expect(hold({ loopPayload })).toBeNull();
+    expect(hold({ loopPayload, attempted: true, scheduled: false })).toBeNull();
+    expect(hold({ loopPayload, attempted: true, skipCardOnly: false })).toMatch(/no recorded result/);
+    expect(hold({ loopPayload, attempted: true, inFlight: true })).toMatch(/no recorded result/);
+    expect(hold({ loopPayload, attempted: true, recorded: true })).toMatch(/no recorded result/);
+    expect(hold({ attempted: true, scheduled: false })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' } })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, inFlight: true })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, scheduled: false, inFlight: true })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, scheduled: false, recorded: true })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [clean()] })).toBeNull();
+  });
+});
+
+describe('panel-seat red-team admission', () => {
+  it.each([
+    ['card-only head', true, {}, {}, false],
+    ['scheduled card-only head', true, { scheduled: true }, {}, false],
+    ['attempted card-only head', true, { attempted: true }, {}, false],
+    ['producer skips cards despite caller setting', true, { skipCardOnly: true, attempted: true }, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, false],
+    ['producer requires cards despite caller setting', true, { skipCardOnly: false }, { WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, true],
+    ['caller requires cards', true, {}, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, true],
+    ['in-flight card-only head', true, { skipCardOnly: true, inFlight: true }, {}, true],
+    ['recorded card-only head', true, { skipCardOnly: true, recorded: true }, {}, true],
+    ['non-card head without scheduling evidence', false, {}, {}, true],
+    ['attempted non-card head', false, { attempted: true }, {}, true],
+  ])('%s', (_name, cardOnly, evidence, settings, owed) => {
+    const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: {
+      netBasis: { rev: head }, netChangedFiles: [cardOnly ? 'backlog/123-card.md' : 'scripts/lib/drain-queue-safety.mjs'], netRenameSources: [],
+    } } };
+    const result = hold({ loopPayload, scheduled: false, ...evidence, env: { WE_RED_TEAM_TIMING: 'panel-seat', ...settings } });
+    if (owed) expect(result).toMatch(/no recorded result/);
+    else expect(result).toBeNull();
   });
 });
 
@@ -319,10 +355,17 @@ describe('drain policy cascade', () => {
     expect(r.value).toMatchObject({ waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true });
     expect(r.sources).toMatchObject({ waitForRedTeamBeforeEnqueue: 'standard', dequeueOnSendBack: 'standard' });
     expect(lines.join('')).toContain('dequeueOnSendBack=true (standard)');
-    expect(r.value).toMatchObject({ redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45, enqueueWhenRedTeamNeverScheduled: true });
-    expect(lines.join('')).toContain('enqueueWhenRedTeamNeverScheduled=true (standard)');
+    expect(r.value).toMatchObject({ redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 });
+    // Retired: no standard value lets a deadline enqueue an owed head without a red-team result.
+    expect(r.value.enqueueWhenRedTeamNeverScheduled).toBeUndefined();
+    expect(lines.join('')).not.toContain('enqueueWhenRedTeamNeverScheduled');
     expect(lines.join('')).toContain('redTeamPendingBackoffSec=300 (standard)');
     expect(lines.join('')).toContain('redTeamPendingMaxMin=45 (standard)');
+  });
+  it('names a leftover enqueueWhenRedTeamNeverScheduled (env or setting) as retired and ignored', () => {
+    const lines = [];
+    readDrainQueueSafety({ env: { WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED: 'true' }, tool: { enqueueWhenRedTeamNeverScheduled: true }, platform: {}, log: l => lines.push(l) });
+    expect(lines.join('')).toContain('env WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED and drain.enqueueWhenRedTeamNeverScheduled setting is retired and ignored');
   });
   it('resolves pending timing and provenance independently, rejecting invalid timings', () => {
     const r = readDrainQueueSafety({ env: { WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC: '600', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: 'NaN' },
@@ -384,5 +427,55 @@ describe('confirmed dequeue', () => {
   it('recognizes ready removal and leaves ready accepted PRs alone', () => {
     expect(sendBackReason([])).toContain('ready-to-merge');
     expect(sendBackReason(['review:accepted', 'ready-to-merge'])).toBeNull();
+  });
+});
+
+// A requested pass holds even when the scheduler has never written a live-head status.
+it('an old-head break does not count for the live head and the PR stays held pending', () => {
+  expect(hold({ scheduled: false, requestPending: true, comments: [clean(prior, 'web-everything', broken)] }))
+    .toMatch(/no recorded result on the live head/);
+});
+it('a break recorded on the live head still requires send-back', () => {
+  expect(hold({ scheduled: false, requestPending: true, comments: [clean(head, 'web-everything', broken)] }))
+    .toMatch(/requiring send-back/);
+});
+
+describe('queue file overlap card policy', () => {
+  it('defaults true with standard source and logs it', () => {
+    const lines = [];
+    const r = readDrainQueueSafety({ env: {}, tool: {}, platform: {}, log: l => lines.push(l) });
+    expect(r.value.queueFileOverlapIncludesCards).toBe(true);
+    expect(r.sources.queueFileOverlapIncludesCards).toBe('standard');
+    expect(lines.join('')).toContain('queueFileOverlapIncludesCards=true (standard)');
+  });
+  it('uses the existing cascade and boolean env override', () => {
+    const input = { platform: { queueFileOverlapIncludesCards: false }, tool: { queueFileOverlapIncludesCards: true } };
+    expect(readDrainQueueSafety({ ...input, env: {} }).sources.queueFileOverlapIncludesCards).toBe('tool');
+    const r = readDrainQueueSafety({ ...input, env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'off' } });
+    expect(r.value.queueFileOverlapIncludesCards).toBe(false);
+    expect(r.sources.queueFileOverlapIncludesCards).toBe('env');
+    const invalid = readDrainQueueSafety({ env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'typo' }, tool: { queueFileOverlapIncludesCards: 'false' }, platform: {} });
+    expect(invalid.value.queueFileOverlapIncludesCards).toBe(true);
+    expect(invalid.invalid).toHaveLength(2);
+  });
+});
+
+
+describe('card-only restamped head without a review run', () => {
+  it('exempts verified card files even with a pending request', () => {
+    expect(hold({ loopPayload: null, requestPending: true, realFilesCardOnly: true })).toBeNull();
+    expect(hold({ loopPayload: null, requestPending: true, realFilesCardOnly: false })).toMatch(/no recorded result/);
+    expect(hold({ loopPayload: { findings: { read: { netBasis: { rev: prior } } } }, requestPending: true, realFilesCardOnly: true })).toBeNull();
+  });
+  it.each(['recorded', 'inFlight', 'attempted', 'queued'])('preserves %s work', flag => {
+    expect(hold({ loopPayload: null, requestPending: true, realFilesCardOnly: true, [flag]: true })).toMatch(/no recorded result/);
+  });
+  it('preserves a review for this head, including uppercase revisions', () => {
+    expect(hold({ loopPayload: { findings: { read: { netBasis: { rev: head.toUpperCase() } } } },
+      requestPending: true, realFilesCardOnly: true })).toMatch(/no recorded result/);
+  });
+  it('preserves a recorded send-back before applying the exemption', () => {
+    expect(hold({ loopPayload: null, requestPending: true, realFilesCardOnly: true,
+      comments: [clean(head, 'web-everything', broken), gate(head, 'sent-back')] })).toMatch(/requiring send-back/);
   });
 });

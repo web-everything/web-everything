@@ -45,6 +45,10 @@ describe('head-bound red-team operator labels', () => {
     const loopPayload = { findings: { read: { netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
     const plan = (env, evidence) => planRedTeamStatusLabels({ ...input, labels: [], comments: [], env, evidence: { loopPayload, ...evidence } }).add;
     expect(plan({}, { scheduled: true })).toBeNull();
+    expect(plan({}, { scheduled: true, attempted: true })).toBeNull();
+    expect(plan({}, { attempted: true, skipCardOnly: false })).toBe('red-team:pending');
+    expect(plan({}, { attempted: true, recorded: true })).toBe('red-team:pending');
+    expect(planRedTeamStatusLabels({ ...input, comments: [], evidence: { attempted: true } }).add).toBe('red-team:pending');
     expect(plan({ WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, { scheduled: true })).toBe('red-team:pending');
     expect(plan({}, { scheduled: true, inFlight: true })).toBe('red-team:pending');
   });

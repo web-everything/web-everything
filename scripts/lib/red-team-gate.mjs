@@ -29,7 +29,8 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { isHumanOperatorComment } from './operator-identity.mjs';
 
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
-import { parseLatestHumanClearedSha, REVIEWED_SHA_MARKER } from './review-escalation.mjs';
+import { parseLatestHumanClearedSha, REVIEWED_SHA_MARKER, clearanceBindsHead } from './review-escalation.mjs';
+import { scrubPublish } from './secret-scrub.mjs';
 import { commentCreatedAt, roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
 
 // ── The comment the producer writes ─────────────────────────────────────────────────────────────────────────────
@@ -144,6 +145,25 @@ export function readConfirmedBreaks({ env = process.env, path = RED_TEAM_SETTING
   return resolveConfirmedBreaks({ file, env });
 }
 
+/**
+ * redTeam.timing: panel-seat (standard prototype default) runs on every reviewed head
+ * beside the jurors; post-accept restores the sequential accept-only path.
+ * Standard < platform < tool < WE_RED_TEAM_TIMING; invalid values keep the lower layer.
+ */
+export function resolveRedTeamTiming({ file = {}, platform, env = {} } = {}) {
+  const pick = o => o?.timing === undefined ? {} : { timing: o.timing };
+  return resolveCascade({ standard: { timing: 'panel-seat' }, platform: pick(platform),
+    tool: pick(file?.redTeam), envValues: { timing: env.WE_RED_TEAM_TIMING },
+    valid: v => ['panel-seat', 'post-accept'].includes(v) });
+}
+export function readRedTeamTiming({ env = process.env, path = RED_TEAM_SETTINGS_FILE, log = () => {} } = {}) {
+  let file = {};
+  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
+  const resolved = resolveRedTeamTiming({ file, platform: platformPreference('redTeam', { env }), env });
+  log(formatCascadeSourcesLine('redTeam', resolved));
+  return resolved;
+}
+
 /** Repo-reading and card-only controls share the standard/platform/tool/env cascade. */
 export const RED_TEAM_PROBE_DEFAULTS = Object.freeze({ recheckReadsRepo: true, skipCardOnly: true, statusLabels: true });
 export const RED_TEAM_PROBE_ENV = Object.freeze({
@@ -165,6 +185,73 @@ export function readRedTeamProbes({ env = process.env, path = RED_TEAM_SETTINGS_
   let file = {};
   try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
   const resolved = resolveRedTeamProbes({ file, platform: platformPreference('redTeam', { env }), env });
+  log(formatCascadeSourcesLine('redTeam', resolved));
+  return resolved;
+}
+
+/**
+ * `redTeam.operatorRulings.anyState` (default true; kill switch env {@link OPERATOR_RULINGS_ENV}=false): may an
+ * OPERATOR ruling (`record-red-team-ruling`, a human operator account) rule on a confirmed break in ANY state of the
+ * live result (at the round cap, sent back, or carded)? Off restores the round-cap-only rule: the CLI refuses a
+ * result not parked at the cap, and this reader lets an operator release override only what the gate handed over,
+ * never a recorded send-back. Automation never gets this: an operator release counts only from a human operator. */
+/* `redTeam.operatorRulings.carryAcrossRebase` (default true; kill switch env {@link OPERATOR_RULINGS_CARRY_ENV}=false):
+ * an operator RELEASE (card / not-real) made on head A still counts on head B only across a trusted verdict carry
+ * (identical net patch, review-job carryAcrossRebase) AND a trusted `we:red-team-carry-lines` record proving the
+ * break's cited line is byte-identical on A and B ({@link redTeamCarryLinesMarker}). Off: no operator release ever
+ * carries; the new head is re-ruled. Restrictive records (send-back, held, operator-block) always carry. */
+export const OPERATOR_RULINGS_DEFAULTS = Object.freeze({ anyState: true, carryAcrossRebase: true });
+export const OPERATOR_RULINGS_ENV = 'WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE';
+export const OPERATOR_RULINGS_CARRY_ENV = 'WE_RED_TEAM_OPERATOR_RULINGS_CARRY';
+const envBool = (raw) => {
+  const v = raw === undefined || raw === '' ? undefined : String(raw).trim().toLowerCase();
+  return v === undefined ? undefined : ['true', 'on', '1'].includes(v) ? true : ['false', 'off', '0'].includes(v) ? false : raw;
+};
+export function resolveOperatorRulings({ file = {}, platform, env = {} } = {}) {
+  const pick = (o) => Object.fromEntries(Object.keys(OPERATOR_RULINGS_DEFAULTS)
+    .filter((k) => o?.operatorRulings?.[k] !== undefined).map((k) => [k, o.operatorRulings[k]]));
+  return resolveCascade({ standard: OPERATOR_RULINGS_DEFAULTS, platform: pick(platform), tool: pick(file?.redTeam),
+    envValues: { anyState: envBool(env[OPERATOR_RULINGS_ENV]), carryAcrossRebase: envBool(env[OPERATOR_RULINGS_CARRY_ENV]) },
+    valid: (x) => typeof x === 'boolean' });
+}
+export function readOperatorRulings({ env = process.env, path = RED_TEAM_SETTINGS_FILE, log = () => {} } = {}) {
+  let file = {};
+  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
+  let platform;
+  try { platform = platformPreference('redTeam', { env }); } catch { platform = undefined; }
+  const resolved = resolveOperatorRulings({ file, platform, env });
+  log(formatCascadeSourcesLine('redTeam.operatorRulings', resolved));
+  return resolved;
+}
+
+/**
+ * What the drain does when an owed post-accept red team has no result on the live head at its wait deadline
+ * (`drain.redTeamPendingMaxMin`). Every value HOLDS the PR: `hold` publishes the operator note; `requeue-then-hold`
+ * (standard) first re-requests the red team once for that head, and holds with the note if that also produces no
+ * result. No file or platform value can restore merge-without-result: `merge-without-result` is accepted ONLY from the
+ * operator's own env (`WE_RED_TEAM_DEADLINE_ACTION`) together with a named `WE_RED_TEAM_DEADLINE_OVERRIDE_BY`, and the
+ * drain logs it as an operator override on every use. Anywhere else it is invalid and the lower layer stands.
+ */
+export const RED_TEAM_DEADLINE_ACTIONS = Object.freeze(['hold', 'requeue-then-hold']);
+export const RED_TEAM_DEADLINE_OVERRIDE = 'merge-without-result';
+export const RED_TEAM_DEADLINE_ENV = 'WE_RED_TEAM_DEADLINE_ACTION';
+export const RED_TEAM_DEADLINE_OVERRIDE_BY_ENV = 'WE_RED_TEAM_DEADLINE_OVERRIDE_BY';
+export function resolveRedTeamDeadlineAction({ file = {}, platform, env = {} } = {}) {
+  const raw = env[RED_TEAM_DEADLINE_ENV];
+  const envAction = raw === undefined || raw === '' ? undefined : String(raw).trim().toLowerCase();
+  const overrideBy = String(env[RED_TEAM_DEADLINE_OVERRIDE_BY_ENV] ?? '').trim().slice(0, 100);
+  const operatorOverride = envAction === RED_TEAM_DEADLINE_OVERRIDE && overrideBy !== '';
+  const pick = o => (o?.deadlineAction === undefined ? {} : { deadlineAction: o.deadlineAction });
+  const resolved = resolveCascade({ standard: { deadlineAction: 'requeue-then-hold' }, platform: pick(platform), tool: pick(file?.redTeam),
+    envValues: { deadlineAction: operatorOverride ? undefined : envAction }, valid: v => RED_TEAM_DEADLINE_ACTIONS.includes(v) });
+  if (!operatorOverride) return { ...resolved, operatorOverride: null };
+  return { ...resolved, value: { deadlineAction: RED_TEAM_DEADLINE_OVERRIDE }, sources: { deadlineAction: 'env' },
+    leafValues: { deadlineAction: RED_TEAM_DEADLINE_OVERRIDE }, operatorOverride: { by: overrideBy } };
+}
+export function readRedTeamDeadlineAction({ env = process.env, path = RED_TEAM_SETTINGS_FILE, log = () => {} } = {}) {
+  let file = {};
+  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
+  const resolved = resolveRedTeamDeadlineAction({ file, platform: platformPreference('redTeam', { env }), env });
   log(formatCascadeSourcesLine('redTeam', resolved));
   return resolved;
 }
@@ -199,8 +286,8 @@ export const RED_TEAM_GATE_MARKER = '<!-- we:red-team-gate';
 /**
  * What the gate records per head, one comment per ACTION so a failed action stays retryable on its own:
  * the send-back step records `sent-back`, or `round-cap` (the cap is reached or the round could not be read; the
- * operator rules instead); the card step records `card-queued`, and only after the landing job was really spawned
- * (a spawn is all the shared seam reports: whether the detached job later lands the card is that job's own concern).
+ * operator rules instead); the card step records `card-queued` after a durable owed filing or a spawned landing job
+ * (for a spawn, the shared seam reports only that it started; the detached job owns the later landing).
  * `no-send-back` is only ever a RESULT label (nothing to send back); it is never recorded.
  */
 export const GATE_OUTCOMES = Object.freeze({ SENT_BACK: 'sent-back', ROUND_CAP: 'round-cap', NOTHING_TO_SEND: 'no-send-back', CARD_QUEUED: 'card-queued' });
@@ -349,13 +436,37 @@ export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { re
 }
 
 
-/** Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE. */
-export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { repo = pr?.repo ?? null, standingRuling = pr?.standingRuling ?? null } = {}) {
-  const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, repo, standingRuling });
-  if (!disposition.held.length) return null;
+/**
+ * Saved (never-posted) findings publish only if every raw field, the extra composed outputs, and their NFKC forms pass
+ * the secret scrub; otherwise ALL their text is withheld, keeping index, confirmation and class. PURE.
+ */
+export const WITHHELD_FINDING_SUMMARY = '[finding text withheld: failed the secret scrub]';
+export function withholdUnpublishableFindings(findings, composed = []) {
+  const texts = [findings.flatMap(f => Object.values(f)).join('\n'), ...composed].map(String);
+  if (!texts.some(t => scrubPublish(t).length || scrubPublish(t.normalize('NFKC')).length)) return findings;
+  return findings.map(f => ({ index: f.index, confirmed: f.confirmed, impact: breakClass(f), category: 'withheld',
+    file: null, line: null, summary: WITHHELD_FINDING_SUMMARY }));
+}
+
+/**
+ * Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE apart from
+ * `readSaved`: when the thread holds no live-head result, the gate may have decided on saved evidence (its comment was
+ * withheld), so the caller's lazy saved-result reader is asked, exactly as the gate and the drain hold ask it.
+ */
+export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { readSaved = null, repo = pr?.repo ?? null, standingRuling = pr?.standingRuling ?? null, clearanceCoverage = null } = {}) {
   const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
   if (labels.includes('review:changes')) return null;
-  return { head: disposition.result.rev, since: disposition.since, findings: disposition.held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
+  const read = savedResult => readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, savedResult, repo, standingRuling, clearanceCoverage });
+  let disposition = read(null);
+  // A held break needs a trusted gate record on this head, so a thread without one never pays for the store read.
+  const savedResult = !disposition.result && readSaved && gateOutcomesForHead(pr?.comments, pr?.number, pr?.headRefOid).size
+    ? readSaved() : null;
+  if (savedResult) disposition = read(savedResult);
+  if (!disposition.held.length) return null;
+  // Same rule as the gate: one unpublishable finding withholds every finding's text.
+  const held = savedResult ? withholdUnpublishableFindings(disposition.held,
+    [disposition.result.findings.flatMap(f => Object.values(f)).join('\n')]) : disposition.held;
+  return { head: disposition.result.rev, since: disposition.since, findings: held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
 }
 
 const CARRIED_LINE_RE = /^<!-- review-verdict-carried from=[0-9a-f]{40} to=[0-9a-f]{40} patch-id=[0-9a-f]{40} -->$/;
@@ -394,19 +505,31 @@ const recordBody = r => String((typeof r.c === 'string' ? r.c : r.c?.body) ?? ''
 /** Thread order: creation time, then thread position. A record without a time takes the time of the record before it,
  * so the key is total (a sort never meets a contradiction). PURE. */
 const threadOrder = (a, b) => a.ts - b.ts || a.i - b.i;
-const indexedRecords = comments => {
+/** A comment's creation time in either read shape: GraphQL/`gh pr view` (`createdAt`) or the REST thread the drain reads (`created_at`). */
+export const commentTime = c => Date.parse(c?.createdAt ?? c?.created_at);
+const indexedRecords = (comments, savedResult = null) => {
   let ts = 0;
-  return threadRecords(comments).map((r, i) => {
-    const t = Date.parse(commentCreatedAt(r.c)); // GraphQL `createdAt` or raw REST `created_at` (the drain's read)
+  const records = threadRecords(comments).map((r, i) => {
+    const t = commentTime(r.c);
     if (Number.isFinite(t)) ts = t;
     return { ...r, i, ts };
   });
+  if (savedResult) {
+    const savedAt = Date.parse(savedResult.scoredAt);
+    const times = records.map(r => commentTime(r.c));
+    const ordered = Number.isFinite(savedAt) && times.every((t, i) => Number.isFinite(t) && (!i || t >= times[i - 1]));
+    // Internal evidence is not a posted comment. Unknown chronology cannot establish a later operator ruling
+    // or bind a legacy marker; an explicit result id can still dedup the gate's own action.
+    const at = ordered ? records.reduce((at, r, i) => times[i] <= savedAt ? r.at : at, -1) + 0.5 : Infinity;
+    records.push({ c: null, at, i: at, ts: ordered ? savedAt : Infinity, parsed: savedResult, saved: true });
+  }
+  return records;
 };
 
 /** The newest trusted red-team result for this PR and head among the records, or null. PURE. */
 function latestResult(records, pr, sha) {
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;
-  return records.map(r => ({ ...r, parsed: parseRedTeamComment(recordBody(r)) }))
+  return records.map(r => ({ ...r, parsed: r.parsed ?? parseRedTeamComment(recordBody(r)) }))
     .filter(r => r.parsed?.pr === Number(pr) && r.parsed.rev === sha).sort(threadOrder).at(-1) ?? null;
 }
 
@@ -431,9 +554,9 @@ function gateRecordsFor(records, pr, sha, hit) {
  * The live head's latest red-team result (carried ones included) and the outcomes the gate recorded for THAT result.
  * The gate dedups on this, so a record for an earlier same-head result never stops it deciding a newer one. PURE.
  */
-export function liveResultGateState(comments, pr, head, repo = null, standingRuling = null) {
+export function liveResultGateState(comments, pr, head, repo = null, standingRuling = null, savedResult = null) {
   const live = String(head ?? '').toLowerCase();
-  const records = indexedRecords(comments);
+  const records = indexedRecords(comments, savedResult);
   const hit = latestResult(records, pr, live);
   if (!hit) return { result: null, resultId: null, headReviewIndex: null, outcomes: new Set(), sendBackOutcome: null, reopened: false };
   const gates = gateRecordsFor(records, pr, live, hit);
@@ -458,6 +581,9 @@ function firstReviewIndex(records, pr, head) {
   return first ? first.at : null;
 }
 
+/** Every `reviewed-sha` marker in a body, lowercased (the marker supports 7-40 hex chars, so callers match by prefix). PURE. */
+const reviewedShaPrefixes = body => [...String(body ?? '').matchAll(REVIEWED_SHA_ANY_RE)].map(m => m[1].toLowerCase());
+
 /**
  * Did the operator rule on the head's confirmed breaks? The gate handed THIS result over (a `round-cap` record that
  * decides it), and a trusted clear-human ceremony for that head came after the result and every send-back/cap record.
@@ -465,12 +591,24 @@ function firstReviewIndex(records, pr, head) {
  * head. A carried result defers to the ruling on the head it was carried from, read from the thread before the carry.
  * PURE.
  */
-function operatorRuled(records, pr, head) {
-  const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
-  if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
+/** Gate decisions that (re)hold a break: a clearance before any of them never approves it. An operator `block`
+ *  (`operator-block`) is one, so a block after a clear-human ceremony re-holds (any author: it only adds a hold). */
+const HOLDING_OUTCOMES = Object.freeze([GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK, 'operator-block']);
+function operatorRuled(records, pr, head, coverageOf = null) {
+  const trusted = records.filter(r => r.saved || isTrustedMarkerAuthor(r.c));
+  // approval-binding (2026-10-21): the operator's clearance binds this head by sha, or by a trusted git proof that the
+  // net change is the one cleared (read lazily, only when the sha rule fails). The ruling itself must still be found
+  // on the carry chain below — coverage never stands in for the ceremony comment after the cap.
+  const clearedSha = parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c));
+  if (clearedSha !== head) {
+    let coverage = null;
+    try { coverage = typeof coverageOf === 'function' ? coverageOf(head) : coverageOf; } catch { coverage = null; }
+    if (!clearanceBindsHead({ humanClearedSha: clearedSha, headSha: head, coverage })) return false;
+  }
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
   const rulingHeads = new Set();
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
+  const chain = [head]; // every head the carry traversal has visited, live head first
   for (let sha = head, rs = trusted, want = null; sha && rs.length;) {
     const result = latestResult(rs, pr, sha);
     // A carry hop counts only when the prior head's result is the one that was carried (same id).
@@ -482,22 +620,23 @@ function operatorRuled(records, pr, head) {
     // Only a human operator's own clear-human comment is a ruling; an automation-posted copy (even by a trusted bot) is not.
     const cleared = lastAt(rs, r => !r.from && isHumanOperatorComment(r.c) && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
+    // A cap that names this result id already decided it: posting an identical copy later (a saved result's comment)
+    // keeps the ruling. A legacy cap without a name, or a saved result of unknown chronology, needs the ruling after
+    // the result itself.
+    const named = cap?.gate.result === want && Number.isFinite(result.at);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
-    // A plain accept of ANY head in this proven carry chain after the ceremony supersedes it.
-    // Scan the whole thread: accepts before or after a carry must survive its historical truncation.
-    // The marker may name a head abbreviated (7–40 hex, any case), as its builder and parser allow: a prefix match supersedes.
-    const reviewed = body => [...body.matchAll(REVIEWED_SHA_ANY_RE)]
-      .some(([, s]) => [...rulingHeads].some(h => h.startsWith(s.toLowerCase())));
+    // A plain accept of ANY head on the carry chain (live head to the ruled head) after the human ceremony supersedes it; a bot-posted cleared-human marker cannot revive it.
     const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
-      && reviewed(recordBody(r)));
-    if (cap && cleared && !reaccepted && cleared.at > result.at && gates.every(r =>
-      ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
+      && reviewedShaPrefixes(recordBody(r)).some(m => chain.some(h => h.startsWith(m) || m.startsWith(h))));
+    if (cap && cleared && !reaccepted && cleared.at > cap.at && (cleared.at > result.at || named) && gates.every(r =>
+      !HOLDING_OUTCOMES.includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
-    if (gates.some(r => !r.from && [GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome))) return false;
+    if (gates.some(r => !r.from && HOLDING_OUTCOMES.includes(r.gate.outcome))) return false;
     if (!result.from) return false;
     rs = rs.filter(r => r.at < result.at);
     sha = result.from;
+    chain.push(sha);
   }
   return false;
 }
@@ -511,6 +650,9 @@ function operatorRuled(records, pr, head) {
 const INDEX_LIST = '\\((#\\d+(?:, #\\d+)*)\\)';
 const GATE_ACTION_LINES = [
   ['card', new RegExp(`^- \\d+ finding\\(s\\) filed as a follow-up card ${INDEX_LIST}(?: — landing job [^\\n]*)?\\.$`)],
+  ['card', new RegExp(`^- \\d+ finding\\(s\\) recorded, owed as a follow-up card ${INDEX_LIST} — filing paused; will file on resume\\.$`)],
+  // OPERATOR-ONLY (`record-red-team-ruling --card=<ref>`): it counts (as `card`) only inside an `operator-*` record a human operator authored, whatever wraps it.
+  ['operator-card', new RegExp(`^- \\d+ finding\\(s\\) carded by the operator to \`[^\`\\n]+\` ${INDEX_LIST}\\.$`)],
   ['advisory', new RegExp(`^- \\d+ finding\\(s\\) left advisory ${INDEX_LIST}\\.$`)],
   ['send-back', new RegExp(`^- \\d+ confirmed break\\(s\\) sent back to the fixer ${INDEX_LIST}(?: — the PR was already under review:changes)?\\.$`)],
   ['held', new RegExp(`^- \\d+ confirmed break\\(s\\) NOT sent back: [^\\n]*?(?: ${INDEX_LIST})?\\.$`)],
@@ -540,12 +682,17 @@ function gateActionLines(body) {
  * finding. A carried result also keeps the actions bound to the result it was carried from (the same findings,
  * re-keyed); the newer head's own records win. An operator ruling releases only what the gate handed over (`held`).
  */
-export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null } = {}) {
+export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, savedResult = null, repo = null, standingRuling = null, operatorRulings, clearanceCoverage = null } = {}) {
   const live = String(head ?? '').toLowerCase();
-  const records = indexedRecords(comments);
+  const records = indexedRecords(comments, savedResult);
   const result = latestResult(records, pr, live)?.parsed ?? null;
   const plan = planRedTeamActions(result, setting ?? readConfirmedBreaks({ env }).value);
+  const rulingScope = operatorRulings ?? readOperatorRulings({ env }).value;
+  const anyState = rulingScope.anyState !== false;
+  const carryRulings = rulingScope.carryAcrossRebase !== false;
   const actions = new Map();
+  // The breaks whose operator release may still count on the hop being read (null on the live head = all of them).
+  let carryAllowed = null;
   const grants = gateRoundGrants(comments, pr, repo, standingRuling);
   let legacyHeld = false, liveGates = [];
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
@@ -558,13 +705,26 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (first) liveGates = gates;
     const { supersededCaps } = resolveSendBackStep(gates, grants);
     const own = new Map();
+    // Kill switch off: the gate handed this result to the operator only if its send-back step ended at the round cap.
+    const handedOver = sendBackStepState(gates, grants).outcome === GATE_OUTCOMES.ROUND_CAP;
     for (const r of gates) {
-      for (const { action, indices } of gateActionLines(recordBody(r))) {
+      for (const line of gateActionLines(recordBody(r))) {
+        const { indices } = line;
+        let { action } = line;
+        if (action === 'operator-card') {
+          if (!r.gate.outcome.startsWith('operator-') || !isHumanOperatorComment(r.c)) continue;
+          action = 'card';
+        }
         // Only a human operator may release a break held at the round cap; automation lines release only what the gate itself decided.
         // This is applied per action line (not by dropping the forged comment, which would also drop its restrictive `held` lines).
-        if (RELEASING_ACTIONS.has(action) && !AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome) && !isHumanOperatorComment(r.c)) continue;
+        const operatorRelease = RELEASING_ACTIONS.has(action) && !AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome);
+        if (operatorRelease && !isHumanOperatorComment(r.c)) continue;
         if (action === 'held' && !indices.length) legacyHeld = true;
         for (const index of indices) {
+          // An operator release made on an EARLIER head counts only where the carry proved this break's cited line unchanged.
+          if (operatorRelease && !first && !(carryRulings && carryAllowed?.has(index))) continue;
+          // Kill switch off: an operator release cannot override a recorded send-back the fixer still owns (not at the cap).
+          if (operatorRelease && !anyState && own.get(index) === 'send-back' && !handedOver) continue;
           // A stale cap POST cannot overwrite the per-finding send-back that superseded its decision.
           if (action === 'held' && own.get(index) === 'send-back' && supersededCaps.has(r)) continue;
           own.set(index, action);
@@ -573,6 +733,8 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     }
     for (const [index, action] of own) if (!actions.has(index)) actions.set(index, action);
     if (!hit.from) break;
+    const proven = carryLinesFor(records, pr, hit.from, sha, want);
+    carryAllowed = carryAllowed === null ? proven : new Set([...carryAllowed].filter((i) => proven.has(i)));
     rs = rs.filter(r => r.at < hit.at);
     sha = hit.from;
   }
@@ -580,7 +742,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   // Audited grants unseen by the cap decision let a later send-back stand, even if the cap POST arrives last.
   // Without a repo there is no grant credit and the cap keeps winning.
   const outcome = sendBackStepState(liveGates, grants).outcome;
-  const ruled = operatorRuled(records, pr, live);
+  const ruled = operatorRuled(records, pr, live, clearanceCoverage);
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {
     const recorded = actions.get(f.index);
@@ -592,4 +754,89 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (action === 'send-back') sendBack.push(f);
   }
   return { result, sendBack, held, since: commentCreatedAt(capRecord) ?? null, outcome };
+}
+
+/**
+ * The live head's latest result; per finding the actions a HUMAN OPERATOR's named gate record (`operator-*`,
+ * `result=` this result) took on it, in thread order; and every finding ANY trusted record already carded for this
+ * result (the gate's own card filing too). `record-red-team-ruling` dedups on this (no second card). PURE.
+ * @returns {{resultId:(string|null), ruled:Map<number, string[]>, carded:Set<number>}}
+ */
+export function operatorRulingsOnLiveResult(comments, pr, head) {
+  const live = String(head ?? '').toLowerCase();
+  const records = indexedRecords(comments);
+  const hit = latestResult(records, pr, live);
+  const ruled = new Map();
+  const carded = new Set();
+  if (!hit) return { resultId: null, ruled, carded };
+  const id = redTeamResultId(hit.parsed);
+  for (const r of gateRecordsFor(records, pr, live, hit).sort(threadOrder)) {
+    const human = isHumanOperatorComment(r.c);
+    const operator = r.gate.outcome.startsWith('operator-') && human && r.gate.result === id;
+    for (const { action, indices } of gateActionLines(recordBody(r))) {
+      const card = action === 'card' || action === 'operator-card';
+      if (card && (AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome) || operator)) for (const index of indices) carded.add(index);
+      if (!operator) continue;
+      const a = action === 'operator-card' ? 'card' : action;
+      for (const index of indices) ruled.set(index, [...(ruled.get(index) ?? []), a]);
+    }
+  }
+  return { resultId: id, ruled, carded };
+}
+
+/**
+ * Version guard for the derived `red-team:*` label writers (live #5502, 2026-10-21 17:07 ET: a pass daemon on an OLDER
+ * clone re-derived `red-team:blocked` over an operator ruling its reader did not understand). The `operator-*` gate
+ * outcomes THIS reader understands; a trusted record on the live head with any other `operator-*` outcome was written
+ * by a newer reader, so a label writer on this code must not re-derive the label. PURE.
+ */
+export const READER_OPERATOR_OUTCOMES = Object.freeze(['operator-card', 'operator-not-real', 'operator-block']);
+export function unknownOperatorOutcomes(comments, pr, head) {
+  const live = String(head ?? '').toLowerCase();
+  const out = new Set();
+  for (const c of Array.isArray(comments) ? comments : []) {
+    const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
+    if (m && m.pr === Number(pr) && m.rev === live && m.outcome.startsWith('operator-') && !READER_OPERATOR_OUTCOMES.includes(m.outcome)
+      && isTrustedMarkerAuthor(c)) out.add(m.outcome);
+  }
+  return [...out];
+}
+
+/**
+ * The record the verdict carry (review-job carryAcrossRebase) posts beside its carry comment: for the carried result,
+ * which breaks' cited `file:line` is byte-identical on the old and new head. Only these may keep an operator release
+ * across the carry. A break with no cited file/line, or a changed line, is never listed (fail closed). PURE.
+ */
+export const RED_TEAM_CARRY_LINES_MARKER = '<!-- we:red-team-carry-lines';
+export function redTeamCarryLinesMarker({ pr, from, to, result, unchanged }) {
+  const list = [...new Set(unchanged ?? [])].map(Number).filter(Number.isInteger).sort((a, b) => a - b);
+  return `${RED_TEAM_CARRY_LINES_MARKER} pr=${Number(pr)} from=${String(from).toLowerCase()} to=${String(to).toLowerCase()} result=${result} unchanged=${list.join(',') || 'none'} -->`;
+}
+export function parseRedTeamCarryLinesMarker(body) {
+  const m = /^<!-- we:red-team-carry-lines pr=(\d+) from=([0-9a-f]{40}) to=([0-9a-f]{40}) result=([0-9a-f]{16}) unchanged=(none|\d+(?:,\d+)*) -->/.exec(String(body ?? '').trimStart());
+  return m ? { pr: Number(m[1]), from: m[2], to: m[3], result: m[4], unchanged: m[5] === 'none' ? [] : m[5].split(',').map(Number) } : null;
+}
+/** The indices a trusted carry-lines record proves unchanged for this exact hop and result (intersection when several). PURE. */
+function carryLinesFor(records, pr, from, to, result) {
+  let out = null;
+  for (const r of records) {
+    if (r.from || r.saved) continue;
+    const m = parseRedTeamCarryLinesMarker(recordBody(r));
+    if (!m || m.pr !== Number(pr) || m.from !== from || m.to !== to || m.result !== result) continue;
+    out = out === null ? new Set(m.unchanged) : new Set([...out].filter((i) => m.unchanged.includes(i)));
+  }
+  return out ?? new Set();
+}
+
+/** Which confirmed findings' cited line is byte-identical on two heads. `readLine(sha, file, line)` returns the line
+ *  text or null (missing file/line); any null on either side, or no cited file/line, is "changed". PURE given the reader. */
+export function unchangedCitedLines(findings, { fromSha, toSha, readLine }) {
+  const out = [];
+  for (const f of findings ?? []) {
+    if (!f?.file || !Number.isInteger(f.line) || f.line < 1) continue;
+    let a = null, b = null;
+    try { a = readLine(fromSha, f.file, f.line); b = readLine(toSha, f.file, f.line); } catch { continue; }
+    if (typeof a === 'string' && typeof b === 'string' && a === b) out.push(f.index);
+  }
+  return out;
 }

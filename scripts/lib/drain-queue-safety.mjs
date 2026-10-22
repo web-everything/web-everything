@@ -1,9 +1,10 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
-import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamOwedOnHead, redTeamPanelSeatOwed } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
+import { savedRedTeamFallback } from './drain-saved-red-team.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
 export function readDrainQueueSafety({ env = process.env, tool, platform, log = () => {} } = {}) {
@@ -12,11 +13,16 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
   const numberEnv = key => env[key] === undefined ? undefined : Number(env[key]);
   const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
-    env, platform, standard: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45, enqueueWhenRedTeamNeverScheduled: true },
-    valid: { enqueueWhenRedTeamNeverScheduled: v => typeof v === 'boolean', waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
-    envValues: { enqueueWhenRedTeamNeverScheduled: booleanEnv('WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
+    env, platform, standard: { queueFileOverlapIncludesCards: true, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamRequestCooldownMin: 5, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
+    valid: { queueFileOverlapIncludesCards: v => typeof v === 'boolean', waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamRequestCooldownMin: positive, redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
+    envValues: { queueFileOverlapIncludesCards: booleanEnv('WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamRequestCooldownMin: numberEnv('WE_DRAIN_RED_TEAM_REQUEST_COOLDOWN_MIN'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
   });
   log(formatCascadeSourcesLine('drain', r));
+  // Retired: this switch let the drain enqueue an owed head with NO red-team result once the deadline passed. It is no
+  // longer read; past the deadline the PR is held (redTeam.deadlineAction). Name a leftover value so nobody trusts it.
+  const retired = [env.WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED !== undefined ? 'env WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED' : null,
+    r.layered?.enqueueWhenRedTeamNeverScheduled !== undefined ? 'drain.enqueueWhenRedTeamNeverScheduled setting' : null].filter(Boolean);
+  if (retired.length) log(`⚠ ${retired.join(' and ')} is retired and ignored: past the red-team deadline the PR is held (redTeam.deadlineAction)`);
   return r;
 }
 
@@ -29,16 +35,28 @@ export function sendBackReason(labels) {
 
 /** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
 export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
-  return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
+  const panel = redTeamPanelSeatOwed(loopPayload, env);
+  return redTeamOwedOnHead({ read: loopPayload?.findings?.read,
+    evidence: { ...evidence, scheduled: evidence.scheduled || panel }, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
-export function redTeamEnqueueHold({ loopPayload, comments, pr, head, repo = null, standingRuling = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
+// `clearanceCoverage` (approval-binding): a coverage verdict or a lazy `(head) => verdict`, so an operator ruling recorded
+// on an older head counts when trusted git proves the live head carries the same net change.
+export function redTeamEnqueueHold({ loopPayload, comments, repo, pr, head, standingRuling = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, attempted = false, requestPending = false, skipCardOnly, realFilesCardOnly = false, queued = false, clearanceCoverage = null } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   // `standingRuling`: the verified scope, so an automatic grant counts here exactly as in the gate (PR #5758).
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
+  let disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling, clearanceCoverage });
+  if (!disposition.result) {
+    const savedResult = savedRedTeamFallback({ repo, pr, head, env })();
+    if (savedResult) disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, savedResult, repo, standingRuling, clearanceCoverage });
+  }
   if (disposition.sendBack.length || disposition.held.length)
     return 'post-accept red team confirmed a break requiring send-back';
-  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }) || disposition.result) return null;
+  if (disposition.result?.recheckIncomplete) return 'post-accept red team pending: saved red-team re-check incomplete';
+  if (disposition.result) return null;
+  if (realFilesCardOnly === true && !inFlight && !recorded && !attempted && !queued
+    && loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() !== head?.toLowerCase()) return null;
+  if (!requestPending && !postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, attempted, skipCardOnly })) return null;
   return 'post-accept red team has no recorded result on the live head';
 }
 

@@ -44,6 +44,22 @@ function ruling(rec, { result = 'card', key = rec.referrals[0].key, runId = rec.
 }
 const ctx = (over = {}) => ({ repo, pr: 7, head, body: '<!-- authored-by-actor: author -->', cardReadable: (c) => c === CARD, ...over });
 
+describe('operator protection repo aliases', () => {
+  it.each([
+    ['chalbert/web-everything', 'web-everything/web-everything', true],
+    ['web-everything/web-everything', 'chalbert/web-everything', true],
+    ['web-everything/web-everything', 'other/repo', false],
+  ])('protects block for %s / %s', (recordRepo, rulingRepo, matches) => {
+    const rec = { ...referral(), repo: recordRepo };
+    const comments = [gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(
+      ruling(rec, { repo: rulingRepo, result: 'block' })))];
+    const result = openReferralFindings({ ...ctx({ repo: recordRepo }), comments });
+    expect(result.open).toHaveLength(1);
+    expect(result.open[0].protectingRulings).toHaveLength(matches ? 1 : 0);
+    expect(result.blocked).toEqual(matches ? [rec.referrals[0].key] : []);
+  });
+});
+
 describe('#4979 gate: operator rulings alongside reviewer rulings', () => {
   const blocked = referral({ rulings: ['block'] });
   const thread = (...extra) => [gh(renderReferralRecord(blocked)), ...extra];
@@ -381,7 +397,8 @@ describe('operator finding selectors and follow-up', () => {
     const s = sink();
     await expect(s.run(payload)).resolves.toEqual({ action: 'send-back', sentBack: true, labelCleared: false });
     expect(s.calls[0]).toMatchObject({ exe: process.execPath, body: payload.body, options: { encoding: 'utf8', timeout: 120_000 } });
-    expect(s.calls[0].args).toEqual([expect.stringMatching(/scripts\/review-set-label.mjs$/), '7', '--repo=o/r', '--to=changes', expect.stringMatching(/^--body-file=/), '--actor=chalbert', '--channel=chat']);
+    expect(s.calls[0].args).toEqual([expect.stringMatching(/scripts\/review-set-label.mjs$/), '7', '--repo=o/r', '--to=changes', expect.stringMatching(/^--body-file=/), '--actor=chalbert', '--channel=chat',
+      `--judged-head=${head}`]); // #5492 rebuild slice 2: the bounce row names the head the ruling was planned on
     expect(s.calls).toHaveLength(1);
     expect(existsSync(s.path())).toBe(false);
   });

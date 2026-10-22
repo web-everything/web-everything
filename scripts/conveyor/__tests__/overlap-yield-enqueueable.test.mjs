@@ -169,3 +169,77 @@ describe('landable overlap target setting provenance', () => {
     }
   });
 });
+
+describe('planOverlapYieldAroundBlockedTargets — a blocked target never makes others wait', () => {
+  // The 2026-10-20 17:58Z shape: #5659/#5655/#5653 (card PRs) all yield to #5485, which is red-team-pending.
+  const row = (number, additions) => ({ number, repo, baseRefName: 'main', isDraft: false, labels: ['review:accepted', 'ready-to-merge'],
+    files: [{ path: 'backlog/x.md', additions, deletions: 0 }], filesComplete: true, readyAtMs: null, windowMs: null, item: null,
+    exempt: false, requiredCheckRed: false, dependsOn: new Set() });
+  const xs = [row(5659, 1), row(5655, 2), row(5653, 3)];
+  const ys = [...xs, row(5485, 500)];
+  const compute = (openPrRows) => ({ waits: overlapYieldWaits({ candidates: xs, openPrs: openPrRows, nowMs: 0, ignoreBudget: true }), skips: new Map() });
+
+  it('baseline: every waiter yields to the biggest overlapping PR (#5485)', () => {
+    const w = compute(ys).waits;
+    expect([...w.values()].map((x) => x.yieldTo)).toEqual([5485, 5485, 5485]);
+  });
+
+  it('a blocked #5485 is skipped and logged; waiters proceed in normal order (here: the next eligible target)', async () => {
+    const { planOverlapYieldAroundBlockedTargets, formatBlockedYieldTargetLine } = await load();
+    const blockOf = vi.fn((r) => (r.number === 5485 ? { kind: 'red-team-pending', reason: 'post-accept red team has no recorded result on the live head' } : null));
+    const r = planOverlapYieldAroundBlockedTargets({ openPrRows: ys, compute, blockOf });
+    expect(r.ctx.waits.has(overlapRowKey({ repo, number: 5653 }))).toBe(false); // the biggest remaining one leads
+    expect([...r.ctx.waits.values()].every((w) => w.yieldTo !== 5485)).toBe(true);
+    expect(r.skipped).toEqual([expect.objectContaining({ pr: 5485, kind: 'red-team-pending', waiters: expect.arrayContaining([`${repo}#5659`, `${repo}#5655`, `${repo}#5653`]) })]);
+    expect(formatBlockedYieldTargetLine(r.skipped[0])).toMatch(/^overlap-yield skipped: #5485 blocked \(red-team-pending\)/);
+    expect(blockOf.mock.calls.filter(([x]) => x.number === 5485)).toHaveLength(1); // decided once per pass
+  });
+
+  it('keeps going past many blocked targets (no round cap leaves a blocked target in place)', async () => {
+    const { planOverlapYieldAroundBlockedTargets } = await load();
+    const big = Array.from({ length: 12 }, (_, i) => row(6000 + i, 1000 - i));
+    const all = [...xs, ...big];
+    const comp = (openPrRows) => ({ waits: overlapYieldWaits({ candidates: xs, openPrs: openPrRows, nowMs: 0, ignoreBudget: true }), skips: new Map() });
+    const r = planOverlapYieldAroundBlockedTargets({ openPrRows: all, compute: comp, blockOf: (x) => (x.number >= 6000 ? { kind: 'red-team-pending', reason: 'x' } : null) });
+    expect([...r.ctx.waits.values()].some((w) => w.yieldTo >= 6000)).toBe(false);
+    expect(r.skipped).toHaveLength(12);
+  });
+
+  it('when every target is blocked, nobody waits', async () => {
+    const { planOverlapYieldAroundBlockedTargets } = await load();
+    const r = planOverlapYieldAroundBlockedTargets({ openPrRows: ys, compute, blockOf: () => ({ kind: 'review-hold', reason: 'x' }) });
+    expect(r.ctx.waits.size).toBe(0);
+  });
+
+  it('an eligible target keeps today\'s yield', async () => {
+    const { planOverlapYieldAroundBlockedTargets } = await load();
+    const r = planOverlapYieldAroundBlockedTargets({ openPrRows: ys, compute, blockOf: () => null });
+    expect([...r.ctx.waits.values()].map((x) => x.yieldTo)).toEqual([5485, 5485, 5485]);
+    expect(r.skipped).toEqual([]);
+  });
+
+  it('fail closed: a target whose eligibility cannot be read keeps the yield', async () => {
+    const { planOverlapYieldAroundBlockedTargets } = await load();
+    const r = planOverlapYieldAroundBlockedTargets({ openPrRows: ys, compute, blockOf: (x) => { if (x.number === 5485) throw new Error('gh down'); return null; } });
+    expect([...r.ctx.waits.values()].map((x) => x.yieldTo)).toEqual([5485, 5485, 5485]);
+    expect(r.unknown).toEqual([expect.objectContaining({ pr: 5485, error: 'gh down' })]);
+  });
+
+  it('disabled setting keeps today\'s behaviour and never calls blockOf', async () => {
+    const { planOverlapYieldAroundBlockedTargets } = await load();
+    const blockOf = vi.fn(() => ({ kind: 'red-team-pending', reason: 'x' }));
+    const r = planOverlapYieldAroundBlockedTargets({ openPrRows: ys, compute, blockOf, enabled: false });
+    expect([...r.ctx.waits.values()].map((x) => x.yieldTo)).toEqual([5485, 5485, 5485]);
+    expect(blockOf).not.toHaveBeenCalled();
+  });
+
+  it('drain.overlapYieldSkipsBlockedTarget resolves CLI > env > default ON, with source', async () => {
+    const { resolveOverlapYieldSkipsBlockedTargetSetting: r, formatOverlapYieldSkipsBlockedTargetSetting: f } = await load();
+    expect(r({})).toEqual({ value: true, source: 'default' });
+    expect(r({ env: { WE_DRAIN_OVERLAP_YIELD_SKIPS_BLOCKED_TARGET: 'off' } })).toEqual({ value: false, source: 'env' });
+    expect(r({ argv: ['--overlap-yield-skips-blocked-target'], env: { WE_DRAIN_OVERLAP_YIELD_SKIPS_BLOCKED_TARGET: '0' } })).toEqual({ value: true, source: 'cli' });
+    expect(() => r({ argv: ['--overlap-yield-skips-blocked-target', '--no-overlap-yield-skips-blocked-target'] })).toThrow(/mutually exclusive/);
+    expect(() => r({ env: { WE_DRAIN_OVERLAP_YIELD_SKIPS_BLOCKED_TARGET: 'maybe' } })).toThrow(/must be/);
+    expect(f({ value: true, source: 'default' })).toBe('policy · drain.overlapYieldSkipsBlockedTarget=on (source: default)');
+  });
+});

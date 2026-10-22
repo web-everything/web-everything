@@ -1981,9 +1981,26 @@ export function parseLatestHumanClearedSha(comments) {
  * fixing" — it is worth fixing, just not by extending this same forgeable primitive further.
  * @returns {boolean}
  */
-export function shouldReparkForTestTampering({ tampered, netDiffScored, humanClearedSha = null, headSha = null } = {}) {
+export function shouldReparkForTestTampering({ tampered, netDiffScored, humanClearedSha = null, headSha = null, clearanceCoverage = null } = {}) {
   if (!tampered || !netDiffScored) return false;
-  return !(humanClearedSha && headSha && humanClearedSha === headSha);
+  return !clearanceBindsHead({ humanClearedSha, headSha, coverage: clearanceCoverage });
+}
+
+/**
+ * THE one predicate every "is the operator's human clearance bound to this live head?" reader asks (operator
+ * 2026-10-21, `we:scripts/lib/approval-binding.mjs`). True when the sha-bound clearance names the head (today's rule),
+ * OR when `coverage` — a `clearanceCovers` / `readClearanceCoverage` verdict computed by trusted code from git FOR THIS
+ * SAME head (`coverage.liveHead`) — says the recorded clearance covers it. A verdict for any other head, or any
+ * non-`true` `covers`, is ignored (fail closed to sha identity). Pure; lives here (not in approval-binding.mjs) so this
+ * module's own gates can call it without an import cycle; approval-binding.mjs re-exports it.
+ * @param {{humanClearedSha?:string|null, headSha?:string|null, coverage?:{covers?:boolean, liveHead?:string}|null}} o
+ */
+export function clearanceBindsHead({ humanClearedSha = null, headSha = null, coverage = null } = {}) {
+  const head = typeof headSha === 'string' ? headSha.trim().toLowerCase() : '';
+  if (!/^[0-9a-f]{7,40}$/.test(head)) return false;
+  if (typeof humanClearedSha === 'string' && humanClearedSha.trim().toLowerCase() === head) return true;
+  return !!(coverage && coverage.covers === true && /^[0-9a-f]{40}$/.test(head)
+    && typeof coverage.liveHead === 'string' && coverage.liveHead.toLowerCase() === head);
 }
 
 /**
@@ -2115,12 +2132,15 @@ export function findContradictoryReviewVerdicts(labels) {
  * @returns {{heal: boolean, reason: string, decision?: object, comment?: string}}
  */
 export function decideContradictoryVerdictHeal({
-  currentLabels = [], humanClearedSha = null, acceptedSha = null, headSha = null, fetchOk = false,
+  currentLabels = [], humanClearedSha = null, acceptedSha = null, headSha = null, fetchOk = false, clearanceCoverage = null,
 } = {}) {
   const contradiction = findContradictoryReviewVerdicts(currentLabels);
   if (!contradiction.length) return { heal: false, reason: 'no-contradiction' };
   if (contradiction.length === 2 && contradiction.includes(REVIEW_LABELS.pending) && contradiction.includes(REVIEW_LABELS.accepted)) {
     if (!fetchOk || !headSha) return { heal: false, reason: 'fetch-unavailable' };
+    // 2026-10-21 — an operator clearance proven (approval-binding) to cover the live head is not a stale acceptance,
+    // whatever sha the latest accept record names (#5530: the drain's own renumbering moved the head).
+    if (clearanceBindsHead({ humanClearedSha: null, headSha, coverage: clearanceCoverage })) return { heal: false, reason: 'clearance-covers-head' };
     if (!acceptedSha) return { heal: false, reason: 'accept-sha-unknown' };
     const accepted = acceptedSha.toLowerCase();
     const head = headSha.toLowerCase();
@@ -2136,7 +2156,7 @@ export function decideContradictoryVerdictHeal({
     return { heal: false, reason: 'unsupported-pair' };
   }
   if (!fetchOk) return { heal: false, reason: 'fetch-unavailable' };
-  if (humanClearedSha && headSha && humanClearedSha === headSha) return { heal: false, reason: 'genuine-clearance' };
+  if (clearanceBindsHead({ humanClearedSha, headSha, coverage: clearanceCoverage })) return { heal: false, reason: 'genuine-clearance' };
   return {
     heal: true,
     reason: 'no-genuine-clearance',
@@ -2921,7 +2941,11 @@ export function decideReviewGate({
   escalate, humanRequired = false, labels = [], acceptedSha = null, headSha = null,
   acceptedDiff = null, headDiff = null, acceptedContribution = null, headContribution = null,
   operatorClearance = null, headReadFailed = false, engineTier = false, deviation = null, humanClearedSha = null, permissionChange = false,
+  clearanceCoverage = null,
 } = {}) {
+  // 2026-10-21 (approval-binding) — the operator's recorded clearance covers the live head: the same sha, or a trusted
+  // git proof (`clearanceCovers`) that the net change equals the one the operator cleared. One answer for every hold below.
+  const humanCovered = clearanceBindsHead({ humanClearedSha, headSha, coverage: clearanceCoverage });
   // A reviewer verdict (whoever applied it — for a human-gated PR only a human can) always wins, and is checked
   // FIRST so it overrides even the sticky human gate below: review:accepted IS the human clearing the gate →
   // merge; review:changes → the author lane fixes + re-pushes.
@@ -2937,7 +2961,9 @@ export function decideReviewGate({
     const fresh = acceptanceCoversHead({
       acceptedSha, headSha, acceptedDiff, headDiff, acceptedContribution, headContribution, headReadFailed,
     });
-    if (!fresh.covers) {
+    // A later record's sha (a fresh plain accept, a re-stamp) may lag the head while the operator's clearance is
+    // proven to cover it: that acceptance is the human's, of this content — not stale (#5742/#5530/#5485).
+    if (!fresh.covers && !humanCovered) {
       // Re-park for a fresh review: review:pending re-arms an agent panel; a gate-self/human-gated PR (fresh
       // humanRequired score, or a sticky review:human still present) re-parks review:human — only a human may
       // re-clear it. staleAcceptance flags this as the #2409 outcome for the drain's comment + label swap.
@@ -3029,7 +3055,7 @@ export function decideReviewGate({
     // `humanClearedSha` from `parseLatestHumanClearedSha` (trusted-author gated, `reviewed-sha` + `cleared-human`
     // in the SAME comment). The bare `operatorClearance` is forgeable/stale and is NOT accepted here. Without
     // one, re-park `review:human`.
-    const deviationCleared = !!(humanClearedSha && headSha && String(humanClearedSha).toLowerCase() === String(headSha).toLowerCase());
+    const deviationCleared = humanCovered;
     if (deviation && !deviationCleared) {
       return {
         action: 'park',
