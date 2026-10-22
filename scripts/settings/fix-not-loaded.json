@@ -1,0 +1,8 @@
+{
+  "fixNotLoaded": {
+    "readyMinutes": 30,
+    "lookbackDays": 7,
+    "probeBudgetMs": 15000,
+    "storePath": "~/workspace/.operations/coordination/fix-ready.jsonl"
+  }
+}

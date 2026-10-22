@@ -54,11 +54,11 @@ const ADDED_2026_10_14 = ['main-ci-red-owner-stalled'];
 const ADDED_2026_10_15 = ['operator-hold-aged'];
 // Operator 2026-10-17: the nightly coroner must alert when it fails (it never ran 10-15/10-16).
 const ADDED_2026_10_17 = ['nightly-coroner-failed'];
-const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_09, ...ADDED_2026_10_14, ...ADDED_2026_10_15, ...ADDED_2026_10_17, 'disk-space'])];
+const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_09, ...ADDED_2026_10_14, ...ADDED_2026_10_15, ...ADDED_2026_10_17, 'disk-space', 'fix-not-loaded'])];
 
 describe('NOTIFY_EVEN_IN_SHADOW', () => {
-  it('is exactly the union of the approved operator decisions — 28 entries', () => {
-    expect(APPROVED).toHaveLength(28);
+  it('is exactly the union of the approved operator decisions — 29 entries', () => {
+    expect(APPROVED).toHaveLength(29);
     expect([...NOTIFY_EVEN_IN_SHADOW].sort()).toEqual([...APPROVED].sort());
   });
 
