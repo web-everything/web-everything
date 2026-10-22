@@ -63,7 +63,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
     if (head !== p.head) throw new Error(`PR #${p.pr}'s head moved to ${head} since the plan (${p.head}); nothing written — re-run against the new head`);
     const comments = operatorBoundComments(thread.comments);
     let now;
-    try { now = rulableBreaks({ comments, labels: thread.labels, pr: p.pr, head, setting: p.setting }); }
+    try { now = rulableBreaks({ comments, repo: p.repo, labels: thread.labels, pr: p.pr, head, setting: p.setting }); }
     catch (e) { throw new Error(`${e.message}; nothing written`); }
     if (now.state.resultId !== p.resultId) throw new Error(`the red-team result on the live head changed since the plan (${p.resultId} -> ${now.state.resultId}); nothing written — re-run`);
     const rulable = now.rulable.map((f) => f.index);
@@ -71,7 +71,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
     if (gone.length) throw new Error(`break(s) ${gone.map((i) => `#${i}`).join(', ')} are no longer held for the operator / rulable (already ruled or carded); nothing written`);
     return { comments, labels: thread.labels ?? [] };
   };
-  const disposition = (p, comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: p.pr, head: p.head, setting: p.setting });
+  const disposition = (p, comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), repo: p.repo, pr: p.pr, head: p.head, setting: p.setting });
   /** After the write: same head, same result, the record WE wrote is in the thread as a human operator's comment, and
    *  the gate (reading that thread) no longer holds or sends back any selected break. */
   const proveReleased = (p, what, record) => {
@@ -79,7 +79,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
     const head = String(after.headRefOid ?? '').toLowerCase();
     if (head !== p.head) throw new Error(`${what} was posted but PR #${p.pr}'s head moved to ${head}; the ruling binds to ${p.head} only — inspect and re-run on the new head`);
     const comments = operatorBoundComments(after.comments);
-    if (liveResultGateState(comments, p.pr, head).resultId !== p.resultId) throw new Error(`${what} was posted but the live red-team result changed; inspect the thread before retrying`);
+    if (liveResultGateState(comments, p.pr, head, p.repo).resultId !== p.resultId) throw new Error(`${what} was posted but the live red-team result changed; inspect the thread before retrying`);
     if (record && !comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isHumanOperatorComment(c))) {
       throw new Error(`${what} is not in the read-back as a human operator's comment (altered, or posted as another account); inspect the thread before retrying`);
     }

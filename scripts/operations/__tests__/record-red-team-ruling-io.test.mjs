@@ -1,7 +1,8 @@
 /** Live existing-card reader, sink and CLI subset; all IO injected. */
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
+import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { planRedTeamRuling, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
 import { operatorBoundComments } from '../../lib/operator-identity.mjs';
 
@@ -35,7 +36,56 @@ function fake({ liveHead = HEAD, labels = [], identity = OP, author = 'chalbert'
 }
 const payloadFor = (over = {}, readOver = {}) => planRedTeamRuling(read(readOver), input(over));
 const heldAfter = comments => readRedTeamDisposition({ comments, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).held;
+
+function extendedThread({ grantRepo = repo, grantPr = PR, author = OP, sent = true, lateCap = false } = {}) {
+  const comments = thread();
+  const { resultId } = liveResultGateState(comments, PR, HEAD);
+  // Explicit snapshots model a cap decision made before the grant, even if its POST lands last.
+  const cap = bot(`${redTeamGateMarker(PR, HEAD, 'round-cap', resultId, [])}\n- 1 confirmed break(s) NOT sent back: round cap (#1).`, '2026-10-20T23:41:12Z');
+  comments[1] = cap;
+  comments.push({ author, createdAt: '2026-10-20T23:45:00Z', body: buildRoundExtensionComment({
+    repo: grantRepo, pr: grantPr, by: 1, actor: OP.login, channel: 'test', reason: 'one more fix round', at: '2026-10-20T23:45:00Z',
+  }) });
+  if (sent) {
+    const ids = gateRoundGrants(operatorBoundComments(comments), PR, repo).map(g => g.id);
+    comments.push(bot(`${redTeamGateMarker(PR, HEAD, 'sent-back', resultId, ids)}\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-10-20T23:46:00Z'));
+  }
+  if (lateCap) {
+    comments.splice(1, 1);
+    comments.push({ ...cap, createdAt: '2026-10-20T23:47:00Z' });
+  }
+  return comments;
+}
+
 describe('existing-card IO', () => {
+  for (const phase of ['planning', 'pre-write']) {
+    it.each([
+      ['authenticated grant and send-back', {}, true],
+      ['cap POST arriving after send-back', { lateCap: true }, true],
+      ['grant awaiting send-back', { sent: false }, false],
+      ['grant for another repo', { grantRepo: 'other/repo' }, false],
+      ['grant for another PR', { grantPr: PR + 1 }, false],
+      ['automation-posted grant without a verified standing ruling', { author: { login: 'web-everything', type: 'Bot' } }, false],
+    ])(`${phase}: %s preserves the current owner`, (_name, options, fixerOwns) => {
+      const plan = payloadFor(); // Plan while the break is still cap-held.
+      const comments = extendedThread(options);
+      const d = readRedTeamDisposition({ comments: operatorBoundComments(comments), repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS });
+      expect(d.outcome).toBe(fixerOwns ? 'sent-back' : 'round-cap');
+      expect(d.held.map(f => f.index)).toEqual(fixerOwns ? [] : [1]);
+      expect(d.sendBack.map(f => f.index)).toEqual(fixerOwns ? [1] : []);
+      const f = fake({ initial: comments });
+      const act = phase === 'planning' ? () => payloadFor({}, { comments }) : () => f.sinks[RED_TEAM_RULING_CARD_EFFECT](plan);
+      if (fixerOwns) {
+        expect(act).toThrow(phase === 'planning' ? /no red-team break is held/ : /no red-team break is held.*nothing written/);
+        expect(f.posted).toEqual([]);
+        expect(f.labelSyncs).toEqual([]);
+        expect(readRedTeamDisposition({ comments: operatorBoundComments(f.comments), repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).sendBack.map(f => f.index)).toEqual([1]);
+      } else {
+        expect(act()).toMatchObject({ indices: [1] });
+        expect(f.posted).toHaveLength(phase === 'planning' ? 0 : 2);
+      }
+    });
+  }
   it('a sink re-checks the poster: a bot identity writes nothing', () => {
     const f = fake({ identity: { login: 'web-everything[bot]', type: 'Bot' } });
     expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/not a human account/);
