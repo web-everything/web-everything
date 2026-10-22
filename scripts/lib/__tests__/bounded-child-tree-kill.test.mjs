@@ -8,7 +8,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { descendantPids, killProcessTree, markedPidsFromPs, peerHolderPids, startTreeWatchdog } from '../bounded-child.mjs';
+import { descendantPids, killProcessTree, markedPidsFromPs, peerHolderPids } from '../bounded-child.mjs';
+import { startTreeWatchdog } from '../tree-watchdog.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
 
 describe('descendantPids', () => {
@@ -102,13 +103,16 @@ describe('startTreeWatchdog (PR #5768)', () => {
     // loaded code. (A plain process: vitest's loader cannot import a module from outside the project root.)
     const dir = mkdtempSync(join(tmpdir(), 'tree-watchdog-swap-'));
     try {
-      const copy = join(dir, 'bounded-child.mjs');
-      writeFileSync(copy, readFileSync(resolve(process.cwd(), 'scripts/lib/bounded-child.mjs')));
+      const copy = join(dir, 'tree-watchdog.mjs');
+      const helperCopy = join(dir, 'bounded-child.mjs');
+      writeFileSync(copy, readFileSync(resolve(process.cwd(), 'scripts/lib/tree-watchdog.mjs')));
+      writeFileSync(helperCopy, readFileSync(resolve(process.cwd(), 'scripts/lib/bounded-child.mjs')));
       const probe = join(dir, 'probe.mjs');
       writeFileSync(probe, `import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 const loaded = await import(${JSON.stringify(pathToFileURL(copy).href)});
 writeFileSync(${JSON.stringify(copy)}, 'export const broken = true;\\n');
+writeFileSync(${JSON.stringify(helperCopy)}, 'export const broken = true;\\n');
 const victim = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript())}], { stdio: 'ignore' });
 const exited = new Promise((r) => victim.once('exit', (code, signal) => r(signal)));
 const warned = [];
