@@ -749,7 +749,8 @@ describe('in-flight PID reconciliation', () => {
       const bytes = JSON.stringify(marker);
       writeFileSync(file, bytes);
       const inFlight = new Map([[dir, entry()]]);
-      reconcileInFlight(inFlight, { isAlive: () => false, killGroup: vi.fn(), log: vi.fn() });
+      // This orphan's group is gone too: never probe the host's group 777 (EPERM also means alive).
+      reconcileInFlight(inFlight, { isAlive: () => false, groupAlive: () => false, killGroup: vi.fn(), log: vi.fn() });
       expect(inFlight.size).toBe(0);
       expect(readFileSync(file, 'utf8')).toBe(bytes);
       expect(laneNeedsVerifyDispatch(JSON.parse(readFileSync(file, 'utf8')), 'abc')).toBe(marker.status === 'running');
