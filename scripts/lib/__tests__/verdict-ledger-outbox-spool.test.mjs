@@ -5,8 +5,7 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
-import fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
+import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -20,20 +19,17 @@ import { ledgerGitPath } from '../verdict-ledger-path.mjs';
 import { buildLedgerEvent, checkLedgerAppendRows, parseLedgerEvents } from '../verdict-ledger.mjs';
 import { lockDirFor, readLockEntry } from '../../readiness/file-locks.mjs';
 
-// Node's named builtin exports must be synchronized after replacing a default-export
-// method. Spy on the guarded native fs so faults also reach already-loaded ESM consumers.
-function spyOnFs(method) {
-  const spy = vi.spyOn(fs, method);
-  syncBuiltinESMExports();
-  return spy;
-}
+// Use a Vitest module facade so spies reach the spool's and file-locks' named imports.
+// syncBuiltinESMExports cannot update the builtin export snapshots held by the runner.
+// Keep the real, hermetically guarded implementations behind the facade.
+vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
+const spyOnFs = (method) => vi.spyOn(fs, method);
 
 const REPO = 'web-everything/web-everything';
 const scratch = [];
 const outbox = () => { const dir = mkdtempSync(join(tmpdir(), 'ob-regression-')); scratch.push(dir); return dir; };
 afterEach(() => {
   vi.restoreAllMocks();
-  syncBuiltinESMExports();
   for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -475,7 +471,6 @@ describe('outbox never-throw helpers', () => {
     expect(readLockEntry(outboxLockRoot(dir), OUTBOX_LOCK_PATH)?.owner).toBe(owner);
     expect(log).not.toHaveBeenCalled();
     write.mockRestore();
-    syncBuiltinESMExports();
   });
 
   it('safeLog and defaultLog swallow diagnostic sink failures', () => {
