@@ -10,6 +10,35 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync,
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
+// Read-only proof tests can run even where the launcher forbids Git metadata writes.
+const proofSource = /function localRemoteShas\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
+const defaultFetch = '+refs/heads/*:refs/remotes/origin/*';
+const excludedOps = '^refs/heads/ops/*';
+const customFetchCases = [
+  ['exact ops remap', [defaultFetch, excludedOps, '+refs/heads/ops/review-requests:refs/remotes/origin/saved']],
+  ['wildcard ops remap', [defaultFetch, excludedOps, '+refs/heads/ops/*:refs/remotes/origin/archive/*']],
+  ['additional exclusion', [defaultFetch, excludedOps, '^refs/heads/saved']],
+  ['restricted positive mapping', ['+refs/heads/trunk:refs/remotes/origin/trunk', excludedOps]],
+  ['tag remap', [defaultFetch, excludedOps, '+refs/tags/*:refs/remotes/origin/tags/*']],
+  ['missing config', null],
+  ['empty config', []],
+];
+it.each(customFetchCases)('local remote proof rejects %s', (_name, fetchValues) => {
+  const tryGit = (args) => args[0] === 'config'
+    ? fetchValues?.join('\n') ?? null
+    : 'unique refs/remotes/origin/saved \nunique refs/remotes/origin/archive/review-requests ';
+  const localRemoteShas = new Function('tryGit', `${proofSource}; return localRemoteShas;`)(tryGit);
+  expect([...localRemoteShas('/unused')]).toEqual([]);
+});
+it.each([[defaultFetch], [defaultFetch, excludedOps], [defaultFetch, excludedOps, defaultFetch]])(
+  'local remote proof retains standard direct refs and excludes symbolic and ops refs (%j)', (...fetchValues) => {
+  const tryGit = (args) => args[0] === 'config'
+    ? fetchValues.join('\n')
+    : 'fresh refs/remotes/origin/trunk \nstale refs/remotes/origin/ops/review-requests \nstale refs/remotes/origin/saved refs/remotes/origin/ops/review-requests';
+  const localRemoteShas = new Function('tryGit', `${proofSource}; return localRemoteShas;`)(tryGit);
+  expect([...localRemoteShas('/unused')]).toEqual(['fresh']);
+});
+
 it('provision + acquire keep ops/* out of a lane while explicit reader fetches still work', () => {
   const base = mkdtempSync(join(tmpdir(), 'pool-git-diet-'));
   const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -75,7 +104,7 @@ it('provision + acquire keep ops/* out of a lane while explicit reader fetches s
 const staleOpsCases = ['explicit', 'auto'].flatMap((mode) =>
   ['exact tip', 'ancestor'].flatMap((containment) =>
     ['deleted', 'moved'].flatMap((change) =>
-      ['none', 'direct', 'chained', 'HEAD', 'external'].map((alias) => ({ mode, containment, change, alias })))));
+      ['none', 'direct', 'chained', 'HEAD', 'external', 'mapped', 'wildcard-mapped'].map((alias) => ({ mode, containment, change, alias })))));
 
 it.each(staleOpsCases)('$mode acquire protects $containment work when its only ops proof was $change (alias: $alias)', ({ mode, containment, change, alias }) => {
   withContainmentLane(({ base, origin, reference, lane, git, run }) => {
@@ -108,6 +137,12 @@ it.each(staleOpsCases)('$mode acquire protects $containment work when its only o
     } else if (alias === 'external') {
       git(['update-ref', 'refs/saved/proof', staleTip], lane);
       git(['symbolic-ref', 'refs/remotes/origin/saved', 'refs/saved/proof'], lane);
+    } else if (alias === 'mapped' || alias === 'wildcard-mapped') {
+      const mapping = alias === 'mapped'
+        ? `+${ops}:refs/remotes/origin/saved`
+        : '+refs/heads/ops/*:refs/remotes/origin/archive/*';
+      git(['config', '--add', 'remote.origin.fetch', mapping], lane);
+      git(['fetch', '--quiet', 'origin', mapping], lane);
     }
 
     const mutation = change === 'deleted'
