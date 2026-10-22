@@ -99,6 +99,26 @@ describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before r
     expect(f.rebuild).toHaveBeenCalled();
   });
 
+  it.each([1000, 1001])('operator-instruction length %s enforces the 1000-character cap before load registration', async (length) => {
+    const f = fixture();
+    const instruction = `yes load ${'x'.repeat(length - 9)}`;
+    expect(instruction).toHaveLength(length);
+    const r = await f.load({
+      ref: 'lane/promote-stale-green', allowConflict: true, operatorInstruction: instruction,
+      readViewer: async () => 'chalbert',
+    });
+    const entry = readOverlays(f.clone, { env: f.env }).find((o) => o.ref === 'lane/promote-stale-green');
+    if (length === 1000) {
+      expect(r.refused).toBeFalsy();
+      expect(entry.conflictOverride.instruction).toBe(instruction);
+      expect(f.rebuild).toHaveBeenCalledOnce();
+    } else {
+      expect(r).toMatchObject({ registered: false, refused: true });
+      expect(entry).toBeUndefined();
+      expect(f.rebuild).not.toHaveBeenCalled();
+    }
+  });
+
   it('a check that cannot run (ref missing on origin) refuses — fail closed', async () => {
     const f = fixture();
     const r = await f.load({ ref: 'lane/does-not-exist' });

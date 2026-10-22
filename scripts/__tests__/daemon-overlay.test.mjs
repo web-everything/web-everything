@@ -220,6 +220,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     ['an agent-typed --actor=operator under another human credential', ['--operator-instruction=yes register 2826 despite the conflict', '--actor=operator', '--by=chalbert'], 'someone-else'],
     ['an agent-typed --actor=operator when no credential can be read', ['--operator-instruction=yes register 2826 despite the conflict', '--actor=operator'], null],
     ['a one-word instruction', ['--operator-instruction=ok'], 'chalbert'],
+    ['an operator instruction over the 1000-character cap', [`--operator-instruction=yes register ${'x'.repeat(988)}`], 'chalbert'],
   ])('--allow-conflict with %s is refused (exit 2) and registers nothing', (_label, extra, login) => {
     const { originDir, cloneDir, overlayDir, env } = makeFixture();
     advanceMain(originDir, (dir) => writeFile(dir, 'shared.mjs', 'export const X = 1;\n'));

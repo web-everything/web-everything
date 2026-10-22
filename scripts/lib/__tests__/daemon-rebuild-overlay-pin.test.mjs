@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { rebuildClone } from '../daemon-rebuild.mjs';
-import { addOverlay } from '../daemon-overlays.mjs';
+import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -80,6 +80,75 @@ function fixture() {
 }
 
 describe('overlay-pin — a moving overlay whose new tip conflicts stays at its adopted head', () => {
+  it('an adopted head already carried by a sibling overlay produces no content-free pin or overlay-pinned alert', async () => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_STACK_MODE = 'independent';
+    await f.tick();
+    const sibling = f.push('lane/sibling', f.mOld, { 'shared.txt': 'sibling\n' });
+    addOverlay(f.clone, { ref: 'lane/sibling', pr: 5840 }, { env: f.env });
+    expect(await f.tick()).toMatchObject({ adopted: true });
+    expect(readRebuildState(f.clone, f.env).adopted.applied.find((a) => a.ref === 'lane/moving')).toMatchObject({ sha: f.mOld });
+    const moving = f.push('lane/moving', f.mOld, { 'shared.txt': 'moving\n' });
+
+    const result = await f.tick();
+    expect(result.plan.decisions.find((d) => d.ref === 'lane/moving')).toMatchObject({ action: 'drop', reason: 'conflict', sha: moving });
+    expect(result.plan.applied.some((a) => a.ref === 'lane/moving')).toBe(false);
+    expect(result.plan.establishedLost).toEqual([]); // the sibling still carries the old content
+    expect(result.alerts.map((a) => a.kind)).toContain('overlay-conflict-dropped');
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-pinned');
+    expect(f.pinnedLogs()).toEqual([]);
+    expect(isAncestor(f.clone, sibling, f.head())).toBe(true);
+    expect(isAncestor(f.clone, f.mOld, f.head())).toBe(true);
+  });
+
+  it.each([false, true])('planB with establishedLost emits fallback-plain-main-unplannable; planA2 attribution=%s also refuses loss', async (attributable) => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+    for (const ref of ['lane/moving', 'lane/fix-a', 'lane/fix-b']) removeOverlay(f.clone, ref, { env: f.env });
+    // A mechanism overlay needs a non-pinned repair to merge after main moves. Without the repair it is
+    // skippable (main carries the mechanism), but establishedLost must stop BOTH smoke fallbacks.
+    const base = f.push('main', f.init, {
+      'shared.txt': 'base\n',
+      'scripts/lib/daemon-rebuild.mjs': '// core\n',
+      'scripts/lib/daemon-overlays.mjs': '// core\n',
+      'scripts/lib/daemon-rebuild/x.mjs': '// base\n',
+    });
+    const pinned = f.push('lane/pinned', base, {
+      'shared.txt': 'overlay\n', 'scripts/lib/daemon-rebuild/x.mjs': '// overlay\n',
+    });
+    addOverlay(f.clone, { ref: 'lane/pinned', pr: 5850 }, { env: f.env });
+    expect(await f.tick()).toMatchObject({ adopted: true });
+    const live = f.head();
+    const main = f.push('main', base, { 'shared.txt': 'main\n' });
+    f.push('lane/repair', main, { 'shared.txt': 'base\n', 'bad.mjs': '// regression\n' });
+    f.push('lane/good', main, { 'good.txt': 'good\n' });
+    for (const ref of ['lane/repair', 'lane/good']) addOverlay(f.clone, { ref }, { env: f.env });
+    f.smoke.mockImplementation(async ({ root }) => {
+      const bad = spawnSync('git', ['cat-file', '-e', 'HEAD:bad.mjs'], { cwd: root }).status === 0;
+      return bad ? { verdict: 'code', attempts: 1, smoke: { results: [{
+        name: 'regression', ok: false, mayBeTransient: false,
+        detail: attributable ? `file://${root}/bad.mjs:1` : 'boom',
+      }] } } : { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+    });
+
+    const result = await f.tick();
+    expect(result.reason).toBe('smoke-rejected');
+    expect(result.adopted).not.toBe(true);
+    expect(result.alerts.find((a) => a.kind === 'fallback-plain-main-unplannable')?.detail.reason)
+      .toBe('established-overlay-conflict: lane/pinned');
+    if (attributable) {
+      expect(result.alerts.find((a) => a.kind === 'overlay-set-aside-failed')?.detail.failed)
+        .toBe('established-overlay-conflict: lane/pinned');
+    }
+    expect(result.alerts.map((a) => a.kind)).not.toContain('fallback-plain-main');
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-set-aside-attributed');
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-dropped-smoke-failed');
+    expect(f.smoke).toHaveBeenCalledTimes(3); // initial adoption, failing candidate, last-good control only
+    expect(f.head()).toBe(live);
+    expect(isAncestor(f.clone, pinned, f.head())).toBe(true);
+    expect(readOverlays(f.clone, { env: f.env }).map((o) => o.ref)).toEqual(['lane/pinned', 'lane/repair', 'lane/good']);
+  }, 60_000);
+
   it.each([
     { name: 'retryable pin first', order: ['lane/a', 'lane/b', 'lane/c'], joint: false },
     { name: 'blocked pin first', order: ['lane/b', 'lane/a', 'lane/c'], joint: false },
