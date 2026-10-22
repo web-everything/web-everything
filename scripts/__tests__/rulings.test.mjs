@@ -18,7 +18,7 @@ afterEach(() => { for (const dir of temporary.splice(0)) rmSync(dir, { recursive
 const row = (n, cls = 'D', rule = 'Rule') => `R${n} | standing | ${cls} | "quote" | ${rule}`;
 function run(script, path, args = [], input = '') {
   return spawnSync(process.execPath, [resolve(root, 'scripts', script), ...args], {
-    cwd: root, env: { ...process.env, RULINGS_DIGEST_PATH: path }, input, encoding: 'utf8', timeout: 10000,
+    cwd: root, env: { ...process.env, RULINGS_DIGEST_PATH: path, PRECOMPACT_SNAPSHOT_PATH: `${path}.snapshot.json` }, input, encoding: 'utf8', timeout: 10000,
   });
 }
 function context(output) { return output.hookSpecificOutput.additionalContext; }
@@ -151,6 +151,100 @@ describe('rulings digest', () => {
     const result = run('rulings-inject.mjs', resolve(path, '..'));
     expect(result.status).toBe(0);
     expect(context(JSON.parse(result.stdout))).toMatch(/^rulings digest warning: [^\n]+$/);
+  });
+
+  it('appends only the latest matching session snapshot for compact, excluding startup and resume', () => {
+    const path = digest();
+    writeFileSync(path, row(1));
+    writeFileSync(`${path}.snapshot.json`, JSON.stringify({ snapshots: [
+      { sessionId: 'A', atEt: 'old', trigger: 'auto', pendingAsks: ['old ask'] },
+      { sessionId: 'A', atEt: '2026-10-22 10:30', trigger: 'manual', agents: [{ name: 'worker', status: 'running' }], pendingAsks: ['new ask'] },
+      { sessionId: 'B', atEt: '2026-10-22 10:31', trigger: 'auto', pendingAsks: ['session B ask'] },
+    ] }));
+    for (const source of ['compact', 'startup', 'resume']) {
+      const result = run('rulings-inject.mjs', path, [], JSON.stringify({ source, session_id: 'A' }));
+      expect(result.status, result.stderr).toBe(0);
+      const text = context(JSON.parse(result.stdout));
+      expect(text).toContain(row(1));
+      if (source === 'compact') {
+        expect(text).toContain(`${row(1)}\n\nPre-compaction snapshot (2026-10-22 10:30 ET, trigger manual):`);
+        expect(text).toContain('worker(running)');
+        expect(text).toContain('new ask');
+        expect(text).not.toContain('old ask');
+        expect(text).not.toContain('session B ask');
+      } else expect(text).not.toContain('Pre-compaction snapshot');
+    }
+  });
+
+  it('uses the remaining context budget and truncates oversized snapshots at a line boundary', () => {
+    const path = digest();
+    const ruling = row(1, 'D', 'é'.repeat(2900));
+    writeFileSync(path, ruling);
+    writeFileSync(`${path}.snapshot.json`, JSON.stringify({ snapshots: [{ sessionId: 'A', atEt: 'today', trigger: 'auto',
+      pendingAsks: Array.from({ length: 100 }, (_, n) => `ask ${n} ${'é'.repeat(100)}`),
+    }] }));
+    const result = run('rulings-inject.mjs', path, [], JSON.stringify({ source: 'compact', session_id: 'A' }));
+    expect(result.status, result.stderr).toBe(0);
+    const text = context(JSON.parse(result.stdout));
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(8192);
+    expect(text).toContain(ruling);
+    expect(text).toContain('Pre-compaction snapshot');
+    expect(text).toMatch(/\n… snapshot truncated$/);
+    const direct = context(buildInjection({ text: ruling, path, source: 'test', snapshotText: 'snapshot\n' + 'é'.repeat(10000) }));
+    expect(Buffer.byteLength(direct)).toBeLessThanOrEqual(8192);
+    expect(direct).toMatch(/\nsnapshot\n… snapshot truncated$/);
+  });
+
+  it('preserves a roughly 6.5 KB digest with a configured 7000-byte budget', () => {
+    const rows = Array.from({ length: 45 }, (_, n) => row(n + 1, 'D', 'x'.repeat(110)));
+    const text = rows.join('\n');
+    expect(Buffer.byteLength(text)).toBeGreaterThan(6144);
+    expect(Buffer.byteLength(text)).toBeLessThan(7000);
+    const args = { text, path: '/tmp/digest', source: 'test', maxBytes: 7000, maxLines: 50 };
+    const original = context(buildInjection(args));
+    const injected = context(buildInjection({ ...args, snapshotText: 'snapshot\n' + 'é'.repeat(3000) }));
+    for (const ruling of rows) expect(injected).toContain(ruling);
+    expect(injected.startsWith(original + '\n\n')).toBe(true);
+    expect(Buffer.byteLength(injected)).toBeLessThanOrEqual(8192);
+    expect(injected).toMatch(/\n… snapshot truncated$/);
+  });
+
+  it('preserves the entire digest and appends only an omission note when it exhausts the budget', () => {
+    const text = Array.from({ length: 50 }, (_, n) => row(n + 1, 'D', 'x'.repeat(180))).join('\n');
+    const args = { text, path: '/tmp/digest', source: 'test', maxBytes: 15000, maxLines: 50 };
+    const original = context(buildInjection(args));
+    expect(Buffer.byteLength(original)).toBeGreaterThan(8192);
+    expect(context(buildInjection({ ...args, snapshotText: 'private snapshot data' })))
+      .toBe(original + '\n\npre-compaction snapshot omitted: digest uses the budget');
+    expect(original).toContain(text);
+  });
+
+  it.each([undefined, '', 'missing'])('reports no snapshot for a missing or unmatched session ID: %s', (session_id) => {
+    const path = digest();
+    writeFileSync(path, row(1));
+    writeFileSync(`${path}.snapshot.json`, JSON.stringify({ snapshots: [
+      { sessionId: 'B', atEt: 'today', trigger: 'auto', pendingAsks: ['session B ask'] },
+      { sessionId: '', atEt: 'today', trigger: 'auto', pendingAsks: ['anonymous ask'] },
+    ] }));
+    const result = run('rulings-inject.mjs', path, [], JSON.stringify({ source: 'compact', session_id }));
+    expect(result.status, result.stderr).toBe(0);
+    const text = context(JSON.parse(result.stdout));
+    expect(text).toContain('no pre-compaction snapshot for this session');
+    expect(text).not.toContain('session B ask');
+    expect(text).not.toContain('anonymous ask');
+  });
+
+  it('reports missing, invalid or malformed snapshot files on compact', () => {
+    const path = digest();
+    writeFileSync(path, row(1));
+    for (const content of [null, '{bad', 'null', '{"snapshots":{}}', '{"snapshots":[{"sessionId":"A","agents":[null]}]}']) {
+      if (content !== null) writeFileSync(`${path}.snapshot.json`, content);
+      const result = run('rulings-inject.mjs', path, [], '{"source":"compact","session_id":"A"}');
+      expect(result.status).toBe(0);
+      expect(context(JSON.parse(result.stdout))).toContain(row(1));
+      expect(context(JSON.parse(result.stdout))).not.toContain('Pre-compaction snapshot');
+      expect(context(JSON.parse(result.stdout))).toContain('no pre-compaction snapshot for this session');
+    }
   });
 
   it('adds and retires atomically, excludes retired rows, and honors --digest', () => {

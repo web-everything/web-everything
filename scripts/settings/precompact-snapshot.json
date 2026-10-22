@@ -1,0 +1,8 @@
+{
+  "precompactSnapshot": {
+    "snapshotPath": "~/workspace/.operations/handoff/session-snapshot.json",
+    "handoffPath": "~/workspace/.operations/handoff/handoff-webeverything.md",
+    "maxBytes": 4096,
+    "keep": 3
+  }
+}
