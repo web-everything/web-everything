@@ -72,20 +72,23 @@ export function laneDietConfigOps({ fetchValues = [], kv = {} } = {}) {
   return ops;
 }
 
-/** Read diet settings from git's scoped, NUL-delimited listing. Include all scopes only for fetch proofs. Pure. */
-export function laneDietConfigState(output, { localOnly = true } = {}) {
+/** Read local diet settings and effective fetch mappings from git's scoped config listing. Pure. */
+export function laneDietConfigState(output) {
   const values = new Map();
+  const effectiveFetchValues = [];
   const parts = String(output).split('\0');
   for (let i = 0; i + 1 < parts.length; i += 2) {
-    if (localOnly && parts[i] !== 'local') continue;
     const entry = parts[i + 1], end = entry.indexOf('\n');
     const key = end < 0 ? entry : entry.slice(0, end);
     const value = end < 0 ? '' : entry.slice(end + 1);
+    if (key === 'remote.origin.fetch') effectiveFetchValues.push(value);
+    if (parts[i] !== 'local') continue;
     if (!values.has(key)) values.set(key, []);
     values.get(key).push(value);
   }
   return {
     fetchValues: values.get('remote.origin.fetch') || [],
+    effectiveFetchValues,
     kv: Object.fromEntries(Object.keys(LANE_DIET_KV).map((key) => [key, (values.get(key.toLowerCase()) || []).join('\n').trim()])),
   };
 }

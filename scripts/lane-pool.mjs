@@ -281,16 +281,17 @@ const FETCH_LOCK_RETRY_BASE_MS = 250;
 function ensureLaneDietConfig(dir, current) {
   try {
     const ops = applyLaneDietConfig((args) => git(args, dir, { timeout: LOCAL_GIT_TIMEOUT_MS }), current);
-    // Only reuse an effective config snapshot when neither the scrub nor the diet changed it.
-    if (ops.length === 0) return current?.fetchConfig;
+    // Only an unchanged scrub snapshot can describe the mapping used by the following fetch.
+    // Config repairs (including removed includes) and recovery retries require a fresh proof read.
+    return ops.length === 0 ? current?.effectiveFetchValues : undefined;
   } catch (e) {
     log(`  ⚠ ${dir}: lane git-diet config not applied (${String(e && e.message ? e.message : e).split('\n')[0]})`);
   }
 }
 function fetchOriginPruneWithRetry(dir, dietConfig) {
-  const fetchConfig = ensureLaneDietConfig(dir, dietConfig);
+  const fetchSpecs = ensureLaneDietConfig(dir, dietConfig);
   retryTransientGit(() => git(['fetch', 'origin', '--prune', '--quiet'], dir, { timeout: NETWORK_GIT_TIMEOUT_MS }), { attempts: FETCH_LOCK_RETRY_ATTEMPTS, baseMs: FETCH_LOCK_RETRY_BASE_MS });
-  return fetchConfig;
+  return fetchSpecs;
 }
 
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
@@ -1197,13 +1198,15 @@ function liveRemoteShas(dir) {
  *  stale-cache case `aheadIsProvablyPushed`'s own docblock warns against (a ref deleted on origin AFTER
  *  landing, whose local remote-tracking ref lingers). Used to re-verify containment right before the
  *  destructive reset, on data no older than the fetch that immediately precedes it — no second network call. */
-function localRemoteShas(dir, fetchConfig = tryGit(['config', '--get-all', 'remote.origin.fetch'], dir)) {
+function localRemoteShas(dir, fetchedSpecs) {
   // A destination's name alone cannot prove that fetch refreshed it: a custom mapping can
   // populate origin/saved from an excluded ops source. Only the standard lane mapping has
   // the freshness semantics below. Fail closed for other positives or negatives (including
   // restricted fetches), rather than treating their possibly stale destinations as proofs.
-  if (fetchConfig === null) return new Set();
-  const fetchSpecs = fetchConfig.split('\n');
+  // A successful acquire fetch may supply its immediately preceding, unchanged scrub snapshot.
+  const fetchConfig = fetchedSpecs === undefined ? tryGit(['config', '--get-all', 'remote.origin.fetch'], dir) : null;
+  if (fetchedSpecs === undefined && fetchConfig === null) return new Set();
+  const fetchSpecs = fetchedSpecs ?? fetchConfig.split('\n');
   const standardFetch = '+refs/heads/*:refs/remotes/origin/*';
   if (!fetchSpecs.includes(standardFetch) || fetchSpecs.some((spec) =>
     spec !== standardFetch && spec !== '^refs/heads/ops/*')) return new Set();
@@ -1917,12 +1920,7 @@ const acquireResetSnapshots = new Map();
 function scrubClaimedLaneConfig(dir, reason) {
   let dietConfig;
   // Reuse an unchanged scrub read for the next fetch. Removing an include can also remove diet settings.
-  const { removed, kept } = scrubRiskyLaneConfig(dir, { log, onConfig: (output) => {
-    dietConfig = laneDietConfigState(output);
-    // Fetch uses effective config, including global, worktree and command scopes. A custom mapping
-    // in any of those scopes must still make localRemoteShas fail closed.
-    dietConfig.fetchConfig = laneDietConfigState(output, { localOnly: false }).fetchValues.join('\n');
-  } });
+  const { removed, kept } = scrubRiskyLaneConfig(dir, { log, onConfig: (output) => { dietConfig = laneDietConfigState(output); } });
   if (removed.length) journalLaneEvent(dir, { action: 'config-scrub', removed, kept, reason });
   return removed.length ? undefined : dietConfig;
 }
@@ -1935,15 +1933,16 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     // object, dangling ref) is healed or quarantined + re-provisioned here, so acquire hands out a healthy lane.
     // LAZY on purpose: the health probe costs ~6 git spawns, so a healthy lane (the common case) never pays for it —
     // it runs only once the fetch or the pre-reset checks below actually fail with a corruption-shaped error.
-    const fetchForReset = (current) => {
-      try { return fetchOriginHealing(repo, chosen, { allowReclone: true, dietConfig: current }); }
-      catch (e) {
-        // A deleted exact custom refspec can make fetch fail before the containment re-check.
-        // No successful fetch means no fresh proof; retain the fetch error and release the claim.
-        throw new Error(`lane-${chosen} is no longer provably safe to reset: fetch failed (${msgOf(e).trim()})`, { cause: e });
+    const fetchForReset = (config) => {
+      try {
+        return fetchOriginHealing(repo, chosen, { allowReclone: true, dietConfig: config });
+      } catch (e) {
+        // A missing explicitly mapped ref can abort fetch before the containment re-check.
+        // Preserve the cause and refuse the reset just as when fresh refs provide no proof.
+        throw new Error(`lane-${chosen} is no longer provably safe to reset: origin fetch failed (${msgOf(e).trim()})`, { cause: e });
       }
     };
-    let fetchConfig = fetchForReset(dietConfig);
+    let fetchedSpecs = fetchForReset(dietConfig);
     const repairUnhealthyClone = () => {
       let health = diagnoseLane(dir);
       if (!health.ok) {
@@ -1952,7 +1951,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
         health = diagnoseLane(dir);
         if (!health.ok) recloneLane(repo, chosen, health.problems.join('; '));
       }
-      fetchConfig = fetchForReset();
+      fetchedSpecs = fetchForReset();
     };
     const resetToBase = () => {
     // #2924 — re-verify containment on FRESH post-fetch remote-tracking refs, immediately before the
@@ -1968,7 +1967,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
       // without this, a litter-only-dirty lane picked exactly because it looked acquirable would immediately
       // fail this re-verify, one line later, on the identical litter it was already cleared for.
       const dirty = litterAdjustedDirty(dir, uncommitted > 0);
-      const provablyPushed = ahead === 0 || aheadIsProvablyPushed(dir, localRemoteShas(dir, fetchConfig), repo.branch);
+      const provablyPushed = ahead === 0 || aheadIsProvablyPushed(dir, localRemoteShas(dir, fetchedSpecs), repo.branch);
       if (dirty || !provablyPushed) {
         // #3407 — THROWS (was `fail()`, uncatchable) so a caller can restore/drop this claim's lease — and, on
         // auto-pick, fall through to the next candidate — before the process actually exits.

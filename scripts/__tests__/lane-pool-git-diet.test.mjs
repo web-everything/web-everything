@@ -14,6 +14,29 @@ import { tmpdir } from 'node:os';
 const proofSource = /function localRemoteShas\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
 const defaultFetch = '+refs/heads/*:refs/remotes/origin/*';
 const excludedOps = '^refs/heads/ops/*';
+const ensureSource = /function ensureLaneDietConfig\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
+it.each([
+  ['unchanged', [], false, [defaultFetch, excludedOps]],
+  ['repaired', [['config', '--local', '--add', 'remote.origin.fetch', excludedOps]], false, undefined],
+  ['failed', [], true, undefined],
+])('fetch config snapshot is reused only when %s', (_name, ops, failed, expected) => {
+  const ensureLaneDietConfig = new Function('applyLaneDietConfig', 'log', `${ensureSource}; return ensureLaneDietConfig;`)(
+    () => { if (failed) throw new Error('config failed'); return ops; }, () => {},
+  );
+  expect(ensureLaneDietConfig('/unused', { effectiveFetchValues: [defaultFetch, excludedOps] })).toEqual(expected);
+  expect(ensureLaneDietConfig('/unused')).toBeUndefined();
+});
+it.each([[defaultFetch, excludedOps], [defaultFetch, excludedOps, '+refs/heads/ops/*:refs/remotes/origin/archive/*']])(
+  'local proof uses the effective config from its successful fetch (%j)', (...fetchValues) => {
+  const calls = [];
+  const localRemoteShas = new Function('tryGit', `${proofSource}; return localRemoteShas;`)((args) => {
+    calls.push(args);
+    if (args[0] === 'config') throw new Error('redundant config spawn');
+    return 'fresh refs/remotes/origin/trunk \n';
+  });
+  expect([...localRemoteShas('/unused', fetchValues)]).toEqual(fetchValues.length === 2 ? ['fresh'] : []);
+  expect(calls.every((args) => args[0] === 'for-each-ref')).toBe(true);
+});
 const customFetchCases = [
   ['exact ops remap', [defaultFetch, excludedOps, '+refs/heads/ops/review-requests:refs/remotes/origin/saved']],
   ['wildcard ops remap', [defaultFetch, excludedOps, '+refs/heads/ops/*:refs/remotes/origin/archive/*']],
@@ -48,7 +71,7 @@ it.each([
     return 'fresh refs/remotes/origin/trunk \nstale refs/remotes/origin/ops/review-requests ';
   };
   const localRemoteShas = new Function('tryGit', `${proofSource}; return localRemoteShas;`)(tryGit);
-  expect([...localRemoteShas('/unused', fetchValues.join('\n'))]).toEqual(expected);
+  expect([...localRemoteShas('/unused', fetchValues)]).toEqual(expected);
 });
 
 it('provision + acquire keep ops/* out of a lane while explicit reader fetches still work', () => {
