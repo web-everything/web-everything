@@ -332,6 +332,16 @@ export function parseCheckerVerdict(message) {
   return { approved: false, verdict: 'unreadable', reason: `the first line was not APPROVE or REJECT: ${lines[0].slice(0, 120)}` };
 }
 
+/** Only the audit's explicit first-line clearance passes; silence and unknown answers refuse. PURE. */
+export function parseAuditVerdict(message) {
+  const lines = String(message ?? '').split('\n').map(l => l.trim()).filter(Boolean);
+  const head = (lines[0] ?? '').replace(/[*_`#>\s]/g, '').toUpperCase();
+  const reason = lines.slice(1).join(' ').slice(0, 500);
+  if (head === 'NOTWEAKENED') return { approved: true, verdict: 'not-weakened', reason: reason || 'audit found no weakening' };
+  if (head === 'WEAKENED') return { approved: false, verdict: 'weakened', reason: reason || 'audit found weakening' };
+  return { approved: false, verdict: 'unreadable', reason: 'audit gave no readable first-line verdict' };
+}
+
 /**
  * Sum `git diff --numstat` output. PURE. Binary files (`-\t-\tpath`) count as one file and zero lines.
  * `exclude` drops paths that were untracked BEFORE the worker ran: `gemini-direct-task.mjs` intent-adds every
@@ -471,7 +481,7 @@ export function buildHealCommitMessage({ pr, reason, worker, item = null, subjec
  * only moves `selectProbationWorker`'s rotation on and shows up in the probation report as "launched".
  * @param {object} o
  */
-export function launchScorecardRow({ worker, pr, repo, handle, item = null, launchOutcome, checker = null, diff = null, scoredAt, modelEvidence = {} }) {
+export function launchScorecardRow({ worker, pr, repo, handle, item = null, launchOutcome, checker = null, diff = null, scoredAt, modelEvidence = {}, postRunCheck = null }) {
   return {
     rubricVersion: 'probation-launch.1',
     provider: worker.provider,
@@ -490,6 +500,7 @@ export function launchScorecardRow({ worker, pr, repo, handle, item = null, laun
     worker: worker.id,
     launchOutcome,
     checker,
+    ...(postRunCheck != null ? { postRunCheck } : {}),
     diff,
     pr,
     repo,
