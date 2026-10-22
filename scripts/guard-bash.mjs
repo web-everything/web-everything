@@ -5046,6 +5046,24 @@ if (IS_CLI) {
   }
   const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes, laneTargets, laneLeaseFacts, reportedCwd };
   const r = decide(cmd, guardCtx);
+  // lane-lease-occupant — lease liveness follows the OCCUPANT: an allowed call in a lane renews that lane's lease when
+  // this session is its declared occupant or the call asserts the lease's own slug (throttled; a stale lease is never
+  // revived). Dynamic import so a Bash call outside any lane pays nothing. Never wedges the hook.
+  if (!r) {
+    try {
+      const roots = new Map();
+      const effRoot = effectiveCwd ? laneRootFromCwd(effectiveCwd) : null;
+      if (effRoot) roots.set(effRoot, assertedLaneSlug(cmd));
+      for (const t of laneTargets || []) for (const d of t.dirs) {
+        const root = d && laneRootFromCwd(d);
+        if (root) roots.set(root, assertedLaneSlug(t.segment) || roots.get(root) || null);
+      }
+      if (roots.size) {
+        const { renewLeaseOnUse } = await import('./lib/lane-lease-renew.mjs');
+        for (const [root, slug] of roots) renewLeaseOnUse({ laneRoot: root, mySessionId: hookSessionId, assertedSlug: slug });
+      }
+    } catch { /* a heartbeat fault never blocks a command */ }
+  }
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed
     // OUTSIDE `decide` (which stays byte-stable for the golden corpus) and wrapped in its own try/catch: an

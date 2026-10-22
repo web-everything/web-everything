@@ -1,0 +1,4 @@
+{
+  "$comment": "laneLease.renewOnUseMinutes (default 5, range 1-60): how often a lane's own occupant renews its lease just by using the lane (guard-bash / guard-lane heartbeat), so the 240-minute TTL runs from the last use, not from the short-lived acquire shell. Resolves standard -> platform laneLease -> this file -> env WE_LANE_LEASE_RENEW_MINUTES, logged by the policy cascade. There is deliberately no setting that turns off the destructive-op proof (LANE_SESSION must equal the live holder slug).",
+  "laneLease": { "renewOnUseMinutes": 5 }
+}

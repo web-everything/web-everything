@@ -591,6 +591,35 @@ export function laneDestructiveOpVerdict({ lease = null, assertedSlug = null, cl
   return allow('holder', 'the current holder asserted its slug on a live lease');
 }
 
+/** Built-in settings for lease liveness. `renewOnUseMinutes`: how often a holder's own use of its lane renews the
+ *  lease (a heartbeat; the TTL then runs from the last renewal). Range 1–60. */
+export const BUILT_IN_LANE_LEASE_SETTINGS = Object.freeze({ renewOnUseMinutes: 5 });
+export const LANE_LEASE_SETTING_RULES = Object.freeze({
+  renewOnUseMinutes: (v) => Number.isFinite(v) && v >= 1 && v <= 60,
+});
+export const LANE_LEASE_SETTING_ENV = Object.freeze({ renewOnUseMinutes: 'WE_LANE_LEASE_RENEW_MINUTES' });
+
+/**
+ * Lease liveness follows the OCCUPANT, not the acquiring shell. When the lane's current occupant uses it — the
+ * declared occupant (`workerSession`, stamped by `adopt` / `acquire --adopt`) is this session, or the call asserts the
+ * lease's own slug — return the lease renewed at `nowIso`, or null when nothing should be written. Pure.
+ * Never renews a STALE lease (an expired hold is never revived by its old holder — it re-acquires), a reserved one
+ * (no TTL), or one renewed less than `throttleMs` ago (one write per throttle window, not per tool call).
+ * @param {{lease?:object|null, mySessionId?:string|null, assertedSlug?:string|null, nowMs:number, throttleMs?:number}} p
+ */
+export function leaseRenewalOnUse({ lease = null, mySessionId = null, assertedSlug = null, nowMs, throttleMs = BUILT_IN_LANE_LEASE_SETTINGS.renewOnUseMinutes * 60_000 } = {}) {
+  if (!lease || typeof lease !== 'object' || lease.reserved || !Number.isFinite(nowMs)) return null;
+  if (isLeaseStale(lease, nowMs)) return null;
+  const required = laneMarkedSlug(lease) || laneHolderSlug(lease);
+  const bySlug = !!assertedSlug && !!required && assertedSlug === required;
+  const worker = laneWorkerSession(lease);
+  const byOccupant = !!worker && !!mySessionId && worker === mySessionId;
+  if (!bySlug && !byOccupant) return null;
+  const last = Math.max(Date.parse(lease.acquiredAt) || 0, Date.parse(lease.renewedAt) || 0);
+  if (nowMs - last < throttleMs) return null;
+  return { ...lease, renewedAt: new Date(nowMs).toISOString(), renewedBy: bySlug ? 'holder-slug' : 'occupant' };
+}
+
 // ── The lane hold rule (#xbdixjc) ─────────────────────────────────
 // "May this lane be released, reset, removed or reclaimed right now?" A fixer that ends its turn to await verify
 // looks gone to the lease reaper; on 2026-10-08 17:00–21:00Z the reaper released 24 lanes holding unpushed work

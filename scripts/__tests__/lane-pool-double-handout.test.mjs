@@ -76,6 +76,54 @@ async function pausedAcquire(extra, mutate, { auto = false, barrierEnv = 'LANE_P
 
 // Each test owns its pool; no production session listing or remote GitHub calls are needed.
 describe('a live lease cannot be handed to a second session', () => {
+  it('refuses a reaper release judged against an older holder; auto-pick gets lane-2', () => {
+    provision(2);
+    expect(acquire().code).toBe(0);
+    const original = readFileSync(marker(), 'utf8');
+    const refused = release('--expect-holder=older-holder');
+    expect(refused.code).toBe(0);
+    expect(refused.err).toContain('lease is no longer the one the caller judged');
+    expect(readFileSync(marker(), 'utf8')).toBe(original);
+    const second = runPool(['acquire', '--session=other', ...poolArgs()], { CLAUDE_CODE_SESSION_ID: 'sess-B' });
+    expect(second.code).toBe(0);
+    expect(second.out.trim()).toBe(join(poolRoot, 'double-handout', 'lane-2'));
+  });
+
+  it('still releases a matching judged holder and acquiredAt', () => {
+    provision();
+    expect(acquire().code).toBe(0);
+    const lease = readLease();
+    expect(release(`--expect-holder=${lease.holder}`, `--expect-acquired-at=${lease.acquiredAt}`).code).toBe(0);
+    expect(existsSync(marker())).toBe(false);
+  });
+
+  it('refuses a matching holder with a different judged acquiredAt, including legacy timestamp-only releases', () => {
+    provision();
+    expect(acquire().code).toBe(0);
+    const original = readFileSync(marker(), 'utf8');
+    expect(release(`--expect-holder=${readLease().holder}`, '--expect-acquired-at=old').code).toBe(0);
+    expect(readFileSync(marker(), 'utf8')).toBe(original);
+    expect(release('--expect-acquired-at=old').code).toBe(0);
+    expect(readFileSync(marker(), 'utf8')).toBe(original);
+    expect(release(`--expect-acquired-at=${readLease().acquiredAt}`).code).toBe(0);
+    expect(existsSync(marker())).toBe(false);
+  });
+
+  it.each([
+    ['--all-pools', '--expect-holder=y'],
+    ['--all-pools', '--expect-acquired-at=old'],
+    ['--all', '--expect-holder=y'],
+    ['--all', '--expect-acquired-at=old'],
+  ])('refuses bulk release %s with %s and leaves leases intact', (bulk, expected) => {
+    provision();
+    expect(acquire('--session=x').code).toBe(0);
+    const original = readFileSync(marker(), 'utf8');
+    const result = runPool(['release', bulk, '--session=x', expected, ...poolArgs()]);
+    expect(result.code).not.toBe(0);
+    expect(result.err).toContain('--expect-holder/--expect-acquired-at need a single --lane=N');
+    expect(readFileSync(marker(), 'utf8')).toBe(original);
+  });
+
   it.each(['delete', 'replace'])('fails without stdout or a reset when its lease is lost mid-acquire (%s)', async (mode) => {
     provision();
     const head = git(['rev-parse', 'HEAD'], laneDir());
@@ -97,6 +145,32 @@ describe('a live lease cannot be handed to a second session', () => {
     if (mode === 'replace') expect(readFileSync(marker(), 'utf8')).toBe(foreign);
     else expect(existsSync(marker())).toBe(false);
   }, 20_000);
+
+  it('recovery requires the matching live holder and never recreates a released marker', () => {
+    provision();
+    expect(acquire().code).toBe(0);
+    const holder = readLease().holder;
+    expect(acquire(`--expect-holder=${holder}`).code).toBe(0);
+    expect(readLease().holder).toBe(holder);
+    const original = readFileSync(marker(), 'utf8');
+    expect(acquire('--expect-holder=WRONG').code).not.toBe(0);
+    expect(readFileSync(marker(), 'utf8')).toBe(original);
+    expect(release(`--expect-holder=${holder}`).code).toBe(0);
+    expect(acquire(`--expect-holder=${holder}`).code).not.toBe(0);
+    expect(existsSync(marker())).toBe(false);
+  });
+
+  it('recovery refuses an expired matching holder without modifying the marker', () => {
+    provision();
+    expect(acquire().code).toBe(0);
+    const lease = readLease();
+    lease.acquiredAt = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+    delete lease.renewedAt;
+    const original = JSON.stringify(lease);
+    writeFileSync(marker(), original);
+    expect(acquire(`--expect-holder=${lease.holder}`).code).not.toBe(0);
+    expect(readFileSync(marker(), 'utf8')).toBe(original);
+  });
 
   it('a failed base acquire removes only its own claim on a free lane', () => {
     provision();
