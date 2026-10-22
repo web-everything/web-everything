@@ -406,13 +406,18 @@ export function createDrainMergeStrategy({
           const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
           const source = deadline.sources?.deadlineAction ?? 'standard';
           const missing = !evidence.inFlight && !evidence.queued && !evidence.recorded;
+          // The one re-request for this head gets its own full wait (queued or running included) before the operator
+          // is asked. Still held throughout: the request itself is never a result.
+          if (wait.requestedAt != null && now() - wait.requestedAt < maxMin * 60_000) return outcome;
+          let requestFailed = null;
           if (missing && deadlineAction === 'requeue-then-hold') {
-            // The one re-request for this head gets its own full wait before the operator is asked.
-            if (wait.requestedAt != null && now() - wait.requestedAt < maxMin * 60_000) return outcome;
             if (wait.requestedAt == null && typeof requestRedTeam === 'function') {
               let requested = false;
-              try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
-              catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
+              try {
+                const r = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload });
+                requested = r?.requested === true;
+                if (!requested) requestFailed = String(r?.reason ?? 'not requested').slice(0, 200);
+              } catch (e) { requestFailed = firstLine(e); log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
               if (requested) {
                 wait.requestedAt = now();
                 writeState(statePath, before);
@@ -425,7 +430,8 @@ export function createDrainMergeStrategy({
             // The only path to merge-without-result: the operator's own env, named, logged on every use.
             log.write(`  ⚠ OPERATOR OVERRIDE: enqueuing ${slugOf(c.repo)}#${c.num} on ${headSha} with NO red-team result after ${maxMin} min (redTeam.deadlineAction=${RED_TEAM_DEADLINE_OVERRIDE}, env, by ${deadline.operatorOverride.by})\n`);
           } else {
-            const why = missing ? (wait.requestedAt != null ? 'still none after one re-request' : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
+            const why = missing ? (wait.requestedAt != null ? 'still none after one re-request' : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold'
+              : requestFailed ? `red-team re-request not posted: ${requestFailed}` : 'no red-team request path')
               : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
             const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
             if (wait.deadlineHeldAt == null) {
