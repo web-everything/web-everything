@@ -1613,7 +1613,12 @@ function tryClaimLane(dir, session, nowMs, ttlMs) {
     const holder = laneHolderSlug(existing) || mintedHolder;
     // …and it KEEPS the declared occupant for the same reason: dropping it would silently un-protect a lane an
     // agent is working in. `--adopt` on the re-acquire is the deliberate way to (re-)claim it.
-    writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing)));
+    const barrier = process.env.LANE_POOL_TEST_RENEWAL_BARRIER;
+    if (barrier) pauseForTestBarrier(barrier, 10_000);
+    if (!sameLease(readLease(dir), existing)) return null;
+    // The compare→rename window can only clobber a claim made microseconds after someone dropped OUR live lease;
+    // that claimant's assertOwnClaim fails before its reset: no double hand-out, and our marker is never absent.
+    try { writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing))); } catch { return null; }
     return holder;
   }
   if (isLeaseStale(existing, nowMs, ttlMs)) {
@@ -1846,12 +1851,24 @@ function laneHoldRefuses(dir, action, { byHolder = false, unpushed } = {}) {
  * #3383 — undo a claim that the acquire then refused: put back the lease that was there before when it was a live one
  * (a holder re-acquiring its own lane keeps its hold), otherwise remove the lease the claim just wrote.
  */
-function restoreLeaseAfterRefusedClaim(dir, preExisting) {
+function restoreLeaseAfterRefusedClaim(dir, preExisting, claimedHolder) {
   try {
-    if (preExisting && !isLeaseStale(preExisting, Date.now(), ttlMsFromFlags())) writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preExisting, null, 2) + '\n');
-    // journal-exempt: drops only the claim THIS refused acquire just wrote — the lane never changed hands.
-    else rmSync(LEASE_MARKER(dir), { force: true });
-  } catch { /* the refusal still stands; a stale lease ages out on its own */ }
+    if (preExisting && !isLeaseStale(preExisting, Date.now(), ttlMsFromFlags())) {
+      if (readLease(dir)?.holder !== claimedHolder) return;
+      writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preExisting, null, 2) + '\n');
+    } else {
+      const n = /lane-(\d+)$/.exec(dir)?.[1] ?? '?';
+      takeMarkerIf(dir, (moved) => !!moved && moved.holder === claimedHolder, n);
+    }
+  } catch { /* the refusal still stands; never overwrite a concurrent claim */ }
+}
+
+function assertOwnClaim(dir, holderSlug) {
+  const lease = readLease(dir);
+  if (lease && !isLeaseStale(lease, Date.now(), ttlMsFromFlags()) && lease.holder === holderSlug) return;
+  const error = new Error(`lease lost mid-acquire: ${basename(dir)} lease is now ${lease ? describeLease(lease) : 'absent'}, not holder ${holderSlug} — another actor (reaper/release) dropped it; not handing this lane out`);
+  error.code = 'LEASE_LOST';
+  throw error;
 }
 
 /**
@@ -2096,6 +2113,7 @@ function cmdAcquire(repo) {
       }
       fail(`lane-${n} is ${describeLease(lease) || 'held'} — pick another lane`);
     }
+    acquireAfterClaimTestBarrier();
     // #3390 — the explicit-lane path is the ONLY claim route that reaches the destructive reset below with no
     // #2267 dirty/ahead check at all: auto-pick's own candidate source (`isLaneAcquirable`, via the cached
     // scan) never selects a dirty/ahead candidate to begin with, and `refreshLane` calls `laneDirtyOrAhead`
@@ -2130,7 +2148,7 @@ function cmdAcquire(repo) {
       if (dirty || !provablyPushed) {
         // #3383 — a refusal hands the lane back: the claim above already wrote OUR lease, and leaving it would hold
         // a lane nobody is using until its TTL (found live 2026-09-24: two refused acquires held lane-1 and lane-11).
-        restoreLeaseAfterRefusedClaim(dir, preExisting);
+        restoreLeaseAfterRefusedClaim(dir, preExisting, holderSlug);
         fail(
           `lane-${n} has ${uncommitted} uncommitted change(s) and is ${ahead} commit(s) ahead of origin/${repo.branch} ` +
             `— acquire --lane=${n} would destroy that work via its reset-to-origin step. Use --force to reclaim it ` +
@@ -2315,14 +2333,23 @@ function cmdAcquire(repo) {
         // blip, the #2924 re-verify, a bad `--base`, an npm hiccup) — none of which are reasons to give up on
         // every OTHER candidate this pool might still offer.
         try {
+          acquireAfterClaimTestBarrier();
+          assertOwnClaim(laneDir(repo, pick), holderSlug);
           provisionClaimedLane(repo, pick, false); // auto-pick never targets a reserved lane
+          assertOwnClaim(laneDir(repo, pick), holderSlug);
           chosen = pick;
           break;
         } catch (e) {
+          if (e.code === 'LEASE_LOST') {
+            log(`  ⚠ lane-${pick}: ${e.message} — trying another candidate`);
+            excluded.add(pick);
+            holderSlug = null;
+            continue;
+          }
           log(`  ⚠ lane-${pick} claimed but failed to provision (${String(e && e.message ? e.message : e).split('\n')[0]}) — releasing it and trying another candidate`);
           // Auto-pick never re-acquires its OWN prior lane (`selfLane` is excluded from `pickable` above), so
           // there is never a live lease of ours to restore here — just drop the one this claim just wrote.
-          restoreLeaseAfterRefusedClaim(laneDir(repo, pick), null);
+          restoreLeaseAfterRefusedClaim(laneDir(repo, pick), null, holderSlug);
           excluded.add(pick);
           holderSlug = null;
           sawProvisionFailure = true;
@@ -2423,9 +2450,11 @@ function cmdAcquire(repo) {
   // would silently re-run `fetchOriginPruneWithRetry`/`checkout -B`/`ensureDeps` a second time for no reason.
   if (flags.lane !== undefined) {
     try {
+      assertOwnClaim(dir, holderSlug);
       provisionClaimedLane(repo, chosen, targetWasReserved);
+      assertOwnClaim(dir, holderSlug);
     } catch (e) {
-      restoreLeaseAfterRefusedClaim(dir, preClaimLease);
+      if (e.code !== 'LEASE_LOST') restoreLeaseAfterRefusedClaim(dir, preClaimLease, holderSlug);
       fail(e && e.message ? e.message : String(e));
     }
   }
@@ -2458,6 +2487,7 @@ function cmdAcquire(repo) {
   // checkout's parent — correct only when run from the primary; run from INSIDE a lane (a consumer's cwd) it
   // mis-points the shared pool-root sibling clones at itself. The pool-root siblings are a provision/refresh
   // concern; a leased lane borrows a pool those already set up. (Regressed a live acquire until caught — #2275.)
+  try { assertOwnClaim(dir, holderSlug); } catch (e) { fail(e.message); }
   log(`${flags.reserve ? 'RESERVED' : 'acquired'} lane-${chosen} for ${session}${flags.purpose ? ` (${flags.purpose})` : ''}${flags.base ? ` @ base=${flags.base}` : ''}${flags.reserve ? ' — PERMANENT, off-limits to acquire/refresh/provision (#2350)' : ''} → ${dir}`);
   // #2997 — hand the acquirer its minted holder slug. This is the one signal that separates THIS holder from a
   // sibling agent of the same session, so it must reach the acquirer and nowhere else. It is needed only in the
@@ -3764,6 +3794,7 @@ const TRIM_REACQUIRED = { kind: 'leased', reason: 're-leased after trim evaluate
  *  accepts what was moved; otherwise put it back without clobbering a marker written meanwhile (`link` fails if
  *  the name exists). Returns true iff the marker was taken. */
 function takeMarkerIf(dir, isMine, n) {
+  if (!isMine(readLease(dir))) return false;
   const file = LEASE_MARKER(dir);
   const aside = `${file}.trim-${process.pid}`;
   try { renameSync(file, aside); } catch { return false; } // gone or replaced since — don't guess
@@ -3873,9 +3904,9 @@ function sweepLeftoverTrash(repo) {
  *  `acquireReclaimTestBarrier` below) all use: write `<path>.ready`, then wait (≤30s) for `<path>.go` — so a
  *  test can land a real, concurrent second CLI invocation exactly inside the race window this call is pausing
  *  in. Unset env var (production) ⇒ every one of these is a no-op; this helper is never reached at all. */
-function pauseForTestBarrier(path) {
+function pauseForTestBarrier(path, timeoutMs = 30_000) {
   writeFileSync(`${path}.ready`, '');
-  const deadline = Date.now() + 30_000;
+  const deadline = Date.now() + timeoutMs;
   while (!existsSync(`${path}.go`) && Date.now() < deadline) sleepSyncMs(50);
 }
 
@@ -3905,6 +3936,13 @@ function reapTestBarrier() {
   const p = process.env.LANE_POOL_REAP_TEST_BARRIER;
   if (!p) return;
   pauseForTestBarrier(p);
+}
+
+/** Test-only post-claim seam: wait at most 10s before checking ownership and provisioning. */
+function acquireAfterClaimTestBarrier() {
+  const p = process.env.LANE_POOL_TEST_AFTER_CLAIM_BARRIER;
+  if (!p) return;
+  pauseForTestBarrier(p, 10_000);
 }
 
 /** #x96v5hl — test-only seam: `LANE_POOL_ACQUIRE_RECLAIM_TEST_BARRIER=<path>` makes `tryClaimLane`'s
