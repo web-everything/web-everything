@@ -143,10 +143,13 @@ describe('CLI relative --repo', () => {
 });
 
 describe('resolveCap — env override (private pools only), clamped sane', () => {
-  const priv = (cap) => ({ LANE_POOL_ROOT: '/tmp/private-pool', WE_HEAVY_ADMISSION_CAP: cap });
-  it('defaults when unset', () => expect(resolveCap({})).toBe(DEFAULT_ADMISSION_CAP));
+  // Hermetic (live 2026-10-21): without this the platform layer is the host's real ~/.claude/platform-preferences.json,
+  // so an operator setting `heavyAdmission.cap` turned every verify on that host red. A missing file = no platform layer.
+  const NO_PREFS = { WE_PLATFORM_PREFERENCES: join(tmpdir(), `we-no-platform-prefs-${process.pid}.json`) };
+  const priv = (cap) => ({ ...NO_PREFS, LANE_POOL_ROOT: '/tmp/private-pool', WE_HEAVY_ADMISSION_CAP: cap });
+  it('defaults when unset', () => expect(resolveCap({ ...NO_PREFS })).toBe(DEFAULT_ADMISSION_CAP));
   it('reads WE_HEAVY_ADMISSION_CAP for a private pool', () => expect(resolveCap(priv('5'))).toBe(5));
-  it('ignores WE_HEAVY_ADMISSION_CAP on the shared host pool', () => expect(resolveCap({ WE_HEAVY_ADMISSION_CAP: '5' })).toBe(DEFAULT_ADMISSION_CAP));
+  it('ignores WE_HEAVY_ADMISSION_CAP on the shared host pool', () => expect(resolveCap({ ...NO_PREFS, WE_HEAVY_ADMISSION_CAP: '5' })).toBe(DEFAULT_ADMISSION_CAP));
   it('falls back on a non-finite or sub-1 value', () => {
     expect(resolveCap(priv('nope'))).toBe(DEFAULT_ADMISSION_CAP);
     expect(resolveCap(priv('0'))).toBe(DEFAULT_ADMISSION_CAP);
