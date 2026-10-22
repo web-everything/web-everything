@@ -14,7 +14,8 @@ import { laneStateSnapshot } from '../lib/lane-history.mjs';
 import { cleanLaneLitter } from '../lib/lane-litter.mjs';
 import { diagnoseLane } from '../lib/lane-repair.mjs';
 import { snapshotWorkTree } from '../lib/lane-salvage.mjs';
-import { gitStatusSummary } from '../lane-whois.mjs';
+import { gitStatusSummary, aheadCommits } from '../lane-whois.mjs';
+import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 
 const POOL_SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -177,13 +178,17 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
       chmodSync(join(evil, h), 0o755);
     }
     git(['config', '--local', 'core.fsmonitor', script], lane);
+    // A `--reference` lane has alternates, so its fetch runs a lane-set alternateRefsCommand (PR #5775 self-review).
+    git(['config', '--local', 'core.alternateRefsCommand', script], lane);
     git(['config', '--local', '--replace-all', 'core.hooksPath', evil], lane);
     try {
       expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
       expect(existsSync(marker) ? readFileSync(marker, 'utf8') : '').toBe('');
       expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('.githooks');
+      expect(git(['rev-parse', 'origin/main'], lane)).toBe(git(['rev-parse', 'main'], originDir));
     } finally {
       git(['config', '--local', '--unset', 'core.fsmonitor'], lane);
+      git(['config', '--local', '--unset', 'core.alternateRefsCommand'], lane);
     }
   });
 
@@ -207,6 +212,31 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
       git(['config', '--local', '--unset', 'core.fsmonitor'], lane);
       rmSync(join(lane, 'untracked-wip.txt'), { force: true });
       for (const r of Object.values(refs)) spawnSync('git', ['update-ref', '-d', r], { cwd: lane });
+    }
+  });
+
+  it('a lane-set log.showSignature + gpg.program never runs on a "signed" ahead commit, and no lazy fetch is allowed (PR #5775)', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    const marker = join(base, 'gpg-ran');
+    const script = join(base, 'gpg.sh');
+    writeFileSync(script, `#!/bin/sh\necho "$0 $*" >> "${marker}"\nexit 1\n`);
+    chmodSync(script, 0o755);
+    const head = git(['rev-parse', 'HEAD'], lane);
+    const tree = git(['rev-parse', 'HEAD^{tree}'], lane);
+    const who = 'A <a@realcorp.io> 1700000000 +0000';
+    const body = `tree ${tree}\nparent ${head}\nauthor ${who}\ncommitter ${who}\ngpgsig -----BEGIN PGP SIGNATURE-----\n x\n -----END PGP SIGNATURE-----\n\nsigned ahead\n`;
+    const signed = execFileSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'], { cwd: lane, input: body, encoding: 'utf8' }).trim();
+    git(['update-ref', 'refs/heads/main', signed], lane);
+    git(['config', '--local', 'log.showSignature', 'true'], lane);
+    git(['config', '--local', 'gpg.program', script], lane);
+    try {
+      expect(aheadCommits(lane, 'origin/main')).toEqual([expect.objectContaining({ sha: signed, subject: 'signed ahead' })]);
+      expect(existsSync(marker) ? readFileSync(marker, 'utf8') : '').toBe('');
+      expect(laneGitHardeningEnv({}).GIT_NO_LAZY_FETCH).toBe('1');
+    } finally {
+      git(['config', '--local', '--unset', 'log.showSignature'], lane);
+      git(['config', '--local', '--unset', 'gpg.program'], lane);
+      git(['update-ref', 'refs/heads/main', head], lane);
     }
   });
 

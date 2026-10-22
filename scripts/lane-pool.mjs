@@ -746,7 +746,7 @@ function laneFingerprint(dir, branch) {
   const dirtyPaths = [...trackedModifiedPaths, ...untrackedPaths].sort();
   const aheadShas = aheadCommits(dir, branchRef).map((c) => c.sha).sort();
   let headSha = null;
-  try { headSha = readGit(['rev-parse', 'HEAD'], { cwd: dir, ...defaultGitTimeoutOpt() }).trim(); } catch { /* unborn/corrupt HEAD — null is a valid, never-matching fingerprint value */ }
+  try { headSha = readGit(['rev-parse', 'HEAD'], { cwd: dir, ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(['rev-parse']) }).trim(); } catch { /* unborn/corrupt HEAD — null is a valid, never-matching fingerprint value */ }
   return { headSha, dirtyPaths, aheadShas };
 }
 
@@ -2747,6 +2747,8 @@ function cmdRelease(repo) {
     // — the root cause of the 2026-09-07 incident this card documents (46 of 48 lanes DIRTY with only this
     // litter, the other 2 clean-but-ahead — the whole pool read 0 of 48 acquirable at once). Any
     // non-allowlisted dirty state (real uncommitted work) is left completely untouched by this call.
+    // The snapshot and litter `status` / `clean` would run a lane-set clean filter, which no env pin reaches (PR #5775).
+    scrubClaimedLaneConfig(dir, 'before release snapshot');
     const beforeLitter = laneStateSnapshot(dir, `origin/${repo.branch}`);
     // xbdixjc — a release by anyone but the holder (the reaper's `--force`, a delivered-lease release) may not
     // drop a lane whose fixer is parked awaiting verify or that holds verifying / verified-unpushed work.
@@ -4277,6 +4279,9 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
     out({ reclaimed: false, salvaged: false, kept: true, keptReason: g2.reason });
     return;
   }
+  // Salvage stages the tree (`add -A`), which runs a lane-set clean filter no env pin can reach: scrub first,
+  // under the hold, not only before the reset below (PR #5775 self-review).
+  scrubClaimedLaneConfig(dir, 'before salvage');
   let salvage;
   try {
     salvage = salvageLane({
@@ -4289,9 +4294,9 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
           try {
             const { trackedModifiedPaths, untrackedPaths } = gitStatusSummary(dir);
             // HEAD's subject only names THIS lane's work when HEAD is not already on origin (else it is main's tip).
-            const ahead = Number(readGit(['rev-list', '--count', `origin/${repo.branch}..HEAD`], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim()) || 0;
-            const subject = ahead ? readGit(['log', '-1', '--format=%s'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim() : '';
-            const branch = readGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+            const ahead = Number(readGit(['rev-list', '--count', `origin/${repo.branch}..HEAD`], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], ...readOnlyGitEnv(['rev-list']) }).trim()) || 0;
+            const subject = ahead ? readGit(['log', '-1', '--format=%s'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], ...readOnlyGitEnv(['log']) }).trim() : '';
+            const branch = readGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], ...readOnlyGitEnv(['rev-parse']) }).trim();
             return guessCardIds({ paths: [...trackedModifiedPaths, ...untrackedPaths], commitSubject: subject, branch });
           } catch { return []; }
         })(),
