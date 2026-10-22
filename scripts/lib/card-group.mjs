@@ -55,6 +55,7 @@ import { readSettings } from './settings-files.mjs';
 import { gitRun, hashObjectVerified } from './git-run.mjs';
 import { isCardPath, isCardOnlyDiff } from '../ci-card-only.mjs';
 import { resolveRaisedByConflict, loadCardConflictSettings } from './card-conflict-resolve.mjs';
+import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { mapHashReferences } from '../backlog/id.mjs';
 import { bornAsIndexFromItems } from '../conveyor/queue-store.mjs';
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './constellation-repos.mjs';
@@ -662,18 +663,12 @@ export function createCardGrouping({
     const sha = String(r.stdout ?? '').split(/\s/)[0];
     return r.status === 0 && SHA.test(sha) ? sha : null;
   };
-  // Only the LATEST run of the required check counts: a superseded failure (a cancelled run, then a green rerun)
-  // must never close a currently green combined PR. A run is ordered by its completion, else its start; gh reports
-  // an unfinished run's completedAt as year 0001, which is no time at all. Ties keep the later rollup row.
-  const runAt = c => {
-    for (const v of [c?.completedAt, c?.startedAt]) { const t = Date.parse(v ?? ''); if (Number.isFinite(t) && t > 0) return t; }
-    return -Infinity;
-  };
+  // Only the LATEST run of the required check counts: a superseded failure (a cancelled run, then a green or still
+  // queued rerun) must never close a currently green combined PR. The shared per-name collapse is the one reading
+  // of "latest" (a queued or running rerun is the newest; CheckRun outranks a status context).
   const requiredFailed = pr => {
-    const runs = (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []).filter(c => c?.name === 'test' || c?.context === 'test');
-    if (!runs.length) return false;
-    const latest = runs.reduce((a, b) => (runAt(b) >= runAt(a) ? b : a));
-    return ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'].includes(String(latest?.conclusion || latest?.state || '').toUpperCase());
+    const latest = collapseRollupToLatestPerName(pr?.statusCheckRollup).find(c => c?.name === 'test' || c?.context === 'test');
+    return !!latest && ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'].includes(String(latest.conclusion || latest.state || '').toUpperCase());
   };
 
   const api = {
@@ -988,7 +983,14 @@ export function createCardGrouping({
           num = Number(/\/pull\/(\d+)/.exec(url)?.[1]);
         } catch (e) { say(`PR create for ${branch} failed (${firstLine(e)}) — the next reconcile adopts or drops it`); return { reason: 'pr create failed' }; }
         if (!Number.isInteger(num)) return { reason: 'pr create returned no number' };
-        mutate(s => { const x = s.groups.find(g => isLocalGroupId(g, id)); if (x) x.pr = num; });
+        const kept = mutate(s => { const x = s.groups.find(g => isLocalGroupId(g, id)); if (x) x.pr = num; return !!x; });
+        if (kept?.ok && kept.result === false) {
+          // Opening outlived the reconcile's 15-minute drop: the record (and its card reservation) is gone and the
+          // sources were released, so an untracked combined PR could land beside them or beside a newer group.
+          try { gh(['pr', 'close', String(num), '--repo', localSlug, '--comment', 'Card group record was dropped while this PR was being opened; its sources land on their own. (drain.group, card xym8nt4)']); }
+          catch (e) { say(`close of untracked combined PR #${num} failed (${firstLine(e)})`); }
+          return { reason: `group record dropped while opening — combined PR #${num} closed` };
+        }
         for (const s of p.sources) comment(s.num, `Grouped with ${p.sources.filter(x => x.num !== s.num).map(x => `#${x.num}`).join(', ')} into the combined card PR #${num} (they all edit ${p.files.map(f => `\`${f}\``).join(', ')}). This PR stays open and is held by the drain; it is closed only after #${num} merges and its lines are confirmed on main. If #${num} closes, fails, or is sent back, this PR goes back to landing on its own. (drain.group, card xym8nt4)`);
         say(`opened #${num}: ${summary} — ${formatCardGroupSetting(setting)}`);
         return { formed: { id, pr: num, branch, sources: record.sources }, proof };

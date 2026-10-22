@@ -834,6 +834,22 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(readGroupState(statePath).groups).toHaveLength(1);
     });
 
+    it('a record dropped while the PR was being opened closes the untracked combined PR (no reservation-less group)', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json');
+      // Another pass's reconcile drops the pr:null record (15-minute rule) while `pr create` is in flight.
+      const exec = (cmd, args) => {
+        if (args[0] === 'pr' && args[1] === 'create') writeFileSync(statePath, JSON.stringify({ groups: [], failed: {} }));
+        return t.exec(cmd, args);
+      };
+      const r = createCardGrouping({ ...t.opts, exec, statePath, withLock: fn => ({ ran: true, result: fn() }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.formed).toBeUndefined();
+      expect(r.reason).toMatch(/group record dropped while opening — combined PR #77 closed/);
+      expect(t.calls.filter(c => c.startsWith('pr close'))).toEqual([expect.stringMatching(/^pr close 77 --repo o\/r /)]);
+      expect(t.calls.some(c => c.startsWith('pr comment'))).toBe(false);
+      expect(readGroupState(statePath).groups).toEqual([]);
+    });
+
     it('a claim refuses (fail closed) while an open group has no recorded file list', () => {
       const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
       const statePath = join(tmp(), 's.json');
@@ -1135,6 +1151,12 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       ['an older FAILURE status context is superseded by a newer SUCCESS', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [
         { context: 'test', state: 'FAILURE', startedAt: '2026-10-21T10:00:00Z' },
         { context: 'test', state: 'SUCCESS', startedAt: '2026-10-21T10:30:00Z' }] } }],
+      ['a cancelled required run has a queued rerun listed first (gh zero dates on both stamps)', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [
+        { name: 'test', status: 'QUEUED', conclusion: '', startedAt: '0001-01-01T00:00:00Z', completedAt: '0001-01-01T00:00:00Z' },
+        { name: 'test', status: 'COMPLETED', conclusion: 'CANCELLED', startedAt: '2026-10-21T10:00:00Z', completedAt: '2026-10-21T10:05:00Z' }] } }],
+      ['a running rerun was queued before the old run was cancelled', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [
+        { name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-21T10:03:00Z', completedAt: '0001-01-01T00:00:00Z' },
+        { name: 'test', status: 'COMPLETED', conclusion: 'CANCELLED', startedAt: '2026-10-21T10:00:00Z', completedAt: '2026-10-21T10:05:00Z' }] } }],
       ['a failed required run is re-running (gh zero completedAt on the rerun)', { combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [
         { name: 'test', conclusion: 'FAILURE', startedAt: '2026-10-21T10:00:00Z', completedAt: '2026-10-21T10:05:00Z' },
         { name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-21T10:10:00Z', completedAt: '0001-01-01T00:00:00Z' }] } }],
