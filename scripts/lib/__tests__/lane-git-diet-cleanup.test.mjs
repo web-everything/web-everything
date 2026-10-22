@@ -4,7 +4,7 @@
  *   leased/borrowed/symlinked lanes, keeps the working tree, frees the ledger blobs, is idempotent).
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, symlinkSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
@@ -232,6 +232,119 @@ describe('real git: cleanup CLI', () => {
       expect(git(dir, 'fsck', '--connectivity-only', '--no-progress')).toBe('');
       expect(out.rows[0].skipped).toMatch(/repack filter/i);
       expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).toBe(configBefore);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  const snapshot = (dir) => ({ config: readFileSync(join(dir, '.git', 'config'), 'utf8'), refs: refs(dir), objects: git(dir, 'count-objects', '-v') });
+  const hasOpsRef = (dir) => existsSync(join(dir, '.git', 'refs', 'remotes', 'origin', 'ops', 'review-requests'))
+    || readFileSync(join(dir, '.git', 'packed-refs'), 'utf8').includes('refs/remotes/origin/ops/review-requests');
+  const hook = (dir, ran) => git(dir, 'config', 'gc.recentObjectsHook', `touch '${ran}'`);
+  const commondir = (dir, target) => writeFileSync(join(dir, '.git', 'commondir'), `${target}\n`);
+
+  // Each startup refusal through the CLI (both modes): the lane, and any repo it points into, stay untouched.
+  it.each([
+    ...['index.lock', 'HEAD.lock', 'packed-refs.lock', 'gc.pid', 'shallow.lock', 'config.lock'].map((name) => [`git lock ${name}`, (dir) => writeFileSync(join(dir, '.git', name), ''), `git lock present (${name})`]),
+    ['gc.recentObjectsHook', (dir, other, ran) => hook(dir, ran), 'gc.recentObjectsHook configured (gc would run it)'],
+    ['absolute commondir', (dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
+    ['relative commondir', (dir, other) => commondir(dir, relative(join(dir, '.git'), join(other, '.git'))), /^git common dir is redirected/],
+    ['redirected object store', (dir, other) => {
+      rmSync(join(dir, '.git', 'objects'), { recursive: true, force: true });
+      symlinkSync(join(other, '.git', 'objects'), join(dir, '.git', 'objects'));
+    }, /^object store is redirected/],
+  ])('refuses a lane with a %s at startup, changing nothing', (_, plant, reason) => {
+    const dir = lane(15);
+    const other = join(root, 'refusal-other');
+    const ran = join(root, 'refusal-hook-ran');
+    git(root, 'clone', '-q', up, dir);
+    git(root, 'clone', '-q', up, other);
+    plant(dir, other, ran);
+    const laneBefore = snapshot(dir);
+    const otherBefore = snapshot(other);
+    try {
+      for (const mode of [[], ['--prune-expire=now', '--apply']]) {
+        const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--lanes=15', '--json', ...mode], { env, encoding: 'utf8' }));
+        expect(out.rows[0].skipped).toMatch(reason);
+        expect(snapshot(dir)).toEqual(laneBefore);
+        expect(snapshot(other)).toEqual(otherBefore);
+        expect(existsSync(ran)).toBe(false);
+        expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+      }
+    } finally {
+      for (const path of [dir, other, ran]) rmSync(path, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  // Run --apply paused at `stage` (the CLI's vitest-only seam), change the lane there, then let it continue.
+  const runPaused = async (n, stage, change) => {
+    const signals = mkdtempSync(join(root, 'pause-'));
+    const child = spawn('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', `--lanes=${n}`, '--json'], {
+      env: { ...env, VITEST: 'true', LANE_GIT_DIET_TEST_PAUSE_AT: stage, LANE_GIT_DIET_TEST_PAUSE_DIR: signals },
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    const exited = new Promise((done) => child.on('close', done));
+    try {
+      while (!existsSync(join(signals, 'ready'))) {
+        if (child.exitCode !== null) throw new Error(`CLI exited before pausing: ${stderr}`);
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      change();
+    } finally {
+      writeFileSync(join(signals, 'go'), '');
+    }
+    expect(await exited, stderr).toBe(0);
+    rmSync(signals, { recursive: true, force: true });
+    return JSON.parse(stdout);
+  };
+
+  it.each([
+    ['git lock', (dir) => writeFileSync(join(dir, '.git', 'index.lock'), ''), 'git lock present (index.lock)'],
+    ['gc.recentObjectsHook', (dir, other, ran) => hook(dir, ran), 'gc.recentObjectsHook configured (gc would run it)'],
+    ['redirected common dir', (dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
+  ])('the under-claim recheck refuses a %s that appears after the startup check', async (_, plant, reason) => {
+    const dir = lane(16);
+    const other = join(root, 'recheck-other');
+    const ran = join(root, 'recheck-hook-ran');
+    git(root, 'clone', '-q', up, dir);
+    git(root, 'clone', '-q', up, other);
+    const otherBefore = snapshot(other);
+    try {
+      const out = await runPaused(16, 'after-claim', () => plant(dir, other, ran));
+      expect(out.rows[0].skipped).toMatch(reason);
+      // The recheck runs before any write: no diet config, the ops ref kept, the hook never ran, our claim dropped.
+      expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).not.toContain(LANE_OPS_NEGATIVE_FETCH);
+      expect(hasOpsRef(dir)).toBe(true);
+      expect(existsSync(ran)).toBe(false);
+      expect(snapshot(other)).toEqual(otherBefore);
+      expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    } finally {
+      for (const path of [dir, other, ran]) rmSync(path, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('loses the O_EXCL claim race to a marker written after the startup check, and leaves that marker', async () => {
+    const dir = lane(17);
+    git(root, 'clone', '-q', up, dir);
+    const configBefore = readFileSync(join(dir, '.git', 'config'), 'utf8');
+    const foreign = JSON.stringify({ holder: 'someone-else', session: 'someone-else', purpose: 'busy', acquiredAt: new Date().toISOString() });
+    try {
+      const out = await runPaused(17, 'before-claim', () => writeFileSync(join(dir, '.git', '.lane-lease'), foreign));
+      expect(out.rows[0].skipped).toBe('lost the claim race (someone took the lane)');
+      expect(readFileSync(join(dir, '.git', '.lane-lease'), 'utf8')).toBe(foreign);
+      expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).toBe(configBefore);
+      expect(hasOpsRef(dir)).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it('unclaim removes only a marker that is still ours', async () => {
+    const dir = lane(18);
+    git(root, 'clone', '-q', up, dir);
+    const foreign = JSON.stringify({ holder: 'someone-else', session: 'someone-else', purpose: 'busy', acquiredAt: new Date().toISOString() });
+    try {
+      await runPaused(18, 'after-claim', () => writeFileSync(join(dir, '.git', '.lane-lease'), foreign));
+      expect(readFileSync(join(dir, '.git', '.lane-lease'), 'utf8')).toBe(foreign);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 

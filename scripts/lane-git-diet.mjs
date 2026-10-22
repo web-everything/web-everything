@@ -136,6 +136,19 @@ function unclaim(dir, holder) {
   const lease = readLease(dir);
   if (lease && lease.holder === holder) rmSync(leaseFile(dir), { force: true });
 }
+// TEST SEAM (honoured only under vitest): pause at one stage until the test signals, so it can change the lane
+// inside a window the startup checks cannot see. The seam itself writes nothing into the lane.
+const testPause = (stage) => {
+  const at = process.env.VITEST && process.env.LANE_GIT_DIET_TEST_PAUSE_AT;
+  const signals = process.env.LANE_GIT_DIET_TEST_PAUSE_DIR;
+  if (at !== stage || !signals) return;
+  writeFileSync(join(signals, 'ready'), '');
+  const deadline = Date.now() + 30_000;
+  while (!existsSync(join(signals, 'go'))) {
+    if (Date.now() > deadline) throw new Error(`test pause at ${stage} timed out`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+};
 
 const poolDir = join(POOL_ROOT, POOL);
 const lanes = readdirSync(poolDir)
@@ -158,9 +171,11 @@ for (const n of lanes) {
       rows.push({ lane: n, mode: 'dry-run', opsRefs: refs.length, loose: counts.count || 0, packs: counts.packs || 0, projectedBytes: projected });
       continue;
     }
+    testPause('before-claim');
     const holder = claim(dir);
     if (!holder) { rows.push({ lane: n, skipped: 'lost the claim race (someone took the lane)' }); continue; }
     try {
+      testPause('after-claim');
       const recheck = cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), symlinkedGitPaths: symlinkedGitPaths(dir), lease: null, nowMs: Date.now(), locks: locksIn(dir), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir) });
       if (!recheck.ok) { rows.push({ lane: n, skipped: recheck.reason }); continue; }
       const before = duBytes(join(dir, '.git'));
