@@ -1,4 +1,4 @@
-/** PR #5817: disabling the stall digest must release queue suppression; feed/state paths must be disjoint. */
+/** PR #5817: explicit disable releases suppression; settings failures preserve it; feed/state paths are disjoint. */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +10,7 @@ import { acknowledge, replay, runOnce, sidecarsOf, unacknowledged } from '../../
 const SOURCE = 'scripts/conveyor/pr-stall-digest.mjs';
 export default {
   id: 'pr-stall-digest-disable-and-path-collision',
-  title: 'disabled stall producers release queue heads and colliding feed paths preserve digest state',
+  title: 'explicit disable releases queue heads, settings failures retain stalls, and feed paths preserve digest state',
   card: 'PR #5817',
   fixedBy: { sha: 'HEAD', where: 'lane/stall-sweep-3', paths: [SOURCE, 'scripts/conveyor/pr-stall-sweep.mjs', 'scripts/conveyor/pr-sweep.mjs', 'scripts/operations/needs-you-feed.mjs'] },
   fixPresent(root) { return readFileSync(join(root, SOURCE), 'utf8').includes('releaseStalledSuppression'); },
@@ -47,6 +47,34 @@ export default {
         if (!replay({ path }).some(event => event.kind === 'cleared' && event.was === 'stalled' && event.pr === 2)) violations.push(`${name}: no clear event for the disabled producer`);
         await poll();
         if (!replay({ path }).some(event => event.kind === 'needs-you')) violations.push(`${name}: queue never published the head`);
+      }
+      for (const failure of ['platform-read', 'env-mode']) {
+        const dir = join(root, failure, 'pr-stall-sweep'), path = join(root, failure, 'events.jsonl');
+        const prefs = join(root, failure, 'prefs.json');
+        const env = { WE_PLATFORM_PREFERENCES_FILE: prefs, WE_PR_STALL_SWEEP_MODE: failure === 'env-mode' ? 'typo' : 'shadow' };
+        let alerts = 0;
+        const options = { feedPath: path, stateDir: dir, env: {}, now, notify: () => { alerts++; return { ok: true }; } };
+        publishStalledDigest({ items: [item] }, options);
+        writeFileSync(prefs, failure === 'platform-read' ? '{broken json' : '{}');
+        const files = [path, sidecarsOf(path).state, join(dir, 'digest-state.json')];
+        const before = files.map(file => readFileSync(file, 'utf8'));
+        const report = await runPrSweep({ now, env, config: {},
+          settings: { value: { idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, repos: [repo] }, sources: {} },
+          readPrevious: () => ({ stallSweep: { lastRunAt: now } }), readPrs: () => [], readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
+          notify: options.notify, flush: () => ({}), persist: () => {}, append: () => {},
+          stallSweep: args => runStallSweep({ ...args, dir, log: () => {} }),
+          stallDigest: (pass, opts) => publishStalledDigest(pass, { ...opts, feedPath: path }) });
+        if (!report.errors.length) violations.push(`${failure}: settings failure was not reported`);
+        if (files.some((file, i) => readFileSync(file, 'utf8') !== before[i])) violations.push(`${failure}: settings failure changed feed or digest state`);
+        const poll = await runOnce({ env, now, liveGate: false, log: () => {},
+          settings: { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } },
+          exec: () => JSON.stringify({ ready: [{ repo, number: 1, head }] }) });
+        if (poll.lines.length) violations.push(`${failure}: settings failure released queue suppression`);
+        if (!unacknowledged({ path }).some(event => event.kind === 'stalled')) violations.push(`${failure}: settings failure hid the operator item`);
+        writeFileSync(prefs, '{}');
+        env.WE_PR_STALL_SWEEP_MODE = 'shadow';
+        const recovered = publishStalledDigest({ items: [item] }, { ...options, env });
+        if (recovered.lines.length || alerts !== 1) violations.push(`${failure}: recovery republished or repeated the alert`);
       }
       const stateDir = join(root, 'collision', 'pr-stall-sweep');
       mkdirSync(stateDir, { recursive: true });

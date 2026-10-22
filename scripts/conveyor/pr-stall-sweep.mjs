@@ -74,12 +74,14 @@ export function resolveStallSweepSettings({ env = process.env, read = readFileSy
   for (const k of SCALARS) if (!valid[k](value[k])) { bad.push(`resolved ${k}=${JSON.stringify(value[k])}`); value[k] = STALL_SWEEP_DEFAULTS[k]; sources[k] = 'standard (resolved value unusable)'; }
   // The kill switch fails closed: an unusable mode in ANY layer (env, repo file, platform) turns the sweep OFF.
   // An unreadable settings layer is unknown policy: OFF, never a lower layer's `shadow`.
-  if (layerUnreadable || (env[STALL_SWEEP_MODE_ENV] !== undefined && !STALL_SWEEP_MODES.includes(envValues.mode)) || rawModes.some((m) => !STALL_SWEEP_MODES.includes(m)) || bad.some((x) => /^(?:env|tool|platform|resolved)[ .]?mode\b/.test(x))) {
+  const settingsUnreadable = layerUnreadable || (env[STALL_SWEEP_MODE_ENV] !== undefined && !STALL_SWEEP_MODES.includes(envValues.mode)) || rawModes.some((m) => !STALL_SWEEP_MODES.includes(m)) || bad.some((x) => /^(?:env|tool|platform|resolved)[ .]?mode\b/.test(x));
+  if (settingsUnreadable) {
     value.mode = 'off'; sources.mode = 'unusable mode value: off';
+    if (!errors.length && !bad.length) errors.push('unusable mode value: off');
   }
   // The FINAL values (after the fail-closed overrides) are what get logged, with each leaf's source.
   logCascadeSources('prStallSweep', { value, sources, invalid: bad }, { env, log });
-  return { value, sources, errors: [...errors, ...bad] };
+  return { value, sources, settingsUnreadable, errors: [...errors, ...bad] };
 }
 
 /** Where `pr-sweep-io#resolveStalledAfter` took the threshold from (env > settings > standard), for the pass log. */
@@ -185,7 +187,8 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   // Disabled/not-due passes still carry the metadata needed to release a disabled digest's feed suppression.
   // Under test only an explicitly passed dir can reach a writer.
   const outDir = dir ?? (isUnderTest(env) ? null : stallSweepDir(env));
-  const base = { mode: cfg.mode, digest: cfg.digest, dir: outDir, sources: s.sources, errors: [...(s.errors ?? [])], state: state ?? {} };
+  const base = { mode: cfg.mode, digest: cfg.digest, dir: outDir, settingsUnreadable: !!s.settingsUnreadable,
+    sources: s.sources, errors: [...(s.errors ?? [])], state: state ?? {} };
   if (cfg.mode === 'off') return { ...base, skipped: 'off' };
   const last = Number(state?.lastRunAt);
   if (!force && Number.isFinite(last) && last <= now && now - last < cfg.intervalMinutes * 60_000) return { ...base, skipped: 'not-due' };

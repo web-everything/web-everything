@@ -243,8 +243,9 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     }
   }
   const path = checkedFeedPath(settings.path.value), statePath = statePathOf(path);
-  const stallSettings = resolveStallSweepSettings({ env, log: () => {} }).value;
-  const stallProducerEnabled = stallSettings.mode !== 'off' && stallSettings.digest;
+  const stallSettings = resolveStallSweepSettings({ env, log: () => {} });
+  // A settings failure cannot establish that the producer was disabled; keep honoring its open items.
+  const honorStalled = stallSettings.settingsUnreadable || (stallSettings.value.mode !== 'off' && stallSettings.value.digest);
   mkdirSync(dirname(statePath), { recursive: true });
   // Serialization prevents concurrent once/loop calls from duplicating the same transition.
   return withFileLock(`${statePath}.lock`, () => {
@@ -252,7 +253,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
     // The PR stall sweep's open `stalled` item already asks about this PR head: a NEW queue item for it is not
     // published twice (one already open stays, so it is never cleared by this filter).
-    const stalled = stallProducerEnabled ? prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length)) : [];
+    const stalled = honorStalled ? prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length)) : [];
     const asked = i => !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
     const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
     const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });

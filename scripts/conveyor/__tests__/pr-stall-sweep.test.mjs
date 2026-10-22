@@ -11,7 +11,7 @@ import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
 import { runPrSweep } from '../pr-sweep.mjs';
 import { runPrSweepJob } from '../pr-sweep-job.mjs';
 import { publishStalledDigest } from '../pr-stall-digest.mjs';
-import { sidecarsOf, replay, unacknowledged } from '../../operations/needs-you-feed.mjs';
+import { sidecarsOf, replay, runOnce, unacknowledged } from '../../operations/needs-you-feed.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -310,6 +310,49 @@ describe('wiring', () => {
   const base = { now: NOW, config: {}, settings: { value: { idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, dispatchDiagnosis: false, repos: [REPO] }, sources: {} },
     readPrevious: () => ({ stallSweep: { lastRunAt: 1 } }), readPrs: () => [], readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: async () => ({}),
     notify: () => ({ ok: true }), flush: () => ({}), persist: () => {}, append: () => {} };
+  it.each(['repo read', 'platform read', 'env mode', 'repo mode', 'platform mode', 'repo block', 'platform block'])
+    ('an unreadable-settings pass leaves stalled items and suppression open: %s', async failure => {
+      const dir = auditDir(), path = join(dir, '..', 'needs-you-events.jsonl');
+      const item = { lane: 'operator', repo: REPO, pr: 1, head: HEAD, state: 'needs-decision:note' };
+      const notify = vi.fn(() => ({ ok: true }));
+      const options = { feedPath: path, stateDir: dir, env: {}, now: NOW, notify };
+      publishStalledDigest({ items: [item] }, options);
+      const files = [path, sidecarsOf(path).state, join(dir, 'digest-state.json')];
+      const before = files.map(file => readFileSync(file, 'utf8'));
+      const settings = resolveStallSweepSettings({
+        env: { WE_PLATFORM_PREFERENCES_FILE: join(dir, 'prefs.json'), ...(failure === 'env mode' ? { WE_PR_STALL_SWEEP_MODE: 'typo' } : {}) },
+        read: file => {
+          const layer = String(file).endsWith('pr-stall-sweep.json') ? 'repo' : 'platform';
+          if (failure === `${layer} read`) throw new Error('settings temporarily unreadable');
+          return JSON.stringify({ prStallSweep: failure === `${layer} block` ? false
+            : { mode: failure === `${layer} mode` ? {} : 'shadow', digest: false } });
+        }, log: () => {},
+      });
+      expect(settings.value.mode).toBe('off');
+      const report = await runPrSweep({ ...base, notify,
+        stallSweep: args => runStallSweep({ ...args, dir, settings,
+          read: () => { throw new Error('unreadable settings must prevent a PR read'); } }),
+        stallDigest: (pass, opts) => publishStalledDigest(pass, { ...opts, feedPath: path }) });
+      expect(report.errors.length).toBeGreaterThan(0);
+      expect(unacknowledged({ path })).toMatchObject([{ kind: 'stalled', pr: 1 }]);
+      expect(files.map(file => readFileSync(file, 'utf8'))).toEqual(before);
+      expect(settings.settingsUnreadable).toBe(true);
+      // Recovery on the same head neither republishes nor repeats the delivered alert.
+      const recovered = publishStalledDigest({ items: [item] }, options);
+      expect(recovered.lines).toEqual([]);
+      expect(notify).toHaveBeenCalledOnce();
+    });
+  it('a queue poll keeps stalled suppression when the producer settings fail closed', async () => {
+    const dir = auditDir(), path = join(dir, '..', 'needs-you-events.jsonl');
+    publishStalledDigest({ items: [{ lane: 'operator', repo: REPO, pr: 1, head: HEAD, state: 'needs-decision:note' }] },
+      { feedPath: path, stateDir: dir, env: {}, now: NOW, notify: () => ({ ok: true }) });
+    const result = await runOnce({ now: NOW, env: { WE_PR_STALL_SWEEP_MODE: 'typo' }, liveGate: false, log: () => {},
+      settings: { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } },
+      exec: () => JSON.stringify({ ready: [{ repo: REPO, number: 1, head: HEAD }] }) });
+    expect(result.lines).toEqual([]);
+    expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual([`${REPO}#1@${HEAD}:stalled`]);
+    expect(unacknowledged({ path })).toMatchObject([{ kind: 'stalled', pr: 1 }]);
+  });
   it.each([
     { mode: 'off', digest: true },
     { mode: 'shadow', digest: false },

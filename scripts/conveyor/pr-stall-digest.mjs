@@ -92,12 +92,14 @@ const feedKeyOfId = (x) => { const at = x.lastIndexOf('@'); return `${x.slice(0,
 
 /**
  * Publish one pass's operator items. Returns `{lines, fresh, notified, errors}`. Never throws.
- * @param {{items:object[], incomplete:boolean}} pass  the `runStallSweep` result
+ * @param {{items:object[], incomplete:boolean, settingsUnreadable?:boolean}} pass  the `runStallSweep` result
  * @param {{now?:number, env?:object, feedPath?:string, stateDir:string, notify?:Function, enabled?:boolean}} o
  */
 export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true } = {}) {
   const errors = [];
   if (isUnderTest(env) && !feedPath) return { lines: [], fresh: [], notified: false, errors, skipped: 'under-test' }; // never the real feed
+  // Unknown policy is not an explicit disable: preserve open items, suppression and alert obligations until recovery.
+  if (pass?.settingsUnreadable) return { lines: [], fresh: [], notified: false, errors, skipped: 'settings unreadable' };
   if (!enabled) return releaseStalledSuppression({ feedPath, env, stateDir, errors, now });
   if (!Array.isArray(pass?.items)) return { lines: [], fresh: [], notified: false, errors, skipped: 'no pass' };
   const items = pass.items.filter((i) => i.lane === 'operator').map(feedItem);
