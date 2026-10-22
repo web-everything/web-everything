@@ -1,0 +1,4 @@
+{
+  "$comment": "Re-check active per-model Antigravity quota holds at most hourly. WE_AGY_REPROBE=0 disables probes; WE_AGY_REPROBE_INTERVAL_MIN overrides the interval.",
+  "agyQuotaReprobe": { "enabled": true, "intervalMinutes": 60 }
+}

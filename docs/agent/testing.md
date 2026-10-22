@@ -1991,3 +1991,46 @@ ON. They resolve through the shared policy cascade: standard → platform → re
 with each source logged. Dispatch strips disabled brief sections. The verify step's first-commit
 check applies to build lane branches and delivery leases on local `main`, and warns if no test was added or updated; this advisory
 cannot prove a red run. Git-read errors are reported as unknown rather than evidence of compliance.
+
+
+### Antigravity quota rechecks
+
+Quota tests must pass a temporary `dir` to `readAgyHold`, `saveAgyHold`, and
+`readAgyHoldReprobing`; never use the real home quota store. Inject `probe` or
+`spawnSyncFn` so unit tests cannot launch `agy`. Judge tests must inject `readHold`
+and `saveHold` too: the production reader may now perform a synchronous probe.
+Hold matching collapses only effort suffixes, preserving `-thinking`. Alias requests
+honor any active hold in their backend. Observations with a known served alias or
+conflicting requested/served canonical models remain backend-wide and cannot be
+superseded by a model probe. Alias-only observations are never probed.
+Hold read errors propagate; errors after finding a hold keep it.
+Successful probes require exactly one init event with matching canonical concrete
+served identity, exit zero, no spawn error, and a
+terminal result with no error, an absent or `SUCCESS` status, and response text equal to
+`OK` (case-insensitive) after stripping surrounding punctuation, quotes, and whitespace.
+For success, stderr must be empty after trimming; non-quota text yields `error` and
+is retained in `errorText`. Classify quota evidence before this stderr gate: real agy
+quota errors arrive on stderr (`Individual quota reached ... Resets in 126h11m11s.`
+followed by `AGY_ERROR` with `RESOURCE_EXHAUSTED`). Repeated or conflicting init
+events yield `error`. Every non-empty stdout line must parse as JSON, and no non-empty line
+may follow a result event (including another result). Cover malformed/truncated
+lines before, between, and after events with injected-spawn regressions; blank lines
+and whitespace-only stderr remain acceptable.
+Bound the injected spawn with a timeout, `SIGKILL`, and maxBuffer.
+Exercise stale-lock interleavings: rename and verify the displaced lock's age, then
+atomically claim probe state with a token/start time and re-read ownership before probing;
+a fresh claim blocks even forced probes. Probe state
+supersedes model-identified observations by file mtime; legacy backend-wide
+observations without a model remain conservative. A probe error or quota message
+without an explicit reset duration never authorizes shortening an existing hold.
+An explicit-reset replacement of a default-launch observation (including a missing
+`requestedModel`) retains `requestedModel: 'default'` and the probed concrete served
+model; assert the new deadline through both default and concrete-model lookups.
+Invalid reprobe environment overrides fall through to valid settings before defaults;
+assert each field's effective source, especially when settings disable reprobing.
+Reset certainty and the deadline must come from the same parsed phrase with at least
+one numeric h/m/s component and the whole duration token in h/m/s order, followed
+by end of text, whitespace, or `. , ; ) " '`. Partial tokens such as `1month` and `5x`
+use the one-hour fallback without explicit certainty. An unparseable first phrase followed by a numeric reset
+must not authorize supersession using the guessed one-hour deadline. The internal
+`quotaResetExplicit` boolean stays outside the string-only telemetry whitelist.
