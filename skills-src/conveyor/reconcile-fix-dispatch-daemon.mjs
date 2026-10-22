@@ -82,7 +82,7 @@ import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mj
 import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatch-claim.mjs'; // dup-heal-dispatch
 import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
 import { defaultListAgents as listAgentsForStop } from '../../scripts/operations/dispatch-lane-io.mjs';
-import { makeAwaitingVerifyResolver as awaitingResolverForStop } from '../../scripts/conveyor/await-verify.mjs';
+import { makeAwaitingVerifyResolver as awaitingResolverForStop, readAwaitVerifyRecordForSession as readAwaitRecordForStop } from '../../scripts/conveyor/await-verify.mjs';
 import { isPidAlive as pidAliveForStop } from '../../scripts/lib/dispatch-throttle.mjs';
 import { loadFixSessionPolicy, formatFixSessionPolicyLine } from '../../scripts/lib/fix-session-liveness.mjs';
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
@@ -1259,6 +1259,7 @@ export function withFixDispatchClaimRefresh(effects, {
   // The stop re-reads each session UNCACHED right before acting: the sweep's snapshot may be stale by then.
   listFresh = () => listAgentsForStop({ all: true, env: { ...process.env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } }),
   awaitingFor = awaitingResolverForStop(), pidAlive = pidAliveForStop,
+  hasAwaitRecord = (row) => Boolean(readAwaitRecordForStop(row.cwd, row)),
 } = {}) {
   const tick = effects.tickOnce;
   let loggedPolicy = null;
@@ -1300,7 +1301,7 @@ export function withFixDispatchClaimRefresh(effects, {
             let fresh;
             try { fresh = (listFresh() ?? []).find((a) => a?.sessionId === sess.sessionId) ?? null; } catch { fresh = undefined; }
             let awaiting = false;
-            try { awaiting = fresh ? awaitingFor(fresh, { pr: r.pr })?.awaiting === true : false; } catch { awaiting = true; }
+            try { awaiting = fresh ? (awaitingFor(fresh, { pr: r.pr })?.awaiting === true || hasAwaitRecord(fresh)) : false; } catch { awaiting = true; }
             const why = fresh === undefined ? 'session list unreadable'
               : !fresh ? 'no longer listed'
                 : fresh.kind !== 'background' ? `${fresh.kind || 'unknown-kind'} session`

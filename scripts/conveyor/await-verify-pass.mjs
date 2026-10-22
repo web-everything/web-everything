@@ -39,7 +39,7 @@ import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { readFixDispatchClaim } from './fix-claim-store.mjs';
 import { listWrappedWorkerAgents, requestWrappedResume } from '../operations/worker-wrapper-launch.mjs';
 import { AGENT_GONE_STATES } from './lease-reaper.mjs';
-import { loadFixSessionPolicy, isRowGone, samePrintedHandle, cliStartedCopy, rowProcessAlive } from '../lib/fix-session-liveness.mjs';
+import { loadFixSessionPolicy, isRowGone, isRowMidTurn, samePrintedHandle, cliStartedCopy } from '../lib/fix-session-liveness.mjs';
 import { loadVerifyRecoverySettings } from '../lib/verify-recovery-settings.mjs';
 import { loadFixPushPolicy, formatFixPushPolicyLine } from '../lib/fix-push-policy.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
@@ -903,9 +903,9 @@ export async function defaultAwaitVerifyIo({
         // Only a DIFFERENT printed handle is a forked copy to stop. `printedId` is the SHORT handle, so it is compared
         // with the session's own short handle (a short-vs-uuid compare called every unconfirmed resume a fork and
         // could stop the session that had just resumed). The requested session itself is never the cleanup target.
-        const forked = Boolean(printedId) && !samePrintedHandle(printedId, session);
+        const forked = Boolean(printedId) && (sessionPolicy.resumeStopsLiveIdle ? !samePrintedHandle(printedId, session) : printedId !== session.sessionId);
         let copyStopped = false;
-        if (!outcome.resumed && forked) { try { stopSession({ handle: printedId }); copyStopped = true; } catch { /* best-effort cleanup of the copy */ } }
+        if (!outcome.resumed && forked) { try { copyStopped = stopSession({ handle: printedId })?.alreadyGone !== true; } catch { /* best-effort cleanup of the copy */ } }
         return { resumed: !!outcome.resumed, printedId, forked, copyStopped, copyNote: cliStartedCopy(stdout) };
       };
       const refused = stopFirst(session);
@@ -919,9 +919,15 @@ export async function defaultAwaitVerifyIo({
       const copyGone = (handle) => {
         let rows;
         try { rows = io.defaultListAgents({ all: true, env: liveEnv }); } catch { return false; }
-        const copyRow = (rows ?? []).find((x) => samePrintedHandle(handle, x));
-        for (let i = 0; i < 10 && copyRow && rowProcessAlive(copyRow, pidAliveFn); i += 1) sleep(500);
-        return !copyRow || !rowProcessAlive(copyRow, pidAliveFn);
+        // POSITIVE evidence only: the copy's own row is listed, in a terminal state, with no live pid and no turn
+        // running. A missing row (listing lag) or a pid-less busy row is unknown, never "gone".
+        const exitedNow = (x) => Boolean(x) && isRowGone(x, pidAliveFn) && !isRowMidTurn(x);
+        let copyRow = (rows ?? []).find((x) => samePrintedHandle(handle, x));
+        for (let i = 0; i < 10 && !exitedNow(copyRow); i += 1) {
+          sleep(500);
+          try { copyRow = (io.defaultListAgents({ all: true, env: liveEnv }) ?? []).find((x) => samePrintedHandle(handle, x)); } catch { return false; }
+        }
+        return exitedNow(copyRow);
       };
       if (!r.resumed && r.forked && r.copyNote && r.copyStopped && sessionPolicy.resumeStopsLiveIdle && copyGone(r.printedId)) {
         const row = liveRow();

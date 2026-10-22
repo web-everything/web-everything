@@ -170,7 +170,7 @@ import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { isPidAlive } from '../lib/dispatch-throttle.mjs';
-import { makeAwaitingVerifyResolver } from './await-verify.mjs';
+import { makeAwaitingVerifyResolver, readAwaitVerifyRecordForSession } from './await-verify.mjs';
 import { loadFixSessionPolicy, isRowMidTurn } from '../lib/fix-session-liveness.mjs';
 
 // card 302 — resolve red-main capacity through the shared policy layers.
@@ -971,7 +971,9 @@ export function resumeBgSession(planned, {
   stop = stopSession, wait = defaultConfirmWait, claimOwner = fixDispatchClaimOwner(), acquireClaim = acquireFixDispatchClaim,
   releaseClaim = releaseFixDispatchClaim, claimRoot, sessionCwdFor = (id) => dispatchSessionCwd(id, { root: REPO_ROOT }),
   ensureSessionCwd = ensureDispatchSessionCwd,
-  pidAlive = isPidAlive, sessionPolicy = null, candidateRow = undefined, awaitingFor = null,
+  pidAlive = isPidAlive, sessionPolicy = null, candidateRow = undefined, awaitingFor = null, hasAwaitRecord = null,
+  // The stop decision reads the listing UNCACHED (the 20s agents cache could show a turn that has since started).
+  listFresh = () => defaultListAgents({ all: true, env: { ...process.env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } }),
 } = {}) {
   // #x0jphk5 — TAKE THE CLAIM before ever issuing `--resume`. Ownership is confirmed above (both HEAD-sha and
   // name), so what remains is a genuine race: two dispatchers reading the same stale listing could BOTH reach
@@ -1010,7 +1012,7 @@ export function resumeBgSession(planned, {
       return { resumed: false, resumeAttempt: { attempted: false, candidate, forked: false, refused, why } };
     };
     let row;
-    try { row = (listAgentsAll() ?? []).find((a) => normalizeHandle(a?.sessionId) === normalizeHandle(candidate)) ?? null; } catch { row = undefined; }
+    try { row = (listFresh() ?? []).find((a) => normalizeHandle(a?.sessionId) === normalizeHandle(candidate)) ?? null; } catch { row = undefined; }
     if (row === undefined) return declined('the session list could not be read before the resume');
     // Only a row that positively shows a live process is acted on; a row with no pid keeps the old bare resume.
     if (row && rowProcessUp(row, pidAlive)) {
@@ -1024,6 +1026,10 @@ export function resumeBgSession(planned, {
       let awaiting;
       try { awaiting = (awaitingFor ?? makeAwaitingVerifyResolver())(row, { pr: planned.pr })?.awaiting === true; } catch { awaiting = true; }
       if (awaiting) return declined(`session ${candidate} holds an await-verify record for PR #${planned.pr}`, 'session-awaiting-verify');
+      // ANY await record (expired, or for another PR) also means "not ours to stop"; declined the old way (no resume).
+      let record;
+      try { record = (hasAwaitRecord ?? ((r) => Boolean(readAwaitVerifyRecordForSession(r.cwd, r))))(row); } catch { record = true; }
+      if (record) return declined(`session ${candidate} still holds an await-verify record; not stopping it`);
       try { stop({ handle: row.id || String(candidate).slice(0, 8) }); } catch (e) { return declined(`claude stop failed: ${String(e?.message ?? e).split('\n')[0]}`); }
       let exited = !rowProcessUp(row, pidAlive);
       for (let i = 0; i < 20 && !exited; i += 1) { wait(500); exited = !rowProcessUp(row, pidAlive); }

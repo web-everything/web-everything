@@ -134,6 +134,16 @@ describe('replay #5492 11:50Z — the listing showed no pid, but the CLI still s
 });
 
 describe('the copy-note retry never joins a copy that may still be running', () => {
+  it('a copy listed busy with no pid (unknown liveness) is not followed by a second resume', async () => {
+    const row = { ...ROW_5729, id: '40d1dea4', sessionId: '40d1dea4-07b0-44db-a3af-b83734d28c60', name: 'fix-5492', pid: 5492 };
+    const cli = fakeCli({ row, copies: ['29166621'] });
+    const stop = cli.stop;
+    cli.stop = (a) => { const out = stop(a); const c = cli.rows.find((x) => x.id === a.handle); if (a.handle === '29166621' && c) Object.assign(c, { state: 'working', status: 'busy' }); return out; };
+    const { pid: _hidden, ...stale } = row;
+    const r = (await awaitVerifyResumeIo(cli)).resume({ session: { ...stale }, prompt: 'red verdict' });
+    expect(r).toEqual({ resumed: false, reason: 'forked-copy-stopped' });
+    expect(cli.calls.filter((c) => c[0] === 'spawn')).toHaveLength(1);
+  });
   it('a copy whose stop failed is not followed by a second resume', async () => {
     const row = { ...ROW_5729, id: '40d1dea4', sessionId: '40d1dea4-07b0-44db-a3af-b83734d28c60', name: 'fix-5492', pid: 5492 };
     const cli = fakeCli({ row, copies: ['29166621'] });
@@ -165,7 +175,8 @@ describe('replay #5729 11:15Z — the ROUND resume of a done row whose process i
       candidate: ROW_5729.sessionId, prompt: '# New review round', listAgentsAll: () => cli.list(),
       spawnAgent: () => cli.spawn(), stop: cli.stop, wait: () => {}, pidAlive: cli.pidAlive,
       acquireClaim: () => ({ ok: true }), releaseClaim: () => released.push('released'),
-      sessionCwdFor: () => '/ops/dispatch/x', ensureSessionCwd: (p) => p, awaitingFor: () => null, ...extra,
+      sessionCwdFor: () => '/ops/dispatch/x', ensureSessionCwd: (p) => p, awaitingFor: () => null, hasAwaitRecord: () => false,
+      listFresh: () => cli.list(), ...extra,
     });
     return { r, released };
   };
@@ -191,6 +202,12 @@ describe('replay #5729 11:15Z — the ROUND resume of a done row whose process i
     expect(FIXER_MID_TURN_REFUSALS.has(r.resumeAttempt.refused)).toBe(true);
     expect(cli.calls).toEqual([]);
     expect(released).toEqual(['released']);
+  });
+  it('an expired or other-PR await record still blocks the stop (declined the old way, no resume)', () => {
+    const cli = fakeCli({ row: ROW_5729 });
+    const { r } = run(cli, { hasAwaitRecord: () => true });
+    expect(r).toMatchObject({ resumed: false, resumeAttempt: { refused: 'stop-before-resume' } });
+    expect(cli.calls).toEqual([]);
   });
   it('a live process with no turn status is never stopped (declined the old way)', () => {
     const cli = fakeCli({ row: { ...ROW_5729, status: undefined } });
@@ -233,6 +250,16 @@ describe('replay #5758 11:00Z — the claim sweep and the released fixer\'s live
     expect(r.refreshed).toHaveLength(1);
     expect(readFixDispatchClaim(key())).not.toBeNull();
   });
+  it.each(['hung', 'selfReportedDone', 'authExpired'])('a done row mid-turn with a live pid is never settled, even flagged %s', (flag) => {
+    claim();
+    const r = refreshLiveFixDispatchClaims({
+      lockRoot: claimRoot, nowMs: T0 + 25 * 60_000, nowIso: () => new Date(T0 + 25 * 60_000).toISOString(), sessionPolicy: resolveFixSessionPolicy({}),
+      hungInfoFor: () => (flag === 'hung' ? { hung: true } : null), awaitingVerifyFor: null, alive: (pid) => pid === 7777,
+      listAgentsAll: () => [{ id: 'ddac038c', sessionId: SID, name: 'fix-5758', kind: 'background', state: 'done', status: 'busy', pid: 7777, startedAt: T0, ...(flag !== 'hung' ? { [flag]: true } : {}) }],
+    });
+    expect(r.released).toBeUndefined();
+    expect(readFixDispatchClaim(key())).not.toBeNull();
+  });
   it('a renamed row is still matched by its bound session id', () => {
     claim();
     const r = sweep({ id: 'ddac038c', sessionId: SID, name: 'some generated title', kind: 'background', state: 'working', status: 'busy', pid: 7777, startedAt: T0 }, new Set([7777]));
@@ -247,7 +274,7 @@ describe('replay #5758 11:00Z — the claim sweep and the released fixer\'s live
     const lines = [];
     const tick = vi.fn(async () => 'ticked');
     const wrapped = withFixDispatchClaimRefresh({ tickOnce: tick }, { log: { error: (l) => lines.push(l) }, refresh: () => result, stop, loadPolicy: () => resolveFixSessionPolicy({}),
-      listFresh: () => [row], awaitingFor: () => null, pidAlive: (pid) => pid === 7777 });
+      listFresh: () => [row], awaitingFor: () => null, hasAwaitRecord: () => false, pidAlive: (pid) => pid === 7777 });
     expect(await wrapped.tickOnce()).toBe('ticked');
     expect(stop).toHaveBeenCalledWith({ handle: 'ddac038c' });
     expect(lines.join('\n')).toMatch(/stopped session ddac038c \(pid 7777, status idle\) after releasing claim fixing-5758 \(we\) — fix\.stopOnClaimRelease=true \(standard\)/);
@@ -281,7 +308,7 @@ describe('replay #5758 11:00Z — the claim sweep and the released fixer\'s live
     const lines = [];
     const fresh = { ...sess, kind: 'background', state: 'done', cwd: '/x', ...patch };
     const wrapped = withFixDispatchClaimRefresh({ tickOnce: async () => null }, { log: { error: (l) => lines.push(l) }, refresh: () => result, stop,
-      loadPolicy: () => resolveFixSessionPolicy({}), listFresh: () => [fresh], awaitingFor, pidAlive: (pid) => pid === 7777 });
+      loadPolicy: () => resolveFixSessionPolicy({}), listFresh: () => [fresh], awaitingFor, hasAwaitRecord: () => false, pidAlive: (pid) => pid === 7777 });
     await wrapped.tickOnce();
     expect(stop).not.toHaveBeenCalled();
     expect(lines.join('\n')).toMatch(re);

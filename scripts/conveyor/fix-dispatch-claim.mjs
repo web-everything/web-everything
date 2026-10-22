@@ -324,7 +324,11 @@ export function refreshLiveFixDispatchClaims({
       // an exact sessionId match settles that claim regardless of start time.
       const ownRun = (a) => (entry.meta.sessionId && a.sessionId === entry.meta.sessionId)
         || (Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
-      const settled = agentsAll.some((a) => ['done', 'stopped', 'failed'].includes(a.state) && ownRun(a));
+      // A terminal-state row that is mid-turn with a live pid is NOT settled (hung/selfReportedDone/authExpired cannot
+      // make it so): such a claim is left to its plain TTL, exactly like a hung `working` row.
+      const runningNow = (a) => byPid && isRowMidTurn(a) && rowProcessAlive(a, alive);
+      const settled = agentsAll.some((a) => ['done', 'stopped', 'failed'].includes(a.state) && ownRun(a))
+        && !agentsAll.some((a) => ownRun(a) && runningNow(a));
       if (settled) {
         const current = readLockEntry(lockRoot, fixDispatchResource({ repo, pr, kind }));
         if (current?.owner === entry.owner && current.meta?.claimedAt === claimedAt) {
