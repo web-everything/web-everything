@@ -149,6 +149,20 @@ describe('planHumanDeescalation', () => {
     expect(plan({ timeline: { status: 'ok', items: [added('someone-else')] } }).action).toBe('keep');
     expect(plan({ timeline: { status: 'ok', items: [added(), { ...added(), change: 'removed', createdAt: at(1000) }, added('chalbert', 2000)] } }).action).toBe('keep');
   });
+  it('a non-clearable failure recorded by a no-op park (added=no) behind a cleared round-cap → kept', () => {
+    const noop = bot(`Mandatory referral review parked to review:human: mandatory referral: comments unavailable; hold retained.\n\n${buildHumanEscalationMarker({ kind: K.REFERRAL_PERSISTENCE_FAILED, head: HEAD, added: false })}`, 600_000);
+    const roundCap = bot(buildHumanEscalationComment({ kind: K.ROUND_CAP, head: HEAD }), 10_000);
+    expect(plan({ pr: { comments: [roundCap, noop, grant(3_600_000)] } }).reason).toMatch(/referral-persistence-failed does not de-escalate/);
+  });
+  it('an added=no record never explains an add, even of a clearable kind', () => {
+    const noop = bot(`Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: x.\n\n${buildHumanEscalationMarker({ kind: K.REFERRAL_LEDGER_SYNC_FAILED, head: HEAD, added: false })}`, 20_000);
+    expect(plan({ pr: { comments: [noop] } }).reason).toMatch(/no escalation record/);
+  });
+  it('a record from an earlier label lifecycle (before the last removal) never explains the current add', () => {
+    const items = [added(BOT, -3_000), { ...added(BOT, -2_000), change: 'removed' }, added()];
+    const old = bot(buildHumanEscalationComment({ kind: K.ROUND_CAP, head: HEAD }), -2_500);
+    expect(plan({ timeline: { status: 'ok', items }, pr: { comments: [old, grant(3_600_000)] } }).reason).toMatch(/no escalation record/);
+  });
   it('a hand add EVER on this PR → kept, even when an automation write restored it later (the label mirror)', () => {
     const items = [added('chalbert', -7_200_000), { ...added('chalbert', -3_600_000), change: 'removed' }, added()];
     expect(plan({ timeline: { status: 'ok', items } }).reason).toMatch(/hand-added by chalbert/);

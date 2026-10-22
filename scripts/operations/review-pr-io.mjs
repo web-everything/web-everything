@@ -1425,7 +1425,7 @@ export function createReviewPrSinks({
         if (overflows.length) {
           const reason = `${overflows.length} overflow hold(s). ${overflows[0]}`;
           for (const detail of overflows) {
-            labelProvider.postComment(read.repo, read.pr, `Mandatory referral review parked to review:human: ${detail}\n\n${buildHumanEscalationMarker({ kind: HUMAN_ESCALATION_KINDS.REFERRAL_OVERFLOW, head: state.headRefOid })}`);
+            labelProvider.postComment(read.repo, read.pr, `Mandatory referral review parked to review:human: ${detail}\n\n${buildHumanEscalationMarker({ kind: HUMAN_ESCALATION_KINDS.REFERRAL_OVERFLOW, head: state.headRefOid, added: false })}`);
           }
           result.pending.push('referral-overflow');
           result.reason = reason;
@@ -1521,12 +1521,12 @@ export function createReviewPrSinks({
         // Only a verdict-ledger mirror failure leaves the thread whole (thread-clearable); any other failure may
         // have lost the finding itself, so its record kind never de-escalates.
         const kind = referralFailureKind(error.message ?? error);
-        // The record names WHY this park added the label, so it rides only a park that did add it: a no-op park
-        // (the label already stood, for whatever reason) must never explain someone else's hold.
         const added = park(live, kind, { marked: false });
         const reason = String(error.message ?? error).replace(/\s+/g, ' ').slice(0, 400);
-        const message = `Mandatory referral review parked to review:human: ${reason}.${added ? `\n\n${buildHumanEscalationMarker({
-          kind, head: live?.headRefOid ?? read.netBasis?.rev })}` : ''}`;
+        // Recorded either way: a no-op park's record (`added=no`) still counts, so a non-clearable failure holds
+        // behind any earlier hold, but only a park that added the label can explain it.
+        const message = `Mandatory referral review parked to review:human: ${reason}.\n\n${buildHumanEscalationMarker({
+          kind, head: live?.headRefOid ?? read.netBasis?.rev, added })}`;
         try { labelProvider.postComment(read.repo, read.pr, message); }
         catch (commentError) { out(`Could not post referral park reason: ${commentError.message}`); }
         out(message);

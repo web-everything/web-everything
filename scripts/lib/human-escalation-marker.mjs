@@ -54,13 +54,17 @@ export const ESCALATION_COMMENT_PREFIXES = Object.freeze([
 ]);
 
 const SHA_RE = /^[0-9a-f]{40}$/;
-const MARKER_LINE_RE = /^<!-- we:human-escalation kind=([a-z0-9-]+) head=([0-9a-f]{40}|none) -->$/;
+const MARKER_LINE_RE = /^<!-- we:human-escalation kind=([a-z0-9-]+) head=([0-9a-f]{40}|none)(?: added=(yes|no))? -->$/;
 const normHead = head => (typeof head === 'string' && SHA_RE.test(head.toLowerCase()) ? head.toLowerCase() : 'none');
 
-/** The marker line. Throws on an unknown kind: a writer must name a real cause. */
-export function buildHumanEscalationMarker({ kind, head } = {}) {
+/**
+ * The marker line. Throws on an unknown kind: a writer must name a real cause. `added: false` records an escalation
+ * whose park wrote no label (the hold already stood): it still counts — a non-clearable kind still holds — but it can
+ * never be the record that EXPLAINS an add.
+ */
+export function buildHumanEscalationMarker({ kind, head, added = true } = {}) {
   if (!KNOWN_KINDS.has(kind)) throw new Error(`unknown human-escalation kind: ${kind}`);
-  return `<!-- we:human-escalation kind=${kind} head=${normHead(head)} -->`;
+  return `<!-- we:human-escalation kind=${kind} head=${normHead(head)}${added ? '' : ' added=no'} -->`;
 }
 
 /** Fold text that must never form a marker line or an HTML comment delimiter. */
@@ -107,8 +111,8 @@ export function readHumanEscalations(comments, { inferLegacy = false } = {}) {
       // Exactly one marker, as the last line, under a writer's own first line. Anything else holds.
       const count = (body.match(/we:human-escalation/g) ?? []).length;
       out.push(m && owned && count === 1 && KNOWN_KINDS.has(m[1])
-        ? { ...base, kind: m[1], head: m[2] === 'none' ? null : m[2], legacy: false }
-        : { ...base, kind: 'unknown', head: null, legacy: false });
+        ? { ...base, kind: m[1], head: m[2] === 'none' ? null : m[2], legacy: false, added: m[3] !== 'no' }
+        : { ...base, kind: 'unknown', head: null, legacy: false, added: false });
       return;
     }
     if (!inferLegacy) return;
@@ -116,9 +120,9 @@ export function readHumanEscalations(comments, { inferLegacy = false } = {}) {
     if (start.startsWith(REFERRAL_PARK_PREFIX)) {
       const reason = start.slice(REFERRAL_PARK_PREFIX.length).trim();
       out.push({ ...base, kind: /^referral-overflow:/.test(reason) ? HUMAN_ESCALATION_KINDS.REFERRAL_OVERFLOW : referralFailureKind(reason),
-        head: null, legacy: true });
+        head: null, legacy: true, added: true });
     } else if (start.startsWith(NOTE_COMMENT_HEAD) && NOTE_ROUND_CAP_RE.test(body)) {
-      out.push({ ...base, kind: HUMAN_ESCALATION_KINDS.ROUND_CAP, head: null, legacy: true });
+      out.push({ ...base, kind: HUMAN_ESCALATION_KINDS.ROUND_CAP, head: null, legacy: true, added: true });
     }
     // A mandatory referral record is NOT read as an escalation record: it is posted on every review, so its
     // proximity to a label add proves nothing about why the label went on (audit round 4).

@@ -193,8 +193,12 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   const escalations = readHumanEscalations(comments, { inferLegacy: settings.inferLegacy === true });
   if (escalations.some(e => !Number.isFinite(time(e.createdAt)))) return keep('an escalation record has no readable time');
   const windowStart = addAt - SINCE_BEFORE_MS;
+  // A record from an earlier label lifecycle (before the last removal) never explains this add.
+  const lastLabel = timeline.items.lastIndexOf(last);
+  const priorRemoval = timeline.items.slice(0, lastLabel).filter(i => i.label === REVIEW_LABELS.human && i.change === 'removed').at(-1);
+  const explainFrom = Math.max(addAt - ATTRIBUTION_SKEW_MS, priorRemoval ? time(priorRemoval.createdAt) + 1 : -Infinity);
   const explains = e => { const t = time(e.createdAt);
-    return login(e.author) === login(last.actor) && t >= addAt - ATTRIBUTION_SKEW_MS && t <= addAt + ATTRIBUTION_AFTER_MS; };
+    return e.added !== false && login(e.author) === login(last.actor) && t >= explainFrom && t <= addAt + ATTRIBUTION_AFTER_MS; };
   if (!escalations.some(explains)) return keep('no escalation record by the labelling login at the review:human add');
   const since = escalations.filter(e => time(e.createdAt) >= windowStart);
   const kinds = [...new Set(since.map(e => e.kind))];
