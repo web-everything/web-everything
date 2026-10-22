@@ -30,7 +30,7 @@
  *
  * Usage:
  *   node scripts/conveyor/health-watch.mjs tick    [--json] [--force-gh] [--no-gh] [--dry-run] [--state-root=DIR]
- *                                                  [--logs-dir=DIR] [--lock-root=DIR] [--self-sync-dir=DIR]
+ *                                                  [--logs-dir=DIR] [--lock-root=DIR] [--self-sync-dir=DIR] [--fix-ready-store=FILE]
  *                                                  [--heavy-run-samples-file=FILE]  # ungated heavy-run history fixture
  *                                                  [--ps-fixture=FILE] [--machine-load-fixture=FILE]  # machine-overload's inputs, real by default
  *                                                  [--no-investigate]  # skip the #4078 investigation pass entirely
@@ -84,6 +84,7 @@ import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // #4317 — the same "which paths are DAEMON clones" registry `guard-lane.mjs`/`guard-bash.mjs` already use, so
 // this probe's notion of "a daemon clone" can never drift from the guards'.
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
+import { probeFixReady } from './fix-ready-probe.mjs';
 import { probeDaemonCloneBranches } from '../lib/daemon-clone-branch-probe.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
 import { probeBuildSessions, probeExternalRuns } from './build-supervision.mjs';
@@ -1179,6 +1180,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.leases = flags['lock-root'] ? attempt('leases', leaseScan)
     : (attempt('daemonStatus', () => probeDaemonStatus()) ?? attempt('leases', leaseScan));
   probes.selfSync = attempt('selfSync', () => probeSelfSync(flags['self-sync-dir'] || defaultSelfSyncDir()));
+  probes.fixReady = attempt('fixReady', () => probeFixReady({ storePath: flags['fix-ready-store'] || undefined }));
   probes.cloneLag = (flags['logs-dir'] || flags['lock-root'] || flags['state-root']) ? undefined : attempt('cloneLag', () => probeCloneLag());
   probes.daemonCloneBranches = (flags['logs-dir'] || flags['lock-root'] || flags['state-root']) ? undefined : attempt('daemonCloneBranches', () => probeDaemonCloneBranches({ workspace: workspaceOf(REPO_ROOT) }));
   probes.lanePools = attempt('lanePools', () => probeLanePools(logsDir));
