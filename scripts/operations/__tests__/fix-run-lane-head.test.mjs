@@ -50,11 +50,18 @@ describe('fixer lane head guard', () => {
     const recovery = f.calls.find(c => c.args.includes('--lane=10') && c.args.includes('acquire'));
     expect(recovery.cmd).toBe('node');
     expect(recovery.args).toEqual(['/we/scripts/lane-pool.mjs', 'acquire', '--lane=10',
-      '--session=fix-5759', '--purpose=conveyor-fix', '--base=lane/pr']);
+      '--session=fix-5759', `--expect-holder=${holder}`, '--purpose=conveyor-fix', '--base=lane/pr']);
     expect(recovery.opts).toMatchObject({ cwd: '/we', env: { LANE_SESSION: holder } });
     expect(f.readLease.mock.calls.length).toBeGreaterThanOrEqual(3);
     expect(f.calls.some(c => c.args.includes('reset') || c.args.includes('fetch'))).toBe(false);
     expect(f.calls.filter(c => c.args.includes('rev-parse')).length).toBeGreaterThanOrEqual(4);
+  });
+  it('refuses recovery with an empty holder without calling acquire', () => {
+    const f = fixture({ head: oldHead });
+    expect(() => ensureLaneHead({ lanePath: '/lanes/lane-10', prHead, holder: '',
+      sessionSlug: 'fix-5759', ref: 'lane/pr', weRoot: '/we', run: f.run, readLease: f.readLease }))
+      .toThrow(LauncherError);
+    expect(f.calls.some(c => c.args.includes('acquire'))).toBe(false);
   });
   it('refuses a foreign lease before spawn and records infra failure, releasing the claim', async () => {
     const f = fixture({ head: oldHead, owner: foreign });
