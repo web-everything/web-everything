@@ -83,3 +83,22 @@ it('main moves a review:human PR to NEEDS YOU, retaining its reasons; also lists
   for (const label of ['extend rounds', 'send back past the cap', 'answer the stand-down', 'close']) expect(needsYou).toContain(`    ${label}: `);
   expect(text.split('NOT READY')[1].split('STOOD DOWN')[0]).not.toContain('o/n#5270');
 });
+
+describe('an INFO-kind 🔔 comment is never an open question (live #5758, 2026-10-21)', () => {
+  const infoBody = `${NOTE_COMMENT_MARKER}\n\nneeds your decision: released-claim-session-ignored\n\nPR #5758: ignoring live pid 1\n\n<!-- conveyor-note-key: released-claim-session-ignored:5758:PR #5758: ignoring live pid 1 -->`;
+  it('alone: no row', () => {
+    expect(latestUnresolvedPersonNote([note('2026-10-21T13:24:00Z', infoBody)])).toBeNull();
+    expect(needsPersonRow('we', { number: 5758, title: 't', comments: [note('2026-10-21T13:24:00Z', infoBody)] })).toBeNull();
+  });
+  it('after a real question: the real question still shows', () => {
+    expect(latestUnresolvedPersonNote([note(), note('2026-10-21T13:24:00Z', infoBody)])).toMatchObject({ kind: 'round-cap-exhausted' });
+  });
+});
+
+describe('an INFO comment posted with operator credentials is not an answer (Codex audit, 2026-10-21)', () => {
+  it('the earlier real question stays open', () => {
+    const infoBody = `${NOTE_COMMENT_MARKER}\n\nneeds your decision: released-claim-session-ignored\n\nx\n\n<!-- conveyor-note-key: released-claim-session-ignored:5270:x -->`;
+    expect(latestUnresolvedPersonNote([note(), operator('2026-10-21T13:24:00Z', infoBody)])).toMatchObject({ kind: 'round-cap-exhausted' });
+    expect(latestUnresolvedPersonNote([note(), operator('2026-10-21T13:24:00Z')])).toBeNull();
+  });
+});

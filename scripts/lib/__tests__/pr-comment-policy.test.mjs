@@ -158,3 +158,13 @@ describe('isNoActionDrainReason / drainReasonCommentSuppressed', () => {
     }
   });
 });
+
+describe('INFO note kinds — log only, never a question (live #5758/#5729/#5485, 2026-10-21)', () => {
+  it('released-claim-session-ignored is info; escalations and unknown kinds are not', async () => {
+    const { isInfoNote, INFO_NOTE_KINDS } = await import('../pr-comment-policy.mjs');
+    expect(INFO_NOTE_KINDS).toEqual(['released-claim-session-ignored']);
+    expect(isInfoNote({ kind: 'released-claim-session-ignored' })).toBe(true);
+    expect(isInfoNote('released-claim-session-ignored')).toBe(true);
+    for (const k of ['awaiting-permission', 'session-overrun', 'round-cap-exhausted', 'mystery', undefined]) expect(isInfoNote({ kind: k })).toBe(false);
+  });
+});

@@ -220,3 +220,13 @@ describe('postNoteComment — the IO shell', () => {
     expect(postNoteComment({ pr: 10, body: 'hello', exec })).toEqual({ ok: false, error: 'gh: rate limited' });
   });
 });
+
+describe('planNoteComment — an INFO note never posts, in any mode (live #5758, 2026-10-21)', () => {
+  const info = { kind: 'released-claim-session-ignored', prNumber: 5758, pid: 1, text: 'PR #5758: ignoring live pid 1 — finished work' };
+  it.each(['on-change-or-action', 'all'])('mode %s → suppressed info', (mode) => {
+    expect(planNoteComment(info, [], { mode })).toMatchObject({ alreadyPosted: true, suppressed: 'info' });
+  });
+  it('an escalation in mode all still posts', () => {
+    expect(planNoteComment({ kind: 'awaiting-permission', prNumber: 1, sessionId: 's', text: 't' }, [], { mode: 'all' })).toMatchObject({ alreadyPosted: false, suppressed: null });
+  });
+});
