@@ -46,7 +46,7 @@
  *   - `retryMin` (integer 1..1440, standard 30): how long a source set whose build failed is not retried
  */
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -499,7 +499,11 @@ export function cardGroupHold(state, { num, repo, localSlug, files = null, mainF
   const paths = Array.isArray(files) ? files.map(f => (typeof f === 'string' ? f : f?.path)).filter(Boolean) : [];
   for (const g of state?.groups ?? []) {
     if (!sameRepo(g.repo, slug)) continue;
-    if (Number(g.pr) === Number(num)) continue; // the combined PR itself lands normally
+    if (Number(g.pr) === Number(num)) {
+      // An abandoned creation is owned only so reconcile can close it. It must never enqueue in the meantime.
+      if (g.closePending) return { kind: 'card-grouped', reason: `grouped into #${g.pr} (closure pending; drain.group)` };
+      continue; // the combined PR itself lands normally
+    }
     const where = g.pr ? `#${g.pr}` : `pending card group ${g.id}`;
     if (g.sources?.some(s => Number(s.num) === Number(num)))
       return { kind: 'card-grouped', reason: `grouped into ${where} (lands with it; drain.group)` };
@@ -622,6 +626,10 @@ export function createCardGrouping({
   const say = line => { if (!quiet) log.write(`  card-group: ${line}\n`); };
   const isLocalGroup = g => sameRepo(g.repo, localSlug);
   const isLocalGroupId = (g, id) => isLocalGroup(g) && g.id === id;
+  // A source-set ID may be reused after expiry. Every resumed writer must still own the same creation.
+  const isLocalGroupAttempt = (g, record) => isLocalGroupId(g, record.id)
+    && g.attemptId === record.attemptId && g.createdAt === record.createdAt && g.commit === record.commit && g.branch === record.branch;
+  const isLocalGroupSnapshot = (g, record) => isLocalGroupAttempt(g, record) && g.pr === record.pr;
   let setting = settings;
   if (!setting) setting = readCardGroupSettings({ env, log: line => log.write(`  ${line}\n`) });
   if (!statePath) setting = { ...setting, enabled: false, sources: { ...(setting.sources ?? {}), enabled: 'no state path (test run)' } };
@@ -729,13 +737,16 @@ export function createCardGrouping({
             // Opening interrupted: adopt the PR if one exists for the branch, else drop the record after 15 min.
             let found = null;
             try { found = JSON.parse(gh(['pr', 'list', '--repo', localSlug, '--head', g.branch, '--state', 'all', '--json', 'number,state']))[0] ?? null; } catch { continue; }
-            if (found) { mutate(s => { const x = s.groups.find(y => isLocalGroupId(y, g.id)); if (x) x.pr = found.number; }); say(`${tag}: adopted #${found.number}`); }
+            if (found) {
+              const adopted = mutate(s => { const x = s.groups.find(y => isLocalGroupSnapshot(y, g)); if (x) x.pr = found.number; return !!x; });
+              if (adopted?.ok && adopted.result) say(`${tag}: adopted #${found.number}`);
+            }
             else if (now() - (g.createdAt ?? 0) > 15 * 60_000) {
               // Re-check under the lock: the forming pass may have recorded its PR since this snapshot was read.
               const dropped = mutate(s => {
-                const x = s.groups.find(y => isLocalGroupId(y, g.id));
-                if (!x || x.pr || x.createdAt !== g.createdAt) return false;
-                s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); s.failed[sourceSetKey(g.sources)] = now();
+                const x = s.groups.find(y => isLocalGroupSnapshot(y, g));
+                if (!x || x.pr) return false;
+                s.groups = s.groups.filter(y => !isLocalGroupSnapshot(y, g)); s.failed[sourceSetKey(g.sources)] = now();
                 return true;
               });
               if (dropped?.ok && dropped.result === true) { say(`${tag}: no PR was opened — record dropped, sources released`); dissolved.push(g.id); }
@@ -772,11 +783,11 @@ export function createCardGrouping({
               }
             }
             if (retry) continue;
-            mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); });
+            mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupSnapshot(y, g)); });
             done.push(g.id);
             continue;
           }
-          let why = repairNeeds(g);
+          let why = g.closePending ? 'group record dropped while opening' : repairNeeds(g);
           if (why) { /* the repair outranks the group */ }
           else if (pr.state === 'CLOSED') why = 'combined PR closed without merging';
           else if (labelNames(pr.labels).some(l => l === 'review:changes' || l === 'review:human')) why = `combined PR sent back (${labelNames(pr.labels).filter(l => l === 'review:changes' || l === 'review:human').join(', ')})`;
@@ -798,7 +809,10 @@ export function createCardGrouping({
           for (const s of g.sources) comment(s.num, `Card group #${g.pr} dissolved (${why}). This PR goes back to the normal drain path. (drain.group, card xym8nt4)`);
           // Memo the dissolved source set, so form() does not rebuild the same group for retryMin (a known dissolve
           // cause would otherwise re-form, re-comment and re-open every pass). A moved source head is a new set.
-          mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); s.failed[sourceSetKey(g.sources)] = now(); });
+          mutate(s => {
+            if (!s.groups.some(y => isLocalGroupSnapshot(y, g))) return;
+            s.groups = s.groups.filter(y => !isLocalGroupSnapshot(y, g)); s.failed[sourceSetKey(g.sources)] = now();
+          });
           say(`${tag}: dissolved — ${why}`);
           dissolved.push(g.id);
         }
@@ -937,7 +951,7 @@ export function createCardGrouping({
         const summary = `#${p.sources.map(s => s.num).join(' #')} on ${p.files.length} card file(s) → ${built.commit.slice(0, 12)}; union check ok (${proof.perFile.map(f => `${f.path.split('/').pop().slice(0, 24)} +${f.combinedAdded}/${f.sourceAdded}`).join(', ')})`;
         if (dryRun) { say(`DRY RUN would open: ${summary}`); return { plan: p, built, proof, dryRun: true }; }
         const branch = `${CARD_GROUP_BRANCH_PREFIX}${id}`;
-        const record = { id, repo: localSlug, branch, pr: null, base, commit: built.commit, createdAt: now(),
+        const record = { id, attemptId: randomUUID(), repo: localSlug, branch, pr: null, base, commit: built.commit, createdAt: now(),
           sources: p.sources.map(s => ({ num: s.num, headSha: s.headSha })), files: p.files };
         if (typeof withLock !== 'function' || typeof readQueueFiles !== 'function') return { reason: 'no land mutex / queue read wired — fail closed' };
         // Inside the land mutex every enqueue runs in: prove no source is queued and every source is still at
@@ -977,12 +991,12 @@ export function createCardGrouping({
         const remote = run('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd });
         const existing = String(remote.stdout ?? '').split(/\s/)[0];
         if (remote.status !== 0 || (existing && existing !== built.commit)) {
-          mutate(s => { s.groups = s.groups.filter(g => !isLocalGroupId(g, id)); });
+          mutate(s => { s.groups = s.groups.filter(g => !isLocalGroupSnapshot(g, record)); });
           return failAll(p.sources, existing ? `branch ${branch} already exists at another commit` : 'ls-remote failed');
         }
         if (!existing) {
           const push = run('git', ['push', 'origin', `${built.commit}:refs/heads/${branch}`], { cwd, env });
-          if (push.status !== 0) { mutate(s => { s.groups = s.groups.filter(g => !isLocalGroupId(g, id)); }); return failAll(p.sources, `push failed (${String(push.stderr ?? '').split('\n')[0]})`); }
+          if (push.status !== 0) { mutate(s => { s.groups = s.groups.filter(g => !isLocalGroupSnapshot(g, record)); }); return failAll(p.sources, `push failed (${String(push.stderr ?? '').split('\n')[0]})`); }
         }
         const title = `card group: ${p.sources.length} approved card PRs on ${p.files.map(f => f.split('/').pop().split('-')[0]).join(', ')}`;
         let num = null;
@@ -992,22 +1006,32 @@ export function createCardGrouping({
           num = Number(/\/pull\/(\d+)/.exec(url)?.[1]);
         } catch (e) { say(`PR create for ${branch} failed (${firstLine(e)}) — the next reconcile adopts or drops it`); return { reason: 'pr create failed' }; }
         if (!Number.isInteger(num)) return { reason: 'pr create returned no number' };
-        const kept = mutate(s => { const x = s.groups.find(g => isLocalGroupId(g, id)); if (x) x.pr = num; return !!x; });
-        if (kept?.ok && kept.result === false) {
+        const orphanId = `${id}-orphan-${num}`;
+        const orphan = { ...record, id: orphanId, pr: num, closePending: true };
+        const kept = mutate(s => {
+          const x = s.groups.find(g => isLocalGroupAttempt(g, record));
+          // The source-set ID can be reused after expiry. A resumed creator cannot overwrite its replacement.
+          if (x && (x.pr == null || Number(x.pr) === num)) {
+            x.pr = num;
+            return true;
+          }
+          // Record ownership BEFORE closing, even when a newer group owns these sources/cards. This record is
+          // for cleanup only: the PR itself and its sources/cards stay held until closure succeeds. A distinct
+          // ID preserves the replacement, and survives a crash or a failed close for the next reconcile.
+          if (!s.groups.some(g => isLocalGroupId(g, orphanId)))
+            s.groups.push(orphan);
+          return false;
+        });
+        if (!kept?.ok) return { reason: `combined PR #${num} ownership update failed (${kept?.reason ?? 'state update failed'})` };
+        if (kept.result === false) {
           // Opening outlived the reconcile's 15-minute drop: the record (and its card reservation) is gone and the
           // sources were released, so an untracked combined PR could land beside them or beside a newer group.
           try { gh(['pr', 'close', String(num), '--repo', localSlug, '--comment', 'Card group record was dropped while this PR was being opened; its sources land on their own. (drain.group, card xym8nt4)']); }
           catch (e) {
-            // Never leave it untracked: re-record it (when nothing claimed its sources or cards meanwhile) so the
-            // reconcile owns it from here — it dissolves it, or lands it like any group.
-            const back = mutate(s => {
-              const open = s.groups.filter(isLocalGroup);
-              if (open.some(g => g.sources.some(y => record.sources.some(z => Number(y.num) === z.num)) || !Array.isArray(g.files) || g.files.some(f => record.files.includes(f)))) return false;
-              s.groups.push({ ...record, pr: num, createdAt: now() });
-              return true;
-            });
-            say(`close of untracked combined PR #${num} failed (${firstLine(e)}) — ${back?.result === true ? 're-recorded for the reconcile' : 'left open untracked'}`);
+            say(`close of untracked combined PR #${num} failed (${firstLine(e)}) — re-recorded for the reconcile`);
+            return { reason: `group record dropped while opening — combined PR #${num} closure pending` };
           }
+          mutate(s => { s.groups = s.groups.filter(g => !isLocalGroupSnapshot(g, orphan)); });
           return { reason: `group record dropped while opening — combined PR #${num} closed` };
         }
         for (const s of p.sources) comment(s.num, `Grouped with ${p.sources.filter(x => x.num !== s.num).map(x => `#${x.num}`).join(', ')} into the combined card PR #${num} (they all edit ${p.files.map(f => `\`${f}\``).join(', ')}). This PR stays open and is held by the drain; it is closed only after #${num} merges and its lines are confirmed on main. If #${num} closes, fails, or is sent back, this PR goes back to landing on its own. (drain.group, card xym8nt4)`);

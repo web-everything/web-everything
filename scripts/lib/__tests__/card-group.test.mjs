@@ -12,6 +12,9 @@ import {
 } from '../card-group.mjs';
 import { planLabelDrain } from '../../merge-ai-prs.mjs';
 import { overlapRowKey } from '../../conveyor/land-overlap-yield.mjs';
+import { withLandWriteLock } from '../../readiness/drain-lock.mjs';
+import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
+import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 
 const dirs = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop(), { recursive: true, force: true }); });
@@ -716,6 +719,61 @@ describe('createCardGrouping — claim under the land mutex, close on current he
   }
 
   describe('form: admission and eligibility', () => {
+    it.each(['ls-remote', 'push'])('a stale %s failure never rolls back a replacement claim', failure => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json');
+      let replacement;
+      const run = (cmd, args, opts) => {
+        if (args[0] === failure && (failure === 'push' || args.at(-1).startsWith('refs/heads/lane/card-group-'))) {
+          const original = readGroupState(statePath).groups[0];
+          replacement = { ...original, createdAt: original.createdAt + 1 };
+          writeFileSync(statePath, JSON.stringify({ groups: [replacement], failed: {} }));
+          return { status: 1, stdout: '', stderr: 'remote unavailable' };
+        }
+        return t.opts.run(cmd, args, opts);
+      };
+      const result = createCardGrouping({ ...t.opts, run, statePath, withLock: fn => ({ ran: true, result: fn() }) })
+        .form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(result.formed).toBeUndefined();
+      expect(result.reason).toMatch(/ls-remote failed|push failed/);
+      expect(readGroupState(statePath).groups).toEqual([replacement]);
+      expect(t.calls.some(c => c.startsWith('pr create'))).toBe(false);
+    });
+
+    it('the real land mutex excludes an enqueue during a group claim, then the enqueue re-reads its hold', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json'), lockRoot = tmp();
+      const locked = (owner, fn) => withLandWriteLock(fn, { lockRoot, owner, waitMs: 0, runUnlockedOnContention: false });
+      let enqueueCalls = 0, during;
+      const strategy = createDrainMergeStrategy({
+        localSlug: 'o/r', resolved: { policy: resolveMergeDeliveryPolicy({ tool: { strategy: 'github-merge-queue' } }) },
+        env: { ...process.env, WE_DRAIN_CARD_GROUP_STATE: statePath }, log: { write() {} }, quiet: true,
+        exec: () => { enqueueCalls++; throw new Error('held source must never reach GitHub'); },
+      });
+      const enqueue = () => locked('enqueue', () => strategy.enqueue({ num: 1 }, t.heads[1], { comments: [] }));
+      const withLock = fn => locked('group', () => { during = enqueue(); return fn(); });
+      const r = createCardGrouping({ ...t.opts, statePath, withLock }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(during).toMatchObject({ ran: false, contended: true });
+      expect(r.formed?.pr).toBe(77);
+      expect(enqueue()).toMatchObject({ ran: true, result: { enqueued: false, kind: 'card-grouped' } });
+      expect(enqueueCalls).toBe(0);
+    });
+
+    it('the real land mutex excludes a claim during enqueue, then queue membership refuses the next claim', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json'), lockRoot = tmp();
+      const locked = (owner, fn) => withLandWriteLock(fn, { lockRoot, owner, waitMs: 0, runUnlockedOnContention: false });
+      let queued = false, during;
+      const grouping = createCardGrouping({ ...t.opts, statePath, withLock: fn => locked('group', fn),
+        readQueueFiles: () => ({ entries: queued ? [{ num: 1, files: [CARD] }] : [] }) });
+      const form = () => grouping.form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(locked('enqueue', () => { during = form(); queued = true; }).ran).toBe(true);
+      expect(during.reason).toMatch(/land mutex held/);
+      expect(form().formed).toBeUndefined();
+      expect(readGroupState(statePath).groups).toEqual([]);
+      expect(t.calls.some(c => c.startsWith('pr create'))).toBe(false);
+    });
+
     it.each(['item', 'couple', 'coupleKey'])('keeps an item-resolving or coupled candidate serial (%s)', field => {
       const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]), 3: card([1, 2, 12]) });
       t.verdicts[1][field] = 'xabc123';
