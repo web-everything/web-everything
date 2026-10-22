@@ -119,26 +119,28 @@ export function citedLinesFingerprint({ file, line, text }) {
   return createHash('sha256').update(JSON.stringify([file, line - 1 - start, excerpt])).digest('hex');
 }
 
-/** A summary or scenario normalised for an EXACT comparison: whitespace runs folded and the ends trimmed, nothing
- *  else — case, signs, operators and punctuation all stay significant (`n < 0` vs `n > 0`, `parse(-1)` vs `parse(1)`). PURE. */
-function norm(s) {
-  return String(s ?? '').replace(/\s+/g, ' ').trim();
+/**
+ * Text that cannot prove two reports are the same break: missing, or carrying a quoted literal (`'`, `"`, a backtick),
+ * whose inner whitespace the rendered comment may already have folded (`parse("a  b")` vs `parse("a b")`). PURE.
+ */
+function unprovable(s) {
+  return typeof s !== 'string' || !s.trim() || /["'`]/.test(s);
 }
 
 /**
  * Are two red-team findings THE SAME BREAK (beyond citing the same code)? Same file, same category, same impact class
- * (a confirmed finding with no stated impact counts as `broken`, as the gate does), AND the same normalised summary or
- * the same normalised failure scenario. Deliberately exact: a reworded report of an old break is raised again (the
- * conservative side); a NEW break at an old location — even one differing by a single identifier — never inherits an
- * old ruling. PURE.
+ * (a confirmed finding with no stated impact counts as `broken`, as the gate does), AND the identical summary AND the
+ * identical failure scenario (exact strings, nothing normalised — case, signs, operators and spacing all count). Text
+ * with a quoted literal never matches (see {@link unprovable}). Deliberately strict: a reworded report of an old break
+ * is raised again (the conservative side); a NEW break at an old location never inherits an old ruling. PURE.
  */
 export function sameBreak(a, b) {
   if (!a || !b || !a.file || a.file !== b.file) return false;
   if (String(a.category ?? '') !== String(b.category ?? '')) return false;
   const cls = (f) => (f.impact === 'degraded' || f.impact === 'cosmetic' ? 'degraded' : 'broken');
   if (cls(a) !== cls(b)) return false;
-  const sa = norm(a.summary), sc = norm(a.scenario);
-  return Boolean((sa && sa === norm(b.summary)) || (sc && sc === norm(b.scenario)));
+  if ([a.summary, b.summary, a.scenario, b.scenario].some(unprovable)) return false;
+  return a.summary === b.summary && a.scenario === b.scenario;
 }
 
 /**

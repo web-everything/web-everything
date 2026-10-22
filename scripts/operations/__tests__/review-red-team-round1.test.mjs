@@ -241,7 +241,7 @@ const H1 = '1'.repeat(40);
 const H2 = '2'.repeat(40);
 const bot = (body, at) => ({ author: { login: 'web-everything' }, createdAt: at, body });
 const rtComment = (rev, findings, at) => bot(renderRedTeamComment({ pr: 4722, rev, provider: 'codex', model: 'm', findings, recheckStatus: 'ok', foldedVerdict: 'changes' }), at);
-const F = (o) => ({ summary: 's', category: 'edge-case', impactIfUnfixed: 'broken', file: 'scripts/x.mjs', line: 3, confirmedByRecheck: true, recheckReason: 'real', ...o });
+const F = (o) => ({ summary: 's', category: 'edge-case', impactIfUnfixed: 'broken', file: 'scripts/x.mjs', line: 3, confirmedByRecheck: true, recheckReason: 'real', failure_scenario: 'x(1)', ...o });
 // Lines 1-6 padding, 9 = 'c' (the carded break), 10 = the division (the sent-back break), then more padding.
 const FILE = ['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'a', 'b', 'c', 'const x = 1 / n;', 'd', 'e', 'f', 'g', 'h'].join('\n');
 
@@ -254,13 +254,16 @@ describe('citedLinesFingerprint + suppressPreviouslyRuled', () => {
     expect(citedLinesFingerprint({ file: 'x.mjs', line: 4, text: null })).toBeNull();
     // Anchored: two different lines of a short file never share a fingerprint, even though their excerpts are equal.
     expect(citedLinesFingerprint({ file: 'x.mjs', line: 1, text: 'a\nb' })).not.toBe(citedLinesFingerprint({ file: 'x.mjs', line: 2, text: 'a\nb' }));
-    const g = (index, o = {}) => ({ index, file: 'x.mjs', category: 'edge-case', impact: 'broken', summary: `zero divisor crashes parse ${index}`, ...o });
+    const g = (index, o = {}) => ({ index, file: 'x.mjs', category: 'edge-case', impact: 'broken', summary: `zero divisor crashes parse ${index}`, scenario: `parse(${index})`, ...o });
     // The audit probe: two breaks differing by one identifier are NOT the same break.
     expect(sameBreak(g(1, { summary: 'parse crashes when src is nil' }), g(1, { summary: 'parse crashes when dst is nil' }))).toBe(false);
     expect(sameBreak(g(1, { summary: 'fails when n < 0' }), g(1, { summary: 'fails when n > 0' }))).toBe(false);
     expect(sameBreak(g(1, { summary: 'x', scenario: 'parse(-1)' }), g(1, { summary: 'y', scenario: 'parse(1)' }))).toBe(false);
-    expect(sameBreak(g(1, { summary: 'parse  crashes when\nsrc is nil ' }), g(1, { summary: 'parse crashes when src is nil' }))).toBe(true);
-    expect(sameBreak(g(1, { summary: 'a', scenario: 'f(0)' }), g(1, { summary: 'b', scenario: 'f(0)' }))).toBe(true);
+    expect(sameBreak(g(1, { summary: 'parse  crashes', scenario: 'p(1)' }), g(1, { summary: 'parse crashes', scenario: 'p(1)' }))).toBe(false);
+    expect(sameBreak(g(1, { summary: 'a', scenario: 'f(0)' }), g(1, { summary: 'b', scenario: 'f(0)' }))).toBe(false);
+    expect(sameBreak(g(1, { summary: 'p fails', scenario: 'parse("a  b")' }), g(1, { summary: 'p fails', scenario: 'parse("a  b")' }))).toBe(false);
+    expect(sameBreak(g(1, { summary: 'p fails', scenario: 'p(0)' }), g(1, { summary: 'p fails', scenario: 'p(0)' }))).toBe(true);
+    expect(sameBreak(g(1, { summary: 'p fails' }), g(1, { summary: 'p fails' }))).toBe(false);
     const plan = { sendBack: [g(1), g(2), g(4, { impact: 'broken', summary: 'unrelated null deref' })], card: [g(3, { impact: 'degraded' })], advisory: [] };
     const ruled = [{ rev: H1, fingerprint: 'fp1', finding: g(1) }, { rev: H1, fingerprint: 'fp3', finding: g(3, { impact: 'degraded' }) },
       { rev: H1, fingerprint: 'fp4', finding: g(4, { impact: 'degraded', summary: 'formatting nit' }) }];
