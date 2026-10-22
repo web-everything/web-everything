@@ -157,7 +157,7 @@ describe('end to end: real git commit through the hook', () => {
     const lane = makeRepo('has space/.lanes/web-everything/lane-6');
     setIdent(lane, placeholder);
     // A copy of the guard and its import chain inside the spaced path, so argv[1] really contains the space.
-    for (const rel of ['guard-git-identity.mjs', 'lib/git-identity.mjs', 'lib/policy-cascade.mjs', 'lib/settings-files.mjs', 'lib/under-test.mjs', 'lib/under-test.cjs']) {
+    for (const rel of ['guard-git-identity.mjs', 'lib/git-identity.mjs', 'lib/lane-git-hardening.mjs', 'lib/policy-cascade.mjs', 'lib/settings-files.mjs', 'lib/under-test.mjs', 'lib/under-test.cjs']) {
       mkdirSync(dirname(join(lane, 'scripts', rel)), { recursive: true });
       writeFileSync(join(lane, 'scripts', rel), readFileSync(join(REPO, 'scripts', rel)));
     }
@@ -169,7 +169,7 @@ describe('end to end: real git commit through the hook', () => {
   it.each([[''], ['--preserve-symlinks-main']])('a SYMLINKED checkout path still runs the guard (NODE_OPTIONS=%j)', (nodeOptions) => {
     const lane = makeRepo('real/.lanes/web-everything/lane-7');
     setIdent(lane, placeholder);
-    for (const rel of ['guard-git-identity.mjs', 'lib/git-identity.mjs', 'lib/policy-cascade.mjs', 'lib/settings-files.mjs', 'lib/under-test.mjs', 'lib/under-test.cjs']) {
+    for (const rel of ['guard-git-identity.mjs', 'lib/git-identity.mjs', 'lib/lane-git-hardening.mjs', 'lib/policy-cascade.mjs', 'lib/settings-files.mjs', 'lib/under-test.mjs', 'lib/under-test.cjs']) {
       mkdirSync(dirname(join(lane, 'scripts', rel)), { recursive: true });
       writeFileSync(join(lane, 'scripts', rel), readFileSync(join(REPO, 'scripts', rel)));
     }
