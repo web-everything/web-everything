@@ -14,9 +14,10 @@
  *      login, never another account), and no hand add of `review:human` appears anywhere on the PR's timeline (the
  *      label mirror can restore a ledgered hand label under its own login): a hand label is never lifted.
  *   2. WHY. A trusted escalation record (`we:scripts/lib/human-escalation-marker.mjs`) posted BY THAT SAME LOGIN
- *      right after the add (5 s skew before, 300 s after: every clearable writer labels first, then records). Every
- *      escalation recorded from 180 s before the add on is of a kind the setting enables (only kinds with a clearing
- *      proof can be enabled), and is cleared:
+ *      right after the add (5 s skew before, 300 s after: every clearable writer labels first, then records), and
+ *      after the last removal before it. Every escalation recorded since the operator last removed the label (all
+ *      time if never) is of a kind the setting enables (only kinds with a clearing proof can be enabled), and is
+ *      cleared:
  *        - referral kinds: the live head carries at least one trusted mandatory referral record, and the gate's own
  *          reader shows nothing pending, blocked or malformed on it (a moved head with no record of its own keeps it);
  *        - round-cap: an operator round-extension grant was posted after the latest round-cap record.
@@ -75,12 +76,13 @@ export const DEESCALATE_KINDS_STANDARD = CLEARABLE_ESCALATION_KINDS;
 const KNOWN = new Set(Object.values(HUMAN_ESCALATION_KINDS));
 /**
  * Every clearable writer posts its record right AFTER its own label write, so only a record in
- * [add − clock skew, add + 300 s] explains the add. Escalations recorded from 180 s before the add on are all
- * counted (a writer that posts first, such as the card-extraction hold, must still be seen and hold).
+ * [add − clock skew, add + 300 s] explains the add. Every escalation recorded since the last hand removal of the
+ * label is counted (a writer that records first, such as the card-extraction hold, must still be seen and hold).
  */
 export const ATTRIBUTION_SKEW_MS = 5_000;
 export const ATTRIBUTION_AFTER_MS = 300_000;
-export const SINCE_BEFORE_MS = 180_000;
+/** A park's review:awaiting-advisory add lands within this of its review:human add (or any time after it). */
+const ADVISORY_PAIR_MS = 180_000;
 export const DEESCALATED_MARKER_RE = /<!-- we:human-deescalated pr=\d+ head=[0-9a-f]{40} kinds=[a-z0-9,-]+ -->/;
 const PARK_MARKER_RE = /<!-- (?:human-surface-repark|mechanical-hold-handoff): ([0-9a-f]{40}) -->/gi;
 /** Labels whose presence alone keeps the hold. */
@@ -192,7 +194,10 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   // 2. WHY it went on, and whether every recorded cause is cleared.
   const escalations = readHumanEscalations(comments, { inferLegacy: settings.inferLegacy === true });
   if (escalations.some(e => !Number.isFinite(time(e.createdAt)))) return keep('an escalation record has no readable time');
-  const windowStart = addAt - SINCE_BEFORE_MS;
+  // Every escalation recorded since the operator last took the label off counts (all time if never): a cause
+  // recorded long before this add (a hold whose own label write came later, a resumed writer) still holds.
+  const handRemoval = timeline.items.filter(i => i.label === REVIEW_LABELS.human && i.change === 'removed' && !isAutomationLogin(i.actor)).at(-1);
+  const windowStart = handRemoval ? time(handRemoval.createdAt) : -Infinity;
   // A record from an earlier label lifecycle (before the last removal) never explains this add.
   const lastLabel = timeline.items.lastIndexOf(last);
   const priorRemoval = timeline.items.slice(0, lastLabel).filter(i => i.label === REVIEW_LABELS.human && i.change === 'removed').at(-1);
@@ -215,7 +220,8 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   // 3. No other hold.
   const referralWhy = referralNotClean(referral);
   if (referralWhy) return keep(referralWhy);
-  if (timeline.items.some(i => i.label === REVIEW_LABELS.awaitingAdvisory && i.change === 'added' && time(i.createdAt) >= windowStart))
+  // The drain's and the hand-off's parks add review:awaiting-advisory beside review:human (even while it stands).
+  if (timeline.items.some(i => i.label === REVIEW_LABELS.awaitingAdvisory && i.change === 'added' && time(i.createdAt) >= Math.max(windowStart, addAt - ADVISORY_PAIR_MS)))
     return keep('review:awaiting-advisory was added since the escalation (a drain or hand-off park)');
   let sendBacks;
   try { sendBacks = openOperatorSendBacks({ ...pr, comments }); } catch (e) { return keep(`operator send-backs unreadable: ${errorText(e)}`); }

@@ -159,6 +159,13 @@ describe('planHumanDeescalation', () => {
     expect(plan({ pr: { comments: [pendingRecord(), cap] } }).reason).toMatch(/round-cap not cleared/);
     expect(plan({ pr: { comments: [pendingRecord(), cap, grant(3_600_000)] } }).action).toBe('deescalate');
   });
+  it('a non-clearable record long BEFORE the add (a resumed card-extraction hold) still holds; a hand removal answers it', () => {
+    const held = bot(`Card extraction held for a person: x. Nothing was extracted or dropped.\n\n${buildHumanEscalationMarker({ kind: K.CARD_EXTRACTION_HELD })}\n`, -600_000);
+    expect(plan({ pr: { comments: [held, pendingRecord()] } }).reason).toMatch(/card-extraction-held does not de-escalate/);
+    // The operator took the label off after that hold: it is answered; a later escalation stands on its own.
+    const items = [added(BOT, -900_000), { ...added('chalbert', -300_000), change: 'removed' }, added()];
+    expect(plan({ timeline: { status: 'ok', items }, pr: { comments: [held, pendingRecord()] } }).action).toBe('deescalate');
+  });
   it('an added=no record never explains an add, even of a clearable kind', () => {
     const noop = bot(`Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: x.\n\n${buildHumanEscalationMarker({ kind: K.REFERRAL_LEDGER_SYNC_FAILED, head: HEAD, added: false })}`, 20_000);
     expect(plan({ pr: { comments: [noop] } }).reason).toMatch(/no escalation record/);
