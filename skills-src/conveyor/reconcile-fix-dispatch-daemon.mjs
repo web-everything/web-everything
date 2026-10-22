@@ -80,6 +80,8 @@ import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-c
 import { fixLauncherAvailable, fixDetachedProvider } from '../../scripts/operations/dispatch-providers/fix.mjs';
 import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mjs';
 import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatch-claim.mjs'; // dup-heal-dispatch
+import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
+import { loadFixSessionPolicy, formatFixSessionPolicyLine } from '../../scripts/lib/fix-session-liveness.mjs';
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
 import { applyReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs'; // #3383 follow-up — tag at dispatch, see runTickAllRepos
 import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-health.mjs'; // card x5kagse
@@ -1249,8 +1251,11 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
  *   {@link refreshLiveFixDispatchClaims}); a test never wants a real `claude agents --json --all` call.
  * @returns {object} the SAME effects object, with `tickOnce` wrapped.
  */
-export function withFixDispatchClaimRefresh(effects, { log = console, refresh = refreshLiveFixDispatchClaims } = {}) {
+export function withFixDispatchClaimRefresh(effects, {
+  log = console, refresh = refreshLiveFixDispatchClaims, stop = stopSession, loadPolicy = () => loadFixSessionPolicy(),
+} = {}) {
   const tick = effects.tickOnce;
+  let loggedPolicy = null;
   return {
     ...effects,
     tickOnce: async (...args) => {
@@ -1266,8 +1271,32 @@ export function withFixDispatchClaimRefresh(effects, { log = console, refresh = 
       for (const r of Array.isArray(result?.refreshed) ? result.refreshed : []) {
         log.error(`reconcile-fix-dispatch-daemon: refreshed live claim ${r.kind}-${r.pr} (${r.repo}) — still owned by ${r.owner}`);
       }
-      for (const r of result?.released ?? []) {
+      const released = result?.released ?? [];
+      for (const r of released) {
         log.error(`reconcile-fix-dispatch-daemon: released ${r.reason ? 'dead borrowed' : 'settled'} claim ${r.kind}-${r.pr} (${r.repo}) — ${r.reason ?? 'overlap slot free'}`);
+      }
+      // fix.stopOnClaimRelease (we:scripts/lib/fix-session-liveness.mjs): a released claim's own session whose process
+      // is still up is stopped now, so a released fixer never keeps running (and never holds a hung tool call) after
+      // the PR was handed on. Only rows the sweep itself named (background, this run, live pid); best-effort.
+      const withLive = released.filter((r) => Array.isArray(r.liveSessions) && r.liveSessions.length);
+      if (withLive.length) {
+        let policy;
+        try { policy = loadPolicy(); } catch { policy = { stopOnClaimRelease: true, sources: { stopOnClaimRelease: 'standard' } }; }
+        const line = formatFixSessionPolicyLine(policy);
+        if (line !== loggedPolicy) { loggedPolicy = line; log.error(`reconcile-fix-dispatch-daemon: ${line}`); }
+        for (const r of withLive) {
+          for (const sess of r.liveSessions) {
+            const handle = sess.id || String(sess.sessionId ?? '').slice(0, 8);
+            const src = `fix.stopOnClaimRelease=${policy.stopOnClaimRelease} (${policy.sources?.stopOnClaimRelease ?? 'standard'})`;
+            if (!policy.stopOnClaimRelease) { log.error(`reconcile-fix-dispatch-daemon: left session ${handle} running after releasing claim ${r.kind}-${r.pr} (${r.repo}) — ${src}`); continue; }
+            try {
+              const out = stop({ handle });
+              log.error(`reconcile-fix-dispatch-daemon: stopped session ${handle} (pid ${sess.pid}, status ${sess.status ?? 'unknown'}) after releasing claim ${r.kind}-${r.pr} (${r.repo})${out?.alreadyGone ? ' — already gone' : ''} — ${src}`);
+            } catch (e) {
+              log.error(`reconcile-fix-dispatch-daemon: could not stop session ${handle} after releasing claim ${r.kind}-${r.pr} (${r.repo}): ${String((e && e.message) || e).split('\n')[0]}`);
+            }
+          }
+        }
       }
       return tick(...args);
     },

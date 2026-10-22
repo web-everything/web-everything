@@ -169,6 +169,8 @@ import { resolveOperationRoute, resolvePolicyModel } from '../lib/dispatch-routi
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { isPidAlive } from '../lib/dispatch-throttle.mjs';
+import { loadFixSessionPolicy, isRowMidTurn } from '../lib/fix-session-liveness.mjs';
 
 // card 302 — resolve red-main capacity through the shared policy layers.
 export function resolveMainFixCapacity(env = process.env) {
@@ -944,7 +946,13 @@ export function tryResumeFix(planned, {
     candidate,
     prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned),
     repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
+    candidateRow: candidateRow ?? null,
   });
+}
+
+/** Is the row's own pid a live process? (a row with no pid has no known process.) */
+function rowProcessUp(row, pidAlive) {
+  return Number.isInteger(row?.pid) && row.pid > 0 && pidAlive(row.pid) === true;
 }
 
 /**
@@ -959,6 +967,7 @@ export function resumeBgSession(planned, {
   stop = stopSession, wait = defaultConfirmWait, claimOwner = fixDispatchClaimOwner(), acquireClaim = acquireFixDispatchClaim,
   releaseClaim = releaseFixDispatchClaim, claimRoot, sessionCwdFor = (id) => dispatchSessionCwd(id, { root: REPO_ROOT }),
   ensureSessionCwd = ensureDispatchSessionCwd,
+  pidAlive = isPidAlive, sessionPolicy = null, candidateRow = undefined,
 } = {}) {
   // #x0jphk5 — TAKE THE CLAIM before ever issuing `--resume`. Ownership is confirmed above (both HEAD-sha and
   // name), so what remains is a genuine race: two dispatchers reading the same stale listing could BOTH reach
@@ -984,6 +993,32 @@ export function resumeBgSession(planned, {
     };
   }
   const releaseOurClaim = () => releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
+
+  // fix.resumeStopsLiveIdle (we:scripts/lib/fix-session-liveness.mjs) — a `done` row whose pid is still alive is an
+  // idle but RUNNING process, and `--resume` on it starts a copy under a new id (measured live 2026-10-21; every round
+  // resume of #5729 that day forked and fell back to a cold start). Stop it first so `--resume` wakes the SAME id. A
+  // row mid-turn, not a background dispatch, or not stoppable in time is never resumed: the caller cold-starts as today.
+  const policy = sessionPolicy ?? loadFixSessionPolicy();
+  // A caller's own pre-resume row that shows no live process needs no second listing read (callers count reads).
+  if (policy.resumeStopsLiveIdle && !(candidateRow !== undefined && !rowProcessUp(candidateRow, pidAlive))) {
+    const declined = (why) => {
+      releaseOurClaim();
+      return { resumed: false, resumeAttempt: { attempted: false, candidate, forked: false, refused: 'stop-before-resume', why } };
+    };
+    let row;
+    try { row = (listAgentsAll() ?? []).find((a) => normalizeHandle(a?.sessionId) === normalizeHandle(candidate)) ?? null; } catch { row = undefined; }
+    if (row === undefined) return declined('the session list could not be read before the resume');
+    // Only a row that positively shows a live process is acted on; a row with no pid keeps the old bare resume.
+    if (row && rowProcessUp(row, pidAlive)) {
+      if (row.kind !== 'background') return declined(`session ${candidate} is ${row.kind || 'unknown-kind'}, not a background dispatch`);
+      if (isRowMidTurn(row)) return declined(`session ${candidate} is mid-turn (status ${row.status})`);
+      try { stop({ handle: row.id || String(candidate).slice(0, 8) }); } catch (e) { return declined(`claude stop failed: ${String(e?.message ?? e).split('\n')[0]}`); }
+      let exited = !rowProcessUp(row, pidAlive);
+      for (let i = 0; i < 20 && !exited; i += 1) { wait(500); exited = !rowProcessUp(row, pidAlive); }
+      if (!exited) return declined(`session ${candidate} (pid ${row.pid}) was still alive 10s after claude stop`);
+      wait(1_000);
+    }
+  }
 
   const resumeArgv = buildAgentArgv({
     payload: { prompt },
@@ -1118,7 +1153,7 @@ export function tryResumeRoundFix(planned, {
   const attempt = resume(planned, {
     ...resumeOptions,
     candidate: decision.sessionId, prompt, repo,
-    listAgentsAll,
+    listAgentsAll, candidateRow: inputs.prior ?? null,
     sessionCwdFor: () => priorCwd,
   });
   if (attempt.resumed) {

@@ -33,6 +33,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { isLeaseStale, LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { isRowMidTurn } from '../lib/fix-session-liveness.mjs';
 
 /** Listing states a `claude --bg` session can be resumed from. A `working` (or idle-but-running) session would fork. */
 export const RESUMABLE_STATES = Object.freeze(['done', 'stopped', 'failed', 'error']);
@@ -107,6 +108,10 @@ export function planRoundResume({ planned, settings, prior, job, transcript, lan
   if (!prior) return no('no-prior-session', 'no earlier fixer session is listed for this PR');
   if (!RESUMABLE_STATES.includes(prior.state)) {
     return no('prior-session-busy', `the earlier session ${prior.id ?? prior.sessionId} is ${prior.state} (resuming it would fork a copy)`);
+  }
+  // A `done` row can still be mid-turn: `status` is the turn signal (we:scripts/lib/fix-session-liveness.mjs).
+  if (isRowMidTurn(prior)) {
+    return no('prior-session-busy', `the earlier session ${prior.id ?? prior.sessionId} is ${prior.state} but mid-turn (status ${prior.status})`);
   }
   if (!job) return no('job-record-gone', `no job record for ${prior.id ?? prior.sessionId}`);
   if (job.template && job.template !== 'bg') return no('not-a-bg-session', `job template ${job.template}`);

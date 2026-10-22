@@ -46,7 +46,18 @@ for (const [file, kind] of [['fix-agent-brief.md', 'fix'], ['fix-agent-ci-brief.
     });
 
     it('never tells the agent to hold its turn on a blocking check or to push the PR ref itself (#5137)', () => {
-      expect(filled).not.toMatch(/check --wait=\d+/);
+      // fixer-resume (operator 2026-10-21): the ONLY wait a fixer may run itself is one bounded `check --wait`
+      // (<= 9 min, the tool clamps it further), with a single re-request on timeout and then a stand-down —
+      // never an open-ended one. The harness still owns the normal wait (mark + end turn).
+      const waits = [...filled.matchAll(/check --repo=\. --wait=(\d+)/g)].map((m) => Number(m[1]));
+      expect(waits.length).toBeLessThanOrEqual(1);
+      for (const ms of waits) expect(ms).toBeLessThanOrEqual(540000);
+      expect(filled.match(/check --wait=\d+/g) ?? []).toEqual([]);
+      if (waits.length) {
+        expect(filled).toMatch(/`timeout` → `request` ONCE more/);
+        expect(filled).toMatch(/--outcome=blocked-on-infra --cause="verify-wait-timeout/);
+        expect(filled).toMatch(/never chained into one pipeline/);
+      }
       expect(fencedCommands(filled).some((c) => /git push origin HEAD:refs\/heads\/\{\{LANE_REF\}\}$/.test(c))).toBe(false);
       expect(filled).toMatch(/\*\*end your turn\*\*/);
     });
@@ -133,9 +144,11 @@ describe('fix-agent-ci-brief.md — metadata-only heal skips the local verify (#
 // above; the delivery brief and prepare brief are asserted in await-verify-briefs.test.mjs, card 4). No brief tells an
 // agent to loop on `check --wait=` any more.
 for (const file of ['fix-agent-brief.md', 'fix-agent-ci-brief.md', 'delivery-agent-brief.md', 'prepare-item-agent-brief.md']) {
-  it(`${file} has no check --wait command to loop on`, () => {
+  it(`${file} has no check --wait command to loop on (fixers: at most one bounded one)`, () => {
     const text = readFileSync(join(HERE, '..', file), 'utf8');
-    expect(fencedCommands(text).filter((c) => /check\b.*--wait/.test(c))).toEqual([]);
+    const waits = fencedCommands(text).filter((c) => /check\b.*--wait/.test(c));
+    if (!file.startsWith('fix-agent')) { expect(waits).toEqual([]); return; }
+    expect(waits).toEqual(['node {{WE_ROOT}}/scripts/verify-lane.mjs check --repo=. --wait=540000 --json']);
   });
 }
 

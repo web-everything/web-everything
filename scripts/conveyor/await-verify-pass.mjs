@@ -39,6 +39,7 @@ import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { readFixDispatchClaim } from './fix-claim-store.mjs';
 import { listWrappedWorkerAgents, requestWrappedResume } from '../operations/worker-wrapper-launch.mjs';
 import { AGENT_GONE_STATES } from './lease-reaper.mjs';
+import { loadFixSessionPolicy, isRowGone, samePrintedHandle, cliStartedCopy } from '../lib/fix-session-liveness.mjs';
 import { loadVerifyRecoverySettings } from '../lib/verify-recovery-settings.mjs';
 import { loadFixPushPolicy, formatFixPushPolicyLine } from '../lib/fix-push-policy.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
@@ -848,20 +849,27 @@ export async function defaultAwaitVerifyIo({
       // A background session whose turn ended is still a live process, and `--bg --resume` on a live session
       // "starts a copy" instead of continuing it (found live 2026-10-07: two forked copies, no resume). Stop the
       // idle process first; `--resume` then wakes the SAME id. The pass never gets here for a busy session.
-      // A gone session (the reaper's own AGENT_GONE_STATES: done/failed/stopped) has no process to stop or wait on.
-      const isGone = (row) => AGENT_GONE_STATES.has(String(row?.state ?? '').toLowerCase());
-      if (!isGone(session)) {
+      // A gone session has no process to stop or wait on. fix.resumeStopsLiveIdle (we:scripts/lib/fix-session-liveness.mjs):
+      // a `done` row whose pid is still alive is NOT gone — its turn ended but its process is up (measured live
+      // 2026-10-21; #5729/#5492 forked three times each and went resume-exhausted because `done` was read as gone).
+      const sessionPolicy = loadFixSessionPolicy({ env });
+      const isGone = sessionPolicy.resumeStopsLiveIdle
+        ? (row) => isRowGone(row, pidAliveFn)
+        : (row) => AGENT_GONE_STATES.has(String(row?.state ?? '').toLowerCase());
+      // Only a background dispatch is ever stopped: an operator's own terminal session (`kind:'interactive'`) is
+      // never ours to kill. STRICT, like the session reaper's guard: a row must positively say `kind:'background'`,
+      // so a missing or empty kind fails closed, and the freshly-read row is held to the same rule below.
+      const notBackground = (row) => ({ resumed: false, reason: `stop-before-resume: ${row?.kind || 'unknown-kind'} session is not a background dispatch` });
+      // This session's row right now, read UNCACHED (the 20s agents cache would hand back the very row the pass
+      // already judged): the row, null when it is not listed, or undefined when the list cannot be read.
+      const liveRow = () => { try { return io.defaultListAgents({ all: true, env: liveEnv }).find((s) => s?.sessionId === session.sessionId) ?? null; } catch { return undefined; } };
+      /** Stop the idle process and wait (bounded) for it to exit. null = stopped (or nothing to stop); else a refusal. */
+      const stopFirst = (row) => {
+        if (isGone(row)) return null;
         // `claude stop` takes the SHORT job id; a full session uuid answers "No job matching" (read as already
         // gone) and leaves the process running, so the resume forked again (found live 2026-10-07, fix-4151).
         const handle = session.id || String(session.sessionId).slice(0, 8);
-        // Only a background dispatch is ever stopped: an operator's own terminal session (`kind:'interactive'`) is
-        // never ours to kill. STRICT, like the session reaper's guard: a row must positively say `kind:'background'`,
-        // so a missing or empty kind fails closed, and the freshly-read row is held to the same rule below.
-        const notBackground = (row) => ({ resumed: false, reason: `stop-before-resume: ${row?.kind || 'unknown-kind'} session is not a background dispatch` });
         if (session.kind !== 'background') return notBackground(session);
-        // This session's row right now, read UNCACHED (the 20s agents cache would hand back the very row the pass
-        // already judged): the row, null when it is not listed, or undefined when the list cannot be read.
-        const liveRow = () => { try { return io.defaultListAgents({ all: true, env: liveEnv }).find((s) => s?.sessionId === session.sessionId) ?? null; } catch { return undefined; } };
         // The pass saw it idle a moment ago; a new turn since then must not be killed mid-flight. An unreadable list
         // cannot show that, so it refuses too (the next tick retries).
         const before = liveRow();
@@ -870,28 +878,49 @@ export async function defaultAwaitVerifyIo({
         if (before && isSessionBusy(before)) return { resumed: false, reason: 'stop-before-resume: session started a new turn' };
         try { stopSession({ handle }); } catch (e) { return { resumed: false, reason: `stop-before-resume: ${String(e?.message ?? e).split('\n')[0]}` }; }
         // With a known pid, the process itself is the exit signal. Without one (a swallowed "No job matching"
-        // looks the same), only a row that EXPLICITLY lists a gone state (done/failed/stopped) counts: an unreadable
-        // list or a missing row is "unknown", never "exited".
-        const knownPid = Number.isInteger(session.pid) && session.pid > 0;
-        const exited = () => (knownPid ? !pidAliveFn(session.pid) : isGone(liveRow()));
+        // looks the same), only a row that EXPLICITLY lists a gone state counts: an unreadable list or a missing
+        // row is "unknown", never "exited".
+        const pid = Number.isInteger(before?.pid) && before.pid > 0 ? before.pid : session.pid;
+        const knownPid = Number.isInteger(pid) && pid > 0;
+        const exited = () => (knownPid ? !pidAliveFn(pid) : isGone(liveRow()));
         for (let i = 0; i < 20 && !exited(); i += 1) sleep(500);
         if (!exited()) return { resumed: false, reason: 'stop-before-resume: process still alive' };
         sleep(1_000);
+        return null;
+      };
+      /** One `--bg --resume`: spawn, confirm against fresh listings, and classify what the CLI printed. */
+      const spawnResume = () => {
+        const argv = io.buildAgentArgv({ payload: { prompt }, resumeSessionId: session.sessionId });
+        let stdout = '';
+        try { stdout = String(io.defaultSpawnAgent(argv, { cwd: session.cwd }) ?? ''); } catch (e) { return { error: String(e?.message ?? e).split('\n')[0] }; }
+        const printedId = io.parseBackgroundedId(stdout);
+        let outcome = { resumed: false };
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          outcome = io.resumeSucceeded({ printedId, requestedSessionId: session.sessionId, agentsAfter: io.defaultListAgents({ all: true, env: liveEnv }) });
+          if (outcome.resumed || attempt === 3) break;
+          sleep(2_000);
+        }
+        // Only a DIFFERENT printed handle is a forked copy to stop. `printedId` is the SHORT handle, so it is compared
+        // with the session's own short handle (a short-vs-uuid compare called every unconfirmed resume a fork and
+        // could stop the session that had just resumed). The requested session itself is never the cleanup target.
+        const forked = Boolean(printedId) && !samePrintedHandle(printedId, session);
+        if (!outcome.resumed && forked) { try { stopSession({ handle: printedId }); } catch { /* best-effort cleanup of the copy */ } }
+        return { resumed: !!outcome.resumed, printedId, forked, copyNote: cliStartedCopy(stdout) };
+      };
+      const refused = stopFirst(session);
+      if (refused) return refused;
+      let r = spawnResume();
+      if (r.error) return { resumed: false, reason: r.error };
+      // The CLI said the session was still running, so this started a copy (stopped above). That is the live-idle
+      // state the stop exists for: stop the original now and resume it ONCE more, instead of spending an attempt.
+      if (!r.resumed && r.forked && r.copyNote && sessionPolicy.resumeStopsLiveIdle) {
+        const row = liveRow();
+        const again = row === undefined ? { resumed: false, reason: 'stop-before-resume: session list unreadable' } : stopFirst(row ?? session);
+        if (again) return again;
+        r = spawnResume();
+        if (r.error) return { resumed: false, reason: r.error };
       }
-      const argv = io.buildAgentArgv({ payload: { prompt }, resumeSessionId: session.sessionId });
-      let stdout = '';
-      try { stdout = String(io.defaultSpawnAgent(argv, { cwd: session.cwd }) ?? ''); } catch (e) { return { resumed: false, reason: String(e?.message ?? e).split('\n')[0] }; }
-      const printedId = io.parseBackgroundedId(stdout);
-      let outcome = { resumed: false };
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
-        outcome = io.resumeSucceeded({ printedId, requestedSessionId: session.sessionId, agentsAfter: io.defaultListAgents({ all: true, env: liveEnv }) });
-        if (outcome.resumed || attempt === 3) break;
-        sleep(2_000);
-      }
-      // Only a DIFFERENT printed id is a forked copy to stop; the requested session itself is never the cleanup target.
-      const forked = Boolean(printedId) && printedId !== session.sessionId;
-      if (!outcome.resumed && forked) { try { stopSession({ handle: printedId }); } catch { /* best-effort cleanup of the copy */ } }
-      return { resumed: !!outcome.resumed, reason: outcome.resumed ? null : (forked ? 'forked-copy-stopped' : (printedId ? 'resume-unconfirmed' : 'no-backgrounded-id')) };
+      return { resumed: r.resumed, reason: r.resumed ? null : (r.forked ? 'forked-copy-stopped' : (r.printedId ? 'resume-unconfirmed' : 'no-backgrounded-id')) };
     },
   };
 }

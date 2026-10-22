@@ -87,6 +87,7 @@ import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs
 import { startedAtMs } from './reconcile-core.mjs';
 import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
 import { isClaimRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
+import { isRowMidTurn, rowProcessAlive } from '../lib/fix-session-liveness.mjs';
 
 // The light store helpers live in `fix-claim-store.mjs` (no dispatch graph — see its header); re-exported here so
 // every existing importer of this module is unchanged.
@@ -203,13 +204,16 @@ export function releaseFixDispatchClaim({
  * @param {{repo:string, pr:number, kind?:string, agentsAll:Array<object>}} o
  * @returns {boolean}
  */
-export function isClaimSessionLive({ repo, pr, kind = 'fix', agentsAll, name: nameOverride = null }) {
+export function isClaimSessionLive({ repo, pr, kind = 'fix', agentsAll, name: nameOverride = null, sessionId = null, pidAlive = null }) {
   // fix-procedure: a `kind:'fixing'` claim names its session in `meta.who` (any fixer identity), not a minted
   // `<kind>-<pr>` slug — `mintSessionSlug` would throw on the kind — so the caller passes the name directly.
   const name = nameOverride ?? fixDispatchSessionName({ repo, pr, kind });
   return (Array.isArray(agentsAll) ? agentsAll : []).some((a) => (
-    a && String(a.name ?? '') === name
-    && a.state !== 'done' && a.state !== 'stopped' && a.state !== 'failed'
+    a && (String(a.name ?? '') === name || (sessionId && a.sessionId === sessionId))
+    // A terminal `state` is not the turn signal: a row reading `done` whose `status` says a turn is running and whose
+    // pid is alive is still working (we:scripts/lib/fix-session-liveness.mjs). Only checked when a pid probe is given.
+    && ((a.state !== 'done' && a.state !== 'stopped' && a.state !== 'failed')
+      || (typeof pidAlive === 'function' && isRowMidTurn(a) && rowProcessAlive(a, pidAlive)))
     // PR #2789 review: raw `state` lies for a HUNG session (it keeps reading 'working' until reaped). Honor the
     // same upstream AGENT-level finished verdicts `reconcile-core.mjs#assessLiveness` already trusts.
     && a.hung !== true && a.selfReportedDone !== true && a.authExpired !== true
@@ -298,7 +302,10 @@ export function refreshLiveFixDispatchClaims({
       }
       continue;
     }
-    const agentsAll = (Array.isArray(listed) ? listed : []).filter((a) => a && String(a.name ?? '') === name)
+    // The claim's bound session id matches its row even if the listing renamed it (a resumed session can list under a
+    // generated title), so liveness never hangs on the name alone.
+    const boundSessionId = entry.meta.sessionId ?? null;
+    const agentsAll = (Array.isArray(listed) ? listed : []).filter((a) => a && (String(a.name ?? '') === name || (boundSessionId && a.sessionId === boundSessionId)))
       .map((a) => {
         let info = null;
         try { info = hungInfoFor(a, nowMs, hungThresholdMs); } catch { info = null; }
@@ -307,21 +314,26 @@ export function refreshLiveFixDispatchClaims({
     const isAwaiting = typeof awaitingVerifyFor === 'function' && agentsAll.some((row) => {
       try { return awaitingVerifyFor(row, { pr })?.awaiting === true; } catch { return false; }
     });
-    if (!isAwaiting && !isClaimSessionLive({ repo, pr, kind, agentsAll, name })) {
+    if (!isAwaiting && !isClaimSessionLive({ repo, pr, kind, agentsAll, name, sessionId: boundSessionId, pidAlive: alive })) {
       // A terminal row must belong to THIS dispatch, not an older round with the
       // same reusable name. Missing/failed listings and the spawn-listing lag
       // never release a claim. A live sibling above always wins over old rows.
       // #3964 (2026-10-05): a fixer's own session starts before its fixing claim;
       // an exact sessionId match settles that claim regardless of start time.
-      const settled = agentsAll.some((a) =>
-        ['done', 'stopped', 'failed'].includes(a.state)
-        && ((entry.meta.sessionId && a.sessionId === entry.meta.sessionId)
-          || (Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs)));
+      const ownRun = (a) => (entry.meta.sessionId && a.sessionId === entry.meta.sessionId)
+        || (Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
+      const settled = agentsAll.some((a) => ['done', 'stopped', 'failed'].includes(a.state) && ownRun(a));
       if (settled) {
         const current = readLockEntry(lockRoot, fixDispatchResource({ repo, pr, kind }));
         if (current?.owner === entry.owner && current.meta?.claimedAt === claimedAt) {
           const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
-          if (result.released) released.push({ repo, pr, kind, owner: entry.owner });
+          // fix.stopOnClaimRelease: this run's own background sessions whose PROCESS is still up are named, so the
+          // daemon can stop them now instead of leaving a released fixer running (#5758, 2026-10-21: released as
+          // settled at 07:00 ET, still in a hung Bash call until 07:44 ET).
+          const liveSessions = agentsAll
+            .filter((a) => a.kind === 'background' && ownRun(a) && rowProcessAlive(a, alive))
+            .map((a) => ({ id: a.id ?? null, sessionId: a.sessionId ?? null, pid: a.pid, status: a.status ?? null }));
+          if (result.released) released.push({ repo, pr, kind, owner: entry.owner, ...(liveSessions.length ? { liveSessions } : {}) });
         }
       }
       continue;

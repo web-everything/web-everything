@@ -453,10 +453,31 @@ hand-back, no re-arm, no `fix-end` on a red head — except through the gate-red
 your commit may already be on the PR, **never amend, rebase or force-push a marked commit**: repair with a NEW
 commit on top. With the setting off, nothing is pushed until green (the flow below is unchanged either way).
 
-Then **end your turn**: reply with one line (`awaiting verify for <sha>`) and stop. Never `check --wait`, never
+Then **end your turn**: reply with one line (`awaiting verify for <sha>`) and stop. Never an open-ended wait (the one
+bounded `check --wait` below is the only wait you ever run yourself), never
 `sleep`, never a backgrounded Bash/Monitor wait (the one exception: step 5's parallel self-review Agent call), never read output files in a loop (#x36vidg), never `reset` or re-`request`
 yourself. `mark` refuses a dirty tree or a sha that is not HEAD — commit first. The fix daemon reads the verdict
 every tick and resumes THIS session with a message that starts `[harness verify verdict — #5137]`.
+
+**One gate command per Bash call, and only bounded waits (#5758).** Run `request`, `mark` and `check` each as its
+OWN Bash call — never chained into one pipeline (`check …; request … | grep …; mark … | head …`). On 2026-10-21 one
+such chain hung 50 minutes in a fixer, outlived its claim, and held the lane until the session was killed. If you
+must read the verdict yourself (a verify run was still changing your lane when you looked, or a resume message says
+there is no verdict yet), make ONE bounded call — the tool clamps `--wait` to its own ceiling:
+
+```bash
+node {{WE_ROOT}}/scripts/verify-lane.mjs check --repo=. --wait=540000 --json
+```
+
+A settled status → act on it as listed below. `timeout` → `request` ONCE more, `mark` again with the SAME
+`--attempt`, and end your turn. A second `timeout` for the same sha → stand down with a clear reason, not a third wait:
+
+```bash
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-infra --cause="verify-wait-timeout: <sha> did not settle within two bounded waits"
+node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
+```
+
+This exit releases the claim but leaves `review:changes`, so the unverified head is never handed back or landed.
 
 A dispatched agent cannot run the gate itself: `we:scripts/guard-bash.mjs` denies any `verify-lane.mjs` invocation
 except `request` / `check` / `reset` (#3105) — including a bare `run --repo=.` and `run` wrapped in
