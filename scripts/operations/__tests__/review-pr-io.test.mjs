@@ -2214,6 +2214,15 @@ describe('#4315 durable referral effects', () => {
     expect(h.judge).not.toHaveBeenCalled();
     expect(h.state.labels).toEqual(['review:human']);
     expect(h.state.comments.at(-1).body).toContain(`parked to review:human: ${result.reason}`);
+    // The park added the label, so its comment records WHY — a kind that never de-escalates (the finding may be lost).
+    expect(h.state.comments.at(-1).body).toMatch(/<!-- we:human-escalation kind=referral-persistence-failed head=[0-9a-f]{40} -->$/);
+  });
+  it('a persistence-failure park that wrote no label (review:human already stood) records no escalation', async () => {
+    const h = harness({ failure: 'post' });
+    h.state.labels = ['review:human'];
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(h.state.comments.at(-1).body).toContain('parked to review:human:');
+    expect(h.state.comments.some(c => c.body.includes('we:human-escalation'))).toBe(false);
   });
   it.each(['attempt', 'completion', 'failure-snapshot'])('%s persistence failure parks with its reason', async failure => {
     const h = harness({ failure });

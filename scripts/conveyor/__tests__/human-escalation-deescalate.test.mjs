@@ -153,8 +153,10 @@ describe('planHumanDeescalation', () => {
     const items = [added('chalbert', -7_200_000), { ...added('chalbert', -3_600_000), change: 'removed' }, added()];
     expect(plan({ timeline: { status: 'ok', items } }).reason).toMatch(/hand-added by chalbert/);
   });
-  it('an unreadable comment anywhere in the thread → kept', () => {
-    expect(plan({ pr: { comments: [pendingRecord(), { author: { login: BOT }, body: null, createdAt: at(30_000) }] } }).reason).toMatch(/comment is unreadable/);
+  it('an unreadable comment (body or author) anywhere in the thread → kept', () => {
+    expect(plan({ pr: { comments: [pendingRecord(), { author: { login: BOT }, body: null, createdAt: at(30_000) }] } }).reason).toMatch(/unreadable/);
+    const orphan = buildOrphanGuardComment({ decision: 'escalate', reason: 'r', prNumber: 5805, headSha: HEAD });
+    expect(plan({ pr: { comments: [pendingRecord(), { author: null, body: orphan, createdAt: at(30_000) }] } }).reason).toMatch(/author\) is unreadable/);
   });
   it('the broad preset is judged on the hunks too; a bad surfaces setting → kept', () => {
     expect(plan({ surfaces: 'broad' }).action).toBe('deescalate');
@@ -207,9 +209,9 @@ describe('planHumanDeescalation', () => {
 
 describe('resolveDeescalateSettings', () => {
   const none = () => { throw new Error('absent'); };
-  it('standard on, every clearable kind, legacy inference on', () => {
+  it('standard on, every clearable kind, legacy inference OFF (a pre-marker comment cannot prove its add)', () => {
     const s = resolveDeescalateSettings({ env: {}, readFile: none, platform: null, log: () => {} });
-    expect(s).toMatchObject({ enabled: true, inferLegacy: true, kinds: [...DEESCALATE_KINDS_STANDARD] });
+    expect(s).toMatchObject({ enabled: true, inferLegacy: false, kinds: [...DEESCALATE_KINDS_STANDARD] });
     expect(DEESCALATE_KINDS_STANDARD).not.toContain(K.REFERRAL_PERSISTENCE_FAILED);
     expect(s.sources.humanDeescalateEnabled).toBe('standard');
   });
@@ -345,7 +347,7 @@ describe('IO readers', () => {
     const comments = readCommentsStrict(5805, { repo: REPO, exec });
     expect(comments[1].body).toBeNull();
     expect(exec.mock.calls[0][1]).toContain(`repos/${REPO}/issues/5805/comments`);
-    expect(plan({ pr: { comments: [pendingRecord(), ...comments] } }).reason).toMatch(/comment is unreadable/);
+    expect(plan({ pr: { comments: [pendingRecord(), ...comments] } }).reason).toMatch(/is unreadable/);
   });
   it('readNetDiffText diffs the merge-base with origin/main against the head and fails closed', () => {
     const git = vi.fn((dir, args) => (args[0] === 'merge-base' ? `${'f'.repeat(40)}\n` : 'diff --git a/x b/x\n'));

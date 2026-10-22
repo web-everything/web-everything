@@ -1040,6 +1040,7 @@ export function createReviewPrSinks({
           catch (commentError) { out(`Could not post the escalation record: ${commentError.message}`); }
         }
         if (labelNames(state.labels).includes('review:changes')) out(plan.reason);
+        return adds;
       };
       const persist = (record) => {
         const before = fresh();
@@ -1520,10 +1521,12 @@ export function createReviewPrSinks({
         // Only a verdict-ledger mirror failure leaves the thread whole (thread-clearable); any other failure may
         // have lost the finding itself, so its record kind never de-escalates.
         const kind = referralFailureKind(error.message ?? error);
-        park(live, kind, { marked: false });
+        // The record names WHY this park added the label, so it rides only a park that did add it: a no-op park
+        // (the label already stood, for whatever reason) must never explain someone else's hold.
+        const added = park(live, kind, { marked: false });
         const reason = String(error.message ?? error).replace(/\s+/g, ' ').slice(0, 400);
-        const message = `Mandatory referral review parked to review:human: ${reason}.\n\n${buildHumanEscalationMarker({
-          kind, head: live?.headRefOid ?? read.netBasis?.rev })}`;
+        const message = `Mandatory referral review parked to review:human: ${reason}.${added ? `\n\n${buildHumanEscalationMarker({
+          kind, head: live?.headRefOid ?? read.netBasis?.rev })}` : ''}`;
         try { labelProvider.postComment(read.repo, read.pr, message); }
         catch (commentError) { out(`Could not post referral park reason: ${commentError.message}`); }
         out(message);

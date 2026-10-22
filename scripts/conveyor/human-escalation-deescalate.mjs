@@ -43,8 +43,9 @@
  *   humanDeescalateEnabled (boolean, standard true; kill switch env WE_REVIEW_HUMAN_DEESCALATE=off),
  *   humanDeescalateKinds (array, a subset of round-cap, referral-pending, referral-malformed,
  *   referral-ledger-sync-failed; env WE_REVIEW_HUMAN_DEESCALATE_KINDS, comma list), humanDeescalateInferLegacy
- *   (boolean, standard true; env WE_REVIEW_HUMAN_DEESCALATE_INFER_LEGACY) — read the pre-marker comment shapes so the
- *   holds already standing (the live case) are judged too.
+ *   (boolean, standard false; env WE_REVIEW_HUMAN_DEESCALATE_INFER_LEGACY) — read the pre-marker comment shapes too.
+ *   Off by default: a pre-marker park comment was posted even by a park that wrote no label, so it cannot prove
+ *   that it explains an add. Every comment's body and author must be readable.
  *
  * Usage: node scripts/conveyor/human-escalation-deescalate.mjs [--repo=<owner/name>] [--pr=<n>] [--apply] [--json]
  *   (report only without --apply). The review daemon's hold sweep runs it with apply.
@@ -103,7 +104,9 @@ export function resolveDeescalateSettings({ env = process.env, readFile = readFi
   const kindsEnv = typeof env.WE_REVIEW_HUMAN_DEESCALATE_KINDS === 'string'
     ? env.WE_REVIEW_HUMAN_DEESCALATE_KINDS.split(',').map(s => s.trim()).filter(Boolean) : undefined;
   const resolved = cascadePolicy('review', tool, {
-    standard: { humanDeescalateEnabled: true, humanDeescalateKinds: [...DEESCALATE_KINDS_STANDARD], humanDeescalateInferLegacy: true },
+    // Legacy inference is OFF by default: a pre-marker park comment was posted even by a park that wrote no label,
+    // so it cannot prove it explains an add (audit round 5). Turn it on only to judge an old hold by hand.
+    standard: { humanDeescalateEnabled: true, humanDeescalateKinds: [...DEESCALATE_KINDS_STANDARD], humanDeescalateInferLegacy: false },
     platform, env, log,
     envValues: { humanDeescalateEnabled: bool(env.WE_REVIEW_HUMAN_DEESCALATE), humanDeescalateKinds: kindsEnv,
       humanDeescalateInferLegacy: bool(env.WE_REVIEW_HUMAN_DEESCALATE_INFER_LEGACY) },
@@ -167,7 +170,8 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   const comments = pr?.comments;
   if (!Array.isArray(comments)) return keep('comments unreadable');
   // One unreadable comment could be the record of a later, non-clearable escalation: hold.
-  if (!comments.every(c => c && typeof c === 'object' && typeof c.body === 'string')) return keep('a comment is unreadable');
+  if (!comments.every(c => c && typeof c === 'object' && typeof c.body === 'string'
+    && typeof (c.author?.login ?? c.user?.login) === 'string' && (c.author?.login ?? c.user?.login))) return keep('a comment (body or author) is unreadable');
   if (typeof pr?.body !== 'string') return keep('PR body unreadable');
   const holding = HOLDING_LABELS.find(l => hasReviewLabel(labels, l));
   if (holding) return keep(`${holding} stands`);
