@@ -1015,6 +1015,37 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     expect(enqueuedAny(h) || enqueuedAny(restarted)).toBe(false);
   });
 
+  it('the re-request attempt is saved BEFORE the hook runs: a crash inside the hook never re-requests the head', () => {
+    let attempts = 0, h, atHookTime;
+    // The drain dies inside the hook: only what was on disk when the hook started survives.
+    const crash = () => { attempts++; atHookTime ??= structuredClone(h.state()); throw new Error('drain process killed'); };
+    const started = pastDeadline({ requestRedTeam: crash });
+    h = started.h;
+    const { clock, notes } = started;
+    h.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    expect(atHookTime.redTeamPending['cwd#5283']).toMatchObject({ headSha: HEAD, requestAttemptedAt: clock.t });
+    const restarted = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t + 301_000, initial: atHookTime,
+      requestRedTeam: crash, publishNeedsYou: item => notes.push(item) });
+    expect(restarted.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(attempts).toBe(1);
+  });
+
+  it('a refused attempt is per head: a NEW live head gets its own one re-request', () => {
+    const requests = [];
+    const NEXT = 'f'.repeat(40);
+    const { h, clock } = pastDeadline({ requestRedTeam: input => { requests.push(input.head); return { requested: false }; } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ deadlineHeld: true });
+    const moved = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t, initial: h.state(),
+      ghView: { 5283: { state: 'OPEN', headRefOid: NEXT, labels: ACCEPTED, id: 'PR_NODE' } },
+      requestRedTeam: input => { requests.push(input.head); return { requested: false }; }, publishNeedsYou: () => {} });
+    expect(moved.s.enqueue({ num: 5283 }, NEXT, { comments: [] })).toMatchObject({ healthSmell: false });
+    expect(moved.state().redTeamPending['cwd#5283'].requestAttemptedAt).toBeUndefined();
+    clock.t += 45 * 60_000;
+    expect(moved.s.enqueue({ num: 5283 }, NEXT, { comments: [] })).toMatchObject({ deadlineHeld: true,
+      reason: expect.stringContaining('the one re-request was not accepted') });
+    expect(requests).toEqual([HEAD, NEXT]);
+  });
+
   it('suppresses the real needs-you feed when only process.env marks the test run', () => {
     expect(isUnderTest(process.env)).toBe(true);
     publishAttention.mockClear();

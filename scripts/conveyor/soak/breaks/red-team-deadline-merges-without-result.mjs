@@ -27,7 +27,9 @@ export default {
   },
   fixPresent(root) {
     try {
-      return readFileSync(join(root, 'scripts/lib/drain-merge-strategy.mjs'), 'utf8').includes('readRedTeamDeadlineAction')
+      const strategy = readFileSync(join(root, 'scripts/lib/drain-merge-strategy.mjs'), 'utf8');
+      // requestAttemptedAt: the PR #5827 repair that tries a refused or throwing request hook once per head.
+      return strategy.includes('readRedTeamDeadlineAction') && strategy.includes('requestAttemptedAt')
         && /export function readRedTeamDeadlineAction\b/.test(readFileSync(join(root, 'scripts/lib/red-team-gate.mjs'), 'utf8'));
     } catch { return false; }
   },

@@ -413,6 +413,7 @@ export function createDrainMergeStrategy({
             // One attempt per head, recorded whether or not the hook accepts it: a refused or failing hook is never re-called.
             if (wait.requestedAt == null && wait.requestAttemptedAt == null && typeof requestRedTeam === 'function') {
               wait.requestAttemptedAt = now();
+              writeState(statePath, before); // durable before the side effect: a crash mid-request never re-requests
               let requested = false;
               try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
               catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
