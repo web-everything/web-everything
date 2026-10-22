@@ -10,6 +10,58 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync,
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runReclaimCase } from '../conveyor/soak/breaks/lane-reset-symbolic-ops-proof.mjs';
+import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+
+it.each(['https://example.com/pool.git', '/canonical/pool.git', 'file:///canonical/pool.git', './canonical/pool.git'])(
+  'remote probe isolates lane config and uses the canonical pool URL %s', (originUrl) => {
+  const source = /function liveRemoteShasProbe\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
+  const calls = [], removed = [];
+  const inherited = { GIT_DIR: '/lane/.git', GIT_COMMON_DIR: '/lane/.git', GIT_WORK_TREE: '/lane',
+    GIT_CONFIG: '/lane/.git/config', GIT_CONFIG_PARAMETERS: "'protocol.allow=always'" };
+  const probe = new Function('tryGit', 'mkdtempSync', 'tmpdir', 'join', 'dirname', 'rmSync', 'laneGitHardeningEnv', 'process', 'resolve',
+    `${source}; return liveRemoteShasProbe;`)(
+    (...args) => { calls.push(args); return 'abc refs/heads/trunk'; },
+    () => '/isolated/probe', () => '/isolated', join, () => '/isolated',
+    (dir) => removed.push(dir), laneGitHardeningEnv, { env: inherited }, resolve,
+  );
+  const repo = { originUrl };
+  expect([...probe(repo).shas]).toEqual(['abc']);
+  const [args, cwd, options] = calls[0];
+  expect(args).toEqual(['ls-remote', '--heads', '--', originUrl.startsWith('.') ? resolve(originUrl) : originUrl]);
+  expect(cwd).toBe('/isolated/probe');
+  expect(options.env.GIT_CEILING_DIRECTORIES).toBe('/isolated');
+  for (const key of Object.keys(inherited)) expect(options.env[key]).toBeUndefined();
+  const config = Object.fromEntries(Array.from({ length: Number(options.env.GIT_CONFIG_COUNT) }, (_, i) =>
+    [options.env[`GIT_CONFIG_KEY_${i}`], options.env[`GIT_CONFIG_VALUE_${i}`]]));
+  expect(config['protocol.file.allow']).toBe(originUrl.startsWith('https:') ? undefined : 'always');
+  expect(options.timeout).toBe(20000);
+  expect(removed).toEqual(['/isolated/probe']);
+});
+
+it.each(['missing origin', 'failed Git read', 'failed isolation'])(
+  'remote probe fails closed on %s', (failure) => {
+  const source = /function liveRemoteShasProbe\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
+  const calls = [], removed = [];
+  const probe = new Function('tryGit', 'mkdtempSync', 'tmpdir', 'join', 'dirname', 'rmSync', 'laneGitHardeningEnv', 'resolve',
+    `${source}; return liveRemoteShasProbe;`)(
+    (...args) => { calls.push(args); return null; },
+    () => { if (failure === 'failed isolation') throw Error('unavailable'); return '/isolated/probe'; },
+    () => '/isolated', join, () => '/isolated', (dir) => removed.push(dir), laneGitHardeningEnv, resolve,
+  );
+  expect(probe({ originUrl: failure === 'missing origin' ? null : 'https://example.com/pool.git' }))
+    .toEqual({ ok: false, shas: new Set() });
+  expect(calls).toHaveLength(failure === 'failed Git read' ? 1 : 0);
+  expect(removed).toEqual(failure === 'failed Git read' ? ['/isolated/probe'] : []);
+});
+
+it('remote probe protocol pins override inherited permissive defaults', () => {
+  const env = laneGitHardeningEnv({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'always' });
+  const config = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+    [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+  expect(config['protocol.allow']).toBe('never');
+  expect(config['protocol.https.allow']).toBe('always');
+  expect(config['protocol.ssh.allow']).toBe('always');
+});
 
 // Read-only proof tests can run even where the launcher forbids Git metadata writes.
 const proofSource = /function localRemoteShas\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
@@ -260,6 +312,11 @@ it.each([
   { kind: 'dirty' }, { alias: 'wildcard-mapped', kind: 'dirty' },
   { dryRun: true }, { race: true }, { live: true },
   { live: true, containment: 'ancestor' }, { live: true, kind: 'dirty' },
+  { dryRun: true, hostileRemote: 'origin' },
+  { dryRun: true, hostileRemote: 'rewrite' },
+  { dryRun: true, hostileRemote: 'worktree-rewrite' },
+  { dryRun: true, live: true, hostileRemote: 'origin' },
+  { dryRun: true, live: true, hostileRemote: 'rewrite' },
 ])('refresh then reclaim validates live preservation (%j)', async (options) => {
   const report = await runReclaimCase(resolve('.'), options);
   expect(report.violations).toEqual([]);

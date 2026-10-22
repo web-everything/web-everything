@@ -18,7 +18,7 @@ export default {
     const source = readFileSync(join(root, 'scripts/lane-pool.mjs'), 'utf8');
     const proof = /function localRemoteShas\([^]*?\n\}/.exec(source)?.[0] ?? '';
     const reclaim = /function laneReclaimPreservationProof\([^]*?\n\}/.exec(source)?.[0] ?? '';
-    return proof.includes('%(symref)') && proof.includes('remote.origin.fetch') && reclaim.includes('liveRemoteShas(dir)');
+    return proof.includes('%(symref)') && proof.includes('remote.origin.fetch') && reclaim.includes('liveRemoteShas(repo)');
   },
   async run({ root = REPO_ROOT } = {}) {
     const violations = [];
@@ -31,6 +31,11 @@ export default {
       { alias: 'mapped' }, { alias: 'wildcard-mapped', kind: 'dirty' },
       { dryRun: true }, { race: true }, { live: true },
       { live: true, containment: 'ancestor' }, { live: true, kind: 'dirty' },
+      { dryRun: true, hostileRemote: 'origin' },
+      { dryRun: true, hostileRemote: 'rewrite' },
+      { dryRun: true, hostileRemote: 'worktree-rewrite' },
+      { dryRun: true, live: true, hostileRemote: 'origin' },
+      { dryRun: true, live: true, hostileRemote: 'rewrite' },
     ]) {
       const report = await runReclaimCase(root, options);
       violations.push(...report.violations.map((message) => `reclaim ${JSON.stringify(options)}: ${message}`));
@@ -44,7 +49,7 @@ export function runReclaimCase(root = REPO_ROOT, options = {}) {
   return runAliasCase(root, options.alias ?? 'none', { ...options, command: 'reclaim' });
 }
 
-async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit', change = 'moved', containment = 'exact', dryRun = false, live = false, race = false } = {}) {
+async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit', change = 'moved', containment = 'exact', dryRun = false, live = false, race = false, hostileRemote = null } = {}) {
     const base = mkdtempSync(join(tmpdir(), 'soak-symbolic-ops-'));
     const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     try {
@@ -105,6 +110,18 @@ async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit',
         const beforeHead = git(['rev-parse', 'HEAD'], lane);
         const refresh = cli(['refresh', '--count=1']);
         if (refresh.status !== 0 || !refresh.stderr.includes('SKIPPED')) throw Error(`fixture refresh failed: ${refresh.stderr}`);
+        const helperMarker = join(base, 'remote-helper-ran');
+        if (hostileRemote) {
+          const helper = join(base, 'remote-helper.sh');
+          writeFileSync(helper, `#!/bin/sh\ntouch '${helperMarker}'\nexit 1\n`);
+          const remote = `ext::sh ${helper}`;
+          git(['config', 'protocol.ext.allow', 'always'], lane);
+          if (hostileRemote === 'origin') git(['config', 'remote.origin.url', remote], lane);
+          else {
+            if (hostileRemote === 'worktree-rewrite') git(['config', 'extensions.worktreeConfig', 'true'], lane);
+            git(['config', hostileRemote === 'worktree-rewrite' ? '--worktree' : '--local', `url.${remote}.insteadOf`, origin], lane);
+          }
+        }
         // Mutate the remote between the initial proof and the under-claim reproof.
         if (race) {
           const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
@@ -128,9 +145,10 @@ process.exit(result.status ?? 1);
         if (reclaim.status !== 0) throw Error(`fixture reclaim failed: ${reclaim.stderr}`);
         const report = JSON.parse(reclaim.stdout);
         const violations = [];
+        if (existsSync(helperMarker)) violations.push('reclaim dry-run executed a lane-controlled remote helper');
         if (live) {
-          if (!report.reclaimed) violations.push('live non-ops proof no longer permits reclaim');
-          if (readFileSync(join(lane, 'work.txt'), 'utf8') !== 'seed\n') violations.push('live control did not reset');
+          if (!(dryRun ? report.wouldReclaim : report.reclaimed)) violations.push('live non-ops proof no longer permits reclaim');
+          if (readFileSync(join(lane, 'work.txt'), 'utf8') !== (dryRun ? content : 'seed\n')) violations.push('live control changed the wrong work');
         } else {
           if (report.reclaimed || report.wouldReclaim || report.preserved) violations.push('stale ops proof authorized reclaim');
           if (git(['rev-parse', 'HEAD'], lane) !== beforeHead || readFileSync(join(lane, 'work.txt'), 'utf8') !== content) violations.push('reclaim destroyed unique work');
