@@ -120,27 +120,19 @@ export function citedLinesFingerprint({ file, line, text }) {
 }
 
 /**
- * Text that cannot prove two reports are the same break: missing, or carrying a quoted literal (`'`, `"`, a backtick),
- * whose inner whitespace the rendered comment may already have folded (`parse("a  b")` vs `parse("a b")`). PURE.
- */
-function unprovable(s) {
-  return typeof s !== 'string' || !s.trim() || /["'`]/.test(s);
-}
-
-/**
  * Are two red-team findings THE SAME BREAK (beyond citing the same code)? Same file, same category, same impact class
- * (a confirmed finding with no stated impact counts as `broken`, as the gate does), AND the identical summary AND the
- * identical failure scenario (exact strings, nothing normalised — case, signs, operators and spacing all count). Text
- * with a quoted literal never matches (see {@link unprovable}). Deliberately strict: a reworded report of an old break
- * is raised again (the conservative side); a NEW break at an old location never inherits an old ruling. PURE.
+ * (a confirmed finding with no stated impact counts as `broken`, as the gate does), AND the same identity digest the
+ * renderer stamped from the RAW category, impact, summary and scenario (`review-extra-seats.mjs#redTeamBreakIdentity`)
+ * — never the rendered text, which folds whitespace. A finding without an identity (an older comment) never matches.
+ * Deliberately strict: a reworded report of an old break is raised again (the conservative side); a NEW break at an
+ * old location never inherits an old ruling. PURE.
  */
 export function sameBreak(a, b) {
   if (!a || !b || !a.file || a.file !== b.file) return false;
   if (String(a.category ?? '') !== String(b.category ?? '')) return false;
   const cls = (f) => (f.impact === 'degraded' || f.impact === 'cosmetic' ? 'degraded' : 'broken');
   if (cls(a) !== cls(b)) return false;
-  if ([a.summary, b.summary, a.scenario, b.scenario].some(unprovable)) return false;
-  return a.summary === b.summary && a.scenario === b.scenario;
+  return typeof a.identity === 'string' && /^[0-9a-f]{32}$/.test(a.identity) && a.identity === b.identity;
 }
 
 /**

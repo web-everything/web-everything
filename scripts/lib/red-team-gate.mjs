@@ -49,6 +49,7 @@ export function redTeamMarker(pr, rev) {
 const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/i;
 const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
+const IDENTITY_RE = /^ {3}- Identity: ([0-9a-f]{32})$/;
 
 /**
  * Parse ONE red-team comment body. PURE. Returns null for anything that is not one (no leading marker).
@@ -76,6 +77,8 @@ export function parseRedTeamComment(body) {
     }
     const s = SUB_RE.exec(line);
     if (s && findings.length) findings.at(-1)[s[1] === 'Scenario' ? 'scenario' : 'recheck'] = s[2].trim();
+    const id = IDENTITY_RE.exec(line);
+    if (id && findings.length) findings.at(-1).identity = id[1];
   }
   return { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
 }

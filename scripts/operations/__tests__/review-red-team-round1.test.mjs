@@ -8,12 +8,12 @@
 import { describe, it, expect } from 'vitest';
 
 import { runReviewJob } from '../review-job.mjs';
-import { speculateRedTeam, finishSpeculativeRedTeam, runRedTeam, renderRedTeamComment, reserveSeatCalls, redTeamOwedThisRound } from '../review-extra-seats.mjs';
+import { speculateRedTeam, finishSpeculativeRedTeam, runRedTeam, renderRedTeamComment, reserveSeatCalls, redTeamOwedThisRound, redTeamBreakIdentity } from '../review-extra-seats.mjs';
 import { applyRedTeamGate, buildGateComment } from '../red-team-gate-apply.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 import { extractFindings } from '../../conveyor/fix-context-pack.mjs';
 import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, readRedTeamDisposition, redTeamGateMarker, ruledEarlierBreaks } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, parseRedTeamComment, readRedTeamDisposition, redTeamGateMarker, ruledEarlierBreaks } from '../../lib/red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
 import {
   citedLinesFingerprint, decideRound1FixHold, formatRedTeamTimingLine, resolveRedTeamTiming, round1RedTeamOwedFor, sameBreak, suppressPreviouslyRuled,
@@ -254,19 +254,19 @@ describe('citedLinesFingerprint + suppressPreviouslyRuled', () => {
     expect(citedLinesFingerprint({ file: 'x.mjs', line: 4, text: null })).toBeNull();
     // Anchored: two different lines of a short file never share a fingerprint, even though their excerpts are equal.
     expect(citedLinesFingerprint({ file: 'x.mjs', line: 1, text: 'a\nb' })).not.toBe(citedLinesFingerprint({ file: 'x.mjs', line: 2, text: 'a\nb' }));
-    const g = (index, o = {}) => ({ index, file: 'x.mjs', category: 'edge-case', impact: 'broken', summary: `zero divisor crashes parse ${index}`, scenario: `parse(${index})`, ...o });
-    // The audit probe: two breaks differing by one identifier are NOT the same break.
-    expect(sameBreak(g(1, { summary: 'parse crashes when src is nil' }), g(1, { summary: 'parse crashes when dst is nil' }))).toBe(false);
-    expect(sameBreak(g(1, { summary: 'fails when n < 0' }), g(1, { summary: 'fails when n > 0' }))).toBe(false);
-    expect(sameBreak(g(1, { summary: 'x', scenario: 'parse(-1)' }), g(1, { summary: 'y', scenario: 'parse(1)' }))).toBe(false);
-    expect(sameBreak(g(1, { summary: 'parse  crashes', scenario: 'p(1)' }), g(1, { summary: 'parse crashes', scenario: 'p(1)' }))).toBe(false);
-    expect(sameBreak(g(1, { summary: 'a', scenario: 'f(0)' }), g(1, { summary: 'b', scenario: 'f(0)' }))).toBe(false);
-    expect(sameBreak(g(1, { summary: 'p fails', scenario: 'parse("a  b")' }), g(1, { summary: 'p fails', scenario: 'parse("a  b")' }))).toBe(false);
-    expect(sameBreak(g(1, { summary: 'p fails', scenario: 'p(0)' }), g(1, { summary: 'p fails', scenario: 'p(0)' }))).toBe(true);
-    expect(sameBreak(g(1, { summary: 'p fails' }), g(1, { summary: 'p fails' }))).toBe(false);
+    const g = (index, o = {}) => ({ index, file: 'x.mjs', category: 'edge-case', impact: 'broken', summary: `zero divisor crashes parse ${index}`, identity: String(index).repeat(32).slice(0, 32), ...o });
+    // Identity is the renderer's digest of the RAW fields: breaks that render alike (folded spacing) stay distinct.
+    const id = (summary, failure_scenario = 'p(0)') => redTeamBreakIdentity({ category: 'edge-case', impactIfUnfixed: 'broken', summary, failure_scenario });
+    expect(id('p fails', 'parse(/a  b/.source)')).not.toBe(id('p fails', 'parse(/a b/.source)'));
+    expect(id('fails when n < 0')).not.toBe(id('fails when n > 0'));
+    expect(sameBreak(g(1, { identity: id('p fails') }), g(1, { identity: id('p fails') }))).toBe(true);
+    expect(sameBreak(g(1, { identity: id('p fails') }), g(1, { identity: id('p fails ') }))).toBe(false);
+    expect(sameBreak(g(1, { identity: undefined }), g(1, { identity: undefined }))).toBe(false); // no identity (an older comment): never the same break
+    expect(parseRedTeamComment(renderRedTeamComment({ pr: 1, rev: REV, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ ...F({ summary: 'p fails', failure_scenario: 'p(0)', category: 'edge-case', impactIfUnfixed: 'broken' }) }] })).findings[0].identity).toBe(id('p fails'));
     const plan = { sendBack: [g(1), g(2), g(4, { impact: 'broken', summary: 'unrelated null deref' })], card: [g(3, { impact: 'degraded' })], advisory: [] };
     const ruled = [{ rev: H1, fingerprint: 'fp1', finding: g(1) }, { rev: H1, fingerprint: 'fp3', finding: g(3, { impact: 'degraded' }) },
-      { rev: H1, fingerprint: 'fp4', finding: g(4, { impact: 'degraded', summary: 'formatting nit' }) }];
+      { rev: H1, fingerprint: 'fp4', finding: g(4, { impact: 'degraded', summary: 'formatting nit', identity: 'f'.repeat(32) }) }];
     const out = suppressPreviouslyRuled({ plan, fingerprintOf: (f) => (f.index === 2 ? null : `fp${f.index}`), ruled });
     // #2 has no fingerprint; #4 cites the ruled location but is a DIFFERENT break (class and summary differ).
     expect(out.sendBack.map((f) => f.index)).toEqual([2, 4]);

@@ -1247,6 +1247,11 @@ const WHITESPACE_RUN = new RegExp('\\s+', 'g');
 const CLASS_UNSAFE = new RegExp('[(),]', 'g');
 
 /** The ONE advisory comment. PURE. Starts with the dedup marker line. */
+/** Card 6212 — a confirmed break's identity: a digest of its raw category, impact, summary and scenario. PURE. */
+export function redTeamBreakIdentity(f) {
+  return createHash('sha256').update(JSON.stringify([String(f?.category ?? ''), String(f?.impactIfUnfixed ?? ''), String(f?.summary ?? ''), String(f?.failure_scenario ?? '')])).digest('hex').slice(0, 32);
+}
+
 export function renderRedTeamComment({ pr, rev, provider, model, findings, recheckStatus, foldedVerdict }) {
   const confirmed = findings.filter((f) => f.confirmedByRecheck);
   const head = [
@@ -1269,6 +1274,9 @@ export function renderRedTeamComment({ pr, rev, provider, model, findings, reche
     const cls = (v, fallback) => one(publishable(v)).replace(CLASS_UNSAFE, ' ').trim() || fallback;
     return `${i + 1}. [${tag}] (${cls(f.category, 'uncategorised')}, ${cls(f.impactIfUnfixed, 'impact?')})${where} — ${one(publishable(f.summary))}`
       + `${f.failure_scenario ? `\n   - Scenario: ${one(publishable(f.failure_scenario))}` : ''}`
+      // Card 6212 — the break's identity, digested from the RAW fields before any folding, so the gate can tell two
+      // breaks apart that render alike (`we:scripts/lib/red-team-timing.mjs#sameBreak`).
+      + `\n   - Identity: ${redTeamBreakIdentity(f)}`
       + `${f.recheckReason ? `\n   - Re-check: ${one(publishable(f.recheckReason))}` : ''}`
       + `${Array.isArray(f.filesRead) ? `\n   - Files read: ${one(f.filesRead.map(publishable).join(', ')) || 'none'}` : ''}`;
   });
