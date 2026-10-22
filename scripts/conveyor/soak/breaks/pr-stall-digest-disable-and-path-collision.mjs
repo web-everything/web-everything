@@ -18,7 +18,7 @@ export default {
     const root = mkdtempSync(join(tmpdir(), 'soak-stall-digest-'));
     const violations = [];
     const now = Date.parse('2026-10-22T14:00:00Z');
-    const repo = 'web-everything/web-everything', head = 'a'.repeat(40);
+    const repo = 'acme/widgets', head = 'a'.repeat(40);
     const item = { lane: 'operator', repo, pr: 1, head, state: 'needs-decision:note' };
     const notify = () => ({ ok: true });
     try {
