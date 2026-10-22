@@ -70,11 +70,18 @@ describe('laneDietConfigOps (pure)', () => {
       + entry('local', 'remote.Origin.fetch', '+refs/heads/other:refs/remotes/Origin/other')
       + entry('local', 'remote.origin.fetch', LANE_DEFAULT_FETCH)
       + entry('local', 'remote.origin.fetch', LANE_OPS_NEGATIVE_FETCH)
+      + entry('worktree', 'remote.origin.fetch', '+refs/heads/work:refs/remotes/origin/work')
+      + entry('command', 'remote.origin.fetch', '^refs/heads/private/*')
       + entry('local', 'alias.multiline', 'one\nremote.origin.fetch\nother')
       + entry('local', 'fetch.unpacklimit', '1') + entry('local', 'fetch.unpacklimit', '1')
       + entry('command', 'transfer.unpacklimit', '1');
     const current = laneDietConfigState(output);
-    expect(current).toEqual({ fetchValues: [LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH], kv: { 'fetch.unpackLimit': '1\n1', 'transfer.unpackLimit': '' } });
+    expect(current).toEqual({
+      fetchValues: [LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH],
+      effectiveFetchValues: [LANE_OPS_NEGATIVE_FETCH, LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH,
+        '+refs/heads/work:refs/remotes/origin/work', '^refs/heads/private/*'],
+      kv: { 'fetch.unpackLimit': '1\n1', 'transfer.unpackLimit': '' },
+    });
     expect(laneDietConfigOps(current)).toEqual([
       ['config', '--local', '--replace-all', 'fetch.unpackLimit', '1'],
       ['config', '--local', '--replace-all', 'transfer.unpackLimit', '1'],
