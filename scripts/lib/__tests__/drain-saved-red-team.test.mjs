@@ -176,7 +176,8 @@ describe('saved red-team admission', () => {
     const findings = [{ confirmedByRecheck: true, impactIfUnfixed: 'broken' }];
     const { env } = fixture([row({ findings, confirmedMissCount: 1, scoredAt: '2026-10-17T10:00:00Z' })]);
     const cap = { author: { login: 'web-everything' }, createdAt: '2026-10-17T10:01:00Z', body: redTeamGateMarker(pr, head, 'round-cap') };
-    const cleared = { author: { login: 'web-everything' }, createdAt: '2026-10-17T10:02:00Z', body: [
+    // main #5803: a clear-human ruling counts only when the human operator posted it.
+    const cleared = { author: { login: 'chalbert' }, createdAt: '2026-10-17T10:02:00Z', body: [
       '✅ review — `review:human` cleared via the sanctioned path', '',
       'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
       buildReviewedShaMarker(head), buildClearedHumanMarker('operator'),
@@ -262,7 +263,8 @@ describe('saved round-cap break: RULING NEEDED and the clear-human ruling (PR #5
   const setting = { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' };
   const broken = { confirmedByRecheck: true, impactIfUnfixed: 'broken', category: 'edge-case',
     file: 'scripts/example.mjs', line: 3, summary: 'two writers race' };
-  const cleared = at => ({ author: { login: 'web-everything' }, createdAt: at, body: [
+  // main #5803: a clear-human ruling counts only when the human operator posted it.
+  const cleared = at => ({ author: { login: 'chalbert' }, createdAt: at, body: [
     '✅ review — `review:human` cleared via the sanctioned path', '',
     'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
     buildReviewedShaMarker(head), buildClearedHumanMarker('operator'),
