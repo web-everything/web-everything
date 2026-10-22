@@ -13,7 +13,7 @@ import { applyRedTeamGate, buildGateComment } from '../red-team-gate-apply.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 import { extractFindings } from '../../conveyor/fix-context-pack.mjs';
 import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, parseRedTeamComment, readRedTeamDisposition, redTeamGateMarker, ruledEarlierBreaks } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, parseRedTeamComment, readRedTeamDisposition, redTeamGateMarker, redTeamResultId, ruledEarlierBreaks } from '../../lib/red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
 import {
   citedLinesFingerprint, decideRound1FixHold, formatRedTeamTimingLine, resolveRedTeamTiming, round1RedTeamOwedFor, sameBreak, suppressPreviouslyRuled,
@@ -262,6 +262,14 @@ describe('citedLinesFingerprint + suppressPreviouslyRuled', () => {
     expect(sameBreak(g(1, { identity: id('p fails') }), g(1, { identity: id('p fails') }))).toBe(true);
     expect(sameBreak(g(1, { identity: id('p fails') }), g(1, { identity: id('p fails ') }))).toBe(false);
     expect(sameBreak(g(1, { identity: undefined }), g(1, { identity: undefined }))).toBe(false); // no identity (an older comment): never the same break
+    // Two results that render alike but are different breaks never share a gate decision (result id keyed by identity).
+    const render = (sc) => parseRedTeamComment(renderRedTeamComment({ pr: 1, rev: REV, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [F({ summary: 'p fails', failure_scenario: sc })] }));
+    expect(render('parse(/a  b/.source)').findings[0].scenario).toBe(render('parse(/a b/.source)').findings[0].scenario);
+    expect(redTeamResultId(render('parse(/a  b/.source)'))).not.toBe(redTeamResultId(render('parse(/a b/.source)')));
+    // A result without identities (older comments) keeps its v1 id.
+    const old = render('p(0)'); old.findings.forEach((f) => { delete f.identity; });
+    expect(redTeamResultId(old)).toMatch(/^[0-9a-f]{16}$/);
     expect(parseRedTeamComment(renderRedTeamComment({ pr: 1, rev: REV, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
       findings: [{ ...F({ summary: 'p fails', failure_scenario: 'p(0)', category: 'edge-case', impactIfUnfixed: 'broken' }) }] })).findings[0].identity).toBe(id('p fails'));
     const plan = { sendBack: [g(1), g(2), g(4, { impact: 'broken', summary: 'unrelated null deref' })], card: [g(3, { impact: 'degraded' })], advisory: [] };

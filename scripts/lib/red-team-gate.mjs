@@ -92,6 +92,12 @@ const RESULT_ID_FIELDS = ['index', 'confirmed', 'recheckOutcome', 'category', 'i
 export function redTeamResultId(parsed) {
   if (!parsed) return null;
   const findings = (parsed.findings ?? []).map(f => RESULT_ID_FIELDS.map(k => f?.[k] ?? null));
+  // Card 6212 — a result whose findings carry the renderer's raw-field Identity is keyed by it too (`v2`): two results
+  // that render alike but are different breaks never share a decision. Results without one keep their `v1` id, so
+  // every decision recorded before this change still names the result it decided.
+  if ((parsed.findings ?? []).some(f => typeof f?.identity === 'string')) {
+    return createHash('sha256').update(JSON.stringify(['v2', findings, (parsed.findings ?? []).map(f => f?.identity ?? null)])).digest('hex').slice(0, 16);
+  }
   return createHash('sha256').update(JSON.stringify(['v1', findings])).digest('hex').slice(0, 16);
 }
 

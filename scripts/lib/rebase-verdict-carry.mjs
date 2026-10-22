@@ -46,7 +46,9 @@ function informationalProvenance(body, sha, pr) {
     || line === 'The red team tried to break this change and reported nothing.'
     || line === "A confirmed break is recorded as a miss for the accepting review and for the builder's model."
     || parseRedTeamComment(`${rest.slice(0, rest.indexOf('-->') + 3)}\n${line}`)?.findings.length === 1
-    || /^ {3}- (?:Scenario|Re-check): [^\n]*$/.test(line));
+    || /^ {3}- (?:Scenario|Re-check): [^\n]*$/.test(line)
+    // Card 6212 — the renderer's raw-field break identity (a fixed-shape digest, no model text).
+    || /^ {3}- Identity: [0-9a-f]{32}$/.test(line));
 }
 
 /** IO: compare whitespace-sensitive net patches; missing objects get one fetch. Never throws. */
