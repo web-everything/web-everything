@@ -15,14 +15,14 @@
  *      label mirror can restore a ledgered hand label under its own login): a hand label is never lifted.
  *   2. WHY. A trusted escalation record (`we:scripts/lib/human-escalation-marker.mjs`) posted BY THAT SAME LOGIN
  *      right after the add (5 s skew before, 300 s after: every clearable writer labels first, then records), and
- *      after the last removal before it. Every escalation recorded since the operator last removed the label (all
- *      time if never) is of a kind the setting enables (only kinds with a clearing proof can be enabled), and is
- *      cleared:
+ *      after the last removal before it — and so for EVERY add since the operator (a User actor with the operator's
+ *      exact login) last removed the label. Every escalation recorded since that removal (all time if never) is of a
+ *      kind the setting enables (only kinds with a clearing proof can be enabled), and is cleared:
  *        - referral kinds: the live head carries at least one trusted mandatory referral record, and the gate's own
  *          reader shows nothing pending, blocked or malformed on it (a moved head with no record of its own keeps it);
  *        - round-cap: an operator round-extension grant was posted after the latest round-cap record.
  *   3. NO OTHER HOLD. The live referral state is clean (always, whatever the kind); no `review:awaiting-advisory` is
- *      on the PR or was added since the escalation (the drain's and the hand-off's park shape); no
+ *      on the PR or was added since the operator's last removal (the drain's and the hand-off's park shape); no
  *      `review:accepted` (lifting would expose it to the drain), no `review:held-mechanical`; no
  *      `advisory:ruling-needed`; no `red-team:blocked`; no open operator send-back; no human-surface re-park /
  *      mechanical hand-off marker for the live head.
@@ -81,8 +81,6 @@ const KNOWN = new Set(Object.values(HUMAN_ESCALATION_KINDS));
  */
 export const ATTRIBUTION_SKEW_MS = 5_000;
 export const ATTRIBUTION_AFTER_MS = 300_000;
-/** A park's review:awaiting-advisory add lands within this of its review:human add (or any time after it). */
-const ADVISORY_PAIR_MS = 180_000;
 export const DEESCALATED_MARKER_RE = /<!-- we:human-deescalated pr=\d+ head=[0-9a-f]{40} kinds=[a-z0-9,-]+ -->/;
 const PARK_MARKER_RE = /<!-- (?:human-surface-repark|mechanical-hold-handoff): ([0-9a-f]{40}) -->/gi;
 /** Labels whose presence alone keeps the hold. */
@@ -191,7 +189,6 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   // ledgered hand label under its own login): never lift it.
   const handAdd = timeline.items.find(i => i.label === REVIEW_LABELS.human && i.change === 'added' && !isAutomationLogin(i.actor));
   if (handAdd) return keep(`review:human was hand-added by ${handAdd.actor ?? 'an unknown actor'} on this PR`);
-  const addAt = time(last.createdAt);
 
   // 2. WHY it went on, and whether every recorded cause is cleared.
   const escalations = readHumanEscalations(comments, { inferLegacy: settings.inferLegacy === true });
@@ -199,16 +196,26 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   // Every escalation recorded since the operator last took the label off counts (all time if never): a cause
   // recorded long before this add (a hold whose own label write came later, a resumed writer) still holds.
   // Only the OPERATOR's own removal answers earlier causes; an unknown or other actor never does.
-  const handRemoval = timeline.items.filter(i => i.label === REVIEW_LABELS.human && i.change === 'removed'
-    && OPERATOR_LOGINS.includes(String(i.actor).toLowerCase())).at(-1); // exact login: `chalbert[bot]` is not the operator
-  const windowStart = handRemoval ? time(handRemoval.createdAt) : -Infinity;
-  // A record from an earlier label lifecycle (before the last removal) never explains this add.
-  const lastLabel = timeline.items.lastIndexOf(last);
-  const priorRemoval = timeline.items.slice(0, lastLabel).filter(i => i.label === REVIEW_LABELS.human && i.change === 'removed').at(-1);
-  const explainFrom = Math.max(addAt - ATTRIBUTION_SKEW_MS, priorRemoval ? time(priorRemoval.createdAt) + 1 : -Infinity);
-  const explains = e => { const t = time(e.createdAt);
-    return e.added !== false && login(e.author) === login(last.actor) && t >= explainFrom && t <= addAt + ATTRIBUTION_AFTER_MS; };
-  if (!escalations.some(explains)) return keep('no escalation record by the labelling login at the review:human add');
+  // Exact login AND a User actor: `chalbert[bot]`, or an App acting under the operator's name, is not the operator.
+  const operatorRemoval = i => i.label === REVIEW_LABELS.human && i.change === 'removed'
+    && OPERATOR_LOGINS.includes(String(i.actor).toLowerCase()) && i.actorType === 'User';
+  const handRemovalIndex = timeline.items.findLastIndex(operatorRemoval);
+  const windowStart = handRemovalIndex >= 0 ? time(timeline.items[handRemovalIndex].createdAt) : -Infinity;
+  // EVERY review:human add since the operator last took the label off must be explained by its own record: an
+  // earlier unexplained add (a drain park, a rule-required hold) may be a cause nobody has answered yet. A record
+  // from an earlier label lifecycle (before the removal preceding that add) never explains it.
+  const explained = (add, index) => {
+    const at = time(add.createdAt);
+    const priorRemoval = timeline.items.slice(0, index).filter(i => i.label === REVIEW_LABELS.human && i.change === 'removed').at(-1);
+    const from = Math.max(at - ATTRIBUTION_SKEW_MS, priorRemoval ? time(priorRemoval.createdAt) + 1 : -Infinity);
+    return escalations.some(e => { const t = time(e.createdAt);
+      return e.added !== false && login(e.author) === login(add.actor) && t >= from && t <= at + ATTRIBUTION_AFTER_MS; });
+  };
+  const adds = timeline.items.map((item, index) => ({ item, index }))
+    .filter(({ item, index }) => item.label === REVIEW_LABELS.human && item.change === 'added' && index > handRemovalIndex);
+  if (!adds.length || !explained(last, timeline.items.lastIndexOf(last))) return keep('no escalation record by the labelling login at the review:human add');
+  const unexplained = adds.find(({ item, index }) => !explained(item, index));
+  if (unexplained) return keep(`an earlier review:human add (${unexplained.item.createdAt}) since the operator's last removal has no escalation record`);
   const since = escalations.filter(e => time(e.createdAt) >= windowStart);
   const kinds = [...new Set(since.map(e => e.kind))];
   for (const kind of kinds) {
@@ -225,8 +232,8 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   const referralWhy = referralNotClean(referral);
   if (referralWhy) return keep(referralWhy);
   // The drain's and the hand-off's parks add review:awaiting-advisory beside review:human (even while it stands).
-  if (timeline.items.some(i => i.label === REVIEW_LABELS.awaitingAdvisory && i.change === 'added' && time(i.createdAt) >= Math.max(windowStart, addAt - ADVISORY_PAIR_MS)))
-    return keep('review:awaiting-advisory was added since the escalation (a drain or hand-off park)');
+  if (timeline.items.some(i => i.label === REVIEW_LABELS.awaitingAdvisory && i.change === 'added' && time(i.createdAt) >= windowStart))
+    return keep("review:awaiting-advisory was added since the operator's last removal (a drain or hand-off park)");
   let sendBacks;
   try { sendBacks = openOperatorSendBacks({ ...pr, comments }); } catch (e) { return keep(`operator send-backs unreadable: ${errorText(e)}`); }
   if (!Array.isArray(sendBacks)) return keep('operator send-backs unreadable');
