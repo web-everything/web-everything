@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction } from '../../lib/health-watch-lane-scan.mjs';
+import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction, laneProbeEnv } from '../../lib/health-watch-lane-scan.mjs';
 import { createStaleStateReader } from '../stale-state-io.mjs';
 import { OPERATIONS } from '../run.mjs';
 import { DIRTY_PROBE_ARGS, laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
@@ -19,6 +19,84 @@ const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'health-lane-scan-')
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const policy = { interval: 300, source: 'standard', invalid: [] };
 const rows = [{ lane: { path: '/fixture/lane-1', clean: false, lease: { agentPid: 123 } }, ahead: 2 }];
+
+describe('operator send-back regressions', () => {
+  it('freshLaneSafety never runs inherited GIT_CONFIG_PARAMETERS fsmonitor commands (read-only Git)', () => {
+    const marker = join(temp(), 'executed');
+    vi.stubEnv('GIT_CONFIG_PARAMETERS', `'core.fsmonitor=echo executed >> "${marker}"'`);
+    try {
+      const exec = vi.fn(execFileSync);
+      freshLaneSafety({ path: process.cwd(), exec });
+      expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(true);
+      expect(existsSync(marker)).toBe(false);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(['2', 'garbage', '999999999'])('replaces all inherited config overrides before pinning (count=%s)', count => {
+    const inherited = { GIT_CONFIG_COUNT: count, GIT_CONFIG_PARAMETERS: "'core.fsmonitor=marker'",
+      GIT_CONFIG_KEY_0: 'core.worktree', GIT_CONFIG_VALUE_0: '/foreign',
+      GIT_CONFIG_KEY_99: 'filter.marker.clean', GIT_CONFIG_VALUE_99: 'marker',
+      GIT_CONFIG_KEY_stray: 'include.path', GIT_CONFIG_VALUE_stray: '/foreign/config' };
+    for (const [key, value] of Object.entries(inherited)) vi.stubEnv(key, value);
+    try {
+      const env = laneProbeEnv('/fixture/lane');
+      const overrides = Object.fromEntries(Object.entries(env).filter(([key]) => /^GIT_CONFIG_(PARAMETERS|COUNT|KEY_.*|VALUE_.*)$/.test(key)));
+      expect(overrides).toEqual({ GIT_CONFIG_COUNT: String(LANE_GIT_CONFIG_PINS.length),
+        ...Object.fromEntries(LANE_GIT_CONFIG_PINS.flatMap(([key, value], i) =>
+          [[`GIT_CONFIG_KEY_${i}`, key], [`GIT_CONFIG_VALUE_${i}`, value]])) });
+      for (const [key, value] of Object.entries(inherited)) expect(process.env[key]).toBe(value);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  const cachedReader = (initial = {}) => {
+    const lane = { path: '/fixture/lane-1', clean: true,
+      lease: { workerSession: 'old-worker', pid: 10, agentPid: 11 }, ...initial };
+    let now = 0;
+    let leaseText = JSON.stringify(lane.lease);
+    const run = vi.fn(bin => bin === 'git' ? '0' : JSON.stringify({ lanes: [lane] }));
+    const readText = vi.fn(() => {
+      if (leaseText instanceof Error) throw leaseText;
+      return leaseText;
+    });
+    const probe = vi.fn(pid => pid === 21);
+    const read = createStaleStateReader({ root: '/fixture', run, readText, probe, now: () => now,
+      listFiles: () => [], runStore: { list: () => [] }, laneScan: { dir: temp(), policy, log: vi.fn() } });
+    read();
+    run.mockClear();
+    probe.mockClear();
+    now = 120000;
+    return { read, run, readText, probe, setLease: value => { leaseText = value; } };
+  };
+
+  it.each([{}, { lease: null }, { lease: null, readError: 'old corrupt lease' }])(
+    'at 120s cached old-worker/free/error lane shows live current-worker (%j)', initial => {
+      const r = cachedReader(initial);
+      const lease = { workerSession: 'current-worker', pid: 20, agentPid: 21, acquiredAt: new Date(100000).toISOString() };
+      r.setLease(JSON.stringify(lease));
+      expect(r.read().records[0]).toMatchObject({ owner: 'current-worker', ownerPid: 21, ownerPidAlive: true,
+        pid: 20, ageMs: 20000, lease, lane: { lease }, hasUnsafeWork: null });
+      expect(r.run).not.toHaveBeenCalled();
+      expect(r.probe).not.toHaveBeenCalledWith(11);
+      expect(r.readText).toHaveBeenCalledWith('/fixture/lane-1/.git/.lane-lease');
+    });
+
+  it('omits a cached lease that has since been removed', () => {
+    const r = cachedReader();
+    r.setLease(Object.assign(new Error('gone'), { code: 'ENOENT' }));
+    expect(r.read().records).toEqual([]);
+    expect(r.probe).not.toHaveBeenCalled();
+  });
+
+  it.each(['{broken', 'null', '[]', new Error('unreadable lease')])('reports unknown ownership on fresh lease read failure (%s)', value => {
+    const r = cachedReader();
+    r.setLease(value);
+    const row = r.read().records[0];
+    expect(row).toMatchObject({ owner: null, ownerPid: null, ownerPidAlive: null, hasUnsafeWork: null });
+    expect(row.readError).toBeTruthy();
+    expect(row.lane.lease).toBeNull();
+    expect(r.probe).not.toHaveBeenCalled();
+  });
+});
 
 describe('health-watch persistent lane scan', () => {
   it('skips within the interval across readers, retains lane data and logs interval/source once', () => {
@@ -73,7 +151,11 @@ describe('health-watch persistent lane scan', () => {
     const readClaim = vi.fn(() => ({ found: true, status: 'active', rel: 'backlog/123-active.md',
       content: '---\nstatus: active\npid: 123\n---\n' }));
     const options = { root: '/fixture', run, now: () => now, probe: () => alive,
-      listFiles: () => ['123-active.md'], readText: () => '---\nstatus: active\n---\n', readClaim,
+      listFiles: () => ['123-active.md'], readText: path => {
+        if (path === '/fixture/lane-1/.git/.lane-lease') return JSON.stringify(lane.lease);
+        if (path === '/fixture/lane-2/.git/.lane-lease') throw new Error('bad lease');
+        return '---\nstatus: active\n---\n';
+      }, readClaim,
       runStore: { list: () => [] }, laneScan: { dir, policy, log: vi.fn() } };
     const first = createStaleStateReader(options)();
     now = 42000;
@@ -95,7 +177,8 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
   const reader = (dir, lanes, aheadOut) => {
     let now = 1000;
     const run = vi.fn((bin) => bin === 'git' ? aheadOut : JSON.stringify({ lanes }));
-    const options = { root: '/fixture', run, now: () => now, probe: () => false, listFiles: () => [], readText: () => '',
+    const options = { root: '/fixture', run, now: () => now, probe: () => false, listFiles: () => [],
+      readText: path => JSON.stringify(lanes.find(lane => path === `${lane.path}/.git/.lane-lease`)?.lease),
       readClaim: vi.fn(), runStore: { list: () => [] }, laneScan: { dir, policy, log: vi.fn() } };
     return { read: () => createStaleStateReader(options)(), tick: ms => { now += ms; }, run };
   };
@@ -130,6 +213,10 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
   });
   it('isolates both the lane-pool child and per-lane git reporting reads from inherited Git selectors', () => {
     vi.stubEnv('GIT_DIR', '/foreign/clean');
+    vi.stubEnv('GIT_CONFIG_PARAMETERS', "'core.fsmonitor=marker'");
+    vi.stubEnv('GIT_CONFIG_COUNT', '1');
+    vi.stubEnv('GIT_CONFIG_KEY_0', 'core.worktree');
+    vi.stubEnv('GIT_CONFIG_VALUE_0', '/foreign/clean');
     const r = reader(temp(), [{ path: '/fixture/lane-1', clean: true, lease }], '0');
     try {
       r.read();
@@ -137,6 +224,9 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
         .toEqual([[false, '/fixture', '/'], [true, '/fixture/lane-1', '/fixture'], [true, '/fixture/lane-1', '/fixture']]);
       for (const [, , options] of r.run.mock.calls) {
         expect(options.env).not.toHaveProperty('GIT_DIR');
+        expect(options.env).not.toHaveProperty('GIT_CONFIG_PARAMETERS');
+        expect(options.env.GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));
+        expect(options.env.GIT_CONFIG_KEY_0).toBe('core.fsmonitor');
         expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
       }
     } finally { vi.unstubAllEnvs(); }

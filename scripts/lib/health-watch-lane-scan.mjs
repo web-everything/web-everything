@@ -78,7 +78,13 @@ export function laneRedirectConfig(listOutput) {
 
 /** Env every lane probe git runs under, on top of the repo's lane hardening. */
 export function laneProbeEnv(path) {
-  return { ...laneGitHardeningEnv(laneGitEnv(path)), GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0',
+  const env = laneGitEnv(path);
+  // Command-scope parameters outrank the indexed pins. Drop every inherited override before installing our own,
+  // including orphaned indexed entries and malformed counts; none is trusted input to a safety probe.
+  for (const key of Object.keys(env)) {
+    if (/^GIT_CONFIG_(PARAMETERS|COUNT|KEY_.*|VALUE_.*)$/.test(key)) delete env[key];
+  }
+  return { ...laneGitHardeningEnv(env), GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0',
     GIT_NO_LAZY_FETCH: '1' };
 }
 
