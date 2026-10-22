@@ -49,6 +49,10 @@ export function redTeamMarker(pr, rev) {
 const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/i;
 const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
+// Any reviewed-sha marker the shared parser reads (full or abbreviated, any case), and a case variant of the marker
+// name too: only used to SUPERSEDE a ruling, where reading more holds more.
+const REVIEWED_SHA_ANY_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->`, 'gi');
+const REVIEWED_SHA_FULL_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-fA-F]{40})\\s*-->`, 'g');
 
 /**
  * Parse ONE red-team comment body. PURE. Returns null for anything that is not one (no leading marker).
@@ -161,6 +165,38 @@ export function readRedTeamProbes({ env = process.env, path = RED_TEAM_SETTINGS_
   let file = {};
   try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
   const resolved = resolveRedTeamProbes({ file, platform: platformPreference('redTeam', { env }), env });
+  log(formatCascadeSourcesLine('redTeam', resolved));
+  return resolved;
+}
+
+/**
+ * What the drain does when an owed post-accept red team has no result on the live head at its wait deadline
+ * (`drain.redTeamPendingMaxMin`). Every value HOLDS the PR: `hold` publishes the operator note; `requeue-then-hold`
+ * (standard) first re-requests the red team once for that head, and holds with the note if that also produces no
+ * result. No file or platform value can restore merge-without-result: `merge-without-result` is accepted ONLY from the
+ * operator's own env (`WE_RED_TEAM_DEADLINE_ACTION`) together with a named `WE_RED_TEAM_DEADLINE_OVERRIDE_BY`, and the
+ * drain logs it as an operator override on every use. Anywhere else it is invalid and the lower layer stands.
+ */
+export const RED_TEAM_DEADLINE_ACTIONS = Object.freeze(['hold', 'requeue-then-hold']);
+export const RED_TEAM_DEADLINE_OVERRIDE = 'merge-without-result';
+export const RED_TEAM_DEADLINE_ENV = 'WE_RED_TEAM_DEADLINE_ACTION';
+export const RED_TEAM_DEADLINE_OVERRIDE_BY_ENV = 'WE_RED_TEAM_DEADLINE_OVERRIDE_BY';
+export function resolveRedTeamDeadlineAction({ file = {}, platform, env = {} } = {}) {
+  const raw = env[RED_TEAM_DEADLINE_ENV];
+  const envAction = raw === undefined || raw === '' ? undefined : String(raw).trim().toLowerCase();
+  const overrideBy = String(env[RED_TEAM_DEADLINE_OVERRIDE_BY_ENV] ?? '').trim().slice(0, 100);
+  const operatorOverride = envAction === RED_TEAM_DEADLINE_OVERRIDE && overrideBy !== '';
+  const pick = o => (o?.deadlineAction === undefined ? {} : { deadlineAction: o.deadlineAction });
+  const resolved = resolveCascade({ standard: { deadlineAction: 'requeue-then-hold' }, platform: pick(platform), tool: pick(file?.redTeam),
+    envValues: { deadlineAction: operatorOverride ? undefined : envAction }, valid: v => RED_TEAM_DEADLINE_ACTIONS.includes(v) });
+  if (!operatorOverride) return { ...resolved, operatorOverride: null };
+  return { ...resolved, value: { deadlineAction: RED_TEAM_DEADLINE_OVERRIDE }, sources: { deadlineAction: 'env' },
+    leafValues: { deadlineAction: RED_TEAM_DEADLINE_OVERRIDE }, operatorOverride: { by: overrideBy } };
+}
+export function readRedTeamDeadlineAction({ env = process.env, path = RED_TEAM_SETTINGS_FILE, log = () => {} } = {}) {
+  let file = {};
+  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* defaults */ }
+  const resolved = resolveRedTeamDeadlineAction({ file, platform: platformPreference('redTeam', { env }), env });
   log(formatCascadeSourcesLine('redTeam', resolved));
   return resolved;
 }
@@ -444,10 +480,12 @@ export function liveResultGateState(comments, pr, head, repo = null, standingRul
  * head (in thread order, as fix dispatch does; never by clocks). Null when there is none. PURE.
  */
 function firstReviewIndex(records, pr, head) {
-  const reviewed = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*${head}\\s*-->`, 'i');
+  // Only the marker name the shared parser reads counts (an earlier anchor raises the cap); an abbreviated marker
+  // does not anchor, which only lowers it.
+  const reviewed = body => [...body.matchAll(REVIEWED_SHA_FULL_RE)].some(([, s]) => s.toLowerCase() === head);
   const first = records.find(r => {
     const result = parseRedTeamComment(recordBody(r));
-    return (result?.pr === Number(pr) && result.rev === head) || reviewed.test(recordBody(r));
+    return (result?.pr === Number(pr) && result.rev === head) || reviewed(recordBody(r));
   });
   return first ? first.at : null;
 }
@@ -463,19 +501,29 @@ function operatorRuled(records, pr, head) {
   const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
+  const rulingHeads = new Set();
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
   for (let sha = head, rs = trusted, want = null; sha && rs.length;) {
     const result = latestResult(rs, pr, sha);
     // A carry hop counts only when the prior head's result is the one that was carried (same id).
     if (!result || (want && redTeamResultId(result.parsed) !== want)) return false;
+    rulingHeads.add(sha);
     want = redTeamResultId(result.parsed);
     const gates = gateRecordsFor(rs, pr, sha, result);
     const cap = gates.filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1);
-    const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
+    // Only a human operator's own clear-human comment is a ruling; an automation-posted copy (even by a trusted bot) is not.
+    const cleared = lastAt(rs, r => !r.from && isHumanOperatorComment(r.c) && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
-    if (cap && cleared && cleared.at > result.at && gates.every(r =>
+    // A plain accept of ANY head in this proven carry chain after the ceremony supersedes it.
+    // Scan the whole thread: accepts before or after a carry must survive its historical truncation.
+    // The marker may name a head abbreviated (7–40 hex, any case), as its builder and parser allow: a prefix match supersedes.
+    const reviewed = body => [...body.matchAll(REVIEWED_SHA_ANY_RE)]
+      .some(([, s]) => [...rulingHeads].some(h => h.startsWith(s.toLowerCase())));
+    const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
+      && reviewed(recordBody(r)));
+    if (cap && cleared && !reaccepted && cleared.at > result.at && gates.every(r =>
       ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
     if (gates.some(r => !r.from && [GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome))) return false;
