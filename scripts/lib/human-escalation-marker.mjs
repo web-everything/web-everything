@@ -71,8 +71,8 @@ export function buildHumanEscalationMarker({ kind, head, added = true } = {}) {
 export const neutralizeEscalationText = text => String(text ?? '').replace(/<!--/g, '<!- -').replace(/--(!?)>/g, '- -$1>');
 
 /** A short trusted comment naming the escalation, for writers that post nothing else. */
-export function buildHumanEscalationComment({ kind, head, detail = '' } = {}) {
-  const marker = buildHumanEscalationMarker({ kind, head });
+export function buildHumanEscalationComment({ kind, head, detail = '', added = true } = {}) {
+  const marker = buildHumanEscalationMarker({ kind, head, added });
   const text = neutralizeEscalationText(detail).trim();
   return [`${ESCALATION_HEADLINE} (${kind})`, ...(text ? ['', text] : []), '',
     'The conveyor lifts this hold by itself once this cause is cleared, the net diff needs no human, and no other human-only reason stands.',

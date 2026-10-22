@@ -6,6 +6,7 @@
  *   own sibling suites (`runHungCiRecoveryAllRepos`, `runMainRedRebaseAllRepos`) — per-repo isolation via
  *   injected `tick`, then a `runTickAllRepos` merge proof, then a source-contract proof.
  */
+import { buildHumanEscalationComment } from '../../../scripts/lib/human-escalation-marker.mjs';
 import { buildNoteComment } from '../../../scripts/conveyor/reconcile-note-comment.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -213,9 +214,26 @@ describe('exhausted fix parking', () => {
     }
     // A successful park also posts its escalation record (we:scripts/lib/human-escalation-marker.mjs), even when
     // the note comment itself was already posted.
+    // When review:human already stood, the cap is recorded once as `added=no` (it counts, never explains the add).
+    const standing = !dryRun && labels.includes('review:human') ? 1 : 0;
     const records = postComment.mock.calls.filter(([o]) => o.body.includes('we:human-escalation kind=round-cap'));
-    expect(records).toHaveLength(calls);
-    expect(postComment).toHaveBeenCalledTimes((alreadyPosted || dryRun ? 0 : 1) + calls);
+    expect(records).toHaveLength(calls + standing);
+    expect(records.filter(([o]) => o.body.includes('added=no'))).toHaveLength(standing);
+    expect(postComment).toHaveBeenCalledTimes((alreadyPosted || dryRun ? 0 : 1) + calls + standing);
+  });
+
+  it('a cap reached while review:human stands is recorded once per cap episode (a later grant opens a new one)', () => {
+    const note = { kind: 'round-cap-exhausted', capKind: 'fix', prNumber: 20, attempts: 5, cap: 5, parkToHuman: true };
+    const record = { author: { login: 'web-everything' }, body: buildHumanEscalationComment({ kind: 'round-cap', added: false }) };
+    const run = (comments) => {
+      const postComment = vi.fn(() => ({ ok: true }));
+      const tick = () => ({ notes: [note], prsByNumber: new Map([[20, { labels: [{ name: 'review:human' }],
+        comments: [{ body: buildNoteComment(note), author: { login: 'web-everything' } }, ...comments] }]]) });
+      runReconcileNotesAllRepos({ repos: ['we'], tick, parkToHuman: vi.fn(), postComment, dryRun: false, autoRoundGrant: () => null });
+      return postComment.mock.calls.filter(([o]) => o.body.includes('we:human-escalation')).length;
+    };
+    expect(run([])).toBe(1);
+    expect(run([record])).toBe(0);
   });
 });
 

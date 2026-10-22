@@ -154,6 +154,11 @@ describe('planHumanDeescalation', () => {
     const roundCap = bot(buildHumanEscalationComment({ kind: K.ROUND_CAP, head: HEAD }), 10_000);
     expect(plan({ pr: { comments: [roundCap, noop, grant(3_600_000)] } }).reason).toMatch(/referral-persistence-failed does not de-escalate/);
   });
+  it('a cap reached while the referral hold stood (round-cap added=no) holds until a grant follows it', () => {
+    const cap = bot(buildHumanEscalationComment({ kind: K.ROUND_CAP, head: HEAD, added: false }), 1_800_000);
+    expect(plan({ pr: { comments: [pendingRecord(), cap] } }).reason).toMatch(/round-cap not cleared/);
+    expect(plan({ pr: { comments: [pendingRecord(), cap, grant(3_600_000)] } }).action).toBe('deescalate');
+  });
   it('an added=no record never explains an add, even of a clearable kind', () => {
     const noop = bot(`Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: x.\n\n${buildHumanEscalationMarker({ kind: K.REFERRAL_LEDGER_SYNC_FAILED, head: HEAD, added: false })}`, 20_000);
     expect(plan({ pr: { comments: [noop] } }).reason).toMatch(/no escalation record/);

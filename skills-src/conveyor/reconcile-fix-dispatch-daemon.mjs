@@ -50,7 +50,8 @@ import { resolveFixSafety } from '../../scripts/conveyor/repeated-finding-reset.
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
 import { decideParkToHuman } from '../../scripts/lib/review-escalation.mjs';
-import { HUMAN_ESCALATION_KINDS, buildHumanEscalationComment } from '../../scripts/lib/human-escalation-marker.mjs';
+import { HUMAN_ESCALATION_KINDS, buildHumanEscalationComment, readHumanEscalations } from '../../scripts/lib/human-escalation-marker.mjs';
+import { roundExtensionGrants } from '../../scripts/conveyor/round-extension-mark.mjs';
 import { hostname } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -466,6 +467,20 @@ export function runReconcileNotesAllRepos({
           }
         } catch (e) {
           parking.parkError = String(e?.message ?? e).split('\n')[0];
+        }
+      } else if (n.parkToHuman && pr && !dryRun && Array.isArray(pr.comments)) {
+        // The hold already stood (another escalation, or a rule): the cap is still a cause a person (or a round
+        // grant) must answer. Record it once per cap episode as `added=no` — it counts against any de-escalation
+        // until a grant follows it, but never explains the label's add.
+        const episodeStart = roundExtensionGrants(pr.comments, { repo: pr.repo ?? repo, pr: n.prNumber }).at(-1)?.index ?? -1;
+        const recordedThisEpisode = readHumanEscalations(pr.comments)
+          .some((e) => e.kind === HUMAN_ESCALATION_KINDS.ROUND_CAP && e.index > episodeStart);
+        if (!recordedThisEpisode) {
+          const recorded = postComment({ repo, pr: n.prNumber, body: buildHumanEscalationComment({
+            kind: HUMAN_ESCALATION_KINDS.ROUND_CAP, head: pr?.headRefOid, added: false,
+            detail: `Fix rounds exhausted (${n.attempts}/${n.cap}) while review:human already stood. A round grant (\`round-extension\`) answers it.` }) });
+          parking.escalationRecorded = !!recorded?.ok;
+          if (!recorded?.ok) parking.escalationRecordError = recorded?.error ?? 'not posted';
         }
       }
       if (plan.alreadyPosted) {
