@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
-import * as fs from 'node:fs';
+import realFs, * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -19,11 +19,16 @@ import { ledgerGitPath } from '../verdict-ledger-path.mjs';
 import { buildLedgerEvent, checkLedgerAppendRows, parseLedgerEvents } from '../verdict-ledger.mjs';
 import { lockDirFor, readLockEntry } from '../../readiness/file-locks.mjs';
 
-// Use a Vitest module facade so spies reach the spool's and file-locks' named imports.
-// syncBuiltinESMExports cannot update the builtin export snapshots held by the runner.
-// Keep the real, hermetically guarded implementations behind the facade.
-vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
-const spyOnFs = (method) => vi.spyOn(fs, method);
+// Install stable mock functions before consumers import fs. Replacing an export later with
+// spyOn can leave consumers holding the original function. Keep real, guarded I/O as the
+// default implementation, and configure faults on the same functions the consumers imported.
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, ...Object.fromEntries([
+    'openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'readFileSync', 'renameSync', 'readdirSync',
+  ].map(method => [method, vi.fn(actual.default[method])])) };
+});
+const spyOnFs = (method) => vi.mocked(fs[method]).mockClear();
 
 const REPO = 'web-everything/web-everything';
 const scratch = [];
@@ -291,11 +296,11 @@ describe('outbox settings: a cascade, logged with its source', () => {
 describe('outbox publication', () => {
   it.each(['short write', 'altered read-back bytes'])('rejects %s before rename and cleans up the temporary file', (fault) => {
     const dir = outbox();
-    const realWrite = fs.writeFileSync;
+    const realWrite = realFs.writeFileSync;
     if (fault === 'short write') {
       spyOnFs('writeFileSync').mockImplementationOnce((fd, text) => realWrite(fd, text.slice(0, -2)));
     } else {
-      const realRead = fs.readFileSync;
+      const realRead = realFs.readFileSync;
       // Still valid JSON with the same payload and checksum: only byte comparison detects this.
       spyOnFs('readFileSync').mockImplementationOnce((...args) => `${realRead(...args)} `);
     }
@@ -311,7 +316,7 @@ describe('outbox publication', () => {
     const calls = [];
     const paths = new Map();
     for (const method of ['openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'readFileSync', 'renameSync']) {
-      const real = fs[method];
+      const real = realFs[method];
       spyOnFs(method).mockImplementation((...args) => {
         calls.push([method, paths.get(args[0]) ?? args[0]]);
         const result = real(...args);
@@ -368,7 +373,7 @@ describe('outbox publication', () => {
 
   it.each(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EISDIR', 'EBADF'])('tolerates unsupported directory fsync %s', (code) => {
     const dir = outbox();
-    const realSync = fs.fsyncSync;
+    const realSync = realFs.fsyncSync;
     spyOnFs('fsyncSync').mockImplementationOnce(realSync).mockImplementationOnce(() => {
       throw Object.assign(new Error('unsupported'), { code });
     });
@@ -380,7 +385,7 @@ describe('outbox publication', () => {
 
   it.each([false, true])('returns the published name on directory fsync failure (throwing logger: %s)', (throwing) => {
     const dir = outbox();
-    const realSync = fs.fsyncSync;
+    const realSync = realFs.fsyncSync;
     spyOnFs('fsyncSync').mockImplementationOnce(realSync).mockImplementationOnce(() => { throw ioError(); });
     const log = vi.fn(() => { if (throwing) throw new Error('sink failed'); });
     const name = enqueueOutboxEntry(dir, holdEntry(), { log });
