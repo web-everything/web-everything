@@ -10,6 +10,11 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, existsSync, r
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ensureLaneHooksPath, LANE_HOOKS_PATH } from '../lib/git-identity.mjs';
+import { laneStateSnapshot } from '../lib/lane-history.mjs';
+import { cleanLaneLitter } from '../lib/lane-litter.mjs';
+import { diagnoseLane } from '../lib/lane-repair.mjs';
+import { snapshotWorkTree } from '../lib/lane-salvage.mjs';
+import { gitStatusSummary } from '../lane-whois.mjs';
 
 const POOL_SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -179,6 +184,29 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
       expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('.githooks');
     } finally {
       git(['config', '--local', '--unset', 'core.fsmonitor'], lane);
+    }
+  });
+
+  it('the lane libs lane-pool calls (history snapshot, litter, repair probe, salvage, whois) run no lane-set fsmonitor (PR #5775)', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    const marker = join(base, 'lib-fsmonitor-ran');
+    const script = join(base, 'lib-marker.sh');
+    writeFileSync(script, `#!/bin/sh\necho "$0 $*" >> "${marker}"\n`);
+    chmodSync(script, 0o755);
+    git(['config', '--local', 'core.fsmonitor', script], lane);
+    writeFileSync(join(lane, 'untracked-wip.txt'), 'dirty\n'); // dirty, so salvage stages and writes a wip tree
+    const refs = { head: 'refs/salvage/fsmon/head', wip: 'refs/salvage/fsmon/wip' };
+    try {
+      expect(laneStateSnapshot(lane, 'origin/main').dirty).toBe(1);
+      expect(gitStatusSummary(lane)).not.toBeNull();
+      expect(diagnoseLane(lane).ok).toBe(true);
+      cleanLaneLitter(lane);
+      expect(snapshotWorkTree(lane, { refs, branchRef: 'origin/main' }).wipSha).toMatch(/^[0-9a-f]{40}$/);
+      expect(existsSync(marker) ? readFileSync(marker, 'utf8') : '').toBe('');
+    } finally {
+      git(['config', '--local', '--unset', 'core.fsmonitor'], lane);
+      rmSync(join(lane, 'untracked-wip.txt'), { force: true });
+      for (const r of Object.values(refs)) spawnSync('git', ['update-ref', '-d', r], { cwd: lane });
     }
   });
 

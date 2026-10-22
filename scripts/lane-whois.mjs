@@ -48,6 +48,7 @@ import { join, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { guardedPoolRoot } from './lib/lane-pool-paths.mjs';
+import { laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
 import { LEASE_FILENAME, isLeaseStale, describeLease, laneHolderSlug, DEFAULT_LEASE_TTL_MINUTES } from './lib/lane-lease.mjs';
 import { readLaneHistory, lastLaneHistoryEntry, readLaneJournal } from './lib/lane-history.mjs';
 import { claudeProjectsRoot, summarizeLaneTouches } from './lib/lane-transcript-attribution.mjs';
@@ -106,12 +107,12 @@ const PR_CACHE_TTL_MS = Number(process.env.WE_LANE_WHOIS_PR_CACHE_TTL_MS) || 60_
 /** Read-only `git`. Never throws - a probe failure just means "unknown", never a crash. Hard-timed (see above)
  *  so one wedged lane (corrupt object DB, an fsmonitor hook that hangs, an NFS-mounted clone gone stale) can
  *  never stall the whole pool sweep — the same failure shape a `null` return already handles everywhere else
- *  in this file. */
+ *  in this file. The lane hardening pins keep a lane-set `core.fsmonitor` from running on `status` (PR #5775). */
 function tryGit(dir, args, opts = {}) {
   try {
     return execFileSync('git', args, {
       cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,
+      timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL', env: laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' }), ...opts,
     }).replace(/\n+$/, '');
   } catch {
     return null;
