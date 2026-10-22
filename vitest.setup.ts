@@ -102,6 +102,9 @@ if (process.env.WE_TEST_SANDBOX !== '0') {
     if (ENV_STRIP_ALLOWLIST.has(key)) continue;
     if (ENV_STRIP_PREFIXES.some((p) => key.startsWith(p))) delete process.env[key];
   }
+  // PR #5729 — a launchd daemon parent (`com.we.*` / `com.plateau.*`) marks every child a gh daemon caller
+  // (`isDaemonCaller`), which turns fail-soft paths into refusals. Ambient daemon state, so stripped like the rest.
+  if (/^(com\.we\.|com\.plateau\.)/.test(process.env.XPC_SERVICE_NAME || '')) delete process.env.XPC_SERVICE_NAME;
 }
 
 // HERMETIC BY DEFAULT (card xcu4cqf — main was red ~5.5 h on 2026-10-08 because a soak scenario read live GitHub
