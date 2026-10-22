@@ -128,7 +128,7 @@ import { CONTROL_OPS, operatorControlOperation, finishOperatorControl } from './
 import { createOperatorControlsReader, createOperatorControlsSinks } from './operator-controls-io.mjs';
 // The operator's audited auto-repair round extension (cap + granted rounds, read by reconcile-core).
 import { extendRoundsOperation, EXTEND_ROUNDS_OP } from './extend-rounds.mjs';
-import { createExtendRoundsReader, createExtendRoundsSinks } from './extend-rounds-io.mjs';
+import { createExtendRoundsReader, createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 // #4979 — the sanctioned writer of an OPERATOR's block/card/not-real ruling on a PR's mandatory referrals.
 import { recordReferralRulingOperation, RECORD_REFERRAL_RULING_OP } from './record-referral-ruling.mjs';
 import { createRecordReferralRulingReader, createRecordReferralRulingSinks } from './record-referral-ruling-io.mjs';
@@ -137,6 +137,9 @@ import { createLandHumanOnlyReader, createLandHumanOnlySinks } from './land-huma
 import { createClearStuckSessionReader, createClearStuckSessionSinks } from './clear-stuck-session-io.mjs';
 import { docketRefreshOperation, DOCKET_REFRESH_OP, finishDocketOutcome } from './docket-refresh.mjs';
 import { createDocketRefreshReader, createDocketRefreshSinks } from './docket-refresh-io.mjs';
+import { prSweepOperation, PR_SWEEP_OP } from './pr-sweep.mjs';
+import { assessPrSweep, finishPrSweep } from './pr-sweep-core.mjs';
+import { createPrSweepReader } from './pr-sweep-io.mjs';
 import { perfSnapshotOperation, PERF_SNAPSHOT_OP, finishPerfSnapshot } from './perf-snapshot.mjs';
 import { createPerfSnapshotReader, createPerfSnapshotSinks } from './perf-snapshot-io.mjs';
 // #3892 (epic #3443 graduation slice) — the SAFE conveyor restart, ported from `origin/lane/mechanical-dispatcher`.
@@ -268,7 +271,7 @@ export const OPERATIONS = Object.freeze({
   // read → plan → write: the operator's audited round extension, read back through the cap's own counter.
   [EXTEND_ROUNDS_OP]: () => ({
     declaration: extendRoundsOperation({ readExtensionContext: createExtendRoundsReader() }),
-    sinks: createExtendRoundsSinks(),
+    sinks: createExtendRoundsSinks({ regate: runRedTeamGateForPr }),
   }),
   // #4979 — read → plan → write: the operator's referral ruling, pinned to the live head, read back through the gate.
   [RECORD_REFERRAL_RULING_OP]: () => ({
@@ -523,6 +526,14 @@ export const OPERATIONS = Object.freeze({
     sinks: createDocketRefreshSinks(),
     finish: finishDocketOutcome,
   }),
+  // Read-only (every step is compute, no sinks): for EVERY open PR, one `waitingOn` state + actor + since, folded from
+  // labels, hold comments, red-team gate records, the drain's skip reasons and live review/fix jobs; STALLED rows carry
+  // the exact next command. `finish` prints the table; `--json` carries the same report as the verdict.
+  [PR_SWEEP_OP]: () => ({
+    declaration: prSweepOperation({ readSweep: createPrSweepReader(), assess: assessPrSweep }),
+    sinks: {},
+    finish: finishPrSweep,
+  }),
   // Held card 119 — the repeatable, no-LLM perf snapshot: recomputes the Opus perf sweep's numbers (verify markers,
   // heavy-admission records, build-dispatch tick log, CI via gh, coroner changeRequests, fix outcomes, executor
   // receipts), appends ONE schema-versioned row to `.operations/metrics/perf/snapshots.jsonl` (knob `--store`), keeps
@@ -628,7 +639,9 @@ export function resolveOperation(name, opts = {}) {
   const build = Object.hasOwn(OPERATIONS, String(name ?? '')) ? OPERATIONS[name] : undefined;
   if (typeof build !== 'function') {
     throw new Error(
-      `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`,
+      `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`
+      + ' — if this checkout is behind origin/main, update it with `git pull --ff-only origin main`.'
+      + ' After updating, land-human-only can run from a fresh lane: node scripts/run-fresh.mjs land-human-only …',
     );
   }
   // `finish` is OPTIONAL (most builders omit it): a per-operation post-process over `runOperationCli`'s
@@ -713,7 +726,7 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: controlPolicy.zeroWrites || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
@@ -723,7 +736,7 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

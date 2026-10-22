@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/lib/build-policy.mjs", "we:scripts/verify-lane.mjs", "we:backlog/x7utze6-decide-codex-self-review-and-gate-per-caller-class.md", "we:scripts/codex-direct-task.mjs", "we:scripts/lib/build-self-review.mjs", "we:skills-src/coroner/SKILL.md", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs", "we:scripts/lib/__tests__/build-policy.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/__tests__/codex-direct-task.test.mjs", "we:scripts/lib/__tests__/build-self-review.test.mjs"]
+scope: ["we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/lib/build-policy.mjs", "we:scripts/verify-lane.mjs", "we:backlog/6925-decide-codex-self-review-and-gate-per-caller-class.md", "we:scripts/codex-direct-task.mjs", "we:scripts/lib/build-self-review.mjs", "we:skills-src/coroner/SKILL.md", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs", "we:scripts/lib/__tests__/build-policy.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/__tests__/codex-direct-task.test.mjs", "we:scripts/lib/__tests__/build-self-review.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---

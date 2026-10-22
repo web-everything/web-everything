@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5358-wip-deep-links-card-n-highlights-a-card-agent-session-opens.md"]
+scope: ["we:scripts/check-backlog-item.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/operations/prepare-stamp-land.mjs", "we:scripts/__tests__/check-backlog-item.test.mjs", "we:scripts/operations/__tests__/prepare-stamp-land.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -20,7 +20,11 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+1. **Executable** — planned `we:scripts/__tests__/check-backlog-item.test.mjs` → `rejects_completed_preparation_with_acceptance_placeholders`: a fixture attempting completed preparation or open-to-ready activation with executable Acceptance/Done-when TODOs is rejected with the exact item/criterion identified; fully authored fixtures pass. Cover both section names and numbered/[A#] forms. When implemented, run `npm run test:unit -- <test-file>` from WE using this planned file's path after the `we:` prefix.
+2. **Executable** — planned `we:scripts/__tests__/check-backlog-item.test.mjs` → `requires_repository_case_and_observable_assertion_per_guarantee`: remove the repository-qualified planned file, named case, observable assertion or guarantee mapping in turn from acceptance and behavioral edge-case fixtures. Each omission fails completion; a complete mapping (including a planned file not yet created) passes. Merely naming a test elsewhere in prose cannot satisfy an unmapped guarantee.
+3. **Executable** — planned `we:scripts/__tests__/check-backlog-item.test.mjs` → `requires_omitted_setting_default_case`: a configurable default guarantee with only explicit-value tests fails; adding a named omitted-setting case and observable default/source assertion passes. Missing, malformed and explicit values require their own applicable mappings.
+4. **Executable** — planned `we:scripts/operations/__tests__/prepare-stamp-land.test.mjs` → `preparation_cannot_stamp_or_activate_invalid_test_plan`: drive the actual preparation/stamp transition with each invalid fixture above; assert no completion stamp or ready/active transition is published. A valid fixture completes. Run with `npm run test:unit -- <test-file>` using this planned file's path after `we:` when implemented.
+5. **Must** — mapping validation is deterministic and does not pretend to judge whether an assertion proves the guarantee. Preparation review must separately assess assertion adequacy, including caller wiring and error/recovery paths. Open unprepared drafts may remain filed without being stamped ready.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -30,16 +34,17 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — validate parsed criterion/mapping structure, never execute card text; planned `we:scripts/__tests__/check-backlog-item.test.mjs` → `mapping_text_is_data`: shell-like strings cannot execute and invalid mapping fields are rejected. No HTTP endpoint is added.
+2. **Truncated reads** — planned `we:scripts/__tests__/check-backlog-item.test.mjs` → `partial_mapping_cannot_complete_preparation`: truncated/empty sections fail with the missing field identified.
+3. **Shared state files** — planned `we:scripts/operations/__tests__/prepare-stamp-land.test.mjs` → `changed_card_is_revalidated_before_stamp`: change the card after initial validation; the final invalid bytes are refused without a stamp/activation.
+4. **Fail closed** — validator read/parse failures cannot publish completion; planned `we:scripts/operations/__tests__/prepare-stamp-land.test.mjs` → `validation_failure_prevents_completion`: inject each failure and assert no stamp or status advance.
+5. **Identity scoping** — mappings bind each behavioral guarantee ID to its own file/case/assertion (`requires_repository_case_and_observable_assertion_per_guarantee`).
+6. **State over time** — open drafts stay fileable, but every completion/activation revalidates; planned `we:scripts/operations/__tests__/prepare-stamp-land.test.mjs` → `draft_can_be_filed_but_not_promoted_with_todos`: filing succeeds, completion/activation fails until mappings are supplied.
+7. **Who wrote it** — all preparation publication routes use the same validation (`preparation_cannot_stamp_or_activate_invalid_test_plan`); assertion adequacy remains a review obligation.
 
 ## Also raised by
 
+- Also raised by web-everything/web-everything#5742 (2026-10-20 advisory, correctness/coverage): reject completed preparation with executable Acceptance TODOs or behavioral guarantees lacking a repository-qualified planned test, named case and observable assertion, including omitted-setting defaults. The cases above are implementation debt, not a claim that this gate already exists.
 - Also raised by web-everything/web-everything#4988 (finding 1: `we:backlog/5919-drain-confirm-a-pr-is-merged-before-recording-it-as-landed.md:34` — Add a deterministic backlog validation gate requiring each behavioral edge-case requirement to reference a concrete planned test, repository-qualified file, and observable assertion.) · key `approval-prevention-key:web-everything/web-everything#4988@478e38ad58368f3169ae3e0d590ddabf1a67b0c5`
 - Also raised by web-everything/web-everything#5304 (finding 1: `we:backlog/6135-daemon-smoke-dry-runs-get-their-own-gh-budget-or-a-recorded.md:30` — Add a deterministic backlog validation gate requiring each behavioral constraint to reference a planned test file, named case, and observable assertion; review whether those assertions actually establish the constraint.) · key `approval-prevention-key:web-everything/web-everything#5304@06d68c108737a620799e952941d591d703e9aed3`
 - Also raised by web-everything/web-everything#5311 (finding 2: `we:backlog/6132-grouped-builds-a-single-digit-member-id-must-not-drop-resolu.md:12` — Add a card-validation gate requiring each behavioral acceptance constraint to reference a planned test file, named case, and observable assertion; review whether those assertions actually exercise each constraint.)
@@ -97,3 +102,7 @@ One line per class: either the handling, or `n/a: <why>`.
 - Also raised by web-everything/web-everything#5632 (finding 1: `we:backlog/6346-the-needs-you-cursor-must-verify-earlier-log-records-not-onl.md:12` — Add a deterministic card-validation gate requiring each behavioral acceptance criterion to reference a planned test file, named case, and observable assertion.) · key `approval-prevention-key:web-everything/web-everything#5632@29017fd067abf7f7061465d6828705a7f9bd9eab`
 - Also raised by web-everything/web-everything#5632 (finding 4: `we:backlog/6349-mixed-test-gaming-reasons-are-admitted-by-the-route.md:12` — Add a card-validation gate requiring named planned tests and assertions for each admission/refusal criterion.)
 - Also raised by web-everything/web-everything#5632 (finding 7: `we:backlog/6352-a-non-prefixed-review-pr-run-id-is-refused-cleanly-not-with.md:12` — Add deterministic card validation requiring each behavioral criterion to map to a planned test file, named case, and asserted outcome.)
+- Also raised by web-everything/web-everything#5635 (finding 1: `we:backlog/6363-run-record-retention-tiered-prune-and-archive-of-old-operati.md:30` — Add a deterministic card-validation gate requiring each acceptance guarantee to reference a repository-qualified test file, named existing or planned case, and observable assertion.) · key `approval-prevention-key:web-everything/web-everything#5635@e149de6b62b83b861011375da5878c7e337c0620`
+- Also raised by web-everything/web-everything#5675 (finding 1: `we:backlog/6438-prevention-add-a-prepare-time-gate-that-refuses-to-start-a-s.md:22` — Implement the deterministic preparation-transition gate already tracked by cards #5360, #5473 and #5668: reject unresolved executable Acceptance placeholders and require each behavioral obligation to identify a repository-qualified test file, named planned or implemented case, and observable assert…) · key `approval-prevention-key:web-everything/web-everything#5675@40779c7b901432b0fc45c6f819dc1dbd0ac4c9fd`
+- Also raised by web-everything/web-everything#5648 (finding 1: `we:backlog/6410-we-prototype-rollout-runs-a-guard-audit-and-a-running-loader.md:17` — Add a deterministic card-validation gate requiring each acceptance and behavioral-constraint ID to map to a repository-qualified test file, named planned case, and observable assertion; review whether each assertion actually pins its constraint.) · key `approval-prevention-key:web-everything/web-everything#5648@302a0ee1b51ed8034311afbfa0e04491aaa12b29`
+- Also raised by web-everything/web-everything#5634 (finding 1: `we:backlog/6326-red-team-follow-ups-from-web-everything-web-everything-5510.md:21` — Implement the deterministic preparation gate already filed in cards 5360 and 5473: before activation, reject unresolved executable Acceptance placeholders and require each behavioral obligation to map to a repository-qualified test file, named planned or implemented case, and observable assertion. …) · key `approval-prevention-key:web-everything/web-everything#5634@33c0550c61315b2c5128c8baccfdb5dcd2641b28`

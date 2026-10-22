@@ -1067,6 +1067,7 @@
   "scripts/conveyor/soak/breaks/claude-auth-dispatch-pause.soak.test.mjs": 75.31,
   "scripts/conveyor/soak/breaks/claude-auth-expired.soak.test.mjs": 50.31,
   "scripts/conveyor/soak/breaks/claude-auth-false-positive.soak.test.mjs": 55.15,
+  "scripts/conveyor/soak/breaks/clear-human-automation-poster.soak.test.mjs": 8.76,
   "scripts/conveyor/soak/breaks/clone-reader-starved.soak.test.mjs": 8.24,
   "scripts/conveyor/soak/breaks/compare-without-files-never-trusted.soak.test.mjs": 92.81,
   "scripts/conveyor/soak/breaks/conflicting-head-missing-checks-refused.soak.test.mjs": 0.9,
@@ -1148,6 +1149,8 @@
   "scripts/conveyor/soak/breaks/stacked-pr-missing-checks-refused.soak.test.mjs": 0.76,
   "scripts/conveyor/soak/breaks/stale-fixing-label-ci-heal-owed.soak.test.mjs": 30.95,
   "scripts/conveyor/soak/breaks/stalled-label-freezes-whole-build-queue.soak.test.mjs": 0.01,
+  "scripts/conveyor/soak/breaks/stalled-review-feed-poll.soak.test.mjs": 0.05,
+  "scripts/conveyor/soak/breaks/stalled-review-pre-advise-crash.soak.test.mjs": 0.12,
   "scripts/conveyor/soak/breaks/standdown-pr-holds-scope-slot.soak.test.mjs": 80.48,
   "scripts/conveyor/soak/breaks/sticky-smoke-rejection.soak.test.mjs": 253.36,
   "scripts/conveyor/soak/breaks/superseded-pr-dispatched.soak.test.mjs": 10.14,
@@ -1191,6 +1194,11 @@
   "scripts/conveyor/soak/breaks/superseded-pr-dispatched.soak.test.mjs": 0.76,
   "scripts/conveyor/soak/breaks/takeover-void-cancels-later-retry.soak.test.mjs": 0.32,
   "scripts/conveyor/soak/breaks/withdrawn-operator-block-directs-takeover.soak.test.mjs": 0.53,
+  "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.soak.test.mjs": 15.28,
+  "scripts/conveyor/soak/breaks/review-fast-checks-strand-sibling-repos.soak.test.mjs": 5.24,
+  "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.soak.test.mjs": 9.01,
+  "scripts/conveyor/soak/breaks/review-timing-optional-red-drops-reviewer-liveness.soak.test.mjs": 8.8,
+  "scripts/conveyor/soak/breaks/review-timing-refused-review-strands-heal.soak.test.mjs": 8.81,
   "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96
  }
 }

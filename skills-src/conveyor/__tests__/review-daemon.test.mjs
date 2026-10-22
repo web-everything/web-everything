@@ -6,7 +6,7 @@ import { readReviewCiGate } from '../../../scripts/lib/review-ci-gate-io.mjs';
  *   and the per-tick sequence, both with every effect injected (no real gh/claude, no real lease/timer).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -45,6 +45,7 @@ import {
   REVIEW_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS, defaultReapSessions, hasStaleMainRefusal, defaultAcquirableLaneCount,
   explainPendingNotDispatched, priorityNamesForLiveProcessPrs, runConvertAdvisoryTick, runConvertAdvisoryTickAllRepos,
   resolveConvertAdvisoryEnabled, sweepReviewHolds, operatorHoldsFromPlan, formatOperatorHoldsRecord, OPERATOR_HOLD_KINDS,
+  countLiveReviewRounds,
 } from '../review-daemon.mjs';
 import { planReviewDispatch } from '../../../scripts/operations/review-dispatch.mjs';
 import { tagReviewStatus } from '../../../scripts/conveyor/review-status-tag.mjs';
@@ -62,6 +63,248 @@ const noPrepReview = () => null;
 /** The `review-status:*` writes only (the same writer also keeps the one `status:*` label, pr-status-label.mjs). */
 const reviewStatusCalls = (calls) => calls.filter((c) => !(String(c.spec?.add ?? '').startsWith('status:')
   || (!c.spec?.add && (c.spec?.remove ?? []).length && c.spec.remove.every((r) => r.startsWith('status:')))));
+
+describe('live review cap with Node configuration options', () => {
+  it.each([
+    'node scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+    'node ./scripts/verify-lane.mjs run --files=scripts/operations/review-loop-cli.mjs',
+    'node scripts/verify-lane.mjs --files=scripts/operations/review-job.mjs',
+    'node scripts/verify-lane.mjs run --files scripts/operations/review-loop-cli.mjs',
+    'node scripts/verify-lane.mjs run --files="scripts/operations/review-job.mjs"',
+    'node scripts/verify-lane.mjs run --files=skills-src/Review Work/review-job.mjs',
+    'node scripts/verify-lane.mjs run --repo=/tmp/Review Work --files=../Wörk/`source`/review-loop-cli.mjs --json',
+    'node scripts/verify-lane.mjs run --files=Review\rWork/review-job.mjs',
+    'node scripts/verify-lane.mjs run --files=Review\u2028Work/review-job.mjs',
+    'node -r ./package.json scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+    'node -r ./package.json -r ./boot.cjs scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+    'node --require=./package.json --import=./boot.mjs scripts/verify-lane.mjs --files=scripts/operations/review-job.mjs',
+    'node -r ./package.json --no-warnings scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+    'node -r ./package.json -- scripts/verify-lane.mjs run --files=scripts/operations/review-loop-cli.mjs',
+    'node -r ./package.json --stack-size=1024 scripts/verify-lane.mjs --files=scripts/operations/review-job.mjs',
+    'node --title worker scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+    'node --openssl-config ./openssl.cnf scripts/verify-lane.mjs run --files=scripts/operations/review-loop-cli.mjs',
+    'nodejs scripts/verify-lane.mjs run --files=scripts/operations/review-loop-cli.mjs',
+    'bun scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+  ])('keeps three review seats available for a relative verifier: %s', async command => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => `101 1 ${command}` });
+    const before = { live: budget.live, left: budget.left };
+    const dispatch = vi.fn(() => ({ agentId: 'started-review' }));
+    const tick = runReviewTickAllRepos({ repos: ['review-cap-fixture/healthy'], liveReviewBudget: budget,
+      authGateOverride: () => ({ paused: false, reason: null }),
+      reconcile: () => ({ dispatch: [1, 2, 3].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }),
+      dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      acquirableLanes: () => 40 });
+    expect({ ...before, dispatched: tick.dispatched.length, deferred: tick.deferredForCap })
+      .toEqual({ live: 0, left: 3, dispatched: 3, deferred: 0 });
+    expect(dispatch).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    'node scripts/verify-lane.mjs Work/scripts/operations/review-job.mjs --files=changed.mjs',
+    'node scripts/verify-lane.mjs Work/scripts/operations/review-job.mjs run --files=changed.mjs',
+    'node -r ./Boot.json Work/boot.cjs scripts/verify-lane.mjs --files=scripts/operations/review-job.mjs',
+    'node -r ./package.json --unknown-option value scripts/verify-lane.mjs --files=scripts/operations/review-job.mjs',
+  ])('keeps unexplained path fragments outside the verifier signature ambiguous: %s', async command => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => command }))
+      .toMatchObject({ left: 0, reason: expect.stringContaining('unknown') });
+  });
+
+  it('still counts independent reviews beside a relative verifier file list', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => [
+      '101 1 node scripts/verify-lane.mjs run --files=scripts/operations/review-job.mjs',
+      '102 1 node scripts/operations/review-job.mjs run --pr=1',
+      '103 1 node scripts/operations/review-loop-cli.mjs --pr=2',
+    ].join('\n') })).toMatchObject({ live: 2, left: 1 });
+  });
+
+  it('resolves absolute runtime paths without consuming a utility argument and holds conflicting paths', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'review-runtime-paths-'));
+    const prefix = join(root, 'Node');
+    const runtime = join(`${prefix} Tools`, 'bin', 'node');
+    const budget = tail => liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => [101, 102, 103].map(pr => `${pr} 1 ${runtime} ${tail} --pr=${pr}`).join('\n') });
+    try {
+      mkdirSync(join(`${prefix} Tools`, 'bin'), { recursive: true });
+      writeFileSync(runtime, '');
+      expect(budget('scripts/operations/review-loop-cli.mjs')).toMatchObject({ live: 3, left: 0 });
+      expect(budget('--require=./package.json scripts/operations/review-loop-cli.mjs'))
+        .toMatchObject({ live: 3, left: 0 });
+      expect(budget('"scripts/verify-lane.mjs" --files=scripts/operations/review-loop-cli.mjs'))
+        .toMatchObject({ live: 0, left: 3 });
+      writeFileSync(prefix, '');
+      expect(budget('scripts/operations/review-loop-cli.mjs'))
+        .toMatchObject({ left: 0, reason: expect.stringContaining('unknown') });
+      rmSync(runtime);
+      // Only the extensionless utility prefix exists; its arguments mention node and a review.
+      expect(budget('scripts/operations/review-loop-cli.mjs')).toMatchObject({ live: 0, left: 3 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    '/Applications/Node Tools/bin/node',
+    './Node Tools/bin/nodejs',
+    '../Bun Tools/bin/bun',
+    'Node Tools/bin/node',
+    '/Applications/Node -Tools/bin/node',
+    '/Applications/node -e Tools/bin/node',
+    './node --print Tools/bin/node',
+    'bun -p Tools/bin/bun',
+    '/Applications/Node\tTools/bin/electron',
+    '/Applications/Node\rTools/bin/node',
+    '/Applications/Node\u2028Tools/bin/node',
+    '/Applications/Nöde\u200b Tools/bin/node',
+    '/Applications/Node `Tools`/bin/node',
+    '/Applications/Node \\Tools/bin/node',
+    '"/Applications/Node Tools/bin/node"',
+  ])('holds dispatch for reviews behind a spaced runtime path: %s', async runtime => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => [101, 102, 103].map(pr =>
+        `${pr} 1 ${runtime} scripts/operations/review-loop-cli.mjs --pr=${pr}`).join('\n') });
+    expect(budget.left).toBe(0);
+    const dispatch = vi.fn();
+    const tick = runReviewTickAllRepos({ repos: ['review-cap-fixture/healthy'], liveReviewBudget: budget,
+      authGateOverride: () => ({ paused: false, reason: null }),
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 104 }], refusals: [] }),
+      dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      acquirableLanes: () => 40 });
+    expect(tick.deferredForCap).toBe(1);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    './Review -Work/scripts/operations/review-loop-cli.mjs',
+    '../Review --Work/scripts/operations/review-job.mjs',
+    'Review --files=Work/scripts/operations/review-loop-cli.mjs',
+    './Review ./Work/scripts/operations/review-loop-cli.mjs',
+    './Review ../Work/scripts/operations/review-loop-cli.mjs',
+    './Review - Work/scripts/operations/review-loop-cli.mjs',
+    '-r ./Boot -Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+    './Review.mjs Work/scripts/operations/review-loop-cli.mjs',
+    '../Review.cjs Work/scripts/operations/review-job.mjs',
+    'Review.js Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs\tWork/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs\rWork/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs\u2028Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs\u2029Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs Wörk/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs -Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs --files=Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs ./Work/scripts/operations/review-loop-cli.mjs',
+    './Review.mjs ../Work/scripts/operations/review-loop-cli.mjs',
+    '-r ./Boot.json Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+    '--require=../Boot.node Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+    '--import=./Boot.mjs Work/boot.mjs scripts/operations/review-loop-cli.mjs',
+    '-r ./Boot.json Work/boot.cjs -- scripts/operations/review-loop-cli.mjs',
+    '-r ./Boot.json Work/boot.cjs -r ./second.cjs scripts/operations/review-loop-cli.mjs',
+    '-r ./Boot.json -Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+    '--require=./Boot.json ./Work/boot.cjs scripts/operations/review-loop-cli.mjs',
+    '-r Boot.json Work/boot.hook ./scripts/operations/review-loop-cli.mjs',
+    '--import Boot.mjs Work/boot.mjs ./scripts/operations/review-loop-cli.mjs',
+    './review-loop-cli.mjs Work/scripts/operations/review-job.mjs',
+    './review-job.mjs Work/scripts/operations/review-loop-cli.mjs',
+  ])('holds dispatch for flattened relative paths with ambiguous directory fragments: %s', async argv => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => [1, 2, 3].map(pr => `${100 + pr} 1 node ${argv} --pr=${pr}`).join('\n') });
+    const leftBeforeTick = budget.left;
+    const dispatch = vi.fn(() => ({ agentId: 'unexpected-review' }));
+    const tick = runReviewTickAllRepos({ repos: ['review-cap-fixture/healthy'], liveReviewBudget: budget,
+      authGateOverride: () => ({ paused: false, reason: null }),
+      reconcile: () => ({ dispatch: [1, 2, 3].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }),
+      dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      acquirableLanes: () => 40 });
+    expect({ left: leftBeforeTick, dispatched: tick.dispatched.length, deferred: tick.deferredForCap })
+      .toEqual({ left: 0, dispatched: 0, deferred: 3 });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each(['--openssl-config', '--icu-data-dir', '--redirect-warnings', '--diagnostic-dir'])
+  ('skips the value of %s before locating the entrypoint', async flag => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'review-node-options-'));
+    const config = join(root, 'openssl.cnf');
+    writeFileSync(config, '');
+    try {
+      for (const option of [`${flag} ${config}`, `${flag} "${config}"`, `${flag}='${config}'`,
+        `${flag}=${config}`, `${flag.replaceAll('-', '_').replace(/^__/, '--')} ${config}`]) {
+        const commands = [1, 2, 3].map(pr =>
+          `${100 + pr} 1 node ${option} scripts/operations/review-loop-cli.mjs --pr=${pr}`);
+        expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+          listCommands: () => commands.join('\n') }), option).toMatchObject({ live: 3, left: 0 });
+        // Unquoted output paths may not exist yet: they cannot disambiguate a verifier entrypoint from
+        // a script-looking fragment inside the value. Explicit quotes can disambiguate either kind.
+        const ambiguousOutput = ['--redirect-warnings', '--diagnostic-dir'].includes(flag) && !/["']/.test(option);
+        expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+          listCommands: () => `node ${option} ${join(process.cwd(), 'scripts/verify-lane.mjs')} --files=scripts/operations/review-loop-cli.mjs` }),
+        option).toMatchObject(ambiguousOutput ? { left: 0, reason: expect.stringContaining('unknown') } : { live: 0, left: 3 });
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['--future-value /tmp/openssl.cnf', '--logfile /tmp/v8.log', '--future-value=/tmp/with space/config.cnf'])
+  ('holds dispatch when an unknown option could hide the script: %s', async option => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => `node ${option} scripts/operations/review-loop-cli.mjs` }))
+      .toMatchObject({ left: 0, reason: expect.stringContaining('unknown') });
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => `node ${option} scripts/verify-lane.mjs` })).toMatchObject({ live: 0, left: 3 });
+  });
+
+  it.each(['--no-warnings', '--inspect=127.0.0.1:9229', '--enable-source-maps --max-old-space-size 4096',
+    '--trace-gc', '--dns-result-order ipv4first --unhandled-rejections strict'])
+  ('distinguishes reviews from verifier arguments after known options: %s', async option => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    for (const [entry, live] of [['scripts/operations/review-job.mjs', 1], ['scripts/verify-lane.mjs', 0]]) {
+      expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+        listCommands: () => `node ${option} ${join(process.cwd(), entry)} --files=scripts/operations/review-loop-cli.mjs` }))
+        .toMatchObject({ live, left: 3 - live });
+    }
+  });
+
+  it('resolves flattened spaced option paths and holds ambiguous text values', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'review-option-spaces-'));
+    const config = join(root, 'config dir', 'openssl.js');
+    mkdirSync(join(root, 'config dir'));
+    writeFileSync(config, '');
+    const budget = option => liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => [1, 2, 3].map(pr =>
+        `${100 + pr} 1 node ${option} scripts/operations/review-loop-cli.mjs --pr=${pr}`).join('\n') });
+    try {
+      for (const option of [`--openssl-config ${config}`, `--openssl-config=${config}`,
+        `--icu-data-dir ${join(root, 'config dir')}`, `--openssl-config "${config}"`]) {
+        expect(budget(option), option).toMatchObject({ live: 3, left: 0 });
+      }
+      // A prefix that also exists makes the flattened value impossible to recover with certainty.
+      writeFileSync(join(root, 'config'), '');
+      expect(budget(`--openssl-config ${config}`)).toMatchObject({ left: 0, reason: expect.stringContaining('unknown') });
+      expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+        listCommands: () => `node --openssl-config ${config} scripts/verify-lane.mjs` }))
+        .toMatchObject({ live: 0, left: 3 });
+      for (const option of ['--openssl-config ./config dir/openssl.js', '--title worker dir/worker.js',
+        '--conditions custom dir/condition.js', '--conditions custom -e', '--conditions /tmp -e',
+        '--openssl-config ./config -e /openssl.cnf', '--conditions custom --require',
+        '--redirect-warnings /tmp -e']) {
+        expect(budget(option), option).toMatchObject({ left: 0, reason: expect.stringContaining('unknown') });
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('does not deduplicate a job whose condition contains a loop filename', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '2' }, listCommands: () => [
+      '101 1 node scripts/operations/review-job.mjs',
+      '102 101 node --conditions custom fake/review-loop-cli.mjs scripts/operations/review-job.mjs',
+    ].join('\n') })).toMatchObject({ left: 0, reason: expect.stringContaining('unknown') });
+  });
+});
 
 describe('hasStaleMainRefusal', () => {
   const staleMessage = () => {
@@ -277,7 +520,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     expect(tagRound).toHaveBeenCalledWith({ pr: 10, repo: expect.any(String), round: 2 }); // attempts+1
     expect(out).toEqual({
       reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], notStarted: [], refusals: 0,
-      pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForAuth: 0, authPaused: false, authPauseReason: null,
+      pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForCap: 0, deferredForCapReason: null, deferredForAuth: 0, authPaused: false, authPauseReason: null,
       staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: [], holdReconcileError: null, liveProcessPrs: [], operatorHolds: { observedAt: 7, holds: [] },
     });
@@ -596,6 +839,280 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     });
     expect(dispatch).not.toHaveBeenCalled();
     expect(out.deferredForLanes).toBe(3);
+  });
+
+  it('EMERGENCY live-review cap: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => '101 1 node scripts/operations/review-job.mjs --pr=1\n102 101 node x/review-loop-cli.mjs\n103 1 node other.mjs\n' });
+    expect(budget).toMatchObject({ live: 1, max: 3, left: 2 });
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    for (let i = 0; i < 2; i++) runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, liveReviewBudget: budget });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    const closed = liveReviewRoundBudget({ env: {}, listCommands: () => { throw Error('ps failed'); } });
+    expect(closed.left).toBe(0);
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '5' }, listCommands: () => '' })).toMatchObject({ max: 5, left: 5 });
+  });
+
+  it('live-review cap counts only processes RUNNING a review script, never one that names it in an argument (live 2026-10-20)', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const ps = [
+      'node /snap/scripts/verify-lane.mjs --repo=/x --files=scripts/operations/review-job.mjs,scripts/operations/review-loop-cli.mjs',
+      'node /snap/scripts/verify-lane.mjs --files=["scripts/operations/review-job.mjs"]',
+      '101 1 /usr/local/bin/node /clone/scripts/operations/review-job.mjs run --pr=5766',
+      '102 101 node scripts/operations/review-loop-cli.mjs --pr=5766 --repo=a/b',
+      'grep review-job.mjs',
+      'vim scripts/operations/review-loop-cli.mjs',
+    ].join('\n');
+    expect(liveReviewRoundBudget({ env: {}, listCommands: () => ps })).toMatchObject({ live: 1, max: 3, left: 2 });
+    // a preload / loader value is not the script; other node runtimes and a direct (shebang) run still count
+    const preloaded = [
+      'node --import ./boot.mjs scripts/operations/review-loop-cli.mjs --pr=1',
+      'node -r ./boot.cjs --max-old-space-size=4096 scripts/operations/review-loop-cli.mjs --pr=2',
+      '/usr/bin/nodejs scripts/operations/review-loop-cli.mjs --pr=3',
+      '/clone/scripts/operations/review-loop-cli.mjs --pr=4',
+    ].join('\n');
+    expect(liveReviewRoundBudget({ env: {}, listCommands: () => preloaded })).toMatchObject({ live: 4, left: 0 });
+  });
+
+  it.each(['-r ./package.json', '--require ./package.json', '--require=./package.json',
+    '-r "./package.json"', "-r './package.json'", '-r ../Boot Work/package.json',
+    '-r ./bootstrap.hook', '-r ./native.node', '-r ./package', '--require=./package',
+    '-r ./bootstrap/', '-r ./package.json -r ./boot.cjs',
+    '-r ./Boot.v1 Work/boot.cjs', '--require=./Boot.v1 Work/boot.cjs',
+    '-r "./Boot.json Work/boot.cjs"', '-r "./Boot Work/bootstrap"',
+    `-r ${join(process.cwd(), 'package.json')}`])('JSON and other preload files preserve the cap: %s', async preload => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const commands = [1, 2, 3].map(pr =>
+      `node ${preload} scripts/operations/review-loop-cli.mjs --pr=${pr} --repo=web-everything/web-everything`);
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => commands.join('\n') });
+    expect(budget).toMatchObject({ live: 3, max: 3, left: 0 });
+    const dispatch = vi.fn(() => ({ agentId: 'unexpected-review' }));
+    runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, liveReviewBudget: budget,
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40 });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each(['-r ./package.json', '--require=./package.json'])('holds ambiguous preloaded verifier listings: %s', async preload => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const command = `node ${preload} scripts/verify-lane.mjs scripts/operations/review-loop-cli.mjs`;
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => command }))
+      .toMatchObject({ left: 0, reason: expect.stringContaining('unknown') });
+    // Explicit quoted argv still excludes a verifier's changed-file arguments.
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' },
+      listCommands: () => `node ${preload.replace('./package.json', '"./package.json"')} -- "scripts/verify-lane.mjs" --files=scripts/operations/review-loop-cli.mjs` }))
+      .toMatchObject({ live: 0, left: 3 });
+  });
+
+  it.each(['-r ./package', '--require=./package', '-r ./bootstrap.hook'])('holds ambiguous spaced review paths after extensionless preloads: %s', async preload => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const command = `node ${preload} scripts/Review Work/review-loop-cli.mjs --pr=1`;
+    expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => command }))
+      .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+  });
+
+  it('confirmed non-starts leave capacity for healthy repos on every tick', () => {
+    for (let tick = 0; tick < 2; tick++) {
+      const budget = { left: 3 };
+      const out = runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], liveReviewBudget: budget,
+        reconcile: ({ repo }) => repo === 'repo-a' ? reviewsPlan(3) : reviewsPlan(1),
+        dispatch: ({ repo }) => {
+          if (repo === 'repo-b') return { agentId: 'healthy' };
+          return { skipped: 'review-ci: unreadable-ci' };
+        },
+        holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40,
+      });
+      expect(out.dispatched).toEqual([{ prNumber: 100, agentId: 'healthy', repo: 'repo-b' }]);
+      expect(out.deferredForCap).toBe(0);
+      expect(budget.left).toBe(2);
+    }
+  });
+
+  it.each([null, { left: 1 }])('retains reservations on exceptions that may follow a successful spawn: %j', liveReviewBudget => {
+    const dispatch = vi.fn(() => { throw Error('job record write failed after spawn'); });
+    const out = runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, liveReviewBudget,
+      acquirableLanes: () => [4], holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(out.failed).toEqual([{ prNumber: 100, error: 'job record write failed after spawn' }]);
+    if (liveReviewBudget) expect(liveReviewBudget.left).toBe(0);
+  });
+
+  it('tries later eligible reviews with refunded capacity and reuses only unconsumed lanes', () => {
+    const budget = { left: 1 };
+    const dispatch = vi.fn(({ pr }) => pr === 100 ? { skipped: 'unreadable-ci' } : { agentId: 'started' });
+    const prs = [100, 101, 102].map(number => ({ number, labels: ['review:pending'] }));
+    const out = runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, liveReviewBudget: budget,
+      readPrs: () => prs, readAgents: () => [], acquirableLanes: () => [4, 9],
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(out.dispatched).toEqual([{ prNumber: 101, agentId: 'started' }]);
+    expect(dispatch.mock.calls.map(([o]) => [o.pr, o.preferLane])).toEqual([[100, 4], [101, 4]]);
+    expect(out.notStarted).toEqual([{ prNumber: 100, reason: 'unreadable-ci' }]);
+    expect(out.deferredForCap).toBe(1);
+    expect(out.pendingNotDispatched.map(o => o.prNumber)).toEqual([102]);
+    expect(budget.left).toBe(0);
+  });
+
+  // PR #5769 audit: a live-job skip keeps its seat unless this tick's ps count already holds that job.
+  it.each([
+    ['not counted this tick', new Set(), 0],
+    ['already counted this tick', new Set([77]), 1],
+    ['no counted set', undefined, 0],
+  ])('a live-job skip refunds its reservation only when its pid was counted (%s)', (_name, countedJobPids, left) => {
+    const budget = { left: 1, ...(countedJobPids ? { countedJobPids } : {}) };
+    const dispatch = vi.fn(() => ({ mode: 'job', agentId: null, jobPid: 77, skipped: 'live-job' }));
+    const prs = [100].map(number => ({ number, labels: ['review:pending'] }));
+    runReviewTick({ reconcile: () => reviewsPlan(1), dispatch, liveReviewBudget: budget,
+      readPrs: () => prs, readAgents: () => [], acquirableLanes: () => [4],
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(budget.left).toBe(left);
+  });
+
+  it('each job absorbs at most one descendant loop, never below max(jobs, loops); counted job pids are reported', () => {
+    const counted = new Set();
+    expect(countLiveReviewRounds(['10 1 node /a/review-job.mjs', '11 10 node /a/review-loop-cli.mjs',
+      '12 10 node /a/review-loop-cli.mjs'], { countedJobPids: counted })).toBe(2);
+    expect([...counted]).toEqual([10]);
+    expect(countLiveReviewRounds(['10 1 node /a/review-job.mjs', '20 1 node /a/review-job.mjs',
+      '11 10 node /a/review-loop-cli.mjs', '12 10 node /a/review-loop-cli.mjs', '13 10 node /a/review-loop-cli.mjs'])).toBe(4);
+  });
+
+  it.each([
+    ['independent commands without ancestry', [
+      'node /a/review-job.mjs run --pr=1', 'node /a/review-job.mjs run --pr=2', 'node /a/review-loop-cli.mjs --pr=3',
+    ], 3],
+    ['only actual child loops deduplicate', [
+      '10 1 node /a/review-job.mjs run --pr=1', '11 10 node /a/review-loop-cli.mjs --pr=1',
+      '20 1 node /a/review-job.mjs run --pr=2', '30 1 node /a/review-loop-cli.mjs --pr=1',
+    ], 3],
+    ['intermediate parent processes', [
+      '10 1 node /a/review-job.mjs', '11 10 sh wrapper.sh', '12 11 node /a/review-loop-cli.mjs',
+    ], 1],
+    ['unquoted whitespace in checkout paths', [
+      '10 1 node /Users/user/Review Work/scripts/operations/review-job.mjs run --pr=1',
+      '11 10 node /Users/user/Review Work/scripts/operations/review-loop-cli.mjs --pr=1',
+    ], 1],
+    ['quoted paths and preload values', [
+      'node --import "/a/Boot Work/boot.mjs" "/a/Review Work/review-job.mjs" run',
+      "node -r '/a/Boot Work/boot.cjs' '/a/Review Work/review-loop-cli.mjs'",
+      'node /a/Review Work/review-loop-cli.mjs --pr=3',
+      '"/a/Review Work/review-loop-cli.mjs" --pr=4',
+    ], 4],
+    ['unquoted preload paths and runtime scalar values', [
+      'node --import /a/Boot Work/boot.mjs /a/Review Work/review-job.mjs run',
+      'node -r /a/Boot Work/boot.cjs /a/Review Work/review-loop-cli.mjs',
+      'node --conditions development --title worker /a/Review Work/review-job.mjs',
+    ], 3],
+    ['script extensions inside spaced directory names', [
+      'node /a/Review.mjs/Work Space/review-job.mjs',
+    ], 1],
+    ['argument-like text inside spaced checkout names', [
+      'node /a/Review.mjs Work/review-job.mjs run --pr=1',
+      'node /a/Review - Work/review-job.mjs run --pr=2',
+      'node /a/Review -- Work/review-loop-cli.mjs --pr=3',
+    ], 3, path => path === '/a/Review.mjs Work/review-job.mjs'],
+    ['spaced preload paths supplied with equals', [
+      'node --import=/a/Boot Work/boot.mjs /a/review-job.mjs',
+      'node --require=/a/Boot Work/boot.cjs /a/review-loop-cli.mjs',
+      'node --loader="/a/Boot Work/boot.mjs" /a/review-job.mjs',
+      'node --import=/a/Review Work/review-job.mjs /a/verify-lane.mjs',
+    ], 3],
+    ['review filenames in other scripts and runtime evaluation arguments', [
+      'node /a/Review Work/verify-lane.mjs --files=/a/review-job.mjs',
+      'node /a/verify-lane.mjs scripts/operations/review-job.mjs',
+      'node "scripts/tool.mjs" inspect scripts/operations/review-loop-cli.mjs',
+      'node --import /a/review-job.mjs /a/verify-lane.mjs',
+      'node -e "text" /a/review-job.mjs', 'node --print "text" /a/review-loop-cli.mjs',
+      'node -e0 /a/review-job.mjs', 'node -p0 /a/review-loop-cli.mjs',
+      '/bin/sh /a/review-job.mjs', 'grep /a/review-job.mjs', 'vim scripts/operations/review-loop-cli.mjs',
+      '/usr/bin/grep scripts/operations/review-job.mjs', '/usr/bin/vim scripts/operations/review-loop-cli.mjs',
+      'node tool inspect scripts/operations/review-job.mjs',
+    ], 0],
+    ['parent cycles terminate and unrelated loops still count', [
+      '10 11 node other.mjs', '11 10 node /a/review-loop-cli.mjs',
+    ], 1],
+  ])('counts live rounds: %s', (_name, lines, expected, isScriptFile) => {
+    expect(countLiveReviewRounds(lines, { isScriptFile })).toBe(expected);
+  });
+
+  it('resolves ambiguous absolute script paths on disk and holds when the listing cannot distinguish them', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'review-paths-'));
+    const prefix = join(root, 'Review.mjs');
+    const script = join(`${prefix} Work`, 'review-job.mjs');
+    try {
+      mkdirSync(`${prefix} Work`);
+      writeFileSync(script, '');
+      const read = () => liveReviewRoundBudget({ env: {}, listCommands: () => `node ${script} run --pr=1` });
+      expect(read()).toMatchObject({ live: 1, left: 2 });
+      // Both argv interpretations now name real files: taking either interpretation could undercount.
+      writeFileSync(prefix, '');
+      expect(read()).toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => 'node /missing/Review.mjs Work/review-job.mjs' }))
+        .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${prefix} inspect scripts/operations/review-job.mjs` }))
+        .toMatchObject({ live: 0, left: 3 });
+      for (const files of ['x'.repeat(1500), Array(150).fill('scripts/some-file.mjs').join(' ')]) {
+        expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${prefix} --files=${files} scripts/operations/review-job.mjs` }))
+          .toMatchObject({ live: 0, left: 3 });
+      }
+      const shortPrefix = join(root, 'Review');
+      const otherScript = join(`${shortPrefix} Work`, 'review-loop-cli.mjs');
+      mkdirSync(`${shortPrefix} Work`);
+      writeFileSync(otherScript, '');
+      writeFileSync(shortPrefix, '');
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${otherScript} --pr=1` }))
+        .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+      const dashScript = join(root, 'Review -Work', 'review-job.mjs');
+      mkdirSync(join(root, 'Review -Work'));
+      writeFileSync(dashScript, '');
+      // The extensionless prefix from the previous case makes this command ambiguous too.
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${dashScript} run --pr=1` }))
+        .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+      rmSync(shortPrefix);
+      // Once only the full script exists, the option-like directory fragment must not hide it.
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${dashScript} run --pr=1` }))
+        .toMatchObject({ live: 1, left: 2 });
+      expect(liveReviewRoundBudget({ env: {}, listCommands: () => 'node Review Work/scripts/operations/review-job.mjs run --pr=1' }))
+        .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
+      expect(() => countLiveReviewRounds(['node /a/Review Work/review-job.mjs'], {
+        isScriptFile: () => { throw Object.assign(new Error('unreadable'), { code: 'EACCES' }); },
+      })).toThrow('unreadable');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a cap-bound tick says the live-review cap held the review, never "no acquirable lane"', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => 'node a/review-job.mjs run\nnode b/review-job.mjs run\nnode c/review-job.mjs run' });
+    const prs = [100, 101].map((number) => ({ number, labels: [{ name: 'review:human' }] }));
+    const out = runReviewTick({ reconcile: () => reviewsPlan(2), readPrs: () => prs, readAgents: () => [], dispatch: vi.fn(),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40, liveReviewBudget: budget });
+    expect(out.deferredForLanes).toBe(0);
+    expect(out.deferredForCap).toBe(2);
+    const reasons = out.pendingNotDispatched.flatMap((p) => p.reasons).join('\n');
+    expect(reasons).toMatch(/held by the live-review cap \(live review rounds 3 of maxLiveReviewRounds=3 \(tool\); 40 lane\(s\) acquirable\)/);
+    expect(reasons).not.toMatch(/no acquirable lane/);
+    const starved = runReviewTick({ reconcile: () => reviewsPlan(2), readPrs: () => prs, readAgents: () => [], dispatch: vi.fn(),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 0 });
+    expect(starved.deferredForLanes).toBe(2);
+    expect(starved.pendingNotDispatched[0].reasons.join('\n')).toMatch(/no acquirable lane this tick \(0 acquirable\)/);
+  });
+
+  it('scarce review seats go main-fix first, then review:human / ready-to-merge, oldest first', async () => {
+    const { orderReviewsForDispatch } = await import('../review-daemon.mjs');
+    const reviews = [{ prNumber: 9 }, { prNumber: 8 }, { prNumber: 7 }, { prNumber: 6, mainFix: true }, { prNumber: 5 }];
+    const labelsByPr = new Map([[8, [{ name: 'review:human' }]], [9, ['ready-to-merge']]]);
+    expect(orderReviewsForDispatch(reviews, { labelsByPr }).map((r) => r.prNumber)).toEqual([6, 8, 9, 5, 7]);
+    // red-team request rows keep their slots (the main-fix red-team is placed first on purpose)
+    const withRedTeam = [{ prNumber: 20, redTeamRequest: {} }, { prNumber: 9 }, { prNumber: 8 }, { prNumber: 3, carriedAcceptHead: 'a' }];
+    expect(orderReviewsForDispatch(withRedTeam, { labelsByPr }).map((r) => r.prNumber)).toEqual([20, 8, 9, 3]);
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    runReviewTick({ reconcile: () => ({ dispatch: reviews.map((r) => ({ kind: 'review', ...r })), refusals: [] }),
+      readPrs: () => [5, 6, 7, 8, 9].map((number) => ({ number, labels: labelsByPr.get(number) ?? [] })), readAgents: () => [],
+      dispatch, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 2 });
+    expect(dispatch.mock.calls.map(([o]) => o.pr)).toEqual([6, 8]);
   });
 
   it('deferred reviews still feed statusCandidates (the whole owed list, not just what got dispatched)', () => {
@@ -1814,6 +2331,18 @@ describe('operator-hold snapshots (card 5653)', () => {
     ]);
     expect(operatorHoldsFromPlan({})).toEqual([]);
     expect(OPERATOR_HOLD_KINDS).toHaveLength(4);
+  });
+
+  // Live #5752: a failed referral persist with retries left resumes on its own; it waits on a person only once exhausted.
+  it('leaves out a referral persist failure that still has retries, and reports it once they are exhausted', () => {
+    const retrying = { persistenceFailed: true, exhausted: false, retryAt: 2_000 };
+    const exhausted = { persistenceFailed: true, exhausted: true, retryAt: null };
+    expect(operatorHoldsFromPlan({ refusals: [
+      { kind: 'review-referrals-pending', prNumber: 1, referralHold: retrying },
+      { kind: 'owed-ci-rerun', prNumber: 2, reviewRefusal: { kind: 'review-referrals-pending', referralHold: retrying } },
+      { kind: 'review-referrals-pending', prNumber: 3, referralHold: exhausted },
+      { kind: 'review-referrals-pending', prNumber: 4, referralHold: { persistenceFailed: false, exhausted: false, retryAt: null } },
+    ] })).toEqual([{ prNumber: 3, kind: 'review-referrals-pending' }, { prNumber: 4, kind: 'review-referrals-pending' }]);
   });
 
   it('a successful tick carries the snapshot taken at plan completion, empty list included, without changing dispatch', () => {

@@ -8,6 +8,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
+import { humanReviewHold } from './pr-sweep-core.mjs';
+import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
@@ -60,6 +62,10 @@ const sectionReasons = {
   rulingNeeded: 'review parked with confirmed findings — your block/card/not-real ruling',
   stoodDown: 'fix agent asked a question — your judgment; no label changed',
 };
+// Only these kinds can be represented (and therefore resolved by absence) in itemsFromReport.
+// Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
+// a successful queue read supplies no evidence that their independently owned condition resolved.
+const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -93,18 +99,19 @@ function fromKey(key) {
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
   return { repo: m[1], pr: Number(m[2]), head: m[3], was: m[4] };
 }
-export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete } = {}) {
+export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null } = {}) {
   const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys), current = new Map(items.map(sanitizeItem).map(i => [keyOf(i), i]));
+  const retained = new Set([...prev].filter(key => incomplete || (clearKinds && !clearKinds.has(fromKey(key).was))));
   const lines = [];
   for (const [key, item] of current) if (!prev.has(key)) {
     const event = { at, ...item };
     lines.push(`NEEDS-YOU ${item.repo}#${item.pr} ${item.kind}: ${item.reason}${item.title ? ` | title (untrusted): ${JSON.stringify(item.title)}` : ''}${item.pick || item.command ? ` | pick: ${item.pick || item.command}` : ''} ${JSON.stringify(event)}`);
   }
-  if (!incomplete) for (const key of prev) if (!current.has(key)) {
+  for (const key of prev) if (!retained.has(key) && !current.has(key)) {
     const event = { at, kind: 'cleared', ...sanitizeItem(fromKey(key)) };
     lines.push(`NEEDS-YOU-CLEARED ${event.repo}#${event.pr} left ${event.was} ${JSON.stringify(event)}`);
   }
-  return { lines, openKeys: [...new Set([...(incomplete ? prev : []), ...current.keys()])] };
+  return { lines, openKeys: [...new Set([...retained, ...current.keys()])] };
 }
 export function parseFeedLine(line) {
   if (!/^NEEDS-YOU(?:-CLEARED)? /.test(line)) return null;
@@ -161,8 +168,44 @@ export function monitorCommand(path = feedPath()) {
   path = checkedFeedPath(path);
   return `tail -n 0 -F '${path.replace(/'/g, "'\\''")}' | grep --line-buffered NEEDS-YOU`;
 }
+/**
+ * Drop "your review" items whose LIVE PR no longer qualifies (red team not clear on the live head, sent back, a fix
+ * claim open): operator-queue's report can lag the labels by a tick, and a notification cannot be taken back. A PR
+ * that cannot be read is KEPT (an alert is never suppressed on missing evidence); the failure is logged. Only items
+ * that came from the queue's `ready` section are judged. Returns `{kept, held}`.
+ */
+export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error, deadlineMs = 120000, concurrency = 4,
+  fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } } } = {}) {
+  const ready = new Set((report.ready ?? []).map((r) => `${r.repo}#${r.number ?? r.pr}`));
+  const deadline = Date.now() + deadlineMs;
+  const out = new Array(items.length); const held = [];
+  const judge = async (index) => {
+    const item = items[index];
+    if (item.kind !== 'needs-you' || !ready.has(`${item.repo}#${item.pr}`)) { out[index] = item; return; }
+    // Bounded work: past the pass deadline an item is KEPT unjudged, never dropped on missing evidence.
+    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = item; return; }
+    try {
+      const opts = { cwd, encoding: 'utf8', timeout: 60000, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024 };
+      const view = JSON.parse(String(await gh('gh', ['pr', 'view', String(item.pr), '--repo', item.repo, '--json', 'labels,headRefOid'], opts)));
+      const pages = JSON.parse(String(await gh('gh', ['api', '--paginate', '--slurp', `repos/${item.repo}/issues/${item.pr}/comments?per_page=100`], opts)));
+      if (!Array.isArray(pages) || !view || typeof view.headRefOid !== 'string' || !view.headRefOid.trim()) throw new Error('unreadable live PR');
+      const comments = pages.flat().map((c) => ({ author: { login: c.user?.login ?? '' }, body: c.body ?? '', createdAt: c.created_at }));
+      const reasons = humanReviewHold({ number: item.pr, headRefOid: view.headRefOid, labels: view.labels ?? [], comments }, now,
+        { fixClaimLive: fixClaimLive(item.repo, item.pr) });
+      if (reasons.length) { held.push({ item, reasons }); return; }
+      // Publish the head that was actually checked, not a stale one from the report or a later lookup.
+      out[index] = { ...item, head: view.headRefOid };
+    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = item; }
+  };
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => { while (next < items.length) await judge(next++); }));
+  const kept = out.filter(Boolean);
+  kept.incomplete = items.incomplete;
+  return { kept, held };
+}
 export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled, home = homedir(), now = new Date(), checkoutRoot = CHECKOUT_ROOT,
-  env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true } = {}) {
+  env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true,
+  liveGate = true } = {}) {
   logSettings(settings, log);
   assertProducerCheckout(checkoutRoot, { env, settings });
   let stdout, failedRead = false;
@@ -175,7 +218,9 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   const report = JSON.parse(String(stdout));
   if (!report || typeof report !== 'object' || !Array.isArray(report.ready)) throw new Error('needs-you-feed: invalid operator-queue report');
   if (failedRead) report.incomplete = true;
-  const items = itemsFromReport(report);
+  const gated = !liveGate ? { kept: itemsFromReport(report), held: [] } : await gateReadyItems(itemsFromReport(report), report, { gh, cwd: checkoutRoot, now: new Date(now).getTime(), log });
+  for (const { item, reasons } of gated.held) log(`needs-you-feed ${item.repo}#${item.pr} held back from your review: ${reasons.join('; ')}`);
+  const items = gated.kept;
   // Resolve before locking: gh admission/network waits must not hold the feed-state lock.
   for (const item of items) if (!item.head) {
     try {
@@ -194,7 +239,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   return withFileLock(`${statePath}.lock`, () => {
     if (!owns()) return { lines: [], superseded: true };
     const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
-    const result = diffFeed(prev.openKeys, items, now);
+    const result = diffFeed(prev.openKeys, items, now, { clearKinds: REPORT_KINDS });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;
