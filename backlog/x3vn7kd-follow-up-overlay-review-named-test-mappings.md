@@ -3,7 +3,7 @@ kind: story
 size: 2
 parent: "4075"
 status: open
-scope: ["we:backlog/6926-prevention-cache-persistent-overlay-pin-retry-outcomes-by-co.md", "we:backlog/6927-prevention-authenticate-conflict-overrides-through-a-trusted.md", "we:backlog/6928-prevention-map-overlay-audit-guards-to-named-regression-test.md", "we:scripts/lib/__tests__/daemon-rebuild-overlay-pin.test.mjs", "we:scripts/lib/__tests__/daemon-rebuild-retry-pass.test.mjs", "we:scripts/lib/__tests__/overlay-review-test-mappings.test.mjs"]
+scope: ["we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md", "we:backlog/6926-prevention-cache-persistent-overlay-pin-retry-outcomes-by-co.md", "we:backlog/6927-prevention-authenticate-conflict-overrides-through-a-trusted.md", "we:backlog/6928-prevention-map-overlay-audit-guards-to-named-regression-test.md", "we:scripts/lib/__tests__/daemon-rebuild-overlay-pin.test.mjs", "we:scripts/lib/__tests__/daemon-rebuild-retry-pass.test.mjs", "we:scripts/lib/__tests__/overlay-review-test-mappings.test.mjs"]
 dateOpened: "2026-10-22"
 tags: []
 ---
