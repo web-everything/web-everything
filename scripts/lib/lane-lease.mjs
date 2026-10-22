@@ -538,6 +538,59 @@ export function isDeliveredLease({ porcelain, headIsAncestorOfUpstream, headComm
     && headCommitMs >= acquiredAtMs;
 }
 
+// ── Destructive ops need the CURRENT holder's slug on a LIVE lease (lane-lease-occupant, 2026-10-22) ──────────
+// Live incident, 2026-10-22 ~05:52 ET: an orchestration subagent's lane-7 lease went TTL-stale (nothing renewed it
+// while the agent kept using the lane), conveyor session fix-5775 took lane-7 over at 04:40 ET (a fresh holder slug),
+// and the subagent then ran `cd ../lane-7 && … ; LANE_SESSION=<its OLD slug> git reset --hard …` as the tail of a
+// command whose leading `cd` named a different lane. The reset ran on fix-5775's tree. Two gaps: the guard only
+// looked at the command's FIRST `cd`, and in the uncontested topology it never asked for the slug at all — so a
+// stale slug was never even compared. This rule closes both: every destructive git op in a lane must assert the
+// lane's CURRENT holder slug, on a lease that is still live. Pure; the guard supplies the facts.
+
+/** The rule's name, as it appears in deny messages. */
+export const LANE_OP_PROOF_RULE = 'lane-op-proof';
+
+/**
+ * May this destructive git op run in this lane? Pure.
+ *   • LIVE lease: the asserted `LANE_SESSION` slug must equal the lease's required slug (the #2413 marked slug for a
+ *     workflow lane, else the #2997 minted `holder`). Absent ⇒ deny; a different slug ⇒ deny ("not the current
+ *     holder — if it was yours, your lease was lost"); a live lease with no slug to prove ⇒ deny. `LANE_CLOBBER_OK`
+ *     does NOT pass a live lease: someone holds that lane, and only their slug proves it is them.
+ *   • STALE lease asserted with its own slug ⇒ deny `lease-lost` ("re-acquire"): the old holder's hold is gone and it
+ *     must never be re-used silently. No override.
+ *   • STALE lease otherwise, or NO lease ⇒ deny, unless `LANE_CLOBBER_OK=1` (the existing escape, kept only where no
+ *     live holder exists to be clobbered — cleaning up an abandoned lane).
+ * @param {{lease?:object|null, assertedSlug?:string|null, clobberOk?:boolean, nowMs:number, lane?:string}} facts
+ * @returns {{allowed:boolean, code:string, reason:string}}
+ */
+export function laneDestructiveOpVerdict({ lease = null, assertedSlug = null, clobberOk = false, nowMs, lane = 'this lane' } = {}) {
+  const allow = (code, reason) => ({ allowed: true, code, reason });
+  const deny = (code, reason) => ({ allowed: false, code, reason: `${LANE_OP_PROOF_RULE}: ${reason}` });
+  const required = laneMarkedSlug(lease) || laneHolderSlug(lease);
+  const reacquire = 'acquire a lane (`node scripts/lane-pool.mjs acquire --purpose=<why> --adopt`) and work there';
+  if (!lease) {
+    if (clobberOk) return allow('no-lease-override', 'no lease and LANE_CLOBBER_OK=1');
+    return deny('no-lease', `${lane} holds no lease, so nothing proves this destructive git op is yours — ${reacquire}. Cleaning up an abandoned, unleased lane: prefix \`LANE_CLOBBER_OK=1\`.`);
+  }
+  if (!Number.isFinite(nowMs) || isLeaseStale(lease, nowMs)) {
+    if (assertedSlug && required && assertedSlug === required) {
+      return deny('lease-lost', `lease lost — re-acquire. The lease you hold on ${lane} (LANE_SESSION=${assertedSlug}) has EXPIRED; another session may take this lane at any moment, and an expired lease is never re-used. ${reacquire}.`);
+    }
+    if (clobberOk) return allow('stale-lease-override', 'stale lease and LANE_CLOBBER_OK=1');
+    return deny('lease-expired', `${lane}'s lease has expired, so nothing proves this destructive git op is yours — ${reacquire}. Cleaning up an abandoned lane: prefix \`LANE_CLOBBER_OK=1\`.`);
+  }
+  if (!required) {
+    return deny('unprovable', `${lane}'s live lease carries no holder slug, so no command can prove it holds the lane — re-acquire it or pick another lane.`);
+  }
+  if (!assertedSlug) {
+    return deny('slug-absent', `${lane} holds a LIVE lease; a destructive git op there must assert the CURRENT holder's slug inline — prefix \`LANE_SESSION=<your holder slug>\` (printed by \`lane-pool.mjs acquire\` and \`adopt\`). No slug was asserted. If you do not hold this lane, ${reacquire}.`);
+  }
+  if (assertedSlug !== required) {
+    return deny('not-holder', `LANE_SESSION=${assertedSlug} is not ${lane}'s CURRENT holder. If that slug was yours, your lease was lost and another session holds this lane now — lease lost — re-acquire; never act on this lane again. ${reacquire}.`);
+  }
+  return allow('holder', 'the current holder asserted its slug on a live lease');
+}
+
 // ── The lane hold rule (#xbdixjc) ─────────────────────────────────
 // "May this lane be released, reset, removed or reclaimed right now?" A fixer that ends its turn to await verify
 // looks gone to the lease reaper; on 2026-10-08 17:00–21:00Z the reaper released 24 lanes holding unpushed work

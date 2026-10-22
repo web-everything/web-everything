@@ -109,6 +109,7 @@ import {
   leaseOwnedBy,
   leaseOwnedByCaller,
   laneHolderSlug,
+  laneMarkedSlug,
   laneWorkerSession,
   isContestedLease,
   isDeliveredLease,
@@ -1606,7 +1607,10 @@ function tryClaimLane(dir, session, nowMs, ttlMs) {
     if (e.code !== 'EEXIST') throw e;
   }
   const existing = readLease(dir);
-  if (leaseOwnedBy(existing, session)) {
+  // lane-lease-occupant — only a LIVE hold is refreshed in place. An EXPIRED lease is never silently re-used by its
+  // old holder (keeping its slug would let a returning holder's stale `LANE_SESSION` assert past the guard): it goes
+  // through the stale take-over below like anyone else's — the hold rule, a fresh slug, a journalled expiry.
+  if (leaseOwnedBy(existing, session) && !isLeaseStale(existing, nowMs, ttlMs)) {
     // #2997 — an IDEMPOTENT re-acquire of our own hold KEEPS the existing `holder` slug. Re-minting here would
     // silently invalidate the slug the current holder is already asserting in its commands, turning its next
     // legitimate destructive op into a mismatch deny — a self-inflicted false refusal.
@@ -1646,7 +1650,10 @@ function tryClaimLane(dir, session, nowMs, ttlMs) {
     // A reclaim is a NEW hold by a NEW holder, so it mints a fresh slug — the dead owner's slug must not carry
     // over, or a returning zombie would still assert its way past the guard. The dead owner's declared
     // OCCUPANCY is dropped for the same reason (only `--adopt` re-declares it for the new holder).
-    try { writeLeaseAtomic(file, bodyFor(mintedHolder, adopted), { exclusive: true }); return mintedHolder; } catch { return null; }
+    // lane-lease-occupant — the SAME holder re-taking its own expired lease gets a fresh slug (above) but keeps its
+    // declared occupant, exactly as the old in-place refresh did, so the Edit/Write guard's protection is not dropped.
+    const keepOccupant = leaseOwnedBy(existing, session) ? laneWorkerSession(existing) : null;
+    try { writeLeaseAtomic(file, bodyFor(mintedHolder, adopted || keepOccupant), { exclusive: true }); return mintedHolder; } catch { return null; }
   }
   return null; // a LIVE lease held by another session — this lane is taken, even with --force
 }
@@ -2494,7 +2501,9 @@ function cmdAcquire(repo) {
   // CONTESTED topology (another live lease shares this session id), which is exactly when the guards and
   // `release` ask for it — hence "keep it if a sibling is live", not "prefix everything from now on".
   // Rides stderr (`log`) so `--json`-less stdout stays the clean lane path the `LANE=$(…)` contract depends on.
-  log(`  holder slug: ${holderSlug} — if a SIBLING agent of your session also holds a lane, prove this one is yours:`);
+  // lane-lease-occupant — the destructive-op proof is no longer contested-only: every destructive git op in a lane
+  // must assert the CURRENT holder's slug on a live lease, so say so plainly at the one seam the acquirer reads.
+  log(`  holder slug: ${holderSlug} — every destructive git op in this lane must assert it (LANE_SESSION=<slug>); release with it too:`);
   log(`    release:        node scripts/lane-pool.mjs release --lane=${chosen} --session=${holderSlug}`);
   log(`    destructive op: LANE_SESSION=${holderSlug} git reset --hard origin/${repo.branch}`);
   // #2997 r2 — OCCUPANCY is a separate declaration from the lease, because `ownerSession` records whoever ran
@@ -4440,6 +4449,10 @@ function cmdAdopt(repo) {
   });
   log(`  adopted lane-${n} — occupant session is now ${me}${current && current !== me ? ` (took over from ${current})` : ''}`);
   log('    Edit/Write into this lane from ANY other session is now refused by guard-lane.mjs (#2997).');
+  // lane-lease-occupant — the occupant needs the holder slug: every destructive git op in a lane now asserts it.
+  if (laneHolderSlug(lease) || laneMarkedSlug(lease)) {
+    log(`    holder slug: ${laneMarkedSlug(lease) || laneHolderSlug(lease)} — destructive op: LANE_SESSION=${laneMarkedSlug(lease) || laneHolderSlug(lease)} git reset --hard origin/${repo.branch}`);
+  }
   if (flags.json) process.stdout.write(JSON.stringify({ lane: n, path: dir, workerSession: me, previousWorkerSession: current }, null, 2) + '\n');
 }
 
