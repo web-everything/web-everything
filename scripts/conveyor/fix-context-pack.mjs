@@ -108,6 +108,9 @@ export function logContextPackSettings(resolved, { log = (l) => console.error(l)
 
 const CHANGES_RE = /^\s*🔁\s*(?:human\s+)?review\s+—\s+changes requested/u;
 const ADVISORY_RE = /^\s*\*{0,2}⚠️\s*THIS IS AN ADVISORY REVIEW/u;
+// Card 6212 — the red-team gate's `sent-back` record that carries a fix list (the PR was already under review:changes:
+// a round-1 red team beside the panel). It is part of the same round's ask.
+const RED_TEAM_FIX_LIST_RE = /^\s*<!-- we:red-team-gate pr=\d+ rev=[0-9a-f]{40} outcome=sent-back[^\n]*-->[\s\S]*\nFix list — /u;
 const REF_RE = /(?<![\w@./-])([\w@.-][\w@.\-/]*\.[A-Za-z0-9]{1,8}):(\d{1,6})(?:-(\d{1,6}))?/g;
 const JSON_REF_RE = /"([\w@.-][\w@.\-/]*\.[A-Za-z0-9]{1,8})",\s*(\d{1,6})/g;
 
@@ -124,16 +127,22 @@ export function extractFindings(comments = [], { labels = null, isTrusted = () =
   const mode = !names ? null : names.includes('review:changes') ? 'changes' : names.includes('advisory:changes') ? 'advisory' : null;
   let changes = null;
   let advisory = null;
+  let redTeam = null;
   (comments ?? []).forEach((c, i) => {
     const body = String(c?.body ?? '');
     if (!isTrusted(c)) return; // a look-alike comment from anyone else is never staged as the ask
     if (CHANGES_RE.test(body)) changes = { i, c };
     else if (ADVISORY_RE.test(body)) advisory = { i, c };
+    else if (RED_TEAM_FIX_LIST_RE.test(body)) redTeam = { i, c };
   });
   if (mode === 'changes') advisory = null;
   if (mode === 'advisory' && advisory) changes = null;
   const findings = [];
   if (changes) findings.push({ kind: 'changes', body: String(changes.c.body), createdAt: changes.c.createdAt ?? null });
+  // The red team's fix list for the same round: only after the changes-requested comment it joins, never in advisory mode.
+  if (changes && mode !== 'advisory' && redTeam && redTeam.i > changes.i) {
+    findings.push({ kind: 'red-team', body: String(redTeam.c.body), createdAt: redTeam.c.createdAt ?? null });
+  }
   if (advisory && (!changes || advisory.i > changes.i)) {
     findings.push({ kind: 'advisory', body: String(advisory.c.body), createdAt: advisory.c.createdAt ?? null });
   }
@@ -266,7 +275,7 @@ export function renderFixPack({ findings = [], refs = [], fileText = () => null,
   if (budget <= 0) return '';
   const parts = [header];
   for (const f of findings) {
-    const title = `### Finding (verbatim — ${f.kind === 'advisory' ? 'latest advisory review' : 'latest changes-requested comment'}${f.createdAt ? `, ${f.createdAt}` : ''})\n\n`;
+    const title = `### Finding (verbatim — ${f.kind === 'advisory' ? 'latest advisory review' : f.kind === 'red-team' ? 'red-team breaks sent back in the same round' : 'latest changes-requested comment'}${f.createdAt ? `, ${f.createdAt}` : ''})\n\n`;
     const room = Math.min(budget, Math.max(400, Math.floor(budget * (findings.length > 1 ? 0.35 : 0.55))));
     if (room <= bytes(title) + 80) break;
     // Quoted, so the comment's own headings stay inside the finding instead of reading as brief sections.

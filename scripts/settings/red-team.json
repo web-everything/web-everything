@@ -1,6 +1,6 @@
 {
   "redTeam": {
-    "$comment": "statusLabels defaults true (WE_RED_TEAM_STATUS_LABELS override); head-bound derived status only, recorded results remain authoritative. skipCardOnly defaults true; card-only net diffs never schedule a pass.",
+    "$comment": "statusLabels defaults true (WE_RED_TEAM_STATUS_LABELS override); head-bound derived status only, recorded results remain authoritative. skipCardOnly defaults true; card-only net diffs never schedule a pass. timing (card 6212, scripts/lib/red-team-timing.mjs) round1|post-accept, standard post-accept (trial; env WE_RED_TEAM_TIMING, post-accept is the kill switch; panel-seat is an alias of round1): round1 runs the red team beside the panel in the same round, finishes it on a changes review so its confirmed breaks join that send-back, reuses it on the accepted head, and does not re-raise a break ruled on an earlier head whose cited lines are unchanged. round1FixHoldMinutes (standard 30, env WE_RED_TEAM_ROUND1_FIX_HOLD_MINUTES) bounds how long fix dispatch waits for an in-flight round-1 pass. Both resolve standard -> platform redTeam -> this file -> env, logged with source.",
     "confirmedBreaks": {
       "broken": "send-back",
       "degraded": "card",

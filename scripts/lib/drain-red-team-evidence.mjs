@@ -76,3 +76,29 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
   return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
 }
+
+/**
+ * Card 6212 — the head's red-team status record and whether its writer is alive (the same liveness probe the drain
+ * uses above), for fix dispatch's bounded wait on a round-1 pass. Null when there is no record. Never throws on a
+ * missing record; an unreadable one is null too (the fixer then does not wait — the wait is only an optimisation).
+ */
+export function readRedTeamStatusRecord({ repo, pr, head, env = process.env, isAlive = pidAlive, host = hostname(),
+  namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
+  if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return null;
+  let status, statusAt;
+  try {
+    const path = statusPath({ repo, pr, head }, env);
+    status = JSON.parse(readFileSync(path, 'utf8'));
+    statusAt = statSync(path).mtimeMs;
+  } catch { return null; }
+  if (status?.repo !== repo || Number(status.pr) !== Number(pr) || status.head !== head) return null;
+  let writerAlive = true;
+  if (!((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace))) {
+    writerAlive = isAlive(status.pid);
+    if (writerAlive && status.pidStart) {
+      const start = readPidStart(status.pid);
+      writerAlive = !start || start === status.pidStart;
+    }
+  }
+  return { status, statusAt, writerAlive };
+}

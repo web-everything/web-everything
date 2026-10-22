@@ -463,6 +463,8 @@ const REVIEW_CODE_PATH_FILES = new Set([
   // Verdict carry and red-team marker helpers are direct dependencies of review-job's acceptance path.
   'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/drain-red-team-evidence.mjs',
   'scripts/lib/red-team-status-labels.mjs',
+  // Card 6212 — `redTeam.timing` (round-1 red team), read by review-job.
+  'scripts/lib/red-team-timing.mjs',
   // 117 S3b — the review session and the review job now launch / record through the unified worker wrapper.
   'scripts/operations/worker-wrapper-launch.mjs', 'scripts/operations/worker-wrapper.mjs',
 ]);

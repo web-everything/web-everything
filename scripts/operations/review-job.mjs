@@ -111,6 +111,7 @@ import {
 import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
 } from '../lib/review-speculative-red-team.mjs';
+import { formatRedTeamTimingLine, readRedTeamTiming, round1RedTeamOwedFor } from '../lib/red-team-timing.mjs';
 import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, readStackBase, readStackThread, resolveStackAwareReview, stackNetDiffText, liveStackMarkers } from '../conveyor/review-stack-base.mjs';
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -369,7 +370,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // x00g3tt — the POST-ACCEPT RED TEAM, its own process and wall, run only after the added seats. Advisory: it
     // posts one deduped comment and writes evidence; nothing it returns reaches a label, merge or verdict.
-    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug }) => {
+    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, round1 = false }) => {
       if (!redTeamEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
       const loopFile = join(dir, `${slug}.red-team.loop.json`);
       try {
@@ -377,6 +378,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         writeFileSync(loopFile, JSON.stringify(loopPayload));
         const r = node([
           'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`, `--loop-json=${loopFile}`,
+          ...(round1 ? ['--round1'] : []),
         ], { timeoutMs: resolveSeatTimeoutMs(env) + 20 * 60 * 1000 });
         for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
           writeLineSync(2, `  ${line}`);
@@ -405,6 +407,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // Card xbizuci — `review.speculativeRedTeam` resolved through the policy cascade (see `../lib/review-speculative-red-team.mjs`).
     speculativeRedTeamSetting: () => loadSpeculativeRedTeam({ env }),
+    // Card 6212 — `redTeam.timing` (round1 | post-accept) resolved through the policy cascade (`../lib/red-team-timing.mjs`).
+    redTeamTimingSetting: () => readRedTeamTiming({ env }),
     // Card xbizuci — THE SPECULATIVE RED TEAM, its own detached process group so it runs WHILE the loop runs (the loop
     // is a blocking spawnSync). It waits for the loop's read sink, makes the call, and writes its pass to `passFile`.
     startSpeculativeRedTeam: ({ pr, repo, lanePath, slug, waitMs }) => {
@@ -455,13 +459,14 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // Card xbizuci — the second half of an accepted review's speculative pass, its own process and wall (same
     // containment as `runRedTeam`).
-    finishSpeculativeRedTeam: ({ pr, repo, loopPayload, slug, handle }) => {
+    finishSpeculativeRedTeam: ({ pr, repo, loopPayload, slug, handle, round1 = false }) => {
       const loopFile = join(dir, `${slug}.red-team.loop.json`);
       try {
         mkdirSync(dir, { recursive: true });
         writeFileSync(loopFile, JSON.stringify(loopPayload));
         const r = node([
           'scripts/operations/review-extra-seats.mjs', 'red-team-finish', `--pr=${pr}`, `--repo=${repo}`, `--pass=${handle.passFile}`, `--loop-json=${loopFile}`,
+          ...(round1 ? ['--round1'] : []),
         ], { timeoutMs: 10 * 60 * 1000 });
         for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
           writeLineSync(2, `  ${line}`);
@@ -498,6 +503,8 @@ export function speculativeRedTeamWallMs(env = process.env) {
  * Card xbizuci — SETTLE THE SPECULATIVE RED TEAM once the review is over. Returns `{decision, ..., result}` where
  * `result`, when set, IS the red team's result for this review (the caller treats it exactly like `runRedTeam`'s),
  * and null means "run the sequential pass" (`sequential`, `stale`, `superseded`) or "nothing is owed" (`discard`).
+ *   `accepted` means "a result is owed this round": the accept, or (card 6212, `round1`) a `changes` review under
+ *   `redTeam.timing=round1`, whose finish is told so (`--round1`) and keeps juror findings from staling the pass.
  *   - not accepted → `discard`: called off (killed if still running), nothing posted or routed, spend recorded;
  *   - accepted + a model call in hand → `finish` (`red-team-finish` re-checks it judged the review's very read;
  *     a different read is `stale`, a clean row that landed meanwhile is `superseded` — both record the call as
@@ -507,7 +514,7 @@ export function speculativeRedTeamWallMs(env = process.env) {
  *   - accepted + no model call (disabled, skipped, a prior row to resume, no read sunk) → `sequential`.
  * Never throws past its own `try` (the caller also contains it). Removes the pass's files when done.
  */
-export function settleSpeculativeRedTeam({ spec, accepted, out, input }, io) {
+export function settleSpeculativeRedTeam({ spec, accepted, out, input, round1 = false }, io) {
   const at = (ms) => (Number.isFinite(ms) && Number.isFinite(spec.startedAt) ? ms - spec.startedAt : null);
   const timings = (pass) => ({
     readAfterMs: at(pass?.timings?.readAt), finishedAfterMs: at(pass?.timings?.finishedAt), loopFinishedAfterMs: at(spec.loopFinishedAt),
@@ -539,7 +546,7 @@ export function settleSpeculativeRedTeam({ spec, accepted, out, input }, io) {
     log(`${decision}; pass ${pass?.status ?? 'none'}; read at +${base.timings.readAfterMs ?? '?'}ms, pass done at +${base.timings.finishedAfterMs ?? '?'}ms, `
       + `loop done at +${base.timings.loopFinishedAfterMs ?? '?'}ms; waited ${base.waitedMs ?? '?'}ms after the review`);
     if (decision === 'finish') {
-      const result = io.finishSpeculativeRedTeam({ pr: out.pr, repo: out.repo, loopPayload: input.loopPayload, slug: out.sessionSlug, handle: spec });
+      const result = io.finishSpeculativeRedTeam({ pr: out.pr, repo: out.repo, loopPayload: input.loopPayload, slug: out.sessionSlug, handle: spec, ...(round1 ? { round1: true } : {}) });
       if (result?.status === 'stale' || result?.status === 'superseded') {
         const spend = io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, pass, reason: `${result.status}: ${result.reason ?? ''}` });
         log(`${result.status} (${result.reason ?? ''}) — sequential pass instead; spend ${spend?.status ?? '-'}`);
@@ -633,6 +640,19 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     seatsBox.speculativeEnabled = setting?.enabled === true;
     if (setting) io.log(`review-job: ${formatSpeculativeRedTeamSourceLine(setting)}`);
   }
+  // Card 6212 — `redTeam.timing` (policy cascade; the layer that set it is logged). `round1` starts the red team beside
+  // the panel whatever `review.speculativeRedTeam` says, and keeps it on a `changes` round too. `post-accept` (or an io
+  // without the hook) is the old order exactly.
+  let timing = null;
+  if (typeof io.redTeamTimingSetting === 'function') {
+    try { timing = io.redTeamTimingSetting(); } catch { timing = null; }
+    if (timing) io.log(`review-job: ${formatRedTeamTimingLine(timing)}`);
+  }
+  const round1 = timing?.round1 === true;
+  if (round1 && !seatsBox.speculativeEnabled && typeof io.startSpeculativeRedTeam === 'function') {
+    seatsBox.speculativeEnabled = true;
+    io.log('review-job: the red team starts beside the panel (redTeam.timing=round1), whatever review.speculativeRedTeam says');
+  }
   const out = runReviewArc(opts, io, seatsBox);
   const recordSeats = (rows) => {
     const observed = rows.filter(r => r?.startedAt).map(r => seatTiming({ ...r, verdict: r.seatVerdict ?? r.verdict ?? null }));
@@ -643,9 +663,22 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
   const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
+  // Card 6212 — under `redTeam.timing=round1` a `changes` review owes the red team too: its confirmed breaks join this
+  // round's send-back instead of opening a new round after the next accept.
+  const round1Changes = round1 && !accepted && Boolean(seatsBox.input) && round1RedTeamOwedFor(seatsBox.input.loopPayload);
+  const owed = accepted || round1Changes;
+  if (round1) out.redTeamTiming = { timing: 'round1', round: accepted ? 'accept' : round1Changes ? 'changes' : 'not-owed' };
   // The accept is already labelled, and the added seats below can take minutes: record the pass as queued now, so
   // the drain holds the head until the pass records its result. The `finished` write at the end supersedes it.
-  if (accepted && (spec || typeof io.runRedTeam === 'function')) io.redTeamStatus?.({ ...seatsBox.input, status: 'queued' });
+  // Round 1: the same record makes fix dispatch wait (bounded) for the pass, so the fixer gets both lists together.
+  if (owed && (spec || typeof io.runRedTeam === 'function')) io.redTeamStatus?.({ ...seatsBox.input, status: 'queued' });
+  // Card 6212 — a round-1 `changes` review settles the red team FIRST (the fixer is waiting on it); the added seats
+  // are advisory and come after. An accept keeps the old order below.
+  if (round1Changes) {
+    runOwedRedTeam();
+    // Written now, not after the added seats: this record is what the fix dispatch waits on.
+    io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam?.status ?? null });
+  }
   // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
   // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
   // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
@@ -662,45 +695,50 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     recordSeats(extraSeats?.seats ?? []);
     out.extraSeats = summarizeExtraSeats(extraSeats);
   }
-  // x00g3tt — THE POST-ACCEPT RED TEAM: owed only when the review ACCEPTED (`redTeamOwedFor`), and only after
-  // everything above. Same containment as the seats: a crash is a status in `redTeam`, never a changed outcome.
-  // Card xbizuci — under `review.speculativeRedTeam` it was already started beside the loop (`seatsBox.speculative`):
-  // an accept finishes THAT pass (same rows, comment and gate as the sequential pass); anything else calls it off.
-  if (spec) {
-    try {
-      out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted, out, input: seatsBox.input }, io);
-      recordSeats(out.redTeamSpeculative.seatTimings ?? []);
-    } catch (e) {
-      out.redTeamSpeculative = { decision: 'error', reason: tail(e?.message ?? e, 300) };
-    }
-  }
-  if (accepted && (out.redTeamSpeculative?.result || typeof io.runRedTeam === 'function')) {
-    let redTeam = out.redTeamSpeculative?.result ?? null;
-    if (!redTeam) {
+  // Card 6212 — the red team's settle + pass + gate, ONE body for both moments it can run (a round-1 `changes` review
+  // runs it before the added seats, an accept after them, exactly as before).
+  function runOwedRedTeam() {
+    // x00g3tt — THE POST-ACCEPT RED TEAM: owed only when the review ACCEPTED (`redTeamOwedFor`), and only after
+    // everything above. Same containment as the seats: a crash is a status in `redTeam`, never a changed outcome.
+    // Card xbizuci — under `review.speculativeRedTeam` it was already started beside the loop (`seatsBox.speculative`):
+    // an accept finishes THAT pass (same rows, comment and gate as the sequential pass); anything else calls it off.
+    if (spec) {
       try {
-        redTeam = io.runRedTeam(seatsBox.input);
+        out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted: owed, out, input: seatsBox.input, round1 }, io);
+        recordSeats(out.redTeamSpeculative.seatTimings ?? []);
       } catch (e) {
-        redTeam = { status: 'error', reason: tail(e?.message ?? e, 300) };
+        out.redTeamSpeculative = { decision: 'error', reason: tail(e?.message ?? e, 300) };
       }
     }
-    if (out.redTeamSpeculative) delete out.redTeamSpeculative.result;
-    io.log(`review-job ${out.sessionSlug}: red team — ${redTeam?.status ?? 'none'}${redTeam?.reason ? ` (${redTeam.reason})` : ''}`
-      + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
-    recordSeats(redTeam?.seat ? [redTeam.seat] : []);
-    out.redTeam = summarizeRedTeam(redTeam);
-    // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
-    // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
-    // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
-    if (typeof io.runRedTeamGate === 'function') {
-      let gate;
-      try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
-      io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);
-      out.redTeamGate = { status: gate?.status ?? null, outcome: gate?.outcome ?? null, ...(gate?.reason ?? gate?.error ? { reason: gate.reason ?? gate.error } : {}),
-        ...(gate?.plan ? { sendBack: gate.plan.sendBack.length, card: gate.plan.card.length, advisory: gate.plan.advisory.length } : {}) };
+    if (owed && (out.redTeamSpeculative?.result || typeof io.runRedTeam === 'function')) {
+      let redTeam = out.redTeamSpeculative?.result ?? null;
+      if (!redTeam) {
+        try {
+          redTeam = io.runRedTeam(round1 ? { ...seatsBox.input, round1: true } : seatsBox.input);
+        } catch (e) {
+          redTeam = { status: 'error', reason: tail(e?.message ?? e, 300) };
+        }
+      }
+      if (out.redTeamSpeculative) delete out.redTeamSpeculative.result;
+      io.log(`review-job ${out.sessionSlug}: red team — ${redTeam?.status ?? 'none'}${redTeam?.reason ? ` (${redTeam.reason})` : ''}`
+        + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
+      recordSeats(redTeam?.seat ? [redTeam.seat] : []);
+      out.redTeam = summarizeRedTeam(redTeam);
+      // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
+      // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
+      // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
+      if (typeof io.runRedTeamGate === 'function') {
+        let gate;
+        try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
+        io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);
+        out.redTeamGate = { status: gate?.status ?? null, outcome: gate?.outcome ?? null, ...(gate?.reason ?? gate?.error ? { reason: gate.reason ?? gate.error } : {}),
+          ...(gate?.plan ? { sendBack: gate.plan.sendBack.length, card: gate.plan.card.length, advisory: gate.plan.advisory.length } : {}) };
+      }
     }
   }
+  if (!round1Changes) runOwedRedTeam();
   if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam?.status ?? null });
-  else if (spec && seatsBox.input) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
+  else if (spec && seatsBox.input && !round1Changes) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
   return out;
 }
 

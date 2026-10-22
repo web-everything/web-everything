@@ -2,6 +2,7 @@
 import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
+import { round1RedTeamOwedFor } from '../lib/red-team-timing.mjs';
 import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
 import { PROVIDER_CAP_ENV, resolveProviderCap } from './review-seat-policy.mjs';
@@ -1003,6 +1004,15 @@ function notOwedReason(loopPayload) {
   return `review verdict is ${v.verdict ?? 'missing'}${v.humanRequired === true ? ' (human gate; the panel did not reduce to accept)' : ''}, not accept`;
 }
 
+/**
+ * Card 6212 — is a red-team pass owed on this finished review? The ordinary accept ({@link redTeamOwedFor}), or —
+ * only under `redTeam.timing=round1` (`round1`) — a plain `changes` review, whose confirmed breaks join that round's
+ * send-back. PURE.
+ */
+export function redTeamOwedThisRound(loopPayload, { round1 = false } = {}) {
+  return redTeamOwedFor(loopPayload) || (round1 === true && round1RedTeamOwedFor(loopPayload));
+}
+
 /** Did a TRUSTED principal already post this head's red-team comment? A marker from any other login never counts. PURE. */
 export function redTeamCommentPosted(comments, pr, rev) {
   const marker = redTeamMarker(pr, rev);
@@ -1377,10 +1387,10 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
  * This sequential entry runs both back to back, exactly as before the split.
  * @param {ReturnType<typeof createRedTeamIo>} io
  */
-export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true } = {}, io = createRedTeamIo({ env })) {
+export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true, round1 = false } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
+    if (!redTeamOwedThisRound(loopPayload, { round1 })) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     const read = loopPayload?.findings?.read;
     const recording = record !== false && loopPayload?.replay !== true;
     const pass = await speculateRedTeam({ pr, repo, lanePath, read, claudeFindings: claudeFindingsFromLoop(loopPayload), env, post, record: recording }, io);
@@ -1619,10 +1629,10 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
  * different input). A clean row for this head that landed meanwhile wins: the pass is `superseded` and the caller
  * records its spend as discarded and runs the sequential pass, which resumes from that row. Never throws.
  */
-export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, env = process.env, post = true } = {}, io = createRedTeamIo({ env })) {
+export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, env = process.env, post = true, round1 = false } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
+    if (!redTeamOwedThisRound(loopPayload, { round1 })) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     if (pass?.status !== 'speculated') return { status: 'stale', reason: `the speculative pass is ${pass?.status ?? 'missing'}, not speculated` };
     const read = loopPayload?.findings?.read;
     const fp = redTeamReadFingerprint(read);
@@ -1631,8 +1641,10 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     }
     // The sequential brief lists the jurors' own findings so the red team does not repeat them; a speculative brief
     // was written before they existed. Identical only when there were none — otherwise the sequential pass runs.
+    // Card 6212 — under `redTeam.timing=round1` the red team is a seat of the round, briefed independently of the
+    // jurors (card 6209): their findings never alone make the pass stale, on a `changes` round or on the accept.
     const jurorFindings = claudeFindingsFromLoop(loopPayload);
-    if (Array.isArray(jurorFindings) && jurorFindings.length) {
+    if (round1 !== true && Array.isArray(jurorFindings) && jurorFindings.length) {
       return { status: 'stale', reason: `the jurors raised ${jurorFindings.length} finding(s) the speculative brief could not carry (the sequential brief lists them so the red team does not repeat them)` };
     }
     let records = [];
@@ -1797,7 +1809,7 @@ if (IS_CLI) {
     runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() })
       .then((result) => emit(result, renderSeatSummary));
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
-    runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post') })
+    runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), round1: rest.includes('--round1') })
       .then((result) => emit(result, renderRedTeamSummary));
   } else if (sub === 'red-team-speculate' && flag('pr') && flag('repo') && flag('lane') && flag('read-sink') && flag('out')) {
     // Card xbizuci — THE SPECULATIVE RED TEAM, started by the review job beside the review loop. It waits for the
@@ -1837,7 +1849,7 @@ if (IS_CLI) {
     // Card xbizuci — the second half of an ACCEPTED review's speculative pass: seat row, folded verdict, effects.
     let pass = null;
     try { pass = JSON.parse(readFileSync(flag('pass'), 'utf8')); } catch { pass = null; }
-    finishSpeculativeRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), loopPayload: readPayload(), pass, post: !rest.includes('--no-post') })
+    finishSpeculativeRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), loopPayload: readPayload(), pass, post: !rest.includes('--no-post'), round1: rest.includes('--round1') })
       .then((result) => emit(result, renderRedTeamSummary));
   } else if (sub === 'red-team-replay' && flag('pr') && flag('repo') && flag('lane')) {
     // READ-ONLY replay against an already-accepted PR: never posts and never writes the scorecard store
@@ -1857,9 +1869,9 @@ if (IS_CLI) {
       .then((comments) => runRedTeam({ pr, repo: flag('repo'), lanePath: flag('lane'), loopPayload: replayPayload({ view: { ...view, comments }, diffText }), post: false, record: false }))
       .then((result) => emit(result, renderRedTeamSummary));
   } else {
-    process.stderr.write('usage: review-extra-seats.mjs run|red-team --pr=<n> --repo=<owner/repo> --lane=<path> --loop-json=<file> [--no-post]\n'
+    process.stderr.write('usage: review-extra-seats.mjs run|red-team --pr=<n> --repo=<owner/repo> --lane=<path> --loop-json=<file> [--no-post] [--round1]\n'
       + '       review-extra-seats.mjs red-team-speculate --pr=<n> --repo=<owner/repo> --lane=<path> --read-sink=<file> --out=<file> [--wait-ms=<n>]\n'
-      + '       review-extra-seats.mjs red-team-finish --pr=<n> --repo=<owner/repo> --pass=<file> --loop-json=<file> [--no-post]\n'
+      + '       review-extra-seats.mjs red-team-finish --pr=<n> --repo=<owner/repo> --pass=<file> --loop-json=<file> [--no-post] [--round1]\n'
       + '       review-extra-seats.mjs red-team-replay --pr=<n> --repo=<owner/repo> --lane=<local clone holding the head>\n');
     process.exitCode = 2;
   }

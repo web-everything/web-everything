@@ -199,7 +199,10 @@ export const RED_TEAM_GATE_MARKER = '<!-- we:red-team-gate';
  * (a spawn is all the shared seam reports: whether the detached job later lands the card is that job's own concern).
  * `no-send-back` is only ever a RESULT label (nothing to send back); it is never recorded.
  */
-export const GATE_OUTCOMES = Object.freeze({ SENT_BACK: 'sent-back', ROUND_CAP: 'round-cap', NOTHING_TO_SEND: 'no-send-back', CARD_QUEUED: 'card-queued' });
+export const GATE_OUTCOMES = Object.freeze({ SENT_BACK: 'sent-back', ROUND_CAP: 'round-cap', NOTHING_TO_SEND: 'no-send-back', CARD_QUEUED: 'card-queued',
+  // Card 6212 — confirmed breaks left advisory because the same break, citing unchanged lines, was already ruled on an
+  // earlier head (`we:scripts/lib/red-team-timing.mjs#suppressPreviouslyRuled`). Recorded only under redTeam.timing=round1.
+  PRIOR_RULING: 'prior-ruling' });
 
 /** `result` names the decided result ({@link redTeamResultId}). `grantIds` records the send-back step's grant
  * snapshot, not its POST time. Older records omit these fields. */
@@ -503,7 +506,7 @@ const GATE_ACTION_LINES = [
 /** Action lines that release a finding from the send-back / held set. */
 const RELEASING_ACTIONS = new Set(['card', 'advisory']);
 /** The outcomes automation records for decisions the gate itself made; any other release needs a human operator author. */
-const AUTOMATION_RELEASE_OUTCOMES = new Set([GATE_OUTCOMES.SENT_BACK, GATE_OUTCOMES.CARD_QUEUED]);
+const AUTOMATION_RELEASE_OUTCOMES = new Set([GATE_OUTCOMES.SENT_BACK, GATE_OUTCOMES.CARD_QUEUED, GATE_OUTCOMES.PRIOR_RULING]);
 
 /** PURE: the action lines of ONE gate record, read only from the block right after its marker (and heading). */
 function gateActionLines(body) {
@@ -565,7 +568,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   // Without a repo there is no grant credit and the cap keeps winning.
   const outcome = sendBackStepState(liveGates, grants).outcome;
   const ruled = operatorRuled(records, pr, live);
-  const sendBack = [], held = [];
+  const sendBack = [], held = [], released = [];
   for (const f of result?.findings ?? []) {
     const recorded = actions.get(f.index);
     // Two raced gate runs can record both send-back and round-cap for one result; the cap wins (sendBackStepOutcome).
@@ -574,6 +577,31 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
         ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
     if (action === 'held' && !ruled) held.push(f);
     if (action === 'send-back') sendBack.push(f);
+    // Card 6212 — a confirmed break someone RULED on: a recorded card / advisory action, or the operator's ruling on a
+    // break the gate held at the round cap. A break only planned (no record yet) or sent back is never ruled.
+    if (f.confirmed && (RELEASING_ACTIONS.has(recorded) || (action === 'held' && ruled))) released.push(f);
   }
-  return { result, sendBack, held, since: commentCreatedAt(capRecord) ?? null, outcome };
+  return { result, sendBack, held, released, since: commentCreatedAt(capRecord) ?? null, outcome };
+}
+
+/**
+ * Card 6212 — every confirmed break RULED on an EARLIER head of this PR (`released` by {@link readRedTeamDisposition}
+ * on that head), newest head first, for the gate's remembered-breaks check. Only trusted red-team results count; the
+ * live head is never an earlier head. PURE.
+ * @returns {Array<{rev:string, finding:object}>}
+ */
+export function ruledEarlierBreaks({ comments, pr, head, setting, repo = null, standingRuling = null, env = process.env } = {}) {
+  const live = String(head ?? '').toLowerCase();
+  const revs = [];
+  for (const r of indexedRecords(comments)) {
+    const parsed = parseRedTeamComment(recordBody(r));
+    if (parsed?.pr === Number(pr) && parsed.rev !== live && /^[0-9a-f]{40}$/.test(parsed.rev) && !revs.includes(parsed.rev)) revs.push(parsed.rev);
+  }
+  const out = [];
+  for (const rev of revs.reverse()) {
+    let d;
+    try { d = readRedTeamDisposition({ comments, pr, head: rev, setting, env, repo, standingRuling }); } catch { continue; }
+    for (const finding of d.released ?? []) out.push({ rev, finding });
+  }
+  return out;
 }

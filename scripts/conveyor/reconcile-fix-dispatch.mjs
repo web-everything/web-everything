@@ -169,6 +169,8 @@ import { resolveOperationRoute, resolvePolicyModel } from '../lib/dispatch-routi
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { readRedTeamStatusRecord } from '../lib/drain-red-team-evidence.mjs';
+import { decideRound1FixHold, readRedTeamTiming } from '../lib/red-team-timing.mjs';
 
 // card 302 — resolve red-main capacity through the shared policy layers.
 export function resolveMainFixCapacity(env = process.env) {
@@ -1756,6 +1758,18 @@ export function classifyEnvFaultRefusals(refusals) {
  *   for PRs the plan DID offer. Handing up `reconciled.refusals` itself is what lets the daemon's own onTick
  *   print the reconcile layer's real reason instead of discarding it to a count.
  */
+/**
+ * Card 6212 — under `redTeam.timing=round1`, should this `review:changes` fix wait for the head's in-flight round-1 red
+ * team, so the fixer gets the panel's and the red team's findings in one round? Bounded by
+ * `redTeam.round1FixHoldMinutes`; any read failure is "do not wait" (the wait only saves a round, it guards nothing).
+ */
+export function defaultRound1RedTeamHold({ repo, pr, head, now = Date.now(), env = process.env }) {
+  const setting = readRedTeamTiming({ env });
+  if (!setting.round1) return { hold: false, why: 'redTeam.timing is not round1' };
+  const rec = readRedTeamStatusRecord({ repo, pr, head, env });
+  return decideRound1FixHold({ setting, status: rec?.status ?? null, statusAt: rec?.statusAt, now, writerAlive: rec?.writerAlive ?? true });
+}
+
 export function runReconcileFixDispatch({
   root = REPO_ROOT,
   repo = null,
@@ -1765,6 +1779,8 @@ export function runReconcileFixDispatch({
   tryResume = tryResumeFix,
   // Card xrbu1bp — the round resume. Off under a test runner unless injected (it reads the live agent listing).
   tryResumeRound = isUnderTestEnv() ? null : tryResumeRoundFix,
+  // Card 6212 — the bounded wait for a round-1 red team in flight on the head. Off under a test runner unless injected.
+  round1RedTeamHold = isUnderTestEnv() ? null : defaultRound1RedTeamHold,
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
   // Card xd1tvd0 — rewrite the scope-overlap fences to each PR's git net diff vs current main (the `fixOverlap`
@@ -1978,6 +1994,12 @@ export function runReconcileFixDispatch({
   const queueBudget = queueBudgetFrom(queueAdmission, { root, repo: repoKey });
   const dispatched = [];
   for (const entry of planned) {
+    // Card 6212 — a round-1 red team still running on this head: wait (bounded) so its breaks join this round's fix.
+    if (typeof round1RedTeamHold === 'function' && entry.labels?.includes('review:changes') && entry.headRefOid) {
+      let h = null;
+      try { h = round1RedTeamHold({ repo: CONSTELLATION_REPOS[repoKey]?.slug ?? null, pr: entry.pr, head: entry.headRefOid }); } catch { h = null; }
+      if (h?.hold) { refusals.push({ pr: entry.pr, kind: 'red-team-round1', why: h.why }); continue; }
+    }
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
     const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) : { admit: true };
     if (t.admit && t.note) console.error(`reconcile-fix-dispatch: PR #${entry.pr} fix launch admitted: ${t.note}`);

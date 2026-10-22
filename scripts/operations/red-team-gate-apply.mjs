@@ -39,8 +39,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
+  GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker, ruledEarlierBreaks,
 } from '../lib/red-team-gate.mjs';
+import { citedLinesFingerprint, formatRedTeamTimingLine, readRedTeamTiming, suppressPreviouslyRuled } from '../lib/red-team-timing.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
 import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
@@ -99,7 +100,7 @@ export function buildSendBackArgv({ repo, pr, bodyPath }) {
 }
 
 /** The gate's own record for ONE action on the head. PURE. */
-export function buildGateComment({ pr, head, outcome, plan, round, result = null, grantIds = null, cardResult = null, sendBackResult = null, cap = DEFAULT_ROUND_CAP }) {
+export function buildGateComment({ pr, head, outcome, plan, round, result = null, grantIds = null, cardResult = null, sendBackResult = null, cap = DEFAULT_ROUND_CAP, priorRuled = null }) {
   const lines = [redTeamGateMarker(pr, head, outcome, result, grantIds),`**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
   if (plan.sendBack.length) {
     lines.push(outcome === GATE_OUTCOMES.ROUND_CAP
@@ -111,6 +112,16 @@ export function buildGateComment({ pr, head, outcome, plan, round, result = null
       + `${cardResult?.ok ? ` — landing job ${sanitizeCardField(cardResult.session ?? cardResult.handle ?? '', 120)}` : ` — FILING FAILED: ${sanitizeCardField(cardResult?.error ?? 'unknown', 300)}`}.`);
   }
   if (plan.advisory.length) lines.push(`- ${plan.advisory.length} finding(s) left advisory (${plan.advisory.map((f) => `#${f.index}`).join(', ')}).`);
+  // Card 6212 — the PR was already under `review:changes` (a round-1 red team beside the panel's send-back): no
+  // send-back comment of the gate's own was written, so the fix list rides on this record, where the fixer's context
+  // pack stages it next to the review's findings. Below a blank line, so the action-line reader never sees it.
+  if (outcome === GATE_OUTCOMES.SENT_BACK && sendBackResult?.already && plan.sendBack.length) {
+    lines.push('', `Fix list — the red team's confirmed break(s) on this head, in the same round as the review's findings:`, ...plan.sendBack.map(findingLine));
+  }
+  if (outcome === GATE_OUTCOMES.PRIOR_RULING && Array.isArray(priorRuled) && priorRuled.length) {
+    lines.push('', 'Not raised again (redTeam.timing=round1): each was already ruled on an earlier head, and the lines it cites are unchanged:',
+      ...priorRuled.map(({ finding, rev }) => `- #${finding.index} ${where(finding)} — ruled on head \`${String(rev).slice(0, 12)}\``));
+  }
   return lines.join('\n');
 }
 
@@ -141,7 +152,37 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     const { result: parsed, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo, standingRuling);
     if (!parsed) return { status: 'no-red-team-on-head', head };
     const setting = io.readSetting();
-    const plan = planRedTeamActions(parsed, setting.value);
+    let plan = planRedTeamActions(parsed, setting.value);
+    // Card 6212 — REMEMBERED BREAKS (redTeam.timing=round1 only): a confirmed break already ruled on an earlier head,
+    // whose cited lines are unchanged at this head, is not sent back or carded again. Recorded once (`prior-ruling`)
+    // so the drain's disposition reader sees it released. Fail closed: any read that fails leaves the break in place.
+    let timing = null;
+    try { timing = io.readTiming?.() ?? null; } catch { timing = null; }
+    if (timing?.round1 && (plan.sendBack.length || plan.card.length)) {
+      let ruled = [];
+      try { ruled = ruledEarlierBreaks({ comments: view?.comments, pr, head, setting: setting.value, repo, standingRuling }); } catch { ruled = []; }
+      if (ruled.length) {
+        const texts = new Map();
+        const textAt = (sha, path) => {
+          const key = `${sha}:${path}`;
+          if (!texts.has(key)) { let t = null; try { t = io.readFileAt({ repo, sha, path }); } catch { t = null; } texts.set(key, typeof t === 'string' ? t : null); }
+          return texts.get(key);
+        };
+        const fp = (f, sha) => citedLinesFingerprint({ file: f.file, line: f.line, text: f.file ? textAt(sha, f.file) : null });
+        const suppressed = suppressPreviouslyRuled({ plan, fingerprintOf: (f) => fp(f, head),
+          ruled: ruled.map(({ rev, finding }) => ({ rev, fingerprint: fp(finding, rev) })) });
+        if (suppressed.priorRuled.length) {
+          plan = { sendBack: suppressed.sendBack, card: suppressed.card, advisory: suppressed.advisory };
+          if (!dryRun && !recorded.has(GATE_OUTCOMES.PRIOR_RULING)) {
+            try {
+              io.postComment({ repo, pr, body: buildGateComment({ pr, head, outcome: GATE_OUTCOMES.PRIOR_RULING, result: resultId, round: null,
+                plan: { sendBack: [], card: [], advisory: suppressed.priorRuled.map((x) => x.finding) }, priorRuled: suppressed.priorRuled }) });
+            } catch (e) { return { status: 'prior-ruling-record-failed', head, plan, error: String(e?.message ?? e).slice(0, 200) }; }
+          }
+          io.log?.(`red-team gate: #${pr} ${suppressed.priorRuled.length} confirmed break(s) not raised again — ruled on an earlier head, cited lines unchanged (${formatRedTeamTimingLine(timing)})`);
+        }
+      }
+    }
     if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
     // One record per ACTION (see the header): what is already recorded for this result is not repeated, what is not stays pending.
     const priorSend = sendBackOutcome;
@@ -215,7 +256,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
 }
 
 /** Statuses the CLI reports with a nonzero exit: every failure, including a record that could not be posted. */
-export const GATE_FAILURE_STATUSES = Object.freeze(['error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed']);
+export const GATE_FAILURE_STATUSES = Object.freeze(['error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed', 'prior-ruling-record-failed']);
 
 /** The CLI exit code for a gate result: 1 on any failure status, else 0. PURE. */
 export const gateExitCode = (r) => (GATE_FAILURE_STATUSES.includes(r?.status) ? 1 : 0);
@@ -247,6 +288,12 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     // Fresh per run on the App identity: a closed or edited ruling stops crediting automatic grants at the next run.
     readGrantScope: ({ repo, pr, head, comments }) => standingRulingScope({ repo, pr: { number: Number(pr), headRefOid: head, comments } }),
     readSetting: () => readConfirmedBreaks({ env }),
+    // Card 6212 — `redTeam.timing`, and one file's text at one commit (the remembered-breaks check). A failed read is null.
+    readTiming: () => readRedTeamTiming({ env }),
+    readFileAt: ({ repo, sha, path }) => {
+      if (!/^[0-9a-f]{40}$/.test(String(sha)) || !/^[\w@./-]+$/.test(String(path)) || String(path).split('/').includes('..')) return null;
+      return gh(['api', '-H', 'Accept: application/vnd.github.raw', `repos/${repo}/contents/${encodeURI(path)}?ref=${sha}`]);
+    },
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
     readRoundAsOf: ({ repo, pr, at, head }) => readReviewRoundAsOf({ repo, pr, at, head }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).
