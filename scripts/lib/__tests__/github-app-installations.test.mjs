@@ -133,5 +133,5 @@ describe('legacy slugs from old origin remotes are canonicalized before reaching
     expect(resolveRepos({ self: 'frontier-ui/frontierui' })[0]).toBe('frontier-ui/frontierui');
     expect(resolveRepos({ repos: 'frontierui,chalbert/plateau-app', self: 'web-everything/web-everything' }))
       .toEqual(['frontier-ui/frontierui', 'plateauapp/plateau-app']);
-  });
+  }, 60_000); // imports the ~7.5k-line drain module: over 5s on a loaded host
 });
