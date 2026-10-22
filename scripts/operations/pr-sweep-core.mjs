@@ -30,6 +30,9 @@ import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authors
 import { openReferralFindings } from './record-referral-ruling.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
+import { standDownComments, isStandDownSuperseded, standDownReason, standDownTrailerReason } from '../conveyor/stand-down.mjs';
+import { isAdvisoryMechanismStandDownSuperseded } from '../conveyor/advisory-fix-mark.mjs';
+import { isOperatorAnswerStandDownSuperseded } from '../conveyor/stand-down-answer-core.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, gateOutcomesForHead, parseRedTeamGateMarker, redTeamRulingNeeded, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
 
 export { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT };
@@ -40,9 +43,11 @@ export const ACTORS = Object.freeze(['fixer', 'reviewer', 'red-team', 'drain', '
 const REFERRAL_HOLD_MARKER = 'review-referral-hold';
 const HOLD_LEAD = /^\s*review paused:/i;
 const NEEDS_DECISION_RE = /conveyor\s+—\s+needs your decision/i;
-const FIX_BEGIN_RE = /conveyor fix-begin\s+—\s+fix claim held/i;
-const FIX_END_RE = /conveyor fix-end\s+—\s+fix claim released/i;
-const REARM_RE = /conveyor fix\s+—\s+re-armed for re-review/i;
+// Leading-line markers only (an optional emoji first): a later comment QUOTING one is not renewed work.
+const LEAD = String.raw`^\s*(?:[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]\u{FE0F}?\s+)?`; // an emoji, never `>` (a quote)
+const FIX_BEGIN_RE = new RegExp(`${LEAD}conveyor fix-begin\\s+—\\s+fix claim held`, 'iu');
+const FIX_END_RE = new RegExp(`${LEAD}conveyor fix-end\\s+—\\s+fix claim released`, 'iu');
+const REARM_RE = new RegExp(`${LEAD}conveyor fix\\s+—\\s+re-armed for re-review`, 'iu');
 const ENQUEUE_RE = /we-drain-enqueue-clearance/;
 
 const t = (v) => { const n = Date.parse(v ?? ''); return Number.isFinite(n) ? n : null; };
@@ -134,6 +139,35 @@ export function needsDecisionOpen(comments, { headCommittedAt = null } = {}) {
     text: body.split('\n').filter(Boolean).slice(1, 3).join(' ').slice(0, 200) };
 }
 
+/**
+ * A TERMINAL fixer stand-down on the live head with nothing since (live #5768, 2026-10-21: the fixer stood down at
+ * 18:01Z with `reason=gate-red`, the fix-dispatch daemon treats that as terminal on the head, and the sweep still said
+ * `fixing` for 4+ hours). The newest stand-down the fix daemon itself still counts as terminal: the SAME predicates as
+ * `reconcile-core.mjs#countUnresolvedStandDowns` (trusted, holds on the live head per `standDownComments`, not
+ * superseded by the watch, the advisory-mechanism rule or an operator answer; `lapseOnNewHead` unset reads its
+ * setting), unless a trusted fix claim or re-arm came after it, or a live job names the PR.
+ * Returns `{at, reason}` (the marker's machine reason, else its prose clause) or null.
+ */
+const REPAIR_JOBS = new Set(['fix-run', 'ci-heal', 'deliver-item-run']);
+// PR numbers are repository-local: an unknown repository cannot prove work on this PR.
+const jobMatchesPr = (job, pr) => Number(job.pr) === pr.number && !!job.repo && job.repo === pr.repo;
+export function fixStoodDown(pr, { liveJobs = [], lapseOnNewHead } = {}) {
+  let sd = null;
+  const list = sorted(pr.comments);
+  const opts = { headRefOid: pr.headRefOid ?? null, headChangedAt: pr.headCommittedAt ?? null, lapseOnNewHead };
+  for (const e of list) {
+    if (standDownComments([e.c], opts).length && isTrustedMarkerAuthor(e.c) && !isStandDownSuperseded(pr.comments, e.i)
+      && !isAdvisoryMechanismStandDownSuperseded(pr.comments, e.i) && !isOperatorAnswerStandDownSuperseded(pr.comments, e.i)) sd = e;
+  }
+  if (!sd) return null;
+  // An undated stand-down still counts (the daemon counts it); nothing can be proven to come after it.
+  if (sd.at !== null && list.some((e) => e.at !== null && e.at > sd.at && trusted(e) && (FIX_BEGIN_RE.test(bodyOf(e.c)) || REARM_RE.test(bodyOf(e.c))))) return null;
+  // Only REPAIR work started after the marker revives it (a reviewer, or a job from before it, does not).
+  if ((liveJobs ?? []).some((j) => REPAIR_JOBS.has(j.kind) && jobMatchesPr(j, pr)
+    && sd.at !== null && Number.isFinite(j.startedAt) && j.startedAt > sd.at)) return null;
+  return { at: sd.at, reason: standDownTrailerReason(bodyOf(sd.c)) ?? standDownReason(bodyOf(sd.c)) ?? 'unknown' };
+}
+
 /** An open fix claim (trusted begin with no later release) younger than {@link FIX_CLAIM_LIVE_MS}. PURE. */
 export function openFixClaim(comments, now) {
   let begin = null; let end = null;
@@ -183,6 +217,9 @@ const realChecks = (pr) => (Array.isArray(pr?.statusCheckRollup) ? pr.statusChec
   .filter((c) => (c?.name ?? c?.context) !== 'review-gate');
 const failingChecks = (pr) => realChecks(pr)
   .some((c) => ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'].includes(String(c?.conclusion ?? c?.state ?? '').toUpperCase()));
+/** When the newest failing check finished: CI-failure age never comes from `updatedAt` (a comment would reset it). */
+const failedAt = (pr) => mx(...realChecks(pr).filter((c) => ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'].includes(String(c?.conclusion ?? c?.state ?? '').toUpperCase()))
+  .map((c) => t(c?.completedAt ?? c?.createdAt ?? c?.startedAt))); // CheckRun completedAt, legacy StatusContext createdAt
 const runningChecks = (pr) => realChecks(pr)
   .some((c) => ['IN_PROGRESS', 'QUEUED', 'PENDING'].includes(String(c?.status ?? c?.state ?? '').toUpperCase()) && !c?.conclusion);
 
@@ -250,6 +287,19 @@ export function deriveWaitingOn(pr, ctx) {
   const sentBack = outcomes.has(GATE_OUTCOMES.SENT_BACK);
   const fixing = has('review:changes') || has('status:fixing') || has('review-status:fixing') || has('status:sent-back-red-team');
   const claim = openFixClaim(pr.comments, now);
+  // A fixer that STOOD DOWN on this head is not "fixing": nothing will move it (the fix daemon treats it as terminal).
+  // Whatever the labels say (a stood-down PR can still read `review:pending`); only the operator holds above outrank it,
+  // and it comes before the send-back-cleared check (re-running the gate cannot revive a fixer that stood down).
+  // The owed human review keeps its operator priority, but only when that IS the state it would get (no draft, repair,
+  // CI or red-team wait would be chosen first below).
+  const humanOwed = has('review:human') && has('advisory:accepted') && !pr.isDraft && !fixing && !has('ci:failed') && !failingChecks(pr)
+    && !has('status:awaiting-ci') && !has('checking') && !runningChecks(pr) && !has('red-team:pending')
+    && !drainSkips.some((x) => x.num === pr.number && (!x.repo || x.repo === pr.repo) && x.kind === 'red-team-pending')
+    && !(sentBack && !claim); // a cleared send-back would be chosen first
+  const stood = humanOwed ? null : fixStoodDown(pr, { liveJobs, lapseOnNewHead: ctx.standDownLapse });
+  if (stood) return { ...done('system:fix-stood-down', 'system', stood.at, `the fixer stood down on this head (reason=${stood.reason}) and nothing has picked it up since; the fix daemon treats that as terminal`,
+    actions.answerNote, [`stand-down reason=${stood.reason}`]), terminal: true };
+
   if (sentBack && !fixing && !claim && (has('ready-to-merge') || has('review:accepted') || has('review:human'))) {
     return done('red-team-sent-back-cleared', 'nobody', labelAt('ready-to-merge', 'review:accepted', 'review:human'),
       'a confirmed red-team break was sent back, but the review label was cleared, so no fixer owns it', actions.sendBack, ['we:red-team-gate outcome=sent-back']);
@@ -257,13 +307,16 @@ export function deriveWaitingOn(pr, ctx) {
 
   // A draft with no hold label is a PR its author is still building or repairing: the fixer owns it, and it is only
   // flagged once it has sat past the threshold with no live job.
-  if (pr.isDraft) return done('draft', 'fixer', claim?.at ?? null,
+  // An expired claim still dates the wait (a later outsider comment must not reset the clock).
+  const lastClaimAt = mx(...sorted(pr.comments).filter((e) => trusted(e) && FIX_BEGIN_RE.test(bodyOf(e.c))).map((e) => e.at));
+  // ...but a newer push still advances it.
+  if (pr.isDraft) return done('draft', 'fixer', lastClaimAt === null ? (claim?.at ?? null) : mx(claim?.at ?? lastClaimAt, t(pushedAt)),
     claim ? 'draft while a fix claim is held' : 'draft with no hold label; its author is still working', actions.why, ['draft']);
 
-  if (fixing) return done(has('status:sent-back-red-team') ? 'sent-back-red-team' : 'fixing', 'fixer', mx(claim?.at, moved('review:changes', 'status:fixing', 'review-status:fixing', 'status:sent-back-red-team')),
+  if (fixing) return done(has('status:sent-back-red-team') ? 'sent-back-red-team' : 'fixing', 'fixer', mx(claim?.at ?? (lastClaimAt === null ? null : mx(lastClaimAt, t(pushedAt))), moved('review:changes', 'status:fixing', 'review-status:fixing', 'status:sent-back-red-team')),
     'a fixer owns the next move', actions.why, [labels.find((l) => /fixing|changes|sent-back/.test(l))].filter(Boolean));
 
-  if (has('ci:failed') || failingChecks(pr)) return done('ci-failed', 'fixer', moved('ci:failed'), 'CI failed; the CI-heal fixer owns it', actions.why, ['failing check']);
+  if (has('ci:failed') || failingChecks(pr)) return done('ci-failed', 'fixer', moved('ci:failed') ?? failedAt(pr), 'CI failed; the CI-heal fixer owns it', actions.why, ['failing check']);
   if (has('status:awaiting-ci') || has('checking') || runningChecks(pr)) {
     return done('awaiting-ci', 'ci', moved('status:awaiting-ci', 'checking'), 'checks are running', actions.why, ['checks running']);
   }
@@ -331,9 +384,9 @@ export function humanReviewHold(pr, now, { fixClaimLive = null } = {}) {
 /** The live jobs that cover this PR: ps processes naming its repo and number, plus an open fix claim. PURE. */
 export function jobsFor(pr, liveJobs, now) {
   // A PR number alone cannot identify a repository; unknown-repo processes cannot prove activity here.
-  const mine = (liveJobs ?? []).filter((j) => Number(j.pr) === pr.number && j.repo && j.repo === pr.repo);
+  const mine = (liveJobs ?? []).filter((j) => jobMatchesPr(j, pr));
   const claim = openFixClaim(pr.comments, now);
-  return claim ? [...mine, { kind: 'fix', source: 'fix-claim comment', pr: pr.number }] : mine;
+  return claim ? [...mine, { kind: 'fix', source: 'fix-claim comment', pr: pr.number, at: claim.at }] : mine;
 }
 
 /**
@@ -346,13 +399,19 @@ export function assessPrSweep(read) {
   const thresholdMinutes = Number.isFinite(read.stalledAfterMinutes) && read.stalledAfterMinutes > 0
     ? read.stalledAfterMinutes : STALLED_AFTER_MINUTES_DEFAULT;
   const rows = read.prs.map((pr) => {
-    const d = deriveWaitingOn(pr, { now, drainSkips: read.drainSkips ?? [], liveJobs: read.liveJobs ?? [], holdOptions: read.holdOptions });
+    const d = deriveWaitingOn(pr, { now, drainSkips: read.drainSkips ?? [], liveJobs: read.liveJobs ?? [], holdOptions: read.holdOptions, standDownLapse: read.standDownLapse });
     const jobs = jobsFor(pr, read.liveJobs, now);
-    const live = jobs.length > 0 || (d.state === 'awaiting-ci' && runningChecks(pr));
+    // A terminal stand-down already excludes every later claim and live job; an older fix claim is not liveness. A
+    // claim COMMENT with no process is liveness only inside the threshold: an orphaned claim is not a fixer at work.
+    // A fixer / CI-heal wait is live only through REPAIR work: a reviewer process does not repair anything.
+    const real = jobs.filter((j) => (j.source !== 'fix-claim comment' || (Number.isFinite(j.at) && now - j.at <= thresholdMinutes * 60_000))
+      && (d.actor !== 'fixer' || j.source === 'fix-claim comment' || REPAIR_JOBS.has(j.kind)));
+    const live = !d.terminal && (real.length > 0 || (d.state === 'awaiting-ci' && runningChecks(pr)));
     const ageMinutes = d.since === null ? null : Math.max(0, Math.round((now - d.since) / 60_000));
     let stalledReason = null;
     if (d.actor === 'operator') stalledReason = 'waiting on the operator';
     else if (d.actor === 'nobody') stalledReason = 'nobody owns the next move';
+    else if (d.terminal && !live) stalledReason = 'terminal: nothing will move it on this head';
     else if (!live && ageMinutes !== null && ageMinutes > thresholdMinutes) {
       stalledReason = `waiting on ${d.actor} for ${ageMinutes} min (> ${thresholdMinutes}) with no live job`;
     }
@@ -360,7 +419,7 @@ export function assessPrSweep(read) {
       repo: pr.repo, number: pr.number, title: pr.title ?? '', url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.number}`,
       waitingOn: d.state, actor: d.actor,
       since: d.since === null ? null : new Date(d.since).toISOString(), approxSince: d.approxSince, ageMinutes,
-      liveJob: live ? (jobs[0]?.kind ?? 'checks') : null, why: d.why, evidence: d.evidence,
+      liveJob: live ? (real[0]?.kind ?? 'checks') : null, why: d.why, evidence: d.evidence,
       stalled: stalledReason !== null, stalledReason,
       next: stalledReason ? (d.next ?? nextActions(pr).why) : null,
     };

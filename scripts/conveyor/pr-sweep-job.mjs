@@ -14,6 +14,7 @@ import { daemonJobsDir, deleteRun } from '../operations/run-store.mjs';
 import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
 import { readGit } from '../lib/proc-read.mjs';
 import { resolvePrSweepSettings } from './pr-sweep.mjs';
+import { resolveStallSweepSettings } from './pr-stall-sweep.mjs';
 export { resolvePrSweepSettings };
 export const PR_SWEEP_JOB_KIND = HEALTH_PR_SWEEP_KIND;
 const SELF = fileURLToPath(import.meta.url);
@@ -29,7 +30,8 @@ function pruneJob(store, id) {
 }
 export async function runPrSweepJob({ now, state = {}, config, settings, sourceRoot = ROOT, dir, env = process.env,
   store = createJobStore(daemonJobsDir('health-pr-sweep', env)), enqueue = enqueueJob, reattach = reattachTick,
-  evict = evictToTrash, prune = pruneJob, snapshot, codeSha, log = console.error, warmGate = {} } = {}) {
+  evict = evictToTrash, prune = pruneJob, snapshot, codeSha, log = console.error, warmGate = {},
+  stallSettings = () => resolveStallSweepSettings({ env, log }) } = {}) {
   mkdirSync(store.dir, { recursive: true });
   const mine = () => store.list().records.filter((r) => r.job.kind === PR_SWEEP_JOB_KIND.kind);
   const consumed = new Set(Array.isArray(state.consumed) ? state.consumed : []);
@@ -41,7 +43,10 @@ export async function runPrSweepJob({ now, state = {}, config, settings, sourceR
   const next = { ...state };
   const flight = mine().find((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status));
   const last = Number(state.lastEnqueuedAt);
-  const due = !Number.isFinite(last) || last > now || now - last >= config.intervalMinutes * 60000;
+  // The stall sweep rides this job: when it is on, the job runs at least as often as the stall interval.
+  let stall = null; try { stall = stallSettings()?.value; } catch (e) { log(`pr-sweep stall settings: ${e.message}`); }
+  const interval = stall && stall.mode !== 'off' ? Math.min(config.intervalMinutes, stall.intervalMinutes) : config.intervalMinutes;
+  const due = !Number.isFinite(last) || last > now || now - last >= interval * 60000;
   let enqueued = null;
   if (due && !flight) {
     const rec = enqueue({ store, kindDef: PR_SWEEP_JOB_KIND, now, codeSha: codeSha ?? readGit(['-C', sourceRoot, 'rev-parse', 'HEAD']).trim(), input: { dir, sourceRoot, ...(settings ? { settings: { value: settings.value, sources: settings.sources, errors: settings.errors } } : { config: { prSweep: config } }) } });
