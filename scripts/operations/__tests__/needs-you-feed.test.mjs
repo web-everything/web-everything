@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, assertProducerCheckout, monitorCommand, main } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
@@ -347,5 +347,40 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const withFlag = Object.assign(items(), { incomplete: true });
     const { kept } = await gateReadyItems(withFlag, report, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
     expect(kept.incomplete).toBe(true);
+  });
+});
+
+describe('stall sweep coexistence', () => {
+  it.each([
+    { WE_PR_STALL_SWEEP_MODE: 'off' },
+    { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'false' },
+  ])('ignores stale stalled keys before cleanup when the producer is disabled: %j', async env => {
+    const path = join(temp(), 'needs-you-events.jsonl');
+    const repo = 'web-everything/web-everything', head = 'a'.repeat(40);
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [`${repo}#5@${head}:stalled`] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ env, settings, liveGate: false, log: () => {},
+      exec: () => JSON.stringify({ ready: [{ repo, number: 5, head }] }) });
+    expect(result.lines).toHaveLength(1);
+    expect(replay({ path })[0]).toMatchObject({ pr: 5, kind: 'needs-you' });
+  });
+  it.each([
+    { name: 'a new queue item for a head with an open stalled item is not published twice', queueOpen: false },
+    { name: 'an already-open queue item is retained when the same head also has an open stalled item', queueOpen: true },
+  ])('$name', async ({ queueOpen }) => {
+    const path = join(temp(), 'needs-you-events.jsonl');
+    const head = 'a'.repeat(40); const repo = 'web-everything/web-everything';
+    const stalledKey = `${repo}#5@${head}:stalled`;
+    const queueKey = `${repo}#5@${head}:ruling-needed`;
+    const openKeys = [stalledKey, ...(queueOpen ? [queueKey] : [])];
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys }));
+    const report = { ready: [], rulingNeeded: [{ repo, number: 5, head, reason: 'parked' }] };
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ exec: async () => JSON.stringify(report), settings,
+      env: { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'true' }, liveGate: false, log: () => {} });
+    expect(result.lines).toEqual([]);
+    expect(result.openKeys).toEqual(openKeys);
+    expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual(openKeys);
+    expect(replay({ path })).toEqual([]);
   });
 });

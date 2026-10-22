@@ -10,6 +10,8 @@ import { resolveStallSweepSettings, runStallSweep, planStallActions, stallSweepD
 import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
 import { runPrSweep } from '../pr-sweep.mjs';
 import { runPrSweepJob } from '../pr-sweep-job.mjs';
+import { publishStalledDigest } from '../pr-stall-digest.mjs';
+import { sidecarsOf } from '../../operations/needs-you-feed.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -274,6 +276,22 @@ describe('wiring', () => {
   const base = { now: NOW, config: {}, settings: { value: { idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, dispatchDiagnosis: false, repos: [REPO] }, sources: {} },
     readPrevious: () => ({ stallSweep: { lastRunAt: 1 } }), readPrs: () => [], readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: async () => ({}),
     notify: () => ({ ok: true }), flush: () => ({}), persist: () => {}, append: () => {} };
+  it.each([
+    { mode: 'off', digest: true },
+    { mode: 'shadow', digest: false },
+  ])('a disabled producer releases stalled keys even before its next due pass: %j', async config => {
+    const dir = auditDir(), path = join(dir, '..', 'needs-you-events.jsonl');
+    const key = `${REPO}#1@${HEAD}:stalled`;
+    publishStalledDigest({ items: [{ lane: 'operator', repo: REPO, pr: 1, head: HEAD, state: 'needs-decision:note' }] },
+      { feedPath: path, stateDir: dir, env: {}, notify: () => ({ ok: true }) });
+    expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual([key]);
+    const report = await runPrSweep({ ...base,
+      stallSweep: args => runStallSweep({ ...args, dir, settings: shadow(config), state: { lastRunAt: NOW },
+        read: () => { throw new Error('disabled/not-due sweep must not read'); } }),
+      stallDigest: (pass, options) => publishStalledDigest(pass, { ...options, feedPath: path }) });
+    expect(report.errors).toEqual([]);
+    expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual([]);
+  });
   it('the health PR job runs the stall sweep and keeps its state', async () => {
     const stallSweep = vi.fn(async ({ state }) => ({ mode: 'shadow', state: { lastRunAt: NOW, was: state.lastRunAt }, items: [], act: [] }));
     const report = await runPrSweep({ ...base, stallSweep });
@@ -285,6 +303,15 @@ describe('wiring', () => {
     const order = [];
     await runPrSweep({ ...base, persist: () => order.push('persist'), stallSweep: async () => { order.push('stall'); return { state: {} }; } });
     expect(order).toEqual(['persist', 'stall', 'persist']);
+  });
+  it('a pass with items publishes the operator digest; a skipped pass does not', async () => {
+    const stallDigest = vi.fn(() => ({ lines: ['x'], fresh: [1], notified: true, errors: [] }));
+    const report = await runPrSweep({ ...base, stallDigest, stallSweep: async () => ({ mode: 'shadow', state: {}, items: [], act: [], dir: '/tmp/pr-stall-sweep', digest: true }) });
+    expect(stallDigest).toHaveBeenCalledOnce(); expect(report.stallSweep.digest).toEqual({ published: 1, alerted: 1, notified: true });
+    expect(stallDigest.mock.calls[0][1]).toMatchObject({ stateDir: '/tmp/pr-stall-sweep', enabled: true });
+    const skipped = vi.fn();
+    await runPrSweep({ ...base, stallDigest: skipped, stallSweep: async () => ({ mode: 'shadow', skipped: 'not-due', state: {} }) });
+    expect(skipped).not.toHaveBeenCalled();
   });
   it('a dry run does not run it', async () => {
     const stallSweep = vi.fn();
