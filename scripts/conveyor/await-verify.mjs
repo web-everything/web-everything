@@ -153,6 +153,22 @@ export function readAwaitVerifyRecordForSession(cwd, session, { dir = awaitVerif
     ?? readStoredAwaitVerify(session?.sessionId, { dir, ...io })
     ?? readStoredAwaitVerify(session?.name, { dir, ...io });
 }
+/**
+ * STRICT presence: does this session hold ANY await record, or might it (a record file that exists but could not be
+ * read or parsed)? Only a clean "no such file" counts as absent. For callers deciding whether a session may be stopped.
+ */
+export function hasAwaitVerifyRecordStrict(cwd, session, { readFileSyncFn = readFileSync, ...opts } = {}) {
+  let unknown = false;
+  const strictRead = (path, enc) => {
+    let text;
+    try { text = readFileSyncFn(path, enc); } catch (e) { if (e?.code !== 'ENOENT' && e?.code !== 'ENOTDIR') unknown = true; throw e; }
+    try { if (!isObject(JSON.parse(text))) unknown = true; } catch { unknown = true; }
+    return text;
+  };
+  let record = null;
+  try { record = readAwaitVerifyRecordForSession(cwd, session, { ...opts, readFileSyncFn: strictRead }); } catch { return true; }
+  return Boolean(record) || unknown;
+}
 /** Every parseable store record with its key; unreadable entries are skipped. */
 export function listStoredAwaitVerify({ dir = awaitVerifyStoreDir(), readdirSyncFn = readdirSync, readFileSyncFn = readFileSync } = {}) {
   let names = [];

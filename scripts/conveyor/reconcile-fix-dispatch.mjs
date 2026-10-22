@@ -170,7 +170,7 @@ import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { isPidAlive } from '../lib/dispatch-throttle.mjs';
-import { makeAwaitingVerifyResolver, readAwaitVerifyRecordForSession } from './await-verify.mjs';
+import { makeAwaitingVerifyResolver, hasAwaitVerifyRecordStrict } from './await-verify.mjs';
 import { loadFixSessionPolicy, isRowMidTurn } from '../lib/fix-session-liveness.mjs';
 
 // card 302 — resolve red-main capacity through the shared policy layers.
@@ -1028,7 +1028,7 @@ export function resumeBgSession(planned, {
       if (awaiting) return declined(`session ${candidate} holds an await-verify record for PR #${planned.pr}`, 'session-awaiting-verify');
       // ANY await record (expired, or for another PR) also means "not ours to stop"; declined the old way (no resume).
       let record;
-      try { record = (hasAwaitRecord ?? ((r) => Boolean(readAwaitVerifyRecordForSession(r.cwd, r))))(row); } catch { record = true; }
+      try { record = (hasAwaitRecord ?? ((r) => hasAwaitVerifyRecordStrict(r.cwd, r)))(row); } catch { record = true; }
       if (record) return declined(`session ${candidate} still holds an await-verify record; not stopping it`);
       try { stop({ handle: row.id || String(candidate).slice(0, 8) }); } catch (e) { return declined(`claude stop failed: ${String(e?.message ?? e).split('\n')[0]}`); }
       let exited = !rowProcessUp(row, pidAlive);

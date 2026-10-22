@@ -23,6 +23,7 @@ import { planRoundResume } from '../fix-resume.mjs';
 import { refreshLiveFixDispatchClaims, readFixDispatchClaim } from '../fix-dispatch-claim.mjs';
 import { acquireFixClaim } from '../fix-procedure.mjs';
 import { withFixDispatchClaimRefresh } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
+import { hasAwaitVerifyRecordStrict } from '../await-verify.mjs';
 
 // The live rows, as `claude agents --json --all` listed them (2026-10-21).
 const SID_5729 = '6b08e7a7-cad4-4747-a793-90a3c882d59f';
@@ -317,5 +318,25 @@ describe('replay #5758 11:00Z — the claim sweep and the released fixer\'s live
     claim();
     const result = sweep({ id: 'ddac038c', sessionId: SID, name: 'fix-5758', kind: 'background', state: 'stopped', startedAt: T0 }, new Set());
     expect(result.released).toEqual([expect.not.objectContaining({ liveSessions: expect.anything() })]);
+  });
+});
+
+describe('hasAwaitVerifyRecordStrict — only a clean "no such file" is absent', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'await-strict-'));
+  afterEach(() => {});
+  const session = { sessionId: 'ddac038c-bcfe-4cd0-9d51-c983476b47b1', name: 'fix-5758' };
+  const enoent = () => { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; };
+  it('absent when every read is ENOENT', () => {
+    expect(hasAwaitVerifyRecordStrict(dir, session, { dir, readFileSyncFn: enoent })).toBe(false);
+  });
+  it('present (unknown) when a read fails with EACCES', () => {
+    const eacces = () => { const e = new Error('EACCES'); e.code = 'EACCES'; throw e; };
+    expect(hasAwaitVerifyRecordStrict(dir, session, { dir, readFileSyncFn: eacces })).toBe(true);
+  });
+  it('present (unknown) when a record file is corrupt', () => {
+    expect(hasAwaitVerifyRecordStrict(dir, session, { dir, readFileSyncFn: () => '{not json' })).toBe(true);
+  });
+  it('present when a record parses', () => {
+    expect(hasAwaitVerifyRecordStrict(dir, session, { dir, readFileSyncFn: () => '{"pr":5758}' })).toBe(true);
   });
 });
