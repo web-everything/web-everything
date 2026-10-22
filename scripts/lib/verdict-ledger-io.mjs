@@ -179,7 +179,9 @@ export function readLedgerFromGit({
   let oldText;
   let newText;
   try {
-    retryTransientGit(() => run(['fetch', '--quiet', '--prune', 'origin', ledgerFetchRefspec(LEGACY_LEDGER_BRANCH), ledgerFetchRefspec(newRef)], { cwd: board }));
+    // No `--prune`: a ledger-only ref deleted on the remote stays readable from its last fetched copy (its rows stay
+    // visible), while every WRITE fetches its target by an exact refspec and so fails instead of re-creating it.
+    retryTransientGit(() => run(['fetch', '--quiet', 'origin', ledgerFetchRefspec(LEGACY_LEDGER_BRANCH), ledgerFetchRefspec(newRef)], { cwd: board }));
     newTip = trackingTip(run, board, newRef);
     if (!newTip && plan.requireNew) {
       return { status: 'unreadable', reason: 'required-ledger-ref-absent', error: `${newRef} is the ledger write ref (cutover on) but does not exist on origin` };

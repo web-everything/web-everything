@@ -54,7 +54,7 @@ import { retryTransientGit } from './git-fetch-retry.mjs';
 import { assertPushRef, trackingRefspec, withGitError, worktreeGitEnv } from './git-transport-branch.mjs';
 import { parseLedgerEvents, ledgerEventId } from './verdict-ledger.mjs';
 import { ledgerGitPath } from './verdict-ledger-path.mjs';
-import { LEGACY_LEDGER_BRANCH, ALLOWED_LEDGER_BRANCHES, resolveLedgerRefSettings, ledgerWritePlan, ledgerPushRefFor, ledgerFetchRefspec } from './verdict-ledger-ref.mjs';
+import { LEGACY_LEDGER_BRANCH, ALLOWED_LEDGER_BRANCHES, resolveLedgerRefSettings, ledgerWritePlan, ledgerPushRefFor, ledgerFetchRefspec, unionLedgerTexts } from './verdict-ledger-ref.mjs';
 import { workspaceFor } from './lane-pool-paths.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -447,17 +447,32 @@ function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined, d
   for (const [path, group] of byPath) {
     const { text: base, mode } = readBlobAt(run, board, tip, path, env);
     const seen = new Set(parseLedgerEvents(base).map(ledgerEventId));
-    // ABSORB: rows only the other ref holds are appended FIRST, byte for byte, in that ref's order. That makes them
-    // shared (the union's anchors) before this writer adds anything for the same PR, so a PR is never left with rows
-    // written on both refs since they diverged (which the union refuses to order), and the target ends a superset.
+    // ABSORB: rows only the other ref holds are appended FIRST, byte for byte, in that ref's order, so the target stays a
+    // superset and later rows for the same PR land after them. ONLY WHEN THAT IS PROVABLY THE OTHER REF'S OWN ORDER
+    // (audit 2026-10-21 round 3: absorbing must never turn an `unreadable` union into an `ok` one): the union of the two
+    // must form ({@link unionLedgerTexts}: no PR written on both refs since they diverged, no conflicting row, no order
+    // conflict), and for every PR the other ref owns, its rows the target lacks must all come AFTER the rows both hold.
+    // Otherwise this write is refused before anything is pushed (loud; the next write after a repair retries it).
     const absorbed = [];
     if (otherTip) {
-      for (const line of readBlobAt(run, board, otherTip, path, env).text.split('\n')) {
+      const otherText = readBlobAt(run, board, otherTip, path, env).text;
+      const targetIsOld = branch === LEGACY_LEDGER_BRANCH;
+      const u = targetIsOld ? unionLedgerTexts(base, otherText, { idOf: ledgerEventId }) : unionLedgerTexts(otherText, base, { idOf: ledgerEventId });
+      if (!u.ok) throw new Error(`verdict-ledger-outbox: refusing to write ${path}: the two ledger refs cannot be merged (${u.reason}: ${u.error})`);
+      const targetKeys = new Set();
+      for (const line of base.split('\n')) { try { if (line.trim()) targetKeys.add(ledgerEventId(JSON.parse(line))); } catch { /* malformed: never a key */ } }
+      const sawOtherOnly = new Set();
+      for (const line of otherText.split('\n')) {
         if (!line.trim()) continue;
-        let id;
-        try { id = ledgerEventId(JSON.parse(line)); } catch { continue; } // a malformed row is never copied
-        if (seen.has(id)) continue;
-        seen.add(id);
+        let ev;
+        try { ev = JSON.parse(line); ev = { id: ledgerEventId(ev), pr: ev.pr }; } catch { continue; } // a malformed row is never copied
+        if (targetKeys.has(ev.id)) {
+          if (sawOtherOnly.has(ev.pr)) throw new Error(`verdict-ledger-outbox: refusing to write ${path}: PR ${ev.pr} on ${dedupeAlso} has a shared row after a row ${branch} lacks; absorbing would reorder it`);
+          continue;
+        }
+        sawOtherOnly.add(ev.pr);
+        if (seen.has(ev.id)) continue;
+        seen.add(ev.id);
         absorbed.push(line);
       }
     }

@@ -405,6 +405,8 @@ describe('gatherPrFacts reads the shared verdict ledger (#5802)', () => {
   const read = (authority, text, { size = Buffer.byteLength(text), blobError = null, labels } = {}) => {
     const exec = fakeExec([
       [/^git fetch --quiet origin .*ops\/review-requests/, ''],
+      // The ledger-only ref (verdict-ledger-ref.mjs) is absent here: the read is today's read of the old ref.
+      [/^git for-each-ref --format=%\(refname\) %\(objectname\) refs\/remotes\/origin\/ops\/verdict-ledger$/, ''],
       [/^git ls-tree --name-only origin\/ops\/review-requests -- verdict-ledger\/o-r.jsonl$/, 'verdict-ledger/o-r.jsonl\n'],
       [/^git rev-parse --verify --quiet origin\/ops\/review-requests:verdict-ledger\/o-r.jsonl$/, 'b'.repeat(40)],
       [/^git cat-file -s b{40}$/, String(size)],

@@ -57,7 +57,7 @@ const validRef = (v) => typeof v === 'string' && v !== LEGACY_LEDGER_BRANCH && A
 /** The full push ref for an allow-listed ledger branch. THROWS on anything else (no ref is ever pushed unchecked). */
 export function ledgerPushRefFor(branch) {
   if (!ALLOWED_LEDGER_BRANCHES.includes(branch)) {
-    throw new Error(`verdict-ledger-ref: "${branch}" is not a ledger ref (allowed: ${ALLOWED_LEDGER_BRANCHES.join(', ')})`);
+    throw new Error(`verdict-ledger-ref: refusing to push "${branch}": not a ledger ref (allowed: ${ALLOWED_LEDGER_BRANCHES.join(', ')})`);
   }
   return `refs/heads/${branch}`;
 }

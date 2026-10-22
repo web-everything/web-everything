@@ -201,7 +201,7 @@ describe('real git: dual read + writer switch + migration', () => {
     });
   });
 
-  it('a PR written on both refs since they diverged holds every read, and the next write absorbs it back to readable', async () => {
+  it('a PR written on both refs since they diverged holds every read AND every write; nothing guesses its order (audit round 3)', async () => {
     await withBareOrigin(async (ctx) => {
       seedLegacy(ctx);
       append(ctx, [1]);
@@ -212,11 +212,25 @@ describe('real git: dual read + writer switch + migration', () => {
       // A writer that bypasses the plan (explicit branch: an older build) writes the same PR to the old ref.
       append(ctx, [hold], cfg(), { branch: OLD });
       expect(read(ctx, cfg({ cutover: 'on' }))).toMatchObject({ status: 'unreadable', reason: 'union-ambiguous-order' });
-      append(ctx, [10], cfg({ cutover: 'on' })); // absorbs the old-only hold, in the order the push saw it
-      const r = read(ctx, cfg({ cutover: 'on' }));
-      expect(r.status).toBe('ok');
-      const nine = r.text.split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((x) => x.pr === 9);
-      expect(nine.map((x) => x.verdict)).toEqual(['accepted', 'changes']);
+      const newTip = originTip(ctx, NEW);
+      const oldTip = originTip(ctx, OLD);
+      // Neither mode's writer may "heal" it by absorbing in an order it cannot know.
+      expect(() => append(ctx, [10], cfg({ cutover: 'on' }))).toThrow(/cannot be merged/);
+      expect(() => append(ctx, [10], cfg())).toThrow(/cannot be merged/);
+      expect([originTip(ctx, NEW), originTip(ctx, OLD)]).toEqual([newTip, oldTip]);
+      expect(read(ctx).status).toBe('unreadable');
+    });
+  });
+
+  it('absorb copies another ref\'s rows only as a validated suffix: a straggler for a PR the target never saw lands intact', async () => {
+    await withBareOrigin(async (ctx) => {
+      seedLegacy(ctx);
+      append(ctx, [1]);
+      migrate(ctx);
+      append(ctx, [11, 12]); // stragglers on the old ref
+      append(ctx, [13], cfg({ cutover: 'on' }));
+      expect(onOrigin(ctx, NEW)).toEqual([1, 11, 12, 13]);
+      expect(read(ctx, cfg({ cutover: 'on' })).status).toBe('ok');
     });
   });
 
