@@ -23,9 +23,15 @@ export function batchHoldIsExpected(state, { now, policy }) {
 export function isCollectingBatchPr(repo, number, { stateDir = cardBatchStateDir(), now = Date.now(), policy } = {}) {
   try {
     policy ??= effectiveCardBatchPolicy();
-    for (const file of readdirSync(stateDir).filter(f => f.endsWith('.json'))) {
+    const files = readdirSync(stateDir).filter(f => f.endsWith('.json')).map(f => join(stateDir, f));
+    try {
+      const sealedDir = join(stateDir, 'sealed');
+      const remainder = new RegExp(`-\\d+r\\d+-(${CARD_BATCH_KINDS.join('|')})\\.json$`);
+      files.push(...readdirSync(sealedDir).filter(f => remainder.test(f)).map(f => join(sealedDir, f)));
+    } catch { /* missing/unreadable archive must not prevent the top-level scan */ }
+    for (const file of files) {
       let state;
-      try { state = JSON.parse(readFileSync(join(stateDir, file), 'utf8')); } catch { continue; }
+      try { state = JSON.parse(readFileSync(file, 'utf8')); } catch { continue; }
       const stateRepo = state.repo ?? state.members?.[0]?.source?.repo;
       if (Number(state.pr) === Number(number) && stateRepo === repo && batchHoldIsExpected(state, { now, policy })) return true;
     }

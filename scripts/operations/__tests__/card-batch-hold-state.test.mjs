@@ -1,9 +1,9 @@
 // @vitest-environment node
 /** An open, collecting card batch is held on purpose and must not raise a needs-you alert. */
 import { afterEach, expect, it } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { isCollectingBatchPr } from '../card-batch-hold-state.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 
@@ -18,6 +18,7 @@ const open5790 = { batchRef: 'lane/card-batch-filing-5', seq: 5, headSha: 'f'.re
   pr: 5790, kind: 'filing', repo: 'web-everything/web-everything', holdApplied: true };
 function check(state, now, number = 5790, name = 'web-everything-web-everything-filing.json') {
   const dir = mkdtempSync(join(tmpdir(), 'hold-state-')); dirs.push(dir);
+  mkdirSync(dirname(join(dir, name)), { recursive: true });
   writeFileSync(join(dir, name), JSON.stringify(state));
   return isCollectingBatchPr('web-everything/web-everything', number, { stateDir: dir, now, policy });
 }
@@ -46,4 +47,14 @@ it('stays quiet while a capacity-paused seal waits to retry, and raises when it 
 });
 it('fails open (keeps alerting) when the state dir is unreadable', () => {
   expect(isCollectingBatchPr('web-everything/web-everything', 5790, { stateDir: '/nonexistent/x', now: OPENED, policy })).toBe(false);
+});
+it('covers paused extraction remainders in sealed only until grace expires and excludes ordinary archives', () => {
+  const paused = { ...open5790, sealedAt: OPENED + 60 * MIN, seal: { step: 'record-sealed' }, verifyUnrun: 3,
+    verifyRetryAfter: new Date(OPENED + 75 * MIN).toISOString() };
+  const remainder = 'sealed/web-everything-web-everything-5r1-filing.json';
+  expect(check(paused, OPENED + 70 * MIN, 5790, remainder)).toBe(true);
+  expect(check(paused, OPENED + 200 * MIN, 5790, remainder)).toBe(false);
+  expect(check(paused, OPENED + 70 * MIN, 5999, remainder)).toBe(false);
+  expect(check({ ...paused, repo: 'other/repo' }, OPENED + 70 * MIN, 5790, remainder)).toBe(false);
+  expect(check(paused, OPENED + 70 * MIN, 5790, 'sealed/web-everything-web-everything-5-filing.json')).toBe(false);
 });

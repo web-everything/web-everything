@@ -269,11 +269,12 @@ export async function publishBatch(input, opts = {}) {
 }
 
 /** Probe through admission itself so crashed/expired holders can be reclaimed without an unrelated job. */
-const defaultHeavyQueue = async ({ now }) => {
-  const { admissionLockRoot, resolveCap, resolveFastSlots, tryAcquireSlot, releaseOwnedSlot } = await import('../readiness/heavy-admission.mjs');
-  const lockRoot = admissionLockRoot(ROOT);
-  const cap = resolveCap();
-  const fastSlots = resolveFastSlots();
+export const defaultHeavyQueue = async ({ now, env = process.env }) => {
+  const { admissionLockRoot, resolveCap, resolveFastSlots, tryAcquireSlot, releaseOwnedSlot, isAdmissionOff } = await import('../readiness/heavy-admission.mjs');
+  if (isAdmissionOff(env)) return { freeCount: 1 };
+  const lockRoot = admissionLockRoot(ROOT, env);
+  const cap = resolveCap(env);
+  const fastSlots = resolveFastSlots(env);
   const owner = `card-batch-capacity:${process.pid}:${randomUUID()}`;
   const slots = Array.from({ length: cap + fastSlots }, (_, i) => i);
   const acquired = tryAcquireSlot({ lockRoot, cap, owner, nowMs: now, nowIso: new Date(now).toISOString(), pid: process.pid, slots });

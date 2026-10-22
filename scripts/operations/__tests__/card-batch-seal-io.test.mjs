@@ -4,7 +4,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { publishBatch, sealDueBatches, HOLD_LABEL, VERIFY_UNRUN_CAP, resolveAdoptDescendantHead } from '../card-batch-seal-io.mjs';
+import { publishBatch, sealDueBatches, defaultHeavyQueue, HOLD_LABEL, VERIFY_UNRUN_CAP, resolveAdoptDescendantHead } from '../card-batch-seal-io.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 import { resolveVerifyRetryMinutes } from '../../lib/card-batch-settings.mjs';
 import { admissionLockRoot, admissionStatus, tryAcquireSlot } from '../../readiness/heavy-admission.mjs';
@@ -274,6 +274,26 @@ it('re-arm leaves a pause that was renewed after the scan', async () => {
 });
 const unrunPausedState = (f, retryAfter) => writeFileSync(f.statePath, JSON.stringify({ ...f.state, sealedAt: 500,
   seal: { step: 'record-sealed' }, verifyUnrun: VERIFY_UNRUN_CAP, verifyRetryAfter: new Date(retryAfter).toISOString() }));
+it('re-arms an expired capacity pause with all slots live when admission is off', async () => {
+  const f = fixture({ maxCards: 1 });
+  const env = { LANE_POOL_ROOT: f.dir, WE_HEAVY_ADMISSION_CAP: '2', WE_HEAVY_ADMISSION_FAST_SLOTS: '1', WE_HEAVY_ADMISSION: 'off' };
+  const lockRoot = admissionLockRoot(f.dir, env);
+  const now = 20_000;
+  for (let slot = 0; slot < 3; slot++) {
+    expect(tryAcquireSlot({ lockRoot, cap: 2, slots: [slot], owner: `holder-${slot}`, pid: process.pid,
+      nowMs: now, nowIso: new Date(now).toISOString() }).ok).toBe(true);
+  }
+  unrunPausedState(f, 10_000);
+  const spawn = vi.fn(fakeChild);
+  expect(await defaultHeavyQueue({ now, env: { ...env, WE_HEAVY_ADMISSION: 'on' } })).toEqual({ freeCount: 0 });
+  expect(await sealDueBatches({ now, stateDir: f.dir, policy: f.opts.policy, spawn,
+    readHeavyQueue: ({ now }) => defaultHeavyQueue({ now, env }) })).toEqual([f.statePath]);
+  expect(spawn).toHaveBeenCalledOnce();
+  expect(f.read().verifyRetryAfter).toBeUndefined();
+  expect(admissionStatus({ lockRoot, cap: 2, fastSlots: 1, nowMs: now }).freeCount).toBe(0);
+  // An invalid clock would throw if the probe touched slots instead of returning at the off switch.
+  expect(await defaultHeavyQueue({ now: NaN, env })).toEqual({ freeCount: 1 });
+});
 it.each([
   ['all expired', [0, 1, 2], true],
   ['only fast slot expired', [2], true],
