@@ -452,6 +452,7 @@ export function createDrainMergeStrategy({
             if (requested) {
               wait.requestedAt = now();
               writeState(statePath, before);
+              log.write(`  merge-queue: requested red team for #${c.num} on ${headSha} through review dispatch\n`);
               return { ...outcome, redTeamRequested: true };
             }
           }
