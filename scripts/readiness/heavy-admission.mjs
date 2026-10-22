@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readSendBackFixPriority } from '../conveyor/fix-waiting-priority.mjs';
 /**
  * @file scripts/readiness/heavy-admission.mjs
  * @description THE HEAVY-COMMAND ADMISSION QUEUE (#3461, ratified by #3456) — a capacity semaphore, distinct
@@ -1075,6 +1076,11 @@ export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL
     const self = rankable.find((m) => m.owner === owner);
     if (self && waiterPriorityClass(self) === 'P0') return oldestOwner(p0) === owner;
     if (p0.some((m) => m.owner !== owner)) return false;
+    // P1 yields to P0 and precedes P3 within its own queue lane. A FULL P1 cannot take
+    // a short-only slot, so it must not prevent short waiters from using that capacity.
+    const sendBacks = rankable.filter(m => waiterPriorityClass(m) === 'P1'
+      && (lane === null || queueLaneOf(normalizeKind(m.kind)) === lane));
+    if (sendBacks.length) return oldestOwner(sendBacks) === owner;
   }
   const live = rankable.filter((m) => lane === null || queueLaneOf(normalizeKind(m.kind)) === lane);
   if (live.length === 0) return true;
@@ -1156,7 +1162,9 @@ export async function acquireSlotBlocking({
   const cls = classifyWaiterPriority({
     purpose: waiterLease?.purpose ?? null, session: waiterLease?.session ?? null, holder: waiterLease?.holder ?? null,
     envSession: clipIdentity(env?.[HOLD_SESSION_ENV]),
-  }, priority);
+  }, priority, { sendBackFixes: priority.mode === 'enforce'
+    ? (seams.readSendBackFixes ?? readSendBackFixPriority)({ env, nowMs: startedAt, waitingOnly: false }) : [] });
+  if (cls.class === 'P1') log(`heavy-command admission: ${cls.reason} — class P1, ahead of normal waiters, below red-main repair [${prioritySrc}]\n`);
   if (cls.class === 'P0') {
     log(`heavy-command admission: red-main repair — class P0 (${cls.reason}; matched ${cls.matched.field}=${cls.matched.value} by /${cls.matched.pattern}/) ranks ahead of every other waiter and may take any free slot, heavy or fast [${prioritySrc}]\n`);
   }
@@ -1169,7 +1177,7 @@ export async function acquireSlotBlocking({
   // succeeds with zero wait below — `isOldestLiveWaiter` reports it "oldest" (nothing else live to rank
   // against) on its very first check.
   markWaiting({ lockRoot, owner, lane, num, pid, repo, kind: jobKind, nowIso: new Date(startedAt).toISOString(),
-    priority: cls.class, priorityReason: cls.class === 'P0' ? cls.reason : null });
+    priority: cls.class, priorityReason: cls.class !== 'P3' ? cls.reason : null });
   let lastLoggedAt = startedAt;
   let ceilingChecked = false;
   let yieldLogged = false;
