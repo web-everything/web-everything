@@ -91,7 +91,7 @@ import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repo
 import { hookSurfaceChanged, resetHookSurface, snapshotHookSurface, withHooksDisabled } from '../lib/git-hook-surface.mjs';
 import { AGY_CLAUDE_MODEL_BY_TIER, PROBATION_ROSTER, PROBATION_WORKERS, PROVEN_TASK_ENVELOPES, probationWorkerForRoute, isStatuteTierPath } from '../lib/provider-routing.mjs';
 import { resolveBuildArgonModel } from '../lib/build-argon-settings.mjs';
-import { runPostRunChecks } from '../lib/direct-launch-checks.mjs';
+import { realChecksIo, runPostRunChecks } from '../lib/direct-launch-checks.mjs';
 import { isDocScopePath } from '../lib/dispatch-task-type.mjs';
 import {
   buildCheckerArgv, parseCheckerVerdict, buildDocFixCommitMessage, buildDocFixTask, buildWorkerArgv, frontmatterTamperedBeyondClaim, PREPARE_OWNED_FRONTMATTER_KEYS,
@@ -923,7 +923,7 @@ export function probationHoldIdentityEnv({ session, runId = null, taskType = 'do
   };
 }
 
-export function realIo({ session, runId = null, taskType = 'doc-fix', env = process.env, repoRoot = WE_ROOT } = {}) {
+export function realIo({ session, runId = null, taskType = 'doc-fix', env = process.env, repoRoot = WE_ROOT, checksIo = {} } = {}) {
   const workerEnv = { ...env, LANE_SESSION: session, ...probationHoldIdentityEnv({ session, runId, taskType }) };
   const laneEnv = withHooksDisabled(workerEnv);
   // cwd alone is insufficient: backlog/operation tools derive their roots from import.meta.url.
@@ -981,7 +981,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       }
       return realLane;
     },
-    forPrepareCard: ({ session: cardSession }) => realIo({ session: cardSession, taskType: 'prepare', env, repoRoot }),
+    forPrepareCard: ({ session: cardSession }) => realIo({ session: cardSession, taskType: 'prepare', env, repoRoot, checksIo }),
     batchExternalCap: Number(env.WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL ?? 4),
     retainPrepareCommit: (dir, ref, sha) => {
       sh('git', ['update-ref', `refs/heads/${ref}`, sha], { cwd: dir, env: laneEnv });
@@ -1103,7 +1103,9 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       // Redact before taking a tail: otherwise a cut can remove a token's identifying prefix.
       return { modelEvidence: parseAgyReportEvidence(r.stdout ?? r.out), ok: r.ok, out: redactSecrets(r.out).slice(-4000), lastMessage: typeof lastMessage === 'string' ? lastMessage : '' };
     },
-    postRunChecks: (options) => runPostRunChecks({ ...options, weRoot: WE_ROOT }),
+    postRunChecks: (options) => runPostRunChecks({ ...options, weRoot: WE_ROOT }, {
+      ...realChecksIo({ preexisting: options.preexisting }), ...checksIo,
+    }),
     runChecker: (argv, dir) => {
       const r = trySh(process.execPath, argv, { cwd: dir, env: workerEnv, timeout: 20 * 60 * 1000 });
       if (!r.ok) return '';

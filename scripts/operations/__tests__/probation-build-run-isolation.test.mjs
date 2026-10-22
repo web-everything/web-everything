@@ -68,9 +68,10 @@ function fixture({ report, blockerStatus } = {}) {
   }
   return { root, repo, lane, scratch };
 }
-function launch(f, extraEnv = {}, setup = '', flags = []) {
+function launch(f, extraEnv = {}, setup = '', flags = [], auditMessage = 'NOT WEAKENED\nfixture audit stub') {
   const code = `import { realIo, runProbationBuild, parseArgs } from ${JSON.stringify(moduleUrl)};
-    const io = realIo({ repoRoot: ${JSON.stringify(f.repo)}, session: 'probe' });
+    const checksIo = { runAudit: () => ${JSON.stringify(auditMessage)} };
+    const io = realIo({ repoRoot: ${JSON.stringify(f.repo)}, session: 'probe', checksIo });
     io.appendScorecard = () => {}; // shared telemetry is outside this checkout-isolation probe
     ${setup}
     console.log(JSON.stringify(await runProbationBuild(parseArgs(['--num=4291', '--worker=codex', '--session=probe', ...${JSON.stringify(flags)}]), io)));`;
@@ -102,7 +103,7 @@ describe('probation build checkout isolation', () => {
         const fs = await import('node:fs');
         io.preparePolicy = { autoSize: false };
         io.forPrepareCard = ({ session }) => {
-          const child = realIo({ repoRoot: ${JSON.stringify(f.repo)}, session });
+          const child = realIo({ repoRoot: ${JSON.stringify(f.repo)}, session, checksIo });
           const id = session.split('-').at(-1);
           child.appendScorecard = () => {};
           child.runWorker = (_argv, dir) => {
@@ -176,6 +177,19 @@ describe('probation build checkout isolation', () => {
       expect(snapshot(f.repo)).toEqual(before);
       expect(readFileSync(join(f.lane, 'backlog/4291-probe.md'), 'utf8')).toContain(`status: ${mode === 'success' ? 'resolved' : 'open'}`);
       expect(readFileSync(join(f.lane, 'docs/probe.md'), 'utf8')).toBe(mode === 'success' ? 'After\n' : 'Before\n');
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  it('rejects a weakened audit and leaves the daemon clone and lane clean', () => {
+    const f = fixture();
+    try {
+      const before = snapshot(f.repo);
+      const result = launch(f, {}, '', [], 'WEAKENED\nfixture: removed assertion');
+      expect(result.outcome).toBe('gate-red');
+      expect(result.detail).toMatch(/^rejected:audit/);
+      expect(snapshot(f.repo)).toEqual(before);
+      expect(readFileSync(join(f.lane, 'backlog/4291-probe.md'), 'utf8')).toContain('status: open');
+      expect(readFileSync(join(f.lane, 'docs/probe.md'), 'utf8')).toBe('Before\n');
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   });
 
