@@ -259,9 +259,31 @@ describe('hooks-path verification never runs lane-controlled git config commands
       run(['config', '--worktree', 'core.hooksPath', '/dev/null']);
     },
   };
+  it('a sparse index whose .githooks tree is missing never lazy-fetches through a lane-set uploadpack', () => {
+    lanes(({ marker, make }) => {
+      const lane = make('sparse', false, (dir, run) => {
+        hook(dir);
+        mkdirSync(join(dir, 'keep'));
+        writeFileSync(join(dir, 'keep/file'), 'k\n');
+        run(['add', '.githooks/pre-commit', 'keep/file']);
+        run(['-c', 'user.name=Fixture', '-c', 'user.email=f@realcorp.io', 'commit', '-q', '-m', 'v1']);
+        run(['sparse-checkout', 'set', '--cone', '--sparse-index', 'keep']);
+        const tree = run(['rev-parse', 'HEAD:.githooks']).trim();
+        rmSync(join(dir, '.git/objects', tree.slice(0, 2), tree.slice(2)));
+        run(['config', 'core.repositoryformatversion', '1']);
+        run(['config', 'extensions.partialClone', 'origin']);
+        run(['config', 'remote.origin.url', dir]);
+        run(['config', 'remote.origin.promisor', 'true']);
+        run(['config', 'remote.origin.uploadpack', `echo uploadpack >> "${marker}"; git-upload-pack`]);
+      });
+      expect(existsSync(join(lane, '.githooks/pre-commit'))).toBe(false);
+      for (const write of [false, true]) expect(ensureLaneHooksPath(lane, { write, log: () => {} }).status).toBe('error');
+      expect(existsSync(marker) ? readFileSync(marker, 'utf8') : '').toBe('');
+    });
+  });
   it('pins every lane-hardening key except the core.hooksPath under test', () => {
     const args = laneHooksGitArgs(['ls-files', '--error-unmatch', '--', '.githooks/pre-commit']);
-    expect(args).toEqual(expect.arrayContaining(['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null']));
+    expect(args).toEqual(expect.arrayContaining(['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', '-c', 'protocol.allow=never']));
     expect(args.some((a) => a.startsWith('core.hooksPath='))).toBe(false);
     expect(args.slice(-4)).toEqual(['ls-files', '--error-unmatch', '--', '.githooks/pre-commit']);
   });

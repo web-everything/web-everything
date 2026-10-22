@@ -213,8 +213,10 @@ for (const a of rest) {
 const READ_ONLY_GIT = new Set(['status', 'rev-list', 'rev-parse', 'for-each-ref', 'ls-remote', 'cherry', 'ls-tree', 'show', 'symbolic-ref', 'merge-base', 'log', 'cat-file']);
 const isReadOnlyGit = (args) => READ_ONLY_GIT.has(args[0]) || (args[0] === 'remote' && args[1] === 'get-url');
 // A lane's `.git/config` is agent-writable and this script (and the resident health watch that shells it) runs git in lanes
-// the agent may have released, so `git status` must never execute a lane-chosen `core.fsmonitor` / hook (scripts/lib/lane-git-hardening.mjs).
-const readOnlyGitEnv = (args) => (isReadOnlyGit(args) ? { env: laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' }) } : {});
+// the agent may have released, so no git call it makes there may execute a lane-chosen `core.fsmonitor` / hook
+// (scripts/lib/lane-git-hardening.mjs). That includes the MUTATING ones: acquire's `checkout -B --force` and refresh's
+// `reset --hard` ran a lane-set fsmonitor and post-checkout / reference-transaction hooks (PR #5775 self-review).
+const readOnlyGitEnv = (args) => ({ env: laneGitHardeningEnv(isReadOnlyGit(args) ? { ...process.env, GIT_OPTIONAL_LOCKS: '0' } : process.env) });
 // #xn432dz — while a bounded `list --acquirable` scan runs, every git child is capped at the scan's REMAINING
 // budget, so one hung git can't outlive the overall timeout. A killed child reads as `null` through `tryGit`,
 // which some probes read fail-OPEN (e.g. porcelain null ⇒ "clean") — so the scan loop re-checks the deadline
@@ -387,7 +389,8 @@ function writeLaneEnv(repo, n) {
   // Rides every provision/refresh/acquire call site: point the lane at the tracked hooks so the pre-commit guards
   // (incl. the placeholder-author guard) run even when npm `prepare` never did (`--no-install`, `--reference` clone).
   // Default runner on purpose: NOT laneGitHardeningEnv, which pins core.hooksPath=/dev/null and would hide the value
-  // an agent's own commit resolves. It carries every OTHER hardening pin (laneHooksGitArgs), so lane config runs nothing.
+  // an agent's own commit resolves. Its runner carries every OTHER pin plus no-lazy-fetch (laneHooksGitArgs), so the
+  // check's own `ls-files` / `config` calls run no lane-chosen command.
   const hooks = ensureLaneHooksPath(laneDir(repo, n), { log });
   if (!['ok', 'set', 'skipped'].includes(hooks.status)) {
     // Throw so acquire's existing refused-claim handler restores/releases the lease before trying again.

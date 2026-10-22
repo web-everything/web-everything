@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ensureLaneHooksPath, LANE_HOOKS_PATH } from '../lib/git-identity.mjs';
@@ -156,6 +156,29 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
       expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('/dev/null');
     } finally {
       rmSync(lock, { force: true });
+    }
+  });
+
+  it('a re-provision (fetch + reset + clean) runs no lane-set fsmonitor or hook, then repairs hooksPath (PR #5775)', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    const marker = join(base, 'lane-config-ran');
+    const evil = join(base, 'evil-hooks');
+    mkdirSync(evil, { recursive: true });
+    const script = join(evil, 'marker.sh');
+    writeFileSync(script, `#!/bin/sh\necho "$0 $*" >> "${marker}"\n`);
+    chmodSync(script, 0o755);
+    for (const h of ['post-checkout', 'reference-transaction', 'post-merge']) {
+      writeFileSync(join(evil, h), `#!/bin/sh\necho "${h}" >> "${marker}"\n`);
+      chmodSync(join(evil, h), 0o755);
+    }
+    git(['config', '--local', 'core.fsmonitor', script], lane);
+    git(['config', '--local', '--replace-all', 'core.hooksPath', evil], lane);
+    try {
+      expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+      expect(existsSync(marker) ? readFileSync(marker, 'utf8') : '').toBe('');
+      expect(git(['config', '--get', 'core.hooksPath'], lane)).toBe('.githooks');
+    } finally {
+      git(['config', '--local', '--unset', 'core.fsmonitor'], lane);
     }
   });
 

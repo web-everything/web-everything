@@ -208,7 +208,9 @@ export function withoutGitConfigEnv(env = process.env) {
 function hooksVerifyEnv(env) {
   const out = withoutGitConfigEnv(env);
   delete out.GIT_EXTERNAL_DIFF;
-  return { ...out, GIT_PAGER: 'cat', PAGER: 'cat' };
+  // No lazy fetch: a sparse index whose `.githooks` tree is missing from a lane-declared promisor remote made `ls-files`
+  // fetch through the lane's `remote.origin.uploadpack` (PR #5775 self-review). Without it, git fails (→ `error`).
+  return { ...out, GIT_PAGER: 'cat', PAGER: 'cat', GIT_NO_LAZY_FETCH: '1' };
 }
 
 /**
@@ -219,7 +221,8 @@ function hooksVerifyEnv(env) {
  */
 export function laneHooksGitArgs(args) {
   const pins = LANE_GIT_CONFIG_PINS.filter(([k]) => k !== 'core.hooksPath').flatMap(([k, v]) => ['-c', `${k}=${v}`]);
-  return ['--no-pager', ...pins, ...hardenLaneGitArgs(args)];
+  // `protocol.allow=never`: the lazy-fetch backstop for a git older than GIT_NO_LAZY_FETCH (see hooksVerifyEnv).
+  return ['--no-pager', ...pins, '-c', 'protocol.allow=never', ...hardenLaneGitArgs(args)];
 }
 
 /** Would git actually run this hook? Git checks `access(X_OK)` and silently skips a hook that fails it; a shell hook
