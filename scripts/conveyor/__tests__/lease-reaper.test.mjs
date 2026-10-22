@@ -594,17 +594,17 @@ describe('sessionGoneForLease — THE FIX: is the lease\'s own delivery-agent se
     expect(sessionGoneForLease(lease, states, { nowMs: NOW, graceMs: 5 * 60_000 })).toBe(null); // inside a 5min grace
   });
 
-  it('a session listed in a terminal state (done/failed/stopped) → true (gone), NO grace check needed', () => {
-    // A positive, directly-observed row — not an inference from silence — so even a lease acquired seconds ago
-    // reaps immediately once its own session reports a terminal state.
+  it('a session listed in a terminal state (done/failed/stopped) → true (gone) past the listing grace', () => {
+    // Reused session names can list a previous round's terminal row during the listing grace.
     const states = sessionStateByName([
       { kind: 'background', name: 'conveyor-100', state: 'done' },
       { kind: 'background', name: 'conveyor-101', state: 'failed' },
       { kind: 'background', name: 'conveyor-102', state: 'stopped' },
     ]);
-    expect(sessionGoneForLease(fresh({ session: 'conveyor-100' }), states, { nowMs: NOW })).toBe(true);
-    expect(sessionGoneForLease(fresh({ session: 'conveyor-101' }), states, { nowMs: NOW })).toBe(true);
-    expect(sessionGoneForLease(fresh({ session: 'conveyor-102' }), states, { nowMs: NOW })).toBe(true);
+    expect(sessionGoneForLease(agedPastGrace({ session: 'conveyor-100' }), states, { nowMs: NOW })).toBe(true);
+    expect(sessionGoneForLease(agedPastGrace({ session: 'conveyor-101' }), states, { nowMs: NOW })).toBe(true);
+    expect(sessionGoneForLease(agedPastGrace({ session: 'conveyor-102' }), states, { nowMs: NOW })).toBe(true);
+    for (const session of ['conveyor-100', 'conveyor-101', 'conveyor-102']) expect(sessionGoneForLease(fresh({ session, acquiredAt: new Date(NOW - 5_000).toISOString() }), states, { nowMs: NOW })).toBe(null);
     // Even with no nowMs at all — the terminal-state branch never needs an age.
     expect(sessionGoneForLease({ session: 'conveyor-100' }, states)).toBe(true);
   });
@@ -658,10 +658,11 @@ describe('sessionGoneForLease — THE FIX: is the lease\'s own delivery-agent se
     const states = sessionStateByName([{ kind: 'background', name: 'conveyor-63', state: 'blocked' }]);
     expect(sessionGoneForLease({ session: 'conveyor-63' }, states, { pidAlive: false })).toBe(true);
   });
-  it('pidAlive=false wins even for a lease acquired moments ago — it is a direct read, not an inference needing a grace window', () => {
+  it('pidAlive=false → gone past the listing grace, but a lease acquired moments ago is kept', () => {
     const states = sessionStateByName([{ kind: 'background', name: 'conveyor-64', state: 'working' }]);
     const justAcquired = { session: 'conveyor-64', acquiredAt: new Date(NOW - 5_000).toISOString() };
-    expect(sessionGoneForLease(justAcquired, states, { nowMs: NOW, pidAlive: false })).toBe(true);
+    expect(sessionGoneForLease(agedPastGrace({ session: 'conveyor-64' }), states, { nowMs: NOW, pidAlive: false })).toBe(true);
+    expect(sessionGoneForLease(justAcquired, states, { nowMs: NOW, pidAlive: false })).toBe(null);
   });
   it('pidAlive=true → unchanged (a listed, non-terminal, REALLY alive session stays kept)', () => {
     const states = sessionStateByName([{ kind: 'background', name: 'conveyor-65', state: 'working' }]);
@@ -920,11 +921,11 @@ describe('fetchSessionSignals — #xbk2is9 the three-way `agents` null contract 
 });
 
 describe('reapPlan — the #3383 phantom-listing shape end to end (classifyReap + sessionGoneForLease + sessionPidAliveByName)', () => {
-  it('a fresh, well-within-TTL lease whose session is listed "working" but has NO real process → reaped as session-gone', () => {
+  it('a well-within-TTL lease past the listing grace whose session is listed "working" but has NO real process → reaped as session-gone', () => {
     // The exact incident shape: lane-62's lease looked identical to a healthy in-progress build from every axis
-    // except real process liveness — acquired recently, session still in the listing, state ordinary, TTL nowhere
+    // except real process liveness — past the listing grace, session still in the listing, state ordinary, TTL nowhere
     // close. Only the ps-scan-backed pidAlive read tells them apart.
-    const lease = fresh({ session: 'conveyor-62' });
+    const lease = agedPastGrace({ session: 'conveyor-62' });
     const sessions = [{ kind: 'background', name: 'conveyor-62', sessionId: 'dead0000-0000-0000-0000-000000000000', state: 'working' }];
     const sessionStates = sessionStatesForReap(sessions);
     const pidAliveByName = sessionPidAliveByName(sessions, { psOutput: 'no matching session ids in this ps aux capture' });
@@ -937,6 +938,7 @@ describe('reapPlan — the #3383 phantom-listing shape end to end (classifyReap 
     expect(reap).toHaveLength(1);
     expect(reap[0].reason).toBe('session-gone');
     expect(keep).toHaveLength(0);
+    expect(reapPlan([{ pool: 'web-everything', lane: 62, dir: '/x/lane-62', lease: fresh({ session: lease.session, acquiredAt: new Date(NOW - 5_000).toISOString() }) }], { nowMs: NOW, ttlMs: TTL_MS, signalsFor }).keep).toHaveLength(1);
   });
   it('the SAME shape but the ps aux capture DOES contain the session id (a real live process) → kept', () => {
     const lease = fresh({ session: 'conveyor-63' });
