@@ -370,7 +370,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // x00g3tt — the POST-ACCEPT RED TEAM, its own process and wall, run only after the added seats. Advisory: it
     // posts one deduped comment and writes evidence; nothing it returns reaches a label, merge or verdict.
-    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, round1 = false }) => {
+    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, round1 = false, holdStatus = false }) => {
       if (!redTeamEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
       const loopFile = join(dir, `${slug}.red-team.loop.json`);
       try {
@@ -378,7 +378,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         writeFileSync(loopFile, JSON.stringify(loopPayload));
         const r = node([
           'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`, `--loop-json=${loopFile}`,
-          ...(round1 ? ['--round1'] : []),
+          ...(round1 ? ['--round1'] : []), ...(holdStatus ? ['--hold-status'] : []),
         ], { timeoutMs: resolveSeatTimeoutMs(env) + 20 * 60 * 1000 });
         for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
           writeLineSync(2, `  ${line}`);
@@ -459,14 +459,14 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // Card xbizuci — the second half of an accepted review's speculative pass, its own process and wall (same
     // containment as `runRedTeam`).
-    finishSpeculativeRedTeam: ({ pr, repo, loopPayload, slug, handle, round1 = false }) => {
+    finishSpeculativeRedTeam: ({ pr, repo, loopPayload, slug, handle, round1 = false, holdStatus = false }) => {
       const loopFile = join(dir, `${slug}.red-team.loop.json`);
       try {
         mkdirSync(dir, { recursive: true });
         writeFileSync(loopFile, JSON.stringify(loopPayload));
         const r = node([
           'scripts/operations/review-extra-seats.mjs', 'red-team-finish', `--pr=${pr}`, `--repo=${repo}`, `--pass=${handle.passFile}`, `--loop-json=${loopFile}`,
-          ...(round1 ? ['--round1'] : []),
+          ...(round1 ? ['--round1'] : []), ...(holdStatus ? ['--hold-status'] : []),
         ], { timeoutMs: 10 * 60 * 1000 });
         for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
           writeLineSync(2, `  ${line}`);
@@ -514,7 +514,7 @@ export function speculativeRedTeamWallMs(env = process.env) {
  *   - accepted + no model call (disabled, skipped, a prior row to resume, no read sunk) → `sequential`.
  * Never throws past its own `try` (the caller also contains it). Removes the pass's files when done.
  */
-export function settleSpeculativeRedTeam({ spec, accepted, out, input, round1 = false }, io) {
+export function settleSpeculativeRedTeam({ spec, accepted, out, input, round1 = false, holdStatus = false }, io) {
   const at = (ms) => (Number.isFinite(ms) && Number.isFinite(spec.startedAt) ? ms - spec.startedAt : null);
   const timings = (pass) => ({
     readAfterMs: at(pass?.timings?.readAt), finishedAfterMs: at(pass?.timings?.finishedAt), loopFinishedAfterMs: at(spec.loopFinishedAt),
@@ -540,13 +540,15 @@ export function settleSpeculativeRedTeam({ spec, accepted, out, input, round1 = 
     }
     const remaining = Math.max(60_000, speculativeRedTeamWallMs() - (Date.now() - spec.startedAt));
     const waited = io.awaitSpeculativeRedTeam(spec, { timeoutMs: remaining });
+    // Card 6212 — the speculative process is done: the caller re-asserts its own hold on the head's status at once.
+    if (holdStatus) { try { io.redTeamStatus?.({ ...input, status: 'running' }); } catch { /* best effort */ } }
     const pass = waited.spec;
     const decision = decideSpeculativeOutcome({ accepted: true, spec: waited.timedOut ? null : pass });
     const base = { waitedMs: waited.waitedMs ?? null, timings: timings(pass), seatTimings: speculativeSeatTimings(pass) };
     log(`${decision}; pass ${pass?.status ?? 'none'}; read at +${base.timings.readAfterMs ?? '?'}ms, pass done at +${base.timings.finishedAfterMs ?? '?'}ms, `
       + `loop done at +${base.timings.loopFinishedAfterMs ?? '?'}ms; waited ${base.waitedMs ?? '?'}ms after the review`);
     if (decision === 'finish') {
-      const result = io.finishSpeculativeRedTeam({ pr: out.pr, repo: out.repo, loopPayload: input.loopPayload, slug: out.sessionSlug, handle: spec, ...(round1 ? { round1: true } : {}) });
+      const result = io.finishSpeculativeRedTeam({ pr: out.pr, repo: out.repo, loopPayload: input.loopPayload, slug: out.sessionSlug, handle: spec, ...(round1 ? { round1: true } : {}), ...(holdStatus ? { holdStatus: true } : {}) });
       if (result?.status === 'stale' || result?.status === 'superseded') {
         const spend = io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, pass, reason: `${result.status}: ${result.reason ?? ''}` });
         log(`${result.status} (${result.reason ?? ''}) — sequential pass instead; spend ${spend?.status ?? '-'}`);
@@ -704,7 +706,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     // an accept finishes THAT pass (same rows, comment and gate as the sequential pass); anything else calls it off.
     if (spec) {
       try {
-        out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted: owed, out, input: seatsBox.input, round1 }, io);
+        out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted: owed, out, input: seatsBox.input, round1, holdStatus: round1Changes }, io);
         recordSeats(out.redTeamSpeculative.seatTimings ?? []);
       } catch (e) {
         out.redTeamSpeculative = { decision: 'error', reason: tail(e?.message ?? e, 300) };
@@ -714,7 +716,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       let redTeam = out.redTeamSpeculative?.result ?? null;
       if (!redTeam) {
         try {
-          redTeam = io.runRedTeam(round1 ? { ...seatsBox.input, round1: true } : seatsBox.input);
+          redTeam = io.runRedTeam(round1 ? { ...seatsBox.input, round1: true, ...(round1Changes ? { holdStatus: true } : {}) } : seatsBox.input);
         } catch (e) {
           redTeam = { status: 'error', reason: tail(e?.message ?? e, 300) };
         }

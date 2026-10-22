@@ -119,29 +119,25 @@ export function citedLinesFingerprint({ file, line, text }) {
   return createHash('sha256').update(JSON.stringify([file, line - 1 - start, excerpt])).digest('hex');
 }
 
-/** The words a summary is compared on: lower-case runs of 4+ letters/digits. PURE. */
-function summaryWords(s) {
-  return new Set(String(s ?? '').toLowerCase().match(/[a-z0-9_]{4,}/g) ?? []);
+/** A summary or scenario normalised for an EXACT comparison: lower case, runs of non-alphanumerics folded to one space. PURE. */
+function norm(s) {
+  return String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
-
-/** Minimum share of shared summary words (Jaccard) for two reports to be the same break. */
-export const SAME_BREAK_MIN_SIMILARITY = 0.4;
 
 /**
  * Are two red-team findings THE SAME BREAK (beyond citing the same code)? Same file, same category, same impact class
- * (a confirmed finding with no stated impact counts as `broken`, as the gate does), and summaries that share at least
- * {@link SAME_BREAK_MIN_SIMILARITY} of their words. A new break at an old location is never an old ruling's. PURE.
+ * (a confirmed finding with no stated impact counts as `broken`, as the gate does), AND the same normalised summary or
+ * the same normalised failure scenario. Deliberately exact: a reworded report of an old break is raised again (the
+ * conservative side); a NEW break at an old location — even one differing by a single identifier — never inherits an
+ * old ruling. PURE.
  */
 export function sameBreak(a, b) {
   if (!a || !b || !a.file || a.file !== b.file) return false;
   if (String(a.category ?? '') !== String(b.category ?? '')) return false;
   const cls = (f) => (f.impact === 'degraded' || f.impact === 'cosmetic' ? 'degraded' : 'broken');
   if (cls(a) !== cls(b)) return false;
-  const wa = summaryWords(a.summary), wb = summaryWords(b.summary);
-  if (!wa.size || !wb.size) return false;
-  let shared = 0;
-  for (const w of wa) if (wb.has(w)) shared += 1;
-  return shared / (wa.size + wb.size - shared) >= SAME_BREAK_MIN_SIMILARITY;
+  const sa = norm(a.summary), sc = norm(a.scenario);
+  return Boolean((sa && sa === norm(b.summary)) || (sc && sc === norm(b.scenario)));
 }
 
 /**

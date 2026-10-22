@@ -16,7 +16,7 @@ import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.m
 import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, readRedTeamDisposition, redTeamGateMarker, ruledEarlierBreaks } from '../../lib/red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
 import {
-  citedLinesFingerprint, decideRound1FixHold, formatRedTeamTimingLine, resolveRedTeamTiming, round1RedTeamOwedFor, suppressPreviouslyRuled,
+  citedLinesFingerprint, decideRound1FixHold, formatRedTeamTimingLine, resolveRedTeamTiming, round1RedTeamOwedFor, sameBreak, suppressPreviouslyRuled,
 } from '../../lib/red-team-timing.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -88,7 +88,7 @@ function jobIo({ verdict = 'changes', timing = ROUND1, speculative = OFF, spec =
     releaseLane: () => {},
     log: (l) => calls.push(['log', l]),
     runExtraSeats: () => { calls.push(['extra-seats']); return { status: 'ran', seats: [] }; },
-    runRedTeam: (o) => { calls.push(['sequential', o.round1 === true]); return { status: 'ran', foldedVerdict: 'accept', findings: [], comment: { status: 'posted' } }; },
+    runRedTeam: (o) => { calls.push(['sequential', o.round1 === true, ...(o.holdStatus ? [true] : [])]); return { status: 'ran', foldedVerdict: 'accept', findings: [], comment: { status: 'posted' } }; },
     runRedTeamGate: () => { calls.push(['gate']); return { status: 'applied', outcome: 'sent-back' }; },
     redTeamStatus: (o) => calls.push([`status:${o.status}`]),
     speculativeRedTeamSetting: () => speculative,
@@ -97,7 +97,7 @@ function jobIo({ verdict = 'changes', timing = ROUND1, speculative = OFF, spec =
     speculativeReadSunk: () => true,
     awaitSpeculativeRedTeam: () => { calls.push(['await']); return { spec, waitedMs: 3 }; },
     cancelSpeculativeRedTeam: () => { calls.push(['cancel']); return { spec, reserved: spec ? { callId: spec.callId } : null }; },
-    finishSpeculativeRedTeam: (o) => { calls.push(['finish', o.loopPayload.verdict.verdict, o.round1 === true]); return { status: 'ran', foldedVerdict: 'changes', findings: [], comment: { status: 'posted' } }; },
+    finishSpeculativeRedTeam: (o) => { calls.push(['finish', o.loopPayload.verdict.verdict, o.round1 === true, ...(o.holdStatus ? [true] : [])]); return { status: 'ran', foldedVerdict: 'changes', findings: [], comment: { status: 'posted' } }; },
     recordDiscardedRedTeam: (o) => { calls.push(['discard-row', o.reason]); return { status: 'recorded' }; },
     cleanupSpeculativeRedTeam: () => calls.push(['cleanup']),
   };
@@ -110,8 +110,9 @@ describe('runReviewJob under redTeam.timing', () => {
     const { io, calls } = jobIo({ verdict: 'changes' });
     const out = runReviewJob({ pr: 7, repo: REPO }, io);
     // `running` again before the gate: the fixer keeps waiting until the gate has published the fix list.
-    expect(kinds(calls)).toEqual(['start', 'loop', 'status:queued', 'await', 'finish', 'cleanup', 'status:running', 'gate', 'status:finished', 'extra-seats']);
-    expect(calls.find((c) => c[0] === 'finish')).toEqual(['finish', 'changes', true]);
+    // The job re-asserts its hold as soon as the pass process is done, and the finish is told not to mark it finished.
+    expect(kinds(calls)).toEqual(['start', 'loop', 'status:queued', 'await', 'status:running', 'finish', 'cleanup', 'status:running', 'gate', 'status:finished', 'extra-seats']);
+    expect(calls.find((c) => c[0] === 'finish')).toEqual(['finish', 'changes', true, true]);
     expect(calls.some((c) => c[0] === 'discard-row')).toBe(false);
     expect(out.redTeamTiming).toEqual({ timing: 'round1', round: 'changes' });
     expect(out.redTeam.status).toBe('ran');
@@ -145,7 +146,7 @@ describe('runReviewJob under redTeam.timing', () => {
   it('round1 + changes, a pass that made no call (e.g. a prior row): the sequential pass runs, told round1', () => {
     const { io, calls } = jobIo({ verdict: 'changes', spec: { status: 'prior-row', reason: 'clean row' } });
     runReviewJob({ pr: 7, repo: REPO }, io);
-    expect(calls.find((c) => c[0] === 'sequential')).toEqual(['sequential', true]);
+    expect(calls.find((c) => c[0] === 'sequential')).toEqual(['sequential', true, true]);
     expect(kinds(calls).indexOf('gate')).toBeLessThan(kinds(calls).indexOf('extra-seats'));
   });
 
@@ -254,6 +255,10 @@ describe('citedLinesFingerprint + suppressPreviouslyRuled', () => {
     // Anchored: two different lines of a short file never share a fingerprint, even though their excerpts are equal.
     expect(citedLinesFingerprint({ file: 'x.mjs', line: 1, text: 'a\nb' })).not.toBe(citedLinesFingerprint({ file: 'x.mjs', line: 2, text: 'a\nb' }));
     const g = (index, o = {}) => ({ index, file: 'x.mjs', category: 'edge-case', impact: 'broken', summary: `zero divisor crashes parse ${index}`, ...o });
+    // The audit probe: two breaks differing by one identifier are NOT the same break.
+    expect(sameBreak(g(1, { summary: 'parse crashes when src is nil' }), g(1, { summary: 'parse crashes when dst is nil' }))).toBe(false);
+    expect(sameBreak(g(1, { summary: 'Parse crashes when src is nil.' }), g(1, { summary: 'parse crashes, when src is nil' }))).toBe(true);
+    expect(sameBreak(g(1, { summary: 'a', scenario: 'f(0)' }), g(1, { summary: 'b', scenario: 'F(0)' }))).toBe(true);
     const plan = { sendBack: [g(1), g(2), g(4, { impact: 'broken', summary: 'unrelated null deref' })], card: [g(3, { impact: 'degraded' })], advisory: [] };
     const ruled = [{ rev: H1, fingerprint: 'fp1', finding: g(1) }, { rev: H1, fingerprint: 'fp3', finding: g(3, { impact: 'degraded' }) },
       { rev: H1, fingerprint: 'fp4', finding: g(4, { impact: 'degraded', summary: 'formatting nit' }) }];
@@ -296,8 +301,8 @@ describe('the red-team gate under round1', () => {
   it('a break ruled on an earlier head with unchanged cited lines is not raised again; one only sent back still is', async () => {
     const comments = earlier();
     expect(ruledEarlierBreaks({ comments, pr: 4722, head: H2, setting: CONFIRMED_BREAKS_DEFAULTS }).map((x) => [x.rev, x.finding.summary])).toEqual([[H1, 'carded on H1']]);
-    // H2 moved the file down one line and the red team re-raised both breaks (one reworded) at their moved lines.
-    comments.push(rtComment(H2, [F({ impactIfUnfixed: 'degraded', line: 10, summary: 'carded on H1, reworded' }), F({ line: 11, summary: 'sent back on H1' })], '2026-10-21T20:30:00Z'));
+    // H2 moved the file down one line and the red team re-raised both breaks at their moved lines.
+    comments.push(rtComment(H2, [F({ impactIfUnfixed: 'degraded', line: 10, summary: 'Carded on H1.' }), F({ line: 11, summary: 'sent back on H1' })], '2026-10-21T20:30:00Z'));
     const files = { [`${H1}:scripts/x.mjs`]: FILE, [`${H2}:scripts/x.mjs`]: `moved\n${FILE}` };
     const { io, calls } = gateIo({ comments, files });
     const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
