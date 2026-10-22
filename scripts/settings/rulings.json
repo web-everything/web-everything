@@ -1,0 +1,7 @@
+{
+  "rulings": {
+    "digestPath": "~/workspace/.operations/handoff/rulings.md",
+    "injectMaxLines": 40,
+    "injectMaxBytes": 6144
+  }
+}

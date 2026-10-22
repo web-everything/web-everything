@@ -38,6 +38,15 @@
         ]
       },
       {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/rulings-inject.mjs"
+          }
+        ]
+      },
+      {
         "hooks": [
           {
             "type": "command",
