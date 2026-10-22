@@ -39,6 +39,18 @@ it.each([[defaultFetch], [defaultFetch, excludedOps], [defaultFetch, excludedOps
   expect([...localRemoteShas('/unused')]).toEqual(['fresh']);
 });
 
+it.each([
+  [[defaultFetch, excludedOps], ['fresh']],
+  [[defaultFetch, excludedOps, '+refs/heads/ops/review-requests:refs/remotes/origin/saved'], []],
+])('local remote proof reuses the effective fetch snapshot (%j)', (fetchValues, expected) => {
+  const tryGit = (args) => {
+    if (args[0] === 'config') throw new Error('redundant config read');
+    return 'fresh refs/remotes/origin/trunk \nstale refs/remotes/origin/ops/review-requests ';
+  };
+  const localRemoteShas = new Function('tryGit', `${proofSource}; return localRemoteShas;`)(tryGit);
+  expect([...localRemoteShas('/unused', fetchValues.join('\n'))]).toEqual(expected);
+});
+
 it('provision + acquire keep ops/* out of a lane while explicit reader fetches still work', () => {
   const base = mkdtempSync(join(tmpdir(), 'pool-git-diet-'));
   const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();

@@ -72,12 +72,12 @@ export function laneDietConfigOps({ fetchValues = [], kv = {} } = {}) {
   return ops;
 }
 
-/** Read the local diet settings from git's scoped, NUL-delimited config listing. Pure. */
-export function laneDietConfigState(output) {
+/** Read diet settings from git's scoped, NUL-delimited listing. Include all scopes only for fetch proofs. Pure. */
+export function laneDietConfigState(output, { localOnly = true } = {}) {
   const values = new Map();
   const parts = String(output).split('\0');
   for (let i = 0; i + 1 < parts.length; i += 2) {
-    if (parts[i] !== 'local') continue;
+    if (localOnly && parts[i] !== 'local') continue;
     const entry = parts[i + 1], end = entry.indexOf('\n');
     const key = end < 0 ? entry : entry.slice(0, end);
     const value = end < 0 ? '' : entry.slice(end + 1);

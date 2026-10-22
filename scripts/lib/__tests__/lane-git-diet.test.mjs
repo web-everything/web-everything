@@ -80,6 +80,15 @@ describe('laneDietConfigOps (pure)', () => {
       ['config', '--local', '--replace-all', 'transfer.unpackLimit', '1'],
     ]);
   });
+  it('includes every effective fetch mapping when preparing a reset proof', () => {
+    const entry = (scope, value) => `${scope}\0remote.origin.fetch\n${value}\0`;
+    const values = [LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH,
+      '+refs/heads/ops/review-requests:refs/remotes/origin/saved', '^refs/heads/saved',
+      '+refs/heads/trunk:refs/remotes/origin/trunk'];
+    const output = ['local', 'local', 'global', 'worktree', 'command'].map((scope, i) => entry(scope, values[i])).join('');
+    expect(laneDietConfigState(output).fetchValues).toEqual(values.slice(0, 2));
+    expect(laneDietConfigState(output, { localOnly: false }).fetchValues).toEqual(values);
+  });
 });
 
 describe('ops-ref reader inventory', () => {
