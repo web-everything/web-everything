@@ -17,6 +17,8 @@ import {
 import { parseOperationArgv } from '../cli-adapter.mjs';
 import { prSweepOperation, PR_SWEEP_OP } from '../pr-sweep.mjs';
 import { createPrSweepReader, parseDrainSkips, parseLiveJobs, resolveStalledAfter, LIST_LIMIT } from '../pr-sweep-io.mjs';
+import { formatPrResult } from '../../lib/merge-gate-verdict.mjs';
+import { GATE_IDS } from '../../lib/merge-gate-inventory.mjs';
 import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
@@ -218,6 +220,18 @@ describe.each([
   ['decision note', needsDecisionOpen, c('plateau-worker[bot]', '2026-10-21T05:25:58Z',
     '🔔 conveyor — needs your decision\n\npermission prompt'), 'needs-decision:note'],
 ])('%s closure lifecycle', (_name, reader, note, state) => {
+  it('a future commit timestamp cannot close an active hold', () => {
+    const now = Date.parse('2026-10-21T12:00:00Z');
+    const comments = [{ ...note, createdAt: '2026-10-21T11:00:00Z' }];
+    const headCommittedAt = '2026-10-22T00:00:00Z';
+    expect(reader(comments, { headCommittedAt, now })).toMatchObject({ at: Date.parse(comments[0].createdAt) });
+    expect(sweep([mkPr({ labels: L('review:human'), comments, headCommittedAt,
+      updatedAt: '2026-10-21T11:50:00Z' })], { now }).prs[0])
+      .toMatchObject({ waitingOn: state, actor: 'operator', stalled: true });
+    expect(reader(comments, { headCommittedAt: '2026-10-21T11:30:00Z', now })).toBeNull();
+    expect(sweep([mkPr({ labels: L('review:human'), comments, headCommittedAt: '2026-10-21T11:30:00Z' })], { now }).prs[0].waitingOn)
+      .toBe('human-review-pending-advisory');
+  });
   it.each(['push', 'operator reply'])('only a later %s closes the item; earlier and equal timestamps preserve it', (kind) => {
     const at = Date.parse(note.createdAt);
     for (const offset of [-1, 0, 1]) {
@@ -338,6 +352,29 @@ describe('thresholds, drain, ci', () => {
     expect(row(sweep([p]), 2)).toMatchObject({ actor: 'ci', stalled: false });
     const g = mkPr({ number: 3, labels: L('ready-to-merge'), statusCheckRollup: [{ name: 'review-gate', conclusion: 'FAILURE' }] });
     expect(row(sweep([g]), 3).waitingOn).toBe('ready-to-merge');
+  });
+  it('only a head-bound human-only merge-gate verdict excuses a failed check', () => {
+    const p = mkPr({ labels: L('review:human', 'advisory:accepted'), updatedAt: '2026-10-21T11:05:00Z',
+      comments: [c('plateau-reviewer[bot]', '2026-10-21T11:00:00Z', `**Verdict:** accept\nNet basis: \`abc..${HEAD}\``)],
+      statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'FAILURE' }] });
+    p.mergeGateVerdict = { headSha: HEAD.toUpperCase(), results: [{ id: 'review-acceptance', status: 'hold' }] };
+    const result = sweep([p]).prs[0];
+    expect(result).toMatchObject({ waitingOn: 'human-review', actor: 'operator', stalled: true });
+    expect(result.next).toMatchObject({ summary: 'human review: accept or send back', command: `/review 5485   # repo ${REPO}` });
+    for (const mergeGateVerdict of [undefined, { error: 'unreadable' }, { headSha: HEAD },
+      { ...p.mergeGateVerdict, headSha: 'another-head' },
+      { headSha: HEAD, results: [...p.mergeGateVerdict.results, { id: 'red-main-freeze', status: 'hold' }] },
+      { headSha: HEAD, results: [...p.mergeGateVerdict.results, { id: 'ledger', status: 'fail-closed' }] }]) {
+      expect(sweep([{ ...p, mergeGateVerdict }]).prs[0]).toMatchObject({ waitingOn: 'ci-failed', actor: 'fixer' });
+    }
+    for (const check of [{ name: 'test', conclusion: 'FAILURE' }, { context: 'test', state: 'ERROR' },
+      { name: 'other-merge-gate', conclusion: 'FAILURE' }]) {
+      expect(sweep([{ ...p, statusCheckRollup: [...p.statusCheckRollup, check] }]).prs[0])
+        .toMatchObject({ waitingOn: 'ci-failed', actor: 'fixer', stalled: false, next: null });
+    }
+    expect(sweep([{ ...p, statusCheckRollup: [{ context: 'merge-gate', state: 'FAILURE' }] }]).prs[0].waitingOn).toBe('human-review');
+    expect(sweep([{ ...p, labels: L('ready-to-merge') }]).prs[0].waitingOn).toBe('ci-failed');
+    expect(sweep([{ ...p, labels: L('review:human', 'advisory:accepted', 'ci:failed') }]).prs[0].waitingOn).toBe('ci-failed');
   });
   it('not-certified drain skip is the operator\'s', () => {
     const p = mkPr({ number: 4, labels: L('ready-to-merge') });
@@ -492,6 +529,43 @@ describe('io helpers', () => {
     const out = read({});
     expect(out.prs).toEqual([]);
     expect(out.unreadable).toEqual([`${REPO}: boom`]);
+  });
+  it('the reader attaches verdict evidence only for a review:human PR with merge-gate as the single failing check', () => {
+    const gate = { name: 'merge-gate', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/12/job/34' };
+    const results = GATE_IDS.map((id) => ({ id, status: id === 'review-acceptance' ? 'hold' : 'pass', reason: 'fixture' }));
+    let pr = { number: 9, state: 'OPEN', headRefOid: HEAD, labels: L('review:human'),
+      statusCheckRollup: [gate, { name: 'review-gate', conclusion: 'FAILURE' }, { name: 'test', conclusion: 'SUCCESS' }] };
+    let failRead = false;
+    const calls = [];
+    const run = (_f, args) => {
+      calls.push(args);
+      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([pr]);
+      if (args[0] === 'pr' && args.includes('commits')) return '{"commits":[]}';
+      if (args[0] === 'api' && args[1] === '--paginate') return '[[]]';
+      if (args[0] === 'api' && args[1] === `repos/${REPO}/actions/jobs/34`) {
+        if (failRead) throw new Error('job unreadable');
+        return JSON.stringify({ head_sha: HEAD });
+      }
+      if (args[0] === 'api' && args[1] === `repos/${REPO}/actions/jobs/34/logs`)
+        return formatPrResult({ num: 9, ok: false, results });
+      throw new Error(`unexpected command: ${args.join(' ')}`);
+    };
+    const read = () => createPrSweepReader({ run, ps: () => '', readText: () => '', now: () => NOW, settings: () => ({}) })({ repo: REPO });
+    expect(read()).toMatchObject({ prs: [{ mergeGateVerdict: { num: 9, headSha: HEAD, results } }], unreadable: [] });
+    failRead = true;
+    expect(read().prs[0].mergeGateVerdict).toEqual({ error: 'job unreadable' });
+    failRead = false;
+    const base = pr;
+    for (const variant of [
+      { ...base, labels: [] },
+      { ...base, statusCheckRollup: [...base.statusCheckRollup, { name: 'test', conclusion: 'FAILURE' }] },
+      { ...base, statusCheckRollup: [{ ...gate, conclusion: 'SUCCESS' }] },
+    ]) {
+      pr = variant;
+      calls.length = 0;
+      expect(read().prs[0]).not.toHaveProperty('mergeGateVerdict');
+      expect(calls.some((args) => args.some((arg) => arg.includes('/actions/jobs/')))).toBe(false);
+    }
   });
   it('the reader joins the list, paginated comments, and the head commit date', () => {
     const run = (_f, args) => {

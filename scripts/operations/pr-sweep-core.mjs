@@ -26,6 +26,7 @@
  * (setting `prSweep.stalledAfterMinutes`, standard 45) with no live job for the PR. Every stalled row carries the
  * exact next action. PURE: no fs, no clock, no network, no process in this file (`pr-sweep-io.mjs` has them all).
  */
+import { humanReviewOnlyHold } from '../lib/merge-gate-verdict.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { openReferralFindings } from './record-referral-ruling.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -67,9 +68,9 @@ const closesHold = (e) => isOperatorAuthored(e.c) || (trusted(e) && CLOSERS.some
  * `review:accepted` LABEL alone never closes it: only a dated record after the hold does. Returns the hold
  * (`{at, count, text}`) or null. PURE.
  * @param {Array} comments
- * @param {{headCommittedAt?: (string|null)}} [o]
+ * @param {{headCommittedAt?: (string|null), now?: number}} [o] now bounds push evidence; omitted = unbounded (no clock read)
  */
-export function referralHoldOpen(comments, { headCommittedAt = null } = {}) {
+export function referralHoldOpen(comments, { headCommittedAt = null, now = Infinity } = {}) {
   const list = sorted(comments);
   let hold = null;
   for (const e of list) {
@@ -80,7 +81,7 @@ export function referralHoldOpen(comments, { headCommittedAt = null } = {}) {
   if (!hold || hold.at === null) return null;
   if (!/need a ruling|waiting on your ruling|referral/i.test(bodyOf(hold.c))) return null;
   const pushed = t(headCommittedAt);
-  if (pushed !== null && pushed > hold.at) return null;
+  if (pushed !== null && pushed > hold.at && pushed <= now) return null;
   for (const e of list) {
     if (e === hold || e.at === null || e.at <= hold.at) continue;
     if (closesHold(e)) return null;
@@ -121,13 +122,13 @@ export function holdEvidence(pr, hold, { cardReadable = (ref) => referralCardRea
  * `dispute` is true only for the fixer/reviewer ruling disagreement; other notes (permission block, exhausted
  * repairs, infrastructure) share the headline and need a different answer. PURE.
  */
-export function needsDecisionOpen(comments, { headCommittedAt = null } = {}) {
+export function needsDecisionOpen(comments, { headCommittedAt = null, now = Infinity } = {}) {
   const list = sorted(comments);
   let note = null;
   for (const e of list) if (trusted(e) && NEEDS_DECISION_RE.test(bodyOf(e.c))) note = e;
   if (!note || note.at === null) return null;
   const pushed = t(headCommittedAt);
-  if (pushed !== null && pushed > note.at) return null;
+  if (pushed !== null && pushed > note.at && pushed <= now) return null;
   for (const e of list) if (e.at !== null && e.at > note.at && isOperatorAuthored(e.c)) return null;
   const body = bodyOf(note.c);
   return { at: note.at, dispute: /disagree about a ruling|operator ruled .* came back/i.test(body),
@@ -181,8 +182,17 @@ const DRAIN_SKIP_ACTOR = Object.freeze({
 // `review-gate` is the review's own mirror, not CI (operator-queue drops it too).
 const realChecks = (pr) => (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [])
   .filter((c) => (c?.name ?? c?.context) !== 'review-gate');
-const failingChecks = (pr) => realChecks(pr)
-  .some((c) => ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'].includes(String(c?.conclusion ?? c?.state ?? '').toUpperCase()));
+// Only the failed job's readable live-head verdict can prove a human-only hold.
+const failingChecks = (pr) => {
+  const failing = realChecks(pr)
+    .filter((c) => ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'].includes(String(c?.conclusion ?? c?.state ?? '').toUpperCase()));
+  const verdict = pr.mergeGateVerdict;
+  if (failing.length === 1 && (failing[0]?.name ?? failing[0]?.context) === 'merge-gate'
+    && labelNames(pr).includes('review:human') && verdict && !verdict.error && Array.isArray(verdict.results)
+    && pr.headRefOid && String(verdict.headSha ?? '').toLowerCase() === String(pr.headRefOid).toLowerCase()
+    && humanReviewOnlyHold(verdict.results).only) return false;
+  return failing.length > 0;
+};
 const runningChecks = (pr) => realChecks(pr)
   .some((c) => ['IN_PROGRESS', 'QUEUED', 'PENDING'].includes(String(c?.status ?? c?.state ?? '').toUpperCase()) && !c?.conclusion);
 
@@ -212,7 +222,7 @@ export function deriveWaitingOn(pr, ctx) {
     return { state, actor, since: since ?? t(pr.updatedAt), approxSince: since === null || since === undefined, why, next, evidence };
   };
 
-  const hold = referralHoldOpen(pr.comments, { headCommittedAt: pushedAt });
+  const hold = referralHoldOpen(pr.comments, { headCommittedAt: pushedAt, now });
   if (hold) {
     const ev = holdEvidence(pr, hold, ctx.holdOptions);
     const keys = ev.open.map((f) => `${f.file}${f.line ? `:${f.line}` : ''}`);
@@ -233,7 +243,7 @@ export function deriveWaitingOn(pr, ctx) {
   if (rt) return done('ruling-needed:red-team-round-cap', 'operator', rt.since ?? null,
     `red team round cap reached with ${rt.findings.length} unresolved finding(s)`, actions.redTeamRuling, ['we:red-team-gate outcome=round-cap']);
 
-  const decision = needsDecisionOpen(pr.comments, { headCommittedAt: pushedAt });
+  const decision = needsDecisionOpen(pr.comments, { headCommittedAt: pushedAt, now });
   if (decision) return done(decision.dispute ? 'ruling-needed:dispute' : 'needs-decision:note', 'operator', decision.at,
     decision.dispute ? `fixer and reviewer disagree; a person must decide (${decision.text})` : `an escalation note awaits your answer (${decision.text})`,
     decision.dispute ? actions.referralRuling : actions.answerNote, ['needs-your-decision note']);

@@ -9,6 +9,7 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
+import { ADVISORY_OUTCOMES, advisoryCoversHead, latestAdvisory } from '../lib/advisory-labels.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
@@ -192,6 +193,10 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       const comments = pages.flat().map((c) => ({ author: { login: c.user?.login ?? '' }, body: c.body ?? '', createdAt: c.created_at }));
       const reasons = humanReviewHold({ number: item.pr, headRefOid: view.headRefOid, labels: view.labels ?? [], comments }, now,
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
+      const advisory = latestAdvisory(comments);
+      if (advisory?.outcome !== ADVISORY_OUTCOMES.ACCEPT || !advisoryCoversHead(advisory, view.headRefOid)) {
+        reasons.push('no accepting advisory covers the live head');
+      }
       if (reasons.length) { held.push({ item, reasons }); return; }
       // Publish the head that was actually checked, not a stale one from the report or a later lookup.
       out[index] = { ...item, head: view.headRefOid };

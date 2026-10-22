@@ -292,6 +292,25 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   const report = { ready: [{ repo, number: 5768, title: 't' }], needsYourMerge: [{ repo, number: 9, title: 'm' }] };
   const gate = (view, comments) => async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify(view));
   const items = () => itemsFromReport(report);
+  const advisory = (rev = head, outcome = 'accept') => ({ user: { login: 'plateau-reviewer[bot]' }, created_at: at,
+    body: `**Verdict:** ${outcome}\n**Advisory outcome:** ${outcome}\nNet basis: \`abc..${rev}\`` });
+
+  it('withholds readiness when the live head has no accepting advisory, even if the report head was accepted', async () => {
+    const old = 'a'.repeat(40);
+    const r2 = { ready: [{ repo, number: 5768, head: old }] };
+    const view = { headRefOid: head, labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }] };
+    for (const comments of [[advisory(old)], [], [advisory(head, 'changes')]]) {
+      const { kept, held } = await gateReadyItems(itemsFromReport(r2), r2,
+        { gh: gate(view, comments), now: Date.parse(at), fixClaimLive: () => false, log: () => {} });
+      expect(kept).toHaveLength(0);
+      expect(held).toEqual([{ item: expect.objectContaining({ head: old, pr: 5768 }),
+        reasons: ['no accepting advisory covers the live head'] }]);
+    }
+    const { kept, held } = await gateReadyItems(itemsFromReport(r2), r2,
+      { gh: gate(view, [advisory()]), fixClaimLive: () => false, log: () => {} });
+    expect(held).toEqual([]);
+    expect(kept[0].head).toBe(head);
+  });
 
   it('drops a ready item whose live PR is red-team:blocked + review:changes, and says why', async () => {
     const gh = gate({ headRefOid: head, labels: [{ name: 'review:changes' }, { name: 'red-team:blocked' }] }, []);
@@ -300,7 +319,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(held[0].reasons).toEqual(expect.arrayContaining(['the red team blocked the live head', 'it was sent back (review:changes)']));
   });
   it('keeps a ready item whose live PR is clean, and never judges needs-your-merge rows', async () => {
-    const gh = gate({ headRefOid: head, labels: [{ name: 'red-team:clear' }] }, []);
+    const gh = gate({ headRefOid: head, labels: [{ name: 'red-team:clear' }] }, [advisory()]);
     const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });
     expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
     expect(held).toEqual([]);
@@ -323,13 +342,13 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   it('publishes the head it CHECKED, not a stale one from the report or a later lookup', async () => {
     const stale = [{ repo, number: 5768, head: 'stale' }];
     const r2 = { ready: stale };
-    const { kept } = await gateReadyItems(itemsFromReport(r2), r2, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    const { kept } = await gateReadyItems(itemsFromReport(r2), r2, { gh: gate({ headRefOid: head, labels: [] }, [advisory()]), log: () => {} });
     expect(kept[0].head).toBe(head);
   });
   it('the real fix-claim lease overrides the comment heuristic (expired lease = not claimed; live lease = claimed)', async () => {
     const created_at = new Date(Date.now() - 600000).toISOString();
     const body = '🔒 conveyor fix-begin — fix claim held';
-    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[{ user: { login: 'plateau-worker[bot]' }, body, created_at }]]) : JSON.stringify({ headRefOid: head, labels: [] }));
+    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[advisory(), { user: { login: 'plateau-worker[bot]' }, body, created_at }]]) : JSON.stringify({ headRefOid: head, labels: [] }));
     const live = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => true });
     expect(live.held[0].reasons).toEqual(['a fix claim is open']);
     const expired = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => false });
@@ -345,7 +364,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   });
   it('keeps the incomplete flag the diff uses', async () => {
     const withFlag = Object.assign(items(), { incomplete: true });
-    const { kept } = await gateReadyItems(withFlag, report, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    const { kept } = await gateReadyItems(withFlag, report, { gh: gate({ headRefOid: head, labels: [] }, [advisory()]), log: () => {} });
     expect(kept.incomplete).toBe(true);
   });
 });

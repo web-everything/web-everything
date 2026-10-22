@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, fstatSync, openSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { parsePrResultTable } from '../lib/merge-gate-verdict.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
@@ -76,6 +77,23 @@ export function tailOf(path, bytes = 4_000_000) {
 
 const jsonGh = (run, args) => JSON.parse(run('gh', args, { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 120_000 }));
 
+// Mirror operator-queue's reader without importing its runtime graph into this read-only operation.
+function readMergeGateVerdict({ repo, check, number, exec }) {
+  try {
+    const id = check?.detailsUrl?.match(/\/actions\/runs\/\d+\/job\/(\d+)/)?.[1];
+    if (!id) return { error: 'merge-gate check URL has no job id' };
+    const endpoint = `repos/${repo}/actions/jobs/${id}`;
+    const options = { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 };
+    const job = JSON.parse(exec('gh', ['api', endpoint], options));
+    if (typeof job?.head_sha !== 'string' || !job.head_sha) return { error: 'job has no head_sha' };
+    const log = exec('gh', ['api', `${endpoint}/logs`], options);
+    const parsed = parsePrResultTable(log, number);
+    return parsed.error ? parsed : { headSha: job.head_sha, ...parsed };
+  } catch (error) {
+    return { error: String(error?.message ?? error).split('\n')[0] };
+  }
+}
+
 /** The reader `run.mjs` binds. Every dependency is injectable for tests. */
 export function createPrSweepReader({ run = ghSync, now = () => Date.now(), readText = tailOf,
   ps = () => execFileSync('ps', ['-axo', 'pid,etime,command'], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
@@ -108,7 +126,13 @@ export function createPrSweepReader({ run = ghSync, now = () => Date.now(), read
             .map((e) => ({ label: e.label.name, at: e.created_at }));
           const view = jsonGh(run, ['pr', 'view', String(p.number), '-R', repo, '--json', 'commits']);
           const commit = (view.commits ?? []).filter((c) => c.oid === p.headRefOid).pop();
-          prs.push({ ...p, repo, comments, labelEvents, headCommittedAt: commit?.committedDate ?? null });
+          const failing = (p.statusCheckRollup ?? []).filter((check) => (check.name ?? check.context) !== 'review-gate'
+            && ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'].includes(String(check.conclusion ?? check.state ?? '').toUpperCase()));
+          const mergeGateVerdict = (p.labels ?? []).some((label) => label.name === 'review:human')
+            && failing.length === 1 && (failing[0].name ?? failing[0].context) === 'merge-gate'
+            ? readMergeGateVerdict({ repo, check: failing[0], number: p.number, exec: run }) : undefined;
+          prs.push({ ...p, repo, comments, labelEvents, headCommittedAt: commit?.committedDate ?? null,
+            ...(mergeGateVerdict ? { mergeGateVerdict } : {}) });
         } catch (e) { unreadable.push(`${repo}#${p.number}: ${String(e?.message ?? e).split('\n')[0]}`); }
       }
     }
