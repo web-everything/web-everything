@@ -64,6 +64,48 @@ function fixture() {
 }
 
 describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before registering', () => {
+  it('refuses re-registering a carried ref whose conflicting tip is only applied as a pin without an operator override', async () => {
+    const f = fixture();
+    Object.assign(f.env, {
+      WE_DAEMON_STATE_DIR: mktemp('we-reregister-state-'),
+      WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-reregister-lock-'),
+      WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0',
+      WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
+    });
+    const a0 = f.push('lane/a', { 'a.txt': 'A\n' });
+    addOverlay(f.clone, { ref: 'lane/a' }, { env: f.env });
+    expect(await rebuildClone({
+      root: f.clone, env: f.env, prState: async () => 'OPEN',
+      runSmoke: async () => ({ verdict: 'pass', smoke: { results: [{ name: 'fixture', ok: true }] } }),
+    })).toMatchObject({ adopted: true });
+    removeOverlay(f.clone, 'lane/a', { env: f.env });
+    const a1 = f.push('lane/a', { 'shared.mjs': 'export const X = 1;\n' }, a0);
+    const live = await dryRunRebuild({
+      root: f.clone, env: f.env, prState: async () => 'OPEN', extraOverlays: [{ ref: 'lane/a' }],
+    });
+    expect(live.plan).toMatchObject({ ok: true, establishedLost: [] });
+    expect(live.plan.applied).toContainEqual(expect.objectContaining({ ref: 'lane/a', sha: a0, pinnedFrom: a1 }));
+
+    const check = await stackAwareOverlayCheck({
+      root: f.clone, ref: 'lane/a', existingOverlays: readOverlays(f.clone, { env: f.env }), env: f.env,
+    });
+    expect(check).toMatchObject({ ok: true, clean: false, files: ['shared.mjs'] });
+    const refused = await f.load({ ref: 'lane/a', pr: null });
+    expect(refused).toMatchObject({ registered: false, refused: true, reason: 'conflict' });
+    expect(readOverlays(f.clone, { env: f.env }).some(o => o.ref === 'lane/a')).toBe(false);
+    expect(f.rebuild).not.toHaveBeenCalled();
+
+    const allowed = await f.load({
+      ref: 'lane/a', pr: null, allowConflict: true,
+      operatorInstruction: 're-register the carried overlay', readViewer: async () => 'chalbert',
+    });
+    expect(allowed.refused).toBeFalsy();
+    expect(readOverlays(f.clone, { env: f.env }).find(o => o.ref === 'lane/a').conflictOverride).toMatchObject({
+      instruction: 're-register the carried overlay', actor: 'chalbert', files: ['shared.mjs'],
+    });
+    expect(f.rebuild).toHaveBeenCalledOnce();
+  }, 60_000);
+
   it('admits M0/A0/M1/A1/R repair through the full plan with edge resolution off and no override', async () => {
     const f = fixture();
     Object.assign(f.env, {

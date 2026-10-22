@@ -264,14 +264,15 @@ export async function previewOverlayConflict({
     }
 
     // A repair can unlock a moving tip's retry even when it conflicts with the stack's pinned head.
-    // Ask the whole planner before refusing; ok alone is insufficient because it can drop overlays.
+    // Ask the whole planner before refusing; it must retain overlays and apply the candidate's current tip.
+    // A carried ref re-registered at a conflicting tip can be pinned, which still requires an operator override.
     if (mt.status === 1) {
       const planCandidate = await planRebuild({
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding.concat([{ ref, pr }]),
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
       });
-      if (planCandidate.ok && planCandidate.applied.some((o) => o.ref === ref)
+      if (planCandidate.ok && planCandidate.applied.some((o) => o.ref === ref && !o.pinnedFrom)
         && planCandidate.establishedLost.length === 0) {
         return { ok: true, clean: true, mainSha, cur, candSha, setAside };
       }
