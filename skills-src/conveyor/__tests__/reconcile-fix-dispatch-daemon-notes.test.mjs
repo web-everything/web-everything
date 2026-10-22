@@ -211,7 +211,11 @@ describe('exhausted fix parking', () => {
       }));
       expect(out.comments[0].parked).toBe(true);
     }
-    expect(postComment).toHaveBeenCalledTimes(alreadyPosted || dryRun ? 0 : 1);
+    // A successful park also posts its escalation record (we:scripts/lib/human-escalation-marker.mjs), even when
+    // the note comment itself was already posted.
+    const records = postComment.mock.calls.filter(([o]) => o.body.includes('we:human-escalation kind=round-cap'));
+    expect(records).toHaveLength(calls);
+    expect(postComment).toHaveBeenCalledTimes((alreadyPosted || dryRun ? 0 : 1) + calls);
   });
 });
 

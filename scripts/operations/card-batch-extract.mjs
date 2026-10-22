@@ -17,6 +17,7 @@ import { CARD_BATCH_STATE_DIR, HOLD_LABEL, batchExec } from './card-batch-seal-i
 import { extractSubmitResult } from './open-pr.mjs';
 import { parseRunJsonTail } from './land-prevention-card.mjs';
 import { cardOnlyEligibility } from '../lib/card-batch-policy.mjs';
+import { HUMAN_ESCALATION_KINDS, buildHumanEscalationMarker } from '../lib/human-escalation-marker.mjs';
 
 const ROOT = resolve(dirname(new URL(import.meta.url).pathname), '../..');
 const MARKER = 'Card-Batch: ';
@@ -151,7 +152,7 @@ export async function extractCard(input, opts = {}) {
       // Comment first, label last: the label is what marks the hold as seen, so it must not land while the comment is owed.
       if (!journal.heldCommented) {
         await gh(['pr', 'comment', String(old.pr), '--repo', repo, '--body-file',
-          bodyFile(`Card extraction held for a person: ${journal.held.reason}. Nothing was extracted or dropped.\n`)]);
+          bodyFile(`Card extraction held for a person: ${journal.held.reason}. Nothing was extracted or dropped.\n\n${buildHumanEscalationMarker({ kind: HUMAN_ESCALATION_KINDS.CARD_EXTRACTION_HELD, head: null })}\n`)]);
         journal.heldCommented = true;
         save();
       }

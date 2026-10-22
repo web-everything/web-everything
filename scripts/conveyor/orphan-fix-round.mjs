@@ -34,6 +34,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { HUMAN_ESCALATION_KINDS, buildHumanEscalationMarker } from '../lib/human-escalation-marker.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
@@ -107,7 +108,7 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
     reason: `fix round ended ${ctx.roundAt} without addressing the review (${evidence ? 'evidence but the head never moved' : 'no fix evidence'}) and nobody owns it` };
 }
 
-export function buildOrphanGuardComment({ decision, reason, prNumber }) {
+export function buildOrphanGuardComment({ decision, reason, prNumber, headSha = null }) {
   const head = decision === 'redispatch' ? 're-dispatched a fixer' : decision === 'rearm' ? 're-armed for review' : 'escalated to a person';
   return [
     `${ORPHAN_GUARD_MARKER} — ${head}`,
@@ -116,6 +117,8 @@ export function buildOrphanGuardComment({ decision, reason, prNumber }) {
     '',
     'Every fix round must end owned: re-armed for review, re-dispatched, or with a person. This one ended with',
     '`review:changes` and no owner, so the fix daemon acted. It counts as the same review round.',
+    // An escalation records WHY it added review:human (we:scripts/lib/human-escalation-marker.mjs).
+    ...(decision === 'escalate' ? ['', buildHumanEscalationMarker({ kind: HUMAN_ESCALATION_KINDS.ORPHAN_FIX_EXHAUSTED, head: headSha })] : []),
   ].join('\n');
 }
 
@@ -219,7 +222,7 @@ export async function runOrphanFixRoundPass({
             : await escalate({ slug, pr: p.number, labels });
         if (!r?.ok) { row.result = `not-done: ${r?.why ?? '?'}`; continue; }
         row.result = plan.decision === 'rearm' ? 're-armed' : plan.decision === 'redispatch' ? 're-dispatched' : 'escalated';
-        try { postComment({ slug, pr: p.number, body: buildOrphanGuardComment({ decision: plan.decision, reason: plan.reason, prNumber: p.number }) }); }
+        try { postComment({ slug, pr: p.number, body: buildOrphanGuardComment({ decision: plan.decision, reason: plan.reason, prNumber: p.number, headSha: p.headRefOid }) }); }
         catch (e) { row.result += ` (marker comment failed: ${String(e?.message ?? e).split('\n')[0]})`; }
       } catch (e) {
         if (!rows.includes(row)) rows.push(row);

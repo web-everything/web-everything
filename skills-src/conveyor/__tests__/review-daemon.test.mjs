@@ -39,6 +39,13 @@ vi.mock('../../../scripts/conveyor/human-surface-repark.mjs', async (importOrigi
   const actual = await importOriginal();
   return { ...actual, sweepHumanSurfaceRepark: (...args) => sweepHumanSurfaceReparkMock(...args) };
 });
+// Same for the escalation de-escalation sweep: its default shells real `gh` reads. Behavior is proven in
+// scripts/conveyor/__tests__/human-escalation-deescalate.test.mjs.
+const sweepHumanDeescalationMock = vi.fn(() => []);
+vi.mock('../../../scripts/conveyor/human-escalation-deescalate.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, sweepHumanDeescalation: (...args) => sweepHumanDeescalationMock(...args) };
+});
 
 import {
   runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
@@ -1482,6 +1489,23 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
     sweepHumanSurfaceReparkMock.mockImplementationOnce(() => { throw new Error('gh down'); });
     sweepReviewHoldLabelsMock.mockReturnValueOnce([{ num: 7, remove: ['review:pending'] }]);
     expect(sweepReviewHolds({ repo: 'o/n' })).toEqual([{ num: 0, repark: 'sweep-failed', error: 'gh down' }, { num: 7, remove: ['review:pending'] }]);
+  });
+
+  it('runs the escalation de-escalation (apply) between the re-park and the reconcile; kept PRs are not listed', () => {
+    sweepHumanSurfaceReparkMock.mockReturnValueOnce([{ num: 1, repark: 'reparked' }]);
+    sweepHumanDeescalationMock.mockReturnValueOnce([{ num: 5502, action: 'deescalated', reason: 'escalation cleared' },
+      { num: 9, action: 'keep', reason: 'hand label' }]);
+    sweepReviewHoldLabelsMock.mockReturnValueOnce([{ num: 7, remove: ['review:pending'] }]);
+    const out = sweepReviewHolds({ repo: 'o/n' });
+    expect(sweepHumanDeescalationMock).toHaveBeenLastCalledWith({ repo: 'o/n', apply: true });
+    expect(out.map(r => r.num)).toEqual([1, 5502, 7]);
+    expect(out[1].deescalate).toBe('deescalated');
+  });
+
+  it('a de-escalation failure is its own entry and never stops the reconcile', () => {
+    sweepHumanDeescalationMock.mockImplementationOnce(() => { throw new Error('boom'); });
+    sweepReviewHoldLabelsMock.mockReturnValueOnce([]);
+    expect(sweepReviewHolds({ repo: 'o/n' })).toEqual([{ num: 0, deescalate: 'sweep-failed', error: 'boom' }]);
   });
 
   it('runs holdReconcile with THIS tick\'s own repo, independent of reconcile\'s plan', () => {

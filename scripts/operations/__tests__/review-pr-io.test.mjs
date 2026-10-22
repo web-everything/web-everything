@@ -3025,7 +3025,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     const state = { headRefOid: H1, body: '<!-- authored-by-actor: author -->', labels: ['review:pending'], comments: [], createdAt: '' };
     const trace = [];
     const provider = { readPrState: () => structuredClone(state), ensureLabel: () => {},
-      postComment: (repo, pr, body) => { trace.push(body.includes('mandatory-referrals-v1') ? 'referral' : 'advisory'); state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }); },
+      postComment: (repo, pr, body) => { trace.push(body.includes('mandatory-referrals-v1') ? 'referral' : body.includes('we:human-escalation') ? 'escalation-record' : 'advisory'); state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }); },
       editComment: (id, body) => { state.comments.find(c => c.id === id).body = body; },
       setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...state.labels.filter((l) => !plan.remove.includes(l)), plan.add]; } };
     const referralJudge = vi.fn(async (request) => ({ sessionId: request.sessionId, value: { rulings: [] } }));
@@ -3084,6 +3084,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     // The attempt updates the original comment; an empty ruling answer posts nothing else.
     expect(referralBefore).toBe(1);
     expect(advisoryBefore).toBe(0); // this fixture has no advisory humanRequired input
+    expect(w.trace.filter((t) => t === 'escalation-record')).toHaveLength(1); // the park records why, once
 
     // The same tool-less seat re-raises the same claim on the same head: the REPRODUCED answer proves the verifier is never consulted.
     const second = await w.runOnce('run-2', REPRODUCED);

@@ -3821,7 +3821,7 @@ describe('#4315 operation / I/O restart soak', () => {
       const trace = [], judge = vi.fn(async () => ({ value: { rulings: [] } }));
       const provider = {
         readPrState: () => { trace.push('read'); return structuredClone(state); },
-        postComment: (repo, pr, body) => { trace.push('post'); state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }); },
+        postComment: (repo, pr, body) => { trace.push(body.includes('we:human-escalation') ? 'escalation-record' : 'post'); state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }); },
         editComment: (id, body) => { trace.push('edit'); state.comments.find(c => c.id === id).body = body; },
         setLabels: (repo, pr, plan) => { trace.push(`label:${plan.add}`); state.labels = [...state.labels.filter(l => !plan.remove.includes(l)), plan.add]; },
       };
@@ -3848,6 +3848,9 @@ describe('#4315 operation / I/O restart soak', () => {
       }
       expect(judge).toHaveBeenCalledTimes(1);
       expect(trace.filter(x => x === 'post')).toHaveLength(1);
+      // The park records WHY once (the label's first add), never once per restart.
+      expect(trace.filter(x => x === 'escalation-record')).toHaveLength(1);
+      expect(state.comments.find(c => c.body.includes('we:human-escalation'))?.body).toContain('kind=referral-pending');
       expect(trace).toContain('edit');
       expect(state.labels).toEqual(['review:human']);
       expect(trace.indexOf('post')).toBeLessThan(trace.findIndex(x => x.startsWith('label:')));

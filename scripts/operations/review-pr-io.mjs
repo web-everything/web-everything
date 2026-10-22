@@ -12,6 +12,7 @@ import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryRef
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
+import { HUMAN_ESCALATION_KINDS, buildHumanEscalationComment, buildHumanEscalationMarker } from '../lib/human-escalation-marker.mjs';
 import { buildReviewJudgeRequest } from './review-pr.mjs';
 import { referralSeatDisabled } from './review-seat-policy.mjs';
 export { referralSeatDisabled } from './review-seat-policy.mjs';
@@ -1024,11 +1025,19 @@ export function createReviewPrSinks({
       const fresh = () => readReferralState(read.repo, read.pr, read.netBasis.rev);
       const context = (state) => ({ repo: read.repo, pr: read.pr, head: state.headRefOid,
         body: typeof state.body === 'string' ? state.body : '', createdAt: state.createdAt, cardReadable });
-      const park = (state) => {
+      // Every park records WHY (we:scripts/lib/human-escalation-marker.mjs): a fresh add posts a marker comment
+      // naming the kind, so the de-escalation reconcile can lift it once that cause clears. `marked: false` when
+      // the caller's own comment carries the marker instead.
+      const park = (state, kind, { marked = true, detail = '' } = {}) => {
         const plan = decideParkToHuman({ currentLabels: labelNames(state.labels) });
         const remove = plan.removeLabels.filter(l => labelNames(state.labels).includes(l));
-        if (remove.length || !labelNames(state.labels).includes(plan.addLabel)) {
+        const adds = !labelNames(state.labels).includes(plan.addLabel);
+        if (remove.length || adds) {
           labelProvider.setLabels(read.repo, read.pr, { add: plan.addLabel, remove });
+        }
+        if (adds && marked) {
+          try { labelProvider.postComment(read.repo, read.pr, buildHumanEscalationComment({ kind, head: state.headRefOid ?? read.netBasis.rev, detail })); }
+          catch (commentError) { out(`Could not post the escalation record: ${commentError.message}`); }
         }
         if (labelNames(state.labels).includes('review:changes')) out(plan.reason);
       };
@@ -1073,7 +1082,7 @@ export function createReviewPrSinks({
       try {
         state = fresh();
         const prior = readReferralRecords(state.comments, context(state));
-        if (prior.malformed) { park(state); return mandatoryReferralState(state.comments, context(state)); }
+        if (prior.malformed) { park(state, HUMAN_ESCALATION_KINDS.REFERRAL_MALFORMED, { detail: 'A mandatory referral record on this PR is malformed.' }); return mandatoryReferralState(state.comments, context(state)); }
         // Retire only persisted findings, before merging this run's fresh referrals. Keep the source bytes
         // and a durable reason so every acceptance reader sees the same decision, including after a restart.
         const priorOperatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
@@ -1415,12 +1424,15 @@ export function createReviewPrSinks({
         if (overflows.length) {
           const reason = `${overflows.length} overflow hold(s). ${overflows[0]}`;
           for (const detail of overflows) {
-            labelProvider.postComment(read.repo, read.pr, `Mandatory referral review parked to review:human: ${detail}`);
+            labelProvider.postComment(read.repo, read.pr, `Mandatory referral review parked to review:human: ${detail}\n\n${buildHumanEscalationMarker({ kind: HUMAN_ESCALATION_KINDS.REFERRAL_OVERFLOW, head: state.headRefOid })}`);
           }
           result.pending.push('referral-overflow');
           result.reason = reason;
         }
-        if (result.pending.length) park(state);
+        if (result.pending.length) {
+          const kind = overflows.length ? HUMAN_ESCALATION_KINDS.REFERRAL_OVERFLOW : HUMAN_ESCALATION_KINDS.REFERRAL_PENDING;
+          park(state, kind, { marked: !overflows.length, detail: `${result.pending.length} mandatory referral(s) on head \`${String(state.headRefOid ?? '').slice(0, 12)}\` await a ruling (block, card or not-real).` });
+        }
         for (const record of result.records) mirrorReferral(record);
         // The label mirror reads the verdict ledger, not jury snapshots. Publish only rulings the
         // trusted, read-back thread actually counts (independence, supersession and readable cards
@@ -1505,9 +1517,10 @@ export function createReviewPrSinks({
         try { live = labelProvider.readPrState(read.repo, read.pr); }
         catch (readError) { out(`Could not refresh referral park labels: ${readError.message}`); }
         if (!live) live = { labels: read.labels ?? [] };
-        park(live);
+        park(live, HUMAN_ESCALATION_KINDS.REFERRAL_PERSISTENCE_FAILED, { marked: false });
         const reason = String(error.message ?? error).replace(/\s+/g, ' ').slice(0, 400);
-        const message = `Mandatory referral review parked to review:human: ${reason}.`;
+        const message = `Mandatory referral review parked to review:human: ${reason}.\n\n${buildHumanEscalationMarker({
+          kind: HUMAN_ESCALATION_KINDS.REFERRAL_PERSISTENCE_FAILED, head: live?.headRefOid ?? read.netBasis?.rev })}`;
         try { labelProvider.postComment(read.repo, read.pr, message); }
         catch (commentError) { out(`Could not post referral park reason: ${commentError.message}`); }
         out(message);

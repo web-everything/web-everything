@@ -103,6 +103,7 @@ import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
 // exact gap this wiring closes.
 import { sweepReviewHoldLabels } from '../../scripts/conveyor/review-hold-reconcile.mjs';
 import { sweepHumanSurfaceRepark } from '../../scripts/conveyor/human-surface-repark.mjs';
+import { sweepHumanDeescalation } from '../../scripts/conveyor/human-escalation-deescalate.mjs';
 import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mjs';
 // #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical, no-session executor for a
 // `kind:'convert-advisory'` dispatch entry. Wired as its OWN additive pipeline stage below
@@ -335,7 +336,8 @@ export function resolveReviewTickSharing(env = process.env) {
 
 /**
  * The tick's review-hold sweeps: the human-surface re-park (live #5193 — an accepted PR whose head touches a
- * human-only surface goes back to `review:human`) runs first, then the stray-label reconcile. A re-park failure is
+ * human-only surface goes back to `review:human`) runs first, then the escalation de-escalation, then the
+ * stray-label reconcile. A re-park failure is
  * its own entry and never stops the reconcile.
  */
 export function sweepReviewHolds(opts) {
@@ -343,7 +345,16 @@ export function sweepReviewHolds(opts) {
   try { repark = sweepHumanSurfaceRepark(opts) ?? []; } catch (e) {
     repark = [{ num: 0, repark: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] }];
   }
-  return [...repark, ...(sweepReviewHoldLabels(opts) ?? [])];
+  // After the re-park (which can ADD a rule-required hold), lift an escalation-added `review:human` whose recorded
+  // cause is cleared and that no rule requires (we:scripts/conveyor/human-escalation-deescalate.mjs). Its own entry.
+  let deescalate;
+  try {
+    deescalate = (sweepHumanDeescalation({ repo: opts?.repo ?? null, apply: true, ...(opts?.listPrs ? { listPrs: opts.listPrs } : {}) }) ?? [])
+      .filter(r => r.action !== 'keep').map(r => ({ ...r, deescalate: r.action }));
+  } catch (e) {
+    deescalate = [{ num: 0, deescalate: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] }];
+  }
+  return [...repark, ...deescalate, ...(sweepReviewHoldLabels(opts) ?? [])];
 }
 
 /**

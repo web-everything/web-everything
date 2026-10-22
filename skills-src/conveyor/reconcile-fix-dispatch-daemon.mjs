@@ -50,6 +50,7 @@ import { resolveFixSafety } from '../../scripts/conveyor/repeated-finding-reset.
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
 import { decideParkToHuman } from '../../scripts/lib/review-escalation.mjs';
+import { HUMAN_ESCALATION_KINDS, buildHumanEscalationComment } from '../../scripts/lib/human-escalation-marker.mjs';
 import { hostname } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -455,6 +456,14 @@ export function runReconcileNotesAllRepos({
             removeLabels: decision.removeLabels.filter((label) => labels.includes(label)) });
           parking.parked = !!outcome.ok;
           if (!outcome.ok) parking.parkError = outcome.error;
+          // Record WHY the label went on (we:scripts/lib/human-escalation-marker.mjs), so the de-escalation
+          // reconcile can lift it once a round grant answers the cap. A failed record only costs that lift.
+          if (outcome.ok) {
+            const recorded = postComment({ repo, pr: n.prNumber, body: buildHumanEscalationComment({
+              kind: HUMAN_ESCALATION_KINDS.ROUND_CAP, head: pr?.headRefOid,
+              detail: `Fix rounds exhausted (${n.attempts}/${n.cap}). A round grant (\`round-extension\`) answers it.` }) });
+            if (!recorded?.ok) parking.escalationRecordError = recorded?.error ?? 'not posted';
+          }
         } catch (e) {
           parking.parkError = String(e?.message ?? e).split('\n')[0];
         }

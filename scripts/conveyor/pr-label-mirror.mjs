@@ -94,7 +94,10 @@ const TIMELINE_MAX_PAGES = 5;
  * @returns {Promise<{status:'ok', items:Array<{label:string, change:'added'|'removed', actor:string|null, actorType:string|null, createdAt:string}>}
  *   | {status:'unreadable', reason:string}>}
  */
-export async function readLabelTimeline({ repo, pr, read = readGh, maxPages = TIMELINE_MAX_PAGES } = {}) {
+export async function readLabelTimeline(options) { return readLabelTimelineSync(options); }
+
+/** The same read, synchronous (its `gh` reads already are), for callers inside a sync tick. */
+export function readLabelTimelineSync({ repo, pr, read = readGh, maxPages = TIMELINE_MAX_PAGES } = {}) {
   try {
     if (!REPO_RE.test(String(repo)) || !Number.isInteger(Number(pr))) return { status: 'unreadable', reason: 'bad-target' };
     const [owner, name] = repo.split('/');
