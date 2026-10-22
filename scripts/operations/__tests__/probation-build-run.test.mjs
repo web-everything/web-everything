@@ -103,6 +103,7 @@ function fakeIo({
   const cleanSnapshot = { configHash: 'clean', files: {} };
   const tamperedSnapshot = { configHash: 'clean', files: { 'pre-commit': 'planted' } };
   const io = {
+    postRunChecks: () => ({ accepted: true, outcome: 'accepted', reason: 'ok', steps: [] }),
     log: () => {},
     openBlockers: () => [],
     acquireLane: (o) => { calls.push(['acquireLane', o.lane, o.scope]); return lane; },
@@ -145,6 +146,22 @@ function fakeIo({
 const args = (worker = codex, extra = {}) => parseArgs(['--num=4291', '--session=probation-4291', `--worker=${JSON.stringify(worker)}`, '--lane=22', '--scope=we:docs/probation/probation.md', ...Object.entries(extra).map(([k, v]) => `--${k}=${v}`)]);
 
 describe('shared direct-launch post-run checks', () => {
+  it.each(['unavailable', 'error'])('discards the diff when post-run checks are %s', async failure => {
+    const { io, calls } = fakeIo();
+    const rows = [];
+    io.appendScorecard = row => rows.push(row);
+    if (failure === 'unavailable') delete io.postRunChecks;
+    else io.postRunChecks = async () => { throw new Error('checks exploded'); };
+    const result = await runProbationBuild(args(), io);
+    expect(result.outcome).toBe('gate-red');
+    expect(result.detail).toMatch(new RegExp(`^rejected:${failure} — `));
+    expect(result.detail).toContain(failure === 'error' ? 'checks exploded' : 'post-run checks are not wired');
+    expect(calls).toContainEqual(['discard', 'base-sha']);
+    expect(calls.some(c => c[0] === 'resolve' || c[0] === 'openPr')).toBe(false);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].postRunCheck).toBe(`rejected:${failure}`);
+  });
+
   it('discards an audit rejection and records its outcome for redispatch', async () => {
     const { io, calls } = fakeIo();
     const rows = [];

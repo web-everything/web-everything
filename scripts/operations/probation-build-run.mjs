@@ -706,9 +706,14 @@ export async function runProbationBuild(args, io) {
             // Scope = the card's plain entries plus the paths the allowlist above already accepted (its sibling-test
             // globs and owned new tests), so a FRESH re-read of the diff (tracked + untracked) must be a subset of
             // what was vetted. The claimed card and pre-existing untracked files are not the worker's diff.
-            const r = await io.postRunChecks({ dir: lanePath, base: baseSha, brief: item.spec,
-              scope: [...new Set([...scopeEntries.filter((e) => !e.includes('*')), ...summary.paths.filter((p) => allowed(p, scopeEntries))])],
-              preexisting: excludeFromDiff, envelope: PROVEN_TASK_ENVELOPES[taskType] });
+            let r;
+            try {
+              r = await io.postRunChecks({ dir: lanePath, base: baseSha, brief: item.spec,
+                scope: [...new Set([...scopeEntries.filter((e) => !e.includes('*')), ...summary.paths.filter((p) => allowed(p, scopeEntries))])],
+                preexisting: excludeFromDiff, envelope: PROVEN_TASK_ENVELOPES[taskType] });
+            } catch (error) {
+              return abandon('gate-red', `rejected:error — ${error?.message ?? String(error)}`, { diff: diffRow, postRunCheck: 'rejected:error' });
+            }
             const auditHooks = hookSurfaceChanged(postHookSurface, io.snapshotHookSurface(lanePath));
             if (auditHooks.changed) {
               if (!io.resetHookSurface(lanePath, preHookSurface).clean) baseSha = null;
@@ -716,7 +721,7 @@ export async function runProbationBuild(args, io) {
             }
             if (!r.accepted) return abandon('gate-red', `${r.outcome} — ${r.reason}`, { diff: diffRow, postRunCheck: r.outcome });
             postRunCheck = 'accepted';
-          } else log('post-run checks unavailable');
+          } else return abandon('gate-red', 'rejected:unavailable — post-run checks are not wired', { diff: diffRow, postRunCheck: 'rejected:unavailable' });
         }
 
         const resolved = preparing ? validateAndStampPrepare(num, postWorkerItem, lanePath, io, prepareAutoSize) : io.resolveItem(num, lanePath);

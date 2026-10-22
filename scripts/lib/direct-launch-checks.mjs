@@ -45,10 +45,9 @@ export function scopeVerdict({ paths, scope, summary, envelope }) {
 }
 
 /** Synchronous IO keeps the existing launcher contract; children have bounded output and time. */
-export function realChecksIo({ preexisting = [] } = {}) {
-  const run = (file, args, dir, timeout = TIMEOUT_MS) => execFileSync(file, args, {
-    cwd: dir, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout,
-  });
+export function realChecksIo({ preexisting = [], run = (file, args, dir, timeout = TIMEOUT_MS) => execFileSync(file, args, {
+  cwd: dir, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout,
+}) } = {}) {
   const git = (dir, args) => run('git', args, dir);
   const untracked = dir => git(dir, ['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(p => p && !preexisting.includes(p));
   const newFileDiff = (dir, path, stat = false) => {
@@ -75,11 +74,23 @@ export function realChecksIo({ preexisting = [] } = {}) {
         return `${counts[1]}\t${counts[2]}\t${path}\0`;
       }).join(''),
     runTests: (dir, paths) => {
-      const { file, args } = admittedArgv('npx', ['vitest', 'related', '--run', '--passWithNoTests', ...paths]);
-      run(file, args, dir);
-      return { ok: true, reason: 'scoped tests passed' };
+      const { file, args } = admittedArgv('npx', ['vitest', 'related', '--run', ...paths]);
+      try {
+        run(file, args, dir);
+        return { ok: true, reason: 'scoped tests passed' };
+      } catch (error) {
+        const output = [error.stdout, error.stderr].filter(value => value != null).map(String).join('\n');
+        const reason = output.includes('No test files found') ? 'no tests cover the changed code' : 'scoped tests failed';
+        return { ok: false, reason: `${reason}${output ? ` — ${output.slice(-1500)}` : ''}` };
+      }
     },
-    runAudit: (argv, dir) => JSON.parse(run(process.execPath, argv, dir)).lastMessage,
+    runAudit: (argv, dir) => {
+      const report = JSON.parse(run(process.execPath, argv, dir));
+      if (!report || report.timedOut === true || (report.exitCode !== 0 && !(report.exitCode === undefined && report.lastMessage))) {
+        throw new Error('audit did not complete successfully');
+      }
+      return report.lastMessage;
+    },
   };
 }
 

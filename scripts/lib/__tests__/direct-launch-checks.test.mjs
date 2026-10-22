@@ -1,7 +1,7 @@
 /** Pin the direct-worker rejection ladder without spawning tests or models. */
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { AUDIT_QUESTION, auditArgv, parseAuditVerdict, runPostRunChecks, scopeVerdict } from '../direct-launch-checks.mjs';
+import { AUDIT_QUESTION, auditArgv, parseAuditVerdict, realChecksIo, runPostRunChecks, scopeVerdict } from '../direct-launch-checks.mjs';
 
 const options = { dir: '/lane', base: 'base', weRoot: '/we', brief: 'Repair the bug', scope: ['we:src/a.js'], envelope: { maxFiles: 2, maxLoc: 20 } };
 function fixture(overrides = {}) {
@@ -122,5 +122,46 @@ describe('runPostRunChecks', () => {
   it('refuses missing untracked line evidence under an envelope', () => {
     const { io } = fixture({ numstat: () => '' });
     expect(runPostRunChecks(options, io).outcome).toBe('rejected:scope');
+  });
+});
+
+
+describe('realChecksIo with a fake command runner', () => {
+  it.each([
+    { exitCode: 0, timedOut: true, lastMessage: 'NOT WEAKENED' },
+    { exitCode: 1, timedOut: false, lastMessage: 'NOT WEAKENED' },
+    { timedOut: false },
+  ])('rejects incomplete or failed audit reports: %j', report => {
+    const { runAudit } = realChecksIo({ run: () => JSON.stringify(report) });
+    const { io, calls } = fixture({ runAudit });
+    expect(runPostRunChecks(options, io).outcome).toBe('rejected:audit');
+    expect(calls).not.toContain('numstat');
+  });
+
+  it.each([
+    { exitCode: 0, timedOut: false, lastMessage: 'NOT WEAKENED' },
+    { lastMessage: 'NOT WEAKENED' },
+  ])('accepts successful and legacy message-only audit reports: %j', report => {
+    const { runAudit } = realChecksIo({ run: () => JSON.stringify(report) });
+    const { io } = fixture({ runAudit });
+    expect(runPostRunChecks(options, io).accepted).toBe(true);
+  });
+
+  it.each([
+    ['No test files found', 'no tests cover the changed code'],
+    ['Assertion failed', 'scoped tests failed'],
+  ])('reports %s with a bounded output tail', (output, reason) => {
+    let commandArgs;
+    const stdout = `${output}\n${'x'.repeat(1600)}`;
+    const stderr = 'stderr sentinel';
+    const { runTests } = realChecksIo({ run: (_file, args) => {
+      commandArgs = args;
+      throw Object.assign(new Error('non-zero exit'), { stdout, stderr });
+    } });
+    const { io } = fixture({ runTests });
+    const result = runPostRunChecks(options, io);
+    expect(result).toMatchObject({ outcome: 'rejected:test', reason: `${reason} — ${`${stdout}\n${stderr}`.slice(-1500)}` });
+    expect(commandArgs).not.toContain('--passWithNoTests');
+    expect(commandArgs).toEqual(expect.arrayContaining(['vitest', 'related', '--run', 'src/a.js']));
   });
 });
