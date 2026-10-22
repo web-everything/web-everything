@@ -26,3 +26,19 @@ it('rejects object-shaped and unknown leaves', () => {
   const r = readBuilderSlotSettings({ env: {}, platform: { enabled: false }, read: () => ({ builderSlots: { enabled: { nested: true }, maxClaude: { nested: 9 }, unrelated: true } }) });
   expect(r.enabled).toBe(false); expect(r.maxClaude).toBe(1); expect(r.unrelated).toBeUndefined();
 });
+
+it('cascades maxAgeMs and logs its effective provenance', () => {
+  const lines = [];
+  const read = () => ({ builderSlots: { maxAgeMs: 30000000 } });
+  const platform = { maxAgeMs: 25000000 };
+  expect(readBuilderSlotSettings({ env: {}, read: () => ({}), platform }).sources.maxAgeMs).toBe('platform');
+  expect(readBuilderSlotSettings({ env: {}, read, platform }).sources.maxAgeMs).toBe('tool');
+  expect(readBuilderSlotSettings({ env: { WE_POLICY_CASCADE_LOG: '1', WE_BUILDER_SLOTS_MAX_AGE_MS: '40000000' }, read, platform, log: l => lines.push(l) })).toMatchObject({ maxAgeMs: 40000000, sources: { maxAgeMs: 'env' } });
+  expect(lines.join()).toContain('maxAgeMs=40000000 (env)');
+});
+it.each(['1000', '1.5', '-1', '999999999999999999999', ''])('rejects invalid maxAgeMs %s and falls back to the lower layer', value => {
+  expect(readBuilderSlotSettings({ env: { WE_BUILDER_SLOTS_MAX_AGE_MS: value }, platform: { maxAgeMs: 30000000 }, read: () => ({ builderSlots: { maxAgeMs: 1 } }) })).toMatchObject({ maxAgeMs: 30000000, sources: { maxAgeMs: 'platform' } });
+});
+it('keeps the hard cap at least as large as a TTL above the standard six-hour cap', () => {
+  expect(readBuilderSlotSettings({ env: { WE_BUILDER_SLOTS_TTL_MS: '30000000' }, platform: {}, read: () => ({}) })).toMatchObject({ ttlMs: 30000000, maxAgeMs: 30000000 });
+});

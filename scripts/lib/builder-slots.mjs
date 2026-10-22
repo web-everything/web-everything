@@ -5,6 +5,7 @@ import { hostname as machineHostname } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
+import { countBuilderClasses, executorClass } from '../conveyor/build-dispatch-policy.mjs';
 import { readBuilderSlotSettings } from './builder-slots-settings.mjs';
 
 const sleepDefault = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -20,8 +21,16 @@ function atomic(root, rec) {
   const path = pathFor(root, rec.id), tmp = `${path}.${randomBytes(6).toString('hex')}.tmp`;
   try { writeFileSync(tmp, JSON.stringify(rec), { flag: 'wx', mode: 0o600 }); renameSync(tmp, path); } finally { remove(tmp); }
 }
-export function isStale(rec, now = Date.now(), { hostname = machineHostname(), isPidAlive = pidAlive } = {}) {
-  return Boolean((rec.pid && rec.host === hostname && !isPidAlive(rec.pid)) || rec.heartbeatAt + rec.ttlMs < now);
+function validateRecord(rec, name) {
+  if (!rec || name !== `${rec.id}.json` || !['claude', 'codex', 'antigravity'].includes(rec.class)
+      || typeof rec.purpose !== 'string' || typeof rec.host !== 'string'
+      || !(rec.pid === null || (Number.isSafeInteger(rec.pid) && rec.pid > 0)) || !Number.isFinite(rec.startedAt)
+      || !Number.isFinite(rec.heartbeatAt) || !Number.isFinite(rec.ttlMs) || rec.ttlMs < 1000) throw new Error('Invalid builder slot record');
+  return rec;
+}
+export function isStale(rec, now = Date.now(), { hostname = machineHostname(), isPidAlive = pidAlive, settings, maxAgeMs = (settings ?? readBuilderSlotSettings()).maxAgeMs } = {}) {
+  if (rec.pid && rec.host === hostname) return !isPidAlive(rec.pid) || now - rec.startedAt > maxAgeMs;
+  return rec.heartbeatAt + rec.ttlMs < now;
 }
 export function listSlots(o = {}) {
   const { root, now, ...probe } = options(o);
@@ -30,15 +39,12 @@ export function listSlots(o = {}) {
   return names.filter(n => n.endsWith('.json')).flatMap(name => {
     let rec;
     try { rec = JSON.parse(readFileSync(join(root, name), 'utf8')); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
-    if (!rec || name !== `${rec.id}.json` || !['claude', 'codex', 'antigravity'].includes(rec.class)
-      || typeof rec.purpose !== 'string' || typeof rec.host !== 'string'
-      || !(rec.pid === null || (Number.isSafeInteger(rec.pid) && rec.pid > 0)) || !Number.isFinite(rec.startedAt)
-      || !Number.isFinite(rec.heartbeatAt) || !Number.isFinite(rec.ttlMs) || rec.ttlMs < 1000) throw new Error('Invalid builder slot record');
+    validateRecord(rec, name);
     const stale = isStale(rec, now(), probe);
     if (stale) {
       // Re-read right before deleting: a heartbeat may have renewed the lease since the snapshot above.
       let again = null;
-      try { again = JSON.parse(readFileSync(join(root, name), 'utf8')); } catch { /* gone or unreadable: leave it */ }
+      try { again = validateRecord(JSON.parse(readFileSync(join(root, name), 'utf8')), name); } catch (e) { if (e.code !== 'ENOENT') throw e; }
       if (again && isStale(again, now(), probe)) remove(join(root, name));
       else if (again) return [{ ...again, stale: false }];
     }
@@ -57,25 +63,29 @@ export async function acquireSlot(o = {}) {
   const cap = kind === 'claude' ? (caps.claude ?? caps.maxClaude) : (caps.codex ?? caps.external ?? caps.maxExternal);
   const ttlMs = o.ttlMs ?? settings.ttlMs;
   if (!Number.isSafeInteger(cap) || cap < 0 || !Number.isSafeInteger(ttlMs) || ttlMs < 1000) throw new Error('Invalid builder slot bounds');
-  mkdirSync(root, { recursive: true });
-  const lock = join(root, '.lock');
-  const lockStart = now();
-  for (;;) {
-    try { mkdirSync(lock); break; } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      try { if (now() - statSync(lock).mtimeMs > 10000) { rmSync(lock, { recursive: true, force: true }); continue; } } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
-      if (now() - lockStart > 11000) throw new Error('Builder slot mutex busy; retry acquisition');
-      await (o.sleep ?? sleepDefault)(20);
-    }
-  }
   try {
-    const holders = listSlots(p).filter(r => !r.stale && (kind === 'claude' ? r.class === 'claude' : r.class !== 'claude'));
-    if (holders.length >= cap) return { ok: false, reason: 'full', class: kind, cap, holders };
-    const id = randomBytes(6).toString('hex'), at = now();
-    const record = { id, class: kind, purpose: o.purpose ?? '', pid: o.pid ?? null, host: hostname, startedAt: at, heartbeatAt: at, ttlMs };
-    atomic(root, record);
-    return { ok: true, id, record };
-  } finally { rmSync(lock, { recursive: true, force: true }); }
+    mkdirSync(root, { recursive: true });
+    const lock = join(root, '.lock');
+    const lockStart = now();
+    for (;;) {
+      try { mkdirSync(lock); break; } catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+        try { if (now() - statSync(lock).mtimeMs > 10000) { rmSync(lock, { recursive: true, force: true }); continue; } } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+        if (now() - lockStart > 11000) throw new Error('Builder slot mutex busy; retry acquisition');
+        await (o.sleep ?? sleepDefault)(20);
+      }
+    }
+    try {
+      const live = listSlots(p).filter(r => !r.stale);
+      const holders = live.filter(r => executorClass(r.class) === executorClass(kind));
+      const counts = countBuilderClasses([...(o.inFlightRows ? await o.inFlightRows() : []), ...live.map(r => ({ num: `slot-${r.id}`, executor: r.class }))]);
+      if (counts[executorClass(kind)] >= cap) return { ok: false, reason: 'full', class: kind, cap, counts, holders };
+      const id = randomBytes(6).toString('hex'), at = now();
+      const record = { id, class: kind, purpose: o.purpose ?? '', pid: o.pid ?? null, host: hostname, startedAt: at, heartbeatAt: at, ttlMs };
+      atomic(root, record);
+      return { ok: true, id, record };
+    } finally { rmSync(lock, { recursive: true, force: true }); }
+  } catch (e) { return { ok: false, reason: 'unreadable', error: String(e?.message ?? e).split('\n')[0].replace(/[\p{Cc}\p{Cf}]/gu, '') || 'unknown error' }; }
 }
 export function heartbeatSlot(id, o = {}) {
   if (id === 'disabled' || (o.settings ?? readBuilderSlotSettings()).enabled === false) return;
@@ -102,7 +112,7 @@ export async function waitForSlot(o = {}) {
   const start = now(); let lastNotice = -Infinity;
   for (;;) {
     const result = await acquireSlot(o);
-    if (result.ok) return result;
+    if (result.ok || result.reason === 'unreadable') return result;
     const at = now();
     if (at - start >= waitMs) return { ...result, reason: 'wait-budget' };
     if (at - lastNotice >= 60000) { o.onWaiting?.(result); lastNotice = at; }

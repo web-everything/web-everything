@@ -1040,20 +1040,22 @@ export async function main({ runner = codexDirectTask, slotOptions = {} } = {}) 
 
   // Foreground orchestrator work occupies the same external builder pool as the daemon.
   const settings = slotOptions.settings ?? readBuilderSlotSettings();
+  slotOptions = { ...slotOptions, settings };
   let slot, heartbeat;
   const cleanup = () => {
     if (heartbeat) clearInterval(heartbeat);
-    if (slot) releaseSlot(slot.id, slotOptions);
+    if (slot?.ok) { releaseSlot(slot.id, slotOptions); slot = null; }
   };
   const signalHandlers = Object.fromEntries(['SIGINT', 'SIGTERM'].map(signal => [signal, () => {
     try { cleanup(); } finally { process.removeListener(signal, signalHandlers[signal]); process.kill(process.pid, signal); }
   }]));
   if (!process.env.WE_BUILDER_SLOT_HELD && settings.enabled) {
     const waitMs = flags['wait-ms'] === undefined ? settings.waitMs : Number(flags['wait-ms']);
-    slot = await waitForSlot({ ...slotOptions, settings, class: 'codex', pid: process.pid,
+    slot = await waitForSlot({ ...slotOptions, inFlightRows: slotOptions.inFlightRows ?? (async () => (await import('../skills-src/conveyor/build-dispatch-daemon.mjs')).listBuilderInFlightRows()), settings, class: 'codex', pid: process.pid,
       purpose: ['codex-direct-task', flags.card && `card=${flags.card}`, flags.caller && `caller=${flags.caller}`].filter(Boolean).join(' '), waitMs });
     if (!slot.ok) {
-      console.error(`codex-direct-task: no external builder slot free within ${waitMs}ms (cap ${settings.maxExternal}, holders: ${JSON.stringify(slot.holders)})`);
+      if (slot.reason === 'unreadable') console.error(`codex-direct-task: builder slot store unreadable: ${slot.error}`);
+      else console.error(`codex-direct-task: no external builder slot free within ${waitMs}ms (cap ${settings.maxExternal}, holders: ${JSON.stringify(slot.holders)})`);
       process.exitCode = 75;
       return;
     }

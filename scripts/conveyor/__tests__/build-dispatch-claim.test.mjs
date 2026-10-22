@@ -146,3 +146,15 @@ describe('build-dispatch resume marker (#4131/#4382 build-orphan-adopt)', () => 
     }
   });
 });
+
+it('annotates a claim atomically, preserving its metadata; absent claims are a no-op', async () => {
+  const { annotateBuildDispatchClaim } = await import('../build-dispatch-claim.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'claim-slot-'));
+  try {
+    expect(annotateBuildDispatchClaim({ num: '123', slotId: 'abc', lockRoot: root })).toBe(false);
+    acquireBuildDispatchClaim({ num: '123', scope: ['we:a'], lockRoot: root });
+    const before = listBuildDispatchClaims({ lockRoot: root })[0];
+    expect(annotateBuildDispatchClaim({ num: '123', slotId: 'abc', lockRoot: root })).toBe(true);
+    expect(listBuildDispatchClaims({ lockRoot: root })[0]).toEqual({ ...before, meta: { ...before.meta, slotId: 'abc' } });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

@@ -159,8 +159,44 @@ export function normalizeOpenPrs(byRepo) {
   return out;
 }
 
-function executorClass(executor) {
+export function executorClass(executor) {
   return executor === 'codex' || executor === 'antigravity' ? 'external' : 'claude';
+}
+
+/** Linked items remain in-flight; only a live lease of the same class owns their count. */
+export function countBuilderClasses(rows) {
+  const counts = { claude: 0, external: 0 };
+  const slotClasses = new Map(rows.filter(r => String(r.num).startsWith('slot-'))
+    .map(r => [String(r.num).slice(5), executorClass(r.executor)]));
+  for (const row of rows) {
+    const kind = executorClass(row.executor);
+    if (row.slotLink && slotClasses.get(row.slotLink) === kind) continue;
+    counts[kind] += 1;
+  }
+  return counts;
+}
+
+/** Merge durable evidence using the planner's per-item identity and executor precedence. */
+export function dedupeBuilderRows(rows) {
+  const byNum = new Map();
+  for (const f of rows) {
+    const k = normNum(f.num);
+    if (!k) continue;
+    const prev = byNum.get(k);
+    byNum.set(k, prev ? { ...prev, slotLink: prev.slotLink || f.slotLink, executor: (['claude', 'codex', 'antigravity'].includes(prev.executor) ? prev.executor : f.executor ?? prev.executor), scope: [...new Set([...(prev.scope || []), ...(f.scope || [])])], source: `${prev.source}+${f.source}` } : { ...f, num: k });
+  }
+  return [...byNum.values()];
+}
+
+/** A missing/stale lease restores ordinary claim counting; retain every item's overlap evidence. */
+export function markSlotBackedRows(rows, claims, slots) {
+  const ids = new Set(slots.map(r => String(r.num).replace(/^slot-/, '')));
+  const links = new Map();
+  for (const c of claims) {
+    const num = normNum(c.meta?.num), id = c.meta?.slotId;
+    if (id && ids.has(id) && !links.has(num)) links.set(num, id);
+  }
+  return rows.map(r => links.has(normNum(r.num)) ? { ...r, slotLink: links.get(normNum(r.num)) } : r);
 }
 
 /**
@@ -213,6 +249,7 @@ export function planBuildDispatch({
   // `main-ci-red-core.mjs#mainRedBuildFreeze`. Holds BUILDS only — prepares (light) never come through here and the
   // main-fix owner is dispatched by the health watch — so it is kept out of `freeze.frozen`. `null` = before this card.
   mainRedFreeze = null,
+  slotStoreError,
 } = {}) {
   const hold = [];
   const dispatch = [];
@@ -240,22 +277,16 @@ export function planBuildDispatch({
   const frozen = freezeReasons.length > 0;
 
   // Dedupe in-flight by num (a claim and a run record for the same build are one build).
-  const inFlightByNum = new Map();
-  for (const f of inFlight) {
-    const k = normNum(f.num);
-    if (!k) continue;
-    const prev = inFlightByNum.get(k);
-    inFlightByNum.set(k, prev ? { ...prev, executor: (['claude', 'codex', 'antigravity'].includes(prev.executor) ? prev.executor : f.executor ?? prev.executor), scope: [...new Set([...(prev.scope || []), ...(f.scope || [])])], source: `${prev.source}+${f.source}` } : { ...f, num: k });
-  }
-  const running = [...inFlightByNum.values()];
+  const running = dedupeBuilderRows(inFlight);
+  const inFlightByNum = new Map(running.map(r => [r.num, r]));
   // Card x3vs6tu (2026-09-29): the cap counts ONLY this builder's own durable in-flight builds — never
   // `externalBuilding` (machine-wide "building", not attributable to this builder). Kept as a logged signal
   // below (`externalBuilding` on the return value), never folded into `busy`/`slots` any more.
   const busy = running.length;
   // Legacy `slots` reports Claude headroom; `slotsByClass` exposes both pools.
   const caps = { claude: policy.maxConcurrentBuilds, external: policy.maxConcurrentExternalBuilds ?? BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds };
-  const counts = { claude: 0, external: 0 };
-  for (const r of running) counts[executorClass(r.executor)] += 1;
+  const counts = countBuilderClasses(running);
+  if (slotStoreError) counts.external = Math.max(counts.external, caps.external);
   const slotsByClass = Object.fromEntries(Object.entries(caps).map(([kind, cap]) => [kind, Math.max(0, cap - counts[kind])]));
   const picked = [];
   // #4353 — a policy object missing `maxOpenItems` (a caller predating this field) must never silently disable
@@ -324,7 +355,7 @@ export function planBuildDispatch({
       continue;
     }
     const kind = executorClass(c.executor);
-    if (slotsByClass[kind] <= 0) { hold.push({ ...base, rule: 'cap', reason: `${counts[kind]} ${kind} builds in flight (cap ${caps[kind]})` }); continue; }
+    if (slotsByClass[kind] <= 0) { hold.push({ ...base, rule: 'cap', reason: slotStoreError && kind === 'external' ? `builder slot store unreadable: ${slotStoreError}` : `${counts[kind]} ${kind} builds in flight (cap ${caps[kind]})` }); continue; }
     slotsByClass[kind] -= 1;
     counts[kind] += 1;
     openItems.add(num);

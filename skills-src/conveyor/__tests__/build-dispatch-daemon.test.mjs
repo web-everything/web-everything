@@ -574,6 +574,59 @@ describe('runBuildDispatchTick', () => {
     expect(dispatches).toEqual([{ num: '3827', pid: 1001 }]);
   });
 
+  it.each([false, true])('slot-store read failure holds external only (unreadable=%s)', async unreadable => {
+    vi.stubEnv('WE_BUILDER_SLOTS', 'on');
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const dispatches = [];
+    const effects = effectsFor({ lockRoot, pid: 1, dispatches });
+    effects.planTick = () => {
+      const tick = sameFileTick();
+      tick.decisions.admission.queue[1].scope = ['plateau-app:src/other.ts'];
+      return tick;
+    };
+    effects.predictRoute = num => ({ executor: num === '3827' ? 'codex' : 'claude' });
+    effects.listBuilderSlots = () => { if (unreadable) throw new Error('bad JSON\nextra line'); return []; };
+    try {
+      const tick = await runBuildDispatchTick({ live: true, prepareEnabled: false, effects,
+        policy: { ...BUILD_DISPATCH_POLICY, maxLaunchesPerTick: 2 } });
+      expect(tick.plan.freeze.frozen).toBe(false);
+      if (unreadable) {
+        expect(tick.slotStore).toEqual({ error: 'bad JSON' });
+        expect(tick.plan.hold).toContainEqual(expect.objectContaining({ num: '3827', rule: 'cap', reason: expect.stringContaining('builder slot store unreadable') }));
+        expect(dispatches.map(r => r.num)).toEqual(['2662']);
+        expect(errorLog.mock.calls.filter(([line]) => line.includes('external builders HELD'))).toEqual([['build-dispatch-daemon: external builders HELD - builder slot store unreadable: bad JSON']]);
+      } else expect(dispatches.map(r => r.num)).toEqual(['3827', '2662']);
+    } finally { errorLog.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it('does not consult the slot store when disabled', async () => {
+    vi.stubEnv('WE_BUILDER_SLOTS', 'off');
+    const listBuilderSlots = vi.fn(() => { throw new Error('must not read'); });
+    try {
+      const tick = await runBuildDispatchTick({ effects: { ...effectsFor({ lockRoot, pid: 1, dispatches: [] }), listBuilderSlots }, prepareEnabled: false });
+      expect(listBuilderSlots).not.toHaveBeenCalled();
+      expect(tick.slotStore).toBeUndefined();
+      expect(tick.plan.dispatch).toHaveLength(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each([false, true])('links durable rows without undercounting claim-only Claude capacity (hasRun=%s)', async hasRun => {
+    vi.stubEnv('WE_BUILDER_SLOTS', 'on');
+    const { annotateBuildDispatchClaim } = await import('../../../scripts/conveyor/build-dispatch-claim.mjs');
+    acquireBuildDispatchClaim({ num: '3827', scope: ['plateau-app:src/main.ts'], lockRoot });
+    annotateBuildDispatchClaim({ num: '3827', slotId: 'abc', lockRoot });
+    const base = effectsFor({ lockRoot, pid: 1, dispatches: [], runStoreInFlight: hasRun ? [{ num: '3827', scope: ['plateau-app:src/main.ts'], executor: 'codex', source: 'run' }] : [] });
+    try {
+      for (const slots of [[{ num: 'slot-abc', scope: [], executor: 'codex', borrowedFix: true }], []]) {
+        const tick = await runBuildDispatchTick({ effects: { ...base, listBuilderSlots: () => slots }, prepareEnabled: false });
+        expect(tick.plan.inFlight.find(r => r.num === '3827').slotLink).toBe(slots.length ? 'abc' : undefined);
+        expect(tick.plan.slotsByClass.external).toBe(BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds - (hasRun || slots.length ? 1 : 0));
+        expect(tick.plan.slotsByClass.claude).toBe(BUILD_DISPATCH_POLICY.maxConcurrentBuilds - (hasRun ? 0 : 1));
+        expect(tick.plan.hold).toContainEqual(expect.objectContaining({ num: '3827', rule: 'in-flight' }));
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('control: WITHOUT the durable claim, the same restart dispatches #3827 twice', async () => {
     const dispatches = [];
     const noClaims = (pid) => ({
@@ -4753,4 +4806,32 @@ describe('prepare discovery under repository PR volume', () => {
       expect(listBuildBackoffs({ path })).toEqual([]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+it('listBuilderInFlightRows counts a lead and two member claims as one builder', async () => {
+  const { listBuilderInFlightRows } = await import('../build-dispatch-daemon.mjs');
+  const rows = await listBuilderInFlightRows({
+    listClaims: () => [
+      { owner: 'lead', meta: { num: '7101', groupLead: '7101' } },
+      { owner: 'member1', meta: { num: '7102', groupLead: '7101' } },
+      { owner: 'member2', meta: { num: '7103', groupLead: '7101' } },
+    ],
+    listSlots: () => [], listRuns: async () => [{ num: '7101', executor: 'codex' }], listBorrowed: () => [],
+  });
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ num: '7101', executor: 'codex' });
+});
+
+it.each([false, true])('listBuilderInFlightRows preserves slot links with and without slot rows (includeSlots=%s)', async includeSlots => {
+  const { listBuilderInFlightRows } = await import('../build-dispatch-daemon.mjs');
+  const { countBuilderClasses } = await import('../../../scripts/conveyor/build-dispatch-policy.mjs');
+  const slot = { num: 'slot-abc', executor: 'codex', scope: [] };
+  for (const hasRun of [false, true]) {
+    const rows = await listBuilderInFlightRows({ includeSlots,
+      listClaims: () => [{ owner: 'test', meta: { num: '123', slotId: 'abc' } }],
+      listSlots: () => [slot], listRuns: async () => hasRun ? [{ num: '123', executor: 'codex' }] : [], listBorrowed: () => [],
+    });
+    expect(rows.find(r => r.num === '123').slotLink).toBe('abc');
+    expect(countBuilderClasses(rows)).toEqual(hasRun ? { claude: 0, external: 1 } : { claude: 1, external: includeSlots ? 1 : 0 });
+  }
 });

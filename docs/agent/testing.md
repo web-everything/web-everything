@@ -1,5 +1,36 @@
 # Testing — Three-Tier Strategy
 
+## Builder lease accounting
+
+Builder admission and dispatch share `build-dispatch-policy.mjs`'s `executorClass`,
+`countBuilderClasses`, and per-num deduplication. A claim plus a run record is one item.
+A claim annotated with a **live** `slotId` keeps its item in flight for overlap/admission
+via `slotLink`. Its lease owns the class count only when the deduplicated item's executor
+class matches the live slot's class. Unknown/claim-only executors still consume Claude
+capacity alongside an external slot; a known external run and its external slot count once.
+Count daemon rows and live `slot-<id>` rows together so the counter can verify the link.
+When the lease disappears, ordinary claim/run counting resumes. A probation launcher
+excludes its own num while acquiring its replacement lease, annotates the claim
+immediately, and forwards
+`WE_BUILDER_SLOT_HELD` to worker and checker subprocesses.
+
+Probation worker/checker children run asynchronously and register with `lease.track(child)`.
+SIGINT/SIGTERM terminates their process groups, waits for child close (escalating to SIGKILL
+at five seconds), releases capacity, then re-raises. Test that capacity remains occupied
+before close with an injected signal emitter, kill spy, fake child and fake clock.
+Local PID leases ignore heartbeat starvation: reclaim only a dead PID or age beyond
+`builderSlots.maxAgeMs` (six hours; `WE_BUILDER_SLOTS_MAX_AGE_MS`, integer at least TTL).
+PID-less and remote leases still use heartbeat TTL. Invalid cap overrides fall back through
+the policy cascade; a TTL above six hours raises the standard fallback cap to that TTL.
+Member claims (`groupLead` differs from their own num) do not consume another builder row.
+
+A slot-store read failure holds external dispatch only; Claude capacity remains available.
+Foreground acquisition refuses unreadable slot/provider/mutex evidence immediately (exit 75).
+The operator can inspect/repair the named store and retry; it never waits out corrupt evidence.
+`WE_BUILDER_SLOTS=off` bypasses slot IO. Cover these paths with injected roots/rows and
+fake clocks; `builder-slot-launchers.test.mjs` also probes cold daemon import and CLI exit 75.
+Run these and the affected daemon/planner/worker suites through host heavy admission.
+
 ## Daemon entry boot smoke
 
 Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`

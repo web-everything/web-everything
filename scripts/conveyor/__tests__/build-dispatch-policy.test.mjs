@@ -631,3 +631,65 @@ describe('prepare throughput batches', () => {
     expect(window.has('20')).toBe(false);
   });
 });
+
+// Builder leases share the planner's executor classifier and durable-item identity.
+describe('shared builder accounting', () => {
+  it('matches class counts and preserves the missing-error plan', async () => {
+    const { countBuilderClasses, dedupeBuilderRows, executorClass } = await import('../build-dispatch-policy.mjs');
+    const rows = [{ num: '#123', executor: 'codex', scope: ['we:a'], source: 'claim' },
+      { num: '123', executor: 'codex', scope: ['we:b'], source: 'run' },
+      { num: '124', executor: 'antigravity' }, { num: '125' }];
+    const counts = countBuilderClasses(dedupeBuilderRows(rows));
+    const plan = planBuildDispatch({ inFlight: rows });
+    expect(counts).toEqual({ claude: 1, external: 2 });
+    expect(plan.slotsByClass).toEqual({ claude: Math.max(0, BUILD_DISPATCH_POLICY.maxConcurrentBuilds - counts.claude), external: BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds - counts.external });
+    expect(planBuildDispatch({ inFlight: rows, slotStoreError: undefined })).toEqual(plan);
+    expect(executorClass('unknown')).toBe('claude');
+  });
+  it('counts a slot-backed claim and run once, retaining the in-flight hold and restoring the count after slot loss', async () => {
+    const { countBuilderClasses, dedupeBuilderRows, markSlotBackedRows } = await import('../build-dispatch-policy.mjs');
+    const claims = [{ meta: { num: '123', slotId: 'abc' } }];
+    const rows = [{ num: '123', source: 'claim', scope: [] }, { num: '123', executor: 'codex', source: 'run', scope: [] }];
+    const slot = { num: 'slot-abc', executor: 'codex', borrowedFix: true, scope: [] };
+    for (const slots of [[slot], []]) {
+      const inFlight = [...markSlotBackedRows(rows, claims, slots), ...slots];
+      expect(countBuilderClasses(dedupeBuilderRows(inFlight))).toEqual({ claude: 0, external: 1 });
+      const plan = planBuildDispatch({ inFlight, candidates: [{ num: '123', scope: ['we:c'], executor: 'codex' }] });
+      expect(plan.slotsByClass.external).toBe(BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds - 1);
+      expect(plan.hold[0]).toMatchObject({ num: '123', rule: 'in-flight' });
+    }
+  });
+  it.each([undefined, null, 'unknown', 'claude'])('keeps a claim classified as Claude beside a linked Codex slot (executor=%s)', async executor => {
+    const { countBuilderClasses, dedupeBuilderRows, markSlotBackedRows } = await import('../build-dispatch-policy.mjs');
+    const claims = [{ meta: { num: '#123', slotId: 'abc' } }];
+    const marked = markSlotBackedRows([{ num: '123', executor, scope: ['we:a'] }], claims,
+      [{ num: 'slot-abc', executor: 'codex', scope: [], borrowedFix: true }]);
+    expect(marked[0].slotLink).toBe('abc');
+    const inFlight = [...marked, { num: 'slot-abc', executor: 'codex', scope: [], borrowedFix: true }];
+    expect(countBuilderClasses(dedupeBuilderRows(inFlight))).toEqual({ claude: 1, external: 1 });
+    const plan = planBuildDispatch({ inFlight, candidates: [{ num: '124', executor: 'claude', scope: ['we:b'] }],
+      policy: { ...BUILD_DISPATCH_POLICY, maxConcurrentBuilds: 1 } });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.hold).toContainEqual(expect.objectContaining({ num: '124', rule: 'cap' }));
+    expect(countBuilderClasses(marked)).toEqual({ claude: 1, external: 0 });
+    expect(countBuilderClasses(markSlotBackedRows([{ num: '123' }], claims, []))).toEqual({ claude: 1, external: 0 });
+  });
+  it('preserves the first truthy slot link through per-num merges in either evidence order', async () => {
+    const { countBuilderClasses, dedupeBuilderRows } = await import('../build-dispatch-policy.mjs');
+    const claim = { num: '#123', slotLink: 'abc' };
+    const run = { num: '123', executor: 'codex' };
+    for (const rows of [[claim, run], [run, claim]]) {
+      const merged = dedupeBuilderRows([...rows, { num: '123', slotLink: 'other' }]);
+      expect(merged).toMatchObject([{ num: '123', executor: 'codex', slotLink: 'abc' }]);
+      expect(countBuilderClasses([...merged, { num: 'slot-abc', executor: 'antigravity' }])).toEqual({ claude: 0, external: 1 });
+      expect(countBuilderClasses(merged)).toEqual({ claude: 0, external: 1 });
+    }
+  });
+  it('holds only external candidates when the slot store is unreadable', () => {
+    const plan = planBuildDispatch({ candidates: [{ num: '123', scope: ['we:a'], executor: 'codex' },
+      { num: '124', scope: ['we:b'], executor: 'claude' }], slotStoreError: 'bad JSON' });
+    expect(plan.freeze.frozen).toBe(false);
+    expect(plan.hold).toEqual([expect.objectContaining({ num: '123', rule: 'cap', reason: 'builder slot store unreadable: bad JSON' })]);
+    expect(plan.dispatch.map(r => r.num)).toEqual(['124']);
+  });
+});

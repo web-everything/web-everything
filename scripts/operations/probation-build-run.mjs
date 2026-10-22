@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { startBuilderLease } from '../lib/builder-slot-lease.mjs';
+import { annotateBuildDispatchClaim } from '../conveyor/build-dispatch-claim.mjs';
+import { normNum } from '../conveyor/queue-store.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { resolveOperationRoute, resolvePolicyModel, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
 import { parseAgyReportEvidence } from '../lib/antigravity-run-evidence.mjs';
@@ -75,7 +78,7 @@ import { classifyPrepareFailure } from '../conveyor/prepare-failure-policy.mjs';
 
 import { runPrepareBatch } from './prepare-batch.mjs';
 import { createHash, randomBytes } from 'node:crypto';
-import { execFileSync, execFile } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { summarizeAgyEvents } from '../gemini-direct-task.mjs';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
@@ -347,6 +350,7 @@ export async function runProbationBuild(args, io) {
   let lanePath = null;
   let baseSha = null;
   let preexisting = [];
+  let builderLease;
   let workerRan = false; // did the worker actually run? decides the caught error's scorecard attribution.
   // `executor` defaults to the worker's (a launch attempt worth a scorecard row) but a pre-worker consistency
   // check that never ran it passes `'none'` explicitly, so `finish` never credits/blames it for a trial it had
@@ -454,6 +458,18 @@ export async function runProbationBuild(args, io) {
     const task = preparing ? fillPrepareBrief(num, item) : buildDocFixTask({ num, title: item.title, spec: item.spec, scope: item.scope, taskType }) +
       '\nIf the work already exists, check every Done-when against main and find the delivering commit in git log. ' +
       'When all checks pass, report "spec already done on main: commit <sha>" with the actual delivering SHA.\n';
+    // Replace this run's existing durable evidence with its lease; all OTHER builds still count.
+    const slotOptions = io.builderSlotOptions ?? {};
+    const inFlightRows = slotOptions.inFlightRows ?? (async () =>
+      (await import('../../skills-src/conveyor/build-dispatch-daemon.mjs')).listBuilderInFlightRows());
+    builderLease = await startBuilderLease({ ...slotOptions, env: io.env ?? process.env,
+      class: worker.id === 'codex' ? 'codex' : 'antigravity', purpose: `build #${num}`, waitMs: slotOptions.waitMs ?? 10000,
+      inFlightRows: async () => (await inFlightRows()).filter(r => normNum(r.num) !== normNum(num)) });
+    if (!builderLease.ok) return abandon('gate-red', builderLease.reason === 'unreadable'
+      ? `could not start: builder slot store unreadable: ${builderLease.error}`
+      : `could not start: external builder slots full (cap ${builderLease.cap})`, {}, 'none');
+    if (builderLease.id) (io.annotateBuildDispatchClaim ?? annotateBuildDispatchClaim)({ num, slotId: builderLease.id });
+    const heldEnv = builderLease.id ? { WE_BUILDER_SLOT_HELD: builderLease.id } : {};
     let taskFile = io.writeTaskFile(lanePath, 'probation-build-task.md', task);
     let summary, diffRow, postHookSurface;
     const preHookSurface = hookReset.snapshot;
@@ -479,7 +495,7 @@ export async function runProbationBuild(args, io) {
         }
         if (input && !refusal) {
           resultWorker = lightWorker;
-          const answer = await io.runWorker(lightWorkerArgv({ worker: lightWorker, lanePath, taskFile: lightTask, card: num }), lanePath);
+          const answer = await io.runWorker(lightWorkerArgv({ worker: lightWorker, lanePath, taskFile: lightTask, card: num }), lanePath, heldEnv, builderLease);
           workerRan = true;
           const lightHooks = hookSurfaceChanged(preHookSurface, io.snapshotHookSurface(lanePath));
           if (lightHooks.changed) {
@@ -507,7 +523,7 @@ export async function runProbationBuild(args, io) {
       if (!run) {
         // Full preparation and its repair retry always use the dispatcher's worker.
         resultWorker = worker;
-        run = await io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile, card: num, caller: 'probation-build-run.mjs' }), lanePath);
+        run = await io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile, card: num, caller: 'probation-build-run.mjs' }), lanePath, heldEnv, builderLease);
       }
       modelEvidence = run.modelEvidence ?? {};
       workerRan = true;
@@ -689,7 +705,7 @@ export async function runProbationBuild(args, io) {
             `Reject scope creep, weakened tests, incorrect fixes${resultWorker.simpleOnly ? ', or work that is not simple and mechanical' : ', or incomplete acceptance criteria'}.`,
             item.spec, io.diffText(lanePath, baseSha, preparing ? [item.path] : []),
           ].join('\n\n'));
-          const verdict = parseCheckerVerdict(io.runChecker(buildCheckerArgv({ checker: resultWorker.checker, weRoot: lanePath, dir: lanePath, taskFile: checkerTask, card: num, caller: 'probation-build-run.mjs' }), lanePath));
+          const verdict = parseCheckerVerdict(await io.runChecker(buildCheckerArgv({ checker: resultWorker.checker, weRoot: lanePath, dir: lanePath, taskFile: checkerTask, card: num, caller: 'probation-build-run.mjs' }), lanePath, heldEnv, builderLease));
           checkerRow = { provider: resultWorker.checker, verdict: verdict.verdict, reason: verdict.reason };
           const checkerHooks = hookSurfaceChanged(postHookSurface, io.snapshotHookSurface(lanePath));
           if (checkerHooks.changed) {
@@ -808,7 +824,7 @@ export async function runProbationBuild(args, io) {
     // that failed before the worker ever ran (so `finish` never writes a scorecard row for a trial the worker
     // had no part in), the worker's own otherwise — see the `abandon` docblock above.
     return abandon('escalated-needs-human', `unexpected error: ${e?.message ?? e}`, {}, workerRan ? resultWorker.executor : 'none');
-  }
+  } finally { builderLease?.close?.(); }
 }
 
 // ─── the real processes ────────────────────────────────────────────────────────────────────────────────────
@@ -821,6 +837,34 @@ export function gateFailureDetail(output) {
     ? 'check:standards'
     : first?.startsWith('FAIL') ? 'vitest' : 'verify-lane';
   return `${check}: ${(first || lines.find(line => line) || 'no diagnostic output').slice(0, 1500)}`;
+}
+
+/** Bounded asynchronous launcher; its lease tracks the child through close. */
+function runTrackedChild(argv, { cwd, env, timeout, lease, spawnFn = spawn }) {
+  return new Promise(resolve => {
+    const child = spawnFn(process.execPath, argv, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    lease?.track(child);
+    let stdout = '', stderr = '', bytes = 0, failed = false;
+    const killChild = () => {
+      failed = true;
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+    };
+    const timer = setTimeout(killChild, timeout);
+    const collect = (stream, chunk) => {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > 64 * 1024 * 1024) { killChild(); return; }
+      if (stream === 'stdout') stdout += chunk; else stderr += chunk;
+    };
+    child.stdout.setEncoding?.('utf8');
+    child.stderr.setEncoding?.('utf8');
+    child.stdout.on('data', chunk => collect('stdout', chunk));
+    child.stderr.on('data', chunk => collect('stderr', chunk));
+    child.on('error', () => { failed = true; });
+    child.once('close', code => {
+      clearTimeout(timer);
+      resolve({ ok: !failed && code === 0, stdout, out: stdout + stderr });
+    });
+  });
 }
 
 function sh(bin, args, opts = {}) {
@@ -898,13 +942,14 @@ export function probationHoldIdentityEnv({ session, runId = null, taskType = 'do
   };
 }
 
-export function realIo({ session, runId = null, taskType = 'doc-fix', env = process.env, repoRoot = WE_ROOT } = {}) {
+export function realIo({ session, runId = null, taskType = 'doc-fix', env = process.env, repoRoot = WE_ROOT, spawnFn = spawn } = {}) {
   const workerEnv = { ...env, LANE_SESSION: session, ...probationHoldIdentityEnv({ session, runId, taskType }) };
   const laneEnv = withHooksDisabled(workerEnv);
   // cwd alone is insufficient: backlog/operation tools derive their roots from import.meta.url.
   // Daemon clones are allowed as read-only launch sources; every writer uses the lane's script copy.
   const node = (script, args, opts) => trySh(process.execPath, [join(opts.cwd, script), ...args], opts);
   return {
+    env,
     log: (m) => console.error(m),
     // One fingerprint of every gitignored entry (collapsed directories by mode/size/mtime, files by content up
     // to 1 MiB). Codex's read-only sandbox is the real guard inside large ignored trees such as node_modules.
@@ -1053,7 +1098,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       writeFileSync(p, text);
       return p;
     },
-    runWorker: async (argv, dir = process.cwd()) => {
+    runWorker: async (argv, dir = process.cwd(), heldEnv = {}, lease) => {
       // Foreground and awaited: each launcher owns a fresh session; independent cards may run concurrently.
       // `workerEnv`, never `laneEnv`: the worker's own git use keeps the repo's guard hooks (see `realIo`).
       const launcher = argv.find((arg) => /(?:codex|gemini)-direct-task\.mjs$/.test(arg));
@@ -1064,11 +1109,8 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
         try { const s = statSync(path); return `${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`; } catch { return null; }
       };
       const before = signature(logPath);
-      const r = await new Promise(resolveRun => {
-        execFile(process.execPath, argv, { cwd: dir, env: workerEnv, timeout: 70 * 60 * 1000,
-          killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) =>
-          resolveRun({ ok: !error, stdout, out: stdout + stderr }));
-      });
+      const r = await runTrackedChild(argv, { cwd: dir, env: { ...workerEnv, ...heldEnv },
+        timeout: 70 * 60 * 1000, lease, spawnFn });
       // Capture now, before any lane cleanup. Never attribute an untouched previous run's log.
       const lastMessage = captureWorkerMessage(r.out, (reportedPath) => {
         const path = reportedPath ? resolve(dir, reportedPath) : logPath;
@@ -1078,8 +1120,8 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       // Redact before taking a tail: otherwise a cut can remove a token's identifying prefix.
       return { modelEvidence: parseAgyReportEvidence(r.stdout ?? r.out), ok: r.ok, out: redactSecrets(r.out).slice(-4000), lastMessage: typeof lastMessage === 'string' ? lastMessage : '' };
     },
-    runChecker: (argv, dir) => {
-      const r = trySh(process.execPath, argv, { cwd: dir, env: workerEnv, timeout: 20 * 60 * 1000 });
+    runChecker: async (argv, dir, heldEnv = {}, lease) => {
+      const r = await runTrackedChild(argv, { cwd: dir, env: { ...workerEnv, ...heldEnv }, timeout: 20 * 60 * 1000, lease, spawnFn });
       if (!r.ok) return '';
       try { return JSON.parse(r.out).lastMessage ?? ''; } catch { return ''; }
     },

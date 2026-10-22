@@ -34,8 +34,9 @@ import { join } from 'node:path';
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import {
-  reserve, readLockEntry, releaseLockDir, parseLockEntry, isLeaseExpired,
+  lockDirFor, reserve, readLockEntry, releaseLockDir, parseLockEntry, isLeaseExpired,
 } from '../readiness/file-locks.mjs';
+import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { normNum } from './queue-store.mjs';
 
 /** A build takes up to a few hours; the TTL only matters when retirement never fires (a lost build). */
@@ -69,6 +70,17 @@ export function acquireBuildDispatchClaim({
     ...(replacesStamp !== undefined ? { replacesStamp } : {}) };
   const result = reserve(lockRoot, resource, owner, nowMs, nowIso, pid, 'unknown', leaseMinutes, meta);
   return { ...result, resource, lockRoot };
+}
+
+/** Link a build's durable claim to its foreground lease; absent claims are a no-op. */
+export function annotateBuildDispatchClaim({ repo = 'we', num, slotId, lockRoot = buildDispatchClaimRoot() } = {}) {
+  const resource = buildDispatchResource({ repo, num });
+  const entry = readLockEntry(lockRoot, resource);
+  if (!entry) return false;
+  try {
+    writeJsonAtomic(join(lockDirFor(lockRoot, resource), 'lock.json'), { ...entry, meta: { ...entry.meta, slotId } }, { mode: 0o600 });
+    return true;
+  } catch (e) { if (e.code === 'ENOENT') return false; throw e; }
 }
 
 /** Release a claim — ANY owner may retire it once the build it guards is observably done (PR open, item gone).

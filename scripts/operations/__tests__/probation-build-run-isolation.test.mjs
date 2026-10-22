@@ -74,7 +74,7 @@ function launch(f, extraEnv = {}, setup = '', flags = []) {
     io.appendScorecard = () => {}; // shared telemetry is outside this checkout-isolation probe
     ${setup}
     console.log(JSON.stringify(await runProbationBuild(parseArgs(['--num=4291', '--worker=codex', '--session=probe', ...${JSON.stringify(flags)}]), io)));`;
-  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(f.root, 'registry'),
+  const env = { ...process.env, WE_BUILDER_SLOTS: 'off', WE_DAEMON_OVERLAY_DIR: join(f.root, 'registry'),
     WE_COORDINATION_ROOT: join(f.root, 'coordination'), GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test', ...extraEnv };
   delete env.LANE_POOL_ROOT; // force repo-derived discovery, despite an unrelated caller cwd
   return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', code], { cwd: f.scratch, env, encoding: 'utf8' }));
