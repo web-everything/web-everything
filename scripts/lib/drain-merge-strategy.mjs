@@ -42,6 +42,9 @@ import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { redTeamEnabled } from './review-red-team-policy.mjs';
 import { readDrainQueueSafety, postAcceptRedTeamOwed, redTeamEnqueueHold as redTeamEnqueueHoldAtHead, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
+import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { isUnderTest } from './under-test.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { numberingProvenAncestors, hasRedTeamEvidence } from './numbering-red-team-alias.mjs';
 import { resolveNumberingRedTeamSetting } from './numbering-carry.mjs';
@@ -284,6 +287,8 @@ export function createDrainMergeStrategy({
       files: c?.listedFilesComplete === true ? c.listedFiles : null });
   },
   readGrantScope = standingRulingScope, // PR #5758: the verified standing-ruling scope the red-team gate also reads
+  redTeamDeadline, // resolved redTeam.deadlineAction (test seam); read from the cascade when absent
+  publishNeedsYou, // operator note publisher; the real needs-you feed outside a test run
 } = {}) {
   const { policy, note } = resolved;
   // The red-team readers credit an automatic round grant exactly as the gate does; unreadable = no automatic credit.
@@ -394,12 +399,17 @@ export function createDrainMergeStrategy({
     if (r.line) say(`  ${r.line}`);
     return r.relieve === true;
   };
+  const deadline = redTeamDeadline ?? readRedTeamDeadlineAction({ env, log: line => log.write(`  ${line}\n`) });
+  const deadlineAction = deadline.value?.deadlineAction ?? 'requeue-then-hold';
+  // The real operator feed is never written from a test run unless the test injects its own publisher.
+  const publishNote = publishNeedsYou ?? (isUnderTest(env) ? null : item => publishAttention(item));
   const pendingOutcome = (c, pending, quiet = false) => {
     const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
     const healthSmell = now() - pending.firstPendingAt >= maxMin * 60_000;
     if (healthSmell && !quiet) log.write(`  health smell: ${slugOf(c.repo)}#${c.num} red-team-pending on ${pending.headSha} for ${Math.floor((now() - pending.firstPendingAt) / 60_000)} min (redTeamPendingMaxMin=${maxMin}, ${safety.sources?.redTeamPendingMaxMin ?? 'standard'})\n`);
     if (!quiet) say(`  merge-queue: defer #${c.num}: ${pending.reason}`);
-    return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: pending.reason, healthSmell };
+    return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: pending.reason, healthSmell,
+      ...(pending.deadlineHeldAt != null ? { deadlineHeld: true } : {}) };
   };
   const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels,reviews'], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
   // The complete thread as pages. The drain's own comment reader allows 256 MiB: a long thread must not hit the 1 MiB default.
@@ -809,12 +819,13 @@ export function createDrainMergeStrategy({
       const reason = held ? variants[0] : null;
       if (!reason) return null;
       // Blocked only where enqueue's own path certainly stops: a send-back class reason, a request already made,
-      // a saved/attempted/untrusted result, or the never-scheduled escape switched off. Any other held reason can
-      // still reach that escape and enqueue, so it is unknown (keep the yield).
+      // a saved/attempted/untrusted result, or no operator merge-without-result override. Only with that override can a
+      // held reason still enqueue, so it is unknown (keep the yield).
       const stops = reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete') || reason.includes(NUMBERING_ALIAS_WAIT)
         || requestFixed || evidence.untrustedSavedResult || evidence.recorded || evidence.attempted
-        || safety.value.enqueueWhenRedTeamNeverScheduled === false;
-      if (!stops) throw new Error('red-team hold may still take the never-scheduled enqueue escape');
+        // drain.enqueueWhenRedTeamNeverScheduled is retired: only the named operator env override can still enqueue.
+        || !(deadlineAction === RED_TEAM_DEADLINE_OVERRIDE && deadline.operatorOverride?.by);
+      if (!stops) throw new Error('red-team hold may still take the operator merge-without-result override');
       return { kind: 'red-team-pending', reason };
     },
     enqueue(c, headSha, { comments = null, prepared = null, holdOnly = false } = {}) {
@@ -883,18 +894,52 @@ export function createDrainMergeStrategy({
             retryAt: now() + (safety.value.redTeamPendingBackoffSec ?? 300) * 1000,
             commentCount: pages.flat().length, observation, checkedAt: now(), reason,
             ...(sameHead && pending.requestedAt != null ? { requestedAt: pending.requestedAt } : {}),
-            ...(sameHead && pending.requestAttemptedAt != null ? { requestAttemptedAt: pending.requestAttemptedAt } : {}) };
+            ...(sameHead && pending.requestAttemptedAt != null ? { requestAttemptedAt: pending.requestAttemptedAt } : {}),
+            ...(sameHead && pending.deadlineHeldAt != null ? { deadlineHeldAt: pending.deadlineHeldAt } : {}),
+            ...(sameHead && pending.notifiedAt != null ? { notifiedAt: pending.notifiedAt } : {}) };
           before.redTeamPending[key] = wait;
           writeState(statePath, before);
           priorityReserveStamp(c, headSha, true);
           const outcome = pendingOutcome(c, wait);
-          // Historical rows can request recovery, but never waive the hold or use the enqueue escape.
+          // Historical rows can request recovery, but never waive the hold or use the enqueue escape. A confirmed break
+          // (its own send-back routing) and the other held-by-construction reasons: the hold is the whole answer.
           if (reason.includes('requiring send-back') || reason.includes('saved red-team re-check incomplete') || reason.includes(NUMBERING_ALIAS_WAIT)) return outcome;
-          if (!staleRequest.eligible && (evidence.untrustedSavedResult || (panelSeat && !neverScheduled) || (!neverScheduled && !outcome.healthSmell) || evidence.inFlight || evidence.queued || evidence.recorded || evidence.attempted)) return outcome;
+          // Past the deadline with NO red-team result on this exact head the PR stays HELD: it may move only on a
+          // result for this head, a proven-identical carry of one, an operator ruling through the red-team ruling path
+          // (all read by redTeamEnqueueHold above), or a card-only diff that owes no pass. Never a timed bypass.
+          const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
+          const source = deadline.sources?.deadlineAction ?? 'standard';
+          const missing = !evidence.inFlight && !evidence.queued && !evidence.recorded;
+          const deadlineHold = () => {
+            // Before the deadline, or inside the one re-request's own full wait, the plain hold is the whole answer.
+            if (!outcome.healthSmell || (wait.requestedAt != null && now() - wait.requestedAt < maxMin * 60_000)) return outcome;
+            const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
+              : evidence.attempted || evidence.untrustedSavedResult ? 'run left no usable result'
+                : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
+              : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
+            const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
+            if (wait.deadlineHeldAt == null) {
+              wait.deadlineHeldAt = now();
+              log.write(`  merge-queue: HOLD ${slugOf(c.repo)}#${c.num} on ${headSha}: ${heldReason}; redTeamPendingMaxMin=${maxMin} (${safety.sources?.redTeamPendingMaxMin ?? 'standard'}), redTeam.deadlineAction=${deadlineAction} (${source}); never enqueued without a result\n`);
+            }
+            if (wait.notifiedAt == null && publishNote) {
+              try {
+                publishNote({ repo: slugOf(c.repo), pr: Number(c.num), head: headSha, kind: 'red-team-deadline-held', reason: heldReason,
+                  pick: `https://github.com/${slugOf(c.repo)}/pull/${c.num}` });
+                wait.notifiedAt = now();
+              } catch (e) { log.write(`  ⚠ red-team deadline note for #${c.num} not published (${firstLine(e)}) — PR stays held; retried at the next recheck\n`); }
+            }
+            writeState(statePath, before);
+            return { ...outcome, deadlineHeld: true, reason: heldReason };
+          };
+          if (!staleRequest.eligible && (evidence.untrustedSavedResult || (panelSeat && !neverScheduled) || (!neverScheduled && !outcome.healthSmell) || evidence.inFlight || evidence.queued || evidence.recorded || evidence.attempted)) return deadlineHold();
+          // The one re-request for this head gets its own full wait before the operator is asked.
+          if (wait.requestedAt != null) return deadlineHold();
+          // redTeam.deadlineAction=hold: past the deadline ask the operator without another request.
+          if (outcome.healthSmell && deadlineAction === 'hold') return deadlineHold();
           let requested = false;
-          if (wait.requestedAt != null) return outcome;
-          if (wait.requestedAt == null && typeof requestRedTeam === 'function') {
-            if (wait.requestAttemptedAt != null && now() - wait.requestAttemptedAt < cooldownMin * 60_000) return outcome;
+          if (typeof requestRedTeam === 'function') {
+            if (wait.requestAttemptedAt != null && now() - wait.requestAttemptedAt < cooldownMin * 60_000) return deadlineHold();
             wait.requestAttemptedAt = now();
             writeState(statePath, before);
             log.write(`  merge-queue: requesting red team for #${c.num} on ${headSha}: redTeamRequestCooldownMin=${cooldownMin} (${cooldownSource})\n`);
@@ -904,13 +949,15 @@ export function createDrainMergeStrategy({
           if (requested) {
             wait.requestedAt = now();
             writeState(statePath, before);
-            log.write(`  merge-queue: requested red team for #${c.num} on ${headSha} through review dispatch\n`);
+            log.write(`  merge-queue: requested red team for #${c.num} on ${headSha} through review dispatch (redTeam.deadlineAction=${deadlineAction}, ${source})\n`);
             return { ...outcome, redTeamRequested: true };
           }
-          if (neverScheduled || evidence.untrustedSavedResult || evidence.recorded || evidence.attempted) return outcome;
-          const fallback = safety.value.enqueueWhenRedTeamNeverScheduled ?? true;
-          log.write(`  merge-queue: #${c.num} red team never scheduled — enqueueWhenRedTeamNeverScheduled=${fallback} (${safety.sources?.enqueueWhenRedTeamNeverScheduled ?? 'standard'}); no successful red-team request path\n`);
-          if (!fallback) return outcome;
+          // drain.enqueueWhenRedTeamNeverScheduled is retired: no setting enqueues an owed head without a result. The
+          // only path to merge-without-result is the operator's own env override, named and logged on every use, and
+          // only where the retired escape applied (no run recorded, attempted, in flight or queued).
+          if (!(outcome.healthSmell && missing && !neverScheduled && !evidence.untrustedSavedResult && !evidence.attempted
+            && deadlineAction === RED_TEAM_DEADLINE_OVERRIDE && deadline.operatorOverride?.by)) return deadlineHold();
+          log.write(`  ⚠ OPERATOR OVERRIDE: enqueuing ${slugOf(c.repo)}#${c.num} on ${headSha} with NO red-team result after ${maxMin} min (redTeam.deadlineAction=${RED_TEAM_DEADLINE_OVERRIDE}, env, by ${deadline.operatorOverride.by})\n`);
         }
       }
       if (holdOnly) return null;
