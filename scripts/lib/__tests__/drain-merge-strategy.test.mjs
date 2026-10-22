@@ -625,14 +625,14 @@ describe('recorded hold read-only admission', () => {
   const initial = () => ({ pending: [], followedUp: [], redTeamPending: {
     [key]: { headSha: HEAD, firstPendingAt: 0, retryAt: 0, reason: 'no recorded result on the live head' },
   } });
-  function reader({ state, write, head = HEAD, evidence = {}, labels = ['review:accepted', 'ready-to-merge'], onView = () => {}, request = () => {} }) {
+  function reader({ state, write, head = HEAD, evidence = {}, labels = ['review:accepted', 'ready-to-merge'], onView = () => {}, request = () => {}, redTeamDeadline }) {
     const mutations = [];
     const s = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'unused-hold-state',
       resolved: policyOf('github-merge-queue'), env: { WE_RED_TEAM_TIMING: 'post-accept' },
       queueSafety: { value: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true } },
       now: () => 1000, log: { write: () => {} },
       readFile: () => JSON.stringify(state()), writeState: (_path, value) => write(structuredClone(value)),
-      readRedTeamEvidence: () => evidence, requestRedTeam: request,
+      readRedTeamEvidence: () => evidence, requestRedTeam: request, ...(redTeamDeadline ? { redTeamDeadline } : {}),
       labelProvider: { ensureLabel: () => mutations.push('ensure-label'), setLabels: () => mutations.push('labels') },
       exec: (_cmd, args) => {
         if (args[0] === 'pr' && args[1] === 'view') {
@@ -723,9 +723,14 @@ describe('recorded hold read-only admission', () => {
       const r = run({ state: st, evidence: { scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } } });
       expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow();
     });
-    it('a held reason that could still take the never-scheduled enqueue escape is unknown (throws)', () => {
+    it('with the never-scheduled escape retired, an unrequested held reason is blocked', () => {
       const r = run({ state: requested({ requestedAt: undefined }), evidence: inFlight });
-      expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/never-scheduled/);
+      expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    });
+    it('only the named operator merge-without-result override can still enqueue it, so that is unknown (throws)', () => {
+      const r = run({ state: requested({ requestedAt: undefined }), evidence: inFlight,
+        redTeamDeadline: { value: { deadlineAction: 'merge-without-result' }, sources: { deadlineAction: 'env' }, operatorOverride: { by: 'operator' } } });
+      expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/merge-without-result override/);
     });
     it('no recorded wait on THIS head ⇒ not blocked (waiters keep yielding)', () => {
       const r = run({ state: requested({ headSha: 'f'.repeat(40) }), evidence: inFlight });
@@ -934,11 +939,14 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
       expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ kind: 'red-team-pending', healthSmell: true });
       expect(next.logs.join('')).toContain('health smell:');
       expect(next.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')) || c[2] === 'comment')).toBe(false);
-      // A completed retry on the same head releases the persisted hold at the next allowed probe.
+      // A retry record with no saved-result provenance on the same head is not a result.
       writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
         repo: LOCAL, pr: 5283, rev: HEAD, status: 'ok', recheckStatus: 'ok', findings: [], confirmedMissCount: 0 }] }));
       clock = next.state().redTeamPending['cwd#5283'].retryAt;
-      expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
+      // The retry record carries no saved-result provenance, so it is not a trusted result. Before the deadline hold
+      // (lane/redteam-no-merge-without-result) the retired never-scheduled escape enqueued it anyway; now it stays held.
+      expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+      expect(next.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it.each([['card-only', { scheduled: true, inFlight: false, recorded: false,
