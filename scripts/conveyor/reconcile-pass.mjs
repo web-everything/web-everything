@@ -112,7 +112,7 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 // `systemFixRef` PRs reconcile-core.mjs's own escalation branch will independently re-derive from the same data.
 import { latestCiHealEscalationForHead, enrichPrsWithEscalationBaseFacts } from './ci-heal-escalation-mark.mjs';
 import { readLiveFixClaim } from './fix-procedure.mjs';
-import { enrichPrsWithReferralHolds } from './review-referral-hold.mjs';
+import { enrichPrsWithReferralHolds, enrichPrsWithReferralHoldAutoResolve } from './review-referral-hold.mjs';
 import { ledgerHoldStep, failClosedHolds, ledgerDeciding, renderLedgerShadowSummary } from './review-hold-ledger-shadow.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
@@ -1456,6 +1456,9 @@ export function runReconcilePass({
   enrichFixClaims = enrichPrsWithFixClaims,
   enrichTimeouts = enrichPrsWithTimeoutEvidence,
   enrichReferralHolds = enrichPrsWithReferralHolds,
+  // stale-hold-resume — a pause whose every live-head finding is already ruled resolves itself (send-back or resume).
+  // Runs AFTER the ledger step, which can replace the pause. Injectable like every other enrich step.
+  enrichReferralAutoResolve = enrichPrsWithReferralHoldAutoResolve,
   // Ledger plan slice H (card xqh3tkh): the same hold decisions derived from the verdict ledger, per family
   // (`verdictLedger.readSource.<family>`, default `both` = shadow: today's decision stands and disagreements are
   // journaled). Injectable like every other enrich step; see {@link enrichPrsWithLedgerHolds}.
@@ -1542,8 +1545,8 @@ export function runReconcilePass({
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
-    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
+  const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralAutoResolve(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { repo: CONSTELLATION_REPOS[repoKey].slug, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   if (repoKey === 'we') enrichOwedMainRule(prsBeforeMechanical, { repo: CONSTELLATION_REPOS[repoKey].slug, settings: resolveRefreshSettings({ env }) });
   const mechanicalSetting = mechanicalRoundsSetting(loadMechanicalRoundsSetting, env);

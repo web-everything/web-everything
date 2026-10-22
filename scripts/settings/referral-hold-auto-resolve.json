@@ -1,0 +1,8 @@
+{
+  "$comment": "Tool layer of referralHoldAutoResolve (scripts/conveyor/review-referral-hold.mjs#resolveReferralHoldAutoResolve): standard → platform → this file → env, value and source logged by policy-cascade. stale-hold-resume (operator 2026-10-21): a referral pause whose every live-head finding carries a gate-readable ruling resolves itself. enabled=false (env WE_REFERRAL_HOLD_AUTO_RESOLVE=0) is the kill switch back to the plain pause. onBlock: send-back | pause (env WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_BLOCK). onClean: resume | pause (env WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_CLEAN). It never accepts and never clears review:human.",
+  "referralHoldAutoResolve": {
+    "enabled": true,
+    "onBlock": "send-back",
+    "onClean": "resume"
+  }
+}
