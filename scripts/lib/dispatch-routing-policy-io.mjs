@@ -50,7 +50,8 @@ export function resolveDispatchRoute(dispatch, options = {}) {
     if (hold) availability[provider] = hold;
   }
   const route = decideDispatchRoute(dispatch, { ...options, availability, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
-  (options.log ?? defaultLog)(directLaunchLogLine({ kind: dispatch?.kind }));
+  try { (options.log ?? defaultLog)(directLaunchLogLine({ kind: dispatch?.kind })); }
+  catch { /* Logging must not prevent dispatch from returning its route. */ }
   return route;
 }
 export function routingPolicyEnv() {
