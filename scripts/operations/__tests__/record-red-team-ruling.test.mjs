@@ -98,6 +98,18 @@ describe('cap-only existing-card declaration', () => {
     expect(body.split('\n').some((l) => l.startsWith('<!--'))).toBe(false);
     expect(body).toContain('> x');
   });
+  it.each([
+    ['standard comment', '<!-- marker -->', '&lt;!-- marker --&gt;'],
+    ['alternate comment end', '<!-- marker --!>', '&lt;!-- marker --!&gt;'],
+    ['nested and partial delimiters', '<!<!-- marker --!>-->', '&lt;!&lt;!-- marker --!&gt;--&gt;'],
+    ['HTML and literal entities', '<b>A & B &lt;</b>', '&lt;b&gt;A &amp; B &amp;lt;&lt;/b&gt;'],
+    ['multiple lines', 'first\r\n<!-- marker --!>\nlast', 'first\n> &lt;!-- marker --!&gt;\n> last'],
+  ])('escapes %s in the quoted reason', (_name, reason, escaped) => {
+    const body = buildRuleReasonComment({ head: HEAD, ruling: 'card', actor: 'chalbert', channel: 'c', at: 't', reason, findings: [] });
+    const quote = body.split("The operator's reason, verbatim:\n")[1];
+    expect(quote).toBe(`> ${escaped}`);
+    expect(quote.replace(/^> /gm, '')).not.toMatch(/[<>]/);
+  });
   it('plans a cited readable card and permits review:changes alongside a trusted cap', () => {
     const p = planRedTeamRuling(read({ labels: ['review:changes'] }), input());
     expect(p).toMatchObject({ effect: RED_TEAM_RULING_CARD_EFFECT, head: HEAD, indices: [1], actor: 'chalbert', cardRef: CARD });

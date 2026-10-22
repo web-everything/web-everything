@@ -42,7 +42,8 @@ export function selectBreaks(held, spec, noun = 'held for the operator') {
 
 /** The reason comment: the operator's words, quoted, with no way to forge a marker. PURE. */
 export function buildRuleReasonComment({ head, ruling, actor, channel, at, reason, findings, cardNote = '', cause = null }) {
-  const quote = String(reason).replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').replace(/\r\n/g, '\n')
+  // Escape HTML text rather than matching comment delimiters, including alternate and partial forms.
+  const quote = String(reason).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\r\n/g, '\n')
     .split('\n').map((l) => `> ${l}`).join('\n');
   return [
     `**Operator ruling on the post-accept red team: ${ruling}** (head \`${String(head).slice(0, 12)}\`)`,
