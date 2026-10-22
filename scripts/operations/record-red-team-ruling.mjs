@@ -58,13 +58,13 @@ export function buildRuleReasonComment({ head, ruling, actor, channel, at, reaso
 }
 
 /** Shared cap-only eligibility rule for planning and the sink's pre-write check. PURE. */
-export function rulableBreaks({ comments, pr, head, setting }) {
-  const state = liveResultGateState(comments, pr, head);
+export function rulableBreaks({ comments, repo, pr, head, setting }) {
+  const state = liveResultGateState(comments, pr, head, repo);
   if (!state.result) throw new Error(`no red-team result on the live head ${head.slice(0, 9)} — nothing to rule on`);
   if (!state.outcomes.has(GATE_OUTCOMES.ROUND_CAP)) {
     throw new Error(`the red-team result on head ${head.slice(0, 9)} was not parked at the round cap (no trusted \`round-cap\` gate record decides it)`);
   }
-  const held = readRedTeamDisposition({ comments, pr, head, setting }).held;
+  const held = readRedTeamDisposition({ comments, repo, pr, head, setting }).held;
   if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)');
   return { state, rulable: held, noun: 'held for the operator' };
 }
@@ -87,7 +87,7 @@ export function planRedTeamRuling(read, input) {
   const head = String(read.head ?? '').toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error('the PR head could not be read; nothing to rule on');
   const comments = operatorBoundComments(read.comments);
-  const { state, rulable, noun } = rulableBreaks({ comments, pr, head, setting: read.setting });
+  const { state, rulable, noun } = rulableBreaks({ comments, repo: input.repo, pr, head, setting: read.setting });
   const selected = selectBreaks(rulable, input.break, noun);
   const unconfirmed = selected.filter((f) => !f.confirmed);
   if (unconfirmed.length) throw new Error(`break(s) ${unconfirmed.map((f) => `#${f.index}`).join(', ')} were not confirmed by the re-check; only a confirmed break can be ruled on`);

@@ -1,9 +1,10 @@
 /** Cap-only declaration subset of record-red-team-ruling: no live IO or later-slice imports. */
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState } from '../../lib/red-team-gate.mjs';
-import { planRedTeamRuling, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
+import { planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
+import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 
 const repo = 'o/r';
 const PR = 5530;
@@ -52,6 +53,40 @@ describe('cap-only existing-card declaration', () => {
   it('refuses a round-cap record from an untrusted author', () => {
     const forged = { author: { login: 'mallory' }, body: redTeamGateMarker(PR, HEAD, 'round-cap') };
     expect(() => planRedTeamRuling(read({ comments: [redTeam(), forged] }), input())).toThrow(/not parked at the round cap/);
+  });
+  const sentBackAfterGrant = (lateCap = false) => {
+    const result = redTeam();
+    const { resultId } = liveResultGateState([result], PR, HEAD, repo);
+    const at = '2026-10-20T23:45:00Z';
+    const grant = { author: OP, createdAt: at, body: buildRoundExtensionComment({
+      repo, pr: PR, by: 1, actor: OP.login, channel: 'claude-code-chat', reason: 'one more round', at,
+    }) };
+    const grantIds = gateRoundGrants([grant], PR, repo).map(g => g.id);
+    expect(grantIds).toHaveLength(1);
+    const cap = bot(`${redTeamGateMarker(PR, HEAD, 'round-cap', resultId, [])}\n- 1 confirmed break(s) NOT sent back: cap (#1).`,
+      lateCap ? '2026-10-20T23:55:00Z' : '2026-10-20T23:41:12Z');
+    const sentBack = bot(`${redTeamGateMarker(PR, HEAD, 'sent-back', resultId, grantIds)}\n- 1 confirmed break(s) sent back to the fixer (#1).`,
+      '2026-10-20T23:50:00Z');
+    return lateCap ? [result, grant, sentBack, cap] : [result, cap, grant, sentBack];
+  };
+  it.each([false, true])('refuses a break returned to the fixer after a grant (late cap: %s)', lateCap => {
+    const comments = sentBackAfterGrant(lateCap);
+    const scope = { comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS };
+    expect(liveResultGateState(comments, PR, HEAD, repo)).toMatchObject({ sendBackOutcome: 'sent-back', reopened: false });
+    const disposition = readRedTeamDisposition(scope);
+    expect(disposition).toMatchObject({ outcome: 'sent-back', held: [] });
+    expect(disposition.sendBack.map(f => f.index)).toEqual([1]);
+    expect(() => planRedTeamRuling(read({ comments }), input())).toThrow(/no red-team break is held/);
+    expect(() => rulableBreaks(scope)).toThrow(/no red-team break is held/);
+  });
+  it.each(['foreign repo', 'untrusted author'])('does not credit a grant from a %s', variant => {
+    const comments = sentBackAfterGrant();
+    const grant = comments[2];
+    comments[2] = variant === 'foreign repo'
+      ? { ...grant, body: grant.body.replace('"repo":"o/r"', '"repo":"other/repo"') }
+      : { ...grant, author: { login: 'mallory' } };
+    expect(gateRoundGrants(comments, PR, repo)).toEqual([]);
+    expect(planRedTeamRuling(read({ comments }), input())).toMatchObject({ effect: RED_TEAM_RULING_CARD_EFFECT, indices: [1] });
   });
   it('refuses a break already carded by the gate (no second card)', () => {
     const { resultId } = liveResultGateState(thread(), PR, HEAD);
