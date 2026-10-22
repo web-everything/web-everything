@@ -39,7 +39,7 @@ import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { readFixDispatchClaim } from './fix-claim-store.mjs';
 import { listWrappedWorkerAgents, requestWrappedResume } from '../operations/worker-wrapper-launch.mjs';
 import { AGENT_GONE_STATES } from './lease-reaper.mjs';
-import { loadFixSessionPolicy, isRowGone, samePrintedHandle, cliStartedCopy } from '../lib/fix-session-liveness.mjs';
+import { loadFixSessionPolicy, isRowGone, samePrintedHandle, cliStartedCopy, rowProcessAlive } from '../lib/fix-session-liveness.mjs';
 import { loadVerifyRecoverySettings } from '../lib/verify-recovery-settings.mjs';
 import { loadFixPushPolicy, formatFixPushPolicyLine } from '../lib/fix-push-policy.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
@@ -904,8 +904,9 @@ export async function defaultAwaitVerifyIo({
         // with the session's own short handle (a short-vs-uuid compare called every unconfirmed resume a fork and
         // could stop the session that had just resumed). The requested session itself is never the cleanup target.
         const forked = Boolean(printedId) && !samePrintedHandle(printedId, session);
-        if (!outcome.resumed && forked) { try { stopSession({ handle: printedId }); } catch { /* best-effort cleanup of the copy */ } }
-        return { resumed: !!outcome.resumed, printedId, forked, copyNote: cliStartedCopy(stdout) };
+        let copyStopped = false;
+        if (!outcome.resumed && forked) { try { stopSession({ handle: printedId }); copyStopped = true; } catch { /* best-effort cleanup of the copy */ } }
+        return { resumed: !!outcome.resumed, printedId, forked, copyStopped, copyNote: cliStartedCopy(stdout) };
       };
       const refused = stopFirst(session);
       if (refused) return refused;
@@ -913,7 +914,16 @@ export async function defaultAwaitVerifyIo({
       if (r.error) return { resumed: false, reason: r.error };
       // The CLI said the session was still running, so this started a copy (stopped above). That is the live-idle
       // state the stop exists for: stop the original now and resume it ONCE more, instead of spending an attempt.
-      if (!r.resumed && r.forked && r.copyNote && sessionPolicy.resumeStopsLiveIdle) {
+      // Only once the copy is CONFIRMED gone (its stop succeeded and a fresh listing shows no live process under its
+      // handle): a copy that may still be running must never be joined by a second live session. Bounded (~5s).
+      const copyGone = (handle) => {
+        let rows;
+        try { rows = io.defaultListAgents({ all: true, env: liveEnv }); } catch { return false; }
+        const copyRow = (rows ?? []).find((x) => samePrintedHandle(handle, x));
+        for (let i = 0; i < 10 && copyRow && rowProcessAlive(copyRow, pidAliveFn); i += 1) sleep(500);
+        return !copyRow || !rowProcessAlive(copyRow, pidAliveFn);
+      };
+      if (!r.resumed && r.forked && r.copyNote && r.copyStopped && sessionPolicy.resumeStopsLiveIdle && copyGone(r.printedId)) {
         const row = liveRow();
         const again = row === undefined ? { resumed: false, reason: 'stop-before-resume: session list unreadable' } : stopFirst(row ?? session);
         if (again) return again;

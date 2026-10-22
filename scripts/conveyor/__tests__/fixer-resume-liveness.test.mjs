@@ -133,6 +133,19 @@ describe('replay #5492 11:50Z — the listing showed no pid, but the CLI still s
   });
 });
 
+describe('the copy-note retry never joins a copy that may still be running', () => {
+  it('a copy whose stop failed is not followed by a second resume', async () => {
+    const row = { ...ROW_5729, id: '40d1dea4', sessionId: '40d1dea4-07b0-44db-a3af-b83734d28c60', name: 'fix-5492', pid: 5492 };
+    const cli = fakeCli({ row, copies: ['29166621'] });
+    const stop = cli.stop;
+    cli.stop = (a) => { if (a.handle === '29166621') { cli.calls.push(['stop', a.handle]); throw new Error('claude stop timed out'); } return stop(a); };
+    const { pid: _hidden, ...stale } = row;
+    const r = (await awaitVerifyResumeIo(cli)).resume({ session: { ...stale }, prompt: 'red verdict' });
+    expect(r).toEqual({ resumed: false, reason: 'forked-copy-stopped' });
+    expect(cli.calls).toEqual([['spawn'], ['stop', '29166621']]); // no stop of the original, no second spawn
+  });
+});
+
 describe('the printed short handle is never mistaken for a fork', () => {
   it('an unconfirmed resume that printed the session\'s OWN short id stops nothing', async () => {
     const cli = fakeCli({ row: { ...ROW_5729, pid: undefined, state: 'stopped' } });
@@ -152,7 +165,7 @@ describe('replay #5729 11:15Z — the ROUND resume of a done row whose process i
       candidate: ROW_5729.sessionId, prompt: '# New review round', listAgentsAll: () => cli.list(),
       spawnAgent: () => cli.spawn(), stop: cli.stop, wait: () => {}, pidAlive: cli.pidAlive,
       acquireClaim: () => ({ ok: true }), releaseClaim: () => released.push('released'),
-      sessionCwdFor: () => '/ops/dispatch/x', ensureSessionCwd: (p) => p, ...extra,
+      sessionCwdFor: () => '/ops/dispatch/x', ensureSessionCwd: (p) => p, awaitingFor: () => null, ...extra,
     });
     return { r, released };
   };
@@ -168,6 +181,14 @@ describe('replay #5729 11:15Z — the ROUND resume of a done row whose process i
     const { r, released } = run(cli);
     expect(r).toMatchObject({ resumed: false, resumeAttempt: { refused: 'session-mid-turn' } });
     expect(FIXER_MID_TURN_REFUSALS.has(r.resumeAttempt.refused)).toBe(true); // the caller defers, never cold-starts
+    expect(cli.calls).toEqual([]);
+    expect(released).toEqual(['released']);
+  });
+  it('an idle session holding an await-verify record is never stopped; the caller defers', () => {
+    const cli = fakeCli({ row: ROW_5729 });
+    const { r, released } = run(cli, { awaitingFor: (row, { pr }) => ({ awaiting: row.sessionId === SID_5729 && pr === 5729 }) });
+    expect(r).toMatchObject({ resumed: false, resumeAttempt: { refused: 'session-awaiting-verify' } });
+    expect(FIXER_MID_TURN_REFUSALS.has(r.resumeAttempt.refused)).toBe(true);
     expect(cli.calls).toEqual([]);
     expect(released).toEqual(['released']);
   });

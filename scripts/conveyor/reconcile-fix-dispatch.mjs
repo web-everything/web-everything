@@ -170,6 +170,7 @@ import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { isPidAlive } from '../lib/dispatch-throttle.mjs';
+import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { loadFixSessionPolicy, isRowMidTurn } from '../lib/fix-session-liveness.mjs';
 
 // card 302 — resolve red-main capacity through the shared policy layers.
@@ -951,7 +952,7 @@ export function tryResumeFix(planned, {
 }
 
 /** Resume refusals that mean the earlier fixer is still in a turn: the caller defers, it never cold-starts beside it. */
-export const FIXER_MID_TURN_REFUSALS = new Set(['session-mid-turn', 'prior-session-mid-turn']);
+export const FIXER_MID_TURN_REFUSALS = new Set(['session-mid-turn', 'prior-session-mid-turn', 'session-awaiting-verify']);
 
 /** Is the row's own pid a live process? (a row with no pid has no known process.) */
 function rowProcessUp(row, pidAlive) {
@@ -970,7 +971,7 @@ export function resumeBgSession(planned, {
   stop = stopSession, wait = defaultConfirmWait, claimOwner = fixDispatchClaimOwner(), acquireClaim = acquireFixDispatchClaim,
   releaseClaim = releaseFixDispatchClaim, claimRoot, sessionCwdFor = (id) => dispatchSessionCwd(id, { root: REPO_ROOT }),
   ensureSessionCwd = ensureDispatchSessionCwd,
-  pidAlive = isPidAlive, sessionPolicy = null, candidateRow = undefined,
+  pidAlive = isPidAlive, sessionPolicy = null, candidateRow = undefined, awaitingFor = null,
 } = {}) {
   // #x0jphk5 — TAKE THE CLAIM before ever issuing `--resume`. Ownership is confirmed above (both HEAD-sha and
   // name), so what remains is a genuine race: two dispatchers reading the same stale listing could BOTH reach
@@ -1018,6 +1019,11 @@ export function resumeBgSession(planned, {
       // missing is never stopped either; it is declined the old way (no resume), since nothing shows a turn running.
       if (isRowMidTurn(row)) return declined(`session ${candidate} is mid-turn (status ${row.status})`, 'session-mid-turn');
       if (!row.status) return declined(`session ${candidate} has a live process but no turn status; not stopping it`);
+      // An idle session waiting on its own verify verdict belongs to the await-verify pass (which delivers that
+      // verdict); this resume never stops it, and the caller defers rather than start a second fixer.
+      let awaiting;
+      try { awaiting = (awaitingFor ?? makeAwaitingVerifyResolver())(row, { pr: planned.pr })?.awaiting === true; } catch { awaiting = true; }
+      if (awaiting) return declined(`session ${candidate} holds an await-verify record for PR #${planned.pr}`, 'session-awaiting-verify');
       try { stop({ handle: row.id || String(candidate).slice(0, 8) }); } catch (e) { return declined(`claude stop failed: ${String(e?.message ?? e).split('\n')[0]}`); }
       let exited = !rowProcessUp(row, pidAlive);
       for (let i = 0; i < 20 && !exited; i += 1) { wait(500); exited = !rowProcessUp(row, pidAlive); }

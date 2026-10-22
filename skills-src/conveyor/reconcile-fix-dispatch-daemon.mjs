@@ -1295,8 +1295,8 @@ export function withFixDispatchClaimRefresh(effects, {
             const handle = sess.id || String(sess.sessionId ?? '').slice(0, 8);
             const src = `fix.stopOnClaimRelease=${policy.stopOnClaimRelease} (${policy.sources?.stopOnClaimRelease ?? 'standard'})`;
             if (!policy.stopOnClaimRelease) { log.error(`reconcile-fix-dispatch-daemon: left session ${handle} running after releasing claim ${r.kind}-${r.pr} (${r.repo}) — ${src}`); continue; }
-            // Re-check right before the stop: still a background row, still a live process, still idle (or judged
-            // hung by the sweep), and no await-verify record for this PR. Anything else, or an unreadable list: leave it.
+            // Re-check right before the stop: still a background row, still a live process, idle NOW (the fresh
+            // status wins over any earlier verdict), and no await-verify record for this PR. Anything else, or an unreadable list: leave it.
             let fresh;
             try { fresh = (listFresh() ?? []).find((a) => a?.sessionId === sess.sessionId) ?? null; } catch { fresh = undefined; }
             let awaiting = false;
@@ -1305,7 +1305,7 @@ export function withFixDispatchClaimRefresh(effects, {
               : !fresh ? 'no longer listed'
                 : fresh.kind !== 'background' ? `${fresh.kind || 'unknown-kind'} session`
                   : !(Number.isInteger(fresh.pid) && fresh.pid > 0 && pidAlive(fresh.pid)) ? 'process already gone'
-                    : !(String(fresh.status ?? '').toLowerCase() === 'idle' || sess.hung === true) ? `mid-turn (status ${fresh.status ?? 'missing'})`
+                    : String(fresh.status ?? '').toLowerCase() !== 'idle' ? `mid-turn (status ${fresh.status ?? 'missing'})`
                       : awaiting ? 'it holds an await-verify record' : null;
             if (why) { log.error(`reconcile-fix-dispatch-daemon: did not stop session ${handle} after releasing claim ${r.kind}-${r.pr} (${r.repo}) — ${why}`); continue; }
             try {

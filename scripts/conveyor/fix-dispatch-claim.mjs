@@ -332,11 +332,11 @@ export function refreshLiveFixDispatchClaims({
           // fix.stopOnClaimRelease: this run's own background sessions whose PROCESS is still up are named, so the
           // daemon can stop them now instead of leaving a released fixer running (#5758, 2026-10-21: released as
           // settled at 07:00 ET, still in a hung Bash call until 07:44 ET).
-          // Only an IDLE row (turn over) or one the hung detector judged hung; never a row mid-turn.
+          // Only an IDLE row (turn over); never a row mid-turn, even one judged hung (that stays with the hung path).
           const liveSessions = agentsAll
             .filter((a) => a.kind === 'background' && ownRun(a) && rowProcessAlive(a, alive)
-              && (String(a.status ?? '').toLowerCase() === 'idle' || a.hung === true))
-            .map((a) => ({ id: a.id ?? null, sessionId: a.sessionId ?? null, pid: a.pid, status: a.status ?? null, ...(a.hung === true ? { hung: true } : {}) }));
+              && String(a.status ?? '').toLowerCase() === 'idle')
+            .map((a) => ({ id: a.id ?? null, sessionId: a.sessionId ?? null, pid: a.pid, status: a.status ?? null }));
           if (result.released) released.push({ repo, pr, kind, owner: entry.owner, ...(liveSessions.length ? { liveSessions } : {}) });
         }
       }
