@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { classifyStall, JUDGED_STATES, NEVER_AUTOMATIC, POLICY_ACTOR } from '../pr-stall-classify.mjs';
+import { classifyStall, CLASSIFY_DEFAULTS, demoteNeverAutomatic, JUDGED_STATES, NEVER_AUTOMATIC, POLICY_ACTOR } from '../pr-stall-classify.mjs';
 import { MAX_TOTAL_ROUND_EXTENSIONS } from '../round-extension-mark.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -34,6 +34,24 @@ const VERDICT_NAMES = [null, 'grant', 'send-back', 'card-the-rest', 'suggest-spl
 const card = { id: 'we:backlog/xabc123-coverage.md', readable: true };
 const run = (state, v, o = {}) => classifyStall({ row: row(state, o.row), head: HEAD, verdict: v === null ? null : verdict(v, TRIGGER[state] ?? 'red-team-cap'), files: ['scripts/foo.mjs'], card, ...o.ctx });
 const at = (state, o = {}) => classifyStall({ head: HEAD, files: ['scripts/foo.mjs'], ...o, row: row(state, o.row) });
+
+describe('never-automatic last line of defence', () => {
+  it.each(NEVER_AUTOMATIC.flatMap((action) => ['system', 'policy'].map((lane) => [lane, action])))
+  ('demotes %s action %s to an operator command', (lane, action) => {
+    const item = { lane, action, reason: 'automatic branch', command: null, key: 'k', evidence: ['e'] };
+    expect(demoteNeverAutomatic(item, 'operator-next')).toEqual({ ...item, lane: 'operator',
+      reason: `fail-closed: ${action} is never automatic`, command: 'operator-next' });
+    expect(item.lane).toBe(lane);
+  });
+  it.each(NEVER_AUTOMATIC)('preserves an operator action %s', (action) => {
+    const item = { lane: 'operator', action, command: 'existing' };
+    expect(demoteNeverAutomatic(item, 'fallback')).toBe(item);
+  });
+  it.each([['system', 'tooling-card'], ['policy', 'grant']])('preserves permitted %s action %s', (lane, action) => {
+    const item = { lane, action };
+    expect(demoteNeverAutomatic(item, 'fallback')).toBe(item);
+  });
+});
 
 // Non-judged states: the verdict never changes the answer.
 const FIXED = {
@@ -313,16 +331,34 @@ describe('policy guardrails', () => {
 });
 
 describe('every policy is a setting, and settings only make it stricter', () => {
+  const actionCases = {
+    systemActions: {
+      'await-ledger-outbox': ['system:ledger-write-miss'],
+      'resume-stale-hold': ['system:stale-hold', null, { staleHoldAutoResume: true }],
+      'rerun-red-team-gate': ['red-team-sent-back-cleared'],
+      'ask-review-daemon': ['awaiting-review'],
+      'tooling-card': ['fixing'],
+    },
+    policyActions: {
+      grant: ['ruling-needed:red-team-round-cap', 'grant'],
+      block: ['ruling-needed:red-team-round-cap', 'send-back'],
+      card: ['ruling-needed:referral-hold', 'card-the-rest'],
+    },
+  };
+  it.each(Object.keys(actionCases))('%s disable fixtures cover exactly the declared actions', (group) => {
+    expect(Object.keys(actionCases[group]).sort()).toEqual(Object.keys(CLASSIFY_DEFAULTS[group]).sort());
+  });
   it('a state forced to the operator never reaches an automatic lane', () => {
     expect(at('fixing', { settings: { stateLanes: { fixing: 'operator' } } })).toMatchObject({ lane: 'operator', action: 'tooling-card' });
     expect(at('ruling-needed:red-team-round-cap', { verdict: verdict('grant'), settings: { stateLanes: { 'ruling-needed:red-team-round-cap': 'operator' } } }).lane).toBe('operator');
     expect(at('fixing', { settings: { stateLanes: { fixing: 'auto' } } }).lane).toBe('system');
   });
-  it.each([['systemActions', 'tooling-card', 'fixing', null], ['systemActions', 'ask-review-daemon', 'awaiting-review', null],
-    ['policyActions', 'grant', 'ruling-needed:red-team-round-cap', 'grant'], ['policyActions', 'block', 'ruling-needed:red-team-round-cap', 'send-back'],
-    ['policyActions', 'card', 'ruling-needed:referral-hold', 'card-the-rest']])('%s.%s off sends it to the operator', (group, action, state, v) => {
-    const o = { settings: { [group]: { [action]: false } }, card, ...(v ? { verdict: verdict(v, TRIGGER[state]) } : {}) };
-    const r = at(state, o);
+  it.each(Object.keys(actionCases).flatMap((group) => Object.keys(CLASSIFY_DEFAULTS[group]).map((action) => [group, action])))
+  ('%s.%s off sends it to the operator', (group, action) => {
+    const [state, v, settings = {}] = actionCases[group][action];
+    const o = { settings, card, ...(v ? { verdict: verdict(v, TRIGGER[state]) } : {}) };
+    expect(at(state, o)).toMatchObject({ lane: group === 'systemActions' ? 'system' : 'policy', action });
+    const r = at(state, { ...o, settings: { ...settings, [group]: { [action]: false } } });
     expect([r.lane, r.action]).toEqual(['operator', action]);
     expect(r.reason).toMatch(/setting/);
     expect(typeof r.command).toBe('string');

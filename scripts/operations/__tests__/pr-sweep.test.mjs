@@ -31,6 +31,45 @@ const mkPr = (o) => ({ repo: REPO, number: 5485, title: 't', isDraft: false, hea
 const sweep = (prs, extra = {}) => assessPrSweep({ now: NOW, stalledAfterMinutes: 45, prs, liveJobs: [], drainSkips: [], ...extra });
 const row = (report, n) => report.prs.find((r) => r.number === n);
 
+describe('repair process identity at a terminal stand-down', async () => {
+  const { buildStandDownComment } = await import('../../conveyor/stand-down.mjs');
+  const stoppedAt = Date.parse('2026-10-21T11:00:00Z');
+  const pr = mkPr({ labels: L('review:changes'), comments: [c('web-everything', new Date(stoppedAt).toISOString(),
+    buildStandDownComment({ reason: 'gate-red', detail: 'verify red' }))] });
+  const laterJob = { pr: pr.number, startedAt: stoppedAt + 60_000 };
+  const kinds = ['fix-run', 'ci-heal', 'deliver-item-run'];
+  it.each(kinds.flatMap((kind) => [undefined, null, '', 'o/other'].map((repo) => [kind, repo])))
+  ('an unknown-repository or mismatched %s repair process cannot revive a stand-down: %s', (kind, repo) => {
+    expect(row(sweep([pr], { liveJobs: [{ ...laterJob, kind, repo }] }), pr.number)).toMatchObject({
+      waitingOn: 'system:fix-stood-down', stalled: true, liveJob: null,
+    });
+  });
+  it.each(kinds)('a later %s repair process in the same repository revives the stand-down', (kind) => {
+    expect(row(sweep([pr], { liveJobs: [{ ...laterJob, kind, repo: REPO }] }), pr.number))
+      .toMatchObject({ waitingOn: 'fixing', stalled: false, liveJob: kind });
+  });
+  it.each(['--repo=o/other', '--repo o/other', '--pr=9999', '--pr 9999', '--repo=', '--pr='])
+  ('ambiguous process identity cannot revive a stand-down: %s', (extra) => {
+    // The real fixer uses the last flag; ps must not credit its first identity to this PR.
+    const jobs = parseLiveJobs(`123 00:01 node scripts/conveyor/fix-run.mjs --pr=${pr.number} --repo=${REPO} ${extra}`, NOW);
+    expect(jobs).toEqual([]);
+    expect(row(sweep([pr], { liveJobs: jobs }), pr.number))
+      .toMatchObject({ waitingOn: 'system:fix-stood-down', stalled: true, liveJob: null });
+  });
+  it.each([`--pr=${pr.number}x --repo=${REPO}`, `--pr=${pr.number} --repo=${REPO}!`])
+  ('a malformed process identity cannot revive a stand-down: %s', (flags) => {
+    const jobs = parseLiveJobs(`123 00:01 node scripts/conveyor/fix-run.mjs ${flags}`, NOW);
+    expect(row(sweep([pr], { liveJobs: jobs }), pr.number))
+      .toMatchObject({ waitingOn: 'system:fix-stood-down', stalled: true, liveJob: null });
+  });
+  it.each([['another PR', { pr: pr.number + 1 }], ['undated', { startedAt: undefined }],
+    ['earlier', { startedAt: stoppedAt - 1 }], ['simultaneous', { startedAt: stoppedAt }]])
+  ('a matching repository does not revive a stand-down with %s work', (_name, patch) => {
+    expect(row(sweep([pr], { liveJobs: [{ ...laterJob, kind: 'fix-run', repo: REPO, ...patch }] }), pr.number))
+      .toMatchObject({ waitingOn: 'system:fix-stood-down', stalled: true, liveJob: null });
+  });
+});
+
 const hold = c('plateau-worker[bot]', '2026-10-21T02:24:21Z',
   'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back\n\n<!-- review-referral-hold: efb6cc81e16fce34ed263b83c6473009fc7e040a7fa67d80810639908a2ea701 -->');
 

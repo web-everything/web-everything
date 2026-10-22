@@ -149,6 +149,8 @@ export function needsDecisionOpen(comments, { headCommittedAt = null } = {}) {
  * Returns `{at, reason}` (the marker's machine reason, else its prose clause) or null.
  */
 const REPAIR_JOBS = new Set(['fix-run', 'ci-heal', 'deliver-item-run']);
+// PR numbers are repository-local: an unknown repository cannot prove work on this PR.
+const jobMatchesPr = (job, pr) => Number(job.pr) === pr.number && !!job.repo && job.repo === pr.repo;
 export function fixStoodDown(pr, { liveJobs = [], lapseOnNewHead } = {}) {
   let sd = null;
   const list = sorted(pr.comments);
@@ -161,7 +163,7 @@ export function fixStoodDown(pr, { liveJobs = [], lapseOnNewHead } = {}) {
   // An undated stand-down still counts (the daemon counts it); nothing can be proven to come after it.
   if (sd.at !== null && list.some((e) => e.at !== null && e.at > sd.at && trusted(e) && (FIX_BEGIN_RE.test(bodyOf(e.c)) || REARM_RE.test(bodyOf(e.c))))) return null;
   // Only REPAIR work started after the marker revives it (a reviewer, or a job from before it, does not).
-  if ((liveJobs ?? []).some((j) => REPAIR_JOBS.has(j.kind) && Number(j.pr) === pr.number && (!j.repo || j.repo === pr.repo)
+  if ((liveJobs ?? []).some((j) => REPAIR_JOBS.has(j.kind) && jobMatchesPr(j, pr)
     && sd.at !== null && Number.isFinite(j.startedAt) && j.startedAt > sd.at)) return null;
   return { at: sd.at, reason: standDownTrailerReason(bodyOf(sd.c)) ?? standDownReason(bodyOf(sd.c)) ?? 'unknown' };
 }
@@ -382,7 +384,7 @@ export function humanReviewHold(pr, now, { fixClaimLive = null } = {}) {
 /** The live jobs that cover this PR: ps processes naming its repo and number, plus an open fix claim. PURE. */
 export function jobsFor(pr, liveJobs, now) {
   // A PR number alone cannot identify a repository; unknown-repo processes cannot prove activity here.
-  const mine = (liveJobs ?? []).filter((j) => Number(j.pr) === pr.number && j.repo && j.repo === pr.repo);
+  const mine = (liveJobs ?? []).filter((j) => jobMatchesPr(j, pr));
   const claim = openFixClaim(pr.comments, now);
   return claim ? [...mine, { kind: 'fix', source: 'fix-claim comment', pr: pr.number, at: claim.at }] : mine;
 }
