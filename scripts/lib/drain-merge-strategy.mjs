@@ -260,10 +260,10 @@ export function createDrainMergeStrategy({
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null, readReviewAgents = listAgentsWithReviewJobs,
-  redTeamDeadline, // resolved redTeam.deadlineAction; otherwise read from the cascade
-  publishNeedsYou, // real operator feed outside tests; injectable for tests
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
   readGrantScope = standingRulingScope, // PR #5758: the verified standing-ruling scope the red-team gate also reads
+  redTeamDeadline, // resolved redTeam.deadlineAction (test seam); read from the cascade when absent
+  publishNeedsYou, // operator note publisher; the real needs-you feed outside a test run
 } = {}) {
   const { policy, note } = resolved;
   // The red-team readers credit an automatic round grant exactly as the gate does; unreadable = no automatic credit.

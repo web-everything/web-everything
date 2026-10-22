@@ -18,6 +18,8 @@ import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team
 
 import { publishAttention } from '../../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../under-test.mjs';
+// The real operator feed is never written from this file: every test either injects a publisher or relies on the
+// test-run guard, and the guard's own tests assert against this stand-in.
 vi.mock('../../operations/needs-you-feed.mjs', async importOriginal => ({ ...(await importOriginal()), publishAttention: vi.fn() }));
 
 const HEAD = 'b'.repeat(40);
