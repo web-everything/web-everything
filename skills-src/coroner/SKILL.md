@@ -52,6 +52,13 @@ node scripts/operations/coroner-extract.mjs --since=<ISO|last> --json > "$SCRATC
 - Other metrics: session minutes by kind, share inside gate commands, verify-lane median/p90, wait-timeouts, direct vitest,
   heavy slot holds by kind, marker admission wait, reaped waiters, denials by type, loops, verify-daemon
   kills/supersedes (untimestamped tail), top PRs by session time, refusal reasons and refusals by PR.
+- `orchestrator` streams main-session JSONL into per-session and total corrections, ruling misses, wasted turns,
+  tokens per outcome and compaction fallout. Quotes are redacted and capped at 160 characters.
+  Add `orchestrator.frictions` to the ranking table and apply step 3’s evidence-based NEW vs COVERED-BY judgment.
+  Their `UNJUDGED` status awaits that judgment; `candidateCoveredBy` is only a keyword-match hint to check.
+  Reads are capped by `WE_CORONER_ORCH_FILE_CAP` (1 GiB) and `WE_CORONER_ORCH_TOTAL_CAP` (2 GiB); check `truncated` and `dropped` before interpreting counts.
+  Use `--orchestrator-session=<id>` to scope, `--no-orchestrator` / `WE_CORONER_NO_ORCH` to skip;
+  `WE_CORONER_ORCH_DIR` overrides the default `<WE_CORONER_PROJECTS>/<repo-root-with-slashes-as-hyphens>`.
 
 ## 2. Error rates first, then rank
 

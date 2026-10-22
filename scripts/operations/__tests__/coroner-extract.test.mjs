@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { builderMetrics, ciCheckName, collectInputs, extractMetrics, fetchCiRuns, fixOutcome, gateCause, parseMarkers, parsePlistXml, resolveDaemonLog, parseTranscript, percentile, rateMetric, readBounded, runCoroner } from '../coroner-extract.mjs';
+import { builderMetrics, ciCheckName, collectInputs, extractMetrics, fetchCiRuns, fixOutcome, gateCause, parseMarkers, parsePlistXml, resolveDaemonLog, parseTranscript, percentile, rateMetric, readBounded, runCoroner, runCoronerWithOrchestrator } from '../coroner-extract.mjs';
 
 const since = '2026-10-05T17:00:00.000Z', until = '2026-10-05T18:00:00.000Z';
 const at = (minutes) => new Date(Date.parse(since) + minutes * 60000).toISOString();
@@ -26,6 +28,84 @@ beforeEach(() => {
   env = Object.fromEntries(['JOBS', 'JOBS_ARCHIVE', 'PROJECTS', 'DAEMON_DIR', 'VERIFY_LOG', 'ADMISSION', 'LANES', 'STATE', 'COORD', 'BACKLOG'].map((key) => [`WE_CORONER_${key}`, join(root, key.toLowerCase())]));
 });
 afterEach(() => { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); });
+
+describe('orchestrator CLI path', () => {
+  it.each(['partial', 'error'])('warns on stderr for an orchestrator %s result', (mode) => {
+    const dir = join(root, 'sessions');
+    const file = write(join(dir, 'denied.jsonl'), '{}\n');
+    const preload = write(join(root, 'deny-transcript.mjs'), `
+      import fs from 'node:fs';
+      const file = ${JSON.stringify(file)}, dir = ${JSON.stringify(dir)};
+      const createReadStream = fs.createReadStream;
+      const readdirSync = fs.readdirSync;
+      fs.createReadStream = (path, options) => path !== file ? createReadStream(path, options)
+        : createReadStream(path, { ...options, fs: { ...fs, open(_p, _f, _m, cb) {
+          queueMicrotask(() => cb(Object.assign(new Error('private transcript failure'), { code: 'EACCES' })));
+        } } });
+      if (${JSON.stringify(mode)} === 'error') fs.readdirSync = (path, ...args) => path === dir ? [null] : readdirSync(path, ...args);
+    `);
+    const child = spawnSync(process.execPath, ['--import', preload,
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'coroner-extract.mjs'),
+      `--since=${since}`, `--until=${until}`, '--json'], {
+      encoding: 'utf8', env: { ...process.env, ...env, HOME: root, WE_CORONER_NO_CI: '1',
+        WE_CORONER_NO_ORCH: '', WE_CORONER_ORCH_DIR: dir,
+        RULINGS_DIGEST_PATH: join(root, 'rulings.md'), FIX_READY_STORE: join(root, 'fix-ready.jsonl'),
+        HEALTH_WATCH_SELF_SYNC_DIR: join(root, 'sync') },
+    });
+    expect(child.status).toBe(0);
+    const orchestrator = JSON.parse(child.stdout).orchestrator;
+    if (mode === 'partial') {
+      expect(orchestrator).toMatchObject({ partial: true, errors: [{ file: 'denied.jsonl', code: 'EACCES' }] });
+      expect(JSON.parse(fs.readFileSync(env.WE_CORONER_STATE, 'utf8')).lastEnd).toBe(until);
+    } else expect(orchestrator.error).toEqual(expect.any(String));
+    expect(child.stderr).toContain('warning: orchestrator collection is incomplete');
+    expect(child.stderr).not.toContain('private transcript failure');
+  });
+
+  it('rejects invalid session ids before changing the cursor', () => {
+    const previous = '{"lastEnd":"unchanged"}\n';
+    write(env.WE_CORONER_STATE, previous);
+    expect(() => runCoroner([`--since=${since}`, '--orchestrator-session=../invalid'], { env, home: root, now: until }))
+      .toThrow('invalid orchestrator session id');
+    expect(fs.readFileSync(env.WE_CORONER_STATE, 'utf8')).toBe(previous);
+  });
+
+  it('returns a bounded collection error and preserves the cursor on failure', async () => {
+    write(env.WE_CORONER_STATE, 'previous');
+    const badEnv = { ...env, WE_CORONER_NO_CI: '1', WE_CORONER_ORCH_DIR: join(root, 'sessions') };
+    // A malformed directory entry triggers an unexpected collection error; ordinary missing dirs are optional.
+    const io = { ...fs, readdirSync(dir, ...args) {
+      return dir === badEnv.WE_CORONER_ORCH_DIR ? [null] : fs.readdirSync(dir, ...args);
+    } };
+    const result = await runCoronerWithOrchestrator([`--since=${since}`, '--json'], {
+      env: badEnv, home: root, now: until, io,
+    });
+    expect(result.metrics.orchestrator.error).toEqual(expect.any(String));
+    expect(result.metrics.orchestrator.error.length).toBeLessThanOrEqual(160);
+    expect(JSON.parse(result.output).orchestrator).toEqual(result.metrics.orchestrator);
+    expect(fs.readFileSync(env.WE_CORONER_STATE, 'utf8')).toBe('previous');
+  });
+
+  it('searches merged PRs independently of the opened cohort through the CLI path', async () => {
+    const calls = [];
+    const gh = (args) => {
+      calls.push(args);
+      if (args.includes('--state') && args[args.indexOf('--state') + 1] === 'merged') {
+        return [{ number: 42, mergedAt: at(1) }, { number: 43, mergedAt: at(2) }];
+      }
+      return [];
+    };
+    const result = await runCoronerWithOrchestrator([`--since=${since}`, '--json', '--no-save'], {
+      env, home: root, now: until, gh,
+    });
+    const searches = calls.filter((args) => args.includes('merged'));
+    expect(searches).toHaveLength(1);
+    expect(searches[0]).toContain(`merged:${since}..${until}`);
+    expect(searches[0]).toContain('--limit');
+    expect(result.metrics.orchestrator.totals.tokensPerOutcome).toMatchObject({ mergedPrs: 2, outcomes: 2, outcomesPartial: false });
+    expect(JSON.parse(result.output).orchestrator.totals.tokensPerOutcome.mergedPrs).toBe(2);
+  });
+});
 
 describe('card 130 S2 outcome labels', () => {
   const state = { state: 'stopped', detail: 'stopped' };
