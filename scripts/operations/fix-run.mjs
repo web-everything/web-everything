@@ -501,6 +501,7 @@ export function ensureLaneHead({ lanePath, prHead, holder, sessionSlug, ref, lan
       run('node', [
         resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'acquire',
         `--lane=${basename(lanePath).replace(/^lane-/, '')}`, `--session=${sessionSlug}`,
+        ...(typeof holder === 'string' && holder.length > 0 ? [`--expect-holder=${holder}`] : []),
         '--purpose=conveyor-fix', `--base=${ref}`, ...(laneRepo ? [`--repo=${laneRepo}`] : []),
       ], { cwd: weRoot, env: { ...laneGitHardeningEnv(process.env), LANE_SESSION: holder } });
       check = inspectLaneHead(options);

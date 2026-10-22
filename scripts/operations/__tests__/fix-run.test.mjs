@@ -165,7 +165,7 @@ describe('runFixCli', () => {
     expect((await runFixCli(argv, { ...m.io, run, readLease })).code).toBe(0);
     const recoveryIndex = m.calls.findIndex(c => c.includes('acquire') && c.includes('--lane=5'));
     expect(m.calls[recoveryIndex]).toEqual(['node', '/we/scripts/lane-pool.mjs', 'acquire',
-      '--lane=5', '--session=fix-7', '--purpose=conveyor-fix', '--base=lane/7-x', '--repo=/w']);
+      '--lane=5', '--session=fix-7', '--expect-holder=test-holder', '--purpose=conveyor-fix', '--base=lane/7-x', '--repo=/w']);
     expect(m.envs[recoveryIndex].LANE_SESSION).toBe('test-holder');
     expect(m.calls.slice(recoveryIndex + 1).some(c => c.includes('--verify') && c.includes('HEAD'))).toBe(true);
     expect(readLease.mock.calls.length).toBeGreaterThanOrEqual(3);
