@@ -12,23 +12,26 @@ afterEach(() => vi.unstubAllEnvs());
 
 const argv = ['--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--provider=codex', '--repo=o/r', '--lane-repo=/w'];
 function mk(heads, { merging: startMerging = false } = {}) {
+  const initialHead = heads.shift();
+  let preparedHead = initialHead;
   const calls = [];
   let merging = startMerging;
   const run = vi.fn((cmd, args, opts) => {
     calls.push([cmd, ...args]);
-    if (cmd === 'gh') return JSON.stringify({ title: 'T', body: 'B' });
-    if (args.includes('acquire')) return 'noise\n/lanes/lane-5\n';
+    if (cmd === 'gh') return JSON.stringify({ title: 'T', body: 'B', headRefOid: initialHead });
+    if (args.includes('acquire')) return JSON.stringify({ path: '/lanes/lane-5', holder: 'test-holder' });
     if (args.includes('--absolute-git-dir')) return tmpdir();
     if (args.includes('--git-path')) return merging ? 'MERGE_HEAD' : '';
     if (args.includes('merge')) merging = true;
-    if (args.includes('commit')) merging = false;
+    if (args.includes('commit')) { merging = false; preparedHead = heads[0] ?? initialHead; }
+    if (args.includes('--verify') && args.includes('HEAD')) return preparedHead;
     if (args[0] === 'rev-parse') return heads.shift();
     return '';
   });
   const spawn = vi.fn(async () => ({ finalMessage: 'done' }));
   const pendingRearm = { read: vi.fn(() => null), write: vi.fn(), clear: vi.fn() };
   const write = vi.fn();
-  return { calls, run, spawn, write, io: { recordPush: () => {}, run, pendingRearm,
+  return { calls, run, spawn, write, io: { readLease: () => ({ holder: 'test-holder' }), recordPush: () => {}, run, pendingRearm,
     readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }],
     releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {},
     removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write, writeErr: () => {},

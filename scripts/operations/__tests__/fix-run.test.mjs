@@ -88,14 +88,16 @@ describe('a codex borrow launches through fix-run with the filled brief', () => 
 describe('runFixCli', () => {
   const argv = ['--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--provider=codex', '--repo=o/r', '--lane-repo=/w'];
   const mk = (heads) => {
+    const initialHead = heads.shift();
     const calls = [];
     const envs = [];
     const run = vi.fn((cmd, args, opts) => {
       calls.push([cmd, ...args]);
       envs.push(opts?.env);
-      if (cmd === 'gh') return JSON.stringify({ title: 'T', body: 'B' });
-      if (args.includes('acquire')) return 'noise\n/lanes/lane-5\n';
+      if (cmd === 'gh') return JSON.stringify({ title: 'T', body: 'B', headRefOid: initialHead });
+      if (args.includes('acquire')) return JSON.stringify({ path: '/lanes/lane-5', holder: 'test-holder' });
       if (args.includes('--absolute-git-dir')) return tmpdir(); // the staging copy is made (and removed) under it
+      if (args.includes('--verify') && args.includes('HEAD')) return initialHead;
       if (args[0] === 'rev-parse') return heads.shift();
       return '';
     });
@@ -106,7 +108,7 @@ describe('runFixCli', () => {
       write: vi.fn((_r, _p, sha) => { owed.sha = sha; }),
       clear: vi.fn(() => { owed.sha = null; }),
     };
-    return { calls, envs, run, spawn, owed, pendingRearm, io: { recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
+    return { calls, envs, run, spawn, owed, pendingRearm, io: { readLease: () => ({ holder: 'test-holder' }), recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
   it.each([undefined, '42', '0'])('passes the acquire wait policy (%s)', async value => {
     if (value === undefined) vi.stubEnv('WE_FIX_RUN_ACQUIRE_WAIT_MS', '');
@@ -135,6 +137,39 @@ describe('runFixCli', () => {
       reason: '✗ lock contention: retry (lane-pool.mjs acquire)',
     }));
     expect(writeErr).toHaveBeenCalledWith(expect.stringContaining(error.message));
+  });
+  it.each([undefined, null, '', 42, {}])('releases the lane when acquire returns a malformed holder: %j', async holder => {
+    const m = mk(['aaa']);
+    const run = (cmd, args, opts) => {
+      if (args.includes('acquire')) {
+        m.calls.push([cmd, ...args]);
+        return JSON.stringify({ path: '/lanes/lane-5', holder });
+      }
+      return m.run(cmd, args, opts);
+    };
+    expect((await runFixCli(argv, { ...m.io, run })).code).toBe(1);
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.find(c => c.includes('release'))).toEqual(['node', '/we/scripts/lane-pool.mjs',
+      'release', '--repo=/w', '--lane=5', '--session=fix-7']);
+  });
+  it('passes the repository selector to recovery and re-reads the lease and head', async () => {
+    const m = mk(['aaa', 'aaa']);
+    let recovered = false;
+    const readLease = vi.fn(() => ({ holder: 'test-holder' }));
+    const run = (cmd, args, opts) => {
+      const value = m.run(cmd, args, opts);
+      if (args.includes('acquire') && args.includes('--lane=5')) recovered = true;
+      if (args.includes('--verify') && args.includes('HEAD') && !recovered) return 'old-head';
+      return value;
+    };
+    expect((await runFixCli(argv, { ...m.io, run, readLease })).code).toBe(0);
+    const recoveryIndex = m.calls.findIndex(c => c.includes('acquire') && c.includes('--lane=5'));
+    expect(m.calls[recoveryIndex]).toEqual(['node', '/we/scripts/lane-pool.mjs', 'acquire',
+      '--lane=5', '--session=fix-7', '--purpose=conveyor-fix', '--base=lane/7-x', '--repo=/w']);
+    expect(m.envs[recoveryIndex].LANE_SESSION).toBe('test-holder');
+    expect(m.calls.slice(recoveryIndex + 1).some(c => c.includes('--verify') && c.includes('HEAD'))).toBe(true);
+    expect(readLease.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(m.spawn).toHaveBeenCalledOnce();
   });
   it('records a no-change Argon outcome and resolves its provider', async () => {
     const m = mk(['aaa','aaa']), recordRouted = vi.fn(()=>({}));
@@ -297,7 +332,7 @@ describe('runFixCli', () => {
       let copied = null;
       const run = (cmd, args, opts) => {
         if (args.includes('status')) return ' M file.txt\0?? .fix-commit-msg.txt\0 D gone.txt\0';
-        if (args.includes('acquire')) return lane;
+        if (args.includes('acquire')) return JSON.stringify({ path: lane, holder: 'test-holder' });
         if (opts?.input !== undefined) inputs.push(String(opts.input));
         if (args.includes('add')) copied = { cwd: opts.cwd, text: readFileSync(join(opts.cwd, 'file.txt'), 'utf8') };
         return m.run(cmd, args, opts);
@@ -338,7 +373,7 @@ describe('runFixCli', () => {
     const run = (cmd, args, opts) => {
       if (cmd === 'gh' && args.includes('view')) {
         m.calls.push([cmd, ...args]);
-        return JSON.stringify({ title: 'T', body: 'B', baseRefName: 'develop', mergeable });
+        return JSON.stringify({ title: 'T', body: 'B', headRefOid: 'aaa', baseRefName: 'develop', mergeable });
       }
       return m.run(cmd, args, opts);
     };
@@ -517,7 +552,8 @@ describe('runFixCli', () => {
           if (args.includes('fetch') || args.includes('push')) return '';
           return execFileSync(cmd, args, { cwd: dir, env: { ...env, ...opts?.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: 'utf8', stdio: 'pipe', input: opts?.input });
         }
-        if (args.includes('acquire')) return dir;
+        if (args.includes('acquire')) return JSON.stringify({ path: dir, holder: 'test-holder' });
+        if (cmd === 'gh' && args.includes('view')) return JSON.stringify({ title: 'T', headRefOid: git('rev-parse', 'HEAD').trim() });
         return m.run(cmd, args, opts);
       };
       const out = await runFixCli([...argv, '--merge-onto=target'], { ...m.io, run });
@@ -536,7 +572,7 @@ describe('runFixCli', () => {
       if (cmd === 'gh' && args.includes('view')) {
         expect(['title,body,baseRefName,mergeable,headRefOid', 'headRefOid,labels,statusCheckRollup']).toContain(args[args.indexOf('--json') + 1]);
         m.calls.push([cmd, ...args]);
-        return JSON.stringify({ title: 'T', body: 'B', baseRefName: base });
+        return JSON.stringify({ title: 'T', body: 'B', headRefOid: 'aaa', baseRefName: base });
       }
       return m.run(cmd, args, opts);
     };
@@ -602,7 +638,8 @@ describe('runFixCli', () => {
           if (args.includes('fetch') || args.includes('push')) return '';
           return execFileSync(cmd, args, { cwd: dir, env: { ...env, ...opts?.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: 'utf8', stdio: 'pipe', input: opts?.input });
         }
-        if (args.includes('acquire')) return dir;
+        if (args.includes('acquire')) return JSON.stringify({ path: dir, holder: 'test-holder' });
+        if (cmd === 'gh' && args.includes('view')) return JSON.stringify({ title: 'T', headRefOid: git('rev-parse', 'HEAD').trim() });
         return m.run(cmd, args, opts);
       };
       const recordOutcome = vi.fn();
@@ -958,10 +995,9 @@ describe('runFixCli', () => {
   it('never runs merge --abort in the agent-writable lane after its git config changed', async () => {
     const m = mk(['aaa', 'aaa']);
     let merging = false;
-    let listed = 0;
     const run = (cmd, args, opts) => {
       m.calls.push([cmd, ...args]);
-      if (args.includes('--show-scope')) return listed++ === 0 ? 'local\0user.name=x\0' : 'local\0filter.x.smudge=evil\0';
+      if (args.includes('--show-scope')) return !m.spawn.mock.calls.length ? 'local\0user.name\nx\0' : 'local\0filter.x.smudge\nevil\0';
       if (args.includes('--git-path')) return 'MERGE_HEAD';
       if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
       if (args.includes('status')) return 'UU file.txt\0';
@@ -975,11 +1011,10 @@ describe('runFixCli', () => {
     // The same guard covers the crash path: the agent throws after rewriting the config.
     const m2 = mk(['aaa', 'aaa']);
     let merging2 = false;
-    let listed2 = 0;
     m2.spawn.mockImplementation(async () => { throw new Error('agent crashed'); });
     const run2 = (cmd, args, opts) => {
       m2.calls.push([cmd, ...args]);
-      if (args.includes('--show-scope')) return listed2++ === 0 ? 'local\0user.name=x\0' : 'local\0filter.x.smudge=evil\0';
+      if (args.includes('--show-scope')) return !m2.spawn.mock.calls.length ? 'local\0user.name\nx\0' : 'local\0filter.x.smudge\nevil\0';
       if (args.includes('--git-path')) return 'MERGE_HEAD';
       if (args.includes('merge') && args.includes('--no-commit')) { merging2 = true; throw new Error('conflicts'); }
       if (args.includes('status')) return 'UU file.txt\0';
@@ -1042,9 +1077,8 @@ describe('runFixCli', () => {
   });
   it('refuses to commit or push when the agent changed the lane git config', async () => {
     const m = mk(['aaa', 'aaa']);
-    let listed = 0;
     const run = (cmd, args, opts) => {
-      if (args.includes('--show-scope')) { m.calls.push([cmd, ...args]); return listed++ === 0 ? 'local\0user.name=x\0' : 'local\0core.sshcommand=evil\0'; }
+      if (args.includes('--show-scope')) { m.calls.push([cmd, ...args]); return !m.spawn.mock.calls.length ? 'local\0user.name\nx\0' : 'local\0core.sshcommand\nevil\0'; }
       if (args.includes('status')) return ' M file.txt\0';
       return m.run(cmd, args, opts);
     };
@@ -1310,13 +1344,12 @@ describe('runFixCli', () => {
   });
   it('refuses to push when the agent changed the lane repo-local git config (remote url, sshCommand, insteadOf...)', async () => {
     const calls = [];
-    let cfg = 0;
     const run = vi.fn((cmd, args) => {
       calls.push([cmd, ...args]);
-      if (cmd === 'gh') return '{}';
-      if (args.includes('acquire')) return '/lanes/lane-5';
-      if (args[0] === 'rev-parse') return cfg++ ? 'bbb' : 'aaa';
-      if (args[0] === 'config') return calls.filter((c) => c[1] === 'config').length === 1 ? 'remote.origin.url=https://x/r' : 'remote.origin.url=https://evil/r';
+      if (cmd === 'gh') return JSON.stringify({ headRefOid: 'aaa' });
+      if (args.includes('acquire')) return JSON.stringify({ path: '/lanes/lane-5', holder: 'test-holder' });
+      if (args.includes('rev-parse')) return m.spawn.mock.calls.length ? 'bbb' : 'aaa';
+      if (args.includes('config')) return !m.spawn.mock.calls.length ? 'local\0remote.origin.url\nhttps://x/r\0' : 'local\0remote.origin.url\nhttps://evil/r\0';
       return '';
     });
     const m = mk([]);
