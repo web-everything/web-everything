@@ -2052,6 +2052,11 @@ to seed fresh synthetic App caches under their disposable home. Keep personal fa
 the real guard and per-owner routing must still run before listing, freeze, or merge assertions.
 Each fixture invocation also needs a fresh throttle ledger, even when it reuses a home:
 fake merges consume the real per-minute write budget and can make later scenarios wait.
+The synthetic CLI fixture gives fake writes a larger budget: a three-repo drain provisions
+42 labels before merging, exceeding the production budget of 40. Keep accounting and the
+auth guard enabled. App-enabled soak worlds must use numeric installation IDs in their
+owner map and rotate both the legacy and per-installation caches together; otherwise the
+guard cannot route the refreshed token and an expiry probe becomes an unrelated auth refusal.
 On an App-token rejection, keep gh's original stderr before the daemon refusal diagnostic,
 so callers that read the first error line still report GitHub's actual cause.
 The simulator binds its synthetic `sim-token-1` to matching App-token provenance; its fake

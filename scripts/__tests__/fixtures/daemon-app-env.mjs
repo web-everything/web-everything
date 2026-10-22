@@ -24,6 +24,9 @@ export function daemonAppEnv(home) {
     // Each CLI scenario gets its own real throttle ledger, including scenarios that reuse a home.
     // Fake mutations must not spend a later scenario's per-minute write budget.
     WE_GH_THROTTLE_LOCK_ROOT: join(home, `gh-throttle-${randomUUID()}`),
+    // Three-repo drains provision 42 labels before merging. Account for every fake write without
+    // waiting a production minute (the default budget is 40); retain the real throttle and guard.
+    WE_GH_THROTTLE_WRITE_BUDGET_PER_MIN: '1000',
     GH_TOKEN: '', GITHUB_TOKEN: '', GH_HOST: 'github.com', GH_REPO: '',
     WE_GITHUB_AUTH: 'app', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_DELIVERY_IDENTITY: 'none',
     WE_GITHUB_APP_ID: appId, WE_GITHUB_APP_INSTALLATION_ID: installationId,
