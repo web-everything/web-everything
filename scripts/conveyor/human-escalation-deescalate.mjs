@@ -204,17 +204,26 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   // EVERY review:human add since the operator last took the label off must be explained by its own record: an
   // earlier unexplained add (a drain park, a rule-required hold) may be a cause nobody has answered yet. A record
   // from an earlier label lifecycle (before the removal preceding that add) never explains it.
+  // Each record explains at most ONE add, and only inside that add's own lifecycle: after the removal before it and
+  // before the next review:human event after it.
+  const used = new Set();
   const explained = (add, index) => {
     const at = time(add.createdAt);
-    const priorRemoval = timeline.items.slice(0, index).filter(i => i.label === REVIEW_LABELS.human && i.change === 'removed').at(-1);
+    const human = i => i.label === REVIEW_LABELS.human;
+    const priorRemoval = timeline.items.slice(0, index).filter(i => human(i) && i.change === 'removed').at(-1);
+    const nextEvent = timeline.items.slice(index + 1).find(human);
     const from = Math.max(at - ATTRIBUTION_SKEW_MS, priorRemoval ? time(priorRemoval.createdAt) + 1 : -Infinity);
-    return escalations.some(e => { const t = time(e.createdAt);
-      return e.added !== false && login(e.author) === login(add.actor) && t >= from && t <= at + ATTRIBUTION_AFTER_MS; });
+    const to = Math.min(at + ATTRIBUTION_AFTER_MS, nextEvent ? time(nextEvent.createdAt) - 1 : Infinity);
+    const record = escalations.find(e => { const t = time(e.createdAt);
+      return !used.has(e) && e.added !== false && login(e.author) === login(add.actor) && t >= from && t <= to; });
+    if (record) used.add(record);
+    return !!record;
   };
   const adds = timeline.items.map((item, index) => ({ item, index }))
     .filter(({ item, index }) => item.label === REVIEW_LABELS.human && item.change === 'added' && index > handRemovalIndex);
-  if (!adds.length || !explained(last, timeline.items.lastIndexOf(last))) return keep('no escalation record by the labelling login at the review:human add');
+  // Oldest first, so a record is claimed by the add it follows.
   const unexplained = adds.find(({ item, index }) => !explained(item, index));
+  if (!adds.length || unexplained?.item === last) return keep('no escalation record by the labelling login at the review:human add');
   if (unexplained) return keep(`an earlier review:human add (${unexplained.item.createdAt}) since the operator's last removal has no escalation record`);
   const since = escalations.filter(e => time(e.createdAt) >= windowStart);
   const kinds = [...new Set(since.map(e => e.kind))];
@@ -244,6 +253,10 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   // 4. No human-only change.
   if (!net?.ok || !Array.isArray(net.files) || !net.files.length || !net.files.every(f => typeof f === 'string' && f))
     return keep(`net file set unreadable (${net?.reason ?? 'no read'})`);
+  // The hunk lookup reads `a => b` / `{a => b}` as rename notation, and quoting changes a header's spelling: a file
+  // name outside a plain path alphabet could be matched to another file's hunks. Hold rather than guess.
+  const oddName = net.files.find(f => !/^[A-Za-z0-9._@+\-]+(?:\/[A-Za-z0-9._@+\-]+)*$/.test(f));
+  if (oddName) return keep(`a net file name outside the plain path alphabet (${JSON.stringify(oddName).slice(0, 80)})`);
   let score;
   // The net diff TEXT too: permission surfaces (a sandbox grant in any script), statute anchors and marked invariants
   // are judged from the hunks, so file names alone cannot rule them out.

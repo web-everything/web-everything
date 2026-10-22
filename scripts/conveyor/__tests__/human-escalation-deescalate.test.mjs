@@ -187,6 +187,16 @@ describe('planHumanDeescalation', () => {
     const first = bot(buildHumanEscalationComment({ kind: K.REFERRAL_PENDING, head: HEAD }), -899_000);
     expect(plan({ timeline: { status: 'ok', items }, pr: { comments: [first, pendingRecord()] } }).action).toBe('deescalate');
   });
+  it('one record explains one add, inside its own lifecycle (never an earlier add it followed a removal of)', () => {
+    const items = [added(BOT, -120_000), { ...added(BOT, -60_000), change: 'removed' }, added()];
+    // The only record follows the LAST add; the first add (an unstamped hold) stays unexplained.
+    expect(plan({ timeline: { status: 'ok', items }, pr: { comments: [pendingRecord(1_000)] } }).reason).toMatch(/earlier review:human add/);
+  });
+  it('a net file name outside the plain path alphabet (rename notation, quotes, spaces) → kept', () => {
+    for (const odd of ['scripts/payload => innocuous.mjs', 'scripts/{a => b}.mjs', 'scripts/sp ace.mjs', 'scripts/"q".mjs']) {
+      expect(plan({ net: netOf(['scripts/conveyor/foo.mjs', odd]) }).reason, odd).toMatch(/plain path alphabet/);
+    }
+  });
   it('an added=no record never explains an add, even of a clearable kind', () => {
     const noop = bot(`Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: x.\n\n${buildHumanEscalationMarker({ kind: K.REFERRAL_LEDGER_SYNC_FAILED, head: HEAD, added: false })}`, 20_000);
     expect(plan({ pr: { comments: [noop] } }).reason).toMatch(/no escalation record/);
