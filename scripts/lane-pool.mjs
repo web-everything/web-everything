@@ -1238,7 +1238,7 @@ function liveRemoteShasProbe(repo) {
     // Explicit local pool origins are supported too. Permit file transport only for that canonical
     // path, in this isolated process; lane protocol settings never participate in this decision.
     // GIT_ALLOW_PROTOCOL overrides even per-protocol inherited config and a parent's wider allowlist.
-    env.GIT_ALLOW_PROTOCOL = 'https:ssh';
+    env.GIT_ALLOW_PROTOCOL = 'https:http:git:ssh';
     if (remote.startsWith('/') || remote.startsWith('file://')) {
       env.GIT_ALLOW_PROTOCOL += ':file';
       const i = Number(env.GIT_CONFIG_COUNT);

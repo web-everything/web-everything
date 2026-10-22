@@ -49,16 +49,35 @@ it('read-only regression: ordinary hardened callers retain their transport polic
   expect(laneGitConfigArgs().some(arg => arg.startsWith('protocol.'))).toBe(false);
 });
 
-it.each(['https://example.com/pool.git', 'ssh://example.com/pool.git', 'git@example.com:pool.git',
-  '/canonical/pool.git', 'file:///canonical/pool.git', './canonical/pool.git'])(
-  'remote probe isolates lane config and uses the canonical pool URL %s', (originUrl) => {
+// --origin accepts arbitrary Git URLs. Built-in HTTP/Git/SSH and local transports are supported;
+// other schemes (including executable remote helpers) must fail closed even if inherited config allows them.
+it.each([
+  ['https://example.com/pool.git', 'https', true],
+  ['http://example.com/pool.git', 'http', true],
+  ['git://example.com/pool.git', 'git', true],
+  ['ssh://example.com/pool.git', 'ssh', true],
+  ['git@example.com:pool.git', 'ssh', true],
+  ['/canonical/pool.git', 'file', true],
+  ['file:///canonical/pool.git', 'file', true],
+  ['./canonical/pool.git', 'file', true],
+  ['ftp://example.com/pool.git', 'ftp', false],
+  ['ftps://example.com/pool.git', 'ftps', false],
+  ['rsync://example.com/pool.git', 'rsync', false],
+  ['ext::sh -c echo', 'ext', false],
+  ['custom::pool', 'custom', false],
+])(
+  'remote probe isolates lane config: %s (%s supported=%s)', (originUrl, protocol, supported) => {
   const source = /function liveRemoteShasProbe\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
   const calls = [], removed = [];
   const inherited = { GIT_DIR: '/lane/.git', GIT_COMMON_DIR: '/lane/.git', GIT_WORK_TREE: '/lane',
     GIT_CONFIG: '/lane/.git/config', GIT_CONFIG_PARAMETERS: "'protocol.allow=always'" };
   const probe = new Function('tryGit', 'mkdtempSync', 'tmpdir', 'join', 'dirname', 'rmSync', 'laneGitHardeningEnv', 'process', 'resolve',
     `${source}; return liveRemoteShasProbe;`)(
-    (...args) => { calls.push(args); return 'abc refs/heads/trunk'; },
+    (...args) => {
+      calls.push(args);
+      // Model Git's final transport allowlist without network access or repository writes.
+      return args[2].env.GIT_ALLOW_PROTOCOL.split(':').includes(protocol) ? 'abc refs/heads/trunk' : null;
+    },
     () => '/isolated/probe', () => '/isolated', join, () => '/isolated',
     (dir) => removed.push(dir), laneGitHardeningEnv, { env: { ...inherited,
       GIT_ALLOW_PROTOCOL: 'ext:file:http', GIT_CONFIG_COUNT: '1',
@@ -66,7 +85,7 @@ it.each(['https://example.com/pool.git', 'ssh://example.com/pool.git', 'git@exam
     } }, resolve,
   );
   const repo = { originUrl };
-  expect([...probe(repo).shas]).toEqual(['abc']);
+  expect(probe(repo)).toEqual({ ok: supported, shas: new Set(supported ? ['abc'] : []) });
   const [args, cwd, options] = calls[0];
   expect(args).toEqual(['ls-remote', '--heads', '--', originUrl.startsWith('.') ? resolve(originUrl) : originUrl]);
   expect(cwd).toBe('/isolated/probe');
@@ -78,8 +97,10 @@ it.each(['https://example.com/pool.git', 'ssh://example.com/pool.git', 'git@exam
   expect(config['protocol.file.allow']).toBe(localOrigin ? 'always' : undefined);
   expect(config['protocol.allow']).toBe('never');
   expect(config['protocol.https.allow']).toBe('always');
+  expect(config['protocol.http.allow']).toBe('always');
+  expect(config['protocol.git.allow']).toBe('always');
   expect(config['protocol.ssh.allow']).toBe('always');
-  expect(options.env.GIT_ALLOW_PROTOCOL).toBe(localOrigin ? 'https:ssh:file' : 'https:ssh');
+  expect(options.env.GIT_ALLOW_PROTOCOL).toBe(localOrigin ? 'https:http:git:ssh:file' : 'https:http:git:ssh');
   expect(options.timeout).toBe(20000);
   expect(removed).toEqual(['/isolated/probe']);
 });

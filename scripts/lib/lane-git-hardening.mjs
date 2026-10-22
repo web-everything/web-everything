@@ -37,6 +37,8 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
 const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
   ['protocol.allow', 'never'],
   ['protocol.https.allow', 'always'],
+  ['protocol.http.allow', 'always'],
+  ['protocol.git.allow', 'always'],
   ['protocol.ssh.allow', 'always'],
 ]);
 
