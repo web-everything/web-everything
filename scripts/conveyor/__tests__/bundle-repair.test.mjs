@@ -2,7 +2,7 @@
 // build by an overlay conflict. Pins the trigger thresholds, one repair per clone, the kill switch, the brief never
 // carrying a forbidden command, and the escalation path.
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -11,7 +11,7 @@ import {
   planBundleRepairs, planReconcile, validateOutcome,
 } from '../bundle-repair-core.mjs';
 import {
-  defaultLock, fillRepairBrief, ledgerPath, outcomePath, readLedger, recordOutcome, repairSettingsEnv, resolveBundleRepairSettings,
+  defaultLock, fillRepairBrief, ledgerPath, outcomePath, readLedger, recordOutcome, repairSettingsEnv, resolveBundleRepairSettings, readHostPlatformBundleRepair,
   runBundleRepairs, workerSpawnEnv,
 } from '../bundle-repair-dispatch.mjs';
 
@@ -463,8 +463,136 @@ describe('settings via the cascade', () => {
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/^policy-cascade · bundleRepair: .*enabled=true \(env\)/));
   });
 
-  it('the committed tool file ships disabled, in shadow', () => {
+  it('the committed tool file never sets enabled/mode — those defaults live in the standard layer only', () => {
     const file = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/bundle-repair.json'), 'utf8'));
-    expect(file.bundleRepair).toMatchObject({ enabled: false, mode: 'shadow' });
+    expect(Object.hasOwn(file.bundleRepair, 'enabled')).toBe(false);
+    expect(Object.hasOwn(file.bundleRepair, 'mode')).toBe(false);
+    expect(BUNDLE_REPAIR_STANDARD).toMatchObject({ enabled: false, mode: 'shadow' });
+  });
+
+  const hostFile = (obj) => {
+    const d = mkdtempSync(join(tmpdir(), 'br-plat-'));
+    const p = join(d, 'platform-preferences.json');
+    writeFileSync(p, typeof obj === 'string' ? obj : JSON.stringify(obj));
+    return p;
+  };
+
+  it('platform enabled → enabled, sourced from the platform layer (the host platform-preferences file), over the real tool file', async () => {
+    const path = hostFile({ heavyAdmission: { cap: 3 }, bundleRepair: { enabled: true, mode: 'shadow' } });
+    const log = vi.fn();
+    const r = await resolveBundleRepairSettings({ env: { WE_PLATFORM_PREFERENCES: path, WE_POLICY_CASCADE_LOG: '1' }, log });
+    expect(r.settings).toMatchObject({ enabled: true, mode: 'shadow' });
+    expect(r.sources).toMatchObject({ enabled: 'platform', mode: 'platform', triggerMinutes: 'tool' });
+    expect(r.invalid).toEqual([]);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^policy-cascade · bundleRepair: enabled=true \(platform\)/));
+  });
+
+  it('the env kill switch still wins over a platform enable', async () => {
+    const path = hostFile({ bundleRepair: { enabled: true, mode: 'live' } });
+    const r = await resolveBundleRepairSettings({ env: { WE_PLATFORM_PREFERENCES: path, WE_BUNDLE_REPAIR_ENABLED: '0', WE_POLICY_CASCADE_LOG: '0' } });
+    expect(r.settings.enabled).toBe(false);
+    expect(r.sources.enabled).toBe('env');
+    expect(r.sources.mode).toBe('platform');
+  });
+
+  it('the host file: default path is the real user home; missing = not set; unreadable/invalid named, never enables', async () => {
+    const reads = [];
+    const out = readHostPlatformBundleRepair({ env: {}, home: '/h', underTest: false, readFile: (p) => { reads.push(p); return '{"bundleRepair":{"enabled":true}}'; } });
+    expect(reads).toEqual(['/h/.claude/platform-preferences.json']);
+    expect(out.block).toEqual({ enabled: true });
+    expect(readHostPlatformBundleRepair({ env: {}, readFile: () => { throw new Error('must not read under test'); } })).toEqual({});
+    const enoent = Object.assign(new Error('nope'), { code: 'ENOENT' });
+    expect(readHostPlatformBundleRepair({ env: { WE_PLATFORM_PREFERENCES: '/x' }, readFile: () => { throw enoent; } }).block).toBeUndefined();
+    const bad = await resolveBundleRepairSettings({ env: { WE_PLATFORM_PREFERENCES: hostFile('{torn'), WE_POLICY_CASCADE_LOG: '0' } });
+    expect(bad.settings.enabled).toBe(false);
+    expect(bad.sources.enabled).toBe('standard');
+    expect(bad.invalid.join()).toMatch(/platform: /);
+    const notObj = await resolveBundleRepairSettings({ env: { WE_PLATFORM_PREFERENCES: hostFile({ bundleRepair: true }), WE_POLICY_CASCADE_LOG: '0' } });
+    expect(notObj.settings.enabled).toBe(false);
+    expect(notObj.invalid.join()).toMatch(/not an object/);
+    const badLeaf = await resolveBundleRepairSettings({ env: { WE_PLATFORM_PREFERENCES: hostFile({ bundleRepair: { enabled: 'yes' } }), WE_POLICY_CASCADE_LOG: '0' } });
+    expect(badLeaf.settings.enabled).toBe(false);
+    expect(badLeaf.invalid.join()).toMatch(/platform\.enabled/);
+  });
+
+  it('fails closed: an unreadable host file or any invalid leaf never leaves repairs on (a repo-platform or valid enable is overridden)', async () => {
+    const repo = hostFile({ bundleRepair: { enabled: true, mode: 'live' } });
+    const torn = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0', WE_PLATFORM_PREFERENCES_FILE: repo, WE_PLATFORM_PREFERENCES: hostFile('{torn') } });
+    expect(torn.settings.enabled).toBe(false);
+    expect(torn.sources.enabled).toBe('fail-closed');
+    const mixed = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0', WE_PLATFORM_PREFERENCES: hostFile({ bundleRepair: { enabled: true, mode: 'live', maxConcurrent: 0 } }) } });
+    expect(mixed.settings.enabled).toBe(false);
+    expect(mixed.sources.enabled).toBe('fail-closed');
+    for (const block of [{ enabled: true, mode: {} }, { enabled: true, maxConcurrent: {} }, { enabled: true, clones: {} }]) {
+      const r = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0', WE_PLATFORM_PREFERENCES: hostFile({ bundleRepair: block }) } });
+      expect(r.settings.enabled).toBe(false);
+      expect(r.sources.enabled).toBe('fail-closed');
+      expect(r.invalid.length).toBeGreaterThan(0);
+    }
+    const repoTorn = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0', WE_PLATFORM_PREFERENCES_FILE: hostFile('{torn'), WE_PLATFORM_PREFERENCES: repo } });
+    expect(repoTorn.settings.enabled).toBe(false);
+    expect(repoTorn.sources.enabled).toBe('fail-closed');
+    expect(repoTorn.invalid.join()).toMatch(/platform \(repo\)/);
+    const repoHidden = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0',
+      WE_PLATFORM_PREFERENCES_FILE: hostFile({ bundleRepair: { enabled: true, mode: {} } }), WE_PLATFORM_PREFERENCES: hostFile({ bundleRepair: { enabled: true, mode: 'live' } }) } });
+    expect(repoHidden.settings.enabled).toBe(false);
+    expect(repoHidden.invalid.join()).toMatch(/platform \(repo\)\.mode/);
+    const toolDir = (files) => {
+      const d = mkdtempSync(join(tmpdir(), 'br-tool-'));
+      for (const [n, c] of Object.entries(files)) writeFileSync(join(d, n), typeof c === 'string' ? c : JSON.stringify(c));
+      return d;
+    };
+    const plat = { enabled: true, mode: 'live' };
+    const tornTool = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: plat,
+      toolFiles: { dir: toolDir({ 'bundle-repair.json': '{torn' }), legacyPath: null } });
+    expect(tornTool.settings.enabled).toBe(false);
+    expect(tornTool.invalid.join()).toMatch(/tool \(settings\/bundle-repair\.json\)/);
+    const legacy = join(toolDir({}), 'dispatch-settings.json');
+    writeFileSync(legacy, JSON.stringify({ bundleRepair: { mode: {} } }));
+    const hiddenTool = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: plat,
+      toolFiles: { dir: toolDir({ 'bundle-repair.json': { bundleRepair: { mode: 'live' } } }), legacyPath: legacy } });
+    expect(hiddenTool.settings.enabled).toBe(false);
+    expect(hiddenTool.invalid.join()).toMatch(/tool \(dispatch-settings\.json\)\.mode/);
+    const noDir = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: plat,
+      toolFiles: { dir: join(toolDir({}), 'missing'), legacyPath: null } });
+    expect(noDir.settings.enabled).toBe(false);
+    expect(noDir.invalid.join()).toMatch(/settings dir/);
+    const danglingDir = toolDir({});
+    symlinkSync(join(danglingDir, 'gone.json'), join(danglingDir, 'bundle-repair.json'));
+    const dangling = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: plat, toolFiles: { dir: danglingDir, legacyPath: null } });
+    expect(dangling.settings.enabled).toBe(false);
+    expect(dangling.invalid.join()).toMatch(/tool \(settings\/bundle-repair\.json\)/);
+    const danglingLegacy = join(toolDir({}), 'dispatch-settings.json');
+    symlinkSync(join(danglingDir, 'gone-legacy.json'), danglingLegacy);
+    const dl = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: plat, toolFiles: { dir: toolDir({}), legacyPath: danglingLegacy } });
+    expect(dl.settings.enabled).toBe(false);
+    expect(dl.invalid.join()).toMatch(/tool \(dispatch-settings\.json\)/);
+    const noLegacy = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: plat, toolFiles: { dir: toolDir({}), legacyPath: join(toolDir({}), 'absent.json') } });
+    expect(noLegacy.settings.enabled).toBe(true);
+    const linkDir = toolDir({});
+    const hostLink = join(linkDir, 'host.json'); symlinkSync(join(linkDir, 'gone-host.json'), hostLink);
+    const repoLink = join(linkDir, 'repo.json'); symlinkSync(join(linkDir, 'gone-repo.json'), repoLink);
+    const enabler = hostFile({ bundleRepair: { enabled: true } });
+    const hostDangling = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0', WE_PLATFORM_PREFERENCES_FILE: enabler, WE_PLATFORM_PREFERENCES: hostLink } });
+    expect(hostDangling.settings.enabled).toBe(false);
+    expect(hostDangling.invalid.join()).toMatch(/platform: /);
+    const repoDangling = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0', WE_PLATFORM_PREFERENCES_FILE: repoLink, WE_PLATFORM_PREFERENCES: enabler } });
+    expect(repoDangling.settings.enabled).toBe(false);
+    expect(repoDangling.invalid.join()).toMatch(/platform \(repo repo\.json\)/);
+    const nullTool = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: plat,
+      toolFiles: { dir: toolDir({ 'bundle-repair.json': { bundleRepair: null } }), legacyPath: null } });
+    expect(nullTool.settings.enabled).toBe(false);
+    const nullRepo = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0',
+      WE_PLATFORM_PREFERENCES_FILE: hostFile({ bundleRepair: null }), WE_PLATFORM_PREFERENCES: hostFile({ bundleRepair: { enabled: true } }) } });
+    expect(nullRepo.settings.enabled).toBe(false);
+    expect(nullRepo.sources.enabled).toBe('fail-closed');
+    const cleanTool = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: plat,
+      toolFiles: { dir: toolDir({ 'bundle-repair.json': { bundleRepair: { triggerMinutes: 20 } } }), legacyPath: null } });
+    expect(cleanTool.settings).toMatchObject({ enabled: true, mode: 'live', triggerMinutes: 20 });
+    expect(cleanTool.invalid).toEqual([]);
+    const objTool = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: { enabled: true }, tool: { mode: {} } });
+    expect(objTool.settings.enabled).toBe(false);
+    const badTool = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: { enabled: true }, tool: { wallTimeMinutes: 1 } });
+    expect(badTool.settings.enabled).toBe(false);
   });
 });
