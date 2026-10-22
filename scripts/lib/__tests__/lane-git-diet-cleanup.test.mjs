@@ -4,7 +4,7 @@
  *   leased/borrowed/symlinked lanes, keeps the working tree, frees the ledger blobs, is idempotent).
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, symlinkSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
@@ -97,6 +97,77 @@ describe('real git: cleanup CLI', () => {
     symlinkSync(lane(1), lane(4)); // lane-4 is a symlink alias of lane-1
   }, 60_000);
   afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  it.each(['shallow', 'index', 'gc.log', 'FETCH_HEAD', 'ORIG_HEAD', 'custom/nested/file', 'custom/dangling'])('reports and refuses a symlink at .git/%s', (path) => {
+    const dir = lane(13);
+    git(root, 'clone', '-q', up, dir);
+    const victim = join(root, 'outside-git-file');
+    const contents = `${git(dir, 'rev-parse', 'HEAD')}\n`;
+    writeFileSync(victim, contents);
+    const link = join(dir, '.git', path);
+    rmSync(link, { force: true });
+    mkdirSync(join(link, '..'), { recursive: true });
+    symlinkSync(path.endsWith('dangling') ? join(root, 'absent') : victim, link);
+    const configBefore = readFileSync(join(dir, '.git', 'config'), 'utf8');
+    const refsBefore = refs(dir);
+    try {
+      for (const mode of [[], ['--apply']]) {
+        const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--lanes=13', '--json', ...mode], { env, encoding: 'utf8' }));
+        expect(out.rows[0].skipped).toBe(`symlinked git paths (${path})`);
+        expect(readFileSync(victim, 'utf8')).toBe(contents);
+        expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).toBe(configBefore);
+        expect(refs(dir)).toEqual(refsBefore);
+        expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it.each(['scan root', 'pool root', 'pool', 'tmp root', 'late scan root', 'borrower object store', 'alternate target'])('fails closed when borrower discovery cannot inspect the %s', (variant) => {
+    const dir = lane(14);
+    git(root, 'clone', '-q', up, dir);
+    const late = variant === 'late scan root';
+    const borrower = join(root, 'unreadable-borrower');
+    const intermediate = join(root, 'unreadable-cache', 'nested', 'objects');
+    const resolving = ['borrower object store', 'alternate target'].includes(variant);
+    if (resolving) {
+      mkdirSync(join(borrower, 'objects', 'info'), { recursive: true });
+      mkdirSync(join(intermediate, 'info'), { recursive: true });
+      writeFileSync(join(borrower, 'objects', 'info', 'alternates'), `${intermediate}\n`);
+      writeFileSync(join(intermediate, 'info', 'alternates'), `${join(dir, '.git', 'objects')}\n`);
+    }
+    const denied = resolving ? (variant === 'borrower object store' ? join(borrower, 'objects') : intermediate)
+      : variant === 'pool root' ? poolRoot : variant === 'pool' ? join(poolRoot, 'web-everything') : variant === 'tmp root' ? tmpdir() : root;
+    const method = resolving ? 'realpathSync' : 'readdirSync';
+    // Patch the builtin in the child process: deterministic EACCES even when tests run as root.
+    const preload = `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+      const original = fs.${method}; const literal = ${JSON.stringify(denied)}; const denied = fs.realpathSync(literal); let calls = 0;
+      fs.${method} = function(path, ...args) {
+        if ((String(path) === denied || String(path) === literal) && ++calls >= ${late ? 2 : 1}) throw Object.assign(new Error('injected EACCES scanning ' + path), { code: 'EACCES' });
+        return original.call(this, path, ...args);
+      }; syncBuiltinESMExports();`;
+    const configBefore = readFileSync(join(dir, '.git', 'config'), 'utf8');
+    const refsBefore = refs(dir);
+    const countsBefore = git(dir, 'count-objects', '-v');
+    try {
+      const out = spawnSync('node', ['--import', `data:text/javascript,${encodeURIComponent(preload)}`, CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--apply', '--lanes=14', '--json'], { env, encoding: 'utf8', timeout: 50_000, maxBuffer: 1024 * 1024 });
+      if (late) {
+        expect(out.status).toBe(0);
+        expect(JSON.parse(out.stdout).rows[0].error).toContain('injected EACCES');
+      } else {
+        expect(out.status).toBe(1);
+        expect(out.stderr).toContain('injected EACCES');
+        expect(out.stderr).toContain('borrowerMap');
+        expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).toBe(configBefore);
+        expect(refs(dir)).toEqual(refsBefore);
+      }
+      expect(git(dir, 'count-objects', '-v')).toBe(countsBefore);
+      expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(borrower, { recursive: true, force: true });
+      rmSync(join(root, 'unreadable-cache'), { recursive: true, force: true });
+    }
+  }, 60_000);
 
   it.each(['info', 'info/refs'])('refuses a symlink at .git/%s before server-info can overwrite an outside file', (path) => {
     const dir = lane(10);

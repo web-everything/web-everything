@@ -45,7 +45,7 @@ if (unknown.length) { process.stderr.write(`unknown flag(s): ${unknown.map((f) =
 const APPLY = flags.apply === true;
 const POOL = typeof flags.pool === 'string' ? flags.pool : 'web-everything';
 if (!CLEANUP_POOLS.includes(POOL)) { process.stderr.write(`--pool must be one of ${CLEANUP_POOLS.join(', ')}\n`); process.exit(2); }
-const real = (p) => { try { return realpathSync(p); } catch { return null; } };
+const real = (p) => { try { return realpathSync(p); } catch (err) { if (['ENOENT', 'ENOTDIR'].includes(err.code)) return null; throw err; } };
 const POOL_ROOT = real(typeof flags['pool-root'] === 'string' ? flags['pool-root'] : join(homedir(), 'workspace', '.lanes'));
 const SCAN_ROOT = real(typeof flags['scan-root'] === 'string' ? flags['scan-root'] : join(homedir(), 'workspace'));
 if (!POOL_ROOT || !SCAN_ROOT) { process.stderr.write('pool root / scan root does not exist\n'); process.exit(2); }
@@ -70,7 +70,7 @@ const gcRepackFilters = (dir) => { try { return git(dir, ['config', '--name-only
 function borrowerMap() {
   const map = new Map();
   const candidates = [];
-  const kids = (d) => { try { return readdirSync(d).map((n) => join(d, n)); } catch { return []; } };
+  const kids = (d) => { try { return readdirSync(d).map((n) => join(d, n)); } catch (err) { if (['ENOENT', 'ENOTDIR'].includes(err.code)) return []; throw err; } };
   candidates.push(...kids(SCAN_ROOT), ...kids(real(tmpdir()) || tmpdir()));
   for (const pool of kids(POOL_ROOT)) candidates.push(...kids(pool));
   for (const repo of candidates) {
@@ -102,8 +102,7 @@ function borrowerMap() {
   return map;
 }
 const BORROWERS = borrowerMap();
-// Every path the cleanup writes through (including repack's info/refs server-info update) must be local.
-const GIT_WRITE_PATHS = ['config', 'config.worktree', 'packed-refs', 'refs', 'logs', 'HEAD', 'objects', 'info', LEASE_FILENAME];
+// Audit the whole Git directory: GC's write paths extend beyond config, refs, logs and objects.
 const symlinkedGitPaths = (dir) => {
   const links = [];
   const visit = (path) => {
@@ -112,7 +111,7 @@ const symlinkedGitPaths = (dir) => {
     if (entry.isSymbolicLink()) { links.push(path); return; } // Never traverse even a dangling link.
     if (entry.isDirectory()) for (const name of readdirSync(join(dir, '.git', path))) visit(join(path, name));
   };
-  GIT_WRITE_PATHS.forEach(visit);
+  visit('');
   return links;
 };
 const commonDir = (dir) => { try { return real(resolve(dir, git(dir, ['rev-parse', '--git-common-dir']).trim())); } catch { return null; } };
