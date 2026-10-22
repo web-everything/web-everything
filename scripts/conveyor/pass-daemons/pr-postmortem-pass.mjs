@@ -19,11 +19,21 @@ const MIN_COLLECTION_FAILURE_SPAN_MS = 30*60000;
  */
 export function listMergedSince(repo, since, until, { gh = ghJson, maxPages = 100 } = {}) {
   const found = new Map();
-  for (let page = 1; page <= maxPages; page++) {
+  const readPage = page => {
     const rows = gh(['api',`repos/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}`]);
     if (!Array.isArray(rows) || rows.some(p => !Number.isFinite(Date.parse(p.updated_at)))) throw Error('invalid merged PR listing');
+    if (rows.some(p => Date.parse(p.updated_at) > Date.parse(until))) throw Error('listing shifted; cursor retained');
+    return rows;
+  };
+  for (let page = 1; page <= maxPages; page++) {
+    const rows = readPage(page);
     for (const p of rows) if (p.merged_at && Date.parse(p.merged_at) >= Date.parse(since) && Date.parse(p.merged_at) <= Date.parse(until)) found.set(p.number,p);
-    if (rows.length < 100 || Date.parse(rows.at(-1).updated_at) < Date.parse(since)) return [...found.values()].sort((a,b) => a.merged_at.localeCompare(b.merged_at) || a.number-b.number);
+    if (rows.length < 100 || Date.parse(rows.at(-1).updated_at) < Date.parse(since)) {
+      // A lone updated row can move onto an already-read page without leaving
+      // any newer timestamps on the remaining pages. Recheck the newest rows.
+      if (page > 1) readPage(1);
+      return [...found.values()].sort((a,b) => a.merged_at.localeCompare(b.merged_at) || a.number-b.number);
+    }
   }
   throw Error('merged PR listing exceeds page cap; cursor retained');
 }

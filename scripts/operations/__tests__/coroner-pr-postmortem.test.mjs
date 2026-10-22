@@ -34,6 +34,65 @@ function collectorGh(overrides = {}) {
 }
 const collectWith = gh => collectPrTimeline('example/repo',1,{gh,comments:() => fixture().comments,env:{WE_FIX_LOOP_LEDGER:join(process.cwd(),'.absent-coroner-ledger')}});
 describe('per PR postmortem', () => {
+  it.each([1,101])('retains the cursor when #101 moves to page 1 among %i updates between reads and finds it on the stable poll', async moved => {
+    const dir = temp(), file = join(dir,'merge-cursor-example%2Frepo.json');
+    const original = JSON.stringify({cursor:at(500),done:[]});
+    const listing = Array.from({length:201},(_,i) => ({number:i+1,updated_at:at(650),merged_at:i === 100 ? at(600) : null}));
+    let stable = false;
+    const pages = [], reads = [];
+    const gh = args => {
+      const page = Number(new URL(`https://example.test/${args.at(-1)}`).searchParams.get('page'));
+      pages.push(page);
+      // A batch leaves a newer row on page 2; a single move can only be
+      // detected by rechecking page 1 after finishing the listing.
+      if (!stable && page === 2) for (const row of listing) if (row.number >= 101 && row.number < 101+moved) row.updated_at = at(701);
+      return [...listing].sort((a,b) => b.updated_at.localeCompare(a.updated_at) || a.number-b.number)
+        .slice((page-1)*100,page*100).map(row => ({...row}));
+    };
+    const args = {repo:'example/repo',dir,settings,
+      listMerged:(repo,since,until) => listMergedSince(repo,since,until,{gh}),
+      collect:(_repo,pr) => { reads.push(pr); return fixture(pr); }};
+    try {
+      fs.writeFileSync(file,original);
+      await expect(runPostmortemPass({...args,now:at(700)})).rejects.toThrow('listing shifted; cursor retained');
+      expect(pages).toEqual(moved === 1 ? [1,2,3,1] : [1,2]);
+      expect(fs.readFileSync(file,'utf8')).toBe(original);
+      expect(reads).toEqual([]);
+      stable = true;
+      await runPostmortemPass({...args,now:at(702)});
+      expect(reads).toEqual([101]);
+      expect(JSON.parse(fs.readFileSync(file))).toMatchObject({cursor:at(702),done:[101]});
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('rejects a shifted row even on a short first page with no merge', () => {
+    expect(() => listMergedSince('example/repo',at(500),at(700),{
+      gh:() => [{number:101,updated_at:at(701),merged_at:null}],
+    })).toThrow('listing shifted; cursor retained');
+  });
+  it.each([0,2999,3000])('marks %i collected files incomplete against changed_files and suppresses scope verdicts', count => {
+    const raw = collectWith(collectorGh({
+      '/pulls/1': {merged_at:at(600),created_at:at(0),changed_files:3001,head:{ref:'lane/no-card'},base:{sha:'z'}},
+      '/files?': [Array.from({length:count},(_,i) => ({filename:`src/${i}.js`}))],
+    }));
+    const report = buildPostmortem({...raw,scope:['src/**']});
+    expect(raw.completeness.core).toBe('incomplete');
+    expect(report.scope).toMatchObject({status:'unknown',outside:null});
+    expect(report.causes.some(c => c.cause === 'scope-creep')).toBe(false);
+  });
+  it('retains scope verdicts when the file list matches changed_files', () => {
+    const raw = collectWith(collectorGh({
+      '/pulls/1': {merged_at:at(600),created_at:at(0),changed_files:1,head:{ref:'lane/no-card'},base:{sha:'z'}},
+      '/files?': [[{filename:'outside.js'}]],
+    }));
+    expect(raw.completeness.core).toBe('complete');
+    expect(buildPostmortem({...raw,scope:['src/**']}).scope).toMatchObject({status:'observed',outside:['outside.js']});
+  });
+  it.each([3000,2000])('rounds phase duration once after summing %i ms intervals', duration => {
+    const stamp = ms => new Date(Date.parse(at(0))+ms).toISOString();
+    const labels = [0,1,2].map(i => ({event:'labeled',created_at:stamp(i*duration),label:{name:i ? `unrelated-${i}` : 'checking'}}));
+    const report = buildPostmortem({...fixture(),labels,mergedAt:stamp(3*duration)});
+    expect(report.phases).toEqual([{phase:'ci-wait',minutes:Math.round(3*duration/6000)/10}]);
+  });
   it('retries a removed quarantine entry after cursor advancement', async () => {
     const dir = temp(); const reads = []; let fail = true;
     const file = join(dir,'merge-cursor-example%2Frepo.json');

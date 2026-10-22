@@ -81,7 +81,7 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
     if (time(e.at) > time(start)) intervals.push({ phase: phase(), from: start, to: e.at, minutes: minutes(start, e.at) });
     if (!e.end) { if (e.add) live.add(e.name); else live.delete(e.name); } start = e.at;
   }
-  const phases = [...new Set(intervals.map(i => i.phase))].map(phase => ({ phase, minutes: Math.round(intervals.filter(i => i.phase === phase).reduce((s,i) => s+i.minutes, 0)*10)/10 }));
+  const phases = [...new Set(intervals.map(i => i.phase))].map(phase => ({ phase, minutes: Math.round(intervals.filter(i => i.phase === phase).reduce((s,i) => s+time(i.to)-time(i.from), 0)/6000)/10 }));
   const ciRuns = checks.map(c => ({ name: c.name, headSha: c.head_sha, createdAt: c.created_at ?? c.started_at, updatedAt: c.completed_at, conclusion: c.conclusion }));
   const extracted = buildPrRounds({ comments, commits, ciRuns, files: input.files, mergedAt });
   const rounds = extracted.rounds.map(r => ({ ...r, causes: r.triggers.flatMap(trigger => {
@@ -165,7 +165,7 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
   const standDowns = trusted.filter(c => /stood down|STAND-DOWN|not-a-ci-break/i.test(c.body.split('\n')[0])).map(c => ({ at: c.at, evidence: c.ref }));
   const drainSkips = trusted.filter(c => /drain.skip/i.test(c.body.split('\n')[0])).map(c => ({ at: c.at, reason: c.body.split('\n')[0].replace(/^.*drain.skip[: —-]*/i,''), evidence: c.ref }));
   const scopeKey = repoKeyForSlug(repo) ?? repo;
-  const outside = scope?.length ? (input.files ?? []).map(f => f.filename).filter(f => !scope.some(g => coversFile(g.includes(':') ? g : `${scopeKey}:${g}`, `${scopeKey}:${f}`))) : null;
+  const outside = scope?.length && input.completeness?.core !== 'incomplete' ? (input.files ?? []).map(f => f.filename).filter(f => !scope.some(g => coversFile(g.includes(':') ? g : `${scopeKey}:${g}`, `${scopeKey}:${f}`))) : null;
   const prepareHistory = prepares.map(p => ({ ...p, ageHours: minutes(p.at,openedAt) === null ? null : minutes(p.at,openedAt)/60, stale: time(openedAt)-time(p.at) > SETTINGS.prepareStaleHours*3600000 }));
   const causes = rounds.flatMap(r => r.causes.map(c => ({ ...c, phase: 'fix-rounds', minutesLost: null, evidence: [r.at, r.head, c.evidence].filter(Boolean) })));
   causes.push(...gaps.filter(g => g.minutesLost > 0).map(g => ({ cause: `handoff:${g.kind}`, phase: g.kind, minutesLost: g.minutesLost, evidence: g.evidence })), ...falseFindings.map(f => ({ cause: `false-finding:${f.cause}`, phase: 'review', minutesLost: null, evidence: [f.ref ?? f.at] })));
@@ -373,8 +373,13 @@ function collectCompletePrTimeline(repo, pr, { gh, comments, env }) {
     }
   },null);
   if (completeness.card === 'incomplete') { scope = null; prepares.length = 0; }
+  const files = ghPages(`${root}/pulls/${pr}/files?per_page=100`,gh);
+  if (files.length < p.changed_files) {
+    completeness.core = 'incomplete';
+    warnings.push(`PR file list incomplete: collected ${files.length} of ${p.changed_files} changed files; scope verdict is unknown.`);
+  }
   return { repo, pr: Number(pr), openedAt:p.created_at, mergedAt:p.merged_at, url:p.html_url, labels, comments:thread, commits, checks, verdicts, fixLoop,
-    files: ghPages(`${root}/pulls/${pr}/files?per_page=100`,gh), scope, prepares, warnings, completeness };
+    files, scope, prepares, warnings, completeness };
 }
 
 // Shared local serialization, with dead-process recovery, using the existing lease primitive.
