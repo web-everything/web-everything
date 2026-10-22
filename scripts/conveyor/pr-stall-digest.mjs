@@ -13,7 +13,7 @@
  *   An alert that fails to send is retried next pass. Each item: reason, 1-3 evidence lines, one paste-ready command.
  *   Setting `prStallSweep.digest` (standard true) turns it off; the quiet hours are the shared `quietHours` settings.
  */
-import { mkdirSync, readFileSync, realpathSync, readlinkSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, readlinkSync, statSync } from 'node:fs';
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
@@ -42,9 +42,14 @@ function canonicalPath(path) {
 function checkedDigestFeedPath(feedPath, env, stateDir) {
   const path = checkedFeedPath(feedPath ?? feedSettings({ env }).path.value);
   const target = canonicalPath(path), dir = canonicalPath(stateDir), lexicalDir = resolve(stateDir);
-  const within = (file, root) => file === root || file.startsWith(`${root}${sep}`);
-  const metadata = ['digest-state.json', 'digest.lock'].map(name => canonicalPath(join(stateDir, name)));
-  if (within(path, lexicalDir) || within(target, dir) || metadata.includes(target)) throw new Error('feed path is reserved for stall digest state');
+  // Compare case-folded and NFC-normalized: a case-insensitive or normalizing filesystem resolves spellings JS keeps apart.
+  const fold = (file) => file.normalize('NFC').toLowerCase();
+  const within = (file, root) => fold(file) === fold(root) || fold(file).startsWith(`${fold(root)}${sep}`);
+  const names = ['digest-state.json', 'digest.lock'];
+  const metadata = names.map(name => canonicalPath(join(stateDir, name)));
+  // A hard link shares the inode with its metadata file and resolves to its own path: compare identity when both exist.
+  const sameFile = (a, b) => { try { const x = statSync(a), y = statSync(b); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
+  if (within(path, lexicalDir) || within(target, dir) || metadata.some(file => fold(file) === fold(target) || sameFile(file, target))) throw new Error('feed path is reserved for stall digest state');
   return path;
 }
 

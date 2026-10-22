@@ -4,7 +4,7 @@
  *   retried failed alert, and never suppressed on a failed read.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, chmodSync, symlinkSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, chmodSync, symlinkSync, linkSync, utimesSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -98,6 +98,25 @@ describe('the stalled feed kind', () => {
     expect(r.lines).toEqual([]);
     expect(readFileSync(mine, 'utf8')).toBe(before);
     if (path !== mine) expect(existsSync(path)).toBe(false);
+  });
+  it.each(['DIGEST-STATE.JSON', 'Digest.Lock', 'Nested/events.jsonl'])('refuses a case variant of digest state (%s)', name => {
+    const ctx = setup(); mkdirSync(ctx.stateDir, { recursive: true });
+    const mine = join(ctx.stateDir, 'digest-state.json'), before = '{"published":[],"unnotified":[]}\n';
+    writeFileSync(mine, before);
+    const path = join(ctx.stateDir.replace(/pr-stall-sweep$/, 'PR-Stall-Sweep'), name);
+    const r = run(ctx, [op(1)], { feedPath: path, notify: () => ({ ok: true }) });
+    expect(r.errors.join(' ')).toMatch(/reserved/); expect(r.lines).toEqual([]);
+    expect(readFileSync(mine, 'utf8')).toBe(before);
+  });
+  it('refuses a hard link to the digest state file', () => {
+    const ctx = setup(); mkdirSync(ctx.stateDir, { recursive: true });
+    const mine = join(ctx.stateDir, 'digest-state.json'), before = '{"published":[],"unnotified":[]}\n';
+    writeFileSync(mine, before);
+    const link = join(ctx.stateDir, '..', 'linked.jsonl');
+    linkSync(mine, link);
+    const r = run(ctx, [op(1)], { feedPath: link, notify: () => ({ ok: true }) });
+    expect(r.errors.join(' ')).toMatch(/reserved/); expect(r.lines).toEqual([]);
+    expect(readFileSync(mine, 'utf8')).toBe(before);
   });
   it.each(['file', 'directory'])('refuses a %s symlink alias into digest state', type => {
     const ctx = setup(); mkdirSync(ctx.stateDir, { recursive: true });
