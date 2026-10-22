@@ -28,8 +28,7 @@ function fixture(run) {
       require('node:fs').writeFileSync(${JSON.stringify(called)}, 'called');
       process.stdout.write(JSON.stringify({ token: process.env.GH_TOKEN, daemon: process.env.WE_GH_DAEMON_CALLER }));
     `, { mode: 0o755 });
-    const env = { ...process.env, ...daemonAppEnv(home), PATH: `${bin}:${process.env.PATH}`,
-      WE_GH_THROTTLE_LOCK_ROOT: join(home, 'throttle') };
+    const env = { ...process.env, ...daemonAppEnv(home), PATH: `${bin}:${process.env.PATH}` };
     const invoke = (endpoint = 'repos/web-everything/web-everything') => spawnSync(process.execPath,
       ['--input-type=module', '-e', probe, endpoint], { cwd: home, env, encoding: 'utf8', timeout: 15_000 });
     run({ env, home, called, invoke });
@@ -45,6 +44,14 @@ describe('daemon CLI App fixture', () => {
       expect(r.status, r.stderr).toBe(0);
       expect(JSON.parse(r.stdout)).toMatchObject({ token: DAEMON_APP_FIXTURE_TOKEN, daemon: expect.any(String) });
     }
+    expect(existsSync(join(env.WE_GH_THROTTLE_LOCK_ROOT, 'calls.jsonl'))).toBe(true);
+  }));
+
+  it('isolates throttle spending even when CLI scenarios reuse the same home', () => fixture(({ env, home }) => {
+    const next = daemonAppEnv(home);
+    expect(dirname(env.WE_GH_THROTTLE_LOCK_ROOT)).toBe(home);
+    expect(dirname(next.WE_GH_THROTTLE_LOCK_ROOT)).toBe(home);
+    expect(next.WE_GH_THROTTLE_LOCK_ROOT).not.toBe(env.WE_GH_THROTTLE_LOCK_ROOT);
   }));
 
   it('still refuses inherited personal auth when no App cache or configuration is supplied', () => fixture(({ env, home, called, invoke }) => {

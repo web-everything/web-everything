@@ -768,7 +768,7 @@ function invalidateSharedCache() {
 // for a payload over the ~64KB pipe-buffer size that write is ASYNCHRONOUS — \`process.exit()\` tears the
 // process down before it drains, silently truncating whatever \`gh\` printed. Setting \`exitCode\` and letting the
 // script fall off the end instead keeps the event loop alive until every queued write really lands.
-function runInherited(env, reason) {
+function runInherited(env, reason, rejectedStderr) {
   const inheritedApp = DAEMON && !unsupportedHost && env.GH_TOKEN && env.WE_GH_AUTH_TOKEN_HASH === createHash('sha256').update(env.GH_TOKEN).digest('hex');
   if (DAEMON) {
     if (!inheritedApp) {
@@ -777,6 +777,8 @@ function runInherited(env, reason) {
         + (reason || tokenMisses.join('; ') || 'no fresh token cached')
         + '; ghAuth.personalFallback=' + personalFallback + ' (source: ' + personalFallbackSource + ')';
       if (personalFallback === 'refuse') {
+        // Keep gh's actual cause first for callers that classify only the first stderr line.
+        if (rejectedStderr) process.stderr.write(rejectedStderr + (rejectedStderr.endsWith('\\n') ? '' : '\\n'));
         process.stderr.write('gh-shim: REFUSING personal-auth fallback' + detail + '\\n');
         process.exitCode = 1;
         return;
@@ -1067,7 +1069,7 @@ if (!token) {
     const stderrText = withToken.stderr ? withToken.stderr.toString('utf8') : '';
     if (withToken.status !== 0 && looksLikeAppTokenAuthFailure(stderrText)) {
       invalidateSharedCache();
-      runInherited(process.env, 'App token rejected (HTTP 401 / Bad credentials)'); // guarded inherited-auth retry
+      runInherited(process.env, 'App token rejected (HTTP 401 / Bad credentials)', stderrText); // guarded inherited-auth retry
     } else {
       if (withToken.stdout && withToken.stdout.length) process.stdout.write(withToken.stdout);
       if (withToken.stderr && withToken.stderr.length) process.stderr.write(withToken.stderr);

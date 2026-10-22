@@ -2050,5 +2050,9 @@ canonical owner `web-everything`. Run the touched `gh-app-shim`, `github-app-aut
 Drain CLI fixtures with fake `gh` binaries use `scripts/__tests__/fixtures/daemon-app-env.mjs`
 to seed fresh synthetic App caches under their disposable home. Keep personal fallback refused:
 the real guard and per-owner routing must still run before listing, freeze, or merge assertions.
+Each fixture invocation also needs a fresh throttle ledger, even when it reuses a home:
+fake merges consume the real per-minute write budget and can make later scenarios wait.
+On an App-token rejection, keep gh's original stderr before the daemon refusal diagnostic,
+so callers that read the first error line still report GitHub's actual cause.
 The simulator binds its synthetic `sim-token-1` to matching App-token provenance; its fake
 GitHub still owns revocation checks. Never enable personal fallback globally in test setup.

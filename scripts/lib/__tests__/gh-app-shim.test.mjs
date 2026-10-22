@@ -1125,6 +1125,7 @@ require(${JSON.stringify(shim)});
       expect(r.status).toBe(1);
       expect(r.stderr).toContain('REFUSING');
       expect(r.stderr).toContain('App token rejected');
+      expect(r.stderr).toContain('HTTP 401: Bad credentials\ngh-shim: REFUSING');
       expect(readFileSync(f.invoked, 'utf8')).toBe('called\n');
       expect(existsSync(f.cache)).toBe(false);
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
