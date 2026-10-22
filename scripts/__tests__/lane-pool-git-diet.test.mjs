@@ -9,11 +9,34 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { runReclaimCase } from '../conveyor/soak/breaks/lane-reset-symbolic-ops-proof.mjs';
 
 // Read-only proof tests can run even where the launcher forbids Git metadata writes.
 const proofSource = /function localRemoteShas\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
 const defaultFetch = '+refs/heads/*:refs/remotes/origin/*';
 const excludedOps = '^refs/heads/ops/*';
+const reclaimSource = /function laneReclaimPreservationProof\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
+// Exercise the production proof without invoking the CLI or writing Git metadata. The old
+// whois helpers deliberately report the stale tracking ref as preserved, reproducing the gap.
+it.each(['commit', 'dirty file', 'failed remote read', 'stale base patch'])(
+  'reclaim live proof rejects %s backed only by stale tracking refs', (variant) => {
+  const dirty = variant === 'dirty file';
+  const proof = new Function('gitStatusSummary', 'aheadCommits', 'aheadCommitsPreserved',
+    'lanePreservedFileChecker', 'liveRemoteShas', 'tryGit', 'readFileSync', 'join', 'filePreservedInMain',
+    `${reclaimSource}; return laneReclaimPreservationProof;`)(
+    () => ({ trackedModifiedPaths: dirty ? ['file.txt'] : [], untrackedPaths: [] }),
+    () => dirty ? [] : [{ sha: 'unique', subject: 'unique work' }],
+    (_dir, branch, _commits, maxProbes) => new Map([['unique', maxProbes !== 0 || branch === 'stale-base']]),
+    () => () => true,
+    () => new Set(variant === 'failed remote read' ? [] : ['trunk']),
+    (args) => args[0] === 'rev-parse' ? (variant === 'stale base patch' ? 'stale-base' : 'trunk') : 'unique',
+    () => 'unique content', join,
+    (_dir, _path, ref, _content, refs = []) => [ref, ...refs].includes('unique'),
+  );
+  const result = proof('/unused', 'trunk');
+  expect(result.preserved).toBe(false);
+  expect(dirty ? result.unpreservedFiles : result.unpreservedCommitShas).toEqual([dirty ? 'file.txt' : 'unique']);
+});
 const ensureSource = /function ensureLaneDietConfig\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
 it.each([
   ['unchanged', [], false, [defaultFetch, excludedOps]],
@@ -216,6 +239,18 @@ it.each(['explicit', 'auto'])('%s acquire can still reset work contained by a fr
     expect(git(['rev-parse', 'HEAD'], lane)).toBe(git(['rev-parse', 'refs/heads/trunk'], origin));
     expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('seed\n');
   });
+}, 60000);
+
+it.each([
+  {}, { change: 'deleted' }, { containment: 'ancestor' },
+  { alias: 'symbolic', change: 'deleted', containment: 'ancestor' },
+  { alias: 'mapped' }, { alias: 'wildcard-mapped' },
+  { kind: 'dirty' }, { alias: 'wildcard-mapped', kind: 'dirty' },
+  { dryRun: true }, { race: true }, { live: true },
+  { live: true, containment: 'ancestor' }, { live: true, kind: 'dirty' },
+])('refresh then reclaim validates live preservation (%j)', async (options) => {
+  const report = await runReclaimCase(resolve('.'), options);
+  expect(report.violations).toEqual([]);
 }, 60000);
 
 function withContainmentLane(check) {

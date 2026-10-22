@@ -1,8 +1,8 @@
 /** PR #5805: symbolic aliases and direct remaps of excluded ops tips must never authorize a lane reset.
- * Runs the real acquire CLI against disposable repositories; no network or host lanes are used.
+ * Runs the real acquire and reclaim CLIs against disposable repositories; no network or host lanes are used.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,20 +17,34 @@ export default {
   fixPresent(root) {
     const source = readFileSync(join(root, 'scripts/lane-pool.mjs'), 'utf8');
     const proof = /function localRemoteShas\([^]*?\n\}/.exec(source)?.[0] ?? '';
-    return proof.includes('%(symref)') && proof.includes('remote.origin.fetch');
+    const reclaim = /function laneReclaimPreservationProof\([^]*?\n\}/.exec(source)?.[0] ?? '';
+    return proof.includes('%(symref)') && proof.includes('remote.origin.fetch') && reclaim.includes('liveRemoteShas(dir)');
   },
   async run({ root = REPO_ROOT } = {}) {
     const violations = [];
     for (const alias of ['symbolic', 'mapped', 'wildcard-mapped']) {
-      const report = await runAliasCase(root, alias);
+      const report = await runAliasCase(root, alias, { change: alias === 'symbolic' ? 'deleted' : 'moved' });
       violations.push(...report.violations.map((message) => `${alias}: ${message}`));
+    }
+    for (const options of [
+      {}, { alias: 'symbolic', change: 'deleted', containment: 'ancestor' },
+      { alias: 'mapped' }, { alias: 'wildcard-mapped', kind: 'dirty' },
+      { dryRun: true }, { race: true }, { live: true },
+      { live: true, containment: 'ancestor' }, { live: true, kind: 'dirty' },
+    ]) {
+      const report = await runReclaimCase(root, options);
+      violations.push(...report.violations.map((message) => `reclaim ${JSON.stringify(options)}: ${message}`));
     }
     return { violations };
   },
   judge(report) { return report.violations; },
 };
 
-async function runAliasCase(root, alias) {
+export function runReclaimCase(root = REPO_ROOT, options = {}) {
+  return runAliasCase(root, options.alias ?? 'none', { ...options, command: 'reclaim' });
+}
+
+async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit', change = 'moved', containment = 'exact', dryRun = false, live = false, race = false } = {}) {
     const base = mkdtempSync(join(tmpdir(), 'soak-symbolic-ops-'));
     const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     try {
@@ -43,37 +57,91 @@ async function runAliasCase(root, alias) {
       git(['add', 'work.txt'], reference);
       git(['commit', '--quiet', '-m', 'seed'], reference);
       git(['push', '--quiet', 'origin', 'HEAD:refs/heads/trunk'], reference);
+      const bin = join(base, 'bin');
+      mkdirSync(bin);
+      for (const [name, source] of [['claude', '#!/bin/sh\necho "[]"\n'], ['lsof', '#!/bin/sh\nexit 0\n']]) {
+        writeFileSync(join(bin, name), source);
+        chmodSync(join(bin, name), 0o755);
+      }
       const cli = (args) => spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), ...args,
         `--origin=${origin}`, `--reference=${reference}`, '--name=symbolic-ops', '--branch=trunk', '--no-install'], {
-        encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: pool }, timeout: 30000, maxBuffer: 1024 * 1024,
+        encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: pool, PATH: `${bin}:${process.env.PATH}`, WE_LANE_SALVAGE_QUIET_MIN: '0' }, timeout: 30000, maxBuffer: 1024 * 1024,
       });
       const provision = cli(['provision', '--count=1']);
       if (provision.status !== 0) throw Error(`fixture provision failed: ${provision.stderr}`);
       const lane = join(pool, 'symbolic-ops', 'lane-1');
       git(['config', 'user.email', 'test@example.com'], lane);
       git(['config', 'user.name', 'Test'], lane);
-      const content = 'unique lane work\n';
+      // The shared blob predicate trims Git output; avoid a trailing newline so the positive
+      // dirty-file control exercises a preservation match rather than that conservative mismatch.
+      const content = 'unique lane work';
       writeFileSync(join(lane, 'work.txt'), content);
       git(['add', 'work.txt'], lane);
       git(['commit', '--quiet', '-m', 'unique work'], lane);
       const head = git(['rev-parse', 'HEAD'], lane);
       const ops = 'refs/heads/ops/review-requests';
       const tracking = 'refs/remotes/origin/ops/review-requests';
+      if (containment === 'ancestor') git(['commit', '--quiet', '--allow-empty', '-m', 'descendant'], lane);
       git(['push', '--quiet', 'origin', `HEAD:${ops}`], lane);
       git(['fetch', '--quiet', 'origin', `+${ops}:${tracking}`], lane);
       if (alias === 'symbolic') {
         git(['symbolic-ref', 'refs/remotes/origin/saved', tracking], lane);
-        git(['update-ref', '-d', ops], origin);
-      } else {
+      } else if (alias === 'mapped' || alias === 'wildcard-mapped') {
         const mapping = alias === 'mapped'
           ? `+${ops}:refs/remotes/origin/saved`
           : '+refs/heads/ops/*:refs/remotes/origin/archive/*';
         git(['config', '--add', 'remote.origin.fetch', mapping], lane);
         git(['fetch', '--quiet', 'origin', mapping], lane);
-        git(['update-ref', ops, 'refs/heads/trunk'], origin);
       }
-      if (git(['for-each-ref', `--contains=${head}`, '--format=%(refname)', 'refs/heads/'], origin)) {
+      if (containment === 'ancestor') git(['reset', '--hard', '--quiet', head], lane);
+      if (live) git(['push', '--quiet', 'origin', `${tracking}:refs/heads/lane/landed`], lane);
+      const mutation = change === 'deleted' ? ['update-ref', '-d', ops] : ['update-ref', ops, 'refs/heads/trunk'];
+      if (!race) git(mutation, origin);
+      if (!live && !race && git(['for-each-ref', `--contains=${head}`, '--format=%(refname)', 'refs/heads/'], origin)) {
         throw Error('fixture work is still contained by a remote branch');
+      }
+      if (command === 'reclaim') {
+        if (kind === 'dirty') git(['reset', '--mixed', '--quiet', 'origin/trunk'], lane);
+        const beforeHead = git(['rev-parse', 'HEAD'], lane);
+        const refresh = cli(['refresh', '--count=1']);
+        if (refresh.status !== 0 || !refresh.stderr.includes('SKIPPED')) throw Error(`fixture refresh failed: ${refresh.stderr}`);
+        // Mutate the remote between the initial proof and the under-claim reproof.
+        if (race) {
+          const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+          const marker = join(base, 'probed');
+          writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
+const { existsSync, writeFileSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+if (args[0] === 'ls-remote') {
+  if (existsSync(${JSON.stringify(marker)})) {
+    const changed = spawnSync(${JSON.stringify(realGit)}, ${JSON.stringify(mutation)}, { cwd: ${JSON.stringify(origin)} });
+    if (changed.status !== 0) process.exit(1);
+  } else writeFileSync(${JSON.stringify(marker)}, 'first proof');
+}
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
+process.exit(result.status ?? 1);
+`);
+          chmodSync(join(bin, 'git'), 0o755);
+        }
+        const reclaim = cli(['reclaim', '--lane=1', '--json', ...(dryRun ? ['--dry-run'] : [])]);
+        if (reclaim.status !== 0) throw Error(`fixture reclaim failed: ${reclaim.stderr}`);
+        const report = JSON.parse(reclaim.stdout);
+        const violations = [];
+        if (live) {
+          if (!report.reclaimed) violations.push('live non-ops proof no longer permits reclaim');
+          if (readFileSync(join(lane, 'work.txt'), 'utf8') !== 'seed\n') violations.push('live control did not reset');
+        } else {
+          if (report.reclaimed || report.wouldReclaim || report.preserved) violations.push('stale ops proof authorized reclaim');
+          if (git(['rev-parse', 'HEAD'], lane) !== beforeHead || readFileSync(join(lane, 'work.txt'), 'utf8') !== content) violations.push('reclaim destroyed unique work');
+          if (!dryRun) {
+            const journal = readFileSync(join(pool, 'symbolic-ops', '.lane-journal.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+            const last = journal.at(-1);
+            if (last.action !== 'reclaim-refused' || last.unpushed !== true) violations.push('refusal did not journal unpushed work');
+          }
+        }
+        if (existsSync(join(lane, '.git', '.lane-lease'))) violations.push('reclaim retained its temporary claim');
+        return { violations };
       }
       const acquire = cli(['acquire', '--lane=1', '--session=symbolic-ops-proof', '--hard-max=1']);
       const violations = [];
