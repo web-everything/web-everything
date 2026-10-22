@@ -271,14 +271,14 @@ export async function prepareRebuild({
   // overlay-pin — `overlay-pinned` is logged ONCE per (ref, new tip), not every tick the pin holds; the record
   // (`state.pinnedNotified`: ref → the new tip last reported) is pruned to the refs still pinned this plan.
   const pinnedBefore = state.pinnedNotified && typeof state.pinnedNotified === 'object' ? state.pinnedNotified : {};
-  const pinnedNow = {};
+  const pinnedNow = Object.create(null);
   for (const event of plan.alerts || []) {
     if (event.kind === 'overlay-pinned') {
       const { ref, pr, newTip, files } = event.detail;
       pinnedNow[ref] = newTip;
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
       if (pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
-      if (pinnedBefore[ref] === newTip) continue;
+      if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === newTip) continue;
     }
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {

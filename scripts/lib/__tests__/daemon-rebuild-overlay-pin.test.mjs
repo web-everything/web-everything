@@ -80,6 +80,20 @@ function fixture() {
 }
 
 describe('overlay-pin — a moving overlay whose new tip conflicts stays at its adopted head', () => {
+  it('logs one overlay-pinned alert over three unchanged ticks for __proto__', async () => {
+    const f = fixture();
+    removeOverlay(f.clone, 'lane/moving', { env: f.env });
+    const old = f.push('__proto__', f.init, { 'proto.txt': 'old\n' });
+    addOverlay(f.clone, { ref: '__proto__' }, { env: f.env });
+    expect(await f.tick()).toMatchObject({ adopted: true });
+    const tip = f.push('__proto__', old, { [DAEMON]: lines({ 2: 'conflict' }) });
+    for (let i = 0; i < 3; i++) await f.tick();
+    expect(f.pinnedLogs()).toHaveLength(1);
+    const notified = readRebuildState(f.clone, f.env).pinnedNotified;
+    expect(Object.hasOwn(notified, '__proto__')).toBe(true);
+    expect(notified.__proto__).toBe(tip);
+  }, 60_000);
+
   it('an adopted head already carried by a sibling overlay produces no content-free pin or overlay-pinned alert', async () => {
     const f = fixture();
     f.env.WE_DAEMON_OVERLAY_STACK_MODE = 'independent';

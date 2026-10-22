@@ -263,6 +263,20 @@ export async function previewOverlayConflict({
       return { ok: true, clean: true, mainSha, cur, candSha, setAside };
     }
 
+    // A repair can unlock a moving tip's retry even when it conflicts with the stack's pinned head.
+    // Ask the whole planner before refusing; ok alone is insufficient because it can drop overlays.
+    if (mt.status === 1) {
+      const planCandidate = await planRebuild({
+        git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding.concat([{ ref, pr }]),
+        prState: (p) => defaultPrState({ pr: p, root }),
+        edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
+      });
+      if (planCandidate.ok && planCandidate.applied.some((o) => o.ref === ref)
+        && planCandidate.establishedLost.length === 0) {
+        return { ok: true, clean: true, mainSha, cur, candSha, setAside };
+      }
+    }
+
     // Only status 1 is merge-tree's documented "merge had conflicts". Anything else (unrelated histories, a
     // missing object, a crash) proves nothing about mergeability — it must fail closed as `ok:false`, never read
     // as a confirmed conflict that `--allow-conflict` could then override (PR #2827 review).

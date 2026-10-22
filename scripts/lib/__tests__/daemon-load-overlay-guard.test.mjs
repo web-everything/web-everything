@@ -64,6 +64,41 @@ function fixture() {
 }
 
 describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before registering', () => {
+  it('admits M0/A0/M1/A1/R repair through the full plan with edge resolution off and no override', async () => {
+    const f = fixture();
+    Object.assign(f.env, {
+      WE_DAEMON_STATE_DIR: mktemp('we-repair-state-'),
+      WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-repair-lock-'),
+      WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0',
+      WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
+    });
+    removeOverlay(f.clone, 'lane/fix-procedure', { env: f.env });
+    const m0 = f.push('main', { 'shared.mjs': 'base\n', 'a.txt': 'base\n' });
+    const a0 = f.push('lane/a', { 'a.txt': 'old-A\n' }, m0);
+    addOverlay(f.clone, { ref: 'lane/a' }, { env: f.env });
+    const rebuild = () => rebuildClone({
+      root: f.clone, env: f.env, prState: async () => 'OPEN',
+      runSmoke: async () => ({ verdict: 'pass', smoke: { results: [{ name: 'fixture', ok: true }] } }),
+    });
+    expect(await rebuild()).toMatchObject({ adopted: true });
+    const m1 = f.push('main', { 'shared.mjs': 'main\n' }, m0);
+    const a1 = f.push('lane/a', { 'shared.mjs': 'new-A\n', 'a.txt': 'new-A\n' }, a0);
+    const repair = f.push('lane/repair', { 'shared.mjs': 'base\n', 'a.txt': 'new-A\n', 'repair.txt': 'R\n' }, m1);
+    const live = await dryRunRebuild({
+      root: f.clone, env: f.env, prState: async () => 'OPEN', extraOverlays: [{ ref: 'lane/repair' }],
+    });
+    expect(live.plan).toMatchObject({ ok: true, establishedLost: [] });
+    for (const [ref, sha] of [['lane/a', a1], ['lane/repair', repair]]) {
+      expect(live.plan.applied).toContainEqual(expect.objectContaining({ ref, sha }));
+    }
+    const result = await f.load({ ref: 'lane/repair', pr: null, rebuild });
+    expect(result.refused, JSON.stringify(result)).toBeFalsy();
+    expect(readOverlays(f.clone, { env: f.env }).find(o => o.ref === 'lane/repair')).toBeDefined();
+    for (const sha of [a1, repair]) {
+      expect(gitOk(f.clone, ['merge-base', '--is-ancestor', sha, 'HEAD'])).toBe('');
+    }
+  }, 60_000);
+
   it('fails closed when the adopted HEAD cannot be read', async () => {
     const run = vi.fn(() => ({ status: 1, stdout: '', stderr: 'HEAD unavailable' }));
     expect(await previewOverlayConflict({
