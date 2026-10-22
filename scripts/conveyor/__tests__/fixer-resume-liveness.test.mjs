@@ -15,10 +15,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   isRowGone, isRowMidTurn, rowProcessAlive, samePrintedHandle, cliStartedCopy,
-  resolveFixSessionPolicy, formatFixSessionPolicyLine, FIX_RESUME_STOPS_LIVE_IDLE_ENV, FIX_STOP_ON_CLAIM_RELEASE_ENV,
+  resolveFixSessionPolicy, formatFixSessionPolicyLine, FIX_RESUME_STOPS_LIVE_IDLE_ENV, FIX_STOP_ON_CLAIM_RELEASE_ENV, FIX_CLAIM_LIVENESS_BY_PID_ENV,
 } from '../../lib/fix-session-liveness.mjs';
 import { defaultAwaitVerifyIo } from '../await-verify-pass.mjs';
-import { resumeBgSession } from '../reconcile-fix-dispatch.mjs';
+import { resumeBgSession, FIXER_MID_TURN_REFUSALS } from '../reconcile-fix-dispatch.mjs';
 import { planRoundResume } from '../fix-resume.mjs';
 import { refreshLiveFixDispatchClaims, readFixDispatchClaim } from '../fix-dispatch-claim.mjs';
 import { acquireFixClaim } from '../fix-procedure.mjs';
@@ -53,12 +53,12 @@ describe('fix-session-liveness — what a listing row says about the process', (
     expect(cliStartedCopy(COPY_NOTE('6b08e7a7', 'c94eeec8'))).toBe(true);
     expect(cliStartedCopy('backgrounded · 6b08e7a7')).toBe(false);
   });
-  it('the two switches resolve through the cascade and name their source', () => {
+  it('the three switches resolve through the cascade and name their source', () => {
     expect(resolveFixSessionPolicy({})).toMatchObject({ resumeStopsLiveIdle: true, stopOnClaimRelease: true, sources: { resumeStopsLiveIdle: 'standard', stopOnClaimRelease: 'standard' } });
     const p = resolveFixSessionPolicy({ tool: { stopOnClaimRelease: false }, env: { [FIX_RESUME_STOPS_LIVE_IDLE_ENV]: 'off', [FIX_STOP_ON_CLAIM_RELEASE_ENV]: 'maybe' } });
     expect(p).toMatchObject({ resumeStopsLiveIdle: false, stopOnClaimRelease: false, sources: { resumeStopsLiveIdle: 'env', stopOnClaimRelease: 'tool' } });
     expect(p.invalid).toEqual(['env.stopOnClaimRelease="maybe"']);
-    expect(formatFixSessionPolicyLine(p)).toBe('fix-session-policy: resumeStopsLiveIdle=false (env), stopOnClaimRelease=false (tool); ignored invalid env.stopOnClaimRelease="maybe"');
+    expect(formatFixSessionPolicyLine(p)).toBe('fix-session-policy: resumeStopsLiveIdle=false (env), stopOnClaimRelease=false (tool), claimLivenessByPid=true (standard); ignored invalid env.stopOnClaimRelease="maybe"');
   });
 });
 
@@ -166,9 +166,16 @@ describe('replay #5729 11:15Z — the ROUND resume of a done row whose process i
   it('a session mid-turn is never stopped or resumed', () => {
     const cli = fakeCli({ row: { ...ROW_5729, status: 'busy' } });
     const { r, released } = run(cli);
-    expect(r).toMatchObject({ resumed: false, resumeAttempt: { refused: 'stop-before-resume' } });
+    expect(r).toMatchObject({ resumed: false, resumeAttempt: { refused: 'session-mid-turn' } });
+    expect(FIXER_MID_TURN_REFUSALS.has(r.resumeAttempt.refused)).toBe(true); // the caller defers, never cold-starts
     expect(cli.calls).toEqual([]);
     expect(released).toEqual(['released']);
+  });
+  it('a live process with no turn status is never stopped (declined the old way)', () => {
+    const cli = fakeCli({ row: { ...ROW_5729, status: undefined } });
+    const { r } = run(cli);
+    expect(r).toMatchObject({ resumed: false, resumeAttempt: { refused: 'stop-before-resume' } });
+    expect(cli.calls).toEqual([]);
   });
   it('kill switch off: the copy is started and stopped, as before', () => {
     const cli = fakeCli({ row: ROW_5729 });
@@ -178,7 +185,10 @@ describe('replay #5729 11:15Z — the ROUND resume of a done row whose process i
   });
   it('planRoundResume declines a done row that is mid-turn', () => {
     const d = planRoundResume({ planned: { pr: 5729, attempts: 2 }, settings: {}, prior: { ...ROW_5729, status: 'busy' } });
-    expect(d).toMatchObject({ resume: false, reason: 'prior-session-busy' });
+    expect(d).toMatchObject({ resume: false, reason: 'prior-session-mid-turn' });
+    expect(FIXER_MID_TURN_REFUSALS.has(d.reason)).toBe(true);
+    const off = planRoundResume({ planned: { pr: 5729, attempts: 2 }, settings: {}, prior: { ...ROW_5729, status: 'busy' }, midTurnGuard: false });
+    expect(off.reason).not.toBe('prior-session-mid-turn');
   });
 });
 
@@ -189,7 +199,7 @@ describe('replay #5758 11:00Z — the claim sweep and the released fixer\'s live
   const T0 = Date.parse('2026-10-21T10:35:00.000Z');
   const SID = 'ddac038c-bcfe-4cd0-9d51-c983476b47b1';
   const key = () => ({ repo: 'we', pr: 5758, kind: 'fixing', lockRoot: claimRoot });
-  const sweep = (row, pids) => refreshLiveFixDispatchClaims({
+  const sweep = (row, pids, sessionPolicy = resolveFixSessionPolicy({})) => refreshLiveFixDispatchClaims({ sessionPolicy,
     lockRoot: claimRoot, nowMs: T0 + 25 * 60_000, nowIso: () => new Date(T0 + 25 * 60_000).toISOString(),
     hungInfoFor: () => null, awaitingVerifyFor: null, alive: (pid) => pids.has(pid), listAgentsAll: () => [row],
   });
@@ -215,7 +225,8 @@ describe('replay #5758 11:00Z — the claim sweep and the released fixer\'s live
     const stop = vi.fn(() => ({ stopped: true }));
     const lines = [];
     const tick = vi.fn(async () => 'ticked');
-    const wrapped = withFixDispatchClaimRefresh({ tickOnce: tick }, { log: { error: (l) => lines.push(l) }, refresh: () => result, stop, loadPolicy: () => resolveFixSessionPolicy({}) });
+    const wrapped = withFixDispatchClaimRefresh({ tickOnce: tick }, { log: { error: (l) => lines.push(l) }, refresh: () => result, stop, loadPolicy: () => resolveFixSessionPolicy({}),
+      listFresh: () => [row], awaitingFor: () => null, pidAlive: (pid) => pid === 7777 });
     expect(await wrapped.tickOnce()).toBe('ticked');
     expect(stop).toHaveBeenCalledWith({ handle: 'ddac038c' });
     expect(lines.join('\n')).toMatch(/stopped session ddac038c \(pid 7777, status idle\) after releasing claim fixing-5758 \(we\) — fix\.stopOnClaimRelease=true \(standard\)/);
@@ -229,6 +240,30 @@ describe('replay #5758 11:00Z — the claim sweep and the released fixer\'s live
     await wrapped.tickOnce();
     expect(stop).not.toHaveBeenCalled();
     expect(lines.join('\n')).toMatch(/left session ddac038c running .* fix\.stopOnClaimRelease=false \(env\)/);
+  });
+  it('kill switch claimLivenessByPid off: the old name/state-only view releases the mid-turn done row', () => {
+    claim();
+    const row = { id: 'ddac038c', sessionId: SID, name: 'fix-5758', kind: 'background', state: 'done', status: 'busy', pid: 7777, startedAt: T0 };
+    const r = sweep(row, new Set([7777]), resolveFixSessionPolicy({ env: { [FIX_CLAIM_LIVENESS_BY_PID_ENV]: 'off' } }));
+    expect(r.released).toHaveLength(1);
+    expect(r.released[0].liveSessions).toBeUndefined(); // a mid-turn row is never named for a stop
+  });
+  it.each([
+    ['it started a new turn', { status: 'busy' }, () => null, /mid-turn \(status busy\)/],
+    ['it now holds an await-verify record', {}, () => ({ awaiting: true }), /holds an await-verify record/],
+    ['its process is already gone', { pid: 1 }, () => null, /process already gone/],
+    ['it is interactive', { kind: 'interactive' }, () => null, /interactive session/],
+  ])('the stop re-reads the row and leaves it when %s', async (_why, patch, awaitingFor, re) => {
+    const sess = { id: 'ddac038c', sessionId: SID, pid: 7777, status: 'idle' };
+    const result = { checked: 1, refreshed: [], released: [{ repo: 'we', pr: 5758, kind: 'fixing', owner: 'o', liveSessions: [sess] }] };
+    const stop = vi.fn();
+    const lines = [];
+    const fresh = { ...sess, kind: 'background', state: 'done', cwd: '/x', ...patch };
+    const wrapped = withFixDispatchClaimRefresh({ tickOnce: async () => null }, { log: { error: (l) => lines.push(l) }, refresh: () => result, stop,
+      loadPolicy: () => resolveFixSessionPolicy({}), listFresh: () => [fresh], awaitingFor, pidAlive: (pid) => pid === 7777 });
+    await wrapped.tickOnce();
+    expect(stop).not.toHaveBeenCalled();
+    expect(lines.join('\n')).toMatch(re);
   });
   it('a gone session (no live pid) is released with nothing to stop', () => {
     claim();

@@ -81,6 +81,9 @@ import { fixLauncherAvailable, fixDetachedProvider } from '../../scripts/operati
 import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mjs';
 import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatch-claim.mjs'; // dup-heal-dispatch
 import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
+import { defaultListAgents as listAgentsForStop } from '../../scripts/operations/dispatch-lane-io.mjs';
+import { makeAwaitingVerifyResolver as awaitingResolverForStop } from '../../scripts/conveyor/await-verify.mjs';
+import { isPidAlive as pidAliveForStop } from '../../scripts/lib/dispatch-throttle.mjs';
 import { loadFixSessionPolicy, formatFixSessionPolicyLine } from '../../scripts/lib/fix-session-liveness.mjs';
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
 import { applyReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs'; // #3383 follow-up — tag at dispatch, see runTickAllRepos
@@ -1253,6 +1256,9 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
  */
 export function withFixDispatchClaimRefresh(effects, {
   log = console, refresh = refreshLiveFixDispatchClaims, stop = stopSession, loadPolicy = () => loadFixSessionPolicy(),
+  // The stop re-reads each session UNCACHED right before acting: the sweep's snapshot may be stale by then.
+  listFresh = () => listAgentsForStop({ all: true, env: { ...process.env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } }),
+  awaitingFor = awaitingResolverForStop(), pidAlive = pidAliveForStop,
 } = {}) {
   const tick = effects.tickOnce;
   let loggedPolicy = null;
@@ -1289,6 +1295,19 @@ export function withFixDispatchClaimRefresh(effects, {
             const handle = sess.id || String(sess.sessionId ?? '').slice(0, 8);
             const src = `fix.stopOnClaimRelease=${policy.stopOnClaimRelease} (${policy.sources?.stopOnClaimRelease ?? 'standard'})`;
             if (!policy.stopOnClaimRelease) { log.error(`reconcile-fix-dispatch-daemon: left session ${handle} running after releasing claim ${r.kind}-${r.pr} (${r.repo}) — ${src}`); continue; }
+            // Re-check right before the stop: still a background row, still a live process, still idle (or judged
+            // hung by the sweep), and no await-verify record for this PR. Anything else, or an unreadable list: leave it.
+            let fresh;
+            try { fresh = (listFresh() ?? []).find((a) => a?.sessionId === sess.sessionId) ?? null; } catch { fresh = undefined; }
+            let awaiting = false;
+            try { awaiting = fresh ? awaitingFor(fresh, { pr: r.pr })?.awaiting === true : false; } catch { awaiting = true; }
+            const why = fresh === undefined ? 'session list unreadable'
+              : !fresh ? 'no longer listed'
+                : fresh.kind !== 'background' ? `${fresh.kind || 'unknown-kind'} session`
+                  : !(Number.isInteger(fresh.pid) && fresh.pid > 0 && pidAlive(fresh.pid)) ? 'process already gone'
+                    : !(String(fresh.status ?? '').toLowerCase() === 'idle' || sess.hung === true) ? `mid-turn (status ${fresh.status ?? 'missing'})`
+                      : awaiting ? 'it holds an await-verify record' : null;
+            if (why) { log.error(`reconcile-fix-dispatch-daemon: did not stop session ${handle} after releasing claim ${r.kind}-${r.pr} (${r.repo}) — ${why}`); continue; }
             try {
               const out = stop({ handle });
               log.error(`reconcile-fix-dispatch-daemon: stopped session ${handle} (pid ${sess.pid}, status ${sess.status ?? 'unknown'}) after releasing claim ${r.kind}-${r.pr} (${r.repo})${out?.alreadyGone ? ' — already gone' : ''} — ${src}`);

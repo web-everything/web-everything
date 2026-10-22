@@ -87,7 +87,7 @@ import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs
 import { startedAtMs } from './reconcile-core.mjs';
 import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
 import { isClaimRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
-import { isRowMidTurn, rowProcessAlive } from '../lib/fix-session-liveness.mjs';
+import { isRowMidTurn, rowProcessAlive, loadFixSessionPolicy } from '../lib/fix-session-liveness.mjs';
 
 // The light store helpers live in `fix-claim-store.mjs` (no dispatch graph — see its header); re-exported here so
 // every existing importer of this module is unchanged.
@@ -264,12 +264,14 @@ export function refreshLiveFixDispatchClaims({
   awaitingVerifyFor = makeAwaitingVerifyResolver(),
   hungThresholdMs = resolveHungThresholdMs(),
   alive = isPidAlive,
+  sessionPolicy = null,
   nowIso = () => new Date().toISOString(),
   nowMs = Date.parse(nowIso()),
 } = {}) {
   const claims = listFixDispatchClaims(lockRoot);
   if (!claims.length) return { checked: 0, refreshed: [] };
   const listed = listAgentsAll();
+  const byPid = (sessionPolicy ?? loadFixSessionPolicy()).claimLivenessByPid;
   if (listed && typeof listed.then === 'function') {
     throw new TypeError('refreshLiveFixDispatchClaims: listAgentsAll must be synchronous (got a Promise)');
   }
@@ -304,7 +306,7 @@ export function refreshLiveFixDispatchClaims({
     }
     // The claim's bound session id matches its row even if the listing renamed it (a resumed session can list under a
     // generated title), so liveness never hangs on the name alone.
-    const boundSessionId = entry.meta.sessionId ?? null;
+    const boundSessionId = byPid ? entry.meta.sessionId ?? null : null;
     const agentsAll = (Array.isArray(listed) ? listed : []).filter((a) => a && (String(a.name ?? '') === name || (boundSessionId && a.sessionId === boundSessionId)))
       .map((a) => {
         let info = null;
@@ -314,7 +316,7 @@ export function refreshLiveFixDispatchClaims({
     const isAwaiting = typeof awaitingVerifyFor === 'function' && agentsAll.some((row) => {
       try { return awaitingVerifyFor(row, { pr })?.awaiting === true; } catch { return false; }
     });
-    if (!isAwaiting && !isClaimSessionLive({ repo, pr, kind, agentsAll, name, sessionId: boundSessionId, pidAlive: alive })) {
+    if (!isAwaiting && !isClaimSessionLive({ repo, pr, kind, agentsAll, name, sessionId: boundSessionId, pidAlive: byPid ? alive : null })) {
       // A terminal row must belong to THIS dispatch, not an older round with the
       // same reusable name. Missing/failed listings and the spawn-listing lag
       // never release a claim. A live sibling above always wins over old rows.
@@ -330,9 +332,11 @@ export function refreshLiveFixDispatchClaims({
           // fix.stopOnClaimRelease: this run's own background sessions whose PROCESS is still up are named, so the
           // daemon can stop them now instead of leaving a released fixer running (#5758, 2026-10-21: released as
           // settled at 07:00 ET, still in a hung Bash call until 07:44 ET).
+          // Only an IDLE row (turn over) or one the hung detector judged hung; never a row mid-turn.
           const liveSessions = agentsAll
-            .filter((a) => a.kind === 'background' && ownRun(a) && rowProcessAlive(a, alive))
-            .map((a) => ({ id: a.id ?? null, sessionId: a.sessionId ?? null, pid: a.pid, status: a.status ?? null }));
+            .filter((a) => a.kind === 'background' && ownRun(a) && rowProcessAlive(a, alive)
+              && (String(a.status ?? '').toLowerCase() === 'idle' || a.hung === true))
+            .map((a) => ({ id: a.id ?? null, sessionId: a.sessionId ?? null, pid: a.pid, status: a.status ?? null, ...(a.hung === true ? { hung: true } : {}) }));
           if (result.released) released.push({ repo, pr, kind, owner: entry.owner, ...(liveSessions.length ? { liveSessions } : {}) });
         }
       }

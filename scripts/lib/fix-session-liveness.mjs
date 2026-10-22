@@ -23,7 +23,11 @@
  *   `fix.resumeStopsLiveIdle`  (default true; env WE_FIX_RESUME_STOPS_LIVE_IDLE) — a resume first stops an idle session
  *                               whose process is still up, so `--resume` wakes the same id. Off = the old state-only view.
  *   `fix.stopOnClaimRelease`   (default true; env WE_FIX_STOP_ON_CLAIM_RELEASE) — when the claim sweep releases a fixer's
- *                               claim as settled while that session's process is still up, the daemon stops it.
+ *                               claim as settled while that session's process is still up and idle (or judged hung),
+ *                               the daemon re-reads it and stops it.
+ *   `fix.claimLivenessByPid`   (default true; env WE_FIX_CLAIM_LIVENESS_BY_PID) — the claim sweep also matches the claim's
+ *                               bound session id, and a `done` row that is mid-turn with a live pid keeps its claim.
+ *   With all three off, every path is the pre-2026-10-21 one.
  * PURE except {@link loadFixSessionPolicy} (reads the two files; never throws).
  */
 import { readFileSync } from 'node:fs';
@@ -67,15 +71,17 @@ export function cliStartedCopy(stdout) {
 
 export const FIX_RESUME_STOPS_LIVE_IDLE_ENV = 'WE_FIX_RESUME_STOPS_LIVE_IDLE';
 export const FIX_STOP_ON_CLAIM_RELEASE_ENV = 'WE_FIX_STOP_ON_CLAIM_RELEASE';
-export const STANDARD_FIX_SESSION_POLICY = Object.freeze({ resumeStopsLiveIdle: true, stopOnClaimRelease: true });
+export const FIX_CLAIM_LIVENESS_BY_PID_ENV = 'WE_FIX_CLAIM_LIVENESS_BY_PID';
+export const STANDARD_FIX_SESSION_POLICY = Object.freeze({ resumeStopsLiveIdle: true, stopOnClaimRelease: true, claimLivenessByPid: true });
 const KEYS = Object.freeze([
   ['resumeStopsLiveIdle', FIX_RESUME_STOPS_LIVE_IDLE_ENV],
   ['stopOnClaimRelease', FIX_STOP_ON_CLAIM_RELEASE_ENV],
+  ['claimLivenessByPid', FIX_CLAIM_LIVENESS_BY_PID_ENV],
 ]);
 
 /**
  * Resolve both switches. Pure.
- * @returns {{resumeStopsLiveIdle:boolean, stopOnClaimRelease:boolean, sources:Record<string,string>, invalid:string[]}}
+ * @returns {{resumeStopsLiveIdle:boolean, stopOnClaimRelease:boolean, claimLivenessByPid:boolean, sources:Record<string,string>, invalid:string[]}}
  */
 export function resolveFixSessionPolicy({ platform = null, tool = null, env = {} } = {}) {
   const out = { ...STANDARD_FIX_SESSION_POLICY, sources: {}, invalid: [] };

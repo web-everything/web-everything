@@ -950,6 +950,9 @@ export function tryResumeFix(planned, {
   });
 }
 
+/** Resume refusals that mean the earlier fixer is still in a turn: the caller defers, it never cold-starts beside it. */
+export const FIXER_MID_TURN_REFUSALS = new Set(['session-mid-turn', 'prior-session-mid-turn']);
+
 /** Is the row's own pid a live process? (a row with no pid has no known process.) */
 function rowProcessUp(row, pidAlive) {
   return Number.isInteger(row?.pid) && row.pid > 0 && pidAlive(row.pid) === true;
@@ -1001,9 +1004,9 @@ export function resumeBgSession(planned, {
   const policy = sessionPolicy ?? loadFixSessionPolicy();
   // A caller's own pre-resume row that shows no live process needs no second listing read (callers count reads).
   if (policy.resumeStopsLiveIdle && !(candidateRow !== undefined && !rowProcessUp(candidateRow, pidAlive))) {
-    const declined = (why) => {
+    const declined = (why, refused = 'stop-before-resume') => {
       releaseOurClaim();
-      return { resumed: false, resumeAttempt: { attempted: false, candidate, forked: false, refused: 'stop-before-resume', why } };
+      return { resumed: false, resumeAttempt: { attempted: false, candidate, forked: false, refused, why } };
     };
     let row;
     try { row = (listAgentsAll() ?? []).find((a) => normalizeHandle(a?.sessionId) === normalizeHandle(candidate)) ?? null; } catch { row = undefined; }
@@ -1011,7 +1014,10 @@ export function resumeBgSession(planned, {
     // Only a row that positively shows a live process is acted on; a row with no pid keeps the old bare resume.
     if (row && rowProcessUp(row, pidAlive)) {
       if (row.kind !== 'background') return declined(`session ${candidate} is ${row.kind || 'unknown-kind'}, not a background dispatch`);
-      if (isRowMidTurn(row)) return declined(`session ${candidate} is mid-turn (status ${row.status})`);
+      // Mid-turn: never stopped, and the caller defers (no second fixer beside it). A live process whose turn signal is
+      // missing is never stopped either; it is declined the old way (no resume), since nothing shows a turn running.
+      if (isRowMidTurn(row)) return declined(`session ${candidate} is mid-turn (status ${row.status})`, 'session-mid-turn');
+      if (!row.status) return declined(`session ${candidate} has a live process but no turn status; not stopping it`);
       try { stop({ handle: row.id || String(candidate).slice(0, 8) }); } catch (e) { return declined(`claude stop failed: ${String(e?.message ?? e).split('\n')[0]}`); }
       let exited = !rowProcessUp(row, pidAlive);
       for (let i = 0; i < 20 && !exited; i += 1) { wait(500); exited = !rowProcessUp(row, pidAlive); }
@@ -1124,7 +1130,8 @@ export function tryResumeRoundFix(planned, {
   const desiredModel = table?.model ? claudeSpawnAlias(String(table.model)) : null;
   const defaultBranch = 'main'; // every constellation repo's default branch (reconcile-pass assumes the same)
   const inputs = readInputs({ planned, slug, root, listAgentsAll, defaultBranch, repoSlug: ghRepoSlug(repo) });
-  const decision = planRoundResume({ planned, settings: fixSettings, desiredModel, scratchRoot, realpath, ...inputs });
+  const midTurnGuard = (resumeOptions.sessionPolicy ?? loadFixSessionPolicy()).resumeStopsLiveIdle;
+  const decision = planRoundResume({ planned, settings: fixSettings, desiredModel, scratchRoot, realpath, ...inputs, midTurnGuard });
   if (!decision.resume) return declined(decision);
   if (dryRun) return { resumed: false, decision, dryRun: true, roundEscalation };
   // The resumed session reloads `<cwd>/.claude/settings.local.json`, whose guard hooks were written at its first
@@ -2087,6 +2094,10 @@ export function runReconcileFixDispatch({
         dispatched.push(attempt.result);
         continue; // no lane ever popped for this entry
       }
+      if (FIXER_MID_TURN_REFUSALS.has(attempt.resumeAttempt?.refused)) {
+        refusals.push({ pr: entry.pr, kind: 'fixer-mid-turn', why: attempt.resumeAttempt.why });
+        continue; // the earlier fixer is still in a turn: never a second fixer beside it
+      }
       resumeAttempt = attempt.resumeAttempt;
     }
     // Card xrbu1bp — round N>1 of an ordinary fix: resume the previous round's own session first (lane-free, like the
@@ -2103,6 +2114,10 @@ export function runReconcileFixDispatch({
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
         dispatched.push(attempt.result);
         continue; // no lane ever popped for this entry
+      }
+      if (FIXER_MID_TURN_REFUSALS.has(attempt?.resumeAttempt?.refused)) {
+        refusals.push({ pr: entry.pr, kind: 'fixer-mid-turn', why: attempt.resumeAttempt.why });
+        continue; // the earlier fixer is still in a turn: never a second fixer beside it
       }
       if (attempt?.resumeAttempt) {
         resumeAttempt = attempt.resumeAttempt;

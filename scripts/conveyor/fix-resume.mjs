@@ -97,7 +97,7 @@ export function latestSessionRow(agentsAll, slug) {
  *   resume trigger starts in the previous session's cwd, so that cwd must be one of its direct children
  * @param {(p:string)=>string} [o.realpath] resolves symlinks (identity by default; the IO caller passes the real one)
  */
-export function planRoundResume({ planned, settings, prior, job, transcript, lane, base, desiredModel = null, scratchRoot = null, realpath = (p) => p } = {}) {
+export function planRoundResume({ planned, settings, prior, job, transcript, lane, base, desiredModel = null, scratchRoot = null, realpath = (p) => p, midTurnGuard = true } = {}) {
   const no = (reason, why) => ({ resume: false, reason, why });
   if (settings?.resumeAcrossRounds === 'off') return no('setting-off', 'fix.resumeAcrossRounds is off');
   const round = roundOf(planned);
@@ -110,8 +110,8 @@ export function planRoundResume({ planned, settings, prior, job, transcript, lan
     return no('prior-session-busy', `the earlier session ${prior.id ?? prior.sessionId} is ${prior.state} (resuming it would fork a copy)`);
   }
   // A `done` row can still be mid-turn: `status` is the turn signal (we:scripts/lib/fix-session-liveness.mjs).
-  if (isRowMidTurn(prior)) {
-    return no('prior-session-busy', `the earlier session ${prior.id ?? prior.sessionId} is ${prior.state} but mid-turn (status ${prior.status})`);
+  if (midTurnGuard && isRowMidTurn(prior)) {
+    return no('prior-session-mid-turn', `the earlier session ${prior.id ?? prior.sessionId} is ${prior.state} but mid-turn (status ${prior.status})`);
   }
   if (!job) return no('job-record-gone', `no job record for ${prior.id ?? prior.sessionId}`);
   if (job.template && job.template !== 'bg') return no('not-a-bg-session', `job template ${job.template}`);
