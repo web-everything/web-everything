@@ -19,7 +19,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP } = {}) {
+function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -62,7 +62,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const readFile = () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); };
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
-    dryRun, env, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
@@ -753,7 +753,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     edited.s.enqueue({ num: 5283 }, HEAD, { comments: [{ id: 1, body: 'operator ruling' }] });
     expect(edited.calls.filter(c => c.includes('--slurp'))).toHaveLength(1);
   });
-  it('raises a named health smell and enqueues a never-scheduled pass at the maximum, even during backoff', () => {
+  it('raises a named health smell and HOLDS a never-scheduled pass at the maximum, even during backoff (no merge without a result)', () => {
     let clock = 1_000;
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
       env: { WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC: '7200', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '45' } });
@@ -761,12 +761,14 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     clock += 45 * 60_000 - 1;
     expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ healthSmell: false });
     clock += 1;
-    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deferred: true, kind: 'red-team-pending', healthSmell: true, deadlineHeld: true });
     expect(h.logs.join('')).toContain(`health smell: ${LOCAL}#5283 red-team-pending on ${HEAD}`);
     expect(h.logs.join('')).toContain('redTeamPendingMaxMin=45, env');
-    expect(h.calls.filter(c => c.includes('--slurp'))).toHaveLength(3);
-    expect(h.logs.join('')).toContain('red team never scheduled');
-    expect(h.logs.join('')).toContain('enqueueWhenRedTeamNeverScheduled=true (standard)');
+    // First read + the deadline recheck despite the 7200s backoff; no third (clearance-stamp) read, since nothing enqueues.
+    expect(h.calls.filter(c => c.includes('--slurp'))).toHaveLength(2);
+    expect(h.logs.join('')).toContain(`HOLD ${LOCAL}#5283 on ${HEAD}: held: no red-team result on this head after 45 min (no red-team request path)`);
+    expect(h.logs.join('')).toContain('redTeam.deadlineAction=requeue-then-hold (standard)');
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
   });
   it.each([5439, 5443])('enqueues accepted #%s when the review scheduler owes no pass', num => {
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
@@ -782,30 +784,38 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, healthSmell: true });
     expect(h.logs.join('')).not.toContain('red team never scheduled');
   });
-  it('requests an overdue missing pass through the supplied review dispatch path', () => {
+  it('requests an overdue missing pass ONCE through the supplied review dispatch path, then holds (never enqueues)', () => {
     let clock = 1000;
-    const requests = [];
+    const requests = [], notes = [];
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
-      requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+      requestRedTeam: input => { requests.push(input); return { requested: true }; }, publishNeedsYou: item => notes.push(item) });
     h.s.enqueue({ num: 5283 }, HEAD);
     expect(requests).toHaveLength(0);
     clock += 45 * 60_000;
     expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, healthSmell: true, redTeamRequested: true });
     expect(requests).toEqual([expect.objectContaining({ repo: LOCAL, pr: 5283, head: HEAD })]);
+    expect(notes).toHaveLength(0); // the re-request gets its own full wait before the operator is asked
     expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false });
     expect(requests).toHaveLength(1);
     clock += 45 * 60_000;
-    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deferred: true, deadlineHeld: true });
     expect(requests).toHaveLength(1);
+    expect(notes).toEqual([expect.objectContaining({ repo: LOCAL, pr: 5283, head: HEAD, kind: 'red-team-deadline-held',
+      reason: expect.stringContaining('still none after one re-request') })]);
+    clock += 10 * 60 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(requests).toHaveLength(1);
+    expect(notes).toHaveLength(1);
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
   });
-  it('honors the fallback switch and logs its source', () => {
+  it('a retired enqueueWhenRedTeamNeverScheduled=true no longer releases the hold, and says so', () => {
     let clock = 1000;
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
-      env: { WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED: 'off' } });
+      env: { WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED: 'on' } });
     h.s.enqueue({ num: 5283 }, HEAD);
     clock += 45 * 60_000;
-    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, healthSmell: true });
-    expect(h.logs.join('')).toContain('enqueueWhenRedTeamNeverScheduled=false (env)');
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, healthSmell: true, deadlineHeld: true });
+    expect(h.logs.join('')).toContain('WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED is retired and ignored');
   });
   it('a new live head resets the pending age and backoff', () => {
     const initial = { pending: [], followedUp: [], redTeamPending: { 'cwd#5283': {
@@ -831,6 +841,133 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
   });
 });
 
+
+describe('red-team wait deadline never merges without a result (redTeam.deadlineAction)', () => {
+  const ACCEPTED = ['review:accepted', 'ready-to-merge'];
+  const enqueuedAny = h => h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')));
+  const clean = { user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` };
+  const pastDeadline = (opts = {}) => {
+    const clock = { t: 1000 };
+    const notes = [];
+    const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t, publishNeedsYou: item => notes.push(item), ...opts });
+    h.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    clock.t += 45 * 60_000;
+    return { h, clock, notes };
+  };
+
+  it('deadline passed + no result: held with a clear reason, one operator note for repo/PR/head, no enqueue', () => {
+    const { h, clock, notes } = pastDeadline();
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true, deadlineHeld: true,
+      reason: 'held: no red-team result on this head after 45 min (no red-team request path)' });
+    expect(notes).toEqual([{ repo: LOCAL, pr: 5283, head: HEAD, kind: 'red-team-deadline-held',
+      reason: 'held: no red-team result on this head after 45 min (no red-team request path)', pick: `https://github.com/${LOCAL}/pull/5283` }]);
+    expect(h.state().redTeamPending['cwd#5283']).toMatchObject({ headSha: HEAD, firstPendingAt: 1000, deadlineHeldAt: clock.t, notifiedAt: clock.t });
+    // Repeated passes and a drain restart keep the hold and publish nothing new.
+    for (let i = 0; i < 3; i++) { clock.t += 10 * 60_000; expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true }); }
+    const restarted = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t, initial: h.state(), publishNeedsYou: item => notes.push(item) });
+    clock.t += 10 * 60_000;
+    expect(restarted.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(notes).toHaveLength(1);
+    expect(enqueuedAny(h) || enqueuedAny(restarted)).toBe(false);
+  });
+
+  it('a failed note publication leaves the hold intact and retries at the next recheck', () => {
+    let fail = true;
+    const notes = [];
+    const { h, clock } = pastDeadline({ publishNeedsYou: item => { if (fail) throw new Error('feed lock busy'); notes.push(item); } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(h.logs.join('')).toContain('red-team deadline note for #5283 not published (feed lock busy) — PR stays held');
+    fail = false;
+    clock.t += 300_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(notes).toHaveLength(1);
+    expect(enqueuedAny(h)).toBe(false);
+  });
+
+  it.each(['inFlight', 'queued', 'recorded'])('a %s run past the deadline is held with the note and is not re-requested', field => {
+    const requests = [];
+    const { h, notes } = pastDeadline({ evidence: { loopPayload: { verdict: { verdict: 'accept' } }, [field]: true, scheduled: true },
+      requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(requests).toHaveLength(0);
+    expect(notes).toHaveLength(1);
+  });
+
+  it('result arrives after the deadline hold: merges (enqueues) on that exact head and clears the hold', () => {
+    const { h, clock } = pastDeadline();
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ deadlineHeld: true });
+    const after = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t + 60_000, initial: h.state(), liveComments: [clean] });
+    expect(after.s.enqueue({ num: 5283 }, HEAD, { comments: [clean] })).toMatchObject({ enqueued: true });
+    expect(after.state().redTeamPending['cwd#5283']).toBeUndefined();
+  });
+
+  it('a result for a DIFFERENT head never releases the hold', () => {
+    const { h, clock } = pastDeadline();
+    h.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    const other = { user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5283 rev=${'d'.repeat(40)} -->\n### Post-accept red team — no break found` };
+    const after = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t + 60_000, initial: h.state(), liveComments: [other] });
+    expect(after.s.enqueue({ num: 5283 }, HEAD, { comments: [other] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+  });
+
+  it('a proven-identical carry of a result arriving after the hold merges', () => {
+    const { h, clock } = pastDeadline();
+    h.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    const prior = 'a'.repeat(40);
+    const carried = { user: { login: 'web-everything[bot]' }, body: [
+      `<!-- review-verdict-carried from=${prior} to=${HEAD} patch-id=${'c'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.',
+      `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->`, '### Post-accept red team — no break found'].join('\n') };
+    const after = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t + 60_000, initial: h.state(), liveComments: [carried] });
+    expect(after.s.enqueue({ num: 5283 }, HEAD, { comments: [carried] })).toMatchObject({ enqueued: true });
+  });
+
+  it('a card-only diff (red team off for that class) is unaffected even with an old pending record past the deadline', () => {
+    const initial = { pending: [], followedUp: [], redTeamPending: { 'cwd#5283': { headSha: HEAD, firstPendingAt: 0, retryAt: 0, commentCount: 0,
+      reason: 'post-accept red team has no recorded result on the live head', deadlineHeldAt: 1, notifiedAt: 1 } } };
+    const notes = [];
+    const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, initial, now: () => 10 * 60 * 60_000, publishNeedsYou: item => notes.push(item),
+      evidence: { scheduled: true, inFlight: false, recorded: false, loopPayload: { findings: { read: { netChangedFiles: ['backlog/123-card.md'] } } } } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
+    expect(notes).toHaveLength(0);
+  });
+
+  it('deadlineAction=hold publishes the note without re-requesting', () => {
+    const requests = [];
+    const { h, notes } = pastDeadline({ env: { WE_RED_TEAM_DEADLINE_ACTION: 'hold' }, requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true, reason: expect.stringContaining('redTeam.deadlineAction=hold') });
+    expect(requests).toHaveLength(0);
+    expect(notes).toHaveLength(1);
+    expect(h.logs.join('')).toContain('redTeam.deadlineAction=hold (env)');
+  });
+
+  it.each([
+    ['a settings-file value', { redTeamDeadline: undefined, env: {} }, { file: { redTeam: { deadlineAction: 'merge-without-result' } } }],
+    ['a platform value', { env: {} }, { platform: { deadlineAction: 'merge-without-result' } }],
+    ['env without a named operator', { env: { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result' } }, null],
+  ])('%s can never restore merge-without-result', async (_name, opts, layer) => {
+    const { resolveRedTeamDeadlineAction } = await import('../red-team-gate.mjs');
+    const redTeamDeadline = layer ? resolveRedTeamDeadlineAction({ ...layer, env: opts.env }) : undefined;
+    if (layer) expect(redTeamDeadline.invalid.join(' ')).toContain('merge-without-result');
+    const { h, notes } = pastDeadline({ ...opts, ...(redTeamDeadline ? { redTeamDeadline } : {}) });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(notes).toHaveLength(1);
+    expect(enqueuedAny(h)).toBe(false);
+  });
+
+  it('only the explicit operator env override enqueues without a result, logged with who and the source', () => {
+    const { h, notes } = pastDeadline({ env: { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: 'chalbert' } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
+    expect(h.logs.join('')).toContain(`OPERATOR OVERRIDE: enqueuing ${LOCAL}#5283 on ${HEAD} with NO red-team result after 45 min (redTeam.deadlineAction=merge-without-result, env, by chalbert)`);
+    expect(notes).toHaveLength(0);
+  });
+
+  it('the operator override never waives an in-flight run or a confirmed break', () => {
+    const { h } = pastDeadline({ env: { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: 'chalbert' },
+      evidence: { loopPayload: { verdict: { verdict: 'accept' } }, inFlight: true, scheduled: true } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(enqueuedAny(h)).toBe(false);
+  });
+});
 
 describe('queue safeguard overrides and untracked queue entries', () => {
   it.each(['WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE', 'WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('%s off preserves enqueue without a red-team result', key => {
