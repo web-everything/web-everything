@@ -357,7 +357,7 @@ describe('await-verify clear — the timeout exit only releases once no record i
     const code = main(['clear', '--who=fix-5758', '--cwd=/lane'], {
       env: { CLAUDE_CODE_SESSION_ID: 'ddac038c-bcfe-4cd0-9d51-c983476b47b1' },
       exec: () => '/lane\n', clear: () => ({ cleared: true }), clearStore: () => ({ cleared: false }),
-      read: () => null, readStore: () => ({ pr: 5758 }), out: (l) => outs.push(l), err: (l) => errs.push(l),
+      read: () => null, readStore: () => ({ pr: 5758 }), laneLeft: () => false, storeLeft: () => false, out: (l) => outs.push(l), err: (l) => errs.push(l),
     });
     expect(code).toBe(3);
     expect(JSON.parse(outs[0])).toEqual({ cleared: true, remaining: ['store'] });
@@ -368,8 +368,21 @@ describe('await-verify clear — the timeout exit only releases once no record i
     const code = main(['clear', '--who=fix-5758', '--cwd=/lane'], {
       env: { CLAUDE_CODE_SESSION_ID: 'ddac038c-bcfe-4cd0-9d51-c983476b47b1' },
       exec: () => '/lane\n', clear: () => ({ cleared: true }), clearStore: () => ({ cleared: true }),
-      read: () => null, readStore: () => null, out: () => {}, err: () => {},
+      read: () => null, readStore: () => null, laneLeft: () => false, storeLeft: () => false, out: () => {}, err: () => {},
     });
     expect(code).toBe(0);
+  });
+});
+
+describe('strict leftovers after a clear', () => {
+  it('an EACCES on the lane record or the store file counts as remaining; ENOENT does not', async () => {
+    const { strictLaneRecordLeft, strictStoreRecordLeft } = await import('../await-verify.mjs');
+    const err = (code) => () => { const e = new Error(code); e.code = code; throw e; };
+    const dirStat = (p) => (String(p).endsWith('.git') ? { isDirectory: () => true } : err('ENOENT')());
+    expect(strictLaneRecordLeft('/lane', { statFn: dirStat })).toBe(false);
+    expect(strictLaneRecordLeft('/lane', { statFn: (p) => (String(p).endsWith('.git') ? { isDirectory: () => true } : err('EACCES')()) })).toBe(true);
+    expect(strictLaneRecordLeft('/lane', { statFn: err('EACCES') })).toBe(true);
+    expect(strictStoreRecordLeft('fix-5758', { dir: '/s', statFn: err('ENOENT') })).toBe(false);
+    expect(strictStoreRecordLeft('fix-5758', { dir: '/s', statFn: err('EACCES') })).toBe(true);
   });
 });

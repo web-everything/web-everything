@@ -460,6 +460,15 @@ export async function runAwaitVerifyPass({
       const prompt = buildAwaitVerifyResumePrompt({
         kind: record.pendingResume.kind, record, marker: record.pendingResume.marker ?? marker, detail: record.pendingResume.detail,
       });
+      // A fixer whose fix claim is gone (it released it, or another session holds it now) is never woken by a late
+      // verdict: that would put it back to work beside whoever took the PR. Unreadable -> wait for the next tick.
+      const claimCheck = typeof io.resumeClaimCheck === 'function' ? io.resumeClaimCheck(record) : { ok: true };
+      if (claimCheck?.defer) { row.result = `${row.result ? `${row.result}; ` : ''}resume-deferred (${claimCheck.reason})`; rows.push(row); continue; }
+      if (claimCheck && claimCheck.ok === false) {
+        clearOrNote(key, record);
+        row.result = `${row.result ? `${row.result}; ` : ''}not resumed: ${claimCheck.reason}`;
+        rows.push(row); continue;
+      }
       const failures = (record.resumeFailures ?? 0) + 1;
       if (!persist({ ...record, resumeFailures: failures })) { rows.push(row); continue; }
       const resumed = io.resume({ session, prompt });
@@ -840,6 +849,18 @@ export async function defaultAwaitVerifyIo({
         incomplete.push(...(wrapped.incomplete ?? []));
       } catch (e) { incomplete.push({ reason: `wrapped worker listing failed: ${why(e)}`, session: null }); }
       return Object.defineProperty(rows, 'incomplete', { value: incomplete });
+    },
+    // Only a fix / ci-heal record bound to a session id is checked; a claim bound to another session, or none at all,
+    // refuses the resume. A token-bound claim (no session id) is left as before.
+    resumeClaimCheck: (record) => {
+      if (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record?.kind) || !record?.sessionId) return { ok: true };
+      const repoKey = repoKeyForSlug(record.repo);
+      if (!repoKey) return { ok: true };
+      let claim;
+      try { claim = readClaim(repoKey, record.pr); } catch (e) { return { defer: true, reason: `fix claim unreadable: ${String(e?.message ?? e).split('\n')[0]}` }; }
+      if (!claim) return { ok: false, reason: `no fix claim is held for PR #${record.pr} any more` };
+      if (claim.meta?.sessionId && claim.meta.sessionId !== record.sessionId) return { ok: false, reason: `the PR #${record.pr} fix claim is held by another session` };
+      return { ok: true };
     },
     resume: ({ session, prompt }) => {
       if (session?.kind === 'wrapped-worker') return requestWrappedResumeFn({ session, prompt });

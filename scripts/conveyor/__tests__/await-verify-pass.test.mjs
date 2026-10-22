@@ -1159,3 +1159,34 @@ describe('verify-only infra retries', () => {
     expect([...h.store.values()][0].pendingResume).toBeUndefined();
   });
 });
+
+// fixer-resume (2026-10-21): a late verdict never wakes a fixer whose claim is gone or held by another session.
+describe('resume claim check', () => {
+  it('a red verdict for a fixer whose claim was released is not resumed, and the record is dropped', async () => {
+    const h = harness();
+    h.io.resumeClaimCheck = () => ({ ok: false, reason: 'no fix claim is held for PR #4115 any more' });
+    h.state.marker = marker('red');
+    const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.size).toBe(0);
+    expect(rows[0].result).toMatch(/not resumed: no fix claim is held/);
+  });
+  it('an unreadable claim defers the resume and keeps the record', async () => {
+    const h = harness();
+    h.io.resumeClaimCheck = () => ({ defer: true, reason: 'fix claim unreadable: EACCES' });
+    h.state.marker = marker('red');
+    await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.size).toBe(1);
+  });
+  it('the default IO refuses a claim held by another session, allows its own, and ignores delivery/prepare', async () => {
+    const claims = { held: { meta: { sessionId: 'S-own' } } };
+    const io = await defaultAwaitVerifyIo({ readClaimFn: () => claims.held, pushRefusalFn: () => null, dispatchIo: { defaultListAgents: () => [] } });
+    const r = { kind: 'fix', repo: 'web-everything/web-everything', pr: 4115, sessionId: 'S-own' };
+    expect(io.resumeClaimCheck(r)).toEqual({ ok: true });
+    expect(io.resumeClaimCheck({ ...r, sessionId: 'S-old' })).toMatchObject({ ok: false });
+    claims.held = null;
+    expect(io.resumeClaimCheck(r)).toMatchObject({ ok: false, reason: expect.stringMatching(/no fix claim/) });
+    expect(io.resumeClaimCheck({ ...r, kind: 'delivery' })).toEqual({ ok: true });
+  });
+});

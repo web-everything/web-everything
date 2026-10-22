@@ -172,6 +172,28 @@ export function hasAwaitVerifyRecordStrict(cwd, session, { readFileSyncFn = read
   try { record = readAwaitVerifyRecordForSession(cwd, session, { ...opts, statFn: strictStat, readFileSyncFn: strictRead }); } catch { return true; }
   return Boolean(record) || unknown;
 }
+/** STRICT: is the lane-local record file (possibly) still there? Only ENOENT/ENOTDIR counts as absent. */
+export function strictLaneRecordLeft(cwd, { statFn = statSync, readFileSyncFn = readFileSync } = {}) {
+  const gone = (e) => e?.code === 'ENOENT' || e?.code === 'ENOTDIR';
+  if (typeof cwd !== 'string' || !cwd) return false;
+  const git = resolve(cwd, '.git');
+  let path;
+  try {
+    const st = statFn(git);
+    if (st.isDirectory()) path = resolve(git, AWAIT_VERIFY_FILE);
+    else {
+      const m = /^gitdir:\s*([^\r\n]+)\s*$/.exec(String(readFileSyncFn(git, 'utf8')));
+      if (!m?.[1]?.trim()) return true;
+      path = resolve(cwd, m[1].trim(), AWAIT_VERIFY_FILE);
+    }
+  } catch (e) { return !gone(e); }
+  try { statFn(path); return true; } catch (e) { return !gone(e); }
+}
+/** STRICT: is a store record file (possibly) still there for `key`? Only ENOENT/ENOTDIR counts as absent. */
+export function strictStoreRecordLeft(key, { dir = awaitVerifyStoreDir(), statFn = statSync } = {}) {
+  if (!nonEmpty(key) || !STORE_KEY_RE.test(key)) return false;
+  try { statFn(join(dir, `${key}.json`)); return true; } catch (e) { return !(e?.code === 'ENOENT' || e?.code === 'ENOTDIR'); }
+}
 /** Every parseable store record with its key; unreadable entries are skipped. */
 export function listStoredAwaitVerify({ dir = awaitVerifyStoreDir(), readdirSyncFn = readdirSync, readFileSyncFn = readFileSync } = {}) {
   let names = [];
@@ -293,6 +315,7 @@ export function main(argv = process.argv.slice(2), {
   read = readAwaitVerifyRecord, clear = clearAwaitVerifyRecord, out = console.log, err = console.error,
   writeStore = writeStoredAwaitVerify, readStore = readStoredAwaitVerify, clearStore = clearStoredAwaitVerify,
   readSelfReviewFn = readSelfReview, writeSelfReviewFn = writeSelfReview, selfReviewPolicy = loadSelfReviewPolicy,
+  laneLeft = (c) => strictLaneRecordLeft(c), storeLeft = (k) => strictStoreRecordLeft(k),
 } = {}) {
   const [command, ...args] = argv;
   const flags = Object.fromEntries(args.filter((arg) => arg.startsWith('--')).map((arg) => {
@@ -316,7 +339,11 @@ export function main(argv = process.argv.slice(2), {
       const store = clearStore(key);
       // A clear is only "done" when NEITHER record is left: a caller about to release its claim (the fixer's
       // verify-wait-timeout exit) must never leave a record that a later verdict could resume it from.
-      const remaining = [read(cwd) ? 'lane' : null, key && readStore(key) ? 'store' : null].filter(Boolean);
+      // STRICT: an unreadable or corrupt leftover counts as remaining (only a clean "no such file" is absent).
+      const remaining = [
+        read(cwd) || laneLeft(cwd) ? 'lane' : null,
+        key && (readStore(key) || storeLeft(key)) ? 'store' : null,
+      ].filter(Boolean);
       out(JSON.stringify({ cleared: lane.cleared || store.cleared, ...(remaining.length ? { remaining } : {}) }));
       if (remaining.length) { err(`await-verify clear: ${remaining.join(' and ')} record still present — do not release the claim`); return 3; }
       return 0;
