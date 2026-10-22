@@ -1991,3 +1991,21 @@ ON. They resolve through the shared policy cascade: standard → platform → re
 with each source logged. Dispatch strips disabled brief sections. The verify step's first-commit
 check applies to build lane branches and delivery leases on local `main`, and warns if no test was added or updated; this advisory
 cannot prove a red run. Git-read errors are reported as unknown rather than evidence of compliance.
+
+## Fixer lane HEAD and lease probe
+
+`fix-run.mjs` retains the `holder` returned by `lane-pool acquire --json`; the ambient
+session is not proof that a later lease belongs to the fixer. It checks the on-disk
+`.git/.lane-lease` and exact PR head before starting the agent, preserves launcher
+merge preparation, and checks ownership again before staging and pushing. Only an
+owned, clean lane can be fetched/reset to the pinned PR SHA; recovery rechecks the
+lease and HEAD. These checks detect takeover but do not make the allocator atomic.
+
+For a read-only observation, run
+`node scripts/operations/fix-run.mjs --probe-lane-head --lane-path=<absolute lane path> --pr=<PR> --holder=<original acquired holder> [--repo=owner/repo]`.
+The probe prints the observed lease, HEAD, current GitHub PR head and pure
+`laneHeadCheck` decision. Omitting `--holder` refuses ownership rather than treating
+the current occupant as ours. Git optional locks are disabled, so status does not
+refresh the index. The live PR head may have advanced since an incident; compare
+against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
+`fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.

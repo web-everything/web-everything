@@ -37,6 +37,7 @@ import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecu
 import { appendFixLoopRow, isInfraFixRunOutcome } from '../conveyor/fix-loop-ledger.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { riskyLaneConfig, LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
@@ -437,10 +438,84 @@ export function renderCiHealContext(inputs) {
 
 /** Lane path = last non-empty stdout line of `lane-pool acquire` (it prints the path last). */
 export function parseAcquiredLanePath(stdout) {
+  try {
+    const parsed = JSON.parse(String(stdout));
+    if (typeof parsed.path === 'string' && parsed.path.startsWith('/')) return parsed.path;
+  } catch { /* legacy path-only output */ }
   const lines = String(stdout ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
   const path = lines.filter((l) => l.startsWith('/')).pop();
   if (!path) throw new Error(`fix-run: lane-pool acquire printed no lane path (got ${JSON.stringify(lines.slice(-2))})`);
   return path;
+}
+
+/** Read the allocator's marker, never infer ownership from the ambient session. */
+export function readLaneLease(lanePath) {
+  try { return JSON.parse(readFileSync(join(lanePath, '.git', LEASE_FILENAME), 'utf8')); }
+  catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+}
+
+/** Pure decision; clean must be positively observed before a reset can be proposed. */
+export function laneHeadCheck({ laneHead, prHead, lease, holder, clean = false }) {
+  const mismatch = `${laneHead?.slice(0, 9) || 'unknown'}, not PR head ${prHead?.slice(0, 9) || 'unknown'}`;
+  const location = laneHead && laneHead === prHead ? `at PR head ${prHead.slice(0, 9)}` : `at ${mismatch}`;
+  const why = !holder || !lease?.holder || lease.holder !== holder
+    ? `${location}; lease now held by ${lease?.holder || 'unknown (missing lease/holder)'} (expected ${holder || 'unknown'})`
+    : !laneHead || !prHead ? 'cannot resolve lane HEAD or PR head'
+    : laneHead === prHead ? 'lease is ours and HEAD matches'
+    : `at ${mismatch}${clean ? '; clean lane with our lease' : '; lane is dirty or cleanliness is unproven'}`;
+  const action = !holder || !lease?.holder || lease.holder !== holder || !laneHead || !prHead ? 'refuse'
+    : laneHead === prHead ? 'ok' : clean ? 'reset' : 'refuse';
+  return { ok: action === 'ok', action, why };
+}
+
+/** Thin read-only IO shared by recovery and the live probe. */
+export function inspectLaneHead({ lanePath, prHead, holder, run = sh, readLease = readLaneLease }) {
+  const opts = { cwd: lanePath, env: { ...laneGitHardeningEnv(process.env), LANE_SESSION: holder || '', GIT_OPTIONAL_LOCKS: '0' } };
+  const config = run('git', [...LANE_CONFIG_LIST_ARGS], opts);
+  if (riskyLaneConfig(config).length) throw new LauncherError('unsafe lane git config; refusing lane head inspection');
+  const laneHead = run('git', [...HARDENED_GIT_ARGS, 'rev-parse', '--verify', 'HEAD'], opts).trim();
+  const clean = !run('git', [...HARDENED_GIT_ARGS, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], opts).trim();
+  const lease = readLease(lanePath);
+  return { laneHead, prHead, holder: holder || null, lease, clean,
+    ...laneHeadCheck({ laneHead, prHead, lease, holder, clean }) };
+}
+
+export function assertLaneLease({ lanePath, holder, readLease = readLaneLease, phase = 'start the agent' }) {
+  try {
+    const lease = readLease(lanePath);
+    if (!holder || lease?.holder !== holder) throw new Error(`lease now held by ${lease?.holder || 'unknown'} (expected ${holder || 'unknown'})`);
+  } catch (e) {
+    throw new LauncherError(`fix-run: ${basename(lanePath)} ${e.message}; refusing to ${phase}`);
+  }
+}
+
+/** Recover only a clean, still-owned lane. A launcher merge must never be discarded. */
+export function ensureLaneHead({ lanePath, prHead, holder, run = sh, readLease = readLaneLease, allowReset = true }) {
+  try {
+    const options = { lanePath, prHead, holder, run, readLease };
+    let check = inspectLaneHead(options);
+    if (check.action === 'reset' && allowReset) {
+      const opts = { cwd: lanePath, env: { ...laneGitHardeningEnv(process.env), LANE_SESSION: holder } };
+      run('git', [...HARDENED_GIT_ARGS, 'fetch', 'origin', prHead], opts);
+      // Fetch can block: re-read both the marker and tree immediately before the destructive command.
+      check = inspectLaneHead(options);
+      if (check.action === 'reset') {
+        run('git', [...HARDENED_GIT_ARGS, 'reset', '--hard', prHead], opts);
+        check = inspectLaneHead(options);
+      }
+    }
+    if (!check.ok) throw new Error(`${check.why}${!allowReset ? '; launcher merge preparation must be preserved' : ''}`);
+    return check;
+  } catch (e) {
+    throw new LauncherError(`fix-run: ${basename(lanePath)} ${e.message}; refusing to start the agent`);
+  }
+}
+
+/** No fetch, acquire, reset, release or other writes. Supply the ORIGINAL acquire holder to prove ownership. */
+export function probeLaneHead({ lanePath, pr, repo, holder, run = sh, readLease = readLaneLease }) {
+  const { headRefOid: prHead } = JSON.parse(run('gh', ['pr', 'view', String(pr), '--json', 'headRefOid',
+    ...(repo ? [`--repo=${repo}`] : [])], { cwd: lanePath }));
+  return inspectLaneHead({ lanePath, prHead, holder, run, readLease });
 }
 
 export function isNothingToRearmRefusal(err) {
@@ -511,6 +586,7 @@ export async function runFixCli(argv = [], {
   releaseClaim = releaseBorrowedClaim,
   recordOutcome = recordBorrowOutcome,
   recordRouted = recordRoutedOutcome,
+  readLease = readLaneLease,
   readFile = readLaneFileSafe,
   stageEntry = laneStageEntry,
   fileExists = existsSync,
@@ -611,20 +687,27 @@ export async function runFixCli(argv = [], {
     write(`fix-run: lane acquire wait ${acquireWait.ms}ms (${acquireWait.source})\n`);
     const poolArgs = [
       resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'acquire', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
-      `--wait-ms=${acquireWait.ms}`, '--purpose=conveyor-fix', `--session=${sessionSlug}`, ...(launch.scope ? [`--scope=${launch.scope}`] : []), `--base=${ref}`,
+      `--wait-ms=${acquireWait.ms}`, '--purpose=conveyor-fix', '--json', `--session=${sessionSlug}`, ...(launch.scope ? [`--scope=${launch.scope}`] : []), `--base=${ref}`,
     ];
-    const lanePath = parseAcquiredLanePath(run('node', poolArgs, { cwd: weRoot }));
+    const acquired = run('node', poolArgs, { cwd: weRoot });
+    const lanePath = parseAcquiredLanePath(acquired);
+    const holder = JSON.parse(acquired).holder;
+    if (typeof holder !== 'string' || !holder) throw new LauncherError('fix-run: acquire returned no holder slug; refusing to start the agent');
     const laneNum = basename(lanePath).replace(/^lane-/, '');
-    laneRelease = () => run('node', [
-      resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'release', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
-      `--lane=${laneNum}`, `--session=${sessionSlug}`,
-    ], { cwd: weRoot });
-    const gitEnv = { ...laneGitHardeningEnv(process.env), GIT_LITERAL_PATHSPECS: '1' };
+    laneRelease = () => {
+      assertLaneLease({ lanePath, holder, readLease, phase: 'release the lane' });
+      return run('node', [
+        resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'release', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
+        `--lane=${laneNum}`, `--session=${holder}`,
+      ], { cwd: weRoot });
+    };
+    const gitEnv = { ...laneGitHardeningEnv(process.env), GIT_LITERAL_PATHSPECS: '1', LANE_SESSION: holder };
+    const checkLane = (head, allowReset = true) => ensureLaneHead({ lanePath, prHead: head, holder, run, readLease, allowReset });
     const laneConfig = () => run('git', [...LANE_CONFIG_LIST_ARGS], { cwd: lanePath, env: gitEnv });
-    before = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
     const configBefore = laneConfig();
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
+    before = checkLane(prHeadSha).laneHead;
     const rearm = head => {
       // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
       try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
@@ -712,6 +795,7 @@ export async function runFixCli(argv = [], {
       .map(entry => /^(\d+) ([0-9a-f]+) ([0-3])\t([\s\S]*)$/.exec(entry))
       .filter(m => m && OID_RE.test(m[2]) && m[4] === path)
       .map(m => ({ mode: m[1], oid: m[2], stage: m[3] }));
+    let preparedHead = before;
     let unmerged = [];
     let mergePrompt = '';
     if (target) {
@@ -721,6 +805,7 @@ export async function runFixCli(argv = [], {
       // Runs from the catch after the agent may have rewritten the lane config: `merge --abort` checks files out through
       // any smudge filter, so re-verify the config first and, on a mismatch, leave the lane to be discarded instead.
       abortMerge = () => {
+        assertLaneLease({ lanePath, holder, readLease, phase: 'abort merge' });
         if (!inMerge()) return;
         const now = laneConfig();
         if (now !== configBefore || riskyLaneConfig(now).length) throw new LauncherError('lane git config changed; not running merge --abort in it');
@@ -741,7 +826,10 @@ export async function runFixCli(argv = [], {
         }
         unmerged = conflicts.map(c => c.path);
       }
-      if (!unmerged.length && inMerge()) commitMerge();
+      if (!unmerged.length && inMerge()) {
+        commitMerge();
+        preparedHead = git('rev-parse', '--verify', 'HEAD').trim();
+      }
       if (unmerged.length) mergePrompt = `The launcher has ALREADY started git merge origin/${target}; the conflicted files are: ${unmerged.join(', ')}. Resolve them by editing the files only. Do NOT run any git command that writes (merge, add, commit, checkout, reset, stash, rebase) — the sandbox forbids .git writes; the launcher stages and commits after you exit.\n\n`;
     }
     // Capture emitted widths before the agent runs: the merge itself may already have changed .gitattributes. Widths come
@@ -788,6 +876,7 @@ export async function runFixCli(argv = [], {
       finalMessage = `repeated finding: restored scope-baseline ${reset.baseline} plus ${reset.replay.length} in-scope commits`;
       write(`fix-run: ${finalMessage}\n`);
     } else try {
+      checkLane(unmerged.length ? before : preparedHead, !target);
       spawned = await provider.spawn({
         taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
         sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
@@ -808,6 +897,7 @@ export async function runFixCli(argv = [], {
       throw e;
     }
     finalMessage = agentFinalMessage(spawned) || finalMessage;
+    assertLaneLease({ lanePath, holder, readLease, phase: 'push or stage files' });
     const configAfterAgent = laneConfig();
     if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new LauncherError('lane git config changed while the agent ran; refusing to push');
     const statusAfterAgent = git('status', '--porcelain=v1', '-z', '--untracked-files=all');
@@ -863,6 +953,7 @@ export async function runFixCli(argv = [], {
       }
       // Record the owed re-arm BEFORE the push (best effort): a crash anywhere after the push must not lose it.
       try { pendingRearm.write(launch.repo, pr, after); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
+      assertLaneLease({ lanePath, holder, readLease, phase: 'push' });
       run('git', [...HARDENED_GIT_ARGS, 'push', '--no-verify', 'origin', `HEAD:refs/heads/${ref}`], { cwd: lanePath, env: gitEnv }); // never --force
       rearm(after);
       pendingRearm.clear(launch.repo, pr);
@@ -888,6 +979,17 @@ export async function runFixCli(argv = [], {
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
-  const { code } = await runFixCli(process.argv.slice(2));
-  process.exitCode = code;
+  if (process.argv.includes('--probe-lane-head')) {
+    try {
+      const flags = Object.fromEntries(process.argv.slice(2).filter(a => a.includes('=')).map(a => {
+        const i = a.indexOf('='); return [a.slice(2, i), a.slice(i + 1)];
+      }));
+      if (!flags['lane-path'] || !flags.pr) throw new Error('--lane-path and --pr are required');
+      console.log(JSON.stringify(probeLaneHead({ lanePath: resolve(flags['lane-path']), pr: flags.pr,
+        repo: flags.repo, holder: flags.holder }), null, 2));
+    } catch (e) { console.error(`fix-run: probe failed: ${e.message}`); process.exitCode = 1; }
+  } else {
+    const { code } = await runFixCli(process.argv.slice(2));
+    process.exitCode = code;
+  }
 }
