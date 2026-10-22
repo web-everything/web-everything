@@ -9,9 +9,10 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
-const REPO = 'web-everything/web-everything';
+const REPO = CONSTELLATION_REPOS.we.slug;
 const PRS = [11, 12, 13, 14, 15, 16];
 
 // The worker's process group contains every node/git/hook descendant, so even a
