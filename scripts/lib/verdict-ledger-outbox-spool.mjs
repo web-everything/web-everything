@@ -46,7 +46,7 @@ import { dirname, join, resolve } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { ledgerEventId } from './verdict-ledger.mjs';
 import { ledgerGitPath } from './verdict-ledger-path.mjs';
-import { reserve, readLockEntry, releaseLockDirIf, heartbeatOwn } from '../readiness/file-locks.mjs';
+import { reserve, readLockEntry, releaseLockDirIf, heartbeatOwn, DEFAULT_LEASE_MINUTES } from '../readiness/file-locks.mjs';
 
 export const OUTBOX_ENV = 'WE_VERDICT_LEDGER_OUTBOX';
 export const OUTBOX_DIR_ENV = 'WE_VERDICT_LEDGER_OUTBOX_DIR';
@@ -203,6 +203,8 @@ function validateEntry(e) {
   if (e.sum !== entrySum(e)) return 'integrity sum mismatch';
   if (e.path !== ledgerGitPath(e.repo)) return `path ${e.path} is not the ledger path of ${e.repo}`;
   for (let i = 0; i < e.lines.length; i += 1) {
+    // JSON.parse accepts pretty-printed JSON and coerces non-strings; a JSONL consumer cannot.
+    if (typeof e.lines[i] !== 'string' || /[\r\n]/u.test(e.lines[i])) return `line ${i} must be a single-line JSON string`;
     let row;
     try { row = JSON.parse(e.lines[i]); } catch { return `line ${i} is not JSON`; }
     if (!isPlainObject(row) || row.id !== e.ids[i]) return `line ${i} does not carry id ${e.ids[i]}`;
@@ -242,7 +244,11 @@ export function tryLock(dir, budgetMs) {
   ensureDurableDir(lockRoot);
   const owner = `${hostname()}:${process.pid}:${randomBytes(4).toString('hex')}`;
   const t = Date.now();
-  const r = reserve(lockRoot, OUTBOX_LOCK_PATH, owner, t, new Date(t).toISOString(), process.pid, probeLiveness, leaseMinutesFor(budgetMs));
+  // The holder's budget governs reclaim, even when repo/env settings differ between writers. Legacy or
+  // malformed metadata uses the shared lock default, never the contender's budget. Heartbeats preserve meta.
+  const heldLeaseMinutes = (entry) => validMs(entry?.meta?.leaseMinutes) ? entry.meta.leaseMinutes : DEFAULT_LEASE_MINUTES;
+  const r = reserve(lockRoot, OUTBOX_LOCK_PATH, owner, t, new Date(t).toISOString(), process.pid, probeLiveness,
+    heldLeaseMinutes, { leaseMinutes: leaseMinutesFor(budgetMs) });
   return r.ok ? owner : null;
 }
 
