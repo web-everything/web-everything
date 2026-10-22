@@ -6281,7 +6281,7 @@ Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:
 (`#6268`).** The operator's words: *"we should have the option to use a db for settings instead of in code, at least as
 override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-platform-default](#config-extends-platform-default)
 (the new layer is one more cascade layer, each value with its source logged) and the settings-edit authority decision
-`#xugqjw1` (cited by id).
+`#6239` (cited by id).
 
 **The rule:**
 1. **One new top layer, `operator-override`.** Order: standard < platform < tool < env < operator-override (Fork 2 = a).
