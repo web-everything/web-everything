@@ -9,19 +9,22 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
-import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
+import { resolveRunsDir, REVIEW_RUN_ID_PREFIX, tryReadRun } from '../operations/run-store.mjs';
+import { sameRepo, parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
-import { parseReviewedSha } from '../lib/review-escalation.mjs';
+import { resolveReferralSafetySettings } from '../lib/review-settings.mjs';
+import { parseLatestHumanClearedSha, parseReviewedSha } from '../lib/review-escalation.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 
+// Match we:scripts/conveyor/rearm-review.mjs#REARM_COMMENT_MARKER locally: importing it closes a daemon boot cycle.
+// The equality test keeps this first-line matcher tied to the canonical marker.
+export const REFERRAL_REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-review';
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
 export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing']));
@@ -67,8 +70,11 @@ export function reviewRunEvidence(run) {
   const attempted = new Set((state?.records ?? [])
     .filter(r => r.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
+  // PR #5520 — a run started under a chosen `--run-id` says so in its record (`run-record.mjs#chosenRunIdRecord`).
+  // Inline, not a helper: the disk cache is keyed by this function's source.
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
+    ...(run.idChosen === true ? { custom: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
     pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
@@ -81,33 +87,66 @@ export function reviewRunEvidence(run) {
   };
 }
 
+/** PR #5520 — the head a `review-pr` run reviewed, finished or not. {@link reviewRunEvidence} drops a run that never
+ *  finished `advise` (a publication effect that failed, a crash), but that run still reviewed this head: a carry
+ *  that may stand in only for a head nobody reviewed must see it. */
+export function reviewRunHead(run) {
+  if (run?.op !== 'review-pr') return null;
+  const read = run.findings?.read;
+  const head = read?.netBasis?.rev;
+  return sha(head) ? { id: run.id, repo: read.repo, pr: Number(read.pr), head,
+    ...(run.idChosen === true ? { custom: true } : {}) } : null;
+}
+
 // Cache only small projections, never full diffs/seat transcripts. A changed file is parsed again.
 const evidenceCache = new Map();
+const headCache = new Map();
 /** The on-disk projection beside the records (not `.json`, so no run-store listing reads it as a record). Live
  *  2026-10-10: 3,303 review-pr records (0.8 GB) were re-parsed by EVERY reconcile-pass process — minutes under host
  *  load, enough to time out the drain rebuild's reconcile/dispatch smoke checks. Keyed by the projection's own source,
  *  so a change to {@link reviewRunEvidence} never serves a stale projection. */
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
+export const REVIEW_HEAD_CACHE_FILE = '.review-run-heads.cache';
 /** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
 export const EVIDENCE_DISK_MIN_MISSES = 32;
-const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).digest('hex').slice(0, 16);
-function readEvidenceDiskCache(file) {
+const projectionCode = project => createHash('sha256').update(String(project)).digest('hex').slice(0, 16);
+function readEvidenceDiskCache(file, code) {
   try {
     const c = JSON.parse(readFileSync(file, 'utf8'));
-    return c?.v === 1 && c.code === EVIDENCE_CODE && c.entries && typeof c.entries === 'object' ? c.entries : {};
+    return c?.v === 1 && c.code === code && c.entries && typeof c.entries === 'object' ? c.entries : {};
   } catch { return {}; }
 }
-function writeEvidenceDiskCache(file, entries) {
+function writeEvidenceDiskCache(file, code, entries) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify({ v: 1, code: EVIDENCE_CODE, entries }));
+    writeFileSync(tmp, JSON.stringify({ v: 1, code, entries }));
     renameSync(tmp, file);
   } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
 }
 export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
+  return readRunProjections({ dir, readRun, memo, persist, project: reviewRunEvidence, cacheFile: REVIEW_EVIDENCE_CACHE_FILE });
+}
+export const REVIEW_RUN_STORE_MISSING = 'REVIEW_RUN_STORE_MISSING';
+/** Every `review-pr` run's reviewed head ({@link reviewRunHead}), including runs that never finished. A missing store
+ *  throws {@link REVIEW_RUN_STORE_MISSING}: it proves nothing about which heads were reviewed, so it is never `[]`. */
+export function readReviewRunHeads({ dir = resolveRunsDir(), readRun = tryReadRun, memo = headCache, persist = true } = {}) {
+  return readRunProjections({ dir, readRun, memo, persist, project: reviewRunHead, cacheFile: REVIEW_HEAD_CACHE_FILE,
+    missing: () => { throw Object.assign(new Error(`review run store missing: ${dir}`), { code: REVIEW_RUN_STORE_MISSING }); } });
+}
+
+/** PR #5520 operator send-back — the readers find review runs by name, so the name must be true: `writeRun` writes a
+ *  `review-pr` record only under a `review-pr-` id, and no other operation's ({@link REVIEW_RUN_ID_PREFIX}). Inside
+ *  that namespace a chosen `--run-id` is still possible: such a record carries `idChosen`, and an id not shaped as
+ *  `newRunId('review-pr')` mints it (a record written before `idChosen`) is not trusted either. Both are tagged
+ *  `custom`. A custom run still counts as a review of its head; it never counts as a clean one. */
+const MINTED_REVIEW_RUN_ID_RE = /^review-pr-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export const isMintedReviewRunId = id => MINTED_REVIEW_RUN_ID_RE.test(String(id));
+
+function readRunProjections({ dir, readRun, memo, persist, project, cacheFile, missing = () => [] }) {
+  const code = projectionCode(project);
   let names;
-  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
-  const file = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
+  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return missing(); throw e; }
+  const file = join(dir, cacheFile);
   let disk = null;
   let dirty = false;
   const kept = {};
@@ -116,7 +155,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
   // daemon had written even one new record) — ~140 MB of transient heap per pass, several passes per tick. A warm
   // process now parses its few missed records directly and leaves the file alone; the file is read (and rewritten)
   // only when this call misses every record or more than EVIDENCE_DISK_MIN_MISSES of them. Same evidence either way.
-  const rows = names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json')).map(name => {
+  const rows = names.filter(n => n.startsWith(REVIEW_RUN_ID_PREFIX) && n.endsWith('.json')).map(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     return { name, path, key: `${stat.mtimeMs}:${stat.size}` };
@@ -130,21 +169,22 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
     const key = `${stat.mtimeMs}:${stat.size}`;
     let cached = memo.get(path);
     if (cached?.key !== key && useDisk) {
-      disk ??= readEvidenceDiskCache(file);
+      disk ??= readEvidenceDiskCache(file, code);
       const hit = disk[name];
       if (hit?.key === key) cached = { key, evidence: hit.evidence ?? null };
     }
     if (cached?.key !== key) {
-      cached = { key, evidence: reviewRunEvidence(readRun(name.slice(0, -5), dir)) };
+      cached = { key, evidence: project(readRun(name.slice(0, -5), dir)) };
       dirty = true;
     }
     memo.set(path, cached);
     kept[name] = cached;
-    return cached.evidence ? [cached.evidence] : [];
+    if (!cached.evidence) return [];
+    return [isMintedReviewRunId(name.slice(0, -5)) ? cached.evidence : { ...cached.evidence, custom: true }];
   });
   if (useDisk) {
-    disk ??= readEvidenceDiskCache(file);
-    if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, kept);
+    disk ??= readEvidenceDiskCache(file, code);
+    if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, code, kept);
   }
   return out;
 }
@@ -171,11 +211,12 @@ function wakeEvents(pr, run) {
     const operatorRuling = parseOperatorRulingComment(c);
     if (operatorRuling) {
       const r = operatorRuling.record;
-      return r && r.repo === run.repo && r.pr === run.pr && r.head === run.head ? [{ at, kind: 'ruling' }] : [];
+      return r && sameRepo(r.repo, run.repo) && r.pr === run.pr && r.head === run.head ? [{ at, kind: 'ruling' }] : [];
     }
+    if (body.includes('<!-- paused-review-auto-rearm:')) return [];
     // `operator` marks a person's own word: the only event that answers a spent persist-retry budget.
     const operator = isOperatorAuthored(c);
-    if (body.startsWith(REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [{ at, kind: 'fresh', operator }];
+    if (body.startsWith(REFERRAL_REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [{ at, kind: 'fresh', operator }];
     // An operator reply is a request to reconsider, never authority to clear the human gate.
     return operator ? [{ at, kind: 'fresh', operator }] : [];
   });
@@ -266,7 +307,8 @@ function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.
     // Read exactly as the gate reads it (readable-card rule, author stamp, PR body/createdAt): a release the
     // gate would immediately re-park loops the review on every tick, which this hold exists to prevent.
     const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
-    if (!live.pending.length && live.records.some(r => r.head === pr.headRefOid
+    if (!live.pending.length
+      && live.records.some(r => r.head === pr.headRefOid
       && r.repo === repo && r.pr === Number(pr.number))) return { hold: null, released: 'live-release' };
   }
   const exhausted = last.persistenceFailed && retryAt === null;
@@ -394,18 +436,97 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
       releases, source: retry?.source ?? 'standard' } } : {}) };
 }
 
+/** Historical auto-rearm receipt, retained for readers; it no longer creates a wake. */
+export const pausedReviewRearmMarker = head => `<!-- paused-review-auto-rearm: ${head} -->`;
+
+/** Pure classification of a paused PR using the gate's live state, including unattempted records and reason holds.
+ * Same-head pauses need a person even if all finding rulings are already recorded.
+ */
+export function classifyPausedReview(pr, live) {
+  if (!sha(pr?.headRefOid)) return { action: 'none', findings: [] };
+  const records = live.records.filter(r => r.head === pr.headRefOid);
+  const all = [...new Map(records.flatMap(r => r.referrals.map(f => [f.key, {
+    key: f.key, file: f.finding?.file ?? null, line: f.finding?.line ?? null,
+    summary: f.finding?.summary ?? '',
+  }]))).values()];
+  const pending = [...new Map(live.pendingFindings.map(f => [f.key, {
+    key: f.key, file: f.file, line: f.line, summary: f.summary,
+  }])).values()];
+  if (live.pending.length) return { action: 'raise', findings: pending.length ? pending : all, reasons: live.pendingReasons };
+  if (!records.length || !all.length) return { action: 'none', findings: [] };
+  // Ruled findings need an explicit operator re-arm; never spend a new same-head window.
+  return { action: 'raise', findings: all };
+}
+
+/** Shared paused-referral report source. The ordinary ledger deliberately filters unattempted records and
+ * operator-verdict send-backs; a later same-head pause still owes visibility of what the live gate holds.
+ */
+export function pausedReviewRulingNeeded(pr, { repo, readRuns = readReviewRunEvidence,
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
+  const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
+  if (!live.records.some(r => r.head === pr.headRefOid)) return null;
+  const decision = classifyPausedReview(pr, live);
+  if (decision.action !== 'raise') return null;
+  const runs = readRuns();
+  if (!(pr.referralHold?.head === pr.headRefOid || decideReferralHold(pr, runs, { repo })
+    || decideSameHeadHold(pr, runs, { repo }))) return null;
+  return { head: pr.headRefOid, since: null,
+    findings: decision.findings.map(f => ({ ...f, reason: 'paused-referral' })) };
+}
+
 /** Block-ruled referrals on the PR's CURRENT head, once EVERY referral on it is ruled (none pending): the PR is owed a
  * FIX, not a review. The same-head pause stops only a re-review of an unchanged head; the fix is what changes it
  * (live 2026-10-06, #4017: three `block` rulings, the pause refused every fix tick, so no push ever came).
  * Read exactly as the gate reads it. Any pending referral, or no block, answers `[]`. Never throws.
  */
-export function blockRuledReferralsFor(pr, { repo, cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
+export function blockRuledReferralsFor(pr, { repo, cardReadable = ref => referralCardReadable(ref, REPO_ROOT), ...options } = {}) {
   try {
     if (!sha(pr?.headRefOid)) return [];
     const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
     if (live.pending.length || !live.blockedFindings?.length) return [];
-    return live.blockedFindings.map(b => ({ key: b.key, findingId: b.findingId ?? null, finding: b.finding }));
+    return filterFixerReferrals(pr, live.blockedFindings.map(b => ({ key: b.key, findingId: b.findingId ?? null, finding: b.finding })),
+      { repo, cardReadable, ...options });
   } catch { return []; }
+}
+
+/** Dispatch only: never mutate the gate or infer identity from similar finding prose.
+ * Every current record holding a key must qualify; unknown/malformed evidence retains the dispatch.
+ * Operator identity spans heads, but suppression requires human clearance of the current head.
+ */
+export function filterFixerReferrals(pr, findings, { repo,
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT),
+  safety = resolveReferralSafetySettings(), log = line => console.error(line),
+} = {}) {
+  if (safety.value.noFixerOnClearedRuled !== true || !findings?.length) return findings;
+  try {
+    const read = readReferralRecords(pr.comments, { head: pr.headRefOid });
+    if (read.malformed || !repo || !sha(pr.headRefOid)) return findings;
+    const operators = [];
+    for (const comment of pr.comments ?? []) {
+      const parsed = parseOperatorRulingComment(comment);
+      if (parsed?.malformed) return findings;
+      const r = parsed?.record;
+      if (!r || r.actor.toLowerCase() === 'auto-policy') continue;
+      for (const x of r.rulings) operators.push({ ...x, repo: r.repo, pr: r.pr, at: r.at });
+    }
+    const cleared = parseLatestHumanClearedSha(pr.comments) === pr.headRefOid;
+    const kept = findings.filter(f => {
+      const records = read.records.filter(r => r.repo === repo && r.pr === Number(pr.number)
+        && r.head === pr.headRefOid && (!f.runId || f.runId === r.runId)
+        && r.referrals.some(x => x.key === f.key));
+      if (!records.length) return true;
+      return !records.every(r => {
+        const latest = operators.filter(o => sameRepo(o.repo, repo) && o.pr === Number(pr.number)
+          && o.runId === r.runId && o.key === f.key)
+          .sort((a, b) => Date.parse(a.at) - Date.parse(b.at)).at(-1);
+        if (latest) return cleared && (latest.result === 'not-real' || (latest.result === 'card' && cardReadable(latest.card)));
+        // Open reviewer/policy blocks and unruled findings still need a fixer, even on a cleared head.
+        return false;
+      });
+    });
+    if (kept.length < findings.length) log(`review.noFixerOnClearedRuled=true (source: ${safety.sources.noFixerOnClearedRuled}) — ${repo}#${pr.number}: suppressed ${findings.length - kept.length} fixer referral(s)`);
+    return kept;
+  } catch { return findings; }
 }
 
 function defaultReadComments({ repo, number }) {
@@ -527,7 +648,7 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
 /** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
  * Known pre-send rate-limit failures can retry with bounded backoff; all other failures remain visible locally.
  */
-export function notifyReferralHold({ repo, prNumber, hold, comments = [],
+export function notifyReferralHold({ repo, prNumber, hold, comments = [], pr,
   dir = join(dirname(resolveRunsDir()), 'review-referral-notices'), now = Date.now(),
   log = line => console.error(line), publishNeedsYou,
   post = body => execFileSyncThrottled('gh', ['pr', 'comment', String(prNumber), '--repo', repo, '--body', body],
@@ -536,7 +657,12 @@ export function notifyReferralHold({ repo, prNumber, hold, comments = [],
   if (hold.kind === 'same-head' && hold.noVerdict?.exhausted) {
     raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now, log, publish: publishNeedsYou });
   }
-  if (hold.kind === 'same-head') return;
+  let paused;
+  if (pr?.headRefOid === hold.head) {
+    paused = classifyPausedReview(pr, liveReferralState(pr, { repo, pr: Number(prNumber),
+      cardReadable: ref => referralCardReadable(ref, REPO_ROOT) }));
+  }
+  if (hold.kind === 'same-head' && (!paused || paused.action === 'none')) return;
   const marker = `<!-- review-referral-hold: ${hold.episode} -->`;
   const path = join(dir, `${hash([repo, prNumber, hold.episode])}.json`);
   mkdirSync(dir, { recursive: true });
@@ -556,7 +682,7 @@ export function notifyReferralHold({ repo, prNumber, hold, comments = [],
   // "N referrals need a ruling" named nothing). A read failure just leaves the old, shorter notice.
   let findings = '';
   try {
-    const need = rulingNeeded({ headRefOid: hold.head, comments }, { cardReadable: ref => referralCardReadable(ref, REPO_ROOT) });
+    const need = paused?.action === 'raise' ? paused : rulingNeeded({ headRefOid: hold.head, comments }, { cardReadable: ref => referralCardReadable(ref, REPO_ROOT) });
     if (need) findings = `\n\nWaiting on your ruling (block, card or not-real):\n${need.findings
       .map(f => `- \`${f.file ?? 'no file'}${f.line ? `:${f.line}` : ''}\` — ${f.summary}`).join('\n')}`;
   } catch { /* the short notice still posts */ }

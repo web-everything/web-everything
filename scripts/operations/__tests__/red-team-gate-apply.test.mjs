@@ -155,6 +155,33 @@ describe('applyRedTeamGate', () => {
     expect(calls).toEqual([]);
   });
 
+  it('records a paused owed card once and reads its finding as already handled', async () => {
+    const comments = [comment([F({ impactIfUnfixed: 'degraded' })])];
+    let attempts = 0;
+    const { io, calls } = fakeIo({ comments, fileCard: () => {
+      attempts++;
+      return { ok: false, skipped: true, step: 'paused', reason: 'filing paused', num: null, url: null };
+    } });
+    const result = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(result.status).toBe('applied');
+    expect(gateExitCode(result)).toBe(0);
+    expect(calls[0][1].body).toContain('recorded, owed as a follow-up card (#1) — filing paused; will file on resume.');
+    expect(calls[0][1].body).not.toMatch(/FAILED|undefined|null/);
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: { degraded: 'send-back' } }).sendBack).toEqual([]);
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('already-acted');
+    expect(attempts).toBe(1);
+  });
+
+  it.each([
+    { ok: false, step: 'paused', error: 'could not record owed filing' },
+    { ok: false, skipped: true, step: 'other', error: 'other failure' },
+  ])('keeps an unrecorded or unrelated filing failure retryable: %j', async card => {
+    const { io, calls } = fakeIo({ comments: [comment([F({ impactIfUnfixed: 'degraded' })])], fileCard: () => card });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('card-failed');
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('card-failed');
+    expect(calls).toEqual([]);
+  });
+
   // F4: the round is the only bound on send-backs. An unreadable round must not be read as "round 1".
   it('an unreadable round counts as the cap: no send-back, the operator rules', async () => {
     for (const unreadable of [null, undefined, NaN, '3']) {
@@ -676,6 +703,7 @@ describe('review-job runs the gate right after the red team', () => {
   function jobIo(verdict, over = {}) {
     const calls = [];
     const io = {
+    redTeamTimingSetting: () => ({ value: { timing: 'post-accept' }, sources: { timing: 'tool' }, invalid: [] }),
       root: '/daemon', now: (() => { let t = 0; return () => { t += 10; return t; }; })(), newActorId: () => 'a',
       readPrevCompletion: () => null, report: () => {}, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
       acquireLane: () => ({ lanePath: '/lanes/lane-7' }), runLoop: () => ({ status: 0, stdout: JSON.stringify(loop(verdict)), stderr: '' }),

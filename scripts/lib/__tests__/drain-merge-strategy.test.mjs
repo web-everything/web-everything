@@ -1,16 +1,22 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createDrainMergeStrategy, resolveDrainMergePolicy, readEnqueueClearance, buildClearanceComment, hasClearanceFor, DRY_RUN_STRATEGY_ENV,
-  readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
+  staleRedTeamRequestEligibility, requestDrainRedTeam, readDrainRedTeamRequests, finishDrainRedTeamRequest, readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
 } from '../drain-merge-strategy.mjs';
+import { readReserves, writeReserves } from '../priority-reserve.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
+import { saveProvenanceFixtures } from './fixtures/saved-red-team-provenance.mjs';
+import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
+import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
+import { withLandWriteLock } from '../../readiness/drain-lock.mjs';
 
 const HEAD = 'b'.repeat(40);
 const BASE_TIP = 'e'.repeat(40);
@@ -19,7 +25,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP } = {}) {
+function harness({ gitExec, resolveRealFiles, priorityReserve, reservePath, strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = { ...process.env, WE_RED_TEAM_TIMING: 'post-accept' }, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, readReviewAgents = () => [], baseTip = () => BASE_TIP, strategyExtra = {}, evidenceFor = null } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -27,6 +33,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   let removed = false;
   const exec = (cmd, args, opts) => {
     calls.push([cmd, ...args]);
+    if (cmd === 'git' && gitExec) return gitExec(args, opts);
     if (args.includes('--slurp')) {
       // Exercise Node's real output-buffer limit for the oversized-thread regression.
       const out = JSON.stringify([liveComments ?? ghView[args[2]]?.comments ?? []]);
@@ -41,14 +48,14 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     if (cmd === 'git' && args[0] === 'rev-parse') return `${baseTip()}\n`; // the base tip the pinned diff used
     if (cmd === 'git' && args[0] === 'ls-remote') return `${baseTip()}\t${args.at(-1)}\n`; // the live base tip
     if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : ''; // the pinned change list of the judged head
-    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: ghView[args[2]]?.headRefOid ?? HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
     if (args[0] === 'pr' && args[1] === 'view' && viewThrows.includes(Number(args[2]))) throw new Error('gh: HTTP 502');
     if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN', headRefOid: HEAD, labels, id: 'PR_NODE' }); }
     if (args[0] === 'api' && args[1] === 'graphql') {
       if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify(queueFacts ?? { data: { repository: { mergeQueue: { entries: {
         nodes: !removed && queued ? [{ pullRequest: { id: 'PR_NODE', number: 5283 } }] : [], pageInfo: { hasNextPage: false },
       } } } } });
-      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: !removed && (queued || mutated) && (inQueue ?? true), headRefOid: HEAD } } } });
+      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: !removed && (queued || mutated) && (inQueue ?? true), headRefOid: Object.values(ghView)[0]?.headRefOid ?? HEAD } } } });
       if (args.some(a => a.includes('dequeuePullRequest'))) { removed = true; return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } }); }
       const response = mutation ?? (enqueueFails
         ? { errors: [{ message: 'Pull request is not mergeable' }] }
@@ -62,7 +69,10 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const readFile = () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); };
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
-    dryRun, env, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    ...strategyExtra,
+    ...(resolveRealFiles ? { resolveRealFiles } : {}),
+    ...(priorityReserve ? { priorityReserve } : {}), ...(reservePath ? { reservePath } : {}),
+    dryRun, env, readReviewAgents, readRedTeamEvidence: (o) => { if (evidenceFor) return evidenceFor(o); if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
@@ -90,6 +100,15 @@ describe('drain merge strategy — drain-direct (default) is unchanged', () => {
 });
 
 describe('drain merge strategy — github-merge-queue', () => {
+  it('xym8nt4: a card-group source is deferred as card-grouped and never reaches the enqueue mutation', () => {
+    const { s, calls } = harness({ strategy: 'github-merge-queue', strategyExtra: {
+      cardGroupHold: c => (c.num === 42 ? { kind: 'card-grouped', reason: 'grouped into #9 (lands with it; drain.group)' } : null) } });
+    const r = s.enqueue({ num: 42, repo: null }, HEAD, { comments: [] });
+    expect(r).toMatchObject({ enqueued: false, deferred: true, kind: 'card-grouped' });
+    expect(calls.some(c => c.join(' ').includes('enqueuePullRequest'))).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
   it('enqueues only the local repo PRs (sibling-repo impl halves stay direct)', () => {
     const { s } = harness({ strategy: 'github-merge-queue' });
     expect(s.enqueues(null)).toBe(true);
@@ -262,6 +281,27 @@ describe('drain merge strategy — github-merge-queue', () => {
     // pass 3: complete → never run again
     const m3 = [];
     expect(h2.s.collectQueueMerged({ merged: m3, landedThisPass: new Set() })).toEqual([]);
+    expect(m3).toEqual([]);
+  });
+
+  it('live 2026-10-21 "merged 2 (#5798, #5798)": one PR pending as cwd#N AND <slug>#N is ONE landing', () => {
+    // The real state left behind: followedUp held both 'cwd#5798' and 'web-everything/web-everything#5798'.
+    const initial = { pending: [{ num: 5798, repo: null, headSha: HEAD }, { num: 5798, repo: LOCAL, headSha: HEAD }], followedUp: [] };
+    const h = harness({ strategy: 'github-merge-queue', initial, ghView: { 5798: MERGED } });
+    const merged = [];
+    const done = h.s.collectQueueMerged({ merged, landedThisPass: new Set() });
+    expect(merged.map((m) => m.num)).toEqual([5798]);
+    h.s.confirmQueueFollowUps(done);
+    expect(h.state().pending).toEqual([]);
+    // a landing another path already recorded this pass (the cascade's already-merged probe) is not pushed again
+    const h2 = harness({ strategy: 'github-merge-queue', initial: { pending: [{ num: 7, repo: LOCAL }], followedUp: [] }, ghView: { 7: MERGED } });
+    const m2 = [{ num: 7, repo: null }];
+    h2.s.collectQueueMerged({ merged: m2, landedThisPass: new Set() });
+    expect(m2).toHaveLength(1);
+    // a legacy `cwd#N` followedUp entry still retires its slug-keyed pending twin
+    const h3 = harness({ strategy: 'github-merge-queue', initial: { pending: [{ num: 9, repo: LOCAL }], followedUp: ['cwd#9'] }, ghView: { 9: MERGED } });
+    const m3 = [];
+    expect(h3.s.collectQueueMerged({ merged: m3, landedThisPass: new Set() })).toEqual([]);
     expect(m3).toEqual([]);
   });
 
@@ -580,7 +620,327 @@ describe('merge-ai-prs hook wiring', () => {
 });
 
 
+describe('recorded hold read-only admission', () => {
+  const key = 'cwd#5283';
+  const initial = () => ({ pending: [], followedUp: [], redTeamPending: {
+    [key]: { headSha: HEAD, firstPendingAt: 0, retryAt: 0, reason: 'no recorded result on the live head' },
+  } });
+  function reader({ state, write, head = HEAD, evidence = {}, labels = ['review:accepted', 'ready-to-merge'], onView = () => {}, request = () => {} }) {
+    const mutations = [];
+    const s = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'unused-hold-state',
+      resolved: policyOf('github-merge-queue'), env: { WE_RED_TEAM_TIMING: 'post-accept' },
+      queueSafety: { value: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true } },
+      now: () => 1000, log: { write: () => {} },
+      readFile: () => JSON.stringify(state()), writeState: (_path, value) => write(structuredClone(value)),
+      readRedTeamEvidence: () => evidence, requestRedTeam: request,
+      labelProvider: { ensureLabel: () => mutations.push('ensure-label'), setLabels: () => mutations.push('labels') },
+      exec: (_cmd, args) => {
+        if (args[0] === 'pr' && args[1] === 'view') {
+          onView();
+          return JSON.stringify({ headRefOid: typeof head === 'function' ? head() : head, labels });
+        }
+        if (args.includes('--slurp')) return '[[]]';
+        mutations.push(args);
+        return '{}';
+      },
+    });
+    return { s, mutations };
+  }
+
+  it.each(['held', 'clear', 'request', 'sent-back'])('holdOnly performs zero shared-state writes: %s', mode => {
+    let stored = initial();
+    const writes = [];
+    const requests = [];
+    const h = reader({ state: () => stored, write: value => { writes.push(value); stored = value; },
+      labels: mode === 'sent-back' ? ['review:changes'] : mode === 'clear' ? ['ready-to-merge'] : ['review:accepted', 'ready-to-merge'],
+      evidence: mode === 'clear' ? { skipCardOnly: true, scheduled: false }
+        : mode === 'request' ? { scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } }
+          : { scheduled: true, inFlight: true },
+      request: value => { requests.push(value); return { requested: true }; },
+    });
+    const before = structuredClone(stored);
+    const outcome = h.s.recordedHold({ num: 5283 }, HEAD);
+    expect(outcome).toBeNull(); // every case needs the ordinary locked path to refresh/clear/dequeue
+    expect(writes).toEqual([]);
+    expect(stored).toEqual(before);
+    expect(h.mutations).toEqual([]);
+    expect(requests).toEqual([]);
+  });
+
+  describe('yieldTargetHold (overlap-yield target eligibility, read-only)', () => {
+    const rec = (extra = {}) => ({ ...initial().redTeamPending[key], requestedAt: 500, ...extra });
+    // A local target: enqueue may read either cwd# or owner/name#, so a settled answer needs both.
+    const requested = (extra = {}) => ({ pending: [], followedUp: [], redTeamPending: { [key]: rec(extra), [`${LOCAL}#5283`]: rec(extra) } });
+    // `state` is the stored OBJECT here; reader() wants a getter, so it must not be spread over the getter.
+    const run = ({ state: initialState, ...opts }) => {
+      let stored = initialState ?? requested();
+      const writes = []; const requests = [];
+      const h = reader({ ...opts, state: () => stored, write: value => { writes.push(value); stored = value; },
+        request: value => { requests.push(value); return { requested: true }; } });
+      return { h, writes, requests };
+    };
+    const inFlight = { scheduled: true, inFlight: true };
+    it('a requested red-team wait on the live head with no result is a blocking hold — and nothing is written', () => {
+      const r = run({ evidence: inFlight });
+      expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+      expect(r.writes).toEqual([]); expect(r.requests).toEqual([]); expect(r.h.mutations).toEqual([]);
+    });
+    it.each([['cwd#5283', null], ['cwd#5283', LOCAL], [`${LOCAL}#5283`, null], [`${LOCAL}#5283`, LOCAL]])('a wait under only %s (repo %s) is unknown — it throws, waiters keep yielding', (k, repoArg) => {
+      const r = run({ state: { pending: [], followedUp: [], redTeamPending: { [k]: rec() } }, evidence: inFlight });
+      expect(() => r.h.s.yieldTargetHold({ num: 5283, repo: repoArg }, HEAD)).toThrow(/only some of the keys/);
+    });
+    it('both keys recorded on this head ⇒ blocked for either repo naming', () => {
+      for (const repoArg of [null, LOCAL]) {
+        const r = run({ evidence: inFlight });
+        expect(r.h.s.yieldTargetHold({ num: 5283, repo: repoArg }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+      }
+    });
+    it('reads red-team evidence with an explicit, migration-free runs dir', () => {
+      const seen = [];
+      vi.stubEnv('OPERATION_RUNS_DIR', '/tmp/we-yield-probe-runs');
+      const s2 = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'x', resolved: policyOf('github-merge-queue'),
+        env: { WE_RED_TEAM_TIMING: 'post-accept' }, queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} },
+        readFile: () => JSON.stringify(requested()), readRedTeamEvidence: (a) => { seen.push(a); return inFlight; },
+        exec: (_c, args) => (args[0] === 'pr' ? JSON.stringify({ headRefOid: HEAD, labels: ['review:accepted', 'ready-to-merge'] }) : args.includes('--slurp') ? '[[]]' : '{}') });
+      s2.yieldTargetHold({ num: 5283 }, HEAD);
+      expect(seen).toHaveLength(1);
+      expect(seen[0].runsDir).toBe('/tmp/we-yield-probe-runs');
+      vi.unstubAllEnvs();
+    });
+    it('Codex audit #3: a cold probe on a head with no red-team trace and no proof yet is unknown (throws — keep yielding), runs no git', () => {
+      const calls = [];
+      const s2 = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'x', resolved: policyOf('github-merge-queue'),
+        env: { WE_RED_TEAM_TIMING: 'post-accept' }, queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} },
+        readFile: () => JSON.stringify(requested()), readRedTeamEvidence: () => ({ scheduled: false, recorded: false, inFlight: false, loopPayload: null }),
+        numberingRedTeamSetting: () => ({ value: true, source: 'test' }),
+        exec: (c, args) => { calls.push(c); return args[0] === 'pr' ? JSON.stringify({ headRefOid: HEAD, labels: ['review:accepted', 'ready-to-merge'] }) : args.includes('--slurp') ? '[[]]' : '{}'; } });
+      expect(() => s2.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/numbering alias not yet proven/);
+      expect(calls).not.toContain('git');
+    });
+    it('aliases that disagree on the request state are unknown (throws — keep yielding)', () => {
+      const st = requested();
+      st.redTeamPending[`${LOCAL}#5283`] = rec({ requestedAt: undefined }); // no requestedAt
+      const r = run({ state: st, evidence: { scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } } });
+      expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow();
+    });
+    it('a held reason that could still take the never-scheduled enqueue escape is unknown (throws)', () => {
+      const r = run({ state: requested({ requestedAt: undefined }), evidence: inFlight });
+      expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/never-scheduled/);
+    });
+    it('no recorded wait on THIS head ⇒ not blocked (waiters keep yielding)', () => {
+      const r = run({ state: requested({ headSha: 'f'.repeat(40) }), evidence: inFlight });
+      expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toBeNull();
+    });
+    it('a live head that moved is unknown — it throws so the caller keeps the yield', () => {
+      const r = run({ head: 'a'.repeat(40), evidence: inFlight });
+      expect(() => r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/live head/);
+    });
+    it('an unreadable follow-up state throws (fail closed)', () => {
+      const s = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'x', resolved: policyOf('github-merge-queue'),
+        queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} }, readFile: () => '{not json' });
+      expect(() => s.yieldTargetHold({ num: 5283 }, HEAD)).toThrow(/unreadable/);
+    });
+    it('a sent-back target is blocked (sent-back)', () => {
+      const r = run({ labels: ['review:changes'], evidence: inFlight });
+      expect(r.h.s.yieldTargetHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'sent-back' });
+    });
+    it('strictly read-only: never runs git, never lists agents/jobs, and an unsettled card-only answer is unknown, not blocked', () => {
+      const gitCalls = []; const agentReads = [];
+      const s = createDrainMergeStrategy({ localSlug: LOCAL, statePath: 'x', resolved: policyOf('github-merge-queue'),
+        env: { WE_RED_TEAM_TIMING: 'post-accept' }, queueSafety: { value: { waitForRedTeamBeforeEnqueue: true } }, log: { write: () => {} },
+        readFile: () => JSON.stringify(requested()), writeState: () => { throw new Error('write'); },
+        readReviewAgents: () => { agentReads.push(1); return []; },
+        readRedTeamEvidence: () => ({ scheduled: false, loopPayload: { verdict: { verdict: 'accept' } } }),
+        exec: (cmd, args) => {
+          if (cmd === 'git') { gitCalls.push(args); throw new Error('git must not run'); }
+          if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: HEAD, labels: ['review:accepted', 'ready-to-merge'] });
+          if (args.includes('--slurp')) return '[[]]';
+          return '{}';
+        } });
+      let out; let threw = null;
+      try { out = s.yieldTargetHold({ num: 5283, headRef: 'lane/x' }, HEAD); } catch (e) { threw = e; }
+      expect(gitCalls).toEqual([]);
+      expect(agentReads).toEqual([]);
+      // Either every variant agrees on a definite stop, or the probe says it cannot tell. Never a guessed "blocked".
+      if (!threw) expect(out === null || out.kind === 'red-team-pending').toBe(true);
+    });
+  });
+
+  it('keeps a cached hold and refreshes an expired hold only on ordinary locked enqueue', () => {
+    const root = mkdtempSync(join(tmpdir(), 'hold-refresh-lock-'));
+    try {
+      let stored = initial();
+      stored.redTeamPending[key].retryAt = 2000;
+      const writes = [];
+      let locked = false;
+      const h = reader({ state: () => stored, write: value => { writes.push(locked); stored = value; },
+        evidence: { scheduled: true, inFlight: true },
+      });
+      expect(h.s.recordedHold({ num: 5283 }, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+      expect(writes).toEqual([]);
+      stored.redTeamPending[key].retryAt = 0;
+      expect(h.s.recordedHold({ num: 5283 }, HEAD)).toBeNull();
+      expect(writes).toEqual([]);
+      // A peer's queue entry arrives after the pre-check and must survive the locked state re-read.
+      stored.pending.push({ num: 77, headSha: HEAD });
+      const result = withLandWriteLock(() => {
+        locked = true;
+        try { return h.s.enqueue({ num: 5283 }, HEAD); } finally { locked = false; }
+      }, { lockRoot: root, runUnlockedOnContention: false });
+      expect(result.result).toMatchObject({ kind: 'red-team-pending' });
+      expect(writes).toEqual([true]);
+      expect(stored.pending).toEqual([expect.objectContaining({ num: 77 })]);
+      expect(stored.redTeamPending[key].retryAt).toBe(301000);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['held', 'clear'])('overlapping drains preserve the newer-head hold and queue entries: %s old head', mode => {
+    const root = mkdtempSync(join(tmpdir(), 'hold-merge-lock-'));
+    try {
+      let stored = initial();
+      let locked = false;
+      let liveHead = HEAD;
+      const newerHead = 'c'.repeat(40);
+      const writes = [];
+      const write = value => { writes.push({ locked, value }); stored = value; };
+      const lock = fn => withLandWriteLock(() => {
+        locked = true;
+        try { return fn(); } finally { locked = false; }
+      }, { lockRoot: root, runUnlockedOnContention: false });
+      const peer = reader({ state: () => stored, write, head: newerHead, evidence: { scheduled: true, inFlight: true } });
+      let interleaved = false;
+      const old = reader({ state: () => stored, write, head: () => liveHead,
+        labels: mode === 'clear' ? ['ready-to-merge'] : ['review:accepted', 'ready-to-merge'],
+        evidence: mode === 'clear' ? { skipCardOnly: true, scheduled: false } : { scheduled: true, inFlight: true },
+        onView: () => {
+          if (interleaved) return;
+          interleaved = true;
+          // The old drain has read its snapshot. A second drain now records a new head under the real mutex.
+          expect(lock(() => {
+            stored.pending.push({ num: 77, repo: null, headSha: newerHead });
+            return peer.s.enqueue({ num: 5283 }, newerHead);
+          }).result).toMatchObject({ kind: 'red-team-pending' });
+        },
+      });
+      old.s.recordedHold({ num: 5283 }, HEAD);
+      expect(stored.redTeamPending[key].headSha).toBe(newerHead);
+      expect(stored.pending).toEqual([expect.objectContaining({ num: 77 })]);
+      expect(writes.every(w => w.locked)).toBe(true);
+      // Falling through the pre-check is not clearance: locked enqueue re-reads state and the live head.
+      liveHead = newerHead;
+      expect(lock(() => old.s.enqueue({ num: 5283 }, HEAD)).result).toMatchObject({ kind: 'live-state-unreadable' });
+      expect(stored.redTeamPending[key].headSha).toBe(newerHead);
+      expect(stored.pending).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
 describe('post-accept red-team enqueue barrier (#5283)', () => {
+  it('an owed panel seat never uses the overdue request or never-scheduled escape', () => {
+    let clock = 1000;
+    const requests = [];
+    const options = { strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      now: () => clock, env: { WE_RED_TEAM_TIMING: 'panel-seat', WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED: 'true' },
+      evidence: { scheduled: true, recorded: false, attempted: false, inFlight: false,
+        loopPayload: { verdict: { verdict: 'needs-human' }, findings: { read: { netBasis: { rev: HEAD } } } } },
+      requestRedTeam: input => { requests.push(input); return { requested: false }; } };
+    const first = harness(options);
+    expect(first.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    clock += 120 * 60_000;
+    const overdue = harness({ ...options, initial: first.state() });
+    expect(overdue.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(requests).toEqual([]);
+  });
+  it('a head with no red team ever scheduled gets one request, once, with a cooldown', () => {
+    let clock = 1000;
+    const requests = [];
+    let available = false;
+    const options = { strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
+      env: { WE_DRAIN_RED_TEAM_REQUEST_COOLDOWN_MIN: '2', WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC: '7200' },
+      evidence: { scheduled: false, recorded: false, attempted: false, inFlight: false, loopPayload: null },
+      requestRedTeam: input => { requests.push(input); return { requested: available }; } };
+    const first = harness(options);
+    expect(first.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(requests).toHaveLength(1);
+    const next = harness({ ...options, initial: first.state() });
+    clock += 120_000 - 1;
+    expect(next.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false });
+    expect(requests).toHaveLength(1);
+    available = true;
+    clock += 1;
+    expect(next.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, redTeamRequested: true });
+    expect(requests).toHaveLength(2);
+    expect(next.logs.join('')).toContain('redTeamRequestCooldownMin=2 (env)');
+    clock += 200 * 60_000;
+    const restarted = harness({ ...options, initial: next.state() });
+    expect(restarted.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(requests).toHaveLength(2);
+    const newHead = 'c'.repeat(40);
+    const moved = harness({ ...options, initial: restarted.state(), ghView: { 5485: { headRefOid: newHead, labels: options.labels } } });
+    expect(moved.s.enqueue({ num: 5485 }, newHead)).toMatchObject({ enqueued: false, redTeamRequested: true });
+    expect(requests.at(-1).head).toBe(newHead);
+  });
+  it('replays #5461: old-head break, live head with no scheduled work requests and stays pending', () => {
+    const liveHead = 'ff45ed96c40644e5537370df84b6b30328b1a73e';
+    const oldHead = '4752c275333c66228ea55c4b6d65f4038c760d38';
+    const requests = [];
+    const comment = { user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ pr: 5461, rev: oldHead,
+      findings: [{ summary: 'old break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }], recheckStatus: 'ok' }) };
+    const labels = ['review:accepted', 'ready-to-merge', 'status:ready-to-merge', 'review-round:11', 'red-team:pending'];
+    const h = harness({ strategy: 'github-merge-queue', labels, ghView: { 5461: { headRefOid: liveHead, labels, isDraft: false } },
+      liveComments: [comment], evidence: { scheduled: false, attempted: false, recorded: false, inFlight: false },
+      requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    const outcome = h.s.enqueue({ num: 5461 }, liveHead);
+    expect(outcome).toMatchObject({ enqueued: false, kind: 'red-team-pending', redTeamRequested: true });
+    expect(outcome.reason).toContain('no recorded result on the live head');
+    expect(outcome.reason).not.toContain('requiring send-back');
+    expect(requests).toEqual([expect.objectContaining({ pr: 5461, head: liveHead })]);
+  });
+
+  it.each([null, LOCAL])('enqueues a saved clean live-head result without comments (repo=%s)', repo => {
+    const root = mkdtempSync(join(tmpdir(), 'drain-saved-wiring-'));
+    try {
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
+      const path = resolveScorecardStorePath(env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: LOCAL, pr: 5283, rev: HEAD, status: 'ok', seatVerdict: 'accept',
+        recheckStatus: 'ok', confirmedMissCount: 0, findings: [] }] }));
+      saveProvenanceFixtures(env);
+      const h = harness({ strategy: 'github-merge-queue', env, labels: ['review:accepted', 'ready-to-merge'], liveComments: [] });
+      expect(h.s.enqueue({ num: 5283, repo }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
+      expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(true);
+      expect(h.state().redTeamPending?.[`${repo ?? 'cwd'}#5283`]).toBeUndefined();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each(['pending', 'error', undefined])('persists incomplete saved rechecks and never waives them as unscheduled: %s', recheckStatus => {
+    const root = mkdtempSync(join(tmpdir(), 'drain-incomplete-wiring-'));
+    try {
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
+      const path = resolveScorecardStorePath(env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: LOCAL, pr: 5283, rev: HEAD, status: 'ok', recheckStatus, confirmedMissCount: 1,
+        findings: [{ confirmedByRecheck: true, impactIfUnfixed: 'degraded' }, { confirmedByRecheck: false }] }] }));
+      saveProvenanceFixtures(env);
+      let clock = 0;
+      const h = harness({ strategy: 'github-merge-queue', env, now: () => clock,
+        labels: ['review:accepted', 'ready-to-merge'], liveComments: [] });
+      expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ kind: 'red-team-pending', healthSmell: false });
+      expect(h.state().redTeamPending['cwd#5283'].reason).toContain('saved red-team re-check incomplete');
+      clock = 46 * 60_000;
+      const next = harness({ strategy: 'github-merge-queue', env, now: () => clock, initial: h.state(),
+        labels: ['review:accepted', 'ready-to-merge'], liveComments: [] });
+      expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ kind: 'red-team-pending', healthSmell: true });
+      expect(next.logs.join('')).toContain('health smell:');
+      expect(next.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')) || c[2] === 'comment')).toBe(false);
+      // A completed retry on the same head releases the persisted hold at the next allowed probe.
+      writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: LOCAL, pr: 5283, rev: HEAD, status: 'ok', recheckStatus: 'ok', findings: [], confirmedMissCount: 0 }] }));
+      clock = next.state().redTeamPending['cwd#5283'].retryAt;
+      expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it.each([['card-only', { scheduled: true, inFlight: false, recorded: false,
     loopPayload: { findings: { read: { netChangedFiles: ['backlog/123-card.md'] } } } }],
     ['not scheduled', { scheduled: false, inFlight: false, recorded: false, loopPayload: { verdict: { verdict: 'accept' } } }]])('%s enqueues without an owed pass', (_name, evidence) => {
@@ -795,8 +1155,80 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false });
     expect(requests).toHaveLength(1);
     clock += 45 * 60_000;
-    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(requests).toHaveLength(1);
+  });
+  it('replays #5485: unparseable attempt holds without another request across restart and deadline, then accepts a usable result', () => {
+    let clock = 1000;
+    const requests = [];
+    const thread = [];
+    const options = { strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock,
+      env: { WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '2' }, liveComments: thread,
+      evidence: { scheduled: true, recorded: true, attempted: true, loopPayload: { verdict: { verdict: 'accept' } } },
+      requestRedTeam: input => { requests.push(input); return { requested: true }; } };
+    const first = harness(options);
+    expect(first.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false });
+    clock += 2 * 60_000;
+    expect(first.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    const restarted = harness({ ...options, initial: first.state() });
+    clock += 60 * 60_000;
+    expect(restarted.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false });
+    expect(requests).toHaveLength(0);
+    expect(restarted.logs.join('')).not.toContain('red team never scheduled');
+    expect(first.logs.join('')).toContain('redTeamPendingMaxMin=2, env');
+    thread.push({ user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5485 rev=${HEAD} -->\n### Post-accept red team — no break found` });
+    expect(restarted.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
+  });
+  // Operator ruling (PR #5551): a run that ran but left no usable result is not "never scheduled". The head stays
+  // held until a usable result exists; stale attempts can request recovery without admission.
+  function erroredRunAfterDeadline({ status, row, writer = LOCAL, rev = HEAD, read = {} }) {
+    const root = mkdtempSync(join(tmpdir(), 'drain-errored-red-team-'));
+    try {
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs') };
+      const rows = row ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo: LOCAL, pr: 5283, rev: HEAD, status: row, seatVerdict: null }] : [];
+      const path = resolveScorecardStorePath(env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ version: 1, records: rows }));
+      if (status) recordRedTeamStatus({ repo: writer, pr: 5283, ...status,
+        loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev }, ...read } } } }, { env });
+      // The job that wrote the status is gone: a dead pid is not a live pass.
+      const evidence = readDrainRedTeamEvidence({ repo: LOCAL, pr: 5283, head: HEAD, env, readScorecards: () => rows, isAlive: () => false });
+      expect(evidence).toMatchObject({ inFlight: false });
+      let clock = 1000;
+      const requests = [];
+      const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], now: () => clock, env,
+        evidence: { ...evidence, loopPayload: evidence.loopPayload ?? { verdict: { verdict: 'accept' } } },
+        requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+      const first = h.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+      clock += 45 * 60_000;
+      return { first, second: h.s.enqueue({ num: 5283 }, HEAD, { comments: [] }), h, requests };
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+  it.each([
+    ['errored', { status: { status: 'finished', result: { status: 'error' } }, row: 'error' }],
+    ['errored with no seat row', { status: { status: 'finished', result: { status: 'error' } } }],
+    ['unparseable', { status: { status: 'finished', result: { status: 'ran', comment: 'posted-failed' } }, row: 'unparseable' }],
+    ['not-posted', { status: { status: 'finished', result: { status: 'ran', comment: 'not-posted' } }, row: 'not-posted' }],
+    ['errored, no job status', { row: 'error' }],
+    ['crashed while running', { status: { status: 'running' } }],
+    ['errored, status written under another repo and head case',
+      { status: { status: 'finished', result: { status: 'error' } }, writer: 'Web-Everything/Web-Everything', rev: HEAD.toUpperCase() }],
+  ])('an %s red-team run plus 45 min elapsed is still held', (_name, run) => {
+    const { first, second, h, requests } = erroredRunAfterDeadline(run);
+    expect(first).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(second).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
+    expect(h.logs.join('')).not.toContain('red team never scheduled');
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+    expect(requests).toHaveLength(run.status ? 1 : 0);
+  });
+  it('releases an errored card-only attempt without a seat row when the producer skips cards', () => {
+    const { first, second, requests } = erroredRunAfterDeadline({
+      status: { status: 'finished', result: { status: 'error' } },
+      read: { netChangedFiles: ['backlog/123-card.md'] },
+    });
+    expect(first).toMatchObject({ enqueued: true });
+    expect(second).toMatchObject({ enqueued: true });
+    expect(requests).toHaveLength(0);
   });
   it('honors the fallback switch and logs its source', () => {
     let clock = 1000;
@@ -876,6 +1308,32 @@ describe('queue safeguard overrides and untracked queue entries', () => {
     const h = harness({ strategy: 'github-merge-queue', queued: true });
     h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
     expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+  });
+});
+
+describe('durable drain red-team requests', () => {
+  it('records once per normalized repo/PR/head, preserves consumption, and dry-run writes nothing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'drain-request-'));
+    const env = { WE_COORDINATION_ROOT: root };
+    const input = { repo: LOCAL, pr: 5485, head: HEAD };
+    try {
+      expect(requestDrainRedTeam(input, { env, dryRun: true })).toEqual({ requested: false });
+      expect(readDrainRedTeamRequests({ env })).toEqual([]);
+      expect(requestDrainRedTeam(input, { env })).toEqual({ requested: true });
+      const [request] = readDrainRedTeamRequests({ env });
+      expect(request).toMatchObject(input);
+      finishDrainRedTeamRequest(request, { env });
+      expect(requestDrainRedTeam({ ...input, repo: LOCAL.toUpperCase(), head: HEAD.toUpperCase() }, { env })).toEqual({ requested: true });
+      expect(readDrainRedTeamRequests({ env })).toEqual([]);
+      expect(requestDrainRedTeam({ ...input, head: 'c'.repeat(40) }, { env })).toEqual({ requested: true });
+      expect(readDrainRedTeamRequests({ env })).toHaveLength(1);
+      expect(requestDrainRedTeam(input, { env, write: () => { throw new Error('disk full'); } })).toEqual({ requested: true });
+      expect(requestDrainRedTeam({ ...input, head: 'd'.repeat(40) }, { env, write: () => { throw new Error('disk full'); } })).toEqual({ requested: false });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('wires the live drain construction and suppresses the writer for dry-run', () => {
+    const source = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+    expect(/requestRedTeam:.*DRY_RUN.*requestDrainRedTeam/.test(source)).toBe(true);
   });
 });
 
@@ -975,5 +1433,1099 @@ describe('drain pre-stage queue admission', () => {
     if (variant === 'unreadable') expect(() => s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toThrow('evidence unreadable');
     else expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+});
+
+
+describe('orphaned accepted panel-seat recovery', () => {
+  const panel = { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: HEAD }, netChangedFiles: ['scripts/x.mjs'] } } };
+  const evidence = { scheduled: true, recorded: false, attempted: false, inFlight: false, loopPayload: panel };
+  function setup(extra = {}) {
+    const requests = [];
+    let clock = 1000;
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      env: { WE_RED_TEAM_TIMING: 'panel-seat', WE_DRAIN_RED_TEAM_REQUEST_COOLDOWN_MIN: '2' }, evidence,
+      requestRedTeam: input => { requests.push(input); return { requested: false }; }, now: () => clock, ...extra });
+    return { ...h, requests, advance: ms => { clock += ms; } };
+  }
+  const stale = { ...evidence, recorded: true, attempted: true, untrustedSavedResult: true, noUsableResult: true };
+  it.each(['panel-seat', 'post-accept'])('%s requests stale rows once and keeps the head held', timing => {
+    const requestRedTeam = vi.fn(() => ({ requested: true }));
+    const h = setup({ evidence: stale, requestRedTeam, env: { WE_RED_TEAM_TIMING: timing } });
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending', redTeamRequested: true });
+    expect(requestRedTeam).toHaveBeenCalledWith({ repo: LOCAL, pr: 5485, head: HEAD, loopPayload: panel });
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    h.advance(60 * 60_000);
+    const restarted = setup({ evidence: stale, requestRedTeam, initial: h.state(), now: () => 3_601_000,
+      env: { WE_RED_TEAM_TIMING: timing } });
+    expect(restarted.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(restarted.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+  });
+  it.each([
+    { noUsableResult: false }, { inFlight: true }, { queued: true },
+  ])('does not request stale-looking rows with usable or active evidence (%j)', extra => {
+    const h = setup({ evidence: { ...stale, ...extra } });
+    h.s.enqueue({ num: 5485 }, HEAD);
+    h.advance(60 * 60_000);
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.requests).toHaveLength(0);
+  });
+  it('respects cooldown for failed stale-row requests and never falls through to enqueue', () => {
+    const h = setup({ evidence: stale });
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(1);
+    h.advance(60_000);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(1);
+    h.advance(60_000);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(2);
+    h.advance(60 * 60_000);
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+  });
+  // Live gap #5549: the operator accepted a needs-human head, its panel seat errored, and no request was ever filed.
+  const operatorAccepted = { ...stale, recorded: false, untrustedSavedResult: false, loopPayload: { ...panel,
+    verdict: { verdict: 'needs-human', humanRequired: true, blockedReferrals: [{ seat: 'correctness' }] } } };
+  it('recovers an operator-accepted needs-human head with an attempted, unusable pass', () => {
+    expect(staleRedTeamRequestEligibility({ evidence: operatorAccepted, repo: LOCAL, pr: 5549, head: HEAD,
+      labels: ['review:accepted', 'ready-to-merge'], enabled: true, panelSeat: true, reviewAgents: [] }))
+      .toEqual({ eligible: true, reason: 'stale rows with no usable result' });
+  });
+  it('never recovers that head without a live review:accepted label', () => {
+    expect(staleRedTeamRequestEligibility({ evidence: operatorAccepted, repo: LOCAL, pr: 5549, head: HEAD,
+      labels: ['review:human', 'ready-to-merge'], enabled: true, panelSeat: true, reviewAgents: [] }))
+      .toEqual({ eligible: false, reason: 'PR not accepted' });
+  });
+  it.each(['requiring send-back', 'saved red-team re-check incomplete'])('does not recover a recorded break: %s', reason => {
+    expect(staleRedTeamRequestEligibility({ evidence: stale, repo: LOCAL, pr: 5485, head: HEAD,
+      labels: ['review:accepted'], enabled: true, panelSeat: true, reviewAgents: [], reason }).eligible).toBe(false);
+  });
+  it('does not request stale rows in dry run', () => {
+    const h = setup({ evidence: stale, dryRun: true });
+    expect(() => h.s.enqueue({ num: 5485 }, HEAD)).toThrow('enqueue refused in dry run');
+    expect(h.requests).toHaveLength(0);
+  });
+  it('requests an unseated accepted head promptly, retries on cooldown, and holds until a usable result', () => {
+    const h = setup();
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.requests).toHaveLength(1);
+    h.advance(60_000);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(1);
+    h.advance(60_000);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(2);
+    expect(h.logs.join('')).toContain('requesting red team for #5485');
+    expect(h.logs.join('')).not.toContain('red team never scheduled');
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+  });
+  it.each([
+    { evidence: { ...evidence, inFlight: true } }, { evidence: { ...evidence, queued: true } },
+    { evidence: { ...evidence, attempted: true } }, { evidence: { ...evidence, recorded: true } },
+    { readReviewAgents: () => [{ name: 'review-pr-5485-we', state: 'working', repo: LOCAL, pr: 5485, kind: 'review-job' }] },
+    { readReviewAgents: () => { throw Error('unreadable jobs'); } },
+    { labels: ['ready-to-merge'] },
+    { evidence: { ...evidence, loopPayload: { ...panel, verdict: { verdict: 'needs-human' } } } },
+    { readReviewAgents: () => [{ name: 'review-5485', state: 'queued' }] },
+    { evidence: { ...evidence, scheduled: false }, readReviewAgents: () => [{ name: 'review-5485', state: 'queued' }] },
+    { evidence: { ...evidence, loopPayload: { ...panel, findings: { read: { netBasis: { rev: 'c'.repeat(40) } } } } } },
+    { readReviewAgents: () => Object.defineProperty([], 'incomplete', { value: [{ session: 'review-5485' }] }) },
+    { requestRedTeam: undefined },
+    { evidence: { ...evidence, loopPayload: { ...panel, findings: { read: { netBasis: { rev: HEAD }, netChangedFiles: ['backlog/123-card.md'] } } } } },
+    { env: { WE_RED_TEAM_TIMING: 'panel-seat', WE_REVIEW_RED_TEAM: 'off' } },
+    { env: { WE_RED_TEAM_TIMING: 'panel-seat', WE_REVIEW_EXTRA_SEATS: 'off' } },
+  ])('does not request when work, exemption, or refusal prevents recovery (%j)', extra => {
+    const h = setup(extra);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    h.advance(60 * 60_000);
+    h.s.enqueue({ num: 5485 }, HEAD);
+    expect(h.requests).toHaveLength(0);
+  });
+  it.each([
+    ['panel-seat', 'recorded'], ['panel-seat', 'attempted'],
+    ['post-accept', 'recorded'], ['post-accept', 'attempted'],
+  ])('%s holds %s evidence without requesting again, until a usable result exists', (timing, field) => {
+    const thread = [];
+    const requestRedTeam = vi.fn(() => ({ requested: true }));
+    const h = setup({ liveComments: thread, requestRedTeam,
+      env: { WE_RED_TEAM_TIMING: timing }, evidence: { ...evidence, [field]: true } });
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    h.advance(60 * 60_000);
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending', healthSmell: true });
+    expect(requestRedTeam).not.toHaveBeenCalled();
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+    thread.push({ user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5485 rev=${HEAD} -->\n### Post-accept red team — no break found` });
+    expect(h.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
+    expect(requestRedTeam).not.toHaveBeenCalled();
+  });
+  it('records a successful request once, keeps holding, then admits a usable head result', () => {
+    const requests = [];
+    const thread = [];
+    const h = setup({ liveComments: thread, requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, redTeamRequested: true });
+    h.advance(60 * 60_000);
+    expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false });
+    expect(requests).toHaveLength(1);
+    expect(h.logs.join('')).toContain('requested red team for #5485');
+    thread.push({ user: { login: 'web-everything[bot]' }, body: `<!-- we:red-team-advisory pr=5485 rev=${HEAD} -->\n### Post-accept red team — no break found` });
+    expect(h.s.enqueue({ num: 5485 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
+  });
+});
+
+describe('live queue file-overlap admission', () => {
+  const card = 'backlog/123-card.md';
+  const candidate = { num: 42, listedFiles: [card], listedFilesComplete: true };
+  const facts = numbers => ({ data: { repository: { mergeQueue: { entries: {
+    pageInfo: { hasNextPage: false }, nodes: numbers.map(number => ({ pullRequest: { number } })),
+  } } } } });
+  const setup = (over = {}) => harness({ strategy: 'github-merge-queue',
+    queueFacts: facts([43]), ghView: { 43: { files: [{ path: card }] } }, ...over });
+  it.each([
+    ['disjoint net files', 'git', ['scripts/candidate.mjs'], ['scripts/queued.mjs'], false],
+    ['shared net files', 'git', ['scripts/shared.mjs'], ['scripts/shared.mjs'], true],
+    ['unverifiable git', 'github', [card], [card], true],
+    ['unknown files', 'github', null, null, false],
+  ])('uses resolved files in both queue admission paths: %s', (_name, source, candidateFiles, queuedFiles, held) => {
+    const resolveRealFiles = vi.fn(({ pr, ghFiles }) => ({ source, disagreed: source === 'git',
+      files: pr.headRefName === 'lane/candidate' ? candidateFiles : queuedFiles }));
+    const h = setup({ resolveRealFiles, ghView: { 43: { files: [card], headRefName: 'lane/queued', baseRefName: 'main', headRefOid: HEAD } } });
+    const c = { ...candidate, headRef: 'lane/candidate' };
+    expect(h.s.queueOverlapHold(c, HEAD)?.kind ?? null).toBe(held ? 'queue-file-overlap' : null);
+    const result = h.s.enqueue(c, HEAD);
+    expect(result.kind ?? null).toBe(held ? 'queue-file-overlap' : null);
+    expect(result.enqueued).toBe(!held);
+    expect(resolveRealFiles).toHaveBeenCalledWith({ pr: expect.objectContaining({ headRefName: 'lane/candidate', baseRefName: 'main', headRefOid: HEAD }), repo: LOCAL, ghFiles: [card], cwd: process.cwd(), run: expect.any(Function) });
+    if (candidateFiles !== null) expect(resolveRealFiles).toHaveBeenCalledWith({ pr: expect.objectContaining({ headRefName: 'lane/queued', headRefOid: HEAD }), repo: LOCAL, ghFiles: [card], cwd: process.cwd(), run: expect.any(Function) });
+    const logs = h.logs.filter(line => line.includes('real files for #'));
+    expect(logs).toHaveLength(source === 'git' ? 2 : 0); // one per pre-check/enqueue decision
+  });
+  it('falls back conservatively when the resolver throws', () => {
+    const h = setup({ resolveRealFiles: () => { throw new Error('unavailable'); } });
+    expect(h.s.queueOverlapHold(candidate, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.s.enqueue(candidate, HEAD).kind).toBe('queue-file-overlap');
+  });
+  it('pre-check shares the enqueue reason, caches only its own reads and expires after 30s', () => {
+    let time = 1_000;
+    const h = setup({ now: () => time });
+    const hold = h.s.queueOverlapHold(candidate, HEAD);
+    expect(hold).toEqual({ kind: 'queue-file-overlap', deferred: true, reason: `#43 share ${card}` });
+    expect(h.s.queueOverlapHold({ ...candidate, num: 44 }, HEAD)).toEqual(hold);
+    expect(h.calls).toHaveLength(2); // queue discovery + queued PR files, no writes
+    const result = h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) });
+    expect(result).toEqual({ enqueued: false, ...hold });
+    expect(h.calls.filter(c => c.includes('files,headRefName,baseRefName,headRefOid'))).toHaveLength(2); // enqueue read fresh
+    time += 30_000;
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toEqual(hold);
+    expect(h.calls.filter(c => c.includes('files,headRefName,baseRefName,headRefOid'))).toHaveLength(3);
+  });
+  it.each([
+    ['missing', { num: 42 }],
+    ['incomplete', { ...candidate, listedFilesComplete: false }],
+    ['capped', { ...candidate, listedFiles: Array(100).fill(card) }],
+    ['malformed', { ...candidate, listedFiles: [null] }],
+    ['other repo', { ...candidate, repo: 'other/repo' }],
+  ])('pre-check makes no reads when files or mode are unknown: %s', (_name, c) => {
+    const h = setup();
+    expect(h.s.queueOverlapHold(c, HEAD)).toBeNull();
+    expect(h.calls).toEqual([]);
+    expect(h.state()).toBeNull();
+  });
+  it('pre-check never caches queue read errors', () => {
+    const failures = [43];
+    const h = setup({ viewThrows: failures });
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull();
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull();
+    expect(h.calls).toHaveLength(4);
+    failures.pop();
+    expect(h.s.queueOverlapHold(candidate, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.calls).toHaveLength(6);
+  });
+  it.each([
+    ['self excluded', { queueFacts: facts([42]), ghView: { 42: { files: [card] } } }],
+    ['cards disabled', { env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'off' } }],
+    ['disjoint', { ghView: { 43: { files: ['other'] } } }],
+    ['unknown queued files', { ghView: { 43: { files: null } } }],
+    ['direct mode', { strategy: 'drain-direct' }],
+  ])('pre-check fails open for %s', (_name, options) => {
+    const h = setup(options);
+    expect(h.s.queueOverlapHold(candidate, HEAD)).toBeNull();
+  });
+  it('pre-check also reads in dry run without any mutation', () => {
+    const h = setup({ dryRun: true });
+    expect(h.s.queueOverlapHold(candidate, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.calls).toHaveLength(2);
+    expect(h.state()).toBeNull();
+  });
+  it('defers shared cards before any enqueue mutation and reports policy source', () => {
+    const h = setup();
+    expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toEqual({
+      enqueued: false, deferred: true, kind: 'queue-file-overlap', reason: `#43 share ${card}`,
+    });
+    expect(h.calls.some(call => call.some(arg => arg.includes('enqueuePullRequest')))).toBe(false);
+    expect(h.logs.join('')).toContain(`defer #42 (shares ${card} with queued #43) — includeCards=true (standard)`);
+    expect(h.calls.filter(call => call[0] === 'gh' && call.includes('files,headRefName,baseRefName,headRefOid'))).toEqual([
+      ['gh', 'pr', 'view', '43', '--repo', LOCAL, '--json', 'files,headRefName,baseRefName,headRefOid'],
+    ]);
+    expect(h.calls.some(call => call[0] === 'git' && ['fetch', 'diff'].includes(call[1]))).toBe(false);
+  });
+  it.each([
+    ['disjoint', { ghView: { 43: { files: [{ path: 'scripts/other.mjs' }] } } }],
+    ['self excluded', { queueFacts: facts([42]) }],
+    ['cards disabled', { env: { WE_DRAIN_QUEUE_FILE_OVERLAP_INCLUDES_CARDS: 'off' } }],
+    ['queued list capped', { ghView: { 43: { files: Array(100).fill({ path: card }) } } }],
+  ])('continues through existing admission when %s', (_label, over) => {
+    const h = setup(over);
+    expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
+    expect(h.calls.some(call => call.some(arg => arg.includes('enqueuePullRequest')))).toBe(true);
+  });
+  describe('fails closed when the locked live queue read fails', () => {
+    const labels = ['review:accepted', 'ready-to-merge', 'red-team:pending'];
+    const pendingState = () => ({ pending: [], followedUp: [], redTeamPending: {
+      'cwd#42': { headSha: HEAD, firstPendingAt: 0, retryAt: 0, commentCount: 0, checkedAt: 0, reason: 'red team pending' } } });
+    const evidence = { scheduled: false, inFlight: false, recorded: false, attempted: false, loopPayload: { verdict: { verdict: 'accept' } } };
+    const enqueueCalled = h => h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')));
+    const pendingRemoved = h => h.calls.some(call => call.includes('--remove-label') && call.includes('red-team:pending'));
+    it.each([
+      ['queue read errors', { viewThrows: [43] }, 'gh: HTTP 502'],
+      ['queue response malformed', { queueFacts: { data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false } } } } } } }, 'unreadable merge queue'],
+      ['queue read throws an empty message', { onView: { 43: () => { throw new Error(''); } } }, 'queue read error'],
+    ])('%s: holds with queue-read-failed, keeps red-team:pending and its pending record', (_name, over, detail) => {
+      const h = setup({ ...over, labels, evidence, initial: pendingState() });
+      const result = h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) });
+      expect(result).toMatchObject({ enqueued: false, deferred: true, kind: 'queue-read-failed' });
+      expect(result.reason).toContain(detail);
+      expect(enqueueCalled(h)).toBe(false);
+      expect(pendingRemoved(h)).toBe(false);
+      expect(h.state().redTeamPending['cwd#42']).toMatchObject({ headSha: HEAD });
+      expect(h.logs.join('')).toContain('holding #42 (queue-read-failed), retried next pass');
+    });
+    it('control: a successful read enqueues, then drops red-team:pending and the pending record', () => {
+      const h = setup({ ghView: { 43: { files: [{ path: 'scripts/other.mjs' }] } }, labels, evidence, initial: pendingState() });
+      expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
+      expect(enqueueCalled(h)).toBe(true);
+      expect(pendingRemoved(h)).toBe(true);
+      const enqueueAt = h.calls.findIndex(call => call.some(arg => String(arg).includes('enqueuePullRequest')));
+      expect(h.calls.findIndex(call => call.includes('--remove-label'))).toBeGreaterThan(enqueueAt);
+      expect(h.state().redTeamPending?.['cwd#42']).toBeUndefined();
+    });
+  });
+  it.each([
+    ['missing', { num: 42 }],
+    ['incomplete', { ...candidate, listedFilesComplete: false }],
+    ['capped', { ...candidate, listedFiles: Array(100).fill(card) }],
+    ['malformed', { ...candidate, listedFiles: [null] }],
+  ])('fails open when candidate files are %s', (_label, c) => {
+    const h = setup();
+    expect(h.s.enqueue(c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
+    expect(h.logs.join('')).toContain('candidate files unknown — continuing enqueue');
+    expect(h.calls.some(call => call[0] === 'gh' && call.includes('files,headRefName,baseRefName,headRefOid'))).toBe(false);
+  });
+});
+
+
+describe('card-overlap clean-merge relief (drain.cardOverlapCleanMerge)', () => {
+  const card = 'backlog/123-card.md';
+  const TIP = 'c'.repeat(40);
+  const QH = HEAD; // the harness confirms queue entry by the first ghView head
+  const candidate = { num: 42, listedFiles: [card], listedFilesComplete: true };
+  const facts = numbers => ({ data: { repository: { mergeQueue: { entries: {
+    pageInfo: { hasNextPage: false }, nodes: numbers.map(number => ({ pullRequest: { number } })),
+  } } } } });
+  const mergeRun = status => vi.fn((cmd, args) => args[0] === 'cat-file' ? { status: 0 }
+    : args[0] === 'merge-tree' ? { status, stdout: status === 0 ? `${'d'.repeat(40)}\n` : `${'d'.repeat(40)}\n${card}\n` } : { status: 128 });
+  const setup = ({ enabled = true, status = 0, tip = { sha: TIP, num: 43, entries: [{ num: 43, headSha: QH }] }, queuedFiles = [card], files = [card] } = {}) => {
+    const readQueueTip = vi.fn(() => tip);
+    const cardMergeRun = mergeRun(status);
+    const h = harness({ strategy: 'github-merge-queue', queueFacts: facts([43]), ghView: { 43: { files: queuedFiles.map(path => ({ path })), headRefOid: QH } },
+      strategyExtra: { cardOverlapCleanMerge: { enabled, source: 'tool' }, readQueueTip, cardMergeRun } });
+    return { ...h, readQueueTip, cardMergeRun, c: { ...candidate, listedFiles: files } };
+  };
+  it('enqueues a card-only overlap that merges cleanly onto the queue tip', () => {
+    const h = setup();
+    expect(h.s.queueOverlapHold(h.c, HEAD)).toBeNull();
+    expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
+    expect(h.cardMergeRun).toHaveBeenCalledWith('git', ['merge-tree', '--write-tree', '--name-only', '--no-messages', TIP, HEAD], expect.anything());
+    expect(h.logs.join('')).toContain('card-overlap clean-merge: #42 with #43 → enqueue');
+    expect(h.logs.join('')).toContain('drain.cardOverlapCleanMerge=on (tool)');
+  });
+  it('keeps the deferral on a conflict', () => {
+    const h = setup({ status: 1 });
+    expect(h.s.queueOverlapHold(h.c, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: false, kind: 'queue-file-overlap' });
+    expect(h.logs.join('')).toContain(`card-overlap clean-merge: #42 with #43 → skip: conflict (${card})`);
+  });
+  it.each([
+    ['merge-tree error', { status: 128 }],
+    ['queue tip unknown', { tip: { error: 'a queue entry has no merge-group commit yet' } }],
+    ['queue changed between reads', { tip: { sha: TIP, num: 44, entries: [{ num: 43, headSha: QH }, { num: 44, headSha: QH }] } }],
+    ['queued PR re-queued at a new head', { tip: { sha: TIP, num: 43, entries: [{ num: 43, headSha: 'f'.repeat(40) }] } }],
+  ])('keeps the deferral on %s', (_name, over) => {
+    const h = setup(over);
+    expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: false, kind: 'queue-file-overlap' });
+    expect(h.logs.join('')).toMatch(/card-overlap clean-merge: #42 with #43 → skip: /);
+  });
+  it('keeps the deferral, without a dry merge, when any shared path is not a card', () => {
+    const h = setup({ files: [card, 'scripts/x.mjs'], queuedFiles: [card, 'scripts/x.mjs'] });
+    expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: false, kind: 'queue-file-overlap' });
+    expect(h.readQueueTip).not.toHaveBeenCalled();
+    expect(h.cardMergeRun).not.toHaveBeenCalled();
+    expect(h.logs.join('')).toContain('→ skip: non-card overlap');
+  });
+  it('does nothing new when the setting is off', () => {
+    const h = setup({ enabled: false });
+    expect(h.s.enqueue(h.c, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: false, kind: 'queue-file-overlap' });
+    expect(h.readQueueTip).not.toHaveBeenCalled();
+    expect(h.logs.join('')).not.toContain('card-overlap clean-merge');
+  });
+});
+
+describe('red-team requests while queue-file-overlap deferred', () => {
+  const c = { num: 42, listedFiles: ['scripts/x.mjs'], listedFilesComplete: true };
+  const panel = { verdict: { verdict: 'accept' }, findings: { read: {
+    netBasis: { rev: HEAD }, netChangedFiles: ['scripts/x.mjs'],
+  } } };
+  const evidence = { scheduled: false, recorded: false, attempted: false, inFlight: false, loopPayload: panel };
+  const key = 'cwd#42';
+  function setup(extra = {}) {
+    let clock = 1000;
+    const requestRedTeam = vi.fn(() => ({ requested: true }));
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      env: { WE_RED_TEAM_TIMING: 'post-accept', WE_DRAIN_RED_TEAM_REQUEST_COOLDOWN_MIN: '2' }, evidence,
+      requestRedTeam, now: () => clock,
+      queueFacts: { data: { repository: { mergeQueue: { entries: {
+        pageInfo: { hasNextPage: false }, nodes: [{ pullRequest: { number: 43 } }],
+      } } } } }, ghView: { 43: { files: [{ path: 'scripts/x.mjs' }] } }, ...extra });
+    return { ...h, requestRedTeam, advance: ms => { clock += ms; } };
+  }
+  const hasEnqueueMutation = h => h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')));
+
+  const sibling = { ...c, repo: 'plateauapp/plateau-app' };
+  it('requests once for a non-local repo in enqueue mode without adding a hold', () => {
+    const h = setup();
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: true });
+    expect(h.requestRedTeam).toHaveBeenCalledWith({ repo: sibling.repo, pr: 42, head: HEAD, loopPayload: panel });
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(h.s.enqueues(sibling.repo)).toBe(false);
+    expect(h.s.recordedHold(sibling, HEAD)).toBeNull();
+    expect(h.s.queueOverlapHold(sibling, HEAD)).toBeNull();
+    expect(h.state().redTeamPending[`${sibling.repo}#42`].requestedAt).toBe(1000);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([
+    ['not accepted', { labels: ['ready-to-merge'] }],
+    ['dry run', { dryRun: true }],
+    ['head mismatch', { ghView: { 42: { headRefOid: 'a'.repeat(40), labels: ['review:accepted', 'ready-to-merge'] } } }],
+    ['direct mode', { strategy: 'drain-direct' }],
+  ])('does not request for a non-local repo when %s', (_label, extra) => {
+    const h = setup(extra);
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toBeNull();
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('respects request cooldown for a non-local repo', () => {
+    const requestRedTeam = vi.fn(() => ({ requested: false }));
+    const h = setup({ requestRedTeam });
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    h.advance(60_000);
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    h.advance(60_000);
+    expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
+    expect(requestRedTeam).toHaveBeenCalledTimes(2);
+    expect(h.s.recordedHold(sibling, HEAD)).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([
+    { labels: ['review:accepted'] },
+    { labels: ['review:accepted', 'ready-to-merge', 'review:changes'] },
+    { labels: ['review:accepted', 'ready-to-merge', 'review:human'] },
+    { labels: ['review:accepted', 'ready-to-merge', 'review:pending'] },
+  ])('refuses send-back labels without writing state: $labels', ({ labels }) => {
+    const h = setup({ labels });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(h.calls.some(call => call.includes('--slurp'))).toBe(false);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([true, false])('does not request after a complete live-head result (confirmed break=%s)', confirmedBreak => {
+    const h = setup({ liveComments: [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 42, rev: HEAD, recheckStatus: 'ok',
+      findings: confirmedBreak ? [{ summary: 'live break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }] : [],
+    }) }] });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    expect(h.calls).toContainEqual(['gh', 'api', '--paginate', '--slurp', `repos/${LOCAL}/issues/42/comments`]);
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('refuses an incomplete saved red-team recheck without writing state', () => {
+    const root = mkdtempSync(join(tmpdir(), 'drain-deferred-incomplete-'));
+    try {
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root,
+        WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
+      const path = resolveScorecardStorePath(env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: LOCAL, pr: 42, rev: HEAD, status: 'ok', recheckStatus: 'pending', confirmedMissCount: 1,
+        findings: [{ confirmedByRecheck: true, impactIfUnfixed: 'degraded' }, { confirmedByRecheck: false }] }] }));
+      saveProvenanceFixtures(env);
+      const h = setup({ env, liveComments: [] });
+      expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+      expect(h.requestRedTeam).not.toHaveBeenCalled();
+      expect(h.state()).toBeNull();
+      expect(hasEnqueueMutation(h)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('returns null for unreadable complete comments without writing state', () => {
+    const h = setup({ liveComments: { unreadable: true } });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toBeNull();
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('requests once during overlap, persists the request, and leaves admission held', () => {
+    const h = setup();
+    const hold = h.s.queueOverlapHold(c, HEAD);
+    expect(hold).toMatchObject({ kind: 'queue-file-overlap' });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: true });
+    expect(h.requestRedTeam).toHaveBeenCalledWith({ repo: LOCAL, pr: 42, head: HEAD, loopPayload: panel });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(h.state().redTeamPending[key]).toEqual({ headSha: HEAD, firstPendingAt: 1000, retryAt: 1000,
+      checkedAt: 1000, commentCount: 0, requestAttemptedAt: 1000, requestedAt: 1000,
+      reason: 'red team requested while queue-file-overlap deferred' });
+    expect(hasEnqueueMutation(h)).toBe(false);
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    h.advance(60 * 60_000);
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    expect(h.s.enqueue(c, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(h.s.queueOverlapHold(c, HEAD)).toEqual(hold);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('persists failed attempts before dispatch and retries only after cooldown', () => {
+    let h;
+    const requestRedTeam = vi.fn(() => {
+      expect(h.state().redTeamPending[key].requestAttemptedAt).toBeDefined();
+      throw new Error('dispatcher unavailable');
+    });
+    h = setup({ requestRedTeam });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    h.advance(60_000);
+    h.s.requestRedTeamWhileDeferred(c, HEAD);
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    h.advance(60_000);
+    h.s.requestRedTeamWhileDeferred(c, HEAD);
+    expect(requestRedTeam).toHaveBeenCalledTimes(2);
+    expect(h.state().redTeamPending[key].requestedAt).toBeUndefined();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each(['recorded', 'attempted', 'inFlight', 'queued'])('refuses %s evidence without stale recovery eligibility', field => {
+    const h = setup({ evidence: { ...evidence, [field]: true } });
+    h.s.requestRedTeamWhileDeferred(c, HEAD);
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([
+    { labels: ['ready-to-merge'] },
+    { ghView: { 42: { headRefOid: 'a'.repeat(40), labels: ['review:accepted'] } } },
+    { dryRun: true },
+    { env: { WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'false' } },
+    { strategy: 'drain-direct' },
+    { requestRedTeam: null },
+    { evidence: { ...evidence, readError: true } },
+    { viewThrows: [42] },
+  ])('does nothing when prerequisites fail (%j)', extra => {
+    const h = setup(extra);
+    expect(() => h.s.requestRedTeamWhileDeferred(c, HEAD)).not.toThrow();
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(h.state()).toBeNull();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('does nothing without a head', () => {
+    const h = setup();
+    expect(h.s.requestRedTeamWhileDeferred(c, null)).toBeNull();
+    expect(h.calls).toEqual([]);
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+  });
+
+  it('takes the land lock before reading state and respects lock refusal', () => {
+    const withLock = vi.fn(fn => ({ ran: true, result: fn() }));
+    const h = setup({ withLock });
+    h.s.requestRedTeamWhileDeferred(c, HEAD);
+    expect(withLock).toHaveBeenCalledTimes(1);
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    const refused = setup({ withLock: () => ({ ran: false }) });
+    expect(refused.s.requestRedTeamWhileDeferred(c, HEAD)).toBeNull();
+    expect(refused.calls).toEqual([]);
+    expect(refused.state()).toBeNull();
+    expect(refused.requestRedTeam).not.toHaveBeenCalled();
+  });
+
+  it.each(['post-accept', 'panel-seat'])('shares stale recovery eligibility for %s', timing => {
+    const h = setup({ env: { WE_RED_TEAM_TIMING: timing },
+      evidence: { ...evidence, scheduled: true, recorded: true, attempted: true, noUsableResult: true } });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: true });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it('requests an orphaned accepted panel seat even when policy marks it scheduled', () => {
+    const h = setup({ env: { WE_RED_TEAM_TIMING: 'panel-seat' }, evidence: { ...evidence, scheduled: true } });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: true });
+    expect(h.requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+
+  it.each([
+    () => [{ name: 'review-42', state: 'queued', repo: LOCAL, pr: 42 }],
+    () => { throw new Error('unknown jobs'); },
+  ])('does not request an orphaned panel seat without proving jobs inactive', readReviewAgents => {
+    const h = setup({ env: { WE_RED_TEAM_TIMING: 'panel-seat' }, readReviewAgents,
+      evidence: { ...evidence, scheduled: true } });
+    expect(h.s.requestRedTeamWhileDeferred(c, HEAD)).toEqual({ requested: false });
+    expect(h.requestRedTeam).not.toHaveBeenCalled();
+    expect(hasEnqueueMutation(h)).toBe(false);
+  });
+});
+
+
+describe('priority file reservations', () => {
+  let dir;
+  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
+  const files = ['scripts/shared.mjs', 'scripts/second.mjs'];
+  const priority = { num: 42, prLabels: ['priority:now'], listedFiles: files, listedFilesComplete: true };
+  const candidate = { num: 44, listedFiles: [files[0]], listedFilesComplete: true };
+  const facts = numbers => ({ data: { repository: { mergeQueue: { entries: {
+    pageInfo: { hasNextPage: false }, nodes: numbers.map(number => ({ pullRequest: { number } })),
+  } } } } });
+  const setup = (over = {}) => {
+    dir = mkdtempSync(join(tmpdir(), 'priority-reserve-'));
+    const reservePath = join(dir, 'drain-priority-reserve.json');
+    const h = harness({ strategy: 'github-merge-queue', reservePath,
+      priorityReserve: () => ({ enabled: true, source: 'default' }), ...over });
+    return { ...h, reservePath };
+  };
+  const stamp = (h, extra = {}) => writeReserves(h.reservePath, {
+    'cwd#42': { num: 42, repo: null, headSha: HEAD, files, at: Date.now(), ...extra },
+  });
+  const accepted = ['priority:now', 'review:accepted', 'ready-to-merge'];
+  const panel = { verdict: { verdict: 'accept' }, findings: { read: {
+    netBasis: { rev: HEAD }, netChangedFiles: files,
+  } } };
+  const pendingEvidence = { scheduled: true, inFlight: true, recorded: false, loopPayload: panel };
+  const rtSetup = (extra = {}) => setup({ labels: accepted, evidence: pendingEvidence,
+    env: { WE_RED_TEAM_TIMING: 'post-accept' }, now: () => 1000, ...extra });
+  it.each(['priority:now', 'priority:urgent'])('stamps %s before a recorded hold and retains its first timestamp', label => {
+    let clock = 1000;
+    const labels = accepted.map(l => l === 'priority:now' ? label : l);
+    const h = rtSetup({ labels, now: () => clock });
+    const c = { ...priority, prLabels: labels };
+    h.s.priorityReserveStamp(c, HEAD);
+    expect(h.calls.filter(call => call.includes('state,headRefOid,labels,reviews'))).toHaveLength(1);
+    expect(readReserves(h.reservePath)['cwd#42']).toMatchObject({ headSha: HEAD, files, rt: true, rtSince: 1000, maxMs: 90 * 60_000 });
+    expect(h.s.enqueue(c, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    clock += 60_000;
+    h.s.priorityReserveStamp(c, HEAD);
+    expect(h.s.recordedHold(c, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    expect(readReserves(h.reservePath)['cwd#42'].rtSince).toBe(1000);
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind).toBe('priority-reserve');
+    expect(h.logs.join('')).toContain('priorityReserveMaxMin=90 (standard)');
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+  it('stamps in ordinary enqueue without changing the red-team hold', () => {
+    const h = rtSetup();
+    expect(h.s.enqueue({ ...priority, prLabels: accepted }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(readReserves(h.reservePath)['cwd#42']).toMatchObject({ rt: true, rtSince: 1000 });
+  });
+  it.each([
+    ['not accepted', ['priority:now', 'ready-to-merge']],
+    ['not ready', ['priority:now', 'review:accepted']],
+    ['send-back', [...accepted, 'review:changes']],
+  ])('does not stamp when %s and drops an existing rt stamp in either path', (_name, labels) => {
+    const live = { state: 'OPEN', headRefOid: HEAD, labels };
+    const h = rtSetup({ ghView: { 42: live } });
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)).toEqual({});
+    stamp(h, { at: 1000, rt: true, rtSince: 1000, maxMs: 90 * 60_000 });
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)).toEqual({});
+    stamp(h, { at: 1000, rt: true, rtSince: 1000, maxMs: 90 * 60_000 });
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each(['hold', 'stamp'])('expires at maxMin in the %s path without extending rtSince', path => {
+    let clock = 1000;
+    const h = rtSetup({ now: () => clock, priorityReserve: () => ({ enabled: true, source: 'default', maxMin: 40, maxMinSource: 'tool' }) });
+    h.s.priorityReserveStamp(priority, HEAD);
+    clock += 31 * 60_000;
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)['cwd#42'].rtSince).toBe(1000);
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind).toBe('priority-reserve');
+    expect(h.logs.join('')).toContain('priorityReserveMaxMin=40 (tool)');
+    clock = 1000 + 40 * 60_000;
+    if (path === 'hold') expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    else h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each([
+    ['head changed', { state: 'OPEN', headRefOid: 'a'.repeat(40), labels: accepted }],
+    ['closed', { state: 'CLOSED', headRefOid: HEAD, labels: accepted }],
+  ])('expires rt stamps when %s', (_name, live) => {
+    const h = rtSetup({ ghView: { 42: live } });
+    stamp(h, { at: 1000, rt: true, rtSince: 1000, maxMs: 90 * 60_000 });
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it('requests the current head locally without overlap, keeps cooldown and preserves the hold', () => {
+    const requestRedTeam = vi.fn(() => ({ requested: true }));
+    const h = rtSetup({ requestRedTeam, evidence: { ...pendingEvidence, scheduled: false, inFlight: false } });
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(h.s.requestRedTeamWhileDeferred(priority, HEAD)).toEqual({ requested: true });
+    expect(requestRedTeam).toHaveBeenCalledWith({ repo: LOCAL, pr: 42, head: HEAD, loopPayload: panel });
+    expect(h.s.requestRedTeamWhileDeferred(priority, HEAD)).toEqual({ requested: false });
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
+    expect(h.s.enqueue(priority, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.s.recordedHold(priority, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    expect(readReserves(h.reservePath)['cwd#42'].rt).toBe(true);
+  });
+  it.each(['break', 'incomplete'])('drops rt reservations for a red-team %s before send-back labels arrive', kind => {
+    const thread = [];
+    const h = rtSetup({ liveComments: thread });
+    h.s.priorityReserveStamp(priority, HEAD);
+    thread.push({ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 42, rev: HEAD, provider: 'codex', model: 'm',
+      recheckStatus: kind === 'incomplete' ? 'pending' : 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+    }) });
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)).toEqual({});
+    stamp(h, { at: 1000, rt: true, rtSince: 1000, maxMs: 90 * 60_000 });
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each([
+    ['default card-only exemption', {}, {}, false],
+    ['card-only skipping disabled', {}, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, true],
+    ['producer exemption overrides disabled skipping', { skipCardOnly: true }, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, false],
+    ['producer requires a pass', { skipCardOnly: false }, {}, true],
+    ['in-flight pass', { inFlight: true }, {}, true],
+    ['recorded pass', { recorded: true }, {}, true],
+    ['attempt-only exemption', { attempted: true }, {}, false],
+  ])('matches the enqueue reason for a card-only PR: %s', (_name, evidence, env, held) => {
+    const h = rtSetup({ env: { WE_RED_TEAM_TIMING: 'post-accept', ...env }, evidence: {
+      ...pendingEvidence, inFlight: false, ...evidence, loopPayload: {
+        verdict: { verdict: 'accept' }, findings: { read: {
+          netBasis: { rev: HEAD }, netChangedFiles: ['backlog/123-card.md'],
+        } },
+      },
+    } });
+    h.s.priorityReserveStamp(priority, HEAD);
+    if (held) expect(readReserves(h.reservePath)['cwd#42']).toMatchObject({ rt: true });
+    else expect(readReserves(h.reservePath)).toEqual({});
+    const result = h.s.enqueue(priority, HEAD);
+    if (held) expect(result).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    else expect(result.enqueued).toBe(true);
+  });
+  it.each([0])('disables rt stamping with maxMin=%s', maxMin => {
+    const h = rtSetup({ priorityReserve: () => ({ enabled: true, source: 'tool', maxMin }) });
+    h.s.priorityReserveStamp(priority, HEAD);
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each([
+    ['disjoint net files', 'git', ['scripts/other.mjs'], false],
+    ['shared net files', 'git', [files[0]], true],
+    ['GitHub fallback', 'github', [files[0]], true],
+    ['unknown files', 'github', null, false],
+  ])('uses resolved candidate files against reserves: %s', (_name, source, realFiles, blocked) => {
+    const h = setup({ resolveRealFiles: () => ({ files: realFiles, source, disagreed: source === 'git' }),
+      ghView: { 42: { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now'] } } });
+    stamp(h);
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind ?? null).toBe(blocked ? 'priority-reserve' : null);
+    const result = h.s.enqueue(candidate, HEAD);
+    expect(result.kind ?? null).toBe(blocked ? 'priority-reserve' : null);
+    expect(result.enqueued).toBe(!blocked);
+  });
+  it('stamps only real files in both overlap paths, and uses those stamps for later candidates', () => {
+    const net = [files[1]];
+    const resolveRealFiles = ({ pr }) => ({ source: 'git', disagreed: true,
+      files: pr.headRefName === 'lane/later' ? [files[0]] : net });
+    const queueFacts = facts([43]);
+    const h = setup({ resolveRealFiles, queueFacts,
+      ghView: { 43: { files: [files[0]] }, 42: { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now'] } } });
+    expect(h.s.queueOverlapHold(priority, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)['cwd#42'].files).toEqual(net);
+    writeReserves(h.reservePath, {});
+    expect(h.s.enqueue(priority, HEAD).kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)['cwd#42'].files).toEqual(net);
+    queueFacts.data.repository.mergeQueue.entries.nodes = [];
+    expect(h.s.priorityReserveHold({ ...candidate, headRef: 'lane/later' }, HEAD)).toBeNull();
+  });
+  it.each(['priority:now', 'priority:urgent'])('persists %s overlap defers in both paths', label => {
+    const h = setup({ queueFacts: facts([43]), ghView: { 43: { files: [files[0]] } } });
+    const c = { ...priority, prLabels: [{ name: label }] };
+    expect(h.s.queueOverlapHold(c, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)['cwd#42']).toMatchObject({ num: 42, headSha: HEAD, files });
+    writeReserves(h.reservePath, {});
+    expect(h.s.enqueue(c, HEAD).kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)['cwd#42'].files).toEqual(files);
+  });
+  it.each([
+    ['expired', 'hint'],
+    ['expired', 'enqueue'],
+    ['head-mismatched', 'hint'],
+    ['head-mismatched', 'enqueue'],
+  ])('replaces an %s rt stamp with an ordinary overlap reservation in the %s path', (reason, path) => {
+    const clock = 1000 + 90 * 60_000;
+    const h = setup({ now: () => clock, queueFacts: facts([43]), ghView: { 43: { files: [files[0]] } } });
+    stamp(h, { headSha: reason === 'head-mismatched' ? 'a'.repeat(40) : HEAD,
+      files: ['old.mjs'], at: 1000, rt: true,
+      rtSince: reason === 'expired' ? 1000 : clock - 1000, maxMs: 90 * 60_000 });
+    const result = path === 'hint' ? h.s.queueOverlapHold(priority, HEAD) : h.s.enqueue(priority, HEAD);
+    expect(result?.kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)['cwd#42']).toEqual({ num: 42, repo: null, headSha: HEAD, files, at: clock });
+  });
+  it('reserves across passes, permits disjoint work and lets priority enqueue and clear its stamp', () => {
+    const queued = facts([43]);
+    const ghView = {
+      43: { files: [files[0]] },
+      42: { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now'] },
+    };
+    let h = setup({ queueFacts: queued, ghView });
+    expect(h.s.enqueue(priority, HEAD).kind).toBe('queue-file-overlap');
+    queued.data.repository.mergeQueue.entries.nodes = [];
+    h = { ...h, ...harness({ strategy: 'github-merge-queue', reservePath: h.reservePath,
+      priorityReserve: () => ({ enabled: true, source: 'default' }), queueFacts: queued, ghView }) };
+    expect(h.s.enqueue(candidate, HEAD)).toEqual({ enqueued: false, deferred: true, kind: 'priority-reserve', reason: `priority #42 reserves ${files[0]}` });
+    expect(h.logs.join('')).toContain('reserved files for priority #42: blocks #44');
+    expect(h.s.enqueue({ ...candidate, num: 45, listedFiles: ['other.mjs'] }, HEAD).enqueued).toBe(true);
+    expect(h.s.enqueue(priority, HEAD).enqueued).toBe(true);
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each([
+    ['not ready', { state: 'OPEN', headRefOid: HEAD, labels: ['priority:now'] }],
+    ['head moved', { state: 'OPEN', headRefOid: 'a'.repeat(40), labels: ['ready-to-merge', 'priority:now'] }],
+    ['closed', { state: 'CLOSED', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now'] }],
+    ['priority removed', { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge'] }],
+    ['sent back', { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now', 'review:changes'] }],
+    ['queued', { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now'], files: ['other.mjs'] }, [42]],
+  ])('drops a stamp when %s', (_name, live, queued = []) => {
+    const h = setup({ ghView: { 42: live }, queueFacts: facts(queued) });
+    stamp(h);
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)).toEqual({});
+    // The harness uses the first view head for queue confirmation too.
+    live.headRefOid = HEAD;
+    expect(h.s.enqueue(candidate, HEAD).enqueued).toBe(true);
+  });
+  it('keeps unreadable live stamps without blocking, and retries reads', () => {
+    const failures = [42];
+    const h = setup({ viewThrows: failures, ghView: { 42: { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:urgent'] } } });
+    stamp(h);
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)['cwd#42']).toBeDefined();
+    failures.pop();
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind).toBe('priority-reserve');
+  });
+  it('refreshes successful live and queue reads after 30 seconds', () => {
+    let time = 1_000;
+    const live = { state: 'OPEN', headRefOid: HEAD, labels: ['ready-to-merge', 'priority:now'] };
+    const h = setup({ now: () => time, ghView: { 42: live } });
+    stamp(h, { at: time });
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind).toBe('priority-reserve');
+    const count = h.calls.length;
+    expect(h.s.priorityReserveHold(candidate, HEAD)?.kind).toBe('priority-reserve');
+    expect(h.calls).toHaveLength(count);
+    live.labels = [];
+    time += 30_000;
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it('disabled setting prevents stamping and holding', () => {
+    const h = setup({ priorityReserve: () => ({ enabled: false, source: 'env' }), queueFacts: facts([43]), ghView: { 43: { files } } });
+    expect(h.s.queueOverlapHold(priority, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(h.s.enqueue(priority, HEAD).kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)).toEqual({});
+    stamp(h);
+    const count = h.calls.length;
+    expect(h.s.priorityReserveHold(candidate, HEAD)).toBeNull();
+    expect(h.calls).toHaveLength(count);
+  });
+  it.each([() => ({ ran: false }), () => { throw new Error('lock unavailable'); }])('hint tolerates a refused or throwing lock', withLock => {
+    const h = setup({ withLock, queueFacts: facts([43]), ghView: { 43: { files } } });
+    expect(h.s.queueOverlapHold(priority, HEAD)?.kind).toBe('queue-file-overlap');
+    expect(readReserves(h.reservePath)).toEqual({});
+  });
+  it.each([
+    ['dry run', { dryRun: true }, candidate],
+    ['other repo', {}, { ...candidate, repo: 'other/repo' }],
+    ['priority', {}, { ...candidate, prLabels: ['priority:urgent'] }],
+    ['unknown files', {}, { ...candidate, listedFilesComplete: false }],
+  ])('does no reserve reads for %s', (_name, options, c) => {
+    const h = setup(options);
+    stamp(h);
+    expect(h.s.priorityReserveHold(c, HEAD)).toBeNull();
+    expect(h.calls).toEqual([]);
+  });
+});
+
+
+describe('card-only restamped head with no review run', () => {
+  const candidate = { num: 42, repo: null, headRef: 'lane/restamped', baseRefName: 'main' };
+  const evidence = { loopPayload: null, scheduled: true, recorded: false, attempted: false, inFlight: false, queued: false };
+  const setup = (files, failure, over = {}) => harness({
+    strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence,
+    env: { WE_RED_TEAM_TIMING: 'post-accept', WE_DRAIN_ENQUEUE_WHEN_RED_TEAM_NEVER_SCHEDULED: 'false' },
+    now: () => 1000,
+    initial: { pending: [], followedUp: [], redTeamPending: { 'cwd#42': {
+      headSha: HEAD, firstPendingAt: 0, retryAt: 0, requestedAt: 0,
+      reason: 'post-accept red team has no recorded result on the live head',
+    } } },
+    gitExec: args => {
+      if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git\n';
+      if (args[0] === 'fetch') {
+        if (failure === 'exit' && args.includes('--no-tags')) throw Object.assign(new Error('fetch failed'), { status: 1 });
+        return '';
+      }
+      if (args[0] === 'rev-parse') return `${args[1] === 'FETCH_HEAD' ? (failure === 'head' ? 'c'.repeat(40) : HEAD) : BASE_TIP}\n`;
+      if (args[0] === 'ls-remote') return `${BASE_TIP}\t${args.at(-1)}\n`;
+      if (args[0] === 'diff') return files.map(f => `${f}\0`).join('');
+      if (args[0] === 'cat-file') return '';
+      throw new Error(`unexpected git ${args.join(' ')}`);
+    },
+    ...over,
+  });
+  it.each(['enqueue', 'prestage'])('%s exempts only verified non-empty card diffs', method => {
+    for (const [files, failure, exempt] of [
+      [['backlog/123-card.md'], null, true],
+      [['backlog/123-card.md', 'scripts/x.mjs'], null, false],
+      [['backlog/123-card.md'], 'exit', false],
+      [['backlog/123-card.md'], 'head', false],
+      [[], null, false],
+    ]) {
+      const h = setup(files, failure);
+      const result = h.s[method](candidate, HEAD);
+      if (method === 'prestage') {
+        expect(result.allowed).toBe(exempt);
+        if (!exempt) expect(result.reason).toBe('post-accept red team has no recorded result on the live head');
+      } else if (exempt) expect(result).toMatchObject({ enqueued: true });
+      else expect(result).toMatchObject({ enqueued: false, kind: 'red-team-pending',
+        reason: 'post-accept red team has no recorded result on the live head' });
+    }
+  });
+  it.each([
+    { recorded: true }, { attempted: true }, { inFlight: true }, { queued: true },
+    { loopPayload: { findings: { read: { netBasis: { rev: HEAD.toUpperCase() } } } } },
+  ])('does not fetch real files when existing evidence rules out the exemption: %j', over => {
+    const h = setup(['backlog/123-card.md'], null, { evidence: { ...evidence, ...over } });
+    expect(h.s.enqueue(candidate, HEAD)).toMatchObject({ kind: 'red-team-pending' });
+    expect(h.calls.some(call => call[0] === 'git')).toBe(false);
+  });
+});
+
+describe('#5742: a head moved only by the drain numbering commit reads red-team evidence from the accepted head', () => {
+  const setup = () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'rt-alias-strategy-'));
+    const git = (...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
+    git('init', '-q'); git('config', 'commit.gpgsign', 'false'); git('config', 'user.name', 'Drain'); git('config', 'user.email', 'd@x');
+    mkdirSync(join(cwd, 'backlog'));
+    writeFileSync(join(cwd, 'backlog/010-old.md'), '---\nstatus: resolved\n---\n');
+    git('add', '.'); git('commit', '-qm', 'base'); git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    writeFileSync(join(cwd, 'backlog/xabc123-foo.md'), '---\nstatus: open\n---\n\n# Foo\n');
+    git('add', '.'); git('commit', '-qm', 'card');
+    const accepted = git('rev-parse', 'HEAD');
+    git('mv', 'backlog/xabc123-foo.md', 'backlog/011-foo.md');
+    writeFileSync(join(cwd, 'backlog/011-foo.md'), '---\nbornAs: xabc123\nstatus: open\n---\n\n# Foo\n');
+    git('add', '.'); git('commit', '-qm', 'drain: JIT-number xabc123→#011 at land (#2288)');
+    const real = new Set(['cat-file', 'rev-list', 'log', 'diff-tree', 'ls-tree', 'grep']);
+    const gitExec = (args, opts) => {
+      if (real.has(args[0]) || (args[0] === 'rev-parse' && args.some((a) => a.endsWith('^{commit}'))))
+        return execFileSync('git', args, { ...opts, cwd });
+      if (args[0] === 'rev-parse') return `${BASE_TIP}\n`;
+      if (args[0] === 'ls-remote') return `${BASE_TIP}\t${args.at(-1)}\n`;
+      return args[0] === 'diff' ? 'scripts/x.mjs\0' : '';
+    };
+    return { cwd, git, accepted, head: git('rev-parse', 'HEAD'), gitExec };
+  };
+  const pendingOn = (sha) => ({ head }) => (head === sha
+    ? { scheduled: true, recorded: false, inFlight: true, loopPayload: { verdict: { verdict: 'accept' } } }
+    : { scheduled: false, recorded: false, inFlight: false, loopPayload: null });
+  const run = ({ head, gitExec, evidenceFor, setting }) => {
+    const requests = [];
+    const labels = ['review:accepted', 'ready-to-merge'];
+    const h = harness({ strategy: 'github-merge-queue', labels, gitExec, evidenceFor, ...(setting ? { strategyExtra: { numberingRedTeamSetting: () => setting } } : {}), ghView: { 5742: { headRefOid: head, labels, isDraft: false } },
+      liveComments: [], requestRedTeam: (input) => { requests.push(input); return { requested: true }; } });
+    return { outcome: h.s.enqueue({ num: 5742 }, head), requests, logs: h.logs.join('') };
+  };
+  it('no red-team request for the numbered head: the accepted head\'s evidence decides', () => {
+    const t = setup();
+    try {
+      const r = run({ ...t, evidenceFor: pendingOn(t.accepted) });
+      expect(r.requests).toEqual([]);
+      expect(r.outcome).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+      expect(r.outcome.reason).toContain('post-accept red team pending on the numbering ancestor');
+      expect(r.outcome.redTeamRequested).toBeFalsy();
+      expect(r.logs).toContain('moved only by drain numbering');
+      expect(r.logs).toContain('xabc123→#011');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('the accepted head\'s saved clean red team admits the numbered head: enqueued, no new red team', () => {
+    const t = setup();
+    const root = mkdtempSync(join(tmpdir(), 'drain-alias-saved-'));
+    try {
+      const env = { WE_RED_TEAM_TIMING: 'post-accept', CONVEYOR_STATE_ROOT: root, WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' };
+      const path = resolveScorecardStorePath(env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: LOCAL, pr: 5742, rev: t.accepted, status: 'ok', seatVerdict: 'accept', recheckStatus: 'ok', confirmedMissCount: 0, findings: [] }] }));
+      saveProvenanceFixtures(env);
+      const requests = [];
+      const labels = ['review:accepted', 'ready-to-merge'];
+      const evidenceFor = ({ head }) => (head === t.accepted
+        ? { scheduled: true, recorded: true, inFlight: false, loopPayload: { verdict: { verdict: 'accept' } } }
+        : { scheduled: false, recorded: false, inFlight: false, loopPayload: null });
+      const mk = () => harness({ strategy: 'github-merge-queue', env, labels, gitExec: t.gitExec, evidenceFor, liveComments: [],
+        ghView: { 5742: { headRefOid: t.head, labels, isDraft: false } }, requestRedTeam: (i) => { requests.push(i); return { requested: true }; } });
+      const h = mk();
+      expect(h.s.enqueue({ num: 5742, repo: LOCAL }, t.head, { comments: [] })).toMatchObject({ enqueued: true });
+      expect(requests).toEqual([]);
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); rmSync(root, { recursive: true, force: true }); }
+  });
+  it('NOT WEAKENED: a smuggled edit in the numbering commit requests a red team for the exact head, as today', () => {
+    const t = setup();
+    try {
+      writeFileSync(join(t.cwd, 'backlog/011-foo.md'), '---\nbornAs: xabc123\nstatus: open\n---\n\n# Foo, edited\n');
+      t.git('add', '.'); t.git('commit', '-q', '--amend', '--no-edit');
+      const head = t.git('rev-parse', 'HEAD');
+      const r = run({ ...t, head, evidenceFor: pendingOn(t.accepted) });
+      expect(r.requests).toEqual([expect.objectContaining({ pr: 5742, head })]);
+      expect(r.logs).not.toContain('moved only by drain numbering');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('kill switch review.carryRedTeamAcrossNumbering=false requests a red team for the exact head (today\'s behavior), logged', () => {
+    const t = setup();
+    try {
+      const r = run({ ...t, evidenceFor: pendingOn(t.accepted), setting: { value: false, source: 'env' } });
+      expect(r.requests).toEqual([expect.objectContaining({ pr: 5742, head: t.head })]);
+      expect(r.logs).toContain('review.carryRedTeamAcrossNumbering=false (env)');
+      expect(r.logs).not.toContain('moved only by drain numbering');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('Codex audit #1: a confirmed break recorded on the numbered head itself is never replaced by the ancestor', () => {
+    const t = setup();
+    try {
+      const requests = [];
+      const labels = ['review:accepted', 'ready-to-merge'];
+      const comment = { user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ pr: 5742, rev: t.head,
+        findings: [{ summary: 'break on the numbered head', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }], recheckStatus: 'ok' }) };
+      const h = harness({ strategy: 'github-merge-queue', labels, gitExec: t.gitExec, evidenceFor: pendingOn(t.accepted), liveComments: [comment],
+        ghView: { 5742: { headRefOid: t.head, labels, isDraft: false } }, requestRedTeam: (i) => { requests.push(i); return { requested: true }; } });
+      const outcome = h.s.enqueue({ num: 5742 }, t.head);
+      expect(outcome.enqueued).toBeFalsy();
+      expect(h.logs.join('')).not.toContain('moved only by drain numbering');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('Codex re-audit #1: an exact-head break spelled with an UPPERCASE sha still decides (never the ancestor)', () => {
+    const t = setup();
+    try {
+      const labels = ['review:accepted', 'ready-to-merge'];
+      const comment = { user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ pr: 5742, rev: t.head.toUpperCase(),
+        findings: [{ summary: 'break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }], recheckStatus: 'ok' }) };
+      const clean = { scheduled: true, recorded: true, inFlight: false, loopPayload: { verdict: { verdict: 'accept' } } };
+      const h = harness({ strategy: 'github-merge-queue', labels, gitExec: t.gitExec, liveComments: [comment],
+        evidenceFor: ({ head }) => (head === t.accepted ? clean : { scheduled: false, recorded: false, inFlight: false, loopPayload: null }),
+        ghView: { 5742: { headRefOid: t.head, labels, isDraft: false } }, requestRedTeam: () => ({ requested: true }) });
+      expect(h.s.enqueue({ num: 5742 }, t.head).enqueued).toBeFalsy();
+      expect(h.logs.join('')).not.toContain('moved only by drain numbering');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('Codex re-audit #2: once the ancestor\'s red team ends without a usable result, the exact head is requested (recovery not blocked)', () => {
+    const t = setup();
+    try {
+      let clock = 1000;
+      let ancestor = { scheduled: true, recorded: false, inFlight: true, loopPayload: { verdict: { verdict: 'accept' } } };
+      const requests = [];
+      const labels = ['review:accepted', 'ready-to-merge'];
+      const opts = { strategy: 'github-merge-queue', labels, gitExec: t.gitExec, liveComments: [], now: () => clock,
+        evidenceFor: ({ head }) => (head === t.accepted ? ancestor : { scheduled: false, recorded: false, inFlight: false, loopPayload: null }),
+        ghView: { 5742: { headRefOid: t.head, labels, isDraft: false } }, requestRedTeam: (i) => { requests.push(i); return { requested: true }; } };
+      const first = harness(opts);
+      expect(first.s.enqueue({ num: 5742 }, t.head).reason).toContain('pending on the numbering ancestor');
+      expect(requests).toEqual([]);
+      ancestor = { scheduled: true, recorded: true, inFlight: false, attempted: true, loopPayload: { verdict: { verdict: 'accept' } } };
+      clock += 60 * 60_000;
+      const later = harness({ ...opts, initial: first.state() });
+      later.s.enqueue({ num: 5742 }, t.head);
+      expect(requests).toEqual([expect.objectContaining({ pr: 5742, head: t.head })]);
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('Codex re-audit 2 #2: a confirmed break recorded on the ancestor is the numbered head\'s disposition too (send-back, no new review)', () => {
+    const t = setup();
+    try {
+      const labels = ['review:accepted', 'ready-to-merge'];
+      const comment = { user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ pr: 5742, rev: t.accepted,
+        findings: [{ summary: 'break on the accepted head', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }], recheckStatus: 'ok' }) };
+      const done = { scheduled: true, recorded: true, inFlight: false, attempted: true, loopPayload: { verdict: { verdict: 'accept' } } };
+      const requests = [];
+      const h = harness({ strategy: 'github-merge-queue', labels, gitExec: t.gitExec, liveComments: [comment],
+        evidenceFor: ({ head }) => (head === t.accepted ? done : { scheduled: false, recorded: false, inFlight: false, loopPayload: null }),
+        ghView: { 5742: { headRefOid: t.head, labels, isDraft: false } }, requestRedTeam: (i) => { requests.push(i); return { requested: true }; } });
+      const outcome = h.s.enqueue({ num: 5742 }, t.head);
+      expect(outcome.enqueued).toBeFalsy();
+      expect(outcome.reason).toContain('requiring send-back');
+      expect(requests).toEqual([]);
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('Codex audit #2: evidence that arrives on the numbered head later in the pass wins over a cached alias', () => {
+    const t = setup();
+    try {
+      let headEvidence = { scheduled: false, recorded: false, inFlight: false, loopPayload: null };
+      const reads = [];
+      const evidenceFor = ({ head }) => { reads.push(head); return head === t.accepted ? pendingOn(t.accepted)({ head }) : headEvidence; };
+      const labels = ['review:accepted', 'ready-to-merge'];
+      const h = harness({ strategy: 'github-merge-queue', labels, gitExec: t.gitExec, evidenceFor, liveComments: [],
+        ghView: { 5742: { headRefOid: t.head, labels, isDraft: false } }, requestRedTeam: () => ({ requested: true }) });
+      h.s.enqueue({ num: 5742 }, t.head);
+      expect(reads).toContain(t.accepted);
+      headEvidence = { scheduled: true, recorded: false, inFlight: true, loopPayload: { verdict: { verdict: 'accept' } } };
+      reads.length = 0;
+      const before = h.logs.length;
+      h.s.enqueue({ num: 5742 }, t.head);
+      expect(reads).not.toContain(t.accepted);
+      expect(h.logs.slice(before).join('')).not.toContain('moved only by drain numbering');
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('Codex audit #4: a finished-but-unusable ancestor result does not block recovery — the exact head is requested as today', () => {
+    const t = setup();
+    try {
+      const done = { scheduled: true, recorded: true, inFlight: false, attempted: true, loopPayload: { verdict: { verdict: 'accept' } } };
+      const r = run({ ...t, evidenceFor: ({ head }) => (head === t.accepted ? done : { scheduled: false, recorded: false, inFlight: false, loopPayload: null }) });
+      expect(r.requests).toEqual([expect.objectContaining({ pr: 5742, head: t.head })]);
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
+  });
+  it('the head\'s own evidence always wins over an ancestor', () => {
+    const t = setup();
+    try {
+      const reads = [];
+      const r = run({ ...t, evidenceFor: (o) => { reads.push(o.head); return pendingOn(t.head)(o); } });
+      expect(r.requests).toEqual([]);
+      expect(new Set(reads)).toEqual(new Set([t.head]));
+    } finally { rmSync(t.cwd, { recursive: true, force: true }); }
   });
 });

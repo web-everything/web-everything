@@ -1,3 +1,6 @@
+import { parseCardSquashMarkers } from '../lib/card-squash-marker.mjs';
+import { CARD_SQUASH_SUBJECT } from '../lib/card-squash-rebuild.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { reviewStartGate, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
 /**
  * reconcile-core.mjs — the PURE reconcile pass (#3296): compare DESIRED delivery state against ACTUAL, for
@@ -104,8 +107,8 @@ import { reviewStartGate, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecisi
 import { roundExtensionGrants } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
-import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
-import { rulingDisputeText, noticedRungs } from '../lib/ruling-ledger.mjs';
+import { filterFixerReferrals, REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
+import { rulingDisputeText, rulingAuthority, noticedRungs } from '../lib/ruling-ledger.mjs';
 import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
@@ -122,11 +125,17 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 });
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
+import { ciHealOwed } from './ci-heal-rule.mjs';
+import { staleAcceptanceOwed } from './rearm-review.mjs';
 import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
-import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { countRearmComments } from './rearm-review.mjs';
+// Match rearm-review.mjs's first line locally, as review-referral-hold.mjs does:
+// reading its exported const during boot closes an initialization cycle through the drain.
+// The acceptance test pins this matcher to the canonical marker.
+const REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-review';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
@@ -436,7 +445,10 @@ export function countRealFixRounds(pr) {
     if (!c || !shaPattern.test(c.sha) || seen.has(c.sha) || !Array.isArray(c.parents)
       || c.parents.some((p) => !shaPattern.test(p)) || typeof c.subject !== 'string'
       || typeof c.authoredAt !== 'string' || !Number.isFinite(Date.parse(c.authoredAt))
-      || (c.parents.length > 1 && typeof c.mergesPrWork !== 'boolean')) return fail('invalid-commit');
+      || (c.parents.length > 1 && typeof c.mergesPrWork !== 'boolean')
+      // Old saved facts omit the flag and retain real single-parent accounting; present flags are strict.
+      || (c.mechanicalSquash !== undefined && (typeof c.mechanicalSquash !== 'boolean'
+        || (c.mechanicalSquash && (c.parents.length !== 1 || !CARD_SQUASH_SUBJECT.test(c.subject)))))) return fail('invalid-commit');
     seen.add(c.sha);
   }
   // An empty/truncated enrichment cannot establish that a round was mechanical.
@@ -468,9 +480,10 @@ export function countRealFixRounds(pr) {
     const inWindow = facts.commits.filter((commit) => Date.parse(commit.authoredAt) > start && Date.parse(commit.authoredAt) <= end);
     // A merge that brings the PR's own work in (a repair branch merged --no-ff, or an edit folded into the merge
     // itself) is real, like a fix commit.
-    // A single-parent commit is always real: the drain's rebase is a two-parent commit-tree, so a single-parent
-    // `drain: rebase …` subject is only ever a fix commit borrowing the name.
-    const shas = inWindow.filter((commit) => commit.parents.length === 1 || commit.mergesPrWork)
+    // A single-parent drain subject remains real unless enrichment proved a card-only squash on main.
+    const squashMarkers = parseCardSquashMarkers(pr?.comments);
+    const shas = inWindow.filter((commit) => (commit.parents.length === 1 && (commit.mechanicalSquash !== true
+      || !squashMarkers.some(m => m.newHead === commit.sha))) || commit.mergesPrWork)
       .map((commit) => commit.sha);
     previous = end;
     // Refund only on positive evidence: the window holds commits and every one is an upstream merge or drain rebase.
@@ -2020,7 +2033,16 @@ export function planReconcile({
 
   // Stable: only the red-main fix PR moves to the front; every other PR keeps its order.
   const orderedPrs = (Array.isArray(prs) ? [...prs] : []).sort((a, b) => (isMainFixPriority(a?.number) ? 0 : 1) - (isMainFixPriority(b?.number) ? 0 : 1));
-  for (const pr of orderedPrs) {
+  for (const originalPr of orderedPrs) {
+    const subjectRepo = CONSTELLATION_REPOS[repo]?.slug ?? repo;
+    const pr = { ...originalPr };
+    if (Array.isArray(pr.blockRuledReferrals)) {
+      pr.blockRuledReferrals = filterFixerReferrals(pr, pr.blockRuledReferrals, { repo: subjectRepo });
+    }
+    if (pr.ignoredRulings?.matches?.length) {
+      const matches = filterFixerReferrals(pr, pr.ignoredRulings.matches.map(m => ({ ...m, key: m.finding.key })), { repo: subjectRepo });
+      pr.ignoredRulings = { ...pr.ignoredRulings, matches: matches.map(({ key, ...m }) => m) };
+    }
     const prNumber = Number(pr?.number);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue; // not a PR record; nothing to key on.
     const mainFixPriority = isMainFixPriority(prNumber);
@@ -2626,7 +2648,7 @@ export function planReconcile({
     // PR is owed the same neutral `review:pending` (the promote-draft half strips the contradictory
     // `ready-to-merge` when it writes). Policy `reviewLabelHeal` (env `WE_REVIEW_LABEL_HEAL`): `stuck` (default)
     // adds this variant; `green` keeps only the branch above; `off` disables both.
-    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN' && withPhase.check === 'red'
+    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN' && ['red', 'green'].includes(withPhase.check)
         && String(pr?.headRefName ?? '').startsWith('lane/')
         && withPhase.labels.includes('ready-to-merge')
         && !withPhase.labels.some((l) => l.startsWith('review:'))
@@ -2634,9 +2656,18 @@ export function planReconcile({
         && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'stuck',
-        why: 'ready-to-merge lane PR with a red required check and no review:* label — the drain only scores '
+        why: 'ready-to-merge lane PR with settled checks and no review:* label — the drain only scores '
           + 'review escalation for merge candidates, so nothing would ever review it; apply review:pending',
       });
+      continue;
+    }
+
+    // #5628: a recorded accept on an older head needs the existing guarded re-arm,
+    // then the ordinary review dispatcher. The write half compares recorded
+    // fingerprints before re-arming; a read miss never revokes an acceptance.
+    if (reviewLabelHeal !== 'off' && withPhase.check === 'green' && staleAcceptanceOwed(pr, { requireProof: false })) {
+      dispatch.push({ ...base, ...withPhase, kind: 'restore-review-label', variant: 'stale-accept',
+        label: 'review:pending', why: 'head moved past its accept — verify coverage, then guarded re-arm hands a stale accept to independent review' });
       continue;
     }
 
@@ -2680,7 +2711,8 @@ export function planReconcile({
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
     };
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red');
+    const ciRepairOwed = ['ci-red', 'needs-human'].includes(phase)
+      && ciHealOwed({ state: pr.state, labels: pr.labels, ci: check.state, phase });
     if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
@@ -3104,8 +3136,9 @@ export function planReconcile({
           continue;
         }
       }
-      if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
-        why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
+      const retryRefusal = pr.timeoutRetry && !pr.timeoutRetry.eligible
+        ? { kind: 'timeout-retry-ineligible', prNumber, why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` } : null;
+      if (retryRefusal) refusals.push(retryRefusal);
       // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
       // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
       // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
@@ -3120,7 +3153,7 @@ export function planReconcile({
       const refunded = healBudget.windowRefunded;
       const healFacts = { failingRequiredChecks: failing.required, nonRequiredRed: failing.nonRequired, ciHealBudget: healBudget.log };
       const refund = refunded > 0 ? { refunded } : {};
-      if (ciHealAttempts >= ciHealCap) {
+      if (!ciHealOwed({ state: pr.state, labels: pr.labels, ci: check.state, phase, attempts: ciHealAttempts, cap: ciHealCap })) {
         refuse('cap-exhausted', {
           ...withPhase, ...refund, ...healFacts, attempts: ciHealAttempts, cap: ciHealCap,
           why: `the PR's own durable CI-heal count is ${ciHealAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,
@@ -3147,6 +3180,7 @@ export function planReconcile({
             + ` repair this required-check failure any further; a person must take it over. Last failure: ${lastFailureReason}${reported}`,
         });
       } else {
+        if (retryRefusal) retryRefusal.owner = 'ci-heal';
         dispatch.push({
           ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
           ...(fixTiming.joinCiAndReview && readiness.reviewFindings ? { reviewFixAttempts: roundAttempts() } : {}),
@@ -3178,7 +3212,7 @@ export function planReconcile({
         const trail = fixerLadder.policy.rungs.filter((r) => r.action === 'dispatch' && r.at < (ig.effectiveMisses ?? ig.misses)).map((r) => r.id).join(' > ');
         refuse('ruling-dispute', {
           ...withPhase, rulingNotAddressed: ig,
-          why: `${ig.matches.length} confirmed finding(s) the operator ruled block came back after ${ig.misses} miss(es)`
+          why: `${ig.matches.length} confirmed finding(s) ${rulingAuthority(ig.matches)} ruled block came back after ${ig.misses} miss(es)`
             + `${ig.returns ? ` and ${ig.returns} fixer turn(s) ended without a new head` : ''} — fixer versus reviewer disagreement, needs the operator`,
         });
         notes.push({ kind: 'ruling-dispute', prNumber, head: ig.head, misses: ig.misses, rung: 'human', files,
@@ -3189,7 +3223,7 @@ export function planReconcile({
       dispatch.push({
         ...base, ...withPhase, kind: 'fix', mode: 'ruling-not-addressed', findings: ig.matches.length,
         rulingNotAddressed: { ...ig, rung: { id: rung.id, at: rung.at, label: rung.label, instruction: rung.instruction, taskType: rung.taskType, model: route?.model ?? null }, route },
-        why: `${ig.matches.length} confirmed finding(s) the operator already ruled block came back on a new head`
+        why: `${ig.matches.length} confirmed finding(s) ${rulingAuthority(ig.matches)} already ruled block came back on a new head`
           + ` (${files.join(', ')}) — the last fix did not satisfy the ruling; escalation rung ${rung.at} (${rung.id}): ${rung.label}`,
       });
       continue;

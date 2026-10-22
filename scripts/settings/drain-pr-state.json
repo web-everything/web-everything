@@ -1,0 +1,4 @@
+{
+  "$comment": "Pass-start batching only; per-PR fallback and live write guards remain authoritative. One GraphQL query per repository (each owner's own App token). WE_DRAIN_PR_STATE_BATCHED overrides drain.prState.batched; WE_DRAIN_PR_STATE_PAGE_SIZE / WE_DRAIN_PR_STATE_COMMITS override pageSize / commitsPerPr (defaults 40 / 50).",
+  "drain": { "prState": { "batched": true } }
+}

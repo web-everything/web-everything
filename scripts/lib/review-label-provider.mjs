@@ -37,6 +37,7 @@
  * — all three run every conveyor-runner tick) gets this for free.
  */
 
+import { ensureLabelCached } from './label-cache.mjs';
 import { unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -112,14 +113,9 @@ export const GH_ARGV = Object.freeze({
     '-f', 'query=mutation($id: ID!, $body: String!) { updateIssueComment(input: {id: $id, body: $body}) { issueComment { id } } }',
     '-f', `id=${commentId}`, '-F', `body=@${bodyFile}`],
   currentRepo: () => ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'],
-  // `--force` makes this CREATE-OR-UPDATE, never an error on an already-existing label — the only shape that
-  // is safe to call unconditionally before every `setLabels`. `gh pr edit --add-label` REFUSES a label that
-  // does not exist in the repo yet ("'X' not found"), unlike `we:scripts/review-set-label.mjs`'s own small,
-  // long-lived FIXED label set (created once, years ago) — an open-ended label family like
-  // `we:scripts/conveyor/review-round-tag.mjs`'s `review-round:<N>` mints a brand new name on its very first
-  // use at every N, so ensuring existence has to be part of applying it, not a one-time setup step.
+  // Provision open-ended label families before applying them; existence is cached by the provider.
   ensureLabel: (repo, name, { color = 'ededed', description = '' } = {}) =>
-    ['label', 'create', name, '--repo', repo, '--color', color, '--description', clampLabelDescription(description), '--force'],
+    ['label', 'create', name, '--repo', repo, '--color', color, '--description', clampLabelDescription(description)],
   // The PR's changed files, NET versus its base (#4034 follow-up, card 4034b) — read-only, used ONLY to stamp
   // `changedFiles` on a delegation-trial row before it is written; never to gate or edit anything about the PR
   // itself. `--method GET` IS LOAD-BEARING, not decoration: `gh api` silently switches to `POST` once an `-f`/
@@ -195,7 +191,7 @@ export function createGhProvider({
     },
 
     ensureLabel(repo, name, opts) {
-      exec(GH_ARGV.ensureLabel(repo, name, opts), { maxBuffer: 16 * 1024 * 1024 });
+      ensureLabelCached(GH_ARGV.ensureLabel(repo, name, opts), { exec: args => exec(args, { maxBuffer: 16 * 1024 * 1024 }) });
     },
 
     // The temp file is written and removed HERE rather than by the caller: it is an artefact of this adapter's

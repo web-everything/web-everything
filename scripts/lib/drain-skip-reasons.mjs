@@ -10,17 +10,23 @@
  * drain's own verbatim text; `source` names the bucket it came from.
  */
 
+import { isNonSkipStatus } from './drain-unknown-mergeability.mjs';
+
 export const SKIP_KINDS = Object.freeze([
   'unknown-mergeability', 'conflicting', 'behind', 'checks-pending', 'review-hold', 'cap', 'head-moved',
   'couple-held', 'blocked-by', 'overlap-yield', 'rebuilt-pending-ci', 'merge-failed', 'parked',
   // Former "other" bucket, now named: every skip says which rule held it.
   'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
-  'partner-pending', 'ready-not-reached', 'red-main-hold', 'unrecognized-reason',
+  'red-team-pending', 'merge-lock-held', 'numbering', 'partner-pending', 'ready-not-reached', 'red-main-hold', 'unrecognized-reason',
 ]);
 
 /** Map a drain reason string to a stable kind. Order matters: the most specific signal wins. */
 export function classifySkipReason(reason) {
   const r = String(reason ?? '');
+  if (/red.team.pending|post-accept red team pending/i.test(r)) return 'red-team-pending';
+  if (/number(?:ing|ed).*branch|branch.*numbering|numbering.*owed/i.test(r)) return 'numbering';
+  if (/merge.write mutex|merge-lock-held/i.test(r)) return 'merge-lock-held';
+  if (/merge-queue: not merge-fresh/.test(r)) return 'checks-pending';
   if (/^red-main-hold\b/.test(r)) return 'red-main-hold'; // we:scripts/lib/red-main-hold.mjs — main is red, only the fix PR lands
   if (/mergeable=UNKNOWN|merge state UNKNOWN/i.test(r)) return 'unknown-mergeability';
   if (/mergeable=CONFLICTING|DIRTY/.test(r) && !/BEHIND⇒/.test(r)) return 'conflicting';
@@ -53,8 +59,8 @@ const keyOf = (x) => `${x?.repo ?? ''}#${x?.num}`;
  * @param {Array<{num,repo?,reasons?}>} [p.parked]
  * @returns {Array<{num:number,repo:string|null,kind:string,reason:string,source:string}>}
  */
-export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = [], revalidationAborted = [], pendingRebased = [], coupleHeld = [], deferred = [], parked = [] } = {}) {
-  const landed = new Set(merged.map(keyOf));
+export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = [], revalidationAborted = [], pendingRebased = [], coupleHeld = [], deferred = [], parked = [], enqueueOutcomes = [], passEnded = true } = {}) {
+  const landed = new Set([...merged, ...enqueueOutcomes.filter(x => x.outcome === 'enqueued' || x.enqueued === true)].map(keyOf));
   const rows = new Map();
   const put = (x, kind, reason, source) => {
     const k = keyOf(x);
@@ -62,6 +68,11 @@ export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = []
     rows.set(k, { num: Number(x.num), repo: x.repo ?? null, kind, reason: String(reason ?? ''), source });
   };
   for (const x of failedMerges) put(x, 'merge-failed', x.detail, 'failedMerges');
+  for (const x of enqueueOutcomes) {
+    if (x.outcome === 'enqueued' || x.enqueued === true) continue;
+    const classified = classifySkipReason(x.reason);
+    put(x, x.kind === 'branch-preparation' && classified === 'numbering' ? classified : x.kind || classified, x.reason, 'enqueueOutcomes');
+  }
   for (const x of revalidationAborted) put(x, classifySkipReason(x.reason), x.reason, 'revalidationAborted');
   const rebased = new Set(pendingRebased.map(Number));
   for (const v of verdicts) if (rebased.has(Number(v.num))) put(v, 'rebuilt-pending-ci', 'rebuilt onto main this pass; checks re-running, lands on a later pass', 'pendingRebased');
@@ -73,7 +84,7 @@ export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = []
   }
   for (const x of parked) put(x, 'parked', (x.reasons || []).join('; '), 'parked');
   for (const v of verdicts) {
-    if (v.decision === 'merge') continue;
+    if (v.decision === 'merge' || isNonSkipStatus(v)) continue; // queued / landed / closed is a status, not a skip
     let kind = classifySkipReason(v.reason);
     if (kind === 'unrecognized-reason' && v.escalated === 'yes') kind = 'escalated';
     put(v, kind, v.reason, 'skipped');
@@ -83,12 +94,12 @@ export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = []
   for (const v of verdicts) {
     if (v.decision !== 'merge') continue;
     const partner = v.item == null ? null : verdicts.find((o) => o !== v && o.item != null && String(o.item) === String(v.item)
-      && keyOf(o) !== keyOf(v) && !landed.has(keyOf(o)));
+      && keyOf(o) !== keyOf(v) && !landed.has(keyOf(o)) && (passEnded || rows.has(keyOf(o))));
     if (partner) {
       const pr = rows.get(keyOf(partner));
       put(v, 'partner-pending', `couple partner ${keyOf(partner)} did not land (${pr ? pr.kind : 'ready, not reached'}${pr?.reason ? `: ${pr.reason}` : ''})`, 'unaccounted');
-    } else {
-      put(v, 'ready-not-reached', 'ready at pass start; the pass ended before it was reached (cap, budget or dependency order)', 'unaccounted');
+    } else if (passEnded) {
+      put(v, 'ready-not-reached', 'ready at pass start; the pass ended before it was reached', 'unaccounted');
     }
   }
   return [...rows.values()];

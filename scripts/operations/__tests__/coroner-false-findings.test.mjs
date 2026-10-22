@@ -19,6 +19,13 @@ describe('false-finding cause fixtures', () => {
     ['test-nit', { reason: 'No explicit planned test for truncated lease data' }],
     ['other', { reason: 'A deliberate design choice' }],
   ])('%s', (cause, fixture) => expect(guessFalseFindingCause(fixture)).toBe(cause));
+  it.each([
+    ['chalbert/web-everything', 'web-everything/web-everything', 1],
+    ['web-everything/web-everything', 'chalbert/web-everything', 1],
+    ['web-everything/web-everything', 'other/repo', 0],
+  ])('matches operator ruling to subject %s / %s', (repo, rulingRepo, count) => {
+    expect(falseFindingsForPr({ repo, pr: 5242, comments: [comment(ruling({ repo: rulingRepo }))], window })).toHaveLength(count);
+  });
   it('prefers a recorded cause and retains lens', () => {
     const r = ruling(); r.rulings[0].cause = 'other'; r.rulings[0].lens = 'judgeSecurity';
     expect(extract([comment(r)])[0]).toMatchObject({ cause: 'other', causeBasis: 'recorded', lens: 'judgeSecurity' });

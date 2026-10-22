@@ -150,7 +150,23 @@ export function validateRequest(raw) {
   if (channel !== undefined && (typeof channel !== 'string' || !channel.trim())) {
     return { ok: false, error: '`channel`, when present, must be a non-empty string' };
   }
-  return { ok: true, request: { repo, pr, to, actor, body: body ?? '', sessionId, channel, operatorInstruction } };
+  // #5492 rebuild slice 2 (design v2 W1, Codex break B2): the head the judge actually judged and the judgment
+  // boundary, carried end to end. Optional while producers migrate; when present the single home refuses a clearing
+  // verdict on any other live head instead of stamping the applier's live head onto an old judgment.
+  // A malformed field refuses a CLEARING request but is dropped from a HOLDING one (a hold must still apply).
+  const clearing = ['accepted', 'clear-human', 'restamp'].includes(to);
+  const pick = (name, re, why) => {
+    const v = raw[name];
+    if (v === undefined || (typeof v === 'string' && re.test(v))) return { v };
+    return clearing ? { error: `\`${name}\`, when present, must be ${why}` } : { v: undefined };
+  };
+  const judgedHead = pick('judgedHead', /^[0-9a-f]{40}$/, 'a full 40-hex lowercase SHA');
+  const seen = pick('seen', /^(?:empty|\d{1,9}:[A-Za-z0-9:._-]{8,128})$/, '"empty" or "<n>:<row id>"');
+  const runId = pick('runId', /^[A-Za-z0-9:._-]{1,128}$/, '1-128 id characters');
+  const bad = [judgedHead, seen, runId].find((f) => f.error);
+  if (bad) return { ok: false, error: bad.error };
+  return { ok: true, request: { repo, pr, to, actor, body: body ?? '', sessionId, channel, operatorInstruction,
+    judgedHead: judgedHead.v, seen: judgedHead.v ? seen.v : undefined, runId: runId.v } };
 }
 
 /**
@@ -167,6 +183,9 @@ export function buildLabelArgv(request, bodyFile) {
   ];
   if (bodyFile) argv.push(`--body-file=${bodyFile}`);
   if (request.channel) argv.push(`--channel=${request.channel}`);
+  if (request.judgedHead) argv.push(`--judged-head=${request.judgedHead}`);
+  if (request.seen) argv.push(`--seen=${request.seen}`);
+  if (request.runId) argv.push(`--run-id=${request.runId}`);
   // The single home requires `--reason` for `clear-human` (#2895) and posts it verbatim. The operator's words
   // ARE the reason — nothing is paraphrased, because a paraphrase is the agent's account of what it was told
   // rather than what it was told.

@@ -84,7 +84,7 @@ const OTHER = 3002; // an unrelated PR that is otherwise fully mergeable
  * @param {{ freeze?: 'env'|'legacy'|'both'|null, priorityPrs?: number[]|null, publishedRed?: boolean, holdSetting?: 'on'|'off'|null,
  *           fixMergeable?: string, unfreezeFirst?: boolean, dryRun?: boolean, stranded?: boolean, lateFreeze?: boolean }} o
  */
-function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdSetting = null, fixMergeable = 'MERGEABLE', unfreezeFirst = false, dryRun = false, stranded = false, lateFreeze = false, shared = null, markerKind = null, manualFix = 'hold' } = {}) {
+function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdSetting = null, fixMergeable = 'MERGEABLE', unfreezeFirst = false, dryRun = false, stranded = false, lateFreeze = false, shared = null, markerKind = null, manualFix = 'hold', missingReady = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-rmh-'));
   try {
     const bin = join(dir, 'bin');
@@ -95,7 +95,7 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
       baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: number === FIX ? fixMergeable : 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
-      labels: [{ name: 'ready-to-merge' }], comments: [],
+      labels: missingReady && number === FIX ? [] : [{ name: 'ready-to-merge' }], comments: [],
       commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
@@ -390,4 +390,22 @@ describe('A5 manual fix setting wiring and OFF guidance', () => {
     const r = runCli({ shared: '{bad', holdSetting: 'off' });
     expect(r.result.detail).toMatch(/Check.*ops.*read access.*JSON/);
   }, 30000);
+});
+
+it('reports an open allowed main fix omitted by the ready label listing', () => {
+  const r = runCli({ priorityPrs: [FIX], publishedRed: true, missingReady: true });
+  expect(r.result.skipReasons, r.stderr).toContainEqual(expect.objectContaining({ num: FIX, reason: 'not listed: missing ready-to-merge label' }));
+}, 30000);
+
+it.each(['outcome', 'not-in-pass', 'merged', 'enqueued', 'closed'])('main-fix reporting preserves the real disposition (%s)', async mode => {
+  const { reportRedMainFixSkips } = await import('../merge-ai-prs.mjs');
+  const rows = await reportRedMainFixSkips({ rows: [], fixPrs: [FIX], verdicts: [],
+    merged: mode === 'merged' ? [{ num: FIX, repo: null }] : [],
+    enqueueOutcomes: mode === 'outcome' ? [{ num: FIX, repo: null, reason: 'post-accept red team pending', kind: 'red-team-pending' }] :
+      mode === 'enqueued' ? [{ num: FIX, repo: null, outcome: 'enqueued' }] : [],
+    localSlug: 'fixture/drain-rmh',
+    readPr: () => ({ number: FIX, state: mode === 'closed' ? 'CLOSED' : 'OPEN', labels: ['ready-to-merge'] }),
+  });
+  if (['merged', 'enqueued', 'closed'].includes(mode)) expect(rows).toEqual([]);
+  else expect(rows).toEqual([expect.objectContaining({ num: FIX, reason: mode === 'outcome' ? 'post-accept red team pending' : 'not in this pass listing' })]);
 });

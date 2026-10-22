@@ -17,7 +17,7 @@ const { evaluatePr, main, pollMergeable, standDownRow, stuckInspectedRow } = awa
 const { STAND_DOWN_MARKER, buildStandDownComment } = await import('../conveyor/stand-down.mjs');
 const { STUCK_DISPATCH_MARKER, buildStuckDispatchComment } = await import('../conveyor/stuck-pr-dispatch-marker.mjs');
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 /** A path that never exists, so `main` never reads the real `.conveyor/unsupported-repo.json` sidecar. */
 const NO_UNSUPPORTED = '/nonexistent-operator-queue-test/unsupported-repo.json';
@@ -359,6 +359,10 @@ describe('main — STOOD DOWN section', () => {
   const list = (...prs) => execFileSync.mockReset().mockReturnValueOnce(JSON.stringify(prs));
 
   it('lists an open PR with a leading-line stand-down comment regardless of labels, with its reason', () => {
+    // This pins the legacy STOOD DOWN section. With the default (`needs-you`) a needs-judgment question is shown under
+    // NEEDS YOU instead (still listed, never hidden), so select the legacy layout explicitly rather than depend on
+    // whether the answer reader happened to load.
+    vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'stood-down');
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const body = buildStandDownComment({ reason: 'needs-judgment' });
     list(fixture({ number: 99, labels: [], comments: [{ body, createdAt: '2026-09-20T00:00:00Z', author: { login: 'web-everything' } }] }));

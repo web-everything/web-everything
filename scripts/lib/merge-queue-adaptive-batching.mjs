@@ -350,7 +350,7 @@ export function intermediateRunsToCancel({ nativeGroups = [], runs, groupingStra
 // IO shell: synchronous injected GitHub/filesystem calls, best-effort and fail-open.
 const ioOptions = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] };
 const errorText = e => String(e?.message ?? e).split('\n')[0];
-function graphql(exec, query, fields = []) {
+export function graphql(exec, query, fields = []) {
   const response = JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`, ...fields.flatMap(f => ['-f', f])], ioOptions));
   if (response.errors?.length) throw new Error(response.errors.map(e => e.message).join('; '));
   if (!response.data) throw new Error('missing GraphQL data');
