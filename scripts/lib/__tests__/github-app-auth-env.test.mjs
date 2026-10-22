@@ -4,7 +4,7 @@
  *   read/write, the mint call, the repo listing, the clock, the `process.env` mutation) is injected — no real fs,
  *   no real network, no real GitHub App needed.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -639,10 +639,16 @@ describe('half-configured App auth (2026-10-09 drain incident)', () => {
 });
 
 describe('daemon refresh lookahead and legacy fallback liveness', () => {
+  // Both loop modules are heavy (8s+ to import on a loaded host): load them once, outside the 5s test budget.
+  let runPassDaemonLoop;
+  let runLoopCycle;
+  beforeAll(async () => {
+    ({ runPassDaemonLoop } = await import('../../../skills-src/conveyor/pass-daemon.mjs'));
+    ({ runLoopCycle } = await import('../../conveyor/await-verify-loop.mjs'));
+  }, 120_000);
+
   it.each(['pass', 'verify'].flatMap((loop) => ['returned', 'thrown'].map((failure) => [loop, failure])))
   ('stops the real %s loop when guard installation fails (%s)', async (loop, failure) => {
-    const { runPassDaemonLoop } = await import('../../../skills-src/conveyor/pass-daemon.mjs');
-    const { runLoopCycle } = await import('../../conveyor/await-verify-loop.mjs');
     const env = { PATH: '/usr/bin:/bin', GH_TOKEN: 'fixture-personal' };
     const work = vi.fn(async () => ({ code: 0 }));
     const refresh = () => ensureFreshGithubAppEnv({
@@ -797,7 +803,7 @@ describe('daemon mode defaults from the env markers', () => {
       expect(r.stdout).not.toContain('fixture-personal-token');
       expect(existsSync(invoked)).toBe(false);
     } finally { rmSync(work, { recursive: true, force: true }); }
-  });
+  }, 60_000); // imports the real shim module and spawns the rendered shim: over 5s on a loaded host
 
   it.each([
     ['explicit WE_GH_DAEMON_CALLER', { WE_GH_DAEMON_CALLER: 'drain' }, true],
