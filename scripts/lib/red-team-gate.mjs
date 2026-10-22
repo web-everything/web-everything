@@ -643,7 +643,9 @@ function gateActionLines(body) {
  * Every gate decision (per-finding actions, the send-back outcome, the round-cap hand-over) applies only to the result
  * it decides ({@link gateRecordsFor}), so a record for an earlier same-head result never releases a newer one's
  * finding. A carried result also keeps the actions bound to the result it was carried from (the same findings,
- * re-keyed); the newer head's own records win. An operator ruling releases only what the gate handed over (`held`).
+ * re-keyed); the newer head's own records win. Operator card actions require an explicit matching result id and
+ * a direct human record; an earlier head's release carries only with the cited-line proof and carry policy below.
+ * With any-state rulings disabled, an operator ruling releases only what the gate handed over (`held`).
  */
 export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, savedResult = null, repo = null, standingRuling = null, operatorRulings } = {}) {
   const live = String(head ?? '').toLowerCase();
@@ -675,6 +677,10 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
         const { indices } = line;
         let { action } = line;
         if (action === 'operator-card') {
+          // Operator card releases bind to an exact head/result, never a synthetic carried record.
+          // Historical direct rulings require the explicit carry policy and cited-line proof;
+          // the per-index guard below restricts the release to the proven findings.
+          if (r.from || r.gate.result !== want || (!first && !(carryRulings && carryAllowed?.size))) continue;
           if (!r.gate.outcome.startsWith('operator-') || !isHumanOperatorComment(r.c)) continue;
           action = 'card';
         }
