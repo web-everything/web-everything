@@ -166,11 +166,11 @@ describe('shared direct-launch post-run checks', () => {
     const { io, calls } = fakeIo();
     const rows = [];
     io.appendScorecard = row => rows.push(row);
-    io.postRunChecks = input => {
-      expect(input).toMatchObject({ dir: '/lanes/22', base: 'base-sha', scope: ['docs/probation/probation.md'], preexisting: ['node_modules'] });
-      return { accepted: false, outcome: 'rejected:audit', reason: 'weakened: removed assertion' };
-    };
+    let input;
+    io.postRunChecks = (i) => { input = i; return { accepted: false, outcome: 'rejected:audit', reason: 'weakened: removed assertion' }; };
     const result = await runProbationBuild(args(), io);
+    // The claimed card and pre-existing untracked paths are excluded from the worker's diff.
+    expect(input).toMatchObject({ dir: '/lanes/22', base: 'base-sha', scope: ['docs/probation/probation.md'], preexisting: ['node_modules', 'backlog/4291-probation-launcher.md'] });
     expect(result.outcome).toBe('gate-red');
     expect(result.detail).toMatch(/^rejected:audit — /);
     expect(calls).toContainEqual(['discard', 'base-sha']);
