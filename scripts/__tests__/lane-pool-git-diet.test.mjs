@@ -343,8 +343,11 @@ it.each(staleOpsCases)('$mode acquire protects $containment work when its only o
 const { spawnSync } = require('node:child_process');
 const { appendFileSync } = require('node:fs');
 const args = process.argv.slice(2);
-appendFileSync(${JSON.stringify(trace)}, JSON.stringify(args) + '\\n');
-if (${JSON.stringify(mode)} === 'auto' && args[0] === 'fetch') {
+// Match and trace the subcommand after transport-hardening config options; forward the original argv.
+const commandArgs = args.slice();
+while (commandArgs[0] === '-c') commandArgs.splice(0, 2);
+appendFileSync(${JSON.stringify(trace)}, JSON.stringify(commandArgs) + '\\n');
+if (${JSON.stringify(mode)} === 'auto' && commandArgs[0] === 'fetch') {
   const changed = spawnSync(${JSON.stringify(realGit)}, ${JSON.stringify(mutation)}, { cwd: ${JSON.stringify(origin)}, stdio: 'inherit' });
   if (changed.status !== 0) process.exit(changed.status ?? 1);
 }
