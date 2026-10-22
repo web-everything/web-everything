@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   planHumanDeescalation, sweepHumanDeescalation, resolveDeescalateSettings, readDecisionCards, buildDeescalatedComment,
-  DEESCALATE_KINDS_STANDARD, DEESCALATED_MARKER_RE,
+  readCommentsStrict, readNetDiffText, DEESCALATE_KINDS_STANDARD, DEESCALATED_MARKER_RE,
 } from '../human-escalation-deescalate.mjs';
 import {
   HUMAN_ESCALATION_KINDS as K, buildHumanEscalationMarker, buildHumanEscalationComment, readHumanEscalations, referralFailureKind,
@@ -30,12 +30,15 @@ const base = (over = {}) => ({
   pr: { number: 5805, headRefOid: HEAD, labels: [{ name: 'review:human' }], body: '', createdAt: at(-86_400_000),
     comments: [pendingRecord()], ...(over.pr ?? {}) },
   timeline: { status: 'ok', items: [added()] },
-  net: { ok: true, files: ['scripts/conveyor/foo.mjs', 'scripts/conveyor/__tests__/foo.test.mjs'] },
+  net: netOf(['scripts/conveyor/foo.mjs', 'scripts/conveyor/__tests__/foo.test.mjs']),
   decisionCards: { ok: true, files: [] },
   referral: cleanReferral, settings, repo: REPO,
   ...Object.fromEntries(Object.entries(over).filter(([k]) => k !== 'pr')),
 });
 const plan = over => planHumanDeescalation(base(over));
+// A unified net diff with one section per file (the shape `git diff a/… b/…` prints).
+const diffOf = (files, line = "+const x = 1;") => files.map(f => `diff --git a/${f} b/${f}\nindex 1111111..2222222 100644\n--- a/${f}\n+++ b/${f}\n@@ -1,1 +1,1 @@\n-old\n${line}`).join('\n');
+const netOf = (files, line) => ({ ok: true, files, diffHunks: diffOf(files, line) });
 
 describe('human-escalation marker', () => {
   it('builds a marker that names the kind and head, and refuses an unknown kind', () => {
@@ -112,8 +115,15 @@ describe('planHumanDeescalation', () => {
   });
   it('permission-change PR → kept', () => {
     for (const file of ['.github/workflows/ci.yml', '.claude/settings.json', 'scripts/bootstrap-session.mjs']) {
-      expect(plan({ net: { ok: true, files: ['scripts/conveyor/foo.mjs', file] } }).action, file).toBe('keep');
+      expect(plan({ net: netOf(['scripts/conveyor/foo.mjs', file]) }).action, file).toBe('keep');
     }
+    // Judged from the hunks: a sandbox grant written into an ordinary script.
+    expect(plan({ net: netOf(['scripts/conveyor/new-worker.mjs'], "+const opts = { approval_policy: 'never' };") }).action).toBe('keep');
+    expect(plan({ net: netOf(['scripts/conveyor/new-worker.mjs'], '+const opts = { retries: 2 };') }).action).toBe('deescalate');
+  });
+  it('net diff text unreadable, or a file with no diff section → kept', () => {
+    expect(plan({ net: { ok: true, files: ['scripts/conveyor/foo.mjs'] } }).reason).toMatch(/net diff text unreadable/);
+    expect(plan({ net: { ok: true, files: ['scripts/conveyor/foo.mjs', 'scripts/conveyor/bar.mjs'], diffHunks: diffOf(['scripts/conveyor/foo.mjs']) } }).reason).toMatch(/hunks unavailable/);
   });
   it('a net diff (or a disclosed deviation) the shape rule sends to a human → kept', () => {
     const human = planHumanDeescalation({ ...base(), scoreFiles: () => ({ humanRequired: true, reasons: ['gate-self'] }) });
@@ -138,9 +148,8 @@ describe('planHumanDeescalation', () => {
   it('an unreadable comment anywhere in the thread → kept', () => {
     expect(plan({ pr: { comments: [pendingRecord(), { author: { login: BOT }, body: null, createdAt: at(30_000) }] } }).reason).toMatch(/comment is unreadable/);
   });
-  it('a diff-judged human category active (broad) with no hunks read → kept; narrow judges on names', () => {
-    expect(plan({ surfaces: 'broad' }).reason).toMatch(/diff-judged human category/);
-    expect(plan({ surfaces: 'narrow' }).action).toBe('deescalate');
+  it('the broad preset is judged on the hunks too; a bad surfaces setting → kept', () => {
+    expect(plan({ surfaces: 'broad' }).action).toBe('deescalate');
     expect(plan({ surfaces: 'not-a-preset' }).reason).toMatch(/setting unreadable/);
   });
   it('decision card in the net diff → kept; unreadable card read → kept', () => {
@@ -225,10 +234,15 @@ describe('sweepHumanDeescalation (apply)', () => {
   const io = (over = {}) => {
     const b = base();
     const state = { state: 'OPEN', headRefOid: HEAD, labels: [{ name: 'review:human' }], body: '', createdAt: b.pr.createdAt, comments: [] };
-    const provider = { currentRepo: () => REPO, readPrState: vi.fn(() => state), setLabels: vi.fn(), postComment: vi.fn() };
+    // The fake applies label writes to the live state, the way GitHub does.
+    const setLabels = vi.fn((repo, pr, { add, remove = [] }) => {
+      state.labels = [...state.labels.filter(l => !remove.includes(l.name)), ...(add ? [{ name: add }] : [])];
+    });
+    const provider = { currentRepo: () => REPO, readPrState: vi.fn(() => structuredClone(state)), setLabels, postComment: vi.fn() };
     return { provider, opts: { repo: REPO, apply: true, settings, provider,
       listPrs: () => [{ number: 5805, labels: [{ name: 'review:human' }] }, { number: 9, labels: [{ name: 'review:pending' }] }],
-      readComments: () => b.pr.comments, readTimeline: vi.fn(() => b.timeline), readNetFiles: vi.fn(() => b.net), readCards: () => b.decisionCards,
+      readComments: () => b.pr.comments, readTimeline: vi.fn(() => b.timeline), readCards: () => b.decisionCards,
+      readNetFiles: vi.fn(() => ({ ok: true, files: b.net.files })), readDiff: vi.fn(() => ({ ok: true, text: b.net.diffHunks })),
       resolveSurfaces: () => 'narrow', readReferral: () => cleanReferral, log: vi.fn(), ...over } };
   };
   it('removes review:human, re-arms review:pending, records and logs it; the net read is not repeated for the same head', () => {
@@ -278,6 +292,29 @@ describe('sweepHumanDeescalation (apply)', () => {
       { add: 'review:pending', remove: ['review:human'] }, { add: 'review:human', remove: ['review:pending'] }]);
     expect(opts.log).not.toHaveBeenCalled();
   });
+  it('a write that throws: the head is still re-read — moved → restored; unchanged and label gone → it landed', () => {
+    const st = (h, labels) => ({ state: 'OPEN', headRefOid: h, labels, body: '', comments: [] });
+    const moved = io();
+    for (let i = 0; i < 4; i++) moved.provider.readPrState.mockReturnValueOnce(st(HEAD, [{ name: 'review:human' }]));
+    moved.provider.readPrState.mockReturnValueOnce(st('e'.repeat(40), [{ name: 'review:pending' }]));
+    moved.provider.setLabels.mockImplementationOnce(() => { throw new Error('timeout'); });
+    expect(sweepHumanDeescalation(moved.opts)[0].reason).toMatch(/restored/);
+    expect(moved.provider.setLabels.mock.calls[1][2]).toMatchObject({ add: 'review:human' });
+    const unreadable = io();
+    for (let i = 0; i < 4; i++) unreadable.provider.readPrState.mockReturnValueOnce(st(HEAD, [{ name: 'review:human' }]));
+    unreadable.provider.readPrState.mockImplementationOnce(() => { throw new Error('gh down'); });
+    unreadable.provider.setLabels.mockImplementationOnce(() => { throw new Error('timeout'); });
+    expect(sweepHumanDeescalation(unreadable.opts)[0].reason).toMatch(/restored/);
+    const failed = io();
+    for (let i = 0; i < 5; i++) failed.provider.readPrState.mockReturnValueOnce(st(HEAD, [{ name: 'review:human' }]));
+    failed.provider.setLabels.mockImplementationOnce(() => { throw new Error('422'); });
+    expect(sweepHumanDeescalation(failed.opts)[0]).toMatchObject({ action: 'error', reason: expect.stringMatching(/label write failed/) });
+  });
+  it('a net diff read failure keeps the hold', () => {
+    const { provider, opts } = io({ readDiff: () => ({ ok: false, reason: 'net diff failed' }) });
+    expect(sweepHumanDeescalation(opts)[0].reason).toMatch(/net diff text unreadable/);
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
   it('a throwing read keeps the hold and never stops the sweep; disabled writes nothing', () => {
     const { provider, opts } = io({ readTimeline: () => { throw new Error('gh down'); } });
     expect(sweepHumanDeescalation(opts)[0]).toMatchObject({ action: 'error' });
@@ -291,6 +328,24 @@ describe('sweepHumanDeescalation (apply)', () => {
     provider.readPrState.mockReturnValue({ state: 'OPEN', headRefOid: HEAD, labels: [{ name: 'review:human' }, { name: 'review:changes' }], body: '', comments: [] });
     sweepHumanDeescalation(opts);
     expect(provider.setLabels).toHaveBeenCalledWith(REPO, 5805, { remove: ['review:human'] });
+  });
+});
+
+describe('IO readers', () => {
+  it('readCommentsStrict keeps a null body null (the planner then holds), never an empty string', () => {
+    const exec = vi.fn(() => `${JSON.stringify({ body: 'x', createdAt: at(0), author: { login: BOT } })}\n${JSON.stringify({ body: null, createdAt: at(1), author: { login: BOT } })}\n`);
+    const comments = readCommentsStrict(5805, { repo: REPO, exec });
+    expect(comments[1].body).toBeNull();
+    expect(exec.mock.calls[0][1]).toContain(`repos/${REPO}/issues/5805/comments`);
+    expect(plan({ pr: { comments: [pendingRecord(), ...comments] } }).reason).toMatch(/comment is unreadable/);
+  });
+  it('readNetDiffText diffs the merge-base with origin/main against the head and fails closed', () => {
+    const git = vi.fn((dir, args) => (args[0] === 'merge-base' ? `${'f'.repeat(40)}\n` : 'diff --git a/x b/x\n'));
+    expect(readNetDiffText({ repo: REPO, head: HEAD }, { git, gitDirFor: () => '/r' })).toEqual({ ok: true, text: 'diff --git a/x b/x\n' });
+    expect(git.mock.calls[1][1]).toEqual(expect.arrayContaining(['f'.repeat(40), HEAD, '--src-prefix=a/', '--dst-prefix=b/']));
+    expect(readNetDiffText({ repo: REPO, head: HEAD }, { git: () => 'nope', gitDirFor: () => '/r' }).ok).toBe(false);
+    expect(readNetDiffText({ repo: REPO, head: HEAD }, { git: () => { throw new Error('x'); }, gitDirFor: () => '/r' }).ok).toBe(false);
+    expect(readNetDiffText({ repo: REPO, head: HEAD }, { git, gitDirFor: () => null }).ok).toBe(false);
   });
 });
 

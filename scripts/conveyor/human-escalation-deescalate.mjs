@@ -27,12 +27,14 @@
  *   4. NO HUMAN-ONLY CHANGE. The net file set (fresh fetch vs origin/main) plus the PR body's disclosed deviation
  *      score humanRequired false (the shape rule); no human-only surface is touched (permission surfaces judged
  *      without hunks, so any touch keeps it); no decision card (`backlog/*.md` whose front matter parses to
- *      `kind: decision`) is in the net diff; and no human category judged from diff hunks (statute, marked
- *      invariant, gate-self — the broad preset) is active, since this pass scores file names only.
+ *      `kind: decision`) is in the net diff. The score and the surface check read the net diff TEXT (merge-base with
+ *      origin/main → head), so hunk-judged triggers (a sandbox grant in any script, statute anchors, marked
+ *      invariants) count; an unreadable diff, or any file with no diff section, keeps it.
  *   Every comment must be readable (an unreadable one could hold a later escalation record).
  * The apply path re-reads the labels, comments and timeline after the decision and re-plans (each plan reads the PR
  * state before and after the thread); only a second de-escalate verdict on the same head writes, and a head that
- * moved under the write gets `review:human` straight back. When lifted: `review:human` comes off, `review:pending` goes on unless
+ * moved under the write (or a write whose outcome is unknown and the head cannot be re-read) gets `review:human`
+ * straight back. Comments are read as JSON, so a missing body stays visible and holds. When lifted: `review:human` comes off, `review:pending` goes on unless
  * `review:changes` stands (a review of the live head is still owed), a durable comment records it, and the log line
  * is `review-human de-escalated {"pr":…,"head":…,"reason":…}`.
  *
@@ -54,16 +56,16 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { normOnOff, REVIEW_SETTINGS_FILE } from '../lib/review-seat-settings.mjs';
 import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { HUMAN_ESCALATION_KINDS, REFERRAL_CLEARABLE_KINDS, CLEARABLE_ESCALATION_KINDS, readHumanEscalations } from '../lib/human-escalation-marker.mjs';
-import { REVIEW_LABELS, hasReviewLabel, scoreEscalation, parseDeviationDisclosure } from '../lib/review-escalation.mjs';
+import { REVIEW_LABELS, hasReviewLabel, scoreEscalation, parseDeviationDisclosure, fileHunksResolver } from '../lib/review-escalation.mjs';
 import { sensitiveSurfaceHits, resolveHumanReviewSurfaces, normalizeHumanSurfaces } from '../lib/human-review-surfaces.mjs';
 import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { roundExtensionGrants } from './round-extension-mark.mjs';
 import { readHumanSurfaceNetFiles } from '../lib/human-surface-net-diff.mjs';
 import { defaultGitDirFor, gitExec } from '../operations/free-scope-io.mjs';
-import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { createGhProvider, parseJsonLines } from '../lib/review-label-provider.mjs';
+import { execRead } from '../lib/proc-read.mjs';
 import { defaultListPrs } from './advisory-label-sweep.mjs';
-import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { readLabelTimelineSync } from './pr-label-mirror.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 
@@ -74,8 +76,6 @@ export const ATTRIBUTION_BEFORE_MS = 180_000;
 export const ATTRIBUTION_AFTER_MS = 300_000;
 export const DEESCALATED_MARKER_RE = /<!-- we:human-deescalated pr=\d+ head=[0-9a-f]{40} kinds=[a-z0-9,-]+ -->/;
 const PARK_MARKER_RE = /<!-- (?:human-surface-repark|mechanical-hold-handoff): ([0-9a-f]{40}) -->/gi;
-/** Human-surface categories `scoreEscalation` judges from diff hunks, not from file names alone. */
-const HUNK_JUDGED_CATEGORIES = Object.freeze(['statute', 'marked-invariant', 'gate-self']);
 /** Labels whose presence alone keeps the hold. */
 const HOLDING_LABELS = Object.freeze([REVIEW_LABELS.accepted, REVIEW_LABELS.heldMechanical, REVIEW_LABELS.awaitingAdvisory,
   'advisory:ruling-needed', 'red-team:blocked']);
@@ -152,7 +152,7 @@ function kindCleared(kind, esc, { comments, referral, repo, pr, head }) {
  *   repo:string, scoreFiles?:Function}} o
  */
 export function planHumanDeescalation({ pr, timeline, net, decisionCards, referral, settings, surfaces = 'narrow', repo,
-  scoreFiles = (files, deviation, humanSurfaces) => scoreEscalation({ changedFiles: files, deviation, humanSurfaces }) } = {}) {
+  scoreFiles = (files, deviation, humanSurfaces, diffHunks) => scoreEscalation({ changedFiles: files, deviation, humanSurfaces, diffHunks }) } = {}) {
   const labels = names(pr?.labels);
   if (!hasReviewLabel(labels, REVIEW_LABELS.human)) return keep('no review:human');
   if (!settings?.enabled) return keep('de-escalation disabled (setting)');
@@ -214,17 +214,19 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   if (!net?.ok || !Array.isArray(net.files) || !net.files.length || !net.files.every(f => typeof f === 'string' && f))
     return keep(`net file set unreadable (${net?.reason ?? 'no read'})`);
   let score;
+  // The net diff TEXT too: permission surfaces (a sandbox grant in any script), statute anchors and marked invariants
+  // are judged from the hunks, so file names alone cannot rule them out.
+  if (typeof net.diffHunks !== 'string' || !net.diffHunks) return keep(`net diff text unreadable (${net.diffReason ?? 'no read'})`);
   let categories;
   try { categories = normalizeHumanSurfaces(surfaces).categories; } catch (e) { return keep(`human-surface setting unreadable: ${errorText(e)}`); }
   if (!Array.isArray(categories)) return keep('human-surface setting unreadable');
-  try { score = scoreFiles(net.files, parseDeviationDisclosure(pr.body), surfaces); } catch (e) { return keep(`shape score failed: ${errorText(e)}`); }
+  try { score = scoreFiles(net.files, parseDeviationDisclosure(pr.body), surfaces, net.diffHunks); } catch (e) { return keep(`shape score failed: ${errorText(e)}`); }
   if (score?.humanRequired !== false) return keep(`net diff requires a human (${(score?.reasons ?? []).join('; ') || 'shape rule'})`);
-  // The score runs on file names only. A human category judged from the diff text (statute anchors, marked
-  // invariants) cannot be ruled out without it: hold whenever such a category is active and hunks were not read.
-  if (HUNK_JUDGED_CATEGORIES.some(c => categories.includes(c)) && (score?.signals?.hunksUnavailable?.length ?? 1) > 0)
-    return keep(`a diff-judged human category (${HUNK_JUDGED_CATEGORIES.filter(c => categories.includes(c)).join(', ')}) is active and the hunks were not read`);
+  // A file the diff text has no section for (binary, mode-only, an unmatched spelling) was not judged: hold.
+  if (!Array.isArray(score?.signals?.hunksUnavailable ?? []) || (score?.signals?.hunksUnavailable ?? []).length)
+    return keep(`hunks unavailable for ${(score?.signals?.hunksUnavailable ?? ['?']).slice(0, 3).join(', ')}`);
   let hits;
-  try { hits = sensitiveSurfaceHits(net.files, () => undefined, surfaces); } catch (e) { return keep(`human-surface check failed: ${errorText(e)}`); }
+  try { hits = sensitiveSurfaceHits(net.files, fileHunksResolver(net.diffHunks), surfaces); } catch (e) { return keep(`human-surface check failed: ${errorText(e)}`); }
   if (!Array.isArray(hits)) return keep('human-surface check unreadable');
   if (hits.length) return keep(`human-only surface touched (${[...new Set(hits.map(h => h.category))].join(', ')})`);
   if (!decisionCards?.ok || !Array.isArray(decisionCards.files)) return keep(`decision-card read failed (${decisionCards?.reason ?? 'no read'})`);
@@ -257,6 +259,34 @@ export function readDecisionCards({ repo, head, files }, { git = gitExec(), gitD
   }
 }
 
+/**
+ * IO. The whole net diff text of `head` against its merge-base with origin/main (fetched by the net file read just
+ * before). Any failure → not ok (the hold stays).
+ */
+export function readNetDiffText({ repo, head }, { git = gitExec(), gitDirFor = defaultGitDirFor } = {}) {
+  try {
+    const dir = gitDirFor(repo);
+    if (!dir) return { ok: false, reason: 'no local checkout of this repo' };
+    const mergeBase = String(git(dir, ['merge-base', '--end-of-options', 'origin/main', head])).split('\n')[0].trim();
+    if (!/^[0-9a-f]{40}$/.test(mergeBase)) return { ok: false, reason: 'no merge-base with origin/main' };
+    const text = String(git(dir, ['diff', '--no-ext-diff', '--no-renames', '--no-color', '--src-prefix=a/', '--dst-prefix=b/',
+      '--end-of-options', mergeBase, head]));
+    return text ? { ok: true, text } : { ok: false, reason: 'empty net diff' };
+  } catch (e) {
+    return { ok: false, reason: `net diff failed: ${errorText(e)}` };
+  }
+}
+
+/**
+ * IO. The PR's complete comment thread as JSON lines, so a missing or non-string body stays visible (and holds)
+ * instead of being flattened to an empty string. Throws on a read miss.
+ */
+export function readCommentsStrict(num, { repo, exec = execRead } = {}) {
+  const out = exec('gh', ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/issues/${num}/comments`,
+    '--jq', '.[] | {body, createdAt: .created_at, author: (if .user.login then {login: .user.login} else null end), id: .node_id}']);
+  return parseJsonLines(out);
+}
+
 export function buildDeescalatedComment({ pr, head, kinds, reason }) {
   return ['✅ review:human lifted — the escalation that added it is cleared', '',
     `Recorded escalation(s): ${kinds.map(k => `\`${k}\``).join(', ')}. ${reason}.`,
@@ -272,7 +302,7 @@ export function buildDeescalatedComment({ pr, head, kinds, reason }) {
  */
 export function sweepHumanDeescalation({
   repo = null, prNumber = null, apply = false, env = process.env,
-  listPrs = defaultListPrs, provider = createGhProvider(), readComments = readCompletePrComments,
+  listPrs = defaultListPrs, provider = createGhProvider(), readComments = readCommentsStrict, readDiff = readNetDiffText,
   readTimeline = o => readLabelTimelineSync({ ...o, strict: true }), readNetFiles = readHumanSurfaceNetFiles, readCards = readDecisionCards,
   resolveSurfaces = resolveHumanReviewSurfaces, readReferral = liveReferralState,
   settings = resolveDeescalateSettings({ env }), log = line => writeLineSync(2, line),
@@ -305,6 +335,10 @@ export function sweepHumanDeescalation({
           return { state, plan: keep('state moved during the read') };
         if (!net || net.head !== state.headRefOid) {
           net = { head: state.headRefOid, ...readNetFiles({ repo: resolvedRepo, number: num, headRefOid: state.headRefOid }) };
+          if (net.ok) {
+            const diff = readDiff({ repo: resolvedRepo, head: state.headRefOid });
+            net = diff.ok ? { ...net, diffHunks: diff.text } : { ...net, diffReason: diff.reason };
+          }
           decisionCards = net.ok && Array.isArray(net.files)
             ? readCards({ repo: resolvedRepo, head: state.headRefOid, files: net.files }) : { ok: false, reason: 'no net file set' };
         }
@@ -327,15 +361,26 @@ export function sweepHumanDeescalation({
       }
       const freshLabels = names(second.state.labels);
       const addPending = !(hasReviewLabel(freshLabels, REVIEW_LABELS.changes) || hasReviewLabel(freshLabels, REVIEW_LABELS.pending));
-      provider.setLabels(resolvedRepo, num, { ...(addPending ? { add: REVIEW_LABELS.pending } : {}), remove: [REVIEW_LABELS.human] });
-      // GitHub has no conditional label write. Read once more: a head that moved under the write is a diff nobody
-      // judged, so the hold goes straight back (and an unreadable re-read restores it too).
+      let writeError = null;
+      try { provider.setLabels(resolvedRepo, num, { ...(addPending ? { add: REVIEW_LABELS.pending } : {}), remove: [REVIEW_LABELS.human] }); }
+      catch (e) { writeError = errorText(e); }
+      // GitHub has no conditional label write, and a failed write may still have landed. Read once more, on every
+      // path: a head that moved under the write is a diff nobody judged, so the hold goes straight back (an
+      // unreadable re-read restores it too).
       let after = null;
       try { after = provider.readPrState(resolvedRepo, num); } catch { after = null; }
       if (after?.headRefOid !== second.state.headRefOid) {
-        provider.setLabels(resolvedRepo, num, { add: REVIEW_LABELS.human,
-          remove: addPending && hasReviewLabel(names(after?.labels), REVIEW_LABELS.pending) ? [REVIEW_LABELS.pending] : [] });
-        Object.assign(entry, { action: 'keep', reason: 'head moved during the write; review:human restored' });
+        try {
+          provider.setLabels(resolvedRepo, num, { add: REVIEW_LABELS.human,
+            remove: addPending && hasReviewLabel(names(after?.labels), REVIEW_LABELS.pending) ? [REVIEW_LABELS.pending] : [] });
+          Object.assign(entry, { action: 'keep', reason: 'head moved during the write (or could not be re-read); review:human restored' });
+        } catch (e) {
+          Object.assign(entry, { action: 'error', reason: `head moved during the write and the restore failed: ${errorText(e)}` });
+        }
+        continue;
+      }
+      if (hasReviewLabel(names(after.labels), REVIEW_LABELS.human)) {
+        Object.assign(entry, { action: writeError ? 'error' : 'keep', reason: writeError ? `label write failed: ${writeError}` : 'review:human still present after the write' });
         continue;
       }
       entry.action = 'deescalated';
