@@ -200,7 +200,7 @@ export function planHumanDeescalation({ pr, timeline, net, decisionCards, referr
   // recorded long before this add (a hold whose own label write came later, a resumed writer) still holds.
   // Only the OPERATOR's own removal answers earlier causes; an unknown or other actor never does.
   const handRemoval = timeline.items.filter(i => i.label === REVIEW_LABELS.human && i.change === 'removed'
-    && OPERATOR_LOGINS.includes(login(i.actor))).at(-1);
+    && OPERATOR_LOGINS.includes(String(i.actor).toLowerCase())).at(-1); // exact login: `chalbert[bot]` is not the operator
   const windowStart = handRemoval ? time(handRemoval.createdAt) : -Infinity;
   // A record from an earlier label lifecycle (before the last removal) never explains this add.
   const lastLabel = timeline.items.lastIndexOf(last);

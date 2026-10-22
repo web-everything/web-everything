@@ -172,6 +172,8 @@ describe('planHumanDeescalation', () => {
     expect(plan({ timeline: { status: 'ok', items: nullActor }, pr: { comments: [held, pendingRecord()] } }).reason).toMatch(/no readable actor/);
     const other = [added(BOT, -900_000), { ...added('someone-else', -300_000), change: 'removed' }, added()];
     expect(plan({ timeline: { status: 'ok', items: other }, pr: { comments: [held, pendingRecord()] } }).action).toBe('keep');
+    const app = [added(BOT, -900_000), { ...added('chalbert[bot]', -300_000), change: 'removed' }, added()];
+    expect(plan({ timeline: { status: 'ok', items: app }, pr: { comments: [held, pendingRecord()] } }).action).toBe('keep');
   });
   it('an added=no record never explains an add, even of a clearable kind', () => {
     const noop = bot(`Mandatory referral review parked to review:human: mandatory ruling ledger-write-miss: x.\n\n${buildHumanEscalationMarker({ kind: K.REFERRAL_LEDGER_SYNC_FAILED, head: HEAD, added: false })}`, 20_000);
