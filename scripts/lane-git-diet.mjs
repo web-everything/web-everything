@@ -10,7 +10,7 @@
  *
  * Eligibility (`cleanupEligibility`): a real, non-symlinked `<pool>/lane-N` with its own `.git` dir, NO lease
  * marker, no git lock file, no other repository borrowing its objects (alternates under --scan-root/* and the pool
- * root), and no `gc.recentObjectsHook`. Per eligible lane, on --apply:
+ * root, following alternate chains), and no `gc.recentObjectsHook` or GC repack filtering. Per eligible lane, on --apply:
  *   0. CLAIM the lane: write its lease marker with O_EXCL (the same move as `lane-pool trim`), so a concurrent
  *      acquirer sees a live lease and moves on, and we never act on a lane someone else just took;
  *   1. apply the diet config (negative `^refs/heads/ops/*` refspec + unpackLimit=1);
@@ -64,6 +64,7 @@ const locksIn = (dir) => LOCK_NAMES.filter((f) => existsSync(join(dir, '.git', f
 const duBytes = (p) => { try { return Number(execFileSync('du', ['-sk', p], { encoding: 'utf8', timeout: 300_000 }).split(/\s+/)[0]) * 1024; } catch { return NaN; } };
 const opsRefs = (dir) => git(dir, ['for-each-ref', '--format=%(refname)', 'refs/remotes/origin/ops/']).split('\n').filter(Boolean);
 const gcHooks = (dir) => { try { return git(dir, ['config', '--get-all', 'gc.recentObjectsHook']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
+const gcRepackFilters = (dir) => { try { return git(dir, ['config', '--name-only', '--get-regexp', '^gc\\.repackfilter(to)?$']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
 
 // Who borrows whose objects: repos under <scan-root>/* and <pool-root>/*/*, including Gitfile/common-dir stores.
 function borrowerMap() {
@@ -82,22 +83,27 @@ function borrowerMap() {
       const path = git(repo, ['rev-parse', '--path-format=absolute', '--git-path', 'objects'], 120_000, null);
       stores.push(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(path).replace(/\n$/, ''));
     }
-    for (const objects of new Set(stores)) {
+    // A store outside the candidate roots can itself borrow from a lane. Walk the whole graph per
+    // borrower, canonicalizing every hop so aliases/cycles terminate without losing that borrower's identity.
+    const pending = new Set(stores.map(real).filter(Boolean));
+    for (const objects of pending) {
+      if (pending.size > 10_000) throw new Error('alternate graph too large; cleanup refused');
       let text;
       try { text = readFileSync(join(objects, 'info', 'alternates')); } catch (err) { if (['ENOENT', 'ENOTDIR'].includes(err.code)) continue; throw err; }
       for (const line of parseGitAlternates(text)) {
         const target = real(isAbsolute(line) ? line : resolve(objects, line));
         if (!target) continue;
         if (!map.has(target)) map.set(target, []);
-        map.get(target).push(repo);
+        if (!map.get(target).includes(repo)) map.get(target).push(repo);
+        pending.add(target);
       }
     }
   }
   return map;
 }
 const BORROWERS = borrowerMap();
-// Every path the cleanup writes through (config, refs, HEAD, reflogs, the lease marker) — none may be a symlink.
-const GIT_WRITE_PATHS = ['config', 'config.worktree', 'packed-refs', 'refs', 'logs', 'HEAD', 'objects', LEASE_FILENAME];
+// Every path the cleanup writes through (including repack's info/refs server-info update) must be local.
+const GIT_WRITE_PATHS = ['config', 'config.worktree', 'packed-refs', 'refs', 'logs', 'HEAD', 'objects', 'info', LEASE_FILENAME];
 const symlinkedGitPaths = (dir) => {
   const links = [];
   const visit = (path) => {
@@ -117,7 +123,7 @@ const eligible = (dir) => {
   return cleanupEligibility({
     dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir, realCommonDir: realGitDir ? commonDir(dir) : undefined, realObjectsDir: objects ?? undefined, symlinkedGitPaths: symlinkedGitPaths(dir),
     lease: readLease(dir), nowMs: Date.now(), locks: locksIn(dir),
-    borrowers: (objects && BORROWERS.get(objects)) || [], gcHooks: realGitDir ? gcHooks(dir) : [],
+    borrowers: (objects && BORROWERS.get(objects)) || [], gcHooks: realGitDir ? gcHooks(dir) : [], gcRepackFilters: realGitDir ? gcRepackFilters(dir) : [],
   });
 };
 
@@ -156,7 +162,7 @@ for (const n of lanes) {
     const holder = claim(dir);
     if (!holder) { rows.push({ lane: n, skipped: 'lost the claim race (someone took the lane)' }); continue; }
     try {
-      const recheck = cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), symlinkedGitPaths: symlinkedGitPaths(dir), lease: null, nowMs: Date.now(), locks: locksIn(dir) });
+      const recheck = cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), symlinkedGitPaths: symlinkedGitPaths(dir), lease: null, nowMs: Date.now(), locks: locksIn(dir), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir) });
       if (!recheck.ok) { rows.push({ lane: n, skipped: recheck.reason }); continue; }
       const before = duBytes(join(dir, '.git'));
       const applied = applyLaneDietConfig((args) => git(dir, args));

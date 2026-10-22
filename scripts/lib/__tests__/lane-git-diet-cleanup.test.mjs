@@ -98,6 +98,72 @@ describe('real git: cleanup CLI', () => {
   }, 60_000);
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
+  it.each(['info', 'info/refs'])('refuses a symlink at .git/%s before server-info can overwrite an outside file', (path) => {
+    const dir = lane(10);
+    const outside = join(root, 'outside-info');
+    git(root, 'clone', '-q', up, dir);
+    mkdirSync(outside, { recursive: true });
+    const victim = join(outside, 'refs');
+    writeFileSync(victim, 'valuable outside contents\n');
+    const link = join(dir, '.git', path);
+    rmSync(link, { recursive: true, force: true });
+    symlinkSync(path === 'info' ? outside : victim, link);
+    const configBefore = readFileSync(join(dir, '.git', 'config'), 'utf8');
+    try {
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--apply', '--lanes=10', '--json'], { env, encoding: 'utf8' }));
+      expect(readFileSync(victim, 'utf8')).toBe('valuable outside contents\n');
+      expect(out.rows[0].skipped).toMatch(/symlinked git paths/);
+      expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).toBe(configBefore);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it.each([false, true])('protects transitive alternates through an undiscovered store, including cycles (late: %s)', (late) => {
+    const dir = lane(11);
+    const borrower = join(root, 'transitive-borrower');
+    const intermediate = join(root, 'cache', 'deep', 'objects');
+    git(root, 'clone', '-q', up, dir);
+    git(root, 'clone', '-q', up, borrower);
+    mkdirSync(join(intermediate, 'info'), { recursive: true });
+    const objects = join(dir, '.git', 'objects');
+    const borrowerObjects = join(borrower, '.git', 'objects');
+    writeFileSync(join(borrowerObjects, 'info', 'alternates'), `"${relative(borrowerObjects, intermediate)}"\n`);
+    writeFileSync(join(intermediate, 'info', 'alternates'), `"${relative(intermediate, objects)}"\n${borrowerObjects}\n`);
+    const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: dir, env, input: 'transitive borrower only', encoding: 'utf8' }).trim();
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(join(objects, blob.slice(0, 2), blob.slice(2)), old, old);
+    git(borrower, 'update-ref', 'refs/keep/borrowed', blob);
+    try {
+      expect(git(borrower, 'cat-file', '-p', blob)).toBe('transitive borrower only');
+      if (late) rmSync(join(intermediate, 'info', 'alternates'));
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--apply', '--lanes=11', '--json'], {
+        env: late ? { ...env, VITEST: 'true', LANE_GIT_DIET_TEST_LATE_BORROWER: intermediate, LANE_GIT_DIET_TEST_QUOTED_ALTERNATE: '1' } : env, encoding: 'utf8',
+      }));
+      expect(git(borrower, 'cat-file', '-p', blob)).toBe('transitive borrower only');
+      expect(out.rows[0].skipped).toMatch(/borrowed by .*transitive-borrower/);
+      if (late) expect(out.rows[0].skipped).toMatch(/gc skipped/);
+    } finally {
+      for (const path of [dir, borrower, join(root, 'cache')]) rmSync(path, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it.each(['filter', 'filterTo', 'both'])('refuses GC repack filtering (%s), preserving reachable packed blobs', (variant) => {
+    const dir = lane(12);
+    const outside = join(root, 'filtered');
+    git(root, 'clone', '-q', up, dir);
+    git(dir, 'repack', '-ad');
+    mkdirSync(outside, { recursive: true });
+    if (variant !== 'filterTo') git(dir, 'config', 'gc.repackFilter', 'blob:none');
+    if (variant !== 'filter') git(dir, 'config', 'gc.repackFilterTo', join(outside, 'pack'));
+    const configBefore = readFileSync(join(dir, '.git', 'config'), 'utf8');
+    try {
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--apply', '--lanes=12', '--json'], { env, encoding: 'utf8' }));
+      expect(git(dir, 'cat-file', '-p', 'HEAD:a.txt')).toBe('a');
+      expect(git(dir, 'fsck', '--connectivity-only', '--no-progress')).toBe('');
+      expect(out.rows[0].skipped).toMatch(/repack filter/i);
+      expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).toBe(configBefore);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
   it('dry-run reports a projection and changes nothing', () => {
     const before = git(lane(1), 'count-objects', '-v');
     const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--json'], { env, encoding: 'utf8' }));

@@ -38,14 +38,15 @@ export function parseGitAlternates(text) {
  * with a lease marker at all (live, reserved, or stale: the cleanup claims an ABSENT marker with O_EXCL, exactly like
  * `lane-pool trim`, so it never races an acquirer), any lane with a git lock file present (an op is mid-flight),
  * any lane another repository borrows objects from (`objects/info/alternates` pointing at it: pruning here could
- * delete objects the borrower needs), and any lane with a `gc.recentObjectsHook` (gc would execute it).
+ * delete objects the borrower needs), a `gc.recentObjectsHook` (gc would execute it), or GC repack filtering
+ * (reachable objects could be removed or redirected outside the validated store).
  * @param {{dir: string, poolRoot: string, realDir?: string, realGitDir?: string, lease?: object|null, nowMs: number,
  *   realCommonDir?: string, realObjectsDir?: string, ttlMs?: number, locks?: string[], borrowers?: string[],
- *   gcHooks?: string[], symlinkedGitPaths?: string[]}} o  `realCommonDir`/`realObjectsDir` = resolved `git rev-parse --git-common-dir` and
+ *   gcHooks?: string[], gcRepackFilters?: string[], symlinkedGitPaths?: string[]}} o  `realCommonDir`/`realObjectsDir` = resolved `git rev-parse --git-common-dir` and
  *   `<git dir>/objects`: a `commondir` file or symlinked object store would redirect the cleanup into another repo.
  * @returns {{ok: true} | {ok: false, reason: string}}
  */
-export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCommonDir, realObjectsDir, symlinkedGitPaths = [], lease = null, nowMs, ttlMs, locks = [], borrowers = [], gcHooks = [] }) {
+export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCommonDir, realObjectsDir, symlinkedGitPaths = [], lease = null, nowMs, ttlMs, locks = [], borrowers = [], gcHooks = [], gcRepackFilters = [] }) {
   const root = String(poolRoot || '').replace(/\/+$/, '');
   const rel = String(dir || '').startsWith(`${root}/`) ? String(dir).slice(root.length + 1) : null;
   const m = rel && /^([^/]+)\/lane-(\d+)\/?$/.exec(rel);
@@ -65,6 +66,7 @@ export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCom
   if (locks.length) return { ok: false, reason: `git lock present (${locks.join(', ')})` };
   if (borrowers.length) return { ok: false, reason: `objects borrowed by ${borrowers.join(', ')}` };
   if (gcHooks.length) return { ok: false, reason: 'gc.recentObjectsHook configured (gc would run it)' };
+  if (gcRepackFilters.length) return { ok: false, reason: `GC repack filtering configured (${gcRepackFilters.join(', ')})` };
   return { ok: true };
 }
 
