@@ -19,6 +19,8 @@ PR #5809 review found guard guarantees without named tests. Add a scoped check t
 - [A2] Enumerate smoke fallback alert kinds and require named failing-smoke cases for planA2 and planB, including loss of a carried overlay. Reject missing or stale test names.
 - [A3] Document which references are behavioral regression pins and which have verified revert-red evidence. Existing guards must not be weakened to obtain proof.
 
+PR #5809 review follow-up (2026-10-22): A1 must also require one named test per conjunct of a compound admission refusal predicate, with its other conditions satisfied. Until the checker exists, the review lens must ask which named test breaks if each fails-closed or never guard is removed. Concrete planned acceptance tests for this checker are mapped in `we:backlog/x3vn7kd-follow-up-overlay-review-named-test-mappings.md` A3.
+
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
 Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.

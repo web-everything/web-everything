@@ -80,6 +80,40 @@ function fixture() {
 }
 
 describe('overlay-pin — a moving overlay whose new tip conflicts stays at its adopted head', () => {
+  it('refuses to pin when the adopted head also conflicts', async () => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+    f.env.WE_DAEMON_OVERLAY_STACK_MODE = 'independent';
+    expect(await f.tick()).toMatchObject({ adopted: true });
+    const live = f.head();
+    const registered = readOverlays(f.clone, { env: f.env });
+    const main = f.push('main', f.init, { 'moving.txt': 'main\n' });
+    const tip = f.push('lane/moving', f.mOld, { 'moving.txt': 'v2\n' });
+    f.smoke.mockClear();
+
+    const result = await f.tick();
+    // merge-tree emits a nonempty tree even on conflict. Both heads must really conflict, so removing
+    // the pmt.status guard would apply a marker-bearing tree instead of preserving the live build.
+    for (const sha of [tip, f.mOld]) {
+      const mt = spawnSync('git', ['merge-tree', '--write-tree', '--no-messages', main, sha], {
+        cwd: f.clone, encoding: 'utf8', timeout: 20_000,
+      });
+      expect(mt.status).toBe(1);
+      expect(mt.stdout.split('\n')[0]).toMatch(/^[0-9a-f]{40}$/);
+      expect(mt.stdout.split('\n')[0]).not.toBe(gitOk(f.clone, ['rev-parse', `${main}^{tree}`]).trim());
+    }
+    expect(result).toMatchObject({ moved: false, reason: 'established-overlay-conflict' });
+    expect(result.detail.lost).toContainEqual(expect.objectContaining({ ref: 'lane/moving', sha: tip, reason: 'conflict' }));
+    expect(result.alerts.find(a => a.kind === 'established-overlay-hold')?.detail.refs).toContain('lane/moving');
+    expect(result.alerts.map(a => a.kind)).not.toContain('overlay-pinned');
+    expect(f.pinnedLogs()).toEqual([]);
+    expect(f.smoke).not.toHaveBeenCalled();
+    expect(f.head()).toBe(live);
+    expect(readRebuildState(f.clone, f.env).held).toMatchObject({ reason: 'established-overlay-conflict', lastGood: live });
+    expect(readFileSync(join(f.clone, 'moving.txt'), 'utf8')).toBe('v1\n');
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(registered);
+  }, 60_000);
+
   it('logs one overlay-pinned alert over three unchanged ticks for __proto__', async () => {
     const f = fixture();
     removeOverlay(f.clone, 'lane/moving', { env: f.env });

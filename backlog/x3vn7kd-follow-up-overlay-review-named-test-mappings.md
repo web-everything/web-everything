@@ -3,7 +3,7 @@ kind: story
 size: 2
 parent: "4075"
 status: open
-scope: ["we:backlog/6926-prevention-cache-persistent-overlay-pin-retry-outcomes-by-co.md", "we:backlog/6927-prevention-authenticate-conflict-overrides-through-a-trusted.md", "we:backlog/6928-prevention-map-overlay-audit-guards-to-named-regression-test.md", "we:scripts/lib/__tests__/daemon-rebuild-overlay-pin.test.mjs", "we:scripts/lib/__tests__/daemon-rebuild-retry-pass.test.mjs"]
+scope: ["we:backlog/6926-prevention-cache-persistent-overlay-pin-retry-outcomes-by-co.md", "we:backlog/6927-prevention-authenticate-conflict-overrides-through-a-trusted.md", "we:backlog/6928-prevention-map-overlay-audit-guards-to-named-regression-test.md", "we:scripts/lib/__tests__/daemon-rebuild-overlay-pin.test.mjs", "we:scripts/lib/__tests__/daemon-rebuild-retry-pass.test.mjs", "we:scripts/lib/__tests__/overlay-review-test-mappings.test.mjs"]
 dateOpened: "2026-10-22"
 tags: []
 ---
@@ -17,7 +17,22 @@ File the seven later-round advisory suggestions from PR #5809's 2026-10-22 revie
 - [A1] **Executable** — Amend card 6926 A1–A3 to map each guarantee to concrete planned test names in `we:scripts/lib/__tests__/daemon-rebuild-retry-pass.test.mjs`: cache reuse, input invalidation, exhaustive-search and budget parity, corrupt/incompatible-state recovery, size bounds and writer lifecycle. Add a check that rejects a fixture card missing one required mapping and accepts the fully mapped fixture.
 - [A2] Amend card 6927 A1–A3 with concrete planned names and repository-qualified test files for attacker allowlist/PATH, trusted-reader isolation, shared operator sessions, add/load refusal, extend-rounds reuse, unreadable credentials and recorded verified identity. Exercise both incomplete and complete mapping fixtures in that check.
 - [A3] Amend card 6928 A1–A3 with repository-qualified named tests for the coverage check itself: missing mappings, valid mappings, stale/renamed test references, fallback enumeration and behavioral-versus-revert-red evidence classification. Exercise incomplete and complete fixtures.
-- [A4] Add `refuses to pin when the adopted head also conflicts` to `we:scripts/lib/__tests__/daemon-rebuild-overlay-pin.test.mjs`. Establish an adopted overlay, make both its moving tip and adopted head conflict with the new stack, and assert no pin is applied and the established-overlay hold remains. Record pre-fix/mutation evidence through the sanctioned runner without weakening guards by hand.
+
+### Planned acceptance tests for A1–A3
+
+These are planned checker tests, not claims of existing passing coverage. Implement them in `we:scripts/lib/__tests__/overlay-review-test-mappings.test.mjs` as part of this follow-up:
+
+| Acceptance | Named cases | Explicit assertions |
+| --- | --- | --- |
+| A1 | `rejects each missing cache guarantee mapping in card 6926`; `accepts the complete cache guarantee mapping in card 6926` | Parameterize removal of cache reuse, input invalidation, exhaustive-search parity, budget parity, corrupt-state recovery, incompatible-state recovery, size bounds and writer lifecycle mappings. Each incomplete fixture fails with the omitted guarantee identified; the complete fixture passes with no missing mappings. |
+| A2 | `rejects each missing credential guarantee mapping in card 6927`; `accepts the complete credential guarantee mapping in card 6927` | Remove attacker allowlist, attacker PATH, trusted-reader isolation, shared operator sessions, add refusal, load refusal, extend-rounds reuse, unreadable credentials and recorded verified identity mappings one at a time. Each incomplete fixture fails with the omitted guarantee identified; the complete fixture passes. A mapping without a repository-qualified test file or concrete case name fails. |
+| A3 | `rejects each missing coverage-check guarantee mapping in card 6928`; `accepts the complete coverage-check guarantee mapping in card 6928` | Remove missing-mapping rejection, valid-mapping acceptance, stale references, renamed references, fallback enumeration and behavioral-versus-revert-red classification mappings one at a time. Each incomplete fixture fails with the omitted guarantee identified; the complete fixture passes with no diagnostics. |
+
+Apply the acceptance mapping gate tracked by `we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md` to newly filed follow-up cards too, including this one. Until that gate exists, review each refusal conjunct and ask which named test would fail if it were removed (coverage rule tracked by card 6928).
+
+### Adopted-head regression
+
+- [A4] `refuses to pin when the adopted head also conflicts` is now implemented in `we:scripts/lib/__tests__/daemon-rebuild-overlay-pin.test.mjs`: it establishes an adopted overlay, makes both its moving tip and adopted head conflict with the new stack, and asserts no pin alert, no smoke, unchanged HEAD/registration and an established-overlay hold. Execution and sanctioned mutation evidence remain owed to the launcher; the repair sandbox forbids all `.git` writes, including those needed by the real-git fixtures. Do not weaken guards by hand to obtain proof.
 
 ## Non-goals
 

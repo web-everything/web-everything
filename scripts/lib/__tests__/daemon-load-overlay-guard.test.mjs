@@ -13,9 +13,13 @@ import { runDaemonLoadOverlay } from '../daemon-load-overlay.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { rebuildClone, dryRunRebuild, previewOverlayConflict } from '../daemon-rebuild.mjs';
 import { stackAwareOverlayCheck } from '../../daemon-overlay.mjs';
+import * as planner from '../daemon-rebuild/plan.mjs';
 
 const temps = [];
-afterEach(() => { while (temps.length) rmSync(temps.pop(), { recursive: true, force: true }); });
+afterEach(() => {
+  vi.restoreAllMocks();
+  while (temps.length) rmSync(temps.pop(), { recursive: true, force: true });
+});
 const mktemp = (p) => { const d = mkdtempSync(join(tmpdir(), p)); temps.push(d); return d; };
 const gitOk = (cwd, args) => {
   const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', timeout: 20_000 });
@@ -64,6 +68,38 @@ function fixture() {
 }
 
 describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before registering', () => {
+  it.each([
+    { name: 'planner is not ok', ok: false, establishedLost: [] },
+    { name: 'establishedLost is non-empty', ok: true, establishedLost: [{ ref: 'lane/fix-procedure', reason: 'conflict' }] },
+  ])('refuses full-plan admission when $name even with the candidate applied unpinned', async ({ ok, establishedLost }) => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+    const ref = 'lane/promote-stale-green';
+    const sha = gitOk(f.clone, ['rev-parse', `origin/${ref}`]).trim();
+    const registered = readOverlays(f.clone, { env: f.env });
+    const realPlan = planner.planRebuild;
+    let fullPlanCalls = 0;
+    // Keep the actual step-3 merge conflict and registration path. At the full-plan boundary, isolate
+    // each refusal conjunct: the candidate IS applied at its current tip, and only this condition fails.
+    const plan = vi.spyOn(planner, 'planRebuild').mockImplementation(async (options) => {
+      if (!options.overlays.some(o => o.ref === ref)) return realPlan(options);
+      fullPlanCalls++;
+      expect(options.overlays.map(o => o.ref)).toEqual(['lane/fix-procedure', ref]);
+      return {
+        ok, reason: ok ? undefined : 'pinned-overlay-conflict',
+        applied: [{ ref, sha }], establishedLost,
+      };
+    });
+
+    const result = await f.load({ ref, pr: null });
+    expect(fullPlanCalls).toBe(1); // proves this reached the full-plan admission gate
+    expect(plan).toHaveBeenCalledTimes(2); // existing stack, then candidate-inclusive plan
+    expect(result).toMatchObject({ registered: false, refused: true, reason: 'conflict' });
+    expect(result.conflictCheck).toMatchObject({ ok: true, clean: false, files: ['shared.mjs'] });
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(registered);
+    expect(f.rebuild).not.toHaveBeenCalled();
+  });
+
   it('refuses re-registering a carried ref whose conflicting tip is only applied as a pin without an operator override', async () => {
     const f = fixture();
     Object.assign(f.env, {
