@@ -10,13 +10,14 @@ import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
-import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
+import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
+  referralRecordState, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { parseReviewedSha } from '../lib/review-escalation.mjs';
-import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
@@ -388,7 +389,10 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '')
     + (retryAt !== null ? `; the next automatic re-run is due at ${new Date(retryAt).toISOString()}` : '');
-  return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count,
+  // stale-hold-resume — every attempt since the wake, finished or not: the resume-once bound must count a review that
+  // died before `advise` too, or a failing review would be resumed every tick.
+  const attemptsSinceWake = history.filter(r => Number.isFinite(r.startedAt) && r.startedAt >= wake).length;
+  return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count, attemptsSinceWake,
     why, retryAt, persistenceFailed: false, exhausted: false,
     ...(noVerdict ? { noVerdict: { exhausted: noVerdictExhausted, releasesSpent: Math.max(0, Math.min(spent, releases)),
       releases, source: retry?.source ?? 'standard' } } : {}) };
@@ -406,6 +410,177 @@ export function blockRuledReferralsFor(pr, { repo, cardReadable = ref => referra
     if (live.pending.length || !live.blockedFindings?.length) return [];
     return live.blockedFindings.map(b => ({ key: b.key, findingId: b.findingId ?? null, finding: b.finding }));
   } catch { return []; }
+}
+
+/** The daemon's log prefix for a pause it resolved on its own (stale-hold-resume). */
+export const REFERRAL_HOLD_AUTO_RESOLVED = 'referral-hold auto-resolved';
+
+/**
+ * `referralHoldAutoResolve` — the stale-hold-resume policy, resolved standard → platform → tool → env with
+ * policy-cascade source logging (operator rule 2026-10-21: every policy is a setting, logged with value and source).
+ * - `enabled` (standard true): false is the kill switch back to today's pause, byte-identical (no answer at all).
+ *   Env `WE_REFERRAL_HOLD_AUTO_RESOLVE=0|1`.
+ * - `onBlock` (standard `send-back`): a live-head block sends the PR back to the fixer; `pause` keeps the pause.
+ *   Env `WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_BLOCK`.
+ * - `onClean` (standard `resume`): all card / not-real resumes the PR to its next step; `pause` keeps the pause.
+ *   Env `WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_CLEAN`.
+ * Anything invalid in a layer is ignored (the layer below applies).
+ */
+export const REFERRAL_HOLD_AUTO_RESOLVE_STANDARD = Object.freeze({ enabled: true, onBlock: 'send-back', onClean: 'resume' });
+export const REFERRAL_HOLD_AUTO_RESOLVE_TOOL_FILE = resolve(dirname(fileURLToPath(import.meta.url)), '../settings/referral-hold-auto-resolve.json');
+const AUTO_RESOLVE_VALID = Object.freeze({
+  enabled: v => typeof v === 'boolean',
+  onBlock: v => v === 'send-back' || v === 'pause',
+  onClean: v => v === 'resume' || v === 'pause',
+});
+export function resolveReferralHoldAutoResolve(env = process.env, { tool, log } = {}) {
+  const standard = { value: { ...REFERRAL_HOLD_AUTO_RESOLVE_STANDARD },
+    sources: { enabled: 'standard', onBlock: 'standard', onClean: 'standard' } };
+  try {
+    let block = tool;
+    if (block === undefined) {
+      try { block = JSON.parse(readFileSync(REFERRAL_HOLD_AUTO_RESOLVE_TOOL_FILE, 'utf8'))?.referralHoldAutoResolve; } catch { block = undefined; }
+    }
+    const raw = name => { const v = env?.[name]; return v == null || String(v).trim() === '' ? undefined : String(v).trim(); };
+    const enabledRaw = raw('WE_REFERRAL_HOLD_AUTO_RESOLVE');
+    // Only valid scalar leaves enter the cascade: a malformed value (an object, a typo) in one layer is dropped there,
+    // so the layer below still decides — and the cascade log names exactly what decided.
+    const clean = layer => {
+      if (!layer || typeof layer !== 'object' || Array.isArray(layer)) return undefined;
+      const out = {};
+      for (const k of Object.keys(AUTO_RESOLVE_VALID)) if (AUTO_RESOLVE_VALID[k](layer[k])) out[k] = layer[k];
+      return Object.keys(out).length ? out : undefined;
+    };
+    let platform;
+    try { platform = platformPreference('referralHoldAutoResolve', { env: env ?? {} }); } catch { platform = undefined; }
+    const r = cascadePolicy('referralHoldAutoResolve', clean(block), { platform: clean(platform) ?? {},
+      env: env ?? {}, standard: REFERRAL_HOLD_AUTO_RESOLVE_STANDARD, valid: AUTO_RESOLVE_VALID, ...(log ? { log } : {}),
+      envValues: { enabled: enabledRaw === '0' ? false : enabledRaw === '1' ? true : enabledRaw,
+        onBlock: raw('WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_BLOCK'), onClean: raw('WE_REFERRAL_HOLD_AUTO_RESOLVE_ON_CLEAN') },
+    });
+    const value = {};
+    const sources = {};
+    for (const k of Object.keys(AUTO_RESOLVE_VALID)) {
+      const ok = AUTO_RESOLVE_VALID[k](r.value?.[k]);
+      value[k] = ok ? r.value[k] : REFERRAL_HOLD_AUTO_RESOLVE_STANDARD[k];
+      sources[k] = ok ? r.sources?.[k] ?? 'standard' : 'standard';
+    }
+    return { value, sources };
+  } catch { return standard; }
+}
+const findingLoc = f => `${f?.file ?? 'no file'}${Number.isInteger(f?.line) ? `:${f.line}` : ''}`;
+
+/**
+ * stale-hold-resume (live 2026-10-21, #5773/#5775/#5800) — a PR paused on its live head whose every referral finding
+ * already carries a ruling owes no ruling, yet nothing woke it: the review ran AFTER the rulings, so no ruling or push
+ * was coming, and the same-head pause asked for "an explicit re-arm" forever. This decides, from the thread alone,
+ * what the pause should become. PURE.
+ *
+ * A finding counts as ruled only when the gate itself reads a ruling for it on the LIVE head's own record
+ * (`referralRecordState`: the record's counted ruling, the operator's ruling pinned to this head, or a carry the gate
+ * backs). A ruling that exists only in the verdict ledger (a ledger-write-miss leaves exactly that) or only on an
+ * older head is not readable here, so it never counts. Like the hold's own live release, the read omits the gate's
+ * `seatDisabled` (importing the seat policy closes a cycle): an unruled finding of a since-disabled seat keeps the
+ * pause, the conservative side. Outcomes:
+ * - `send-back`: some live-head finding is ruled `block` (operator or policy or reviewer) and none is pending.
+ * - `resume`: every live-head finding is ruled `card` or `not-real`.
+ * - `stay` (fail closed, with `why`): anything unreadable, pending, missing, malformed, or not on the live head.
+ * Never accepts and never touches `review:human`: the caller acts on the outcome.
+ * @returns {null | {outcome:'send-back'|'resume'|'stay', head:string|null, why:string,
+ *   findings?:Array<object>, blocked?:Array<object>, counts?:Record<string, number>}}
+ */
+export function decideReferralHoldAutoResolve(pr, hold, { repo,
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT), env = process.env,
+  settings = resolveReferralHoldAutoResolve(env) } = {}) {
+  if (!hold || settings?.value?.enabled === false) return null;
+  const policy = settings?.value ?? REFERRAL_HOLD_AUTO_RESOLVE_STANDARD;
+  const source = k => settings?.sources?.[k] ?? 'standard';
+  const head = sha(pr?.headRefOid) ? pr.headRefOid : null;
+  const stay = why => ({ outcome: 'stay', head, why });
+  if (!head || hold.head !== head) return stay('the pause is not on the live head');
+  if (hold.persistenceFailed) return stay('the referral save failed on this head; its own retry budget owns the pause');
+  if (hold.noVerdict) return stay('no verdict ever landed on this head; the no-verdict retries own the pause');
+  if (hold.cause) return stay(`the verdict ledger cannot answer for this PR (${hold.cause})`);
+  let live;
+  try { live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable }); }
+  catch (e) { return stay(`the referral state is unreadable (${String(e?.message ?? e).split('\n')[0]})`); }
+  if (live.malformed) return stay('a referral record or operator ruling on the thread is malformed');
+  if (live.pending.length) {
+    const named = live.pendingFindings.map(findingLoc);
+    return stay(`${named.length || live.pending.length} finding(s) still have no readable ruling`
+      + (named.length ? ` (${named.join(', ')})` : ` (${live.pendingReasons.join(', ')})`));
+  }
+  const records = live.records.filter(r => r.head === head && r.repo === repo && r.pr === Number(pr.number));
+  if (!records.length) return stay('no referral record names the live head');
+  const findings = [];
+  for (const record of records) {
+    const state = referralRecordState(record, { repo, pr: Number(pr.number), head, body: typeof pr.body === 'string' ? pr.body : '',
+      createdAt: pr.createdAt, cardReadable, records: live.records, operatorRulings: live.operatorRulings });
+    if (state.pending.length) return stay(`the live-head record ${record.runId} still holds ${state.pending.length} finding(s) pending`);
+    // THE GATE DECIDES. `referralRecordState` (the acceptance gate's own reader) has already settled every active
+    // referral of this live-head record: pending (returned above), blocked, or cleared by a ruling it counted (the
+    // record's own, the operator's pinned to this head, a carry it backed, or a backed supersession). Its flattened
+    // `rulings` list cannot be mapped back to findings (a carry backing is keyed by its SOURCE finding, which can
+    // collide with a live finding), so it is read only to NAME the kind and who ruled; it never decides.
+    const blockedKeys = new Set(state.blocked);
+    for (const f of activeReferrals(record)) {
+      const where = { file: f.finding?.file ?? null, line: Number.isInteger(f.finding?.line) ? f.finding.line : null };
+      const own = state.rulings.filter(r => r.key === f.key);
+      const carry = (record.carried ?? []).find(c => c.key === f.key);
+      const named = blockedKeys.has(f.key)
+        ? own.filter(r => r.result === 'block').at(-1) ?? { result: 'block' }
+        : own.filter(r => r.result === 'card' || r.result === 'not-real').at(-1)
+          ?? (carry && (carry.result === 'card' || carry.result === 'not-real') ? { result: carry.result, carried: true } : null)
+          ?? ((record.superseded ?? []).some(x => x.key === f.key) ? { result: 'not-real', superseded: true } : null)
+          ?? { result: 'cleared' };
+      findings.push({ runId: record.runId, key: f.key, seat: f.seat ?? null, ...where,
+        summary: String(f.finding?.summary ?? '').replace(/\s+/g, ' ').trim(), result: blockedKeys.has(f.key) ? 'block' : named.result,
+        actor: named.operator ? named.actor : 'reviewer', rationale: named.rationale ?? named.reason ?? '' });
+    }
+  }
+  if (!findings.length) return stay('the live-head records name no active referral');
+  const counts = {};
+  for (const f of findings) counts[f.result] = (counts[f.result] ?? 0) + 1;
+  const blocked = findings.filter(f => f.result === 'block');
+  const tally = Object.entries(counts).map(([k, n]) => `${n} ${k}`).join(', ');
+  if (blocked.length) {
+    if (policy.onBlock !== 'send-back') return { ...stay(`every finding is ruled (${tally}), but referralHoldAutoResolve.onBlock=${policy.onBlock} (source: ${source('onBlock')}) keeps the pause`), counts };
+    return { outcome: 'send-back', head, findings, blocked, counts, policy: `onBlock=send-back (source: ${source('onBlock')})`,
+      why: `every referral finding on head ${head.slice(0, 9)} is ruled (${tally}); ${blocked.length} block ruling(s) owe a fix` };
+  }
+  if (policy.onClean !== 'resume') return { ...stay(`every finding is ruled (${tally}), but referralHoldAutoResolve.onClean=${policy.onClean} (source: ${source('onClean')}) keeps the pause`), counts };
+  return { outcome: 'resume', head, findings, counts, policy: `onClean=resume (source: ${source('onClean')})`,
+    why: `every referral finding on head ${head.slice(0, 9)} is ruled (${tally}); no ruling is owed` };
+}
+
+/** The send-back body for {@link decideReferralHoldAutoResolve}'s `send-back`: the same words a block ruling's own
+ *  follow-up posts (`record-referral-ruling.mjs#planRulingFollowUp`), naming every blocked finding. PURE. */
+export function referralHoldSendBackBody({ head, blocked }) {
+  // Escape HTML text rather than recognizing individual comment delimiters (including alternate endings).
+  const prose = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\s+/g, ' ').trim();
+  const actor = b => String(b.actor).toLowerCase();
+  const byPolicy = blocked.every(b => actor(b) === AUTO_POLICY_ACTOR);
+  const byOperator = blocked.every(b => actor(b) !== AUTO_POLICY_ACTOR && actor(b) !== 'reviewer');
+  return `### Blocked referral findings (${byPolicy ? 'automatic policy ruling' : byOperator ? 'operator ruling' : 'standing block ruling'})\n\n`
+    + `${byPolicy ? 'Policy (review.referralDefault=auto-block) ruled' : byOperator ? 'The operator ruled' : 'The standing rulings on this head rule'} these mandatory-referral findings \`block\` on head \`${head}\`. Fix each one, then push.\n\n`
+    + blocked.map((o, i) => `${i + 1}. \`${findingLoc(o)}\` (${o.seat ?? 'reviewer'}) — ${prose(o.summary)}`
+      + (prose(o.rationale) ? `\n   Rationale: ${prose(o.rationale)}` : '')).join('\n');
+}
+
+/** Attach {@link decideReferralHoldAutoResolve}'s answer to every PR still paused after every hold enrichment (the
+ *  ledger step can replace the pause, so this runs last). Never throws: a failure is a `stay`. */
+export function enrichPrsWithReferralHoldAutoResolve(prs, { repo, env = process.env, decide = decideReferralHoldAutoResolve,
+  settings } = {}) {
+  if (!Array.isArray(prs)) return prs;
+  // Resolved once per pass (the cascade logs its value and source once per process).
+  if (!settings && prs.some(pr => pr?.referralHold)) settings = resolveReferralHoldAutoResolve(env);
+  return prs.map(pr => {
+    if (!pr?.referralHold) return pr;
+    let auto;
+    try { auto = decide(pr, pr.referralHold, { repo, env, ...(settings ? { settings } : {}) }); }
+    catch (e) { auto = { outcome: 'stay', head: pr.headRefOid ?? null, why: `auto-resolve failed (${String(e?.message ?? e).split('\n')[0]})` }; }
+    return auto ? { ...pr, referralHoldAutoResolve: auto } : pr;
+  });
 }
 
 function defaultReadComments({ repo, number }) {
