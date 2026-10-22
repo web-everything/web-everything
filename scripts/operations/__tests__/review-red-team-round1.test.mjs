@@ -257,8 +257,10 @@ describe('citedLinesFingerprint + suppressPreviouslyRuled', () => {
     const g = (index, o = {}) => ({ index, file: 'x.mjs', category: 'edge-case', impact: 'broken', summary: `zero divisor crashes parse ${index}`, ...o });
     // The audit probe: two breaks differing by one identifier are NOT the same break.
     expect(sameBreak(g(1, { summary: 'parse crashes when src is nil' }), g(1, { summary: 'parse crashes when dst is nil' }))).toBe(false);
-    expect(sameBreak(g(1, { summary: 'Parse crashes when src is nil.' }), g(1, { summary: 'parse crashes, when src is nil' }))).toBe(true);
-    expect(sameBreak(g(1, { summary: 'a', scenario: 'f(0)' }), g(1, { summary: 'b', scenario: 'F(0)' }))).toBe(true);
+    expect(sameBreak(g(1, { summary: 'fails when n < 0' }), g(1, { summary: 'fails when n > 0' }))).toBe(false);
+    expect(sameBreak(g(1, { summary: 'x', scenario: 'parse(-1)' }), g(1, { summary: 'y', scenario: 'parse(1)' }))).toBe(false);
+    expect(sameBreak(g(1, { summary: 'parse  crashes when\nsrc is nil ' }), g(1, { summary: 'parse crashes when src is nil' }))).toBe(true);
+    expect(sameBreak(g(1, { summary: 'a', scenario: 'f(0)' }), g(1, { summary: 'b', scenario: 'f(0)' }))).toBe(true);
     const plan = { sendBack: [g(1), g(2), g(4, { impact: 'broken', summary: 'unrelated null deref' })], card: [g(3, { impact: 'degraded' })], advisory: [] };
     const ruled = [{ rev: H1, fingerprint: 'fp1', finding: g(1) }, { rev: H1, fingerprint: 'fp3', finding: g(3, { impact: 'degraded' }) },
       { rev: H1, fingerprint: 'fp4', finding: g(4, { impact: 'degraded', summary: 'formatting nit' }) }];
@@ -302,7 +304,7 @@ describe('the red-team gate under round1', () => {
     const comments = earlier();
     expect(ruledEarlierBreaks({ comments, pr: 4722, head: H2, setting: CONFIRMED_BREAKS_DEFAULTS }).map((x) => [x.rev, x.finding.summary])).toEqual([[H1, 'carded on H1']]);
     // H2 moved the file down one line and the red team re-raised both breaks at their moved lines.
-    comments.push(rtComment(H2, [F({ impactIfUnfixed: 'degraded', line: 10, summary: 'Carded on H1.' }), F({ line: 11, summary: 'sent back on H1' })], '2026-10-21T20:30:00Z'));
+    comments.push(rtComment(H2, [F({ impactIfUnfixed: 'degraded', line: 10, summary: 'carded on H1' }), F({ line: 11, summary: 'sent back on H1' })], '2026-10-21T20:30:00Z'));
     const files = { [`${H1}:scripts/x.mjs`]: FILE, [`${H2}:scripts/x.mjs`]: `moved\n${FILE}` };
     const { io, calls } = gateIo({ comments, files });
     const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);

@@ -119,9 +119,10 @@ export function citedLinesFingerprint({ file, line, text }) {
   return createHash('sha256').update(JSON.stringify([file, line - 1 - start, excerpt])).digest('hex');
 }
 
-/** A summary or scenario normalised for an EXACT comparison: lower case, runs of non-alphanumerics folded to one space. PURE. */
+/** A summary or scenario normalised for an EXACT comparison: whitespace runs folded and the ends trimmed, nothing
+ *  else — case, signs, operators and punctuation all stay significant (`n < 0` vs `n > 0`, `parse(-1)` vs `parse(1)`). PURE. */
 function norm(s) {
-  return String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  return String(s ?? '').replace(/\s+/g, ' ').trim();
 }
 
 /**
