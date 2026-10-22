@@ -87,6 +87,12 @@ describe('resolveGhCredentialEnv — daemon markers × shim PATH position (card 
     const out = resolveGhCredentialEnv({ env: { PATH: '/usr/bin' }, build: writeFailed, exists: () => true, orgShimDir: () => ORG });
     expect(out.PATH.split(':')[0]).toBe(ORG);
   });
+  it('interactive: an org-aware shim already first stays first, ahead of a legacy shim later on PATH', () => {
+    for (const PATH of [`${ORG}:/usr/bin:${LEGACY}`, `${ORG}:/usr/bin`]) {
+      const out = resolveGhCredentialEnv({ env: { PATH }, build: () => null, exists: () => true, orgShimDir: () => ORG });
+      expect(out.PATH).toBe(PATH);
+    }
+  });
   for (const [where, PATH] of [['absent', '/usr/bin:/bin'], ['later', `/usr/bin:${LEGACY}:/bin`], ['first', `${LEGACY}:/usr/bin:/bin`]]) {
     it(`interactive, legacy shim ${where} on PATH: the legacy shim ends up first, once`, () => {
       const out = resolveGhCredentialEnv({ env: { PATH }, build: writeFailed, exists: () => true, orgShimDir: () => null });

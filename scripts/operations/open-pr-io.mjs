@@ -59,7 +59,10 @@ export function resolveGhCredentialEnv({ env = process.env, exists = existsSync,
   // xpd70wx — the target repo may live in ANY constellation org (plateauapp, frontier-ui, web-everything). The
   // legacy shared shim has no owner map and cannot see plateauapp, so prefer the daemons' org-aware shim.
   try {
-    const orgPath = pathWithOrgAwareShim({ pathEnv: env.PATH || '', orgDir: orgShimDir() });
+    const orgDir = orgShimDir();
+    // Already first: keep it there — the legacy branch below must never push it out of first place.
+    if (orgDir && (env.PATH || '').split(':')[0] === orgDir) return env;
+    const orgPath = pathWithOrgAwareShim({ pathEnv: env.PATH || '', orgDir });
     if (orgPath) return { ...env, PATH: orgPath };
   } catch { /* fall through */ }
   const dir = defaultShimDir();
