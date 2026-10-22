@@ -22,6 +22,14 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.attributesFile', '/dev/null'],
   ['core.sshCommand', 'ssh'],
   ['commit.gpgsign', 'false'],
+  // PR #5775 self-review: `log.showSignature` makes every `git log` run `gpg.program` (lane-chosen) on a commit the
+  // agent gave a gpgsig header, and puts signature lines in output callers parse. A `--reference` lane has alternates,
+  // so a lane-set `core.alternateRefsCommand` runs on every fetch; `true` prints no refs (objects still resolve).
+  ['log.showSignature', 'false'],
+  ['gpg.program', 'gpg'],
+  ['gpg.ssh.program', 'ssh-keygen'],
+  ['gpg.x509.program', 'gpgsm'],
+  ['core.alternateRefsCommand', 'true'],
 ]);
 
 /** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line. */
@@ -34,7 +42,9 @@ export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => 
  * @returns {Record<string,string|undefined>}
  */
 export function laneGitHardeningEnv(env = process.env) {
-  const out = { ...env };
+  // No lazy fetch: a lane declaring itself a partial clone of a promisor remote would fetch a missing object through
+  // its own `remote.<name>.uploadpack` on a plain `show` / `diff` / `cat-file` (PR #5775 self-review).
+  const out = { ...env, GIT_NO_LAZY_FETCH: '1' };
   delete out.GIT_EXTERNAL_DIFF;
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
