@@ -36,6 +36,7 @@ export default {
       { dryRun: true, hostileRemote: 'worktree-rewrite' },
       { dryRun: true, live: true, hostileRemote: 'origin' },
       { dryRun: true, live: true, hostileRemote: 'rewrite' },
+      { dryRun: true, live: true, missingOrigin: true },
     ]) {
       const report = await runReclaimCase(root, options);
       violations.push(...report.violations.map((message) => `reclaim ${JSON.stringify(options)}: ${message}`));
@@ -49,7 +50,7 @@ export function runReclaimCase(root = REPO_ROOT, options = {}) {
   return runAliasCase(root, options.alias ?? 'none', { ...options, command: 'reclaim' });
 }
 
-async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit', change = 'moved', containment = 'exact', dryRun = false, live = false, race = false, hostileRemote = null } = {}) {
+async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit', change = 'moved', containment = 'exact', dryRun = false, live = false, race = false, hostileRemote = null, missingOrigin = false } = {}) {
     const base = mkdtempSync(join(tmpdir(), 'soak-symbolic-ops-'));
     const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     try {
@@ -68,8 +69,9 @@ async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit',
         writeFileSync(join(bin, name), source);
         chmodSync(join(bin, name), 0o755);
       }
-      const cli = (args) => spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), ...args,
-        `--origin=${origin}`, `--reference=${reference}`, '--name=symbolic-ops', '--branch=trunk', '--no-install'], {
+      const cli = (args, canonicalOrigin = true) => spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), ...args,
+        ...(canonicalOrigin ? [`--origin=${origin}`] : ['--pool=symbolic-ops']),
+        `--reference=${reference}`, '--name=symbolic-ops', '--branch=trunk', '--no-install'], {
         encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: pool, PATH: `${bin}:${process.env.PATH}`, WE_LANE_SALVAGE_QUIET_MIN: '0' }, timeout: 30000, maxBuffer: 1024 * 1024,
       });
       const provision = cli(['provision', '--count=1']);
@@ -141,10 +143,19 @@ process.exit(result.status ?? 1);
 `);
           chmodSync(join(bin, 'git'), 0o755);
         }
+        const violations = [];
+        if (missingOrigin) {
+          // An existing lane has an origin, but that agent-owned URL cannot supply the pool's trust anchor.
+          git(['remote', 'remove', 'origin'], reference);
+          const refused = cli(['reclaim', '--lane=1', '--dry-run', '--json'], false);
+          if (refused.status === 0 || !/canonical origin.*--origin=/.test(refused.stderr)) {
+            violations.push('origin-less pool did not report the actionable startup invariant');
+          }
+        }
+        // Supplying the canonical origin must recover even when the reference has no origin.
         const reclaim = cli(['reclaim', '--lane=1', '--json', ...(dryRun ? ['--dry-run'] : [])]);
         if (reclaim.status !== 0) throw Error(`fixture reclaim failed: ${reclaim.stderr}`);
         const report = JSON.parse(reclaim.stdout);
-        const violations = [];
         if (existsSync(helperMarker)) violations.push('reclaim dry-run executed a lane-controlled remote helper');
         if (live) {
           if (!(dryRun ? report.wouldReclaim : report.reclaimed)) violations.push('live non-ops proof no longer permits reclaim');

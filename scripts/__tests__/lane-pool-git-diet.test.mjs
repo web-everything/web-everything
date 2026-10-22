@@ -10,9 +10,42 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync,
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runReclaimCase } from '../conveyor/soak/breaks/lane-reset-symbolic-ops-proof.mjs';
-import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, laneGitConfigArgs } from '../lib/lane-git-hardening.mjs';
 
-it.each(['https://example.com/pool.git', '/canonical/pool.git', 'file:///canonical/pool.git', './canonical/pool.git'])(
+// These regressions exercise production functions without invoking the CLI or writing .git.
+const repoSource = /function resolveRepo\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
+function resolvePool(command, extra = {}) {
+  return new Function('flags', 'cmd', 'resolve', 'expandHome', 'CWD_TOP_LEVEL', 'CHECKOUT_ROOT',
+    'tryGit', 'LOCAL_GIT_TIMEOUT_MS', 'fail', 'basename', 'join', 'POOL_ROOT',
+    `${repoSource}; return resolveRepo();`)(
+    { pool: 'existing', reference: '/reference', ...extra }, command, resolve, p => p,
+    null, '/reference', () => null, 1000, message => { throw Error(message); },
+    p => p.split('/').at(-1), join, '/pool',
+  );
+}
+it.each(['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim', 'list'])(
+  'read-only regression: %s rejects a missing canonical origin before probing an existing pool', command => {
+    const flags = command === 'list' ? { acquirable: true } : {};
+    expect(() => resolvePool(command, flags)).toThrow(/canonical origin.*--origin=/);
+    expect(resolvePool(command, { ...flags, origin: '/canonical/origin.git' }).originUrl).toBe('/canonical/origin.git');
+  },
+);
+it.each(['status', 'list', 'path', 'release', 'keep', 'map', 'unmap', 'gc'])(
+  'read-only regression: metadata-only %s retains explicit-pool support without origin', command => {
+    expect(resolvePool(command)).toMatchObject({ originUrl: null, poolDir: '/pool/existing' });
+  },
+);
+it('read-only regression: ordinary hardened callers retain their transport policy', () => {
+  const inherited = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'always' };
+  const env = laneGitHardeningEnv(inherited);
+  const config = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+    [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+  expect(Object.keys(config).filter(k => k.startsWith('protocol.'))).toEqual(['protocol.file.allow']);
+  expect(laneGitConfigArgs().some(arg => arg.startsWith('protocol.'))).toBe(false);
+});
+
+it.each(['https://example.com/pool.git', 'ssh://example.com/pool.git', 'git@example.com:pool.git',
+  '/canonical/pool.git', 'file:///canonical/pool.git', './canonical/pool.git'])(
   'remote probe isolates lane config and uses the canonical pool URL %s', (originUrl) => {
   const source = /function liveRemoteShasProbe\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
   const calls = [], removed = [];
@@ -22,7 +55,10 @@ it.each(['https://example.com/pool.git', '/canonical/pool.git', 'file:///canonic
     `${source}; return liveRemoteShasProbe;`)(
     (...args) => { calls.push(args); return 'abc refs/heads/trunk'; },
     () => '/isolated/probe', () => '/isolated', join, () => '/isolated',
-    (dir) => removed.push(dir), laneGitHardeningEnv, { env: inherited }, resolve,
+    (dir) => removed.push(dir), laneGitHardeningEnv, { env: { ...inherited,
+      GIT_ALLOW_PROTOCOL: 'ext:file:http', GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'always',
+    } }, resolve,
   );
   const repo = { originUrl };
   expect([...probe(repo).shas]).toEqual(['abc']);
@@ -33,7 +69,12 @@ it.each(['https://example.com/pool.git', '/canonical/pool.git', 'file:///canonic
   for (const key of Object.keys(inherited)) expect(options.env[key]).toBeUndefined();
   const config = Object.fromEntries(Array.from({ length: Number(options.env.GIT_CONFIG_COUNT) }, (_, i) =>
     [options.env[`GIT_CONFIG_KEY_${i}`], options.env[`GIT_CONFIG_VALUE_${i}`]]));
-  expect(config['protocol.file.allow']).toBe(originUrl.startsWith('https:') ? undefined : 'always');
+  const localOrigin = originUrl.startsWith('/') || originUrl.startsWith('.') || originUrl.startsWith('file:');
+  expect(config['protocol.file.allow']).toBe(localOrigin ? 'always' : undefined);
+  expect(config['protocol.allow']).toBe('never');
+  expect(config['protocol.https.allow']).toBe('always');
+  expect(config['protocol.ssh.allow']).toBe('always');
+  expect(options.env.GIT_ALLOW_PROTOCOL).toBe(localOrigin ? 'https:ssh:file' : 'https:ssh');
   expect(options.timeout).toBe(20000);
   expect(removed).toEqual(['/isolated/probe']);
 });
@@ -55,7 +96,7 @@ it.each(['missing origin', 'failed Git read', 'failed isolation'])(
 });
 
 it('remote probe protocol pins override inherited permissive defaults', () => {
-  const env = laneGitHardeningEnv({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'always' });
+  const env = laneGitHardeningEnv({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'always' }, { remoteProbe: true });
   const config = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
     [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
   expect(config['protocol.allow']).toBe('never');
@@ -68,6 +109,51 @@ const proofSource = /function localRemoteShas\([^]*?\n\}/.exec(readFileSync(reso
 const defaultFetch = '+refs/heads/*:refs/remotes/origin/*';
 const excludedOps = '^refs/heads/ops/*';
 const reclaimSource = /function laneReclaimPreservationProof\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
+const fileProofSource = /function filePreservedInMain\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-whois.mjs'), 'utf8'))[0];
+function countReclaimProbes({ dirty = 3, commits = 20, tips = 30, liveBase = true, env = {}, unreadable = false } = {}) {
+  const shows = [], contains = [];
+  const fileProof = new Function('tryGit', `${fileProofSource}; return filePreservedInMain;`)(
+    (_dir, args) => { shows.push(args[1]); return null; },
+  );
+  const paths = Array.from({ length: dirty }, (_, i) => `file-${i}`);
+  const proof = new Function('gitStatusSummary', 'aheadCommits', 'aheadCommitsPreserved', 'liveRemoteShas',
+    'tryGit', 'readFileSync', 'join', 'filePreservedInMain', 'process', `${reclaimSource}; return laneReclaimPreservationProof;`)(
+    () => ({ trackedModifiedPaths: paths.slice(0, 1), untrackedPaths: paths.slice(1) }),
+    () => Array.from({ length: commits }, (_, i) => ({ sha: `commit-${i}` })), () => new Map(),
+    () => new Set([...(liveBase ? ['base'] : []), ...Array.from({ length: tips }, (_, i) => `tip-${i}`)]),
+    args => { if (args[0] === 'rev-parse') return 'base'; contains.push(args); return null; },
+    () => { if (unreadable) throw Error('unreadable'); return 'local content'; }, join, fileProof, { env },
+  );
+  const result = proof('/lane', 'trunk', { originUrl: '/canonical' });
+  return { result, contains, shows, fallback: shows.filter(ref => !ref.startsWith('base:')) };
+}
+it('read-only regression: reclaim bounds default fallback probes across all dirty files and commits', () => {
+  const { result, shows, fallback, contains } = countReclaimProbes();
+  expect(result.preserved).toBe(false);
+  expect(contains).toHaveLength(15);
+  expect(shows).toHaveLength(43); // three base reads + forty lane-wide fallbacks
+  expect(fallback.filter(ref => ref.endsWith(':file-0'))).toHaveLength(20);
+  expect(fallback.filter(ref => ref.endsWith(':file-1'))).toHaveLength(20);
+  expect(fallback.filter(ref => ref.endsWith(':file-2'))).toHaveLength(0);
+});
+it.each([true, false])('read-only regression: explicit budgets exhaust across files with live base %s', liveBase => {
+  const { shows, fallback, contains } = countReclaimProbes({ dirty: 4, liveBase, env: {
+    WE_LANE_WHOIS_MAX_REFS: '3', WE_LANE_WHOIS_MAX_FALLBACK_SHOWS: '5', WE_LANE_WHOIS_MAX_CONTAINS_PROBES: '2',
+  } });
+  expect(contains).toHaveLength(2);
+  expect(shows).toHaveLength(liveBase ? 9 : 5);
+  expect(fallback.map(ref => ref.split(':')[1])).toEqual(['file-0', 'file-0', 'file-0', 'file-1', 'file-1']);
+});
+it.each([25, 26])('read-only regression: reclaim skips fallback above 25 dirty files (%s)', dirty => {
+  for (const liveBase of [true, false]) {
+    const { shows, fallback } = countReclaimProbes({ dirty, liveBase, commits: 0 });
+    expect(fallback).toHaveLength(dirty === 25 ? 40 : 0);
+    expect(shows).toHaveLength((liveBase ? dirty : 0) + (dirty === 25 ? 40 : 0));
+  }
+});
+it('read-only regression: failed file reads consume no show probes', () => {
+  expect(countReclaimProbes({ unreadable: true }).shows).toHaveLength(0);
+});
 // Exercise the production proof without invoking the CLI or writing Git metadata. The old
 // whois helpers deliberately report the stale tracking ref as preserved, reproducing the gap.
 it.each(['commit', 'dirty file', 'failed remote read', 'stale base patch'])(
@@ -305,6 +391,7 @@ it.each([
   { dryRun: true, hostileRemote: 'worktree-rewrite' },
   { dryRun: true, live: true, hostileRemote: 'origin' },
   { dryRun: true, live: true, hostileRemote: 'rewrite' },
+  { dryRun: true, live: true, missingOrigin: true },
 ])('refresh then reclaim validates live preservation (%j)', async (options) => {
   const report = await runReclaimCase(resolve('.'), options);
   expect(report.violations).toEqual([]);
