@@ -73,11 +73,11 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
-import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
-import { homedir, hostname } from 'node:os';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { join, basename, resolve, dirname, sep } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
 import { readGit } from './lib/proc-read.mjs';
@@ -1180,17 +1180,42 @@ function effectiveDirtyOrAhead(dir, branch, getRemoteShas) {
  * lanes chasing a headroom that a live probe would never have needed. Any caller that must react differently
  * to "we don't know" than to "we checked and there is genuinely nothing" needs `ok`, not just `shas`.
  */
-function liveRemoteShasProbe(dir, remote = 'origin') {
-  const out = tryGit(['ls-remote', '--heads', remote], dir, { timeout: 20_000 });
-  if (out === null) return { ok: false, shas: new Set() };
-  return { ok: true, shas: new Set(out.split('\n').filter(Boolean).map((l) => l.split(/\s+/)[0]).filter(Boolean)) };
+function liveRemoteShasProbe(repo) {
+  if (!repo.originUrl) return { ok: false, shas: new Set() };
+  // Clone resolves a local path against the invoking cwd. Keep that meaning after isolation;
+  // URLs and scp-style SSH addresses contain a colon before the first slash and stay literal.
+  const remote = /^[^/]*:/.test(repo.originUrl) ? repo.originUrl : resolve(repo.originUrl);
+  let probeDir;
+  try {
+    // No lane config, including worktree config or includes, may affect a live proof. A literal
+    // URL alone is insufficient: url.*.insteadOf can rewrite it to an executable remote helper.
+    probeDir = mkdtempSync(join(tmpdir(), 'lane-remote-probe-'));
+    const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CEILING_DIRECTORIES: dirname(probeDir) });
+    for (const key of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
+      'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS']) delete env[key];
+    // Explicit local pool origins are supported too. Permit file transport only for that canonical
+    // path, in this isolated process; lane protocol settings never participate in this decision.
+    if (remote.startsWith('/') || remote.startsWith('file://')) {
+      const i = Number(env.GIT_CONFIG_COUNT);
+      env[`GIT_CONFIG_KEY_${i}`] = 'protocol.file.allow';
+      env[`GIT_CONFIG_VALUE_${i}`] = 'always';
+      env.GIT_CONFIG_COUNT = String(i + 1);
+    }
+    const out = tryGit(['ls-remote', '--heads', '--', remote], probeDir, { timeout: 20_000, env });
+    if (out === null) return { ok: false, shas: new Set() };
+    return { ok: true, shas: new Set(out.split('\n').filter(Boolean).map((l) => l.split(/\s+/)[0]).filter(Boolean)) };
+  } catch {
+    return { ok: false, shas: new Set() };
+  } finally {
+    if (probeDir) rmSync(probeDir, { recursive: true, force: true });
+  }
 }
 
 /** Live remote tip SHAs (one network call, `timeout` guarded like the adjacent `gh` call — #2920). Returns
  *  an EMPTY set on any failure/timeout, so callers fail closed. Thin wrapper over `liveRemoteShasProbe` —
  *  every caller that only ever needs "what's out there" (never "did the probe itself fail") keeps this. */
-function liveRemoteShas(dir) {
-  return liveRemoteShasProbe(dir).shas;
+function liveRemoteShas(repo) {
+  return liveRemoteShasProbe(repo).shas;
 }
 
 /** #2924 — the LOCAL equivalent of `liveRemoteShas`, network-free. Sound ONLY immediately after a fetch: an
@@ -1365,7 +1390,7 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
       // #4025 — record an outright probe FAILURE on the box itself (never on the returned Set, which stays
       // "no SHAs" either way) so a caller deciding whether to GROW the pool (`cmdProvision`'s `--acquirable`
       // branch) can tell "genuinely nothing pushed" from "we couldn't check" and refuse to grow on the latter.
-      const probe = liveRemoteShasProbe(dir);
+      const probe = liveRemoteShasProbe(repo);
       remoteShasBox.value = probe.shas;
       if (!probe.ok) remoteShasBox.failed = true;
     }
@@ -2386,10 +2411,7 @@ function cmdAcquire(repo) {
         // same process cwd the clone uses) — never from inside an existing lane: a vanished/corrupted `lanes[0]`
         // (#xixn30q) would fail the probe for a purely LOCAL reason and stickily disable growth against a fully
         // reachable origin.
-        const remoteProbeFailed = !(repo.originUrl
-          ? liveRemoteShasProbe(process.cwd(), repo.originUrl)
-          : liveRemoteShasProbe(repo.referencePath)
-        ).ok;
+        const remoteProbeFailed = !liveRemoteShasProbe(repo).ok;
         const added = growPoolOnEmpty(repo, lanes, remoteProbeFailed);
         if (added > 0) {
           excluded.clear();
@@ -3751,7 +3773,7 @@ function laneRemovalEligibility(repo, n, { remoteShasBox, nowMs, ttlMs, deadReas
   }
   const getRemoteShas = () => {
     if (!remoteShasBox) return new Set();
-    if (remoteShasBox.value === null) remoteShasBox.value = liveRemoteShas(dir);
+    if (remoteShasBox.value === null) remoteShasBox.value = liveRemoteShas(repo);
     return remoteShasBox.value;
   };
   const held = laneHoldRefuses(dir, 'remove'); // xbdixjc
@@ -3822,7 +3844,7 @@ function claimLaneForRemoval(repo, n, evaluatedLease, remoteShasBox) {
     return { keep: TRIM_REACQUIRED };
   }
   const getRemoteShas = () => {
-    if (remoteShasBox.value === null) remoteShasBox.value = liveRemoteShas(dir);
+    if (remoteShasBox.value === null) remoteShasBox.value = liveRemoteShas(repo);
     return remoteShasBox.value;
   };
   const { dirty, ahead } = effectiveDirtyOrAhead(dir, repo.branch, getRemoteShas);
@@ -4031,12 +4053,12 @@ function cmdTrim(repo) {
 
 /** Re-derive preservation from a fresh origin snapshot on BOTH passes, including under the claim.
  *  No fetch or ref mutation: unavailable remote objects and failed reads leave work unproven. */
-function laneReclaimPreservationProof(dir, branch) {
+function laneReclaimPreservationProof(dir, branch, repo) {
   const branchRef = `origin/${branch}`;
   const { trackedModifiedPaths, untrackedPaths } = gitStatusSummary(dir);
   const dirtyPaths = [...trackedModifiedPaths, ...untrackedPaths];
   const commits = aheadCommits(dir, branchRef);
-  const remoteShas = dirtyPaths.length || commits.length ? liveRemoteShas(dir) : new Set();
+  const remoteShas = dirtyPaths.length || commits.length ? liveRemoteShas(repo) : new Set();
   const branchSha = tryGit(['rev-parse', '--verify', '--quiet', branchRef], dir);
   const liveBranch = remoteShas.has(branchSha) ? branchSha : null;
   // Disable whois's tracking-ref containment fallback; retain its patch-equivalence proof only
@@ -4133,7 +4155,7 @@ function cmdReclaim(repo) {
     if (flags.json) process.stdout.write(`${JSON.stringify({ lane: n, path: dir, dryRun, reclaimed: false, kept: true, keptReason: held.reason, hold: held.hold }, null, 2)}\n`);
     return;
   }
-  const proof = laneReclaimPreservationProof(dir, repo.branch);
+  const proof = laneReclaimPreservationProof(dir, repo.branch, repo);
   // SNAPSHOT-THEN-RECLAIM (`--salvage`): content that is NOT provably on a remote ref is saved durably first
   // (bundle + patch + refs/salvage/*, indexed) and only then reset — see `we:scripts/lib/lane-salvage.mjs`.
   // Its own liveness gate (no live owner session, no process cwd inside the lane, quiet period) runs here,
@@ -4206,7 +4228,7 @@ function cmdReclaim(repo) {
     fail(`lane-${n}: a lease appeared between the read above and the claim attempt — not reclaimed, safe to retry`);
   }
   // Re-check UNDER the hold — closes the race window between the first read above and this claim.
-  const reproof = laneReclaimPreservationProof(dir, repo.branch);
+  const reproof = laneReclaimPreservationProof(dir, repo.branch, repo);
   // #4139 — `--override` forgives ONLY the specific unpreserved content this call's INITIAL proof already
   // named and logged above (what the operator actually looked at before typing `--override`). If anything NEW
   // and unpreserved raced in during the tiny window between that look and this claim, it was never reviewed by
