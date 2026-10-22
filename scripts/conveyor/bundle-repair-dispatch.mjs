@@ -18,7 +18,10 @@
  *
  * SETTINGS: the `bundleRepair` policy through the cascade (standard → platform → tool
  * `we:scripts/settings/bundle-repair.json` → env `WE_BUNDLE_REPAIR_ENABLED` / `WE_BUNDLE_REPAIR_MODE`), each
- * leaf's source logged (`policy-cascade · bundleRepair: …`). Default `enabled: false`, `mode: shadow`.
+ * leaf's source logged (`policy-cascade · bundleRepair: …`). Default `enabled: false`, `mode: shadow` — STANDARD
+ * layer only; the repo tool file never sets them, so the operator's switch is the platform layer: the `bundleRepair`
+ * block of the real user's `~/.claude/platform-preferences.json` (the file host-overload / heavy-admission read;
+ * `WE_PLATFORM_PREFERENCES` replaces the path), over the repo platform file.
  * KILL SWITCH: the file `~/.claude/conveyor/bundle-repair.kill` (env `WE_BUNDLE_REPAIR_KILL_FILE`) — present means
  * nothing new is launched or posted; running repairs are still reconciled and stopped at their wall time.
  *
@@ -40,10 +43,11 @@
  *   node scripts/conveyor/bundle-repair-dispatch.mjs record --hold=<id> --session=<slug> < outcome.json   (the session's one write)
  */
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir, hostname } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { homedir, hostname, userInfo } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isUnderTest } from '../lib/under-test.mjs';
 
 import {
   BUNDLE_REPAIR_BOT, BUNDLE_REPAIR_KIND, BUNDLE_REPAIR_STANDARD, BUNDLE_REPAIR_VALID, assertBriefSafe, escalationItem,
@@ -94,18 +98,112 @@ const parseBool = (v) => (v === undefined || v === '' ? undefined : ['1', 'true'
  * unreadable tool file is "layer not set", an invalid leaf is ignored (named in `invalid`).
  * @returns {{settings:object, sources:Record<string,string>, invalid:string[]}}
  */
-export async function resolveBundleRepairSettings({ env = process.env, tool, platform, log } = {}) {
-  const { cascadePolicy } = await import('../lib/policy-cascade.mjs');
+export const HOME_PLATFORM_PREFERENCES_ENV = 'WE_PLATFORM_PREFERENCES';
+/** A path is absent only when the path itself is absent — a dangling symlink is an unreadable file, not "not set". */
+const lexists = (path) => { try { lstatSync(path); return true; } catch { return false; } };
+const HOME_PLATFORM_MAX_BYTES = 256 * 1024;
+
+/**
+ * IO: the `bundleRepair` block of the operator's host platform file — the real user's
+ * `~/.claude/platform-preferences.json` (never `$HOME`-derived), or `WE_PLATFORM_PREFERENCES`. Under test the real
+ * file is never read unless that env names one. Never throws: missing = layer not set; unreadable/invalid = `error`.
+ * @returns {{block?:object, error?:string, path?:string}}
+ */
+export function readHostPlatformBundleRepair({ env = process.env, home, readFile = readFileSync, underTest } = {}) {
+  let path = String(env?.[HOME_PLATFORM_PREFERENCES_ENV] ?? '').trim();
+  try {
+    if (!path) {
+      if (underTest ?? (isUnderTest(env) || isUnderTest(process.env))) return {};
+      let h = home; if (!h) { try { h = userInfo().homedir || homedir(); } catch { h = homedir(); } }
+      path = join(h, '.claude', 'platform-preferences.json');
+    }
+    const text = String(readFile(path, 'utf8'));
+    if (Buffer.byteLength(text) > HOME_PLATFORM_MAX_BYTES) return { path, error: `${path}: larger than ${HOME_PLATFORM_MAX_BYTES} bytes` };
+    const data = JSON.parse(text);
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) return { path, error: `${path}: not a JSON object` };
+    if (!Object.hasOwn(data, 'bundleRepair')) return { path };
+    const b = data.bundleRepair;
+    if (b === null || typeof b !== 'object' || Array.isArray(b)) return { path, error: `${path}: bundleRepair is not an object` };
+    return { path, block: b };
+  } catch (e) {
+    if (e?.code === 'ENOENT' && !(path && lexists(path))) return { path };
+    return { path, error: `${path || 'platform-preferences'}: ${String(e?.message ?? e).split('\n')[0]}` };
+  }
+}
+
+export async function resolveBundleRepairSettings({ env = process.env, tool, platform, log, home, readFile, toolFiles } = {}) {
+  const { cascadePolicy, readPlatformPreferences } = await import('../lib/policy-cascade.mjs');
+  const errors = [];
+  const isBlock = (b) => b !== null && typeof b === 'object' && !Array.isArray(b);
+  // Whole-leaf validation of EACH source block on its own, BEFORE any merge or cascade: the cascade walks objects (an
+  // object-valued leaf like `mode: {}` would vanish), and a merge would let one file's valid value conceal another's
+  // invalid one.
+  const checkBlock = (layer, block) => {
+    if (block === undefined) return;
+    if (!isBlock(block)) { errors.push(`${layer}=${JSON.stringify(block)}`); return; }
+    for (const [k, valid] of Object.entries(BUNDLE_REPAIR_VALID)) {
+      if (Object.hasOwn(block, k) && !valid(block[k])) errors.push(`${layer}.${k}=${JSON.stringify(block[k])}`);
+    }
+  };
+  let plat = platform;
+  if (plat === undefined) {
+    // Repo platform file (shared team layer) under the operator's host file; the host file wins per leaf.
+    let repo;
+    try {
+      // Each repo platform file's own block is validated as it is read, before the reader merges them.
+      const rp = readPlatformPreferences({ env, readFile: (path, enc) => {
+        let text;
+        try { text = readFileSync(path, enc); }
+        catch (e) { if (e?.code === 'ENOENT' && lexists(path)) errors.push(`platform (repo ${basename(path)}): dangling or unreadable`); throw e; }
+        try { const data = JSON.parse(String(text)); if (isBlock(data)) checkBlock(`platform (repo ${basename(path)})`, data.bundleRepair); } catch { /* the reader names it */ }
+        return text;
+      } });
+      repo = rp.prefs.bundleRepair;
+      for (const e of rp.errors) errors.push(`platform (repo): ${e}`);
+    } catch (e) { errors.push(`platform (repo): ${String(e?.message ?? e).split('\n')[0]}`); }
+    checkBlock('platform (repo)', repo);
+    const host = readHostPlatformBundleRepair({ env, home, ...(readFile ? { readFile } : {}) });
+    if (host.error) errors.push(`platform: ${host.error}`);
+    checkBlock('platform', host.block);
+    plat = isBlock(host.block) || isBlock(repo) ? { ...(isBlock(repo) ? repo : {}), ...(isBlock(host.block) ? host.block : {}) } : null;
+  } else if (plat !== null) checkBlock('platform', plat);
   let toolBlock = tool;
   if (toolBlock === undefined) {
-    try { toolBlock = (await import('../lib/settings-files.mjs')).readSettings()?.bundleRepair; } catch { toolBlock = undefined; }
+    // Every declared settings file: an unreadable one is an error (it may hold the block), and each file's own
+    // `bundleRepair` block is validated before the merge can let a later file conceal an earlier invalid leaf.
+    try {
+      const sf = await import('../lib/settings-files.mjs');
+      const o = toolFiles ?? {};
+      const declared = sf.readDeclaredSettings(o);
+      for (const e of declared.errors) errors.push(`tool (${e.source}): ${String(e.error).split('\n')[0]}`);
+      const dir = o.dir ?? sf.SETTINGS_DIR;
+      const legacyPath = o.legacyPath === undefined ? sf.LEGACY_SETTINGS_PATH : o.legacyPath;
+      // Our own listing: the reader treats an unlistable directory as empty and a vanished/dangling file as absent;
+      // here both are errors (the repo always ships the directory, and a listed file may hold the block).
+      const files = [];
+      if (legacyPath) files.push({ source: 'dispatch-settings.json', path: legacyPath, optional: true });
+      try { for (const f of readdirSync(dir).filter((n) => n.endsWith('.json')).sort()) files.push({ source: `settings/${f}`, path: join(dir, f) }); }
+      catch (e) { errors.push(`tool (settings dir): ${String(e?.message ?? e).split('\n')[0]}`); }
+      for (const { source, path, optional } of files) {
+        try { const data = JSON.parse(readFileSync(path, 'utf8')); if (isBlock(data)) checkBlock(`tool (${source})`, data.bundleRepair); }
+        catch (e) { if (!(optional && e?.code === 'ENOENT' && !lexists(path))) errors.push(`tool (${source}): ${String(e?.message ?? e).split('\n')[0]}`); }
+      }
+      toolBlock = declared.settings?.bundleRepair;
+    } catch (e) { toolBlock = undefined; errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   }
+  if (tool !== undefined) checkBlock('tool', toolBlock);
   const envValues = { enabled: parseBool(env.WE_BUNDLE_REPAIR_ENABLED), mode: env.WE_BUNDLE_REPAIR_MODE || undefined };
   const r = cascadePolicy('bundleRepair', toolBlock, {
     standard: { ...BUNDLE_REPAIR_STANDARD, clones: [...BUNDLE_REPAIR_STANDARD.clones] }, envValues, valid: BUNDLE_REPAIR_VALID, env,
-    ...(platform !== undefined ? { platform } : {}), ...(log ? { log } : {}),
+    platform: plat ?? null, ...(log ? { log } : {}),
   });
-  return { settings: { ...BUNDLE_REPAIR_STANDARD, ...(r.value || {}) }, sources: r.sources, invalid: r.invalid };
+  const settings = { ...BUNDLE_REPAIR_STANDARD, ...(r.value || {}) };
+  const invalid = [...new Set([...r.invalid, ...errors])];
+  const sources = { ...r.sources };
+  // FAIL CLOSED (as host-overload: invalid/unreadable policy refuses background work): any unreadable settings file
+  // or invalid leaf turns repairs OFF unless the operator enabled them explicitly through env for this process.
+  if (invalid.length && settings.enabled && sources.enabled !== 'env') { settings.enabled = false; sources.enabled = 'fail-closed'; }
+  return { settings, sources, invalid };
 }
 
 // ── host reads ───────────────────────────────────────────────────────────────────────────────────────────────
