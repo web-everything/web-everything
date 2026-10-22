@@ -730,7 +730,16 @@ export function createCardGrouping({
             let found = null;
             try { found = JSON.parse(gh(['pr', 'list', '--repo', localSlug, '--head', g.branch, '--state', 'all', '--json', 'number,state']))[0] ?? null; } catch { continue; }
             if (found) { mutate(s => { const x = s.groups.find(y => isLocalGroupId(y, g.id)); if (x) x.pr = found.number; }); say(`${tag}: adopted #${found.number}`); }
-            else if (now() - (g.createdAt ?? 0) > 15 * 60_000) { mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); s.failed[sourceSetKey(g.sources)] = now(); }); say(`${tag}: no PR was opened — record dropped, sources released`); dissolved.push(g.id); }
+            else if (now() - (g.createdAt ?? 0) > 15 * 60_000) {
+              // Re-check under the lock: the forming pass may have recorded its PR since this snapshot was read.
+              const dropped = mutate(s => {
+                const x = s.groups.find(y => isLocalGroupId(y, g.id));
+                if (!x || x.pr || x.createdAt !== g.createdAt) return false;
+                s.groups = s.groups.filter(y => !isLocalGroupId(y, g.id)); s.failed[sourceSetKey(g.sources)] = now();
+                return true;
+              });
+              if (dropped?.ok && dropped.result === true) { say(`${tag}: no PR was opened — record dropped, sources released`); dissolved.push(g.id); }
+            }
             continue;
           }
           let pr;
@@ -988,7 +997,17 @@ export function createCardGrouping({
           // Opening outlived the reconcile's 15-minute drop: the record (and its card reservation) is gone and the
           // sources were released, so an untracked combined PR could land beside them or beside a newer group.
           try { gh(['pr', 'close', String(num), '--repo', localSlug, '--comment', 'Card group record was dropped while this PR was being opened; its sources land on their own. (drain.group, card xym8nt4)']); }
-          catch (e) { say(`close of untracked combined PR #${num} failed (${firstLine(e)})`); }
+          catch (e) {
+            // Never leave it untracked: re-record it (when nothing claimed its sources or cards meanwhile) so the
+            // reconcile owns it from here — it dissolves it, or lands it like any group.
+            const back = mutate(s => {
+              const open = s.groups.filter(isLocalGroup);
+              if (open.some(g => g.sources.some(y => record.sources.some(z => Number(y.num) === z.num)) || !Array.isArray(g.files) || g.files.some(f => record.files.includes(f)))) return false;
+              s.groups.push({ ...record, pr: num, createdAt: now() });
+              return true;
+            });
+            say(`close of untracked combined PR #${num} failed (${firstLine(e)}) — ${back?.result === true ? 're-recorded for the reconcile' : 'left open untracked'}`);
+          }
           return { reason: `group record dropped while opening — combined PR #${num} closed` };
         }
         for (const s of p.sources) comment(s.num, `Grouped with ${p.sources.filter(x => x.num !== s.num).map(x => `#${x.num}`).join(', ')} into the combined card PR #${num} (they all edit ${p.files.map(f => `\`${f}\``).join(', ')}). This PR stays open and is held by the drain; it is closed only after #${num} merges and its lines are confirmed on main. If #${num} closes, fails, or is sent back, this PR goes back to landing on its own. (drain.group, card xym8nt4)`);

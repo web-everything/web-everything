@@ -850,6 +850,20 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(readGroupState(statePath).groups).toEqual([]);
     });
 
+    it('a dropped record whose combined PR cannot be closed is re-recorded for the reconcile, never left untracked', () => {
+      const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
+      const statePath = join(tmp(), 's.json');
+      const exec = (cmd, args) => {
+        if (args[0] === 'pr' && args[1] === 'create') writeFileSync(statePath, JSON.stringify({ groups: [], failed: {} }));
+        if (args[0] === 'pr' && args[1] === 'close') throw new Error('gh: 502');
+        return t.exec(cmd, args);
+      };
+      const r = createCardGrouping({ ...t.opts, exec, statePath, withLock: fn => ({ ran: true, result: fn() }) }).form({ outcomes: t.outcomes, verdicts: t.verdicts });
+      expect(r.formed).toBeUndefined();
+      expect(readGroupState(statePath).groups.map(g => [g.pr, g.sources.map(s => s.num), g.files])).toEqual([[77, [1, 2], [CARD]]]);
+      expect(t.out.join('')).toMatch(/close of untracked combined PR #77 failed \(gh: 502\) — re-recorded for the reconcile/);
+    });
+
     it('a claim refuses (fail closed) while an open group has no recorded file list', () => {
       const t = formRepo({ 1: card([1, 2, 10]), 2: card([1, 2, 11]) });
       const statePath = join(tmp(), 's.json');
@@ -1169,6 +1183,22 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(state.groups.map(x => x.id)).toEqual(['g']);
       expect(g.holdFor({ num: 1 })).toMatchObject({ kind: 'card-grouped' });
       expect(calls.some(x => x.startsWith('pr comment'))).toBe(false);
+    });
+
+    it('interrupted creation: a PR recorded by the forming pass after the snapshot is never dropped', () => {
+      const statePath = join(tmp(), 's.json');
+      const rec = { id: 'g', repo: 'o/r', pr: null, branch: 'lane/card-group-g', createdAt: T0, files: [CARD], sources: [{ num: 1, headSha: A }, { num: 2, headSha: B }] };
+      writeFileSync(statePath, JSON.stringify({ groups: [rec], failed: {} }));
+      // The list read sees no PR yet; the forming pass records #77 before this reconcile's drop takes the lock.
+      const exec = (cmd, args) => {
+        if (args[0] === 'pr' && args[1] === 'list') { writeFileSync(statePath, JSON.stringify({ groups: [{ ...rec, pr: 77 }], failed: {} })); return '[]'; }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      };
+      const g = createCardGrouping({ localSlug: 'o/r', cwd: tmp(), run: () => { throw new Error('no git on this path'); }, exec, statePath, settings, log: { write() {} }, now: () => T0 + 16 * 60_000 });
+      expect(g.reconcile({ force: true }).dissolved).toEqual([]);
+      const st = readGroupState(statePath);
+      expect(st.groups.map(x => [x.id, x.pr])).toEqual([['g', 77]]);
+      expect(st.failed).toEqual({});
     });
 
     it('interrupted creation: adopts the PR opened for the branch', () => {
