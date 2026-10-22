@@ -24,11 +24,13 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, renameSync, rmSync, readFileSync, writeFileSync, statSync, lstatSync, copyFileSync, cpSync, realpathSync } from 'node:fs';
 import { join, basename, dirname, resolve } from 'node:path';
 import { inspectCloneLock, defaultOwner } from './daemon-clone-lock.mjs';
+import { laneGitHardeningEnv } from './lane-git-hardening.mjs';
 
 const GIT_TIMEOUT_MS = 60_000;
 
+// The lane's `.git/config` is agent-writable: no repair call may run a lane-set `core.fsmonitor` / hook (PR #5775).
 function runGit(args, cwd, input) {
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8', input, timeout: GIT_TIMEOUT_MS, stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8', input, timeout: GIT_TIMEOUT_MS, stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, env: laneGitHardeningEnv(process.env) });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || ''), failed: Boolean(r.error) };
 }
 

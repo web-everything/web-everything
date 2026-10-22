@@ -90,6 +90,9 @@ function buildWeTemplate() {
     [
       'ls-files', '-co', '--exclude-standard', '--',
       'scripts', 'skills-src', 'package.json', 'package-lock.json',
+      // Brief rendering reads this living checklist relative to the cloned build-policy module.
+      // Keep the real dependency: a missing checklist must still fail closed in production.
+      'docs/agent/reviewer-expectations.md',
       // `.gitignore` itself MUST ride along: `lane-pool.mjs` writes a per-lane `.env.local` expecting it to be
       // gitignored (real repo behaviour, confirmed) — without this file in the template, every provisioned
       // lane reads as permanently dirty (`.env.local` shows up as a genuine untracked file) and

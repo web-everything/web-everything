@@ -34,6 +34,7 @@ import { join, basename, dirname, resolve } from 'node:path';
 import { hostname } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { planLitterCleanup } from './lane-litter.mjs';
+import { laneGitHardeningEnv } from './lane-git-hardening.mjs';
 
 /** The ledger's filename, inside `<lane>/.git/`. */
 export const LANE_HISTORY_FILENAME = 'lane-history.jsonl';
@@ -297,9 +298,11 @@ export function destructiveActionVerdict({ unpushed, ownerGone = null, override 
   };
 }
 
+// Every snapshot read runs in a lane whose `.git/config` is agent-writable: `status` would run a lane-set
+// `core.fsmonitor` (PR #5775), so it carries the lane hardening pins (scripts/lib/lane-git-hardening.mjs).
 const snapshotGit = (dir, args) => {
   try {
-    return execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000, maxBuffer: 64 * 1024 * 1024 }).trimEnd();
+    return execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000, maxBuffer: 64 * 1024 * 1024, env: laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' }) }).trimEnd();
   } catch { return null; }
 };
 

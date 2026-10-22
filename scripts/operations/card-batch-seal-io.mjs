@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { acquireLease, atomicRecord, cardBatchStateDir, tokenOf } from './card-batch-io.mjs';
+import { acquireLease, atomicRecord, cardBatchStateDir, sealJobEnv, tokenOf } from './card-batch-io.mjs';
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
 import { effectiveCardBatchPolicy, loadVerifyRetryMinutes, resolveVerifyRetryMinutes } from '../lib/card-batch-settings.mjs';
@@ -332,7 +332,7 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       const at = Number.isFinite(opened) ? Math.max(now, opened) : now;
       if (!kind || (!state.sealedAt && !planPublish({ state, kind, policy, now: at }).reason && !holdPending(state))) continue;
       const child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${path}`],
-        { cwd: ROOT, detached: true, stdio: 'ignore' });
+        { cwd: ROOT, detached: true, stdio: 'ignore', env: sealJobEnv() });
       // Wait only for OS launch, never child completion/verification. Launch failures reach probeErrors.
       await new Promise((resolve, reject) => {
         child.once('error', reject);
