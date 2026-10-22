@@ -59,7 +59,8 @@ export default {
       if (!row) violations.push('the saved break held at the round cap is missing from RULING NEEDED');
       const decision = decideSetLabel({ to: 'clear-human', currentLabels: subject.labels, redTeamRulingHold: row !== null });
       if (!decision.allowed) violations.push(`the advertised clear-human ruling is refused: ${decision.reason}`);
-      comments.push({ author: { login: 'web-everything' }, createdAt: '2026-10-18T09:02:00Z', body: [
+      // main #5803: the clear-human ruling counts only when the human operator posted it.
+      comments.push({ author: { login: 'chalbert' }, createdAt: '2026-10-18T09:02:00Z', body: [
         '✅ review — `review:human` cleared via the sanctioned path', '',
         'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
         buildReviewedShaMarker(head), buildClearedHumanMarker('operator')].join('\n') });
