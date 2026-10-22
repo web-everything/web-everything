@@ -56,7 +56,8 @@ const FAR_EXPIRY = '2099-01-01T00:00:00.000Z';
 function writeTokenCache(w, token) {
   const dir = join(w.home, '.claude', 'github-app-token');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'web-everything.json'), JSON.stringify({ v: 2, token, expiresAt: FAR_EXPIRY }), 'utf8');
+  writeFileSync(join(dir, 'web-everything.json'), JSON.stringify({ v: 2, token, expiresAt: FAR_EXPIRY,
+    appId: w.env.WE_GITHUB_APP_ID, installationId: w.env.WE_GITHUB_APP_INSTALLATION_ID }), 'utf8');
 }
 
 const SPECIFIC = new Set([

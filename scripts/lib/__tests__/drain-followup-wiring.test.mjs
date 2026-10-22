@@ -5,6 +5,7 @@
  * inline numbering / derived regen never run; with the switch off the inline path is unchanged and no job exists.
  * Plus the hook's own contract (fallback to inline, setting cascade, the deps link).
  */
+import { daemonAppEnv } from '../../__tests__/fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
@@ -86,7 +87,7 @@ function runCli({ env: extraEnv = {} } = {}) {
     const r = spawnSync(process.execPath, ['--import', preload, script, '--this-repo', '--label=ready-to-merge',
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
       cwd: dir, encoding: 'utf8', timeout: 30000,
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FU_FIXTURE: fixture, FU_HOME: dir, HOME: dir,
+      env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, FU_FIXTURE: fixture, FU_HOME: dir, HOME: dir,
         WE_DAEMON_JOBS_ROOT: jobsRoot, WE_COORDINATION_ROOT: join(dir, 'coord'), ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();

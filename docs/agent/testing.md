@@ -2046,3 +2046,9 @@ homes and ledgers, and injected minters. Cover `chalbert/web-everything` via `-R
 paths, and a real temporary clone's SSH origin: each selects the worker installation for
 canonical owner `web-everything`. Run the touched `gh-app-shim`, `github-app-auth-env`,
 `github-app-per-owner-routing`, and `github-auth-policy` suites through heavy admission.
+
+Drain CLI fixtures with fake `gh` binaries use `scripts/__tests__/fixtures/daemon-app-env.mjs`
+to seed fresh synthetic App caches under their disposable home. Keep personal fallback refused:
+the real guard and per-owner routing must still run before listing, freeze, or merge assertions.
+The simulator binds its synthetic `sim-token-1` to matching App-token provenance; its fake
+GitHub still owns revocation checks. Never enable personal fallback globally in test setup.
