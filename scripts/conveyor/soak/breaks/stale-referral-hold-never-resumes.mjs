@@ -21,7 +21,6 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
-const REPO = 'web-everything/web-everything';
 // The live per-role bot logins come from host delivery settings a hermetic run does not read; the legacy bot login
 // stands in for them (both are the automation's own trusted identity) — the same mapping the unit test uses.
 const BOTS = new Set(['plateau-merger', 'plateau-reviewer', 'plateau-worker']);
@@ -46,6 +45,8 @@ export default {
     const check = (ok, message) => { if (!ok) violations.push(message); };
     try {
       const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
+      const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
+      const REPO = CONSTELLATION_REPOS.we.slug;
       const hold = await load('scripts/conveyor/review-referral-hold.mjs');
       const { planReconcile } = await load('scripts/conveyor/reconcile-core.mjs');
       const fixtures = join(sourceRoot, 'scripts/conveyor/__tests__/fixtures');
