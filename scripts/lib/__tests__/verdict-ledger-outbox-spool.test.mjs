@@ -1,3 +1,5 @@
+// @vitest-environment node
+// Browser transforms can route Node builtins through browser-external imports, bypassing these fs mocks.
 /**
  * @file verdict-ledger-outbox-spool.test.mjs - layer 1: settings, durable local publication,
  * validation/quarantine, retryable reads, stale diagnostics, and the host-wide flusher lock.
