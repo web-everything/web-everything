@@ -1377,13 +1377,13 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
  * This sequential entry runs both back to back, exactly as before the split.
  * @param {ReturnType<typeof createRedTeamIo>} io
  */
-export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true } = {}, io = createRedTeamIo({ env })) {
+export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true, resumeOnly = false } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
     if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     const read = loopPayload?.findings?.read;
     const recording = record !== false && loopPayload?.replay !== true;
-    const pass = await speculateRedTeam({ pr, repo, lanePath, read, claudeFindings: claudeFindingsFromLoop(loopPayload), env, post, record: recording }, io);
+    const pass = await speculateRedTeam({ pr, repo, lanePath, read, claudeFindings: claudeFindingsFromLoop(loopPayload), env, post, record: recording, resumeOnly }, io);
     if (pass.status !== 'speculated') return pass;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);
   } catch (e) {
@@ -1409,9 +1409,10 @@ export function redTeamReadFingerprint(read) {
  * taken, so a speculative pass that is killed mid-call can still have its spend recorded.
  * `claudeFindings` is null for a speculative pass (the jurors have not answered yet), and `resume: false` makes a
  * prior clean row a `prior-row` status instead of finishing that row's effects (no effect before the verdict).
+ * `resumeOnly` refuses an unreadable store or missing clean prior row before provider selection or reservation.
  */
 export async function speculateRedTeam({
-  pr, repo, lanePath, read, claudeFindings = null, env = process.env, post = true, record = true, onReserved = null, onTiming = () => {}, resume = true,
+  pr, repo, lanePath, read, claudeFindings = null, env = process.env, post = true, record = true, onReserved = null, onTiming = () => {}, resume = true, resumeOnly = false,
 } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
@@ -1428,8 +1429,12 @@ export async function speculateRedTeam({
     }
     const now = io.now();
     let records = [];
-    try { records = io.readRecords(); } catch (e) { io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`); }
+    try { records = io.readRecords(); } catch (e) {
+      if (resumeOnly) return { status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' };
+      io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
+    }
     const prior = priorRedTeamRow(records, pr, rev);
+    if (resumeOnly && !prior) return { status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' };
     // A speculative pass (`resume: false`) must not finish a prior pass's effects before the verdict is known: it
     // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
     if (prior && !resume) return { status: 'prior-row', reason: `a clean red-team row already exists for #${pr} at ${rev.slice(0, 12)}` };
@@ -1797,7 +1802,7 @@ if (IS_CLI) {
     runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() })
       .then((result) => emit(result, renderSeatSummary));
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
-    runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post') })
+    runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only') })
       .then((result) => emit(result, renderRedTeamSummary));
   } else if (sub === 'red-team-speculate' && flag('pr') && flag('repo') && flag('lane') && flag('read-sink') && flag('out')) {
     // Card xbizuci — THE SPECULATIVE RED TEAM, started by the review job beside the review loop. It waits for the
