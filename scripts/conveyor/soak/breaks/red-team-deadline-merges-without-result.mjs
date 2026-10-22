@@ -46,8 +46,22 @@ export default {
       const env = { WE_UNDER_TEST: '1', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '45',
         WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'true', WE_RED_TEAM_DEADLINE_ACTION: 'requeue-then-hold' };
 
-      for (const withRequest of [false, true]) {
-        const mode = withRequest ? 'request hook' : 'no request hook';
+      // A request hook that refuses or throws is still a request attempt: tried once per head, never a result.
+      const hooks = {
+        'no request hook': null,
+        'request hook': () => ({ requested: true }),
+        'refused request hook': () => ({ requested: false }),
+        'throwing request hook': () => { throw new Error('review dispatch unavailable'); },
+      };
+      // The operator override (merge-without-result + a named operator) never waives a live or recorded run.
+      const OVERRIDE = { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: 'soak-operator' };
+      const scenarios = [
+        ...Object.keys(hooks).map(mode => ({ mode, hook: hooks[mode], env, run: {} })),
+        ...['inFlight', 'queued', 'recorded'].map(field => ({ mode: `operator override with a ${field} run`, hook: null,
+          env: { ...env, ...OVERRIDE }, run: { [field]: true } })),
+      ];
+      for (const { mode, hook, env: scenarioEnv, run } of scenarios) {
+        const withRequest = typeof hook === 'function';
         let clock = 1000, queued = false;
         let stored = { pending: [], followedUp: [] };
         const calls = [], requests = [], notes = [];
@@ -55,7 +69,7 @@ export default {
         // scheduled means a pass was owed by the producer's head-bound policy;
         // no job was actually queued, started, recorded, or given a result.
         const evidence = { loopPayload: { verdict: { verdict: 'accept' } },
-          scheduled: true, inFlight: false, queued: false, recorded: false };
+          scheduled: true, inFlight: false, queued: false, recorded: false, ...run };
         const exec = (cmd, args) => {
           calls.push([cmd, ...args]);
           if (cmd === 'git') {
@@ -83,12 +97,12 @@ export default {
           throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
         };
         const s = createDrainMergeStrategy({
-          env, cwd: sourceRoot, now: () => clock, exec,
+          env: scenarioEnv, cwd: sourceRoot, now: () => clock, exec,
           resolved: { policy: resolveMergeDeliveryPolicy({ tool: { strategy: 'github-merge-queue' } }), note: null },
           isLocalRepo: () => true, localSlug: REPO, statePath: '/injected/queue-state.json',
           readFile: () => JSON.stringify(stored), writeState: (_path, state) => { stored = structuredClone(state); },
           readRedTeamEvidence: () => evidence, readGrantScope: () => null,
-          requestRedTeam: withRequest ? input => { requests.push(input); return { requested: true }; } : null,
+          requestRedTeam: withRequest ? input => { requests.push(input); return hook(input); } : null,
           publishNeedsYou: item => notes.push(item),
           cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
           log: { write: line => log?.(line) },
@@ -111,9 +125,11 @@ export default {
           check(requests.length === 1 && requests[0].repo === REPO && requests[0].pr === PR && requests[0].head === HEAD,
             `${mode}: overdue head did not get one head-bound re-request`);
           tick('immediately after re-request');
+          // Every backoff recheck reaches the deadline path again: the hook must not be called a second time.
+          for (let i = 0; i < 3; i++) { clock += 301_000; tick(`backoff recheck ${i + 1}`); }
           clock += WAIT + 1;
           held = tick('past another 45 min without a result');
-          check(requests.length === 1, `${mode}: re-request repeated for the same head`);
+          check(requests.length === 1, `${mode}: re-request repeated for the same head (${requests.length} calls)`);
         }
         // Check observed hold behavior independently of fixPresent; also require
         // the note on trees exposing the deadline API if the hold flag regresses.

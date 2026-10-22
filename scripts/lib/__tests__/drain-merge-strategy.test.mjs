@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,12 @@ import {
 } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
+import { publishAttention } from '../../operations/needs-you-feed.mjs';
+import { isUnderTest } from '../under-test.mjs';
+
+// The real operator feed is never written from this file: every test either injects a publisher or relies on the
+// test-run guard, and the guard's own tests assert against this stand-in.
+vi.mock('../../operations/needs-you-feed.mjs', async importOriginal => ({ ...(await importOriginal()), publishAttention: vi.fn() }));
 
 const HEAD = 'b'.repeat(40);
 const BASE_TIP = 'e'.repeat(40);
@@ -961,11 +967,90 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     expect(notes).toHaveLength(0);
   });
 
-  it('the operator override never waives an in-flight run or a confirmed break', () => {
-    const { h } = pastDeadline({ env: { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: 'chalbert' },
-      evidence: { loopPayload: { verdict: { verdict: 'accept' } }, inFlight: true, scheduled: true } });
+  const OVERRIDE_ENV = { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: 'chalbert' };
+  it.each(['inFlight', 'queued', 'recorded'])('the operator override never waives a %s run (held, never enqueued)', field => {
+    const { h, clock } = pastDeadline({ env: OVERRIDE_ENV,
+      evidence: { loopPayload: { verdict: { verdict: 'accept' } }, [field]: true, scheduled: true } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    clock.t += 10 * 60 * 60_000;
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
     expect(enqueuedAny(h)).toBe(false);
+    expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
+  });
+
+  it('the operator override never waives a confirmed break, even with no run evidence at all', async () => {
+    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+    }) }];
+    // No in-flight, queued or recorded run: only the break's own send-back routing stands between it and the override.
+    const { h, clock } = pastDeadline({ env: OVERRIDE_ENV, liveComments: thread,
+      evidence: { loopPayload: { verdict: { verdict: 'accept' } }, scheduled: true, inFlight: false, queued: false, recorded: false } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false, kind: 'red-team-pending',
+      reason: expect.stringContaining('requiring send-back') });
+    clock.t += 10 * 60 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false });
+    expect(enqueuedAny(h)).toBe(false);
+    expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
+  });
+
+  it.each([
+    ['returns requested:false', () => ({ requested: false })],
+    ['throws', () => { throw new Error('dispatch unavailable'); }],
+  ])('a re-request hook that %s is tried ONCE for the head, then the PR holds with one note (never re-called)', (_name, hook) => {
+    let attempts = 0;
+    const requestRedTeam = input => { attempts++; return hook(input); };
+    const { h, clock, notes } = pastDeadline({ requestRedTeam });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true,
+      reason: expect.stringContaining('the one re-request was not accepted') });
+    expect(attempts).toBe(1);
+    // Every backoff recheck (and a drain restart) keeps the hold without calling the hook again.
+    for (let i = 0; i < 3; i++) { clock.t += 301_000; expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true }); }
+    const restarted = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t, initial: h.state(), requestRedTeam, publishNeedsYou: item => notes.push(item) });
+    clock.t += 301_000;
+    expect(restarted.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(attempts).toBe(1);
+    expect(notes).toHaveLength(1);
+    expect(enqueuedAny(h) || enqueuedAny(restarted)).toBe(false);
+  });
+
+  it('suppresses the real needs-you feed when only process.env marks the test run', () => {
+    expect(isUnderTest(process.env)).toBe(true);
+    publishAttention.mockClear();
+    // An injected env WITHOUT test markers and no injected publisher: process.env alone must keep the real feed unwritten.
+    const { h } = pastDeadline({ env: {}, publishNeedsYou: undefined });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(publishAttention).not.toHaveBeenCalled();
+  });
+
+  it('outside a test run the default publisher IS the real needs-you feed (positive control for the guard above)', () => {
+    vi.stubEnv('VITEST', '');
+    vi.stubEnv('WE_UNDER_TEST', '');
+    try {
+      publishAttention.mockClear();
+      const { h } = pastDeadline({ env: {}, publishNeedsYou: undefined });
+      expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+      expect(publishAttention).toHaveBeenCalledTimes(1);
+      expect(publishAttention).toHaveBeenCalledWith(expect.objectContaining({ pr: 5283, head: HEAD, kind: 'red-team-deadline-held' }));
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
+
+describe('redTeam.deadlineAction resolver: an invalid higher layer preserves the lower layer and its provenance', () => {
+  it.each([
+    ['file merge-without-result over platform hold', { platform: { deadlineAction: 'hold' }, file: { redTeam: { deadlineAction: 'merge-without-result' } } }, 'platform', 'tool.deadlineAction'],
+    ['env merge-without-result (no operator) over file hold', { file: { redTeam: { deadlineAction: 'hold' } }, env: { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result' } }, 'tool', 'env.deadlineAction'],
+    ['env typo over file hold', { file: { redTeam: { deadlineAction: 'hold' } }, env: { WE_RED_TEAM_DEADLINE_ACTION: 'hodl' } }, 'tool', 'env.deadlineAction'],
+    ['platform merge-without-result over nothing keeps the standard', { platform: { deadlineAction: 'merge-without-result' } }, 'standard', 'platform.deadlineAction'],
+    ['env merge-without-result with a blank operator over platform hold', { platform: { deadlineAction: 'hold' }, env: { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: '  ' } }, 'platform', 'env.deadlineAction'],
+  ])('%s', async (_name, layers, source, rejected) => {
+    const { resolveRedTeamDeadlineAction } = await import('../red-team-gate.mjs');
+    const r = resolveRedTeamDeadlineAction(layers);
+    expect(r.value.deadlineAction).toBe(source === 'standard' ? 'requeue-then-hold' : 'hold');
+    expect(r.sources.deadlineAction).toBe(source);
+    expect(r.invalid.join(' ')).toContain(rejected);
+    expect(r.operatorOverride).toBeNull();
   });
 });
 

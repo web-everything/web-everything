@@ -1514,7 +1514,7 @@ pass also holds with the note. Release needs a result on that head, a proven-ide
 through the red-team ruling path, or a card-only diff. The retired `drain.enqueueWhenRedTeamNeverScheduled` is
 ignored; only the operator's env `WE_RED_TEAM_DEADLINE_ACTION=merge-without-result` with a named
 `WE_RED_TEAM_DEADLINE_OVERRIDE_BY` enqueues without a result, logged on every use. Test restarts, head resets,
-request-once, note dedupe and failed publication, policy provenance and comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
+request-once (a refused or throwing hook is tried once per head, then holds), note dedupe and failed publication, policy provenance and comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
 in the shared operations sidecar. Store the host, PID namespace (where available) and process birth time with the pid: a live pid
 with a different birth time is a reused process, not an active red team. An unavailable birth-time
 probe preserves the conservative liveness result. Normalize the birth-time probe to UTC and the C

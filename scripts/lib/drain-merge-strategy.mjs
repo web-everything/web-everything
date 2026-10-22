@@ -393,6 +393,7 @@ export function createDrainMergeStrategy({
             retryAt: now() + (safety.value.redTeamPendingBackoffSec ?? 300) * 1000,
             commentCount: pages.flat().length, observation, checkedAt: now(), reason,
             ...(sameHead && pending.requestedAt != null ? { requestedAt: pending.requestedAt } : {}),
+            ...(sameHead && pending.requestAttemptedAt != null ? { requestAttemptedAt: pending.requestAttemptedAt } : {}),
             ...(sameHead && pending.deadlineHeldAt != null ? { deadlineHeldAt: pending.deadlineHeldAt } : {}),
             ...(sameHead && pending.notifiedAt != null ? { notifiedAt: pending.notifiedAt } : {}) };
           before.redTeamPending[key] = wait;
@@ -409,7 +410,9 @@ export function createDrainMergeStrategy({
           if (missing && deadlineAction === 'requeue-then-hold') {
             // The one re-request for this head gets its own full wait before the operator is asked.
             if (wait.requestedAt != null && now() - wait.requestedAt < maxMin * 60_000) return outcome;
-            if (wait.requestedAt == null && typeof requestRedTeam === 'function') {
+            // One attempt per head, recorded whether or not the hook accepts it: a refused or failing hook is never re-called.
+            if (wait.requestedAt == null && wait.requestAttemptedAt == null && typeof requestRedTeam === 'function') {
+              wait.requestAttemptedAt = now();
               let requested = false;
               try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
               catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
@@ -425,7 +428,9 @@ export function createDrainMergeStrategy({
             // The only path to merge-without-result: the operator's own env, named, logged on every use.
             log.write(`  ⚠ OPERATOR OVERRIDE: enqueuing ${slugOf(c.repo)}#${c.num} on ${headSha} with NO red-team result after ${maxMin} min (redTeam.deadlineAction=${RED_TEAM_DEADLINE_OVERRIDE}, env, by ${deadline.operatorOverride.by})\n`);
           } else {
-            const why = missing ? (wait.requestedAt != null ? 'still none after one re-request' : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
+            const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
+              : wait.requestAttemptedAt != null ? 'the one re-request was not accepted'
+              : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
               : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
             const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
             if (wait.deadlineHeldAt == null) {
