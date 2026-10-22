@@ -157,8 +157,8 @@ function parseMergeTreeConflictFiles(output) {
  * / #2826 was registered at 19:53Z while KNOWINGLY conflicting with `lane/fix-procedure` / #2821 in
  * `scripts/conveyor/review-status-tag.mjs` — nothing refused it, so the next rebuild silently drops #2826 and
  * the fix it carries never goes live). Answers one narrow, register-time question: does `ref` (the candidate
- * overlay) merge cleanly against `origin/main` PLUS every ALREADY-registered overlay, applied in the SAME list
- * order {@link planRebuild} itself uses for a real rebuild — and if not, which file(s) and which registered
+ * overlay) merge cleanly against `origin/main` PLUS every ALREADY-registered overlay, using the SAME adopted
+ * HEAD, established-overlay priority and pinning as {@link planRebuild} for a real rebuild — and if not, which file(s) and which registered
  * overlay(s) it conflicts with.
  *
  * READ-ONLY, exactly like {@link dryRunRebuild}: every command against `root` is read-only, and the actual
@@ -187,6 +187,8 @@ export async function previewOverlayConflict({
 } = {}) {
   if (!isSafeBranchName(ref)) return { ok: false, reason: 'unsafe-ref' };
   const rootGit = makeGit({ run, cwd: root, env, extraEnv: { GIT_OPTIONAL_LOCKS: '0' } });
+  const head = verifyRev(rootGit, 'HEAD');
+  if (!head) return { ok: false, reason: 'head-unresolved' };
 
   let url = originUrl;
   if (!url) {
@@ -220,8 +222,10 @@ export async function previewOverlayConflict({
     const mainSha = verifyRev(scratchGit, 'origin/main^{commit}');
     if (!mainSha) return { ok: false, reason: 'main-unresolved' };
 
-    // 1. Fold every ALREADY-registered overlay, in list order — the SAME `planRebuild` a real rebuild runs —
+    // 1. Fold every ALREADY-registered overlay using the running HEAD — the SAME `planRebuild` a real rebuild runs —
     // to compute `cur`, the exact tree the candidate would land on top of (never re-derived by hand here).
+    // Main is still the fold's base; HEAD supplies established priority and adopted heads for moving-tip pins.
+    // The scratch repo borrows those build objects through alternates, including heads absent from origin.
     // A PINNED overlay that no longer folds (it conflicts with main, or its PR/ref is gone) makes `planRebuild`
     // refuse the whole plan, naming that overlay. That is a problem with the EXISTING list, not with the
     // candidate — so set it aside, re-plan without it, and REPORT it (`setAside`), rather than refusing every
@@ -232,7 +236,7 @@ export async function previewOverlayConflict({
     let planExisting;
     for (;;) {
       planExisting = await planRebuild({
-        git: scratchGit, headSha: mainSha, mainRef: 'origin/main', overlays: folding,
+        git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding,
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
       });

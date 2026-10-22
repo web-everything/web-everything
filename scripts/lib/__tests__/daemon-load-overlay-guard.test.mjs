@@ -10,7 +10,9 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { runDaemonLoadOverlay } from '../daemon-load-overlay.mjs';
-import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
+import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
+import { rebuildClone, dryRunRebuild, previewOverlayConflict } from '../daemon-rebuild.mjs';
+import { stackAwareOverlayCheck } from '../../daemon-overlay.mjs';
 
 const temps = [];
 afterEach(() => { while (temps.length) rmSync(temps.pop(), { recursive: true, force: true }); });
@@ -36,13 +38,14 @@ function fixture() {
   gitOk(clone, ['push', '-q', '-u', 'origin', 'main']);
   const author = join(base, 'author');
   gitOk(base, ['clone', '-q', origin, author]);
-  const push = (ref, files) => {
+  const push = (ref, files, from = 'origin/main') => {
     gitOk(author, ['fetch', '-q', 'origin']);
-    gitOk(author, ['checkout', '-q', '-B', ref, 'origin/main']);
+    gitOk(author, ['checkout', '-q', '-B', ref, from]);
     for (const [n, c] of Object.entries(files)) write(author, n, c);
     gitOk(author, ['add', '-A']);
     gitOk(author, ['commit', '-q', '-m', ref]);
     gitOk(author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${ref}`]);
+    return gitOk(author, ['rev-parse', 'HEAD']).trim();
   };
   const env = {
     ...process.env, WE_DAEMON_OVERLAY_DIR: mktemp('we-load-guard-overlay-'), WE_DAEMON_OVERLAY_STACK_BASES: '{}',
@@ -57,10 +60,60 @@ function fixture() {
     clone, pr: 2826, env, rebuild, versions: null, installed: () => ({ inHead: true, tip: 'x', head: 'y', reason: 'in-head' }),
     log: { error: () => {}, log: () => {} }, ...o,
   });
-  return { clone, env, rebuild, load };
+  return { clone, env, rebuild, load, push };
 }
 
 describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before registering', () => {
+  it('fails closed when the adopted HEAD cannot be read', async () => {
+    const run = vi.fn(() => ({ status: 1, stdout: '', stderr: 'HEAD unavailable' }));
+    expect(await previewOverlayConflict({
+      root: '/unused', ref: 'lane/c', existingOverlays: [], originUrl: '/unused-origin', run,
+    })).toEqual({ ok: false, reason: 'head-unresolved' });
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])('checks the live adopted stack when A moves and B stays established: compatible=%s', async (compatible) => {
+    const f = fixture();
+    Object.assign(f.env, {
+      WE_DAEMON_STATE_DIR: mktemp('we-load-guard-state-'),
+      WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-load-guard-lock-'),
+      WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0',
+      WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
+    });
+    removeOverlay(f.clone, 'lane/fix-procedure', { env: f.env });
+    const a0 = f.push('lane/a', { 'a.txt': 'A\n' });
+    f.push('lane/b', { 'shared.mjs': 'export const X = 2;\n' });
+    for (const ref of ['lane/a', 'lane/b']) addOverlay(f.clone, { ref }, { env: f.env });
+    const adopted = await rebuildClone({
+      root: f.clone, env: f.env, prState: async () => 'OPEN',
+      runSmoke: async () => ({ verdict: 'pass', smoke: { results: [{ name: 'fixture', ok: true }] } }),
+    });
+    expect(adopted.adopted).toBe(true);
+    const a1 = f.push('lane/a', { 'shared.mjs': 'export const X = 1;\n' }, a0);
+    f.push('lane/c', { 'shared.mjs': `export const X = ${compatible ? 2 : 3};\n`, 'c.txt': 'C\n' });
+    const live = await dryRunRebuild({
+      root: f.clone, env: f.env, prState: async () => 'OPEN', extraOverlays: [{ ref: 'lane/c' }],
+    });
+    expect(live.plan.establishedLost).toEqual([]);
+    expect(live.plan.applied).toContainEqual(expect.objectContaining({ ref: 'lane/a', sha: a0, pinnedFrom: a1 }));
+    expect(live.plan.applied.some(o => o.ref === 'lane/c')).toBe(compatible);
+
+    const check = await stackAwareOverlayCheck({
+      root: f.clone, ref: 'lane/c', existingOverlays: readOverlays(f.clone, { env: f.env }), env: f.env,
+    });
+    expect(check).toMatchObject({ ok: true, clean: compatible });
+    const result = await f.load({ ref: 'lane/c', pr: null });
+    if (compatible) {
+      expect(result.refused).toBeFalsy();
+      expect(f.rebuild).toHaveBeenCalledOnce();
+    } else {
+      expect(result).toMatchObject({ registered: false, refused: true, reason: 'conflict' });
+      expect(result.conflictCheck.files).toEqual(['shared.mjs']);
+      expect(f.rebuild).not.toHaveBeenCalled();
+    }
+    expect(readOverlays(f.clone, { env: f.env }).some(o => o.ref === 'lane/c')).toBe(compatible);
+  }, 60_000);
+
   it('an UNREGISTERED ref that conflicts with a registered overlay is refused: nothing registered, no rebuild', async () => {
     const f = fixture();
     const r = await f.load({ ref: 'lane/promote-stale-green' });
