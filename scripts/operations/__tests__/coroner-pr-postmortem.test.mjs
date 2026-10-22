@@ -8,6 +8,9 @@ import { runPostmortemPass, listMergedSince } from '../../conveyor/pass-daemons/
 import { hostname } from 'node:os';
 import { reserve } from '../../readiness/file-locks.mjs';
 import { buildOperatorRulingComment } from '../../lib/jury-core.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
+import { buildDrainReasonComment } from '../../merge-ai-prs.mjs';
+import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
 
 const at = m => new Date(Date.UTC(2026, 9, 17, 0, m)).toISOString();
 const comment = (m, body) => ({ createdAt: at(m), body, author: { login: 'web-everything' } });
@@ -34,6 +37,86 @@ function collectorGh(overrides = {}) {
 }
 const collectWith = gh => collectPrTimeline('example/repo',1,{gh,comments:() => fixture().comments,env:{WE_FIX_LOOP_LEDGER:join(process.cwd(),'.absent-coroner-ledger')}});
 describe('per PR postmortem', () => {
+  it('counts approval losses after carried heads without double-counting restamps', () => {
+    const heads = ['a','b','c','d','e'].map(c => c.repeat(40));
+    const verdicts = [[10,0],[40,2],[65,4]].map(([m,i]) => ({at:at(m),verdict:'accept',coverage:{headSha:heads[i]}}));
+    const carry = (m,from,to) => comment(m,buildVerdictComment({to:'restamp',actor:'drain',headSha:heads[to]})+'\n'+buildVerdictCarriedMarker({fromSha:heads[from],toSha:heads[to],patchId:'f'.repeat(40)}));
+    const input = {...fixture(),mergedAt:at(70),checks:[],
+      commits:[0,20,30,50,60].map((m,i) => ({sha:heads[i],commit:{committer:{date:at(m)},message:'build'}})),
+      verdicts,comments:[carry(21,0,1),carry(51,2,3)],
+      labels:[[10,'labeled'],[31,'unlabeled'],[40,'labeled'],[61,'unlabeled'],[65,'labeled']].map(([m,event]) => ({event,created_at:at(m),label:{name:'review:accepted'}}))};
+    const report = buildPostmortem(input);
+    expect(report.approvals.lost).toBe(2);
+    expect(report.approvals.headChanges.map(c => [c.head,c.nextHead,c.carryApplied])).toEqual([
+      [heads[0],heads[1],true],[heads[1],heads[2],null],[heads[2],heads[3],true],[heads[3],heads[4],null],
+    ]);
+    expect(shouldPostmortem(report)).toBe(true);
+    const restamps = [[21,1],[51,3]].map(([m,i]) => ({at:at(m),verdict:'accept',coverage:{headSha:heads[i]}}));
+    expect(buildPostmortem({...input,verdicts:[...verdicts,...restamps]}).approvals.lost).toBe(2);
+    const carried = buildPostmortem({...input,comments:[...input.comments,carry(31,1,2),carry(61,3,4)]});
+    expect(carried.approvals.lost).toBe(0);
+    expect(carried.approvals.headChanges).toHaveLength(4);
+    expect(shouldPostmortem(carried)).toBe(false);
+  });
+  it('does not reuse a carry marker for a later recurrence of the same head transition', () => {
+    const heads = ['a','b'].map(c => c.repeat(40));
+    const carry = (m,from,to) => comment(m,buildVerdictComment({to:'restamp',actor:'drain',headSha:heads[to]})+'\n'+buildVerdictCarriedMarker({fromSha:heads[from],toSha:heads[to],patchId:'f'.repeat(40)}));
+    const report = buildPostmortem({...fixture(),mergedAt:at(50),checks:[],labels:[],
+      commits:[[0,0],[20,1],[30,0],[40,1]].map(([m,i]) => ({sha:heads[i],commit:{committer:{date:at(m)},message:'build'}})),
+      verdicts:[{at:at(5),verdict:'accept',coverage:{headSha:heads[0]}}],
+      comments:[carry(21,0,1),carry(31,1,0)]});
+    expect(report.approvals.lost).toBe(1);
+    expect(report.approvals.headChanges.map(c => [c.head,c.nextHead,c.carryApplied])).toEqual([
+      [heads[0],heads[1],true],[heads[1],heads[0],true],[heads[0],heads[1],null],
+    ]);
+  });
+  it('never credits an approval with a carry that does not start from its standing head', () => {
+    const heads = ['a','b','c'].map(c => c.repeat(40));
+    const carry = (m,from,to) => comment(m,buildVerdictComment({to:'restamp',actor:'drain',headSha:heads[to]})+'\n'+buildVerdictCarriedMarker({fromSha:heads[from],toSha:heads[to],patchId:'f'.repeat(40)}));
+    const report = buildPostmortem({...fixture(),mergedAt:at(50),checks:[],labels:[],
+      commits:[[0,0],[10,1],[20,2]].map(([m,i]) => ({sha:heads[i],commit:{committer:{date:at(m)},message:'build'}})),
+      verdicts:[{at:at(15),verdict:'accept',coverage:{headSha:heads[0]}}],
+      comments:[carry(21,1,2)]});
+    expect(report.approvals.lost).toBe(1);
+  });
+  it.each([
+    ['equals the following commit timestamp',30],
+    ['is later than the following commit timestamp',35],
+  ])('counts both carried transitions when the first carry time %s', (_name, firstCarryAt) => {
+    const heads = ['a','b','c'].map(c => c.repeat(40));
+    const carry = (m,from,to) => comment(m,buildVerdictComment({to:'restamp',actor:'drain',headSha:heads[to]})+'\n'+buildVerdictCarriedMarker({fromSha:heads[from],toSha:heads[to],patchId:'f'.repeat(40)}));
+    const report = buildPostmortem({...fixture(),mergedAt:at(50),checks:[],labels:[],
+      commits:[0,20,30].map((m,i) => ({sha:heads[i],commit:{committer:{date:at(m)},message:'build'}})),
+      verdicts:[{at:at(5),verdict:'accept',coverage:{headSha:heads[0]}}],
+      comments:[carry(40,1,2),carry(firstCarryAt,0,1)]});
+    expect(report.approvals.lost).toBe(0);
+    expect(report.approvals.headChanges.map(c => [c.head,c.nextHead,c.carryApplied])).toEqual([
+      [heads[0],heads[1],true],[heads[1],heads[2],true],
+    ]);
+  });
+  it('records the production human-clearance handoff only from trusted comments', () => {
+    const body = buildVerdictComment({to:'clear-human',actor:'operator',headSha:'a'.repeat(40),reason:'Reviewed the outstanding concern'});
+    expect(body.split('\n')[0]).toBe('✅ review — `review:human` cleared via the sanctioned path');
+    const input = {...fixture(),comments:[comment(20,body)],checks:[],
+      verdicts:[{at:at(20),verdict:'clear-human',coverage:{headSha:'a'.repeat(40)}}],
+      labels:[{event:'labeled',created_at:at(300),label:{name:'ready-to-merge'}}]};
+    const gap = buildPostmortem(input).gaps.find(g => g.kind === 'clearance-ready');
+    expect(gap).toMatchObject({from:at(20),to:at(300),minutes:280});
+    expect(gap.minutesLost).toBe(280-gap.p90);
+    for (const c of [{...comment(20,body),author:{login:'untrusted-outsider'}},comment(20,'Ordinary update\nPlease use clear-human after review')]) {
+      expect(buildPostmortem({...input,comments:[c]}).gaps.some(g => g.kind === 'clearance-ready')).toBe(false);
+    }
+    expect(buildPostmortem({...input,comments:[comment(20,'clear-human')]}).gaps.find(g => g.kind === 'clearance-ready')).toMatchObject({minutes:280});
+  });
+  it('extracts distinct production drain-skip reasons and preserves legacy single-line reasons', () => {
+    const reasons = ['required check test failed','merge conflict in src/a.js','outstanding dependency #42'];
+    const comments = reasons.map((reason,i) => comment(20+i,buildDrainReasonComment('skip',reason+'\nMore detail')));
+    expect(comments[0].body).toBe('<!-- drain-skip-reason -->\n· **Skipped by the drain**\n\n'+reasons[0]+'\nMore detail');
+    comments.push(comment(30,'drain skip: legacy reason'));
+    const report = buildPostmortem({...fixture(),comments});
+    expect(report.drainSkips.map(c => c.reason)).toEqual([...reasons,'legacy reason']);
+    expect(report.causes.filter(c => c.cause.startsWith('drain-skip:')).map(c => c.cause)).toEqual([...reasons,'legacy reason'].map(reason => `drain-skip:${reason}`));
+  });
   it('retries a removed quarantine entry after cursor advancement', async () => {
     const dir = temp(); const reads = []; let fail = true;
     const file = join(dir,'merge-cursor-example%2Frepo.json');

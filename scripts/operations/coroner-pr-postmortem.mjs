@@ -124,7 +124,7 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
     if (e?.type === 'fix-end') mark('fix-end', c.at, c.ref);
     if (e?.type === 'ci-heal') mark('heal', c.at, c.ref);
     if (/^.*(?:review dispatched|review-begin)/i.test(c.body.split('\n')[0])) mark('review', c.at, c.ref);
-    if (/clear-human|cleared-human/.test(c.body.split('\n')[0])) mark('clearance', c.at, c.ref);
+    if (/clear-human|cleared-human/.test(c.body.split('\n')[0]) || c.body.split('\n')[0] === '✅ review — `review:human` cleared via the sanctioned path') mark('clearance', c.at, c.ref);
   }
   // Attempts are historical boundaries, not a final status per head/name. Keep
   // each distinct check (deduplicated by ID above); gap pairing below supersedes
@@ -155,15 +155,38 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
   }
   const approvals = sorted((verdicts ?? []).filter(v => ['accept','accepted','clear-human'].includes(v.verdict ?? v.action)).map(v => ({ at: v.at, head: v.coverage?.headSha ?? v.head, evidence: v.id ?? v.at })));
   for (const m of marks.filter(m => m.kind === 'accepted' || m.kind === 'clearance')) if (!approvals.some(a => Math.abs(time(a.at)-time(m.at)) < 60000)) approvals.push({ at: m.at, head: heads.filter(h => time(h.at) <= time(m.at)).at(-1)?.sha, evidence: m.evidence });
+  const occurrences = [];
+  for (let i = 1; i < heads.length; i++) {
+    if (!same(heads[i-1].sha,heads[i].sha)) occurrences.push({ prev: heads[i-1], next: heads[i] });
+  }
+  const carryMarkers = sorted(trusted).map(c => ({ comment: c, marker: parseVerdictCarriedMarker(c.body) })).filter(c => c.marker);
+  const usedCarries = new Set(), carriesByOccurrence = new Map();
+  for (const { prev, next } of occurrences) {
+    const carry = carryMarkers.find(c => !usedCarries.has(c) && same(c.marker.fromSha,prev.sha) && same(c.marker.toSha,next.sha) && time(c.comment.at) >= time(next.at));
+    if (carry) { usedCarries.add(carry); carriesByOccurrence.set(next,carry.comment); }
+  }
   const changes = approvals.flatMap(a => {
-    const next = heads.find(h => time(h.at) > time(a.at) && !same(a.head,h.sha));
-    if (!next || !a.head) return [];
-    const carry = trusted.find(c => { const m = parseVerdictCarriedMarker(c.body); return m && same(m.fromSha,a.head) && same(m.toSha,next.sha); });
-    return [{ ...a, nextHead: next.sha, changedAt: next.at, carryApplied: carry ? true : null, carryEvidence: carry?.ref ?? null }];
-  });
+    if (!a.head) return [];
+    const changes = []; let head = a.head;
+    for (const next of heads.filter(h => time(h.at) > time(a.at))) {
+      if (same(head,next.sha)) continue;
+      const assigned = carriesByOccurrence.get(next);
+      // The occurrence's carry counts only if it starts from the head this approval stands on.
+      const carry = assigned && same(parseVerdictCarriedMarker(assigned.body).fromSha,head) ? assigned : null;
+      changes.push({ ...a, head, nextHead: next.sha, changedAt: next.at, carryApplied: carry ? true : null, carryEvidence: carry?.ref ?? null });
+      if (!carry) break;
+      head = next.sha;
+    }
+    return changes;
+  }).filter((c,i,rows) => rows.findIndex(r => r.changedAt === c.changedAt && same(r.head,c.head) && same(r.nextHead,c.nextHead)) === i);
   const falseFindings = falseFindingsForPr({ repo, pr: Number(pr), comments, window: { since: openedAt, until: new Date(time(mergedAt)+1).toISOString() } });
   const standDowns = trusted.filter(c => /stood down|STAND-DOWN|not-a-ci-break/i.test(c.body.split('\n')[0])).map(c => ({ at: c.at, evidence: c.ref }));
-  const drainSkips = trusted.filter(c => /drain.skip/i.test(c.body.split('\n')[0])).map(c => ({ at: c.at, reason: c.body.split('\n')[0].replace(/^.*drain.skip[: —-]*/i,''), evidence: c.ref }));
+  const drainSkips = trusted.filter(c => /drain.skip/i.test(c.body.split('\n')[0])).map(c => {
+    const lines = c.body.split('\n');
+    const reason = lines[0] === '<!-- drain-skip-reason -->' && lines[1] === '· **Skipped by the drain**'
+      ? lines.slice(2).find(line => line.trim())?.trim() ?? '' : lines[0].replace(/^.*drain.skip[: —-]*/i,'');
+    return { at: c.at, reason, evidence: c.ref };
+  });
   const scopeKey = repoKeyForSlug(repo) ?? repo;
   const outside = scope?.length ? (input.files ?? []).map(f => f.filename).filter(f => !scope.some(g => coversFile(g.includes(':') ? g : `${scopeKey}:${g}`, `${scopeKey}:${f}`))) : null;
   const prepareHistory = prepares.map(p => ({ ...p, ageHours: minutes(p.at,openedAt) === null ? null : minutes(p.at,openedAt)/60, stale: time(openedAt)-time(p.at) > SETTINGS.prepareStaleHours*3600000 }));
