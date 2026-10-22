@@ -138,6 +138,39 @@ describe('runFixCli', () => {
     }));
     expect(writeErr).toHaveBeenCalledWith(expect.stringContaining(error.message));
   });
+  it.each([undefined, null, '', 42, {}])('releases the lane when acquire returns a malformed holder: %j', async holder => {
+    const m = mk(['aaa']);
+    const run = (cmd, args, opts) => {
+      if (args.includes('acquire')) {
+        m.calls.push([cmd, ...args]);
+        return JSON.stringify({ path: '/lanes/lane-5', holder });
+      }
+      return m.run(cmd, args, opts);
+    };
+    expect((await runFixCli(argv, { ...m.io, run })).code).toBe(1);
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.find(c => c.includes('release'))).toEqual(['node', '/we/scripts/lane-pool.mjs',
+      'release', '--repo=/w', '--lane=5', '--session=fix-7']);
+  });
+  it('passes the repository selector to recovery and re-reads the lease and head', async () => {
+    const m = mk(['aaa', 'aaa']);
+    let recovered = false;
+    const readLease = vi.fn(() => ({ holder: 'test-holder' }));
+    const run = (cmd, args, opts) => {
+      const value = m.run(cmd, args, opts);
+      if (args.includes('acquire') && args.includes('--lane=5')) recovered = true;
+      if (args.includes('--verify') && args.includes('HEAD') && !recovered) return 'old-head';
+      return value;
+    };
+    expect((await runFixCli(argv, { ...m.io, run, readLease })).code).toBe(0);
+    const recoveryIndex = m.calls.findIndex(c => c.includes('acquire') && c.includes('--lane=5'));
+    expect(m.calls[recoveryIndex]).toEqual(['node', '/we/scripts/lane-pool.mjs', 'acquire',
+      '--lane=5', '--session=fix-7', '--purpose=conveyor-fix', '--base=lane/7-x', '--repo=/w']);
+    expect(m.envs[recoveryIndex].LANE_SESSION).toBe('test-holder');
+    expect(m.calls.slice(recoveryIndex + 1).some(c => c.includes('--verify') && c.includes('HEAD'))).toBe(true);
+    expect(readLease.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(m.spawn).toHaveBeenCalledOnce();
+  });
   it('records a no-change Argon outcome and resolves its provider', async () => {
     const m = mk(['aaa','aaa']), recordRouted = vi.fn(()=>({}));
     const resolveProvider = vi.fn(m.io.resolveProvider);

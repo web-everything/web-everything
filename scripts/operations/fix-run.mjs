@@ -490,19 +490,20 @@ export function assertLaneLease({ lanePath, holder, readLease = readLaneLease, p
 }
 
 /** Recover only a clean, still-owned lane. A launcher merge must never be discarded. */
-export function ensureLaneHead({ lanePath, prHead, holder, run = sh, readLease = readLaneLease, allowReset = true }) {
+export function ensureLaneHead({ lanePath, prHead, holder, sessionSlug, ref, laneRepo, weRoot, run = sh, readLease = readLaneLease, allowReset = true }) {
   try {
     const options = { lanePath, prHead, holder, run, readLease };
     let check = inspectLaneHead(options);
     if (check.action === 'reset' && allowReset) {
-      const opts = { cwd: lanePath, env: { ...laneGitHardeningEnv(process.env), LANE_SESSION: holder } };
-      run('git', [...HARDENED_GIT_ARGS, 'fetch', 'origin', prHead], opts);
-      // Fetch can block: re-read both the marker and tree immediately before the destructive command.
+      if (!sessionSlug || !ref || !weRoot) throw new Error('missing lane-pool recovery context');
+      // The allocator re-verifies pushed containment and the hold rule immediately before reset.
+      // Re-acquiring our own lease preserves its holder; foreign leases are refused above and by the pool.
+      run('node', [
+        resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'acquire',
+        `--lane=${basename(lanePath).replace(/^lane-/, '')}`, `--session=${sessionSlug}`,
+        '--purpose=conveyor-fix', `--base=${ref}`, ...(laneRepo ? [`--repo=${laneRepo}`] : []),
+      ], { cwd: weRoot, env: { ...laneGitHardeningEnv(process.env), LANE_SESSION: holder } });
       check = inspectLaneHead(options);
-      if (check.action === 'reset') {
-        run('git', [...HARDENED_GIT_ARGS, 'reset', '--hard', prHead], opts);
-        check = inspectLaneHead(options);
-      }
     }
     if (!check.ok) throw new Error(`${check.why}${!allowReset ? '; launcher merge preparation must be preserved' : ''}`);
     return check;
@@ -691,18 +692,20 @@ export async function runFixCli(argv = [], {
     ];
     const acquired = run('node', poolArgs, { cwd: weRoot });
     const lanePath = parseAcquiredLanePath(acquired);
-    const holder = JSON.parse(acquired).holder;
-    if (typeof holder !== 'string' || !holder) throw new LauncherError('fix-run: acquire returned no holder slug; refusing to start the agent');
     const laneNum = basename(lanePath).replace(/^lane-/, '');
+    let releaseHolder = null;
     laneRelease = () => {
-      assertLaneLease({ lanePath, holder, readLease, phase: 'release the lane' });
+      if (releaseHolder) assertLaneLease({ lanePath, holder: releaseHolder, readLease, phase: 'release the lane' });
       return run('node', [
         resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'release', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
-        `--lane=${laneNum}`, `--session=${holder}`,
+        `--lane=${laneNum}`, `--session=${releaseHolder || sessionSlug}`,
       ], { cwd: weRoot });
     };
+    const holder = JSON.parse(acquired).holder;
+    if (typeof holder !== 'string' || !holder) throw new LauncherError('fix-run: acquire returned no holder slug; refusing to start the agent');
+    releaseHolder = holder;
     const gitEnv = { ...laneGitHardeningEnv(process.env), GIT_LITERAL_PATHSPECS: '1', LANE_SESSION: holder };
-    const checkLane = (head, allowReset = true) => ensureLaneHead({ lanePath, prHead: head, holder, run, readLease, allowReset });
+    const checkLane = (head, allowReset = true) => ensureLaneHead({ lanePath, prHead: head, holder, sessionSlug, ref, laneRepo: launch.laneRepo, weRoot, run, readLease, allowReset });
     const laneConfig = () => run('git', [...LANE_CONFIG_LIST_ARGS], { cwd: lanePath, env: gitEnv });
     const configBefore = laneConfig();
     const risky = riskyLaneConfig(configBefore);
