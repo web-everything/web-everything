@@ -6471,8 +6471,8 @@ from its class list) and the drain's existing proof-of-land gate (base lands fir
    retargeted back to, the closed base's branch, or is parked `review:human`. A later pass finishes or escalates a
    recovery that a crash interrupted; a recovery read it cannot complete parks the child `review:human`. Independently
    of the claim and every marker, the drain refuses to land any child whose head still carries a closed (unmerged)
-   base's commits that are not on the default branch, read from the child's own base history, and an ancestry read it
-   cannot complete also refuses to land.
+   base's commits that are not on the default branch, read from the base history of the child's head branch (force-
+   pushed base heads included), and an ancestry read it cannot complete also refuses to land.
 6. **Free-scope.** The caller names the intended base PR (`--stack-on=<n>`); free-scope applies the matrix and excludes
    only PR holders in that chain, never agent-registry holders. A cell that may not stack still reports OCCUPIED.
 
