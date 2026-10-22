@@ -63,6 +63,17 @@
         ]
       }
     ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/precompact-snapshot.mjs"
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
