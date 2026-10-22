@@ -5,7 +5,7 @@ import {
   realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setImmediate } from 'node:timers/promises';
@@ -50,7 +50,7 @@ const lockExpiry = (lock, leaseMs) => Number.isFinite(ms(lock.lease?.expiresAt))
 export const tokenOf = path => readLock(path)?.lease?.token;
 
 /** Git runner whose captured output is bounded at 16 MiB; `maxBuffer` follows `...options`, so a caller cannot raise it. */
-export const gitIn = cwd => (args, options = {}) => execFileSync('git', args, {
+export const gitIn = (cwd, exec = execFileSync) => (args, options = {}) => exec('git', args, {
   cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...options, maxBuffer: 16 * 1024 * 1024,
   env: { ...process.env, GIT_AUTHOR_NAME: 'Card batch', GIT_AUTHOR_EMAIL: 'card-batch@localhost',
     GIT_COMMITTER_NAME: 'Card batch', GIT_COMMITTER_EMAIL: 'card-batch@localhost',
@@ -64,6 +64,17 @@ export const gitIn = cwd => (args, options = {}) => execFileSync('git', args, {
  * integration" forever (live 2026-10-21: #5790 stuck draft-withdrawn, #5794 stuck at record-sealed).
  */
 export const sealJobEnv = (env = process.env) => ({ ...env, WE_GITHUB_APP_ROLE: 'worker' });
+
+/** Production GitHub lookup, with a fixed deadline and captured-output limit. */
+export const defaultGh = (args, exec = execFileSync) => exec('gh', args, {
+  encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+});
+
+/** Recovery cannot disable its per-command deadline or raise gitIn's output limit. */
+export const recoveryGitIn = (cwd, exec = execFileSync) => {
+  const run = gitIn(cwd, exec);
+  return (args, options = {}) => run(args, { ...options, timeout: 30_000 });
+};
 
 /** A token prevents a finishing, expired producer from releasing its successor's lease. */
 export function acquireLease(path, owner, now, leaseMs, hook) {
@@ -104,10 +115,120 @@ export function atomicRecord(path, state) {
   } finally { rmSync(temporary, { force: true }); }
 }
 
+// Only this module's fresh GitHub read can authorize a completed seal's retirement.
+const terminalRetirement = Symbol('fresh terminal PR');
+
+/** Archive before replacing the active slot; caller must own and recheck the existing lease. */
+export function retireBatch(statePath, state, { repo, kind, held, terminalPrState, authorization }) {
+  if (basename(dirname(statePath)) === 'sealed') return state;
+  if (!state.sealFailure && (authorization !== terminalRetirement || !['MERGED', 'CLOSED'].includes(terminalPrState))) {
+    throw new Error('batch-sealed');
+  }
+  if (!held()) throw new Error('lease-held');
+  const archiveDir = join(dirname(statePath), 'sealed');
+  mkdirSync(archiveDir, { recursive: true });
+  const archivePath = join(archiveDir, `${repo.replaceAll('/', '-')}-${state.seq}-${kind}.json`);
+  atomicRecord(archivePath, { ...state, kind, repo, ...(terminalPrState ? { terminalPrState } : {}) });
+  if (!held()) throw new Error('lease-held');
+  const successor = { seq: state.seq, lastSealedState: archivePath };
+  atomicRecord(statePath, successor);
+  return successor;
+}
+
+/** Recover closed batch members from their immutable coordinator commits, never from worktree text.
+ * Must refuse on unreadable evidence. Docs/config/data outside top-level cards remain ineligible.
+ * No receive endpoint is added: bounded gh/git output, a timed lookup and the lease bound recovery triggers.
+ */
+function respoolClosed(state, input, stateDir, remote, held) {
+  const git = recoveryGitIn(input.laneDir ?? ROOT);
+  // A stale origin/main must not cause us to discard or duplicate a member.
+  git(['fetch', '--no-tags', remote, 'refs/heads/main']);
+  const main = git(['rev-parse', 'FETCH_HEAD^{commit}']).trim();
+  git(['fetch', '--no-tags', remote, `refs/heads/${state.batchRef}`]);
+  const entries = state.members.map(member => {
+    if (!COMMIT_ID.test(member.commitSha) || !/^[a-z0-9]+$/.test(member.cardId)
+      || member.source?.repo !== input.source.repo) throw new Error('invalid member identity');
+    const lines = git(['show', '-s', '--format=%B', member.commitSha]).split('\n').filter(line => line.startsWith(MARKER));
+    if (lines.length !== 1) throw new Error('invalid member evidence');
+    const data = JSON.parse(lines[0].slice(MARKER.length));
+    git(['merge-base', '--is-ancestor', member.commitSha, state.headSha]);
+    const changed = git(['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', member.commitSha]).split('\0');
+    if (changed.length !== 3 || changed[0] !== 'A' || changed[1] !== data.cardPath) throw new Error('invalid card change');
+    if (data.cardId !== member.cardId || data.idemKey !== member.idemKey || data.kind !== input.kind
+      || data.source?.repo !== input.source.repo || data.batchRef !== state.batchRef
+      || !/^backlog\/[a-z0-9]+-[a-z0-9-]+\.md$/.test(data.cardPath)
+      || !data.cardPath.startsWith(`backlog/${member.cardId}-`)) throw new Error('invalid member evidence');
+    if (git(['ls-tree', main, '--', data.cardPath]).trim()) return null;
+    if (!git(['ls-tree', member.commitSha, '--', data.cardPath]).startsWith('100644 blob ')) throw new Error('invalid card mode');
+    const bytes = git(['show', `${member.commitSha}:${data.cardPath}`], { encoding: 'buffer' });
+    const content = bytes.toString('utf8');
+    if (!Buffer.from(content).equals(bytes)) throw new Error('invalid card encoding');
+    return { cardId: member.cardId, rel: data.cardPath, content, idemKey: member.idemKey, source: member.source };
+  }).filter(Boolean);
+  const pending = join(stateDir, 'pending-prevention');
+  if (!held()) throw new Error('lease-held');
+  mkdirSync(pending, { recursive: true });
+  for (const entry of entries) {
+    if (!held()) throw new Error('lease-held');
+    const path = join(pending, `${entry.cardId}.json`);
+    // Exclusive publish preserves another filer's spool. A conflicting entry holds the batch.
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporary, JSON.stringify(entry), { flag: 'wx' });
+      try { linkSync(temporary, path); }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        const existing = readJSON(path);
+        if (!existing || Object.keys(entry).some(key => JSON.stringify(existing[key]) !== JSON.stringify(entry[key]))) {
+          throw new Error('conflicting pending card');
+        }
+      }
+    } finally { rmSync(temporary, { force: true }); }
+  }
+}
+
+/** A sealed card batch may be retired and replaced only when a fresh GitHub read confirms its PR is MERGED or CLOSED.
+ * Retire a terminal sealed generation under the caller's admission lease; unreadable evidence stays held. */
+export async function retireTerminalBatch(recorded, input, {
+  statePath, stateDir = dirname(statePath), remote = 'origin', gh = defaultGh,
+  held: stillHeld, log = line => process.stderr.write(`${line}\n`),
+}) {
+  if ((!recorded?.sealFailure && recorded?.seal?.step !== 'label-on-green')
+    || !recorded?.batchRef || !recorded.sealedAt || !recorded.pr
+    || basename(dirname(statePath)) === 'sealed') return refuse('batch-sealed');
+  let status = 'UNREADABLE';
+  try {
+    if (!Number.isSafeInteger(recorded.seq) || recorded.seq < 1 || !COMMIT_ID.test(String(recorded.headSha))
+      || !Number.isSafeInteger(Number(recorded.pr)) || Number(recorded.pr) <= 0
+      || recorded.repo && recorded.repo !== input.source.repo
+      || recorded.kind && recorded.kind !== input.kind
+      || recorded.batchRef !== `lane/card-batch-${input.kind}-${recorded.seq}`) throw new Error('invalid batch identity');
+    const view = JSON.parse(await gh(['pr', 'view', String(recorded.pr), '--repo', input.source.repo, '--json', 'number,state,headRefName']));
+    if (Number(view?.number) === Number(recorded.pr) && view.headRefName === recorded.batchRef
+      && ['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) status = view.state;
+    if (!stillHeld()) return refuse('lease-held');
+    if (status === 'CLOSED') respoolClosed(recorded, input, stateDir, remote, stillHeld);
+    if (status === 'MERGED' || status === 'CLOSED') {
+      const retired = recorded;
+      recorded = retireBatch(statePath, recorded, { repo: input.source.repo, kind: input.kind, held: stillHeld, terminalPrState: status, authorization: terminalRetirement });
+      log(`card-batch ${retired.batchRef} PR ${retired.pr} GitHub ${status}: retired${status === 'CLOSED' ? ' and re-spooled' : ''}`);
+    } else {
+      log(`card-batch ${recorded.batchRef} PR ${recorded.pr} GitHub ${status}: kept sealed and held`);
+      return refuse('batch-sealed');
+    }
+  } catch {
+    log(`card-batch ${recorded.batchRef} PR ${recorded.pr} GitHub ${status}: recovery unreadable; kept sealed and held`);
+    return refuse('batch-sealed');
+  }
+  return { action: 'retired', state: recorded };
+}
+
 /** Returns admission/dedupe/refusal; injected crashes throw CARD_BATCH_CRASH at the named boundary. */
 export async function admitCard(input, {
   stateDir = cardBatchStateDir(), remote = 'origin', clock = Date.now,
   owner = `${process.pid}:${randomUUID()}`, policy, leaseMs = 60_000, crashAt, hook,
+  gh = defaultGh,
+  log = line => process.stderr.write(`${line}\n`),
 } = {}) {
   const now = () => ms(clock());
   const initial = planAdmit({ state: null, input, policy, now: now(), owner });
@@ -141,10 +262,20 @@ export async function admitCard(input, {
   try {
     // Permit independent producers to contend even when Git itself is synchronous.
     await setImmediate();
-    const recorded = readJSON(statePath);
+    let recorded = readJSON(statePath);
+    if (basename(dirname(statePath)) === 'sealed') return refuse('batch-sealed');
     if (recorded?.batchRef && !COMMIT_ID.test(String(recorded.headSha))) return refuse('head-mismatch');
-    // The lockfile is authoritative. State's lease is the audit snapshot of its last writer.
+    // Preserve member retries before retiring their membership. Dedupe still takes the remote-head
+    // validation path below; the lockfile, rather than the previous writer's audit lease, is authoritative.
     let plan = planAdmit({ state: recorded && { ...recorded, lease: auditLease }, input, policy, now: now(), owner });
+    if (plan.action !== 'dedupe' && recorded?.batchRef && recorded.sealedAt && recorded.pr) {
+      const result = await retireTerminalBatch(recorded, input, {
+        statePath, stateDir, remote, gh, held: stillHeld, log,
+      });
+      if (result.action !== 'retired') return result;
+      recorded = result.state;
+    }
+    plan = planAdmit({ state: recorded && { ...recorded, lease: auditLease }, input, policy, now: now(), owner });
     if (plan.action === 'refuse') return plan;
     const seq = recorded?.batchRef ? recorded.seq : (recorded?.seq ?? 0) + 1;
     const ref = `refs/heads/${recorded?.batchRef ?? `lane/card-batch-${input.kind}-${seq}`}`;

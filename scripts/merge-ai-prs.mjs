@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { postCardSquashMarker } from './lib/card-squash-marker.mjs';
+import { ensureLabelCached } from './lib/label-cache.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -142,6 +144,7 @@ import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-lab
 import { existsSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname } from 'node:path';
+import { loadCardRebaseSettings } from './lib/card-squash-rebuild.mjs';
 import { rebaseDropManifest, gitRunner } from './lib/rebase-drop-manifest.mjs';
 // fix-couple-split — a couple lands WHOLE in one pass or not at all (hold + contiguous order + carrier pre-flight).
 import { planCoupleCascadeStep, carrierPreflight, openSiblingRefSet, candKey, isImplHalf, isCoupleCarrier } from './lib/couple-cascade.mjs';
@@ -191,7 +194,7 @@ import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.
 import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
-import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
+import { requestDrainRedTeam, createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
@@ -202,6 +205,7 @@ import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './li
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from './lib/drain-concurrency.mjs';
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
+import { resolveDrainPrState, readDrainPrStateBatch, batchedDrainPr } from './lib/drain-pr-state.mjs';
 export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
@@ -1273,9 +1277,9 @@ export function isRebaseDropCandidate(v) {
  *
  * Setting the CHILD'S cwd rather than threading a flag pins EVERY git read the CLI makes, not only the one
  * that is known about today, and leaves the operator's single-PR invocation untouched. `undefined` for a
- * local-repo PR means "inherit", which is already correct. The scripts still come from THIS checkout — the
- * path below resolves from `import.meta.url`, never from cwd. `spawn` is injected so the pinning is
- * assertable without a subprocess.
+ * local-repo PR means "inherit", which is already correct. Script selection is independent of cwd:
+ * daemon restamps prefer their gated CODE clone; other callers use this checkout. `spawn` is injected
+ * so the pinning is assertable without a subprocess.
  */
 /**
  * #1671 review finding — every internal caller of `review-set-label.mjs` needs the SINGLE-token `--repo=`
@@ -1304,12 +1308,19 @@ export function spawnReviewSetLabel({ pr, repo, to, cwd, actor, channel, reason,
   }
 }
 
-export function restampAcceptance({ pr, repo, newHead, cwd, spawn = spawnSync, localRepo = () => localRepoSlug({ cwd }) }) {
+export function restampAcceptance({ pr, repo, newHead, cwd, spawn = spawnSync, localRepo = () => localRepoSlug({ cwd }),
+  env = process.env, exists = existsSync }) {
   try {
     const target = repo || localRepo();
     if (!target) return { ok: false, reason: 'no repo to re-stamp (PR repo unset and the local repo slug unreadable)' };
+    // A no-overlay daemon pass can run from stale DATA even while its gated CODE clone is current.
+    // Select code independently of the target cwd; review-set-label still enforces its freshness refusal.
+    const drainCode = env.DRAIN_DAEMON_WE_CODE_CLONE
+      || (env.DRAIN_DAEMON_WE_CLONE && join(dirname(env.DRAIN_DAEMON_WE_CLONE), 'code'));
+    const drainEntry = drainCode && resolve(drainCode, 'scripts/review-set-label.mjs');
+    const entry = drainEntry && exists(drainEntry) ? drainEntry : new URL('./review-set-label.mjs', import.meta.url).pathname;
     const r = spawn(process.execPath, [
-      new URL('./review-set-label.mjs', import.meta.url).pathname,
+      entry,
       String(pr), `--repo=${target}`, '--to=restamp', '--actor=drain',
       '--channel=drain-rebase', `--reason=head moved to ${newHead} by this drain's own content-preserving rebase`,
       // #x9krtkb (bug 2) — `newHead` used to reach the child ONLY inside `--reason`'s free text, which
@@ -4562,11 +4573,6 @@ async function runCli() {
   const isFastDrainTarget = (repo, p) => REPOS.includes(repo) && matchesOnlyTarget({ prNumber: p.number, onlyPr, repo, onlyRepo, isLocal: isLocalRepo(repo), repoCount: REPOS.length });
   const fastDrainPrs = (repo, prs) => filterToFastDrainTarget(prs, { onlyPr, scope: fastDrain.scope, isTarget: (p) => isFastDrainTarget(repo, p) });
   const repoTag = (repo) => (repo && repo !== localSlug ? `${repo.split('/').pop()}#` : '#'); // display prefix per PR
-  // #2262 — under `--watch`, `sweepOnce()` (below) runs every `--interval`s FOREVER; memoize which (repo, label)
-  // pairs this process has already ensured exist so a long-lived watch doesn't `gh label create` the same
-  // review:* labels every single pass (wasted round-trips on an idempotent one-time mint).
-  const ensuredLabels = new Set();
-
   // #2263 — a SIBLING clone of a non-local constellation repo (`../frontierui`, `../plateau-app` next to this
   // WE clone) lets the rebase-drop plumbing rebuild THAT repo's lane tip too, instead of leaving every
   // CONFLICTING/BEHIND frontierui/plateau-app PR for its author. Best-effort + read-only-check: a repo whose
@@ -4637,7 +4643,7 @@ async function runCli() {
     onDeferred: (reason) => process.stderr.write(`  ⚠ ${repoTag(repo)}${pr.number} ${reason}\n`),
   });
   const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
-  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
+  const mergeStrategy = createDrainMergeStrategy({ requestRedTeam: DRY_RUN ? null : requestDrainRedTeam, resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
   // head, so they are written per candidate only once an enqueue entry point CONFIRMS its merge or enqueue: the
@@ -4792,15 +4798,20 @@ async function runCli() {
   // it and re-fetches next `--watch` pass rather than latching an empty read for the head-SHA lifetime. Behaviour
   // THIS pass is unchanged — the caller still sees `[]` (⇒ isAiGeneratedPr → false → skipped, never merged on
   // missing data); a genuinely-empty successful read returns `{ commits: [], degraded: false }` and DOES cache.
-  const fetchPrCommits = async (repo, num, headSha = null) => {
+  let passPrState = new Map();
+  const fetchPrCommits = async (repo, num, headSha = null, listedRow = null) => {
     // #gh-graphql-budget — a PR's commit list is fixed by its head SHA, and the resident daemon starts a FRESH
     // process every pass (so the in-process `ctxReadCache`/`sweepReadCache` below start empty each time and
     // re-read every open PR's commits every 60s). Persist a successful read on disk keyed by (repo, PR, head SHA).
     const cached = readShaCache({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha, kind: 'commits' });
     if (Array.isArray(cached)) return { commits: cached, degraded: false };
     try {
-      const { stdout } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'commits'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-      const commits = JSON.parse(stdout.trim() || '{}').commits || [];
+      const batched = listedRow && batchedDrainPr(passPrState, repo || localSlug, listedRow);
+      let commits = batched?.commits;
+      if (!commits) {
+        const { stdout } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'commits'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        commits = JSON.parse(stdout.trim() || '{}').commits || [];
+      }
       writeShaCache({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha, kind: 'commits', value: commits });
       return { commits, degraded: false };
     } catch { return { commits: [], degraded: true }; } // gh threw → degraded → re-fetch next pass
@@ -4858,7 +4869,7 @@ async function runCli() {
         let seed = [];
         try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
         const listed = listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
-          heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+          heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed: [...(passPrState.get(slug) || []), ...seed],
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } });
         drainHeavyCacheByRepo.set(repo, listed.cache);
         return resolveListedChecks(repo, listed.rows);
@@ -4876,7 +4887,7 @@ async function runCli() {
         isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
         fetchOne: async ({ repo, p }) => {
           const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
-          const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
+          const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p), p) : { degraded: false }]);
           return { manifest: manifestRes.manifest, ...(readCommits ? { commits: commitsRes.commits } : {}), degraded: manifestRes.degraded || commitsRes.degraded, transient: !!manifestRes.transient };
         },
       });
@@ -4915,16 +4926,11 @@ async function runCli() {
   const reconcileCiLifecycleLabels = (repo, ctx) => {
     if (!RECONCILE) return [];
     const open = fastDrainPrs(repo, ctx.prsByRepo.get(repo) || []);
-    // Mint the two NEW labels once per (repo, process) — `ready-to-merge` is minted by pr-land.mjs (the first
-    // applier); never re-minted here so its color/description keeps ONE single source. Mirrors the review-label
-    // mint below: the WHOLE ensure-loop (including the `ensuredLabels` memoization) is skipped under DRY_RUN, so
-    // a dry-run process never marks a label "ensured" without having actually minted it.
+    // Ensure lifecycle labels through the shared TTL cache. `ready-to-merge` is owned by pr-land.
+    // Dry runs skip provisioning entirely.
     if (!DRY_RUN) {
       for (const [name, meta] of Object.entries(CI_LIFECYCLE_LABEL_META)) {
-        const ensureKey = `${repo || 'cwd'}::${name}`;
-        if (ensuredLabels.has(ensureKey)) continue;
-        ensuredLabels.add(ensureKey);
-        try { execFileSync('gh', ['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* already exists — fine */ }
+        try { ensureLabelCached(['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { exec: args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }); } catch { /* already exists — fine */ }
       }
     }
     const reconciled = [];
@@ -5096,6 +5102,11 @@ async function runCli() {
     }
     process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
   }
+  const prStateSetting = resolveDrainPrState();
+  process.stderr.write(`policy · drain.prState.batched=${prStateSetting.value.batched} (${prStateSetting.sources.batched})\n`);
+  passPrState = prStateSetting.value.batched
+    ? await readDrainPrStateBatch({ repos: (RECONCILE ? CONTEXT_REPOS : REPOS).map(repo => repo || localSlug), exec: execFileP })
+    : new Map();
   // Keep listing, bare-loop and review-escalation policy on one fresh snapshot per pass.
   const workflowEditSetting = resolveDrainWorkflowEditHuman();
   process.stderr.write(`policy · drainWorkflowEditHuman=${workflowEditSetting.value} (${workflowEditSetting.source})\n`);
@@ -5182,7 +5193,7 @@ async function runCli() {
           try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
         }
         listed = __t.time('listing.pages', () => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
-          heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+          heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed: [...(passPrState.get(slug) || []), ...seed],
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }));
         drainHeavyCacheByRepo.set(repo, listed.cache);
       } else if (!slug) {
@@ -5266,7 +5277,7 @@ async function runCli() {
     shaOf: ({ p }) => prReadCacheIdentity(p),
     isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
     fetchOne: async ({ repo, p }) => {
-      const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p)), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
+      const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p), p), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
       return { commits: commitsRes.commits, manifest: manifestRes.manifest, degraded: commitsRes.degraded || manifestRes.degraded, transient: !!manifestRes.transient };
     },
   }));
@@ -5520,7 +5531,9 @@ async function runCli() {
         if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} would rebase-drop manifest (state ${v.state}/${v.mergeable})${cloneDir ? ` via ${cloneDir}` : ''} then merge\n`);
         continue;
       }
-      let r = rebaseDropManifest({ laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
+      const cardRebaseSettings = loadCardRebaseSettings();
+      console.error(`drain rebase: cardRebase.squashToSingleCommit=${cardRebaseSettings.value.squashToSingleCommit} (source: ${cardRebaseSettings.sources.squashToSingleCommit})`);
+      let r = rebaseDropManifest({ cardRebaseSettings, laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
       // #2371 — a REAL (non-manifest) conflict is the manifest resolver's own skip boundary; retry it with the
       // wider content resolver, which ONLY auto-resolves if every conflicting hunk is non-overlapping. Its own
       // skip (a genuine overlapping/unsafe hunk) is left exactly as before — surfaced for `/finish`.
@@ -5534,6 +5547,12 @@ async function runCli() {
       }
       v.rebaseDrop = r.action;
       if (r.action === 'rebased') {
+        postCardSquashMarker({ result: r, readComments: () => {
+          const fetched = fetchPrComments(v.repo, v.num);
+          if (!fetched.read) throw new Error('comments unreadable');
+          return fetched.comments;
+        }, postComment: body => execFileSync('gh', ['pr', 'comment', String(v.num), ...repoFlag(v.repo), '--body', body],
+          { stdio: ['ignore', 'ignore', 'pipe'] }) });
         v.decision = 'merge';
         const healTag = r.healed && r.healed.length ? ` (renumbered ${r.healed.map((h) => `#${h.oldNum}→#${h.newNum}`).join('/')})` : '';
         const contentTag = contentResolved ? ` (auto-resolved non-overlapping content conflict in ${r.mergedPaths.join(', ')})` : '';
@@ -5663,10 +5682,7 @@ async function runCli() {
       const escalationRepos = new Set(verdicts.filter((v) => !v.prestagePendingCi && (v.decision === 'merge' || v.reviewHeld)).map((v) => v.repo || null));
       for (const repo of escalationRepos) {
         for (const [name, meta] of Object.entries(REVIEW_LABEL_META)) {
-          const ensureKey = `${repo || 'cwd'}::${name}`;
-          if (ensuredLabels.has(ensureKey)) continue;
-          ensuredLabels.add(ensureKey);
-          try { execFileSync('gh', ['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* already exists — fine */ }
+          try { ensureLabelCached(['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { exec: args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }); } catch { /* already exists — fine */ }
         }
       }
     }

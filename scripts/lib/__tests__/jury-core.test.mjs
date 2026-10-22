@@ -1,6 +1,6 @@
 import { sameAsLinkAllowed, findCarriedReviewerRuling, reviewerCarryBacking, REFERRAL_CARRY_REASON } from '../jury-core.mjs';
 import { FINDING_ID_PATTERN, findingIdentityTable, bindFindingIds, mintFindingId, normalizeFindingIdentity } from '../jury-core.mjs';
-import { validateOperatorRuling } from '../jury-core.mjs';
+import { validateOperatorRuling, buildOperatorRulingComment, parseOperatorRulingComment } from '../jury-core.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, findCarriedOperatorRuling, liveReferrals, carriedBackingHolds, carriedActor, carriedReasonText, AUTO_POLICY_ACTOR } from '../jury-core.mjs';
 import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
@@ -1588,6 +1588,34 @@ describe('#4315 mandatory referral protocol', () => {
   const rule = (r, result = 'not-real') => ({ id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id,
     lens: 'correctness', result, rationale: 'Verified against the pinned diff', evidence: ['diff:lease-reaper'],
     ...(result === 'card' ? { card: 'we:backlog/4315-example.md' } : {}) });
+
+  it.each([
+    ['chalbert/web-everything', 'chalbert/web-everything', true],
+    ['web-everything/web-everything', 'chalbert/web-everything', true],
+    ['chalbert/web-everything', 'web-everything/web-everything', true],
+    ['chalbert/web-everything', 'chalbert/plateau-app', false],
+  ])('replays operator blocks for referral %s and ruling %s (matches=%s)', (repo, rulingRepo, matches) => {
+    const r = { ...record(), repo };
+    const key = r.referrals[0].key;
+    const initial = post(renderReferralRecord(r));
+    r.rulings = [rule(r, 'not-real')];
+    const reviewer = post(renderReferralRecord(r));
+    const operatorRecord = { version: 1, repo: rulingRepo, pr: r.pr, head: r.head,
+      actor: OPERATOR_LOGINS[0], channel: 'chat', reason: 'Block this finding explicitly',
+      at: '2026-10-18T00:00:00Z', clearerId: 'operator-session',
+      rulings: [{ runId: r.runId, key, result: 'block' }] };
+    const operator = post(buildOperatorRulingComment(operatorRecord));
+    expect(parseOperatorRulingComment(operator)).toEqual({ record: operatorRecord });
+    for (const contextRepo of ['chalbert/web-everything', 'web-everything/web-everything']) {
+      const context = { head: r.head, body: r.authorBody, repo: contextRepo, pr: r.pr };
+      expect(mandatoryReferralState([initial, reviewer], context).blocked).toEqual([]);
+      const state = mandatoryReferralState([initial, reviewer, operator], context);
+      expect(state.blocked).toEqual(matches ? [key] : []);
+      expect(state.blockedFindings.map(f => f.key)).toEqual(matches ? [key] : []);
+      expect(state.pending).toEqual([]);
+      expect(state.records).toEqual([r]);
+    }
+  });
 
   it('validates and requires operator backing for carried rulings', () => {
     const r = record(), key = r.referrals[0].key;

@@ -69,6 +69,49 @@ function fixture({ pinnedA = false } = {}) {
 }
 
 describe('planRebuild retry pass', () => {
+  it('overlay-pin never costs a carried overlay its retry: a new tip a later overlay makes clean beats the pin (Codex audit)', async () => {
+    const base = mktemp('we-retry-pin-');
+    const origin = join(base, 'origin.git');
+    const clone = join(base, 'clone');
+    gitOk(base, ['init', '--bare', '-q', origin]);
+    mkdirSync(clone);
+    gitOk(clone, ['init', '-q', '-b', 'main']);
+    write(clone, 'settings.json', BASE);
+    gitOk(clone, ['add', '-A']);
+    gitOk(clone, ['commit', '-q', '-m', 'init']);
+    gitOk(clone, ['remote', 'add', 'origin', origin]);
+    gitOk(clone, ['push', '-q', '-u', 'origin', 'main']);
+    const author = join(base, 'author');
+    gitOk(base, ['clone', '-q', origin, author]);
+    const push = (ref, from, files) => {
+      gitOk(author, ['fetch', '-q', 'origin']);
+      gitOk(author, ['checkout', '-q', '-B', ref, from]);
+      for (const [n, c] of Object.entries(files)) write(author, n, c);
+      gitOk(author, ['add', '-A']);
+      gitOk(author, ['commit', '-q', '-m', ref]);
+      gitOk(author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${ref}`]);
+      return gitOk(author, ['rev-parse', 'HEAD']).trim();
+    };
+    const runGit = (args, opts = {}) => gitRun(args, { cwd: clone, ...opts });
+    const init = gitOk(clone, ['rev-parse', 'HEAD']).trim();
+    const a0 = push('lane/a', init, { 'a.txt': 'a0\n' });
+    gitOk(clone, ['fetch', '-q', 'origin']);
+    const live = await planRebuild({ git: runGit, headSha: init, mainRef: 'origin/main', overlays: [{ ref: 'lane/a', pr: 1 }] });
+    // A's new head conflicts with main's move; B (registered later) restores the shared file so A merges again
+    const aNew = push('lane/a', a0, { 'settings.json': BASE.replace('  }\n}', '  },\n  "freeze": { "red": "on" }\n}') });
+    const mainSha = push('main', init, { 'settings.json': BASE.replace('"x": "on"', '"x": "on",\n    "y": 15') });
+    push('lane/b', mainSha, { 'settings.json': BASE, 'settings/b.json': '{ "fix": { "y": 15 } }\n' });
+    gitOk(clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: runGit, headSha: live.finalSha, mainRef: 'origin/main', overlays: [{ ref: 'lane/a', pr: 1 }, { ref: 'lane/b', pr: 2 }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.find((d) => d.ref === 'lane/a')).toMatchObject({ action: 'apply', reason: 'applied-retry', sha: aNew });
+    expect(plan.applied.find((x) => x.ref === 'lane/a').pinnedFrom).toBeUndefined();
+    expect(plan.establishedLost).toEqual([]);
+  });
+
+
   it('re-applies an overlay dropped for a conflict once a later overlay made it merge cleanly', async () => {
     const f = fixture();
     const plan = await planRebuild({

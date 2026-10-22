@@ -49,6 +49,40 @@ const resolveDeliveryAgentProvider = async (name) => (await import('./deliver-it
 const readAllComments = async (pr, o) => (await import('../conveyor/pr-comments-complete.mjs')).readCompletePrComments(pr, o);
 const releaseBorrowedClaim = async (o) => (await import('../conveyor/fix-dispatch-claim.mjs')).releaseSessionFixDispatchClaims(o);
 
+/**
+ * IO (injectable as `carryVerdict`): before re-arming a pushed repair, carry the PR's accept when the pushed head's net
+ * change is provably identical to a reviewed head — the shared rebase-verdict-carry.mjs#attemptVerdictCarry, the same
+ * decision and writers the review job uses. Only an ACCEPTED PR is considered (a bounce has nothing to carry, and the
+ * restamp writer refuses anything else, `review:human` included). Never throws; `carried:false` means "re-arm as today".
+ * Live case: #5777/#5779 (2026-10-21), where a CI heal restored exactly the accepted tree and still spent a full round.
+ */
+export async function carryAcceptedPush({ repo, pr, head, lanePath, weRoot, run = sh, write = () => {}, readComments = readAllComments }) {
+  const view = JSON.parse(run('gh', ['pr', 'view', String(pr), ...(repo ? [`--repo=${repo}`] : []), '--json', 'headRefOid,labels'], { cwd: weRoot }) || '{}');
+  const labels = (Array.isArray(view?.labels) ? view.labels : []).map(l => (typeof l === 'string' ? l : l?.name));
+  if (!labels.includes('review:accepted')) return { carried: false, reason: '' };
+  if (view.headRefOid !== head) return { carried: false, reason: `live head ${String(view.headRefOid).slice(0, 9)} is not the pushed head` };
+  const { attemptVerdictCarry, contributionPatchId, resolveCarryAcrossRebase, gitCitedLineReader } = await import('../lib/rebase-verdict-carry.mjs');
+  const { proveIdenticalNetPatch } = await import('../lib/identical-net-patch.mjs');
+  const comments = await readComments(pr, { repo });
+  const laneGit = (f, a, o) => run(f, a, { ...o, cwd: lanePath });
+  return attemptVerdictCarry({
+    log: line => write(`fix-run: ${line}\n`),
+    carryAcrossRebaseSetting: () => resolveCarryAcrossRebase(),
+    readCarryEvidence: () => ({ headSha: view.headRefOid, comments }),
+    contributionPatchId: ({ sha }) => contributionPatchId({ sha, exec: laneGit }),
+    proveIdenticalNetPatch: ({ fromSha, toSha }) => proveIdenticalNetPatch({ fromSha, toSha, cwd: lanePath, exec: execFileSync }),
+    readCitedLine: ({ sha, file, line }) => gitCitedLineReader({ cwd: lanePath })({ sha, file, line }),
+    restampVerdict: ({ newHead, reason }) => {
+      try {
+        run('node', [resolve(weRoot, 'scripts', 'review-set-label.mjs'), String(pr), ...(repo ? [`--repo=${repo}`] : []), '--to=restamp',
+          '--actor=review-carry', `--new-head=${newHead}`, `--reason=${reason}`], { cwd: lanePath });
+        return { ok: true };
+      } catch (e) { return { ok: false, reason: String(e?.stderr || e?.stdout || e?.message || e).split('\n')[0] }; }
+    },
+    postCarryComment: ({ body }) => run('gh', ['pr', 'comment', String(pr), ...(repo ? ['--repo', repo] : []), '--body', body], { cwd: weRoot }),
+  }, { pr: Number(pr), repo, expectHead: head });
+}
+
 export { FIX_RUN_EXECUTORS };
 
 /** Defense in depth: even though Codex protects `.git`, the push runs OUTSIDE its sandbox with our
@@ -74,9 +108,11 @@ export const defaultPendingRearm = (dir = pendingRearmDir()) => ({
       return v && typeof v.sha === 'string' && now - Number(v.at) < PENDING_REARM_MAX_AGE_MS ? v : null;
     } catch { return null; }
   },
-  write(repo, pr, sha, now = Date.now()) {
+  // `conflictRound` survives a crash so a retried hand-back keeps its round class (a conflict round never carries
+  // and never spends an ordinary round).
+  write(repo, pr, sha, now = Date.now(), { conflictRound = false, mainRef = null } = {}) {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now }), { mode: 0o600 });
+    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now, ...(conflictRound ? { conflictRound: true, ...(mainRef ? { mainRef } : {}) } : {}) }), { mode: 0o600 });
   },
   clear(repo, pr) { try { unlinkSync(join(dir, pendingKey(repo, pr))); } catch { /* already gone */ } },
 });
@@ -183,6 +219,23 @@ export function unstagedPaths(porcelain) {
     if (code[1] !== ' ' || UNMERGED_CODES.has(code)) paths.push(row.slice(3));
   }
   return [...new Set(paths.filter(p => p && !SCRATCH_RE.test(basename(p))))];
+}
+
+/**
+ * PURE (#xkmu3gv cap path, 2026-10-21 operator brief). Is this repair a MECHANICAL conflict round — the dispatcher
+ * planned a merge onto the base (`--merge-onto`, a conflict or restack), it is not a CI heal, and the only new content
+ * is that merge: either git merged cleanly and the agent changed nothing, or the agent edited ONLY the conflicted
+ * files. Such a round re-arms through `rearm-review.mjs --round=conflict` (its own smaller cap) instead of spending an
+ * ordinary review round. The label swap is identical either way, so the PR is still re-reviewed; any other edit, or an
+ * unknown state, is an ordinary round (the fail-safe direction: it only spends a round).
+ * @param {{mergeOnto?:string|null, repairKind?:string, conflicted?:boolean, unmerged?:string[], unstaged?:string[],
+ *   mergeCommitted?:boolean, agentPaths?:string[]}} facts
+ */
+export function isMechanicalConflictRound({ mergeOnto = null, repairKind = 'fix', conflicted = false, unmerged = [],
+  unstaged = [], mergeCommitted = false, agentPaths = [] } = {}) {
+  if (!mergeOnto || repairKind !== 'fix') return false;
+  if (conflicted) return unmerged.length > 0 && unstaged.every(p => unmerged.includes(p));
+  return mergeCommitted && agentPaths.length === 0;
 }
 
 // NUL porcelain preserves spaces/newlines and includes both sides of a rename.
@@ -506,6 +559,7 @@ export async function runFixCli(argv = [], {
   resolveProvider = resolveFixProvider,
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
+  carryVerdict = carryAcceptedPush,
   readCiHeal = readCiHealInputs,
   appendLoopRow = appendFixLoopRow,
   releaseClaim = releaseBorrowedClaim,
@@ -625,12 +679,28 @@ export async function runFixCli(argv = [], {
     const configBefore = laneConfig();
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
-    const rearm = head => {
+    const rearm = async (head, { conflictRound = false, mainRef = null } = {}) => {
       // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
       try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
       catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
+      // An ACCEPTED PR whose pushed head has a provably identical net change keeps its accept (the existing restamp +
+      // carried marker, rebase-verdict-carry.mjs#attemptVerdictCarry) — no re-arm comment, so no review round is spent.
+      // Anything unproven falls through to the re-arm exactly as before. A conflict round never carries: it is a bounce.
+      if (!conflictRound) {
+        let carry;
+        try { carry = await carryVerdict({ repo: launch.repo, pr, head, lanePath, weRoot, run, write, readComments }); }
+        catch (e) { carry = { carried: false, reason: String(e?.message ?? e).split('\n')[0] }; }
+        if (carry?.carried) {
+          write(`fix-run: PR #${pr} accept carried ${carry.fromSha} → ${head} (identical net patch, patch-id ${carry.patchId}); no re-arm, no round consumed\n`);
+          return 'carried';
+        }
+        if (carry?.reason) write(`fix-run: PR #${pr} no accept carry (${carry.reason}) — re-arming\n`);
+      }
       try {
-        return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
+        return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : []),
+          // A conflict round records what it resolved against: the merge target, read in the lane that just fetched it.
+          ...(conflictRound ? ['--round=conflict', `--main-ref=${mainRef || target || String(prHead.baseRefName ?? '').trim() || 'main'}`] : [])],
+        { cwd: conflictRound ? lanePath : weRoot });
       } catch (e) {
         const policy = resolveRearmRefusalPolicy();
         if (policy.mode === 'noop' && isNothingToRearmRefusal(e)) {
@@ -642,10 +712,13 @@ export async function runFixCli(argv = [], {
     };
     // A prior run pushed this exact tip and then failed to re-arm (this lane opened AT that tip): finish the hand-back
     // now, before spending a whole agent run on it.
-    if (pendingRearm.read(launch.repo, pr)?.sha === before) {
-      rearm(before);
+    const pending = pendingRearm.read(launch.repo, pr);
+    if (pending?.sha === before) {
+      const handBack = await rearm(before, { conflictRound: pending.conflictRound === true, mainRef: typeof pending.mainRef === 'string' ? pending.mainRef : null });
       pendingRearm.clear(launch.repo, pr);
-      const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
+      const result = handBack === 'carried'
+        ? `PR #${pr} (already pushed ${before.slice(0, 9)}; accept carried — identical net patch — after a failed earlier hand-back)`
+        : `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
       outcome = 'pushed'; reason = 'finished an earlier push';
       write(`fix-run: PR #${pr} finished - ${result}\n`);
       return { code: 0, result };
@@ -713,6 +786,8 @@ export async function runFixCli(argv = [], {
       .filter(m => m && OID_RE.test(m[2]) && m[4] === path)
       .map(m => ({ mode: m[1], oid: m[2], stage: m[3] }));
     let unmerged = [];
+    let mergeCommitted = false;
+    let conflictRound = false;
     let mergePrompt = '';
     if (target) {
       if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(target)) throw new LauncherError(`invalid merge ref: ${target}`);
@@ -741,7 +816,7 @@ export async function runFixCli(argv = [], {
         }
         unmerged = conflicts.map(c => c.path);
       }
-      if (!unmerged.length && inMerge()) commitMerge();
+      if (!unmerged.length && inMerge()) { commitMerge(); mergeCommitted = true; }
       if (unmerged.length) mergePrompt = `The launcher has ALREADY started git merge origin/${target}; the conflicted files are: ${unmerged.join(', ')}. Resolve them by editing the files only. Do NOT run any git command that writes (merge, add, commit, checkout, reset, stash, rebase) — the sandbox forbids .git writes; the launcher stages and commits after you exit.\n\n`;
     }
     // Capture emitted widths before the agent runs: the merge itself may already have changed .gitattributes. Widths come
@@ -812,6 +887,8 @@ export async function runFixCli(argv = [], {
     if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new LauncherError('lane git config changed while the agent ran; refusing to push');
     const statusAfterAgent = git('status', '--porcelain=v1', '-z', '--untracked-files=all');
     const paths = changedPaths(statusAfterAgent);
+    conflictRound = isMechanicalConflictRound({ mergeOnto: launch.mergeOnto, repairKind: launch.repairKind,
+      conflicted: inMerge(), unmerged, unstaged: unstagedPaths(statusAfterAgent), mergeCommitted, agentPaths: paths });
     if (inMerge()) {
       // Every conflicted path is a text UU/AA conflict (checked above), so it must still exist as a regular file in the
       // lane with no conflict markers; a missing, symlinked, hardlinked or escaping path counts as unresolved.
@@ -862,11 +939,12 @@ export async function runFixCli(argv = [], {
         throw new LauncherError('lane git config changed while the agent ran; refusing to push');
       }
       // Record the owed re-arm BEFORE the push (best effort): a crash anywhere after the push must not lose it.
-      try { pendingRearm.write(launch.repo, pr, after); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
+      try { pendingRearm.write(launch.repo, pr, after, undefined, { conflictRound, mainRef: target || null }); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
       run('git', [...HARDENED_GIT_ARGS, 'push', '--no-verify', 'origin', `HEAD:refs/heads/${ref}`], { cwd: lanePath, env: gitEnv }); // never --force
-      rearm(after);
+      const handBack = await rearm(after, { conflictRound });
       pendingRearm.clear(launch.repo, pr);
-      result = `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending)`;
+      result = handBack === 'carried' ? `PR #${pr} (pushed ${after.slice(0, 9)}, accept carried — identical net patch)`
+        : `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending${conflictRound ? ' — mechanical conflict round' : ''})`;
       outcome = 'pushed'; reason = finalMessage || `pushed ${after.slice(0, 9)}`;
     }
     write(`fix-run: PR #${pr} finished - ${result}\n`);

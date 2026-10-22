@@ -226,7 +226,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       // operator instead of being auto-blocked forever. The operator's own structured blocks are NOT registered here
       // (operator mode is unchanged).
       if (ruled && x.result === 'block' && String(parsed.record.actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR) {
-        blocks.set(`structured:${index}:${x.runId}:${x.key}`, { source: 'structured', rulingId: operatorRulingId({ head: parsed.record.head, runId: x.runId, key: x.key, at: parsed.record.at }),
+        blocks.set(`structured:${index}:${x.runId}:${x.key}`, { source: 'structured', actor: parsed.record.actor, rulingId: operatorRulingId({ head: parsed.record.head, runId: x.runId, key: x.key, at: parsed.record.at }),
           finding: findingView(ruled), clearing: clearingView(ruled), ruling: x.reason ?? parsed.record.reason, priorHead: parsed.record.head, index, at: sinceOf(c) });
       }
     }
@@ -250,29 +250,57 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
   // `reviewerCarryBacking`). Only then did the finding not "come back". It once fired anyway on two paths: an
   // auto-policy block ignored the current-head ruling, and a record block ignored a later-head not-real carried forward.
   // The gate's own per-record state decides (`referralRecordState`), so a linked or contradicting block still holds.
-  const gateRecords = readReferralRecords(pr?.comments, { head }).records;
+  const recordsOn = new Map();
+  const gateRecordsOn = (h) => {
+    if (!recordsOn.has(h)) recordsOn.set(h, readReferralRecords(pr?.comments, { head: h }).records);
+    return recordsOn.get(h);
+  };
   const stateCache = new Map();
-  const gateState = (record) => {
-    if (!stateCache.has(record.runId)) {
-      const full = gateRecords.find((r) => r.head === head && r.runId === record.runId) ?? record;
+  const gateState = (record, onHead = head) => {
+    const cacheKey = `${onHead}:${record.runId}`;
+    if (!stateCache.has(cacheKey)) {
+      const onRecords = gateRecordsOn(onHead);
+      const full = onRecords.find((r) => r.head === onHead && r.runId === record.runId) ?? record;
       let state = null;
       try {
-        state = referralRecordState(full, { head, records: gateRecords, operatorRulings,
+        state = referralRecordState(full, { head: onHead, records: onRecords, operatorRulings,
           ...(typeof pr?.body === 'string' ? { body: pr.body } : {}), ...(pr?.createdAt ? { createdAt: pr.createdAt } : {}) });
       } catch { state = null; }
-      stateCache.set(record.runId, state);
+      stateCache.set(cacheKey, state);
     }
-    return stateCache.get(record.runId);
+    return stateCache.get(cacheKey);
   };
   const hasEvidence = (r) => Array.isArray(r?.evidence) && r.evidence.some((e) => oneLine(e).length > 0);
   /** Thread position of the counted not-real-with-evidence ruling that clears `key` on this head, or null. */
-  const notRealClearanceAt = (record, key) => {
-    const state = gateState(record);
+  const notRealClearanceAt = (record, key, onHead = head) => {
+    const state = gateState(record, onHead);
     if (!state || state.pending.includes(key) || state.blocked.includes(key)) return null;
     const ruling = state.rulings.filter((r) => r.key === key || (r.id && record.carried?.some((c) => c.key === key && c.from?.rulingId === r.id))).at(-1);
     if (!ruling || ruling.result !== 'not-real' || !hasEvidence(ruling)) return null;
     const seen = snaps.find((s) => s.record.rulings.some((x) => x.id === ruling.id && x.result === 'not-real'));
     return seen ? seen.index : null;
+  };
+  // PR #5762 @5eba5a13 (2026-10-21): a finding the reviewer only CARRIED onto this head for re-check (`recheck.fromHead`),
+  // and has not ruled here yet, did not "come back" when the head it was carried from ruled it not-real with evidence
+  // after the block: the latest ruling in that finding's own lineage is "fixed", so the old block is satisfied and the
+  // carried copy is simply pending its re-check (it still holds acceptance through the pending gate). A fresh re-raise
+  // (no `recheck`) or a re-check carried from a head that ruled it block, or left it open, still came back.
+  /** Thread position of the counted not-real-with-evidence ruling the re-check source head gave this finding, or null. */
+  const recheckClearanceAt = (f) => {
+    const from = String(f?.recheck?.fromHead ?? '').toLowerCase();
+    if (!SHA.test(from) || from === head) return null;
+    const latestOnFrom = new Map();
+    for (const s of snaps) if (s.record.head === from && s.record.referrals.some((x) => x.key === f.key)) latestOnFrom.set(s.record.runId, s);
+    let at = null;
+    for (const { record } of latestOnFrom.values()) {
+      const ruled = activeRulings(record, f.key);
+      if (!ruled.length) continue;
+      if (ruled.some((r) => r.result !== 'not-real')) return null; // any other standing ruling there: fail closed
+      const seen = notRealClearanceAt(record, f.key, from);
+      if (seen === null) return null;
+      at = at === null ? seen : Math.max(at, seen);
+    }
+    return at;
   };
 
   const matches = [];
@@ -301,12 +329,19 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       // the fixer the rungs that re-ruling bought instead of counting heads from the first ruling.
       let b = null;
       const clearedAt = notRealClearanceAt(record, f.key);
+      // Only while the finding is still merely PENDING on this head: any ruling here (a reviewer's, or a structured
+      // auto-policy block outside `record.rulings`) means it was looked at again, and the ladder counts as before.
+      const hereState = gateState(record);
+      const stillPending = !rulingsHere(f.key).length && !!hereState && hereState.pending.includes(f.key) && !hereState.blocked.includes(f.key)
+        && !operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key);
+      const recheckClearedAt = stillPending ? recheckClearanceAt(f) : null;
       for (const c of blocks.values()) {
         if (c.index > firstIndex) continue; // written after this head's record: a fresh ruling on it
         if (!matchesBlock(g, c)) continue;
         if (c.source === 'record' && rulingsHere(f.key).length) continue;
         if (overruled(c)) continue;
         if (isFindingBlock(c) && clearedAt !== null && clearedAt > c.index) continue; // satisfied, not came back
+        if (isFindingBlock(c) && recheckClearedAt !== null && recheckClearedAt > c.index) continue; // re-check pending, not came back
         if (!b || c.index > b.index) b = c;
       }
       if (!b) continue;
@@ -328,7 +363,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       }
       worst = Math.max(worst, heads.size);
       matches.push({ finding: g, runId: record.runId, blockRulingId: b.rulingId ?? null, ruledFinding: isFindingBlock(b) ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
-        ruledAt: b.at ? new Date(b.at).toISOString() : null, source: b.source, misses: heads.size });
+        ruledAt: b.at ? new Date(b.at).toISOString() : null, source: b.source, ...(b.actor ? { actor: b.actor } : {}), misses: heads.size });
     }
   }
   if (!matches.length) return null;
@@ -374,17 +409,20 @@ export function sentBackAt(comments, head) {
 }
 export const hasSentBack = (comments, head) => sentBackAt(comments, head) !== null;
 
+export const rulingAuthority = (matches = []) => matches.some(m => m.actor === AUTO_POLICY_ACTOR)
+  ? (matches.every(m => m.actor === AUTO_POLICY_ACTOR) ? 'auto-policy' : 'auto-policy and the operator') : 'the operator';
+
 const where = (f) => `${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}`;
 /** The PR comment that goes with the send-back: the durable record AND what the fixer reads. */
 export function renderRulingNotAddressed({ head, matches, rung = null, source = null, items = [] }) {
   if (source === 'operator-send-back') return `${RULING_NOT_ADDRESSED_MARKER}\n\n`
     + 'The last fix left an operator send-back unaddressed; this goes back to a fixer.\n\n'
     + renderOperatorSendBackReviewBlock(items) + sentBackLine(head, rung?.id);
-  return `${RULING_NOT_ADDRESSED_MARKER}\n\nThe last fix did not satisfy a ruling the operator already gave. `
+  return `${RULING_NOT_ADDRESSED_MARKER}\n\nThe last fix did not satisfy a ruling ${rulingAuthority(matches)} already gave. `
     + 'A review on the new head reports the same confirmed finding again, so this goes straight back to a fixer.\n\n'
     + (rung ? `**Escalation rung ${rung.at} (${rung.id}):** ${rung.label}${rung.model ? ` — model ${rung.model}` : ''}.\n\n` : '')
     + matches.map((m) => `- \`${where(m.finding)}\` — ${m.finding.summary}\n`
-      + `  - earlier ruling (${m.priorHead ? `head \`${m.priorHead.slice(0, 9)}\`` : `operator, ${m.ruledAt ?? 'earlier'}`}): ${m.ruling}\n`
+      + `  - earlier ${m.actor === AUTO_POLICY_ACTOR ? 'auto-policy ' : ''}ruling (${m.priorHead ? `head \`${m.priorHead.slice(0, 9)}\`` : `operator, ${m.ruledAt ?? 'earlier'}`}): ${m.ruling}\n`
       + `  - times it came back after the ruling: ${m.misses}`).join('\n')
     + `\n\n${sentBackLine(head, rung?.id)}`;
 }
@@ -393,11 +431,11 @@ export function renderRulingNotAddressed({ head, matches, rung = null, source = 
 export function fixerRulingBrief({ matches, rung = null, source = null, items = [] }) {
   if (source === 'operator-send-back') return renderOperatorSendBackBrief(items);
   return '# Ruling not addressed — read this first\n\n'
-    + 'The operator already ruled on the finding(s) below, and your predecessor\'s last push did not satisfy the ruling. '
+    + `${rulingAuthority(matches)} already ruled on the finding(s) below, and your predecessor's last push did not satisfy the ruling. `
     + 'This is the whole ask: change the code so each finding is actually fixed as ruled. '
     + 'Treat the "⛔ conveyor — ruling not addressed" comment on the PR as the authoritative finding '
     + '(advisory-fix style: repair only this, no verdict, never touch review:human).\n\n'
-    + matches.map((m) => `- ${where(m.finding)} — ${m.finding.summary}\n  Operator ruling, verbatim: ${m.ruling}\n  Note: the last fix did not satisfy this.`).join('\n')
+    + matches.map((m) => `- ${where(m.finding)} — ${m.finding.summary}\n  ${m.actor === AUTO_POLICY_ACTOR ? 'auto-policy' : 'Operator'} ruling, verbatim: ${m.ruling}\n  Note: the last fix did not satisfy this.`).join('\n')
     + (rung?.instruction === TEST_FIRST_INSTRUCTION
       ? '\n\nThis is escalation rung ' + rung.at + ' (' + rung.id + '): the same finding has now come back ' + rung.at + ' time(s). '
         + 'Before changing any code, write a failing test for EACH finding above that fails on the current head for the reason the ruling gives, '
@@ -406,7 +444,7 @@ export function fixerRulingBrief({ matches, rung = null, source = null, items = 
     + '\n\n';
 }
 
-export const rulingDisputeText = (prNumber, ig, trail = '') => `PR #${prNumber}: ${ig.matches.length} confirmed finding(s) the operator ruled "block" came back on the new head `
+export const rulingDisputeText = (prNumber, ig, trail = '') => `PR #${prNumber}: ${ig.matches.length} confirmed finding(s) ${rulingAuthority(ig.matches)} ruled "block" came back on the new head `
   + (ig.returns ? `(${ig.misses} miss(es) after the ruling, and ${ig.returns} fixer turn(s) ended without a new head)` : `(${ig.misses} misses after the ruling)`)
   + ' — fixer and reviewer disagree; a person (or an arbiter) must decide.' + (trail ? ` Ladder so far: ${trail}.` : '') + ' '
   + ig.matches.map((m) => `${where(m.finding)}`).join(', ');

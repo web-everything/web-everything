@@ -691,7 +691,8 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
       f.fetch();
       const plan = await ffPlan(f, { headSha: b1 });
       expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'apply' });
-      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'drop', reason: 'conflict' });
+      // overlay-pin: C's rewritten tip clashes, so C stays at the head the last build adopted (which carried P).
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'apply', reason: 'applied-pinned' });
       expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
     });
 

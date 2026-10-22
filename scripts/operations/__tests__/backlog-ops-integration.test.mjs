@@ -150,7 +150,7 @@ describe('claim + scaffold — the guarded write, on a real filesystem', () => {
       writeFileSync(join(ctx.root, 'backlog', '150-done.md'), CARD('150', 'resolved'));
       writeFileSync(join(ctx.root, 'backlog', 'README.txt'), 'not a card\n');
 
-      const ctxRead = createScaffoldReader({ root: ctx.root })();
+      const ctxRead = createScaffoldReader({ allocate: () => ({ ok: false, reason: 'test disabled' }), log: () => {}, root: ctx.root })();
 
       expect(ctxRead.existingIds.sort()).toEqual(['042', '099', '150']);
       expect(ctxRead.dir).toBe(join(ctx.root, 'backlog'));

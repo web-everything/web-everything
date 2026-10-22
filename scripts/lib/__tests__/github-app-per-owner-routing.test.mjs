@@ -5,7 +5,7 @@
  * `gh` goes through the shim, which picks the token by the target repo's owner.
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -101,5 +101,46 @@ describe('ensureFreshGithubAppEnv({ perOwner: true })', () => {
     expect(r.applied).toBe(true);
     expect(env.GH_TOKEN).toBe('tok-web-everything');
     expect(existsSync(join(dir, 'shim.js'))).toBe(false);
+  });
+});
+
+
+describe('canonical owner routes to the worker App installation', () => {
+  it.each([
+    ['repo flag', ['pr', 'list', '-R', 'chalbert/web-everything']],
+    ['REST repo path', ['api', 'repos/chalbert/web-everything/issues']],
+    ['origin remote', ['pr', 'list']],
+  ])('%s selects web-everything and mints the worker installation', async (_name, args) => {
+    const { resolveDeliveryIdentity, shimRoleTable } = await import('../github-app-identity.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'gh-canonical-worker-'));
+    try {
+      for (const gitArgs of [['init', '-q'], ['remote', 'add', 'origin', 'git@github.com:chalbert/web-everything.git']]) {
+        const r = spawnSync('/usr/bin/git', gitArgs, { cwd: dir, encoding: 'utf8' });
+        expect(r.status, r.stderr).toBe(0);
+      }
+      const identity = resolveDeliveryIdentity({ tool: { worker: { appId: '2', installations: { 'web-everything': '222' }, key: { file: '/fixture/worker-key' } } } });
+      const cachePath = join(dir, 'cache.json');
+      const ghPath = join(dir, 'fake-gh');
+      const shimPath = join(dir, 'shim.cjs');
+      writeFileSync(ghPath, `#!${process.execPath}\nprocess.stdout.write(process.env.GH_TOKEN === 'fixture-worker' ? 'worker-installation' : 'wrong-identity');\n`);
+      chmodSync(ghPath, 0o755);
+      const minted = [];
+      const result = await ensureFreshGithubAppEnv({
+        env: {}, identity, role: 'worker', daemon: true, perOwner: true, cachePath,
+        statusPath: join(dir, 'status.json'), canReadKey: () => true,
+        mint: async ({ installationId }) => { minted.push(installationId); return { token: 'fixture-worker', expiresAt: new Date(Date.now() + 3600e3).toISOString(), permissions: { ...PERMS, actions: 'write' } }; },
+        getInstallationInfo: async () => ({ repositorySelection: 'all' }), log: { error() {} },
+        installShim: async () => {
+          writeFileSync(shimPath, renderGhShimScript({ realGhPath: ghPath, cachePath, roleTable: shimRoleTable({ identity, cachePath }), ghThrottleCliPath: join(dir, 'absent'), refreshCliPath: join(dir, 'absent-refresh') }));
+          return { ok: true };
+        },
+      });
+      expect(result).toMatchObject({ applied: true, role: 'worker' });
+      expect(minted).toEqual(['222']);
+      const r = spawnSync(process.execPath, [shimPath, ...args], { cwd: dir, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: dir, WE_GH_DAEMON_CALLER: 'canonical-owner-test' } });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toBe('worker-installation');
+      expect(r.stderr).not.toContain('personal auth');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

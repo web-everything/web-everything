@@ -82,6 +82,7 @@
  *   node scripts/operations/land-prevention-card.mjs --drain-pending
  *   node scripts/operations/land-prevention-card.mjs --fold-open-singles [--json]
  */
+import { owePreventionFiling, fileOwedPrevention } from '../lib/prevention-filing-owed.mjs';
 import { machinePrTitle, preventionCardTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
@@ -92,8 +93,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
-import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
+import { loadPreventionBatchSettings, formatPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
+import { FILE_ITEM_ROOT_ENV } from './file-item-io.mjs';
 import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
 } from '../lib/approval-prevention-notice.mjs';
@@ -241,6 +243,7 @@ export function parseLandPreventionCardArgv(argv = []) {
     parent: String(flags.parent ?? ''),
     queue: String(flags.queue),
     session: String(flags.session),
+    ...(flags['owed-key'] ? { owedKey: flags['owed-key'] } : {}),
     retract: retractFlags.every(Boolean)
       ? { repo: retractFlags[0], pr: retractFlags[1], headSha: retractFlags[2] }
       : null,
@@ -468,7 +471,19 @@ export async function foldOpenSingles({ lane }, {
  * @returns {Promise<{ok:boolean, step:string, num:(number|string|null), rel:(string|null), pr:(number|null),
  *   url:(string|null), reason:(string|null)}>}
  */
-export async function landPreventionCard(input, {
+export async function landPreventionCard(input, options = {}) {
+  try {
+    // A dry run never files: it reports only, BEFORE any owed-filing obligation can substitute its stored input
+    // (which drops `dryRun`/`root`) or a paused filer records a new one (operator ruling 2026-10-20).
+    if (input?.dryRun) return await landPreventionCardImpl(input, options);
+    const loadFilingSettings = options.loadFilingSettings ?? loadPreventionBatchSettings;
+    if (loadFilingSettings().filingEnabled === false) return await landPreventionCardImpl(input, options);
+    if (options.owedClaimed) return await landPreventionCardImpl(boundLandPreventionCardInput(input), options);
+    return await fileOwedPrevention(input, filing => landPreventionCardImpl(filing.owedKey ? boundLandPreventionCardInput(filing) : filing, options));
+  } catch (e) { return { ok: false, step: 'owed', reason: e.message, pr: null, url: null }; }
+}
+
+async function landPreventionCardImpl(input, {
   exec = defaultExec,
   pendingDir = pendingPreventionDir(),
   write = (line) => process.stdout.write(line),
@@ -479,8 +494,19 @@ export async function landPreventionCard(input, {
   dedupe = runCardDedupe,
   batch = fileIntoBatch,
   loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
+  loadFilingSettings = loadPreventionBatchSettings,
   sleep: wait = sleep,
+  fileExists = existsSync,
+  filerRoot = REPO_ROOT,
 } = {}) {
+  const filing = loadFilingSettings();
+  write(`${formatPreventionBatchSettings(filing)}\n`);
+  if (filing.filingEnabled === false) {
+    const reason = 'prevention filing paused by prevention.filingEnabled';
+    if (input.title && !input.dryRun) owePreventionFiling(input);
+    write(`${reason}\n`);
+    return { ok: false, skipped: true, step: 'paused', reason, num: null, rel: null, pr: null, url: null };
+  }
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
   let scratch = null;
@@ -538,6 +564,7 @@ export async function landPreventionCard(input, {
     // one hop further out. A real delivery agent avoids this by `cd $LANE` + a RELATIVE `scripts/...` path; this
     // does the equivalent by building the lane's own absolute path explicitly.
     const laneRunMjs = join(lane, 'scripts', 'operations', 'run.mjs');
+    const filerRunMjs = join(filerRoot, 'scripts', 'operations', 'run.mjs');
     await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write });
     if (input.foldOpenSingles) {
       const summary = await foldOpenSingles({ lane }, { exec, batch, write });
@@ -597,16 +624,23 @@ export async function landPreventionCard(input, {
     let num = null;
     let rel = null;
     if (filingInput) {
-      write(`land-prevention-card: filing the card in ${lane}…\n`);
+      // THE CARD IS BORN BY THIS CHECKOUT'S CODE, WRITTEN INTO THE LANE (card xx7o40x follow-up, live 2026-10-20:
+      // PR #5728's card was hash-named although number-at-birth was adopted on the review daemon clone, because
+      // this step ran the LANE's own `run.mjs` — origin/main code, which no daemon overlay ever reaches). The
+      // #4317 property is kept by naming the target explicitly (`WE_FILE_ITEM_ROOT`) rather than by borrowing
+      // the lane's code, and re-checked below: the card must exist in the lane.
+      write(`land-prevention-card: filing the card in ${lane} with ${filerRoot}'s file-item…\n`);
       const fileArgv = [
-        laneRunMjs, 'file-item', `--title=${retitle(filingInput, input)}`, `--kind=${filingInput.kind}`, `--size=${filingInput.size}`,
+        filerRunMjs, 'file-item', `--title=${retitle(filingInput, input)}`, `--kind=${filingInput.kind}`, `--size=${filingInput.size}`,
         `--digest=${filingInput.digest}`, `--scope=${filingInput.scope}`,
         ...(filingInput.parent ? [`--parent=${filingInput.parent}`] : []),
         `--queue=${filingInput.queue}`, '--json',
       ];
       let filed;
       try {
-        filed = parseRunJsonTail(exec('node', fileArgv, { cwd: lane, timeout: FILE_ITEM_TIMEOUT_MS }));
+        filed = parseRunJsonTail(exec('node', fileArgv, {
+          cwd: lane, timeout: FILE_ITEM_TIMEOUT_MS, env: { ...process.env, [FILE_ITEM_ROOT_ENV]: lane },
+        }));
       } catch (e) {
         filed = parseRunJsonTail(e?.stdout);
         if (!filed) return fail('file-item', String(e?.message || e).split('\n')[0]);
@@ -614,6 +648,7 @@ export async function landPreventionCard(input, {
       num = filed?.verdict?.num ?? null;
       rel = filed?.verdict?.rel ?? null;
       if (!rel) return fail('file-item', filed?.error || 'file-item produced no card path', { num });
+      if (!fileExists(join(lane, rel))) return fail('file-item', `filed card ${rel} is not in the lane ${lane}`, { num });
     } else if (!mentioned.length) {
       // Every finding is already recorded (on an open PR's card, or verbatim on the card from a retried filing).
       write('land-prevention-card: every finding is already on an open card — nothing to file or land\n');

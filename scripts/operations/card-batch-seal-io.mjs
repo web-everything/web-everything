@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { acquireLease, atomicRecord, cardBatchStateDir, sealJobEnv, tokenOf } from './card-batch-io.mjs';
+import { acquireLease, atomicRecord, cardBatchStateDir, sealJobEnv, retireBatch, retireTerminalBatch, tokenOf } from './card-batch-io.mjs';
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
 import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
 import { effectiveCardBatchPolicy, loadVerifyRetryMinutes, resolveVerifyRetryMinutes } from '../lib/card-batch-settings.mjs';
@@ -61,10 +61,22 @@ export async function publishBatch(input, opts = {}) {
     // A terminal generation is archived before its active slot becomes a sequence-only successor seed.
     if (!state.batchRef && state.lastSealedState) {
       state = readState(state.lastSealedState);
-      return { action: state.sealFailure ? 'held' : 'sealed', state };
+      if (!['MERGED', 'CLOSED'].includes(state.terminalPrState)) return { action: state.sealFailure ? 'held' : 'sealed', state };
     }
     const kind = input.kind ?? kindOf(state, statePath);
     const repo = state.repo ?? state.members[0]?.source.repo;
+    if (['MERGED', 'CLOSED'].includes(state.terminalPrState)) {
+      // An archive hint cannot bypass seal checks or authorize a stale terminal state.
+      if (state.seal?.step !== 'label-on-green') return refuse('batch-sealed');
+      let view;
+      try { view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'number,state,headRefName'])); }
+      catch { return refuse('batch-sealed'); }
+      if (!held()) return refuse('lease-held');
+      if (Number(view?.number) !== Number(state.pr) || view?.headRefName !== state.batchRef
+        || !['MERGED', 'CLOSED'].includes(view.state)) return refuse('batch-sealed');
+      if (basename(dirname(statePath)) === 'sealed' || readState(statePath).lastSealedState) return { action: 'sealed', state };
+      // Active slots retire through the common fresh-read path below.
+    }
     const check = async () => {
       if (!held()) return 'lease-held';
       const advertised = String(await run('git', ['ls-remote', '--refs', remote, `refs/heads/${state.batchRef}`])).trim().split(/\s+/)[0];
@@ -75,17 +87,15 @@ export async function publishBatch(input, opts = {}) {
       state.lease = { owner: lease.owner, expiresAt: lease.expiresAt };
       atomicRecord(statePath, state);
     };
-    const retire = () => {
-      if (basename(dirname(statePath)) === 'sealed') return;
-      if (!held()) throw new Error('lease-held');
-      const archiveDir = join(dirname(statePath), 'sealed');
-      mkdirSync(archiveDir, { recursive: true });
-      const archivePath = join(archiveDir, `${repo.replaceAll('/', '-')}-${state.seq}-${kind}.json`);
-      atomicRecord(archivePath, { ...state, kind, repo });
-      atomicRecord(statePath, { seq: state.seq, lastSealedState: archivePath });
+    const retire = async () => {
+      // The existing failed-seal quarantine is outside terminal-PR recovery.
+      if (state.sealFailure) return retireBatch(statePath, state, { repo, kind, held });
+      return retireTerminalBatch(state, { ...input, source: { repo }, kind, laneDir: cwd }, {
+        statePath, stateDir, remote, gh, held, log: opts.log,
+      });
     };
-    if (state.sealFailure) { retire(); return { action: 'held', state }; }
-    if (state.seal?.step === 'label-on-green') { retire(); return { action: 'sealed', state }; }
+    if (state.sealFailure) { await retire(); return { action: 'held', state }; }
+    if (state.seal?.step === 'label-on-green') { await retire(); return { action: 'sealed', state }; }
     // A capacity pause is honoured by every caller until `sealDueBatches` re-arms it (that is where the free-slot check lives).
     if (state.verifyRetryAfter) return { action: 'deferred', state };
     const restoreProtection = async () => {
@@ -236,7 +246,7 @@ export async function publishBatch(input, opts = {}) {
         if (!verdict.ok) {
           state.sealFailure = { reason: JSON.stringify(verdict.blocking ?? 'verify red'), at: new Date(now()).toISOString() };
           save();
-          retire();
+          await retire();
           return { action: 'held', state };
         }
         const marker = readVerifyMarker(gitDir);
@@ -255,7 +265,7 @@ export async function publishBatch(input, opts = {}) {
       save();
       checkpoint(step);
     }
-    retire();
+    await retire();
     return { action: 'sealed', state };
   } finally {
     try {
@@ -318,7 +328,8 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       const path = resolve(stateDir, file);
       const state = readState(path);
       if (!state.batchRef) continue;
-      if (basename(stateDir) === 'sealed' && (state.sealFailure || state.seal?.step === 'label-on-green')) continue;
+      if (basename(stateDir) === 'sealed' && (state.sealFailure || state.seal?.step === 'label-on-green'
+        || ['MERGED', 'CLOSED'].includes(state.terminalPrState))) continue;
       const kind = kindOf(state, path);
       if (state.verifyRetryAfter && !state.sealFailure) {
         // Verify could not run (capacity): wait out the pause, then re-arm only when the heavy queue has a free slot.

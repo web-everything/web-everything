@@ -53,8 +53,29 @@ export function unattendedAcceptHold({ verdict, comments, repo, pr, head, body =
       });
     if ((verdict.findings ?? []).some(f => f.impactIfUnfixed === 'broken'
       && !cleared.some(ruled => sameFindingForClearing(f, ruled)))) {
-      return 'broken finding is not ruled card or not-real';
+      return BROKEN_UNRULED_HOLD;
     }
   }
   return null;
+}
+
+/** The hold reason a `broken` finding with no card/not-real ruling produces (see {@link unattendedAcceptHold}). */
+export const BROKEN_UNRULED_HOLD = 'broken finding is not ruled card or not-real';
+
+/**
+ * PURE. The `broken` findings that hold a `prevention-outstanding` accept when NOTHING exists that could ever rule
+ * them: no referral record on the PR (any head), no malformed one, no operator ruling, and no referral on the verdict.
+ * Then the hold can never lift by itself (live #5608: 7 runs parked on the same head, no verdict), so the caller sends
+ * the PR back with these findings instead. Returns null whenever a ruling path exists (behaviour unchanged there),
+ * when the live head is not the reviewed one, or when no broken finding is outstanding. Never a reason to accept.
+ */
+export function unrulableBrokenFindings({ verdict, comments, repo, pr, head, body = '', createdAt = '', cardReadable,
+  expectedHead }) {
+  if (verdict?.verdict !== 'prevention-outstanding') return null;
+  if (!head || !expectedHead || head !== expectedHead) return null;
+  if (verdict.referrals?.length || verdict.pendingReferrals?.length || verdict.blockedReferrals?.length) return null;
+  const referrals = mandatoryReferralState(comments, { repo, pr, body, createdAt, cardReadable });
+  if (referrals.malformed || referrals.records.length || referrals.operatorRulings?.length) return null;
+  const broken = (verdict.findings ?? []).filter(f => f?.impactIfUnfixed === 'broken');
+  return broken.length ? broken : null;
 }

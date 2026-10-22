@@ -1,4 +1,17 @@
+import { readRedTeamTiming } from './red-team-gate.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { CARD_REVIEW_CLASS, cardReviewClass } from './card-review-class.mjs';
+import { resolveCardClassSettings } from './review-seat-settings.mjs';
+
+/**
+ * The card-class red-team mode for this read — `off` | `advisory` | `on` (`review.cardClass.redTeam`) — or `null`
+ * when the head is not in the card class, the class is switched off, or the red team is not on `panel-seat`
+ * timing (post-accept keeps its own `skipCardOnly` rule unchanged), i.e. today's red-team rules apply.
+ */
+export function cardClassRedTeamMode(read, env = process.env, settings = resolveCardClassSettings({ env }).value) {
+  if (readRedTeamTiming({ env }).value.timing !== 'panel-seat') return null;
+  return cardReviewClass(read, settings).class === CARD_REVIEW_CLASS.CARD ? settings.redTeam : null;
+}
 /** Shared scheduling policy; importing it never loads a review dispatcher or CLI. */
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
@@ -42,8 +55,49 @@ export function redTeamOwedFor(loopPayload) {
   return advisoryLabelOutcome({ read: loopPayload?.findings?.read, verdict }) === ADVISORY_OUTCOMES.ACCEPT;
 }
 
+/**
+ * Red team owed after acceptance. The caller must first verify a live `review:accepted` label.
+ * An operator may accept a pinned review whose panel verdict still says needs-human.
+ * @param {object|null} loopPayload - The completed review's payload.
+ * @returns {boolean}
+ */
+export function redTeamOwedForAcceptedPr(loopPayload) {
+  return redTeamOwedFor(loopPayload) || (!!loopPayload?.verdict && typeof loopPayload.verdict === 'object'
+    && /^[a-f0-9]{40}$/i.test(loopPayload?.findings?.read?.netBasis?.rev ?? ''));
+}
 
-/** Net diff includes rename/copy sources; unknown paths cannot justify skipping. */
+/**
+ * The red-team pass's own owed gate: a panel accept ({@link redTeamOwedFor}), or a drain request for an accepted PR.
+ * `acceptedPrHead` is stamped only by the drain request consumer after it read a live `review:accepted` on that exact
+ * head; it counts only when it names the payload's pinned head. Live gap #5549: the consumer ran, the pass said
+ * `not-owed`, and the head stayed red-team-pending.
+ * @param {object|null} loopPayload
+ * @returns {boolean}
+ */
+export function redTeamOwedForPass(loopPayload) {
+  if (redTeamOwedFor(loopPayload)) return true;
+  const rev = loopPayload?.findings?.read?.netBasis?.rev;
+  return typeof loopPayload?.acceptedPrHead === 'string' && typeof rev === 'string'
+    && loopPayload.acceptedPrHead.toLowerCase() === rev.toLowerCase() && redTeamOwedForAcceptedPr(loopPayload);
+}
+
+
+/**
+ * A pinned reviewed head owes the panel seat regardless of the panel verdict — except a head in the `card` review
+ * class whose `review.cardClass.redTeam` mode is `off` (skipped) or `advisory` (runs, never owed or blocking).
+ * A decision card, a ratified rule, anything not provably card-only, or the class switched off still owes it.
+ */
+export function redTeamPanelSeatOwed(loopPayload, env = process.env) {
+  const read = loopPayload?.findings?.read;
+  if (readRedTeamTiming({ env }).value.timing !== 'panel-seat' || !/^[a-f0-9]{40}$/i.test(read?.netBasis?.rev ?? '')) return false;
+  return !['off', 'advisory'].includes(cardClassRedTeamMode(read, env));
+}
+
+/** Net diff includes rename/copy sources; unknown paths cannot justify skipping.
+ * Drain consumers (drain-red-team-review/evidence, drain-merge-strategy and drain-queue-safety)
+ * read saved review-pr evidence pinned by netBasis.rev, whose netChangedFiles comes from git.
+ * Never substitute GitHub view.files here. The separate replay producer resolves its GitHub
+ * list through pr-real-files before constructing this read. */
 export function redTeamCardOnly(read) {
   const paths = Array.isArray(read?.netChangedFiles) && read.netChangedFiles.length
     && (read.netRenameSources == null || Array.isArray(read.netRenameSources))
@@ -52,13 +106,14 @@ export function redTeamCardOnly(read) {
 }
 
 /**
- * Is a red-team result owed on this head? A pass that started or finished is always owed its result. A card-only
- * head is exempt only while the producer skips it: the skip decision the producer's process recorded with the
- * head's status (`evidence.skipCardOnly`) wins over `skipCardOnly`, the caller's own resolved setting.
+ * Is a red-team result owed on this head? An in-flight pass or recorded result is always owed its result. A card-only
+ * head with only an attempt is exempt while the producer skips it. The producer's recorded skip decision
+ * (`evidence.skipCardOnly`) wins over `skipCardOnly`, the caller's own resolved setting.
  */
 export function redTeamOwedOnHead({ read, evidence = {}, skipCardOnly = true } = {}) {
   if (evidence.inFlight || evidence.recorded) return true;
   const skip = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : skipCardOnly;
   if (skip && redTeamCardOnly(read)) return false;
+  if (evidence.attempted) return true;
   return !!evidence.scheduled;
 }

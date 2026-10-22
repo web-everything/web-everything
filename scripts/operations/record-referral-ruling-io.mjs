@@ -222,7 +222,9 @@ export function createRecordReferralRulingSinks({ readJson = ghJson, changedLine
           let stdout;
           try {
             stdout = await runSetLabel(process.execPath, [join(REPO_ROOT, 'scripts/review-set-label.mjs'), String(pr),
-              `--repo=${repo}`, '--to=changes', `--body-file=${path}`, `--actor=${actor}`, `--channel=${channel}`],
+              `--repo=${repo}`, '--to=changes', `--body-file=${path}`, `--actor=${actor}`, `--channel=${channel}`,
+              // #5492 rebuild slice 2 (W1): the row names the head the ruling was planned on (checked live above).
+              ...(/^[0-9a-f]{40}$/.test(head ?? '') ? [`--judged-head=${head}`] : [])],
             { encoding: 'utf8', timeout: 120_000 });
           } catch (error) {
             let message;
@@ -240,7 +242,8 @@ export function createRecordReferralRulingSinks({ readJson = ghJson, changedLine
         // A send-back is a HOLDING event: its label hold already applied, so a miss only raises the smell.
         try {
           await appendEvents([buildLedgerEvent({ type: EVENT_TYPES.SEND_BACK, repo, pr, at: now(),
-            source: 'record-referral-ruling', declaredActor: actor, channel, cause: 'block-ruling' })]);
+            source: 'record-referral-ruling', declaredActor: actor, channel, cause: 'block-ruling',
+            ...(/^[0-9a-f]{40}$/.test(head ?? '') ? { judgedHead: head } : {}) })]);
         } catch (e) {
           ledgerWriteMiss = true;
           warn(`ledger-write-miss: send-back of ${repo}#${pr} was applied but not recorded in the verdict ledger: ${String(e?.message ?? e)}`);
