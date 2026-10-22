@@ -37,6 +37,7 @@ export default {
       { dryRun: true, live: true, hostileRemote: 'origin' },
       { dryRun: true, live: true, hostileRemote: 'rewrite' },
       { dryRun: true, live: true, missingOrigin: true },
+      ...['reclaim', 'trim', 'acquire'].map(laneOriginCommand => ({ laneOriginCommand })),
     ]) {
       const report = await runReclaimCase(root, options);
       violations.push(...report.violations.map((message) => `reclaim ${JSON.stringify(options)}: ${message}`));
@@ -50,7 +51,7 @@ export function runReclaimCase(root = REPO_ROOT, options = {}) {
   return runAliasCase(root, options.alias ?? 'none', { ...options, command: 'reclaim' });
 }
 
-async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit', change = 'moved', containment = 'exact', dryRun = false, live = false, race = false, hostileRemote = null, missingOrigin = false } = {}) {
+async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit', change = 'moved', containment = 'exact', dryRun = false, live = false, race = false, hostileRemote = null, missingOrigin = false, laneOriginCommand = null } = {}) {
     const base = mkdtempSync(join(tmpdir(), 'soak-symbolic-ops-'));
     const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     try {
@@ -112,6 +113,34 @@ async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit',
         const beforeHead = git(['rev-parse', 'HEAD'], lane);
         const refresh = cli(['refresh', '--count=1']);
         if (refresh.status !== 0 || !refresh.stderr.includes('SKIPPED')) throw Error(`fixture refresh failed: ${refresh.stderr}`);
+        if (laneOriginCommand) {
+          // This remote really advertises the unique commit, but is owned by the lane.
+          // A local bare repo exercises the full proof without network or transport stubs.
+          const hostileOrigin = join(base, 'hostile.git');
+          git(['clone', '--quiet', '--bare', lane, hostileOrigin]);
+          git(['remote', 'set-url', 'origin', hostileOrigin], lane);
+          if (!git(['ls-remote', '--heads', hostileOrigin], lane).includes(head)) {
+            throw Error('fixture hostile origin does not advertise the unique commit');
+          }
+          const args = laneOriginCommand === 'trim' ? ['--max=1', '--dry-run']
+            : laneOriginCommand === 'reclaim' ? ['--lane=1', '--dry-run']
+              : ['--lane=1', '--no-reap', '--hard-max=1', '--session=lane-origin-proof'];
+          // Deliberately omit both --origin and --reference, as in the live finding.
+          const refused = spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), laneOriginCommand,
+            ...args, '--pool=symbolic-ops', '--branch=trunk', '--no-install', '--json'], {
+            cwd: lane, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024,
+            env: { ...process.env, LANE_POOL_ROOT: pool, PATH: `${bin}:${process.env.PATH}` },
+          });
+          const violations = [];
+          if (refused.status === 0 || !/canonical origin.*--origin=/.test(refused.stderr)) {
+            violations.push(`${laneOriginCommand} accepted or probed an origin inferred from lane cwd`);
+          }
+          if (git(['rev-parse', 'HEAD'], lane) !== beforeHead || readFileSync(join(lane, 'work.txt'), 'utf8') !== content) {
+            violations.push(`${laneOriginCommand} destroyed unique work advertised only by the hostile origin`);
+          }
+          if (existsSync(join(lane, '.git', '.lane-lease'))) violations.push('origin refusal retained a lease');
+          return { violations };
+        }
         const helperMarker = join(base, 'remote-helper-ran');
         const probeMarker = join(base, 'probed');
         if (hostileRemote) {
