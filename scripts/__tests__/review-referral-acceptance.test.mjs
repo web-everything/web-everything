@@ -87,7 +87,7 @@ describe('current-head mandatory referral acceptance', () => {
     try {
       runReviewLabelCli({ argv: [String(pr), `--repo=${repo}`, `--to=${to}`, '--actor=operator', '--reason=approve reviewed head'],
         allowClearHuman: true, defaultActor: 'operator', emit: line => output.push(line),
-        provider: { readPrState: () => state, readLabels: () => state.labels,
+        provider: { readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }), readPrState: () => state, readLabels: () => state.labels,
           postComment: () => writes.push('comment'), setLabels: (_, __, { add, remove }) => {
             writes.push('label'); state.labels = [...state.labels.filter(l => !remove.includes(l)), add];
           } },

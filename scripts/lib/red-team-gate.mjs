@@ -50,6 +50,10 @@ export function redTeamMarker(pr, rev) {
 const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/i;
 const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
+// Any reviewed-sha marker the shared parser reads (full or abbreviated, any case), and a case variant of the marker
+// name too: only used to SUPERSEDE a ruling, where reading more holds more.
+const REVIEWED_SHA_ANY_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->`, 'gi');
+const REVIEWED_SHA_FULL_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-fA-F]{40})\\s*-->`, 'g');
 
 /**
  * Parse ONE red-team comment body. PURE. Returns null for anything that is not one (no leading marker).
@@ -501,10 +505,12 @@ export function liveResultGateState(comments, pr, head, repo = null, standingRul
  * head (in thread order, as fix dispatch does; never by clocks). Null when there is none. PURE.
  */
 function firstReviewIndex(records, pr, head) {
-  const reviewed = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*${head}\\s*-->`, 'i');
+  // Only the marker name the shared parser reads counts (an earlier anchor raises the cap); an abbreviated marker
+  // does not anchor, which only lowers it.
+  const reviewed = body => [...body.matchAll(REVIEWED_SHA_FULL_RE)].some(([, s]) => s.toLowerCase() === head);
   const first = records.find(r => {
     const result = parseRedTeamComment(recordBody(r));
-    return (result?.pr === Number(pr) && result.rev === head) || reviewed.test(recordBody(r));
+    return (result?.pr === Number(pr) && result.rev === head) || reviewed(recordBody(r));
   });
   return first ? first.at : null;
 }
@@ -520,20 +526,31 @@ function operatorRuled(records, pr, head) {
   const trusted = records.filter(r => r.saved || isTrustedMarkerAuthor(r.c));
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
+  const rulingHeads = new Set();
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
   for (let sha = head, rs = trusted, want = null; sha && rs.length;) {
     const result = latestResult(rs, pr, sha);
     // A carry hop counts only when the prior head's result is the one that was carried (same id).
     if (!result || (want && redTeamResultId(result.parsed) !== want)) return false;
+    rulingHeads.add(sha);
     want = redTeamResultId(result.parsed);
     const gates = gateRecordsFor(rs, pr, sha, result);
     const cap = gates.filter(r => r.gate.outcome === GATE_OUTCOMES.ROUND_CAP).sort(threadOrder).at(-1);
-    const cleared = lastAt(rs, r => !r.from && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
+    // Only a human operator's own clear-human comment is a ruling; an automation-posted copy (even by a trusted bot) is not.
+    const cleared = lastAt(rs, r => !r.from && isHumanOperatorComment(r.c) && CLEAR_HUMAN_RULING_RE.test(recordBody(r).replace(/\r\n/g, '\n').trimStart())
       && parseLatestHumanClearedSha([r.c]) === sha);
     // A clearance cannot approve a later send-back, even if an older/unknown grant snapshot leaves the cap winning.
     // This also keeps existing send-backs held while persisted grant identities migrate to a reader-independent key.
+    // A plain accept of ANY head in this proven carry chain after the ceremony supersedes it.
+    // Scan the whole thread: accepts before or after a carry must survive its historical truncation.
+    // The marker may name a head abbreviated (7–40 hex, any case), as its builder and parser allow: a prefix match supersedes.
+    // Overlay merge: a saved red-team record (r.saved, admitted to `trusted` above) is never a human re-accept.
+    const reviewed = body => [...body.matchAll(REVIEWED_SHA_ANY_RE)]
+      .some(([, s]) => [...rulingHeads].some(h => h.startsWith(s.toLowerCase())));
+    const reaccepted = cleared && trusted.some(r => !r.from && !r.saved && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
+      && reviewed(recordBody(r)));
     // (main's stricter rule: the clone's named-cap exception, cleared before a later-posted saved result, is dropped.)
-    if (cap && cleared && cleared.at > result.at && gates.every(r =>
+    if (cap && cleared && !reaccepted && cleared.at > result.at && gates.every(r =>
       ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
     if (gates.some(r => !r.from && [GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome))) return false;

@@ -12,7 +12,9 @@ vi.hoisted(() => { process.env.WE_AUTOMATION_LOGINS = 'web-everything,plateau-wo
 import { isReadOnlyOperation } from '../registry.mjs';
 import {
   assessPrSweep, finishPrSweep, humanReviewHold, needsDecisionOpen, openFixClaim, referralHoldOpen, renderSweepTable,
+  FIX_CLAIM_LIVE_MS, jobsFor,
 } from '../pr-sweep-core.mjs';
+import { parseOperationArgv } from '../cli-adapter.mjs';
 import { prSweepOperation, PR_SWEEP_OP } from '../pr-sweep.mjs';
 import { createPrSweepReader, parseDrainSkips, parseLiveJobs, resolveStalledAfter, LIST_LIMIT } from '../pr-sweep-io.mjs';
 import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
@@ -99,12 +101,11 @@ describe('referral hold evidence (#5530: stale or unsaved hold)', () => {
     expect(r.evidence).toContain('open: backlog/x.md:33');
     expect(r.next.command).toContain('record-referral-ruling');
   });
-  it('0 open findings (every one has a standing ruling) makes the hold stale: system, no operator ask', () => {
+  it('0 open findings cannot dismiss an unlinked hold, even when every saved finding has a ruling', () => {
     // The operator ruled BEFORE the later hold comment, so the hold is the newest event and still "open".
     const r = row(sweep([pr([recordComment, operatorRuling, { ...plainHold, createdAt: '2026-10-21T09:00:00Z' }])]), 5530);
-    expect(r).toMatchObject({ waitingOn: 'system:stale-hold', actor: 'system' });
-    expect(r.next.command).toBeNull();
-    expect(r.next.summary).toMatch(/no operator action/);
+    expect(r).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true });
+    expect(r.next.command).toContain('record-referral-ruling');
   });
   it('a failed referral save is the system\'s even while a finding is open, and still names it', () => {
     const r = row(sweep([pr([recordComment, failedHold])]), 5530);
@@ -124,27 +125,40 @@ describe('referral hold evidence (#5530: stale or unsaved hold)', () => {
     const r = row(sweep([pr([recordComment, { ...plainHold, createdAt: '2026-10-21T09:00:00Z' }, other])]), 5530);
     expect(r).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true });
   });
+  it.each(['referral persistence failed', 'referral-persistence-failed'])(
+    'unrelated trusted diagnostic prose mentioning %s cannot dismiss a newer hold', (phrase) => {
+      const diagnostic = c('plateau-reviewer[bot]', '2026-10-21T09:05:00Z', `Diagnostics: ${phrase} for o/other#7`);
+      const newer = { ...plainHold, createdAt: '2026-10-21T09:00:00Z' };
+      expect(row(sweep([pr([recordComment, operatorRuling, newer, diagnostic])]), 5530))
+        .toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true });
+    });
   it('an older ruled run does not hide newer UNSAVED referrals on the same head (#5485 shape with history)', () => {
     const two = c('plateau-reviewer[bot]', '2026-10-21T09:00:00Z', 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back');
     const r = row(sweep([pr([recordComment, operatorRuling, two])]), 5530);
     expect(r).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator' });
   });
+  it('an older ruled run does not hide an equal count of different unsaved referrals', () => {
+    const newer = c('plateau-reviewer[bot]', '2026-10-21T09:00:00Z',
+      'review paused: 1 referrals need a ruling\n\nWaiting on your ruling (block, card or not-real):\n- `scripts/new.mjs:7` — a different unsaved finding');
+    expect(row(sweep([pr([recordComment, operatorRuling, newer])]), 5530))
+      .toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true });
+  });
   it('a hold whose count is unknown can not be proven stale', () => {
     const noCount = c('plateau-reviewer[bot]', '2026-10-21T09:00:00Z', 'review paused: it resumes on a new push, a ruling, or a send-back\n\nWaiting on your ruling');
     expect(row(sweep([pr([recordComment, operatorRuling, noCount])]), 5530).actor).toBe('operator');
   });
-  it('a malformed operator-ruling record keeps the operator asked under both system branches', () => {
+  it('a malformed operator-ruling record keeps the operator asked even with standing rulings or a failed save', () => {
     const bad = c('chalbert', '2026-10-21T08:50:00Z', '## Operator ruling on mandatory referrals\n<!-- mandatory-referral-operator-ruling-v1: garbage -->');
     const stale = { ...plainHold, createdAt: '2026-10-21T09:00:00Z' };
     expect(row(sweep([pr([recordComment, operatorRuling, bad, stale])]), 5530).actor).toBe('operator');
     expect(row(sweep([pr([recordComment, bad, failedHold])]), 5530).actor).toBe('operator');
   });
-  it('a card ruling counts as standing only when its card is readable', () => {
+  it('a card ruling cannot dismiss an unlinked hold, regardless of card readability', () => {
     const card = c('chalbert', '2026-10-21T08:46:37Z', buildOperatorRulingComment({ version: 1, repo: REPO, pr: 5530, head: HEAD,
       rulings: [{ runId: 'review-pr-1', key, result: 'card', card: 'we:backlog/xcard.md' }], actor: 'chalbert', channel: 'x', reason: 'card it', at: '2026-10-21T08:46:28Z', clearerId: 's1' }));
     const stale = { ...plainHold, createdAt: '2026-10-21T09:00:00Z' };
     const withReader = (cardReadable) => assessPrSweep({ now: NOW, stalledAfterMinutes: 45, prs: [pr([recordComment, card, stale])], holdOptions: { cardReadable } });
-    expect(row(withReader(() => true), 5530)).toMatchObject({ waitingOn: 'system:stale-hold', actor: 'system' });
+    expect(row(withReader(() => true), 5530)).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator' });
     expect(row(withReader(() => false), 5530).actor).toBe('operator');
   });
   it('a system row is still STALLED once it outlives the threshold with no live job', () => {
@@ -197,6 +211,30 @@ describe('ruling dispute (#5784)', () => {
   });
 });
 
+describe.each([
+  ['referral hold', referralHoldOpen, hold, 'ruling-needed:referral-hold'],
+  ['decision dispute', needsDecisionOpen, c('plateau-worker[bot]', '2026-10-21T05:25:58Z',
+    '🔔 conveyor — needs your decision\n\nfixer and reviewer disagree about a ruling'), 'ruling-needed:dispute'],
+  ['decision note', needsDecisionOpen, c('plateau-worker[bot]', '2026-10-21T05:25:58Z',
+    '🔔 conveyor — needs your decision\n\npermission prompt'), 'needs-decision:note'],
+])('%s closure lifecycle', (_name, reader, note, state) => {
+  it.each(['push', 'operator reply'])('only a later %s closes the item; earlier and equal timestamps preserve it', (kind) => {
+    const at = Date.parse(note.createdAt);
+    for (const offset of [-1, 0, 1]) {
+      const timestamp = new Date(at + offset).toISOString();
+      const comments = kind === 'push' ? [note] : [c('chalbert', timestamp, 'proceed'), note];
+      const options = kind === 'push' ? { headCommittedAt: timestamp } : {};
+      const open = reader(comments, options);
+      if (offset > 0) expect(open).toBeNull();
+      else expect(open).toMatchObject({ at });
+      const result = sweep([mkPr({ labels: L('review:pending'), comments, ...options })]).prs[0];
+      expect(result).toMatchObject(offset > 0
+        ? { waitingOn: 'awaiting-review', actor: 'reviewer', stalled: false }
+        : { waitingOn: state, actor: 'operator', stalled: true });
+    }
+  });
+});
+
 describe('draft-withdrawn (#5787)', () => {
   it('a draft with the withdrawn hold waits on the operator with a release command', () => {
     const r = row(sweep([mkPr({ number: 5787, isDraft: true, labels: L('review-status:draft-withdrawn') })]), 5787);
@@ -220,8 +258,45 @@ describe('red-team request held (#5771)', () => {
   it('a live review-job for the PR clears the stall', () => {
     expect(row(sweep([pr], { drainSkips: skips, liveJobs: [{ kind: 'review-job', pr: 5771, repo: REPO }] }), 5771)).toMatchObject({ stalled: false, liveJob: 'review-job' });
   });
-  it('a job for another repo\'s PR with the same number does not count', () => {
-    expect(row(sweep([pr], { drainSkips: skips, liveJobs: [{ kind: 'review-job', pr: 5771, repo: 'o/other' }] }), 5771).stalled).toBe(true);
+  it.each([
+    ['matching repo', REPO, 5771, true],
+    ['another repo', 'o/other', 5771, false],
+    ['null repo', null, 5771, false],
+    ['missing repo', undefined, 5771, false],
+    ['another PR', REPO, 5772, false],
+  ])('jobsFor requires the same repo and PR: %s', (_name, repo, number, matches) => {
+    const job = { kind: 'review-job', pr: number, repo };
+    expect(jobsFor(pr, [job], NOW)).toEqual(matches ? [job] : []);
+    expect(row(sweep([pr], { drainSkips: skips, liveJobs: [job] }), 5771))
+      .toMatchObject({ stalled: !matches, liveJob: matches ? 'review-job' : null });
+  });
+  it('jobs without --repo do not suppress STALLED for same-numbered PRs in another repo', () => {
+    const liveJobs = parseLiveJobs('11915 node /w/scripts/operations/review-job.mjs run --pr=5771');
+    const other = { ...pr, repo: 'o/other' };
+    expect(sweep([pr, other], { liveJobs }).prs.map((r) => ({ repo: r.repo, stalled: r.stalled, liveJob: r.liveJob })))
+      .toEqual([REPO, 'o/other'].map((repo) => ({ repo, stalled: true, liveJob: null })));
+  });
+});
+
+describe('enqueue comment trust', () => {
+  const pr = mkPr({ labels: L('ready-to-merge', 'review:accepted'),
+    labelEvents: [{ label: 'review:accepted', at: '2026-10-21T08:00:00Z' }] });
+  const marker = `<!-- we-drain-enqueue-clearance head=${HEAD} -->`;
+  it.each([false, true])('untrusted enqueue comments cannot suppress STALLED (existing trusted enqueue: %s)', (existing) => {
+    const comments = existing ? [c('plateau-merger[bot]', '2026-10-21T09:00:00Z', marker)] : [];
+    const before = sweep([{ ...pr, comments }]).prs[0];
+    expect(before).toMatchObject({ waitingOn: existing ? 'in-merge-queue' : 'ready-to-merge',
+      since: existing ? '2026-10-21T09:00:00.000Z' : '2026-10-21T08:00:00.000Z', stalled: true });
+    const after = sweep([{ ...pr, comments: [...comments, c('mallory', '2026-10-21T11:14:00Z', marker)] }]).prs[0];
+    expect(after).toEqual(before);
+  });
+  it.each(['plateau-merger[bot]', 'chalbert'])('a matching enqueue from %s legitimately restarts the clock', (login) => {
+    expect(sweep([{ ...pr, comments: [c(login, '2026-10-21T11:14:00Z', marker)] }]).prs[0])
+      .toMatchObject({ waitingOn: 'in-merge-queue', since: '2026-10-21T11:14:00.000Z', stalled: false });
+  });
+  it('a trusted enqueue for an earlier head does not restart the clock', () => {
+    expect(sweep([{ ...pr, comments: [c('plateau-merger[bot]', '2026-10-21T11:14:00Z', marker.replace(HEAD, 'f'.repeat(40)))] }]).prs[0])
+      .toMatchObject({ waitingOn: 'ready-to-merge', since: '2026-10-21T08:00:00.000Z', stalled: true });
   });
 });
 
@@ -268,13 +343,29 @@ describe('thresholds, drain, ci', () => {
     const p = mkPr({ number: 4, labels: L('ready-to-merge') });
     expect(row(sweep([p], { drainSkips: [{ num: 4, repo: REPO, kind: 'not-certified', reason: 'x' }] }), 4)).toMatchObject({ actor: 'operator', stalled: true });
   });
+  it.each(['not-certified', 'red-team-pending'])('a %s drain skip requires the same repo and PR', (kind) => {
+    const p = mkPr({ number: 4, labels: L('ready-to-merge') });
+    const baseline = sweep([p]).prs[0];
+    for (const skip of [
+      { num: 4, repo: null }, { num: 4 }, { num: 4, repo: 'o/other' }, { num: 5, repo: REPO },
+    ]) {
+      expect(sweep([p], { drainSkips: [{ ...skip, kind, reason: 'x' }] }).prs[0]).toEqual(baseline);
+    }
+    expect(sweep([p], { drainSkips: [{ num: 4, repo: REPO, kind, reason: 'x' }] }).prs[0])
+      .toMatchObject({ waitingOn: kind === 'red-team-pending' ? kind : `drain-skip:${kind}` });
+  });
   it('an unreadable PR list is an error, never an empty sweep', () => {
     expect(() => assessPrSweep({ now: NOW })).toThrow(/unreadable/);
   });
   it('orders STALLED first, oldest first', () => {
-    const r = sweep([mkPr({ number: 7, labels: L('ready-to-merge'), updatedAt: '2026-10-21T11:10:00Z' }), mkPr({ number: 8, labels: L('review:human', 'advisory:accepted') })]);
-    expect(r.prs.map((x) => x.number)).toEqual([8, 7]);
-    expect(r.stalledCount).toBe(1);
+    const r = sweep([
+      mkPr({ number: 6, labels: L('ready-to-merge'), updatedAt: '2026-10-21T11:12:00Z' }),
+      mkPr({ number: 9, labels: L('review:human', 'advisory:accepted'), updatedAt: '2026-10-21T11:10:00Z' }),
+      mkPr({ number: 8, labels: L('review:human', 'advisory:accepted'), updatedAt: '2026-10-21T10:00:00Z' }),
+      mkPr({ number: 7, labels: L('review:pending'), updatedAt: '2026-10-21T08:00:00Z' }),
+    ], { liveJobs: [{ kind: 'review-job', pr: 7, repo: REPO }] });
+    expect(r.prs.map((x) => [x.number, x.stalled])).toEqual([[8, true], [9, true], [7, false], [6, false]]);
+    expect(r.stalledCount).toBe(2);
   });
 });
 
@@ -295,15 +386,76 @@ describe('rendering and declaration', () => {
   });
 });
 
+describe('fix claim comment expiration', () => {
+  const started = NOW - FIX_CLAIM_LIVE_MS;
+  const claim = c('plateau-worker[bot]', new Date(started).toISOString(), '🔒 conveyor fix-begin — fix claim held');
+  it('openFixClaim expires an unreleased comment after FIX_CLAIM_LIVE_MS', () => {
+    expect(openFixClaim([claim], NOW - 1)).toEqual({ at: started });
+    expect(openFixClaim([claim], NOW)).toEqual({ at: started });
+    expect(openFixClaim([claim], NOW + 1)).toBeNull();
+  });
+  it('expired unreleased fix claims no longer suppress STALLED or hold back a review notification', () => {
+    const pr = mkPr({ labels: L('review:pending'), updatedAt: new Date(started).toISOString(), comments: [claim] });
+    for (const offset of [-1, 0, 1]) {
+      const now = NOW + offset;
+      const r = assessPrSweep({ now, prs: [pr] }).prs[0];
+      expect(r.stalled).toBe(offset > 0);
+      expect(r.liveJob).toBe(offset > 0 ? null : 'fix');
+      expect(humanReviewHold(pr, now)).toEqual(offset > 0 ? [] : ['a fix claim is open']);
+    }
+  });
+});
+
 describe('io helpers', () => {
-  it('parses the latest drain skip row and live review/fix processes', () => {
+  it('parses every documented pr-sweep flag through its declaration and passes the threshold to the reader', () => {
+    const readSweep = vi.fn(() => ({}));
+    const declaration = prSweepOperation({ readSweep, assess: () => ({}) });
+    const parsed = parseOperationArgv(declaration, [`--repo=${REPO}`, '--pr=5485', '--stalled-after=10', '--json']);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.control.json).toBe(true);
+    declaration.steps[0].step.fn({ input: parsed.input });
+    expect(readSweep).toHaveBeenCalledWith({ repo: REPO, pr: 5485, stalledAfter: 10 });
+  });
+  it.each(['MERGED', 'CLOSED'])('an explicit --pr skips a %s PR and reports its identifier', (state) => {
+    const run = vi.fn(() => JSON.stringify({ number: 301, state }));
+    const out = createPrSweepReader({ run, ps: () => '', readText: () => '', settings: () => ({}) })({ repo: REPO, pr: 301 });
+    expect(out.prs).toEqual([]);
+    expect(out.unreadable).toEqual([`${REPO}#301: PR is ${state}, not OPEN`]);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][1].at(-1).split(',')).toContain('state');
+  });
+  it('an unqualified --pr uses only the primary configured repo', () => {
+    const run = vi.fn(() => JSON.stringify({ number: 301, state: 'MERGED' }));
+    const out = createPrSweepReader({ run, ps: () => '', readText: () => '',
+      settings: () => ({ prSweep: { repos: [REPO, 'o/other'] } }) })({ pr: 301 });
+    expect(out.repos).toEqual([REPO]);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+  it.each(['comments', 'events', 'commits'])('failed PR detail reads report unreadable and preserve other PRs: %s', (endpoint) => {
+    const run = (_file, args) => {
+      if (args[1] === 'list') return JSON.stringify([{ number: 1, state: 'OPEN' }, { number: 2, state: 'OPEN' }]);
+      const fails = endpoint === 'commits' ? args[1] === 'view' && args[2] === '1'
+        : args[0] === 'api' && args[3].includes(`/issues/1/${endpoint}?`);
+      if (fails) throw new Error(`${endpoint} failed\nextra`);
+      return args[0] === 'api' ? '[[]]' : '{"commits":[]}';
+    };
+    const out = createPrSweepReader({ run, ps: () => '', readText: () => '', settings: () => ({}) })({ repo: REPO });
+    expect(out.unreadable).toEqual([`${REPO}#1: ${endpoint} failed`]);
+    expect(out.prs.map((p) => p.number)).toEqual([2]);
+  });
+  it('parses the latest drain skip row', () => {
     const log = 'x\nmerge-ai-prs · skip-reasons: [{"num":1,"repo":"a/b","kind":"k","reason":"old"}]\nmerge-ai-prs · skip-reasons: [{"num":5771,"repo":"web-everything/web-everything","kind":"red-team-pending","reason":"r"}]\nnoise';
     expect(parseDrainSkips(log)).toEqual({ rows: [{ num: 5771, repo: REPO, kind: 'red-team-pending', reason: 'r' }], error: null });
     expect(parseDrainSkips('nothing')).toEqual({ rows: [], error: null });
     expect(parseDrainSkips('merge-ai-prs · skip-reasons: {bad}').error).toMatch(/not valid JSON/);
     expect(parseDrainSkips('merge-ai-prs · skip-reasons: {"a":1}').error).toMatch(/not a list/);
-    const ps = ' 11915 06:55 /bin/node /w/scripts/operations/review-job.mjs run --pr=5786 --repo=web-everything/web-everything --prefer-lane=13\n 2 1 vim x';
-    expect(parseLiveJobs(ps)).toEqual([{ kind: 'review-job', pr: 5786, repo: REPO, source: 'ps' }]);
+  });
+  it.each(['review-job', 'review-extra-seats', 'fix-run', 'ci-heal', 'deliver-item-run', 'red-team-gate-apply'])
+  ('recognizes live %s processes with PR and repo', (kind) => {
+    for (const separator of ['=', ' ']) {
+      const ps = ` 11915 06:55 /bin/node /w/scripts/operations/${kind}.mjs run --pr${separator}5786 --repo${separator}${REPO} --prefer-lane=13\n 2 1 vim x`;
+      expect(parseLiveJobs(ps)).toEqual([{ kind, pr: 5786, repo: REPO, source: 'ps' }]);
+    }
   });
   it('threshold cascade: flag > env > setting > 45', () => {
     expect(resolveStalledAfter({ flag: 10, env: { WE_PR_SWEEP_STALLED_AFTER_MINUTES: '20' }, settings: { prSweep: { stalledAfterMinutes: 30 } } })).toBe(10);
@@ -321,9 +473,9 @@ describe('io helpers', () => {
     const run = (_f, args) => {
       calls.push(args.slice(0, 3).join(' '));
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('commits')) return JSON.stringify({ commits: [] });
-      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: 301, title: 't', headRefOid: HEAD, labels: [] });
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: 301, state: 'OPEN', title: 't', headRefOid: HEAD, labels: [] });
       if (args[0] === 'api') return '[[]]';
-      return JSON.stringify(Array.from({ length: LIST_LIMIT }, (_, i) => ({ number: i + 1, headRefOid: HEAD, labels: [] })));
+      return JSON.stringify(Array.from({ length: LIST_LIMIT }, (_, i) => ({ number: i + 1, state: 'OPEN', headRefOid: HEAD, labels: [] })));
     };
     const rd = (input) => createPrSweepReader({ run, ps: () => '', readText: () => '', now: () => NOW, settings: () => ({}) })(input);
     expect(rd({ repo: REPO, pr: 301 }).prs.map((p) => p.number)).toEqual([301]);
@@ -343,7 +495,7 @@ describe('io helpers', () => {
   });
   it('the reader joins the list, paginated comments, and the head commit date', () => {
     const run = (_f, args) => {
-      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([{ number: 9, title: 't', headRefOid: HEAD, labels: [], updatedAt: 'u' }]);
+      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([{ number: 9, state: 'OPEN', title: 't', headRefOid: HEAD, labels: [], updatedAt: 'u' }]);
       if (args[0] === 'api' && /events/.test(args[3])) return JSON.stringify([[{ event: 'labeled', label: { name: 'review:human' }, created_at: '2026-10-21T00:30:00Z' }, { event: 'closed' }]]);
       if (args[0] === 'api') return JSON.stringify([[{ id: 1, user: { login: 'chalbert' }, body: 'hi', created_at: '2026-10-21T01:00:00Z' }]]);
       return JSON.stringify({ commits: [{ oid: HEAD, committedDate: '2026-10-21T00:00:00Z' }] });

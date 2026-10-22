@@ -87,6 +87,7 @@ export const PR_STATE_FIELDS = Object.freeze(['labels', 'headRefOid', 'headRefNa
  * merge-safety path must be provably argv-preserving, not merely "looks right".
  */
 export const GH_ARGV = Object.freeze({
+  readPostingIdentity: () => ['api', 'user'],
   readPrState: (repo, pr) => ['pr', 'view', String(pr), '--repo', repo, '--json', PR_STATE_FIELDS.join(',')],
   readLabels: (repo, pr) => ['pr', 'view', String(pr), '--repo', repo, '--json', 'labels'],
   // The removals are INTERSECTED with the PR's live labels by `presentRemoveLabels` before they reach here —
@@ -166,6 +167,16 @@ export function createGhProvider({
 } = {}) {
   return {
     name: 'gh',
+
+    // Match postComment's repository-specific App selection, and disable the
+    // personal-token read exception at both the outer throttle and nested shim.
+    readPostingIdentity(repo) {
+      return JSON.parse(exec(GH_ARGV.readPostingIdentity(), {
+        maxBuffer: 1024 * 1024,
+        env: { ...process.env, GH_REPO: repo, WE_GH_THROTTLE_PERSONAL_ROUTE: '0' },
+        throttle: { personalRoute: false },
+      }));
+    },
 
     readPrState(repo, pr) {
       return JSON.parse(exec(GH_ARGV.readPrState(repo, pr), { maxBuffer: 64 * 1024 * 1024 }));
