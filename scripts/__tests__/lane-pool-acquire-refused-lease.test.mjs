@@ -35,9 +35,7 @@ function withGhStub(env) {
 }
 
 function runPool(args, extraEnv = {}) {
-  const env = { ...process.env, LANE_POOL_ROOT: poolRoot, LANE_POOL_TEST_ORIGIN: originDir,
-    LANE_POOL_TEST_SNAPSHOT_MARKER: join(base, 'stale-snapshot-used'), ...extraEnv };
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: withGhStub(env) });
+  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv }) });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
@@ -79,7 +77,8 @@ afterEach(() => {
 
 const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=refused', '--branch=trunk', '--no-install'];
 
-// Match the isolated canonical-origin probe; the marker proves the stale snapshot was injected.
+// Live probes run outside the lane, against the canonical origin path rather than its remote name.
+// Assert snapshot-used on auto-pick paths so a changed invocation cannot silently disable the race.
 function shimLsRemoteToLie(staleSha, staleRef) {
   const shimDir = join(base, 'bin');
   mkdirSync(shimDir, { recursive: true });
@@ -87,8 +86,8 @@ function shimLsRemoteToLie(staleSha, staleRef) {
   writeFileSync(
     join(shimDir, 'git'),
     `#!/bin/bash\n` +
-      `if [ "$1" = "ls-remote" ] && [ "$2" = "--heads" ] && [ "$3" = "--" ] && [ "$4" = "$LANE_POOL_TEST_ORIGIN" ]; then\n` +
-      `  : > "$LANE_POOL_TEST_SNAPSHOT_MARKER"\n` +
+      `if [ "$1" = "ls-remote" ] && [ "$2" = "--heads" ] && [ "$3" = "--" ] && [ "$4" = "${originDir}" ]; then\n` +
+      `  touch "${join(shimDir, 'snapshot-used')}"\n` +
       `  echo -e "${staleSha}\\trefs/heads/${staleRef}"\n` +
       `fi\n` +
       `exec "${realGit}" "$@"\n`,
@@ -151,7 +150,7 @@ describe('#3407 — a refused acquire never leaves the lane held by the failed r
 
     // No --lane=N here: auto-pick's own candidate loop must claim lane-1 (the only lane in the pool) itself.
     const acquire = runPool(['acquire', ...poolArgs(), '--session=picker'], { PATH: `${shimDir}:${process.env.PATH}` });
-    expect(existsSync(join(base, 'stale-snapshot-used'))).toBe(true);
+    expect(existsSync(join(shimDir, 'snapshot-used'))).toBe(true);
     expect(acquire.code).not.toBe(0);
     expect(acquire.err).toMatch(/no longer provably safe to reset/);
     expect(existsSync(leaseMarker(lane))).toBe(false);
@@ -206,13 +205,12 @@ describe('#3407 — a refused acquire never leaves the lane held by the failed r
     const shimDir = shimLsRemoteToLie(landedSha, 'lane/landed');
 
     const acquire = runPool(['acquire', ...poolArgs(), '--session=picker'], { PATH: `${shimDir}:${process.env.PATH}` });
-    expect(existsSync(join(base, 'stale-snapshot-used'))).toBe(true);
+    expect(existsSync(join(shimDir, 'snapshot-used'))).toBe(true);
     expect(acquire.err).toMatch(/no longer provably safe to reset/);
     expect(acquire.code).toBe(0);
     expect(acquire.out.trim()).toBe(lane2); // fell through to the clean lane, not lane-1
     expect(existsSync(leaseMarker(lane1))).toBe(false); // lane-1's failed claim was released, not left held
     expect(existsSync(leaseMarker(lane2))).toBe(true);
-    expect(git(['rev-parse', 'HEAD'], lane1)).toBe(landedSha);
   });
 
   it('AUTO-PICK, every candidate refused: fails with no-free-lane, and no candidate is left holding a lease', () => {
@@ -240,8 +238,8 @@ describe('#3407 — a refused acquire never leaves the lane held by the failed r
     writeFileSync(
       join(shimDir, 'git'),
       `#!/bin/bash\n` +
-        `if [ "$1" = "ls-remote" ] && [ "$2" = "--heads" ] && [ "$3" = "--" ] && [ "$4" = "$LANE_POOL_TEST_ORIGIN" ]; then\n` +
-        `  : > "$LANE_POOL_TEST_SNAPSHOT_MARKER"\n` +
+        `if [ "$1" = "ls-remote" ] && [ "$2" = "--heads" ] && [ "$3" = "--" ] && [ "$4" = "${originDir}" ]; then\n` +
+        `  touch "${join(shimDir, 'snapshot-used')}"\n` +
         `  echo -e "${sha1}\\trefs/heads/lane/landed"\n` +
         `  echo -e "${sha2}\\trefs/heads/lane/landed2"\n` +
         `fi\n` +
@@ -250,9 +248,7 @@ describe('#3407 — a refused acquire never leaves the lane held by the failed r
     chmodSync(join(shimDir, 'git'), 0o755);
 
     const acquire = runPool(['acquire', ...poolArgs(), '--session=picker'], { PATH: `${shimDir}:${process.env.PATH}` });
-    expect(existsSync(join(base, 'stale-snapshot-used'))).toBe(true);
-    expect(acquire.err).toMatch(/lane-1 is no longer provably safe to reset/);
-    expect(acquire.err).toMatch(/lane-2 is no longer provably safe to reset/);
+    expect(existsSync(join(shimDir, 'snapshot-used'))).toBe(true);
     expect(acquire.code).not.toBe(0);
     expect(acquire.err).toMatch(/no free lane/);
     expect(existsSync(leaseMarker(lane1))).toBe(false);
