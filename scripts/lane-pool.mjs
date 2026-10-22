@@ -182,6 +182,7 @@ import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './l
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
 import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
+import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
 const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
@@ -213,8 +214,16 @@ for (const a of rest) {
 const READ_ONLY_GIT = new Set(['status', 'rev-list', 'rev-parse', 'for-each-ref', 'ls-remote', 'cherry', 'ls-tree', 'show', 'symbolic-ref', 'merge-base', 'log', 'cat-file']);
 const isReadOnlyGit = (args) => READ_ONLY_GIT.has(args[0]) || (args[0] === 'remote' && args[1] === 'get-url');
 // A lane's `.git/config` is agent-writable and this script (and the resident health watch that shells it) runs git in lanes
-// the agent may have released, so `git status` must never execute a lane-chosen `core.fsmonitor` / hook (scripts/lib/lane-git-hardening.mjs).
-const readOnlyGitEnv = (args) => (isReadOnlyGit(args) ? { env: laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' }) } : {});
+// the agent may have released, so no git call it makes there may execute a lane-chosen `core.fsmonitor` / hook
+// (scripts/lib/lane-git-hardening.mjs). That includes the MUTATING ones: acquire's `checkout -B --force` and refresh's
+// `reset --hard` ran a lane-set fsmonitor and post-checkout / reference-transaction hooks (PR #5775 self-review).
+const readOnlyGitEnv = (args) => ({ env: laneGitHardeningEnv(isReadOnlyGit(args) ? { ...process.env, GIT_OPTIONAL_LOCKS: '0' } : process.env) });
+// The transport keys those pins cannot reach (PR #5775 self-review): a lane-set `remote.origin.uploadpack` is multi-valued
+// and git uses the FIRST, so no `-c` beats it — `--upload-pack` on the command line does; `protocol.ext.allow=never` beats a
+// lane-set `always` for an `ext::` url or `remote.origin.vcs=ext`. The other command-naming transport keys (credential
+// helper, `core.gitProxy`, `url.*.insteadOf`, includes) are removed by `scrubRiskyLaneConfig` before each fetch.
+const LANE_TRANSPORT_GIT = new Set(['fetch', 'ls-remote']);
+const laneTransportArgs = (args) => (LANE_TRANSPORT_GIT.has(args[0]) ? ['-c', 'protocol.ext.allow=never', args[0], '--upload-pack=git-upload-pack', ...args.slice(1)] : args);
 // #xn432dz — while a bounded `list --acquirable` scan runs, every git child is capped at the scan's REMAINING
 // budget, so one hung git can't outlive the overall timeout. A killed child reads as `null` through `tryGit`,
 // which some probes read fail-OPEN (e.g. porcelain null ⇒ "clean") — so the scan loop re-checks the deadline
@@ -253,7 +262,7 @@ const scanTimeoutOpt = () => (scanDeadlineMs === null ? {} : { timeout: Math.max
 const NETWORK_GIT_TIMEOUT_MS = SHARED_NETWORK_GIT_TIMEOUT_MS;
 const defaultGitTimeoutOpt = () => ({ timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
 const git = (args, cwd, opts = {}) =>
-  readGit(args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim(); // #74d: throws on failure/oversize
+  readGit(laneTransportArgs(args), { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim(); // #74d: throws on failure/oversize
 const gitQuiet = (args, cwd, opts = {}) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts });
 const tryGit = (args, cwd, opts = {}) => {
@@ -353,8 +362,8 @@ function resolveRepo() {
     fail(`${cmd} requires a canonical origin for pool ${explicitPool} — pass --origin=<url> (looked in ${topLevel})`);
   }
   const name = explicitPool || flags.name || basename(originUrl).replace(/\.git$/, '');
-  // Default integration branch: the reference's origin/HEAD if known, else `main`.
-  const head = tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, { timeout: LOCAL_GIT_TIMEOUT_MS });
+  // Only discover a default when --branch is absent; explicit-branch acquire must not pay for an unused probe.
+  const head = flags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, { timeout: LOCAL_GIT_TIMEOUT_MS });
   const branch = flags.branch || (head ? head.replace(/^origin\//, '') : 'main');
   return { name, originUrl: originUrl || null, referencePath: topLevel, branch, poolDir: join(POOL_ROOT, name) };
 }
@@ -403,6 +412,16 @@ function laneEnvLocal(repo, n) {
 // Write AFTER refreshLane's `git clean -fd` (which would otherwise remove this untracked file). `.env.local`
 // is git-ignored so a lane never commits it.
 function writeLaneEnv(repo, n) {
+  // Rides every provision/refresh/acquire call site: point the lane at the tracked hooks so the pre-commit guards
+  // (incl. the placeholder-author guard) run even when npm `prepare` never did (`--no-install`, `--reference` clone).
+  // Default runner on purpose: NOT laneGitHardeningEnv, which pins core.hooksPath=/dev/null and would hide the value
+  // an agent's own commit resolves. Its runner carries every OTHER pin plus no-lazy-fetch (laneHooksGitArgs), so the
+  // check's own `ls-files` / `config` calls run no lane-chosen command.
+  const hooks = ensureLaneHooksPath(laneDir(repo, n), { log });
+  if (!['ok', 'set', 'skipped'].includes(hooks.status)) {
+    // Throw so acquire's existing refused-claim handler restores/releases the lease before trying again.
+    throw new Error(`lane-${n}: core.hooksPath could not be secured (${hooks.detail ?? hooks.status}) — pre-commit guards are not verified; refusing to provision this lane`);
+  }
   const contents = laneEnvLocal(repo, n);
   if (contents === null) return;
   writeFileSync(join(laneDir(repo, n), '.env.local'), contents);
@@ -551,6 +570,7 @@ function ensureOneSibling(repo, name, { force = false } = {}) {
   tryGit(['config', '--local', 'gc.auto', '0'], dest);
   const branchRef = tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], dest);
   const branch = branchRef ? branchRef.replace(/^origin\//, '') : 'main';
+  scrubClaimedLaneConfig(dest, 'before sibling fetch'); // the fetch must run no lane-set credential helper / proxy (see laneTransportArgs)
   tryGit(['fetch', 'origin', '--prune', '--quiet'], dest, { timeout: NETWORK_GIT_TIMEOUT_MS });
 
   if (!force) {
@@ -746,7 +766,7 @@ function laneFingerprint(dir, branch) {
   const dirtyPaths = [...trackedModifiedPaths, ...untrackedPaths].sort();
   const aheadShas = aheadCommits(dir, branchRef).map((c) => c.sha).sort();
   let headSha = null;
-  try { headSha = readGit(['rev-parse', 'HEAD'], { cwd: dir, ...defaultGitTimeoutOpt() }).trim(); } catch { /* unborn/corrupt HEAD — null is a valid, never-matching fingerprint value */ }
+  try { headSha = readGit(['rev-parse', 'HEAD'], { cwd: dir, ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(['rev-parse']) }).trim(); } catch { /* unborn/corrupt HEAD — null is a valid, never-matching fingerprint value */ }
   return { headSha, dirtyPaths, aheadShas };
 }
 
@@ -1263,6 +1283,8 @@ function localRemoteShas(dir, fetchedSpecs) {
 // (safe to unmap its stale item mapping, #2139) from a skipped one (still serving its in-flight item).
 function refreshLane(repo, n, { force = false } = {}) {
   const dir = laneDir(repo, n);
+  // Acquire scrubs before ITS fetch; refresh's fetch ran a lane-set credential helper / `core.gitProxy` (PR #5775 self-review).
+  scrubClaimedLaneConfig(dir, 'before refresh fetch');
   // xj1vryw — self-healing fetch; may quarantine + re-clone a corrupt lane ONLY when no live lease holds it.
   fetchOriginHealing(repo, n, { allowReclone: !liveLease(dir, Date.now(), ttlMsFromFlags()) });
   gitQuiet(['config', '--local', 'gc.auto', '0'], dir);
@@ -2811,6 +2833,8 @@ function cmdRelease(repo) {
     // — the root cause of the 2026-09-07 incident this card documents (46 of 48 lanes DIRTY with only this
     // litter, the other 2 clean-but-ahead — the whole pool read 0 of 48 acquirable at once). Any
     // non-allowlisted dirty state (real uncommitted work) is left completely untouched by this call.
+    // The snapshot and litter `status` / `clean` would run a lane-set clean filter, which no env pin reaches (PR #5775).
+    scrubClaimedLaneConfig(dir, 'before release snapshot');
     const beforeLitter = laneStateSnapshot(dir, `origin/${repo.branch}`);
     // xbdixjc — a release by anyone but the holder (the reaper's `--force`, a delivered-lease release) may not
     // drop a lane whose fixer is parked awaiting verify or that holds verifying / verified-unpushed work.
@@ -2907,6 +2931,26 @@ function printStatus(repo) {
         (r.leased ? ` · ${describeLease(r.lease)}` : ''),
     );
   }
+  warnPlaceholderIdentity(rows.filter((r) => r.exists).map((r) => ({ lane: r.lane, dir: r.path })));
+}
+
+// 2026-10-05..20: the global git config said `test` / `test@test.com` and every lane commit was authored "test"
+// with nothing flagging it. Human-readable `status` (and `provision`, which ends in it) now warns. NOT in `--json`:
+// the machine readers poll that on every tick and only want lane rows. Git resolves the identity in each lane
+// (`git var`, see `laneIdentityReport`), so any per-lane config syntax is covered.
+function warnPlaceholderIdentity(lanes) {
+  try {
+    const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' });
+    // REPORT-only here: `status` writes no state (stale-state and other readers pin that); provision/refresh/acquire set it.
+    // Same allow-list as writeLaneEnv, so any other status (incl. a non-executable pre-commit → error) is flagged.
+    const unhooked = lanes.filter(({ dir }) => !['ok', 'set', 'skipped'].includes(ensureLaneHooksPath(dir, { write: false, log }).status)).map((l) => `lane-${l.lane}`);
+    if (unhooked.length) log(`⚠ the pre-commit guards are not verified in ${unhooked.length} lane(s) (${unhooked.slice(0, 5).join(', ')}${unhooked.length > 5 ? ', …' : ''}) — core.hooksPath is not .githooks or the hook is not runnable (per-lane detail above); \`provision\`/\`refresh\`/\`acquire\` repairs it or refuses the lane.`);
+    const r = laneIdentityReport({ lanes, readIn: (dir) => readGitIdentity(dir, { env }), lists: resolveGitIdentityPlaceholders() });
+    if (r.status === 'ok') return;
+    const shown = r.bad.slice(0, 3).map((b) => `lane-${b.lane}: ${b.detail}`).join(' | ');
+    log(`⚠ git identity ${r.status.toUpperCase()} in ${r.bad.length} lane(s) — commits there would carry it (the lane pre-commit guard refuses them). ${shown}${r.bad.length > 3 ? ' | …' : ''}`);
+    log(`  ${GIT_IDENTITY_FIX_HINT}`);
+  } catch { /* a reporting aid never breaks status */ }
 }
 
 // ── list --acquirable: single-flight + short result cache (#xn432dz) ─────────────────────────────────
@@ -4342,6 +4386,9 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
     out({ reclaimed: false, salvaged: false, kept: true, keptReason: g2.reason });
     return;
   }
+  // Salvage stages the tree (`add -A`), which runs a lane-set clean filter no env pin can reach: scrub first,
+  // under the hold, not only before the reset below (PR #5775 self-review).
+  scrubClaimedLaneConfig(dir, 'before salvage');
   let salvage;
   try {
     salvage = salvageLane({
@@ -4354,9 +4401,9 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
           try {
             const { trackedModifiedPaths, untrackedPaths } = gitStatusSummary(dir);
             // HEAD's subject only names THIS lane's work when HEAD is not already on origin (else it is main's tip).
-            const ahead = Number(readGit(['rev-list', '--count', `origin/${repo.branch}..HEAD`], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim()) || 0;
-            const subject = ahead ? readGit(['log', '-1', '--format=%s'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim() : '';
-            const branch = readGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+            const ahead = Number(readGit(['rev-list', '--count', `origin/${repo.branch}..HEAD`], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], ...readOnlyGitEnv(['rev-list']) }).trim()) || 0;
+            const subject = ahead ? readGit(['log', '-1', '--format=%s'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], ...readOnlyGitEnv(['log']) }).trim() : '';
+            const branch = readGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], ...readOnlyGitEnv(['rev-parse']) }).trim();
             return guessCardIds({ paths: [...trackedModifiedPaths, ...untrackedPaths], commitSubject: subject, branch });
           } catch { return []; }
         })(),

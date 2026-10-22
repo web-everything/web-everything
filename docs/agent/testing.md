@@ -129,6 +129,11 @@ age. Only missing-result scheduling gaps retain the maximum-age scheduling fallb
 
 ## Heavy admission in a restricted filesystem
 
+Verify-daemon orphan fixtures must inject both `isAlive` and `groupAlive`: a fake dead PID
+does not imply its host process group is gone. Signal-zero probes can return `EPERM` in a
+restricted execution environment, which correctly retains the entry. The real-process adoption
+test additionally requires permission to inspect child argv with `ps`.
+
 The host queue needs write access to the admission pool's parent as well as the pool:
 `releaseLockDirIf` atomically renames a lock to a sibling tombstone before removal.
 An `EPERM` on that rename is an admission infrastructure failure, not a suite result.

@@ -26,13 +26,20 @@ it.each(['absent .git', 'missing HEAD'])('refresh heals %s before configuring gc
     looksLikeCorruption: () => false, msgOf: (e) => e.message, log: () => {}, healLaneRefs: () => {},
     recloneLane: () => { broken = false; },
   });
+  const scrub = vi.fn(); const fetch = vi.fn(heal);
   const refresh = poolFunction('refreshLane', {
-    laneDir: (_repo, n) => `/pool/lane-${n}`, gitQuiet: config, fetchOriginHealing: heal,
+    laneDir: (_repo, n) => `/pool/lane-${n}`, gitQuiet: config, fetchOriginHealing: fetch,
+    scrubClaimedLaneConfig: scrub,
     liveLease: () => null, ttlMsFromFlags: () => 0, laneHoldRefuses: () => false,
     laneDirtyOrAhead: () => ({ dirty: true, uncommitted: 1, ahead: 0 }), log: () => {},
   });
   for (const n of [1, 2]) expect(refresh({ branch: 'main' }, n).skipped).toBe(true);
   expect(broken).toBe(false);
+  expect(scrub.mock.calls).toEqual([
+    ['/pool/lane-1', 'before refresh fetch'],
+    ['/pool/lane-2', 'before refresh fetch'],
+  ]);
+  for (const i of [0, 1]) expect(scrub.mock.invocationCallOrder[i]).toBeLessThan(fetch.mock.invocationCallOrder[i]);
   expect(config.mock.calls).toEqual([
     [['config', '--local', 'gc.auto', '0'], '/pool/lane-1'],
     [['config', '--local', 'gc.auto', '0'], '/pool/lane-2'],
@@ -41,12 +48,18 @@ it.each(['absent .git', 'missing HEAD'])('refresh heals %s before configuring gc
 
 it.each([false, true])('sibling clone disables automatic gc (existing=%s)', (existing) => {
   const gitQuiet = vi.fn(); const tryGit = vi.fn(() => 'origin/main');
+  const scrub = vi.fn();
   poolFunction('ensureOneSibling', {
     join, primarySiblingPath: () => '/primary/fui', lstatSync: () => { if (!existing) throw Error('absent'); return { isSymbolicLink: () => false }; },
     existsSync: () => true, tryGit, gitQuiet, cloneReferenceArgs: () => [], log: () => {},
     NETWORK_GIT_TIMEOUT_MS: 1, laneDirtyOrAhead: () => ({ dirty: true, ahead: 0 }),
+    scrubClaimedLaneConfig: scrub,
   })({ poolDir: '/pool' }, 'fui');
   expect([...gitQuiet.mock.calls, ...tryGit.mock.calls]).toContainEqual([['config', '--local', 'gc.auto', '0'], '/pool/fui']);
+  expect(scrub).toHaveBeenCalledWith('/pool/fui', 'before sibling fetch');
+  const fetchIndex = tryGit.mock.calls.findIndex(([args]) => args[0] === 'fetch');
+  expect(fetchIndex).toBeGreaterThanOrEqual(0);
+  expect(scrub.mock.invocationCallOrder[0]).toBeLessThan(tryGit.mock.invocationCallOrder[fetchIndex]);
 });
 
 it('gc command runs one pass and watch re-resolves policy with interactive bypass disabled', () => {

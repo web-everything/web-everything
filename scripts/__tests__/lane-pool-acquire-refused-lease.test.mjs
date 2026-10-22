@@ -86,7 +86,13 @@ function shimLsRemoteToLie(staleSha, staleRef) {
   writeFileSync(
     join(shimDir, 'git'),
     `#!/bin/bash\n` +
-      `if [ "$1" = "ls-remote" ] && [ "$2" = "--heads" ] && [ "$3" = "--" ] && [ "$4" = "${originDir}" ]; then\n` +
+      `if (\n` +
+      `  while [ "$1" = "-c" ]; do shift 2; done\n` +
+      `  [ "$1" = "ls-remote" ] || exit 1\n` +
+      `  shift\n` +
+      `  case "$1" in --upload-pack=*) shift ;; esac\n` +
+      `  [ "$1" = "--heads" ] && [ "$2" = "--" ] && [ "$3" = "${originDir}" ]\n` +
+      `); then\n` +
       `  touch "${join(shimDir, 'snapshot-used')}"\n` +
       `  echo -e "${staleSha}\\trefs/heads/${staleRef}"\n` +
       `fi\n` +
@@ -238,7 +244,13 @@ describe('#3407 — a refused acquire never leaves the lane held by the failed r
     writeFileSync(
       join(shimDir, 'git'),
       `#!/bin/bash\n` +
-        `if [ "$1" = "ls-remote" ] && [ "$2" = "--heads" ] && [ "$3" = "--" ] && [ "$4" = "${originDir}" ]; then\n` +
+        `if (\n` +
+        `  while [ "$1" = "-c" ]; do shift 2; done\n` +
+        `  [ "$1" = "ls-remote" ] || exit 1\n` +
+        `  shift\n` +
+        `  case "$1" in --upload-pack=*) shift ;; esac\n` +
+        `  [ "$1" = "--heads" ] && [ "$2" = "--" ] && [ "$3" = "${originDir}" ]\n` +
+        `); then\n` +
         `  touch "${join(shimDir, 'snapshot-used')}"\n` +
         `  echo -e "${sha1}\\trefs/heads/lane/landed"\n` +
         `  echo -e "${sha2}\\trefs/heads/lane/landed2"\n` +
