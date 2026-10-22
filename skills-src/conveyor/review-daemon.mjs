@@ -78,6 +78,7 @@ import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
+import { spawnLedgerOutboxBackstop } from '../../scripts/lib/verdict-ledger-outbox-backstop.mjs';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
@@ -1100,6 +1101,15 @@ export function realSleep(ms) { return new Promise((resolve) => { setTimeout(res
  *   function's own env-resolved defaults — see its own doc — so this daemon is bounded with no extra wiring
  *   here). `null`/omitted (every pre-existing caller) reaps in the plan's own existing order, unchanged.
  */
+/**
+ * The ledger OUTBOX BACKSTOP (live 2026-10-21, `we:scripts/lib/verdict-ledger-outbox-backstop.mjs`). Every append already
+ * flushes the queue it joins; this pushes what a crashed or failed flusher left behind when no new append comes.
+ * The tick does no git and no board discovery: at most once per interval it starts ONE detached flusher process.
+ */
+export function defaultFlushLedgerOutboxes({ repos = REVIEW_DAEMON_REPOS, spawnBackstop = spawnLedgerOutboxBackstop } = {}) {
+  return [spawnBackstop({ repos })];
+}
+
 export function defaultReapSessions({ priorityNames = null } = {}) {
   return runSessionReaperPass({
     allowedCwd: SESSION_REAPER_REPO_ROOT,
@@ -1561,6 +1571,8 @@ export function buildCliDaemonEffects({
   // card x5f2daz — the light prep review. ON by default in `advise` (it only ever posts a note + `review:prep`);
   // `WE_PREP_REVIEW_MODE=off` turns it off. Injectable so the daemon tests never spawn a model.
   runPrepReview = () => runPrepReviewStage(),
+  // The ledger outbox backstop (we:scripts/lib/verdict-ledger-outbox-backstop.mjs): injectable so tests never spawn.
+  flushLedgerOutboxes = defaultFlushLedgerOutboxes,
 } = {}) {
   // #3383 follow-up (live-caught 2026-09-26) — carries the LAST tick's own `liveProcessPrs` across the
   // `await`/closure boundary into the NEXT tick's `reapSessions()` call, below. A plain closure variable is
@@ -1601,6 +1613,18 @@ export function buildCliDaemonEffects({
         log.error(`review-daemon: session-reap failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
       }
       phaseMs.reap = Date.now() - phaseStarted;
+      phaseStarted = Date.now();
+      // Best-effort like the reap: a ledger-outbox backstop failure is logged (the flush itself logs a stale
+      // outbox as ledger-write-miss) and never takes down the tick.
+      try {
+        for (const f of flushLedgerOutboxes() ?? []) {
+          if (f?.spawned) log.error(`review-daemon: ledger outbox backstop started flusher pid ${f.pid ?? '?'}${f.pending ? ` for ${f.pending} queued entr${f.pending === 1 ? 'y' : 'ies'}` : ''}${f.dir ? ` (${f.dir})` : ''}`);
+          else if (f && (f.flushed || f.ok === false)) log.error(`review-daemon: ledger outbox backstop ${f.ok === false ? 'FAILED' : 'flushed'} ${f.flushed ?? 0} entr${f.flushed === 1 ? 'y' : 'ies'} (${f.dir ?? '?'})${f.error ? `: ${f.error}` : ''}`);
+        }
+      } catch (e) {
+        log.error(`review-daemon: ledger outbox backstop failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
+      }
+      phaseMs.ledgerOutbox = Date.now() - phaseStarted;
       phaseStarted = Date.now();
       const warm = await warmReviewFacts(REVIEW_DAEMON_REPOS); // once a tick: refresh the facts mirror from the Worker (not GitHub)
       log.error(`review-daemon: pr-facts ${warm.skipped ? `off (${warm.skipped})` : (warm.warmed ?? []).map((w) => `${w.repo.split('/')[1]}=${w.ok ? 'store' : `github (${w.reason})`}`).join(' ')}`);
