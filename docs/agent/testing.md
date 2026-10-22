@@ -186,6 +186,11 @@ production writer-to-reader cases in `review-job-red-team.test.mjs`. A completed
 use the same gate, round cap and operator ruling as posted results. An identical result posted
 after a named round-cap ruling keeps that ruling; changed results and unknown saved chronology
 remain held. Saved finding text passes the publication scrub before comments or cards are written.
+The prototype's saved-only round-cap path retains trusted-author clear-human ceremonies; posted
+results require a human operator author. Combining those readers must preserve that boundary:
+the saved exception applies only to the selected saved result, never operator action records,
+carried restamps, or a later posted copy (the prototype requires a fresh ruling for that copy).
+Saved releases still require known chronology and a ceremony after every holding record.
 Corrupt or incomplete evidence refuses admission. Errored, crashed, unparseable and unusable runs
 remain held and cannot use the never-scheduled fallback or re-request path. The existing broad
 recorded-run guard is preserved. Card-only diffs owe no new pass when `skipCardOnly` is on;
