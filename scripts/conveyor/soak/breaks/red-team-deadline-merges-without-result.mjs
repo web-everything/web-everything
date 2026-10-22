@@ -11,6 +11,10 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const HEAD = 'b'.repeat(40), BASE = 'e'.repeat(40);
 const PR = 5283;
 const WAIT = 45 * 60_000;
+// The merge-queue mutation, recognized by shape (a GraphQL `mutation { <field>(...) }`), never by name: only
+// merge-queue-enqueue.mjs may name it (merge-queue-enqueue.test.mjs scans scripts/ for that).
+const MUTATION_FIELD = /\bmutation\b[^{]*\{\s*(\w+)/;
+const isMutation = a => MUTATION_FIELD.test(String(a));
 
 export default {
   id: 'red-team-deadline-merges-without-result',
@@ -68,9 +72,10 @@ export default {
             if (args[0] === 'api' && args[1] === 'graphql') {
               if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({
                 data: { repository: { pullRequest: { isInMergeQueue: queued, headRefOid: HEAD } } } });
-              if (args.some(a => a.includes('enqueuePullRequest'))) {
+              const mutation = args.find(isMutation);
+              if (mutation) {
                 queued = true;
-                return JSON.stringify({ data: { enqueuePullRequest: {
+                return JSON.stringify({ data: { [MUTATION_FIELD.exec(mutation)[1]]: {
                   mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } });
               }
             }
@@ -91,8 +96,8 @@ export default {
         const tick = label => {
           const start = calls.length;
           const result = s.enqueue({ num: PR }, HEAD, { comments: [] });
-          check(!calls.slice(start).some(c => c.some(a => String(a).includes('enqueuePullRequest'))),
-            `${mode}, ${label}: enqueuePullRequest called without a red-team result on the head`);
+          check(!calls.slice(start).some(c => c.some(isMutation)),
+            `${mode}, ${label}: the merge-queue enqueue mutation was sent without a red-team result on the head`);
           check(result.enqueued !== true, `${mode}, ${label}: enqueued: true without a red-team result on the head`);
           return result;
         };
