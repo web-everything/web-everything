@@ -217,6 +217,12 @@ const isReadOnlyGit = (args) => READ_ONLY_GIT.has(args[0]) || (args[0] === 'remo
 // (scripts/lib/lane-git-hardening.mjs). That includes the MUTATING ones: acquire's `checkout -B --force` and refresh's
 // `reset --hard` ran a lane-set fsmonitor and post-checkout / reference-transaction hooks (PR #5775 self-review).
 const readOnlyGitEnv = (args) => ({ env: laneGitHardeningEnv(isReadOnlyGit(args) ? { ...process.env, GIT_OPTIONAL_LOCKS: '0' } : process.env) });
+// The transport keys those pins cannot reach (PR #5775 self-review): a lane-set `remote.origin.uploadpack` is multi-valued
+// and git uses the FIRST, so no `-c` beats it — `--upload-pack` on the command line does; `protocol.ext.allow=never` beats a
+// lane-set `always` for an `ext::` url or `remote.origin.vcs=ext`. The other command-naming transport keys (credential
+// helper, `core.gitProxy`, `url.*.insteadOf`, includes) are removed by `scrubRiskyLaneConfig` before each fetch.
+const LANE_TRANSPORT_GIT = new Set(['fetch', 'ls-remote']);
+const laneTransportArgs = (args) => (LANE_TRANSPORT_GIT.has(args[0]) ? ['-c', 'protocol.ext.allow=never', args[0], '--upload-pack=git-upload-pack', ...args.slice(1)] : args);
 // #xn432dz — while a bounded `list --acquirable` scan runs, every git child is capped at the scan's REMAINING
 // budget, so one hung git can't outlive the overall timeout. A killed child reads as `null` through `tryGit`,
 // which some probes read fail-OPEN (e.g. porcelain null ⇒ "clean") — so the scan loop re-checks the deadline
@@ -255,7 +261,7 @@ const scanTimeoutOpt = () => (scanDeadlineMs === null ? {} : { timeout: Math.max
 const NETWORK_GIT_TIMEOUT_MS = SHARED_NETWORK_GIT_TIMEOUT_MS;
 const defaultGitTimeoutOpt = () => ({ timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
 const git = (args, cwd, opts = {}) =>
-  readGit(args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim(); // #74d: throws on failure/oversize
+  readGit(laneTransportArgs(args), { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim(); // #74d: throws on failure/oversize
 const gitQuiet = (args, cwd, opts = {}) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts });
 const tryGit = (args, cwd, opts = {}) => {
@@ -544,6 +550,7 @@ function ensureOneSibling(repo, name, { force = false } = {}) {
   tryGit(['config', '--local', 'gc.auto', '0'], dest);
   const branchRef = tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], dest);
   const branch = branchRef ? branchRef.replace(/^origin\//, '') : 'main';
+  scrubClaimedLaneConfig(dest, 'before sibling fetch'); // the fetch must run no lane-set credential helper / proxy (see laneTransportArgs)
   tryGit(['fetch', 'origin', '--prune', '--quiet'], dest, { timeout: NETWORK_GIT_TIMEOUT_MS });
 
   if (!force) {
@@ -1199,6 +1206,8 @@ function localRemoteShas(dir) {
 // (safe to unmap its stale item mapping, #2139) from a skipped one (still serving its in-flight item).
 function refreshLane(repo, n, { force = false } = {}) {
   const dir = laneDir(repo, n);
+  // Acquire scrubs before ITS fetch; refresh's fetch ran a lane-set credential helper / `core.gitProxy` (PR #5775 self-review).
+  scrubClaimedLaneConfig(dir, 'before refresh fetch');
   // xj1vryw — self-healing fetch; may quarantine + re-clone a corrupt lane ONLY when no live lease holds it.
   fetchOriginHealing(repo, n, { allowReclone: !liveLease(dir, Date.now(), ttlMsFromFlags()) });
   gitQuiet(['config', '--local', 'gc.auto', '0'], dir);

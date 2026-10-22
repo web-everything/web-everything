@@ -182,6 +182,26 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
     }
   });
 
+  it('a re-provision fetch runs no lane-set uploadpack, and scrubs lane-set transport commands first (PR #5775)', () => {
+    const lane = join(base, 'pool', 'hookspath', 'lane-1');
+    const marker = join(base, 'uploadpack-ran');
+    const script = join(base, 'uploadpack.sh');
+    // Execs the real upload-pack, so a fetch that DID run it still succeeds: only the marker tells.
+    writeFileSync(script, `#!/bin/sh\necho ran >> "${marker}"\nexec git-upload-pack "$@"\n`);
+    chmodSync(script, 0o755);
+    git(['config', '--local', 'remote.origin.uploadpack', script], lane);
+    git(['config', '--local', 'protocol.ext.allow', 'always'], lane);
+    git(['config', '--local', 'credential.helper', `!${script}`], lane);
+    try {
+      expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+      expect(existsSync(marker) ? readFileSync(marker, 'utf8') : '').toBe('');
+      expect(() => git(['config', '--local', '--get', 'protocol.ext.allow'], lane)).toThrow();
+      expect(() => git(['config', '--local', '--get', 'credential.helper'], lane)).toThrow();
+    } finally {
+      git(['config', '--local', '--unset-all', 'remote.origin.uploadpack'], lane);
+    }
+  });
+
   it('status flags a lane whose hooksPath is correct but whose pre-commit git would ignore (not executable)', () => {
     const lane = join(base, 'pool', 'hookspath', 'lane-1');
     git(['config', '--local', '--replace-all', 'core.hooksPath', '.githooks'], lane);
