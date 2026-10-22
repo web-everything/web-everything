@@ -1189,17 +1189,28 @@ function liveRemoteShas(dir) {
   return liveRemoteShasProbe(dir).shas;
 }
 
-/** #2924 — the LOCAL equivalent of `liveRemoteShas`, network-free. Sound ONLY immediately after a fetch: a
- *  local `refs/remotes/origin/*` tip is exactly as fresh as the remote it was just fetched from, unlike the
+/** #2924 — the LOCAL equivalent of `liveRemoteShas`, network-free. Sound ONLY immediately after a fetch: an
+ *  eligible direct tracking tip under the standard fetch mapping is as fresh as that fetch, unlike the
  *  stale-cache case `aheadIsProvablyPushed`'s own docblock warns against (a ref deleted on origin AFTER
  *  landing, whose local remote-tracking ref lingers). Used to re-verify containment right before the
  *  destructive reset, on data no older than the fetch that immediately precedes it — no second network call. */
 function localRemoteShas(dir) {
+  // A destination's name alone cannot prove that fetch refreshed it: a custom mapping can
+  // populate origin/saved from an excluded ops source. Only the standard lane mapping has
+  // the freshness semantics below. Fail closed for other positives or negatives (including
+  // restricted fetches), rather than treating their possibly stale destinations as proofs.
+  const fetchConfig = tryGit(['config', '--get-all', 'remote.origin.fetch'], dir);
+  if (fetchConfig === null) return new Set();
+  const fetchSpecs = fetchConfig.split('\n');
+  const standardFetch = '+refs/heads/*:refs/remotes/origin/*';
+  if (!fetchSpecs.includes(standardFetch) || fetchSpecs.some((spec) =>
+    spec !== standardFetch && spec !== '^refs/heads/ops/*')) return new Set();
   // lane-git-diet — `refs/remotes/origin/ops/*` is excluded from the default fetch (negative refspec), so an ops
   // tracking ref a reader fetched by name earlier is NOT refreshed by the fetch this relies on. Leave it out of the
   // "fresh after fetch" set: fewer proofs only ever makes a reset MORE conservative. Symbolic refs are not
   // independently refreshed either: an innocent-looking alias (including origin/HEAD or a multi-hop alias)
-  // can resolve to an excluded ops ref or a ref outside origin. Only direct non-ops tracking refs are proofs.
+  // can resolve to an excluded ops ref or a ref outside origin. With the standard mapping verified,
+  // only direct non-ops tracking refs are proofs.
   const out = tryGit(['for-each-ref', '--format=%(objectname) %(refname) %(symref)', 'refs/remotes/origin/'], dir);
   if (out === null) return new Set();
   const shas = new Set();
@@ -1934,7 +1945,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     // check, or nothing at all before #3390's own explicit-lane guard — is up to ~30s stale by the time this line runs
     // (the merge-base fan-out, the O_EXCL claim, the fetch just above). A `lane/*` ref deleted or force-pushed
     // on origin inside that window means the earlier proof no longer holds. Network-free: the fetch above
-    // already refreshed every remote-tracking ref, so `localRemoteShas` answers from local state alone.
+    // refreshed eligible tracking refs; `localRemoteShas` checks the mapping before using local state.
     if (!flags.force) {
       const { uncommitted, ahead } = laneDirtyOrAhead(dir, repo.branch);
       // #3383 — re-apply the SAME litter relaxation auto-pick's earlier cached-scan candidate check already
