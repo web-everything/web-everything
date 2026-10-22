@@ -182,14 +182,14 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   read, readFiles, judge = judgeRound, dir, log = console.error, force = false } = {}) {
   const s = settings ?? resolveStallSweepSettings({ env, log });
   const cfg = s.value;
-  const base = { mode: cfg.mode, sources: s.sources, errors: [...(s.errors ?? [])], state: state ?? {} };
+  // Disabled/not-due passes still carry the metadata needed to release a disabled digest's feed suppression.
+  // Under test only an explicitly passed dir can reach a writer.
+  const outDir = dir ?? (isUnderTest(env) ? null : stallSweepDir(env));
+  const base = { mode: cfg.mode, digest: cfg.digest, dir: outDir, sources: s.sources, errors: [...(s.errors ?? [])], state: state ?? {} };
   if (cfg.mode === 'off') return { ...base, skipped: 'off' };
   const last = Number(state?.lastRunAt);
   if (!force && Number.isFinite(last) && last <= now && now - last < cfg.intervalMinutes * 60_000) return { ...base, skipped: 'not-due' };
-  // Under test only an explicitly passed dir is ever written (never an env override that could fall back to home).
-  const outDir = dir ?? (isUnderTest(env) ? null : stallSweepDir(env));
   if (!outDir) return { ...base, skipped: 'under-test' };
-  Object.assign(base, { dir: outDir, digest: cfg.digest });
 
   const raw = await (read ?? createPrSweepReader({ run: strictGh(gh), readText: strictDrainText() }))({});
   const report = assessPrSweep(raw);

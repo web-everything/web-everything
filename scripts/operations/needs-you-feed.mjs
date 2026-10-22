@@ -13,6 +13,7 @@ import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
+import { resolveStallSweepSettings } from '../conveyor/pr-stall-sweep.mjs';
 
 export const CHECKOUT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 function readOptional(path, fallback) {
@@ -235,6 +236,8 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     }
   }
   const path = checkedFeedPath(settings.path.value), statePath = statePathOf(path);
+  const stallSettings = resolveStallSweepSettings({ env, log: () => {} }).value;
+  const stallProducerEnabled = stallSettings.mode !== 'off' && stallSettings.digest;
   mkdirSync(dirname(statePath), { recursive: true });
   // Serialization prevents concurrent once/loop calls from duplicating the same transition.
   return withFileLock(`${statePath}.lock`, () => {
@@ -242,7 +245,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
     // The PR stall sweep's open `stalled` item already asks about this PR head: a NEW queue item for it is not
     // published twice (one already open stays, so it is never cleared by this filter).
-    const stalled = prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length));
+    const stalled = stallProducerEnabled ? prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length)) : [];
     const asked = i => !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
     const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
     const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });

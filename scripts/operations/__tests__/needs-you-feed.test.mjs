@@ -352,6 +352,19 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
 
 describe('stall sweep coexistence', () => {
   it.each([
+    { WE_PR_STALL_SWEEP_MODE: 'off' },
+    { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'false' },
+  ])('ignores stale stalled keys before cleanup when the producer is disabled: %j', async env => {
+    const path = join(temp(), 'needs-you-events.jsonl');
+    const repo = 'web-everything/web-everything', head = 'a'.repeat(40);
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [`${repo}#5@${head}:stalled`] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ env, settings, liveGate: false, log: () => {},
+      exec: () => JSON.stringify({ ready: [{ repo, number: 5, head }] }) });
+    expect(result.lines).toHaveLength(1);
+    expect(replay({ path })[0]).toMatchObject({ pr: 5, kind: 'needs-you' });
+  });
+  it.each([
     { name: 'a new queue item for a head with an open stalled item is not published twice', queueOpen: false },
     { name: 'an already-open queue item is retained when the same head also has an open stalled item', queueOpen: true },
   ])('$name', async ({ queueOpen }) => {
@@ -363,7 +376,8 @@ describe('stall sweep coexistence', () => {
     writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys }));
     const report = { ready: [], rulingNeeded: [{ repo, number: 5, head, reason: 'parked' }] };
     const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
-    const result = await runOnce({ exec: async () => JSON.stringify(report), settings, liveGate: false, log: () => {} });
+    const result = await runOnce({ exec: async () => JSON.stringify(report), settings,
+      env: { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'true' }, liveGate: false, log: () => {} });
     expect(result.lines).toEqual([]);
     expect(result.openKeys).toEqual(openKeys);
     expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual(openKeys);

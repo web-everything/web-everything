@@ -4,11 +4,11 @@
  *   retried failed alert, and never suppressed on a failed read.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, chmodSync, symlinkSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { publishStalledDigest, pasteReady, feedItem } from '../pr-stall-digest.mjs';
-import { replay, unacknowledged, sidecarsOf } from '../../operations/needs-you-feed.mjs';
+import { replay, unacknowledged, sidecarsOf, acknowledge, runOnce } from '../../operations/needs-you-feed.mjs';
 import { gateAlert } from '../../lib/quiet-hours-io.mjs';
 import * as atomicJson from '../../lib/atomic-json-file.mjs';
 
@@ -27,6 +27,80 @@ const sent = () => { const out = []; const notify = (n) => { out.push(n); return
 const run = (ctx, items, o = {}) => publishStalledDigest({ items, incomplete: false, ...o.pass }, { now: NOW, env: {}, ...ctx, ...o });
 
 describe('the stalled feed kind', () => {
+  it('releases stalled suppression when disabled so an acknowledged head can enter the queue feed', async () => {
+    const ctx = setup(); const { notify } = sent();
+    run(ctx, [op(1)], { notify });
+    acknowledge({ path: ctx.feedPath });
+    const sidecar = sidecarsOf(ctx.feedPath).state;
+    const prev = JSON.parse(readFileSync(sidecar, 'utf8'));
+    const other = `${REPO}#9@${H}:needs-you`;
+    writeFileSync(sidecar, JSON.stringify({ ...prev, openKeys: [...prev.openKeys, other], marker: 'preserve' }));
+    const disabled = run(ctx, [], { enabled: false, notify });
+    expect(disabled.errors).toEqual([]);
+    expect(JSON.parse(readFileSync(sidecar, 'utf8'))).toMatchObject({ openKeys: [other], marker: 'preserve' });
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: ctx.feedPath }, allowPrimary: { value: true } };
+    const result = await runOnce({ settings, env: { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'false' },
+      now: NOW + 1, liveGate: false, log: () => {}, exec: () => JSON.stringify({ ready: [{ repo: REPO, number: 1, head: H }] }) });
+    expect(result.lines.some(line => line.startsWith(`NEEDS-YOU ${REPO}#1 needs-you:`))).toBe(true);
+    expect(unacknowledged({ path: ctx.feedPath }).map(event => event.pr)).toEqual([1]);
+  });
+  it.each(['digest-state.json', 'digest.lock', 'other.json', 'nested/events.jsonl'])('refuses a feed inside digest state (%s) without touching existing bytes', name => {
+    const ctx = setup();
+    mkdirSync(ctx.stateDir, { recursive: true });
+    const mine = join(ctx.stateDir, 'digest-state.json');
+    const before = '{"published":[],"current":{},"unnotified":[],"marker":"untouched"}\n';
+    writeFileSync(mine, before);
+    const path = join(ctx.stateDir, name);
+    const r = run({ stateDir: ctx.stateDir }, [op(1)], { env: { WE_NEEDS_YOU_FEED: path }, notify: () => ({ ok: true }) });
+    expect(r.errors.join(' ')).toMatch(/stalled feed:.*reserved/);
+    expect(r.lines).toEqual([]);
+    expect(readFileSync(mine, 'utf8')).toBe(before);
+    if (path !== mine) expect(existsSync(path)).toBe(false);
+  });
+  it.each(['file', 'directory'])('refuses a %s symlink alias into digest state', type => {
+    const ctx = setup(); mkdirSync(ctx.stateDir, { recursive: true });
+    const mine = join(ctx.stateDir, 'digest-state.json'), before = '{"published":[],"unnotified":[]}\n';
+    writeFileSync(mine, before);
+    const alias = join(ctx.stateDir, '..', 'alias');
+    symlinkSync(type === 'file' ? mine : ctx.stateDir, alias);
+    const path = type === 'file' ? alias : join(alias, 'new', 'events.jsonl');
+    const r = run(ctx, [op(1)], { feedPath: path, notify: () => ({ ok: true }) });
+    expect(r.errors.join(' ')).toMatch(/reserved/); expect(r.lines).toEqual([]);
+    expect(readFileSync(mine, 'utf8')).toBe(before);
+  });
+  it('allows a sibling directory whose name starts with the state directory name', () => {
+    const ctx = setup(); const path = join(`${ctx.stateDir}-feed`, 'events.jsonl');
+    const r = run(ctx, [op(1)], { feedPath: path, notify: () => ({ ok: true }) });
+    expect(r.errors).toEqual([]); expect(replay({ path })).toHaveLength(1);
+  });
+  it('refuses the external target of a symlinked digest-state file', () => {
+    const ctx = setup(); mkdirSync(ctx.stateDir, { recursive: true });
+    const target = join(ctx.stateDir, '..', 'saved-state.json'), before = '{"published":[],"unnotified":[]}\n';
+    writeFileSync(target, before);
+    symlinkSync(target, join(ctx.stateDir, 'digest-state.json'));
+    const r = run(ctx, [op(1)], { feedPath: target, notify: () => ({ ok: true }) });
+    expect(r.errors.join(' ')).toMatch(/reserved/); expect(r.lines).toEqual([]);
+    expect(readFileSync(target, 'utf8')).toBe(before);
+  });
+  it.each(['digest-state.json', 'nested/events.jsonl'])('refuses a dangling symlink into new digest state: %s', name => {
+    const ctx = setup(); mkdirSync(ctx.stateDir, { recursive: true });
+    const alias = join(ctx.stateDir, '..', 'events.jsonl');
+    symlinkSync(join(ctx.stateDir, name), alias);
+    const r = run(ctx, [op(1)], { feedPath: alias, notify: () => ({ ok: true }) });
+    expect(r.errors.join(' ')).toMatch(/reserved/); expect(r.lines).toEqual([]);
+    expect(existsSync(join(ctx.stateDir, name))).toBe(false);
+    expect(existsSync(join(ctx.stateDir, 'digest-state.json'))).toBe(false);
+  });
+  it('rejects a stale digest.lock feed before lock recovery can delete its events', () => {
+    const ctx = setup(); mkdirSync(ctx.stateDir, { recursive: true });
+    const path = join(ctx.stateDir, 'digest.lock'), before = 'NEEDS-YOU existing events\n';
+    writeFileSync(path, before);
+    const stale = new Date(Date.now() - 60_000); utimesSync(path, stale, stale);
+    const r = run(ctx, [op(1)], { feedPath: path, notify: () => ({ ok: true }) });
+    expect(r.errors.join(' ')).toMatch(/reserved/); expect(r.lines).toEqual([]);
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    expect(existsSync(join(ctx.stateDir, 'digest-state.json'))).toBe(false);
+  });
   it('publishes each operator item once, with reason, 1-3 evidence lines and one paste-ready command', () => {
     const ctx = setup(); const { out, notify } = sent();
     const r = run(ctx, [op(1), { ...op(2), lane: 'system' }], { notify });

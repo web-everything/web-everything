@@ -193,8 +193,8 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
         lanes: Object.fromEntries(['system', 'policy', 'operator'].map((l) => [l, (out.items ?? []).filter((i) => i.lane === l).length])) };
       errors.push(...(out.errors ?? []).map((e) => `stall sweep: ${e}`));
       // Operator items go to the needs-you feed (kind `stalled`) and one quiet-hours-gated alert per pass.
-      if (out.items && out.dir) {
-        const d = stallDigest(out, { now, env, stateDir: out.dir, notify, enabled: out.digest !== false });
+      if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
+        const d = stallDigest(out, { now, env, stateDir: out.dir, notify, enabled: out.mode !== 'off' && out.digest !== false });
         report.stallSweep.digest = { published: d.lines?.length ?? 0, alerted: d.fresh?.length ?? 0, notified: !!d.notified };
         errors.push(...(d.errors ?? []).map((e) => `stall digest: ${e}`));
       }

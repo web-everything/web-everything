@@ -12,8 +12,8 @@
  *   An alert that fails to send is retried next pass. Each item: reason, 1-3 evidence lines, one paste-ready command.
  *   Setting `prStallSweep.digest` (standard true) turns it off; the quiet hours are the shared `quietHours` settings.
  */
-import { mkdirSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { mkdirSync, readFileSync, realpathSync, readlinkSync } from 'node:fs';
+import { dirname, join, resolve, basename, sep } from 'node:path';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { diffFeed, appendLines, checkedFeedPath, sidecarsOf, REPORT_KINDS, resolveSettings as feedSettings } from '../operations/needs-you-feed.mjs';
@@ -23,6 +23,45 @@ import { isUnderTest } from '../lib/under-test.mjs';
 export const STALLED_KIND = 'stalled';
 const sh = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const readJson = (path, fallback) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch (e) { if (e?.code === 'ENOENT') return fallback; throw e; } };
+
+// Resolve existing ancestors too: a new feed below a symlinked directory still targets that directory's real tree.
+function canonicalPath(path) {
+  path = resolve(path);
+  try { return realpathSync(path); }
+  catch (e) {
+    if (e?.code !== 'ENOENT' || dirname(path) === path) throw e;
+    // realpath cannot resolve a dangling symlink, but appendFileSync will follow it once its target is created.
+    let link;
+    try { link = readlinkSync(path); }
+    catch (error) { if (!['ENOENT', 'EINVAL'].includes(error?.code)) throw error; }
+    if (link !== undefined) return canonicalPath(resolve(dirname(path), link));
+    return join(canonicalPath(dirname(path)), basename(path));
+  }
+}
+function checkedDigestFeedPath(feedPath, env, stateDir) {
+  const path = checkedFeedPath(feedPath ?? feedSettings({ env }).path.value);
+  const target = canonicalPath(path), dir = canonicalPath(stateDir), lexicalDir = resolve(stateDir);
+  const within = (file, root) => file === root || file.startsWith(`${root}${sep}`);
+  const metadata = ['digest-state.json', 'digest.lock'].map(name => canonicalPath(join(stateDir, name)));
+  if (within(path, lexicalDir) || within(target, dir) || metadata.includes(target)) throw new Error('feed path is reserved for stall digest state');
+  return path;
+}
+
+/** A disabled producer relinquishes suppression under the same lock as both feed publishers. */
+function releaseStalledSuppression({ feedPath, env, stateDir, errors }) {
+  try {
+    const path = checkedDigestFeedPath(feedPath, env, stateDir);
+    const sidecar = sidecarsOf(path).state;
+    mkdirSync(dirname(sidecar), { recursive: true });
+    withFileLock(`${sidecar}.lock`, () => {
+      const prev = readJson(sidecar, { openKeys: [] });
+      if (!Array.isArray(prev?.openKeys)) throw new Error('feed state has no openKeys');
+      const openKeys = prev.openKeys.filter(key => !key.endsWith(`:${STALLED_KIND}`));
+      if (openKeys.length !== prev.openKeys.length) writeJsonAtomic(sidecar, { ...prev, openKeys });
+    });
+  } catch (e) { errors.push(`stalled feed: ${String(e?.message ?? e).split('\n')[0]}`); }
+  return { lines: [], fresh: [], notified: false, errors, skipped: 'digest off' };
+}
 
 /** The one paste-ready command: the sweep's next action with the operator's login and this channel filled in. PURE. */
 export function pasteReady(item) {
@@ -53,9 +92,13 @@ const feedKeyOfId = (x) => { const at = x.lastIndexOf('@'); return `${x.slice(0,
  */
 export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true } = {}) {
   const errors = [];
-  if (!enabled || !Array.isArray(pass?.items)) return { lines: [], fresh: [], notified: false, errors, skipped: !enabled ? 'digest off' : 'no pass' };
   if (isUnderTest(env) && !feedPath) return { lines: [], fresh: [], notified: false, errors, skipped: 'under-test' }; // never the real feed
+  if (!enabled) return releaseStalledSuppression({ feedPath, env, stateDir, errors });
+  if (!Array.isArray(pass?.items)) return { lines: [], fresh: [], notified: false, errors, skipped: 'no pass' };
   const items = pass.items.filter((i) => i.lane === 'operator').map(feedItem);
+  // A feed configured as digest.lock may already contain events. Reject it before lock recovery can reclaim it.
+  try { checkedDigestFeedPath(feedPath, env, stateDir); }
+  catch { return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, unlocked: true }); }
   // One delivery at a time: selection, sending and confirmation run under one lock, so two overlapping passes can never
   // both send the same owed alert. If the lock cannot be taken, every item is alerted (a repeat, never a drop).
   try { mkdirSync(stateDir, { recursive: true }); return withFileLock(join(stateDir, 'digest.lock'), () => deliver(items, pass, { now, env, feedPath, stateDir, notify, errors })); }
@@ -67,8 +110,9 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, un
   const id = (f) => `${f.repo}#${f.pr}@${f.head}:${f.state}`;
   const mine = join(stateDir, 'digest-state.json');
   try {
+    // Validate before assigning the confirmation lock: a rejected feed must never mutate our state, even after an alert.
+    const path = checkedDigestFeedPath(feedPath, env, stateDir);
     if (unlocked) throw new Error('delivery lock unavailable');
-    const path = checkedFeedPath(feedPath ?? feedSettings({ env }).path.value);
     const sidecar = sidecarsOf(path).state;
     mkdirSync(dirname(sidecar), { recursive: true }); mkdirSync(stateDir, { recursive: true });
     lock = `${sidecar}.lock`;
