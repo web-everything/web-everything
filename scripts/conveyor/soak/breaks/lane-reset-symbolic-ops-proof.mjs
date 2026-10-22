@@ -113,6 +113,7 @@ async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit',
         const refresh = cli(['refresh', '--count=1']);
         if (refresh.status !== 0 || !refresh.stderr.includes('SKIPPED')) throw Error(`fixture refresh failed: ${refresh.stderr}`);
         const helperMarker = join(base, 'remote-helper-ran');
+        const probeMarker = join(base, 'probed');
         if (hostileRemote) {
           const helper = join(base, 'remote-helper.sh');
           writeFileSync(helper, `#!/bin/sh\ntouch '${helperMarker}'\nexit 1\n`);
@@ -127,19 +128,20 @@ async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit',
         // Mutate the remote between the initial proof and the under-claim reproof.
         if (race) {
           const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-          const marker = join(base, 'probed');
           writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
-const { existsSync, writeFileSync } = require('node:fs');
+const { existsSync, readFileSync, writeFileSync } = require('node:fs');
 const { spawnSync } = require('node:child_process');
 const args = process.argv.slice(2);
-// Inspect the subcommand after transport hardening's global config flags; forward the original argv.
+// Inspect the subcommand after transport-hardening config options, preserving argv for the real Git.
 const commandArgs = args.slice();
 while (commandArgs[0] === '-c') commandArgs.splice(0, 2);
 if (commandArgs[0] === 'ls-remote') {
-  if (existsSync(${JSON.stringify(marker)})) {
+  const count = existsSync(${JSON.stringify(probeMarker)}) ? Number(readFileSync(${JSON.stringify(probeMarker)}, 'utf8')) : 0;
+  writeFileSync(${JSON.stringify(probeMarker)}, String(count + 1));
+  if (count > 0) {
     const changed = spawnSync(${JSON.stringify(realGit)}, ${JSON.stringify(mutation)}, { cwd: ${JSON.stringify(origin)} });
     if (changed.status !== 0) process.exit(1);
-  } else writeFileSync(${JSON.stringify(marker)}, 'first proof');
+  }
 }
 const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
 process.exit(result.status ?? 1);
@@ -159,6 +161,9 @@ process.exit(result.status ?? 1);
         const reclaim = cli(['reclaim', '--lane=1', '--json', ...(dryRun ? ['--dry-run'] : [])]);
         if (reclaim.status !== 0) throw Error(`fixture reclaim failed: ${reclaim.stderr}`);
         const report = JSON.parse(reclaim.stdout);
+        if (race && (!existsSync(probeMarker) || Number(readFileSync(probeMarker, 'utf8')) < 2)) {
+          violations.push('race fixture did not observe both live preservation probes');
+        }
         if (existsSync(helperMarker)) violations.push('reclaim dry-run executed a lane-controlled remote helper');
         if (live) {
           if (!(dryRun ? report.wouldReclaim : report.reclaimed)) violations.push('live non-ops proof no longer permits reclaim');
