@@ -30,16 +30,32 @@ describe('send-back heavy queue priority', () => {
     expect(classifyWaiterPriority({ session: 'fix-5806' }, priority).class).toBe('P3');
     expect(classifyWaiterPriority({ session: 'fix-5806' }, { ...priority, mode: 'off' }, { sendBackFixes: evidence }).class).toBe('P3');
   });
-  it('orders P0 then P1 then P3 across build/test lanes, with FCFS among send-backs and unchanged slot eligibility', () => {
+  it('orders P0 across lanes and P1 before P3 within its lane, with FCFS among send-backs', () => {
     marker('BUILD', 'files', 'P3', 0); marker('TEST', 'FULL', 'P3', 1);
     marker('FIX', 'FULL', 'P1', 2); marker('FIX2', 'FULL', 'P1', 3);
-    expect(next('BUILD')).toBe(false); expect(next('TEST')).toBe(false); expect(next('FIX')).toBe(true); expect(next('FIX2')).toBe(false);
+    expect(next('BUILD')).toBe(true); expect(next('TEST')).toBe(false); expect(next('FIX')).toBe(true); expect(next('FIX2')).toBe(false);
     marker('REPAIR', 'FULL', 'P0', 4);
-    expect(next('REPAIR')).toBe(true); expect(next('FIX')).toBe(false);
+    expect(next('REPAIR')).toBe(true); expect(next('FIX')).toBe(false); expect(next('BUILD')).toBe(false);
     clearWaiting({ lockRoot, owner: 'REPAIR' }); expect(next('FIX')).toBe(true);
     clearWaiting({ lockRoot, owner: 'FIX' }); expect(next('FIX2')).toBe(true);
     expect(isOldestLiveWaiter({ lockRoot, owner: 'BUILD', kind: 'files', nowMs: T0 + 10000, priorityMode: 'off' })).toBe(true);
     expect(slotOrderFor('FULL', 1, 1, 'P1')).toEqual(slotOrderFor('FULL', 1, 1, 'P3'));
+  });
+  it('admits an ordinary short command to a free short-only slot while a FULL P1 waits', async () => {
+    marker('FIX', 'FULL', 'P1', 0);
+    expect(tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0,
+      nowIso: new Date(T0).toISOString(), slots: [0] }).ok).toBe(true);
+    expect(slotOrderFor('FULL', 1, 1, 'P1')).toEqual([0]);
+    const result = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'BUILD', kind: 'files',
+      policy: { ...policy, settings: { ...policy.settings, fastSlots: 1,
+        fastScale: { ...policy.settings.fastScale, maxSlots: 1 } } },
+      env: {}, now: () => T0 + 10000, hostAdmission: () => ({ admitted: true }),
+      readLease: () => null, readSendBackFixes: () => [], log() {}, ceilingMs: 1000,
+      sleep: async () => { throw new Error('short command must not wait for the FULL P1'); },
+    });
+    expect(result).toMatchObject({ ok: true, slot: 1, waitedMs: 0 });
+    expect(listWaiting(lockRoot)).toContainEqual(expect.objectContaining({ owner: 'FIX', priority: 'P1' }));
+    expect(heldSlots({ lockRoot, cap: 1, fastSlots: 1 }).map(h => h.owner)).toEqual(['HOLDER', 'BUILD']);
   });
   it('records the classification through acquireSlotBlocking and never preempts a running holder', async () => {
     expect(tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: new Date(T0).toISOString(), slots: [0] }).ok).toBe(true);

@@ -1995,12 +1995,17 @@ cannot prove a red run. Git-read errors are reported as unknown rather than evid
 ### Previewing host-busy fix waits
 
 `node scripts/conveyor/reconcile-fix-dispatch.mjs --dry-run --repo=we` works from a lane.
-It reads the live planner and the existing resource throttle, prints proposed
-`fix-waiting:host-busy` label changes and overdue alerts, and never launches a fixer,
-changes labels, sends notifications, or saves waiting episodes. A proposed clear is
-conditional on the previewed launch; the live dispatcher clears only after a successful
-fresh launch or resume. Preview reads skip the planner's cache and journal writes and
-checkout auto-sync. Other dispatch gates still apply after resource admission.
+It reads the live planner and the existing resource throttle and prints proposed
+`fix-waiting:host-busy` label changes and overdue alerts. Dry-run makes no label,
+alert, waiting-state, lane-pool or planner-ledger writes and never launches a fixer.
+Lane availability is unknown: admitted entries report “would launch if a lane is free”,
+and proposed clears are conditional on a free lane and a successful launch. Only a
+caller-supplied lane picker can provide preview lane availability; preview never calls
+lane-pool list (which writes scan locks/caches and can reap). The live dispatcher clears
+only after a successful fresh launch or resume. Checkout auto-sync is skipped.
+Reads still pass through the gh throttle (accounting kept on purpose) and may refresh
+local git remote-tracking refs or the agent-list cache. Other dispatch gates still apply
+after resource admission.
 
 The alert limit is `fixWaiting.hostBusyAlertMinutes` (default 30), resolved through the
 policy cascade and logged with its source on every pass. Tool overrides belong in
@@ -2021,10 +2026,20 @@ attempts and lane selection when exercising their paths. Preview tests must inje
 GitHub IO. Build/graduation launch gates only add deferrals after resource admission;
 fix/ci-heal gates and resource floors retain their existing behavior. A waiting record
 expires after three dispatcher intervals (six minutes by default), including if the daemon dies.
+Refreshes do not extend the absolute yield bound: builds/graduations yield only while
+the episode's first deferral (`firstDeferredAt`, or legacy `waitingSince`) is younger than
+`fixWaiting.yieldMaxMinutes` (default 30, valid 1..240). This setting follows the same
+standard → platform → tool → env cascade (`WE_FIX_WAITING_YIELD_MAX_MINUTES`), with its
+source included in the yield reason. Once the bound expires, the existing gate's admission
+stands; the waiting label and overdue alert continue independently. Missing or invalid
+episode origins confer no launch priority.
 Confirmed send-back launches retain session evidence for at most 24 hours for heavy-command
 classification, without continuing to block launches. Both freshness settings resolve through
 `fixWaiting` in the policy cascade and name their sources in priority reasons.
 `heavyAdmission.priority.mode` controls queue ordering: P0 red-main repair, P1 send-back fixer,
-then normal P3. P1 keeps its existing slot eligibility, and running holders are never preempted.
+then normal P3 within each queue lane. A FULL P1 waiter does not block an ordinary short
+command from a free short-only slot. P1 keeps its existing slot eligibility, and running
+holders are never preempted. The broader send-back waiting/priority classification does
+not change reserved fix-cap eligibility: only `review:changes` receives that reservation.
 The focused suites are `fix-waiting-priority.test.mjs` and `heavy-send-back-priority.test.mjs`;
 run them through heavy admission when host capacity permits.

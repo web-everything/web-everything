@@ -1,4 +1,3 @@
-import { isSendBackFix } from './fix-waiting-priority.mjs';
 /**
  * @file scripts/conveyor/reconcile-fix-dispatch.mjs
  * @description #3438 — DISPATCH THE FIX AGENT `we:scripts/conveyor/reconcile-pass.mjs` DECIDES IS OWED.
@@ -1999,7 +1998,7 @@ export function runReconcileFixDispatch({
   };
   for (const entry of planned) {
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
-    const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: isSendBackFix(waitingEntry(entry)) }) : { admit: true };
+    const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) : { admit: true };
     if (!t.admit && t.kind === 'host-load') waiting?.deferred(waitingEntry(entry));
     if (t.admit && t.note) console.error(`reconcile-fix-dispatch: PR #${entry.pr} fix launch admitted: ${t.note}`);
     // Card 87 — ONLY the fixer cap may be borrowed past (never host-load, never a scope wait: those never get here).
@@ -2260,9 +2259,11 @@ export function recordQueueCapRefusal({
  * the exact SAME plan {@link runReconcileFixDispatch} would dispatch against (reused, not re-derived), but
  * never spawns, resumes, acquires, or releases anything — for each planned `fix` entry it only asks
  * {@link ../conveyor/fix-claim-store.mjs#readFixDispatchClaim} whether that PR's `(repo, pr, headRefOid)`
- * claim is currently free or already held, and by whom. This is the live introspection this item's own proof
- * needs (a `--dry-run` before/after showing a claim taken, then refused for a duplicate, with zero side
- * effects on the real system) and a genuine standing tool: an operator — or a future health-daemon check — can
+ * claim is currently free or already held, and by whom. It also previews resource admission and waiting
+ * label/alert changes without label, alert, waiting-state, lane-pool or planner-ledger writes.
+ * Reads still use the gh throttle (accounting kept on purpose) and may refresh local git
+ * remote-tracking refs or the agent-list cache. Lane availability is unknown unless injected.
+ * This is live introspection: an operator — or a future health-daemon check — can
  * ask "is a fix about to be double-dispatched?" without risking a real dispatch itself.
  * @param {object} [o] — the same read-only inputs `runReconcileFixDispatch` itself takes (`repo`, `root`,
  *   `findItemFn`, `loadItems`, `reconcile`, the scope resolvers, `resolveProfile`, `checkStaleness`, `prsFile`).
@@ -2294,20 +2295,26 @@ export function planFixDispatchClaimStatus({
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
   const profile = resolveProfile(repoKey);
   if (!profile?.capabilities?.fix) return { repo: repoKey, entries: [] };
-  const { planned } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
-  const lanes = waiting && dispatchThrottle ? [...(pickFreeLanes ? pickFreeLanes() : freeLaneNumbers({ root, lanePoolRepo: profile.lanePoolRepo }))] : [];
+  const { planned } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef, { includeLabels: true });
+  // lane-pool list writes scan locks/caches and can reap; preview must never call it.
+  const lanes = typeof pickFreeLanes === 'function' ? [...pickFreeLanes()] : null;
   const entries = planned.map((entry) => {
     const row = dispatchEntries.find(row => Number(row.prNumber) === Number(entry.pr));
     const labels = row?.labels ?? entry.labels;
     const operatorSendBack = entry.operatorSendBack ?? row?.operatorSendBack;
     const claim = readClaim({ repo: repoKey, pr: entry.pr, headSha: entry.headRefOid, lockRoot: claimRoot });
-    const throttle = dispatchThrottle?.tryAdmit('fix', { sendBack: isSendBackFix({ ...entry, labels, operatorSendBack }) }) ?? null;
+    const throttle = dispatchThrottle?.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) ?? null;
     if (throttle?.admit === false && throttle.kind === 'host-load') waiting?.deferred({ ...entry, labels, operatorSendBack });
     // A preview can only propose a launch. The live path clears exclusively after dispatched.push().
-    if (throttle?.admit && !claim && lanes.length) {
-      lanes.shift(); waiting?.dispatched({ ...entry, labels, operatorSendBack });
+    const launch = throttle?.admit && !claim
+      ? lanes === null ? 'would launch if a lane is free' : lanes.length ? 'would launch' : 'no free lane'
+      : null;
+    if (launch && launch !== 'no free lane') {
+      lanes?.shift();
+      waiting?.dispatched({ ...entry, labels, operatorSendBack }, { condition: 'if a lane is free and launch succeeds' });
     }
-    return { pr: entry.pr, itemNum: entry.itemNum, headRefOid: entry.headRefOid, claim, ...(throttle ? { throttle } : {}) };
+    return { pr: entry.pr, itemNum: entry.itemNum, headRefOid: entry.headRefOid, claim,
+      ...(throttle ? { throttle } : {}), ...(launch ? { launch } : {}) };
   });
   return { repo: repoKey, entries };
 }
@@ -2430,7 +2437,7 @@ if (IS_CLI) {
       const lines = [`reconcile-fix-dispatch --dry-run — ${status.entries.length} PR(s) planned for repo "${status.repo}"`];
       for (const e of status.entries) {
         const itemLabel = e.itemNum ? `item #${e.itemNum}` : 'no backlog item';
-        if (e.throttle) lines.push(`  PR #${e.pr} throttle: ${e.throttle.admit ? 'admitted (launch not attempted)' : `${e.throttle.kind} — ${e.throttle.why}`}`);
+        if (e.throttle) lines.push(`  PR #${e.pr} throttle: ${e.throttle.admit ? (e.launch ?? 'admitted (launch not attempted)') : `${e.throttle.kind} — ${e.throttle.why}`}`);
         lines.push(e.claim
           ? `  ⚠ PR #${e.pr} (${itemLabel}) — claim ALREADY HELD by ${e.claim.owner} (since ${e.claim.heartbeatAt}) — a real dispatch attempt right now would be REFUSED`
           : `  ✓ PR #${e.pr} (${itemLabel}) — claim free (other dispatch gates still apply)`);

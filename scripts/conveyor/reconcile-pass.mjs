@@ -1504,6 +1504,7 @@ export function runReconcilePass({
 } = {}) {
   // fix-waiting: diagnostics reuse the live planner with cache/journal sinks disabled.
   // A distinct exec binding takes the existing uncached read branches (including timeout evidence).
+  // Keep gh-throttle rate-limit accounting enabled: it is a guard, even for preview reads.
   if (readOnly) {
     const readExec = (...args) => execFileSyncThrottled(...args);
     if (readPrs === defaultReadPrs) readPrs = options => defaultReadPrs({ ...options, exec: readExec });

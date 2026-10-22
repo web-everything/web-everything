@@ -51,7 +51,7 @@ export function createFixWaitingObserver({ repo, path = fixWaitingStatePath(repo
     if (dryRun || !readable) return;
     mkdirSync(dirname(path), { recursive: true }); writeJsonAtomic(path, state);
   };
-  const observe = (entry, waiting) => {
+  const observe = (entry, waiting, { condition } = {}) => {
     try {
       const pr = entry.pr ?? entry.prNumber; const key = `${repo}#${pr}`;
       const previous = state[key];
@@ -60,9 +60,15 @@ export function createFixWaitingObserver({ repo, path = fixWaitingStatePath(repo
         : previous?.labelled === true;
       let row = previous && !(waiting && previous.waiting === false)
         ? { ...previous } : { firstDeferredAt: now, labelled: previous?.labelled === true };
+      // Preserve the episode origin across refreshes, including older records.
+      // Never substitute updatedAt: a refresh is not evidence of the first deferral.
+      row.firstDeferredAt ??= row.waitingSince;
+      if (typeof row.firstDeferredAt === 'string' && Number.isFinite(Date.parse(row.firstDeferredAt))) {
+        row.firstDeferredAt = Date.parse(row.firstDeferredAt);
+      }
       if (waiting !== labelled) {
         const verb = waiting ? 'set' : 'clear';
-        if (dryRun) log(`reconcile-fix-dispatch: would ${verb} ${FIX_WAITING_LABEL} on #${pr} (${repo})`);
+        if (dryRun) log(`reconcile-fix-dispatch: would ${verb} ${FIX_WAITING_LABEL} on #${pr} (${repo})${condition ? ` (${condition})` : ''}`);
         else {
           try {
             if (waiting) provider.ensureLabel(repo, FIX_WAITING_LABEL, {
@@ -95,5 +101,5 @@ export function createFixWaitingObserver({ repo, path = fixWaitingStatePath(repo
       if (JSON.stringify(previous) !== JSON.stringify(state[key])) save();
     } catch (error) { log(`reconcile-fix-dispatch: fix-waiting observation failed: ${error.message}`); }
   };
-  return { deferred: entry => observe(entry, true), dispatched: entry => observe(entry, false) };
+  return { deferred: entry => observe(entry, true), dispatched: (entry, options) => observe(entry, false, options) };
 }

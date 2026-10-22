@@ -1076,9 +1076,10 @@ export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL
     const self = rankable.find((m) => m.owner === owner);
     if (self && waiterPriorityClass(self) === 'P0') return oldestOwner(p0) === owner;
     if (p0.some((m) => m.owner !== owner)) return false;
-    // P1 yields to P0 and takes the next eligible free slot before P3, across both queue lanes.
-    // Slot eligibility is unchanged: a FULL P1 still cannot take a short-only slot.
-    const sendBacks = rankable.filter(m => waiterPriorityClass(m) === 'P1');
+    // P1 yields to P0 and precedes P3 within its own queue lane. A FULL P1 cannot take
+    // a short-only slot, so it must not prevent short waiters from using that capacity.
+    const sendBacks = rankable.filter(m => waiterPriorityClass(m) === 'P1'
+      && (lane === null || queueLaneOf(normalizeKind(m.kind)) === lane));
     if (sendBacks.length) return oldestOwner(sendBacks) === owner;
   }
   const live = rankable.filter((m) => lane === null || queueLaneOf(normalizeKind(m.kind)) === lane);

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createFixWaitingObserver, resolveFixWaitingSettings } from '../fix-waiting.mjs';
@@ -108,9 +108,13 @@ it('clears only after a launch lands in dispatched', () => {
   expect(f.provider.setLabels.mock.calls.at(-1)[2]).toEqual({ remove: ['fix-waiting:host-busy'] });
 });
 it('live dry-run preview evaluates the throttle and only observes refusals', () => {
-  const f = fixture(); const options = passOptions(f, { tryAdmit: () => ({ admit: false, kind: 'host-load', why: 'busy' }) });
+  const f = fixture(); const tryAdmit = vi.fn(() => ({ admit: false, kind: 'host-load', why: 'busy' }));
+  const options = passOptions(f, { tryAdmit });
   const result = planFixDispatchClaimStatus({ ...options, waiting: f.make({ dryRun: true }), readClaim: () => null });
   expect(result.entries[0].throttle).toEqual({ admit: false, kind: 'host-load', why: 'busy' });
+  expect(tryAdmit).toHaveBeenCalledWith('fix', { sendBack: false });
+  expect(f.provider.ensureLabel).not.toHaveBeenCalled();
+  expect(f.notify).not.toHaveBeenCalled();
   expect(f.provider.setLabels).not.toHaveBeenCalled(); expect(existsSync(f.path)).toBe(false);
 });
 
@@ -169,4 +173,69 @@ it('preview cache readers return live evidence without persisting it', () => {
   });
   expect(verdict.owed).toBe(false);
   expect(existsSync(cache)).toBe(false);
+});
+
+it.each(['live', 'preview'])('red-team:blocked alone cannot take a reserved fix-cap slot (%s)', mode => {
+  const f = fixture();
+  const gate = vi.fn(() => ({ admit: true }));
+  const throttle = createResourceFixThrottle({
+    settings: { ...RESOURCE_GATE_STANDARD, cutover: 'enforce',
+      fixCap: { ...RESOURCE_GATE_STANDARD.fixCap, floor: 2, ceiling: 2 } },
+    listClaims: () => [{ meta: { kind: 'fix' } }], alive: () => true,
+    readSnap: () => null, readHeavyWait: () => null, gate, log() {}, sendBackReservedSlots: 1,
+  });
+  const options = passOptions(f, throttle);
+  options.reconcile = () => ({ dispatch: [{ kind: 'fix', prNumber: 5806,
+    headRefName: 'lane/123-fix', labels: ['red-team:blocked'] }], refusals: [] });
+  if (mode === 'live') {
+    expect(runReconcileFixDispatch(options).refusals).toContainEqual(expect.objectContaining({ kind: 'fix-cap' }));
+  } else {
+    const result = planFixDispatchClaimStatus({ ...options, waiting: f.make({ dryRun: true }), readClaim: () => null });
+    expect(result.entries[0].throttle).toMatchObject({ admit: false, kind: 'fix-cap', reserved: 'send-back' });
+  }
+  expect(options.dispatch).not.toHaveBeenCalled();
+  expect(gate).not.toHaveBeenCalled();
+});
+
+it('preview leaves lane availability unknown without touching lane-pool discovery', () => {
+  const f = fixture();
+  const options = passOptions(f, { tryAdmit: () => ({ admit: true }) });
+  delete options.pickFreeLanes;
+  options.resolveProfile = () => ({ capabilities: { fix: true },
+    get lanePoolRepo() { throw new Error('preview must not consult the lane pool'); } });
+  options.reconcile = () => ({ dispatch: [{ kind: 'fix', prNumber: 5806, headRefName: 'lane/123-fix',
+    labels: ['fix-waiting:host-busy'] }], refusals: [] });
+  const result = planFixDispatchClaimStatus({ ...options, waiting: f.make({ dryRun: true }), readClaim: () => null });
+  expect(result.entries[0].launch).toBe('would launch if a lane is free');
+  expect(f.log.mock.calls.flat().join('\n')).toContain('would clear fix-waiting:host-busy on #5806');
+  expect(f.log.mock.calls.flat().join('\n')).toContain('if a lane is free and launch succeeds');
+  expect(options.dispatch).not.toHaveBeenCalled();
+  expect(f.provider.setLabels).not.toHaveBeenCalled();
+  expect(f.notify).not.toHaveBeenCalled();
+  expect(existsSync(f.path)).toBe(false);
+});
+
+it.each([{ lanes: [] }, { lanes: [10] }])('preview uses only an explicitly injected lane picker: %j', ({ lanes }) => {
+  const f = fixture();
+  const options = passOptions(f, { tryAdmit: () => ({ admit: true }) });
+  const dispatched = vi.fn();
+  options.pickFreeLanes = vi.fn(() => lanes);
+  const result = planFixDispatchClaimStatus({ ...options, waiting: { dispatched }, readClaim: () => null });
+  expect(options.pickFreeLanes).toHaveBeenCalledTimes(1);
+  expect(result.entries[0].launch).toBe(lanes.length ? 'would launch' : 'no free lane');
+  expect(dispatched).toHaveBeenCalledTimes(lanes.length ? 1 : 0);
+  expect(lanes).toEqual(lanes.length ? [10] : []);
+});
+
+it('preserves a legacy episode origin across refreshes and resets only after dispatch', () => {
+  const f = fixture();
+  const key = 'web-everything/web-everything#5806';
+  writeFileSync(f.path, JSON.stringify({ [key]: { waiting: true, sendBack: true,
+    waitingSince: new Date(1000).toISOString(), updatedAt: 2000, labelled: true } }));
+  f.make({ now: 3000 }).deferred({ pr: 5806 });
+  f.make({ now: 4000 }).deferred({ pr: 5806 });
+  expect(JSON.parse(readFileSync(f.path, 'utf8'))[key]).toMatchObject({ firstDeferredAt: 1000, updatedAt: 4000 });
+  f.make({ now: 5000 }).dispatched({ pr: 5806 });
+  f.make({ now: 6000 }).deferred({ pr: 5806 });
+  expect(JSON.parse(readFileSync(f.path, 'utf8'))[key].firstDeferredAt).toBe(6000);
 });
