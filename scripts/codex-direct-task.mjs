@@ -90,6 +90,8 @@
  * or a red gate exits 1. A thrown error (including an unavailable self-review) exits 1 in both modes.
  */
 
+import { readBuilderSlotSettings } from './lib/builder-slots-settings.mjs';
+import { waitForSlot, heartbeatSlot, releaseSlot, listSlots } from './lib/builder-slots.mjs';
 import { randomUUID } from 'node:crypto';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
 import { resolveBuildPolicy, appendBuildRequirements } from './lib/build-policy.mjs';
@@ -1006,14 +1008,14 @@ function repoRootFromCwd() {
   return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
 }
 
-async function main() {
+export async function main({ runner = codexDirectTask, slotOptions = {} } = {}) {
   const flags = parseFlags(process.argv.slice(2));
   if (flags.help) {
     console.log(
       'usage: node scripts/codex-direct-task.mjs --task=<text>|--task-file=<path> [--dir=<checkout>] '
       + '[--repo-root=<path>] [--model=<m>] [--effort=low|medium|high|xhigh|max|ultra] [--tier=haiku|sonnet|opus] '
       + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=full|related|none|standards] [--ephemeral] [--clear-rollout-after-run] '
-      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json]\n'
+      + '[--wait-ms=<n>] [--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json]\n'
       + '  --review (#4194): a READ-ONLY review task — Codex runs under `-s read-only` and is told to answer in its '
       + 'final message (the report\'s `lastMessage`) instead of editing files.\n'
       + '  --task-kind defaults to worker (review with --review). Model AND effort follow codex.modelByTask; '
@@ -1036,9 +1038,41 @@ async function main() {
   const repoRoot = flags['repo-root'] ? resolve(flags['repo-root']) : (dir ? undefined : repoRootFromCwd());
   const timeoutMs = flags['timeout-ms'] ? Number(flags['timeout-ms']) : DEFAULT_TIMEOUT_MS;
 
+  // Foreground orchestrator work occupies the same external builder pool as the daemon.
+  const settings = slotOptions.settings ?? readBuilderSlotSettings();
+  slotOptions = { ...slotOptions, settings };
+  let slot, heartbeat;
+  const cleanup = () => {
+    if (heartbeat) clearInterval(heartbeat);
+    if (slot?.ok) { releaseSlot(slot.id, slotOptions); slot = null; }
+  };
+  const signalHandlers = Object.fromEntries(['SIGINT', 'SIGTERM'].map(signal => [signal, () => {
+    try { cleanup(); } finally { process.removeListener(signal, signalHandlers[signal]); process.kill(process.pid, signal); }
+  }]));
+  if (!process.env.WE_BUILDER_SLOT_HELD && settings.enabled) {
+    const waitMs = flags['wait-ms'] === undefined ? settings.waitMs : Number(flags['wait-ms']);
+    slot = await waitForSlot({ ...slotOptions, inFlightRows: slotOptions.inFlightRows ?? (async () => (await import('../skills-src/conveyor/build-dispatch-daemon.mjs')).listBuilderInFlightRows()), settings, class: 'codex', pid: process.pid,
+      purpose: ['codex-direct-task', flags.card && `card=${flags.card}`, flags.caller && `caller=${flags.caller}`].filter(Boolean).join(' '), waitMs });
+    if (!slot.ok) {
+      if (slot.reason === 'unreadable') console.error(`codex-direct-task: builder slot store unreadable: ${slot.error}`);
+      else console.error(`codex-direct-task: no external builder slot free within ${waitMs}ms (cap ${settings.maxExternal}, holders: ${JSON.stringify(slot.holders)})`);
+      process.exitCode = 75;
+      return;
+    }
+    process.on('exit', cleanup);
+    for (const [signal, handler] of Object.entries(signalHandlers)) process.on(signal, handler);
+    heartbeat = setInterval(() => {
+      try { heartbeatSlot(slot.id, slotOptions); } catch (e) { console.error(`codex-direct-task: builder slot heartbeat failed: ${e.message}`); }
+    }, settings.ttlMs / 3);
+    heartbeat.unref();
+  }
   let report;
   try {
-    report = await codexDirectTask({
+    if (slot) {
+      const live = listSlots(slotOptions).filter(r => !r.stale && r.class !== 'claude').length;
+      console.error(`codex-direct-task: builder slot ${slot.id} (external ${live}/${settings.maxExternal})`);
+    }
+    report = await runner({
       task,
       dir,
       repoRoot,
@@ -1063,6 +1097,10 @@ async function main() {
     console.error(`codex-direct-task: ${e.message}`);
     process.exitCode = 1;
     return;
+  } finally {
+    cleanup();
+    process.removeListener('exit', cleanup);
+    for (const [signal, handler] of Object.entries(signalHandlers)) process.removeListener(signal, handler);
   }
 
   process.exitCode = cliExitCode(report, { json: Boolean(flags.json) });

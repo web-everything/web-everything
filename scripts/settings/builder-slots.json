@@ -1,0 +1,4 @@
+{
+  "$comment": "Shared orchestrator builder slots. Cascade: standard → platform builderSlots → tool → WE_BUILDER_SLOTS* environment. enabled is the kill switch; false restores untracked launches.",
+  "builderSlots": { "enabled": true, "maxClaude": 1, "maxExternal": 4, "ttlMs": 1800000, "maxAgeMs": 21600000, "waitMs": 600000 }
+}

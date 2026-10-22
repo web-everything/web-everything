@@ -31,6 +31,8 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
+import { liveBuilderSlotRows } from '../../scripts/lib/builder-slots.mjs';
+import { readBuilderSlotSettings } from '../../scripts/lib/builder-slots-settings.mjs';
 import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/build-dispatch-policy.mjs';
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
@@ -66,7 +68,7 @@ import { runDaemonLoop, startIndependentHeartbeat, realSleep } from './verify-da
 import { normNum } from '../../scripts/conveyor/queue-store.mjs';
 import { collectProtectedNums } from '../../scripts/conveyor/queue-prune.mjs';
 import {
-  BUILD_DISPATCH_POLICY, planBuildDispatch, normalizeOpenPrs, prDeliversNum, prDeliveredNum, reportOpenItems,
+  dedupeBuilderRows, markSlotBackedRows, BUILD_DISPATCH_POLICY, planBuildDispatch, normalizeOpenPrs, prDeliversNum, prDeliveredNum, reportOpenItems,
   collectBuildHolds, stampCoversClaim, firstScopeOverlap,
 } from '../../scripts/conveyor/build-dispatch-policy.mjs';
 import {
@@ -232,11 +234,17 @@ export function readDispatchOutcome(text) {
   return { ...result, dispatching: true, handle: redactSpawnText(effect.handle) };
 }
 
-/**
- * #4295 — the scopes of LIVE fix/ci-heal claims, as `planBuildDispatch`'s `fixInFlight`. A claim with no recorded
- * scope (written before scope rode in `meta`) is skipped: unknown is not proven overlapping.
- * @returns {Array<{pr:number, scope:string[]}>}
- */
+/** This daemon's durable builders, merged by item identity. Live slots own linked items' counts only when their executor classes match. */
+export async function listBuilderInFlightRows({ includeSlots = false, listClaims = listBuildDispatchClaims, listSlots = () => liveBuilderSlotRows({ settings: readBuilderSlotSettings() }), listRuns = cliListRunStoreInFlight, listBorrowed = liveBorrowedFixInFlight } = {}) {
+  const claims = listClaims();
+  const slots = listSlots();
+  const rows = [
+    ...claims.filter(c => !c.meta.groupLead || normNum(c.meta.groupLead) === normNum(c.meta.num)).map(c => ({ num: normNum(c.meta.num), scope: c.meta.scope || [], source: `claim ${c.owner}` })),
+    ...await listRuns(), ...listBorrowed(),
+  ];
+  return dedupeBuilderRows([...markSlotBackedRows(rows, claims, slots), ...(includeSlots ? slots : [])]);
+}
+
 /** Card 87 — live fixes running in a BORROWED builder slot, as in-flight rows the planner counts against that class. */
 export function liveBorrowedFixInFlight(listClaims = () => listFixDispatchClaims(undefined, { liveOnly: true })) {
   return listClaims()
@@ -247,6 +255,11 @@ export function liveBorrowedFixInFlight(listClaims = () => listFixDispatchClaims
     }));
 }
 
+/**
+ * #4295 — the scopes of LIVE fix/ci-heal claims, as `planBuildDispatch`'s `fixInFlight`. A claim with no recorded
+ * scope (written before scope rode in `meta`) is skipped: unknown is not proven overlapping.
+ * @returns {Array<{pr:number, scope:string[]}>}
+ */
 export function liveFixInFlight() {
   return listFixDispatchClaims(undefined, { liveOnly: true })
     .filter((c) => Array.isArray(c.meta.scope) && c.meta.scope.length)
@@ -771,6 +784,16 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }
   // Card 87 — a fix borrowing a builder slot occupies it (no build may be started over it).
   try { inFlight.push(...(effects.listBorrowedFixes?.() ?? [])); } catch { /* an unreadable claim set never blocks the tick */ }
+  let slotStoreError;
+  let slots = [];
+  if (readBuilderSlotSettings().enabled) {
+    try { slots = await effects.listBuilderSlots?.() ?? []; }
+    catch (e) {
+      slotStoreError = String(e?.message ?? e).split('\n')[0].replace(/[\p{Cc}\p{Cf}]/gu, '') || 'unknown error';
+      console.error(`build-dispatch-daemon: external builders HELD - builder slot store unreadable: ${slotStoreError}`);
+    }
+  }
+  inFlight.splice(0, inFlight.length, ...markSlotBackedRows(inFlight, claims, slots), ...slots);
 
   const spawn = Array.isArray(d.spawnBuilds) ? d.spawnBuilds : [];
   // #4349 — a held item (a recent non-PR terminal-outcome cooldown) is dropped from candidates entirely, same
@@ -800,7 +823,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const fixInFlight = effects.listFixClaims ? effects.listFixClaims() : [];
   const mainRedFreeze = (() => { try { return effects.mainRedFreeze ? effects.mainRedFreeze() : null; } catch { return null; } })();
   const dispatchInputs = {
-    candidates, inFlight, openPrs, externalBuilding, killSwitch: effects.killSwitch(), policy, dispatchedByBuilder,
+    slotStoreError, candidates, inFlight, openPrs, externalBuilding, killSwitch: effects.killSwitch(), policy, dispatchedByBuilder,
     fixInFlight,
     // Card xu1nixv — freeze kind `main-red` (setting freeze.mainRed); an effect that is absent or throws = no freeze.
     mainRedFreeze,
@@ -1523,6 +1546,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     statusLine: d.statusLine || '',
     tickCore: { building: externalBuilding, spawnBuilds: spawn, held: admission.held || [], planned: admission.planned || [], queue: admission.queue || [], suppressedBuilds: d.suppressedBuilds || [] },
     plan,
+    ...(slotStoreError ? { slotStore: { error: slotStoreError } } : {}),
     grouping: { settings: groupingSettings, groups: groupedPlan.groups },
     retired,
     // #4349 — items dropped from THIS tick's candidates by a non-PR terminal-outcome cooldown (never the tick
@@ -2712,6 +2736,7 @@ export function cliEffects() {
     listClaims: ({ ignoreExpiry = false } = {}) => listBuildDispatchClaims({ ignoreExpiry }),
     listFixClaims: () => liveFixInFlight(),
     listBorrowedFixes: () => liveBorrowedFixInFlight(),
+    listBuilderSlots: () => liveBuilderSlotRows({ settings: readBuilderSlotSettings() }),
     releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num }),
     acquireClaim: ({ num, scope, groupLead }) => acquireBuildDispatchClaim({ num, scope, groupLead }),
     listRunStoreInFlight: () => [],
@@ -2893,11 +2918,7 @@ async function dryRun(flags) {
   for (const s of core.suppressedBuilds || []) heldByCore.set(normNum(s.num), s.by || 'suppressed');
   const capacityOnly = [...heldByCore.entries()].filter(([, why]) => /capacity/.test(String(why))).map(([num]) => ({ num, lane: null, scope: scopeByNum.get(num) || [] }));
   const openPrs = await effects.fetchOpenPrs();
-  const inFlight = [
-    ...listBuildDispatchClaims().map((c) => ({ num: normNum(c.meta.num), scope: c.meta.scope || [], source: `claim ${c.owner}` })),
-    ...runStoreRows,
-    ...liveBorrowedFixInFlight(),
-  ];
+  const inFlight = tick.plan.inFlight;
   // xovjhwh — the SAME shared derivation `runBuildDispatchTick` calls internally for `tick.plan` (unavailable
   // here since it is local to that function's own call); recomputed from the same two rows this dry-run already
   // fetched (`runStoreRows`/`settledRows`, above), through `deriveDispatchedByBuilder` rather than a second
@@ -2910,7 +2931,7 @@ async function dryRun(flags) {
     const route = await predictRoute(c.num, scope);
     reportCandidates.push({ num: c.num, lane: c.lane, scope, route, executor: route.executor });
   }
-  const ifFreed = planBuildDispatch({ candidates: reportCandidates, inFlight, openPrs: normalizeOpenPrs(openPrs), externalBuilding: core.building, killSwitch: cliKillSwitch(), policy, dispatchedByBuilder, fixInFlight: liveFixInFlight(), mainRedFreeze: cliMainRedFreeze() });
+  const ifFreed = planBuildDispatch({ slotStoreError: tick.slotStore?.error, candidates: reportCandidates, inFlight, openPrs: normalizeOpenPrs(openPrs), externalBuilding: core.building, killSwitch: cliKillSwitch(), policy, dispatchedByBuilder, fixInFlight: liveFixInFlight(), mainRedFreeze: cliMainRedFreeze() });
   const focus = String(flags.focus || '').split(',').map(normNum).filter(Boolean);
   const rows = [];
   const holdByNum = new Map((tick.buildHolds || []).map((h) => [normNum(h.num), h]));
@@ -2946,6 +2967,7 @@ async function dryRun(flags) {
     killSwitch: cliKillSwitch(),
     freeze: tick.plan.freeze,
     openPrs: normalizeOpenPrs(openPrs).map((p) => `${p.repo}#${p.number}`),
+    slotStore: tick.slotStore,
     inFlight: tick.plan.inFlight,
     // #4353 — {inFlight} ∪ {delivered-by-open-PR ∩ this builder's own dispatches, xovjhwh}, the cap this card
     // adds. `filling` names which nums fill it (never just a count) so a full-cap dry-run says WHY, not only
@@ -3065,7 +3087,7 @@ async function live(flags) {
       // or for an older record with none) so the operator's tick line names WHO is running each build without
       // reading scorecards. Additive over the previous bare-num array — nothing on `main` parses this stdout
       // JSON as a strict array-of-strings today (grepped 2026-09-29).
-      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, needsYou: r.needsYou, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, costAdmission: r.costAdmission ? { line: r.costAdmission.line, tally: r.costAdmission.tally } : null, launchSettlement: r.launchSettlement, launchPolicy: r.launchPolicy, sameTickHolds: r.sameTickHolds, capacity: tickCapacity(r) })}\n`);
+      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, slotStore: r.slotStore, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, needsYou: r.needsYou, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, costAdmission: r.costAdmission ? { line: r.costAdmission.line, tally: r.costAdmission.tally } : null, launchSettlement: r.launchSettlement, launchPolicy: r.launchPolicy, sameTickHolds: r.sameTickHolds, capacity: tickCapacity(r) })}\n`);
       if (r.costAdmission?.line) console.error(`build-dispatch-daemon: ${r.costAdmission.line}`);
     },
     onTickError: (e, _tick, loop) => {

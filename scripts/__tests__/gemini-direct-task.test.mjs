@@ -22,6 +22,7 @@ function tempDir() {
 // Exercise the real quota reader without inheriting or changing the host's holds.
 beforeEach(() => {
   vi.stubEnv('ANTIGRAVITY_QUOTA_DIR', tempDir());
+  vi.stubEnv('WE_BUILDER_SLOTS', 'off');
 });
 afterEach(() => {
   vi.unstubAllEnvs();

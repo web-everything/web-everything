@@ -82,6 +82,7 @@
  *   node scripts/gemini-direct-task.mjs --help
  */
 
+import { startBuilderLease } from './lib/builder-slot-lease.mjs';
 import { pickAgyEvidence, agyRunEvidence, readAgyHold, saveAgyHold } from './lib/antigravity-run-evidence.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
@@ -585,7 +586,7 @@ export async function geminiDirectTask({
 /** --flag=value parsing, with repeatable --add-dir. Pure and independently testable. */
 export function parseFlags(argv) {
   const flags = {};
-  const values = ['task', 'task-file', 'dir', 'repo-root', 'model', 'effort', 'add-dir', 'timeout-ms', 'gate', 'log'];
+  const values = ['task', 'task-file', 'dir', 'repo-root', 'model', 'effort', 'add-dir', 'timeout-ms', 'wait-ms', 'gate', 'log'];
   const booleans = ['sandbox', 'no-stream', 'no-install', 'wire-origin-to-remote', 'json', 'help', 'review'];
   for (const arg of argv) {
     const eq = arg.indexOf('=');
@@ -603,10 +604,12 @@ export function parseFlags(argv) {
       flags[key] = true;
     }
   }
+  if (flags['wait-ms'] !== undefined && (!/^\d+$/.test(flags['wait-ms']) || !Number.isSafeInteger(Number(flags['wait-ms'])))) throw new TypeError('Invalid --wait-ms');
   return flags;
 }
 
 export const HELP = `usage: node scripts/gemini-direct-task.mjs --task=<text>|--task-file=<path>
+  --wait-ms=N              Bounds the wait for external builder capacity.
   --dir=<existing checkout>  Default: fresh scratch clone; --repo-root=<path> REQUIRED without --dir.
   --model=<slug> --effort=low|medium|high  Optional passthroughs; no validated recommendation for this role.
   --add-dir=<dir>            Repeatable bookkeeping only, NOT a sandbox or permission boundary.
@@ -670,27 +673,38 @@ export function formatReport(report) {
 }
 
 /** Injectable orchestration seam lets CLI flag/report tests run without any real process. */
-export async function main(argv = process.argv.slice(2), { taskFn = geminiDirectTask, readFileFn = readFileSync } = {}) {
+export async function main(argv = process.argv.slice(2), { taskFn = geminiDirectTask, readFileFn = readFileSync, slotOptions = {} } = {}) {
   const flags = parseFlags(argv);
   if (flags.help) { console.log(HELP); return; }
   if (Boolean(flags.task) === Boolean(flags['task-file'])) {
     throw new TypeError('gemini-direct-task: pass exactly one of --task=<text> or --task-file=<path>');
   }
   const task = flags['task-file'] ? readFileFn(resolve(flags['task-file']), 'utf8') : flags.task;
-  const report = await taskFn({
-    task, dir: flags.dir ? resolve(flags.dir) : undefined,
-    repoRoot: flags['repo-root'] ? resolve(flags['repo-root']) : undefined,
-    model: flags.model, effort: flags.effort, addDirs: flags['add-dir']?.map((dir) => resolve(dir)),
-    sandbox: Boolean(flags.sandbox), timeoutMs: flags['timeout-ms'] ? Number(flags['timeout-ms']) : DEFAULT_TIMEOUT_MS,
-    gate: flags.gate ?? 'none', logFile: flags.log ? resolve(flags.log) : undefined,
-    stream: !flags['no-stream'] && !flags.json, installDeps: !flags['no-install'],
-    wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
-    review: Boolean(flags.review),
-    // npm install normally inherits stdout. Keep --json machine-readable during scratch setup too.
-    execFn: flags.json ? (bin, args, opts = {}) => defaultExecFn(bin, args, {
-      ...opts, ...(opts.stdio === 'inherit' ? { stdio: ['ignore', 2, 2] } : {}),
-    }) : defaultExecFn,
-  });
+  const slot = await startBuilderLease({ ...slotOptions, class: 'antigravity', purpose: 'gemini-direct-task',
+    ...(flags['wait-ms'] === undefined ? {} : { waitMs: Number(flags['wait-ms']) }) });
+  if (!slot.ok) {
+    console.error(slot.reason === 'unreadable' ? `gemini-direct-task: builder slot store unreadable: ${slot.error}`
+      : `gemini-direct-task: no external builder slot free (cap ${slot.cap}, holders: ${JSON.stringify(slot.holders)})`);
+    process.exitCode = 75;
+    return;
+  }
+  let report;
+  try {
+    report = await taskFn({
+      task, dir: flags.dir ? resolve(flags.dir) : undefined,
+      repoRoot: flags['repo-root'] ? resolve(flags['repo-root']) : undefined,
+      model: flags.model, effort: flags.effort, addDirs: flags['add-dir']?.map((dir) => resolve(dir)),
+      sandbox: Boolean(flags.sandbox), timeoutMs: flags['timeout-ms'] ? Number(flags['timeout-ms']) : DEFAULT_TIMEOUT_MS,
+      gate: flags.gate ?? 'none', logFile: flags.log ? resolve(flags.log) : undefined,
+      stream: !flags['no-stream'] && !flags.json, installDeps: !flags['no-install'],
+      wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
+      review: Boolean(flags.review),
+      // npm install normally inherits stdout. Keep --json machine-readable during scratch setup too.
+      execFn: flags.json ? (bin, args, opts = {}) => defaultExecFn(bin, args, {
+        ...opts, ...(opts.stdio === 'inherit' ? { stdio: ['ignore', 2, 2] } : {}),
+      }) : defaultExecFn,
+    });
+  } finally { slot.close(); }
   console.log(flags.json ? JSON.stringify(report, null, 2) : formatReport(report));
   if (report.timedOut || report.exitCode !== 0 || report.events.terminal !== 'SUCCESS' || !report.gate.pass
       || report.events.toolErrors.some((t) => writingTools.includes(t.name))) {

@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 /**
  * agy-launcher-probation (#4291) — the doc-fix BUILD arc of `probation-build-run.mjs` over a fake `io` (no git,
  * no gh, no model). Mirrors `probation-heal-run.test.mjs`'s own fake-io shape and coverage, adapted to a build's
@@ -103,6 +104,7 @@ function fakeIo({
   const cleanSnapshot = { configHash: 'clean', files: {} };
   const tamperedSnapshot = { configHash: 'clean', files: { 'pre-commit': 'planted' } };
   const io = {
+    builderSlotOptions: { settings: { enabled: false } },
     log: () => {},
     openBlockers: () => [],
     acquireLane: (o) => { calls.push(['acquireLane', o.lane, o.scope]); return lane; },
@@ -1691,4 +1693,69 @@ describe('openPr evidence before operation output truncation', () => {
       expect(result.reason).toContain('lane/5754b-prepare-example');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+describe('probation builder lease', () => {
+  it.each([true, false])('takes one slot, annotates the claim, forwards the lease, releases after worker success=%s', async success => {
+    const { listSlots } = await import('../../lib/builder-slots.mjs');
+    const { BUILDER_SLOT_DEFAULTS } = await import('../../lib/builder-slots-settings.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'probation-slot-'));
+    const { io } = fakeIo({ runWorkerOk: success });
+    io.env = {};
+    io.builderSlotOptions = { root, settings: BUILDER_SLOT_DEFAULTS, inFlightRows: async () => [{ num: '4291', executor: 'codex' }], waitMs: 0 };
+    let annotated, ran = false;
+    io.annotateBuildDispatchClaim = data => { annotated = data; };
+    const original = io.runWorker;
+    io.runWorker = (argv, dir, env) => {
+      ran = true;
+      expect(env.WE_BUILDER_SLOT_HELD).toBe(annotated.slotId);
+      expect(listSlots({ root })).toMatchObject([{ id: annotated.slotId, purpose: 'build #4291', pid: process.pid }]);
+      return original(argv, dir);
+    };
+    try {
+      await runProbationBuild(args(), io);
+      expect(ran).toBe(true);
+      expect(annotated).toEqual({ num: '4291', slotId: expect.any(String) });
+      expect(listSlots({ root })).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('skips the slot provider when a parent already owns the lease', async () => {
+    const { io } = fakeIo();
+    io.env = { WE_BUILDER_SLOT_HELD: 'parent' };
+    io.builderSlotOptions = { settings: { enabled: true }, inFlightRows: () => { throw new Error('must not read'); } };
+    expect((await runProbationBuild(args(), io)).outcome).toBe('opened-pr');
+  });
+  it('abandons non-destructively before running a worker on unreadable evidence', async () => {
+    const { io, calls } = fakeIo();
+    const root = mkdtempSync(join(tmpdir(), 'probation-slot-bad-'));
+    writeFileSync(join(root, 'bad.json'), '{');
+    const { BUILDER_SLOT_DEFAULTS } = await import('../../lib/builder-slots-settings.mjs');
+    io.env = {};
+    io.builderSlotOptions = { root, settings: BUILDER_SLOT_DEFAULTS, waitMs: 0 };
+    try {
+      expect(await runProbationBuild(args(), io)).toMatchObject({ outcome: 'gate-red', detail: expect.stringContaining('builder slot store unreadable') });
+      expect(calls.some(c => c[0] === 'worker')).toBe(false);
+      expect(calls.some(c => c[0] === 'discard')).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+it.each(['runWorker', 'runChecker'])('realIo %s tracks its asynchronous child and preserves held env', async method => {
+  const child = new EventEmitter(); child.pid = 123;
+  child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+  let tracked = null;
+  const io = realIo({ env: {}, spawnFn: (bin, argv, opts) => {
+    expect(bin).toBe(process.execPath);
+    expect(argv).toEqual(['fake-launcher']);
+    expect(opts.detached).toBe(true);
+    expect(opts.env.WE_BUILDER_SLOT_HELD).toBe('lease-id');
+    return child;
+  } });
+  const result = io[method](['fake-launcher'], process.cwd(), { WE_BUILDER_SLOT_HELD: 'lease-id' }, { track: c => { tracked = c; } });
+  expect(tracked).toBe(child);
+  child.stdout.emit('data', JSON.stringify({ lastMessage: 'checked' }));
+  child.emit('close', 0);
+  const report = await result;
+  if (method === 'runChecker') expect(report).toBe('checked');
+  else expect(report).toMatchObject({ ok: true, lastMessage: 'checked' });
 });
