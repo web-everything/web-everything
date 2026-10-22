@@ -256,6 +256,29 @@ is live only while its writer's pid is. A crashed scheduled pass, or an acceptin
 picked up, retains the 45-minute never-scheduled recovery path; live passes and recorded breaks
 cannot use it.
 
+Already-reviewed heads with an owed result can use the existing review job's `--red-team-only`
+mode (`--red-team-only=resume|fresh`; the bare flag retains fresh guards). A recorded scorecard row plus a finished status whose `result` string or `result.status` is `ran` or `resumed`
+resumes its missing comment/effects without another model call; a failed recovery persists `resumed` and remains eligible after cooldown, subject to the same clean-row guards;
+only a head with neither status nor row starts fresh. A trusted result comment, live pass,
+non-accept, unreadable evidence, recorded row without a status, or any prior result other than `ran` or `resumed`
+prevents dispatch. The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying. Recovery
+shares the tick's lane/live-review capacity and defaults to a 30-minute retry cooldown through
+`reviewRedTeamOnSkip` (tool: `scripts/settings/review-red-team-on-skip.json`; environment:
+`WE_REVIEW_RED_TEAM_ON_SKIP`, `WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN`). Focused cases
+live in `review-red-team-on-skip.test.mjs` and `review-job-red-team-only.test.mjs`.
+Red-team-only admission strictly persists `queued` and reads back that status with the current
+process's pid before releasing the job slot. A write/read failure or mismatch refuses with
+`red-team-not-owed` and `queued red-team status could not be persisted`, without running the
+red team; label syncing remains best effort. Regression: **refuses a throwing strict queued
+hook in %s mode with zero red-team calls** covers fresh and resume admission.
+
+For filesystem settings and plain Node child imports, resolve paths with
+`join(dirname(fileURLToPath(import.meta.url)), relativePath)`; wrap child import paths in
+`pathToFileURL`. Vite rewrites literal `new URL(relativePath, import.meta.url)` expressions
+as browser asset URLs, which can become HTTP URLs under Vitest's DOM environment.
+Node's ESM loader refuses those URLs, and a settings read can silently fall back instead.
+Assert tool-layer provenance when testing a real default settings path.
+
 `redTeam.statusLabels` defaults true through the same cascade as the probe controls, with
 `WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
 The existing label provider provisions the known metadata and writes the mutually exclusive
