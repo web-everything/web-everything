@@ -1,13 +1,17 @@
 /**
  * @file scripts/lib/verdict-ledger-outbox.mjs
  * @description Layer 3 of the ledger outbox (see verdict-ledger-outbox-spool.mjs): the locked flush — batch
- *   everything queued, push it as ONE plumbing commit, delete only what landed, repeat inside one deadline.
+ *   everything queued, push it as ONE plumbing commit, delete only what landed, repeat inside one deadline — and
+ *   the append side (appendViaOutbox) the io-shell calls.
  *   Re-exports the lower layers so callers import one module.
  */
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { readLockEntry } from '../readiness/file-locks.mjs';
 import { assertPushRef } from './git-transport-branch.mjs';
 import {
-  listOutboxEntries, readEntry, reportIfStale, stillOwn, tryLock, unlock,
+  enqueueOutboxEntry, listOutboxEntries, oldestAgeMs, OUTBOX_LOCK_PATH, outboxLockRoot, readEntry, reportIfStale, staleLine,
+  stillOwn, tryLock, unlock,
 } from './verdict-ledger-outbox-spool.mjs';
 import { classifyPushFailure, originKeyFor, OutboxFlushError } from './verdict-ledger-git.mjs';
 import { common, deadlineBound, pushBatch, reconcilePush } from './verdict-ledger-plumbing.mjs';
@@ -193,4 +197,120 @@ export function flushLedgerOutbox(o = {}) {
     if (!reportIfStale(c, msg)) c.log(msg);
     return { ok: false, flushed, pushed, attempts, error: msg };
   }
+}
+
+/**
+ * The append side. See the header for the full contract.
+ *
+ * OUTCOMES (audit 2026-10-21, round 3 — nothing visible to another flusher is EVER withdrawn):
+ *   · LOCK WON at once: this call's rows ride the flush IN MEMORY, never written to the outbox, so no other process
+ *     can ever hold a copy. Landed → `{queued: false}`. A refused push, or a failure before any push → THROWS
+ *     (truthfully "not recorded": PR 4311, a failed git write never lets a clearing verdict through). A push with
+ *     no answer (outcome UNKNOWN), a lost lease or a spent budget → the rows are THEN queued durably → `{queued: true}`.
+ *   · LOCK HELD: the rows are queued durably (fsynced, read back) → `{queued: true}`; if the lock frees up meanwhile
+ *     this call flushes them itself. From here on the entry is never withdrawn; a failure is logged loudly at once and
+ *     a backlog older than `outboxStaleMs` raises `ledger-write-miss`. Rows carry event ids: a retry never duplicates.
+ *   · THROWS before anything is queued: the stale-outbox refusal, a failed enqueue, or the own entry set aside corrupt.
+ */
+export function appendViaOutbox(o) {
+  const c = common(o);
+  const { lines, ids, path, repo, message } = o;
+  const originKey = o.originKey ?? originKeyFor({ board: c.board, run: c.run });
+  const entry = { board: resolve(c.board), branch: c.branch, path, repo, message, lines, ids, originKey };
+  const queued = (attempts = 0) => ({ status: 'appended', queued: true, rows: lines.length, duplicates: 0, attempts, outboxDir: c.dir });
+  const appendDeadline = Date.now() + c.budgetMs; // ONE budget for the whole append, re-check included (round 5)
+  const recheck = () => {
+    // A row queued after our last empty check but before the release would otherwise wait for the next writer.
+    const left = appendDeadline - Date.now();
+    if (left <= 0) return; // budget spent: the next append or the daemon backstop picks it up
+    try {
+      if (listOutboxEntries(c.dir).length) {
+        const again = flushLedgerOutbox({ ...o, settings: undefined, originKey, budgetMs: left, staleMs: c.staleMs });
+        if (!again.ok) c.log(`verdict-ledger-outbox: post-release flush failed: ${again.error}`);
+      }
+    } catch (e) { c.log(`verdict-ledger-outbox: post-release flush failed: ${e?.message ?? e}`); }
+  };
+
+  let owner = tryLock(c.dir, c.budgetMs);
+  if (owner) {
+    // ── LOCK WON: our rows stay in memory. ──
+    // Named like a queue entry, stamped with THIS call's time, so it sorts after everything queued before it.
+    const selfAt = Math.max(0, Math.trunc(c.now()));
+    const SELF = `${String(selfAt).padStart(15, '0')}-${process.pid}-memory.json`;
+    let result = null;
+    let failure = null;
+    try { result = flushHeld({ ...c, owner, originKey, inMemory: [{ name: SELF, entry }] }); } catch (e) { failure = e; }
+    const res = (result ?? failure)?.results;
+    const mine = res instanceof Map ? res.get(SELF) : undefined;
+    const attempts = (result ?? failure)?.attempts ?? 0;
+    let outcome = null;
+    let toThrow = null;
+    if (mine) {
+      if (failure) c.log(`${String(failure?.message ?? failure).split('\n')[0]} (this append's own rows had already landed)`);
+      outcome = { status: 'appended', queued: false, rows: mine.rows, duplicates: mine.duplicates, attempts, outboxDir: c.dir };
+    } else if (failure && failure?.kind !== 'ambiguous' && failure?.kind !== 'budget') {
+      // Refused, or failed before any push: provably not on the remote, and never visible to anyone else.
+      toThrow = failure instanceof OutboxFlushError ? failure : new OutboxFlushError(String(failure?.message ?? failure).split('\n')[0], { errors: [failure], attempts });
+    } else {
+      // Unknown push outcome, lease lost, or budget spent: keep the rows — durably — for a later flush.
+      try {
+        enqueueOutboxEntry(c.dir, entry, { now: () => selfAt, log: c.log }); // the ORIGINAL order key (round 8)
+        const why = failure ? String(failure?.message ?? failure).split('\n')[0] : `flush stopped (${result?.stopped ?? 'unknown'})`;
+        c.log(`verdict-ledger-outbox: ${why}; this append is queued in ${c.dir}`);
+        outcome = queued(attempts);
+      } catch (e) {
+        toThrow = new OutboxFlushError(`verdict-ledger-outbox: push outcome unknown AND the rows could not be queued (${e?.message ?? e})`, { errors: [failure, e].filter(Boolean), attempts, kind: 'ambiguous' });
+      }
+    }
+    unlock(c.dir, owner, c.log);
+    if (toThrow) { reportIfStale(c, toThrow.message); throw toThrow; }
+    recheck();
+    return outcome;
+  }
+
+  // ── LOCK HELD: queue durably. A throw before the entry exists truthfully means "not recorded". ──
+  const age = oldestAgeMs(c.dir, c.now());
+  if (age.count && age.ageMs > c.staleMs) {
+    const held = readLockEntry(outboxLockRoot(c.dir), OUTBOX_LOCK_PATH)?.owner ?? 'unknown';
+    const line = staleLine(c.dir, age, `flusher lock held by ${held}; this append was NOT queued`);
+    c.log(line);
+    throw new OutboxFlushError(line, { errors: [new Error(line)], attempts: 0, kind: 'stale' });
+  }
+  const name = enqueueOutboxEntry(c.dir, entry, { now: c.now, log: c.log });
+
+  // ── The entry is visible now: never withdrawn. Every path answers landed or queued (or corrupt-own). ──
+  const own = join(c.dir, name);
+  let outcome = queued();
+  let corrupt = null;
+  try {
+    owner = tryLock(c.dir, c.budgetMs);
+    if (owner) {
+      let result = null;
+      let failure = null;
+      try { result = flushHeld({ ...c, owner, originKey }); } catch (e) { failure = e; }
+      const res = (result ?? failure)?.results;
+      const mine = res instanceof Map ? res.get(name) : undefined;
+      const attempts = (result ?? failure)?.attempts ?? 0;
+      if (mine) {
+        outcome = { status: 'appended', queued: false, rows: mine.rows, duplicates: mine.duplicates, attempts, outboxDir: c.dir };
+      } else if (existsSync(own)) {
+        if (failure) {
+          const msg = String(failure?.message ?? failure).split('\n')[0];
+          if (!reportIfStale(c, msg)) c.log(`verdict-ledger-outbox: flush FAILED, this append stays queued in ${c.dir} (${msg})`);
+        }
+        outcome = queued(attempts);
+      } else if (existsSync(join(c.dir, `.corrupt-${name}`))) {
+        corrupt = new OutboxFlushError(`verdict-ledger-outbox: this append's own entry ${name} was found corrupt and set aside; it will never be pushed`, { errors: failure ? [failure] : [], attempts });
+      } else {
+        outcome = { status: 'appended', queued: false, rows: lines.length, duplicates: 0, attempts, outboxDir: c.dir }; // pushed by another flusher
+      }
+    }
+  } catch (e) {
+    c.log(`verdict-ledger-outbox: after queuing ${name}: ${String(e?.message ?? e).split('\n')[0]}; the entry stays queued`);
+  } finally {
+    if (owner) unlock(c.dir, owner, c.log);
+  }
+  if (corrupt) { c.log(`ledger-write-miss: ${corrupt.message}`); throw corrupt; }
+  if (owner) recheck();
+  return outcome;
 }
