@@ -54,14 +54,17 @@ describe('cap-only existing-card declaration', () => {
     const forged = { author: { login: 'mallory' }, body: redTeamGateMarker(PR, HEAD, 'round-cap') };
     expect(() => planRedTeamRuling(read({ comments: [redTeam(), forged] }), input())).toThrow(/not parked at the round cap/);
   });
-  const sentBackAfterGrant = (lateCap = false) => {
+  const standingRuling = { ok: true, id: `${repo}#6000`, author: OP.login, by: 1, maxPerPr: 3, repos: [repo],
+    cardOnlyHeads: { [HEAD]: true }, uneditedComments: ['IC_auto'] };
+  const sentBackAfterGrant = (lateCap = false, verifiedRuling = null) => {
     const result = redTeam();
     const { resultId } = liveResultGateState([result], PR, HEAD, repo);
     const at = '2026-10-20T23:45:00Z';
-    const grant = { author: OP, createdAt: at, body: buildRoundExtensionComment({
+    const grant = { id: 'IC_auto', author: verifiedRuling ? { login: 'web-everything[bot]' } : OP, createdAt: at, body: buildRoundExtensionComment({
       repo, pr: PR, by: 1, actor: OP.login, channel: 'claude-code-chat', reason: 'one more round', at,
+      ...(verifiedRuling ? { standingRuling: verifiedRuling.id, head: HEAD, episode: `${repo}#${PR}@${HEAD}:review:12/12` } : {}),
     }) };
-    const grantIds = gateRoundGrants([grant], PR, repo).map(g => g.id);
+    const grantIds = gateRoundGrants([grant], PR, repo, verifiedRuling).map(g => g.id);
     expect(grantIds).toHaveLength(1);
     const cap = bot(`${redTeamGateMarker(PR, HEAD, 'round-cap', resultId, [])}\n- 1 confirmed break(s) NOT sent back: cap (#1).`,
       lateCap ? '2026-10-20T23:55:00Z' : '2026-10-20T23:41:12Z');
@@ -87,6 +90,34 @@ describe('cap-only existing-card declaration', () => {
       : { ...grant, author: { login: 'mallory' } };
     expect(gateRoundGrants(comments, PR, repo)).toEqual([]);
     expect(planRedTeamRuling(read({ comments }), input())).toMatchObject({ effect: RED_TEAM_RULING_CARD_EFFECT, indices: [1] });
+  });
+  it.each([
+    ['planner', false], ['planner', true], ['eligibility', false], ['eligibility', true],
+  ])('%s refuses a break returned under a verified standing ruling (late cap: %s)', (caller, lateCap) => {
+    const comments = sentBackAfterGrant(lateCap, standingRuling);
+    const scope = { comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, standingRuling };
+    const disposition = readRedTeamDisposition(scope);
+    expect(disposition).toMatchObject({ outcome: 'sent-back', held: [] });
+    expect(disposition.sendBack.map(f => f.index)).toEqual([1]);
+    expect(() => caller === 'planner'
+      ? planRedTeamRuling(read({ comments, standingRuling }), input())
+      : rulableBreaks(scope)).toThrow(/no red-team break is held/);
+  });
+  it('preserves the verified grant in the returned gate state while the break is still held', () => {
+    const comments = sentBackAfterGrant(false, standingRuling).slice(0, -1);
+    const { state } = rulableBreaks({ comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, standingRuling });
+    expect(state).toMatchObject({ sendBackOutcome: 'round-cap', reopened: true });
+  });
+  it.each([
+    ['missing', undefined],
+    ['wrong ruling', { ...standingRuling, id: `${repo}#6001` }],
+    ['unverified comment', { ...standingRuling, uneditedComments: [] }],
+    ['unverified head', { ...standingRuling, cardOnlyHeads: {} }],
+  ])('keeps the cap with %s standing-ruling verification', (_name, scope) => {
+    const comments = sentBackAfterGrant(false, standingRuling);
+    expect(gateRoundGrants(comments, PR, repo, scope)).toEqual([]);
+    expect(planRedTeamRuling(read({ comments, standingRuling: scope }), input()))
+      .toMatchObject({ effect: RED_TEAM_RULING_CARD_EFFECT, indices: [1] });
   });
   it('refuses a break already carded by the gate (no second card)', () => {
     const { resultId } = liveResultGateState(thread(), PR, HEAD);
