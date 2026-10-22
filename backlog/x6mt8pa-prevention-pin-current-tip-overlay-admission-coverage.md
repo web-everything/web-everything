@@ -3,7 +3,7 @@ kind: story
 size: 1
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/preview.mjs", "we:scripts/lib/__tests__/daemon-load-overlay-guard.test.mjs", "we:scripts/conveyor/soak/breaks/overlay-admission-repair-pin.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/preview.mjs", "we:scripts/lib/__tests__/daemon-load-overlay-guard.test.mjs", "we:scripts/conveyor/soak/breaks/overlay-admission-repair-pin.mjs", "we:scripts/conveyor/soak/breaks/overlay-admission-repair-pin.soak.test.mjs"]
 dateOpened: "2026-10-22"
 tags: []
 ---
@@ -31,4 +31,4 @@ PR #5809's security/fail-open-admission finding identified a registration check 
 
 ## Proof status
 
-The pre-fix `npm run test:unit -- scripts/lib/__tests__/daemon-load-overlay-guard.test.mjs` attempt was deferred by heavy admission (exit 75, host load 4.81 per core versus a limit of 4). No test executed. Red proof, post-fix verification and soak proof remain owed to the launcher; no green verdict is claimed.
+The pre-fix unit-test attempt for `we:scripts/lib/__tests__/daemon-load-overlay-guard.test.mjs` was deferred by heavy admission (exit 75, host load 4.81 per core versus a limit of 4). No test executed. Red proof, post-fix verification and soak proof remain owed to the launcher; no green verdict is claimed.
