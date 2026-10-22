@@ -33,6 +33,8 @@ import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
  * duplicates a PR already shown in NEEDS YOU.
  */
 import { readSettings } from '../lib/settings-files.mjs';
+import { execFileSync as execFileSyncRaw } from 'node:child_process';
+import { computeClearanceCoverage, ghFormalReviewsReader } from '../lib/approval-binding.mjs';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -142,8 +144,8 @@ export function rulingNeededRow(repo, pr, options = {}) {
 }
 
 /** A red-team round-cap ruling and its read-only operator command suggestions. PURE. */
-export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS, { readSaved = null } = {}) {
-  const need = redTeamRulingNeeded(pr, setting, { readSaved, repo: repo || pr?.repo || null });
+export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS, { readSaved = null, clearanceCoverage = null } = {}) {
+  const need = redTeamRulingNeeded(pr, setting, { readSaved, repo: repo || pr?.repo || null, clearanceCoverage });
   if (!need) return null;
   const command = `node scripts/review-set-label.mjs ${pr.number} --repo=${repo}`;
   return {
@@ -762,8 +764,13 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         // The gate can hold a break decided on saved evidence (its comment withheld); unreadable evidence is a visible error.
         let redTeamRow = null;
         try {
-          redTeamRow = redTeamRulingRow(repo, pr, redTeamSetting,
-            { readSaved: savedRedTeamFallback?.({ repo, pr: pr.number, head: pr.headRefOid }) ?? null });
+          redTeamRow = redTeamRulingRow(repo, pr, redTeamSetting, {
+            readSaved: savedRedTeamFallback?.({ repo, pr: pr.number, head: pr.headRefOid }) ?? null,
+            // approval-binding: an operator ruling on an older head still counts when git (this checkout) proves the
+            // live head carries the same net change. Lazy — run only when the sha rule fails on a recorded clearance.
+            clearanceCoverage: (head) => computeClearanceCoverage({ comments: pr.comments, liveHead: head, exec: execFileSyncRaw,
+              reviews: ghFormalReviewsReader({ exec: execFileSyncRaw, repo, pr: pr.number }) }),
+          });
         } catch (error) { failedRead(`${repo}#${pr.number} red-team ruling`, error); }
         let ledgerRow = null;
         try { ledgerRow = rulingNeededRow(repo, pr); } catch (error) { failedRead(`${repo}#${pr.number} ruling-needed`, error); }

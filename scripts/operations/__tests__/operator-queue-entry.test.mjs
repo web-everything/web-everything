@@ -76,6 +76,9 @@ const stage = (root) => {
   copyFileSync(join(dirname(LEAF), 'operator-identity.mjs'), join(root, 'lib/operator-identity.mjs'));
   copyFileSync(join(dirname(LEAF), 'review-verdict-carried-marker.mjs'), join(root, 'lib/review-verdict-carried-marker.mjs'));
   symlinkSync(join(dirname(LEAF), 'review-escalation.mjs'), join(root, 'lib/review-escalation.mjs'));
+  // approval-binding (the red-team ruling row's clearance coverage): linked like review-escalation, so its graph
+  // resolves from the source tree.
+  symlinkSync(join(dirname(LEAF), 'approval-binding.mjs'), join(root, 'lib/approval-binding.mjs'));
   // The disposition reader also reads the operator's round grants (a grant after a round-cap record reopens the
   // send-back step); its own imports (marker-authorship, constellation-repos) are already staged above.
   copyFileSync(join(dirname(LEAF), '../conveyor/round-extension-mark.mjs'), join(root, 'conveyor/round-extension-mark.mjs'));

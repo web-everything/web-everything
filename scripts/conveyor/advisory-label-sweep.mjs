@@ -45,6 +45,8 @@ import { readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
  * label provider injectable so the whole pass is testable with no `gh`.
  */
 import { resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { computeClearanceCoverage, ghFormalReviewsReader } from '../lib/approval-binding.mjs';
 import { fileURLToPath } from 'node:url';
 
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -140,6 +142,8 @@ export function planForPr(pr) {
 export function sweepAdvisoryLabels({
   repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence,
   log = line => process.stderr.write(`${line}\n`),
+  // approval-binding: `({repo, pr, comments}) => (head) => coverage` — the CLI passes the read-only git one; null = sha only.
+  clearanceCoverageFor = null,
 } = {}) {
   const prs = listPrs({ repo });
   const results = [];
@@ -154,7 +158,8 @@ export function sweepAdvisoryLabels({
       if (!live || (live.state && live.state !== 'OPEN')) continue;
       const evidence = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid });
       const plan = syncRedTeamStatusLabels({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid,
-        evidence, live, comments: live.comments, provider, dryRun, log });
+        evidence, live, comments: live.comments, provider, dryRun, log,
+        clearanceCoverage: typeof clearanceCoverageFor === 'function' ? clearanceCoverageFor({ repo: resolvedRepo, pr: pr.number, comments: live.comments }) : null });
       if (plan.add || plan.remove.length) results.push({ num: pr.number, ...plan });
     } catch (e) { results.push({ num: pr.number, skipped: `red-team status: ${e.message}` }); }
   }
@@ -204,6 +209,8 @@ if (IS_CLI) {
     try {
       const results = sweepAdvisoryLabels({
         repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
+        clearanceCoverageFor: ({ repo: slug, pr, comments }) => (head) => computeClearanceCoverage({ comments, liveHead: head, exec: execFileSync,
+          reviews: ghFormalReviewsReader({ exec: execFileSync, repo: slug, pr }) }),
       });
       for (const r of results) {
         if (r.skipped) { writeLineSync(2, `  ⚠ PR #${r.num}: no label change (${r.skipped})`); continue; }

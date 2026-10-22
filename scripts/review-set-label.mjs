@@ -122,6 +122,7 @@ import {
 // `runReviewLabelCli` for why that distinction is the whole point). Imported from the CLI that owns it, the same
 // way `we:scripts/fetch-parked.mjs` already does — it is the single home of the #2450 net-diff basis.
 import { readNetDiffAtHead } from './merge-ai-prs.mjs';
+import { computeClearanceCoverage, latestOperatorClearanceRecord } from './lib/approval-binding.mjs'; // 2026-10-21
 import { parseDelegationMarker } from './lib/delegation-marker.mjs';
 import { readStore } from './conveyor/run-scorecard-store.mjs';
 import { logDelegationTrial } from './conveyor/log-delegation-trial.mjs';
@@ -991,10 +992,10 @@ export function runApprovalPreventionFiling({
  * standing-ruling scope (PR #5758), so an automatic grant that reopened the send-back counts exactly as it does in the
  * gate: the fixer then owns the break and there is no ruling to clear. Unreadable scope = no automatic credit.
  */
-export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting, readGrantScope = standingRulingScope, readSaved = null }) {
+export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting, readGrantScope = standingRulingScope, readSaved = null, clearanceCoverage = null }) {
   let standingRuling = null;
   try { standingRuling = readGrantScope({ repo, pr: { number: Number(pr), headRefOid: headSha, comments } }) ?? null; } catch { standingRuling = null; }
-  return redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels, comments }, setting, { repo, standingRuling, readSaved }) !== null;
+  return redTeamRulingNeeded({ number: Number(pr), headRefOid: headSha, labels, comments }, setting, { repo, standingRuling, readSaved, clearanceCoverage }) !== null;
 }
 
 /**
@@ -1456,13 +1457,15 @@ export function runReviewLabelCli({
   };
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
-    && redTeamRulingHeld({ repo, pr, headSha, labels: currentLabels, comments: fullThread(), setting: readConfirmedBreaks().value, readGrantScope,
+    && ((thread) => redTeamRulingHeld({ repo, pr, headSha, labels: currentLabels, comments: thread, setting: readConfirmedBreaks().value, readGrantScope,
       // The gate holds a break decided on saved evidence when its comment was withheld; the ruling clears that too.
       readSaved: () => {
         try { return savedRedTeamFallback({ repo, pr, head: headSha })(); }
         catch (e) { return fail(`saved red-team evidence unreadable — nothing was changed: ${e.message}`, 1); }
       },
-    });
+      // approval-binding: an earlier ruling still counts on a head git proves carries the same net change.
+      clearanceCoverage: (head) => computeClearanceCoverage({ comments: thread, liveHead: head, exec: execFileSyncThrottled,
+        reviews: () => provider.readPrReviews(repo, pr) }) }))(fullThread());
   let decision = decideSetLabel({
     to,
     currentLabels,
@@ -1597,6 +1600,28 @@ export function runReviewLabelCli({
       headDiff: diffScored ? normalizeDiffFingerprint(reviewedDiff) : null,
     });
     if (proofReadMissed && humanCarry.action === 'review-owed') humanCarry.retryable = true;
+    // approval-binding (2026-10-21): the record is not (or no longer) a carryable human clearance — a fresh plain accept
+    // stamped over it (#5485), or the drain's own numbering changed the fingerprint (#5742/#5530) — yet trusted git proves
+    // the operator's recorded clearance covers this head. Then the clearance carries. Never over a later verdict, a
+    // body-derived hold, unreadable reviews or a read miss: those stay the normal gates' (and the operator's) call.
+    if (diffScored && record && !record.laterVerdict && !record.laterBodyDerivedHold && !record.reviewsUnreadable
+      && !humanCarry.retryable && ['review-owed', 'carry'].includes(humanCarry.action) && !(humanCarry.action === 'carry' && humanCarry.human === true)
+      && latestOperatorClearanceRecord(thread.comments)) {
+      const head = String(headSha).toLowerCase();
+      // The COMPLETE thread and the formal reviews, always (a hold past comment 100 must not be crossed), re-judged on
+      // that same evidence: the accept record and the coverage both.
+      const full = readCarryEvidence();
+      const fullRecord = Array.isArray(full.comments) ? latestAcceptRecord(full.comments, full.reviews) : null;
+      const coverage = !fullRecord || fullRecord.laterVerdict || fullRecord.laterBodyDerivedHold || fullRecord.reviewsUnreadable
+        || !Array.isArray(full.reviews) ? { covers: false }
+        : computeClearanceCoverage({ comments: full.comments, liveHead: head, exec: execFileSyncThrottled, reviews: full.reviews,
+          readNetDiff: (sha) => (String(sha).toLowerCase() === head ? { text: reviewedDiff, scored: true, rev: head }
+            : readNetDiffAtHead({ exec: execFileSyncThrottled, headSha: sha, headRef: sha })) });
+      if (coverage.covers && coverage.clearance && coverage.liveHead === head && coverage.clearance.sha !== head) {
+        humanCarry = { action: 'carry', human: true, from: coverage.clearance.sha, to: head,
+          reason: `the operator clearance at ${coverage.clearance.sha.slice(0, 9)} covers the live head (approval-binding ${coverage.tier}: ${coverage.reason})` };
+      }
+    }
     // PR #4631 round 10 (self-review, crash between writes): a lift posts its record (a `cleared-human` comment naming the
     // LIVE head) before its label swap; a swap that then fails leaves the drain label under a clearance that already names
     // this exact head. That is not a refusal — the operator's verdict covers these bytes — so it lifts, provided nothing

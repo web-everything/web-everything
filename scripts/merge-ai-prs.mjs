@@ -230,6 +230,8 @@ import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { applyHumanClearanceCarry, latestHumanClearance, sanitizeActor } from './lib/human-clearance-carry.mjs'; // #xnqxtdy
+import { latestOperatorClearanceRecord, readClearanceCoverage, gitClearanceProofs, clearanceBindsHead, resolveClearanceBindingSettings } from './lib/approval-binding.mjs'; // 2026-10-21
+import { resolveCarryEquivalenceSetting } from './lib/carry-equivalence.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-freeze-shared.mjs';
@@ -779,7 +781,7 @@ export function acceptStandsUnsuperseded({ comments, acceptedSha, readReviews })
  * Git reads must use the PR's own clone; an unavailable sibling clone cannot supply coverage proof.
  * `readReviews` (injectable) reads the PR's formal reviews, only when a marker-less accept's fingerprint is derived.
  */
-export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execFileSync, netDiff = computeNetDiffText, carrySetting = null, readReviews = null }) {
+export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execFileSync, netDiff = computeNetDiffText, carrySetting = null, readReviews = null, carry = null }) {
   const d = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
     '--json', 'headRefOid,headRefName,comments'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
@@ -866,7 +868,54 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     } catch { /* An owed but unreadable diff is not proof of staleness (#3184). */ }
   }
   evidence.headReadFailed = liveDiffReadOwed && !evidence.headDiff;
+  // 2026-10-21 (approval-binding) — the ONE coverage answer for the operator's clearance at this head, from git in the
+  // PR's own clone (trusted code, never a comment). Read-only; any miss is "not covered" and the sha rule stands.
+  // The carry's own switches (a caller's `carry.setting` / `carry.numberingSetting`) narrow it too; formal reviews are
+  // read (once, shared) only when a moved head would need a content-bound cover — unreadable = refused.
+  const clearanceRecord = latestOperatorClearanceRecord(d.comments);
+  const contentCoverOwed = !!clearanceRecord && clearanceRecord.sha !== String(headSha).toLowerCase();
+  let coverReviews;
+  if (contentCoverOwed) { try { coverReviews = readFormalReviews(); } catch { coverReviews = null; } }
+  // A content-bound cover is judged on the COMPLETE thread (a hold past comment 100 must stand); a full first page that
+  // cannot be completed leaves only the sha rule.
+  let coverComments = d.comments;
+  if (contentCoverOwed && d.comments.length >= PR_COMMENTS_PAGE_SIZE) {
+    try { coverComments = readCompletePrComments(pr, { repo, exec }); } catch { coverComments = null; }
+    if (!Array.isArray(coverComments)) coverReviews = null;
+  }
+  evidence.clearanceCoverage = readDrainClearanceCoverage({ comments: Array.isArray(coverComments) ? coverComments : d.comments, headSha, headRefName: d.headRefName,
+    exec: (local || cwd) ? (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }) : null, netDiff, pinnedHeadDiff: evidence,
+    reviews: coverReviews,
+    settings: resolveClearanceBindingSettings({ ...(carry?.setting ? { humanCarry: carry.setting } : {}),
+      ...(carry?.numberingSetting ? { numberingCarry: carry.numberingSetting } : {}) }) });
   return evidence;
+}
+
+/**
+ * IO (read-only git): {@link readClearanceCoverage} for the drain's readers. `exec` must be bound to the PR's own clone;
+ * without one there is no proof, so the verdict is "not covered" (the sha rule stands). A head diff this pass already
+ * read pinned at `headSha` (`pinnedHeadDiff.headDiff`/`headDiffSha`) is reused, never re-labelled. Never throws.
+ */
+export function readDrainClearanceCoverage({ comments, headSha, headRefName = null, exec = null, netDiff = computeNetDiffText,
+  pinnedHeadDiff = null, settings, log, reviews = undefined } = {}) {
+  try {
+    const clearance = latestOperatorClearanceRecord(comments);
+    const head = String(headSha ?? '').toLowerCase();
+    if (!clearance || !/^[0-9a-f]{40}$/.test(head) || clearance.sha === head || typeof exec !== 'function') {
+      return readClearanceCoverage({ comments, liveHead: head, ...(settings ? { settings } : {}), ...(log ? { log } : {}) });
+    }
+    const readNetDiff = (sha) => {
+      const s = String(sha).toLowerCase();
+      if (s === head && pinnedHeadDiff?.headDiff && String(pinnedHeadDiff.headDiffSha ?? '').toLowerCase() === head) {
+        return { text: pinnedHeadDiff.headDiff, scored: true, rev: head };
+      }
+      return readNetDiffAtHead({ exec, headSha: s, headRef: s === head && headRefName ? headRefName : s, netDiff });
+    };
+    return readClearanceCoverage({ comments, liveHead: head, proofs: gitClearanceProofs({ exec, readNetDiff }), reviews,
+      equivalence: resolveCarryEquivalenceSetting().value, ...(settings ? { settings } : {}), ...(log ? { log } : {}) });
+  } catch (e) {
+    return { clearance: null, covers: false, liveHead: String(headSha ?? '').toLowerCase(), reason: `clearance coverage unreadable: ${String(e?.message ?? e).split('\n')[0]}` };
+  }
 }
 
 /** Fresh head, complete thread and formal reviews for the numbering carry's pre-write guard. */
@@ -5555,7 +5604,10 @@ async function runCli() {
       const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
       if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
       const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo,
-        expectedHead: headSha, exec: (file, args, opts) => file === 'gh' ? readGh(args, opts) : execFileSync(file, args, { ...opts, cwd }) });
+        expectedHead: headSha, exec: (file, args, opts) => file === 'gh' ? readGh(args, opts) : execFileSync(file, args, { ...opts, cwd }),
+        readCoverage: ({ comments, headSha: head }) => readDrainClearanceCoverage({ comments, headSha: head, headRefName: v.headRef,
+          exec: (file, args, opts) => execFileSync(file, args, { ...opts, cwd }),
+          reviews: () => parseJsonLines(readGh(GH_ARGV.readPrReviews(v.repo || localSlug, v.num), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })) }) });
       if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
       return decision.hold;
     } catch (e) {
@@ -6007,6 +6059,7 @@ async function runCli() {
       // PR #4631 (ruling a): did the carry below fail on a READ miss (→ the drain's own `review:held-mechanical` park,
       // which the carry sweep retries) rather than a decision (→ `review:human`)? A throw mid-carry counts as a miss.
       let carryRetryable = false;
+      let clearanceCoverage = null;
       if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted)) {
         try {
           const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
@@ -6038,9 +6091,26 @@ async function runCli() {
             carryRetryable = carried.retryable === true;
             if (carried.carried && !AS_JSON) process.stderr.write(`  ↪ ${repoTag(v.repo)}${v.num} human clearance carried: ${carried.reason}\n`);
           }
+          // 2026-10-21 (approval-binding) — the operator's clearance (even one a later plain accept stamped over, #5485)
+          // covers this head when trusted git proves the same net change. Only for the head this pass will merge.
+          const pinned = String(v.listedHeadSha || v.headSha || '').toLowerCase();
+          if (tamperHeadSha && pinned === tamperHeadSha.toLowerCase() && !clearanceBindsHead({ humanClearedSha, headSha: tamperHeadSha })) {
+            // The COMPLETE thread: the carry's own evidence when it ran, else a fresh complete read when the page is full.
+            const slug2 = v.repo || localSlug;
+            let fullComments = cd.comments || [];
+            let fullOk = true;
+            if (fullComments.length >= PR_COMMENTS_PAGE_SIZE) {
+              try { fullComments = readCompletePrComments(v.num, { repo: slug2, exec: (c, a, o) => (c === 'gh' ? readGh(a, o) : execFileSync(c, a, o)) }); }
+              catch { fullOk = false; }
+              if (!Array.isArray(fullComments)) fullOk = false;
+            }
+            if (fullOk) clearanceCoverage = readDrainClearanceCoverage({ comments: fullComments, headSha: tamperHeadSha, headRefName: v.headRef, exec: diffExec,
+              reviews: () => parseJsonLines(readGh(GH_ARGV.readPrReviews(v.repo || localSlug, v.num), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })) });
+            if (clearanceCoverage.covers && !AS_JSON) process.stderr.write(`  ↪ ${repoTag(v.repo)}${v.num} human clearance covers ${tamperHeadSha.slice(0, 9)} (${clearanceCoverage.tier}): ${clearanceCoverage.reason}\n`);
+          }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }
-      if (shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
+      if (shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha, clearanceCoverage })) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;

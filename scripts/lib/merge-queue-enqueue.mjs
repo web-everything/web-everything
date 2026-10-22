@@ -18,6 +18,7 @@ import { readDeclaredSettings } from './settings-files.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
+import { clearanceBindsHead } from './review-escalation.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
 export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
@@ -389,7 +390,7 @@ export function decideStaleMergeGateRefresh({ key, headSha, state = {}, setting 
 }
 
 /** Pure: this authorizes a new run, never excusal or enqueue on the old verdict. */
-export function classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState, humanClearedSha, freeze } = {}) {
+export function classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState, humanClearedSha, freeze, clearanceCoverage = null } = {}) {
   const no = reason => ({ stale: false, reason: `merge-gate ${reason}` });
   if (!headSha || verdict?.head_sha !== headSha) return no('verdict head mismatch');
   if (verdict.error || verdict.ok !== false || !Array.isArray(verdict.results) || !verdict.results.length) return no('verdict unreadable or not HOLD');
@@ -402,7 +403,12 @@ export function classifyStaleMergeGate({ verdict, headSha, landableApartFromMerg
       continue;
     }
     if (row.id === 'test-gaming' || (row.id === 'review-acceptance' && row.reason?.startsWith('human-only:'))) {
-      if (humanClearedSha !== headSha) return no(`hold ${row.id} not cleared on this head`);
+      // approval-binding: test-gaming honours a git-proven clearance coverage; the human-only workflow-edit hold keeps
+      // its exact-head ceremony (that classification is unchanged).
+      const cleared = row.id === 'test-gaming'
+        ? clearanceBindsHead({ humanClearedSha, headSha, coverage: clearanceCoverage })
+        : humanClearedSha === headSha;
+      if (!cleared) return no(`hold ${row.id} not cleared on this head`);
       satisfied.add('human clearance');
     } else if (['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance'].includes(row.id)
       || (row.id === 'ledger' && row.reason?.startsWith('labels:'))) {
@@ -445,7 +451,7 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
     }
     const freeze = verdict.results?.some(r => r.status === 'hold' && r.id === 'red-main-freeze')
       ? await readFreeze({ board: refreshOptions.cloneDir }) : undefined;
-    classification = classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState: true, humanClearedSha: evidence?.humanClearedSha, freeze });
+    classification = classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState: true, humanClearedSha: evidence?.humanClearedSha, freeze, clearanceCoverage: evidence?.clearanceCoverage ?? null });
   } catch (e) { return { ...unchanged, reason: `merge-gate evidence unreadable: ${errText(e)}` }; }
   if (!classification.stale) return { ...unchanged, reason: classification.reason };
   return handleQueueRefresh({ ...refreshOptions, c, key: `${c.repo}#${c.num}`, headSha, setting, statePath,
