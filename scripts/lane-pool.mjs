@@ -1600,13 +1600,12 @@ function tryClaimLane(dir, session, nowMs, ttlMs, expectHolder = undefined) {
     const holder = laneHolderSlug(existing) || mintedHolder;
     // …and it KEEPS the declared occupant for the same reason: dropping it would silently un-protect a lane an
     // agent is working in. `--adopt` on the re-acquire is the deliberate way to (re-)claim it.
-    const laneNum = /lane-(\d+)$/.exec(dir)?.[1] ?? '?';
     const barrier = process.env.LANE_POOL_TEST_RENEWAL_BARRIER;
     if (barrier) pauseForTestBarrier(barrier, 10_000);
-    if (!takeMarkerIf(dir, (moved) => sameLease(moved, existing), laneNum)) return null;
-    const afterTakeBarrier = process.env.LANE_POOL_TEST_RENEWAL_AFTER_TAKE_BARRIER;
-    if (afterTakeBarrier) pauseForTestBarrier(afterTakeBarrier, 10_000);
-    try { writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing)), { exclusive: true }); } catch { return null; }
+    if (!sameLease(readLease(dir), existing)) return null;
+    // The compare→rename window can only clobber a claim made microseconds after someone dropped OUR live lease;
+    // that claimant's assertOwnClaim fails before its reset: no double hand-out, and our marker is never absent.
+    try { writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing))); } catch { return null; }
     return holder;
   }
   if (isLeaseStale(existing, nowMs, ttlMs)) {
@@ -1844,10 +1843,12 @@ function laneHoldRefuses(dir, action, { byHolder = false, unpushed } = {}) {
  */
 function restoreLeaseAfterRefusedClaim(dir, preExisting, claimedHolder) {
   try {
-    const n = /lane-(\d+)$/.exec(dir)?.[1] ?? '?';
-    if (!takeMarkerIf(dir, (moved) => !!moved && moved.holder === claimedHolder, n)) return;
     if (preExisting && !isLeaseStale(preExisting, Date.now(), ttlMsFromFlags())) {
-      writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preExisting, null, 2) + '\n', { exclusive: true });
+      if (readLease(dir)?.holder !== claimedHolder) return;
+      writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preExisting, null, 2) + '\n');
+    } else {
+      const n = /lane-(\d+)$/.exec(dir)?.[1] ?? '?';
+      takeMarkerIf(dir, (moved) => !!moved && moved.holder === claimedHolder, n);
     }
   } catch { /* the refusal still stands; never overwrite a concurrent claim */ }
 }
@@ -2688,6 +2689,9 @@ function deliveredLeaseForLane(dir, lease) {
 }
 
 function cmdRelease(repo) {
+  if ((flags['expect-holder'] !== undefined || flags['expect-acquired-at'] !== undefined) && (flags['all-pools'] || flags.all)) {
+    return fail('--expect-holder/--expect-acquired-at need a single --lane=N');
+  }
   assertReleaseReservedScoped();
   if (flags['all-pools']) return cmdReleaseAllPools(repo); // #2667 — cross-pool release-by-session
   const session = defaultSession();

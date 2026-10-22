@@ -109,6 +109,21 @@ describe('a live lease cannot be handed to a second session', () => {
     expect(existsSync(marker())).toBe(false);
   });
 
+  it.each([
+    ['--all-pools', '--expect-holder=y'],
+    ['--all-pools', '--expect-acquired-at=old'],
+    ['--all', '--expect-holder=y'],
+    ['--all', '--expect-acquired-at=old'],
+  ])('refuses bulk release %s with %s and leaves leases intact', (bulk, expected) => {
+    provision();
+    expect(acquire('--session=x').code).toBe(0);
+    const original = readFileSync(marker(), 'utf8');
+    const result = runPool(['release', bulk, '--session=x', expected, ...poolArgs()]);
+    expect(result.code).not.toBe(0);
+    expect(result.err).toContain('--expect-holder/--expect-acquired-at need a single --lane=N');
+    expect(readFileSync(marker(), 'utf8')).toBe(original);
+  });
+
   it.each(['delete', 'replace'])('fails without stdout or a reset when its lease is lost mid-acquire (%s)', async (mode) => {
     provision();
     const head = git(['rev-parse', 'HEAD'], laneDir());
@@ -202,27 +217,20 @@ describe('a live lease cannot be handed to a second session', () => {
     expect(git(['rev-parse', 'HEAD'], laneDir())).toBe(head);
   }, 20_000);
 
-  it('own-lease re-acquire fails if an exclusive claimant wins after marker removal', async () => {
+  it('own-lease re-acquire keeps the marker present and refuses a second session', async () => {
     provision();
     expect(acquire().code).toBe(0);
+    const original = readFileSync(marker(), 'utf8');
     const originalHolder = readLease().holder;
-    const head = git(['rev-parse', 'HEAD'], laneDir());
-    const workingFile = join(laneDir(), 'file.txt');
-    writeFileSync(workingFile, 'working holder edit\n');
-    let foreign;
     const result = await pausedAcquire([], () => {
-      expect(existsSync(marker())).toBe(false);
-      // This exercises the explicitly permitted gap winner, without resetting the occupant's work.
-      const second = runPool(['acquire', '--lane=1', '--session=other', '--no-reset', ...poolArgs()], { CLAUDE_CODE_SESSION_ID: 'sess-B' });
-      expect(second.code, second.err).toBe(0);
-      expect(readLease().holder).not.toBe(originalHolder);
-      foreign = readFileSync(marker(), 'utf8');
-    }, { barrierEnv: 'LANE_POOL_TEST_RENEWAL_AFTER_TAKE_BARRIER' });
-    expect(result.code).not.toBe(0);
-    expect(result.out).toBe('');
-    expect(readFileSync(marker(), 'utf8')).toBe(foreign);
-    expect(git(['rev-parse', 'HEAD'], laneDir())).toBe(head);
-    expect(readFileSync(workingFile, 'utf8')).toBe('working holder edit\n');
+      expect(readFileSync(marker(), 'utf8')).toBe(original);
+      const second = runPool(['acquire', '--lane=1', '--session=other', ...poolArgs()], { CLAUDE_CODE_SESSION_ID: 'sess-B' });
+      expect(second.code, second.err).not.toBe(0);
+      expect(readFileSync(marker(), 'utf8')).toBe(original);
+    }, { barrierEnv: 'LANE_POOL_TEST_RENEWAL_BARRIER' });
+    expect(result.code, result.err).toBe(0);
+    expect(result.out.trim()).toBe(laneDir());
+    expect(readLease().holder).toBe(originalHolder);
   }, 20_000);
 
   it('auto-pick skips a lost claim and hands out the next candidate', async () => {
