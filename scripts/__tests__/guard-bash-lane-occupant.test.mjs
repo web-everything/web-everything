@@ -59,6 +59,9 @@ describe('destructiveLaneTargets — every cd counts, not just the first', () =>
     expect(destructiveLaneTargets(`L=${LANES}/lane-4; cd "$L" && git clean -fd`, '/ws')[0].dirs).toEqual([`${LANES}/lane-4`]);
     expect(destructiveLaneTargets('cd "$(pick-lane)" && git reset --hard', '/ws')[0].dirs).toEqual([null]);
   });
+  it('`builtin cd` / `command cd` move the cwd too (codex audit r2)', () => {
+    expect(destructiveLaneTargets(`cd ${LANES}/lane-1 && true; builtin cd ../lane-2 && git reset --hard`, '/ws')[0].dirs).toEqual([`${LANES}/lane-2`]);
+  });
   it('a cd inside a subshell adds a candidate instead of replacing one', () => {
     const t = destructiveLaneTargets(`cd ${LANES}/lane-1 && (cd ../lane-2 && true) && git reset --hard`, '/ws');
     expect(t[0].dirs.sort()).toEqual([`${LANES}/lane-1`, `${LANES}/lane-2`]);

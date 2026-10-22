@@ -4356,6 +4356,14 @@ function cmdAdopt(repo) {
     );
   }
   writeFileSync(LEASE_MARKER(dir), JSON.stringify({ ...lease, workerSession: me }, null, 2) + '\n');
+  // lane-lease-occupant (codex audit r2) — the previous occupant's guard hook may be renewing this very lease at the
+  // same instant (`lane-lease-renew.mjs`: re-read, then rename, a window of microseconds). If that rename landed on
+  // top of this write it would restore the old occupant. Re-check once after the window and re-apply.
+  sleepSyncMs(50);
+  const after = readLease(dir);
+  if (after && after.holder === lease.holder && after.acquiredAt === lease.acquiredAt && laneWorkerSession(after) !== me) {
+    writeFileSync(LEASE_MARKER(dir), JSON.stringify({ ...after, workerSession: me }, null, 2) + '\n');
+  }
   // #3383 — record the occupancy hand-off in the lane-history ledger (best-effort).
   appendLaneHistory(dir, laneHistoryEntry({ event: 'adopt', ownerSession: me, workerSession: me, session: lease.session }));
   journalLaneEvent(dir, {

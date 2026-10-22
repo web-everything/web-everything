@@ -2585,7 +2585,7 @@ export function hasDestructiveLaneOp(command) {
 
 /** One `cd` statement's target: `undefined` = not a cd; `null` = a cd whose target cannot be read statically. */
 function laneCdTarget(stmt, vars, home) {
-  const m = stmt.match(/^cd(?:\s+([\s\S]*))?$/);
+  const m = stmt.replace(/^(?:builtin|command)\s+(?=cd(?:\s|$))/, '').match(/^cd(?:\s+([\s\S]*))?$/);
   if (!m) return undefined;
   const rest = (m[1] || '').trim();
   if (!rest) return typeof home === 'string' && home.startsWith('/') ? home : null;   // bare `cd` → $HOME
