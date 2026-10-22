@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { publishStalledDigest } from '../../pr-stall-digest.mjs';
 import { runStallSweep, STALL_SWEEP_DEFAULTS } from '../../pr-stall-sweep.mjs';
 import { runPrSweep } from '../../pr-sweep.mjs';
-import { acknowledge, replay, runOnce, sidecarsOf } from '../../../operations/needs-you-feed.mjs';
+import { acknowledge, replay, runOnce, sidecarsOf, unacknowledged } from '../../../operations/needs-you-feed.mjs';
 
 const SOURCE = 'scripts/conveyor/pr-stall-digest.mjs';
 export default {
@@ -24,8 +24,10 @@ export default {
     try {
       for (const [name, config] of [['digest-off', { mode: 'shadow', digest: false }], ['sweep-off', { mode: 'off', digest: true }]]) {
         const dir = join(root, name, 'pr-stall-sweep'), path = join(root, name, 'events.jsonl');
-        publishStalledDigest({ items: [item] }, { feedPath: path, stateDir: dir, env: {}, now, notify });
+        publishStalledDigest({ items: [item, { ...item, pr: 2 }] }, { feedPath: path, stateDir: dir, env: {}, now, notify });
         acknowledge({ path });
+        // A new state after ack remains visible until the disabled producer explicitly clears it.
+        publishStalledDigest({ items: [item, { ...item, pr: 2, state: 'ruling-needed:dispute' }] }, { feedPath: path, stateDir: dir, env: {}, now, notify });
         const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
         const env = { WE_PR_STALL_SWEEP_MODE: config.mode, WE_PR_STALL_SWEEP_DIGEST: String(config.digest) };
         const poll = () => runOnce({ settings, env, now, liveGate: false, log: () => {},
@@ -41,6 +43,8 @@ export default {
         if (report.errors.length) violations.push(`${name}: ${report.errors.join('; ')}`);
         const keys = JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys;
         if (keys.some(key => key.endsWith(':stalled'))) violations.push(`${name}: cleanup retained stalled suppression`);
+        if (unacknowledged({ path }).some(event => event.kind === 'stalled')) violations.push(`${name}: disabled producer left an unacknowledged stall`);
+        if (!replay({ path }).some(event => event.kind === 'cleared' && event.was === 'stalled' && event.pr === 2)) violations.push(`${name}: no clear event for the disabled producer`);
         await poll();
         if (!replay({ path }).some(event => event.kind === 'needs-you')) violations.push(`${name}: queue never published the head`);
       }

@@ -8,7 +8,8 @@
  *   Dedupe: one item per `repo#pr@head:state` (a new state on the same head is re-published), and nothing the feed
  *   already published for that PR head under another kind (operator-queue's items) is published again. Self-clearing:
  *   on a complete pass a `stalled` item no longer reported gets a `NEEDS-YOU-CLEARED` line; an incomplete pass clears
- *   nothing. NEVER SUPPRESSED ON A FAILED READ: when the feed state cannot be read, the alert still goes out, undeduped.
+ *   nothing. Disabling the producer clears its published items and releases queue suppression under the feed lock.
+ *   NEVER SUPPRESSED ON A FAILED READ: when the feed state cannot be read, the alert still goes out, undeduped.
  *   An alert that fails to send is retried next pass. Each item: reason, 1-3 evidence lines, one paste-ready command.
  *   Setting `prStallSweep.digest` (standard true) turns it off; the quiet hours are the shared `quietHours` settings.
  */
@@ -47,8 +48,9 @@ function checkedDigestFeedPath(feedPath, env, stateDir) {
   return path;
 }
 
-/** A disabled producer relinquishes suppression under the same lock as both feed publishers. */
-function releaseStalledSuppression({ feedPath, env, stateDir, errors }) {
+/** Clear a disabled producer's events before relinquishing suppression, under both publishers' shared feed lock. */
+function releaseStalledSuppression({ feedPath, env, stateDir, errors, now }) {
+  let lines = [];
   try {
     const path = checkedDigestFeedPath(feedPath, env, stateDir);
     const sidecar = sidecarsOf(path).state;
@@ -56,11 +58,14 @@ function releaseStalledSuppression({ feedPath, env, stateDir, errors }) {
     withFileLock(`${sidecar}.lock`, () => {
       const prev = readJson(sidecar, { openKeys: [] });
       if (!Array.isArray(prev?.openKeys)) throw new Error('feed state has no openKeys');
-      const openKeys = prev.openKeys.filter(key => !key.endsWith(`:${STALLED_KIND}`));
-      if (openKeys.length !== prev.openKeys.length) writeJsonAtomic(sidecar, { ...prev, openKeys });
+      const cleared = diffFeed(prev.openKeys, [], now, { clearKinds: new Set([STALLED_KIND]) });
+      // Append first: if publication fails, keep the keys so the next disabled pass retries the clear.
+      appendLines(path, cleared.lines);
+      lines = cleared.lines;
+      if (cleared.openKeys.length !== prev.openKeys.length) writeJsonAtomic(sidecar, { ...prev, openKeys: cleared.openKeys });
     });
   } catch (e) { errors.push(`stalled feed: ${String(e?.message ?? e).split('\n')[0]}`); }
-  return { lines: [], fresh: [], notified: false, errors, skipped: 'digest off' };
+  return { lines, fresh: [], notified: false, errors, skipped: 'digest off' };
 }
 
 /** The one paste-ready command: the sweep's next action with the operator's login and this channel filled in. PURE. */
@@ -93,7 +98,7 @@ const feedKeyOfId = (x) => { const at = x.lastIndexOf('@'); return `${x.slice(0,
 export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true } = {}) {
   const errors = [];
   if (isUnderTest(env) && !feedPath) return { lines: [], fresh: [], notified: false, errors, skipped: 'under-test' }; // never the real feed
-  if (!enabled) return releaseStalledSuppression({ feedPath, env, stateDir, errors });
+  if (!enabled) return releaseStalledSuppression({ feedPath, env, stateDir, errors, now });
   if (!Array.isArray(pass?.items)) return { lines: [], fresh: [], notified: false, errors, skipped: 'no pass' };
   const items = pass.items.filter((i) => i.lane === 'operator').map(feedItem);
   // A feed configured as digest.lock may already contain events. Reject it before lock recovery can reclaim it.

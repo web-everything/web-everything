@@ -5,12 +5,15 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, chmodSync, symlinkSync, utimesSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { publishStalledDigest, pasteReady, feedItem } from '../pr-stall-digest.mjs';
 import { replay, unacknowledged, sidecarsOf, acknowledge, runOnce } from '../../operations/needs-you-feed.mjs';
 import { gateAlert } from '../../lib/quiet-hours-io.mjs';
 import * as atomicJson from '../../lib/atomic-json-file.mjs';
+import * as needsFeed from '../../operations/needs-you-feed.mjs';
+import { Worker } from 'node:worker_threads';
 
 const REPO = 'web-everything/web-everything';
 const H = 'a'.repeat(40);
@@ -27,6 +30,45 @@ const sent = () => { const out = []; const notify = (n) => { out.push(n); return
 const run = (ctx, items, o = {}) => publishStalledDigest({ items, incomplete: false, ...o.pass }, { now: NOW, env: {}, ...ctx, ...o });
 
 describe('the stalled feed kind', () => {
+  it('disabling clears published unacknowledged stalls and preserves other feed kinds', async () => {
+    const ctx = setup(); const { notify } = sent();
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: ctx.feedPath }, allowPrimary: { value: true } };
+    await runOnce({ settings, env: {}, now: NOW, liveGate: false, log: () => {},
+      exec: () => JSON.stringify({ ready: [{ repo: REPO, number: 9, head: H }] }) });
+    run(ctx, [op(1)], { notify });
+    expect(unacknowledged({ path: ctx.feedPath }).map(e => e.pr)).toEqual([9, 1]);
+    const disabled = run(ctx, [], { enabled: false, notify, now: NOW + 1 });
+    expect(disabled.errors).toEqual([]);
+    expect(disabled.lines).toHaveLength(1);
+    expect(replay({ path: ctx.feedPath }).at(-1)).toMatchObject({ kind: 'cleared', was: 'stalled', pr: 1, at: new Date(NOW + 1).toISOString() });
+    expect(unacknowledged({ path: ctx.feedPath }).map(e => e.pr)).toEqual([9]);
+    expect(run(ctx, [], { enabled: false, notify }).lines).toEqual([]);
+  });
+  it('evidence has control and bidi characters stripped in persisted and replayed events', () => {
+    const ctx = setup();
+    run(ctx, [op(1, undefined, { evidence: ['before\u001b[31m\u202eafter\r\n\u2028\u200b'] })], { notify: () => ({ ok: true }) });
+    const line = readFileSync(ctx.feedPath, 'utf8').trim();
+    const event = JSON.parse(line.slice(line.lastIndexOf(' {"at":') + 1));
+    expect(event.evidence).toEqual(['before [31m after    ']);
+    expect(replay({ path: ctx.feedPath })[0].evidence).toEqual(event.evidence);
+  });
+  it.each(['append', 'state save'])('a failed disable-time %s keeps suppression keys until clearing can be retried', boundary => {
+    const ctx = setup(); const { notify } = sent();
+    run(ctx, [op(1)], { notify });
+    const sidecar = sidecarsOf(ctx.feedPath).state;
+    const before = readFileSync(sidecar, 'utf8');
+    const fault = boundary === 'append'
+      ? vi.spyOn(needsFeed, 'appendLines').mockImplementation(() => { throw new Error('injected clear append failure'); })
+      : vi.spyOn(atomicJson, 'writeJsonAtomic').mockImplementation(() => { throw new Error('injected clear state save failure'); });
+    const failed = run(ctx, [], { enabled: false, notify });
+    expect(failed.errors.join(' ')).toMatch(/injected clear/);
+    expect(readFileSync(sidecar, 'utf8')).toBe(before);
+    expect(unacknowledged({ path: ctx.feedPath })).toHaveLength(boundary === 'append' ? 1 : 0);
+    fault.mockRestore();
+    expect(run(ctx, [], { enabled: false, notify }).errors).toEqual([]);
+    expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
+    expect(JSON.parse(readFileSync(sidecar, 'utf8')).openKeys).toEqual([]);
+  });
   it('releases stalled suppression when disabled so an acknowledged head can enter the queue feed', async () => {
     const ctx = setup(); const { notify } = sent();
     run(ctx, [op(1)], { notify });
@@ -159,6 +201,70 @@ describe('the stalled feed kind', () => {
 });
 
 describe('never suppressed', () => {
+  it('overlapping successful passes deliver an owed alert once', async () => {
+    const ctx = setup();
+    run(ctx, [op(1)], { notify: () => ({ ok: false }) });
+    const barrier = new SharedArrayBuffer(3 * Int32Array.BYTES_PER_ELEMENT);
+    const signals = new Int32Array(barrier);
+    const source = `
+      const { parentPort, workerData: d } = require('node:worker_threads');
+      const fs = require('node:fs');
+      (async () => {
+        const { publishStalledDigest } = await import(d.module);
+        const signals = new Int32Array(d.barrier);
+        const open = fs.openSync;
+        fs.openSync = function(path, ...args) {
+          try { return open.call(this, path, ...args); }
+          catch (error) {
+            if (d.index === 1 && path === d.ctx.stateDir + '/digest.lock' && error.code === 'EEXIST') parentPort.postMessage({ phase: 'contended' });
+            throw error;
+          }
+        };
+        parentPort.postMessage({ phase: 'ready' });
+        if (Atomics.wait(signals, d.index, 0, 10000) === 'timed-out') throw new Error('start barrier timed out');
+        let notifications = 0;
+        const result = publishStalledDigest({ items: [d.item], incomplete: false }, {
+          ...d.ctx, env: {}, now: d.now, notify: () => {
+            notifications++;
+            if (d.index === 0) {
+              parentPort.postMessage({ phase: 'notifying' });
+              if (Atomics.wait(signals, 2, 0, 10000) === 'timed-out') throw new Error('notification barrier timed out');
+            }
+            return { ok: true };
+          }
+        });
+        parentPort.postMessage({ phase: 'done', result, notifications });
+      })().catch(error => { throw error; });
+    `;
+    const workers = [0, 1].map(index => new Worker(source, { eval: true, workerData: {
+      index, barrier, ctx, item: op(1), now: NOW, module: pathToFileURL(resolve('scripts/conveyor/pr-stall-digest.mjs')).href,
+    } }));
+    const phase = (worker, name) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { cleanup(); reject(new Error(`worker did not reach ${name}`)); }, 15000);
+      const cleanup = () => { clearTimeout(timer); worker.off('message', message); worker.off('error', error); };
+      const message = value => { if (value.phase === name) { cleanup(); resolve(value); } };
+      const error = value => { cleanup(); reject(value); };
+      worker.on('message', message); worker.on('error', error);
+    });
+    const start = index => { Atomics.store(signals, index, 1); Atomics.notify(signals, index); };
+    try {
+      await Promise.all(workers.map(worker => phase(worker, 'ready')));
+      const notifying = phase(workers[0], 'notifying');
+      start(0); await notifying;
+      const contended = phase(workers[1], 'contended');
+      start(1); await contended; // the second worker actually tried the held delivery lock
+      const done = Promise.all(workers.map(worker => phase(worker, 'done')));
+      start(2);
+      const results = await done;
+      expect(results.map(r => r.result.errors)).toEqual([[], []]);
+      expect(results.map(r => r.notifications)).toEqual([1, 0]);
+      expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).unnotified).toEqual([]);
+      expect(replay({ path: ctx.feedPath })).toHaveLength(1);
+    } finally {
+      for (let index = 0; index < 3; index++) start(index);
+      await Promise.all(workers.map(worker => worker.terminate()));
+    }
+  }, 30000);
   it('a feed state that cannot be read still alerts every item', () => {
     const ctx = setup(); const { out, notify } = sent(); run(ctx, [], { notify });
     writeFileSync(sidecarsOf(ctx.feedPath).state, '{torn');

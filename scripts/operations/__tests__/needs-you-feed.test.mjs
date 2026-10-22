@@ -17,6 +17,27 @@ afterEach(() => {
 const at = '2026-10-15T12:00:00.000Z';
 const item = { repo: 'owner/repo', pr: 12, head: 'abc', kind: 'needs-you', reason: 'ready', pick: 'pick 12' };
 describe('feed', () => {
+  it('sanitizes every feed text field, including nested arrays and legacy evidence', () => {
+    const unsafe = '\r\n\u0000\u001b\u009b\u2028\u2029\u202e\u200b';
+    const text = 'safe `quote` "text" --flag ../path ';
+    const dirty = Object.fromEntries(['repo', 'head', 'kind', 'was', 'reason', 'title', 'pick', 'command', 'state', 'template']
+      .map(field => [field, text + unsafe]));
+    const payload = { ...item, ...dirty, evidence: [text + unsafe, [text + unsafe], { detail: text + unsafe }], extra: { lines: [text + unsafe], count: 3 }, flag: true, empty: null };
+    const clean = value => {
+      if (typeof value === 'string') {
+        expect(value).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+      } else if (value && typeof value === 'object') Object.values(value).forEach(clean);
+    };
+    const line = diffFeed([], [payload], at).lines[0];
+    const persisted = JSON.parse(line.slice(line.lastIndexOf(' {"at":') + 1));
+    clean(persisted);
+    expect(persisted.evidence[0]).toContain(text);
+    expect(persisted).toMatchObject({ pr: 12, flag: true, empty: null, extra: { count: 3 } });
+    const path = join(temp(), 'legacy.jsonl');
+    appendLines(path, [`NEEDS-YOU legacy ${JSON.stringify({ at, ...payload })}`]);
+    clean(replay({ path }));
+    expect(replay({ path })[0].evidence).toEqual(persisted.evidence);
+  });
   it('strips controls and bounds untrusted titles and other fields in opening and cleared lines', () => {
     const unsafe = '\r\n\t\u0000\u001b[31m\u007f\u0085\u009b\u2028\u2029\u202e\u200b';
     const title = 'NEEDS-YOU ruling-needed: run `cmd` "quoted" --flag ../path ' + unsafe + 'x'.repeat(5000);

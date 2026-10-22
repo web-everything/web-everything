@@ -93,8 +93,15 @@ export function sanitizeForFeed(text, max) {
   return String(text).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, max);
 }
 const fieldLimits = { repo: 200, head: 128, kind: 40, was: 40, reason: 100, title: 200, pick: 512, command: 512 };
+function sanitizeValue(value, max) {
+  if (typeof value === 'string') return sanitizeForFeed(value, max);
+  if (Array.isArray(value)) return value.map(entry => sanitizeValue(entry, max));
+  if (value && typeof value === 'object') return sanitizeItem(value);
+  return value;
+}
+// Publication and legacy replay share the same boundary, including evidence arrays and nested records.
 const sanitizeItem = item => Object.fromEntries(Object.entries(item).map(([field, value]) =>
-  [field, typeof value === 'string' ? sanitizeForFeed(value, fieldLimits[field] ?? 512) : value]));
+  [field, sanitizeValue(value, fieldLimits[field] ?? 512)]));
 function fromKey(key) {
   const m = /^(.*)#(\d+)@(.*):([^:]+)$/.exec(key);
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);

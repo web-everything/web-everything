@@ -11,7 +11,7 @@ import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
 import { runPrSweep } from '../pr-sweep.mjs';
 import { runPrSweepJob } from '../pr-sweep-job.mjs';
 import { publishStalledDigest } from '../pr-stall-digest.mjs';
-import { sidecarsOf } from '../../operations/needs-you-feed.mjs';
+import { sidecarsOf, replay, unacknowledged } from '../../operations/needs-you-feed.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -60,6 +60,40 @@ const reader = (gh, unreadable = false) => {
 describe('settings', () => {
   const file = (block) => (path) => { if (String(path).endsWith('pr-stall-sweep.json')) return JSON.stringify({ prStallSweep: block }); const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; };
   const log = () => {};
+  it('digest defaults to true in both the standard and the repository settings', () => {
+    expect(STALL_SWEEP_DEFAULTS.digest).toBe(true);
+    expect(resolveStallSweepSettings({ env: {}, read: file({}), log })).toMatchObject({ value: { digest: true }, sources: { digest: 'standard' } });
+    const repo = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'));
+    expect(repo.prStallSweep.digest).toBe(true);
+  });
+  it.each([['false', false], ['0', false], ['true', true], ['1', true]])('parses WE_PR_STALL_SWEEP_DIGEST=%s as %s', (raw, value) => {
+    expect(resolveStallSweepSettings({ env: { WE_PR_STALL_SWEEP_DIGEST: raw }, read: file({ digest: !value }), log }))
+      .toMatchObject({ value: { digest: value }, sources: { digest: 'env' }, errors: [] });
+  });
+  it.each(['yes', '', 'FALSE', '2'])('rejects invalid digest environment value %j', raw => {
+    const result = resolveStallSweepSettings({ env: { WE_PR_STALL_SWEEP_DIGEST: raw }, read: file({ digest: false }), log });
+    expect(result.value.digest).toBe(false);
+    expect(result.errors.join(' ')).toMatch(/digest/);
+  });
+  it.each([null, 'false', 0, {}, []])('rejects invalid digest file value %j', digest => {
+    const result = resolveStallSweepSettings({ env: {}, read: file({ digest }), log });
+    expect(result.value.digest).toBe(true);
+    expect(result.errors.join(' ')).toMatch(/digest/);
+  });
+  it.each(Object.keys(STALL_SWEEP_DEFAULTS))('validates the %s setting and retains its standard value', key => {
+    const standard = STALL_SWEEP_DEFAULTS[key];
+    // The cascade flattens map leaves: the empty stateLanes standard is represented by an absent map.
+    const effective = value => key === 'stateLanes' && value === undefined ? {} : value;
+    const defaults = resolveStallSweepSettings({ env: {}, read: file({}), log });
+    expect(effective(defaults.value[key])).toEqual(standard);
+    // Exercise the real cascade validator, including leaves of map settings.
+    const invalid = typeof standard === 'object'
+      ? Object.fromEntries((key === 'stateLanes' ? ['fixing'] : Object.keys(standard)).map(leaf => [leaf, 'invalid-setting-value']))
+      : 'invalid-setting-value';
+    const result = resolveStallSweepSettings({ env: {}, read: file({ [key]: invalid }), log });
+    expect(effective(result.value[key])).toEqual(standard);
+    expect(result.errors.join(' ')).toContain(key);
+  });
   it('is off by standard, and every leaf carries its source', () => {
     const s = resolveStallSweepSettings({ env: {}, read: file({}), log });
     expect(s.value).toMatchObject({ mode: 'off', intervalMinutes: 15, maxActionsPerSweep: 3, maxActionsPerHour: 6, maxActionsPerPrHead: 1, grantCeiling: 10 });
@@ -279,18 +313,21 @@ describe('wiring', () => {
   it.each([
     { mode: 'off', digest: true },
     { mode: 'shadow', digest: false },
-  ])('a disabled producer releases stalled keys even before its next due pass: %j', async config => {
+  ])('a disabled producer clears published stalls and releases keys before its next due pass: %j', async config => {
     const dir = auditDir(), path = join(dir, '..', 'needs-you-events.jsonl');
     const key = `${REPO}#1@${HEAD}:stalled`;
     publishStalledDigest({ items: [{ lane: 'operator', repo: REPO, pr: 1, head: HEAD, state: 'needs-decision:note' }] },
       { feedPath: path, stateDir: dir, env: {}, notify: () => ({ ok: true }) });
     expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual([key]);
+    expect(unacknowledged({ path })).toHaveLength(1);
     const report = await runPrSweep({ ...base,
       stallSweep: args => runStallSweep({ ...args, dir, settings: shadow(config), state: { lastRunAt: NOW },
         read: () => { throw new Error('disabled/not-due sweep must not read'); } }),
       stallDigest: (pass, options) => publishStalledDigest(pass, { ...options, feedPath: path }) });
     expect(report.errors).toEqual([]);
     expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual([]);
+    expect(unacknowledged({ path })).toEqual([]);
+    expect(replay({ path }).at(-1)).toMatchObject({ kind: 'cleared', was: 'stalled', pr: 1 });
   });
   it('the health PR job runs the stall sweep and keeps its state', async () => {
     const stallSweep = vi.fn(async ({ state }) => ({ mode: 'shadow', state: { lastRunAt: NOW, was: state.lastRunAt }, items: [], act: [] }));
