@@ -72,7 +72,8 @@ export function renewLeaseOnUse({ laneRoot, mySessionId = null, assertedSlug = n
     writeFileSync(tmp, JSON.stringify(renewed, null, 2) + '\n', { flag: 'wx' });
     try {
       const now = readJson(file);
-      if (!now || now.acquiredAt !== lease.acquiredAt || now.holder !== lease.holder || now.session !== lease.session) return null;
+      if (!now || now.acquiredAt !== lease.acquiredAt || now.holder !== lease.holder || now.session !== lease.session
+        || (now.workerSession ?? null) !== (lease.workerSession ?? null) || (now.renewedAt ?? null) !== (lease.renewedAt ?? null)) return null;
       renameSync(tmp, file);
       return renewed;
     } finally {

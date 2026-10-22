@@ -1623,7 +1623,10 @@ function tryClaimLane(dir, session, nowMs, ttlMs) {
     // A reclaim is a NEW hold by a NEW holder, so it mints a fresh slug — the dead owner's slug must not carry
     // over, or a returning zombie would still assert its way past the guard. The dead owner's declared
     // OCCUPANCY is dropped for the same reason (only `--adopt` re-declares it for the new holder).
-    try { writeLeaseAtomic(file, bodyFor(mintedHolder, adopted), { exclusive: true }); return mintedHolder; } catch { return null; }
+    // lane-lease-occupant — the SAME holder re-taking its own expired lease gets a fresh slug (above) but keeps its
+    // declared occupant, exactly as the old in-place refresh did, so the Edit/Write guard's protection is not dropped.
+    const keepOccupant = leaseOwnedBy(existing, session) ? laneWorkerSession(existing) : null;
+    try { writeLeaseAtomic(file, bodyFor(mintedHolder, adopted || keepOccupant), { exclusive: true }); return mintedHolder; } catch { return null; }
   }
   return null; // a LIVE lease held by another session — this lane is taken, even with --force
 }

@@ -88,3 +88,16 @@ describe('getting a lane back never resets over work the acquirer does not own',
     expect(readFileSync(join(laneDir(), 'file.txt'), 'utf8')).toBe('in-flight edit\n');
   });
 });
+
+describe('codex audit r1 — the old in-place refresh kept the occupant; the stale re-take must too', () => {
+  it('an expired own re-acquire keeps the declared occupant while minting a fresh slug', () => {
+    expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+    expect(runPool(['acquire', '--lane=1', ...poolArgs(), '--session=me', '--adopt']).code).toBe(0);
+    const { holder, workerSession } = readLease();
+    expect(workerSession).toBe('sess-A');
+    age(300);
+    expect(runPool(['acquire', '--lane=1', ...poolArgs(), '--session=me']).code).toBe(0);
+    expect(readLease().holder).not.toBe(holder);
+    expect(readLease().workerSession).toBe('sess-A');
+  });
+});

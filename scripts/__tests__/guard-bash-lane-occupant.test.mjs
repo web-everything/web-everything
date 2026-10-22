@@ -209,4 +209,13 @@ describe('the hook itself, on a real lane layout (CLI)', () => {
     expect(r?.renewedAt).toBeTruthy();
     expect(renewLeaseOnUse({ laneRoot, mySessionId: AGENT_SESSION, settings: { renewOnUseMinutes: 1 } })).toBeNull(); // throttled
   });
+  it('after an occupancy hand-off to B, A's use never renews or rewrites the lease (codex audit r1)', () => {
+    const laneRoot = join(lanes, 'lane-15');
+    const file = join(laneRoot, '.git', '.lane-lease');
+    const orig = readFileSync(file, 'utf8');
+    const adopted = { ...JSON.parse(orig), workerSession: 'B' };
+    writeFileSync(file, JSON.stringify(adopted));
+    expect(renewLeaseOnUse({ laneRoot, mySessionId: AGENT_SESSION, settings: { renewOnUseMinutes: 1 } })).toBeNull();
+    expect(lease('lane-15').workerSession).toBe('B');
+  });
 });
