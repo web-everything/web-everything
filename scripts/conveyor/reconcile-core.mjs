@@ -2044,11 +2044,15 @@ export function planReconcile({
 
     // The evidence every row carries, so a reader never has to go back to the listing to audit a verdict.
     const operatorAnswer = latestOperatorAnswer(pr?.comments);
-    const grants = roundExtensionGrants(pr?.comments, { repo, pr: prNumber });
+    // A standing-ruling grant (automation-posted) counts only under the scope the IO shell verified for this PR
+    // (`we:scripts/conveyor/standing-ruling-io.mjs#enrichPrsWithStandingRulingGrants`); absent, it never counts.
+    const grants = roundExtensionGrants(pr?.comments, { repo, pr: prNumber, standingRuling: pr?.standingRuling ?? null });
     const roundExtensions = grants.reduce((sum, g) => sum + g.by, 0);
     // Each cap uses its own production counter on the thread prefix, never today's durable count map.
     const anchoredCap = (cap, count) => Math.max(cap + roundExtensions,
-      ...grants.map(g => roundExtensionAnchor.value === 'grant'
+      // A standing-ruling (automatic) grant is ALWAYS anchored at the rounds spent when it was posted, whatever the
+      // setting: it answers one limit hit, so it must free a round NOW (max(base + grants, usedAtGrant + by)).
+      ...grants.map(g => (roundExtensionAnchor.value === 'grant' || g.standingRuling)
         ? count({ ...pr, comments: pr.comments.slice(0, g.index) }) + g.by : 0));
     const advisoryFixCapHere = anchoredCap(advisoryFixCap, p => countCompletedAdvisoryEpisodes(p.comments));
     const conflictFixCapHere = anchoredCap(conflictFixCap, p => countStaleConflictFixRounds(p.comments, {

@@ -6,7 +6,9 @@ import { describe, expect, it } from 'vitest';
 import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
   resolveRedTeamProbes, redTeamForHead, gateRoundCap, sendBackStepState, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks, readRedTeamDisposition,
+  liveResultGateState,
 } from '../red-team-gate.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
 const HEAD = 'ea117e881164c3b6366b0bb78a3660c9a00503b1';
@@ -61,6 +63,19 @@ describe('parseRedTeamComment', () => {
     const body = renderRedTeamComment({ pr: 9, rev: HEAD, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' });
     expect(parseRedTeamComment(body).findings).toEqual([]);
     expect(parseRedTeamComment('hello')).toBeNull();
+  });
+});
+
+describe('liveResultGateState: a reviewed-sha marker anchors the head only in the shape the shared parser reads', () => {
+  const anchor = marker => liveResultGateState([bot(`✅ review — accepted\n\n${marker}`), bot(BODY_4722)], 4722, HEAD).headReviewIndex;
+  const resultOnly = liveResultGateState([bot('hello'), bot(BODY_4722)], 4722, HEAD).headReviewIndex;
+  it('a full marker (either SHA case) anchors at the accept', () => {
+    expect(anchor(buildReviewedShaMarker(HEAD))).toBeLessThan(resultOnly);
+    expect(anchor(`<!-- reviewed-sha: ${HEAD.toUpperCase()} -->`)).toBeLessThan(resultOnly);
+  });
+  it('an upper-case marker name or an abbreviated marker never moves the anchor earlier', () => {
+    expect(anchor(`<!-- REVIEWED-SHA: ${HEAD} -->`)).toBe(resultOnly);
+    expect(anchor(buildReviewedShaMarker(HEAD.slice(0, 12)))).toBe(resultOnly);
   });
 });
 
@@ -303,5 +318,15 @@ describe('readRedTeamDisposition: only a human operator releases a break held at
   it('a human-authored operator-card / operator-not-real record releases', () => {
     expect(heldBy(record(human, 'operator-card', CARD))).toBe(0);
     expect(heldBy(record(human, 'operator-not-real', ADVISORY))).toBe(0);
+  });
+  describe('a clear-human ruling comment', () => {
+    const clearBody = ['\u2705 review \u2014 `review:human` cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+      buildReviewedShaMarker(head), buildClearedHumanMarker('operator')].join('\n');
+    const clear = who => ({ ...who, body: clearBody });
+    it('posted by automation never releases the held break', () => {
+      expect(heldBy(clear(automation))).toBe(1);
+      expect(heldBy(clear({ author: { login: 'chalbert[bot]' } }))).toBe(1);
+    });
+    it('posted by a human operator releases it', () => expect(heldBy(clear(human))).toBe(0));
   });
 });

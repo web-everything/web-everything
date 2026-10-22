@@ -1,5 +1,14 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+// The pass-level case below runs runReconcilePass: no test here reaches GitHub, the host or its policy cache.
+vi.mock('node:child_process', async (importOriginal) => ({ ...await importOriginal(), execFileSync: vi.fn() }));
+vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => ({ ...await importOriginal(), execFileSyncThrottled: vi.fn(), runGhSync: vi.fn() }));
+vi.mock('../../lib/write-all-sync.mjs', () => ({ writeAllSync: vi.fn(), writeLineSync: vi.fn() }));
+vi.mock('../../lib/required-status-checks.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, getRequiredStatusChecks: vi.fn(() => ({ checks: [...actual.FALLBACK_REQUIRED_STATUS_CHECKS], source: 'fixture' })) };
+});
 import * as core from '../reconcile-core.mjs';
+import { enrichPrsWithStandingRulingGrants, standingRulingScope } from '../standing-ruling-io.mjs';
 import * as grants from '../round-extension-mark.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { buildAdvisoryFixComment } from '../advisory-fix-mark.mjs';
@@ -18,6 +27,64 @@ const plan = (comments, options = {}, over = {}) => core.planReconcile({ reviewT
     headRefName: 'lane/5169-repair', headRefOid: 'a'.repeat(40), mergeStateStatus: 'CLEAN',
     labels: [{ name: 'review:changes' }], statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
     comments: [{ body: '🔁 human review — changes requested\n\nRepair the bug.' }, ...comments], ...over }], ...options });
+
+const H = 'a'.repeat(40);
+const autoGrant = { id: 'IC_auto', author: bot, createdAt: '2026-10-15T11:00:00Z', body: grants.buildRoundExtensionComment({
+  repo: 'we', pr: 5169, by: 1, actor: 'chalbert', channel: 'standing-ruling-auto', reason: 'ruling', at: '2026-10-15T11:00Z',
+  standingRuling: 'web-everything/web-everything#5751', head: H, episode: `web-everything/web-everything#5169@${H}:fix:12/10` }) };
+const verified = { id: 'web-everything/web-everything#5751', author: 'chalbert', by: 1, maxPerPr: 3,
+  repos: ['web-everything/web-everything'], cardOnlyHeads: { [H]: true }, uneditedComments: ['IC_auto'] };
+
+describe('an automatic (standing-ruling) grant frees a round NOW (live #5690)', () => {
+  // Twelve rounds spent against a cap of 10: an additive +1 (cap 11) would leave the PR stuck at its limit.
+  const over = [...Array.from({ length: 12 }, round), autoGrant];
+  it('is anchored at the rounds spent when posted even with the anchor setting off', () => {
+    for (const roundExtensionAnchor of [{ value: 'grant', source: 'standard' }, { value: 'off', source: 'repo' }]) {
+      expect(plan(over, { roundCap: 10, roundExtensionAnchor }, { standingRuling: verified }).dispatch[0]).toMatchObject({ kind: 'fix', attempts: 12 });
+    }
+  });
+  it('without the verified scope it counts for nothing (cap stays 10)', () => {
+    expect(plan(over, { roundCap: 10 }).refusals[0]).toMatchObject({ kind: 'cap-exhausted', attempts: 12, cap: 10 });
+  });
+
+  // PR #5758 review: every test above injected `standingRuling` straight into planReconcile, so dropping the pass's
+  // enrich call left them green. This runs the PASS, with the real enrich + scope and only the GitHub reads injected.
+  describe('through runReconcilePass', () => {
+    const snapshot = () => ({ number: 5169, state: 'OPEN', headRefName: 'lane/5169-repair', headRefOid: H, baseRefName: 'main',
+      mergeStateStatus: 'CLEAN', labels: [{ name: 'review:changes' }], files: [{ path: 'backlog/5169-x.md' }],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: H }],
+      comments: [{ body: '🔁 human review — changes requested\n\nRepair the bug.' }, ...over] });
+    const id = p => p;
+    const options = () => ({ repo: 'we', readPrs: () => [snapshot()], readAgents: () => [], enrich: id,
+      readRequiredChecks: () => ({ checks: ['test'] }), resolveMainSha: () => null,
+      enrichMainRed: prs => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: id, enrichBaseRef: id, enrichSystemFix: id,
+      enrichEscalationBase: id, enrichFixClaims: id, enrichTimeouts: id, enrichReferralHolds: id, enrichLedgerHolds: id,
+      enrichRulings: id, enrichScopeBloat: id, enrichCodeQL: id, enrichOwedMainRule: () => {},
+      loadMechanicalRoundsSetting: () => ({ value: true, source: 'env' }),
+      env: { WE_REVIEW_ROUND_CAP: '10', WE_REVIEW_START_AFTER: 'ci-green' }, now: Date.parse('2026-10-15T12:00:00Z') });
+    const reads = { readRuling: () => verified, cardOnly: ({ head }) => head === H, unedited: () => ['IC_auto'] };
+    const enrichWith = (deps, seen = []) => (prs, o) => { seen.push(o); return enrichPrsWithStandingRulingGrants(prs,
+      { ...o, readRuling: deps.readRuling, scope: a => standingRulingScope(a, deps) }); };
+
+    it('a verified automatic grant reaches planReconcile and frees the round', async () => {
+      const { runReconcilePass } = await import('../reconcile-pass.mjs');
+      const seen = [];
+      const result = runReconcilePass({ ...options(), enrichStandingRulingGrants: enrichWith(reads, seen) });
+      expect(seen[0]).toMatchObject({ repo: 'web-everything/web-everything' });
+      const row = result.dispatch.find(d => d.prNumber === 5169);
+      expect(row, JSON.stringify(result.refusals)).toMatchObject({ kind: 'fix', attempts: 12 });
+      expect(row.mode).toBeUndefined();
+    });
+    // At the cap the pass hands the PR to a takeover (the pass's default round-cap action), never an ordinary round.
+    it('without the enrich step, or once the head carries code, the cap holds', async () => {
+      const { runReconcilePass } = await import('../reconcile-pass.mjs');
+      for (const enrichStandingRulingGrants of [id, enrichWith({ ...reads, cardOnly: () => false })]) {
+        const result = runReconcilePass({ ...options(), enrichStandingRulingGrants });
+        expect(result.dispatch.find(d => d.prNumber === 5169)).toMatchObject({ kind: 'fix', mode: 'takeover', attempts: 12, cap: 10 });
+      }
+    });
+  });
+});
 
 describe('grants anchored to spent rounds', () => {
   it('anchors +1 at eight spent rounds and owes the resulting head a review', () => {

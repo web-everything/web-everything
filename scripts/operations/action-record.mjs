@@ -1,6 +1,11 @@
 /** #3383 — Pure resource identity and action lifecycle. Expiry is suspicion, never proof of death. */
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-import sweptRepos from '../lib/swept-repos.json' with { type: 'json' };
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+// Read, not `import … with { type: 'json' }`: on Node 22.1 a JSON-module import prints an ExperimentalWarning on
+// every process that loads this module, ahead of a daemon's own output (build-dispatch-daemon's boot test).
+const sweptRepos = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../lib/swept-repos.json'), 'utf8'));
 export class CoordinationUnavailableError extends Error {
   constructor(path, cause) {
     super(`Coordination unavailable at ${path}: ${cause?.message ?? cause}`, { cause });
