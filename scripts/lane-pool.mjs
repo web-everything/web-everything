@@ -42,7 +42,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  *   --pool=<name>        (#2667) select a pool DIRECTLY by its dir-name under POOL_ROOT — the read/release
  *                        selector (status / list / path / release) that needs only the poolDir, no checkout path
  *                        or origin URL (e.g. release a plateau-app-pool lease from the WE checkout)
- *   --origin=<url>       clone source (default: that checkout's `origin` remote URL)
+ *   --origin=<url>       canonical clone source (default: a non-lane checkout's `origin` for preservation ops)
  *   --reference=<path>   object-sharing reference repo for `git clone --reference` (default: --repo path)
  *   --name=<slug>        pool key under the root (default: derived from the origin URL basename)
  *   --branch=<ref>       integration branch (default: detected origin/HEAD, else `main`)
@@ -344,8 +344,28 @@ try {
 function resolveRepo() {
   const repoPath = resolve(expandHome(flags.repo) || (CWD_TOP_LEVEL ? process.cwd() : CHECKOUT_ROOT));
   const referencePath = resolve(expandHome(flags.reference) || repoPath);
-  const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, { timeout: LOCAL_GIT_TIMEOUT_MS }) || referencePath;
-  const originUrl = flags.origin || tryGit(['remote', 'get-url', 'origin'], topLevel, { timeout: LOCAL_GIT_TIMEOUT_MS });
+  // An inherited lane Git context must not override an explicitly selected primary.
+  const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' });
+  for (const key of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS']) delete env[key];
+  const gitOptions = { timeout: LOCAL_GIT_TIMEOUT_MS, env };
+  const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, gitOptions) || referencePath;
+  const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
+    || (cmd === 'list' && flags.acquirable);
+  if (!flags.origin && needsOrigin) {
+    const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
+    const originSourcePaths = [referencePath, topLevel].flatMap(path => [resolve(path), resolveReal(path)]);
+    // The reference/cwd can itself be an agent-owned lane. Never promote its remote
+    // into the trust anchor for a preservation proof, even for --dry-run or --pool.
+    // Check both the supplied path and Git's answer (core.worktree can redirect it),
+    // before and after symlink resolution. Recognize lane-N in other pool roots too;
+    // ambiguous lane-shaped checkouts must supply --origin or a primary --reference.
+    if (originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
+      || path.split(sep).some(part => /^lane-\d+$/.test(part)))) {
+      fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
+    }
+  }
+  const originUrl = flags.origin || tryGit(['remote', 'get-url', 'origin'], topLevel, gitOptions);
   // #2667 — `--pool=<name>` selects a pool DIRECTLY by its directory name under POOL_ROOT, bypassing origin-URL
   // derivation. It is the pool selector for the READ / RELEASE ops (status / list / path / release) that need
   // only `poolDir` — e.g. the main session releasing a cross-locus couple's lingering lease in the `plateau-app`
@@ -356,14 +376,12 @@ function resolveRepo() {
   if (!originUrl && !explicitPool) {
     fail(`could not determine an origin URL — pass --origin=<url> (looked in ${topLevel})`);
   }
-  const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
-    || (cmd === 'list' && flags.acquirable);
   if (!originUrl && needsOrigin) {
     fail(`${cmd} requires a canonical origin for pool ${explicitPool} — pass --origin=<url> (looked in ${topLevel})`);
   }
   const name = explicitPool || flags.name || basename(originUrl).replace(/\.git$/, '');
   // Only discover a default when --branch is absent; explicit-branch acquire must not pay for an unused probe.
-  const head = flags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, { timeout: LOCAL_GIT_TIMEOUT_MS });
+  const head = flags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
   const branch = flags.branch || (head ? head.replace(/^origin\//, '') : 'main');
   return { name, originUrl: originUrl || null, referencePath: topLevel, branch, poolDir: join(POOL_ROOT, name) };
 }

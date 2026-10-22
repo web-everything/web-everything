@@ -7,7 +7,7 @@
 import { it, expect } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runReclaimCase } from '../conveyor/soak/breaks/lane-reset-symbolic-ops-proof.mjs';
 import { laneGitHardeningEnv, laneGitConfigArgs } from '../lib/lane-git-hardening.mjs';
@@ -16,11 +16,11 @@ import { laneGitHardeningEnv, laneGitConfigArgs } from '../lib/lane-git-hardenin
 const repoSource = /function resolveRepo\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
 function resolvePool(command, extra = {}) {
   return new Function('flags', 'cmd', 'resolve', 'expandHome', 'CWD_TOP_LEVEL', 'CHECKOUT_ROOT',
-    'tryGit', 'LOCAL_GIT_TIMEOUT_MS', 'fail', 'basename', 'join', 'POOL_ROOT',
+    'tryGit', 'LOCAL_GIT_TIMEOUT_MS', 'fail', 'basename', 'join', 'POOL_ROOT', 'resolveReal', 'sep', 'laneGitHardeningEnv',
     `${repoSource}; return resolveRepo();`)(
     { pool: 'existing', reference: '/reference', ...extra }, command, resolve, p => p,
     null, '/reference', () => null, 1000, message => { throw Error(message); },
-    p => p.split('/').at(-1), join, '/pool',
+    p => p.split('/').at(-1), join, '/pool', resolve, sep, laneGitHardeningEnv,
   );
 }
 it.each(['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim', 'list'])(
@@ -34,6 +34,11 @@ it.each(['status', 'list', 'path', 'release', 'keep', 'map', 'unmap', 'gc'])(
   'read-only regression: metadata-only %s retains explicit-pool support without origin', command => {
     expect(resolvePool(command)).toMatchObject({ originUrl: null, poolDir: '/pool/existing' });
   },
+);
+it.each(['reclaim', 'trim', 'acquire'])(
+  '%s refuses a lane-derived origin that advertises unique work', async laneOriginCommand => {
+    expect((await runReclaimCase(resolve('.'), { laneOriginCommand })).violations).toEqual([]);
+  }, 60000,
 );
 it('read-only regression: ordinary hardened callers retain their transport policy', () => {
   const inherited = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'always' };
