@@ -1,0 +1,7 @@
+{
+  "directLaunch": {
+    "build": { "provider": "codex" },
+    "fix": { "provider": "codex" },
+    "gemini": { "mode": "trial", "maxConcurrent": 1 }
+  }
+}

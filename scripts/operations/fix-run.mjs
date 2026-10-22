@@ -38,6 +38,7 @@ import { appendFixLoopRow, isInfraFixRunOutcome } from '../conveyor/fix-loop-led
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { riskyLaneConfig, LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { directLaunchLogLine } from '../lib/direct-launch-settings.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
 // `dispatch-lane-io.mjs` -> `dispatch-provider-registry.mjs`, so a static import here is a cycle that makes the
@@ -576,6 +577,7 @@ export async function runFixCli(argv = [], {
   }
   const { pr, sessionSlug, ref } = launch;
   write(`fix-run: starting borrowed repair of PR #${pr} (session ${sessionSlug}, provider ${launch.provider}) - pid ${process.pid}\n`);
+  write(`${directLaunchLogLine({ kind: 'fix' })}\n`);
   try {
     const brief = readPrompt(launch.promptFile);
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.

@@ -4,6 +4,10 @@ import { ROUTING_POLICY_PATH, trustedSnapshot } from './dispatch-routing-policy-
 import { validateRoutingPolicy, DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePureRoute, resolvePolicyModel as resolvePureModel, operationEffort } from './dispatch-routing-policy.mjs';
 import { decideDispatchRoute } from './dispatch-contracts.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
+import { directLaunchLogLine } from './direct-launch-settings.mjs';
+import { isUnderTest } from './under-test.mjs';
+
+const defaultLog = message => { if (!isUnderTest()) console.error(message); };
 function initialPolicy() {
   return trustedSnapshot(process.env.WE_DISPATCH_ROUTING_SNAPSHOT) ?? DEFAULT_ROUTING_POLICY;
 }
@@ -45,7 +49,9 @@ export function resolveDispatchRoute(dispatch, options = {}) {
     const hold = providerQuotaHold(records, provider, options.now ?? Date.now());
     if (hold) availability[provider] = hold;
   }
-  return decideDispatchRoute(dispatch, { ...options, availability, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
+  const route = decideDispatchRoute(dispatch, { ...options, availability, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
+  (options.log ?? defaultLog)(directLaunchLogLine({ kind: dispatch?.kind }));
+  return route;
 }
 export function routingPolicyEnv() {
   return { WE_DISPATCH_ROUTING_SNAPSHOT: JSON.stringify(readRoutingPolicy()) };
