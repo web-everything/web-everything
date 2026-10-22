@@ -4090,6 +4090,13 @@ describe('released fix claim + live pid is not live work (PR #5492 replay)', () 
     expect(plan.notes.find((n) => n.kind === 'released-claim-session-ignored').text).toContain('fix claim was released');
   });
 
+  it('the note carries the reaper evidence: listing handle, release time, start time', () => {
+    const plan = run([begin, end], [spare({ id: 'abc123' })]);
+    expect(plan.notes.find((n) => n.kind === 'released-claim-session-ignored')).toMatchObject({
+      handle: 'abc123', releasedAtMs: Date.parse(RELEASED_AT), startedAt: STARTED_BEFORE, cwd: '/dispatch/ad7088e2',
+    });
+  });
+
   it('UNRELEASED claim (fix-begin after the fix-end) + live pid: still live-process', () => {
     const again = { ...begin, createdAt: '2026-10-20T23:00:00Z' };
     const plan = run([begin, end, again], [spare()]);

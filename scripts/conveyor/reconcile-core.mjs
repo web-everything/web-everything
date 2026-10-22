@@ -2571,6 +2571,9 @@ export function planReconcile({
         notes.push({
           kind: 'released-claim-session-ignored', prNumber, pid: Number.isInteger(b.agent.pid) ? b.agent.pid : null,
           sessionId: b.agent.sessionId ?? null, cwd: b.cwd, head: claimRelease.head,
+          // Evidence for the finished-session reaper (we:scripts/conveyor/finished-session-reap.mjs): the listing's
+          // stop handle, and when the claim was released (how long the session has outlived its work).
+          handle: b.agent.id ?? null, releasedAtMs: claimRelease.releasedAtMs, startedAt: b.agent.startedAt ?? null,
           text: `PR #${prNumber}: ignoring live pid ${b.agent.pid ?? '?'} (${b.cwd}) — its fix claim was released (fix-end at ${String(claimRelease.head).slice(0, 9)}) and no new claim is held, so it is finished work, not live work`,
         });
       }
