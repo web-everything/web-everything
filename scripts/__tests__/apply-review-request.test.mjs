@@ -537,7 +537,7 @@ describe('no other code on the ledger path pushes (C3)', () => {
     const site = pushSites.find((s) => s.startsWith(`${PLUMBING}:`));
     const line = plumbing.split('\n')[Number(site.split(':')[1]) - 1];
     expect(line).toMatch(/\['push', '--porcelain', '--no-follow-tags', 'origin', `\$\{commit\}:\$\{ref\}`\]/);
-    for (const name of ['verdict-ledger-outbox-spool.mjs', 'verdict-ledger-git.mjs']) {
+    for (const name of ['verdict-ledger-outbox-spool.mjs', 'verdict-ledger-git.mjs', 'verdict-ledger-outbox.mjs']) {
       const source = readFileSync(join(SCRIPTS, 'lib', name), 'utf8')
         .split('\n').filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join('\n');
       expect(source).not.toMatch(/stageOnTransportBranch\s*\(/);
