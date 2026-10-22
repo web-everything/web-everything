@@ -186,11 +186,12 @@ export function staleLine(dir, { count, ageMs }, why) {
 
 /** Log the stale line when the oldest entry is past `staleMs`. Never throws. Returns whether it was stale. */
 export function reportIfStale(c, why) {
+  const log = safeLog(c.log);
   try {
     const age = oldestAgeMs(c.dir, c.now());
-    if (age.count && age.ageMs > c.staleMs) { c.log(staleLine(c.dir, age, why)); return true; }
+    if (age.count && age.ageMs > c.staleMs) { log(staleLine(c.dir, age, why)); return true; }
   } catch (e) {
-    c.log(`ledger-write-miss: verdict-ledger outbox ${c.dir} cannot be inspected (${e?.message ?? e}); ${why}`);
+    log(`ledger-write-miss: verdict-ledger outbox ${c.dir} cannot be inspected (${e?.message ?? e}); ${why}`);
     return true;
   }
   return false;
@@ -229,7 +230,7 @@ export function readEntry(dir, name, log) {
   try { e = JSON.parse(text); why = validateEntry(e); } catch (err) { why = `not JSON (${err.message})`; }
   if (!why) return { entry: e };
   try { renameSync(join(dir, name), join(dir, `.corrupt-${name}`)); } catch (err) { return { io: err }; }
-  log(`ledger-write-miss: verdict-ledger outbox entry ${join(dir, name)} is corrupt (${why}); set aside as .corrupt-${name}`);
+  safeLog(log)(`ledger-write-miss: verdict-ledger outbox entry ${join(dir, name)} is corrupt (${why}); set aside as .corrupt-${name}`);
   return { corrupt: true };
 }
 
@@ -269,7 +270,7 @@ export function unlock(dir, owner, log) {
     const entry = readLockEntry(lockRoot, OUTBOX_LOCK_PATH);
     if (entry?.owner === owner) releaseLockDirIf(lockRoot, OUTBOX_LOCK_PATH, entry);
   } catch (e) {
-    log(`verdict-ledger-outbox: releasing the flusher lock on ${dir} failed (${e?.message ?? e}); its lease expires on its own`);
+    safeLog(log)(`verdict-ledger-outbox: releasing the flusher lock on ${dir} failed (${e?.message ?? e}); its lease expires on its own`);
   }
 }
 
