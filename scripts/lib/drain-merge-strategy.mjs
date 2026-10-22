@@ -258,7 +258,7 @@ export function createDrainMergeStrategy({
   const deadline = redTeamDeadline ?? readRedTeamDeadlineAction({ env, log: line => log.write(`  ${line}\n`) });
   const deadlineAction = deadline.value?.deadlineAction ?? 'requeue-then-hold';
   // The real operator feed is never written from a test run unless the test injects its own publisher.
-  const publishNote = publishNeedsYou ?? (isUnderTest(env) ? null : item => publishAttention(item));
+  const publishNote = publishNeedsYou ?? (isUnderTest(env) || isUnderTest(process.env) ? null : item => publishAttention(item));
   const pendingOutcome = (c, pending, quiet = false) => {
     const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
     const healthSmell = now() - pending.firstPendingAt >= maxMin * 60_000;
