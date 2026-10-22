@@ -181,7 +181,7 @@ export function readLedgerFromGit({
   try {
     // No `--prune`: a ledger-only ref deleted on the remote stays readable from its last fetched copy (its rows stay
     // visible), while every WRITE fetches its target by an exact refspec and so fails instead of re-creating it.
-    retryTransientGit(() => run(['fetch', '--quiet', 'origin', ledgerFetchRefspec(LEGACY_LEDGER_BRANCH), ledgerFetchRefspec(newRef)], { cwd: board }));
+    retryTransientGit(() => run(['fetch', '--quiet', 'origin', ledgerFetchRefspec(LEGACY_LEDGER_BRANCH), ledgerFetchRefspec(newRef, { required: plan.requireNew })], { cwd: board }));
     newTip = trackingTip(run, board, newRef);
     if (!newTip && plan.requireNew) {
       return { status: 'unreadable', reason: 'required-ledger-ref-absent', error: `${newRef} is the ledger write ref (cutover on) but does not exist on origin` };
@@ -256,12 +256,13 @@ export function appendLedgerRows({
   // Either way it must be an allow-listed ledger ref, checked before any record is serialized or any git call.
   const { settings: refSettingsLayer, env: refEnv = process.env, log: refLog } = seams;
   let dedupeAlso = null;
+  let fence = null;
   if (branch === undefined) {
     let repoLayer;
     try { repoLayer = refSettingsLayer ?? readSettings(); } catch { repoLayer = {}; }
     const refs = resolveLedgerRefSettings({ repo: repoLayer, env: refEnv });
     logOnce(formatLedgerRefSettings(refs), refLog ?? defaultLog);
-    ({ branch, dedupeAlso } = ledgerWritePlan(refs));
+    ({ branch, dedupeAlso, fence } = ledgerWritePlan(refs));
   }
   const pushRef = ledgerPushRefFor(branch);
   assertPushRef(branch, pushRef); // a wrong ref writes nothing
@@ -283,7 +284,7 @@ export function appendLedgerRows({
     try {
       const dir = outboxDir ?? outboxDirFor({ board, env, ...(gitRun ? { run: gitRun } : {}) });
       return appendViaOutbox({
-        board, branch, dir, repo, path, lines, ids, message, settings: cascade, allowRef: pushRef, dedupeAlso,
+        board, branch, dir, repo, path, lines, ids, message, settings: cascade, allowRef: pushRef, dedupeAlso, fence,
         run: gitRun ?? transport.run, now: transport.now, sleep, random, log, onRetry, removeEntry,
       });
     } catch (e) {
@@ -296,7 +297,7 @@ export function appendLedgerRows({
   // call's rows only. Still computed against the tip it races, still never forced, still loud on exhaustion.
   try {
     return appendDirect({
-      board, branch, repo, path, lines, ids, message, attempts, allowRef: pushRef, settings: cascade, dedupeAlso,
+      board, branch, repo, path, lines, ids, message, attempts, allowRef: pushRef, settings: cascade, dedupeAlso, fence,
       run: transport.run ?? gitRun, sleep, random, log, onRetry,
     });
   } catch (e) {

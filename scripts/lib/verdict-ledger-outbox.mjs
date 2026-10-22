@@ -414,7 +414,7 @@ function readBlobAt(run, board, tip, path, env) {
  * A failure of the PUSH command itself carries `phase: 'publish'` and the `commit`, so the caller can reconcile:
  * a push can land on the remote and still report failure (a dropped connection after the remote accepted it).
  */
-function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined, dedupeAlso = null }) {
+function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined, dedupeAlso = null, fence = null }) {
   const ref = assertPushRef(branch, allowRef);
   const env = boardEnv(board);
   assertSingleDestination({ board, run, env });
@@ -423,10 +423,18 @@ function pushBatch({ board, branch, entries, run, allowRef, sleep = undefined, d
   // THERE is never appended HERE. The target keeps its exact refspec: an absent target fails the fetch, so a writer can
   // never create a ref. Unreadable other ref -> this attempt fails before anything is pushed.
   if (dedupeAlso && (!ALLOWED_LEDGER_BRANCHES.includes(dedupeAlso) || dedupeAlso === branch)) throw new Error(`verdict-ledger-outbox: bad dedupe ref ${dedupeAlso}`);
+  if (fence && (fence.branch === branch || !ALLOWED_LEDGER_BRANCHES.includes(fence.branch))) throw new Error(`verdict-ledger-outbox: bad fence ref ${fence.branch}`);
   const fetchArgs = dedupeAlso
     ? ['fetch', '--quiet', '--prune', 'origin', trackingRefspec(branch), ledgerFetchRefspec(dedupeAlso)]
-    : ['fetch', '--quiet', 'origin', trackingRefspec(branch)];
+    : fence ? ['fetch', '--quiet', 'origin', trackingRefspec(branch), trackingRefspec(fence.branch)]
+      : ['fetch', '--quiet', 'origin', trackingRefspec(branch)];
   retryTransientGit(() => run(fetchArgs, { cwd: board, env }), sleep ? { sleep } : {});
+  if (fence) {
+    // THE RETIREMENT FENCE, on the write side too: a writer may skip the old ref only while its ledger tree is still
+    // exactly the pinned one. Moved -> refused before anything is pushed.
+    const tree = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${fence.branch}:verdict-ledger`], { cwd: board, env })).trim();
+    if (tree !== fence.tree) throw new Error(`verdict-ledger-outbox: refusing to write: ${fence.branch}:verdict-ledger is ${tree || '(missing)'}, not the retired ${fence.tree}`);
+  }
   const tip = String(run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}^{commit}`], { cwd: board, env })).trim();
   if (!/^[0-9a-f]{40,64}$/.test(tip)) throw new Error(`verdict-ledger-outbox: origin/${branch} did not resolve to a commit`);
   let otherTip = null;
@@ -575,7 +583,7 @@ function flushHeld(o) {
   }
 }
 
-function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, random, log, budgetMs, onRetry, removeEntry, allowRef, originKey, results, inMemory = [], dedupeAlso = null }) {
+function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, random, log, budgetMs, onRetry, removeEntry, allowRef, originKey, results, inMemory = [], dedupeAlso = null, fence = null }) {
   // ONE absolute deadline bounds every git call and every retry (audit round 4): no call starts once it has passed,
   // and none may run past it.
   const hardDeadline = Date.now() + budgetMs;
@@ -629,7 +637,7 @@ function flushHeldInner({ board, branch, dir, owner, run: rawRun, now, sleep, ra
       }
       attempts += 1;
       try {
-        landed = pushBatch({ board, branch, entries, run, allowRef, sleep: clampedSleep, dedupeAlso });
+        landed = pushBatch({ board, branch, entries, run, allowRef, sleep: clampedSleep, dedupeAlso, fence });
         break;
       } catch (e) {
         errors.push(e);
@@ -703,6 +711,7 @@ function common(o) {
     removeEntry: o.removeEntry ?? defaultRemove,
     allowRef: o.allowRef ?? null,
     dedupeAlso: o.dedupeAlso ?? null,
+    fence: o.fence ?? null,
   };
 }
 
@@ -767,10 +776,10 @@ export function flushBoardLedgerOutbox({ board, env = process.env, log: rawLog =
     // when an entry was queued: the current readers always read the current write ref, so that is where a queued row
     // is guaranteed to be seen (during a cutover the readers union both refs anyway).
     // During a cutover it also dedupes against the other ref, so an entry that already landed there is never replayed.
-    const { branch, dedupeAlso } = ledgerWritePlan(resolveLedgerRefSettings({ repo: repoLayer, env }));
+    const { branch, dedupeAlso, fence } = ledgerWritePlan(resolveLedgerRefSettings({ repo: repoLayer, env }));
     dir = outboxDirFor({ board, env, ...(run ? { run } : {}) });
     if (!listOutboxEntries(dir).length) return { ok: true, flushed: 0, pushed: false, attempts: 0, dir };
-    return { ...flushLedgerOutbox({ board, dir, settings, log, run, branch, allowRef: ledgerPushRefFor(branch), dedupeAlso }), dir };
+    return { ...flushLedgerOutbox({ board, dir, settings, log, run, branch, allowRef: ledgerPushRefFor(branch), dedupeAlso, fence }), dir };
   } catch (e) {
     const msg = `ledger-write-miss: verdict-ledger outbox backstop for ${board} failed: ${String(e?.message ?? e).split('\n')[0]}`;
     log(msg);
@@ -988,7 +997,7 @@ export function appendDirect(o) {
   const { run, clampedSleep } = deadlineBound(c.run, c.sleep, directDeadline, c.budgetMs);
   for (let attempt = 1; ; attempt += 1) {
     try {
-      const out = pushBatch({ board: c.board, branch: c.branch, entries: [{ name: 'direct', entry }], run, allowRef: c.allowRef, sleep: clampedSleep, dedupeAlso: c.dedupeAlso });
+      const out = pushBatch({ board: c.board, branch: c.branch, entries: [{ name: 'direct', entry }], run, allowRef: c.allowRef, sleep: clampedSleep, dedupeAlso: c.dedupeAlso, fence: c.fence });
       const mine = out.counts.get('direct');
       return { status: 'appended', attempts: attempt, rows: mine.rows, duplicates: mine.duplicates };
     } catch (e) {

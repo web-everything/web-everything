@@ -56,7 +56,7 @@ describe('ledger-ref settings: a cascade, defaults = today, logged with sources'
     expect(s).toMatchObject({ ref: NEW, cutover: 'off', retiredOldTree: null, writeBranch: OLD });
     expect(s.sources).toEqual({ ref: 'standard', cutover: 'standard', retiredOldTree: 'standard' });
     expect(ledgerReadPlan(s)).toEqual({ newRef: NEW, requireNew: false, fence: null });
-    expect(ledgerWritePlan(s)).toEqual({ branch: OLD, dedupeAlso: NEW });
+    expect(ledgerWritePlan(s)).toEqual({ branch: OLD, dedupeAlso: NEW, fence: null });
     expect(formatLedgerRefSettings(s)).toMatch(/cutover=off \(standard\).*writes -> ops\/review-requests; reads -> ops\/review-requests, plus ops\/verdict-ledger whenever it exists$/);
   });
 
@@ -65,7 +65,7 @@ describe('ledger-ref settings: a cascade, defaults = today, logged with sources'
     const s = resolveLedgerRefSettings({ repo: cfg({ cutover: 'off', retiredOldTree: PIN }), env: { [LEDGER_CUTOVER_ENV]: 'on' } });
     expect(s).toMatchObject({ cutover: 'on', retiredOldTree: PIN, writeBranch: NEW, sources: { cutover: 'env', retiredOldTree: 'repo' } });
     expect(ledgerReadPlan(s)).toEqual({ newRef: NEW, requireNew: true, fence: { branch: OLD, tree: PIN } });
-    expect(ledgerWritePlan(s)).toEqual({ branch: NEW, dedupeAlso: null });
+    expect(ledgerWritePlan(s)).toEqual({ branch: NEW, dedupeAlso: null, fence: { branch: OLD, tree: PIN } });
     const offPin = resolveLedgerRefSettings({ repo: cfg({ retiredOldTree: PIN }), env: {} });
     expect(offPin.retiredOldTree).toBe(null);
     expect(offPin.overridden).toEqual([expect.stringMatching(/retiredOldTree ignored/)]);
@@ -77,7 +77,7 @@ describe('ledger-ref settings: a cascade, defaults = today, logged with sources'
   it('cutover on without a pin reads the union and dedupes against the old ref', () => {
     const s = resolveLedgerRefSettings({ repo: cfg({ cutover: 'on' }), env: {} });
     expect(ledgerReadPlan(s)).toEqual({ newRef: NEW, requireNew: true, fence: null });
-    expect(ledgerWritePlan(s)).toEqual({ branch: NEW, dedupeAlso: OLD });
+    expect(ledgerWritePlan(s)).toEqual({ branch: NEW, dedupeAlso: OLD, fence: null });
   });
 
   it('a setting can never aim a ledger push outside the allow-list; the new ref is fetched by a glob, the old exactly', () => {
@@ -86,6 +86,7 @@ describe('ledger-ref settings: a cascade, defaults = today, logged with sources'
     expect(ledgerPushRefFor(NEW)).toBe(`refs/heads/${NEW}`);
     expect(ledgerFetchRefspec(OLD)).toBe(`+refs/heads/${OLD}:refs/remotes/origin/${OLD}`);
     expect(ledgerFetchRefspec(NEW)).toBe(`+refs/heads/${NEW}*:refs/remotes/origin/${NEW}*`);
+    expect(ledgerFetchRefspec(NEW, { required: true })).toBe(`+refs/heads/${NEW}:refs/remotes/origin/${NEW}`);
   });
 });
 
@@ -149,7 +150,7 @@ describe('real git: dual read + writer switch + migration', () => {
       append(ctx, [1]);
       expect(() => append(ctx, [2], cfg({ cutover: 'on' }))).toThrow();
       expect(originHas(ctx, NEW)).toBe(false);
-      expect(read(ctx, cfg({ cutover: 'on' }))).toMatchObject({ status: 'unreadable', reason: 'required-ledger-ref-absent' });
+      expect(read(ctx, cfg({ cutover: 'on' })).status).toBe('unreadable'); // the exact fetch of the write ref fails
       expect(read(ctx).status).toBe('ok'); // writers still on the old ref: today's read
     });
   });
@@ -190,6 +191,10 @@ describe('real git: dual read + writer switch + migration', () => {
       append(ctx, [8]); // off-mode writer: also absorbs the new-only rows 5, 6 into the old ref first
       expect(onOrigin(ctx, OLD)).toEqual([1, 2, 3, 4, 5, 6, 8]);
       expect(read(ctx, retired)).toMatchObject({ status: 'unreadable', reason: 'retired-ref-moved' });
+      // ...and a pinned WRITER refuses too (audit round 4): it may skip the old ref only while the fence holds.
+      const newBefore = originTip(ctx, NEW);
+      expect(() => append(ctx, [20], retired)).toThrow(/not the retired/);
+      expect(originTip(ctx, NEW)).toBe(newBefore);
       // Kill switch = cutover off: readers keep the union, nothing written to the new ref vanishes; a replay of a
       // row that already landed on the new ref is not appended to the old one again.
       append(ctx, [5]);
@@ -231,6 +236,20 @@ describe('real git: dual read + writer switch + migration', () => {
       append(ctx, [13], cfg({ cutover: 'on' }));
       expect(onOrigin(ctx, NEW)).toEqual([1, 11, 12, 13]);
       expect(read(ctx, cfg({ cutover: 'on' })).status).toBe('ok');
+    });
+  });
+
+  it('cutover on: a ledger-only ref deleted on the remote is unreadable, never read from a stale local copy (audit round 4)', async () => {
+    await withBareOrigin(async (ctx) => {
+      seedLegacy(ctx);
+      append(ctx, [1]);
+      migrate(ctx);
+      append(ctx, [2], cfg({ cutover: 'on' }));
+      expect(read(ctx, cfg({ cutover: 'on' })).status).toBe('ok'); // leaves a remote-tracking copy behind
+      git(['update-ref', '-d', `refs/heads/${NEW}`], { cwd: ctx.origin });
+      expect(read(ctx, cfg({ cutover: 'on' })).status).toBe('unreadable');
+      expect(() => append(ctx, [3], cfg({ cutover: 'on' }))).toThrow();
+      expect(originHas(ctx, NEW)).toBe(false); // a writer never re-creates it
     });
   });
 

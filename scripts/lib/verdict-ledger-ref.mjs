@@ -67,8 +67,10 @@ export function ledgerPushRefFor(branch) {
  * glob that matches nothing is not a fetch error, so one fetch learns both "the new ref's tip" and "there is no new
  * ref" without failing today's read. The old ref keeps its exact refspec (its absence stays a read failure, as today).
  */
-export function ledgerFetchRefspec(branch) {
-  if (branch === LEGACY_LEDGER_BRANCH) return `+refs/heads/${branch}:refs/remotes/origin/${branch}`;
+export function ledgerFetchRefspec(branch, { required = false } = {}) {
+  // `required` (cutover on: writers write it): EXACT, so a ref deleted on the remote fails the fetch instead of being
+  // read from a stale remote-tracking copy (audit round 4).
+  if (branch === LEGACY_LEDGER_BRANCH || required) return `+refs/heads/${branch}:refs/remotes/origin/${branch}`;
   ledgerPushRefFor(branch);
   return `+refs/heads/${branch}*:refs/remotes/origin/${branch}*`;
 }
@@ -126,12 +128,14 @@ export function ledgerReadPlan(s) {
 /**
  * PURE: where a write goes, and which OTHER ref its rows are deduped against WHEN THAT REF EXISTS (the writer learns
  * that from the same fetch). Retired old ref: every old row is on the new ref (the pin's precondition), so the new
- * ref's own ids suffice.
- * @returns {{branch: string, dedupeAlso: string|null}}
+ * ref's own ids suffice — but ONLY while the fence holds: every pinned write first checks the old ref's ledger tree
+ * still equals the pin and refuses otherwise (audit round 4: a straggler after retirement must stop writes too).
+ * @returns {{branch: string, dedupeAlso: string|null, fence: {branch: string, tree: string}|null}}
  */
 export function ledgerWritePlan(s) {
-  if (s.cutover === 'on') return { branch: s.ref, dedupeAlso: s.retiredOldTree ? null : LEGACY_LEDGER_BRANCH };
-  return { branch: LEGACY_LEDGER_BRANCH, dedupeAlso: s.ref };
+  if (s.cutover === 'on' && s.retiredOldTree) return { branch: s.ref, dedupeAlso: null, fence: { branch: LEGACY_LEDGER_BRANCH, tree: s.retiredOldTree } };
+  if (s.cutover === 'on') return { branch: s.ref, dedupeAlso: LEGACY_LEDGER_BRANCH, fence: null };
+  return { branch: LEGACY_LEDGER_BRANCH, dedupeAlso: s.ref, fence: null };
 }
 
 /** A row's identity: its event id when it carries one, else its exact (trimmed) line. */
