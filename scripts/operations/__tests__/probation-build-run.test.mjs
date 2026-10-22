@@ -144,6 +144,35 @@ function fakeIo({
 // that needs a DIFFERENT scope (or none) overrides it via `extra.scope` (including `''`, which parses to `[]`).
 const args = (worker = codex, extra = {}) => parseArgs(['--num=4291', '--session=probation-4291', `--worker=${JSON.stringify(worker)}`, '--lane=22', '--scope=we:docs/probation/probation.md', ...Object.entries(extra).map(([k, v]) => `--${k}=${v}`)]);
 
+describe('shared direct-launch post-run checks', () => {
+  it('discards an audit rejection and records its outcome for redispatch', async () => {
+    const { io, calls } = fakeIo();
+    const rows = [];
+    io.appendScorecard = row => rows.push(row);
+    io.postRunChecks = input => {
+      expect(input).toMatchObject({ dir: '/lanes/22', base: 'base-sha', scope: ['docs/probation/probation.md'], preexisting: ['node_modules'] });
+      return { accepted: false, outcome: 'rejected:audit', reason: 'weakened: removed assertion' };
+    };
+    const result = await runProbationBuild(args(), io);
+    expect(result.outcome).toBe('gate-red');
+    expect(result.detail).toMatch(/^rejected:audit — /);
+    expect(calls).toContainEqual(['discard', 'base-sha']);
+    expect(calls.some(c => c[0] === 'resolve')).toBe(false);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].postRunCheck).toBe('rejected:audit');
+  });
+  it('records accepted checks on a successful launch', async () => {
+    const { io } = fakeIo();
+    const rows = [];
+    io.appendScorecard = row => rows.push(row);
+    io.postRunChecks = () => ({ accepted: true, outcome: 'accepted', reason: 'all checks passed' });
+    const result = await runProbationBuild(args(), io);
+    expect(result.outcome).toBe('opened-pr');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].postRunCheck).toBe('accepted');
+  });
+});
+
 describe('Argon feature build checker boundary', () => {
   it.each(['APPROVE', 'REJECT', 'unparseable'])('requires Codex approval before delivering a non-simple feature: %s', async verdict => {
     const { io, calls } = fakeIo({ itemScope: ['we:scripts/feature.mjs'], numstat: '20\t1\tscripts/feature.mjs' });

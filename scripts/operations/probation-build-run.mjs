@@ -91,6 +91,7 @@ import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repo
 import { hookSurfaceChanged, resetHookSurface, snapshotHookSurface, withHooksDisabled } from '../lib/git-hook-surface.mjs';
 import { AGY_CLAUDE_MODEL_BY_TIER, PROBATION_ROSTER, PROBATION_WORKERS, PROVEN_TASK_ENVELOPES, probationWorkerForRoute, isStatuteTierPath } from '../lib/provider-routing.mjs';
 import { resolveBuildArgonModel } from '../lib/build-argon-settings.mjs';
+import { runPostRunChecks } from '../lib/direct-launch-checks.mjs';
 import { isDocScopePath } from '../lib/dispatch-task-type.mjs';
 import {
   buildCheckerArgv, parseCheckerVerdict, buildDocFixCommitMessage, buildDocFixTask, buildWorkerArgv, frontmatterTamperedBeyondClaim, PREPARE_OWNED_FRONTMATTER_KEYS,
@@ -323,7 +324,7 @@ export async function runProbationBuild(args, io) {
     // found is not a trial of it.
     if (executor === resultWorker.executor) {
       io.appendScorecard({ ...launchScorecardRow({
-        worker: { ...resultWorker, taskType }, modelEvidence, checker: checkerRow, pr: row.pr ?? null, repo: REPO_SLUG, handle: session, item: num, launchOutcome: outcome, diff: row.diff ?? null,
+        worker: { ...resultWorker, taskType }, modelEvidence, checker: checkerRow, postRunCheck: row.postRunCheck ?? postRunCheck, pr: row.pr ?? null, repo: REPO_SLUG, handle: session, item: num, launchOutcome: outcome, diff: row.diff ?? null,
       }), ...failure });
     }
     if (declinedReason) detail = `worker-declined: ${declinedReason} — ${detail}`;
@@ -344,6 +345,7 @@ export async function runProbationBuild(args, io) {
   // three variables as the only state the catch needs — closes that for every call, not just the ones a
   // reviewer happened to name.
   let checkerRow = null;
+  let postRunCheck = null;
   let lanePath = null;
   let baseSha = null;
   let preexisting = [];
@@ -697,6 +699,24 @@ export async function runProbationBuild(args, io) {
             return abandon('escalated-needs-human', `refused: checker changed the git-hook surface: ${checkerHooks.reason}`, { diff: diffRow });
           }
           if (!verdict.approved) return abandon('gate-red', `the ${resultWorker.checker} checker did not approve: ${verdict.reason}`, { diff: diffRow });
+        }
+
+        if (!preparing) {
+          if (io.postRunChecks) {
+            // Scope = the card's plain entries plus the paths the allowlist above already accepted (its sibling-test
+            // globs and owned new tests), so a FRESH re-read of the diff (tracked + untracked) must be a subset of
+            // what was vetted. The claimed card and pre-existing untracked files are not the worker's diff.
+            const r = await io.postRunChecks({ dir: lanePath, base: baseSha, brief: item.spec,
+              scope: [...new Set([...scopeEntries.filter((e) => !e.includes('*')), ...summary.paths.filter((p) => allowed(p, scopeEntries))])],
+              preexisting: excludeFromDiff, envelope: PROVEN_TASK_ENVELOPES[taskType] });
+            const auditHooks = hookSurfaceChanged(postHookSurface, io.snapshotHookSurface(lanePath));
+            if (auditHooks.changed) {
+              if (!io.resetHookSurface(lanePath, preHookSurface).clean) baseSha = null;
+              return abandon('escalated-needs-human', `refused: post-run audit changed the git-hook surface: ${auditHooks.reason}`, { diff: diffRow });
+            }
+            if (!r.accepted) return abandon('gate-red', `${r.outcome} — ${r.reason}`, { diff: diffRow, postRunCheck: r.outcome });
+            postRunCheck = 'accepted';
+          } else log('post-run checks unavailable');
         }
 
         const resolved = preparing ? validateAndStampPrepare(num, postWorkerItem, lanePath, io, prepareAutoSize) : io.resolveItem(num, lanePath);
@@ -1078,6 +1098,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       // Redact before taking a tail: otherwise a cut can remove a token's identifying prefix.
       return { modelEvidence: parseAgyReportEvidence(r.stdout ?? r.out), ok: r.ok, out: redactSecrets(r.out).slice(-4000), lastMessage: typeof lastMessage === 'string' ? lastMessage : '' };
     },
+    postRunChecks: (options) => runPostRunChecks({ ...options, weRoot: WE_ROOT }),
     runChecker: (argv, dir) => {
       const r = trySh(process.execPath, argv, { cwd: dir, env: workerEnv, timeout: 20 * 60 * 1000 });
       if (!r.ok) return '';
