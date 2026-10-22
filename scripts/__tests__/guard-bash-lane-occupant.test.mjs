@@ -14,7 +14,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSy
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { decide, destructiveLaneTargets, laneOccupantReason } from '../guard-bash.mjs';
-import { laneDestructiveOpVerdict } from '../lib/lane-lease.mjs';
+import { laneDestructiveOpVerdict, leaseRenewalOnUse } from '../lib/lane-lease.mjs';
+import { readLaneLeaseSettings, renewLeaseOnUse } from '../lib/lane-lease-renew.mjs';
 
 const GUARD = resolve(process.cwd(), 'scripts/guard-bash.mjs');
 const NOW = Date.parse('2026-10-22T09:52:39Z');
@@ -138,6 +139,26 @@ describe('laneDestructiveOpVerdict — the pure table', () => {
   });
 });
 
+describe('leaseRenewalOnUse — liveness follows the occupant', () => {
+  it('renews for the declared occupant or the matching slug, after the throttle window', () => {
+    const lease = ownLive({ acquiredAt: iso(NOW - 10 * MIN) });
+    expect(leaseRenewalOnUse({ lease, mySessionId: AGENT_SESSION, nowMs: NOW, throttleMs: 5 * MIN })).toMatchObject({ renewedAt: iso(NOW), renewedBy: 'occupant' });
+    expect(leaseRenewalOnUse({ lease, mySessionId: 'other', assertedSlug: 'mine-lane-15-aaaaaaaa', nowMs: NOW, throttleMs: 5 * MIN })).toMatchObject({ renewedBy: 'holder-slug' });
+  });
+  it('never for someone else, never inside the throttle window, never a stale or reserved lease', () => {
+    expect(leaseRenewalOnUse({ lease: lane7Fix(), mySessionId: AGENT_SESSION, assertedSlug: OLD_LANE7_SLUG, nowMs: NOW })).toBeNull();
+    expect(leaseRenewalOnUse({ lease: ownLive({ acquiredAt: iso(NOW - 2 * MIN) }), mySessionId: AGENT_SESSION, nowMs: NOW, throttleMs: 5 * MIN })).toBeNull();
+    expect(leaseRenewalOnUse({ lease: lane21Stale(), mySessionId: AGENT_SESSION, nowMs: NOW })).toBeNull();
+    expect(leaseRenewalOnUse({ lease: ownLive({ reserved: true }), mySessionId: AGENT_SESSION, nowMs: NOW })).toBeNull();
+  });
+  it('settings resolve through the cascade with their source; an invalid env value never wins', () => {
+    expect(readLaneLeaseSettings({ env: {}, read: () => ({}), platform: null })).toMatchObject({ value: { renewOnUseMinutes: 5 }, sources: { renewOnUseMinutes: 'standard' } });
+    expect(readLaneLeaseSettings({ env: {}, read: () => ({ laneLease: { renewOnUseMinutes: 7 } }), platform: null }).sources.renewOnUseMinutes).toBe('tool');
+    expect(readLaneLeaseSettings({ env: { WE_LANE_LEASE_RENEW_MINUTES: '9' }, read: () => ({}), platform: null }).value.renewOnUseMinutes).toBe(9);
+    expect(readLaneLeaseSettings({ env: { WE_LANE_LEASE_RENEW_MINUTES: '0' }, read: () => ({}), platform: null }).value.renewOnUseMinutes).toBe(5);
+  });
+});
+
 describe('the hook itself, on a real lane layout (CLI)', () => {
   let root, lanes;
   const write = (lane, lease) => {
@@ -170,5 +191,34 @@ describe('the hook itself, on a real lane layout (CLI)', () => {
     // lane-7's lease is untouched — the old holder's call never renews someone else's lease
     expect(lease('lane-7').renewedAt).toBeUndefined();
   });
-
+  it('the holder\'s own slug in its own live lane is allowed and renews the lease (heartbeat)', () => {
+    const before = lease('lane-15');
+    const out = runHook(`cd ${lanes}/lane-15 && LANE_SESSION=mine-lane-15-aaaaaaaa git reset --hard origin/main`, root);
+    expect(denied(out)).toBe(false);
+    const after = lease('lane-15');
+    expect(after.renewedAt).toBeTruthy();
+    expect(after.holder).toBe(before.holder);
+    expect(after.acquiredAt).toBe(before.acquiredAt);
+  });
+  it('any allowed call by the declared occupant renews; a stale lease is never revived', () => {
+    runHook('git status', join(lanes, 'lane-15'));
+    expect(lease('lane-15').renewedBy).toBe('occupant');
+    runHook('git status', join(lanes, 'lane-21'));
+    expect(lease('lane-21').renewedAt).toBeUndefined();
+  });
+  it('renewLeaseOnUse writes once, then throttles', () => {
+    const laneRoot = join(lanes, 'lane-15');
+    const r = renewLeaseOnUse({ laneRoot, mySessionId: AGENT_SESSION, settings: { renewOnUseMinutes: 1 } });
+    expect(r?.renewedAt).toBeTruthy();
+    expect(renewLeaseOnUse({ laneRoot, mySessionId: AGENT_SESSION, settings: { renewOnUseMinutes: 1 } })).toBeNull(); // throttled
+  });
+  it("after an occupancy hand-off to B, A's use never renews or rewrites the lease (codex audit r1)", () => {
+    const laneRoot = join(lanes, 'lane-15');
+    const file = join(laneRoot, '.git', '.lane-lease');
+    const orig = readFileSync(file, 'utf8');
+    const adopted = { ...JSON.parse(orig), workerSession: 'B' };
+    writeFileSync(file, JSON.stringify(adopted));
+    expect(renewLeaseOnUse({ laneRoot, mySessionId: AGENT_SESSION, settings: { renewOnUseMinutes: 1 } })).toBeNull();
+    expect(lease('lane-15').workerSession).toBe('B');
+  });
 });

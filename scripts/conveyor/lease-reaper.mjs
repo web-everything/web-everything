@@ -1041,9 +1041,9 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  * observer's smaller `DISPATCH_LISTING_GRACE_MINUTES` (2 minutes) DELIBERATELY: that constant's own docblock
  * picks its window by the COST of being wrong, and a wrong guard answer here is the identical failure shape
  * (releases a lane a live agent still holds) the guard constant was calibrated for — not the observer's cheap
- * "reports unresolved, writes nothing" mistake. The grace check applies ONLY to the absence branch: a session
- * that IS listed with a terminal state is a direct, positive observation, not an inference from silence, so it
- * needs no age check.
+ * "reports unresolved, writes nothing" mistake. The 2026-10-22 lane-10 incident showed reused names
+ * (fix-<PR>) can list a previous round's terminal/dead-pid row before this round starts. Those two
+ * signals also require acquiredAt to outlive graceMs; renewedAt does not affect that window.
  *
  * WHY A LISTED TERMINAL STATE OR AN AGED-OUT ABSENCE IS STILL SAFE EVEN ON A TRANSIENT MISS. A released-but-
  * still-live lane is not immediately destroyed: `lane-pool.mjs release` only drops the marker (`lane-lease.mjs`'s
@@ -1064,7 +1064,7 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  *   `ownerAlive` (#xbk2is9) = whether the lease's declared occupant (`workerSession`) is confirmed alive in the
  *   same listing (see {@link ownerSessionAliveForLease}) — `null` when not supplied or unknown (back-compat with
  *   every pre-#xbk2is9 caller). Consulted ONLY in the absence branch below, and ONLY there: it can never override
- *   a REAL, direct death signal about this lease's own TRACKED session — `pidAlive === false`, or the session
+ *   an aged death signal about this lease's TRACKED session — `pidAlive === false`, or the session
  *   listed in a terminal state — because those are positive evidence about the actual worker, while
  *   `ownerAlive` is a proxy (`workerSession`) that can legitimately outlive the one delivery agent a lease was
  *   minted for — see {@link ownerSessionAliveForLease}'s own "known, accepted trade-offs" note
@@ -1087,11 +1087,10 @@ export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DIS
   // gate this check actually means; it matches every kind `parseSessionSlug` accepts, item or PR alike.
   if (!session || !isDispatcherMintedSession(session)) return null; // not a dispatcher-minted name — don't guess
   if (!(sessionStates instanceof Map)) return null; // listing unavailable/all-empty this pass — axis off
-  // #3383 — a REAL, direct death signal wins outright: no grace window (it is not an inference from silence),
-  // and it fires even when the row is LISTED with a non-terminal state (the phantom shape neither branch below
-  // can see — see the docblock above). Deliberately checked BEFORE `ownerAlive` — see the `ownerAlive` @param
-  // doc above for why.
-  if (pidAlive === false) return true;
+  const acquiredAtMs = Date.parse(lease?.acquiredAt);
+  const young = typeof nowMs === 'number' && !Number.isNaN(acquiredAtMs) && nowMs - acquiredAtMs < graceMs;
+  // A dead row can belong to a previous round of this reused session name.
+  if (pidAlive === false) return young ? null : true;
   if (!sessionStates.has(session)) {
     // #xbk2is9 — A HAND-BRIEFED (in-process Agent-tool) DELIVERY AGENT'S LEASE IS HELD BY AN INTERACTIVE
     // SESSION, NOT A `claude --bg` ONE, so this exact `session` name is never separately listed even though it
@@ -1105,9 +1104,9 @@ export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DIS
     if (nowMs - acquiredAtMs < graceMs) return null; // too young — not yet listed is not the same as gone
     return true; // aged past the grace window and still never listed — gone
   }
-  // A listed row — terminal or not — is a DIRECT, positive observation about THIS session's own process,
-  // never overridden by `ownerAlive` (same reasoning as the `pidAlive` ordering above).
-  return AGENT_GONE_STATES.has(sessionStates.get(session));
+  // Listed terminal rows also need grace for reused names; ownerAlive still applies only to absence.
+  const terminal = AGENT_GONE_STATES.has(sessionStates.get(session));
+  return terminal && young ? null : terminal;
 }
 
 /**
@@ -1440,15 +1439,22 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
   };
 }
 
+/** Carry the judged identity into release, including acquiredAt for pre-holder leases. */
+export function judgedLeaseReleaseOptions(candidate) {
+  return { reason: candidate.reason, expectHolder: candidate.lease?.holder, expectAcquiredAt: candidate.lease?.acquiredAt };
+}
+
 /**
  * Delegate the actual reclamation to lane-pool's release (reserved-lane protection lives there). #4370 — the
  * child's journal line names the reaper (not a bare host:pid) and carries the reap classification as its
  * reason (`session-gone`, `pr-merged`, `ttl-stale`, …).
  */
-export function releaseLane(pool, lane, { reason = null, exec = execFileSync, cli = LANE_POOL_CLI, env = process.env } = {}) {
+export function releaseLane(pool, lane, { reason = null, expectHolder, expectAcquiredAt, exec = execFileSync, cli = LANE_POOL_CLI, env = process.env } = {}) {
   // #x5n4zn3 — was bare (no timeout): a real `lane-pool.mjs release` call, one per reaped lease.
   const argv = [cli, 'release', `--pool=${pool}`, `--lane=${lane}`, '--force'];
   if (reason) argv.push(`--reason=${reason}`);
+  if (expectHolder != null) argv.push(`--expect-holder=${expectHolder}`);
+  if (expectAcquiredAt != null) argv.push(`--expect-acquired-at=${expectAcquiredAt}`);
   exec('node', argv, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1521,7 +1527,7 @@ function main(argv) {
       continue;
     }
     try {
-      releaseLane(c.pool, c.lane, { reason: c.reason });
+      releaseLane(c.pool, c.lane, judgedLeaseReleaseOptions(c));
       log(`  reaped ${c.pool}/lane-${c.lane} (${c.reason}; was session ${c.lease?.session ?? 'unknown'})`);
       done.push({ pool: c.pool, lane: c.lane, reason: c.reason, session: c.lease?.session ?? null });
       reaped++;

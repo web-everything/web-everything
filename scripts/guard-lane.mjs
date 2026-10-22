@@ -257,6 +257,11 @@ if (process.argv[1] && realpathSyncSafe(process.argv[1]) === realpathSyncSafe(fi
         try { daemonRoots = daemonCloneRoots(workspaceRootOf(weRoot)); } catch { /* fail-open */ }
         const msg = laneGuardDecision(real, weRoot, { lease, mySessionId, daemonCloneRoots: daemonRoots });
         if (msg) { process.stderr.write('guard-lane: ' + msg + '\n'); process.exit(2); }
+        // lane-lease-occupant — an allowed write by the lane's declared occupant renews its lease (throttled; a
+        // stale lease is never revived). Never wedges the hook.
+        if (laneRoot && lease) {
+          try { (await import('./lib/lane-lease-renew.mjs')).renewLeaseOnUse({ laneRoot, mySessionId }); } catch { /* heartbeat only */ }
+        }
       }
     }
   } catch { /* fail-OPEN: a guard fault must never wedge the agent */ }
