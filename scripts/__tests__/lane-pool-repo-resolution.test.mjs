@@ -13,6 +13,7 @@ function resolveWith(branch, remoteHead) {
   const calls = [];
   const repo = runInNewContext(`${resolver}\nresolveRepo();`, {
     flags: { reference: '/reference', origin: '/origin.git', branch },
+    cmd: 'acquire',
     process: { cwd: () => '/checkout' },
     CWD_TOP_LEVEL: '/checkout', CHECKOUT_ROOT: '/checkout', POOL_ROOT: '/pool',
     LOCAL_GIT_TIMEOUT_MS: 1000,

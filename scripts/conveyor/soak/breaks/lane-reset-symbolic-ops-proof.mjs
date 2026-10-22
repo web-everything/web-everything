@@ -132,7 +132,10 @@ async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit',
 const { existsSync, writeFileSync } = require('node:fs');
 const { spawnSync } = require('node:child_process');
 const args = process.argv.slice(2);
-if (args[0] === 'ls-remote') {
+// Inspect the subcommand after transport hardening's global config flags; forward the original argv.
+const commandArgs = args.slice();
+while (commandArgs[0] === '-c') commandArgs.splice(0, 2);
+if (commandArgs[0] === 'ls-remote') {
   if (existsSync(${JSON.stringify(marker)})) {
     const changed = spawnSync(${JSON.stringify(realGit)}, ${JSON.stringify(mutation)}, { cwd: ${JSON.stringify(origin)} });
     if (changed.status !== 0) process.exit(1);
