@@ -1,10 +1,14 @@
 {
   "redTeam": {
-    "$comment": "statusLabels defaults true (WE_RED_TEAM_STATUS_LABELS override); head-bound derived status only, recorded results remain authoritative. skipCardOnly defaults true; card-only net diffs never schedule a pass.",
+    "$comment": "statusLabels defaults true (WE_RED_TEAM_STATUS_LABELS override); head-bound derived status only, recorded results remain authoritative. skipCardOnly defaults true; card-only net diffs never schedule a pass. rerequest: when the drain holds an owed head with no red-team result past its deadline it posts one head-bound re-request and starts a red-team-only job; enabled (standard true, env WE_RED_TEAM_REREQUEST=off is the kill switch) and maxRequestsPerHead (standard 1, 0-5, env WE_RED_TEAM_REREQUEST_MAX_PER_HEAD) resolve standard < platform < tool < env with sources logged. A request is never a result: the PR stays held.",
     "confirmedBreaks": {
       "broken": "send-back",
       "degraded": "card",
       "unconfirmed": "advisory"
+    },
+    "rerequest": {
+      "enabled": true,
+      "maxRequestsPerHead": 1
     }
   }
 }
