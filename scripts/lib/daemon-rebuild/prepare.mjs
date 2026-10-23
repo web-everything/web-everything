@@ -74,7 +74,11 @@ export async function prepareRebuild({
         && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled) {
         await autoRebase.finishPendingSwaps({ root, env, run, removeOverlay, appendOverlayEvent });
       }
-    } catch { /* best effort; preserve pending evidence */ }
+    } catch (error) {
+      const detail = realAutoRebase.reportNeedsYou({ root, env: stEnv, ref: 'pending-swaps', stage: 'swap', error, now: nowIso });
+      alertsList.push({ kind: 'auto-rebase-needs-you', detail });
+      log?.error?.(`daemon-rebuild: auto-rebase-needs-you ${JSON.stringify(detail)}`);
+    }
   };
 
   // ── Step 0: recovery ──────────────────────────────────────────────────────────────────────────────────
