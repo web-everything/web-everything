@@ -45,18 +45,22 @@ afterEach(() => vi.restoreAllMocks());
 
 describe('deterministic first-match judge classification', () => {
   it.each([
-    ['at-or-near-cap', { round: 4, fixerRunning: true }],
+    ['at-cap', { round: 5 }],
+    ['at-cap', { labels: ['status:round-limit'] }],
     // At a known cap the first rule wins. This gate record also catches an unreadable current round.
     ['red-team-blocked-at-cap', { round: null, redTeam: { state: 'blocked', latestOutcome: 'round-cap' } }],
     ['finding-back-unfixed-more-than-once', { verdictHistory: [{ findings: [{ key: 'k' }] }, { findings: [{ key: 'k' }] }] }],
     ['clean-and-owed-approval', { labels: ['review:human'], latestVerdict: { accepted: true }, redTeam: { state: 'clear' } }],
     ['stalled>45min-no-owner', { minutesSinceUpdate: 46 }],
-    ['fixer running', { fixerRunning: true }],
+    ['fixer running', { fixerRunning: true, round: 5 }],
+    ['fix-loop active (<60 min)', { minutesSinceFixLoop: 59, round: 5 }],
+    ['waiting on review', { round: 4 }],
+    ['in CI', { inCi: true, round: 5 }],
     ['in CI', { inCi: true }],
     ['waiting on review', {}],
   ])('%s', (reason, patch) => {
     expect(needsJudgment(facts(patch))).toEqual({ reason,
-      needsJudgment: !['fixer running', 'in CI', 'waiting on review'].includes(reason) });
+      needsJudgment: !['fixer running', 'in CI', 'waiting on review', 'fix-loop active (<60 min)'].includes(reason) });
   });
   it('does not confuse nonconsecutive findings or missing red-team evidence with a clean approval', () => {
     expect(needsJudgment(facts({ verdictHistory: [{ findings: [{ key: 'k' }] }, { findings: [] }, { findings: [{ key: 'k' }] }] })).needsJudgment).toBe(false);
@@ -97,11 +101,11 @@ describe('injected reader and shared evidence readers', () => {
     for (const field of ['labels', 'headRefOid', 'baseRefOid', 'updatedAt', 'files', 'author']) expect(args.at(-1)).toContain(field);
   });
   it('uses ledger rounds instead of a label guess and retains the latest fix-loop outcome', () => {
-    const f = fixture({ readLedgerRows: () => ['b', 'c', 'd'].map(h => ({ repo: REPO, pr: 1, type: 'review-run', headSha: h.repeat(40), at: at(20) })),
-      readFixRows: () => [{ repo: 'we', pr: 1, kind: 'fix', at: at(3) }, { repo: 'we', pr: 1, kind: 'outcome', outcome: 'no-change', at: at(2) },
-        { repo: 'frontierui', pr: 1, kind: 'outcome', outcome: 'pushed', at: at(1) }] });
-    expect(buildJudgeSweepBundle(f.read()).prs[0]).toMatchObject({ round: 4, cap: 5, reason: 'at-or-near-cap',
-      lastFixLoop: { kind: 'outcome', outcome: 'no-change', at: at(2) } });
+    const f = fixture({ readLedgerRows: () => ['b', 'c', 'd', 'e'].map(h => ({ repo: REPO, pr: 1, type: 'review-run', headSha: h.repeat(40), at: at(20) })),
+      readFixRows: () => [{ repo: 'we', pr: 1, kind: 'fix', at: at(80) }, { repo: 'we', pr: 1, kind: 'outcome', outcome: 'no-change', at: at(70) },
+        { repo: 'frontierui', pr: 1, kind: 'outcome', outcome: 'pushed', at: at(61) }] });
+    expect(buildJudgeSweepBundle(f.read()).prs[0]).toMatchObject({ round: 5, cap: 5, reason: 'at-cap',
+      lastFixLoop: { kind: 'outcome', outcome: 'no-change', at: at(70) } });
   });
   it('extracts findings/lens verdicts and detects a key present in consecutive published verdicts', () => {
     const f = fixture({ readComments: () => [advisory({ head: OLD, findings: [finding], minutes: 20 }), advisory({ findings: [finding] })] });
@@ -165,9 +169,12 @@ describe('injected reader and shared evidence readers', () => {
         statusCheckRollup: ci ? [{ name: 'test', status: 'IN_PROGRESS' }] : [],
       })]));
       const f = fixture({ gh, readJobs: () => fixer ? [{ repo: REPO, pr: 1, kind: 'fix-run' }] : [] });
-      expect(buildJudgeSweepBundle(f.read()).prs[0]).toMatchObject({ needsJudgment: true,
-        reason: 'evidence-unavailable: inspect PR evidence and rerun',
-        evidenceErrors: ['red-team label lacks live result evidence'] });
+      // Operator rule: a live fixer claim or CI in flight wins (noAction); the evidence gap is still reported.
+      expect(buildJudgeSweepBundle(f.read()).prs[0]).toMatchObject(ci || fixer
+        ? { needsJudgment: false, reason: fixer ? 'fixer running' : 'in CI',
+          evidenceErrors: ['red-team label lacks live result evidence'] }
+        : { needsJudgment: true, reason: 'evidence-unavailable: inspect PR evidence and rerun',
+          evidenceErrors: ['red-team label lacks live result evidence'] });
       expect(f.readComments).toHaveBeenCalledTimes(1);
       expect(gh).toHaveBeenCalledTimes(1);
     });

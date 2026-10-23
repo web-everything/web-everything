@@ -9,7 +9,12 @@ export const JUDGE_SWEEP_REPO = 'web-everything/web-everything';
 export function needsJudgment(pr) {
   const yes = reason => ({ needsJudgment: true, reason });
   const no = reason => ({ needsJudgment: false, reason });
-  if (Number.isInteger(pr.round) && Number.isInteger(pr.cap) && pr.round >= pr.cap - 1) return yes('at-or-near-cap');
+  // A live fixer claim, CI in flight, or a fix-loop event under 60 min old means the PR is moving: nothing to judge.
+  if (pr.fixerRunning) return no('fixer running');
+  if (pr.inCi) return no('in CI');
+  if (Number.isFinite(pr.minutesSinceFixLoop) && pr.minutesSinceFixLoop < 60) return no('fix-loop active (<60 min)');
+  const capHold = pr.labels.some(l => /round-limit|cap-exhausted/.test(l));
+  if (capHold || (Number.isInteger(pr.round) && Number.isInteger(pr.cap) && pr.round >= pr.cap)) return yes('at-cap');
   if (pr.redTeam?.latestOutcome === 'round-cap' && pr.redTeam.state === 'blocked'
     && (pr.round === null || pr.round >= pr.cap)) return yes('red-team-blocked-at-cap');
   const [latest, previous] = pr.verdictHistory ?? [];
@@ -24,8 +29,6 @@ export function needsJudgment(pr) {
   if (pr.minutesSinceUpdate > 45 && pr.fixerRunning === false && pr.owner === null) return yes('stalled>45min-no-owner');
   // Unknown is never silently classified as healthy. Operator fallback: inspect this PR's evidence and rerun.
   if (pr.evidenceErrors?.length) return yes('evidence-unavailable: inspect PR evidence and rerun');
-  if (pr.fixerRunning) return no('fixer running');
-  if (pr.inCi) return no('in CI');
   if (pr.owner) return no('owner present');
   if (pr.labels.includes('review:accepted')) return no('awaiting merge');
   if (pr.labels.includes('review:changes')) return no('waiting for fixes');

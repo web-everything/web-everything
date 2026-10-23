@@ -168,6 +168,8 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const result = { number: p.number, title: p.title, labels, headSha, round, cap: baseCap,
         redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,
         openReferrals: null, openSendBacks: null, lastFixLoop, humanRequired: null,
+        minutesSinceFixLoop: lastFixLoop && Number.isFinite(Date.parse(lastFixLoop.at))
+          ? Math.max(0, (start - Date.parse(lastFixLoop.at)) / 60_000) : null,
         minutesSinceUpdate: Math.max(0, (start - Date.parse(p.updatedAt)) / 60_000),
         fixerRunning: errors.includes('live jobs unreadable') || unscopedWorker ? null : fixerRunning,
         owner: (errors.includes('live jobs unreadable') || unscopedWorker) && !owner ? 'unknown' : owner,
