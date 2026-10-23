@@ -682,6 +682,74 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     expect(readGroupState(statePath).groups).toEqual([]);
   });
 
+  describe('after the combined PR merged: a push racing the source close never closes unverified work', () => {
+    // Main after the merge carries source 1's head A. `views[n]` is the sequence of live reads of source n (the last
+    // repeats); a read after a `pr close` reports CLOSED with the head GitHub recorded.
+    function mergedRace(views, { closedAt, reopenFails = false } = {}) {
+      const t = setup();
+      const statePath = join(tmp(), 's.json');
+      git(t.cwd, 'checkout', '-q', '-b', 'merged', t.base);
+      writeFileSync(join(t.cwd, CARD), card([1, 2, 10])); git(t.cwd, 'add', '-A'); git(t.cwd, 'commit', '-qm', 'merged');
+      const mainAfter = git(t.cwd, 'rev-parse', 'HEAD');
+      git(t.cwd, 'checkout', '-q', '-b', 'a-new', t.a);
+      writeFileSync(join(t.cwd, CARD), card([1, 2, 10, 12])); git(t.cwd, 'add', '-A'); git(t.cwd, 'commit', '-qm', 'a-new');
+      const aNew = git(t.cwd, 'rev-parse', 'HEAD');
+      git(t.cwd, 'checkout', '-q', 'main');
+      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr: 77, branch: 'lane/card-group-g',
+        sources: [{ num: 1, headSha: t.a }], ...(closedAt ? { closedAt: { 1: closedAt === 'a' ? t.a : closedAt } } : {}) }], failed: {} }));
+      const seq = views({ a: t.a, aNew });
+      let i = 0, closed = false;
+      const calls = [];
+      const exec = (cmd, args) => {
+        calls.push(args.join(' '));
+        if (args[0] === 'pr' && args[1] === 'view') {
+          if (args[2] === '77') return JSON.stringify({ state: 'MERGED', labels: [] });
+          const v = seq[Math.min(i++, seq.length - 1)];
+          return JSON.stringify({ state: closed ? 'CLOSED' : v.state ?? 'OPEN', isDraft: false, headRefOid: v.head, headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
+        }
+        if (args[0] === 'pr' && args[1] === 'close') { closed = true; return ''; }
+        if (args[0] === 'pr' && args[1] === 'reopen') { if (reopenFails) throw new Error('gh: 502'); closed = false; return ''; }
+        if (args[0] === 'pr' && args[1] === 'comment') return '';
+        throw new Error(`unexpected ${args.join(' ')}`);
+      };
+      const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => mainAfter), exec, statePath, settings, log: { write() {} } });
+      return { r: g.reconcile({ force: true }), calls, state: readGroupState(statePath), t, aNew };
+    }
+
+    it('a push between verification and the close: not closed, the group is kept and the new head re-verified next pass', () => {
+      const { r, calls, state } = mergedRace(h => [{ head: h.a }, { head: h.aNew }]);
+      expect(r.done).toEqual([]);
+      expect(calls.some(c => c.startsWith('pr close'))).toBe(false);
+      expect(state.groups.map(x => x.id)).toEqual(['g']);
+    });
+
+    it('a push that lands while the close runs: the source is reopened and released', () => {
+      const { r, calls, state } = mergedRace(h => [{ head: h.a }, { head: h.a }, { head: h.aNew }]);
+      expect(calls.filter(c => /^pr (close|reopen) 1 /.test(c)).map(c => c.split(' ')[1])).toEqual(['close', 'reopen']);
+      expect(r.done).toEqual(['g']);
+      expect(state.groups).toEqual([]);
+    });
+
+    it('a source closed on an earlier pass whose head has since moved past the verified one is reopened', () => {
+      const { r, calls } = mergedRace(h => [{ state: 'CLOSED', head: h.aNew }], { closedAt: 'a' });
+      expect(calls.some(c => c.startsWith('pr reopen 1 '))).toBe(true);
+      expect(r.done).toEqual(['g']);
+    });
+
+    it('a failed reopen keeps the group so the reopen is retried', () => {
+      const { r, state } = mergedRace(h => [{ state: 'CLOSED', head: h.aNew }], { closedAt: 'a', reopenFails: true });
+      expect(r.done).toEqual([]);
+      expect(state.groups.map(x => x.id)).toEqual(['g']);
+    });
+
+    it('an unmoved source closes once and is never reopened', () => {
+      const { r, calls } = mergedRace(h => [{ head: h.a }]);
+      expect(calls.filter(c => c.startsWith('pr close 1 '))).toHaveLength(1);
+      expect(calls.some(c => c.startsWith('pr reopen'))).toBe(false);
+      expect(r.done).toEqual(['g']);
+    });
+  });
+
   // One source per `edits` entry: a string is the new CARD text, an object maps paths to texts. `baseFiles` are
   // committed on main first. Every PR live-reads OPEN + accepted at its head unless the test changes it.
   function formRepo(edits, { baseFiles } = {}) {
@@ -1192,6 +1260,9 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       ['combined PR conflicts with main', { combined: { state: 'OPEN', labels: waiting, mergeable: 'CONFLICTING' } }, /combined PR conflicts/, true],
       ['sent back: review:changes', { combined: { state: 'OPEN', labels: [{ name: 'review:changes' }] } }, /combined PR sent back \(review:changes\)/, true],
       ['sent back: review:human', { combined: { state: 'OPEN', labels: [{ name: 'review:human' }] } }, /combined PR sent back \(review:human\)/, true],
+      ['sent back: ready-to-merge removed (review:accepted kept)', { combined: { state: 'OPEN', labels: [{ name: 'review:accepted' }], statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] } }, /combined PR sent back \(ready-to-merge was removed\)/, true],
+      ['sent back: made draft', { combined: { state: 'OPEN', isDraft: true, labels: waiting } }, /combined PR sent back \(made draft\)/, true],
+      ['retargeted off main', { combined: { state: 'OPEN', baseRefName: 'lane/other', labels: waiting } }, /combined PR retargeted \(base is lane\/other\)/, true],
       ['required check failed', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] } }, /combined PR failed the required check/, true],
       ['required check timed out (status context)', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ context: 'test', state: 'TIMED_OUT' }] } }, /combined PR failed the required check/, true],
       ['required check needs action (ACTION_REQUIRED)', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'ACTION_REQUIRED' }] } }, /combined PR failed the required check/, true],
