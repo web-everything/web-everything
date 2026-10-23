@@ -7,19 +7,28 @@
 import { execFileSync } from 'node:child_process';
 import nodeFs from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, resolve, join } from 'node:path';
+import { basename, dirname, resolve, join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { cloneKey } from '../lib/daemon-overlays.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, combinedReadyEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+
+/** Same request protocol / gated rebuild as daemon-load-overlay, without touching registrations. */
+export async function retriggerRegistered({ root, ref, env, by }, deps = {}) {
+  const runtime = deps.runtime || await import('../lib/daemon-version-runtime.mjs');
+  const ctx = runtime.resolveVersionedContext({ root, env });
+  if (ctx) return { source: 'submitRequest', requestId: await runtime.submitRequest(ctx, { ref, by }) };
+  const rebuild = deps.rebuild || (await import('../lib/daemon-rebuild.mjs')).rebuildClone;
+  return { source: 'rebuildClone', result: await rebuild({ root, env, mainOnly: false }) };
+}
 
 /** The sole real IO binding; constructing an injected loader performs no ambient reads. */
 export function defaultDeps() {
   return { exec: execFileSync, fs: nodeFs, now: () => Date.now(), sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
     env: { ...process.env, HOME: homedir() }, settings: undefined, cloneKey };
 }
-export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, cloneKey: keyForClone = cloneKey }) {
+export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, cloneKey: keyForClone = cloneKey, retrigger = retriggerRegistered }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
@@ -28,6 +37,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
   const config = policy.value;
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
+  // Keep system Git reachable with a minimal caller PATH (macOS installs it in /usr/bin).
+  if (!childEnv.PATH?.split(delimiter).includes('/usr/bin')) {
+    childEnv.PATH = [childEnv.PATH, '/usr/bin'].filter(Boolean).join(delimiter);
+  }
   // Preserve a stricter caller policy without forwarding overrides that could weaken file policy.
   if (env.WE_OVERLAY_NO_PR?.trim() === 'refuse') childEnv.WE_OVERLAY_NO_PR = 'refuse';
   // A state location is safe configuration, unlike credential or admission-bypass variables.
@@ -85,8 +98,36 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       if (!safeRef(input.branch) || !validSha(input.sha) || !Number.isFinite(config.adoption?.timeoutMs) || config.adoption.timeoutMs < 0
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input');
       stage = 'no-ready';
-      out.gate = readyEvidence(jsonLines(read(expand(config.readyRecordPath))), input);
-      if (!out.gate) return stop('no-ready');
+      let readyText = null;
+      try { readyText = fs.readFileSync(expand(config.readyRecordPath), 'utf8'); }
+      catch (e) { if (e.code !== 'ENOENT') throw e; }
+      const readyRecords = jsonLines(readyText || '');
+      out.gate = readyEvidence(readyRecords, input);
+      let state, readyRows;
+      const statePath = () => state ||= join(expand(env.WE_DAEMON_OVERLAY_DIR || join(env.HOME, '.claude/daemon-overlays')), keyForClone(out.clone));
+      if (!out.gate) {
+        const strictLines = (text) => String(text || '').split(/\r?\n/).filter((line) => line.trim()).map((line) => JSON.parse(line));
+        strictLines(readyText); // A partial trail cannot establish when records began.
+        const events = strictLines(read(`${statePath()}.events.jsonl`));
+        // With neither part records nor registration events there is nothing to prove via Git.
+        if (!events.some((e) => e?.kind === 'added') && !readyRecords.some((r) => r?.ref !== input.branch && validSha(r?.sha))) return stop('no-ready');
+        const listing = loader('list', out.clone);
+        readyRows = lastJson(listing)?.list;
+        if (listing.code !== 0 || !Array.isArray(readyRows) || readyRows.some((r) => !safeRegistrationRef(r?.ref))) return stop('no-ready', { listing });
+        requireGit('fetch', 'origin', input.branch);
+        if (requireGit('rev-parse', `origin/${input.branch}`) !== input.sha) return stop('no-ready');
+        const parts = [];
+        for (const ref of [...new Set(readyRows.map((r) => r.ref))]) {
+          if (ref === input.branch) continue;
+          requireGit('fetch', 'origin', ref);
+          const sha = requireGit('rev-parse', `origin/${ref}`);
+          if (!validSha(sha)) return stop('no-ready');
+          if (ancestor(sha, input.sha)) parts.push({ ref, sha });
+        }
+        if (!parts.length && readyRows.some((r) => r.ref === input.branch)) parts.push({ ref: input.branch, sha: input.sha });
+        out.gate = combinedReadyEvidence(readyRecords, parts, events, readyText === null);
+        if (!out.gate) return stop('no-ready');
+      }
       requireGit('fetch', 'origin', input.branch);
       const tip = requireGit('rev-parse', `origin/${input.branch}`);
       if (tip !== input.sha) return stop('no-ready', { gate: { ...out.gate, reason: 'sha-not-branch-tip', tip } });
@@ -114,14 +155,21 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       const difference = comparePaths(own, effectivePaths);
       out.mainCheck = { ...out.mainCheck, effectivePaths, ...difference };
       if (difference.outside.length || difference.missing.length) return stop('reverts-main', { offendingPaths: difference.outside, missingPaths: difference.missing });
-      if (out.wouldMerge && !input.dryRun) {
+      let priorListing;
+      if (out.wouldMerge) {
+        priorListing = loader('list', out.clone);
+        const priorRows = lastJson(priorListing)?.list;
+        if (priorListing.code !== 0 || !Array.isArray(priorRows) || priorRows.some((r) => !safeRegistrationRef(r?.ref))) return stop('check-unverifiable', { listing: priorListing });
+        if (priorRows.some((r) => r.ref === input.branch)) out.registered = 'already';
+      }
+      if (out.wouldMerge && !input.dryRun && out.registered !== 'already') {
         const commit = requireGit('commit-tree', comparison, '-p', 'origin/main', '-p', input.sha, '-m', `Merge origin/main into ${input.branch}`);
         if (!validSha(commit)) throw new Error('invalid merge commit');
         requireGit('push', 'origin', `${commit}:refs/heads/${out.wouldMerge.ref}`);
         out.effectiveRef = out.wouldMerge.ref; out.effectiveSha = commit;
       }
       out.check = check(out.clone, out.effectiveRef, out.effectiveSha);
-      const listing = loader('list', out.clone);
+      const listing = priorListing || loader('list', out.clone);
       const rows = lastJson(listing)?.list;
       if (listing.code !== 0 || !Array.isArray(rows) || rows.some((r) => !safeRegistrationRef(r?.ref))) return stop('check-unverifiable', { listing });
       const established = [...new Set(rows.map((r) => r.ref))];
@@ -192,7 +240,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       // A stale preview is not proof that the replacement can pass live smoke. Keep every prior
       // registration until adoption; a blocked rebuild times out with recovery guidance below.
       stage = 'check-unverifiable';
-      const state = join(expand(env.WE_DAEMON_OVERLAY_DIR || join(env.HOME, '.claude/daemon-overlays')), keyForClone(out.clone));
+      statePath();
       const deadline = registeredAt + config.adoption.timeoutMs;
       // Rebuilds currently emit to the self-sync state directory. Also read the requested overlay
       // sibling trail, so both the loader events and rebuild refusals are observed.
@@ -217,6 +265,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         out.adoption = { code: probe.code, at: new Date(now()).toISOString(), ...(missing ? { pending: 'candidate-object-missing' } : {}) };
         if (probe.code === 0) { out.adopted = true; break; }
         if (probe.code !== 1 && !missing) return stop('check-unverifiable', { adoption: probe, fallback: `Inspect the daemon clone adoption probe and rerun.${keptNote()}` });
+        if (out.registered === 'already' && !out.retrigger) {
+          out.retrigger = true;
+          out.trigger = await retrigger({ root: out.clone, ref: out.effectiveRef, env: childEnv, by: env.USER || 'unknown' });
+          continue;
+        }
         const remaining = deadline - now();
         if (remaining <= 0) return stop('adoption-timeout', { fallback: `Check the daemon rebuild for the replacement and rerun.${keptNote()}` });
         await sleep(Math.min(config.adoption.pollMs, remaining));

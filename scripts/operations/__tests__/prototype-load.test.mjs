@@ -8,8 +8,8 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { withRealRepo, withBareOrigin } from './helpers/real-repo.mjs';
-import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
-import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
+import { createPrototypeLoader, defaultDeps, retriggerRegistered } from '../prototype-load-io.mjs';
+import { combinedReadyEvidence, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import { createRegistry } from '../registry.mjs';
 import { startRun, advance } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
@@ -25,6 +25,7 @@ const settings = {
 };
 function fixture(options = {}) {
   const candidateSha = options.sha || SHA;
+  const triggers = [];
   const calls = [], records = [], sleeps = [], reads = [], cloneRoots = [];
   let clock = 0;
   let remoteTip = candidateSha;
@@ -42,6 +43,7 @@ function fixture(options = {}) {
     readFileSync(p) {
       reads.push(p);
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      if (p === '/home/test/ready' && options.readyMissing) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
       if (p === '/home/test/ready') return options.ready ?? `bad line\n${JSON.stringify(ready)}\n`;
       if (options.alertsReadError && p.endsWith('.alerts.jsonl')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('.alerts.jsonl')) return options.alerts || '';
@@ -90,9 +92,10 @@ function fixture(options = {}) {
         if (args.at(-1) === 'HEAD^{commit}') return options.badHead ? fail(1) : SHA;
         return options.missingCandidate ? fail(1, '', '') : SHA;
       }
-      expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', options.behind ? MERGE : candidateSha, 'HEAD']);
+      expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', options.behind && !(options.list || []).includes(BASE.branch) ? MERGE : candidateSha, 'HEAD']);
       if (options.missingCandidate && (options.missingForever || sleeps.length === 0)) return fail(128, '', 'Not a valid commit name');
       if (options.adoptionError) return fail(options.adoptionError);
+      if (options.pendingRegistered && (!triggers.length || options.triggerNoAdoption)) return fail(1);
       return options.timeout ? fail(1) : '';
     }
     if (args[0] === 'fetch') {
@@ -106,6 +109,10 @@ function fixture(options = {}) {
       return '';
     }
     if (args[0] === 'rev-parse') {
+      if (options.ready !== undefined || options.readyMissing) {
+        const registeredTip = establishedTips.get(args.at(-1).replace(/^origin\//, ''));
+        if (registeredTip) return registeredTip;
+      }
       const ref = args.at(-1).replace(/^refs\/remotes\/origin\//, '').replace(/\^\{commit\}$/, '');
       if (establishedTips.has(ref)) {
         if (options.refreshError === 'tip') return fail(1);
@@ -121,6 +128,7 @@ function fixture(options = {}) {
       if (args[2] === 'origin/main') return options.behind ? fail(1) : '';
       if (args[2] === TREE) return options.advancedContained ? '' : fail(1);
       if ([...establishedTips.values()].includes(args[2])) {
+        if (options.partNotAncestor) return fail(1);
         if (options.refreshError === 'ancestry') return fail(128);
         if (options.advanceEstablishedAfterContainment) establishedAdvanced = true;
         // The immutable SHA still passes while the registered branch/entry changes underneath it.
@@ -141,13 +149,117 @@ function fixture(options = {}) {
     if (args[0] === 'push') { remoteTip = MERGE; return ''; }
     throw new Error(`unexpected command ${cmd} ${args}`);
   };
-  const load = createPrototypeLoader({ exec, fs, env, settings: structuredClone(settings), now: () => clock,
+  const load = createPrototypeLoader({ exec, fs, env,
+    retrigger: async (request) => { triggers.push(request); if (options.triggerFails) throw new Error('trigger failed'); return { source: 'fake-request', requestId: 'retry-1' }; },
+    settings: structuredClone(settings), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { triggers, calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('prototype-load', () => {
+  it('retriggers a registered but uninstalled tip once and records adoption without re-registering', async () => {
+    const f = fixture({ list: [BASE.branch], pendingRegistered: true });
+    expect(await f.run()).toMatchObject({ ok: true, registered: 'already', adopted: true, retrigger: true });
+    expect(f.triggers).toHaveLength(1);
+    expect(f.triggers[0]).toMatchObject({ root: '/home/test/workspace/wev-control', ref: BASE.branch });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(f.records[0]).toMatchObject({ retrigger: true, adopted: true });
+  });
+  it('retries the original registered ref behind main without publishing or registering a merge ref', async () => {
+    const f = fixture({ list: [BASE.branch], behind: true, pendingRegistered: true });
+    expect(await f.run()).toMatchObject({ retrigger: true, registered: 'already', adopted: true, effectiveRef: BASE.branch });
+    expect(f.calls.some((c) => ['push', 'commit-tree'].includes(c.args[0]))).toBe(false);
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it.each([{ triggerNoAdoption: true, stopReason: 'adoption-timeout' }, { triggerFails: true, stopReason: 'check-unverifiable' }])('records retrigger failure or bounded timeout: %j', async ({ stopReason, ...options }) => {
+    const f = fixture({ list: [BASE.branch], pendingRegistered: true, ...options });
+    expect(await f.run()).toMatchObject({ ok: false, retrigger: true, stopReason, adopted: false });
+    expect(f.triggers).toHaveLength(1);
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(f.records[0].retrigger).toBe(true);
+  });
+  it.each([false, true])('does not retrigger installed tips or dry runs (dry run: %s)', async (dryRun) => {
+    const f = fixture({ list: [BASE.branch], pendingRegistered: dryRun });
+    await f.run({ dryRun });
+    expect(f.triggers).toEqual([]);
+  });
+  it('new registrations keep the existing add path without a retrigger', async () => {
+    const f = fixture();
+    expect(await f.run()).toMatchObject({ ok: true, registered: true, adopted: true });
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(f.triggers).toEqual([]);
+  });
+  it('retriggers when the installed clone has not fetched the registered tip yet', async () => {
+    const f = fixture({ list: [BASE.branch], missingCandidate: true });
+    expect(await f.run()).toMatchObject({ adopted: true, retrigger: true });
+    expect(f.triggers).toHaveLength(1);
+    expect(f.sleeps).toEqual([10]);
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it('uses the versioned request protocol or the plain gated rebuild without adding overlays', async () => {
+    for (const versioned of [true, false]) {
+      const calls = [];
+      const ctx = versioned ? { dir: 'versions' } : null;
+      const result = await retriggerRegistered({ root: 'clone', ref: BASE.branch, env: {}, by: 'tester' }, {
+        runtime: { resolveVersionedContext: () => ctx, submitRequest: (context, request) => { calls.push({ context, request }); return 'id'; } },
+        rebuild: (request) => { calls.push(request); return { adopted: false, reason: 'smoke-rejected' }; },
+      });
+      expect(calls).toHaveLength(1);
+      expect(result.source).toBe(versioned ? 'submitRequest' : 'rebuildClone');
+      if (versioned) expect(calls[0]).toEqual({ context: ctx, request: { ref: BASE.branch, by: 'tester' } });
+      else expect(calls[0]).toEqual({ root: 'clone', env: {}, mainOnly: false });
+    }
+  });
+  const added = (ref, at = '2026-01-01') => ({ kind: 'added', ref, at });
+  const part = { ref: 'lane/part', sha: 'd'.repeat(39) + '0' };
+  const green = { ...part, at: '2026-02-01', tests: 'green', audit: 'NOT WEAKENED' };
+  it.each([false, true])('admits a combined top with historical registration (records missing: %s)', async (readyMissing) => {
+    const f = fixture({ list: [BASE.branch, part.ref], contained: [part.ref], pendingRegistered: true, readyMissing,
+      ready: JSON.stringify({ at: green.at }), events: JSON.stringify(added(part.ref)) });
+    const result = await f.run();
+    expect(result).toMatchObject({ gate: { source: 'registered-before-records' }, retrigger: true, adopted: true });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(f.records).toHaveLength(1);
+  });
+  it('does not count a ready registered ref outside the top ancestry as a combined part', async () => {
+    const f = fixture({ list: [part.ref], ready: JSON.stringify(green), partNotAncestor: true });
+    expect(await f.run()).toMatchObject({ stopReason: 'no-ready', registered: false });
+    expect(f.triggers).toEqual([]);
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it('admits a historical registered standalone ref when the records file is missing', async () => {
+    const f = fixture({ list: [BASE.branch], readyMissing: true, pendingRegistered: true, events: JSON.stringify(added(BASE.branch)) });
+    expect(await f.run()).toMatchObject({ retrigger: true, adopted: true, gate: { source: 'registered-before-records' } });
+  });
+  it.each([{}, { listRaw: '{}' }, { events: JSON.stringify(added(part.ref, green.at)) }])('keeps unproved combined parts at no-ready: %j', async (options) => {
+    const f = fixture({ list: [part.ref], contained: [part.ref], ready: JSON.stringify({ at: green.at }), ...options });
+    expect(await f.run()).toMatchObject({ stopReason: 'no-ready', registered: false });
+    expect(f.triggers).toEqual([]);
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it('admits a combined top from exact-SHA green records for every registered ancestor', async () => {
+    const f = fixture({ list: [part.ref], contained: [part.ref], ready: JSON.stringify(green) });
+    expect(await f.run()).toMatchObject({ gate: { source: 'all-parts-ready' }, adopted: true });
+  });
+  it.each([
+    [[], [], false], [[{ at: green.at }], [added(part.ref, green.at)], false],
+    [[{ at: green.at }], [added(part.ref), { kind: 'removed', ref: part.ref, at: '2026-01-02' }], false],
+    [[{ at: 'invalid' }], [added(part.ref)], false], [[], [added(part.ref)], false],
+    [[{ ...green, sha: TREE }], [], false], [[{ ...green, audit: 'WEAKENED' }], [], false],
+  ])('fails closed on absent, late, removed or invalid part evidence: %j %j', (records, events, missing) => {
+    expect(combinedReadyEvidence(records, [part], events, missing)).toBeNull();
+  });
+  it.each(['ready', 'events'])('fails closed on a malformed historical evidence trail: %s', async (file) => {
+    const f = fixture({ list: [BASE.branch, part.ref], contained: [part.ref], ready: JSON.stringify(green), events: JSON.stringify(added(part.ref)), [file]: '{broken' });
+    expect(await f.run()).toMatchObject({ stopReason: 'no-ready', adopted: false });
+    expect(f.triggers).toEqual([]);
+  });
+  it('admits mixed green and historical parts but refuses any unproved part', () => {
+    const old = { ref: 'lane/old', sha: TREE };
+    expect(combinedReadyEvidence([green], [part, old], [added(old.ref)])?.source).toBe('registered-before-records');
+    expect(combinedReadyEvidence([green], [part, old], [])).toBeNull();
+  });
   it('refuses missing readiness evidence and persists the refusal on a real filesystem', async () => {
     await withRealRepo(async ({ root }) => {
       const recordPath = join(root, 'audit', 'prototype-load.jsonl');

@@ -19,6 +19,22 @@ export function readyEvidence(records, input) {
   const record = records.find((r) => r?.ref === input.branch && r.sha === input.sha && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
   return record ? { source: 'ready-record', record } : null;
 }
+/** Historical registration admits no test claim; the daemon rebuild smoke remains the gate. */
+export function combinedReadyEvidence(records, parts, events, missingRecords = false) {
+  if (!parts.length) return null;
+  const first = Date.parse(records[0]?.at);
+  let historical = false;
+  for (const { ref, sha } of parts) {
+    if (readyEvidence(records, { branch: ref, sha })) continue;
+    // Use the latest lifecycle event: an old add cannot grandfather a later re-registration.
+    const lifecycle = events.filter((e) => e?.ref === ref && ['added', 'removed', 'conflict-dropped'].includes(e.kind)).at(-1);
+    const registered = Date.parse(lifecycle?.at);
+    if (lifecycle?.kind !== 'added' || !Number.isFinite(registered)
+      || (!missingRecords && (!Number.isFinite(first) || registered >= first))) return null;
+    historical = true;
+  }
+  return { source: historical ? 'registered-before-records' : 'all-parts-ready', parts };
+}
 /** Include BOTH sides of renames/copies; NUL output preserves whitespace and quoted paths. */
 export function changedPaths(text) {
   const fields = String(text).split('\0');

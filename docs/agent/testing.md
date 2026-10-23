@@ -793,6 +793,10 @@ A large seed commit can launch detached maintenance/repack that outlives `execFi
 recursive snapshots and cleanup. Apply the same flags to bounded production freshness fetches;
 do not hide the race with sleeps, cleanup retries, or exclusions from the snapshot.
 
+Real Git probes with a minimal child `PATH` must reach the executable on each host: macOS Git
+lives in `/usr/bin`, not `/bin`. The prototype loader retains caller search order and appends
+the system directory; an executable lookup failure must still fail closed, never count as a pending commit.
+
 1. Test behavior, not implementation.
 2. One concept per test; descriptive names (`should notify listeners on setItem`).
 3. Arrange-Act-Assert. Reset state in `beforeEach`/`afterEach`.
