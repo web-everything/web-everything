@@ -1,5 +1,20 @@
 # Testing — Three-Tier Strategy
 
+## Overlay replacement adoption
+
+`daemon-load-overlay.mjs --replaces=old-a,old-b` records each predecessor's
+`replacedBy: {ref, sha}` under the registry lock after registering the replacement.
+`scripts/lib/overlay-swap.mjs` polls ancestry in the daemon clone after the rebuild;
+only an adopted replacement containing each predecessor's freshly fetched origin tip
+may retire that predecessor. Manual removal refuses pending or unknown adoption.
+Timeout restoration uses the original registration metadata and fresh per-entry reads,
+never a saved list. `swapAfterAdopt.timeoutMs` resolves through the policy cascade
+(default ten minutes, tool file `scripts/lib/daemon-rebuild-settings.json`, environment
+`WE_OVERLAY_SWAP_TIMEOUT_MS`) and logs its effective value and source. A Git error
+retains registrations; repair Git and retry. A timeout restores missing registrations;
+repair the replacement and retry. Focused regressions live in `overlay-swap.test.mjs`
+and `daemon-load-overlay.test.mjs`; run both through heavy admission.
+
 ## Daemon entry boot smoke
 
 Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`

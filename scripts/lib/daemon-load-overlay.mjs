@@ -66,7 +66,8 @@ import {
 import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
-import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
+import { addOverlay, removeOverlay, appendOverlayEvent, recordOverlayReplacement } from './daemon-overlays.mjs';
+import { swapAfterAdopt, originTip, readSwapOverlays, overlayGitRun } from './overlay-swap.mjs';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
 import { DEFAULT_REBUILD_LOCK_WAIT_MS, REBUILD_LOCK_WAIT_ENV } from './daemon-rebuild/lease.mjs';
 import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
@@ -623,12 +624,43 @@ export function withDispatchSmoke({
  * {@link dryRunRebuild}'s own `extraOverlays` option, so nothing is ever written to the overlay list on a
  * preview.
  * @param {{clone:string, ref:string, pr?:number|null, base?:string, dryRun?:boolean, env?:NodeJS.ProcessEnv,
- *   log?:Console, addedBy?:string|null, reason?:string|null, now?:string,
+ *   log?:Console, addedBy?:string|null, reason?:string|null, now?:string, replaces?:string|string[],
  *   addOverlayFn?:typeof addOverlay, rebuild?:typeof rebuildClone, dryRunRebuildFn?:typeof dryRunRebuild,
  *   installed?:typeof overlayInstalled, followUpRebuilds?:number, clock?:()=>number, sleep?:(ms:number)=>Promise<void>}} o
  * @returns {Promise<object>}
  */
-export async function runDaemonLoadOverlay({
+export async function runDaemonLoadOverlay(options) {
+  const { replaces = [], run = overlayGitRun, swap = swapAfterAdopt, readOverlaysFn = readSwapOverlays,
+    recordReplacement = recordOverlayReplacement } = options;
+  const refs = typeof replaces === 'string' ? replaces.split(',') : replaces;
+  if (!Array.isArray(refs)) throw new TypeError('daemon-load-overlay: invalid --replaces');
+  for (const old of refs) {
+    assertSafeRef(old, '--replaces');
+    if (old === options.ref) throw new TypeError('daemon-load-overlay: replacement cannot replace itself');
+  }
+  if (!refs.length || options.dryRun) return loadOverlay(options);
+  if (!options.clone || typeof options.clone !== 'string') throw new TypeError('daemon-load-overlay: --clone=<path> is required');
+  const root = resolve(options.clone);
+  const env = options.env ?? process.env;
+  const originalEntries = readOverlaysFn(root, { env }).map(o => ({ ...o }));
+  const newSha = originTip({ root, ref: options.ref, run, env });
+  const add = options.addOverlayFn ?? addOverlay;
+  const result = await loadOverlay({ ...options, addOverlayFn: (...args) => {
+    const list = add(...args);
+    for (const entry of originalEntries.filter(o => refs.includes(o.ref))) {
+      recordReplacement(root, entry.ref, { ref: options.ref, sha: newSha }, { env });
+    }
+    return list;
+  } });
+  if (result.refused || result.rolledBack) return result;
+  const swapped = await swap({ root, newRef: options.ref, newSha, replaces: refs, run, env, originalEntries,
+    readOverlays: readOverlaysFn, addOverlay: add, removeOverlay: options.removeOverlayFn ?? removeOverlay,
+    appendOverlayEvent: options.appendEventFn ?? appendOverlayEvent,
+  });
+  return { ...result, swap: swapped, ...(swapped.ok ? {} : { adopted: false, timedOut: true, reason: swapped.reason }) };
+}
+
+async function loadOverlay({
   clone, ref, pr = null, base = 'main', dryRun = false, env = process.env, log = console,
   addedBy, reason = null, now,
   addOverlayFn = addOverlay, rebuild = rebuildClone, dryRunRebuildFn = dryRunRebuild,
@@ -881,11 +913,13 @@ if (IS_CLI) {
   const wait = !!flags.wait;
   const waitMs = flags['wait-ms'] !== undefined && Number(flags['wait-ms']) > 0 ? Number(flags['wait-ms']) : undefined;
   runDaemonLoadOverlay({
-    clone, ref, pr, base, dryRun, addedBy, reason, wait, waitMs,
+    clone, ref, pr, base, dryRun, addedBy, reason, wait, waitMs, replaces: flags.replaces,
   })
     .then((result) => {
       if (flags.json) {
         process.stdout.write(`${JSON.stringify(result)}\n`);
+      } else if (result.swap?.ok === false) {
+        process.stdout.write(`daemon-load-overlay: swap timed out; prior registrations restored: ${result.swap.restored.join(', ') || '(already present)'}. Repair the replacement and retry.\n`);
       } else if (result.refused) {
         process.stdout.write(`daemon-load-overlay: REFUSED ${ref} (${result.reason}) — nothing registered (${result.root})\n`);
       } else if (result.rolledBack) {
@@ -911,11 +945,12 @@ if (IS_CLI) {
       } else {
         process.stdout.write(`daemon-load-overlay: registered ${ref} but the rebuild was REJECTED (${result.reason}) at ${result.root}\n`);
       }
+      if (!flags.json && result.swap?.retained?.length) process.stdout.write(`  retained refs not contained at their current origin tips: ${result.swap.retained.join(', ')}\n`);
       for (const a of result.alerts || []) process.stdout.write(`  ! ${a.kind}\n`);
       if (!flags.json && result.dispatchSmoke?.result?.ok) {
         process.stdout.write(`  dispatch smoke PASSED (${result.dispatchSmoke.phase}, ${result.dispatchSmoke.result.ms}ms, session ${result.dispatchSmoke.result.sessionId})\n`);
       }
-      process.exitCode = (result.mergedAnything && !result.adopted) || (result.staleAdopt && !result.adopted) || result.timedOut || result.refused || result.rolledBack ? 1 : 0;
+      process.exitCode = result.swap?.ok === false || (result.mergedAnything && !result.adopted) || (result.staleAdopt && !result.adopted) || result.timedOut || result.refused || result.rolledBack ? 1 : 0;
     })
     .catch((e) => {
       process.stderr.write(`daemon-load-overlay: fatal: ${String((e && e.message) || e)}\n`);

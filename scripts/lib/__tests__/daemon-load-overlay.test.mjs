@@ -1443,3 +1443,44 @@ describe('legacy explicit load — bounded busy wait', () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 });
+
+describe('contained overlay replacement wiring', () => {
+  it('registers replacement before rebuilding and invokes swap only after rebuild', async () => {
+    const order = [];
+    const predecessor = { ref: 'lane/old', pr: 7, pinned: true, reason: 'original', addedBy: 'author' };
+    const sha = 'a'.repeat(40);
+    const swap = vi.fn(async o => { order.push('swap'); expect(o.originalEntries).toEqual([predecessor]); return { ok: true, removed: ['lane/old'] }; });
+    const result = await runDaemonLoadOverlay({ clone: 'clone', ref: 'lane/new', pr: 8, replaces: 'lane/old', versions: null,
+      run: a => ({ status: 0, stdout: a.includes('rev-parse') ? sha : '' }),
+      recordReplacement: (root, ref, target) => { order.push(`mark:${ref}`); expect(target).toEqual({ ref: 'lane/new', sha }); },
+      readOverlaysFn: () => [predecessor], addOverlayFn: (root, entry) => { order.push(`add:${entry.ref}`); },
+      rebuild: async () => { order.push('rebuild'); return { adopted: true, moved: true }; },
+      installed: () => ({ inHead: true, tip: sha }), settings: { dispatchSmoke: 'off' }, swap,
+    });
+    expect(order).toEqual(['add:lane/new', 'mark:lane/old', 'rebuild', 'swap']);
+    expect(result.swap.ok).toBe(true);
+    expect(swap.mock.calls[0][0]).toMatchObject({ newRef: 'lane/new', newSha: sha, replaces: ['lane/old'] });
+  });
+  it('keeps dry-run replacements read only', async () => {
+    const swap = vi.fn(), run = vi.fn(), readOverlaysFn = vi.fn();
+    await runDaemonLoadOverlay({ clone: 'clone', ref: 'lane/new', replaces: 'lane/old', dryRun: true,
+      dryRunRebuildFn: async () => ({}), swap, run, readOverlaysFn });
+    expect(swap).not.toHaveBeenCalled(); expect(run).not.toHaveBeenCalled(); expect(readOverlaysFn).not.toHaveBeenCalled();
+  });
+});
+
+it('adds replacement before the shared swap removes predecessors', async () => {
+  const order = [], sha = 'a'.repeat(40);
+  let entries = [{ ref: 'lane/old', pr: 7 }];
+  const result = await runDaemonLoadOverlay({ clone: 'clone', ref: 'lane/new', pr: 8, replaces: ['lane/old'], versions: null,
+    env: { WE_OVERLAY_SWAP_TIMEOUT_MS: '0' },
+    run: a => ({ status: 0, stdout: a.includes('rev-parse') ? sha : '' }),
+    readOverlaysFn: () => entries, recordReplacement: vi.fn(),
+    addOverlayFn: (root, entry) => { order.push(`add:${entry.ref}`); entries.push(entry); },
+    removeOverlayFn: (root, ref) => { order.push(`remove:${ref}`); entries = entries.filter(o => o.ref !== ref); return { removed: true }; },
+    appendEventFn: vi.fn(), rebuild: async () => { order.push('rebuild'); return { adopted: true, moved: true }; },
+    installed: () => ({ inHead: true, tip: sha }), settings: { dispatchSmoke: 'off' },
+  });
+  expect(order).toEqual(['add:lane/new', 'rebuild', 'remove:lane/old']);
+  expect(result.swap).toMatchObject({ ok: true, removed: ['lane/old'] });
+});

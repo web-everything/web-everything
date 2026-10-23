@@ -205,12 +205,12 @@ export function writeOverlays(root, list, { env = process.env } = {}) {
  * `stackBases` (held item 212) records the PR's base-branch chain, nearest first (e.g. `['lane/b', 'lane/a']` for a PR
  * stacked on lane/b, itself on lane/a). The rebuild reads it only when gh cannot answer; leaving it out keeps it as is.
  * @param {{ref:string, pr?:number|null, addedBy?:string|null, reason?:string|null, now?:string, pinned?:boolean,
- *   stackBases?:string[]}} entry
+ *   stackBases?:string[], replacedBy?:{ref:string, sha:string}}} entry
  * @param {{env?:NodeJS.ProcessEnv}} [o]
  * @returns {Array<object>} the new list
  */
 export function addOverlay(root, {
-  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases,
+  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, replacedBy,
 } = {}, { env = process.env } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
@@ -225,14 +225,27 @@ export function addOverlay(root, {
         ref, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
+        ...(replacedBy ? { replacedBy } : {}),
       });
     } else {
       const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
+      if (replacedBy) next.replacedBy = replacedBy;
       list[idx] = next;
     }
+    return writeOverlays(root, list, { env });
+  });
+}
+
+/** Record a pending swap without rewriting a predecessor's current metadata. */
+export function recordOverlayReplacement(root, ref, replacedBy, { env = process.env } = {}) {
+  if (!isSafeBranchName(ref) || !isSafeBranchName(replacedBy?.ref) || !/^[a-f0-9]{40}$/.test(replacedBy?.sha)) {
+    throw new TypeError('daemon-overlays: invalid replacement marker');
+  }
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env).map(entry => entry.ref === ref ? { ...entry, replacedBy } : entry);
     return writeOverlays(root, list, { env });
   });
 }

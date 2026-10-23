@@ -96,6 +96,7 @@ import { mkdirSync, writeFileSync, readFileSync, statSync, rmSync, renameSync } 
 import {
   addOverlay, removeOverlay, readOverlayState, appendOverlayEvent, overlayFilePath, recordEdgeResolution,
 } from './lib/daemon-overlays.mjs';
+import { assertSwapRemovalAdopted } from './lib/overlay-swap.mjs';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
@@ -543,6 +544,7 @@ async function main() {
         : { ok: false, reason: 'no-origin-url' };
     }
   } else if (cmd === 'remove') {
+    assertSwapRemovalAdopted({ root, ref: flags.ref, env });
     const { removed, list } = removeOverlay(root, flags.ref, { env, why: reason || 'operator' });
     if (removed) appendOverlayEvent(root, { kind: 'removed', ref: flags.ref, by, reason }, { env });
     output = { removed, list };
