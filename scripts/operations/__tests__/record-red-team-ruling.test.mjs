@@ -1,10 +1,12 @@
-/** Cap-only declaration subset of record-red-team-ruling: no live IO or later-slice imports. */
+/** Cap-held card rulings: declaration and retry-safe automatic filing, with injected IO. */
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
 import { planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
+import { createRecordRedTeamRulingSinks } from '../record-red-team-ruling-io.mjs';
+import { cardJobKey, conflictingPendingCardJobs } from '../record-red-team-ruling.mjs';
 import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
 import { parseAdvisories, trustedAdvisoryComments } from '../../lib/advisory-labels.mjs';
 
@@ -210,8 +212,7 @@ describe('cap-only existing-card declaration', () => {
     expect(p).toMatchObject({ effect: RED_TEAM_RULING_CARD_EFFECT, head: HEAD, indices: [1], actor: 'chalbert', cardRef: CARD });
     expect(p.cardInput).toBeUndefined();
   });
-  it('requires an existing readable card and a readable head', () => {
-    expect(() => planRedTeamRuling(read(), input({ card: undefined }))).toThrow(/--card is required/);
+  it('requires a cited card to be readable and the head to be readable', () => {
     expect(() => planRedTeamRuling(read({ card: { requested: CARD, readable: false, reason: 'missing' } }), input())).toThrow(/does not resolve to a readable/);
     expect(() => planRedTeamRuling(read({ card: null }), input())).toThrow(/does not resolve to a readable/);
     expect(() => planRedTeamRuling(read({ head: '' }), input())).toThrow(/head could not be read/);
@@ -235,4 +236,288 @@ describe('cap-only existing-card declaration', () => {
     expect(write.effects({ verdict, input: { preview: true } })).toEqual([]);
     expect(() => recordRedTeamRulingOperation({})).toThrow(/needs a/);
   });
+});
+
+
+describe('automatic card filing', () => {
+  const read = (over = {}) => ({ identity: OP, head: HEAD, labels: [{ name: 'review:human' }], comments: thread(), setting: CONFIRMED_BREAKS_DEFAULTS, now: '2026-10-20T20:55:00-04:00', ...over });
+  const input = (over = {}) => ({ repo, pr: PR, break: '1', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'card it, ship the PR', ...over });
+  /** A fake PR whose thread grows as the sinks post (as the operator account), so the read-back proves the gate released the break. */
+  function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims, noPid = false, initial, sharedBreaks, attemptFails = false, receiptFails = false } = {}) {
+    const comments = initial ? [...initial] : thread();
+    const posted = [], cards = [], labelSyncs = [];
+    const attempts = new Set();
+    const gens = new Map(), receipts = new Set(), breakOwners = sharedBreaks ?? new Map();
+    let clock = 1_000_000;
+    const memClaims = {
+      claim: (k) => { if (!gens.has(k)) { gens.set(k, { gen: 0, at: clock }); return { created: true, gen: 0, at: clock }; } return { created: false, ...gens.get(k) }; },
+      reclaim: (k, g) => { if (gens.get(k).gen !== g) return false; gens.set(k, { gen: g + 1, at: clock }); return true; },
+      spawned: (k) => receipts.has(k), markSpawned: (k) => { if (receiptFails) throw new Error('receipt write failed'); receipts.add(k); }, now: () => clock,
+      attempted: (k) => attempts.has(k), markAttempt: (k) => { if (attemptFails) throw new Error('disk full'); if (attempts.has(k)) return false; attempts.add(k); return true; }, clearAttempt: (k) => attempts.delete(k),
+      claimBreak: (k, job) => { if (!breakOwners.has(k)) breakOwners.set(k, job); return breakOwners.get(k); },
+    };
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
+      resolveIdentity: () => identity,
+      claims: claims ?? memClaims,
+      fileCard: (c, session) => { cards.push(c); if (!cardOk) return { ok: false, error: 'spawn failed' }; return { ok: true, session, handle: noPid ? undefined : 'pid:4242' }; },
+      post: (r, n, body) => { if (postFails?.(body)) throw new Error('gh down'); posted.push(body); comments.push({ author: { login: author }, createdAt: '2026-10-20T23:55:00Z', body }); },
+      warn: () => {}, syncLabels: (a) => { labelSyncs.push(a); return { add: null, remove: [] }; },
+    });
+    return { sinks, posted, cards, labelSyncs, comments, memClaims, advance: (ms) => { clock += ms; } };
+  }
+  const payloadFor = (over = {}, readOver = {}) => planRedTeamRuling(read(readOver), input(over));
+  const heldAfter = (comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, repo }).held;
+
+  it('plans a card for a confirmed round-cap break on the live head', () => {
+    const p = planRedTeamRuling(read(), input());
+    expect(p).toMatchObject({ effect: RED_TEAM_RULING_CARD_EFFECT, head: HEAD, indices: [1], actor: 'chalbert' });
+    expect(p.cardInput.digest).toContain('card it, ship the PR');
+    expect(p.cardInput.scope).toContain('backlog/x.md');
+  });
+  it('declares an optional card and dispatches the complete automatic-card payload; preview writes nothing', () => {
+    const operation = recordRedTeamRulingOperation({ readRulingContext: () => read() });
+    expect(operation.input.card.required).toBe(false);
+    const write = operation.steps.find(s => s.name === 'write').step;
+    const verdict = payloadFor();
+    expect(write.effects({ verdict, input: {} })[0].payload).toMatchObject({
+      cardInput: verdict.cardInput, jobKey: verdict.jobKey, session: verdict.session,
+    });
+    expect(write.effects({ verdict, input: { preview: true } })).toEqual([]);
+  });
+  it('pending jobs conflict only for a human-authored intent on this exact head and result with overlapping breaks', () => {
+    const p = payloadFor();
+    const body = `${redTeamGateMarker(PR, HEAD, 'card-pending', p.resultId)}\nOperator card ruling pending (job ffffffffffff, break(s) #1, #2); the break stays held.`;
+    const human = { author: OP, body };
+    expect(conflictingPendingCardJobs([human], p)).toHaveLength(1);
+    for (const comment of [bot(body), { author: { login: 'mallory' }, body },
+      { ...human, body: body.replace(p.resultId, 'f'.repeat(16)) },
+      { ...human, body: body.replace(HEAD, OTHER) },
+      { ...human, body: body.replace('#1, #2', '#3') }]) {
+      expect(conflictingPendingCardJobs([comment], p)).toEqual([]);
+    }
+    expect(conflictingPendingCardJobs([human], { ...p, jobKey: 'ffffffffffff' })).toEqual([]);
+  });
+  it('a reason POST failure keeps the break held; an exact retry records the reason and releases without respawning', () => {
+    let failReason = true;
+    const f = fake({ postFails: body => failReason && body.includes("The operator's reason") });
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/gh down/);
+    expect(heldAfter(f.comments)).toHaveLength(1);
+    expect(f.posted).toHaveLength(1);
+    failReason = false;
+    expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toMatchObject({ card: { reconciled: true } });
+    expect(f.cards).toHaveLength(1);
+    expect(heldAfter(f.comments)).toEqual([]);
+  });
+  it.each(['head', 'grant'])('automatic filing rechecks before release when the %s changes during the reason POST', variant => {
+    const comments = thread(), posted = [], cards = [], synced = [];
+    let reasonPosted = false;
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: reasonPosted && variant === 'head' ? OTHER : HEAD, comments }),
+      resolveIdentity: () => OP, readStandingRulingScope: () => null,
+      claims: fake().memClaims,
+      fileCard: (_input, session) => { cards.push(session); return { ok: true, session, handle: 'pid:1' }; },
+      post: (_repo, _pr, body) => {
+        posted.push(body);
+        comments.push({ author: OP, body, createdAt: '2026-10-21T00:00:00Z' });
+        if (body.includes("The operator's reason")) {
+          reasonPosted = true;
+          if (variant === 'grant') comments.push({ author: OP, createdAt: '2026-10-21T00:01:00Z',
+            body: buildRoundExtensionComment({ repo, pr: PR, by: 1, actor: OP.login,
+              channel: 'chat', reason: 'one more round', at: '2026-10-21T00:01:00Z' }) });
+        }
+      },
+      syncLabels: args => synced.push(args),
+    });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor()))
+      .toThrow(/card queued and reason posted; no release record written/);
+    expect(cards).toHaveLength(1);
+    expect(posted.some(body => body.includes('outcome=operator-card'))).toBe(false);
+    expect(heldAfter(comments)).toHaveLength(1);
+    expect(synced).toEqual([]);
+  });
+  describe('card spawn and retry', () => {
+    it('card: queues the card, persists the reason then releases, and the break stops being held', () => {
+      const f = fake();
+      expect(heldAfter(f.comments)).toHaveLength(1);
+      const p = payloadFor();
+      expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](p)).toMatchObject({ ruling: 'card', indices: [1] });
+      expect(f.cards).toHaveLength(1);
+      expect(f.posted[0]).toMatch(/outcome=card-pending result=[0-9a-f]{16} -->/);
+      expect(f.posted[0]).not.toMatch(/^- /m);
+      expect(f.posted[2]).toMatch(/^<!-- we:red-team-gate pr=5530 rev=d3bee7370\w+ outcome=operator-card result=[0-9a-f]{16} -->/);
+      expect(f.posted[2]).toContain('filed as a follow-up card (#1)');
+      expect(f.posted[1]).toContain('> card it, ship the PR');
+      expect(heldAfter(f.comments)).toHaveLength(0);
+    });
+    it('card: a second run refuses (no duplicate card)', () => {
+      const f = fake();
+      f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor());
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no red-team break is held.*nothing written/);
+      expect(f.cards).toHaveLength(1);
+    });
+    it('card: a card that was not queued leaves only the bare intent, and the break stays held', () => {
+      const f = fake({ cardOk: false });
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/not queued/);
+      expect(f.posted).toHaveLength(1);
+      expect(f.posted[0]).toContain('outcome=card-pending');
+      expect(heldAfter(f.comments)).toHaveLength(1);
+    });
+    it('card: the release record failing after the spawn is recovered by a re-run WITHOUT a second spawn', () => {
+      let failRecord = true;
+      const f = fake({ postFails: (b) => failRecord && b.includes('outcome=operator-card') });
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/gh down/);
+      expect(f.cards).toHaveLength(1);
+      expect(heldAfter(f.comments)).toHaveLength(1);
+      failRecord = false;
+      expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toMatchObject({ card: { reconciled: true } });
+      expect(f.cards).toHaveLength(1);
+      expect(f.posted.filter((b) => b.includes('outcome=card-pending'))).toHaveLength(1);
+      expect(heldAfter(f.comments)).toHaveLength(0);
+    });
+    it('card: a crash before the spawn is retried as the SAME job once the claim is old', () => {
+      const f = fake({ cardOk: false });
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/not queued/);
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/another invocation holds the claim/);
+      f.advance(121_000);
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/not queued/);
+      expect(f.cards).toHaveLength(2); // two ATTEMPTS, neither of which spawned (cardOk false); no job exists to duplicate
+    });
+    it('card: a failed spawn that left a log behind is NOT proof of a queued job (no confirmed child start)', () => {
+      const f = fake({ noPid: true });
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no confirmed child start/);
+      expect(f.memClaims.spawned(payloadFor().jobKey)).toBe(false);
+      expect(heldAfter(f.comments)).toHaveLength(1);
+      f.advance(121_000);
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/may have started its landing job/);
+      expect(f.cards).toHaveLength(1); // at most once: an unconfirmed start is never re-spawned
+    });
+    it('card: two retries on one expired claim spawn at most once (atomic re-claim)', () => {
+      const f = fake();
+      f.memClaims.claim(payloadFor().jobKey); // an earlier invocation claimed and died before spawning
+      f.advance(121_000);
+      const realReclaim = f.memClaims.reclaim;
+      // the rival wins generation 1 between our observation and our takeover
+      f.memClaims.reclaim = (k, g) => { realReclaim(k, g); return realReclaim(k, g); };
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/just took over/);
+      expect(f.cards).toHaveLength(0);
+    });
+    it('file claims: generations are atomic and a receipt, not a log, proves the spawn', async () => {
+      const { mkdtempSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createFileClaims } = await import('../record-red-team-ruling-io.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'claims-'));
+      try {
+        let t = 1000;
+        const c = createFileClaims({ dir, nowMs: () => t });
+        expect(c.claim('k')).toMatchObject({ created: true, gen: 0 });
+        expect(c.claim('k')).toMatchObject({ created: false, gen: 0, at: 1000 });
+        expect(c.reclaim('k', 0)).toBe(true);
+        expect(c.reclaim('k', 0)).toBe(false);
+        expect(c.claim('k')).toMatchObject({ created: false, gen: 1 });
+        expect(c.spawned('k')).toBe(false);
+        c.markSpawned('k', { session: 's', handle: 'pid:1' });
+        expect(c.spawned('k')).toBe(true);
+        expect(c.spawned('other')).toBe(false);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+    it('card: the job key is stable for the same ruling and differs per break/result', () => {
+      const p = payloadFor();
+      expect(cardJobKey({ ...p, indices: [2, 1] })).toBe(cardJobKey({ ...p, indices: [1, 2] }));
+      for (const changed of [{ indices: [2] }, { resultId: 'new-result' }, { head: OTHER }, { repo: 'other/repo' }, { pr: PR + 1 }]) {
+        expect(cardJobKey({ ...p, ...changed })).not.toBe(p.jobKey);
+      }
+      expect(payloadFor().jobKey).toBe(p.jobKey);
+      expect(payloadFor().session).toBe(`red-team-ruling-card-${payloadFor().jobKey}`);
+    });
+  });
+  describe('audit round 3: an interrupted multi-break card filing never spawns a second filing on an overlapping retry', () => {
+    const two = () => [redTeam(HEAD, [
+      { summary: 'one', category: 'edge-case', impactIfUnfixed: 'broken', file: 'a.mjs', line: 1, confirmedByRecheck: true },
+      { summary: 'two', category: 'edge-case', impactIfUnfixed: 'broken', file: 'b.mjs', line: 2, confirmedByRecheck: true }]), capped()];
+    it('spawn ok, release record fails, retry with --break=1 is refused; the exact retry reconciles without a respawn', () => {
+      let failRecord = true;
+      const f = fake({ initial: two(), postFails: (b) => failRecord && b.includes('outcome=operator-card') });
+      const both = planRedTeamRuling(read({ comments: f.comments }), input({ break: '#1,#2' }));
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](both)).toThrow(/gh down/);
+      expect(f.cards).toHaveLength(1);
+      expect(() => planRedTeamRuling(read({ comments: f.comments }), input({ break: '1' }))).toThrow(/already pending for break\(s\) #1, #2/);
+      const one = { ...both, indices: [1], findings: both.findings.slice(0, 1), jobKey: 'ffffffffffff', session: 'x' };
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](one)).toThrow(/already pending for an overlapping break/);
+      failRecord = false;
+      expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(read({ comments: f.comments }), input({ break: '#1,#2' })))).toMatchObject({ card: { reconciled: true } });
+      expect(f.cards).toHaveLength(1);
+    });
+  });
+
+  describe('audit round 4: concurrent overlapping card selections', () => {
+    const two = () => [redTeam(HEAD, [
+      { summary: 'one', category: 'edge-case', impactIfUnfixed: 'broken', file: 'a.mjs', line: 1, confirmedByRecheck: true },
+      { summary: 'two', category: 'edge-case', impactIfUnfixed: 'broken', file: 'b.mjs', line: 2, confirmedByRecheck: true }]), capped()];
+    it('the second of two interleaved invocations (#1,#2 then #1) is refused before anything is written', () => {
+      const shared = new Map();
+      const a = fake({ initial: two(), sharedBreaks: shared });
+      const b = fake({ initial: two(), sharedBreaks: shared });
+      const pa = planRedTeamRuling(read({ comments: two() }), input({ break: '#1,#2' }));
+      const pb = planRedTeamRuling(read({ comments: two() }), input({ break: '1' }));
+      a.sinks[RED_TEAM_RULING_CARD_EFFECT](pa);
+      expect(() => b.sinks[RED_TEAM_RULING_CARD_EFFECT](pb)).toThrow(/already belong to another card job/);
+      expect(a.cards.length + b.cards.length).toBe(1);
+      expect(b.posted).toEqual([]);
+    });
+    it('file claims: a break is owned by the first job, atomically', async () => {
+      const { mkdtempSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createFileClaims } = await import('../record-red-team-ruling-io.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'claims-'));
+      try {
+        const c = createFileClaims({ dir });
+        expect(c.claimBreak('b1', 'jobA')).toBe('jobA');
+        expect(c.claimBreak('b1', 'jobB')).toBe('jobA');
+        expect(c.claimBreak('b1', 'jobA')).toBe('jobA');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  });
+
+  describe('audit round 5: at most one spawn per card job', () => {
+    it('spawn ok, receipt write fails, exact retry after the claim expires refuses instead of spawning again', () => {
+      const f = fake({ receiptFails: true });
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/receipt write failed/);
+      f.advance(121_000);
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/may have started its landing job/);
+      expect(f.cards).toHaveLength(1);
+    });
+    it('an attempt marker that cannot be written spawns nothing', () => {
+      const f = fake({ attemptFails: true });
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/disk full/);
+      expect(f.cards).toHaveLength(0);
+    });
+  });
+
+  describe('audit round 6: the attempt marker is exclusive', () => {
+    it('two exact retries racing past the claim spawn once', async () => {
+      const { mkdtempSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createFileClaims } = await import('../record-red-team-ruling-io.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'claims-'));
+      try {
+        const c = createFileClaims({ dir });
+        expect(c.markAttempt('j')).toBe(true);
+        expect(c.markAttempt('j')).toBe(false);
+        c.clearAttempt('j');
+        expect(c.markAttempt('j')).toBe(true);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+    it('an invocation that loses the attempt race refuses without spawning', () => {
+      const f = fake();
+      const real = f.memClaims.markAttempt;
+      f.memClaims.markAttempt = (k) => { real(k); return real(k); }; // a rival took the attempt between the check and ours
+      expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/may have started its landing job/);
+      expect(f.cards).toHaveLength(0);
+    });
+  });
+
 });
