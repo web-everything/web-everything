@@ -34,6 +34,26 @@ function collectorGh(overrides = {}) {
 }
 const collectWith = gh => collectPrTimeline('example/repo',1,{gh,comments:() => fixture().comments,env:{WE_FIX_LOOP_LEDGER:join(process.cwd(),'.absent-coroner-ledger')}});
 describe('per PR postmortem', () => {
+  it('collects a merge moved from page 2 to page 1 within the cutoff second', () => {
+    const since = at(500), until = '2026-10-17T11:40:00.500Z';
+    const listing = Array.from({length:201},(_,i) => ({number:i+1,updated_at:at(650),merged_at:i === 100 ? at(600) : null}));
+    const pages = [], returned = [];
+    const gh = args => {
+      const page = Number(new URL(`https://example.test/${args.at(-1)}`).searchParams.get('page'));
+      pages.push(page);
+      // #101 starts on page 2, then moves ahead of the already-read page 1.
+      if (page === 2) listing[100].updated_at = at(700);
+      const rows = [...listing].sort((a,b) => b.updated_at.localeCompare(a.updated_at) || a.number-b.number)
+        .slice((page-1)*100,page*100).map(row => ({...row}));
+      returned.push(rows.map(row => row.number));
+      return rows;
+    };
+    const rows = listMergedSince('example/repo',since,until,{gh});
+    expect(pages).toEqual([1,2,3,1]);
+    expect(returned.slice(0,3).flat()).not.toContain(101);
+    expect(returned[3]).toContain(101);
+    expect(rows.map(row => row.number)).toEqual([101]);
+  });
   it.each([1,101])('retains the cursor when #101 moves to page 1 among %i updates between reads and finds it on the stable poll', async moved => {
     const dir = temp(), file = join(dir,'merge-cursor-example%2Frepo.json');
     const original = JSON.stringify({cursor:at(500),done:[]});

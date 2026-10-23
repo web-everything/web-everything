@@ -6,6 +6,29 @@ import { runPostmortemPass, listMergedSince } from '../../pass-daemons/pr-postmo
 import { DEFAULTS, withCoronerLock } from '../../../operations/coroner-pr-postmortem.mjs';
 
 const SOURCE = 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs';
+export async function sameSecondListingScenario() {
+  const dir = fs.mkdtempSync(join(tmpdir(),'soak-same-second-merge-'));
+  const at = minute => new Date(Date.UTC(2026,9,17,0,minute)).toISOString();
+  const cursor = join(dir,'merge-cursor-example%2Frepo.json');
+  const now = '2026-10-17T11:40:00.500Z', reads = [], violations = [];
+  const listing = Array.from({length:201},(_,i) => ({number:i+1,updated_at:at(650),merged_at:i === 100 ? at(600) : null}));
+  const gh = args => {
+    const page = Number(new URL(`https://example.test/${args.at(-1)}`).searchParams.get('page'));
+    if (page === 2) listing[100].updated_at = at(700);
+    return [...listing].sort((a,b) => b.updated_at.localeCompare(a.updated_at) || a.number-b.number)
+      .slice((page-1)*100,page*100).map(row => ({...row}));
+  };
+  try {
+    fs.writeFileSync(cursor,JSON.stringify({cursor:at(500),done:[]}));
+    await runPostmortemPass({repo:'example/repo',dir,now,settings:{value:DEFAULTS},
+      listMerged:(repo,since,until) => listMergedSince(repo,since,until,{gh}),
+      collect:(repo,pr) => { reads.push(pr); return {repo,pr,openedAt:at(0),mergedAt:at(600)}; }});
+    const state = JSON.parse(fs.readFileSync(cursor,'utf8'));
+    if (reads.join(',') !== '101' || !fs.existsSync(join(dir,'postmortem-example%2Frepo-101.md'))) violations.push('same-second page move lost PR #101');
+    if (state.cursor !== now || state.done.join(',') !== '101') violations.push('same-second page move advanced cursor without processing PR #101');
+    return violations;
+  } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+}
 export async function shiftedListingScenario(moved = 101) {
   const dir = fs.mkdtempSync(join(tmpdir(),'soak-shifted-merge-'));
   const at = minute => new Date(Date.UTC(2026,9,17,0,minute)).toISOString();
@@ -96,6 +119,7 @@ export default {
       if (reads.join(',') !== '2,3,2,2,2,2' || !fs.existsSync(join(dir,'postmortem-example%2Frepo-2.md'))) violations.push('operator quarantine removal did not recover publication');
       violations.push(...await shiftedListingScenario());
       violations.push(...await shiftedListingScenario(1));
+      violations.push(...await sameSecondListingScenario());
       violations.push(...await lockLeaseScenario());
       return {violations};
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
