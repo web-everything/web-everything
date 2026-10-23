@@ -1,8 +1,9 @@
 /**
  * @file scripts/operations/record-red-team-ruling.mjs
- * @description Operator card ruling for a confirmed live-head break parked at the round cap.
- * Requires a trusted round-cap record, an optional existing readable --card, a human operator poster,
- * and the operator's --reason and --channel. review:changes may coexist with the cap record.
+ * @description Operator card ruling for a confirmed break in any state of the live result.
+ * Requires an optional existing readable --card, a human operator poster,
+ * and the operator's --reason and --channel. anyState=false restricts rulings to cap-held
+ * breaks outside review:changes, after automation consumes pending round extensions.
  * The ruling binds to the head and result. Preview plans without writing; the sink rechecks
  * before writing and proves release by reading back the human-authored record.
  * Without --card, queues one follow-up through the detached landing job with retry-safe claims.
@@ -14,7 +15,7 @@ import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
-import { GATE_OUTCOMES, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
+import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, operatorRulingsOnLiveResult, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { sanitizeCardField } from '../lib/review-loop-policy.mjs';
 
 export const RECORD_RED_TEAM_RULING_OP = 'record-red-team-ruling';
@@ -30,6 +31,8 @@ export function cardJobKey({ repo, pr, head, resultId, indices }) {
   return createHash('sha256').update(JSON.stringify(['v1', repo, Number(pr), head, resultId, [...indices].sort((a, b) => a - b)])).digest('hex').slice(0, 12);
 }
 
+const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
+const RULING_ACTION = Object.freeze({ card: 'card' });
 const where = (f) => `${f.file ?? '(no file cited)'}${f.line ? `:${f.line}` : ''}`;
 
 /** Pick the selected held breaks from `--break`: `1`, `#1,#3`, `<file>:<line>` or `<file>`. PURE; throws. */
@@ -69,21 +72,44 @@ export function buildRuleReasonComment({ head, ruling, actor, channel, at, reaso
   ].join('\n');
 }
 
-/** Shared cap-only eligibility rule for planning and the sink's pre-write check. PURE. */
-export function rulableBreaks({ comments, repo, pr, head, setting, standingRuling = null }) {
+/**
+ * The breaks an operator may rule on right now, and why. PURE; throws naming the refusal. Shared by the plan and the
+ * sink's pre-write re-check, so both apply the same rule.
+ *   - `anyState` ON (the `redTeam.operatorRulings.anyState` setting, default): ANY confirmed break of the live head's
+ *     latest result, whatever the gate did with it (parked at the cap, sent back, or carded), except one whose latest
+ *     operator ruling on THIS result is already the same ruling (no second card, no duplicate record).
+ *   - OFF (kill switch): today's restriction. Only a result parked at the round cap, never under `review:changes`,
+ *     and only the breaks the gate still holds for the operator.
+ */
+export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruling, citesCard = false, repo, standingRuling = null }) {
+  const anyState = scope?.anyState !== false;
   const state = liveResultGateState(comments, pr, head, repo, standingRuling);
   if (!state.result) throw new Error(`no red-team result on the live head ${head.slice(0, 9)} — nothing to rule on`);
-  if (!state.outcomes.has(GATE_OUTCOMES.ROUND_CAP)) {
-    throw new Error(`the red-team result on head ${head.slice(0, 9)} was not parked at the round cap (no trusted \`round-cap\` gate record decides it)`);
+  const atCap = state.outcomes.has(GATE_OUTCOMES.ROUND_CAP);
+  if (!anyState) {
+    if (!atCap) {
+      throw new Error(`the red-team result on head ${head.slice(0, 9)} was not parked at the round cap (no trusted \`round-cap\` gate record decides it); `
+        + 'a break that is not at the cap belongs to the gate or the fixer (redTeam.operatorRulings.anyState is off)');
+    }
+    if (state.reopened) throw new Error('a pending round extension reopened the red-team gate; let the gate consume the grant before ruling on a break');
+    if (labelNames(labels).includes('review:changes')) {
+      throw new Error('the PR is under review:changes: the fixer owns the breaks, so there is nothing for the operator to rule on (redTeam.operatorRulings.anyState is off)');
+    }
+    const { carded } = operatorRulingsOnLiveResult(comments, pr, head);
+    // A NEW card filing is never made for a break already carded by anyone, in either mode.
+    const held = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope }).held
+      .filter((f) => !(ruling === 'card' && !citesCard && carded.has(f.index)));
+    if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)');
+    return { state, atCap, anyState, rulable: held, noun: 'held for the operator' };
   }
-  // A grant unseen by the cap record returns the decision to automation. The reader
-  // still reports held until that decision is recorded, so held alone is not enough.
-  if (state.reopened) {
-    throw new Error('a pending round extension reopened the red-team gate; let the gate consume the grant before ruling on a break');
-  }
-  const held = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling }).held;
-  if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)');
-  return { state, rulable: held, noun: 'held for the operator' };
+  const { ruled, carded } = operatorRulingsOnLiveResult(comments, pr, head);
+  const action = RULING_ACTION[ruling];
+  // A NEW card filing is never made for a break already carded by anyone (the gate or an operator); citing an
+  // existing card (--card) files nothing, so it only has to differ from the latest operator ruling.
+  const rulable = state.result.findings.filter((f) => f.confirmed && ruled.get(f.index)?.at(-1) !== action
+    && !(ruling === 'card' && !citesCard && carded.has(f.index)));
+  if (!rulable.length) throw new Error(`no confirmed red-team break on the live head is left to rule \`${ruling}\` (none confirmed, or each already ruled \`${ruling}\` by the operator on this result)`);
+  return { state, atCap, anyState, rulable, noun: `confirmed and not already ruled \`${ruling}\` on the live head` };
 }
 
 /**
@@ -124,13 +150,15 @@ export function planRedTeamRuling(read, input) {
   const head = String(read.head ?? '').toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error('the PR head could not be read; nothing to rule on');
   const comments = operatorBoundComments(read.comments);
-  const { state, rulable, noun } = rulableBreaks({ comments, repo: input.repo, pr, head, setting: read.setting, standingRuling: read.standingRuling });
+  const scope = read.scope?.value ?? OPERATOR_RULINGS_DEFAULTS;
+  const { state, atCap, rulable, noun } = rulableBreaks({ comments, repo: input.repo, labels: read.labels, pr, head, setting: read.setting, scope, ruling, citesCard: Boolean(read.card), standingRuling: read.standingRuling });
   const selected = selectBreaks(rulable, input.break, noun);
   const unconfirmed = selected.filter((f) => !f.confirmed);
   if (unconfirmed.length) throw new Error(`break(s) ${unconfirmed.map((f) => `#${f.index}`).join(', ')} were not confirmed by the re-check; only a confirmed break can be ruled on`);
   const base = { repo: input.repo, pr: Number(pr), head, ruling, actor: String(actor).toLowerCase(), channel: String(channel).trim(),
     reason: String(reason), at: read.now, resultId: state.resultId, findings: selected, setting: read.setting,
-    indices: selected.map((f) => f.index) };
+    indices: selected.map((f) => f.index), scope, scopeSources: read.scope?.sources ?? {}, atCap,
+    underChanges: labelNames(read.labels).includes('review:changes') };
   if (read.card) {
     return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardRef: read.card.ref };
   }
@@ -180,7 +208,7 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
           repo: view.verdict.repo, pr: view.verdict.pr, head: view.verdict.head, ruling: view.verdict.ruling,
           actor: view.verdict.actor, channel: view.verdict.channel, reason: view.verdict.reason, at: view.verdict.at,
           resultId: view.verdict.resultId, findings: view.verdict.findings, indices: view.verdict.indices,
-          setting: view.verdict.setting, cardRef: view.verdict.cardRef,
+          setting: view.verdict.setting, scope: view.verdict.scope, cardRef: view.verdict.cardRef,
           cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session,
         },
       }]),

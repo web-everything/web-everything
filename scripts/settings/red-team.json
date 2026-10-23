@@ -5,6 +5,10 @@
       "broken": "send-back",
       "degraded": "card",
       "unconfirmed": "advisory"
+    },
+    "operatorRulings": {
+      "$comment": "anyState (default true; kill switch WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE=false): a human operator's record-red-team-ruling may rule card on any confirmed break of the live head's result (at the cap, sent back, or carded). Off = round-cap-only.",
+      "anyState": true
     }
   }
 }
