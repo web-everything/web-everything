@@ -4434,7 +4434,8 @@ async function runCli() {
   // operator's personal one. Awaited HERE, before any gh work, so a fresh env var is in place for even the
   // very first discovery call; a `--watch` run re-checks at the top of every pass (see the watch loop). See
   // github-app-auth-env.mjs's own header for why this lives outside gh-throttle.mjs.
-  await ensureFreshGithubAppEnv({ log: console, perOwner: true });
+  // PR #5729 — the drain is a daemon: install the gh refusal shim (or refuse) before any gh call.
+  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: true });
   // #4308 — the drain CLI's one-off overlap-yield overrides (`--overlap-yield`/`--no-overlap-yield`/
   // `--overlap-yield-window=<n>`, env `WE_DRAIN_OVERLAP_YIELD`). A usage error (conflicting flags, a bad env
   // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
@@ -7401,7 +7402,7 @@ async function runCli() {
     // #3881 — refresh the App token at the top of EVERY pass (a no-op unless configured, and a plain cache read
     // until the token nears expiry). Never on a timer: this loop sleeps with `sleepSync`, so the event loop is
     // never free for a background refresh to run — the top of a pass is the only point it can.
-    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true });
+    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: true });
     if (leaseHeld) heartbeatDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { scope: leaseScope, repoKey: localSlug }); // #2395 — keep the whole-process lease alive across a long watch (an `under-lease` child never heartbeats — its parent daemon owns that); #2458 re-supply the scope so it survives the heartbeat rewrite; #3440 repoKey selects the same per-repo lock dir
     // #2681 — RE-CHECK the red-main dispatch-freeze EVERY pass: a post-land red can be raised DURING a running
     // watch (the resident drain daemon is a long-lived `--watch`), and stop-the-line must catch it, not just a

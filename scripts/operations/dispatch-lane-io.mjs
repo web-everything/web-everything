@@ -105,7 +105,8 @@ import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 // #3637 — the POC-branch registry, so an item's `deliveryTarget:` resolves against DECLARED branches only.
 import { readRegistry as readPocRegistry, validateDeliveryTarget } from '../lib/poc-branches.mjs';
 import { briefTokensForRepo, repoKeyForScope, deliveryLocusForScope } from '../lib/repo-profile.mjs';
-import { buildGhShimSettingsEnv, sanitizeSpawnEnv, ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
+import { buildGhShimSettingsEnv, sanitizeSpawnEnv, ensureSettingsFilePermissions, isDaemonCaller } from '../lib/gh-app-shim.mjs';
+import { isGithubAppAuthGuardError } from '../lib/github-app-auth-env.mjs';
 // #x9fbg1x — turns OFF Claude Code's own background-session worktree-isolation guard for THIS dispatch's
 // scratch cwd only (never the primary checkout, never a lane clone shared across dispatches) — see that
 // module's own header for the full incident (fix-2748/fix-2770, 2026-09-26) and why the repo-wide tracked
@@ -2151,11 +2152,12 @@ export const DISPATCHED_AGENT_SYSTEM_PROMPT_FILE = join(dirname(fileURLToPath(im
  */
 /**
  * #x8mpubm — THE ONE PLACE a dispatch resolves whether (and how) to route a dispatched session's own `gh`
- * calls through the App-token shim (`we:scripts/lib/gh-app-shim.mjs`). NEVER throws: any failure (no real
- * `gh` on `PATH`, App auth not configured on this host, a read-only shim dir) resolves to `null`, meaning the
- * caller omits `--settings` entirely and the dispatch proceeds exactly as it would have before this existed.
- * A thin wrapper, not re-exported logic — `gh-app-shim.mjs` owns every real decision; this only guarantees
- * the "never blocks a dispatch" contract every sink in this file already holds itself to.
+ * calls through the App-token shim (`we:scripts/lib/gh-app-shim.mjs`). For an INTERACTIVE caller it never
+ * throws: any failure (no real `gh` on `PATH`, App auth not configured on this host, a read-only shim dir)
+ * resolves to `null`, meaning the caller omits `--settings` entirely and the dispatch proceeds as before.
+ * A DAEMON caller (PR #5729) re-throws the shim's refusal, so the dispatch fails closed before the provider
+ * runs — a daemon session without the refusal guard would fall back to personal gh auth.
+ * A thin wrapper, not re-exported logic — `gh-app-shim.mjs` owns every real decision.
  *
  * `cwd` (#x8mpubm follow-up, live-caught 2026-09-24) — the checkout the dispatched session actually starts
  * in (`createDispatchSinks`' own `root`). Forwarded to `buildGhShimSettingsEnv` so it can ALSO write the same
@@ -2166,7 +2168,15 @@ export const DISPATCHED_AGENT_SYSTEM_PROMPT_FILE = join(dirname(fileURLToPath(im
  * @returns {Record<string,string>|null}
  */
 export function resolveGhShimSettingsEnv(cwd, { env } = {}) {
-  try { return buildGhShimSettingsEnv(env ? { cwd, env } : { cwd }); } catch { return null; }
+  try { return buildGhShimSettingsEnv(env ? { cwd, env } : { cwd }); } catch (e) {
+    // PR #5729 — except for a daemon: its refusal guard is the auth boundary, so the dispatch fails closed
+    // instead of starting a session without the shim. `notApplied`: nothing was started, so the executor records
+    // a retryable failure, never an UNKNOWN in-flight entry. Fail-soft stays for interactive callers.
+    if (isGithubAppAuthGuardError(e) || isDaemonCaller(process.env) || (env && isDaemonCaller(env))) {
+      throw notApplied(`dispatch refused: ${String(e?.message || e)}`);
+    }
+    return null;
+  }
 }
 
 /**
@@ -2181,7 +2191,7 @@ export function resolveGhShimSettingsEnv(cwd, { env } = {}) {
 export const DISPATCH_BASH_TIMEOUT_ENV = Object.freeze({ BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '600000' });
 
 /** The dispatched session's `--settings` env: the gh-App shim override (when this host opted in) plus the
- *  #x36vidg Bash timeouts (always). Never throws. */
+ *  #x36vidg Bash timeouts (always). Throws only a daemon's gh-guard refusal (see resolveGhShimSettingsEnv). */
 export function resolveDispatchSettingsEnv(cwd, opts) {
   return { ...(resolveGhShimSettingsEnv(cwd, opts) || {}), ...DISPATCH_BASH_TIMEOUT_ENV };
 }
