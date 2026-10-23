@@ -46,7 +46,7 @@ function fixture({ change = () => undefined, over = {}, options = {} } = {}) {
     throw new Error('unexpected command');
   };
   const result = runGraduateChain({ ...input, ...over }, { exec, cwd: '/repo', env: {}, cascadePolicy, extractSubmitResult,
-    capsPlatform: {}, buildPolicy: { finalGate: 'full', sources: { finalGate: 'standard' } },
+    capsPlatform: {},
     readTemplate: () => '{{commits}} {{diffStat}} {{testResult}} {{audit}}',
     writeBody: body => { bodies.push(body); return '/tmp/body.md'; }, cleanup: () => { cleaned = true; }, ...options });
   return { result, calls, bodies, cleaned, exec };
@@ -116,12 +116,13 @@ describe('graduate-chain', () => {
     expect(calls.find(c => c.args[1] === 'open-pr').args).toContain('--base=lane/parent');
     expect(calls.find(c => c.args[0] === 'merge-tree').args).toContain(`--merge-base=${sha}`);
   });
-  it('honours environment cap provenance and explicit build policy', () => {
-    const { result, calls } = fixture({ options: { env: { WE_GRADUATION_CALLER_MAX: '6' },
-      buildPolicy: { finalGate: 'full', sources: { finalGate: 'tool' } } } });
+  it('honours environment cap provenance and leaves the final gate to the cascade', () => {
+    const { result, calls } = fixture({ options: { env: { WE_GRADUATION_CALLER_MAX: '6' } } });
     expect(result.capSources.callerMax).toBe('env');
     expect(result.caps.callerMax).toBe(6);
-    expect(calls.find(c => c.args[1] === 'verify').env).toMatchObject({ WE_BUILD_FINAL_GATE: 'full', WE_HEAVY_ADMISSION_CEILING_MS: '7200000' });
+    const venv = calls.find(c => c.args[1] === 'verify').env;
+    expect(venv).toMatchObject({ WE_HEAVY_ADMISSION_CEILING_MS: '7200000' });
+    expect(venv).not.toHaveProperty('WE_BUILD_FINAL_GATE');
   });
   for (const [reason, change, acquired] of [
     ['cap-caller', (c, a) => c === 'gh' && a[1] === 'list' && reply(prs(4)), false],
