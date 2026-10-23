@@ -20,6 +20,10 @@ export function resolveBuildPolicy({ env = process.env, tool, platform, readFile
     standard: 'full', platform: platform?.finalGate, env,
     envValues: { '': text(env.WE_BUILD_FINAL_GATE) }, valid: v => ['full', 'related', 'none'].includes(v),
   });
+  const standards = cascadePolicy('build.finalGateStandards', tool?.finalGateStandards, {
+    standard: 'always', platform: platform?.finalGateStandards, env,
+    envValues: { '': text(env.WE_BUILD_FINAL_GATE_STANDARDS) }, valid: v => ['always', 'selected'].includes(v),
+  });
   const selfReview = cascadePolicy('build.selfReview', tool?.selfReview, {
     standard: { enabled: true, maxRounds: 2 }, platform: platform?.selfReview, env,
     envValues: { enabled: bool(env.WE_BUILD_SELF_REVIEW_ENABLED), maxRounds: int(env.WE_BUILD_SELF_REVIEW_MAX_ROUNDS) },
@@ -29,8 +33,8 @@ export function resolveBuildPolicy({ env = process.env, tool, platform, readFile
     standard: { enabled: true }, platform: platform?.reviewerExpectations, env,
     envValues: { enabled: bool(env.WE_BUILD_REVIEWER_EXPECTATIONS_ENABLED) }, valid: { enabled: v => typeof v === 'boolean' },
   });
-  const result = { finalGate: gate.value, selfReview: selfReview.value, reviewerExpectations: checklist.value,
-    sources: { finalGate: gate.sources[''], 'selfReview.enabled': selfReview.sources.enabled, 'selfReview.maxRounds': selfReview.sources.maxRounds, 'reviewerExpectations.enabled': checklist.sources.enabled } };
+  const result = { finalGate: gate.value, finalGateStandards: standards.value, selfReview: selfReview.value, reviewerExpectations: checklist.value,
+    sources: { finalGate: gate.sources[''], finalGateStandards: standards.sources[''], 'selfReview.enabled': selfReview.sources.enabled, 'selfReview.maxRounds': selfReview.sources.maxRounds, 'reviewerExpectations.enabled': checklist.sources.enabled } };
   // Use the common formatter; callers can capture the same line in dispatch receipts.
   const line = formatCascadeSourcesLine('build', { value: result, sources: result.sources });
   if (log) log(line);

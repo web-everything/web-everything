@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { main, renderWorkerBrief } from '../worker-brief.mjs';
+import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 
 const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'], owner: 'tok12345' };
 const files = 'we:scripts/x.mjs,plateau-app:src/y.ts';
@@ -16,8 +17,10 @@ describe('renderWorkerBrief', () => {
       'ONLY when your declared files overlap', 'No overlap', '--files']) expect(lane).toContain(text);
   });
 
-  it('renders every standard section in order and the qualified scope in commands', () => {
-    const brief = renderWorkerBrief(params);
+  it('renders every standard section in order and the qualified scope in commands under the standard policy', () => {
+    // Pin the standard: the live platform preference deliberately selects related tests.
+    const policy = resolveBuildPolicy({ env: {}, tool: {}, platform: {} });
+    const brief = renderWorkerBrief({ ...params, policy });
     const sections = ['## Standard worker rules', '**Scope.**', '1. **Free-scope pre-check.**',
       '2. **Register your scope.**', '3. **Lane.**', '4. **Codex for scoped coding.**',
       '5. **Red-green tests through the heavy queue.**', '6. **One PR.**',
@@ -84,7 +87,7 @@ describe('renderWorkerBrief', () => {
 
   // A plateau-app lane has no scripts/verify-lane.mjs, so Codex's full or related gate would be gate-unavailable.
   it.each([['full', 'standards'], ['related', 'standards'], ['none', 'none']])('a plateau-app brief under finalGate=%s sends Codex --gate=%s', (finalGate, codexGate) => {
-    const policy = { finalGate, selfReview: { enabled: false, maxRounds: 2 }, reviewerExpectations: { enabled: false } };
+    const policy = resolveBuildPolicy({ env: {}, tool: {}, platform: { finalGate } });
     const brief = renderWorkerBrief({ ...params, repo: 'plateau-app', policy });
     expect(brief).toContain(`--dir=<lane> --gate=${codexGate}\``);
     expect(renderWorkerBrief({ ...params, policy })).toContain(`--dir=<lane> --gate=${finalGate}\``);

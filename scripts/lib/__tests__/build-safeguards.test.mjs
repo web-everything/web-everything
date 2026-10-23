@@ -31,6 +31,21 @@ describe('build safeguards policy and briefs', () => {
     }
     expect(buildCodexPrompt('review', { review: true, policy })).not.toContain(checklist);
   });
+  it.each([
+    [{}, 'always', 'standard'],
+    [{ platform: { finalGateStandards: 'selected' } }, 'selected', 'platform'],
+    [{ platform: { finalGateStandards: 'selected' }, tool: { finalGateStandards: 'always' } }, 'always', 'tool'],
+    [{ tool: { finalGateStandards: 'always' }, env: { WE_BUILD_FINAL_GATE_STANDARDS: ' selected ' } }, 'selected', 'env'],
+    [{ platform: { finalGateStandards: 'bad' }, tool: { finalGateStandards: 'bad' }, env: { WE_BUILD_FINAL_GATE_STANDARDS: 'bad' } }, 'always', 'standard'],
+    [{ env: { WE_BUILD_FINAL_GATE_STANDARDS: '' } }, 'always', 'standard'],
+    [{ tool: { finalGateStandards: 'selected' }, env: { WE_BUILD_FINAL_GATE_STANDARDS: 'bad' } }, 'selected', 'tool'],
+  ])('cascades finalGateStandards with provenance: %j', (options, value, source) => {
+    const log = vi.fn();
+    const policy = resolve({ ...options, log });
+    expect(policy.finalGateStandards).toBe(value);
+    expect(policy.sources.finalGateStandards).toBe(source);
+    expect(log.mock.calls[0][0]).toContain(`finalGateStandards="${value}" (${source})`);
+  });
   it('resolves each leaf through all cascade layers and logs the winning sources', () => {
     const p = resolve({ platform: { finalGate: 'related', selfReview: { enabled: false, maxRounds: 3 } },
       tool: { selfReview: { maxRounds: 1 } }, env: { WE_BUILD_SELF_REVIEW_ENABLED: 'true' } });
