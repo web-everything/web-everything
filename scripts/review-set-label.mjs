@@ -1143,8 +1143,10 @@ export function runReviewLabelCli({
   if (onlyIf !== null && !['accepted', 'missing'].includes(onlyIf)) {
     fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
-  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, missing re-arm or a pinned accept');
+  const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
+  if (pinnedRearm && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
     fail('--only-if is only valid with the rearm target');
   }
@@ -1311,7 +1313,7 @@ export function runReviewLabelCli({
     fail(ghErr(e, 'gh pr view failed'), 1);
   }
 
-  if ((guardedRestamp || pinnedAccept || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -1864,6 +1866,11 @@ export function runReviewLabelCli({
   let removals = presentRemoveLabels(decision.removeLabels, currentLabels);
   const applySwap = () => {
     try {
+      if (pinnedRearm && onlyIf !== 'missing') {
+        if (provider.readPrState(repo, pr).headRefOid !== expectedHead) {
+          throw new Error('live head differs from --expect-head');
+        }
+      }
       if (['accepted', 'restamp', 'clear-human'].includes(to)) {
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');

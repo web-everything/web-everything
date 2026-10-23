@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   planOrphanFixRound, runOrphanFixRoundPass, formatOrphanFixRoundLines, buildOrphanGuardComment, verdictReviewedHead,
-  ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS,
+  ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultRearm,
 } from '../orphan-fix-round.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
@@ -22,6 +22,46 @@ const BEGIN = c('2026-10-10T15:03:55Z', `${FIX_BEGIN_MARKER}\n\n**Who:** \`fix-4
 const RESTACK = c('2026-10-10T15:21:28Z', '🔁 restack — merged `origin/lane/gh-merge-queue-gate` into this branch.');
 const END = c('2026-10-10T15:21:33Z', `${FIX_END_MARKER}\n\n\`fix-4715\` released the fix claim at \`124e242da\`.`);
 const pr4715 = (comments, extra = {}) => ({ number: 4715, labels: [{ name: 'review:changes' }, { name: 'review-round:1' }], headRefOid: HEAD, isDraft: false, comments, ...extra });
+
+describe('defaultRearm child diagnostics', () => {
+  it('surfaces the first non-empty child stderr lines and forwards the full head pin', () => {
+    const exec = vi.fn(() => { throw Object.assign(new Error('Command failed: node rearm-review.mjs'), {
+      stderr: Buffer.from('\n\u001b[31mlive head differs from --expect-head\u001b[0m\nrefused\u0000\n'),
+      stdout: Buffer.from(JSON.stringify({ reason: '\u001b[31mshared refusal\u001b[0m\u0000\u202e' })),
+    }); });
+    expect(() => defaultRearm({ slug: 'o/n', pr: 5608, head: HEAD, exec }))
+      .toThrow('orphan-guard re-arm failed: live head differs from --expect-head; refused; shared refusal');
+    expect(exec.mock.calls[0][1]).toContain(`--expect-head=${HEAD}`);
+  });
+
+  it('caps oversized stderr at 300 characters', () => {
+    const exec = () => { throw Object.assign(new Error('Command failed'), { stderr: 'x'.repeat(1000) }); };
+    expect(() => defaultRearm({ slug: 'o/n', pr: 5608, exec }))
+      .toThrow(new Error(`orphan-guard re-arm failed: ${'x'.repeat(300)}`));
+  });
+
+  it.each([
+    JSON.stringify({ reason: '\u001b[31mlive head differs from --expect-head\u001b[0m\u0000' }),
+    JSON.stringify({ error: 'live head differs from --expect-head' }),
+    '\n\u001b[31mlive head differs from --expect-head\u001b[0m\u0000\nignored second line',
+  ])('surfaces sanitized stdout when stderr is empty: %s', stdout => {
+    const exec = () => { throw Object.assign(new Error('Command failed'), { stdout, stderr: '' }); };
+    expect(() => defaultRearm({ slug: 'o/n', pr: 5608, exec }))
+      .toThrow(new Error('orphan-guard re-arm failed: live head differs from --expect-head'));
+  });
+
+  it.each(['x'.repeat(1000), JSON.stringify({ reason: 'x'.repeat(1000) })])('caps oversized stdout at 300 characters', stdout => {
+    const exec = () => { throw Object.assign(new Error('Command failed'), { stdout }); };
+    expect(() => defaultRearm({ slug: 'o/n', pr: 5608, exec }))
+      .toThrow(new Error(`orphan-guard re-arm failed: ${'x'.repeat(300)}`));
+  });
+
+  it('names the missing-output fallback', () => {
+    const exec = () => { throw new Error('spawn failed'); };
+    expect(() => defaultRearm({ slug: 'o/n', pr: 5608, exec }))
+      .toThrow('orphan-guard re-arm failed: child failed without stderr or stdout');
+  });
+});
 
 describe('planOrphanFixRound — the #4715 shapes', () => {
   it('re-arms the live #4715 thread: findings addressed (evidence, head moved), round ended, never re-armed', () => {
