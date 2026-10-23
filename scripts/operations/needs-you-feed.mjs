@@ -13,6 +13,7 @@ import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
+import { resolveStallSweepSettings } from '../conveyor/pr-stall-sweep.mjs';
 
 export const CHECKOUT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 function readOptional(path, fallback) {
@@ -65,7 +66,7 @@ const sectionReasons = {
 // Only these kinds can be represented (and therefore resolved by absence) in itemsFromReport.
 // Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
 // a successful queue read supplies no evidence that their independently owned condition resolved.
-const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
+export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -92,8 +93,15 @@ export function sanitizeForFeed(text, max) {
   return String(text).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, max);
 }
 const fieldLimits = { repo: 200, head: 128, kind: 40, was: 40, reason: 100, title: 200, pick: 512, command: 512 };
+function sanitizeValue(value, max) {
+  if (typeof value === 'string') return sanitizeForFeed(value, max);
+  if (Array.isArray(value)) return value.map(entry => sanitizeValue(entry, max));
+  if (value && typeof value === 'object') return sanitizeItem(value);
+  return value;
+}
+// Publication and legacy replay share the same boundary, including evidence arrays and nested records.
 const sanitizeItem = item => Object.fromEntries(Object.entries(item).map(([field, value]) =>
-  [field, typeof value === 'string' ? sanitizeForFeed(value, fieldLimits[field] ?? 512) : value]));
+  [field, sanitizeValue(value, fieldLimits[field] ?? 512)]));
 function fromKey(key) {
   const m = /^(.*)#(\d+)@(.*):([^:]+)$/.exec(key);
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
@@ -170,7 +178,8 @@ export function replay({ path = feedPath(), since = '1970-01-01T00:00:00Z' } = {
 }
 // Keep the original sidecars only for the canonical filename. Overrides get their own namespace,
 // keyed by resolved path, so changing filenames neither inherits open keys nor another stream's cursor.
-function sidecarsOf(path) {
+/** Exported for the PR stall sweep's `stalled` publisher, which shares this state file and its lock. */
+export function sidecarsOf(path) {
   const absolute = checkedFeedPath(path);
   if (basename(absolute) === 'needs-you-events.jsonl') return {
     state: join(dirname(absolute), 'needs-you-feed-state.json'), ack: join(dirname(absolute), 'needs-you-ack'),
@@ -272,12 +281,20 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     }
   }
   const path = checkedFeedPath(settings.path.value), statePath = statePathOf(path);
+  const stallSettings = resolveStallSweepSettings({ env, log: () => {} });
+  // A settings failure cannot establish that the producer was disabled; keep honoring its open items.
+  const honorStalled = stallSettings.settingsUnreadable || (stallSettings.value.mode !== 'off' && stallSettings.value.digest);
   mkdirSync(dirname(statePath), { recursive: true });
   // Serialization prevents concurrent once/loop calls from duplicating the same transition.
   return withFileLock(`${statePath}.lock`, () => {
     if (!owns()) return { lines: [], superseded: true };
     const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
-    const result = diffFeed(prev.openKeys, items, now, { clearKinds: REPORT_KINDS });
+    // The PR stall sweep's open `stalled` item already asks about this PR head: a NEW queue item for it is not
+    // published twice (one already open stays, so it is never cleared by this filter).
+    const stalled = honorStalled ? prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length)) : [];
+    const asked = i => !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
+    const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
+    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;
