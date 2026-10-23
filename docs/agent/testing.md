@@ -173,7 +173,9 @@ exercise diagnostic propagation through a real-git rebuild fixture. Run these su
 ## Red-team re-check evidence
 
 The drain reads saved red-team evidence for the exact repository, PR and live head when no
-trusted result comment exists. Saved rows require a completed `review-pr` run with
+trusted result comment exists. Saved rows require a completed `review-pr` run, or one
+parked at its human `confirm` step with a verdict and a cursor matching that step in
+its declared roster (all earlier steps finished), with
 `findings.savedRedTeamResult = { writer: 'review-job', references: [{ path, index }], sha256 }`.
 The review job attests the persisted result before running the gate, for panel-seat and
 post-accept timing. Hash the referenced rows as one JSON array, sorting object keys recursively
