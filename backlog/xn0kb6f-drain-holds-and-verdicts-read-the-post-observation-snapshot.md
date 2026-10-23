@@ -17,6 +17,7 @@ Found at PR #5492 (head fa23a3d), operator-carded as expedite under decision xug
   - `head-moved and carried observations update same-pass holds and verdicts` (we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs) — both the hold and the verdict read the rows appended in this pass.
   - `snapshot refresh reads only the appended rows` (we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs) — the refresh reads the ledger from the pre-append offset, never the whole file.
   - `failed snapshot refresh holds PRs with rows appended this pass` (we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs) — fault injection: the refresh read fails, and every PR with a row appended this pass is held, not merged.
+  - `appended row for the same PR number in another repo leaves this PR unchanged` (we:scripts/__tests__/merge-ai-prs-observation-snapshot.test.mjs) — a head-moved row appended this pass for PR N in a sibling repo does not hold or change the verdict of PR N in this repo; a row for PR N in this repo does.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -34,6 +35,6 @@ One line per class: either the handling, or `n/a: <why>`.
 2. **Truncated reads** — the refresh reads from the pre-append offset; a short or failed read counts as a failed refresh (see Fail closed).
 3. **Shared state files** — the ledger is append-only and the drain pass is its writer; the refresh reads only the range this pass appended.
 4. **Fail closed** — if the refresh fails, every PR with a row appended this pass is held for this pass, never merged on the stale snapshot (case `failed snapshot refresh holds PRs with rows appended this pass`).
-5. **Identity scoping** — rows are matched by repo and PR number.
+5. **Identity scoping** — rows are matched by repo and PR number (case `appended row for the same PR number in another repo leaves this PR unchanged`).
 6. **State over time** — the core of this card: rows written in a pass are visible to that pass's holds and verdicts.
 7. **Who wrote it** — n/a: only the drain writes the ledger.

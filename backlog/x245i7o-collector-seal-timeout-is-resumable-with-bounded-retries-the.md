@@ -20,6 +20,7 @@ Per decision x5ioz96 fork 6 skeptic amendment: the root cause of the stuck batch
   - `seal plan starts at the step after the last completed one` (we:scripts/operations/__tests__/card-batch-seal.test.mjs) — the pure step plan in we:scripts/operations/card-batch-seal.mjs, given a recorded last completed step, returns the remaining steps only, and an unknown recorded step yields a held reason, not a restart.
   - `retry count is bounded by the setting, with its source logged` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs).
   - `retry exhaustion holds with a named reason` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — the state keeps sealedAt and the held reason names the timed-out step.
+  - `retry count is per batch and starts at zero for a fresh batch` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — with one batch at its retry limit, (a) the next fresh batch of the same repo and kind, (b) a batch of another kind in the same repo, and (c) a batch of the same kind in another repo each start at zero retries and are not held.
   - `timeout during number-members then resume leaves each member numbered exactly once` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — a timeout injected partway through x1mmp60's numbering step, then a resume, leaves every member with exactly one number, no half-renumbered head, and no extra numbers allocated. This is a cross-slice case, so x245i7o lands after x1mmp60.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
@@ -38,6 +39,6 @@ One line per class: either the handling, or `n/a: <why>`.
 2. **Truncated reads** — a seal job killed partway through a step counts as a timeout; that step re-runs from its start and is never recorded as complete.
 3. **Shared state files** — the retry count and last completed step live in the state file, written under the per-kind lease.
 4. **Fail closed** — retry exhaustion holds with a named reason and never marks the PR ready (case `retry exhaustion holds with a named reason`).
-5. **Identity scoping** — the retry count belongs to one batch (repo, kind, seq) and starts at zero for a fresh batch.
+5. **Identity scoping** — the retry count belongs to one batch (repo, kind, seq) and starts at zero for a fresh batch (case `retry count is per batch and starts at zero for a fresh batch`).
 6. **State over time** — resume from the last completed step; a resumed `number-members` numbers each member exactly once (case `timeout during number-members then resume leaves each member numbered exactly once`).
 7. **Who wrote it** — n/a: only the seal job writes seal progress.
