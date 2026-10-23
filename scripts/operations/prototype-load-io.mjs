@@ -53,11 +53,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
   const requireGit = (...args) => { const r = git(...args); if (r.code !== 0) throw new Error(r.error || `git ${args[0]} failed (${r.code})`); return r.stdout.trim(); };
   const ancestor = (tip, sha) => { const r = git('merge-base', '--is-ancestor', tip, sha); if (![0, 1].includes(r.code)) throw new Error(r.error || 'ancestry unverifiable'); return r.code === 0; };
   const loader = (action, clone, ref, extra = []) => execute('node', [resolve(repo, config.loaderCli), action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])]);
-  const lastJson = (r) => { try { return JSON.parse(r.stdout.trim().split(/\r?\n/).at(-1)); } catch { return null; } };
+  const loaderJson = (r) => { try { return JSON.parse(r.stdout); } catch { return null; } };
   const check = (clone, ref, expectedSha) => {
     const result = loader('add', clone, ref, ['--check', ...(expectedSha ? [`--expected-sha=${expectedSha}`] : [])]);
-    const data = lastJson(result);
+    const data = loaderJson(result);
     if (![0, 3].includes(result.code) || data?.check?.ok !== true || typeof data.check.clean !== 'boolean'
+      || !validSha(data.check.candSha) || data.wouldRegister !== data.check.clean
       // A clean check carries no `files`/`conflicting` (the loader only adds them on a conflict); default them.
       || (data.check.files !== undefined && (!Array.isArray(data.check.files) || !data.check.files.every((file) => typeof file === 'string')))
       || (data.check.conflicting !== undefined && !Array.isArray(data.check.conflicting))
@@ -105,16 +106,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       out.gate = readyEvidence(readyRecords, input);
       let state, readyRows;
       const statePath = () => state ||= join(expand(env.WE_DAEMON_OVERLAY_DIR || join(env.HOME, '.claude/daemon-overlays')), keyForClone(out.clone));
+      const events = jsonLines(read(`${statePath()}.events.jsonl`));
       if (!out.gate) {
-        const strictLines = (text) => String(text || '').split(/\r?\n/).filter((line) => line.trim()).map((line) => JSON.parse(line));
-        strictLines(readyText); // A partial trail cannot establish when records began.
-        const events = strictLines(read(`${statePath()}.events.jsonl`));
         // With neither part records nor registration events there is nothing to prove via Git.
         if (!events.some((e) => e?.kind === 'added') && !readyRecords.some((r) => r?.ref !== input.branch && validSha(r?.sha))) return stop('no-ready');
         const listing = loader('list', out.clone);
-        readyRows = lastJson(listing)?.list;
+        readyRows = loaderJson(listing)?.list;
         if (listing.code !== 0 || !Array.isArray(readyRows) || readyRows.some((r) => !safeRegistrationRef(r?.ref))) return stop('no-ready', { listing });
-        requireGit('fetch', 'origin', input.branch);
+        requireGit('fetch', 'origin', 'main', input.branch);
         if (requireGit('rev-parse', `origin/${input.branch}`) !== input.sha) return stop('no-ready');
         const parts = [];
         for (const ref of [...new Set(readyRows.map((r) => r.ref))]) {
@@ -127,6 +126,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         if (!parts.length && readyRows.some((r) => r.ref === input.branch)) parts.push({ ref: input.branch, sha: input.sha });
         out.gate = combinedReadyEvidence(readyRecords, parts, events, readyText === null);
         if (!out.gate) return stop('no-ready');
+        const uncovered = requireGit('rev-list', '--no-merges', `origin/main..${input.sha}`, '--not', ...parts.map((part) => part.sha));
+        if (uncovered) return stop('no-ready', { uncovered, fallback: 'Prove readiness for every contributing part or test the full top and record its readiness, then retry.' });
       }
       requireGit('fetch', 'origin', input.branch);
       const tip = requireGit('rev-parse', `origin/${input.branch}`);
@@ -158,7 +159,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       let priorListing;
       if (out.wouldMerge) {
         priorListing = loader('list', out.clone);
-        const priorRows = lastJson(priorListing)?.list;
+        const priorRows = loaderJson(priorListing)?.list;
         if (priorListing.code !== 0 || !Array.isArray(priorRows) || priorRows.some((r) => !safeRegistrationRef(r?.ref))) return stop('check-unverifiable', { listing: priorListing });
         if (priorRows.some((r) => r.ref === input.branch)) out.registered = 'already';
       }
@@ -170,7 +171,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       }
       out.check = check(out.clone, out.effectiveRef, out.effectiveSha);
       const listing = priorListing || loader('list', out.clone);
-      const rows = lastJson(listing)?.list;
+      const rows = loaderJson(listing)?.list;
       if (listing.code !== 0 || !Array.isArray(rows) || rows.some((r) => !safeRegistrationRef(r?.ref))) return stop('check-unverifiable', { listing });
       const established = [...new Set(rows.map((r) => r.ref))];
       const contained = [], blocking = [];
@@ -207,7 +208,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         out.registration = result;
         if (result.code !== 0) return stop('register-failed');
         out.registered = true;
-        const evidence = lastJson(result)?.conflictCheck;
+        const evidence = loaderJson(result)?.conflictCheck;
         if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
           return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
         }

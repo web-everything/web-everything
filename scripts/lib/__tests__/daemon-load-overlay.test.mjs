@@ -1011,6 +1011,16 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     expect(statSync(r.diagnostics.stderrFile).mode & 0o777).toBe(0o600);
     expect(readFileSync(r.diagnostics.stderrFile, 'utf8')).toContain('julietword10x');
   });
+  it.each(['launch', 'wrapper'])('sanitizes full %s diagnostics before the 80-character error-class bound', async (source) => {
+    const prefix = `TypeError: ${'context '.repeat(7)}`;
+    const credential = '0123456789abcdef0123456789abcdef01234567';
+    const stderr = `${prefix}${credential}`;
+    const spawn = source === 'launch' ? vi.fn(() => ({ status: 3, stderr }))
+      : launchFixture(({ scratch }) => writeFileSync(join(scratch, 'wrapper.stderr'), stderr));
+    const r = await smoke(spawn);
+    expect(r.diagnostics.errorClass).toBe(`${prefix}<redacted>`);
+    expect(JSON.stringify(r)).not.toContain(credential.slice(0, 12));
+  });
 
   it('retries a launch timeout whose only record is the wrapper\'s own started record', async () => {
     const spawn = launchFixture((a) => {
@@ -1486,6 +1496,49 @@ describe('load outcome audit and registration trigger', () => {
     expect(opts.recordFn.mock.calls[0][0].record).toMatchObject({
       outcome: 'dispatch-smoke-failed', rolledBack: true, registered: false, rollback: { adopted: true },
     });
+  });
+  it.each(['smoke throw', 'smoke detail', 'remove throw', 'recovery throw'])(
+    'sanitizes full %s text before its record-bound truncation', async (source) => {
+      const { appendLoadRecord } = await vi.importActual('../overlay-load-record.mjs');
+      const prefix = 'context '.repeat(source === 'smoke detail' ? 498 : 61);
+      const credential = '0123456789abcdef0123456789abcdef01234567';
+      const text = `${prefix}${credential} trailing context`;
+      const fs = { mkdirSync: vi.fn(), appendFileSync: vi.fn() };
+      const opts = { ...options(), versions: { dir: '/versions' }, wait: true,
+        env: { WE_PROTOTYPE_LOAD_RECORD: 'records.jsonl' },
+        settings: { noPr: 'refuse', dispatchSmoke: 'on', dispatchPaths: [] },
+        submit: () => 'req', waitFor: async () => ({ adopted: true, moved: true, versionId: 'v1' }),
+        inspect: () => ({ inTree: true, required: true, matched: ['dispatch.mjs'] }),
+        dispatchSmoke: async () => {
+          if (source === 'smoke throw') throw new Error(text);
+          return { ok: false, reason: 'commands-denied', detail: source === 'smoke detail' ? text : 'failed' };
+        },
+        removeOverlayFn: () => { if (source === 'remove throw') throw new Error(text); },
+        appendEventFn: vi.fn(),
+        rollbackVersionFn: async () => { if (source === 'recovery throw') throw new Error(text); return { status: 'switched' }; },
+        recordFn: vi.fn((args) => appendLoadRecord({ ...args, fs })),
+      };
+      const result = await runDaemonLoadOverlay(opts);
+      expect(result).toMatchObject({ adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed' });
+      const rawRecord = opts.recordFn.mock.calls[0][0].record;
+      const detail = source.startsWith('smoke') ? rawRecord.dispatchSmoke.result.detail : rawRecord.rollback.reason;
+      const clean = `${prefix}<redacted> trailing context`.slice(0, source === 'smoke detail' ? 4000 : 500);
+      expect(detail).toBe(source === 'remove throw' ? `remove-failed: ${clean}` : source === 'recovery throw' ? `error: ${clean}` : clean);
+      expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
+      for (const sink of [JSON.stringify(rawRecord), fs.appendFileSync.mock.calls[0][1], JSON.stringify(result)]) {
+        expect(sink).not.toContain(credential.slice(0, 12));
+      }
+    });
+  it('sanitizes a multiline secret in a smoke exception before selecting its first line', async () => {
+    const opts = { ...options(), versions: { dir: 'versions-dir', clone: 'clone', home: 'home', settings: {} }, wait: true,
+      settings: { noPr: 'refuse', dispatchSmoke: 'on', dispatchPaths: [] }, submit: () => 'req',
+      waitFor: async () => ({ adopted: true, versionId: 'v1' }),
+      inspect: () => ({ inTree: true, required: true, matched: ['dispatch.mjs'] }),
+      dispatchSmoke: async () => { throw new Error('spawn password="first secret\nsecond secret"\nstack'); },
+      removeOverlayFn: vi.fn(), appendEventFn: vi.fn(), rollbackVersionFn: async () => ({ status: 'switched' }),
+    };
+    await runDaemonLoadOverlay(opts);
+    expect(opts.recordFn.mock.calls[0][0].record.dispatchSmoke.result.detail).toBe('spawn password=<redacted>');
   });
 
   it.each(['validation', 'registration', 'rebuild', 'preview', 'wait'])('records %s exceptions then rethrows the original error', async (stage) => {

@@ -453,7 +453,7 @@ async function runRealDispatchSmokeAttempt({
     const stderr = String(launch.stderr || launch.error?.message || '');
     const diagnostics = {
       launchStartedAt, signal: smokeSignal(launch.signal), exitCode: smokeExitCode(launch.status),
-      errorClass: smokeErrorClass(stderr) ?? smokeErrorClass(String(launch.error ?? '')),
+      errorClass: safeSmokeErrorClass(stderr) ?? safeSmokeErrorClass(String(launch.error ?? '')),
       stderrFile: writeStderrTail(stderr, { dir: diagnosticsDir, label: `dispatch-${sessionId}-launch` }),
     };
     return { ...base, ok: false, reason: 'launch-failed', detail: dispatchSummary('the launch harness failed', diagnostics), diagnostics, ms: Date.now() - t0 };
@@ -513,7 +513,7 @@ async function runRealDispatchSmokeAttempt({
     wrapperPid, wrapperAliveAtTimeout, launchStartedAt, signal: null, exitCode: null,
     sessionAppeared: !!session, transcriptAppeared: !!transcript,
     firstOutputMs: readJson(join(scratch, 'first-output.json'))?.ms ?? null,
-    errorClass: smokeErrorClass(stderr),
+    errorClass: safeSmokeErrorClass(stderr),
     stderrFile: writeStderrTail(stderr, { dir: diagnosticsDir, label: `dispatch-${sessionId}` }),
   };
   const launchTimeout = verdict.reason === 'timeout' && !markerAppeared && !recordAppeared && !session && !transcript;
@@ -561,12 +561,15 @@ async function runDispatchSmokeSafely(dispatchSmoke, args) {
     // Anything that is not a verdict object is a failed smoke: `.ok` / `.reason` are read unguarded downstream.
     if (!(r && typeof r === 'object' && typeof r.ok === 'boolean')) return { ok: false, reason: 'smoke-bad-result' };
     // Every rollback, event-log and thrown-error sink reads `detail` (allow-listed at the source); bound it once, here.
-    return r.detail === undefined ? r : { ...r, detail: redactDetail(r.detail, 'dispatch-smoke') };
+    return r.detail === undefined ? r : { ...r, detail: redactDetail(sanitize(r.detail), 'dispatch-smoke') };
   } catch (e) {
     // The daemon's own exception (a spawn error), not child output: its first line, bounded.
-    return { ok: false, reason: 'smoke-threw', detail: redactDetail(String((e && e.message) || e).split('\n')[0]) };
+    return { ok: false, reason: 'smoke-threw', detail: safeErrorDetail(e) };
   }
 }
+
+const safeErrorDetail = (e) => redactDetail(sanitize(e?.message ?? e, { preserveNewlines: true }).split('\n')[0]);
+const safeSmokeErrorClass = (text) => smokeErrorClass(sanitize(text, { preserveNewlines: true }));
 
 /**
  * Roll the VERSION that failed its dispatch smoke back — and only that one. The daemon's plain `rollback` flips
@@ -653,7 +656,7 @@ export async function runDaemonLoadOverlay(options = {}) {
       await recordFn({ env, record: {
         ...result, clone: result?.root ?? options.clone ?? null, ref: options.ref ?? null,
         pr: options.pr ?? null, registered: result?.registered ?? loadState.registered, outcome,
-        ...(threw ? { error: sanitize(error?.message ?? error) } : {}),
+        ...(threw ? { error: sanitize(error?.message ?? error).slice(0, 500) } : {}),
         ...(loadState.triggerError ? { triggerError: loadState.triggerError } : {}),
       } });
     } catch { /* A failed audit sink must never change the load result or original exception. */ }
@@ -705,7 +708,7 @@ async function loadOverlay({
       triggeredRequestId = wait ? await submit(vctx, { ref, pr, by })
         : await (triggerFn ?? (({ versions: ctx }) => ctx ? submit(ctx, { ref, pr, by }) : null))({ root, ref, pr, by, env, versions: vctx });
     } catch (e) {
-      loadState.triggerError = sanitize(e?.message ?? e) || 'rebuild trigger failed';
+      loadState.triggerError = sanitize(e?.message ?? e).slice(0, 500) || 'rebuild trigger failed';
       log.error?.(`daemon-load-overlay: rebuild trigger failed: ${loadState.triggerError}`);
     }
   }
@@ -719,12 +722,12 @@ async function loadOverlay({
 
   // ROLLBACK — remove ONLY this overlay, then recover through `rebuildWithout`: main + every other overlay, unchanged.
   const rollBack = async (out, ctl, rebuildWithout) => {
-    const why = redactDetail(`dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`, 'dispatch-smoke');
+    const why = redactDetail(sanitize(`dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`), 'dispatch-smoke');
     log.error?.(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${ctl.phase}): ${why}. Removing it and recovering without it (other overlays untouched). Evidence: ${ctl.result.scratch ?? 'n/a'}${ctl.result.transcript ? `, transcript ${ctl.result.transcript}` : ''}`);
     try { removeOverlayFn(root, ref, { env, why }); } catch (e) {
       // The list could not be changed (e.g. its lock timed out): rebuilding now would just load the overlay again, and
       // claiming it was removed would be false. Say so; the operator re-runs the removal.
-      const detail = String((e && e.message) || e).split('\n')[0];
+      const detail = safeErrorDetail(e);
       log.error?.(`daemon-load-overlay: ${ref} could NOT be removed from the overlay list (${detail}) — it is STILL REGISTERED and failed its dispatch smoke; remove it with daemon-overlay.`);
       return {
         ...out, registered: true, removed: false, adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed',
@@ -737,7 +740,7 @@ async function loadOverlay({
       }, { env });
     } catch { /* the audit line is best-effort; the removal above is what matters */ }
     let rebuilt;
-    try { rebuilt = await rebuildWithout(); } catch (e) { rebuilt = { reason: `error: ${String((e && e.message) || e).split('\n')[0]}`, adopted: false }; }
+    try { rebuilt = await rebuildWithout(); } catch (e) { rebuilt = { reason: `error: ${safeErrorDetail(e)}`, adopted: false }; }
     return {
       ...out, registered: false, adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed',
       rollback: { reason: rebuilt.reason, adopted: !!rebuilt.adopted, ...(rebuilt.superseded ? { superseded: true, actual: rebuilt.actual ?? null } : {}) }, head: rebuilt.head !== undefined ? rebuilt.head : out.head,
@@ -844,7 +847,7 @@ async function loadOverlay({
       finishWait({ adopted: false, reason: 'rebuild-threw' });
       throw e;
     }
-    rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${String((e && e.message) || e).split('\n')[0]}` };
+    rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${safeErrorDetail(e)}` };
   }
 
   let check = installedClosed(installed, { root, ref });
@@ -863,7 +866,7 @@ async function loadOverlay({
           finishWait({ adopted: false, reason: 'rebuild-threw' });
           throw e;
         }
-        rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${String((e && e.message) || e).split('\n')[0]}` };
+        rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${safeErrorDetail(e)}` };
       }
       alerts = [...(alerts || []), ...(rebuildResult.alerts || [])];
       check = installedClosed(installed, { root, ref });

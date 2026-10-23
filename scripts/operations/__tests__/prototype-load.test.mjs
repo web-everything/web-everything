@@ -44,10 +44,10 @@ function fixture(options = {}) {
       reads.push(p);
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p === '/home/test/ready' && options.readyMissing) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
-      if (p === '/home/test/ready') return options.ready ?? `bad line\n${JSON.stringify(ready)}\n`;
+      if (p === '/home/test/ready') return options.ready ?? `${JSON.stringify(ready)}\n`;
       if (options.alertsReadError && p.endsWith('.alerts.jsonl')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('.alerts.jsonl')) return options.alerts || '';
-      if (p.endsWith('.events.jsonl')) return options.events || '';
+      if (p.endsWith('.events.jsonl')) return (admitted.length && options.eventsAfterRegistration) || options.events || '';
       const e = new Error('missing'); e.code = 'ENOENT'; throw e;
     },
     mkdirSync() {}, appendFileSync(p, line) { records.push({ path: p, ...JSON.parse(line) }); },
@@ -66,7 +66,7 @@ function fixture(options = {}) {
         return fail(3, JSON.stringify({ check: { ok: false, reason: 'no-pr' }, wouldRegister: false }));
       }
       if (args.includes('--check')) {
-        if (options.checkRaw) return options.checkRaw;
+        if (options.checkRaw || (ref !== BASE.branch && options.staleCheckRaw)) return options.checkRaw || options.staleCheckRaw;
         if (options.unverifiable === ref) return fail(1, JSON.stringify({ check: { ok: false } }));
         const clean = !(options.conflicts || []).includes(ref);
         const data = JSON.stringify({ check: { ok: true, clean, candSha: remoteTip, ...(clean ? {} : { files: ['x'], conflicting: [{ ref: 'lane/other' }] }) }, wouldRegister: clean });
@@ -86,6 +86,7 @@ function fixture(options = {}) {
       if (action === 'remove') registrations.delete(ref);
       return '{}';
     }
+    if (options.gitExec) return options.gitExec(cmd, args, config);
     if (args[0] === '-C') {
       if (options.adoptionExec) return options.adoptionExec(args, config);
       if (args[2] === 'rev-parse') {
@@ -124,6 +125,11 @@ function fixture(options = {}) {
       return options.tip || remoteTip;
     }
     if (args[0] === 'diff') return args.at(-1).startsWith('origin/main...') ? 'M\0x\0' : options.diff ?? 'M\0x\0';
+    if (args[0] === 'rev-list') {
+      expect(args.slice(1, 4)).toEqual(['--no-merges', `origin/main..${candidateSha}`, '--not']);
+      expect(args.length).toBeGreaterThan(4);
+      return options.uncovered || '';
+    }
     if (args[0] === 'merge-base') {
       if (args[2] === 'origin/main') return options.behind ? fail(1) : '';
       if (args[2] === TREE) return options.advancedContained ? '' : fail(1);
@@ -242,6 +248,34 @@ describe('prototype-load', () => {
     const f = fixture({ list: [part.ref], contained: [part.ref], ready: JSON.stringify(green) });
     expect(await f.run()).toMatchObject({ gate: { source: 'all-parts-ready' }, adopted: true });
   });
+  it.each(['absent', 'unproved', 'ready'])('real Git requires readiness for part B alongside ready registered part A (B: %s)', async (partB) => {
+    await withBareOrigin(async ({ clone, seedOriginBranch, git }) => {
+      seedOriginBranch(part.ref, { 'a.txt': 'ready A\n' });
+      seedOriginBranch('lane/unproved', { 'b.txt': 'unproved B\n' });
+      git(['fetch', 'origin']);
+      const a = git(['rev-parse', `origin/${part.ref}`]).trim();
+      const b = git(['rev-parse', 'origin/lane/unproved']).trim();
+      git(['checkout', '-b', BASE.branch, a]);
+      if (partB !== 'absent') git(['merge', '--no-ff', '-m', 'combine A and B', b]);
+      const sha = git(['rev-parse', 'HEAD']).trim();
+      git(['push', 'origin', BASE.branch]);
+      const f = fixture({ sha, list: [part.ref, ...(partB === 'ready' ? ['lane/unproved'] : [])],
+        ready: [JSON.stringify({ ...green, sha: a }), ...(partB === 'ready' ? [JSON.stringify({ ...green, ref: 'lane/unproved', sha: b })] : [])].join('\n'),
+        gitExec: (cmd, args, config) => execFileSync(cmd, args, { ...config, cwd: clone }),
+      });
+      const result = await f.run({ dryRun: true });
+      expect(result).toMatchObject(partB === 'unproved'
+        ? { ok: false, stopReason: 'no-ready', registered: false, adopted: false, uncovered: b }
+        : { ok: true, gate: { source: 'all-parts-ready' } });
+      if (partB === 'unproved') expect(result.fallback).toContain('readiness');
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+  });
+  it('fails closed when combined commit coverage cannot be read', async () => {
+    const f = fixture({ list: [part.ref], ready: JSON.stringify(green), execFailure: 'rev-list' });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', registered: false, adopted: false });
+    expect(mutations(f, 'add')).toEqual([]);
+  });
   it.each([
     [[], [], false], [[{ at: green.at }], [added(part.ref, green.at)], false],
     [[{ at: green.at }], [added(part.ref), { kind: 'removed', ref: part.ref, at: '2026-01-02' }], false],
@@ -254,6 +288,20 @@ describe('prototype-load', () => {
     const f = fixture({ list: [BASE.branch, part.ref], contained: [part.ref], ready: JSON.stringify(green), events: JSON.stringify(added(part.ref)), [file]: '{broken' });
     expect(await f.run()).toMatchObject({ stopReason: 'no-ready', adopted: false });
     expect(f.triggers).toEqual([]);
+  });
+  it.each(['ready', 'events'])('rejects partial %s evidence even with exact top readiness or explicit arguments', async (file) => {
+    for (const explicit of [false, true]) {
+      const ready = JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' });
+      const f = fixture({ ready, [file]: `${file === 'ready' ? ready : JSON.stringify(added(part.ref))}\n{"truncated":` });
+      expect(await f.run(explicit ? { testsRun: 'test-1', audit: 'NOT WEAKENED' } : {}))
+        .toMatchObject({ ok: false, stopReason: 'no-ready', registered: false, adopted: false });
+      expect(mutations(f, 'add')).toEqual([]);
+    }
+  });
+  it('rejects a partial event written after registration before reporting adoption', async () => {
+    const f = fixture({ eventsAfterRegistration: '{"kind":"removed"' });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable', registered: true, adopted: false });
+    expect(f.calls.some((c) => c.args[0] === '-C')).toBe(false);
   });
   it('admits mixed green and historical parts but refuses any unproved part', () => {
     const old = { ref: 'lane/old', sha: TREE };
@@ -562,6 +610,17 @@ describe('prototype-load', () => {
   });
   it.each([{ listRaw: '{}' }, { listRaw: '{broken' }, { checkRaw: '{"check":{"ok":true,"clean":false}}' }])('incomplete loader evidence refuses admission: %j', async (options) => {
     const f = fixture(options); expect((await f.run()).stopReason).toBe('check-unverifiable'); expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it.each([
+    { checkRaw: '{"check":{"ok":true}' },
+    { checkRaw: `{"truncated":\n${JSON.stringify({ check: { ok: true, clean: true, candSha: SHA }, wouldRegister: true })}` },
+    { checkRaw: JSON.stringify({ check: { ok: true } }) },
+    { checkRaw: JSON.stringify({ check: { ok: true, clean: true, candSha: SHA } }) },
+    { list: ['lane/old'], staleCheckRaw: JSON.stringify({ check: { ok: true, clean: true }, wouldRegister: true }) },
+  ])('never authorizes admission from partial or incomplete check JSON: %j', async (options) => {
+    const f = fixture(options);
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable', registered: false, adopted: false });
+    expect(mutations(f, 'add')).toEqual([]);
   });
   it('oversized subprocess output fails closed with an operator fallback', async () => {
     const f = fixture({ execFailure: 'diff' }); const r = await f.run(); expect(r.stopReason).toBe('check-unverifiable'); expect(r.error).toContain('maxBuffer'); expect(r.fallback).toContain('Inspect'); expect(mutations(f, 'add')).toHaveLength(0);

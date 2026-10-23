@@ -2,21 +2,21 @@
 import filesystem from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'prototype-load.json');
 export const MAX_LOAD_RECORD_BYTES = 16_384;
+const SECRET_KEY = /password|passwd|secret|token|api[_-]?key|authorization|credential|cookie/i;
 
 /** Scrub before bounding: truncating first can leave a short, unrecognizable secret fragment. */
-export function sanitize(value) {
-  return redactDetail(String(value ?? '').replace(/[\p{Cc}\p{Cf}]/gu, (c) => /\s/u.test(c) ? c : '')
+export function sanitize(value, { preserveNewlines = false } = {}) {
+  return String(value ?? '').replace(/[\p{Cc}\p{Cf}]/gu, (c) => /\s/u.test(c) ? c : '')
     .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/@]+@/gi, (url) => `${url.slice(0, url.indexOf('://') + 3)}<redacted>@`)
     .replace(/\b(Bearer|Basic)\s+[^\s,;"'<>]+/gi, '$1 <redacted>')
-    .replace(/\b(token|secret|password|passwd|api[_-]?key|authorization)(\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s&,;]+)/gi, '$1$2<redacted>')
+    .replace(/\b(token|secret|password|passwd|api[_-]?key|authorization|credential|cookie)(["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s&,;}]+)/gi, '$1$2<redacted>')
     .replace(/\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, '$1<redacted>')
     // Token-like runs only (mixed letters and digits, no path/branch separators) so refs and clone paths stay readable.
     .replace(/[A-Za-z0-9+/_-]{32,}={0,2}/g, (run) => (/\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run)) || /^[0-9a-f]{32,}$/i.test(run) ? '<redacted>' : run)
-    .replace(/[\p{Cc}\p{Cf}]/gu, ''));
+    .replace(/[\p{Cc}\p{Cf}]/gu, (c) => preserveNewlines && c === '\n' ? c : '');
 }
 
 /** Returns path + pathSource even on write failure; an oversized record keeps its core outcome
@@ -35,7 +35,7 @@ export function appendLoadRecord({ record, env = process.env, fs = filesystem, n
       path = join(env.HOME, path.slice(2));
     }
     const row = { ...record, at: new Date(now()).toISOString(), source: 'daemon-load-overlay', pathSource };
-    const encode = (value) => `${JSON.stringify(value, (_key, v) => typeof v === 'string'
+    const encode = (value) => `${JSON.stringify(value, (key, v) => SECRET_KEY.test(key) ? '<redacted>' : typeof v === 'string'
       ? sanitize(v) : v)}\n`;
     let line = encode(row);
     if (Buffer.byteLength(line) > MAX_LOAD_RECORD_BYTES) {
@@ -49,6 +49,6 @@ export function appendLoadRecord({ record, env = process.env, fs = filesystem, n
     fs.appendFileSync(path, line, 'utf8');
     return { ok: true, path, pathSource };
   } catch (e) {
-    return { ok: false, error: sanitize(e?.message ?? e), path, pathSource };
+    return { ok: false, error: sanitize(e?.message ?? e).slice(0, 500), path, pathSource };
   }
 }

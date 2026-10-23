@@ -2017,7 +2017,9 @@ coordination state. The writer uses prototype-load's `recordPath`, or
 with `detailsTruncated: true` (full details remain in the load's `--json` output).
 Every string value, including nested diagnostics and writer errors, is scrubbed for GitHub
 credentials, Bearer/Basic tokens, URL userinfo, secret assignments and long opaque tokens
-before truncation. Regression fixtures pin redaction and readable clone/ref/outcome fields.
+before truncation. `sanitize` is unbounded; callers apply their detail/error bounds afterwards,
+including before smoke error-class extraction. Serialization also redacts sensitive property
+values by name. Regression fixtures pin redaction and readable clone/ref/outcome fields.
 Legacy clones already rebuild synchronously in this CLI; that behavior is unchanged.
 Versioned clones use `submitRequest`;
 that request is consumed on a daemon tick and does not itself wake a sleeping daemon.

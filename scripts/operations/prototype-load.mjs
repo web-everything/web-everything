@@ -12,7 +12,7 @@ export const safeRegistrationRef = (ref) => typeof ref === 'string' && /^[A-Za-z
 export const safeRef = (ref) => safeRegistrationRef(ref) && ref.startsWith('lane/');
 export const validSha = (sha) => /^[a-f0-9]{40}$/i.test(sha || '');
 export function jsonLines(text) {
-  return String(text).split(/\r?\n/).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
+  return String(text).split(/\r?\n/).filter((line) => line.trim()).map((line) => JSON.parse(line));
 }
 export function readyEvidence(records, input) {
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };

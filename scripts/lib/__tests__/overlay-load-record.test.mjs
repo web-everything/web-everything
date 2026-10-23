@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { appendLoadRecord, MAX_LOAD_RECORD_BYTES } from '../overlay-load-record.mjs';
+import { appendLoadRecord, sanitize, MAX_LOAD_RECORD_BYTES } from '../overlay-load-record.mjs';
 
 const fakeFs = (path = '~/coordination/loads.jsonl') => ({
   readFileSync: vi.fn(() => JSON.stringify({ recordPath: path })),
@@ -51,6 +51,22 @@ describe('appendLoadRecord', () => {
     appendLoadRecord({ record: { ...record, detail: { error: 'ghp_secret123\u001b\n' } }, env: {}, fs, now });
     expect(JSON.parse(fs.appendFileSync.mock.calls[0][1]).detail.error).toBe('ghp_<redacted>');
   });
+  it.each(['password', 'passwd', 'secret', 'token', 'api_key', 'apikey', 'API-KEY', 'Authorization', 'credential', 'cookie', 'accessToken', 'db_password', 'credentials'])(
+    'redacts values by property name %s at every depth, including non-string values', (key) => {
+      const fs = fakeFs('records.jsonl');
+      appendLoadRecord({ record: { ...record, [key]: 'short-value', detail: [
+        { [key]: { nested: 'another-value' }, safe: 'readable' }, { [key]: 123 }, { [key]: null },
+      ] }, env: {}, fs, now });
+      expect(JSON.parse(fs.appendFileSync.mock.calls[0][1])).toMatchObject({
+        ...record, [key]: '<redacted>', detail: [
+          { [key]: '<redacted>', safe: 'readable' }, { [key]: '<redacted>' }, { [key]: '<redacted>' },
+        ],
+      });
+    });
+  it('sanitizes the entire string without truncating diagnostic context', () => {
+    const prefix = 'context '.repeat(600);
+    expect(sanitize(`${prefix}password: "two words" tail`)).toBe(`${prefix}password: <redacted> tail`);
+  });
 
   it.each([
     ['Bearer short-bearer', 'Bearer <redacted>'],
@@ -60,6 +76,11 @@ describe('appendLoadRecord', () => {
     ...['token', 'secret', 'password', 'passwd', 'apikey', 'api_key', 'API-KEY', 'authorization']
       .map((key) => [`${key}=short-credential`, `${key}=<redacted>`]),
     ['password="two secret words"', 'password=<redacted>'],
+    ['"password": "x"', '"password": <redacted>'],
+    ['"password": "escaped \\" secret"', '"password": <redacted>'],
+    ["'secret': 'two secret words'", "'secret': <redacted>"],
+    ...['password', 'passwd', 'secret', 'token', 'api_key', 'apikey', 'authorization', 'credential', 'cookie']
+      .map((key) => [`${key}: short-credential`, `${key}: <redacted>`]),
     ["secret = 'two secret words'", 'secret = <redacted>'],
     ['https://host.example/?token=short-token&next=ok', 'https://host.example/?token=<redacted>&next=ok'],
     ['0123456789abcdef'.repeat(2), '<redacted>'],
@@ -72,10 +93,10 @@ describe('appendLoadRecord', () => {
     const detail = `failed: ${input}\n\u001b`;
     const clean = `failed: ${expected}`;
     appendLoadRecord({ record: {
-      ...record, error: detail, triggerError: detail, detail: { nested: [detail] },
+      ...record, error: detail, triggerError: detail, transcript: detail, detail: { nested: [detail] },
     }, env: {}, fs, now });
     expect(JSON.parse(fs.appendFileSync.mock.calls[0][1])).toMatchObject({
-      ...record, error: clean, triggerError: clean, detail: { nested: [clean] },
+      ...record, error: clean, triggerError: clean, transcript: clean, detail: { nested: [clean] },
     });
     fs.appendFileSync.mockImplementation(() => { throw new Error(detail); });
     expect(appendLoadRecord({ record, env: {}, fs, now })).toMatchObject({ ok: false, error: clean });
