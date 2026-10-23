@@ -3489,6 +3489,34 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     }
   });
 
+  it('plain rearm with a matching --expect-head succeeds', () => {
+    const { exitCode, calls } = run(['9', '--repo=o/n', `--expect-head=${'a'.repeat(40)}`], [REVIEW_LABELS.changes]);
+    expect(exitCode).toBe(0);
+    expect(calls).toEqual(['postComment', 'setLabels']);
+  });
+
+  it('plain rearm refuses a different live head before any write', () => {
+    const { exitCode, calls, payload } = run(['9', '--repo=o/n', `--expect-head=${'b'.repeat(40)}`], [REVIEW_LABELS.changes]);
+    expect(exitCode).toBe(1);
+    expect(payload.error).toContain('live head differs from --expect-head');
+    expect(calls).toEqual([]);
+  });
+
+  it.each(['b'.repeat(40), null])('plain rearm refuses a changed or missing swap-time head before the label write: %s', headRefOid => {
+    const { exitCode, calls, payload } = run(['9', '--repo=o/n', `--expect-head=${'a'.repeat(40)}`],
+      [REVIEW_LABELS.changes], { swapState: { headRefOid } });
+    expect(exitCode).toBe(1);
+    expect(payload.error).toContain('live head differs from --expect-head');
+    expect(calls).toEqual(['postComment']);
+  });
+
+  it.each(['', 'abcdef0', 'z'.repeat(40), 'a'.repeat(41)])('plain rearm refuses non-40-hex --expect-head=%s', head => {
+    const { exitCode, calls, payload } = run(['9', '--repo=o/n', `--expect-head=${head}`], [REVIEW_LABELS.changes]);
+    expect(exitCode).not.toBe(0);
+    expect(payload.error).toContain('full 40-hex SHA');
+    expect(calls).toEqual([]);
+  });
+
   it('only-if fails closed on any value other than accepted, before any write', () => {
     const { exitCode, calls, payload } = run(['9', '--repo=o/n', '--only-if=changes'], [REVIEW_LABELS.changes]);
     expect(exitCode).not.toBe(0);
