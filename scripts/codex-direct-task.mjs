@@ -92,7 +92,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
-import { resolveBuildPolicy, appendBuildRequirements } from './lib/build-policy.mjs';
+import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
 import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
@@ -109,6 +109,7 @@ import {
   CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort, parseRolloutUsageBucket,
 } from './lib/codex-model-routing.mjs';
 import { resolveCodexTaskRoute } from './lib/codex-task-route.mjs';
+import { checkRunTranscript } from './lib/codex-transcript-check.mjs';
 
 // ── constants ─────────────────────────────────────────────────────────────────────────────────────
 export const CODEX_CLI = 'codex';
@@ -258,7 +259,7 @@ export function buildCodexPrompt(task, { review = false, policy = resolveBuildPo
   }
   // #4194 — a REVIEW task's deliverable is its final message, not a diff: say so, instead of the default
   // "make the change directly" suffix that would contradict a read-only review brief.
-  if (review) return `${task.trim()}\n\n---\n\n${REVIEW_MODE_SUFFIX}`;
+  if (review) return `${task.trim()}\n\n---\n\n${REVIEW_MODE_SUFFIX}\n\n${renderCodexTaskRules({ review })}`;
   return (
     appendBuildRequirements(`${task.trim()}\n\n---\n\n`
     + 'Make the change directly by editing files in this working directory. When you are done, STOP — do '
@@ -270,6 +271,7 @@ export function buildCodexPrompt(task, { review = false, policy = resolveBuildPo
     + 'bare `npx vitest`, `npm test`, or `node scripts/check-standards.mjs` — they skip the queue and overload the host.'
     , { policy, selfReview: false })
     + (policy.selfReview.enabled ? `\n\nThe launcher owns the capped pre-review check (${policy.selfReview.maxRounds} repair rounds); do not start a second self-review loop.` : '')
+    + `\n\n${renderCodexTaskRules({ review })}`
   );
 }
 
@@ -931,8 +933,10 @@ export async function codexDirectTask({
   let quota = null;
   let quotaRolloutFile = null;
   let quotaRolloutCleared = false;
+  let transcriptCheck = null;
   if (!ephemeral && summary.threadId) {
     const codexHome = resolveCodexHome(env);
+    transcriptCheck = checkRunTranscript({ codexHome, threadId: summary.threadId, findRolloutFile, env, emit });
     const lookup = clearRolloutAfterRun
       ? collectQuotaFn({ codexHome, threadId: summary.threadId })
       : readQuotaFn({ codexHome, threadId: summary.threadId });
@@ -972,6 +976,7 @@ export async function codexDirectTask({
     gate: gateResult,
     selfReview,
     buildPolicy: policy,
+    transcriptCheck,
     // #x8wbivt Fork 4 — the ratified budget signal, mirroring `judge-spawn.mjs`/`judge-panel.mjs`'s
     // `costUsd`/timing reporting shape on the Claude side (no USD figure exists here; this is the real
     // consumption analogue Codex actually offers).
@@ -987,6 +992,7 @@ export async function codexDirectTask({
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────
 /** Process exit status for a completed run; see the file header's "Exit status". PURE. */
 export function cliExitCode(report, { json = false } = {}) {
+  if (report.transcriptCheck?.verdict === 'fail') return 1;
   if (json) return 0;
   return report.exitCode !== 0 || report.timedOut || !report.gate.pass ? 1 : 0;
 }
