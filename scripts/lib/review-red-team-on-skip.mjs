@@ -1,4 +1,5 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
+import { readSavedRedTeamGateResult } from './drain-saved-red-team.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -48,8 +49,8 @@ export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = 
 }
 
 /** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
-export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, readRecoveryRows, now,
-  setting, lastDispatch }) {
+export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, readRecoveryRows, readSavedResult = readSavedRedTeamGateResult, now,
+  setting = { enabled: true, maxFreshPerHead: 2, retryCooldownMin: 30 }, lastDispatch = new Map() }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -67,7 +68,13 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
       const status = readStatus({ repo, pr, head });
-      const { priorComment: comment } = normalizeRedTeamResult(status?.result);
+      const { priorResult, priorComment: comment } = normalizeRedTeamResult(status?.result);
+      if (status?.status === 'finished' && priorResult === 'ran' && comment === 'withheld') {
+        const saved = readSavedResult({ repo, pr, head });
+        if (!saved || saved.pr !== pr || saved.rev !== head)
+          return skip('saved result unavailable; inspect stored evidence before retrying');
+        return { ...row, action: 'apply-gate', why: 'finished withheld result needs gate application' };
+      }
       if (comment === 'posted') return skip('result posted; comment not visible yet');
       const recovery = readRecoveryRows({ repo, pr, head });
       if (!recovery || !Number.isSafeInteger(recovery.freshAttempts) || recovery.freshAttempts < 0) throw Error('invalid recovery evidence');
@@ -81,21 +88,38 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
 }
 
 const lastDispatch = new Map();
+const lastGateApplications = new Map();
 const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 
 /** Bounded recovery, sharing review capacity. Errors never abort the daemon tick. */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
   env = process.env, setting, readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus, readRecoveryRows = readRedTeamRecoveryRows,
-  now = Date.now, lastDispatch: history = lastDispatch, preferLane } = {}) {
-  const rows = [], dispatched = [], uncertain = [], notStarted = [];
+  now = Date.now, lastDispatch: history = lastDispatch, preferLane, applyGate, history: gateHistory = lastGateApplications, readSavedResult = readSavedRedTeamGateResult } = {}) {
+  const rows = [], dispatched = [], uncertain = [], notStarted = [], applied = [];
+  let gateAttempted = false;
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
   try {
     const at = now();
     const resolved = setting ?? resolveReviewRedTeamOnSkip({ env, log: note }).value;
     rows.push(...planRedTeamOnSkip({ repo, refusals: plan?.refusals, rawPrs, readEvidence: input => readEvidence({ ...input, env }), readStatus: input => readStatus({ ...input, env }),
-      readRecoveryRows: input => readRecoveryRows({ ...input, env }), now: at, setting: resolved, lastDispatch: history }));
+      readSavedResult: input => readSavedResult({ ...input, env }), readRecoveryRows: input => readRecoveryRows({ ...input, env }), now: at, setting: resolved, lastDispatch: history }));
+    const gateKey = row => `${repo}#${row.prNumber}@${row.head}`;
+    rows.sort((a, b) => a.action === 'apply-gate' && b.action === 'apply-gate'
+      ? (gateHistory.get(gateKey(a)) ?? -Infinity) - (gateHistory.get(gateKey(b)) ?? -Infinity) : 0);
     for (const row of rows) {
       let started = false;
+      if (row.action === 'apply-gate') {
+        if (gateAttempted) row.why = 'gate application limit reached; retry next tick';
+        else if (dryRun) row.why = 'dry run (saved gate application)';
+        else {
+          gateAttempted = true;
+          gateHistory.set(gateKey(row), at);
+          try {
+            const result = applyGate({ repo, pr: row.prNumber });
+            applied.push({ prNumber: row.prNumber, status: result?.status ?? 'unknown' });
+          } catch { row.why = 'saved gate application failed; retry next tick or inspect stored evidence'; }
+        }
+      }
       if (row.action === 'dispatch') {
         const budget = capacity?.budget;
         if (!(capacity?.lanes > 0) || (budget && !(budget.left > 0))) row.why = 'no review capacity left';
@@ -132,5 +156,5 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     rows.push({ prNumber: null, head: null, action: 'skip', why: 'red-team recovery inputs unreadable' });
     note(`review-daemon: ${repo}#? already-reviewed-head — red team not dispatched for head unknown: red-team recovery inputs unreadable`);
   }
-  return { rows, dispatched, uncertain, notStarted };
+  return { rows, dispatched, uncertain, notStarted, applied };
 }

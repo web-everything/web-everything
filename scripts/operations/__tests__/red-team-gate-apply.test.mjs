@@ -105,6 +105,52 @@ describe('numbering ancestor proof and production reader', () => {
 });
 
 describe('applyRedTeamGate', () => {
+  it('keeps the pending label when saved evidence disappears before gate application', async () => {
+    const provider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
+    const view = { headRefOid: HEAD, labels: ['review:human', 'advisory:accepted', 'red-team:pending'], comments: [] };
+    const readEvidence = vi.fn(() => ({ scheduled: true, recorded: true }));
+    const syncStatusLabels = createRedTeamGateIo({ env: {}, readEvidence,
+      syncLabels: input => syncRedTeamStatusLabels({ ...input, live: view, comments: [], provider,
+        readGrantScope: () => null, readSavedResult: () => null }) }).syncStatusLabels;
+    const { io, calls } = fakeIo({ ...view, comments: [], readSavedResult: () => null, syncStatusLabels });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'no-red-team-on-head' });
+    expect(readEvidence).toHaveBeenCalledWith({ repo: REPO, pr: 4722, head: HEAD, env: {} });
+    expect(provider.setLabels).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+  it.each([
+    ['raw text beyond the publication clip', 'a'.repeat(1500) + ' ghp_' + 'a'.repeat(36)],
+    ['NFKC credential text', Array.from('ghp_' + 'a'.repeat(36), c => String.fromCharCode(c.charCodeAt(0) + 0xfee0)).join('')],
+  ])('withholds every saved finding field for %s, preserving the routing class', async (_name, summary) => {
+    const saved = { pr: 4722, rev: HEAD, findings: [{ index: 1, confirmed: true, impact: 'broken',
+      category: 'edge-case', summary, file: 'scripts/x.mjs', line: 3 }] };
+    const { io, calls } = fakeIo({ comments: [], readSavedResult: () => saved });
+    const result = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(result).toMatchObject({ status: 'applied', outcome: 'sent-back', plan: { sendBack: [{
+      index: 1, confirmed: true, impact: 'broken', file: null, line: null, category: 'withheld',
+      summary: '[finding text withheld: failed the secret scrub]',
+    }] } });
+    expect(JSON.stringify(calls)).not.toContain(summary);
+  });
+  it('PR 5759: applies saved withheld findings without a posted red-team result', async () => {
+    const head = '5cc8c69d1cc0b6ff5d492c835e379a2d3dac52b2';
+    const parsed = parseRedTeamComment(renderRedTeamComment({ pr: 5759, rev: head, provider: 'codex', model: 'm',
+      findings: [F({ summary: 'unsafe ' + 'ghp_' + 'a'.repeat(36) })], recheckStatus: 'ok', foldedVerdict: 'changes' }));
+    parsed.findings[0].summary = 'unsafe ' + 'ghp_' + 'a'.repeat(36);
+    const readSavedResult = vi.fn(() => parsed);
+    const syncStatusLabels = vi.fn();
+    const { io, calls } = fakeIo({ head, comments: [], labels: ['review:human', 'advisory:accepted', 'red-team:pending'],
+      readSavedResult, syncStatusLabels });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 5759 }, io)).toMatchObject({ status: 'applied', outcome: 'sent-back' });
+    expect(readSavedResult).toHaveBeenCalledWith({ repo: REPO, pr: 5759, head });
+    expect(kinds(calls)).toEqual(['sendBack', 'ledger', 'comment']);
+    expect(JSON.stringify(calls)).not.toContain('ghp_');
+    expect(calls[0][1].body).toContain('finding text withheld');
+    expect(syncStatusLabels).toHaveBeenCalled();
+    expect(await applyRedTeamGate({ repo: REPO, pr: 5759 }, io)).toMatchObject({ status: 'already-acted' });
+    expect(kinds(calls).filter(k => k === 'sendBack')).toHaveLength(1);
+  });
+
   it('numbering over an ancestor break sends back once and dedupes on the ancestor', async () => {
     const numberingAncestors = createRedTeamGateIo({ env: {}, readCommit: ({ head }) => head === HEAD
       ? numberingCommit() : { sha: OTHER, commit: { message: 'fix: original contribution' } } }).numberingAncestors;
