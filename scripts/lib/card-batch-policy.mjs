@@ -83,7 +83,23 @@ export function bypassesBatch({ priority }, kindPolicy) {
   return kindPolicy.highPriorityBypass === true && (priority === 'high' || priority === 'urgent');
 }
 
-/** Admit only newly added, top-level regular backlog cards with distinct textual IDs. */
+/**
+ * The canonical raised-by sidecar path (`we:scripts/lib/raised-by.cjs#raisedByFile`):
+ * `backlog/raised-by/<parent card id>/<source pr>-<24 hex>.md`. The CI card-only classifier
+ * (`we:scripts/ci-card-only.mjs#isCardPath`) already treats exactly this shape as card data.
+ */
+export const RAISED_BY_SIDECAR_RE = /^backlog\/raised-by\/(\d{1,5}|x[a-z0-9]{6})\/(\d+)-([a-f0-9]{24})\.md$/;
+
+/** PURE: the batch member id of a raised-by sidecar (`rb-<parent>-<pr>-<hash>`), else null. */
+export function raisedBySidecarId(path) {
+  const match = RAISED_BY_SIDECAR_RE.exec(String(path ?? ''));
+  return match ? `rb-${match[1]}-${match[2]}-${match[3]}` : null;
+}
+
+/**
+ * Admit only newly added regular backlog data: top-level cards with distinct textual IDs, or canonical
+ * raised-by sidecars (one "Also raised by" note for an existing card). Nothing else — no code, docs or config.
+ */
 export function cardOnlyEligibility(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return { ok: false, reason: 'no changed-file rows' };
   const ids = new Set();
@@ -92,6 +108,12 @@ export function cardOnlyEligibility(rows) {
     const refuse = reason => ({ ok: false, reason: `${String(path)}: ${reason}` });
     if (row?.status !== 'A') return refuse('status must be A');
     if (row?.mode !== '100644') return refuse('mode must be 100644');
+    const sidecar = raisedBySidecarId(path);
+    if (sidecar && isCardPath(path)) {
+      if (ids.has(sidecar)) return refuse(`duplicate raised-by sidecar ${sidecar}`);
+      ids.add(sidecar);
+      continue;
+    }
     if (!isCardPath(path) || !/^backlog\/[^/]+\.md$/.test(path)) return refuse('not a top-level backlog card');
     const match = /^([^-]+)-.+\.md$/.exec(path.slice(path.indexOf('/') + 1));
     if (!match) return refuse('card basename must be <id>-<name>.md');

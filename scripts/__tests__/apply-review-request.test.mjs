@@ -418,9 +418,14 @@ describe('the ledger push can only fast-forward the transport branch (C3)', () =
     repo: REPO, pr: 4318, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test',
   });
 
+  const SHA = 'c'.repeat(40);
   function pushArgvFor(records) {
     const calls = [];
-    const run = (args, opts) => { calls.push(Object.assign([...args], { cwd: opts?.cwd })); return args[0] === 'diff' ? 'verdict-ledger/x.jsonl\n' : ''; };
+    // The plumbing append (2026-10-21): object-producing calls answer an object id; everything else is empty.
+    const run = (args, opts) => {
+      calls.push(Object.assign([...args], { cwd: opts?.cwd, index: opts?.env?.GIT_INDEX_FILE }));
+      return ['rev-parse', 'hash-object', 'write-tree', 'commit-tree'].includes(args[0]) ? `${SHA}\n` : '';
+    };
     appendLedgerRows({
       board: '/board', repo: REPO, records, run, sleep: () => {}, now: () => 1,
       mkdir: () => {}, write: () => {}, read: () => null, rm: () => {},
@@ -436,17 +441,21 @@ describe('the ledger push can only fast-forward the transport branch (C3)', () =
     expect(calls).toBeInstanceOf(Array);
   });
 
-  it('pushes exactly HEAD to the transport branch: no force, no plus-refspec, no other ref', () => {
+  it('pushes exactly the one plumbing commit to the transport branch: no force, no plus-refspec, no other ref', () => {
     const pushes = calls.filter((a) => a[0] === 'push');
-    expect(pushes.map((a) => [...a])).toEqual([['push', '--quiet', 'origin', `HEAD:refs/heads/${LEDGER_TRANSPORT_BRANCH}`]]);
+    expect(pushes.map((a) => [...a])).toEqual([['push', '--porcelain', '--no-follow-tags', 'origin', `${SHA}:refs/heads/${LEDGER_TRANSPORT_BRANCH}`]]);
+    // That commit is the one commit-tree built on the fetched tip, nothing else.
+    const commitTree = calls.find((a) => a[0] === 'commit-tree');
+    expect([...commitTree].slice(0, 4)).toEqual(['commit-tree', SHA, '-p', SHA]);
   });
 
-  it('pushes from the dedicated transport worktree, never from the board checkout it was called with', () => {
-    const [push] = calls.filter((a) => a[0] === 'push');
-    expect(push.cwd).toMatch(/^\/board\/\.operations\/transport\/wt-/);
-    // Every git call that touches refs or the index runs in the worktree too, so the caller's lane is untouched.
-    for (const a of calls.filter((x) => ['checkout', 'add', 'commit', 'push'].includes(x[0]))) {
-      expect(a.cwd).toMatch(/\/\.operations\/transport\/wt-/);
+  it('never touches the board checkout it was called with: no worktree, no checkout, only a temp index', () => {
+    // 2026-10-21: the worktree dance is gone from the ledger path. The caller's lane is untouched because nothing
+    // reads or writes its working tree, its index, or its branches: index work runs on a temp GIT_INDEX_FILE.
+    expect(calls.filter((x) => ['worktree', 'checkout', 'add', 'commit', 'reset', 'stash'].includes(x[0]))).toEqual([]);
+    for (const a of calls.filter((x) => ['read-tree', 'update-index', 'write-tree'].includes(x[0]))) {
+      expect(a.index, a.join(' ')).toBeTruthy();
+      expect(a.index.startsWith('/board')).toBe(false);
     }
   });
 
@@ -468,13 +477,19 @@ describe('the ledger push can only fast-forward the transport branch (C3)', () =
 describe('no other code on the ledger path pushes (C3)', () => {
   const SCRIPTS = join(REPO_ROOT, 'scripts');
   const TRANSPORT = 'scripts/lib/git-transport-branch.mjs';
-  // The ledger append's push is the transport's. The other files are in the STATIC import closure only because
+  const OUTBOX = 'scripts/lib/verdict-ledger-outbox.mjs';
+  // THE LEDGER APPEND'S ONE PUSH (2026-10-21) is the plumbing commit in `verdict-ledger-outbox.mjs` — the outbox
+  // flusher and the direct (CI) path share it. It REPLACED the ledger's use of the transport's worktree push: the
+  // transport's own push stays only for the non-ledger stagers (verdict requests, PR views, handoff), and is in this
+  // closure because the io-shell still READS through that module. The test below proves the io-shell no longer
+  // reaches the worktree stager, so the two are never both a ledger push path. The other files are in the STATIC import closure only because
   // the verdict-ledger / review-escalation modules import them; they push lane refs, not the transport branch,
   // and are not on the ledger-append call path. They are pinned by count rather than ignored: a NEW push in any
   // file here, or in a file newly pulled into the closure, changes this map and must be reviewed on purpose.
   // (`fix-procedure.mjs` counts three because one hit is the `cmd === 'push'` CLI verb, not a git call.)
   const KNOWN_PUSH_SITES = {
     [TRANSPORT]: 1,
+    [OUTBOX]: 1,
     'scripts/lib/rebase-drop-manifest.mjs': 1,
     'scripts/lib/nnn-collision-heal.mjs': 1,
     'scripts/conveyor/fix-procedure.mjs': 3,
@@ -511,6 +526,17 @@ describe('no other code on the ledger path pushes (C3)', () => {
       'scripts/lib/verdict-ledger-io.mjs', 'scripts/lib/git-transport-branch.mjs',
       'scripts/apply-review-request.mjs', 'scripts/collect-review-requests.mjs',
     ]));
+  });
+
+  it('the ledger writes ONLY through the plumbing push: the io-shell no longer reaches the worktree stager', () => {
+    const io = readFileSync(join(SCRIPTS, 'lib', 'verdict-ledger-io.mjs'), 'utf8')
+      .split('\n').filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join('\n');
+    expect(io).not.toMatch(/stageOnTransportBranch/);
+    const outbox = readFileSync(join(SCRIPTS, 'lib', 'verdict-ledger-outbox.mjs'), 'utf8');
+    expect(outbox).not.toMatch(/stageOnTransportBranch\s*\(/);
+    const site = pushSites.find((s) => s.startsWith(`${OUTBOX}:`));
+    const line = outbox.split('\n')[Number(site.split(':')[1]) - 1];
+    expect(line).toMatch(/\['push', '--porcelain', '--no-follow-tags', 'origin', `\$\{commit\}:\$\{ref\}`\]/);
   });
 
   it('finds exactly the known push sites per file, so a new one cannot appear unnoticed', () => {

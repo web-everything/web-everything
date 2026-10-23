@@ -4,21 +4,22 @@
  * carried a ruling. No push or re-arm was coming. The fixtures are the three live threads (and their review-run
  * projections) as captured at 2026-10-21T17:30Z.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import { buildOperatorRulingComment, readReferralRecords, REFERRAL_SUPERSEDE_REASON } from '../../lib/jury-core.mjs';
 import { liveReferralState } from '../../lib/referral-live-context.mjs';
 import { openReferralFindings } from '../../operations/record-referral-ruling.mjs';
 import {
   decideReferralHoldAutoResolve, enrichPrsWithReferralHoldAutoResolve, enrichPrsWithReferralHolds, resolveReferralHoldAutoResolve,
   REFERRAL_HOLD_AUTO_RESOLVE_STANDARD,
-  referralHoldSendBackBody,
+  referralHoldSendBackBody, REFERRAL_HOLD_AUTO_RESOLVED,
 } from '../review-referral-hold.mjs';
 import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
+import { defaultSendBackReferralHold, handleReferralHoldAutoResolve, operatorHoldsFromPlan, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 
 const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 const here = dirname(fileURLToPath(import.meta.url));
@@ -82,6 +83,22 @@ describe('live replays: each PR is paused today, and every live-head finding is 
     expect(row.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', next: 'human-review' });
     expect(row.why).toMatch(/^referral hold auto-resolved — every referral finding on head c5179f564 is ruled \(1 not-real\)/);
     expect(row.why).toMatch(/`review:human` kept/);
+    // Not an operator referral hold any more.
+    expect(operatorHoldsFromPlan(p)).toEqual([]);
+  });
+
+  it('#5775: the review tick logs `referral-hold auto-resolved` once, posts no pause notice, dispatches nothing', () => {
+    const [row] = plan(enrich(FX[5775])).refusals;
+    const notifyReferral = vi.fn(), log = vi.fn(), dispatch = vi.fn(), seen = new Set();
+    const subject = { number: 5775, labels: FX[5775].labels.map(name => ({ name })), comments: [] };
+    for (let t = 0; t < 3; t++) {
+      runReviewTick({ repo, reconcile: () => ({ dispatch: [], refusals: [row] }), dispatch, readPrs: () => [subject], readAgents: () => [],
+        holdReconcile: () => [], tagRound: vi.fn(), tagStatus: vi.fn(), notifyReferral, autoResolveSeen: seen, log });
+    }
+    expect(notifyReferral).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    const lines = log.mock.calls.map(c => c[0]).filter(l => l.includes(REFERRAL_HOLD_AUTO_RESOLVED));
+    expect(lines).toEqual([`review-daemon: referral-hold auto-resolved {"repo":"${repo}","pr":5775,"head":"${FX[5775].headRefOid}","outcome":"resume","counts":{"not-real":1},"next":"human-review"}`]);
   });
 
   it('#5773 resumes: its policy blocks stand only on OLDER heads (088b72962, b85dc59a6), so they never count', () => {
@@ -100,6 +117,14 @@ describe('live replays: each PR is paused today, and every live-head finding is 
     expect(p.dispatch.map(d => d.kind)).toEqual(['review']);
     expect(p.notes.filter(n => n.kind === 'referral-hold-auto-resolved')).toEqual([expect.objectContaining({
       prNumber: 5773, head: FX[5773].headRefOid, outcome: 'resume', next: 'advisory-review', counts: { 'not-real': 3 } })]);
+    // The tick logs it once.
+    const log = vi.fn(), seen = new Set();
+    for (let t = 0; t < 2; t++) {
+      runReviewTick({ repo, reconcile: () => ({ dispatch: [], refusals: [], notes: p.notes }), dispatch: vi.fn(), readPrs: () => [], readAgents: () => [],
+        holdReconcile: () => [], tagRound: vi.fn(), tagStatus: vi.fn(), autoResolveSeen: seen, log });
+    }
+    expect(log.mock.calls.map(c => c[0]).filter(l => l.includes(REFERRAL_HOLD_AUTO_RESOLVED)))
+      .toEqual([`review-daemon: referral-hold auto-resolved {"repo":"${repo}","pr":5773,"head":"${FX[5773].headRefOid}","outcome":"resume","counts":{"not-real":3},"next":"advisory-review"}`]);
   });
 
   it('#5773: a resumed review that DIES before advise (no finished run, no advisory) is not resumed again', () => {
@@ -135,6 +160,7 @@ describe('live replays: each PR is paused today, and every live-head finding is 
     expect(p.dispatch).toEqual([]);
     expect(p.refusals.map(r => r.kind)).toEqual(['review-referrals-pending']);
     expect(p.refusals[0].referralHoldAutoResolve).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/reviewed 2 time\(s\) and the PR still carries no advisory/) });
+    expect(operatorHoldsFromPlan(p)).toEqual([{ prNumber: 5773, kind: 'review-referrals-pending' }]);
   });
 
   it('#5800 (one finding carried not-real from an earlier head, one ruled on the live head) resumes', () => {
@@ -169,6 +195,27 @@ describe('send-back: a block ruling on the live head owes a fix, never a ruling'
     const p = plan(pr);
     // The planner's own block-ruled-referral fix already owns a live-head block whenever it can dispatch one.
     expect(p.dispatch.map(d => [d.kind, d.mode])).toEqual([['fix', 'block-ruled-referral']]);
+    // Where the plan instead refuses the review on the pause (say the fix path is capped), the row carries the
+    // send-back, and the daemon performs it exactly as a block ruling's follow-up does.
+    const row = { prNumber: 5775, kind: 'review-referrals-pending', referralHold: pr.referralHold, referralHoldAutoResolve: pr.referralHoldAutoResolve };
+    const send = vi.fn(() => ({ sentBack: true }));
+    const log = vi.fn();
+    const seen = new Set();
+    const rawPrs = [{ number: 5775, labels: fx.labels.map(name => ({ name })) }];
+    const out = handleReferralHoldAutoResolve({ repo, row, auto: row.referralHoldAutoResolve, rawPrs, send, seen, log });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toMatchObject({ repo, pr: 5775, head: fx.headRefOid, actor: 'chalbert' });
+    expect(send.mock.calls[0][0].body).toContain('scripts/lib/git-identity.mjs:241');
+    expect(out.resolved).toMatchObject({ pr: 5775, head: fx.headRefOid, outcome: 'send-back', sentBack: true });
+    expect(log.mock.calls.map(c => c[0])).toEqual([expect.stringMatching(new RegExp(`^review-daemon: ${REFERRAL_HOLD_AUTO_RESOLVED} \\{"repo":"${repo}","pr":5775,"head":"${fx.headRefOid}","outcome":"send-back"`))]);
+    // A stale listing that still lacks the label: this process already sent it, so nothing is sent again.
+    handleReferralHoldAutoResolve({ repo, row, auto: row.referralHoldAutoResolve, rawPrs, send, seen, log });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledTimes(1);
+    // Next tick the label is review:changes: nothing is sent again.
+    handleReferralHoldAutoResolve({ repo, row, auto: row.referralHoldAutoResolve,
+      rawPrs: [{ number: 5775, labels: [{ name: 'review:human' }, { name: 'review:changes' }] }], send, seen, log });
+    expect(send).toHaveBeenCalledTimes(1);
   });
 
   it('when the plan refuses the review on the pause, the row carries the send-back and says so', () => {
@@ -179,6 +226,24 @@ describe('send-back: a block ruling on the live head owes a fix, never a ruling'
     expect(row.why).toMatch(/\(auto-resolve: every referral finding on head c5179f564 is ruled \(1 block\); 1 block ruling\(s\) owe a fix; sending back to the fixer\)$/);
   });
 
+  it('the review tick acts on the row: sends back, logs once, and posts no "waiting on your ruling" notice', () => {
+    const pr = enrich(fx, { comments });
+    const row = { prNumber: 5775, kind: 'review-referrals-pending', referralHold: pr.referralHold, referralHoldAutoResolve: pr.referralHoldAutoResolve };
+    const notifyReferral = vi.fn(), send = vi.fn(() => ({ sentBack: true })), log = vi.fn(), dispatch = vi.fn();
+    const subject = { number: 5775, labels: fx.labels.map(name => ({ name })), comments: [] };
+    const seen = new Set();
+    for (let t = 0; t < 2; t++) {
+      const out = runReviewTick({ repo, reconcile: () => ({ dispatch: [], refusals: [row] }), dispatch,
+        readPrs: () => [t ? { ...subject, labels: [...subject.labels, { name: 'review:changes' }] } : subject], readAgents: () => [],
+        holdReconcile: () => [], tagRound: vi.fn(), tagStatus: vi.fn(), notifyReferral, sendBackReferralHold: send, autoResolveSeen: seen, log });
+      if (!t) expect(out.referralHoldAutoResolved).toEqual([expect.objectContaining({ pr: 5775, outcome: 'send-back', sentBack: true })]);
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(notifyReferral).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(log.mock.calls.filter(c => c[0].includes(REFERRAL_HOLD_AUTO_RESOLVED))).toHaveLength(1);
+  });
+
   it('#5800 mixed (one block, one not-real on the live head): send-back names only the block', () => {
     const f = FX[5800];
     const r = liveRecord(f);
@@ -187,21 +252,16 @@ describe('send-back: a block ruling on the live head owes a fix, never a ruling'
     expect(auto).toMatchObject({ outcome: 'send-back', counts: { block: 1, 'not-real': 1 } });
     expect(auto.blocked.map(b => b.key)).toEqual([r.referrals[0].key]);
   });
-});
 
-describe('send-back prose is rendered as HTML text', () => {
-  it.each([
-    ['ordinary prose', '  Fix\n this\t finding.  ', 'Fix this finding.'],
-    ['standard comment', '<!-- hidden -->', '&lt;!-- hidden --&gt;'],
-    ['alternate comment ending', '<!-- hidden --!> visible', '&lt;!-- hidden --!&gt; visible'],
-    ['standalone alternate comment ending', '--!>', '--!&gt;'],
-    ['abrupt comment ending', '<!--> visible', '&lt;!--&gt; visible'],
-    ['HTML and entities', '<b>Fix & verify &lt;input&gt;</b>', '&lt;b&gt;Fix &amp; verify &amp;lt;input&amp;gt;&lt;/b&gt;'],
-  ])('escapes %s in both the summary and rationale', (_name, input, escaped) => {
-    const body = referralHoldSendBackBody({ head: FX[5775].headRefOid,
-      blocked: [{ file: 'example.mjs', line: 7, actor: 'reviewer', summary: input, rationale: input }] });
-    expect(body).toContain(`1. \`example.mjs:7\` (reviewer) — ${escaped}\n   Rationale: ${escaped}`);
-    expect(body).not.toMatch(/[<>]/);
+  it('a failed send is not remembered, so the next tick retries it', () => {
+    const auto = { outcome: 'send-back', head: fx.headRefOid, blocked: [{ file: 'a', line: 1, summary: 's', actor: 'auto-policy' }] };
+    const seen = new Set();
+    const send = vi.fn(() => { throw new Error('gh down'); });
+    const r1 = handleReferralHoldAutoResolve({ repo, row: { prNumber: 5775 }, auto, rawPrs: [], send, seen, log: () => {} });
+    expect(r1.error).toMatch(/gh down/);
+    handleReferralHoldAutoResolve({ repo, row: { prNumber: 5775 }, auto, rawPrs: [], send, seen, log: () => {} });
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[0][0].actor).toBe('auto-policy');
   });
 });
 
@@ -329,6 +389,15 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
   it('the kill switch turns it off', () => {
     expect(decide(pr, hold, { env: { WE_REFERRAL_HOLD_AUTO_RESOLVE: '0' } })).toBeNull();
   });
+  it('a stay is logged once per reason, and the pause notice still posts', () => {
+    const log = vi.fn();
+    const seen = new Set();
+    const auto = { outcome: 'stay', head: fx.headRefOid, why: 'x' };
+    expect(handleReferralHoldAutoResolve({ repo, row: { prNumber: 5775 }, auto, seen, log })).toBeNull();
+    handleReferralHoldAutoResolve({ repo, row: { prNumber: 5775 }, auto, seen, log });
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toMatch(/referral-hold auto-resolve kept the pause .*"why":"x"/);
+  });
   it('a resume on a PR that is not review:human stays paused (no second verdict on an unchanged head)', () => {
     const p0 = enrich(fx);
     const p = plan({ ...p0, labels: [{ name: 'review:pending' }] });
@@ -387,5 +456,35 @@ describe('policy: referralHoldAutoResolve is a setting (value and source logged)
     const settings = { value: { enabled: true, onBlock: 'pause', onClean: 'resume' }, sources: { onBlock: 'env' } };
     expect(decide(asPr(fx, [...fx.comments, block]), hold, { settings })).toMatchObject({ outcome: 'stay',
       why: expect.stringMatching(/onBlock=pause \(source: env\)/) });
+  });
+});
+
+describe('the real sender runs a static helper file (no dynamic import inside a code string)', () => {
+  it('spawns scripts/conveyor/referral-hold-send-back.mjs with the args in env and parses its last JSON line', () => {
+    const exec = vi.fn(() => 'noise\n{"action":"send-back","sentBack":true}\n');
+    const out = defaultSendBackReferralHold({ repo, pr: 1, head: 'a'.repeat(40) }, { exec });
+    expect(out).toEqual({ action: 'send-back', sentBack: true });
+    const [bin, argv, opts] = exec.mock.calls[0];
+    expect(bin).toBe(process.execPath);
+    expect(argv).toHaveLength(1);
+    expect(resolvePath(argv[0])).toBe(resolvePath(here, '..', 'referral-hold-send-back.mjs'));
+    expect(JSON.parse(opts.env.WE_AUTO_RESOLVE_SEND_BACK)).toMatchObject({ pr: 1 });
+    expect(readFileSync(argv[0], 'utf8')).not.toMatch(/await import\(/);
+  });
+});
+
+describe('send-back prose is rendered as HTML text', () => {
+  it.each([
+    ['ordinary prose', '  Fix\n this\t finding.  ', 'Fix this finding.'],
+    ['standard comment', '<!-- hidden -->', '&lt;!-- hidden --&gt;'],
+    ['alternate comment ending', '<!-- hidden --!> visible', '&lt;!-- hidden --!&gt; visible'],
+    ['standalone alternate comment ending', '--!>', '--!&gt;'],
+    ['abrupt comment ending', '<!--> visible', '&lt;!--&gt; visible'],
+    ['HTML and entities', '<b>Fix & verify &lt;input&gt;</b>', '&lt;b&gt;Fix &amp; verify &amp;lt;input&amp;gt;&lt;/b&gt;'],
+  ])('escapes %s in both the summary and rationale', (_name, input, escaped) => {
+    const body = referralHoldSendBackBody({ head: FX[5775].headRefOid,
+      blocked: [{ file: 'example.mjs', line: 7, actor: 'reviewer', summary: input, rationale: input }] });
+    expect(body).toContain(`1. \`example.mjs:7\` (reviewer) — ${escaped}\n   Rationale: ${escaped}`);
+    expect(body).not.toMatch(/[<>]/);
   });
 });

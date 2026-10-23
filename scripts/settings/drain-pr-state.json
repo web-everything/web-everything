@@ -1,0 +1,4 @@
+{
+  "$comment": "Pass-start batching only; per-PR fallback and live write guards remain authoritative. WE_DRAIN_PR_STATE_BATCHED overrides drain.prState.batched.",
+  "drain": { "prState": { "batched": true } }
+}

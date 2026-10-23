@@ -27,7 +27,11 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Enabled production-wiring cases must not depend on the prototype's committed filing pause.
+beforeEach(() => vi.stubEnv('WE_PREVENTION_FILING_ENABLED', 'true'));
+afterEach(() => vi.unstubAllEnvs());
 
 import { createRegistry } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
@@ -374,6 +378,36 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
   const stubFileItem = (num = 9001, rel = 'backlog/9001-file-the-guard.md') => async () => ({
     code: 0,
     lines: [JSON.stringify({ verdict: { num, rel, kind: 'story', status: 'open' } })],
+  });
+
+  it('a paused prevention filer holds the run with a non-success exit and no acceptance or false filing receipt', async () => {
+    const { declaration, registry } = registryFor({});
+    const seen = [];
+    const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(),
+      sinks: recordingSinks(seen), makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'r-paused',
+      findFiledPrevention: () => null,
+      fileItem: async () => ({ code: 0, lines: [JSON.stringify({ skipped: true, reason: 'filing paused' })] }),
+    });
+    expect(out.code).toBe(1);
+    expect(out.stopped).toBe('confirm');
+    expect(out.run.findings.confirm).not.toBe('accept');
+    expect(seen.map(s => s.type)).not.toContain(REVIEW_EFFECTS.LABEL);
+    expect(out.lines.join('\n')).toContain('filing paused');
+  });
+
+  it('a recorded owed filing holds the run without a failure exit or false filing receipt', async () => {
+    const { declaration, registry } = registryFor({});
+    const seen = [];
+    const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(),
+      sinks: recordingSinks(seen), makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'r-paused',
+      findFiledPrevention: () => null,
+      fileItem: async () => ({ code: 0, lines: [JSON.stringify({ skipped: true, owed: true, reason: 'filing paused' })] }),
+    });
+    expect(out.code).toBe(0);
+    expect(out.stopped).toBe('confirm');
+    expect(out.run.findings.confirm).not.toBe('accept');
+    expect(seen.map(s => s.type)).not.toContain(REVIEW_EFFECTS.LABEL);
+    expect(out.lines.join('\n')).toContain('filing paused');
   });
 
   it('files ONE backlog card via file-item, then completes the run as an accept — no learnings-pool notice at all', async () => {
@@ -1498,7 +1532,9 @@ describe('unattended acceptance safety boundary', () => {
     expect(fileItem).toHaveBeenCalledOnce();
     expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(true);
   });
-  it('prevention-outstanding with an unruled broken finding cannot accept', async () => {
+  // Live #5608 shape: prevention-outstanding, a `broken` finding, and NO referral record on the PR to rule it. The hold
+  // could never lift, so the loop sends the PR back as `changes` carrying the broken finding — never an accept.
+  it('prevention-outstanding with an unrulable broken finding (no referral record) is sent back as changes, never accepted', async () => {
     const { declaration, registry } = registryFor({ rev: HEAD_A });
     const seen = [];
     const fileItem = vi.fn();
@@ -1507,10 +1543,28 @@ describe('unattended acceptance safety boundary', () => {
       readAcceptancePr: () => ({ headRefOid: HEAD_A, comments: [] }),
       makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'safety-prevention-broken', fileItem });
     expect(out.run.verdict.verdict).toBe('prevention-outstanding');
+    expect(out.stopped).toBe('complete');
+    expect(fileItem).not.toHaveBeenCalled();
+    const labels = seen.filter(s => s.type === REVIEW_EFFECTS.LABEL);
+    expect(labels).toHaveLength(1);
+    expect(JSON.stringify(labels[0].payload)).toMatch(/changes/);
+    expect(JSON.stringify(labels[0].payload)).not.toMatch(/accepted/);
+    // Every broken finding the verdict carries is named (one per seat that raised it) — none is dropped.
+    const broken = out.run.verdict.findings.filter(f => f.impactIfUnfixed === 'broken').length;
+    expect(broken).toBeGreaterThan(0);
+    expect(out.run.input.reason).toContain(`${broken} broken finding(s)`);
+    expect(out.run.input.reason.match(/a magic number should be a named constant/g)).toHaveLength(broken);
+    expect(out.lines.join('\n')).toContain(`sent back as \`changes\` with ${broken} broken finding(s)`);
+  });
+  it('the same broken finding on a moved live head still parks (no send-back on a head it did not review)', async () => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen),
+      readAcceptancePr: () => ({ headRefOid: HEAD_B, comments: [] }),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'safety-prevention-broken-moved', fileItem: vi.fn() });
     expect(out.stopped).toBe('confirm');
     expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
-    expect(fileItem).not.toHaveBeenCalled();
-    expect(out.lines.join('\n')).toMatch(/broken finding is not ruled/);
   });
   it.each([['accept', CLEAN_ANSWER], ['prevention-outstanding', noBroken]])
   ('%s on a live head that moved since the review cannot accept or file', async (verdict, answer) => {
@@ -1577,5 +1631,54 @@ describe('unattended accept reads the live head', () => {
     expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(cleared);
     expect(fileItem).toHaveBeenCalledTimes(verdict === 'prevention-outstanding' && cleared ? 1 : 0);
     if (!cleared) expect(out.lines.join('\n')).toMatch(/mandatory referrals remain open/);
+  });
+  // A referral record EXISTS (here: on an older head, so nothing is open on the live head): the broken finding has a
+  // ruling path, so the unrulable send-back must NOT fire — the run parks exactly as before.
+  it('a broken finding on a PR that has a referral record keeps parking, unchanged', async () => {
+    const comments = [comment(renderReferralRecord({ ...record, head: HEAD_B }))];
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen), cardReadable: () => true,
+      readAcceptancePr: () => ({ headRefOid: HEAD_A, body: record.authorBody, comments }),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'safety-broken-with-record', fileItem: vi.fn() });
+    expect(out.stopped).toBe('confirm');
+    expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+    expect(out.lines.join('\n')).toMatch(/Unattended accept parked: broken finding is not ruled/);
+  });
+});
+
+// Real net-file routing is independent of the execution/acceptance fixtures above.
+import { chooseSecuritySeat, defaultReadChangedFiles, TOUCH_SET_FILE_CAP } from '../review-loop-cli.mjs';
+describe('card light lane uses verified git files', () => {
+  const repo = 'web-everything/web-everything';
+  const info = { headRefName: 'lane/cards', headRefOid: 'a'.repeat(40), baseRefName: 'main' };
+  const cardOnly = { lightLane: true, claudeSeat: false };
+  function reads({ capped = false, moved = false, gitFiles = 'backlog/123-card.md' } = {}) {
+    const calls = [];
+    const exec = (_cmd, args) => {
+      calls.push(args);
+      return JSON.stringify(args[0] === 'pr' ? info : capped
+        ? Array.from({ length: TOUCH_SET_FILE_CAP }, (_, n) => ({ filename: `backlog/${n}-card.md` })) : [{ filename: 'scripts/stale.mjs' }]);
+    };
+    const run = (_cmd, args) => ({ status: 0, stdout: args[0] === 'remote' ? `https://github.com/${repo}.git`
+      : args[0] === 'rev-parse' ? (moved ? 'b'.repeat(40) : info.headRefOid) : args[0] === 'diff' ? gitFiles : '' });
+    return { calls, exec, readChangedFiles: ({ pr }) => defaultReadChangedFiles({ pr, repo, exec, run }) };
+  }
+  it('overrides inflated files and reads mutable head metadata once per attempt', () => {
+    const r = reads();
+    for (let n = 0; n < 2; n++) expect(chooseSecuritySeat(['--pr=5'], { ...r, cardOnly })).toMatchObject({ cardOnlyLight: true, securitySeat: false });
+    expect(r.calls.filter(a => a[0] === 'pr')).toHaveLength(2);
+  });
+  it('a capped GitHub list needs verified git evidence', () => {
+    expect(chooseSecuritySeat(['--pr=5'], { ...reads({ capped: true }), cardOnly }).cardOnlyLight).toBe(true);
+    expect(chooseSecuritySeat(['--pr=5'], { ...reads({ capped: true, moved: true }), cardOnly }).securitySeat).toBe(true);
+  });
+  it('verified lists above the REST cap stay complete and eligible', () => {
+    const r = reads({ capped: true, gitFiles: Array.from({ length: 110 }, (_, n) => `backlog/${n}-card.md`).join('\n') });
+    expect(chooseSecuritySeat(['--pr=5'], { ...r, cardOnly }).cardOnlyLight).toBe(true);
+  });
+  it('a verified code path keeps the full review lane', () => {
+    expect(chooseSecuritySeat(['--pr=5'], { ...reads({ gitFiles: 'scripts/code.mjs' }), cardOnly }).cardOnlyLight).not.toBe(true);
   });
 });

@@ -1,0 +1,6 @@
+{
+  "_comment": "Recover missing red-team results on already-reviewed heads via the existing review job. Env: WE_REVIEW_RED_TEAM_ON_SKIP (0/1), WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN. WE_REVIEW_RED_TEAM_ON_SKIP_MAX_FRESH_PER_HEAD bounds persisted head-bound fresh-attempt slots; exhaustion requires operator inspection.",
+  "enabled": true,
+  "retryCooldownMin": 30,
+  "maxFreshPerHead": 2
+}

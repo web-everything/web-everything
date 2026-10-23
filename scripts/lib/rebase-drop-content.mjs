@@ -34,6 +34,7 @@
  * resolver, never a best-effort guess on a giant/binary/non-UTF-8 blob.
  */
 
+import { loadCardRebaseSettings, cardTreeOnly, pinCardInputs, cardSquashRebuild } from './card-squash-rebuild.mjs';
 import { gitRun as gitRunner, hashObjectVerified, verifyTreeBlob, ensureFullHistory } from './git-run.mjs';
 import { LANE_MANIFEST, parseMergeTree } from './rebase-drop-manifest.mjs';
 import { refuseHeldPush } from '../conveyor/fix-procedure.mjs';
@@ -298,6 +299,8 @@ export function rebaseDropContent({
   manifest = LANE_MANIFEST,
   message,
   tmpIndex = '.git/rebase-drop-content-index',
+  cardRebaseSettings = loadCardRebaseSettings(),
+  dryRun = false,
   cwd,
   run = gitRunner,
 } = {}) {
@@ -391,19 +394,33 @@ export function rebaseDropContent({
     if (!v.ok) return { action: 'error', reason: `write-back verification failed: ${v.reason}` };
   }
 
+  const cardRebaseSetting = { value: cardRebaseSettings.value.squashToSingleCommit, source: cardRebaseSettings.sources.squashToSingleCommit };
+  const squash = cardRebaseSetting.value && cardTreeOnly({ run, cwd, base, tree: resolvedTree });
+  if (squash) {
+    const pinned = pinCardInputs({ run, cwd, base, mergeRef });
+    if (!pinned) return { action: 'error', reason: 'cannot pin card squash inputs' };
+    if (base !== pinned[0] || mergeRef !== pinned[1]) return rebaseDropContent({ laneRef, base: pinned[0], readRef: pinned[1],
+      remote, fetch: false, manifest, tmpIndex, cardRebaseSettings, dryRun, cwd, run,
+      message: message || `drain: rebase ${laneRef} onto ${base}, auto-resolve non-overlapping content conflict(s) in ${Object.keys(plan.merges).join(', ')}${droppedManifest ? `, drop transient ${manifest}` : ''}` });
+  }
   const mergedPaths = Object.keys(plan.merges);
   const msg = message || `drain: rebase ${laneRef} onto ${base}, auto-resolve non-overlapping content conflict(s) in ${mergedPaths.join(', ')}${droppedManifest ? `, drop transient ${manifest}` : ''}`;
-  const ct = run('git', ['commit-tree', resolvedTree, '-p', base, '-p', mergeRef, '-m', msg], { cwd });
+  const built = squash ? cardSquashRebuild({ run, cwd, base, mergeRef, tree: resolvedTree, message: msg }) : null;
+  if (built?.action === 'error') return built;
+  const ct = built ? { status: 0, stdout: built.newCommit } : run('git', ['commit-tree', resolvedTree, '-p', base, '-p', mergeRef, '-m', msg], { cwd });
   const newCommit = String(ct.stdout || '').trim();
   if (ct.status !== 0 || !newCommit) return { action: 'error', reason: `commit-tree failed (${firstLine(ct.stderr)})` };
+
+  if (dryRun) return { action: 'dry-run', newCommit, oldHead: mergeRef, base, laneRef, proof: built?.proof,
+    wouldPush: squash ? 'lease' : 'fast-forward', cardRebaseSetting };
 
   // #4293 — refuse this mechanical push too if another fixer holds the LIVE fix claim on the PR this laneRef
   // belongs to (see `refuseHeldPush`'s own header for why the check lives here, not at each caller).
   const refusal = refuseHeldPush({ run, cwd, remote, branch: laneRef });
   if (refusal) return { action: 'error', reason: refusal.message };
 
-  const push = run('git', ['push', remote, `${newCommit}:refs/heads/${laneRef}`], { cwd });
+  const push = run('git', ['push', ...(squash ? [`--force-with-lease=refs/heads/${laneRef}:${mergeRef}`] : []), remote, `${newCommit}:refs/heads/${laneRef}`], { cwd });
   if (push.status !== 0) return { action: 'error', reason: `push to ${laneRef} failed (${firstLine(push.stderr)})` };
 
-  return { action: 'rebased', newCommit, mergedPaths, droppedManifest, base, laneRef };
+  return { action: 'rebased', newCommit, cardRebaseSetting, ...(built ? { proof: built.proof } : {}), mergedPaths, droppedManifest, base, laneRef };
 }

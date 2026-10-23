@@ -36,6 +36,26 @@ export function resolveNumberingHumanClearanceSetting({ env = process.env, platf
   return { value: resolved.value[key], source: resolved.sources[key] };
 }
 
+/** Carry referral evidence only after the exact numbering move has been proven. */
+export function resolveNumberingCarryReferralEvidenceSetting({ env = process.env, platform, tool = readSettings()?.review } = {}) {
+  const key = 'numberingCarryReferralEvidence';
+  const raw = env?.WE_REVIEW_NUMBERING_CARRY_REFERRAL_EVIDENCE;
+  const parsed = raw === undefined ? undefined : /^(true|on|1)$/i.test(raw) ? true : /^(false|off|0)$/i.test(raw) ? false : raw;
+  const preference = platform === undefined ? platformPreference('review', { env }) : platform;
+  const resolved = cascadePolicy('review', tool && { [key]: tool[key] }, {
+    standard: { [key]: true }, platform: { [key]: preference?.[key] }, env,
+    envValues: { [key]: parsed }, valid: v => typeof v === 'boolean',
+  });
+  return { value: resolved.value[key], source: resolved.sources[key] };
+}
+const loggedReferralEvidenceSettings = new Set();
+function logNumberingCarryReferralEvidenceSetting(setting) {
+  const key = `${setting.value}:${setting.source}`;
+  if (loggedReferralEvidenceSettings.has(key)) return;
+  loggedReferralEvidenceSettings.add(key);
+  process.stderr.write(`policy · review.numberingCarryReferralEvidence=${setting.value} (${setting.source})\n`);
+}
+
 export const NUMBERING_SUBJECT_RE = /^drain: JIT-number (.+) at land \(#2288\)$/;
 export const MAX_NUMBERING_COMMITS = 5;
 export const MAX_NUMBERING_FILES = 256;
@@ -518,12 +538,25 @@ export function numberingWithdrawalOwed(repo, pr) {
 export function numberingRestampSettled(repo, pr, head) { return settledRestamps.has(`${repo}#${pr}@${head}`); }
 const errorReason = (e) => String(e?.message ?? e).split('\n')[0];
 
+// Numbering carries missing review evidence from the accepted head, never a live-head
+// referral hold or read failure. Only the guard's explicit no-review-run code is
+// satisfied by the proven move and the prior head's independently checked clearance;
+// an unfinished live-head run shares the prose refusal but can never be overridden.
+function guardNumberingReferrals({ state, plan, proven, guardReferrals, repo, pr }) {
+  if (!proven) return guardReferrals(state, { repo, pr });
+  guardReferrals({ ...state, headRefOid: plan.from }, { repo, pr });
+  try { return guardReferrals(state, { repo, pr }); }
+  catch (e) {
+    if (e?.code !== 'MANDATORY_REFERRAL_NO_REVIEW_RUN') throw e;
+  }
+}
+
 /**
  * IO: re-read the PR and re-plan right before a write, so a hold, head move or label change that arrived while the
  * proof ran wins over the plan it was given. Returns the fresh state, or the result to return without writing.
  * Nothing here is memoized: a held or unreadable head is planned again on the next pass.
  */
-function replanBeforeWrite({ readLiveState, expected, guardReferrals, repo, pr }) {
+function replanBeforeWrite({ readLiveState, expected, guardReferrals, proveReferralMove, repo, pr }) {
   if (typeof readLiveState !== 'function') return { result: { action: 'retry', reason: 'no live re-read before the write' } };
   let live;
   try { live = readLiveState(); }
@@ -546,7 +579,15 @@ function replanBeforeWrite({ readLiveState, expected, guardReferrals, repo, pr }
     return { ...seen, hold: true, result: { action: 'retry', reason: 'live re-read: the acceptance plan changed' } };
   }
   // A referral hold, or an unreadable referral record, is never proof the acceptance still stands.
-  try { guardReferrals(state, { repo, pr }); }
+  try {
+    const proof = proveReferralMove?.(plan);
+    guardNumberingReferrals({ state, plan, proven: proof?.ok, guardReferrals, repo, pr });
+    // Clearance cannot replace the numbering proof this pass relied on. Abort even
+    // when the live-head guard clears; a later pass can establish a fresh proof.
+    if (proveReferralMove && !proof?.ok) {
+      return { ...seen, hold: true, result: { action: 'retry', reason: `live numbering proof failed: ${proof?.reason ?? 'unreadable proof'}` } };
+    }
+  }
   catch (e) { return { ...seen, hold: true, result: { action: 'retry', reason: errorReason(e) } }; }
   return { state };
 }
@@ -601,7 +642,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   readNetDiff, readLiveState, dryRun = false, writer = 'review-daemon', prove = proveNumberingOnlyMove,
   numberingSetting = resolveNumberingHumanClearanceSetting(), netPatchSetting = resolveIdenticalNetPatchSetting(),
   enabled = resolveHumanClearanceCarrySetting().value, acceptCarry = resolveAcceptCarryForward().value,
-  guardReferrals = refuseWithoutReferralGuard } = {}) {
+  guardReferrals = refuseWithoutReferralGuard, referralEvidenceSetting = resolveNumberingCarryReferralEvidenceSetting() } = {}) {
   const key = `${repo}#${pr}@${state?.headRefOid}`;
   const plan = planNumberingRestamp({ labels: state?.labels, headSha: state?.headRefOid, comments: state?.comments, reviews });
   // A record an earlier pass left on the thread (its withdrawal failed, or the process died after the post) is
@@ -622,11 +663,20 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   if (settledRestamps.has(key)) return null;
   if (!plan.candidate) return plan.retryable ? { action: 'retry', reason: plan.reason } : null;
   if (plan.human && !numberingSetting.value && !netPatchSetting.value) return null;
-  // Use the same live referral guard as the sanctioned acceptance writer, including label-only recovery.
-  // A guard read failure is retryable and never settles the head or grants an acceptance.
-  try { guardReferrals(state, { repo, pr }); }
+  logNumberingCarryReferralEvidenceSetting(referralEvidenceSetting);
+  const numberingOff = plan.human && !numberingSetting.value;
+  const proveMove = (p) => {
+    if (numberingOff) return { ok: false, reason: 'numbering carry disabled' };
+    try { return prove({ exec, cwd, fromSha: p.from, toSha: p.to }); }
+    catch (e) { return { ok: false, retryable: true, reason: errorReason(e) }; }
+  };
+  // An identical-net-patch fallback is not numbering evidence. Only the numbering proof
+  // permits checking the accepted prior head; every other path keeps the current-head guard.
+  const numberingProof = referralEvidenceSetting.value ? proveMove(plan) : null;
+  try { guardNumberingReferrals({ state, plan, proven: numberingProof?.ok, guardReferrals, repo, pr }); }
   catch (e) { return { action: 'retry', reason: errorReason(e) }; }
-  const recheck = (labelsOnly) => replanBeforeWrite({ readLiveState, guardReferrals, repo, pr,
+  const recheck = (labelsOnly) => replanBeforeWrite({ readLiveState, guardReferrals,
+    proveReferralMove: numberingProof?.ok ? proveMove : undefined, repo, pr,
     expected: { from: plan.from, to: plan.to, labelsOnly, human: plan.human, actor: plan.actor, source: plan.source } });
   // A check that does not confirm the write withdraws every record the fresh plan finds stranded and — only for the
   // record THIS pass just posted (`own`) — any hold: one that landed between the pre-write check and the post sits
@@ -652,8 +702,7 @@ export function restampAfterNumbering({ repo, pr, state, reviews, exec = execFil
   const netSetting = netPatchSetting;
   logIdenticalNetPatchSetting(netSetting);
   // A disabled numbering proof is a setting, not a verdict: its refusal is never memoized, so switching it on takes effect.
-  const numberingOff = plan.human && !numberingSetting.value;
-  let proof = numberingOff ? { ok: false, reason: 'numbering carry disabled' } : prove({ exec, cwd, fromSha: plan.from, toSha: plan.to });
+  let proof = numberingProof ?? (numberingOff ? { ok: false, reason: 'numbering carry disabled' } : prove({ exec, cwd, fromSha: plan.from, toSha: plan.to }));
   if (!proof.ok && netSetting.value) {
     // An alternative proof cannot settle a head the first proof could not read: either retryable miss stays retryable.
     const net = proveIdenticalNetPatch({ exec, cwd, fromSha: plan.from, toSha: plan.to });

@@ -1133,6 +1133,27 @@ export function detachedWrapperPidsBySession(runs) {
 }
 
 /**
+ * PURE. Live dispatcher wrapper session slugs from the shared `ps aux` snapshot. Fix wrappers need not
+ * have a run-store effect, and older terminal Claude rows may reuse their slug. A failed scan supplies
+ * no positive evidence; an empty set never asserts that a wrapper died.
+ * @param {string|null} psOutput
+ * @returns {Set<string>}
+ */
+export function liveWrapperSessionsFromPs(psOutput) {
+  const sessions = new Set();
+  if (typeof psOutput !== 'string') return sessions;
+  for (const line of psOutput.split('\n')) {
+    // ps aux has ten columns before COMMAND; require Node itself to execute the wrapper.
+    const command = line.match(/^\s*(?:\S+\s+){10}(.*)$/)?.[1];
+    const wrapper = command?.match(/^(?:\S*\/)?node\s+(?:\S*\/)?(?:fix-run|deliver-item-run|ci-heal-run)\.mjs(?=\s|$)/);
+    if (!wrapper) continue;
+    const found = [...command.slice(wrapper[0].length).matchAll(/(?:^|\s)--session=([^\s]+)(?=\s|$)/g)].map((m) => m[1]);
+    if (found.length === 1) sessions.add(found[0]); // zero or ambiguous (duplicate) --session= gives no evidence
+  }
+  return sessions;
+}
+
+/**
  * Build the reap plan over a flat list of `{ pool, lane, dir, lease }` candidates. Pure — the shell resolves
  * each lease's per-lease signals (via the injected `signalsFor`) and this maps {@link classifyReap} over them.
  * @param {Array<{pool:string, lane:number, dir:string, lease:object|null}>} candidates
@@ -1312,7 +1333,7 @@ export function fetchPrStatesForRepo(repoKey, flags, { exec } = {}) {
 }
 
 /**
- * ONE `claude agents --json --all` read → `{ states, pidAlive }` — the session-name→state Map
+ * ONE `claude agents --json --all` read → `{ states, pidAlive, agents, liveWrapperSessions }` — the session-name→state Map
  * {@link sessionGoneForLease} checks leases against, PLUS (#3383) the session-name→real-liveness Map from the
  * SAME listing, so the phantom-listing widening above needs no second `claude` call. The real fix for the
  * 2026-09-04/05 dead-session-stays-leased incident (see this file's header and {@link sessionGoneForLease}'s own
@@ -1338,13 +1359,13 @@ export function fetchPrStatesForRepo(repoKey, flags, { exec } = {}) {
  * (whose #1921 concern is specifically about the background-only population) degrade on that shape.
  */
 export function fetchSessionSignals(flags, { exec = execFileSync } = {}) {
-  if (flags['no-check-sessions']) return { states: null, pidAlive: new Map(), agents: null };
+  if (flags['no-check-sessions']) return { states: null, pidAlive: new Map(), agents: null, liveWrapperSessions: new Set() };
   let sessions;
   try {
     sessions = defaultListAgents({ exec, all: true });
   } catch (e) {
     log(`  ⚠ \`claude agents --json --all\` failed — session-gone reap axis OFF this run (TTL-stale still applies): ${String(e?.message || e).split('\n')[0]}`);
-    return { states: null, pidAlive: new Map(), agents: null };
+    return { states: null, pidAlive: new Map(), agents: null, liveWrapperSessions: new Set() };
   }
   const states = sessionStatesForReap(sessions);
   if (!states) log('  ⚠ `claude agents --json --all` listed zero background session(s) — session-gone reap axis OFF this run (indistinguishable from a bad read; TTL-stale still applies)');
@@ -1352,7 +1373,7 @@ export function fetchSessionSignals(flags, { exec = execFileSync } = {}) {
   // listed at all; `scanPsOutput` itself never throws (best-effort, returns null on failure).
   const psOutput = Array.isArray(sessions) && sessions.length ? scanPsOutput({ exec }) : null;
   const pidAlive = sessionPidAliveByName(sessions, { psOutput });
-  return { states, pidAlive, agents: Array.isArray(sessions) ? sessions : null };
+  return { states, pidAlive, agents: Array.isArray(sessions) ? sessions : null, liveWrapperSessions: liveWrapperSessionsFromPs(psOutput) };
 }
 
 /** #3903 — the io half of {@link detachedWrapperPidsBySession}: read every run record once, never throwing.
@@ -1405,7 +1426,7 @@ export const LEASE_REAPER_ACTOR = 'lease-reaper';
  * #4332 — the per-lease reap-signal builder `main()` drives (extracted so tests exercise the real wiring).
  * `ownerAlive` is computed BEFORE item resolution so it can veto the branch-derived PR-terminal fallback.
  */
-export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, nowMs }) {
+export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, liveWrapperSessions = new Set(), nowMs }) {
   return (c) => {
     // #x5wm9ot — an item-kind session (`conveyor-`/`prepare-`/`prepare-decision-`) checks `byItem` by its item
     // number; a PR_KIND session (`review-`/`fix-`/`ci-heal-`/`inspect-`) checks `byPr` by its OWN PR number —
@@ -1431,7 +1452,10 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
     const sessionPidAliveNow = c.lease?.session && sessionPidAlive.has(c.lease.session) ? sessionPidAlive.get(c.lease.session) : null;
     // #3903 — a detached delivery wrapper's own pid (see `detachedWrapperPidsBySession`).
     const wrapperPid = c.lease?.session ? wrapperPids.get(c.lease.session) : undefined;
-    const wrapperAlive = wrapperPid === undefined ? null : Boolean(defaultIsPidAlive(wrapperPid));
+    // A detached fixer may have no run-store pid: a matching live argv still overrides stale Claude rows.
+    const wrapperAlive = wrapperPid === undefined
+      ? (liveWrapperSessions.has(c.lease?.session) ? true : null)
+      : Boolean(defaultIsPidAlive(wrapperPid));
     return {
       prState,
       sessionGone: sessionGoneForLease(c.lease, sessionStates, { nowMs, pidAlive: sessionPidAliveNow, wrapperAlive, ownerAlive }),
@@ -1479,7 +1503,7 @@ function main(argv) {
   const ttlMs = ttlMinutes * 60_000;
   const nowMs = Date.now();
 
-  const { states: sessionStates, pidAlive: sessionPidAlive, agents: sessionAgents } = fetchSessionSignals(flags); // states null on zero background rows too; agents null only on a failed/no-array read (see fetchSessionSignals's own doc)
+  const { states: sessionStates, pidAlive: sessionPidAlive, agents: sessionAgents, liveWrapperSessions } = fetchSessionSignals(flags); // states null on zero background rows too; agents null only on a failed/no-array read (see fetchSessionSignals's own doc)
   // #3903 — ONE read of the run store for every in-flight detached-wrapper pid. Best-effort: an unreadable
   // store or record leaves the map empty/partial, which only means the old (listing-only) behaviour applies.
   const wrapperPids = readWrapperPidsForPass({ env: process.env, log });
@@ -1505,7 +1529,7 @@ function main(argv) {
   const distinctRepoKeys = [...new Set(candidates.map((c) => c.repoKey).filter(Boolean))];
   const prStatesByRepo = new Map(distinctRepoKeys.map((repoKey) => [repoKey, fetchPrStatesForRepo(repoKey, flags)]));
 
-  const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, nowMs });
+  const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, liveWrapperSessions, nowMs });
   const plan = reapPlan(candidates, { nowMs, ttlMs, signalsFor });
   const { reap, keep } = applyLaneHold(plan, { nowMs });
 
