@@ -18,7 +18,8 @@ export default {
     const source = readFileSync(join(root, 'scripts/lane-pool.mjs'), 'utf8');
     const proof = /function localRemoteShas\([^]*?\n\}/.exec(source)?.[0] ?? '';
     const reclaim = /function laneReclaimPreservationProof\([^]*?\n\}/.exec(source)?.[0] ?? '';
-    return proof.includes('%(symref)') && proof.includes('remote.origin.fetch') && reclaim.includes('liveRemoteShas(repo)');
+    return proof.includes('%(symref)') && proof.includes('remote.origin.fetch') && reclaim.includes('liveRemoteShas(repo)')
+      && source.includes("'--git-common-dir'");
   },
   async run({ root = REPO_ROOT } = {}) {
     const violations = [];
@@ -38,6 +39,8 @@ export default {
       { dryRun: true, live: true, hostileRemote: 'rewrite' },
       { dryRun: true, live: true, missingOrigin: true },
       ...['reclaim', 'trim', 'acquire'].map(laneOriginCommand => ({ laneOriginCommand })),
+      // A linked worktree of the lane, outside the pool, shares the lane's config and so its hostile origin.
+      { laneOriginCommand: 'reclaim', externalWorktree: true },
     ]) {
       const report = await runReclaimCase(root, options);
       violations.push(...report.violations.map((message) => `reclaim ${JSON.stringify(options)}: ${message}`));
@@ -51,7 +54,7 @@ export function runReclaimCase(root = REPO_ROOT, options = {}) {
   return runAliasCase(root, options.alias ?? 'none', { ...options, command: 'reclaim' });
 }
 
-async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit', change = 'moved', containment = 'exact', dryRun = false, live = false, race = false, hostileRemote = null, missingOrigin = false, laneOriginCommand = null } = {}) {
+async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit', change = 'moved', containment = 'exact', dryRun = false, live = false, race = false, hostileRemote = null, missingOrigin = false, laneOriginCommand = null, externalWorktree = false } = {}) {
     const base = mkdtempSync(join(tmpdir(), 'soak-symbolic-ops-'));
     const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     try {
@@ -125,10 +128,15 @@ async function runAliasCase(root, alias, { command = 'acquire', kind = 'commit',
           const args = laneOriginCommand === 'trim' ? ['--max=1', '--dry-run']
             : laneOriginCommand === 'reclaim' ? ['--lane=1', '--dry-run']
               : ['--lane=1', '--no-reap', '--hard-max=1', '--session=lane-origin-proof'];
+          let cliCwd = lane;
+          if (externalWorktree) {
+            cliCwd = join(base, 'scratch-proof');
+            git(['worktree', 'add', '--quiet', '--detach', cliCwd, 'origin/trunk'], lane);
+          }
           // Deliberately omit both --origin and --reference, as in the live finding.
           const refused = spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), laneOriginCommand,
             ...args, '--pool=symbolic-ops', '--branch=trunk', '--no-install', '--json'], {
-            cwd: lane, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024,
+            cwd: cliCwd, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024,
             env: { ...process.env, LANE_POOL_ROOT: pool, PATH: `${bin}:${process.env.PATH}` },
           });
           const violations = [];

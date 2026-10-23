@@ -354,13 +354,25 @@ function resolveRepo() {
     || (cmd === 'list' && flags.acquirable);
   if (!flags.origin && needsOrigin) {
     const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
-    const originSourcePaths = [referencePath, topLevel].flatMap(path => [resolve(path), resolveReal(path)]);
+    // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
+    // (the git dir and the common dir) is checked too; a worktree whose git dir differs from its common
+    // dir is never a canonical source, wherever it sits on disk.
+    let linkedWorktree = false;
+    const gitOwnerPaths = [referencePath, topLevel].flatMap((dir) => {
+      const [gitDir, commonDir] = ['--git-dir', '--git-common-dir'].map((arg) => {
+        const out = tryGit(['rev-parse', arg], dir, gitOptions);
+        return out ? resolve(dir, out) : null;
+      });
+      if (gitDir && commonDir && resolveReal(gitDir) !== resolveReal(commonDir)) linkedWorktree = true;
+      return [gitDir, commonDir, commonDir && dirname(commonDir)].filter(Boolean);
+    });
+    const originSourcePaths = [referencePath, topLevel, ...gitOwnerPaths].flatMap(path => [resolve(path), resolveReal(path)]);
     // The reference/cwd can itself be an agent-owned lane. Never promote its remote
     // into the trust anchor for a preservation proof, even for --dry-run or --pool.
     // Check both the supplied path and Git's answer (core.worktree can redirect it),
     // before and after symlink resolution. Recognize lane-N in other pool roots too;
     // ambiguous lane-shaped checkouts must supply --origin or a primary --reference.
-    if (originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
+    if (linkedWorktree || originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
       || path.split(sep).some(part => /^lane-\d+$/.test(part)))) {
       fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
     }
