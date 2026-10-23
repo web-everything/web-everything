@@ -16,8 +16,9 @@
  *      the marker is re-read (still ours?) and every eligibility input is re-checked;
  *   1. apply the diet config (negative `^refs/heads/ops/*` refspec + unpackLimit=1);
  *   2. delete the stale `refs/remotes/origin/ops/*` tracking refs (readers re-fetch them explicitly by name);
- *   3. `git gc --prune=<1.hour.ago>` with reflog expiry and worktree pruning OFF: only objects unreachable from every
- *      ref, reflog, index and HEAD, and older than the grace window, are dropped (the old ledger blobs);
+ *   3. `git gc --prune=never` (no cruft pack) with reflog expiry and worktree pruning OFF, a re-check of the claim and
+ *      every input, then `git prune --expire=<1.hour.ago>`: only objects unreachable from every ref, reflog, index
+ *      and HEAD, and older than the grace window, are dropped (the old ledger blobs);
  *   4. drop the claim marker (only if it is still ours).
  * Never `reset`, `clean` or `checkout`; never a working-tree write. Never the primary checkout, `~/workspace/wev-*`,
  * or `.lanes/we-drain-daemon`. Git runs with GIT_DIR-style overrides scrubbed and the lane hardening pins applied.
@@ -133,6 +134,8 @@ const eligible = (dir) => {
     borrowers: (objects && BORROWERS.get(objects)) || [], gcHooks: realGitDir ? gcHooks(dir) : [], gcRepackFilters: realGitDir ? gcRepackFilters(dir) : [],
   });
 };
+// Every eligibility input re-read while we hold the claim (our own marker is the lease, so `lease: null`).
+const recheckUnderClaim = (dir) => cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: null, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir) });
 
 // O_EXCL claim, same marker shape as `lane-pool` (so `acquire` reads it as a live lease and skips the lane).
 function claim(dir) {
@@ -186,7 +189,7 @@ for (const n of lanes) {
       testPause('after-claim');
       // Re-read ownership before any write: a marker rewritten or removed by another holder means the claim is lost.
       if (readLease(dir)?.holder !== holder) { rows.push({ lane: n, skipped: 'claim lost (lease marker is no longer ours)' }); continue; }
-      const recheck = cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: null, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir) });
+      const recheck = recheckUnderClaim(dir);
       if (!recheck.ok) { rows.push({ lane: n, skipped: recheck.reason }); continue; }
       const before = duBytes(join(dir, '.git'));
       const applied = applyLaneDietConfig((args) => git(dir, args));
@@ -206,9 +209,21 @@ for (const n of lanes) {
       // Re-audit right before pruning too: a ref transaction prepared since the recheck holds a `*.lock` naming
       // objects gc would otherwise drop.
       testPause('before-gc');
-      const late = cleanupEligibility({ dir, poolRoot: POOL_ROOT, ...auditGitDir(dir), lease: null, nowMs: Date.now() });
+      const late = recheckUnderClaim(dir);
       if (!late.ok) { rows.push({ lane: n, skipped: `${late.reason} (config + ref cleanup done, gc skipped)` }); continue; }
-      git(dir, ['-c', 'gc.autoDetach=false', '-c', 'gc.reflogExpire=never', '-c', 'gc.reflogExpireUnreachable=never', '-c', 'gc.worktreePruneExpire=never', '-c', 'gc.rerereResolved=36500', '-c', 'gc.rerereUnresolved=36500', 'gc', `--prune=${PRUNE_EXPIRE}`, '--quiet'], GC_TIMEOUT_MS);
+      // Two steps, so the walk that decides what to delete starts seconds after the last audit, not after a long
+      // repack: the gc deletes nothing (no cruft pack, which `git prune` cannot expire: unreachable objects stay or
+      // become loose), then the claim and every input are re-checked, then `git prune` drops only old loose objects
+      // unreachable from every ref, reflog, index and HEAD. A ref transaction prepared during the repack holds a
+      // `*.lock` that check sees. Git has no lock against gc, so prune's own short walk is the remaining window.
+      git(dir, ['-c', 'gc.autoDetach=false', '-c', 'gc.cruftPacks=false', '-c', 'gc.reflogExpire=never', '-c', 'gc.reflogExpireUnreachable=never', '-c', 'gc.worktreePruneExpire=never', '-c', 'gc.rerereResolved=36500', '-c', 'gc.rerereUnresolved=36500', 'gc', '--prune=never', '--quiet'], GC_TIMEOUT_MS);
+      testPause('before-prune');
+      if (readLease(dir)?.holder !== holder) { rows.push({ lane: n, skipped: 'claim lost (lease marker is no longer ours) (repack done, prune skipped)' }); continue; }
+      const final = recheckUnderClaim(dir);
+      if (!final.ok) { rows.push({ lane: n, skipped: `${final.reason} (repack done, prune skipped)` }); continue; }
+      const finalBorrowers = borrowerMap().get(real(join(dir, '.git', 'objects'))) || [];
+      if (finalBorrowers.length) { rows.push({ lane: n, skipped: `objects borrowed by ${finalBorrowers.join(', ')} (repack done, prune skipped)` }); continue; }
+      git(dir, ['prune', `--expire=${PRUNE_EXPIRE}`], GC_TIMEOUT_MS);
       const after = duBytes(join(dir, '.git'));
       const freed = before - after;
       total += Number.isFinite(freed) ? freed : 0;

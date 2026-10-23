@@ -400,6 +400,36 @@ describe('real git: cleanup CLI', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 
+  it('a ref transaction prepared during the repack, before prune, skips prune and keeps the old unreachable commit', async () => {
+    const dir = lane(21);
+    git(root, 'clone', '-q', up, dir);
+    const rescue = git(dir, 'commit-tree', git(dir, 'rev-parse', 'HEAD^{tree}'), '-p', 'HEAD', '-m', 'mid-gc rescue');
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(join(dir, '.git', 'objects', rescue.slice(0, 2), rescue.slice(2)), old, old);
+    try {
+      const out = await runPaused(21, 'before-prune', () => writeFileSync(join(dir, '.git', 'refs', 'heads', 'mid.lock'), `${rescue}\n`));
+      expect(out.rows[0].skipped).toBe('git lock present (refs/heads/mid.lock) (repack done, prune skipped)');
+      expect(git(dir, 'cat-file', '-t', rescue)).toBe('commit');
+      expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it('a claim taken over during the repack skips prune and leaves the new holder\'s marker', async () => {
+    const dir = lane(22);
+    git(root, 'clone', '-q', up, dir);
+    const rescue = git(dir, 'commit-tree', git(dir, 'rev-parse', 'HEAD^{tree}'), '-p', 'HEAD', '-m', 'taken-over rescue');
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(join(dir, '.git', 'objects', rescue.slice(0, 2), rescue.slice(2)), old, old);
+    const marker = join(dir, '.git', '.lane-lease');
+    const theirs = JSON.stringify({ holder: 'someone-else', session: 'someone-else' });
+    try {
+      const out = await runPaused(22, 'before-prune', () => writeFileSync(marker, theirs));
+      expect(out.rows[0].skipped).toBe('claim lost (lease marker is no longer ours) (repack done, prune skipped)');
+      expect(git(dir, 'cat-file', '-t', rescue)).toBe('commit');
+      expect(readFileSync(marker, 'utf8')).toBe(theirs);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
   it('loses the O_EXCL claim race to a marker written after the startup check, and leaves that marker', async () => {
     const dir = lane(17);
     git(root, 'clone', '-q', up, dir);
