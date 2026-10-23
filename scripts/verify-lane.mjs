@@ -18,7 +18,8 @@
  * The pure decision half (marker shape + the gate decision `pr-land` calls) lives in `scripts/lib/lane-verify.mjs`.
  *
  * The default build.finalGate is full: the whole unit tier plus standards, through heavy admission.
- * Set build.finalGate=related to retain the diff-driven selection in lib/verify-lane-gate.mjs.
+ * build.finalGate=related selects related tests; build.finalGateStandards defaults to always,
+ * retaining standards on every diff. Set finalGateStandards=selected for the verify-settings selection.
  * Explicit --gate commands retain precedence. Settings and their sources are logged through policy-cascade.
  *
  * Usage:
@@ -76,12 +77,14 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
-import { alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
-import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
+import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
+import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
+import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -98,7 +101,7 @@ Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run] [flags]
   check     read-only verdict for HEAD (--wait=<ms> blocks until it settles)
   reset     clear a stale marker
   run       synchronous marker-less run
-Flags: --repo=<dir> --json --require-verified --help/-h
+Flags: --repo=<dir> --json --require-verified --dry-run (print default gate only) --help/-h
 Exit: 0 ok, 2 red, 3 usage/refused. Full docs: the header of scripts/verify-lane.mjs.
 `);
   process.exit(0);
@@ -122,7 +125,7 @@ const { requireVerified: REQUIRE_VERIFIED, breakGlass: VERIFY_BREAK_GLASS } = re
 // commands nor any other child we spawn can read it. Later in-band queue markers echo it (see `timedRunGate`).
 const MARKER_NONCE_SUFFIX = markerNonceSuffix(process.env[VERIFY_MARKER_NONCE_ENV]);
 delete process.env[VERIFY_MARKER_NONCE_ENV];
-const MODE = positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
+const MODE = flags['dry-run'] ? 'print-gate' : positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
   : positionals[0] === 'request' ? 'request' : positionals[0] === 'run' ? 'run' : 'verify';
 
 // The lane is agent-writable, and the fix daemon runs `request` against it: its `.git/config` must never be able to execute
@@ -350,8 +353,17 @@ resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
 // changed files for red-cause attribution. It runs no selected-test half (`testCommand`), so no phase, scan or
 // isolated retry built for a selection applies. Any other policy keeps the diff-driven selection.
 function resolveBuildDefaultGate(env) {
-  if (resolveBuildPolicy({ env }).finalGate !== 'full') {
-    return resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
+  const policy = resolveBuildPolicy({ env });
+  if (policy.finalGate !== 'full') {
+    const always = policy.finalGateStandards === 'always';
+    const gateEnv = always ? { ...env, WE_VERIFY_STANDARDS: 'always', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '0' } : env;
+    const gate = resolveDefaultGate({ runGit: git, env: gateEnv, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
+    const source = always ? `build.finalGateStandards (${policy.sources.finalGateStandards})` : gate.decision.settingsSource.standards;
+    gate.decision.standards.source = source;
+    const reason = `build.finalGateStandards=${policy.finalGateStandards} (${policy.sources.finalGateStandards}); standards=${gate.decision.standards.policy} (${source})`;
+    gate.gateReasons.push(reason);
+    gate.decision.reasons = [...gate.decision.reasons, reason];
+    return gate;
   }
   const scripts = readCheckoutScripts();
   const tests = !scripts || scripts.includes('test:unit') ? 'npm run test:unit' : 'npm test';
@@ -366,6 +378,13 @@ function resolveBuildDefaultGate(env) {
   const reason = 'build.finalGate=full — the whole unit tier plus standards';
   return { command, gateReasons: [reason], decision: { mode: 'full', reasons: [reason], changedFiles,
     selectionMode: { mode: 'pr', reason: 'build.finalGate=full' } } };
+}
+// Preview resolves the same default as verify, before any gate, admission or marker writes.
+if (MODE === 'print-gate') {
+  const gate = resolveBuildDefaultGate(process.env);
+  writeAllSync(1, JSON.stringify({ command: gate.command, reasons: [...gate.decision.reasons, ...gate.gateReasons],
+    standards: gate.decision.standards ?? null, decision: gate.decision }) + '\n');
+  process.exit(0);
 }
 let GATE;
 let resolvedGate;
@@ -422,11 +441,27 @@ if (!resolvedGate && typeof flags.gate === 'string') {
     // setting): a stamped selection under our `full`, or a stamped full gate under our `related`, is still a default.
     else if (MODE === 'verify' && typeof flags['run-id'] === 'string') {
       const variants = verifySetting('matchRequestVariants', process.env);
-      const ours = resolveBuildPolicy({ env: process.env }).finalGate === 'full' ? 'full' : 'related';
+      const policy = resolveBuildPolicy({ env: process.env });
+      const ours = policy.finalGate === 'full' ? 'full' : 'related';
+      const { WE_VERIFY_STANDARDS: ownVerifyStandards, ...unpinned } = process.env;
+      const cardOnlyStamp = GATE === CARD_ONLY_SKIP_GATE;
       for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {
         const env = finalGate === ours ? process.env : { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
         const base = finalGate === ours ? resolved : resolveUnder(env);
         resolvedGate = (base.command === GATE ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
+        if (resolvedGate) break;
+        // #5831 — the requester may have stamped under build.finalGateStandards=selected (no standards half) or with the
+        // card-only skip on. `always` pins WE_VERIFY_STANDARDS and the skip, so the matcher's probes cannot reproduce
+        // that stamp under ours, and the child would run it as-is. Every probe pins WE_VERIFY_STANDARDS, so a pinned
+        // resolution is a probe and resolves under the requester's `selected` policy (with the skip for a card-only
+        // stamp); the base and the plan carry no pin and resolve under OURS, so the run never drops our checks. Only a
+        // child that would run MORE than the stamp probes this way; build.finalGateStandards shapes only the related gate.
+        if (finalGate === 'full' || (policy.finalGateStandards !== 'always' && !cardOnlyStamp)) continue;
+        const ownPin = ownVerifyStandards === undefined ? {} : { WE_VERIFY_STANDARDS: ownVerifyStandards };
+        const probePin = { WE_BUILD_FINAL_GATE_STANDARDS: 'selected', ...(cardOnlyStamp ? { WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1' } : {}) };
+        const requesterEnv = finalGate === ours ? unpinned : { ...unpinned, WE_BUILD_FINAL_GATE: finalGate };
+        const underRequester = (e) => Object.hasOwn(e, 'WE_VERIFY_STANDARDS') ? resolveUnder({ ...e, ...probePin }) : resolveUnder({ ...e, ...ownPin });
+        resolvedGate = matchRequestedDefaultGate({ gate: GATE, env: requesterEnv, resolved: base, resolveUnder: underRequester, variants }) ?? undefined;
         if (resolvedGate) break;
       }
     }
@@ -481,13 +516,18 @@ if (preStart && !preStart.corrupt && (['green', 'red', 'infrastructure-failure']
 // weaker `--gate=` override (e.g. `--gate=true`) must never satisfy a LATER request for a different/stronger
 // gate on the same unchanged tree — that would silently skip the real verification the caller actually asked
 // for. Only a green produced by the SAME gate command can answer a cache hit.
+// A dispatched default gate can keep the requester's stamped GATE while resolving a different command under
+// the child's policy. That stamp alone cannot prove the child's checks ran (the requester may have skipped
+// them entirely). Also compare the command that actually ran with this execution plan. Legacy records without
+// that evidence miss the cache once; the next completed run records it.
 const treeHashNow = () => computeWorkingTreeHash({ runGit: git, fileMode: (f) => lstatSync(join(REPO, f)).mode });
 const currentTreeHash = MODE === 'run' ? null : treeHashNow();
 const cacheHit = MODE !== 'run' && preStart && !preStart.corrupt
   && preStart.status === 'green'
   && preStart.sha === headSha
   && currentTreeHash != null && preStart.treeHash === currentTreeHash
-  && preStart.suites === GATE;
+  && preStart.suites === GATE
+  && preStart.executedGate === (resolvedGate?.command ?? GATE);
 
 if (cacheHit) {
   const cachedDetail = `green for ${headSha.slice(0, 8)} — working tree unchanged since that verification (content hash + gate match); no new run needed.${describeIsolatedRetry(preStart)}`;
@@ -521,7 +561,7 @@ if (resolvedGate?.decision?.mode === 'card-only-skip') {
   const now = new Date().toISOString();
   const detail = `card-only diff (CI's definition) - local gate skipped for ${headSha.slice(0, 8)}; CI's check:standards stays the merge authority.`;
   writeMarker({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: now, treeHash: currentTreeHash }),
-    { finishedAt: now, exitCode: 0, sha: headSha, suites: GATE, treeHash: currentTreeHash }), skipped: 'card-only' });
+    { finishedAt: now, exitCode: 0, sha: headSha, suites: GATE, treeHash: currentTreeHash }), skipped: 'card-only', executedGate: resolvedGate.command });
   maybeRecordGreen({ status: 'green', treeHash: currentTreeHash, skipped: 'card-only' });
   emit({ sha: headSha, status: 'green', reason: 'card-only-skip', exitCode: 0, detail }, 0);
 }
@@ -597,6 +637,24 @@ async function acquireAdmission(phase) {
 }
 const admission = await acquireAdmission('vitest');
 let firstPhaseAdmission = phaseAdmission ? admission : null;
+// verify-admission (2026-10-20) — keep whichever slot this process holds alive while the gate runs. The slot lease
+// had no refresh, so a gate past ADMISSION_LEASE_MINUTES lost its slot to the next waiter and kept running
+// unslotted (12 concurrent verify-lanes, `heavy-queue` showing 0 held). The per-phase timeout below bounds how
+// long a refreshed slot can be kept. Unref'd: never keeps this process alive by itself.
+const SLOT_HEARTBEAT_MS = verifySetting('slotHeartbeatMs', process.env);
+process.stderr.write(`verify-lane: slot heartbeat every ${SLOT_HEARTBEAT_MS}ms (slotHeartbeatMs, ${verifySettingSource('slotHeartbeatMs', process.env)})\n`);
+const slotHeartbeat = setInterval(() => {
+  try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
+}, SLOT_HEARTBEAT_MS);
+slotHeartbeat.unref();
+// verify-admission — the hard per-phase ceiling (verify setting `phaseTimeoutMs`, logged with its source).
+const PHASE_TIMEOUT_MS = verifySetting('phaseTimeoutMs', process.env);
+const PHASE_TIMEOUT_SOURCE = verifySettingSource('phaseTimeoutMs', process.env);
+process.stderr.write(`verify-lane: phase timeout ${PHASE_TIMEOUT_MS}ms (phaseTimeoutMs, ${PHASE_TIMEOUT_SOURCE})\n`);
+let phaseTimeout = null;
+// Named per verify-lane process, so a nested verify-lane (a test of this file) adds its own marker instead of replacing ours.
+const GATE_PHASE_MARKER_ENV = `WE_VERIFY_GATE_PHASE_${process.pid}`;
+const HEAVY_ADMISSION_MODULE = new URL('./readiness/heavy-admission.mjs', import.meta.url).href;
 
 // 3. Run the gate in the FOREGROUND, waiting until it exits (forwarded stdio — the agent sees the output live).
 // #3383 (Skeptic review, 2026-09-14) — an UNCONDITIONAL marker, unlike the two admission log lines above
@@ -625,8 +683,12 @@ async function runGate(command, args) {
   let bytes = 0;
   // xaipsbs — the gate's own `npm run test:unit` / `check:standards` are wrapped in `heavy-admission.mjs run`;
   // this flag makes those nested wrappers pass through instead of asking for a second slot for the same work.
+  // PR #5768 — a per-phase env marker every descendant inherits: the watchdog finds one that left the tree AND the group by it.
+  const phaseToken = randomBytes(8).toString('hex');
+  const phaseMarker = `${GATE_PHASE_MARKER_ENV}=${phaseToken}`;
   const result = await new Promise((resolveGate, reject) => {
-    const child = spawn(command, args ?? [], { shell: !args, cwd: REPO, stdio: ['inherit', 'pipe', 'pipe'], env: { ...process.env, [ADMISSION_HELD_ENV]: '1' } });
+    const child = spawn(command, args ?? [], { shell: !args, cwd: REPO, stdio: ['inherit', 'pipe', 'pipe'],
+      env: { ...process.env, [ADMISSION_HELD_ENV]: '1', [GATE_PHASE_MARKER_ENV]: phaseToken } });
     for (const [name, fd] of [['stdout', 1], ['stderr', 2]]) {
       child[name].setEncoding('utf8');
       child[name].on('data', chunk => {
@@ -637,8 +699,52 @@ async function runGate(command, args) {
         writeAllSync(fd, chunk);
       });
     }
-    child.on('error', reject);
-    child.on('close', (code, closeSignal) => resolveGate({ exitCode: Number.isFinite(code) ? code : 2, signal: closeSignal || null }));
+    // verify-admission — kill the phase's whole process TREE on the ceiling (shell → npm exec → vitest → esbuild).
+    // The child stays in this process's group, so a supervisor's group kill of verify-lane still reaches it.
+    // PR #5768 — the ceiling runs on a watchdog THREAD: the output forwarding above writes synchronously, so a reader
+    // that stops reading blocks this event loop, and a timer here would never fire. The slot heartbeat rides the same
+    // thread until the ceiling. The kill also reaches orphans of this group (only when this process LEADS it, so every
+    // member is provably ours), and descendants that left tree and group, found by `phaseMarker` or the output pipes.
+    let settled = false;
+    let exited = null;
+    let grace = null;
+    let announced = false;
+    const announce = () => {
+      if (announced) return;
+      announced = true;
+      process.stderr.write(`\n✗ verify-lane: phase exceeded phaseTimeoutMs=${PHASE_TIMEOUT_MS} (${PHASE_TIMEOUT_SOURCE}) — killed its process tree (pid ${child.pid}); recorded as a timeout, not a test verdict\n`);
+    };
+    const finish = (code, closeSignal) => {
+      if (settled) return;
+      settled = true;
+      watchdog?.stop();
+      clearTimeout(grace);
+      const timedOut = Boolean(watchdog?.fired());
+      if (timedOut) announce();
+      const result = { exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) };
+      // The tree can close before the escape sweeps finish (an escapee that holds no pipe): the phase, and with it the
+      // slot, is not over until they ran.
+      if (timedOut && watchdog) watchdog.settled().then(() => resolveGate(result));
+      else resolveGate(result);
+    };
+    const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
+      pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,
+      kill: { orphansOfOwnGroup: true, marker: phaseMarker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter((fd) => Number.isInteger(fd) && fd > 2) },
+      heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS },
+      onFire: () => {
+        if (settled) return;
+        announce();
+        // A survivor still holding the output pipes would keep 'close' pending forever: settle on exit, or after a grace.
+        grace = setTimeout(() => {
+          child.stdout?.destroy(); child.stderr?.destroy();
+          finish(exited?.code ?? null, exited?.signal ?? 'SIGKILL');
+        }, 10_000);
+        grace.unref();
+      },
+    }) : null;
+    child.on('error', (e) => { watchdog?.stop(); clearTimeout(grace); if (!settled) { settled = true; reject(e); } });
+    child.on('exit', (code, sig) => { exited = { code, signal: sig }; });
+    child.on('close', (code, closeSignal) => finish(code, closeSignal));
   });
   return { ...result, failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
 }
@@ -669,6 +775,7 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   const started = performance.now();
   try {
     const result = await runGate(command, args);
+    if (result.timedOut && !phaseTimeout) phaseTimeout = { phase: kind || 'gate', ceilingMs: PHASE_TIMEOUT_MS };
     if (kind) recordOutcome(outcomeKey ?? kind, buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }));
     return result;
   } catch (error) {
@@ -789,6 +896,7 @@ try {
 } finally {
   if (alwaysRunReportDir) rmSync(alwaysRunReportDir, { recursive: true, force: true });
   gateMs = performance.now() - gateStarted;
+  clearInterval(slotHeartbeat);
   if ((!phaseAdmission && admission.ok) || firstPhaseAdmission?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
 
@@ -833,7 +941,7 @@ const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
-const infrastructure = verificationInfrastructureFailure({ exitCode, signal });
+const infrastructure = verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) });
 // The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
 const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
 // An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).
@@ -881,7 +989,7 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker({ ...finished, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
+writeMarker({ ...finished, executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);

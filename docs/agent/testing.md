@@ -1283,6 +1283,9 @@ separate from transient infrastructure failures and their retry streak.
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.
+If `run` exits 75 (host busy or queue full), do not loop: re-run it once with `run --wait-ms=540000 -- …`,
+which keeps re-trying admission itself (load gate and slot queue, holding its queue place) and still exits 75
+when the budget runs out. `heavyAdmission.runWaitMs` sets a default budget through the settings cascade.
 `WE_FULL_SUITE_OK` bypasses only full-suite selection, never admission. Guard tests should
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.
@@ -1506,11 +1509,15 @@ lookalikes. Persist red-team pending age and retry time per PR/head in queue sta
 through follow-up writes. `drain.redTeamPendingBackoffSec` defaults to 300; a newly observed comment
 can wake the head early. `drain.redTeamPendingMaxMin` defaults to 45; even during backoff, an accepted
 head past that age must log a named health smell and recheck complete comments and run evidence.
-A recorded or live pass still waits. With neither, request through an available review dispatch hook;
-if unavailable, `drain.enqueueWhenRedTeamNeverScheduled` (default true) permits enqueue with a loud
-“red team never scheduled” note and its source. The current drain has no standalone red-team request
-queue, so it uses the fallback. Test restarts, head resets, request/fallback, policy provenance and
-comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
+Past the deadline the PR stays HELD: it never enqueues without a red-team result. `redTeam.deadlineAction`
+(`requeue-then-hold` standard, or `hold`; env `WE_RED_TEAM_DEADLINE_ACTION`, source logged) decides whether a
+missing pass is first re-requested once through an available review dispatch hook (its own full wait), then the
+drain logs the hold and publishes one `red-team-deadline-held` needs-you note per repo/PR/head. A recorded or live
+pass also holds with the note. Release needs a result on that head, a proven-identical carry, an operator ruling
+through the red-team ruling path, or a card-only diff. The retired `drain.enqueueWhenRedTeamNeverScheduled` is
+ignored; only the operator's env `WE_RED_TEAM_DEADLINE_ACTION=merge-without-result` with a named
+`WE_RED_TEAM_DEADLINE_OVERRIDE_BY` enqueues without a result, logged on every use. Test restarts, head resets,
+request-once (a refused or throwing hook is tried once per head, then holds), note dedupe and failed publication, policy provenance and comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
 in the shared operations sidecar. Store the host, PID namespace (where available) and process birth time with the pid: a live pid
 with a different birth time is a reused process, not an active red team. An unavailable birth-time
 probe preserves the conservative liveness result. Normalize the birth-time probe to UTC and the C
@@ -1770,10 +1777,19 @@ separate shadow count and read completeness.
 Builder, fixer and Codex briefs quote `reviewer-expectations.md` inside a data fence (it is derived
 from untrusted PR and CI text). The coroner proposes its concrete examples from recurring findings by PR. `scripts/settings/build.json` overrides the platform's `build` block:
 `finalGate` defaults to `full` (whole unit tier plus standards through heavy admission), with `related`
-and `none` escape settings; `selfReview.enabled` defaults true and `selfReview.maxRounds` defaults 2
+and `none` escape settings. `finalGateStandards` defaults to `always`: non-full gates keep related-test
+selection but run standards on every diff, including code-only and card-only changes (scoped where safe),
+and disable the local card-only skip, including since-last-green selection. Set it to `selected` to retain
+`verify-settings.json` standards selection and card-only skipping. `full` is unchanged by this setting.
+`node scripts/verify-lane.mjs --dry-run` prints the default command, reasons and standards decision without
+running a gate or writing markers. `selfReview.enabled` defaults true and `selfReview.maxRounds` defaults 2
 (0–10). `reviewerExpectations.enabled` defaults true. Sources use the shared policy-cascade formatter.
-Environment overrides are `WE_BUILD_FINAL_GATE`, `WE_BUILD_SELF_REVIEW_ENABLED`,
+Environment overrides are `WE_BUILD_FINAL_GATE`, `WE_BUILD_FINAL_GATE_STANDARDS`, `WE_BUILD_SELF_REVIEW_ENABLED`,
 `WE_BUILD_SELF_REVIEW_MAX_ROUNDS`, and `WE_BUILD_REVIEWER_EXPECTATIONS_ENABLED`.
+
+The verify cache checks both the requested command (`suites`) and the executed command (`executedGate`).
+A child's standards policy can change the execution plan while keeping the requester's stamp. An earlier
+green cannot replace that changed plan; legacy markers without `executedGate` require one fresh run.
 
 A green build gets one cheap correctness/security review of its net diff. Each repair resumes the
 original builder and re-runs the gate; at most `maxRounds` repairs occur, with a final observation

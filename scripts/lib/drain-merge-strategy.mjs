@@ -35,6 +35,9 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
+import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { isUnderTest } from './under-test.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
 import { createHash } from 'node:crypto';
@@ -216,6 +219,8 @@ export function createDrainMergeStrategy({
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
   readGrantScope = standingRulingScope, // PR #5758: the verified standing-ruling scope the red-team gate also reads
+  redTeamDeadline, // resolved redTeam.deadlineAction (test seam); read from the cascade when absent
+  publishNeedsYou, // operator note publisher; the real needs-you feed outside a test run
 } = {}) {
   const { policy, note } = resolved;
   // The red-team readers credit an automatic round grant exactly as the gate does; unreadable = no automatic credit.
@@ -250,12 +255,17 @@ export function createDrainMergeStrategy({
   log.write(`  ${formatMergeDeliverySourcesLine(policy)}${dryRun ? ' [dry run]' : ''}\n`);
   if (note) log.write(`  ⚠ merge-delivery: ${note}\n`);
   const safety = queueSafety ?? readDrainQueueSafety({ env, log: line => log.write(`  ${line}\n`) });
+  const deadline = redTeamDeadline ?? readRedTeamDeadlineAction({ env, log: line => log.write(`  ${line}\n`) });
+  const deadlineAction = deadline.value?.deadlineAction ?? 'requeue-then-hold';
+  // The real operator feed is never written from a test run unless the test injects its own publisher.
+  const publishNote = publishNeedsYou ?? (isUnderTest(env) || isUnderTest(process.env) ? null : item => publishAttention(item));
   const pendingOutcome = (c, pending, quiet = false) => {
     const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
     const healthSmell = now() - pending.firstPendingAt >= maxMin * 60_000;
     if (healthSmell && !quiet) log.write(`  health smell: ${slugOf(c.repo)}#${c.num} red-team-pending on ${pending.headSha} for ${Math.floor((now() - pending.firstPendingAt) / 60_000)} min (redTeamPendingMaxMin=${maxMin}, ${safety.sources?.redTeamPendingMaxMin ?? 'standard'})\n`);
     if (!quiet) say(`  merge-queue: defer #${c.num}: ${pending.reason}`);
-    return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: pending.reason, healthSmell };
+    return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: pending.reason, healthSmell,
+      ...(pending.deadlineHeldAt != null ? { deadlineHeld: true } : {}) };
   };
   const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels,reviews'], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
   // The complete thread as pages. The drain's own comment reader allows 256 MiB: a long thread must not hit the 1 MiB default.
@@ -382,27 +392,62 @@ export function createDrainMergeStrategy({
           const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),
             retryAt: now() + (safety.value.redTeamPendingBackoffSec ?? 300) * 1000,
             commentCount: pages.flat().length, observation, checkedAt: now(), reason,
-            ...(sameHead && pending.requestedAt != null ? { requestedAt: pending.requestedAt } : {}) };
+            ...(sameHead && pending.requestedAt != null ? { requestedAt: pending.requestedAt } : {}),
+            ...(sameHead && pending.requestAttemptedAt != null ? { requestAttemptedAt: pending.requestAttemptedAt } : {}),
+            ...(sameHead && pending.deadlineHeldAt != null ? { deadlineHeldAt: pending.deadlineHeldAt } : {}),
+            ...(sameHead && pending.notifiedAt != null ? { notifiedAt: pending.notifiedAt } : {}) };
           before.redTeamPending[key] = wait;
           writeState(statePath, before);
           const outcome = pendingOutcome(c, wait);
-          // Never waive a recorded break or an active/recorded run. Only the scheduling gap has this escape.
-          if (!outcome.healthSmell || evidence.inFlight || evidence.queued || evidence.recorded || reason.includes('requiring send-back')) return outcome;
-          let requested = false;
-          if (wait.requestedAt != null && now() - wait.requestedAt < (safety.value.redTeamPendingMaxMin ?? 45) * 60_000) return outcome;
-          if (wait.requestedAt == null && typeof requestRedTeam === 'function') {
-            try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
-            catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
+          // Before the deadline, and for a confirmed break (its own send-back routing), the hold is the whole answer.
+          if (!outcome.healthSmell || reason.includes('requiring send-back')) return outcome;
+          // Past the deadline with NO red-team result on this exact head. The PR stays HELD: it may move only on a
+          // result for this head, a proven-identical carry of one, an operator ruling through the red-team ruling path
+          // (all read by redTeamEnqueueHold above), or a card-only diff that owes no pass. Never a timed bypass.
+          const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
+          const source = deadline.sources?.deadlineAction ?? 'standard';
+          const missing = !evidence.inFlight && !evidence.queued && !evidence.recorded;
+          if (missing && deadlineAction === 'requeue-then-hold') {
+            // The one re-request for this head gets its own full wait before the operator is asked.
+            if (wait.requestedAt != null && now() - wait.requestedAt < maxMin * 60_000) return outcome;
+            // One attempt per head, recorded whether or not the hook accepts it: a refused or failing hook is never re-called.
+            if (wait.requestedAt == null && wait.requestAttemptedAt == null && typeof requestRedTeam === 'function') {
+              wait.requestAttemptedAt = now();
+              writeState(statePath, before); // durable before the side effect: a crash mid-request never re-requests
+              let requested = false;
+              try { requested = requestRedTeam({ repo: slugOf(c.repo), pr: c.num, head: headSha, loopPayload: evidence.loopPayload })?.requested === true; }
+              catch (e) { log.write(`  red-team request failed #${c.num}: ${firstLine(e)}\n`); }
+              if (requested) {
+                wait.requestedAt = now();
+                writeState(statePath, before);
+                log.write(`  merge-queue: requested red team for #${c.num} on ${headSha} through review dispatch (redTeam.deadlineAction=${deadlineAction}, ${source})\n`);
+                return { ...outcome, redTeamRequested: true };
+              }
+            }
           }
-          if (requested) {
-            wait.requestedAt = now();
+          if (missing && deadlineAction === RED_TEAM_DEADLINE_OVERRIDE && deadline.operatorOverride?.by) {
+            // The only path to merge-without-result: the operator's own env, named, logged on every use.
+            log.write(`  ⚠ OPERATOR OVERRIDE: enqueuing ${slugOf(c.repo)}#${c.num} on ${headSha} with NO red-team result after ${maxMin} min (redTeam.deadlineAction=${RED_TEAM_DEADLINE_OVERRIDE}, env, by ${deadline.operatorOverride.by})\n`);
+          } else {
+            const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
+              : wait.requestAttemptedAt != null ? 'the one re-request was not accepted'
+              : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
+              : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
+            const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
+            if (wait.deadlineHeldAt == null) {
+              wait.deadlineHeldAt = now();
+              log.write(`  merge-queue: HOLD ${slugOf(c.repo)}#${c.num} on ${headSha}: ${heldReason}; redTeamPendingMaxMin=${maxMin} (${safety.sources?.redTeamPendingMaxMin ?? 'standard'}), redTeam.deadlineAction=${deadlineAction} (${source}); never enqueued without a result\n`);
+            }
+            if (wait.notifiedAt == null && publishNote) {
+              try {
+                publishNote({ repo: slugOf(c.repo), pr: Number(c.num), head: headSha, kind: 'red-team-deadline-held', reason: heldReason,
+                  pick: `https://github.com/${slugOf(c.repo)}/pull/${c.num}` });
+                wait.notifiedAt = now();
+              } catch (e) { log.write(`  ⚠ red-team deadline note for #${c.num} not published (${firstLine(e)}) — PR stays held; retried at the next recheck\n`); }
+            }
             writeState(statePath, before);
-            log.write(`  merge-queue: requested red team for #${c.num} on ${headSha} through review dispatch\n`);
-            return { ...outcome, redTeamRequested: true };
+            return { ...outcome, deadlineHeld: true, reason: heldReason };
           }
-          const fallback = safety.value.enqueueWhenRedTeamNeverScheduled ?? true;
-          log.write(`  merge-queue: #${c.num} red team never scheduled — enqueueWhenRedTeamNeverScheduled=${fallback} (${safety.sources?.enqueueWhenRedTeamNeverScheduled ?? 'standard'}); no successful red-team request path\n`);
-          if (!fallback) return outcome;
         }
       }
       if (before.redTeamPending?.[key]) {

@@ -153,6 +153,8 @@ afterAll(() => killKeepAlives());
 // Admission tests and their child CLIs must not wait on the machine running the suite.
 // Tests of overload set their own reading; production ignores this Vitest-only seam.
 if (process.env.WE_TEST_HOST_LOAD1 === undefined) process.env.WE_TEST_HOST_LOAD1 = '0';
+// verify-admission (2026-10-20) — likewise a fixed, ample host memory headroom (MB), so admission under test never samples the real host.
+if (process.env.WE_TEST_HOST_MEMORY_MB === undefined) process.env.WE_TEST_HOST_MEMORY_MB = '1000000';
 
 // #3383: isolate tests from home AND from each other's durable action holds.
 const ownsCoordinationRoot = process.env.WE_COORDINATION_ROOT === undefined;
