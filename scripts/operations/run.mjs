@@ -107,6 +107,8 @@ import { scaffoldOperation, SCAFFOLD_OP } from './scaffold.mjs';
 import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
 import { fileItemOperation, FILE_ITEM_OP } from './file-item.mjs';
 import { createFileItemReader, createFileItemSinks } from './file-item-io.mjs';
+import { graduateChainOperation, GRADUATE_CHAIN_OP, finishGraduateChain } from './graduate-chain.mjs';
+import { createGraduateChainSinks } from './graduate-chain-io.mjs';
 import { openPrOperation, OPEN_PR_OP } from './open-pr.mjs';
 import { createOpenPrSinks, deriveLaneRef } from './open-pr-io.mjs';
 import { PARK_LABELS } from '../pr-land.mjs';
@@ -482,6 +484,7 @@ export const OPERATIONS = Object.freeze({
   //
   // PARK_LABELS is the home's own, injected rather than restated: a second list here could ask for a park the
   // home refuses.
+  [GRADUATE_CHAIN_OP]: () => ({ declaration: graduateChainOperation({}), sinks: createGraduateChainSinks(), finish: finishGraduateChain }),
   [OPEN_PR_OP]: () => ({
     declaration: openPrOperation({ parkLabels: PARK_LABELS, deriveRef: () => deriveLaneRef() }),
     sinks: createOpenPrSinks(),
