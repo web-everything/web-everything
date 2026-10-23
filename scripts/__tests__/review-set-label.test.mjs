@@ -292,6 +292,17 @@ describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRea
   const changes = [{ name: REVIEW_LABELS.changes }, { name: 'ready-to-merge' }];
   const humanChanges = [{ name: REVIEW_LABELS.human }, { name: REVIEW_LABELS.changes }];
 
+  it('refuses rearm for a human-cleared head; false or omitted clearance preserves the ordinary rearm', () => {
+    const ordinary = decideSetLabel({ to: 'rearm', currentLabels: changes });
+    expect(ordinary.allowed).toBe(true);
+    expect(ordinary.addLabel).toBe(REVIEW_LABELS.pending);
+    expect(decideSetLabel({ to: 'rearm', currentLabels: changes, humanClearedHead: false })).toEqual(ordinary);
+
+    const cleared = decideSetLabel({ to: 'rearm', currentLabels: changes, humanClearedHead: true });
+    expect(cleared.allowed).toBe(false);
+    expect(cleared.reason).toMatch(/human[- ]clearance/i);
+  });
+
   it('re-arms a review:changes bounce → review:pending, dropping review:changes (and #2832 stripping ready-to-merge)', () => {
     const d = decideSetLabel({ to: 'rearm', currentLabels: changes });
     expect(d.allowed).toBe(true);

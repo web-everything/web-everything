@@ -11,6 +11,8 @@ import {
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../fixer-stuck-reclaim.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
+import { parseLatestHumanClearedSha } from '../../lib/review-escalation.mjs';
 
 const BOT = { login: 'web-everything' };
 const c = (createdAt, body, author = BOT) => ({ createdAt, body, author });
@@ -28,6 +30,20 @@ describe('planOrphanFixRound — the #4715 shapes', () => {
     const p = planOrphanFixRound({ pr: pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END]), nowMs: NOW });
     expect(p.decision).toBe('rearm');
     expect(p.roundAt).toBe('2026-10-10T15:21:33.000Z');
+  });
+
+  it('a trusted human clearance prevents rearm only when it names the current head', () => {
+    const withClearance = (headSha) => pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END,
+      c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'Nicolas Gilbert', headSha })),
+    ]);
+    const olderHead = 'd9829f557f3f264ac885722cb9afef18bd91ca7f';
+    const older = withClearance(olderHead);
+    expect(parseLatestHumanClearedSha(older.comments)).toBe(olderHead);
+    expect(planOrphanFixRound({ pr: older, nowMs: NOW }).decision).toBe('rearm');
+
+    const cleared = withClearance(HEAD);
+    expect(parseLatestHumanClearedSha(cleared.comments)).toBe(cleared.headRefOid);
+    expect(planOrphanFixRound({ pr: cleared, nowMs: NOW }).decision).toBe('none');
   });
 
   it('re-dispatches a restack-only round that never addressed the review', () => {

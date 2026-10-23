@@ -12,6 +12,8 @@ import { resolveReviewSettings, validateReviewSettings } from '../../lib/review-
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 import { classifyEvent, normalizeComment } from '../../operations/coroner-rounds.mjs';
 import { H1, H2, H3, H4, repo, record, recordComment, iso } from './ruling-fixtures.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
+import { parseLatestHumanClearedSha } from '../../lib/review-escalation.mjs';
 
 const AUTO = { referralDefault: 'auto-block' };
 const OPERATOR = { referralDefault: 'operator' };
@@ -45,6 +47,21 @@ describe('auto-block plan', () => {
     const plan = planAutoBlock(parked(), { mode: 'auto-block', cardReadable });
     expect(plan.block).toHaveLength(1);
     expect(plan.operator).toHaveLength(0);
+  });
+  it('a trusted human clearance is final for its head; an older clearance leaves the new head reviewable', () => {
+    const withClearance = (headSha) => parked({ headRefOid: H2, comments: [
+      recordComment(record({ head: H2, runId: 'run-2' }), 5),
+      { body: buildVerdictComment({ to: 'clear-human', actor: 'Nicolas Gilbert', headSha }),
+        createdAt: iso(10), author: { login: 'web-everything' } },
+    ] });
+    const opts = { mode: 'auto-block', cardReadable, isJudgment: () => false };
+    const older = withClearance(H1);
+    expect(parseLatestHumanClearedSha(older.comments)).toBe(H1);
+    expect(planAutoBlock(older, opts)).toMatchObject({ head: H2, block: [expect.any(Object)], operator: [] });
+
+    const cleared = withClearance(H2);
+    expect(parseLatestHumanClearedSha(cleared.comments)).toBe(cleared.headRefOid);
+    expect(planAutoBlock(cleared, opts)).toBeNull();
   });
   it('a finding the reviewer marked a judgment call stays with the operator', () => {
     const plan = planAutoBlock(parked(), { mode: 'auto-block', cardReadable, isJudgment: () => true });
