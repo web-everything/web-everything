@@ -362,16 +362,16 @@ function resolveRepo() {
   if (!flags.origin && needsOrigin) {
     const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
     // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
-    // (the git dir and the common dir) is checked too; a worktree whose git dir differs from its common
-    // dir is never a canonical source, wherever it sits on disk.
-    // An unreadable owner is refused too: a failed read must not fall back to the path-only check.
-    let linkedWorktree = false;
+    // (the git dir and the common dir) is checked too: a worktree of a lane is refused wherever it sits on
+    // disk. A worktree of a non-lane primary stays usable (the daemon rebuild smoke runs from one).
+    // An unreadable owner is refused: a failed read must not fall back to the path-only check.
+    let unreadableOwner = false;
     const gitOwnerPaths = [referencePath, topLevel].flatMap((dir) => {
       const [gitDir, commonDir] = ['--git-dir', '--git-common-dir'].map((arg) => {
         const out = tryGit(['rev-parse', arg], dir, gitOptions);
         return out ? resolve(dir, out) : null;
       });
-      if (!gitDir || !commonDir || resolveReal(gitDir) !== resolveReal(commonDir)) linkedWorktree = true;
+      if (!gitDir || !commonDir) unreadableOwner = true;
       return [gitDir, commonDir, commonDir && dirname(commonDir)].filter(Boolean);
     });
     const originSourcePaths = [referencePath, topLevel, ...gitOwnerPaths].flatMap(path => [resolve(path), resolveReal(path)]);
@@ -380,7 +380,7 @@ function resolveRepo() {
     // Check both the supplied path and Git's answer (core.worktree can redirect it),
     // before and after symlink resolution. Recognize lane-N in other pool roots too;
     // ambiguous lane-shaped checkouts must supply --origin or a primary --reference.
-    if (linkedWorktree || originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
+    if (unreadableOwner || originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
       || path.split(sep).some(part => /^lane-\d+$/.test(part)))) {
       fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
     }

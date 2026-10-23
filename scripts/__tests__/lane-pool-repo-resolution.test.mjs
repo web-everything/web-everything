@@ -99,8 +99,6 @@ describe('canonical origin cannot be inferred from a lane', () => {
     // A failed owner read must fail closed, not fall back to the path-only check.
     ['unreadable git dir', { cwd: '/ws/scratch-proof', gitDirs: { gitDir: null } }],
     ['unreadable common dir', { cwd: '/ws/scratch-proof', gitDirs: { commonDir: null } }],
-    ['any linked worktree, even of a non-lane repository', { cwd: '/ws/scratch-proof',
-      gitDirs: { gitDir: '/primary/.git/worktrees/scratch-proof', commonDir: '/primary/.git' } }],
   ];
   for (const command of ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim', 'list']) {
     it.each(variants)(`${command} refuses an implicit lane origin via %s`, (_label, options) => {
@@ -121,6 +119,15 @@ describe('canonical origin cannot be inferred from a lane', () => {
     const { run, calls } = resolveOrigin({ flags: { reference: '/primary' }, remote: '/canonical/project.git' });
     expect(run().originUrl).toBe('/canonical/project.git');
     expect(calls.find(({ args }) => args[0] === 'remote').dir).toBe('/primary');
+  });
+
+  // The daemon rebuild smoke runs lane-pool list/acquire/release from a `git worktree add` candidate of the
+  // primary checkout, with no --origin; only a worktree whose owner is a lane is refused.
+  it.each(['acquire', 'list', 'reclaim'])('keeps %s usable from a linked worktree of a non-lane primary', command => {
+    const { run } = resolveOrigin({ command, cwd: '/ws/candidate', remote: '/canonical/project.git',
+      flags: command === 'list' ? { acquirable: true } : {},
+      gitDirs: { gitDir: '/primary/.git/worktrees/candidate', commonDir: '/primary/.git' } });
+    expect(run().originUrl).toBe('/canonical/project.git');
   });
 
   it('retains origin inference outside lanes', () => {
