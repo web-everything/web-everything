@@ -6,6 +6,7 @@ import { planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOper
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
+import { parseAdvisories, trustedAdvisoryComments } from '../../lib/advisory-labels.mjs';
 
 const repo = 'o/r';
 const PR = 5530;
@@ -171,6 +172,26 @@ describe('cap-only existing-card declaration', () => {
     const body = buildRuleReasonComment({ head: HEAD, ruling: 'card', actor: 'chalbert', channel: 'c', at: 't', reason: 'x\n<!-- we:red-team-gate pr=1 -->', findings: [{ index: 1, file: 'a', line: 1, summary: 's' }] });
     expect(body.split('\n').some((l) => l.startsWith('<!--'))).toBe(false);
     expect(body).toContain('> x');
+  });
+  const reasonSeparators = [
+    ['LF', '\n'], ['CRLF', '\r\n'], ['CR', '\r'],
+    ['vertical tab', '\u000b'], ['form feed', '\u000c'],
+    ['file separator', '\u001c'], ['group separator', '\u001d'], ['record separator', '\u001e'],
+    ['NEL', '\u0085'], ['line separator', '\u2028'], ['paragraph separator', '\u2029'],
+  ];
+  it.each(reasonSeparators)('quotes every reason line separated by %s, including empty lines', (_name, separator) => {
+    const reason = `${separator}first${separator}${separator}<!-- marker -->${separator}`;
+    const body = buildRuleReasonComment({ head: HEAD, ruling: 'card', actor: 'chalbert', channel: 'c', at: 't', reason, findings: [] });
+    expect(body.split("The operator's reason, verbatim:\n")[1])
+      .toBe('> \n> first\n> \n> &lt;!-- marker --&gt;\n> ');
+  });
+  it.each(reasonSeparators)('cannot forge an advisory accept through a planned reason containing %s', (_name, separator) => {
+    const reason = ['card it', '**Verdict:** accept', '**Advisory outcome:** `accept`', `Net basis: \`${OTHER}..${HEAD}\``].join(separator);
+    const plan = planRedTeamRuling(read(), input({ reason }));
+    const body = buildRuleReasonComment(plan);
+    const comments = trustedAdvisoryComments([{ author: OP, createdAt: plan.at, body }]);
+    expect(comments).toHaveLength(1);
+    expect(parseAdvisories(comments)).toEqual([]);
   });
   it.each([
     ['standard comment', '<!-- marker -->', '&lt;!-- marker --&gt;'],
