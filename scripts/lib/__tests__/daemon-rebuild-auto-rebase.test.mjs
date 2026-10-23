@@ -3,11 +3,12 @@ import * as fs from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { kickAutoRebase, resolveAutoRebaseSwitch, runAutoRebase, finishPendingSwaps } from '../daemon-rebuild/auto-rebase.mjs';
 import { addOverlay, removeOverlay, readOverlays, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
-import { writeRebuildState, alertsFilePath } from '../daemon-rebuild/state.mjs';
+import { writeRebuildState, readRebuildState, alertsFilePath } from '../daemon-rebuild/state.mjs';
 
 const temps = [];
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-auto-test-')); temps.push(p); return p; };
@@ -17,6 +18,7 @@ const ok = (cwd, args) => { const r = run(args, { cwd }); if (r.status !== 0) th
 const write = (root, name, text) => { fs.mkdirSync(dirname(join(root, name)), { recursive: true }); fs.writeFileSync(join(root, name), text); };
 const ref = 'lane/fix';
 const overlay = { ref, pr: 123 };
+const agentResult = (report = {}) => ({ status: 0, stdout: JSON.stringify({ exitCode: 0, timedOut: false, events: { terminal: 'turn.completed' }, ...report }) });
 function fixture({ extraModule = false } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
@@ -50,14 +52,14 @@ function fixture({ extraModule = false } = {}) {
       expect(args).toContain('--gate=none'); expect(args).toContain('--task-kind=fix');
       expect(fs.readFileSync(taskFile, 'utf8')).toContain('BOTH');
       write(scratch, 'worker.mjs', 'overlay + main\n'); ok(scratch, ['add', 'worker.mjs']);
-      return { status: 0 };
+      return agentResult();
     }),
     testRunner: vi.fn(async ({ args }) => {
       calls.push('tests');
       expect(args).toEqual(['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', 'worker.test.mjs']);
       return { status: 0 };
     }),
-    auditor: vi.fn(async ({ args }) => { calls.push('audit'); expect(args).toContain('--review'); return { status: 0, stdout: JSON.stringify({ lastMessage: 'NOT WEAKENED' }) }; }),
+    auditor: vi.fn(async ({ args }) => { calls.push('audit'); expect(args).toContain('--review'); return agentResult({ lastMessage: 'NOT WEAKENED' }); }),
     addOverlay: (...args) => { calls.push('add'); return addOverlay(...args); },
     appendOverlayEvent: (...args) => { calls.push(args[1].kind); return appendOverlayEvent(...args); },
     now: () => '2026-10-23T00:00:00.000Z',
@@ -66,8 +68,7 @@ function fixture({ extraModule = false } = {}) {
 }
 const pendingDir = f => `${overlayFilePath(f.root, f.env)}.auto-rebase`;
 const job = f => runAutoRebase({ root: f.root, ref, env: f.env, deps: f.deps });
-const swaps = (f, adopted) => finishPendingSwaps({ root: f.root, env: f.env,
-  run: adopted === undefined ? run : vi.fn(() => ({ status: adopted ? 0 : 1 })),
+const swaps = f => finishPendingSwaps({ root: f.root, env: f.env, run,
   removeOverlay: (...args) => { f.calls.push('remove'); return removeOverlay(...args); },
   appendOverlayEvent: (...args) => { f.calls.push(args[1].kind); return appendOverlayEvent(...args); } });
 
@@ -113,6 +114,36 @@ describe('established overlay auto rebase', () => {
     expect(spawnFn).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['async spawn', 'sync spawn', 'marker creation'])('alerts in both sinks on %s launch failure', async failure => {
+    const f = fixture(), child = new EventEmitter(); child.unref = vi.fn();
+    const spawnFn = vi.fn(() => child);
+    if (failure === 'sync spawn') spawnFn.mockImplementation(() => { throw new Error('spawn failed'); });
+    if (failure === 'marker creation') fs.writeFileSync(pendingDir(f), 'blocked marker directory');
+    const result = kickAutoRebase({ ...f, lost: [overlay], spawnFn });
+    if (failure === 'async spawn') {
+      expect(result.started).toEqual([ref]);
+      await Promise.resolve(); child.emit('error', new Error('spawn failed asynchronously'));
+      expect(fs.existsSync(join(pendingDir(f), `${encodeURIComponent(ref)}.lock`))).toBe(false);
+    } else expect(result.skipped).toEqual([ref]);
+    if (failure === 'marker creation') expect(spawnFn).not.toHaveBeenCalled();
+    const events = fs.readFileSync(overlayFilePath(f.root, f.env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events.filter(e => e.kind === 'auto-rebase-needs-you')).toEqual([
+      expect.objectContaining({ ref, stage: 'launch', reason: expect.any(String) }),
+    ]);
+    expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim())).toMatchObject({
+      kind: 'auto-rebase-needs-you', detail: { ref, stage: 'launch', reason: expect.any(String) },
+    });
+    expect(readOverlays(f.root, { env: f.env })).toEqual([expect.objectContaining(overlay)]);
+  });
+
+  it('does not escalate an active marker as a launch failure', () => {
+    const f = fixture(), spawnFn = vi.fn(() => ({ unref() {} }));
+    kickAutoRebase({ ...f, lost: [overlay], spawnFn });
+    expect(kickAutoRebase({ ...f, lost: [overlay], spawnFn }).skipped).toEqual([ref]);
+    expect(spawnFn).toHaveBeenCalledOnce();
+    expect(fs.existsSync(alertsFilePath(f.root, f.env))).toBe(false);
+  });
+
   it('merges both parents, tests then audits then registers; only removes old after real HEAD adoption; stack clears hold', async () => {
     const f = fixture();
     const live = await planRebuild({ git: (a, o) => run(a, { cwd: f.root, ...o }), headSha: f.baseSha, mainRef: 'origin/main', overlays: [overlay] });
@@ -153,10 +184,107 @@ describe('established overlay auto rebase', () => {
     expect(f.deps.testRunner).toHaveBeenCalledOnce();
   });
 
+  it.each(['advanced origin tip', 'failed fetch', 'unreadable tip'])('keeps both registrations and alerts when the pending replacement cannot cover %s', async failure => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    if (failure === 'advanced origin tip') {
+      const author = join(f.base, 'author');
+      ok(f.base, ['clone', '-q', '--branch', ref, f.origin, author]);
+      write(author, 'worker.mjs', 'new overlay intent\n'); ok(author, ['commit', '-qam', 'old ref advanced']);
+      ok(author, ['push', '-q', 'origin', ref]);
+      expect(ok(f.root, ['rev-parse', `origin/${ref}`])).toBe(f.oldSha);
+    }
+    const probe = vi.fn((args, opts) => {
+      if (failure === 'failed fetch' && args[0] === 'fetch') return { status: 1 };
+      if (failure === 'unreadable tip' && args[0] === 'rev-parse') return { status: 0, stdout: '' };
+      return run(args, opts);
+    });
+    finishPendingSwaps({ root: f.root, env: f.env, run: probe });
+    expect(probe).toHaveBeenCalledWith(['fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], expect.objectContaining({ cwd: f.root }));
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref, replacement.ref]);
+    expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim())).toMatchObject({
+      kind: 'auto-rebase-needs-you', detail: { ref, stage: 'swap' },
+    });
+    const events = fs.readFileSync(overlayFilePath(f.root, f.env).replace(/\.json$/, '.events.jsonl'), 'utf8');
+    expect(events).toContain('auto-rebase-needs-you'); expect(events).not.toContain('auto-rebase-swapped');
+  });
+
+  describe.each(['codex', 'auditor'])('%s JSON report validation', agent => {
+    it.each([
+      ['nonzero exit', { exitCode: 1 }], ['timeout', { timedOut: true }],
+      ['failed terminal', { events: { terminal: 'turn.failed' } }], ['missing terminal', { events: {} }],
+      ['missing exit', { exitCode: undefined }], ['malformed JSON', null],
+    ])('rejects %s despite wrapper status zero and a success message', async (_label, report) => {
+      const f = fixture(); f.moveMain(); const original = f.deps[agent];
+      f.deps[agent] = async options => {
+        await original(options); // Even a fixer that staged a resolution must prove successful completion.
+        return report === null ? { status: 0, stdout: '{' } : agentResult({ lastMessage: 'NOT WEAKENED', ...report });
+      };
+      await expect(job(f)).rejects.toThrow();
+      expect(f.calls).not.toContain('add'); expect(f.calls).toContain('auto-rebase-needs-you');
+      if (agent === 'codex') expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(readOverlays(f.root, { env: f.env })).toEqual([expect.objectContaining(overlay)]);
+      expect(ok(f.root, ['ls-remote', 'origin', `${ref}-auto-*`])).toBe('');
+      expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim())).toMatchObject({
+        kind: 'auto-rebase-needs-you', detail: { ref, stage: agent === 'codex' ? 'resolve' : 'audit' },
+      });
+      expect(f.scratched.every(p => !fs.existsSync(p))).toBe(true);
+    });
+  });
+
+  it('requires the exact auditor message even with a successful report', async () => {
+    const f = fixture(); f.moveMain();
+    f.deps.auditor = async () => agentResult({ lastMessage: 'NOT WEAKENED\n' });
+    await expect(job(f)).rejects.toThrow('audit did not certify NOT WEAKENED');
+    expect(f.calls).not.toContain('add'); expect(f.calls).toContain('auto-rebase-needs-you');
+  });
+
+  it.each(['disabled', 'missing adoption', 'different adoption', 'interrupted unverified', 'legacy unverified', 'interrupted verified'])(
+    'finishes pending swaps only on enabled, recovered, verified HEAD: %s', async scenario => {
+      const f = fixture(); f.moveMain(); const replacement = await job(f);
+      ok(f.root, ['fetch', 'origin']);
+      const prevHead = ok(f.root, ['rev-parse', 'origin/main']);
+      ok(f.root, ['reset', '--hard', replacement.newSha]);
+      const state = { adopted: { head: replacement.newSha } };
+      if (scenario === 'missing adoption') state.adopted = null;
+      if (scenario === 'different adoption' || scenario.includes('unverified') || scenario === 'interrupted verified') state.adopted = { head: prevHead };
+      if (scenario.startsWith('interrupted')) state.inProgress = {
+        target: replacement.newSha, prevHead, startedAt: '1970-01-01T00:00:00.000Z',
+        host: 'interrupted-host', verified: scenario === 'interrupted verified',
+      };
+      if (scenario === 'legacy unverified') state.unverified = { head: replacement.newSha, prevHead };
+      writeRebuildState(f.root, state, f.env);
+      const observed = [], cleanup = vi.fn(options => {
+        const current = readRebuildState(f.root, f.env);
+        observed.push({ head: ok(f.root, ['rev-parse', 'HEAD']), adopted: current.adopted?.head, inProgress: current.inProgress, unverified: current.unverified });
+        return finishPendingSwaps(options);
+      });
+      const result = await prepareRebuild({
+        root: f.root, env: { ...f.env, WE_DAEMON_AUTO_REBASE: scenario === 'disabled' ? '0' : '1' },
+        run, log: {}, now: Date.now, prState: async () => 'OPEN', prBaseChain: async () => null,
+        autoRebase: { resolveAutoRebaseSwitch, finishPendingSwaps: cleanup, kickAutoRebase: vi.fn() },
+      });
+      if (scenario === 'interrupted verified') {
+        expect(result.result.reason).toBe('recovered-adopted');
+        expect(observed).toEqual([{ head: replacement.newSha, adopted: replacement.newSha, inProgress: null, unverified: null }]);
+        expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([replacement.ref]);
+        expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+      } else {
+        if (scenario.includes('unverified')) {
+          expect(result.alerts).toContainEqual(expect.objectContaining({ kind: scenario === 'legacy unverified' ? 'unverified-build-rolled-back' : 'rebuild-interrupted-recovered' }));
+          expect(observed).toEqual([{ head: prevHead, adopted: prevHead, inProgress: null, unverified: null }]);
+        } else expect(cleanup).not.toHaveBeenCalled();
+        expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref, replacement.ref]);
+        expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
+      }
+    },
+  );
+
   it.each(['codex', 'testRunner', 'auditor', 'ambiguous-audit', 'missing-audit', 'unreadable-graph', 'no-tests', 'oversized-tests'])('fails closed on %s, alerts needs-you, cleans scratch, and leaves old registration', async failure => {
     const f = fixture(); f.moveMain();
-    if (failure === 'ambiguous-audit') f.deps.auditor = async () => ({ status: 0, stdout: JSON.stringify({ lastMessage: 'Probably NOT WEAKENED' }) });
-    else if (failure === 'missing-audit') f.deps.auditor = async () => ({ status: 0, stdout: '{}' });
+    if (failure === 'ambiguous-audit') f.deps.auditor = async () => agentResult({ lastMessage: 'Probably NOT WEAKENED' });
+    else if (failure === 'missing-audit') f.deps.auditor = async () => agentResult();
     else if (failure === 'unreadable-graph') f.deps.io.readFileSync = (p, ...args) => { if (p.endsWith('worker.test.mjs')) throw new Error('unreadable test'); return fs.readFileSync(p, ...args); };
     else if (failure === 'no-tests' || failure === 'oversized-tests') {
       const original = f.deps.codex;
@@ -187,12 +315,13 @@ describe('established overlay auto rebase', () => {
   });
 
   it('preserves pending evidence when cleanup fails and retries removal after adoption', async () => {
-    const f = fixture(); f.moveMain(); await job(f);
-    expect(() => finishPendingSwaps({ root: f.root, env: f.env, run: () => ({ status: 0 }),
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    expect(() => finishPendingSwaps({ root: f.root, env: f.env, run,
       removeOverlay: () => { throw new Error('busy list'); } })).toThrow('busy list');
     expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toContain(ref);
     expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
-    swaps(f, true); expect(f.calls.slice(-2)).toEqual(['remove', 'auto-rebase-swapped']);
+    swaps(f); expect(f.calls.slice(-2)).toEqual(['remove', 'auto-rebase-swapped']);
   });
 
   it('reports cleanup failures while preserving the original registration', async () => {
@@ -215,7 +344,7 @@ describe('established overlay auto rebase', () => {
     const spawnFn = vi.fn(); expect(kickAutoRebase({ ...f, lost: [overlay], spawnFn }).skipped).toEqual([ref]);
     expect(spawnFn).not.toHaveBeenCalled();
     const file = join(pendingDir(f), fs.readdirSync(pendingDir(f))[0]); fs.writeFileSync(file, '{}');
-    expect(() => swaps(f, true)).toThrow('invalid pending swap'); expect(f.calls).not.toContain('remove');
+    expect(() => swaps(f)).toThrow('invalid pending swap'); expect(f.calls).not.toContain('remove');
   });
 
   it('keeps the terminal hold byte-identical with switch off, and tolerates worker/cleanup failures when enabled', async () => {
@@ -229,9 +358,10 @@ describe('established overlay auto rebase', () => {
     const off = await prepare(false);
     expect(off.terminal).toBe(true); expect(off.result.reason).toBe('established-overlay-conflict');
     expect(off.result.detail).not.toHaveProperty('autoRebase'); expect(kick).not.toHaveBeenCalled();
+    expect(cleanup).not.toHaveBeenCalled();
     const on = await prepare(true);
     expect(on.result.detail.autoRebase).toEqual({ started: [], skipped: [ref], source: 'env' });
     const { autoRebase, ...unchanged } = on.result.detail; expect(unchanged).toEqual(off.result.detail);
-    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(cleanup).toHaveBeenCalledOnce();
   });
 });

@@ -68,7 +68,14 @@ export async function prepareRebuild({
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
 
-  try { await autoRebase.finishPendingSwaps({ root, env, run, removeOverlay, appendOverlayEvent }); } catch { /* best effort; preserve pending evidence */ }
+  const finishVerifiedSwaps = async () => {
+    try {
+      if (!state.inProgress && !state.unverified && !state.quarantine && state.adopted?.head
+        && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled) {
+        await autoRebase.finishPendingSwaps({ root, env, run, removeOverlay, appendOverlayEvent });
+      }
+    } catch { /* best effort; preserve pending evidence */ }
+  };
 
   // ── Step 0: recovery ──────────────────────────────────────────────────────────────────────────────────
   const indexLockPath = join(root, '.git', 'index.lock');
@@ -124,6 +131,7 @@ export async function prepareRebuild({
           state.held = null;
           writeState();
           alert('rebuild-interrupted-recovered', { target: ip.target, headNow, promoted: true });
+          await finishVerifiedSwaps();
           // Short-circuit here (unlike the non-promoted branch below, which falls through to a fresh plan this
           // same tick): this build is now FULLY adopted, so there is nothing else for this tick to decide.
           return terminal({
@@ -172,6 +180,8 @@ export async function prepareRebuild({
       return terminal({ moved: false, reason: 'quarantined' });
     }
   }
+
+  await finishVerifiedSwaps();
 
   // ── Step 1: must be on main, and the local tree must be safe to move ────────────────────────────────────
   let headRef = git(['symbolic-ref', '--short', 'HEAD']);

@@ -4,10 +4,15 @@
 
 The detached worker in `scripts/lib/daemon-rebuild/auto-rebase.mjs` merges main into a new
 `<ref>-auto-<n>` branch so ancestry preserves the original tip. It retains the old registration
-until the installed HEAD contains the replacement SHA. Per-ref JSON sidecars next to the overlay
+until the verified adopted HEAD contains the replacement SHA and the replacement contains a freshly
+fetched origin tip of the old ref. An advanced or unreadable old tip retains both registrations and
+escalates through `auto-rebase-needs-you`. Per-ref JSON sidecars next to the overlay
 list survive ticks; per-ref markers expire after 30 minutes. Failed workers retain their
 marker until expiry to bound retry cost. `WE_DAEMON_AUTO_REBASE=0` disables
-new jobs. The source of the switch is logged on consultation. Missing related tests, incomplete
+new jobs and pending-swap cleanup. Cleanup follows interrupted-build recovery and requires
+`state.adopted.head === HEAD`. Launch failures write both the needs-you event and alert.
+Both Codex JSON reports must carry exit code zero, no timeout, and terminal `turn.completed`;
+the wrapper process exiting zero alone is insufficient. The source of the switch is logged on consultation. Missing related tests, incomplete
 reads, more than 100 selected tests, failed tests, or an audit without the exact verdict
 `NOT WEAKENED` escalate through `auto-rebase-needs-you`; the old registration remains.
 Select scoped tests from the completed candidate diff against the old tip as well as the
