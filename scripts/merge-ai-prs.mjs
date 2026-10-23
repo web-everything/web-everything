@@ -4632,6 +4632,7 @@ async function runCli() {
   const prestageCache = createPrestageCache();
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
+    queueOwnsFreshness: () => mergeStrategy.queueOwnsFreshness(null),
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }),
     readQueue: () => readQueueFacts({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }),
     readQueueFiles: () => readQueueEntryFiles({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }) });
@@ -5484,8 +5485,9 @@ async function runCli() {
       // landable but still CARRIES the manifest on its head (#2183 first-lander leak — a clean merge would
       // otherwise commit the transient file to `main`). Both cases route through the same plumbing.
       if (v.prestagePendingCi || (!isRebaseDropCandidate(v) && !needsManifestStripBeforeMerge(v))) continue;
-      // xym8nt4 — a card group's sources and combined PR are never rebased by the drain while the group is open:
-      // a moved source head would dissolve the group (the combined PR carries the source content).
+      // xym8nt4 — keep reviewed group heads stable. The queue owns combined-PR freshness; under direct merging,
+      // whole-pass reconciliation closes a BEHIND/DIRTY combined PR and releases its sources for ordinary repair.
+      // Wiring coverage: 'stale group freshness has an owner' exercises both strategies, roles and stale states.
       // The manifest strip is never skipped: a member that still carries the transient manifest is rebuilt as before.
       if (isLocalRepo(v.repo) && !needsManifestStripBeforeMerge(v) && cardGrouping.inGroup(v)) { if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} rebase skipped: in an open card group (drain.group)\n`); continue; }
       if (approvedHeadHold(v)) {

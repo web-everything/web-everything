@@ -30,7 +30,8 @@
  *   3. RECONCILE (throttled). Combined PR merged → each source is checked against the NEW main (all its
  *      added lines present); a verified source is closed with a comment naming the combined PR; an
  *      unverified one is left open and released. Combined PR closed unmerged, failed required CI, or sent back
- *      (`review:changes` / `review:human`), or any source moved (head, labels, state) → the group dissolves:
+ *      (`review:changes` / `review:human`), conflicting, stale without queue-owned freshness, or any source
+ *      moved (head, labels, state) → the group dissolves:
  *      the drain closes ITS OWN combined PR with a comment and every source returns to the serial path with
  *      its approval untouched.
  *
@@ -631,6 +632,8 @@ export function createCardGrouping({
   isMainFix = () => false,
   // The drain's required check name (its `--check` flag): a combined PR is dissolved when THAT check fails.
   requiredCheck = 'test',
+  // Only an active merge queue owns combined-PR freshness. Direct merging must release stale groups.
+  queueOwnsFreshness = () => false,
 } = {}) {
   const say = line => { if (!quiet) log.write(`  card-group: ${line}\n`); };
   const isLocalGroup = g => sameRepo(g.repo, localSlug);
@@ -660,7 +663,7 @@ export function createCardGrouping({
       return { ok: true, result };
     });
   };
-  const readPr = num => JSON.parse(gh(['pr', 'view', String(num), '--repo', localSlug, '--json', 'number,state,isDraft,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,mergedAt,mergeable']));
+  const readPr = num => JSON.parse(gh(['pr', 'view', String(num), '--repo', localSlug, '--json', 'number,state,isDraft,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,mergedAt,mergeable,mergeStateStatus']));
   const comment = (num, body) => { try { gh(['pr', 'comment', String(num), '--repo', localSlug, '--body', body]); return true; } catch (e) { say(`comment on #${num} failed (${firstLine(e)})`); return false; } };
   const liveEligible = (pr, headSha) => {
     const names = labelNames(pr?.labels);
@@ -913,6 +916,8 @@ export function createCardGrouping({
           else if ((why = combinedSentBack(pr))) { /* the drain will never land it */ }
           else if (requiredFailed(pr)) why = 'combined PR failed the required check';
           else if (String(pr.mergeable || '').toUpperCase() === 'CONFLICTING') why = 'combined PR conflicts with main';
+          else if (queueOwnsFreshness() !== true && ['BEHIND', 'DIRTY'].includes(String(pr.mergeStateStatus || '').toUpperCase()))
+            why = 'combined PR needs rebase without queue-owned freshness';
           else {
             for (const s of g.sources) {
               let sp;

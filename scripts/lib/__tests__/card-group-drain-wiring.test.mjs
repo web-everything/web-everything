@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
+import { cardGroupHold } from '../card-group.mjs';
 
 const script = fileURLToPath(new URL('../../merge-ai-prs.mjs', import.meta.url));
 const sha = 'a'.repeat(40), slug = 'web-everything/web-everything';
@@ -17,7 +18,12 @@ const out = x => { fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)
 const page = ${openPrPageFixture};
 if (a[0] === 'repo') out('main');
 if (a[0] === 'pr' && a[1] === 'list') out(a.includes('--base') ? [] : [pr]);
-if (a[0] === 'pr' && a[1] === 'view') out(a[2] === '77' && process.env.GROUP_COMBINED_STATE ? { ...pr, number: 77, state: process.env.GROUP_COMBINED_STATE } : pr);
+if (a[0] === 'pr' && a[1] === 'view') {
+  const row = a[2] === '77' && process.env.GROUP_COMBINED_STATE ? { ...pr, number: 77, state: process.env.GROUP_COMBINED_STATE } : { ...pr };
+  if (!(a[a.indexOf('--json') + 1] || '').split(',').includes('mergeStateStatus')) delete row.mergeStateStatus;
+  out(row);
+}
+if (a[0] === 'pr' && a[1] === 'close' && process.env.GROUP_CLOSE_FAIL === '1') process.exit(1);
 if (a[0] === 'api') {
   if (a[1] === 'user') out('chalbert');
   const path = a.find(x => x.startsWith('repos/')) || '';
@@ -65,11 +71,13 @@ function world(fn) {
       commits: [{ oid: sha, messageHeadline: 'Update readme', authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: sha }],
       comments: [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${sha} -->`, createdAt: new Date().toISOString() }], reviews: [] };
-    const run = ({ role = 'source', grouped = true, only = true, queue = true, heal = false, rebase = false, unreadable = false, combinedState = '' } = {}) => {
+    const run = ({ role = 'source', grouped = true, only = true, queue = true, heal = false, rebase = false, unreadable = false, combinedState = '', preserveGroup = false, closeFail = false } = {}) => {
       const group = { id: 'fixture', repo: slug, pr: role === 'combined' ? 42 : 77,
         branch: role === 'combined' ? pr.headRefName : 'lane/card-group-fixture', createdAt: Date.now(),
-        sources: [{ num: role === 'source' ? 42 : 99, headSha: sha }] };
-      writeFileSync(statePath, unreadable ? '{broken' : JSON.stringify({ groups: grouped ? [group] : [], failed: {}, lastReconcileAt: 0 }));
+        sources: [{ num: role === 'source' ? 42 : 99, headSha: sha }], files: ['backlog/xfixture.md'] };
+      // Preserve the queue-created record across a strategy switch; simulate the next due reconcile tick.
+      const state = preserveGroup ? JSON.parse(readFileSync(statePath, 'utf8')) : { groups: grouped ? [group] : [], failed: {} };
+      writeFileSync(statePath, unreadable ? '{broken' : JSON.stringify({ ...state, lastReconcileAt: 0 }));
       rmSync(fixture + '.queued', { force: true });
       writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
       writeFileSync(settings, JSON.stringify({ mergeDelivery: { strategy: queue ? 'github-merge-queue' : 'drain-direct' } }));
@@ -77,7 +85,7 @@ function world(fn) {
         ...(only ? ['--only=42'] : []), '--no-drain-lease', '--no-red-main-freeze', '--no-overlap-yield',
         ...(!heal ? ['--no-heal-collision'] : []), ...(!rebase ? ['--no-rebase-drop'] : [])], {
         cwd: dir, encoding: 'utf8', timeout: 120_000,
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GROUP_PR: fixture, GROUP_LOG: log, GROUP_COMBINED_STATE: combinedState,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GROUP_PR: fixture, GROUP_LOG: log, GROUP_COMBINED_STATE: combinedState, GROUP_CLOSE_FAIL: closeFail ? '1' : '0',
           WE_DRAIN_CARD_GROUP_STATE: statePath, WE_DRAIN_GROUP_ENABLED: 'on', WE_COORDINATION_ROOT: join(dir, 'coord'),
           LANE_POOL_ROOT: dir, WE_MERGE_DELIVERY_SETTINGS_FILE: settings, WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'off',
           WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'off', WE_DRAIN_WORKFLOW_EDIT_HUMAN: 'off', WE_REVIEW_LEDGER_MODE: 'off',
@@ -143,5 +151,44 @@ describe('real drain card-group orchestration', () => {
     expect(r.state.groups).toEqual([]);
     expect(r.calls.some(a => a[0] === 'gh' && a[1] === 'pr' && a[2] === 'close' && a[3] === '77')).toBe(false); // already closed
     expect(r.calls.some(a => a[0] === 'gh' && a[1] === 'pr' && a[2] === 'comment' && a[3] === '42')).toBe(true);
+  }));
+
+  it.each([true, false].flatMap(queue => ['source', 'combined'].flatMap(role =>
+    ['BEHIND', 'DIRTY'].map(mergeState => ({ queue, role, mergeState }))))
+  )('stale group freshness has an owner (queue=$queue, role=$role, state=$mergeState)', ({ queue, role, mergeState }) => world(({ pr, run }) => {
+    // A persisted group belongs to the queue initially. Keep that exact record when switching strategies.
+    const initial = run({ role, queue: true });
+    const sourceNum = initial.state.groups[0].sources[0].num;
+    const combinedNum = initial.state.groups[0].pr;
+    expect(cardGroupHold(initial.state, { num: sourceNum, localSlug: slug })?.kind).toBe('card-grouped');
+    // Main advances: BEHIND remains MERGEABLE, whereas DIRTY has a content conflict.
+    pr.mergeStateStatus = mergeState;
+    pr.mergeable = mergeState === 'DIRTY' ? 'CONFLICTING' : 'MERGEABLE';
+    const r = run({ role, queue, only: false, rebase: true, preserveGroup: true });
+    expect(rebaseCalls(r.calls)).toEqual([]); // sources keep their reviewed heads until reconciliation
+    const queueOwnsFreshness = queue && mergeState === 'BEHIND';
+    expect(r.state.groups).toHaveLength(queueOwnsFreshness ? 1 : 0);
+    const hold = cardGroupHold(r.state, { num: sourceNum, localSlug: slug });
+    const reservation = cardGroupHold(r.state, { num: 123, localSlug: slug, files: ['backlog/xfixture.md'] });
+    if (queueOwnsFreshness) {
+      expect(hold?.kind).toBe('card-grouped');
+      expect(reservation?.kind).toBe('card-grouped');
+    } else {
+      expect(hold).toBeNull();
+      expect(reservation).toBeNull();
+      expect(r.calls.some(a => a[0] === 'gh' && a[1] === 'pr' && a[2] === 'close' && a[3] === String(combinedNum))).toBe(true);
+      expect(r.calls.some(a => a[0] === 'gh' && a[1] === 'pr' && a[2] === 'comment' && a[3] === String(sourceNum))).toBe(true);
+    }
+  }));
+
+  it('a failed close after switching to direct keeps holds until the next successful reconcile', () => world(({ pr, run }) => {
+    run({ queue: true });
+    pr.mergeStateStatus = 'BEHIND';
+    const failed = run({ queue: false, only: false, preserveGroup: true, closeFail: true });
+    expect(failed.stderr).toContain('closing combined PR failed');
+    expect(cardGroupHold(failed.state, { num: 42, localSlug: slug })?.kind).toBe('card-grouped');
+    const retried = run({ queue: false, only: false, preserveGroup: true });
+    expect(retried.state.groups).toEqual([]);
+    expect(cardGroupHold(retried.state, { num: 42, localSlug: slug })).toBeNull();
   }));
 });
