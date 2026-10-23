@@ -29,6 +29,10 @@ function fixture(options = {}) {
   let clock = 0;
   let remoteTip = candidateSha;
   let tipReads = 0;
+  let establishedAdvanced = false;
+  const establishedTips = new Map((options.list || []).filter(ref => ref !== BASE.branch)
+    .map((ref, i) => [ref, 'd'.repeat(39) + i.toString(16)]));
+  const establishedFetches = new Map();
   const admitted = [];
   const env = { HOME: '/home/test', USER: 'tester', PATH: '/bin', GH_TOKEN: 'secret', NODE_OPTIONS: 'unsafe', WE_ALLOW_NO_PR: '1', ...options.env };
   const ready = { ref: BASE.branch, sha: candidateSha, tests: 'green', audit: 'NOT WEAKENED' };
@@ -70,9 +74,11 @@ function fixture(options = {}) {
         const expected = args.find((a) => a.startsWith('--expected-sha='))?.slice(15);
         if (expected && expected !== remoteTip) return fail(3, JSON.stringify({ conflictCheck: { ok: false, reason: 'sha-moved', candSha: remoteTip } }));
         admitted.push({ ref });
+        if (options.advanceEstablishedDuringAdd) establishedAdvanced = true;
         return options.addRaw ?? JSON.stringify({ conflictCheck: { ok: true, clean: true, candSha: remoteTip } });
       }
       if (action === 'remove' && options.removeFails === ref) return fail(1);
+      if (action === 'remove' && options.advanceEstablishedAfterRemove) establishedAdvanced = true;
       return '{}';
     }
     if (args[0] === '-C') {
@@ -86,8 +92,23 @@ function fixture(options = {}) {
       if (options.adoptionError) return fail(options.adoptionError);
       return options.timeout ? fail(1) : '';
     }
-    if (args[0] === 'fetch') return '';
+    if (args[0] === 'fetch') {
+      const ref = args[2]?.replace(/^\+refs\/heads\//, '').split(':')[0];
+      if (ref === BASE.branch && tipReads > 0 && options.advanceEstablishedBeforeSwap) establishedAdvanced = true;
+      if (establishedTips.has(ref)) {
+        const count = (establishedFetches.get(ref) || 0) + 1;
+        establishedFetches.set(ref, count);
+        if (count > 1 && options.refreshError === 'fetch') return fail(1);
+      }
+      return '';
+    }
     if (args[0] === 'rev-parse') {
+      const ref = args.at(-1).replace(/^refs\/remotes\/origin\//, '').replace(/\^\{commit\}$/, '');
+      if (establishedTips.has(ref)) {
+        if (options.refreshError === 'tip') return fail(1);
+        if (options.refreshError === 'invalid-tip') return '';
+        return establishedAdvanced && ref === 'lane/old' ? TREE : establishedTips.get(ref);
+      }
       tipReads++;
       if (options.tipReadFails && tipReads > 1) return fail(1);
       return options.tip || remoteTip;
@@ -95,6 +116,11 @@ function fixture(options = {}) {
     if (args[0] === 'diff') return args.at(-1).startsWith('origin/main...') ? 'M\0x\0' : options.diff ?? 'M\0x\0';
     if (args[0] === 'merge-base') {
       if (args[2] === 'origin/main') return options.behind ? fail(1) : '';
+      if (args[2] === TREE) return options.advancedContained ? '' : fail(1);
+      if ([...establishedTips.values()].includes(args[2])) {
+        if (options.refreshError === 'ancestry') return fail(128);
+        return '';
+      }
       return (options.contained || []).includes(args[2].slice(7)) ? '' : fail(1);
     }
     if (args[0] === 'merge-tree') return options.mergeConflict ? fail(1, `${TREE}\n100644 ${SHA} 1\tx\nCONFLICT (content): Merge conflict in x\n`) : TREE;
@@ -158,6 +184,36 @@ describe('prototype-load', () => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'] }); const r = await f.run(); expect(r.ok).toBe(true); expect(r.stale).toEqual(['lane/old']); expect(r.removed).toEqual(['lane/old', 'lane/also']);
     const index = f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check'));
     for (const remove of mutations(f, 'remove')) expect(f.calls.indexOf(remove)).toBeGreaterThan(index);
+  });
+  it.each([false, true])('retains an established branch that advances beyond the replacement during add (merge: %s)', async (behind) => {
+    const f = fixture({ behind, list: ['lane/old'], contained: ['lane/old'], advanceEstablishedDuringAdd: true });
+    const r = await f.run();
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(r).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', detail: 'replacement-not-contained', registered: true, adopted: false, removed: [] });
+    expect(r.swap).toMatchObject({ failed: 'lane/old', tip: TREE });
+    expect(r.fallback).toContain('Retain');
+    expect(f.calls.some(c => c.args[0] === '-C')).toBe(false);
+  });
+  it('refreshes each registration after earlier removals rather than precomputing the swap', async () => {
+    const f = fixture({ list: ['lane/first', 'lane/old'], contained: ['lane/first', 'lane/old'], advanceEstablishedAfterRemove: true });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', removed: ['lane/first'], swap: { failed: 'lane/old' } });
+    expect(mutations(f, 'remove').map(c => c.args.find(arg => arg.startsWith('--ref=')))).toEqual(['--ref=lane/first']);
+  });
+  it('refreshes containment when the replacement is already registered', async () => {
+    const f = fixture({ list: [BASE.branch, 'lane/old'], contained: ['lane/old'], advanceEstablishedBeforeSwap: true });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', registered: 'already', removed: [] });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it.each(['fetch', 'tip', 'invalid-tip', 'ancestry'])('retains prior registrations when fresh containment cannot be proved: %s', async (refreshError) => {
+    const f = fixture({ list: ['lane/old'], contained: ['lane/old'], refreshError });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', registered: true, adopted: false, removed: [] });
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('permits an advanced registration whose current tip is still contained', async () => {
+    const f = fixture({ list: ['lane/old'], contained: ['lane/old'], advanceEstablishedDuringAdd: true, advancedContained: true });
+    expect(await f.run()).toMatchObject({ ok: true, adopted: true, removed: ['lane/old'] });
+    expect(f.calls.some(c => c.args.join(' ') === `merge-base --is-ancestor ${TREE} ${SHA}`)).toBe(true);
   });
   it('check-conflict preserves files and conflicting registrations', async () => {
     const f = fixture({ conflicts: [BASE.branch] }); const r = await f.run(); expect(r.stopReason).toBe('check-conflict'); expect(r.check.files).toEqual(['x']); expect(r.check.conflicting).toEqual([{ ref: 'lane/other' }]);

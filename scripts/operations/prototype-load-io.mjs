@@ -150,11 +150,24 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
           return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
         }
       }
+      stage = 'swap-remove-failed';
       for (const ref of contained) {
+        // The preview predates the real add (which can fetch newer, cleanly merging tips).
+        // Refresh each registration at its removal boundary; prove containment using the
+        // immutable fetched SHA, never the earlier preview or a subsequently moving ref.
+        out.swap = { contained, removed: out.removed, failed: ref };
+        requireGit('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
+        const currentTip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${ref}^{commit}`);
+        if (!validSha(currentTip)) throw new Error(`invalid current tip for ${ref}`);
+        if (!ancestor(currentTip, out.effectiveSha)) {
+          return stop('swap-remove-failed', { detail: 'replacement-not-contained', swap: { ...out.swap, tip: currentTip },
+            fallback: 'Retain the remaining registrations; include their current tips in a new tested replacement and retry.' });
+        }
         const result = loader('remove', out.clone, ref, [`--reason=prototype-load: replaced by ${out.effectiveRef}`]);
         if (result.code !== 0) return stop('swap-remove-failed', { swap: { contained, removed: out.removed, failed: ref, result } });
         out.removed.push(ref);
       }
+      out.swap = { contained, removed: out.removed };
       stage = 'check-unverifiable';
       const state = join(expand(env.WE_DAEMON_OVERLAY_DIR || join(env.HOME, '.claude/daemon-overlays')), keyForClone(out.clone));
       const deadline = registeredAt + config.adoption.timeoutMs;
