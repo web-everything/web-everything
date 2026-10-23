@@ -850,14 +850,14 @@ function unsupportedTargetHost(argv, env) {
         return (publicHost(host) || (api && host === 'api.github.com')) ? null : host;
       } catch { return 'invalid URL'; }
     }
-    // gh reads a port-qualified host (github.com:443/o/r) as its own, enterprise host and picks the
-    // enterprise token; read as SCP it would wrongly look like github.com. Never a public target.
-    const port = /^(?:[^@/]+@)?([^/:]+):([0-9]+)(?:[/]|$)/.exec(s);
-    if (port) return port[1] + ':' + port[2];
-    const scp = /^(?:[^@/]+@)?([^/:]+):[^/]/.exec(s);
-    if (scp) return publicHost(scp[1]) ? null : scp[1];
+    // Both readings must name the public host. gh's [HOST/]OWNER/REPO (FromFullName) splits on '/' and
+    // takes the whole first part as the host, so github.com:443, github.com:443?x and
+    // github.com:x@evil.example are other hosts to gh (an enterprise token, or another server) even
+    // though the SCP reading below sees github.com. The SCP reading covers git@host:o/r and remotes.
     const parts = s.split('/');
-    if (parts.length >= 3) return publicHost(parts[0]) ? null : parts[0];
+    if (parts.length >= 3 && parts[0] && !publicHost(parts[0])) return parts[0];
+    const scp = /^(?:[^@/]+@)?([^/:]+):[^/]/.exec(s);
+    if (scp && !publicHost(scp[1])) return scp[1];
     return null;
   };
   if (env.GH_HOST && !publicHost(env.GH_HOST)) return String(env.GH_HOST);
@@ -914,7 +914,8 @@ function unsupportedTargetHost(argv, env) {
     'secret set': ['--repos', '-r'], 'variable set': ['--repos', '-r'],
   }[command] || [];
   // --repos takes a comma-separated list; each entry may name its own host.
-  const repoValueHost = (value) => String(value ?? '').split(',').map((part) => repoHost(part.trim())).find(Boolean) || null;
+  // Each entry is checked as written and trimmed: gh may not trim, and either reading must be public.
+  const repoValueHost = (value) => String(value ?? '').split(',').map((part) => repoHost(part) || repoHost(part.trim())).find(Boolean) || null;
   // Only advance over known boolean shorthands. An unknown shorthand may consume the
   // rest of the argument as content (-fR=... is a workflow field, not a repo selector).
   const booleanShorthands = {

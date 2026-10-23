@@ -1384,6 +1384,8 @@ require(${JSON.stringify(shim)});
     [{}, ['pr', 'list', '--repo=https://%67ithub.com/web-everything/repo']],
     [{}, ['pr', 'list', '--repo=https://ｇｉｔｈｕｂ.com/web-everything/repo']],
     [{ GH_REPO: 'github.com:443/web-everything/repo' }, ['pr', 'list']],
+    [{ GH_REPO: 'github.com:443?x/web-everything/repo' }, ['pr', 'list']],
+    [{ GH_REPO: 'github.com:443@evil.example/web-everything/repo' }, ['pr', 'list']],
     [{ GH_HOST: 'github.com:443' }, ['pr', 'list']],
   ])('refuses enterprise credentials even with trusted public-host provenance (%j, %j)', async (extra, argv) => {
     const { createHash } = await import('node:crypto');
@@ -1467,6 +1469,19 @@ require(${JSON.stringify(shim)});
     ['repo', 'view', 'git@github.com:443/web-everything/web-everything'],
     ['repo', 'view', '--', 'github.com:443/web-everything/web-everything'],
     ['secret', 'set', 'NAME', '--repos', 'web-everything/a,github.com:443/web-everything/b'],
+    // gh's [HOST/]OWNER/REPO takes the whole first part as the host: query/fragment text after the
+    // port, or user@ before another server, never makes it github.com.
+    ['pr', 'list', '-R', 'github.com:443?x/web-everything/web-everything'],
+    ['pr', 'list', '-R', 'github.com:443#x/web-everything/web-everything'],
+    ['pr', 'list', '-R', 'github.com:x@evil.example/web-everything/web-everything'],
+    ['pr', 'list', '-R', 'Git@github.com:x@evil.example/web-everything/web-everything'],
+    ['pr', 'checkout', '-qRgithub.com:443@evil.example/web-everything/web-everything', '1'],
+    ['pr', 'list', '--repo', 'github.com:443@evil.example/web-everything/web-everything'],
+    ['secret', 'set', 'NAME', '--repos', 'web-everything/a,github.com:443@evil.example/web-everything/b'],
+    ['repo', 'create', 'public-repo', '--template', 'github.com:443@evil.example/web-everything/repo'],
+    ['issue', 'transfer', '1', 'github.com:443@evil.example/web-everything/repo'],
+    ['pr', 'list', '-R', ' github.com/web-everything/web-everything'],
+    ['secret', 'set', 'NAME', '--repos', 'web-everything/a,\tgithub.com/web-everything/b'],
   ])('refuses enterprise hosts before using a fresh public App cache: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {
