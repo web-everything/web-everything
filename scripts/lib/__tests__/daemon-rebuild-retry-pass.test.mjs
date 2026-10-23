@@ -65,10 +65,100 @@ function fixture({ pinnedA = false } = {}) {
   const b = push('lane/b', mainSha, { 'settings.json': BASE, 'settings/b.json': '{ "fix": { "y": 15 } }\n' });
   gitOk(clone, ['fetch', '-q', 'origin']);
   const runGit = (args, opts = {}) => gitRun(args, { cwd: clone, ...opts });
-  return { clone, runGit, a, b, mainSha };
+  return { clone, runGit, a, b, mainSha, push };
 }
 
 describe('planRebuild retry pass', () => {
+  it.each([
+    { count: 6, label: 'tries every subset for six pins', jointRetries: 56 },
+    { count: 7, label: 'caps extra joint retries at 64', jointRetries: 64 },
+  ])('$label', async ({ count, jointRetries }) => {
+    const f = fixture();
+    const refs = Array.from({ length: count }, (_, i) => `lane/pin-${i}`);
+    const conflicts = (value) => Object.fromEntries(refs.map((_, i) => [`conflict-${i}.txt`, `${value}\n`]));
+    const base = f.push('main', f.mainSha, conflicts('base'));
+    const old = refs.map((ref, i) => f.push(ref, base, { [`old-${i}.txt`]: 'carried\n' }));
+    const overlays = refs.map((ref) => ({ ref }));
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const live = await planRebuild({ git: f.runGit, headSha: base, mainRef: 'origin/main', overlays });
+    expect(live.applied).toHaveLength(count);
+    f.push('main', base, conflicts('main'));
+    refs.forEach((ref, i) => f.push(ref, old[i], { [`conflict-${i}.txt`]: 'new tip\n' }));
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+
+    // Observe the actual recursive planner entries and which old heads they attempt to pin. Cache identical
+    // deterministic Git queries so the boundary cases spend time on distinct plans rather than child startup.
+    const passes = [];
+    const cache = new Map();
+    const observedGit = (args, opts) => {
+      if (args[0] === 'rev-parse' && args.at(-1) === 'origin/main^{commit}') passes.push(new Set());
+      if (args[0] === 'merge-tree' && old.includes(args.at(-1))) passes.at(-1).add(refs[old.indexOf(args.at(-1))]);
+      const key = JSON.stringify([args, opts]);
+      if (!cache.has(key)) cache.set(key, f.runGit(args, opts));
+      return cache.get(key);
+    };
+    const plan = await planRebuild({ git: observedGit, headSha: live.finalSha, mainRef: 'origin/main', overlays, edgeResolve: false });
+    expect(plan.applied).toHaveLength(count);
+    expect(plan.applied.every((a) => a.pinnedFrom)).toBe(true);
+    const groups = passes.slice(1).map((pinned) => refs.filter((ref) => !pinned.has(ref)));
+    expect([...passes[0]]).toEqual(refs);
+    expect(groups).toHaveLength(1 + count + jointRetries);
+    expect(groups[0]).toEqual(refs);
+    expect(groups.slice(1, count + 1)).toEqual(refs.map((ref) => [ref]));
+    expect(new Set(groups.map((group) => group.join(','))).size).toBe(groups.length);
+    // Independent bit-mask oracle, ordered by subset size then lexicographic ref order.
+    const expected = Array.from({ length: (1 << count) - 1 }, (_, i) =>
+      refs.filter((_, bit) => (i + 1) & (1 << bit)))
+      .filter((group) => group.length > 1 && group.length < count)
+      .sort((a, b) => a.length - b.length || a.join(',').localeCompare(b.join(',')))
+      .slice(0, 64);
+    expect(groups.slice(count + 1)).toEqual(expected);
+    if (count === 6) expect(groups).toHaveLength((1 << count) - 1);
+  }, 120_000);
+
+  it('overlay-pin never costs a carried overlay its retry: a new tip a later overlay makes clean beats the pin (Codex audit)', async () => {
+    const base = mktemp('we-retry-pin-');
+    const origin = join(base, 'origin.git');
+    const clone = join(base, 'clone');
+    gitOk(base, ['init', '--bare', '-q', origin]);
+    mkdirSync(clone);
+    gitOk(clone, ['init', '-q', '-b', 'main']);
+    write(clone, 'settings.json', BASE);
+    gitOk(clone, ['add', '-A']);
+    gitOk(clone, ['commit', '-q', '-m', 'init']);
+    gitOk(clone, ['remote', 'add', 'origin', origin]);
+    gitOk(clone, ['push', '-q', '-u', 'origin', 'main']);
+    const author = join(base, 'author');
+    gitOk(base, ['clone', '-q', origin, author]);
+    const push = (ref, from, files) => {
+      gitOk(author, ['fetch', '-q', 'origin']);
+      gitOk(author, ['checkout', '-q', '-B', ref, from]);
+      for (const [n, c] of Object.entries(files)) write(author, n, c);
+      gitOk(author, ['add', '-A']);
+      gitOk(author, ['commit', '-q', '-m', ref]);
+      gitOk(author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${ref}`]);
+      return gitOk(author, ['rev-parse', 'HEAD']).trim();
+    };
+    const runGit = (args, opts = {}) => gitRun(args, { cwd: clone, ...opts });
+    const init = gitOk(clone, ['rev-parse', 'HEAD']).trim();
+    const a0 = push('lane/a', init, { 'a.txt': 'a0\n' });
+    gitOk(clone, ['fetch', '-q', 'origin']);
+    const live = await planRebuild({ git: runGit, headSha: init, mainRef: 'origin/main', overlays: [{ ref: 'lane/a', pr: 1 }] });
+    // A's new head conflicts with main's move; B (registered later) restores the shared file so A merges again
+    const aNew = push('lane/a', a0, { 'settings.json': BASE.replace('  }\n}', '  },\n  "freeze": { "red": "on" }\n}') });
+    const mainSha = push('main', init, { 'settings.json': BASE.replace('"x": "on"', '"x": "on",\n    "y": 15') });
+    push('lane/b', mainSha, { 'settings.json': BASE, 'settings/b.json': '{ "fix": { "y": 15 } }\n' });
+    gitOk(clone, ['fetch', '-q', 'origin']);
+    const plan = await planRebuild({
+      git: runGit, headSha: live.finalSha, mainRef: 'origin/main', overlays: [{ ref: 'lane/a', pr: 1 }, { ref: 'lane/b', pr: 2 }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.find((d) => d.ref === 'lane/a')).toMatchObject({ action: 'apply', reason: 'applied-retry', sha: aNew });
+    expect(plan.applied.find((x) => x.ref === 'lane/a').pinnedFrom).toBeUndefined();
+    expect(plan.establishedLost).toEqual([]);
+  });
+
+
   it('re-applies an overlay dropped for a conflict once a later overlay made it merge cleanly', async () => {
     const f = fixture();
     const plan = await planRebuild({

@@ -1,9 +1,13 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dispatchTimeoutRetry, timeoutGithubEffects } from '../ci-heal-pr-dispatch.mjs';
 import { readTimeoutBudget } from '../../conveyor/timeout-retry-state.mjs';
+
+// Hermetic: the real file-item path must not allocate a card number over git/network (slice 0).
+beforeAll(() => { process.env.WE_NUMBER_AT_BIRTH = 'off'; });
+afterAll(() => { delete process.env.WE_NUMBER_AT_BIRTH; });
 
 // Dispatch-level coverage of the infra-cancelled re-run path (PR #4024 review): the planner tests pin WHEN a re-run
 // is planned; these pin what the dispatch then DOES — which endpoint, which cap, which job states it will touch, and

@@ -1888,24 +1888,25 @@ describe('rebuildClone — a conflicting pinned overlay is skipped (not dropped)
 
     const mainSha = advanceMain(originDir, (dir) => writeFile(dir, 'shared.txt', 'main change\n'));
 
-    // Before the fix this tick refused `pinned-overlay-conflict` and never moved the clone.
+    // Live 2026-10-21 ~17:12 ET: the pinned overlay is LIVE (applied in the running build), so skipping it would build a
+    // tree that drops live code. xpinskip still names the conflict, but the clone HOLDS on its last-good build.
     const runSmoke = passSmoke();
+    const liveHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
     const second = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => 'OPEN', lockOpts: LOCK_OPTS });
-    expect(second.moved).toBe(true);
-    expect(runSmoke).toHaveBeenCalled(); // smoked as usual
-    expect(gitOk(cloneDir, ['merge-base', '--is-ancestor', mainSha, 'HEAD']) === '').toBe(true);
-    expect(readAt(cloneDir, 'shared.txt')).toBe('main change\n');
-    expect(existsSync(join(cloneDir, 'other.txt'))).toBe(true); // the non-conflicting overlay is still built in
-    expect(readAt(cloneDir, 'scripts/lib/daemon-rebuild.mjs')).toBe('// main rebuild v1\n'); // main's own mechanism
+    expect(second.moved).toBe(false);
+    expect(second.reason).toBe('established-overlay-conflict');
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(liveHead);
+    expect(readAt(cloneDir, 'scripts/lib/daemon-rebuild.mjs')).toContain('finalize fix'); // live code kept
     expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(['lane/fix-rebuild-finalize', 'lane/other']);
     const kinds = second.alerts.map((a) => a.kind);
     expect(kinds.filter((k) => k === 'pinned-overlay-conflict-skipped')).toHaveLength(1);
-    expect(kinds).not.toContain('pinned-overlay-conflict');
-    expect(kinds).not.toContain('overlay-conflict-dropped');
+    expect(kinds).toContain('established-overlay-hold');
     expect(second.alerts.find((a) => a.kind === 'pinned-overlay-conflict-skipped').detail).toMatchObject({
       ref: 'lane/fix-rebuild-finalize', pr: 2768, pinnedBy: 'mechanism', mechanismPaths: ['scripts/lib/daemon-rebuild.mjs'],
     });
-    expect(readRebuildState(cloneDir, env).held).toBeNull();
+    expect(readRebuildState(cloneDir, env).held).toMatchObject({ reason: 'established-overlay-conflict', lastGood: liveHead });
+    void mainSha;
 
     // The branch is rebased onto the new main — the SAME registration re-applies with no operator step.
     const dir = makeAuthorClone(originDir);

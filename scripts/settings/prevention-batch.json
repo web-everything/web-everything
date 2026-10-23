@@ -1,9 +1,15 @@
 {
+  "$comment": "prevention.filingEnabled is an independent filing pause (standard true), not the rolling-batch switch. Paused until the Also-raised-by resolver is proven. Cascade: standard → platform prevention → declared repo settings → WE_PREVENTION_FILING_ENABLED (true/false/1/0); winning source is logged by the filer.",
   "prevention": {
+    "filingEnabled": false,
     "$comment": "batchFiling enables rolling prevention PRs; false restores one PR per card. batchWindowMinutes is the positive integer age in minutes at which a batch seals; batchMaxCards is the positive integer count that seals it early. batchLeaseWaitMinutes is the positive integer wait budget for a detached prevention filer to retry a held batch lease, default 15; it is not part of the policy overlay. Cascade per key: standard defaults (lease wait 15 minutes; other keys from the prevention block in card-batch-policy.json) \u2192 platform prevention in delivery-platform-preferences.json (missing means no preference) \u2192 repo prevention in declared settings \u2192 env WE_PREVENTION_BATCH_FILING (0/1/true/false), WE_PREVENTION_BATCH_WINDOW_MINUTES, WE_PREVENTION_BATCH_MAX_CARDS, WE_PREVENTION_BATCH_LEASE_WAIT_MINUTES. Invalid values are ignored and logged with their layer. Set batchWindowMinutes to 30 to seal every half hour. Set batchLeaseWaitMinutes to 20 (or WE_PREVENTION_BATCH_LEASE_WAIT_MINUTES=20) to wait up to 20 minutes, polling every 30 seconds, before opening the card's own PR if the lease is still held. Operator defaults: enabled, 60 minutes, 25 cards, 15 minutes lease wait.",
     "batchFiling": true,
     "batchWindowMinutes": 60,
     "batchMaxCards": 25,
-    "batchLeaseWaitMinutes": 15
+    "batchLeaseWaitMinutes": 15,
+    "alsoRaised": {
+      "$comment": "route: where an 'also raised' note (a raised-by sidecar for an existing open card) goes. batch (standard) = into the rolling prevention batch PR, or the pending spool when the batch cannot take it now; single = kill switch, one PR per filing (lane/<id>-prevention-card). Cascade: standard batch -> platform prevention.alsoRaised.route -> repo (here) -> env WE_PREVENTION_ALSO_RAISED_ROUTE=batch|single. The filer logs the winning value and its source.",
+      "route": "batch"
+    }
   }
 }

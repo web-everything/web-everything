@@ -2,7 +2,7 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
+import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
   alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
@@ -268,7 +268,18 @@ export async function prepareRebuild({
   if (chainOf.fresh?.size > 0) {
     try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
   }
+  // overlay-pin — `overlay-pinned` is logged ONCE per (ref, new tip), not every tick the pin holds; the record
+  // (`state.pinnedNotified`: ref → the new tip last reported) is pruned to the refs still pinned this plan.
+  const pinnedBefore = state.pinnedNotified && typeof state.pinnedNotified === 'object' ? state.pinnedNotified : {};
+  const pinnedNow = Object.create(null);
   for (const event of plan.alerts || []) {
+    if (event.kind === 'overlay-pinned') {
+      const { ref, pr, newTip, files } = event.detail;
+      pinnedNow[ref] = newTip;
+      // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
+      if (pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
+      if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === newTip) continue;
+    }
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
       const { pr, ref, files } = event.detail;
@@ -279,6 +290,10 @@ export async function prepareRebuild({
       const { pr, ref, files, collidesWith } = event.detail;
       markOverlayConflictWake(env, { pr, ref, files, collidesWith, at: nowIso(), clone: root });
     }
+  }
+  if (plan.ok && JSON.stringify(pinnedBefore) !== JSON.stringify(pinnedNow)) {
+    state.pinnedNotified = Object.keys(pinnedNow).length ? pinnedNow : null;
+    writeState();
   }
   for (const [pr, wake] of readOverlayConflictWakes(env, { maxAgeMs: Infinity })) {
     if (wake.clone === root && !overlaysBefore.some((o) => o.pr === pr && o.ref === wake.ref)) {
@@ -336,7 +351,7 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
   for (const d of plan.decisions) {
-    if (d.pr != null && (d.action === 'apply' || d.action === 'remove')) clearOverlayConflictWake(env, d.pr);
+    if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
       removeOverlay(root, d.ref, { env, why: d.reason });
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
@@ -346,6 +361,24 @@ export async function prepareRebuild({
         ref: d.ref, reason: d.reason, ...(d.files ? { files: d.files } : {}),
       });
     }
+  }
+
+  // The overlays a build applies, read from its own rebuild-committed `daemon-rebuild: merge overlay <ref>` records on
+  // its first-parent line above main ({ref, sha}), plus the recorded adopted set when it is that build. Unreadable
+  // history returns undefined (the superseded rule then refuses: fail closed).
+  function liveOverlaysOf(head, mainSha) {
+    if (!head || !mainSha) return undefined;
+    const log = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', head, '--not', mainSha]);
+    if (log.status !== 0) return undefined;
+    const live = [];
+    for (const l of String(log.stdout ?? '').split('\n').filter(Boolean)) {
+      const [parents, committer, ...rest] = l.split('\t');
+      const ps = String(parents ?? '').split(' ');
+      const hit = rest.join('\t').match(/^daemon-rebuild: merge overlay (\S+) /);
+      if (hit && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && ps.length === 2) live.push({ ref: hit[1], sha: ps[1] });
+    }
+    if (state.adopted?.head === head) for (const a of state.adopted.applied ?? []) if (a?.ref && a.sha) live.push({ ref: a.ref, sha: a.sha });
+    return live;
   }
 
   // ── Step 4: up-to-date / still-rejected short-circuits ──────────────────────────────────────────────
@@ -393,6 +426,11 @@ export async function prepareRebuild({
         rejected: state.rejected,
         nowMs: nowMs(),
         maxAgeMs,
+        // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
+        // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
+        liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
+        carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
+        leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
       if (!m.adopt) {
         clearReadyCandidate(root, stEnv);

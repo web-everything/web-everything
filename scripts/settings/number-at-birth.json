@@ -1,0 +1,9 @@
+{
+  "$comment": "Number cards at creation with a durable birth id record. WE_NUMBER_AT_BIRTH=on|off overrides atBirth. Required remote outages fall back to hash naming; best-effort explicitly permits logged host-only claims.",
+  "backlog": {
+    "cardNumbering": {
+      "atBirth": "on",
+      "atBirthRemote": "required"
+    }
+  }
+}
