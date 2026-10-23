@@ -1,12 +1,12 @@
 /**
  * @file scripts/operations/record-red-team-ruling-io.mjs
- * @description Live reader and retry-safe card sink for cap-held operator rulings. IO is injectable.
+ * @description Live reader and retry-safe card sink for scope-bound operator rulings. IO is injectable.
  */
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { liveResultGateState, readConfirmedBreaks, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, readConfirmedBreaks, readOperatorRulings, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -88,9 +88,12 @@ const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead } 
   return result;
 };
 
+/** Log the effective ruling scope and its policy-cascade source. */
+const readScopeLogged = (env) => readOperatorRulings({ env, log: (m) => process.stderr.write(`${m}\n`) });
+
 export function createRecordRedTeamRulingReader({ env = process.env, readThread = readLiveThread, readSetting = () => readConfirmedBreaks({ env }),
   readStandingRulingScope = standingRulingScope,
-  runGit = git, readOnPr = readCardAtPrHead,
+  readScope = () => readScopeLogged(env), runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = () => resolveOperatorIdentity({ env }), now = () => new Date().toISOString(),
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-red-team-ruling', env }) } = {}) {
@@ -98,9 +101,10 @@ export function createRecordRedTeamRulingReader({ env = process.env, readThread 
     assertFresh();
     const thread = readThread({ repo, pr });
     const head = String(thread.headRefOid ?? '').toLowerCase();
+    const scope = readScope();
     return { head, labels: thread.labels ?? [], comments: thread.comments ?? [],
       standingRuling: readStandingRulingScope({ repo, pr: { ...thread, number: Number(pr), headRefOid: head } }),
-      setting: readSetting().value, now: now(), identity: resolveIdentity(),
+      setting: readSetting().value, scope: { value: scope.value, sources: scope.sources ?? {} }, now: now(), identity: resolveIdentity(),
       card: card === undefined || card === '' ? null : resolveCard(card, { repo, pr, head }) };
   };
 }
@@ -156,7 +160,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
     const comments = operatorBoundComments(thread.comments);
     const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...thread, number: p.pr, headRefOid: head } });
     let now;
-    try { now = rulableBreaks({ comments, repo: p.repo, labels: thread.labels, pr: p.pr, head, setting: p.setting, standingRuling }); }
+    try { now = rulableBreaks({ comments, repo: p.repo, labels: thread.labels, pr: p.pr, head, setting: p.setting, scope: p.scope, ruling: p.ruling, citesCard: Boolean(p.cardRef), standingRuling }); }
     catch (e) { throw new Error(`${e.message}; ${noWrite}`); }
     if (now.state.resultId !== p.resultId) throw new Error(`the red-team result on the live head changed since the plan (${p.resultId} -> ${now.state.resultId}); ${noWrite} — re-run`);
     const rulable = now.rulable.map((f) => f.index);
@@ -176,7 +180,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
     if (record && !comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isHumanOperatorComment(c))) {
       throw new Error(`${what} is not in the read-back as a human operator's comment (altered, or posted as another account); inspect the thread before retrying`);
     }
-    const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, standingRuling });
+    const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: p.scope, standingRuling });
     const still = p.indices.filter((i) => d.held.some((f) => f.index === i) || d.sendBack.some((f) => f.index === i));
     if (still.length) throw new Error(`${what} was posted but the gate still holds break(s) ${still.map((i) => `#${i}`).join(', ')} `
       + '(not authored by the operator account, or an altered body); inspect the thread before retrying');

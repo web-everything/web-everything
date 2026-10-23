@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createActionStore } from '../action-store.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, operatorRulingsOnLiveResult, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
 import { assertRulingCardInputFits, planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
@@ -1123,5 +1123,193 @@ describe('automatic card filing with shared durable claims', () => {
       expect(conflictingPendingCardJobs([c], p)).toEqual([]);
     }
     expect(conflictingPendingCardJobs([human], { ...p, jobKey: 'ffffffffffff' })).toEqual([]);
+  });
+});
+
+const OFF = { value: { anyState: false }, sources: { anyState: 'env' } };
+
+describe('operator ruling in ANY state (live #5502 shape: sent back at repair cap 11/10, operator "5502 approved")', () => {
+  function fake({ initial, liveHead, labels }) {
+    const comments = [...initial], posted = [], cards = [], labelSyncs = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
+      readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      resolveCard: ref => ({ ref, readable: true }),
+      fileCard: (...args) => { cards.push(args); throw new Error('existing-card ruling must not file'); },
+      post: (_repo, _pr, body) => {
+        posted.push(body);
+        comments.push({ author: OP, createdAt: '2026-10-21T20:30:00Z', body });
+      },
+      syncLabels: args => { labelSyncs.push(args); return { add: null, remove: [] }; },
+    });
+    return { sinks, comments, posted, cards, labelSyncs };
+  }
+  const H = '61782334289124cd4fcb51d0bdadb6ef3c795e82';
+  const P = 5502;
+  const F = (line, impact, summary) => ({ summary, category: 'edge-case', impactIfUnfixed: impact, file: 'scripts/operations/coroner-pr-postmortem.mjs', line, confirmedByRecheck: true });
+  const result = bot(renderRedTeamComment({ pr: P, rev: H, provider: 'codex', model: 'gpt-6.1-sol', recheckStatus: 'ok', foldedVerdict: 'changes',
+    findings: [F(159, 'broken', 'A carried approval hides subsequent approval loss'), F(127, 'degraded', 'Production human-clearance comments never establish the boundary'),
+      F(166, 'degraded', 'Production drain-skip comments collapse every reason')] }), '2026-10-21T17:07:55Z');
+  const rid = liveResultGateState([result], P, H).resultId;
+  const gate = (outcome, line, at) => bot(`${redTeamGateMarker(P, H, outcome, rid)}\n**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${H.slice(0, 12)}\`:\n${line}`, at);
+  const live = [result, gate('sent-back', '- 1 confirmed break(s) sent back to the fixer (#1).', '2026-10-21T17:12:20Z'),
+    gate('card-queued', '- 2 finding(s) carded (#2, #3).', '2026-10-21T17:12:23Z')];
+  const LABELS = ['review:changes', 'review:human', 'status:sent-back-red-team', 'review-round:11', 'red-team:blocked'].map((name) => ({ name }));
+  const CARD = 'we:backlog/xvi6k7s-per-pr-delivery-postmortem-on-merge-incident-coroner-trigger.md@pr5502';
+  const card = { requested: CARD, ref: CARD, readable: true, foundIn: 'pr-head', reason: 'readable' };
+  const r5502 = (over = {}) => ({ identity: OP, head: H, labels: LABELS, comments: live, setting: CONFIRMED_BREAKS_DEFAULTS, now: '2026-10-21T16:10:00-04:00',
+    card, scope: { value: { anyState: true }, sources: { anyState: 'tool' } }, ...over });
+  const in5502 = (over = {}) => ({ repo, pr: P, break: '#1,#2,#3', ruling: 'card', card: CARD, actor: 'chalbert', channel: 'claude-code-chat',
+    reason: 'Operator "5502 approved" in Claude Code chat 2026-10-21 ~16:05 ET (approve, card the red-team breaks)', ...over });
+  const disp = (comments, anyState = true) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState } });
+
+  it('before: #1 blocks (sent back), and the old cap-only rule refused the operator', () => {
+    expect(disp(live).sendBack.map((f) => f.index)).toEqual([1]);
+    expect(() => planRedTeamRuling(r5502({ scope: OFF }), in5502())).toThrow(/not parked at the round cap/);
+  });
+  it('plans a card of all three confirmed breaks to the cited existing card, bound to head + result', () => {
+    const p = planRedTeamRuling(r5502(), in5502());
+    expect(p).toMatchObject({ effect: RED_TEAM_RULING_CARD_EFFECT, head: H, resultId: rid, indices: [1, 2, 3], cardRef: CARD, underChanges: true, atCap: false });
+    expect(p.cardInput).toBeUndefined();
+  });
+  it('after the sink: the record releases #1, nothing is filed, labels resync, and a second card is refused', () => {
+    const f = fake({ initial: live, liveHead: H, labels: LABELS });
+    const out = f.sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(r5502(), in5502()));
+    expect(out).toMatchObject({ ruling: 'card', indices: [1, 2, 3], card: { ref: CARD } });
+    expect(f.cards).toEqual([]);
+    expect(f.posted[1]).toMatch(new RegExp(`^<!-- we:red-team-gate pr=5502 rev=${H} outcome=operator-card result=${rid} -->`));
+    expect(f.posted[1]).toContain(`- 3 finding(s) carded by the operator to \`${CARD}\` (#1, #2, #3).`);
+    expect(f.posted[0]).toContain('> Operator "5502 approved"');
+    const after = disp(f.comments);
+    expect(after.sendBack).toEqual([]);
+    expect(after.held).toEqual([]);
+    expect(f.labelSyncs).toEqual([{ repo, pr: P, head: H }]);
+    expect(() => planRedTeamRuling(r5502({ comments: f.comments }), in5502())).toThrow(/already ruled `card`/);
+  });
+  it('a later round-cap supersedes the operator card and permits ruling the held finding again', () => {
+    const f = fake({ initial: live, liveHead: H, labels: LABELS });
+    f.sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(r5502(), in5502()));
+    expect(() => planRedTeamRuling(r5502({ comments: f.comments }), in5502())).toThrow(/already ruled `card`/);
+    f.comments.push(gate('round-cap', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T21:00:00Z'));
+    expect(disp(f.comments).held.map(f => f.index)).toEqual([1]);
+    expect(disp(f.comments).sendBack).toEqual([]);
+    expect(operatorRulingsOnLiveResult(f.comments, P, H).ruled.get(1)).toEqual(['card']);
+    const p = planRedTeamRuling(r5502({ comments: f.comments }), in5502({ break: '1' }));
+    expect(p).toMatchObject({ resultId: rid, indices: [1], cardRef: CARD, atCap: true });
+    expect(p.cardInput).toBeUndefined();
+    // Holding again permits a release to an existing card, never filing a duplicate card.
+    expect(() => planRedTeamRuling(r5502({ comments: f.comments, card: null }), in5502({ card: undefined, break: '1' })))
+      .toThrow(/no confirmed red-team break .* left to rule `card`/);
+    expect(() => planRedTeamRuling(r5502({ comments: f.comments }), in5502({ break: '2' })))
+      .toThrow(/#2 is not a break confirmed and not already ruled/);
+  });
+  it('the same record posted by automation, or naming another result, releases nothing', () => {
+    const body = `${redTeamGateMarker(P, H, 'operator-card', rid)}\n**Red-team gate** operator ruling on head \`x\`:\n- 1 finding(s) carded by the operator to \`${CARD}\` (#1).`;
+    expect(disp([...live, bot(body, '2026-10-21T20:00:00Z')]).sendBack.map((x) => x.index)).toEqual([1]);
+    const other = body.replace(` result=${rid}`, ' result=0123456789abcdef');
+    expect(disp([...live, { author: { login: 'chalbert' }, createdAt: '2026-10-21T20:00:00Z', body: other }]).sendBack.map((x) => x.index)).toEqual([1]);
+    expect(disp([...live, { author: { login: 'chalbert' }, createdAt: '2026-10-21T20:00:00Z', body }]).sendBack).toEqual([]);
+  });
+  it('kill switch off at the reader: an operator release never overrides a recorded send-back', () => {
+    const body = `${redTeamGateMarker(P, H, 'operator-card', rid)}\n**Red-team gate** operator ruling on head \`x\`:\n- 1 finding(s) carded by the operator to \`${CARD}\` (#1).`;
+    expect(disp([...live, { author: { login: 'chalbert' }, createdAt: '2026-10-21T20:00:00Z', body }], false).sendBack.map((x) => x.index)).toEqual([1]);
+  });
+  it('a new head re-evaluates: the ruling does not carry to it', () => {
+    const f = fake({ initial: live, liveHead: H, labels: LABELS });
+    f.sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(r5502(), in5502()));
+    const N = 'a'.repeat(40);
+    const next = bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [F(159, 'broken', 'still broken')] }), '2026-10-21T21:00:00Z');
+    const comments = [...f.comments, next];
+    expect(readRedTeamDisposition({ comments, pr: P, head: N, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } }).sendBack.map((x) => x.index)).toEqual([1]);
+    expect(() => planRedTeamRuling(r5502({ head: N.slice(0, 39) + 'b', comments }), in5502())).toThrow(/no red-team result on the live head/);
+  });
+  it('defaults to cap-only when the read context has no scope', () => {
+    expect(() => planRedTeamRuling(r5502({ scope: undefined }), in5502())).toThrow(/not parked at the round cap/);
+    expect(planRedTeamRuling(read(), input())).toMatchObject({ scope: { anyState: false }, indices: [1] });
+  });
+  it('refuses unconfirmed breaks in any-state mode', () => {
+    const comments = [bot(renderRedTeamComment({ pr: P, rev: H, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ ...F(159, 'broken', 'unconfirmed'), confirmedByRecheck: false }] }), '2026-10-21T17:07:55Z')];
+    expect(() => planRedTeamRuling(r5502({ comments }), in5502({ break: '1' }))).toThrow(/no confirmed red-team break/);
+  });
+  it('the setting cascade: default off, file and env opt in, each with its source', async () => {
+    const { resolveOperatorRulings } = await import('../../lib/red-team-gate.mjs');
+    expect(resolveOperatorRulings({})).toMatchObject({ value: { anyState: false } });
+    expect(resolveOperatorRulings({ file: { redTeam: { operatorRulings: { anyState: false } } } }).value.anyState).toBe(false);
+    const killed = resolveOperatorRulings({ file: { redTeam: { operatorRulings: { anyState: true } } }, env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'off' } });
+    expect(killed.value.anyState).toBe(false);
+    expect(JSON.stringify(killed.sources)).toContain('env');
+    expect(resolveOperatorRulings({ env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'banana' } }).value.anyState).toBe(false);
+    expect(resolveOperatorRulings({ file: { redTeam: { operatorRulings: { anyState: true } } } }).value.anyState).toBe(true);
+    expect(resolveOperatorRulings({ env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'true' } }))
+      .toMatchObject({ value: { anyState: true }, sources: { anyState: 'env' } });
+  });
+});
+
+describe('any-state duplicate filing protection', () => {
+  it.each([false, true])('a prior operator card neither releases nor prevents ruling on an identical repost (anyState: %s)', anyState => {
+    const scope = { value: { anyState } };
+    const resultId = liveResultGateState(thread(), PR, HEAD).resultId;
+    const prior = { author: OP, createdAt: '2026-10-20T23:50:00Z',
+      body: `${redTeamGateMarker(PR, HEAD, 'operator-card', resultId)}\n- 1 finding(s) carded by the operator to \`${CARD}\` (#1).` };
+    const comments = thread([prior]);
+    const disposition = () => readRedTeamDisposition({ comments, pr: PR, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: scope.value });
+    expect(disposition().held).toEqual([]);
+    expect(operatorRulingsOnLiveResult(comments, PR, HEAD).ruled.get(1)).toEqual(['card']);
+    comments.push({ ...redTeam(), createdAt: '2026-10-21T00:00:00Z' },
+      bot(redTeamGateMarker(PR, HEAD, 'round-cap', resultId), '2026-10-21T00:01:00Z'));
+    expect(liveResultGateState(comments, PR, HEAD).resultId).toBe(resultId);
+    expect(disposition().held.map(f => f.index)).toEqual([1]);
+    const dedup = operatorRulingsOnLiveResult(comments, PR, HEAD);
+    expect([...dedup.ruled]).toEqual([]);
+    expect([...dedup.carded]).toEqual([]);
+    expect(planRedTeamRuling(read({ comments, scope }), input())).toMatchObject({ indices: [1], cardRef: CARD, resultId });
+    expect(planRedTeamRuling(read({ comments, scope, card: null }), input({ card: undefined })))
+      .toMatchObject({ indices: [1], resultId });
+    comments.push({ ...prior, createdAt: '2026-10-21T00:02:00Z' });
+    expect(disposition().held).toEqual([]);
+    expect(operatorRulingsOnLiveResult(comments, PR, HEAD).ruled.get(1)).toEqual(['card']);
+    expect(() => planRedTeamRuling(read({ comments, scope }), input()))
+      .toThrow(anyState ? /already ruled `card`/ : /no red-team break is held/);
+  });
+  it('a NEW card is never planned for a break the gate already carded; citing an existing card still is', () => {
+    const H = HEAD;
+    const rid = () => liveResultGateState(thread(), PR, H).resultId;
+    const carded = bot(`${redTeamGateMarker(PR, H, 'card-queued', rid())}\n**Red-team gate** x:\n- 1 finding(s) filed as a follow-up card (#1) — landing job j.`, '2026-10-20T23:50:00Z');
+    expect(() => planRedTeamRuling(read({ scope: { value: { anyState: true } }, comments: thread([carded]), card: null }), input({ card: undefined }))).toThrow(/no confirmed red-team break .* left to rule `card`/);
+    const ref = 'we:backlog/x.md';
+    expect(planRedTeamRuling(read({ scope: { value: { anyState: true } }, comments: thread([carded]), card: { requested: ref, ref, readable: true } }), input({ card: ref }))).toMatchObject({ cardRef: ref, indices: [1] });
+  });
+});
+
+describe('ruling scope binding and provenance', () => {
+  it('default cap-only policy permits review:changes with a trusted cap', () => {
+    expect(planRedTeamRuling(read({ labels: ['review:changes'] }), input())).toMatchObject({ scope: { anyState: false }, indices: [1] });
+  });
+  it('binds the reader scope and sources to the plan and the dispatched payload', async () => {
+    const { createRecordRedTeamRulingReader } = await import('../record-red-team-ruling-io.mjs');
+    const reader = createRecordRedTeamRulingReader({
+      assertFresh: () => {}, readThread: () => ({ headRefOid: HEAD, labels: [], comments: thread() }),
+      readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), readScope: () => OFF,
+      resolveCard: () => card,
+    });
+    const context = reader({ repo, pr: PR, card: CARD });
+    expect(context.scope).toEqual(OFF);
+    const verdict = planRedTeamRuling(context, input());
+    expect(verdict).toMatchObject({ scope: OFF.value, scopeSources: OFF.sources });
+    const operation = recordRedTeamRulingOperation({ readRulingContext: reader });
+    const write = operation.steps.find(s => s.name === 'write').step;
+    expect(write.effects({ verdict, input: {} })[0].payload.scope).toEqual(OFF.value);
+  });
+  it('the sink reapplies the bound cap-only policy when the cap disappears', () => {
+    const posted = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: ['review:changes'], comments: [redTeam()] }),
+      resolveIdentity: () => OP, readStandingRulingScope: () => null, post: (...args) => posted.push(args),
+    });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(read(), input()))).toThrow(/not parked at the round cap.*nothing written/);
+    expect(posted).toEqual([]);
   });
 });
