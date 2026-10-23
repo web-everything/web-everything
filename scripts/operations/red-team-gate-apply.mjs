@@ -5,9 +5,9 @@ import { signalFixDispatch } from '../lib/fix-handoff.mjs';
  * @description THE IMPURE HALF of the red-team gate (card x1b8hlo). The pure half — the parser, the setting, the
  *   decision — is `we:scripts/lib/red-team-gate.mjs`; read its header first.
  *
- *   For one PR, on its LIVE head only:
+ *   For one PR, on its live head or a proven numbering ancestor:
  *     1. read the PR (head, labels, comments) and find the trusted red-team comment for that exact head; a comment on
- *        another head is stale and ignored;
+ *        another head is stale unless only drain numbering commits separate it from the live head;
  *     2. plan the actions under `redTeam.confirmedBreaks`;
  *     3. `send-back` findings: the PR goes to `review:changes` with those findings as the fix list, through the
  *        sanctioned writer (`review-set-label.mjs --to=changes`, which also writes the verdict-ledger row), plus a
@@ -50,6 +50,7 @@ import { spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
 import { readReviewRound, readReviewRoundAsOf } from './review-pr-io.mjs';
 import { appendLedgerEvents } from './record-referral-ruling-io.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { runGhSync } from '../lib/gh-throttle.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
@@ -62,13 +63,43 @@ const findingLine = (f, i) => `${i + 1}. ${where(f)} — (${sanitizeCardField(f.
   + `${sanitizeCardField(f.summary, 600)}${f.scenario ? `\n   - Scenario: ${sanitizeCardField(f.scenario, 1200)}` : ''}`
   + `${f.recheck ? `\n   - Claude's re-check: ${sanitizeCardField(f.recheck, 600)}` : ''}`;
 
+const MAX_NUMBERING_HOPS = 5;
+const sha = value => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
+const cardPath = value => typeof value === 'string' && /^backlog\/[^/]+\.md$/.test(value)
+  && !/[\x00-\x1f\x7f\\]/.test(value);
+
+/**
+ * PURE: nearest-first candidate SHAs across at most five first-parent numbering commits.
+ * Rows are complete GitHub commit responses. Unknown/incomplete evidence refuses the entire proof.
+ * A non-numbering commit terminates the chain; its parents are never candidates.
+ */
+export function proveNumberingAncestors(head, commits) {
+  if (!sha(head) || !Array.isArray(commits) || commits.length > MAX_NUMBERING_HOPS) return [];
+  const ancestors = [];
+  let current = head;
+  for (const row of commits) {
+    if (row?.sha !== current || typeof row?.commit?.message !== 'string') return [];
+    if (!row.commit.message.split('\n')[0].startsWith('drain: JIT-number ')) break;
+    // Refuse merges and possibly truncated API file lists (one page holds 100 files).
+    if (!Array.isArray(row.parents) || row.parents.length !== 1 || !sha(row.parents[0]?.sha)
+      || !Array.isArray(row.files) || !row.files.length || row.files.length >= 100) return [];
+    if (!row.files.every(f => cardPath(f?.filename)
+      && (f.previous_filename === undefined || cardPath(f.previous_filename)))) break;
+    current = row.parents[0].sha;
+    if (current === head || ancestors.includes(current)) return [];
+    ancestors.push(current);
+  }
+  return ancestors;
+}
+
 /** The send-back write-up: the fix list. PURE. */
-export function buildSendBackBody({ pr, head, findings }) {
+export function buildSendBackBody({ pr, head, viaAncestor, findings }) {
   return [
     `**Post-accept red team — ${findings.length} confirmed break(s) sent back to the fixer.**`,
     '',
-    `Claude's re-check confirmed these on head \`${String(head).slice(0, 12)}\` (#${pr}), and the setting \`redTeam.confirmedBreaks\` sends `
+    `Claude's re-check confirmed these on head \`${String(viaAncestor ?? head).slice(0, 12)}\` (#${pr}), and the setting \`redTeam.confirmedBreaks\` sends `
       + 'that class back (card x1b8hlo). Fix each one, then push; the new head is reviewed again.',
+    ...(viaAncestor ? [`This result on \`${viaAncestor}\` applies to the renumbered live head \`${head}\`.`, ''] : []),
     '',
     ...findings.map(findingLine),
   ].join('\n');
@@ -138,11 +169,23 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     try { standingRuling = io.readGrantScope?.({ repo, pr, head, comments: view?.comments }) ?? null; } catch { standingRuling = null; }
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    const { result: parsed, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo, standingRuling);
+    let resultHead = head;
+    let state = liveResultGateState(view?.comments, pr, head, repo, standingRuling);
+    if (!state.result) {
+      let ancestors = [];
+      try { ancestors = await io.numberingAncestors?.({ repo, pr, head }) ?? []; } catch { /* no proof */ }
+      if (!Array.isArray(ancestors) || ancestors.length > MAX_NUMBERING_HOPS || !ancestors.every(sha)) ancestors = [];
+      for (const ancestor of ancestors) {
+        const candidate = liveResultGateState(view?.comments, pr, ancestor, repo, standingRuling);
+        if (candidate.result) { state = candidate; resultHead = ancestor; break; }
+      }
+    }
+    const ancestry = resultHead === head ? {} : { viaAncestor: resultHead };
+    const { result: parsed, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = state;
     if (!parsed) return { status: 'no-red-team-on-head', head };
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
-    if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
+    if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, ...ancestry, plan };
     // One record per ACTION (see the header): what is already recorded for this result is not repeated, what is not stays pending.
     const priorSend = sendBackOutcome;
     // A `round-cap` record is re-decided once for a grant its decision did not see (extend-rounds), including one
@@ -150,29 +193,29 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     const sendPending = plan.sendBack.length > 0 && (!priorSend || reopened);
     const cardPending = plan.card.length > 0 && !recorded.has(GATE_OUTCOMES.CARD_QUEUED);
     if (!dryRun && priorSend === GATE_OUTCOMES.SENT_BACK && sendBackReason(view.labels)) io.dequeueSentBack({ repo, pr, reason: 'post-accept red team sent back to review:changes' });
-    if (!sendPending && !cardPending) return { status: 'already-acted', head, outcome: priorSend ?? GATE_OUTCOMES.CARD_QUEUED, plan };
-    const round = sendPending ? io.readRound({ repo, pr, head }) : null;
+    if (!sendPending && !cardPending) return { status: 'already-acted', head, ...ancestry, outcome: priorSend ?? GATE_OUTCOMES.CARD_QUEUED, plan };
+    const round = sendPending ? io.readRound({ repo, pr, head: resultHead }) : null;
     // The operator's audited grants raise the cap with the same grant-time anchor fix dispatch uses. The anchor counts
     // this head like `readRound` does when the thread shows its review before the grant (thread order, not clocks).
     const grants = sendPending ? gateRoundGrants(view?.comments, pr, repo, standingRuling) : [];
     const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at, g) => {
       const reviewed = Number.isInteger(headReviewIndex) && Number.isInteger(g?.index) && headReviewIndex < g.index;
-      try { return io.readRoundAsOf?.({ repo, pr, at, head: reviewed ? head : null }) ?? null; } catch { return null; }
+      try { return io.readRoundAsOf?.({ repo, pr, at, head: reviewed ? resultHead : null }) ?? null; } catch { return null; }
     } });
     // The round is the only bound on send-backs, so an unreadable one is the cap (the operator rules), never "round 1".
     const capped = sendPending && (!Number.isInteger(round) || round >= effectiveCap);
     const outcome = !plan.sendBack.length ? GATE_OUTCOMES.NOTHING_TO_SEND
       : !sendPending ? priorSend : capped ? GATE_OUTCOMES.ROUND_CAP : GATE_OUTCOMES.SENT_BACK;
     const labels = (view.labels ?? []).map((l) => (typeof l === 'string' ? l : l?.name));
-    const sendBody = sendPending && !capped ? buildSendBackBody({ pr, head, findings: plan.sendBack }) : null;
-    const cardInput = cardPending ? buildRedTeamCardInput({ repo, pr, head, findings: plan.card }) : null;
+    const sendBody = sendPending && !capped ? buildSendBackBody({ pr, head, ...ancestry, findings: plan.sendBack }) : null;
+    const cardInput = cardPending ? buildRedTeamCardInput({ repo, pr, head: resultHead, findings: plan.card }) : null;
     if (dryRun) {
-      return { status: 'dry-run', head, round, cap: sendPending ? effectiveCap : null, reopened, outcome, plan, wouldSendBack: sendPending && outcome === GATE_OUTCOMES.SENT_BACK, sendBody, cardInput, setting };
+      return { status: 'dry-run', head, ...ancestry, round, cap: sendPending ? effectiveCap : null, reopened, outcome, plan, wouldSendBack: sendPending && outcome === GATE_OUTCOMES.SENT_BACK, sendBody, cardInput, setting };
     }
     let sendBackResult = null;
     let marker = null;
     const record = (recordOutcome, recordPlan, extra = {}) => {
-      try { io.postComment({ repo, pr, body: buildGateComment({ pr, head, outcome: recordOutcome, plan: recordPlan, round, result: resultId,
+      try { io.postComment({ repo, pr, body: buildGateComment({ pr, head: resultHead, outcome: recordOutcome, plan: recordPlan, round, result: resultId,
         grantIds: recordOutcome === GATE_OUTCOMES.ROUND_CAP || recordOutcome === GATE_OUTCOMES.SENT_BACK ? grants.map(g => g.id) : null,
         cap: effectiveCap, ...extra }) }); return 'posted'; }
       catch (e) { return `error: ${String(e?.message ?? e).slice(0, 200)}`; }
@@ -186,9 +229,9 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
         else {
           // The writer cannot pin a head for `--to=changes`: re-read it right before the write (see the header).
           const live = String(io.readHead({ repo, pr }) ?? '').toLowerCase();
-          if (live !== head) return { status: 'head-moved', head, liveHead: live, plan };
+          if (live !== head) return { status: 'head-moved', head, ...ancestry, liveHead: live, plan };
           sendBackResult = io.sendBack({ repo, pr, head, body: sendBody });
-          if (!sendBackResult?.ok) return { status: 'send-back-failed', head, round, plan, error: sendBackResult?.error ?? 'unknown' };
+          if (!sendBackResult?.ok) return { status: 'send-back-failed', head, ...ancestry, round, plan, error: sendBackResult?.error ?? 'unknown' };
           try { await io.appendSendBackEvent({ repo, pr, head }); } catch (e) { io.log(`red-team gate: send-back of #${pr} applied but the ledger event missed: ${e.message}`); }
         }
       }
@@ -196,19 +239,19 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
       marker = record(outcome, { ...plan, card: [] }, { sendBackResult });
       // The label is written but its record is not: without it the operator queue never learns the fixer owns the break.
       // Retry-safe: the next run sees review:changes, takes the `already` path (no second label write) and records.
-      if (marker !== 'posted') return { status: 'send-back-record-failed', head, round, outcome, plan, sendBack: sendBackResult, marker, error: marker };
+      if (marker !== 'posted') return { status: 'send-back-record-failed', head, ...ancestry, round, outcome, plan, sendBack: sendBackResult, marker, error: marker };
     }
     let cardResult = null;
     let cardMarker = null;
     if (cardPending) {
       cardResult = io.fileCard(cardInput);
       // A card that was not filed records nothing: a permanent per-head record here would make the failure unretryable.
-      if (!cardResult?.ok) return { status: 'card-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, error: cardResult?.error ?? 'unknown' };
+      if (!cardResult?.ok) return { status: 'card-failed', head, ...ancestry, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, error: cardResult?.error ?? 'unknown' };
       cardMarker = record(GATE_OUTCOMES.CARD_QUEUED, { sendBack: [], card: plan.card, advisory: sendPending ? [] : plan.advisory }, { cardResult });
       // The job is spawned but its record is not on the PR: the next run would queue a DUPLICATE card. Say so, loudly.
-      if (cardMarker !== 'posted') return { status: 'card-record-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, error: cardMarker };
+      if (cardMarker !== 'posted') return { status: 'card-record-failed', head, ...ancestry, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, error: cardMarker };
     }
-    return { status: 'applied', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker };
+    return { status: 'applied', head, ...ancestry, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker };
   } catch (e) {
     return { status: 'error', reason: String(e?.message ?? e).slice(0, 500) };
   }
@@ -224,10 +267,10 @@ export const gateExitCode = (r) => (GATE_FAILURE_STATUSES.includes(r?.status) ? 
 export function renderGateSummary(r) {
   const p = r?.plan;
   const counts = p ? ` (send-back ${p.sendBack.length}, card ${p.card.length}, advisory ${p.advisory.length})` : '';
-  return `red-team gate: ${r?.status ?? 'none'}${r?.outcome ? ` → ${r.outcome}` : ''}${counts}${r?.reason || r?.error ? ` — ${r.reason ?? r.error}` : ''}`;
+  return `red-team gate: ${r?.status ?? 'none'}${r?.outcome ? ` → ${r.outcome}` : ''}${counts}${r?.viaAncestor ? ` — result ${r.viaAncestor} applies to renumbered live head ${r.head}` : ''}${r?.reason || r?.error ? ` — ${r.reason ?? r.error}` : ''}`;
 }
 
-export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}) {
+export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT, readCommit = null, log = line => process.stderr.write(`${line}\n`) } = {}) {
   const gh = (args, input) => {
     const r = spawnSync('gh', args, { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 256 * 1024 * 1024, input, stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
     if (r.status !== 0) throw new Error(`gh ${args.slice(0, 2).join(' ')} failed: ${String(r.stderr ?? r.error?.message ?? '').trim().slice(0, 300)}`);
@@ -244,6 +287,31 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
       ...JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,labels'])),
       comments: readCompletePrComments(Number(pr), { repo }),
     }),
+    numberingAncestors: ({ repo, head }) => {
+      try {
+        if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || !sha(head)) return [];
+        const commits = [];
+        let current = head;
+        // At most five calls, each with a complete, bounded file list. No local clone is owned here.
+        for (let hop = 0; hop < MAX_NUMBERING_HOPS; hop++) {
+          const row = readCommit ? readCommit({ repo, head: current }) : JSON.parse(runGhSync(
+            ['api', `repos/${repo}/commits/${current}?per_page=100&page=1`],
+            { env, encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+          ));
+          // A full page might omit files. Refuse rather than trust an incomplete proof.
+          if (Array.isArray(row?.files) && row.files.length >= 100) {
+            log('red-team gate: numbering proof file limit reached; request a fresh live-head review.');
+            return [];
+          }
+          commits.push(row);
+          const ancestors = proveNumberingAncestors(head, commits);
+          if (ancestors.length !== commits.length) return ancestors;
+          current = ancestors.at(-1);
+        }
+        log('red-team gate: numbering ancestry limited to five hops; older results require a fresh live-head review.');
+        return proveNumberingAncestors(head, commits);
+      } catch { return []; }
+    },
     // Fresh per run on the App identity: a closed or edited ruling stops crediting automatic grants at the next run.
     readGrantScope: ({ repo, pr, head, comments }) => standingRulingScope({ repo, pr: { number: Number(pr), headRefOid: head, comments } }),
     readSetting: () => readConfirmedBreaks({ env }),
@@ -268,7 +336,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     })]),
     fileCard: (input) => spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-card' }),
     postComment: ({ repo, pr, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),
-    log: (line) => process.stderr.write(`${line}\n`),
+    log,
   };
 }
 

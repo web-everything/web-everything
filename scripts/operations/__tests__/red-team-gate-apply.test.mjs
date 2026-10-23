@@ -2,9 +2,9 @@
  * Card x1b8hlo — the red-team gate's impure half over a fake io: broken → send-back, degraded → card,
  * unconfirmed → advisory, a stale head → ignored, the round cap, dedup — and review-job runs it after the red team.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
+import { createRedTeamGateIo, proveNumberingAncestors, applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, liveResultGateState, parseRedTeamComment, parseRedTeamGateMarker, readRedTeamDisposition, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
@@ -49,7 +49,136 @@ const kinds = (calls) => calls.map((c) => c[0]);
 // Every record the gate writes names the result it decided (PR #5482).
 const namedGate = (outcome) => redTeamGateMarker(4722, HEAD, outcome).replace(/ -->$/, ' result=');
 
+const numberingCommit = (head = HEAD, parent = OTHER, files = [{ filename: 'backlog/6936-card.md' }]) => ({
+  sha: head, parents: [{ sha: parent }], commit: { message: 'drain: JIT-number x3vn7kd->#6936 at land' }, files,
+});
+
+describe('numbering ancestor proof and production reader', () => {
+  it('walks only the contiguous first-parent numbering chain, nearest first', () => {
+    const base = '3'.repeat(40);
+    expect(proveNumberingAncestors(HEAD, [numberingCommit(), numberingCommit(OTHER, base),
+      { sha: base, commit: { message: 'fix: real change' } }])).toEqual([OTHER, base]);
+  });
+  it.each([
+    ['non-backlog file', [{ filename: 'scripts/x.mjs' }]],
+    ['code renamed into backlog', [{ filename: 'backlog/6936-card.md', previous_filename: 'scripts/x.mjs' }]],
+    ['non-card file', [{ filename: 'backlog/data.json' }]],
+    ['nested path', [{ filename: 'backlog/sub/card.md' }]],
+  ])('does not prove a numbering commit touching a %s', (_name, files) => {
+    expect(proveNumberingAncestors(HEAD, [numberingCommit(HEAD, OTHER, files)])).toEqual([]);
+  });
+  it.each([
+    ['empty files', { files: [] }], ['missing files', { files: undefined }],
+    ['full API page', { files: Array.from({ length: 100 }, () => ({ filename: 'backlog/card.md' })) }],
+    ['merge', { parents: [{ sha: OTHER }, { sha: '3'.repeat(40) }] }],
+    ['unknown parent', { parents: [] }], ['wrong sha', { sha: OTHER }],
+  ])('fails closed on %s', (_name, patch) => {
+    expect(proveNumberingAncestors(HEAD, [{ ...numberingCommit(), ...patch }])).toEqual([]);
+  });
+  it('caps the reader at five hops; older results need a fresh live-head review', async () => {
+    const heads = [HEAD, ...Array.from({ length: 6 }, (_, i) => String(i + 2).repeat(40))];
+    const readCommit = vi.fn(({ head }) => numberingCommit(head, heads[heads.indexOf(head) + 1]));
+    const log = vi.fn();
+    const reader = createRedTeamGateIo({ env: {}, readCommit, log }).numberingAncestors;
+    expect(reader({ repo: REPO, head: HEAD })).toEqual(heads.slice(1, 6));
+    expect(readCommit).toHaveBeenCalledTimes(5);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('fresh live-head review'));
+    expect(proveNumberingAncestors(HEAD, heads.slice(0, 6).map((h, i) => numberingCommit(h, heads[i + 1])))).toEqual([]);
+    const { io, calls } = fakeIo({ comments: [comment([F()], heads[6])], numberingAncestors: reader });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('no-red-team-on-head');
+    expect(calls).toEqual([]);
+  });
+  it('refuses a full file page and exposes the fresh-review fallback', () => {
+    const log = vi.fn();
+    const reader = createRedTeamGateIo({ env: {}, log, readCommit: () => numberingCommit(HEAD, OTHER,
+      Array.from({ length: 100 }, () => ({ filename: 'backlog/card.md' }))) });
+    expect(reader.numberingAncestors({ repo: REPO, head: HEAD })).toEqual([]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('fresh live-head review'));
+  });
+  it('returns empty on any commit read failure, even after a proven hop', () => {
+    const readCommit = vi.fn(({ head }) => { if (head === HEAD) return numberingCommit(); throw new Error('unreadable'); });
+    expect(createRedTeamGateIo({ env: {}, readCommit }).numberingAncestors({ repo: REPO, head: HEAD })).toEqual([]);
+  });
+});
+
 describe('applyRedTeamGate', () => {
+  it('numbering over an ancestor break sends back once and dedupes on the ancestor', async () => {
+    const numberingAncestors = createRedTeamGateIo({ env: {}, readCommit: ({ head }) => head === HEAD
+      ? numberingCommit() : { sha: OTHER, commit: { message: 'fix: original contribution' } } }).numberingAncestors;
+    const readRound = vi.fn(() => 1);
+    const { io, calls } = fakeIo({ comments: [comment([F(), F()], OTHER)], numberingAncestors, readRound });
+    const first = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(first).toMatchObject({ status: 'applied', head: HEAD, viaAncestor: OTHER, outcome: 'sent-back' });
+    expect(readRound).toHaveBeenCalledWith({ repo: REPO, pr: 4722, head: OTHER });
+    expect(kinds(calls)).toEqual(['sendBack', 'ledger', 'comment']);
+    expect(calls[0][1]).toMatchObject({ head: HEAD });
+    expect(calls[0][1].body).toContain(`applies to the renumbered live head \`${HEAD}\``);
+    expect(parseRedTeamGateMarker(calls[2][1].body)).toMatchObject({ rev: OTHER, outcome: 'sent-back' });
+    expect(renderGateSummary(first)).toContain(`renumbered live head ${HEAD}`);
+    calls.length = 0;
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted', head: HEAD, viaAncestor: OTHER });
+    expect(calls).toEqual([]);
+  });
+  it('ancestor card actions retain their records and dedupe independently', async () => {
+    const { io, calls } = fakeIo({ comments: [comment([F(), F({ impactIfUnfixed: 'degraded' })], OTHER)], numberingAncestors: () => [OTHER] });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('applied');
+    expect(kinds(calls)).toEqual(['sendBack', 'ledger', 'comment', 'card', 'comment']);
+    expect(calls[3][1].digest).toContain(OTHER);
+    expect(parseRedTeamGateMarker(calls[4][1].body)).toMatchObject({ rev: OTHER, outcome: 'card-queued' });
+    calls.length = 0;
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('already-acted');
+    expect(calls).toEqual([]);
+  });
+  it('a failed ancestry read leaves the older result stale', async () => {
+    const { io, calls } = fakeIo({ comments: [comment([F()], OTHER)], numberingAncestors: () => { throw new Error('gh unavailable'); } });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('no-red-team-on-head');
+    expect(calls).toEqual([]);
+  });
+  it('a non-numbering commit breaks the chain to an older result', async () => {
+    const reader = createRedTeamGateIo({ env: {}, readCommit: ({ head }) => head === HEAD ? numberingCommit()
+      : { sha: OTHER, commit: { message: 'fix: implementation change' }, parents: [{ sha: '3'.repeat(40) }] } });
+    const { io, calls } = fakeIo({ comments: [comment([F()], '3'.repeat(40))], numberingAncestors: reader.numberingAncestors });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('no-red-team-on-head');
+    expect(calls).toEqual([]);
+  });
+  it('a live result always wins without consulting ancestors', async () => {
+    const numberingAncestors = vi.fn(() => [OTHER]);
+    const { io, calls } = fakeIo({ comments: [comment([F()], OTHER), comment([F({ confirmedByRecheck: false })])], numberingAncestors });
+    const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(r.status).toBe('advisory-only');
+    expect(r).not.toHaveProperty('viaAncestor');
+    expect(numberingAncestors).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+  it('numbering touching code stays stale at the gate', async () => {
+    const reader = createRedTeamGateIo({ env: {}, readCommit: () => numberingCommit(HEAD, OTHER, [{ filename: 'scripts/x.mjs' }]) });
+    const { io, calls } = fakeIo({ comments: [comment([F()], OTHER)], numberingAncestors: reader.numberingAncestors });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('no-red-team-on-head');
+    expect(calls).toEqual([]);
+  });
+  it('ancestor results still refuse a live-head move before writing', async () => {
+    const { io, calls } = fakeIo({ comments: [comment([F()], OTHER)], numberingAncestors: () => [OTHER], liveHead: '3'.repeat(40) });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'head-moved', head: HEAD, viaAncestor: OTHER });
+    expect(calls).toEqual([]);
+  });
+  it('ancestor results retain the round cap', async () => {
+    const { io, calls } = fakeIo({ comments: [comment([F()], OTHER)], numberingAncestors: () => [OTHER], round: 5 });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ outcome: 'round-cap', viaAncestor: OTHER });
+    expect(kinds(calls)).toEqual(['comment']);
+    expect(parseRedTeamGateMarker(calls[0][1].body)).toMatchObject({ rev: OTHER, outcome: 'round-cap' });
+  });
+  it('an untrusted ancestor advisory cannot send back', async () => {
+    const { io, calls } = fakeIo({ comments: [{ ...comment([F()], OTHER), author: { login: 'outsider' } }], numberingAncestors: () => [OTHER] });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('no-red-team-on-head');
+    expect(calls).toEqual([]);
+  });
+  it('uses the first ancestor with a result', async () => {
+    const { io, calls } = fakeIo({ comments: [comment([F()], '3'.repeat(40)), comment([F({ confirmedByRecheck: false })], OTHER)],
+      numberingAncestors: () => [OTHER, '3'.repeat(40)] });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'advisory-only', viaAncestor: OTHER });
+    expect(calls).toEqual([]);
+  });
+
   it('broken → send-back through review-set-label + ledger event + gate record', async () => {
     const { io, calls } = fakeIo({ comments: [comment([F({ summary: 'two writers' })])] });
     const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
