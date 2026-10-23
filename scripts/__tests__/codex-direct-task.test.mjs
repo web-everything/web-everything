@@ -688,7 +688,7 @@ describe('runGate — none/standards/full, never commits', () => {
   it.each([
     { label: 'success', script: 'console.log("gate output")' },
     { label: 'failure', script: 'process.exit(7)', rejects: true },
-    { label: 'timeout', script: 'setInterval(() => {}, 1000)', options: { timeout: 100 }, rejects: true },
+    { label: 'timeout', script: keepAliveScript({ maxLifetimeMs: 10000 }), options: { timeout: 100 }, rejects: true },
     { label: 'output limit', script: 'console.log("x".repeat(4096))', options: { maxBuffer: 1024 }, rejects: true },
     { label: 'spawn error', bin: 'missing-codex-gate-executable', rejects: true },
   ])('async gate cleans signal listeners after $label', async ({ script, options, rejects, bin }) => {
