@@ -312,7 +312,15 @@ export function scrubPublish(value) {
   for (const m of value.matchAll(BLOB_RUN)) {
     if (shannonEntropy(m[0]) >= BLOB_ENTROPY_MIN) { reasons.push('long opaque blob (≥40 chars, secret-level entropy)'); break; }
   }
-  for (const tok of publishSegments(value)) {
+  // Narrow exemption: only hex metadata on an exact red-team marker line.
+  const segmentValue = value.split('\n').map((line) => {
+    if (!/^(?!.* ([a-z]+)=.* \1=)<!-- we:red-team-(gate|advisory) pr=\d+ rev=[0-9a-f]{40}( [a-z]+=[0-9a-z,_-]+)* -->$/.test(line)) return line;
+    // The leading lookahead rejects any line repeating a key, so each key's hex is unambiguous.
+    return line.replace(/( rev=)[0-9a-f]{40}(?= )/, '$1')
+      .replace(/( result=)[0-9a-f]{16}(?= )/, '$1')
+      .replace(/( grants=)[0-9a-f]+(?:,[0-9a-f]+)*(?= )/, '$1');
+  }).join('\n');
+  for (const tok of publishSegments(segmentValue)) {
     if (isOpaquePublishToken(tok)) { reasons.push('opaque token (unpronounceable ≥20-char key/secret)'); break; }
   }
   reasons.push(...emailReasons(value));
