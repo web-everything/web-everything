@@ -5,7 +5,8 @@
  * All process and filesystem effects are injectable; main accepts an optional stdout sink.
  */
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { lstatSync, readlinkSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -21,6 +22,8 @@ export const STOP_REASONS = Object.freeze(Object.fromEntries(Object.keys(EXIT_CO
 const defaults = {
   exec: (cmd, args, options) => spawnSync(cmd, args, { ...options, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
   readFile: file => readFileSync(file, 'utf8'),
+  lstat: file => lstatSync(file),
+  readlink: file => readlinkSync(file, { encoding: 'buffer' }),
   writeFile: (file, data) => writeFileSync(file, data, { mode: 0o600 }),
   now: Date.now,
   log: line => process.stderr.write(`${String(line).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}\n`),
@@ -121,13 +124,55 @@ async function changedFiles(s, reason = 'diff-out-of-scope') {
   if ([diff, untracked].some(r => !good(r) || typeof r.stdout !== 'string' || (r.stdout && !r.stdout.endsWith('\0')))) {
     fail(reason, 'Cannot read complete changed file list; inspect the lane diff before retrying');
   }
-  return [...new Set([...diff.stdout.split('\0'), ...untracked.stdout.split('\0')].filter(Boolean))];
+  return {
+    files: [...new Set([...diff.stdout.split('\0'), ...untracked.stdout.split('\0')].filter(Boolean))],
+    untracked: untracked.stdout.split('\0').filter(Boolean).sort(),
+  };
+}
+async function worktreeFingerprint(s, untracked, reason) {
+  // Keep originally untracked files separate even after git add moves them into the index.
+  const diff = await git(s, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-renames', s.startSha, '--',
+    '.', ...untracked.map(file => `:(top,literal,exclude)${file}`)]);
+  if (!good(diff) || typeof diff.stdout !== 'string') {
+    fail(reason, 'Cannot read worktree fingerprint; inspect the lane diff before retrying');
+  }
+  const regular = [], links = [];
+  try {
+    for (const file of untracked) {
+      const fullPath = path.join(s.lane.path, file);
+      const stat = await s.io.lstat(fullPath);
+      if (stat.isSymbolicLink()) {
+        // Git stores the link target bytes as a blob, without opening the referent.
+        const target = await s.io.readlink(fullPath);
+        if (!Buffer.isBuffer(target) || !target.length) throw new Error('Unreadable link target');
+        const hash = createHash('sha256').update(`blob ${target.length}\0`).update(target).digest('hex');
+        links.push([file, hash]);
+      } else if (stat.isFile()) regular.push(file);
+      else throw new Error('Unsupported untracked entry');
+    }
+  } catch {
+    fail(reason, 'Cannot read untracked audit entries; inspect the lane diff before retrying');
+  }
+  let hashes = '';
+  if (regular.length) {
+    const r = await git(s, ['hash-object', '--no-filters', '--', ...regular]);
+    if (!good(r) || typeof r.stdout !== 'string' || !r.stdout.endsWith('\n') ||
+        r.stdout.trimEnd().split('\n').length !== regular.length ||
+        r.stdout.trimEnd().split('\n').some(hash => !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(hash))) {
+      fail(reason, 'Cannot hash untracked audit files; inspect the lane diff before retrying');
+    }
+    hashes = r.stdout;
+  }
+  return createHash('sha256').update(JSON.stringify([diff.stdout, untracked, hashes, links])).digest('hex');
 }
 export async function checkDiffScope(s) {
-  s.files = await changedFiles(s);
+  const { files, untracked } = await changedFiles(s);
+  s.files = files;
   if (!s.files.length) fail('no-changes');
   const outside = s.files.filter(f => !pathsWithinScope([f], s.opts.scope));
   if (outside.length) fail('diff-out-of-scope', outside);
+  s.auditUntracked = untracked;
+  s.auditFingerprint = await worktreeFingerprint(s, untracked, 'diff-out-of-scope');
 }
 const heavyPath = s => path.resolve(s.lane.path, 'scripts/readiness/heavy-admission.mjs');
 const testArgs = s => [heavyPath(s), 'run', `--wait-ms=${s.opts.waitMs}`, '--', 'npx', 'vitest', 'run', ...s.opts.tests];
@@ -168,9 +213,13 @@ export async function runAudit(s) {
   if (s.result.audit !== 'NOT WEAKENED') fail('audit-weakened');
 }
 export async function checkAuditedFiles(s) {
-  const files = await changedFiles(s, 'changed-after-audit');
+  const { files } = await changedFiles(s, 'changed-after-audit');
   if (files.length !== s.files.length || files.some(file => !s.files.includes(file))) {
     fail('changed-after-audit', 'Changed file list differs from the audit input; inspect the lane diff before retrying');
+  }
+  if (!s.auditFingerprint || !Array.isArray(s.auditUntracked) ||
+      await worktreeFingerprint(s, s.auditUntracked, 'changed-after-audit') !== s.auditFingerprint) {
+    fail('changed-after-audit', 'Worktree contents differ from the audit input; inspect the lane diff before retrying');
   }
 }
 export async function checkStagedScope(s) {
@@ -195,6 +244,7 @@ export async function commitAndPush(s) {
   if (!good(await git(s, ['add', '--', ...s.files], true))) fail('commit-failed');
   // Commit consumes the whole index, including anything staged by subprocesses.
   await checkStagedScope(s);
+  await checkAuditedFiles(s);
   if (!good(await git(s, ['commit', '-m', title, '-m', 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>'], true))) fail('commit-failed');
   const sha = await git(s, ['rev-parse', 'HEAD']);
   if (!good(sha) || !sha.stdout?.trim()) fail('commit-failed');
@@ -245,10 +295,11 @@ function plan(s) {
     'On test failure: write repair brief, run Codex, check diff scope, run tests once more',
     'Recheck changed and untracked file scope after tests',
     show('node', codexArgs(s, '<audit-task-file>', true)),
-    'Check changed and untracked file list is unchanged since audit started',
+    'Check changed and untracked file list and content fingerprint are unchanged since audit started',
     'git add -- <scope-checked changed files>',
     'git diff --cached --name-only --no-renames -z (require scoped paths to match the audited file list)',
     'git diff --quiet --exit-code --no-ext-diff --no-textconv -- (require the complete index to match the worktree)',
+    'Recheck audited file list and content fingerprint immediately before commit',
     'git commit -m <brief title> -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"',
     'git ls-remote --heads origin <branch> (try suffixes -2 through -9 if occupied)',
     `git push origin HEAD:refs/heads/${s.result.branch}`,

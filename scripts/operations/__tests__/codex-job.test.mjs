@@ -4,7 +4,7 @@
  */
 import { it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
@@ -36,11 +36,14 @@ function fixture(rules = [], { ready = true } = {}) {
         if (args.includes('--show-toplevel')) return ok('/repo\n');
         if (args.includes('rev-parse')) return ok('abc123\n');
         if (args.includes('diff') && args.includes('--quiet')) return ok();
+        if (args.includes('--binary')) return ok('audited binary diff');
+        if (args.includes('hash-object')) return ok(args.slice(args.indexOf('--') + 1).map(() => 'a'.repeat(40) + '\n').join(''));
         if (args.includes('diff')) return ok('scripts/a.mjs\0');
         if (['reset', 'ls-files', 'add', 'commit', 'ls-remote', 'push'].some(x => args.includes(x))) return ok();
       }
       throw new Error(`Unscripted command: ${call.text}`);
     },
+    lstat: () => ({ isSymbolicLink: () => false, isFile: () => true }),
     readFile: async file => {
       if (file.endsWith('fix-ready.mjs')) {
         if (!ready) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
@@ -72,7 +75,7 @@ it('happy path orders gates, captures one JSON line, uses session env and releas
   expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1);
   expect(f.output).toHaveLength(1);
   expect(f.output[0].split('\n')).toHaveLength(2);
-  const expected = ['free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'reset --hard', 'rev-parse HEAD', 'rev-parse origin/main', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'add --', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --', 'commit -m', 'rev-parse HEAD', 'ls-remote', 'push origin', 'fix-ready.mjs mark', 'scripts/operations/run.mjs prototype-load', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
+  const expected = ['free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'reset --hard', 'rev-parse HEAD', 'rev-parse origin/main', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'diff --binary', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'diff --binary', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'diff --binary', 'add --', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --', 'diff --name-only', 'ls-files', 'diff --binary', 'commit -m', 'rev-parse HEAD', 'ls-remote', 'push origin', 'fix-ready.mjs mark', 'scripts/operations/run.mjs prototype-load', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
   expect(f.calls).toHaveLength(expected.length);
   expected.forEach((part, i) => expect(f.calls[i].text).toContain(part));
   expect(f.calls.every(c => c.args.every(a => !a.includes('--force') && !a.includes('--allow-conflict')))).toBe(true);
@@ -258,6 +261,124 @@ it('fails closed on unreadable or incomplete post-audit file lists', async () =>
       expect(code).toBe(23); expect(result.stopReason).toBe('changed-after-audit');
       expect(result.detail).toContain('inspect the lane diff before retrying');
       expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+      released(f); scopeReleased(f);
+    }
+  }
+});
+it.each([
+  { untracked: false, change: true },
+  { untracked: true, change: true },
+  { untracked: true, change: false },
+  { untracked: true, change: false, link: 'missing-target', name: 'dangling symlink' },
+  { untracked: true, change: false, link: '../target-directory', name: 'directory symlink' },
+  { untracked: true, change: true, link: 'missing-target', name: 'changed dangling symlink' },
+])('fingerprints audited content before staging: untracked=$untracked, changed=$change, $name (real Git)', async ({ untracked, change, link }) => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-audit-'));
+  const git = args => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+  try {
+    git(['init', '--quiet']);
+    mkdirSync(path.join(repo, 'scripts'), { recursive: true });
+    writeFileSync(path.join(repo, 'scripts/a.mjs'), 'original\n');
+    git(['add', '--', 'scripts/a.mjs']);
+    const baseline = git(['write-tree']).trim();
+    git(['read-tree', '--empty']);
+    const emptyTree = git(['write-tree']).trim();
+    if (!untracked) git(['read-tree', baseline]);
+    if (link) {
+      rmSync(path.join(repo, 'scripts/a.mjs'));
+      mkdirSync(path.join(repo, 'target-directory'));
+      symlinkSync(link, path.join(repo, 'scripts/a.mjs'));
+    } else writeFileSync(path.join(repo, 'scripts/a.mjs'), 'tested and audited\n');
+    const f = fixture([['codex-direct-task.mjs --review', () => {
+      if (change) {
+        if (link) {
+          rmSync(path.join(repo, 'scripts/a.mjs'));
+          symlinkSync('changed-target', path.join(repo, 'scripts/a.mjs'));
+        } else writeFileSync(path.join(repo, 'scripts/a.mjs'), 'changed after audit\n');
+      }
+      return report();
+    }]]);
+    f.io.lstat = file => lstatSync(path.join(repo, path.relative('/lane', file)));
+    f.io.readlink = file => readlinkSync(path.join(repo, path.relative('/lane', file)), { encoding: 'buffer' });
+    const exec = f.io.exec;
+    f.io.exec = async (cmd, args, options) => {
+      if (cmd === 'git' && ['diff', 'ls-files', 'hash-object', 'add'].some(v => args.includes(v))) {
+        await exec(cmd, args, options);
+        const realArgs = args.slice(2).map(v => v === 'abc123' ? (untracked ? emptyTree : baseline) : v);
+        if (realArgs.includes('--cached')) realArgs.push(untracked ? emptyTree : baseline);
+        try { return ok(git(realArgs)); }
+        catch (error) { return { status: error.status, stdout: error.stdout, stderr: error.stderr }; }
+      }
+      return exec(cmd, args, options);
+    };
+    const { code, result } = await f.run();
+    if (change) {
+      expect(code).toBe(23);
+      expect(result).toMatchObject({ ok: false, stopReason: 'changed-after-audit', audit: 'NOT WEAKENED' });
+      expect(result.detail).toContain('Worktree contents differ');
+      expect(f.calls.some(c => ['add', 'commit', 'push'].some(v => c.args.includes(v)))).toBe(false);
+      expect(git(['diff', '--cached', '--name-only', untracked ? emptyTree : baseline])).toBe('');
+    } else {
+      expect(code).toBe(0); expect(result.ok).toBe(true);
+      expect(f.calls.some(c => c.args.includes('commit'))).toBe(true);
+      expect(git(['diff', '--cached', '--name-only', emptyTree])).toBe('scripts/a.mjs\n');
+      if (link) {
+        expect(git(['ls-files', '--stage'])).toMatch(/^120000 /);
+        expect(git(['show', ':scripts/a.mjs'])).toBe(link);
+      }
+    }
+    released(f); scopeReleased(f);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+it('fails closed when untracked audit entry metadata or symlink targets cannot be read', async () => {
+  for (const failure of ['lstat', 'readlink', 'invalid-target', 'unsupported']) {
+    let audited = false;
+    const f = fixture([
+      ['ls-files', ok('scripts/lib/link\0')],
+      ['codex-direct-task.mjs --review', () => { audited = true; return report(); }],
+    ]);
+    f.io.lstat = () => {
+      if (audited && failure === 'lstat') throw new Error('unreadable metadata');
+      return { isSymbolicLink: () => failure !== 'unsupported' || !audited, isFile: () => false };
+    };
+    f.io.readlink = () => {
+      if (audited && failure === 'readlink') throw new Error('unreadable target');
+      return audited && failure === 'invalid-target' ? undefined : Buffer.from('missing-target');
+    };
+    const { code, result } = await f.run();
+    expect(code).toBe(23); expect(result.stopReason).toBe('changed-after-audit');
+    expect(result.detail).toContain('Cannot read untracked audit entries');
+    expect(f.calls.some(c => ['add', 'commit', 'push'].some(v => c.args.includes(v)))).toBe(false);
+    released(f); scopeReleased(f);
+  }
+});
+it('rechecks the content fingerprint immediately before committing', async () => {
+  let changed = false;
+  const f = fixture([
+    ['diff --quiet', () => { changed = true; return ok(); }],
+    ['diff --binary', () => ok(changed ? 'changed contents at the same path' : 'audited contents')],
+  ]);
+  const { code, result } = await f.run();
+  expect(code).toBe(23); expect(result.stopReason).toBe('changed-after-audit');
+  expect(f.calls.some(c => c.args.includes('add'))).toBe(true);
+  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+  released(f); scopeReleased(f);
+});
+it('fails closed on unreadable or incomplete content fingerprint evidence', async () => {
+  for (const command of ['diff --binary', 'hash-object']) {
+    for (const response of [red(), { status: 0 }, { status: null, error: new Error('output limit') },
+      ...(command === 'hash-object' ? [ok(''), ok('not a hash\n'), ok('a'.repeat(40))] : [])]) {
+      let audited = false;
+      const f = fixture([
+        ['codex-direct-task.mjs --review', () => { audited = true; return report(); }],
+        ['ls-files', ok('scripts/lib/new.mjs\0')],
+        ['diff --cached', ok('scripts/a.mjs\0scripts/lib/new.mjs\0')],
+        [command, () => audited ? response : ok(command === 'hash-object' ? 'a'.repeat(40) + '\n' : 'audited diff')],
+      ]);
+      const { code, result } = await f.run();
+      expect(code).toBe(23); expect(result.stopReason).toBe('changed-after-audit');
+      expect(result.detail).toContain('inspect the lane diff before retrying');
+      expect(f.calls.some(c => ['add', 'commit', 'push'].some(v => c.args.includes(v)))).toBe(false);
       released(f); scopeReleased(f);
     }
   }
