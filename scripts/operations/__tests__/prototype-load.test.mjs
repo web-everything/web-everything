@@ -30,6 +30,8 @@ function fixture(options = {}) {
   let remoteTip = candidateSha;
   let tipReads = 0;
   let establishedAdvanced = false;
+  const lateChanges = [];
+  const registrations = new Map((options.list || []).map(ref => [ref, { ref }]));
   const establishedTips = new Map((options.list || []).filter(ref => ref !== BASE.branch)
     .map((ref, i) => [ref, 'd'.repeat(39) + i.toString(16)]));
   const establishedFetches = new Map();
@@ -57,7 +59,7 @@ function fixture(options = {}) {
     if (cmd === 'plutil') return JSON.stringify({ WorkingDirectory: '/home/test/workspace/review' });
     if (cmd === 'node') {
       const action = args[1], ref = args.find((a) => a.startsWith('--ref='))?.slice(6);
-      if (action === 'list') return options.listRaw ?? JSON.stringify({ list: (options.list || []).map((ref) => ({ ref })) });
+      if (action === 'list') return options.listRaw ?? JSON.stringify({ list: [...registrations.values()] });
       if (action === 'add' && overlaySafetySettings(config.env, { readSettings: () => options.safetySettings || {} }).noPr === 'refuse') {
         return fail(3, JSON.stringify({ check: { ok: false, reason: 'no-pr' }, wouldRegister: false }));
       }
@@ -79,7 +81,7 @@ function fixture(options = {}) {
         return options.addRaw ?? JSON.stringify({ conflictCheck: { ok: true, clean: true, candSha: remoteTip } });
       }
       if (action === 'remove' && options.removeFails === ref) return fail(1);
-      if (action === 'remove' && options.advanceEstablishedAfterRemove) establishedAdvanced = true;
+      if (action === 'remove') registrations.delete(ref);
       return '{}';
     }
     if (args[0] === '-C') {
@@ -120,6 +122,15 @@ function fixture(options = {}) {
       if (args[2] === TREE) return options.advancedContained ? '' : fail(1);
       if ([...establishedTips.values()].includes(args[2])) {
         if (options.refreshError === 'ancestry') return fail(128);
+        if (options.advanceEstablishedAfterContainment) establishedAdvanced = true;
+        // The immutable SHA still passes while the registered branch/entry changes underneath it.
+        if (options.changeAfterContainment) {
+          establishedAdvanced = true;
+          if (options.changeAfterContainment === 'registration replaced') {
+            registrations.set('lane/old', { ref: 'lane/old', addedAt: 'new identity', reason: 'concurrent writer' });
+          }
+          lateChanges.push(options.changeAfterContainment);
+        }
         return '';
       }
       return (options.contained || []).includes(args[2].slice(7)) ? '' : fail(1);
@@ -133,7 +144,7 @@ function fixture(options = {}) {
   const load = createPrototypeLoader({ exec, fs, env, settings: structuredClone(settings), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, sleeps, admitted, reads, cloneRoots, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('prototype-load', () => {
@@ -181,17 +192,15 @@ describe('prototype-load', () => {
   it.each([false, true])('stale-registration names blocker and stops before add (candidate conflict: %s)', async (candidateConflict) => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old', ...(candidateConflict ? [BASE.branch] : [])] }); const r = await f.run(); expect(r.stopReason).toBe('stale-registration'); expect(r.message).toBe('stale-registration: lane/old'); expect(mutations(f, 'add')).toHaveLength(0);
   });
-  it('contained stale registration is replaced by an ordered swap', async () => {
-    const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'] }); const r = await f.run(); expect(r.ok).toBe(true); expect(r.stale).toEqual(['lane/old']); expect(r.removed).toEqual(['lane/old', 'lane/also']);
+  it('contained stale and clean registrations remain after replacement adoption', async () => {
+    const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'] }); const r = await f.run();
+    expect(r).toMatchObject({ ok: false, adopted: true, stopReason: 'swap-remove-failed', detail: 'mutable-registration', removed: [], removedTips: {}, swap: { retained: ['lane/old', 'lane/also'] } });
+    expect(r.stale).toEqual(['lane/old']);
     const index = f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check'));
-    // Both prior registrations remain until the successful (last) adoption probe.
     const adopted = f.calls.findLastIndex((c) => c.args[0] === '-C');
-    const [stale, clean] = mutations(f, 'remove').map((c) => f.calls.indexOf(c));
-    expect(f.calls[stale].args).toContain('--ref=lane/old');
-    expect(stale).toBeGreaterThan(index);
-    expect(stale).toBeGreaterThan(adopted);
-    expect(f.calls[clean].args).toContain('--ref=lane/also');
-    expect(clean).toBeGreaterThan(adopted);
+    expect(adopted).toBeGreaterThan(index);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(r.fallback).toContain('until their changes land on main');
   });
   // Red-team (PR #5832 round 3): a replacement that fails live adoption must not have already
   // removed the working registrations it was meant to replace.
@@ -248,10 +257,30 @@ describe('prototype-load', () => {
     expect(r.fallback).toContain('Retain');
     expect(f.calls.some(c => c.args[0] === '-C')).toBe(true);
   });
-  it('refreshes each registration after earlier removals rather than precomputing the swap', async () => {
-    const f = fixture({ list: ['lane/first', 'lane/old'], contained: ['lane/first', 'lane/old'], advanceEstablishedAfterRemove: true });
-    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', removed: ['lane/first'], swap: { failed: 'lane/old' } });
-    expect(mutations(f, 'remove').map(c => c.args.find(arg => arg.startsWith('--ref=')))).toEqual(['--ref=lane/first']);
+  it('refreshes every registration for diagnosis without removing earlier entries', async () => {
+    const f = fixture({ list: ['lane/first', 'lane/old'], contained: ['lane/first', 'lane/old'], advanceEstablishedAfterContainment: true });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', detail: 'replacement-not-contained', removed: [], swap: { failed: 'lane/old' } });
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it.each([
+    [false, false, 'tip advanced'], [true, false, 'tip advanced'],
+    [false, true, 'tip advanced'], [false, false, 'registration replaced'],
+  ])('retains registrations that change after final containment (merge: %s, already: %s, change: %s)', async (behind, already, changeAfterContainment) => {
+    const f = fixture({ behind, list: [...(already ? [BASE.branch] : []), 'lane/old', 'lane/also'],
+      contained: ['lane/old', 'lane/also'], changeAfterContainment });
+    const r = await f.run();
+    expect(f.lateChanges).toContain(changeAfterContainment);
+    expect(r.adopted).toBe(true);
+    expect(r.ok).toBe(false);
+    expect(r.stopReason).toBe('swap-remove-failed');
+    expect(r.detail).toBe('mutable-registration');
+    expect(r.removed).toEqual([]);
+    expect(r.removedTips).toEqual({});
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
+    expect(f.records[0]).toMatchObject({ ok: false, adopted: true, removed: [], removedTips: {} });
+    expect([...f.registrations.keys()]).toContain('lane/old');
+    if (changeAfterContainment === 'registration replaced') expect(f.registrations.get('lane/old').reason).toBe('concurrent writer');
   });
   it('refreshes containment when the replacement is already registered', async () => {
     const f = fixture({ list: [BASE.branch, 'lane/old'], contained: ['lane/old'], advanceEstablishedBeforeSwap: true });
@@ -265,9 +294,9 @@ describe('prototype-load', () => {
     expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', registered: true, adopted: true, removed: [] });
     expect(mutations(f, 'remove')).toEqual([]);
   });
-  it('permits an advanced registration whose current tip is still contained', async () => {
+  it('retains even an advanced registration whose observed tip is still contained', async () => {
     const f = fixture({ list: ['lane/old'], contained: ['lane/old'], advanceEstablishedDuringAdd: true, advancedContained: true });
-    expect(await f.run()).toMatchObject({ ok: true, adopted: true, removed: ['lane/old'] });
+    expect(await f.run()).toMatchObject({ ok: false, adopted: true, removed: [], detail: 'mutable-registration' });
     expect(f.calls.some(c => c.args.join(' ') === `merge-base --is-ancestor ${TREE} ${SHA}`)).toBe(true);
   });
   it('check-conflict preserves files and conflicting registrations', async () => {
@@ -292,9 +321,9 @@ describe('prototype-load', () => {
     expect((await f.run()).stopReason).toBe('no-ready');
     expect(mutations(f, 'add')).toEqual([]);
   });
-  it('swap-remove-failed leaves remaining entries alone without rollback', async () => {
+  it('swap-remove-failed never invokes the unsafe removal CLI or rolls back adoption', async () => {
     const f = fixture({ list: ['lane/a', 'lane/b', 'lane/c'], contained: ['lane/a', 'lane/b', 'lane/c'], removeFails: 'lane/b' });
-    const r = await f.run(); expect(r.stopReason).toBe('swap-remove-failed'); expect(r.registered).toBe(true); expect(r.removed).toEqual(['lane/a']); expect(r.swap.failed).toBe('lane/b'); expect(mutations(f, 'remove')).toHaveLength(2);
+    const r = await f.run(); expect(r.stopReason).toBe('swap-remove-failed'); expect(r.registered).toBe(true); expect(r.adopted).toBe(true); expect(r.removed).toEqual([]); expect(r.swap.retained).toEqual(['lane/a', 'lane/b', 'lane/c']); expect(mutations(f, 'remove')).toHaveLength(0);
   });
   it('adoption-timeout bounds injected polling and retains registration', async () => {
     const f = fixture({ timeout: true }); const r = await f.run(); expect(r.stopReason).toBe('adoption-timeout'); expect(r.registered).toBe(true); expect(r.adopted).toBe(false); expect(f.sleeps).toEqual([10, 10, 10]);
@@ -381,9 +410,9 @@ describe('prototype-load', () => {
     expect(f.reads).toContain(`${root}/test-clone-key.alerts.jsonl`);
     expect(f.reads).toContain(`${root}/test-clone-key.events.jsonl`);
   });
-  it('uses the existing loader argv contract for checks, list, add and remove', async () => {
+  it('uses the loader argv contract for checks, list and add while refusing unsafe cleanup', async () => {
     const f = fixture({ list: ['lane/old'], contained: ['lane/old'] });
-    expect((await f.run({ why: 'tested change' })).ok).toBe(true);
+    expect(await f.run({ why: 'tested change' })).toMatchObject({ ok: false, adopted: true, detail: 'mutable-registration' });
     const calls = f.calls.filter((c) => c.cmd === 'node').map((c) => c.args.slice(1));
     const clone = '--clone=/home/test/workspace/wev-control';
     expect(calls).toEqual([
@@ -391,7 +420,6 @@ describe('prototype-load', () => {
       ['list', clone, '--json'],
       ['add', clone, '--ref=lane/old', '--check', '--json'],
       ['add', clone, '--ref=lane/new', `--expected-sha=${SHA}`, '--reason=tested change', '--by=tester', '--json'],
-      ['remove', clone, '--ref=lane/old', '--reason=prototype-load: replaced by lane/new'],
     ]);
     const addIndex = f.calls.findIndex((c) => c.cmd === 'node' && c.args.includes('--by=tester'));
     expect(f.calls.slice(addIndex - 2, addIndex).map((c) => c.args)).toEqual([
@@ -411,7 +439,7 @@ describe('prototype-load', () => {
     const f = fixture({ list: [BASE.branch] }); expect((await f.run()).registered).toBe('already'); expect(mutations(f, 'add')).toHaveLength(0); expect(f.calls.at(-1).args[0]).toBe('-C');
   });
   it('dry-run checks original ref and records without push/add/remove or adoption', async () => {
-    const f = fixture({ behind: true, list: ['lane/old'], contained: ['lane/old'] }); const r = await f.run({ dryRun: true }); expect(r.ok).toBe(true); expect(r.wouldMerge.ref).toBe('lane/new-m1'); expect(r.wouldRegister).toBe(true); expect(r.effectiveRef).toBe(BASE.branch); expect(r.wouldRemove).toEqual(['lane/old']);
+    const f = fixture({ behind: true, list: ['lane/old'], contained: ['lane/old'] }); const r = await f.run({ dryRun: true }); expect(r.ok).toBe(true); expect(r.wouldMerge.ref).toBe('lane/new-m1'); expect(r.wouldRegister).toBe(true); expect(r.effectiveRef).toBe(BASE.branch); expect(r.wouldRemove).toEqual([]); expect(r.wouldRetain).toEqual(['lane/old']); expect(r.wouldStopReason).toBe('swap-remove-failed');
     expect(f.calls.some((c) => ['push', 'commit-tree', '-C'].includes(c.args[0]))).toBe(false); expect(mutations(f, 'add')).toHaveLength(0); expect(mutations(f, 'remove')).toHaveLength(0); expect(f.records[0].dryRun).toBe(true);
   });
   it('resolves plist WorkingDirectory with logged source', async () => { const f = fixture(); const r = await f.run({ daemon: 'review' }); expect(r.cloneSource).toBe('plist:com.we.review-daemon'); expect(r.clone).toBe('/home/test/workspace/review'); expect(f.calls[0].cmd).toBe('plutil'); });
@@ -453,5 +481,18 @@ describe('prototype-load', () => {
     run = advance(run, { registry }); run = advance(run, { registry });
     expect(run.verdict).toMatchObject({ ok: true, dryRun: true, registered: false, adopted: false });
     expect(JSON.parse(JSON.stringify(run.verdict)).gate.testsRun).toBe('case-1');
+  });
+  it('publishes incomplete cleanup through the declared operation without losing adoption evidence', async () => {
+    const f = fixture({ list: ['lane/old'], contained: ['lane/old'], changeAfterContainment: 'tip advanced' });
+    const declaration = prototypeLoadOperation();
+    const registry = createRegistry(); registry.register(declaration);
+    const parsed = parseOperationArgv(declaration, [`--branch=${BASE.branch}`, `--sha=${SHA}`, '--daemon=control', '--json']);
+    let run = startRun({ op: declaration.name, id: 'prototype-retention-test', input: parsed.input, registry });
+    run = advance(run, { registry });
+    run = (await applyPendingEffects(run, { store: createMemoryRunStore(), sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => f.run(input) } })).run;
+    run = advance(run, { registry }); run = advance(run, { registry });
+    expect(run.verdict).toMatchObject({ ok: false, adopted: true, stopReason: 'swap-remove-failed', detail: 'mutable-registration', removed: [], removedTips: {} });
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
   });
 });

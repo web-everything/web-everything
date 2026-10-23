@@ -18,10 +18,10 @@ What it does, in order, stopping at the first failure (`stopReason`):
 1. Resolves the daemon to its clone from `scripts/settings/prototype-load.json` (plist WorkingDirectory, with an override for drain's code clone). The source is printed.
 2. Gate: ready record for that exact sha, else refuses `no-ready`.
 3. Keeps main intact: a branch behind main is merged onto main and pushed as `<branch>-m<N>`. Conflicts stop as `behind-main-conflict`; a diff that touches more than the branch's own files stops as `reverts-main`.
-4. Checks against the clone's current registrations with the loader's `add --check`. A registration that conflicts with main is reported as `stale-registration: <name>`; the cure is a rebuilt replacement that contains it (swap), never a removal alone.
+4. Checks against the clone's current registrations with the loader's `add --check`. A registration that conflicts with main is reported as `stale-registration: <name>`; rebase and retest it and include its current tip in a tested replacement, never remove it alone.
 5. Registers the new overlay through `scripts/daemon-overlay.mjs` only. Never `--allow-conflict`, never an operator credential.
 6. Waits (bounded) for the daemon clone to adopt the sha, and reads the rebuild alerts for refusals.
-7. Swap: removes the registrations the new overlay contains only after the daemon adopted it; a refused, timed-out or unverifiable adoption keeps them, including contained stale registrations, and the result names them. If a stale registration blocks adoption, rebase and retest it, include its new tip in a tested replacement, and rerun.
+7. Retains contained registrations even after adoption: their branch tips and identities can change after containment checks, and the loader cannot atomically retire them. Returns `swap-remove-failed` with `detail: mutable-registration` and `adopted: true` for this incomplete cleanup; keep them registered until their changes land on main and normal rebuild cleanup retires them. Dry-run reports `wouldRemove: []`, `wouldRetain`, and `wouldStopReason`. A refused, timed-out or unverifiable adoption also keeps them. If a stale registration blocks adoption, rebase and retest it, include its new tip in a tested replacement, and rerun.
 8. Appends one line to `~/workspace/.operations/coordination/prototype-loads.jsonl` and prints `{ok, daemon, clone, registered, adopted, stopReason}`.
 
 On `behind-main-conflict`: have Codex resolve the conflict, re-run only the touched test files, write a fresh ready record, then run again. Do not re-test anything else.

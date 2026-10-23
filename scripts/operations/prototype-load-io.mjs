@@ -1,7 +1,7 @@
 /**
  * @file Injected prototype admission transaction.
- * WHY (incident 2026-10-22): preserve main, reject incomplete evidence, and remove contained
- * registrations only after the daemon adopts their replacement. Never mutate a daemon worktree.
+ * WHY (incident 2026-10-22): preserve main, reject incomplete evidence, and retain mutable
+ * registrations even after adoption: a containment snapshot cannot authorize deleting a moving ref.
  * Real deps bind only in defaultDeps.
  */
 import { execFileSync } from 'node:child_process';
@@ -142,7 +142,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       if (!out.check.clean) return stop('check-conflict');
       out.swap = { contained };
       if (rows.some((row) => row.ref === out.effectiveRef)) out.registered = 'already';
-      if (input.dryRun) { out.wouldRegister = out.registered !== 'already'; out.wouldRemove = contained; out.ok = true; return out; }
+      if (input.dryRun) {
+        out.wouldRegister = out.registered !== 'already'; out.wouldRemove = []; out.wouldRetain = contained;
+        if (contained.length) out.wouldStopReason = 'swap-remove-failed';
+        out.ok = true; return out;
+      }
       stage = 'register-failed';
       const registeredAt = now();
       stage = 'no-ready';
@@ -160,11 +164,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
           return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
         }
       }
-      const removeContained = (refs) => {
+      const finishSwap = (refs) => {
         for (const ref of refs) {
           // The preview predates the real add (which can fetch newer, cleanly merging tips).
-          // Refresh each registration at its removal boundary; prove containment using the
-          // immutable fetched SHA, never the earlier preview or a subsequently moving ref.
+          // Refresh for diagnostic evidence only. Even this immutable SHA cannot prove that
+          // the mutable registration still names the same work when a later removal executes.
           out.swap = { contained, removed: out.removed, failed: ref };
           requireGit('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
           const currentTip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${ref}^{commit}`);
@@ -173,12 +177,16 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
             return stop('swap-remove-failed', { detail: 'replacement-not-contained', swap: { ...out.swap, tip: currentTip },
               fallback: `Retain the remaining registrations; include their current tips in a new tested replacement and retry.${keptNote()}` });
           }
-          const result = loader('remove', out.clone, ref, [`--reason=prototype-load: replaced by ${out.effectiveRef}`]);
-          if (result.code !== 0) return stop('swap-remove-failed', { swap: { contained, removed: out.removed, failed: ref, result }, fallback: `Inspect the loader removal failure and retry it.${keptNote()}` });
-          out.removed.push(ref);
-          out.removedTips[ref] = currentTip;
         }
         out.swap = { contained, removed: out.removed };
+        // The loader deletes by name, while branch writers do not hold the registry lock.
+        // Neither another fetch nor a registration-identity check can close that race. Until
+        // replacement can atomically retire immutable registrations, retain every entry and
+        // report an incomplete swap rather than claim that an old SHA was safely removed.
+        if (refs.length) return stop('swap-remove-failed', {
+          detail: 'mutable-registration', swap: { ...out.swap, retained: refs },
+          fallback: `The replacement was adopted, but automatic cleanup cannot safely retire mutable registrations. Keep them registered until their changes land on main and normal rebuild cleanup retires them.${keptNote()}`,
+        });
         return null;
       };
       // A stale preview is not proof that the replacement can pass live smoke. Keep every prior
@@ -214,7 +222,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         await sleep(Math.min(config.adoption.pollMs, remaining));
       }
       stage = 'swap-remove-failed';
-      const unswapped = removeContained(contained);
+      const unswapped = finishSwap(contained);
       if (unswapped) return unswapped;
       out.ok = true;
       return out;
