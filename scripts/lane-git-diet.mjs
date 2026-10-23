@@ -13,13 +13,13 @@
  * root, following alternate chains), no `gc.recentObjectsHook` or config-defined `hook.*` (neither obeys the
  * core.hooksPath pin), a common dir that is exactly the lane's own `.git`, a plain ref store (no `<format>://<path>`
  * `extensions.refStorage`; inherited GIT_REFERENCE_BACKEND is scrubbed), no GC repack filtering, and no per-ref
- * `gc.<pattern>.reflogExpire[Unreachable]` (it would override the gc's `never` pins). Per eligible lane, on --apply:
+ * `gc.<pattern>.reflogExpire[Unreachable]`. Per eligible lane, on --apply:
  *   0. CLAIM the lane: write its lease marker with O_EXCL (the same move as `lane-pool trim`), so a concurrent
  *      acquirer sees a live lease and moves on, and we never act on a lane someone else just took; before any write
  *      the marker is re-read (still ours?) and every eligibility input is re-checked;
  *   1. apply the diet config (negative `^refs/heads/ops/*` refspec + unpackLimit=1);
  *   2. delete the stale `refs/remotes/origin/ops/*` tracking refs (readers re-fetch them explicitly by name);
- *   3. `git gc --prune=never` (no cruft pack) with reflog expiry and worktree pruning OFF, a re-check of the claim and
+ *   3. `git repack -A -d -l --unpack-unreachable=never` (no cruft pack), a re-check of the claim and
  *      every input, then `git prune --expire=<1.hour.ago>`: only objects unreachable from every ref, reflog, index
  *      and HEAD, and older than the grace window, are dropped (the old ledger blobs);
  *   4. drop the claim marker (only if it is still ours).
@@ -69,7 +69,7 @@ const duBytes = (p) => { try { return Number(execFileSync('du', ['-sk', p], { en
 const opsRefs = (dir) => git(dir, ['for-each-ref', '--format=%(refname)', 'refs/remotes/origin/ops/']).split('\n').filter(Boolean);
 const gcHooks = (dir) => { try { return git(dir, ['config', '--get-all', 'gc.recentObjectsHook']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
 const gcRepackFilters = (dir) => { try { return git(dir, ['config', '--name-only', '--get-regexp', '^gc\\.repackfilter(to)?$']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
-// `gc.<pattern>.reflogExpire*` beats the generic keys the gc pins to `never`.
+// Keep the conservative GC eligibility checks, even though repack itself performs no expiry.
 const gcReflogPatterns = (dir) => { try { return git(dir, ['config', '--name-only', '--get-regexp', '^gc\\..*\\.reflogexpire(unreachable)?$']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
 // `hook.<name>.command` runs on its `hook.<name>.event` (e.g. reference-transaction on update-ref) whatever core.hooksPath says.
 const configHooks = (dir) => { try { return git(dir, ['config', '--name-only', '--get-regexp', '^hook\\.']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
@@ -226,11 +226,13 @@ for (const n of lanes) {
       const late = recheckUnderClaim(dir);
       if (!late.ok) { rows.push({ lane: n, skipped: `${late.reason} (config + ref cleanup done, gc skipped)` }); continue; }
       // Two steps, so the walk that decides what to delete starts seconds after the last audit, not after a long
-      // repack: the gc deletes nothing (no cruft pack, which `git prune` cannot expire: unreachable objects stay or
-      // become loose), then the claim and every input are re-checked, then `git prune` drops only old loose objects
+      // repack: unreachable objects stay or become loose (no cruft pack, which `git prune` cannot expire), then the
+      // claim and every input are re-checked, then `git prune` drops only old loose objects
       // unreachable from every ref, reflog, index and HEAD. A ref transaction prepared during the repack holds a
       // `*.lock` that check sees. Git has no lock against gc, so prune's own short walk is the remaining window.
-      git(dir, ['-c', 'gc.autoDetach=false', '-c', 'gc.cruftPacks=false', '-c', 'gc.reflogExpire=never', '-c', 'gc.reflogExpireUnreachable=never', '-c', 'gc.worktreePruneExpire=never', '-c', 'gc.rerereResolved=36500', '-c', 'gc.rerereUnresolved=36500', 'gc', '--prune=never', '--quiet'], GC_TIMEOUT_MS);
+      // Call only gc's repack step: even `worktree prune --expire never` can remove an offline worktree with no
+      // index, destroying its HEAD-only reachability root. Repack expires neither worktree metadata nor reflogs.
+      git(dir, ['repack', '-A', '-d', '-l', '--unpack-unreachable=never', '--quiet'], GC_TIMEOUT_MS);
       testPause('before-prune');
       if (readLease(dir)?.holder !== holder) { rows.push({ lane: n, skipped: 'claim lost (lease marker is no longer ours) (repack done, prune skipped)' }); continue; }
       const final = recheckUnderClaim(dir);

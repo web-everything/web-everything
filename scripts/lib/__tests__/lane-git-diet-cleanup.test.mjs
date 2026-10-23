@@ -25,7 +25,7 @@ const IN_FLIGHT_PATHS = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'REBAS
   'rebase-merge/head-name', 'rebase-apply/next', 'sequencer/todo', 'worktrees/w/REBASE_HEAD', 'NOTES_MERGE_PARTIAL', 'NOTES_MERGE_REF', 'NOTES_MERGE_WORKTREE/x'];
 const inFlightName = (path) => path.split('/')[path.startsWith('worktrees/') ? 2 : 0];
 
-describe('CLI gc and prune retention guarantees', () => {
+describe('CLI repack and prune retention guarantees', () => {
   const old = new Date('2000-01-01T00:00:00Z');
   // Each case gets independent, old objects: neither another root nor the prune grace period can save them.
   function fixture(run) {
@@ -88,8 +88,8 @@ describe('CLI gc and prune retention guarantees', () => {
   it.each([
     ['gc.reflogExpire', 'reachable'],
     ['gc.reflogExpireUnreachable', 'unreachable'],
-  ])('%s=never preserves old %s reflog entries despite repo expiry=now', (setting, reachability) => fixture(({ dir, base, retained, graph, apply }) => {
-    // Isolate each pin: the other expiry setting cannot account for this case staying green.
+  ])('repack preserves old %s %s reflog entries despite repo expiry=now', (setting, reachability) => fixture(({ dir, base, retained, graph, apply }) => {
+    // Isolate each expiry setting: the other cannot account for this case staying green.
     git(dir, 'config', 'gc.reflogExpire', 'never');
     git(dir, 'config', 'gc.reflogExpireUnreachable', 'never');
     git(dir, 'config', setting, 'now');
@@ -109,7 +109,7 @@ describe('CLI gc and prune retention guarantees', () => {
     expectGraph(dir, retained);
   }), 60_000);
 
-  it('gc.worktreePruneExpire=never keeps stale linked-worktree metadata and its HEAD-only history despite repo expiry=now', () => fixture(({ dir, root, retained, apply }) => {
+  it('repack keeps stale linked-worktree metadata and its HEAD-only history despite repo expiry=now', () => fixture(({ dir, root, retained, apply }) => {
     const linked = join(root, 'offline-worktree');
     git(dir, 'worktree', 'add', '--detach', linked, retained.commit);
     const admin = git(linked, 'rev-parse', '--absolute-git-dir');
