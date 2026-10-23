@@ -1,4 +1,4 @@
-/** Injected, read-only IO. Clone git calls are exclusively merge-base --is-ancestor. */
+/** Injected, read-only IO. Inside a clone only `git rev-parse HEAD` runs; ancestry is resolved in the primary repo. */
 import { spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -43,8 +43,11 @@ export function createAdoptionMatrixReader({
       const tipSha = fix.sha || tipFor(fix.ref);
       const cells = clones.map((clone, i) => {
         if (!tipSha || !present[i]) return '?';
-        const result = git(['-C', clone.path, 'merge-base', '--is-ancestor', tipSha, 'HEAD']);
-        return result?.status === 0 ? 'yes' : result?.status === 1 ? 'no' : '?';
+        const head = git(['-C', clone.path, 'rev-parse', 'HEAD']);
+        const cloneHead = head?.status === 0 ? String(head.stdout ?? '').trim() : '';
+        if (!cloneHead) return '?';
+        const result = git(['merge-base', '--is-ancestor', tipSha, cloneHead]);
+        return result?.status === 0 ? 'yes' : result?.status === 1 ? 'no' : 'unknown (clone-local build)';
       });
       return { ref: fix.ref, tipSha, cells };
     });
