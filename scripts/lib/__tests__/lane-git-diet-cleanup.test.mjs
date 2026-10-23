@@ -381,6 +381,20 @@ describe('real git: cleanup CLI', () => {
     }
   }, 60_000);
 
+  it('a ref lock that appears after the recheck, just before gc, still skips gc and keeps the old unreachable commit', async () => {
+    const dir = lane(20);
+    git(root, 'clone', '-q', up, dir);
+    const rescue = git(dir, 'commit-tree', git(dir, 'rev-parse', 'HEAD^{tree}'), '-p', 'HEAD', '-m', 'late rescue');
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(join(dir, '.git', 'objects', rescue.slice(0, 2), rescue.slice(2)), old, old);
+    try {
+      const out = await runPaused(20, 'before-gc', () => writeFileSync(join(dir, '.git', 'refs', 'heads', 'late.lock'), `${rescue}\n`));
+      expect(out.rows[0].skipped).toBe('git lock present (refs/heads/late.lock) (config + ref cleanup done, gc skipped)');
+      expect(git(dir, 'cat-file', '-t', rescue)).toBe('commit');
+      expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
   it('loses the O_EXCL claim race to a marker written after the startup check, and leaves that marker', async () => {
     const dir = lane(17);
     git(root, 'clone', '-q', up, dir);

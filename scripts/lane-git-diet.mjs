@@ -111,7 +111,11 @@ const auditGitDir = (dir) => {
     try { entry = lstatSync(join(dir, '.git', path)); } catch (err) { if (err.code === 'ENOENT') return; throw err; }
     if (entry.isSymbolicLink()) { links.push(path); return; } // Never traverse even a dangling link.
     if (path.endsWith('.lock') || path === 'gc.pid') locks.push(path);
-    if (entry.isDirectory()) for (const name of readdirSync(join(dir, '.git', path))) visit(join(path, name));
+    if (!entry.isDirectory()) return;
+    let names;
+    // Git removes empty loose-ref and fan-out dirs as it works: a dir gone since its lstat is simply skipped.
+    try { names = readdirSync(join(dir, '.git', path)); } catch (err) { if (['ENOENT', 'ENOTDIR'].includes(err.code)) return; throw err; }
+    for (const name of names) visit(join(path, name));
   };
   visit('');
   return { symlinkedGitPaths: links, locks };
@@ -197,6 +201,11 @@ for (const n of lanes) {
       }
       const lateBorrowers = borrowerMap().get(real(join(dir, '.git', 'objects'))) || [];
       if (lateBorrowers.length) { rows.push({ lane: n, skipped: `objects borrowed by ${lateBorrowers.join(', ')} (config + ref cleanup done, gc skipped)` }); continue; }
+      // Re-audit right before pruning too: a ref transaction prepared since the recheck holds a `*.lock` naming
+      // objects gc would otherwise drop.
+      testPause('before-gc');
+      const late = cleanupEligibility({ dir, poolRoot: POOL_ROOT, ...auditGitDir(dir), lease: null, nowMs: Date.now() });
+      if (!late.ok) { rows.push({ lane: n, skipped: `${late.reason} (config + ref cleanup done, gc skipped)` }); continue; }
       git(dir, ['-c', 'gc.autoDetach=false', '-c', 'gc.reflogExpire=never', '-c', 'gc.reflogExpireUnreachable=never', '-c', 'gc.worktreePruneExpire=never', '-c', 'gc.rerereResolved=36500', '-c', 'gc.rerereUnresolved=36500', 'gc', `--prune=${PRUNE_EXPIRE}`, '--quiet'], GC_TIMEOUT_MS);
       const after = duBytes(join(dir, '.git'));
       const freed = before - after;
