@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
-import { isCompletedReviewPr } from '../operations/review-pr-completion.mjs';
+import { isCompletedReviewPr, isParkedAtConfirm } from '../operations/review-pr-completion.mjs';
 
 const canonical = value => Array.isArray(value) ? value.map(canonical)
   : value && typeof value === 'object'
@@ -22,7 +22,7 @@ export function verifySavedRedTeamProvenance({ repo, pr, head, path, records, in
       const run = readRun(id, runsDir);
       if (run.op !== 'review-pr' || !sameRepo(run.input?.repo, repo) || Number(run.input?.pr) !== Number(pr)
         || run.findings?.read?.netBasis?.rev !== head) continue;
-      if (!isCompletedReviewPr(run)) { reason = 'review-pr run incomplete'; continue; }
+      if (!isCompletedReviewPr(run) && !isParkedAtConfirm(run)) { reason = 'review-pr run incomplete'; continue; }
       const proof = run.findings?.savedRedTeamResult;
       if (proof?.writer !== 'review-job') { reason = 'missing review-job provenance writer'; continue; }
       if (!Array.isArray(proof.references) || !proof.references.length) { reason = 'missing result reference'; continue; }
