@@ -496,6 +496,17 @@ export function splitFailingChecks(rollup, requiredChecks) {
   return out;
 }
 
+/**
+ * PURE: a review bounce still owes CI repair when a real required check is red (#5729).
+ * Conflict-labelled bounces retain their repair owner; review-gate/merge-gate are intentional holds.
+ */
+export function isBouncedRealRed({ pr, phase, check, requiredChecks }) {
+  return phase === 'bounced' && !labelNames(pr?.labels).includes(CONFLICT_LABEL)
+    && check?.state === 'red'
+    && splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required
+      .some(name => name !== 'review-gate' && name !== 'merge-gate');
+}
+
 /** PURE: settled head CI missing a required job introduced after this PR's base. */
 export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length
@@ -2728,7 +2739,8 @@ export function planReconcile({
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
     };
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red');
+    const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
+    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red') || bouncedRealRed;
     if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
@@ -3157,7 +3169,7 @@ export function planReconcile({
       // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
       // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
       // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
-      if (fixTiming.joinCiAndReview && readiness.ciFailed && readiness.reviewFindings && roundAttempts() >= effectiveRoundCap) {
+      if ((bouncedRealRed || (fixTiming.joinCiAndReview && readiness.ciFailed && readiness.reviewFindings)) && roundAttempts() >= effectiveRoundCap) {
         refuseCapExhausted({ ...withPhase, attempts: roundAttempts(), cap: effectiveRoundCap, capKind: 'fix',
           why: 'joined CI/review repair cannot bypass the review-fix round cap' });
         continue;
