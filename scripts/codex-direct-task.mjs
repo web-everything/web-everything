@@ -1,10 +1,4 @@
 #!/usr/bin/env node
-/* ==================== FOREGROUND ONLY ====================
- * This script is SYNCHRONOUS: it blocks until the delegated Codex task actually completes.
- * Invoke it as a normal FOREGROUND Bash call. NEVER use run_in_background: true.
- * NEVER wrap it in Monitor or a nested wait — there is nothing to watch;
- * the call itself already returns the final result when it finishes.
- * ========================================================= */
 /**
  * codex-direct-task.mjs — a PERSONAL, manually-invoked escape hatch: delegate one real coding task to Codex
  * CLI's agentic (tool-bearing) mode, for a Claude Code operator whose own usage is running low.
@@ -71,12 +65,19 @@
  * live `codex exec` invocation before this file was written, per
  * `we:docs/agent/prototype-based-dev.md`'s "mocking the spawn is the exact seam every real bug lived in" lesson.
  *
+ * Runs inline by default. --detach launches a persistent background job with stdout/stderr files;
+ * wait --job=<id> polls its record for up to 540000 ms (exit 75 means still running).
+ * Records live in CODEX_JOBS_DIR or ~/workspace/.operations/coordination/codex-jobs.
+ *
  * USAGE
  *   node scripts/codex-direct-task.mjs --task="Add a README section documenting X" --dir=<existing checkout>
  *   node scripts/codex-direct-task.mjs --task-file=/path/to/prompt.txt                # no --dir → fresh scratch clone of THIS repo
  *   node scripts/codex-direct-task.mjs --task="…" --dir=<dir> --gate=full --json
  *
- * Flags: --task=<text> | --task-file=<path> (one required), --dir=<existing dir> (default: fresh scratch
+ *   node scripts/codex-direct-task.mjs --task="…" --detach
+ *   node scripts/codex-direct-task.mjs wait --job=<id> [--max-ms=540000]
+ *
+ * Flags: --detach (return a job id immediately), --task=<text> | --task-file=<path> (one required), --dir=<existing dir> (default: fresh scratch
  * clone), --repo-root=<path> (default: this script's own repo root — where a scratch clone is cloned FROM),
  * --model=<model>, --effort=low|medium|high|xhigh|max|ultra, --timeout-ms=<n> (default 30 min), --gate=none|
  * related|standards|full (default full), --ephemeral, --no-stream (still logs to file, just not to stdout too),
@@ -88,19 +89,23 @@
  * Exit status: with --json, a completed run exits 0 and its report carries `exitCode`, `timedOut` and `gate.pass`,
  * the contract machine callers already read (codex-worker, the probation launchers). Without --json, a failed run
  * or a red gate exits 1. A thrown error (including an unavailable self-review) exits 1 in both modes.
+ * Detached job records preserve the task's nonzero code; timeout or a red gate falls back to 1.
  */
 
 import { randomUUID } from 'node:crypto';
+import { withFileLock } from './lib/atomic-json-file.mjs';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
 import { resolveBuildPolicy, appendBuildRequirements } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
 import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import {
-  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync,
+  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
 } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { withCodexUsage } from './lib/codex-usage-ledger.mjs';
 import { admissionLockRoot } from './readiness/heavy-admission.mjs';
@@ -984,11 +989,166 @@ export async function codexDirectTask({
   };
 }
 
+// ── detached jobs ────────────────────────────────────────────────────────────────────────────────
+export const MAX_JOB_WAIT_MS = 540000;
+const jobFs = { mkdirSync, readFileSync, writeFileSync, renameSync, openSync, closeSync };
+export function resolveJobsDir(env = process.env) {
+  return resolve(env.CODEX_JOBS_DIR || join(homedir(), 'workspace', '.operations', 'coordination', 'codex-jobs'));
+}
+function jobRecordPath(jobsDir, id) {
+  if (typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id)) throw new Error('invalid job id');
+  return join(jobsDir, `${id}.json`);
+}
+export function writeJobRecord(record, { jobsDir = resolveJobsDir(), fsDeps = jobFs } = {}) {
+  const path = jobRecordPath(jobsDir, record.id);
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  fsDeps.writeFileSync(tmp, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  fsDeps.renameSync(tmp, path);
+}
+export function readJobRecord(id, { jobsDir = resolveJobsDir(), fsDeps = jobFs } = {}) {
+  const record = JSON.parse(fsDeps.readFileSync(jobRecordPath(jobsDir, id), 'utf8'));
+  if (record.id !== id || !['running', 'done', 'failed'].includes(record.status)
+    || typeof record.resultPath !== 'string' || !record.resultPath
+    || !Number.isInteger(record.pid) || record.pid <= 0
+    || (record.status === 'done' && record.exitCode !== 0)
+    || (record.status === 'running' && record.exitCode !== null)
+    || (record.status === 'failed' && record.exitCode !== null
+      && (!Number.isInteger(record.exitCode) || record.exitCode < 0 || record.exitCode > 255))) {
+    throw new Error('incomplete job record');
+  }
+  return record;
+}
+/** Synchronous read-modify-write: all terminal writers share this per-job lock.
+ * Lock acquisition errors propagate; waiters use a nonblocking attempt and retry on contention.
+ */
+export function updateJobRecord(jobId, update, {
+  jobsDir = resolveJobsDir(), readRecord = id => readJobRecord(id, { jobsDir }),
+  writeRecord = record => writeJobRecord(record, { jobsDir }), withLock = withFileLock, lockOptions = {},
+} = {}) {
+  return withLock(`${jobRecordPath(jobsDir, jobId)}.lock`, () => {
+    const current = readRecord(jobId);
+    if (current.status !== 'running') return current;
+    const updated = update(current);
+    writeRecord(updated);
+    return updated;
+  }, lockOptions);
+}
+export async function startDetachedJob({
+  args = process.argv.slice(2), spawnFn = nodeSpawn, fsDeps = jobFs, now = Date.now,
+  random = randomUUID, jobsDir = resolveJobsDir(), nodePath = process.execPath,
+  scriptPath = fileURLToPath(import.meta.url), env = process.env,
+} = {}) {
+  const startedAt = new Date(now()).toISOString();
+  const id = `${Date.parse(startedAt)}-${random()}`;
+  const recordPath = jobRecordPath(jobsDir, id);
+  fsDeps.mkdirSync(jobsDir, { recursive: true });
+  const resultPath = join(jobsDir, `${id}.result.json`);
+  const fds = [];
+  try {
+    fds.push(fsDeps.openSync(resultPath, 'w', 0o600));
+    fds.push(fsDeps.openSync(join(jobsDir, `${id}.stderr.log`), 'w', 0o600));
+    const child = spawnFn(nodePath, [scriptPath, ...args.filter(a => a !== '--detach' && !a.startsWith('--detach=')), '--json', `--job=${id}`], {
+      detached: true, stdio: ['ignore', ...fds], env: { ...env, CODEX_JOBS_DIR: jobsDir },
+    });
+    await new Promise((resolveSpawn, reject) => {
+      child.once('spawn', resolveSpawn);
+      child.once('error', reject);
+    });
+    const record = { id, pid: child.pid, status: 'running', startedAt, resultPath, exitCode: null };
+    writeJobRecord(record, { jobsDir, fsDeps });
+    child.unref();
+    return { ...record, recordPath };
+  } finally {
+    for (const fd of fds) fsDeps.closeSync(fd);
+  }
+}
+const jobSleep = (ms, options) => delay(ms, undefined, options);
+function jobIsAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (error) {
+    if (error.code === 'EPERM') return true;
+    if (error.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+/** The wait bound is best effort for synchronous fs calls, which cannot be interrupted. */
+export async function waitForJob({
+  jobId, maxMs = MAX_JOB_WAIT_MS,
+  readRecord = id => readJobRecord(id, { jobsDir }),
+  writeRecord = record => writeJobRecord(record, { jobsDir }),
+  isAlive = jobIsAlive, sleep = jobSleep, now = Date.now, pollMs = 1000,
+  jobsDir = resolveJobsDir(),
+  updateRecord = (id, update) => updateJobRecord(id, update, { jobsDir, readRecord, writeRecord, lockOptions: { timeoutMs: 0 } }),
+} = {}) {
+  const requested = Number(maxMs);
+  const budget = Number.isFinite(requested) ? Math.max(0, Math.min(requested, MAX_JOB_WAIT_MS)) : MAX_JOB_WAIT_MS;
+  const deadline = now() + budget;
+  const expired = Symbol('wait budget exhausted');
+  // Synchronous snapshots need no timer (including a zero-budget status check).
+  // Bound asynchronous IO by the SAME deadline, cancelling each losing timer so
+  // an immediate result cannot keep the CLI alive for the rest of the budget.
+  const withinBudget = async operation => {
+    const pending = operation();
+    if (!pending || typeof pending.then !== 'function') return pending;
+    const remaining = deadline - now();
+    if (remaining <= 0) {
+      // Observe late rejections even when the budget was consumed invoking IO.
+      Promise.resolve(pending).catch(() => {});
+      return expired;
+    }
+    const controller = new AbortController();
+    try {
+      return await Promise.race([pending, sleep(remaining, { signal: controller.signal }).then(() => expired)]);
+    } finally {
+      controller.abort();
+    }
+  };
+  let record = { status: 'running', exitCode: null, resultPath: null };
+  const result = () => ({ status: record.status, exitCode: record.exitCode, resultPath: record.resultPath });
+  for (;;) {
+    let snapshot;
+    try { snapshot = await withinBudget(() => readRecord(jobId)); }
+    catch { return { status: 'failed', exitCode: null, resultPath: null, code: 2 }; }
+    if (snapshot === expired) return { ...result(), code: 75 };
+    record = snapshot;
+    if (record.status !== 'running') return { ...result(), code: record.status === 'done' ? 0 : record.exitCode || 1 };
+    if (now() >= deadline) return { ...result(), code: 75 };
+    let alive;
+    try { alive = await withinBudget(() => isAlive(record.pid)); }
+    catch { return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 }; }
+    if (alive === expired) return { ...result(), code: 75 };
+    if (!alive) {
+      if (now() >= deadline) return { ...result(), code: 75 };
+      // The child may have committed its terminal record since our initial read.
+      try {
+        snapshot = await withinBudget(() => updateRecord(jobId, current => ({ ...current, status: 'failed', exitCode: 1,
+          finishedAt: new Date(now()).toISOString() })));
+        if (snapshot === expired) return { ...result(), code: 75 };
+        record = snapshot;
+      } catch (e) {
+        // A contended lock leaves the record running; exit 75 lets the operator wait again.
+        if (!e?.message?.startsWith('withFileLock: timed out waiting for ')) {
+          return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 };
+        }
+      }
+    }
+    if (record.status !== 'running') return { ...result(), code: record.status === 'done' ? 0 : record.exitCode || 1 };
+    const remaining = deadline - now();
+    if (remaining <= 0) return { ...result(), code: 75 };
+    await sleep(Math.min(Math.max(1, pollMs), remaining));
+  }
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────
 /** Process exit status for a completed run; see the file header's "Exit status". PURE. */
 export function cliExitCode(report, { json = false } = {}) {
   if (json) return 0;
   return report.exitCode !== 0 || report.timedOut || !report.gate.pass ? 1 : 0;
+}
+
+/** Internal job records preserve a nonzero task code independently of the foreground contract. */
+function jobExitCode(report) {
+  if (report.exitCode !== 0) return report.exitCode || 1;
+  return report.timedOut || !report.gate.pass ? 1 : 0;
 }
 
 function parseFlags(argv) {
@@ -1002,18 +1162,26 @@ function parseFlags(argv) {
   return flags;
 }
 
+function isWaitInvocation(args) {
+  return args.find(arg => !arg.startsWith('--')) === 'wait';
+}
+
 function repoRootFromCwd() {
   return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
 }
 
 async function main() {
-  const flags = parseFlags(process.argv.slice(2));
+  const args = process.argv.slice(2);
+  const flags = parseFlags(args);
   if (flags.help) {
     console.log(
       'usage: node scripts/codex-direct-task.mjs --task=<text>|--task-file=<path> [--dir=<checkout>] '
       + '[--repo-root=<path>] [--model=<m>] [--effort=low|medium|high|xhigh|max|ultra] [--tier=haiku|sonnet|opus] '
       + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=full|related|none|standards] [--ephemeral] [--clear-rollout-after-run] '
-      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json]\n'
+      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json] [--detach]\n'
+      + '  --detach: launch a detached job; print its id and record path immediately.\n'
+      + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
+      + '  CODEX_JOBS_DIR overrides ~/workspace/.operations/coordination/codex-jobs.\n'
       + '  --review (#4194): a READ-ONLY review task — Codex runs under `-s read-only` and is told to answer in its '
       + 'final message (the report\'s `lastMessage`) instead of editing files.\n'
       + '  --task-kind defaults to worker (review with --review). Model AND effort follow codex.modelByTask; '
@@ -1024,6 +1192,18 @@ async function main() {
       + 'by default (not push-capable) — the real remote is only printed. Pass this to opt back into rewriting '
       + "origin to the real remote so a human can push straight from the clone. No effect with --dir.",
     );
+    return;
+  }
+  if (isWaitInvocation(args)) {
+    const { code, ...result } = await waitForJob({ jobId: flags.job, maxMs: flags['max-ms'] });
+    console.log(JSON.stringify(result));
+    process.exitCode = code;
+    return;
+  }
+  if (flags.detach) {
+    const job = await startDetachedJob({ args });
+    console.log(JSON.stringify({ id: job.id, recordPath: job.recordPath }));
+    process.exitCode = 0;
     return;
   }
   const task = flags['task-file'] ? readFileSync(resolve(flags['task-file']), 'utf8') : flags.task;
@@ -1097,9 +1277,43 @@ async function main() {
     console.log('\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
     console.log('──────────────────────────────────────────────────────────\n');
   }
+  if (flags.job) return jobExitCode(report);
 }
 
 const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  main().catch((e) => { console.error(e); process.exitCode = 1; });
+  const flags = parseFlags(process.argv.slice(2));
+  const internalJob = flags.job && !isWaitInvocation(process.argv.slice(2)) && !flags.detach && !flags.help;
+  let finished = false;
+  const finish = code => {
+    if (!internalJob || finished) return;
+    updateJobRecord(flags.job, record => ({ ...record, status: code === 0 ? 'done' : 'failed', exitCode: code,
+      finishedAt: new Date().toISOString() }));
+    finished = true;
+  };
+  // Synchronous exit bookkeeping also covers uncaught exceptions and explicit process.exit().
+  process.on('exit', code => {
+    try { finish(code); } catch (e) { console.error(`codex-direct-task: job update failed: ${e.message}`); process.exitCode = 1; }
+  });
+  if (internalJob) {
+    for (const signal of ['SIGINT', 'SIGTERM']) {
+      process.once(signal, () => process.exit(signal === 'SIGINT' ? 130 : 143));
+    }
+  }
+  (async () => {
+    if (internalJob) {
+      // The launcher persists the PID after spawn. Do not let a fast child finish before that write.
+      const deadline = Date.now() + 5000;
+      for (;;) {
+        try { if (readJobRecord(flags.job).pid === process.pid) break; } catch { /* launcher is writing */ }
+        if (Date.now() >= deadline) throw new Error('job record was not initialized by launcher');
+        await jobSleep(10);
+      }
+      // Integration-test hook: keep only the --job child alive after its launcher exits.
+      const testDelayMs = Number(process.env.CODEX_DIRECT_TASK_TEST_CHILD_DELAY_MS);
+      if (Number.isFinite(testDelayMs) && testDelayMs > 0) await jobSleep(testDelayMs);
+    }
+    const jobExitCode = await main();
+    finish(jobExitCode ?? process.exitCode ?? 0);
+  })().catch(e => { console.error(e); process.exitCode = 1; });
 }
