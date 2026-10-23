@@ -102,6 +102,9 @@ if (process.env.WE_TEST_SANDBOX !== '0') {
     if (ENV_STRIP_ALLOWLIST.has(key)) continue;
     if (ENV_STRIP_PREFIXES.some((p) => key.startsWith(p))) delete process.env[key];
   }
+  // PR #5729 — a launchd daemon parent (`com.we.*` / `com.plateau.*`) marks every child a gh daemon caller
+  // (`isDaemonCaller`), which turns fail-soft paths into refusals. Ambient daemon state, so stripped like the rest.
+  if (/^(com\.we\.|com\.plateau\.)/.test(process.env.XPC_SERVICE_NAME || '')) delete process.env.XPC_SERVICE_NAME;
 }
 
 // HERMETIC BY DEFAULT (card xcu4cqf — main was red ~5.5 h on 2026-10-08 because a soak scenario read live GitHub
@@ -153,6 +156,8 @@ afterAll(() => killKeepAlives());
 // Admission tests and their child CLIs must not wait on the machine running the suite.
 // Tests of overload set their own reading; production ignores this Vitest-only seam.
 if (process.env.WE_TEST_HOST_LOAD1 === undefined) process.env.WE_TEST_HOST_LOAD1 = '0';
+// verify-admission (2026-10-20) — likewise a fixed, ample host memory headroom (MB), so admission under test never samples the real host.
+if (process.env.WE_TEST_HOST_MEMORY_MB === undefined) process.env.WE_TEST_HOST_MEMORY_MB = '1000000';
 
 // #3383: isolate tests from home AND from each other's durable action holds.
 const ownsCoordinationRoot = process.env.WE_COORDINATION_ROOT === undefined;

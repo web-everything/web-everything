@@ -30,6 +30,7 @@
  *     "dirty" set (#2267's data-loss guard), it never widens what counts as safe to discard.
  */
 import { readGit } from './proc-read.mjs';
+import { laneGitHardeningEnv } from './lane-git-hardening.mjs';
 
 /**
  * The exact live-observed set of scratch files a delivery agent's own arc (`delivery-agent-brief.md`) writes
@@ -199,9 +200,10 @@ export function planLitterCleanup(porcelain, allowlist = LANE_RELEASE_LITTER_ALL
   return { toRemove, leaveDirty };
 }
 
+// The lane's `.git/config` is agent-writable: `status` / `clean` must run no lane-set `core.fsmonitor` (PR #5775).
 const tryGit = (args, cwd) => {
   try {
-    return readGit(args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    return readGit(args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: laneGitHardeningEnv(process.env) }).trim();
   } catch {
     return null;
   }

@@ -71,6 +71,49 @@ function fixture({ pinnedA = false } = {}) {
 
 describe('planRebuild retry pass', () => {
   it.each([
+    { repair: true, explicitA: false, label: 'retries a pin-induced refusal and keeps explicit P (A,P,R)' },
+    { repair: false, explicitA: false, label: 'returns the original pin-induced refusal when retries lose carried A' },
+    { repair: true, explicitA: true, label: 'never disables an explicit pin to escape a refusal' },
+  ])('$label', async ({ repair, explicitA }) => {
+    const f = fixture();
+    const base = f.push('main', f.mainSha, { 'a.txt': 'BASE\n', 'p.txt': 'BASE\n', 'shared.txt': 'BASE\n' });
+    const a0 = f.push('lane/a', base, { 'a.txt': 'OLD-A\n' });
+    const p0 = f.push('lane/p', base, { 'p.txt': 'OLD-P\n' });
+    const overlays = [{ ref: 'lane/a', pinned: explicitA }, { ref: 'lane/p', pinned: true }];
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const args = { git: f.runGit, mainRef: 'origin/main', overlays, edgeResolve: false, stackMode: 'independent' };
+    const live = await planRebuild({ ...args, headSha: base });
+    expect(live.applied.map(a => a.sha)).toEqual([a0, p0]);
+    const main = f.push('main', base, { 'p.txt': 'MAIN\n', 'shared.txt': 'MAIN\n' });
+    const a1 = f.push('lane/a', a0, { 'a.txt': 'NEW-A\n', 'shared.txt': 'NEW-A\n' });
+    const p1 = f.push('lane/p', p0, { 'p.txt': 'MAIN\n', 'a.txt': 'NEW-A\n' });
+    if (repair) {
+      f.push('lane/repair', main, { 'shared.txt': 'BASE\n' });
+      overlays.push({ ref: 'lane/repair' });
+    }
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+
+    const plan = await planRebuild({ ...args, headSha: live.finalSha });
+    if (!repair || explicitA) {
+      expect(plan).toMatchObject({ ok: false, reason: 'pinned-overlay-conflict',
+        detail: { ref: 'lane/p', sha: p1, dropReason: 'conflict', pinnedBy: 'flag' } });
+      expect(plan.alerts).toEqual([expect.objectContaining({ kind: 'overlay-pinned',
+        detail: expect.objectContaining({ ref: 'lane/a', adopted: a0, newTip: a1 }) })]);
+      return;
+    }
+    expect(plan.ok).toBe(true);
+    expect(plan.establishedLost).toEqual([]);
+    expect(plan.applied.find(a => a.ref === 'lane/a')).toMatchObject({ sha: a1 });
+    expect(plan.applied.find(a => a.ref === 'lane/a').pinnedFrom).toBeUndefined();
+    expect(plan.applied.find(a => a.ref === 'lane/p')).toMatchObject({ sha: p1 });
+    expect(plan.applied.find(a => a.ref === 'lane/p').pinnedFrom).toBeUndefined();
+    expect(plan.applied.map(a => a.ref)).toContain('lane/repair');
+    for (const sha of [a0, p0, a1, p1]) {
+      expect(f.runGit(['merge-base', '--is-ancestor', sha, plan.finalSha]).status).toBe(0);
+    }
+  }, 60_000);
+
+  it.each([
     { movedBase: false, label: 'accepts a pin retry whose stack top carries the originally applied base (B,A,C,R)' },
     { movedBase: true, label: 'rejects a pin retry that genuinely drops the originally applied base tip' },
   ])('$label', async ({ movedBase }) => {

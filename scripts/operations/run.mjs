@@ -76,6 +76,8 @@ import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
 import { createMaintenanceSinks } from './maintenance-io.mjs';
 import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
+import { prototypeLoadOperation, PROTOTYPE_LOAD_OP, PROTOTYPE_LOAD_EFFECT } from './prototype-load.mjs';
+import { createPrototypeLoader, defaultDeps as prototypeLoadDeps } from './prototype-load-io.mjs';
 import { collectFreeScope } from './free-scope-io.mjs';
 import { reviewSeatCapsOperation, REVIEW_SEAT_CAPS_OP } from './review-seat-caps.mjs';
 import { readSeatCapUsage } from './review-extra-seats.mjs';
@@ -137,6 +139,9 @@ import { createLandHumanOnlyReader, createLandHumanOnlySinks } from './land-huma
 import { createClearStuckSessionReader, createClearStuckSessionSinks } from './clear-stuck-session-io.mjs';
 import { docketRefreshOperation, DOCKET_REFRESH_OP, finishDocketOutcome } from './docket-refresh.mjs';
 import { createDocketRefreshReader, createDocketRefreshSinks } from './docket-refresh-io.mjs';
+import { prSweepOperation, PR_SWEEP_OP } from './pr-sweep.mjs';
+import { assessPrSweep, finishPrSweep } from './pr-sweep-core.mjs';
+import { createPrSweepReader } from './pr-sweep-io.mjs';
 import { perfSnapshotOperation, PERF_SNAPSHOT_OP, finishPerfSnapshot } from './perf-snapshot.mjs';
 import { createPerfSnapshotReader, createPerfSnapshotSinks } from './perf-snapshot-io.mjs';
 // #3892 (epic #3443 graduation slice) — the SAFE conveyor restart, ported from `origin/lane/mechanical-dispatcher`.
@@ -404,6 +409,13 @@ export const OPERATIONS = Object.freeze({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
   }),
+  [PROTOTYPE_LOAD_OP]: () => ({ declaration: prototypeLoadOperation(),
+    sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => createPrototypeLoader(prototypeLoadDeps())(input) },
+    finish: ({ run, code, lines, json }) => run?.verdict ? {
+      code: run.verdict.ok ? 0 : 1,
+      lines: [JSON.stringify(json ? run.verdict : Object.fromEntries(
+        ['ok', 'daemon', 'clone', 'registered', 'adopted', 'stopReason', ...(run.verdict.stale?.length ? ['stale'] : [])].map((key) => [key, run.verdict[key]])))],
+    } : { code, lines } }),
   // Card xn2wf9t (#3383 follow-up) — the operator's "how close is each non-Claude review seat provider to its
   // own daily call cap" one-liner, `heavy-queue`-style. Read-only, same no-sinks reasoning: every step is
   // `compute`. The real scorecard-store + reservation-ledger read (`readSeatCapUsage`) is bound here, and ONLY here.
@@ -522,6 +534,14 @@ export const OPERATIONS = Object.freeze({
     declaration: docketRefreshOperation({ readFacts: createDocketRefreshReader() }),
     sinks: createDocketRefreshSinks(),
     finish: finishDocketOutcome,
+  }),
+  // Read-only (every step is compute, no sinks): for EVERY open PR, one `waitingOn` state + actor + since, folded from
+  // labels, hold comments, red-team gate records, the drain's skip reasons and live review/fix jobs; STALLED rows carry
+  // the exact next command. `finish` prints the table; `--json` carries the same report as the verdict.
+  [PR_SWEEP_OP]: () => ({
+    declaration: prSweepOperation({ readSweep: createPrSweepReader(), assess: assessPrSweep }),
+    sinks: {},
+    finish: finishPrSweep,
   }),
   // Held card 119 — the repeatable, no-LLM perf snapshot: recomputes the Opus perf sweep's numbers (verify markers,
   // heavy-admission records, build-dispatch tick log, CI via gh, coroner changeRequests, fix outcomes, executor
@@ -715,7 +735,7 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: controlPolicy.zeroWrites || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
@@ -725,7 +745,7 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

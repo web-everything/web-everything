@@ -1331,8 +1331,32 @@ export function acceptLabelDropped({ labels, comments, headSha, now, graceMs = A
  */
 function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
   if (!pr?.referralHold) return false;
+  // stale-hold-resume — `review-referral-hold.mjs#decideReferralHoldAutoResolve` read every live-head finding as ruled.
+  let auto = pr.referralHoldAutoResolve && pr.referralHoldAutoResolve.head === pr.headRefOid ? pr.referralHoldAutoResolve : null;
+  if (auto?.outcome === 'resume') {
+    // All card / not-real: no ruling is owed, so the pause is over and the PR moves to its next step. On a
+    // `review:human` PR whose live head already has its advisory, that step is the human /review, never another panel
+    // (the same-head guard still stands) and never an accept: refuse as the nothing-owed `already-reviewed-head`, which
+    // is not an operator referral hold and posts no "waiting on your ruling" notice. Anything else stays paused.
+    // "Complete" = the live head carries its advisory: the human has what the /review reads. (A head whose one
+    // finished review left no advisory was already resumed above, in planReconcile; a second such run stays paused.)
+    const human = withPhase?.phase === 'needs-human' || (withPhase?.labels ?? []).includes(REVIEW_LABELS.human);
+    const { advisoryIsCurrent } = advisoryHeadState(pr);
+    if (human && advisoryIsCurrent) {
+      refuse('already-reviewed-head', {
+        ...withPhase, ...extra, headSha: pr.headRefOid, referralHoldAutoResolve: { ...auto, next: 'human-review' },
+        why: `referral hold auto-resolved — ${auto.why}; this head's review already ran with those rulings and its advisory is current, so `
+          + 'the next step is the human /review (`review:human` kept); no new panel on an unchanged head',
+      });
+      return true;
+    }
+    auto = { ...auto, outcome: 'stay', why: human ? 'no advisory covers the live head' : 'not a review:human PR, so a re-review of this head would be a second verdict' };
+  }
+  // A `stay` keeps the pause's own words (the daemon logs why it stayed, once per reason).
+  const note = auto?.outcome === 'send-back' ? ` (auto-resolve: ${auto.why}; sending back to the fixer)` : '';
   refuse('review-referrals-pending', {
-    ...withPhase, ...extra, referralHold: pr.referralHold, why: pr.referralHold.why,
+    ...withPhase, ...extra, referralHold: pr.referralHold, why: `${pr.referralHold.why}${note}`,
+    ...(auto ? { referralHoldAutoResolve: auto } : {}),
   });
   return true;
 }
@@ -1999,6 +2023,30 @@ export function planReconcile({
   const dispatch = [];
   const refusals = [];
   const notes = [];
+  // stale-hold-resume — a `review:human` same-head pause whose live-head findings are all ruled, where the head's ONE
+  // finished review left no advisory on the PR (live #5773: its write-up went to a local file only and the label swap
+  // was refused): the review is resumed once. The pause is lifted, so the ordinary advisory review goes out (a
+  // `review:human` PR is never accepted by it, review-pr INVARIANT 2). A head reviewed twice that still has no
+  // advisory keeps the pause, visible to the operator, instead of looping a panel per tick.
+  prs = prs.map(pr => {
+    const auto = pr?.referralHoldAutoResolve;
+    const hold = pr?.referralHold;
+    if (auto?.outcome !== 'resume' || !hold || auto.head !== pr.headRefOid || hold.kind !== 'same-head'
+      || hold.head !== pr.headRefOid || hold.noVerdict || !labelNames(pr.labels).includes(REVIEW_LABELS.human)
+      || advisoryHeadState(pr).advisoryIsCurrent) return pr;
+    // Every attempt since the wake counts, finished or not (a review that dies before `advise` is an attempt too). A
+    // hold that cannot say (a ledger-derived hold carries only finished runs) is never resumed: fail closed.
+    const attempts = Number.isInteger(hold.attemptsSinceWake) ? hold.attemptsSinceWake : null;
+    if (hold.count !== 1 || attempts !== 1) {
+      return { ...pr, referralHoldAutoResolve: { ...auto, outcome: 'stay',
+        why: attempts === null ? 'the pause does not say how many review attempts ran on this head (ledger hold), so the review is not resumed' : `head reviewed ${attempts} time(s) and the PR still carries no advisory for it: the review's write-back fails` } };
+    }
+    const resolved = { ...auto, next: 'advisory-review' };
+    notes.push({ kind: 'referral-hold-auto-resolved', prNumber: Number(pr.number), head: pr.headRefOid, outcome: 'resume',
+      next: 'advisory-review', ...(auto.counts ? { counts: auto.counts } : {}),
+      text: `referral hold auto-resolved — ${auto.why}; the head's one finished review left no advisory on the PR, so it is resumed once (advisory only; \`review:human\` kept)` });
+    return { ...pr, referralHold: null, referralHoldAutoResolve: resolved };
+  });
   // PR number → the live reviewer the joined-fix cap set aside for a CI heal. It still refuses a second review.
   const liveReviewers = new Map();
   const counts = durableCounts && typeof durableCounts === 'object' ? durableCounts : {};
@@ -2044,11 +2092,15 @@ export function planReconcile({
 
     // The evidence every row carries, so a reader never has to go back to the listing to audit a verdict.
     const operatorAnswer = latestOperatorAnswer(pr?.comments);
-    const grants = roundExtensionGrants(pr?.comments, { repo, pr: prNumber });
+    // A standing-ruling grant (automation-posted) counts only under the scope the IO shell verified for this PR
+    // (`we:scripts/conveyor/standing-ruling-io.mjs#enrichPrsWithStandingRulingGrants`); absent, it never counts.
+    const grants = roundExtensionGrants(pr?.comments, { repo, pr: prNumber, standingRuling: pr?.standingRuling ?? null });
     const roundExtensions = grants.reduce((sum, g) => sum + g.by, 0);
     // Each cap uses its own production counter on the thread prefix, never today's durable count map.
     const anchoredCap = (cap, count) => Math.max(cap + roundExtensions,
-      ...grants.map(g => roundExtensionAnchor.value === 'grant'
+      // A standing-ruling (automatic) grant is ALWAYS anchored at the rounds spent when it was posted, whatever the
+      // setting: it answers one limit hit, so it must free a round NOW (max(base + grants, usedAtGrant + by)).
+      ...grants.map(g => (roundExtensionAnchor.value === 'grant' || g.standingRuling)
         ? count({ ...pr, comments: pr.comments.slice(0, g.index) }) + g.by : 0));
     const advisoryFixCapHere = anchoredCap(advisoryFixCap, p => countCompletedAdvisoryEpisodes(p.comments));
     const conflictFixCapHere = anchoredCap(conflictFixCap, p => countStaleConflictFixRounds(p.comments, {

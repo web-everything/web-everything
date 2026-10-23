@@ -29,7 +29,7 @@ import { execFileSync, spawn as spawnChild } from 'node:child_process';
 import { closeSync, openSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { admitCard, cardBatchStateDir } from './card-batch-io.mjs';
+import { admitCard, cardBatchStateDir, sealJobEnv } from './card-batch-io.mjs';
 import { bypassesBatch } from '../lib/card-batch-policy.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { effectiveCardBatchPolicy, formatCardBatchSettings, loadCardBatchSettings, formatPreventionBatchSettings, loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
@@ -67,7 +67,7 @@ export function launchSealJob(statePath, { spawn = spawnChild, open = openSync }
   let log = 'ignore';
   try { log = open(`${statePath}.seal.log`, 'a'); } catch { /* no log; the job still runs */ }
   const child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${statePath}`],
-    { cwd: ROOT, detached: true, stdio: ['ignore', log, log] });
+    { cwd: ROOT, detached: true, stdio: ['ignore', log, log], env: sealJobEnv() });
   if (typeof log === 'number') { try { closeSync(log); } catch { /* the child holds its own copy */ } }
   child.on?.('error', () => {}); // the health-watch tick relaunches a batch whose PR or seal is still owed
   child.unref?.();

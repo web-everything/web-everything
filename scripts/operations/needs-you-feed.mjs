@@ -8,9 +8,12 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
+import { humanReviewHold } from './pr-sweep-core.mjs';
+import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
+import { resolveStallSweepSettings } from '../conveyor/pr-stall-sweep.mjs';
 
 export const CHECKOUT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 function readOptional(path, fallback) {
@@ -63,7 +66,7 @@ const sectionReasons = {
 // Only these kinds can be represented (and therefore resolved by absence) in itemsFromReport.
 // Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
 // a successful queue read supplies no evidence that their independently owned condition resolved.
-const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
+export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -90,8 +93,15 @@ export function sanitizeForFeed(text, max) {
   return String(text).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, max);
 }
 const fieldLimits = { repo: 200, head: 128, kind: 40, was: 40, reason: 100, title: 200, pick: 512, command: 512 };
+function sanitizeValue(value, max) {
+  if (typeof value === 'string') return sanitizeForFeed(value, max);
+  if (Array.isArray(value)) return value.map(entry => sanitizeValue(entry, max));
+  if (value && typeof value === 'object') return sanitizeItem(value);
+  return value;
+}
+// Publication and legacy replay share the same boundary, including evidence arrays and nested records.
 const sanitizeItem = item => Object.fromEntries(Object.entries(item).map(([field, value]) =>
-  [field, typeof value === 'string' ? sanitizeForFeed(value, fieldLimits[field] ?? 512) : value]));
+  [field, sanitizeValue(value, fieldLimits[field] ?? 512)]));
 function fromKey(key) {
   const m = /^(.*)#(\d+)@(.*):([^:]+)$/.exec(key);
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
@@ -132,7 +142,8 @@ export function replay({ path = feedPath(), since = '1970-01-01T00:00:00Z' } = {
 }
 // Keep the original sidecars only for the canonical filename. Overrides get their own namespace,
 // keyed by resolved path, so changing filenames neither inherits open keys nor another stream's cursor.
-function sidecarsOf(path) {
+/** Exported for the PR stall sweep's `stalled` publisher, which shares this state file and its lock. */
+export function sidecarsOf(path) {
   const absolute = checkedFeedPath(path);
   if (basename(absolute) === 'needs-you-events.jsonl') return {
     state: join(dirname(absolute), 'needs-you-feed-state.json'), ack: join(dirname(absolute), 'needs-you-ack'),
@@ -166,8 +177,44 @@ export function monitorCommand(path = feedPath()) {
   path = checkedFeedPath(path);
   return `tail -n 0 -F '${path.replace(/'/g, "'\\''")}' | grep --line-buffered NEEDS-YOU`;
 }
+/**
+ * Drop "your review" items whose LIVE PR no longer qualifies (red team not clear on the live head, sent back, a fix
+ * claim open): operator-queue's report can lag the labels by a tick, and a notification cannot be taken back. A PR
+ * that cannot be read is KEPT (an alert is never suppressed on missing evidence); the failure is logged. Only items
+ * that came from the queue's `ready` section are judged. Returns `{kept, held}`.
+ */
+export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error, deadlineMs = 120000, concurrency = 4,
+  fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } } } = {}) {
+  const ready = new Set((report.ready ?? []).map((r) => `${r.repo}#${r.number ?? r.pr}`));
+  const deadline = Date.now() + deadlineMs;
+  const out = new Array(items.length); const held = [];
+  const judge = async (index) => {
+    const item = items[index];
+    if (item.kind !== 'needs-you' || !ready.has(`${item.repo}#${item.pr}`)) { out[index] = item; return; }
+    // Bounded work: past the pass deadline an item is KEPT unjudged, never dropped on missing evidence.
+    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = item; return; }
+    try {
+      const opts = { cwd, encoding: 'utf8', timeout: 60000, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024 };
+      const view = JSON.parse(String(await gh('gh', ['pr', 'view', String(item.pr), '--repo', item.repo, '--json', 'labels,headRefOid'], opts)));
+      const pages = JSON.parse(String(await gh('gh', ['api', '--paginate', '--slurp', `repos/${item.repo}/issues/${item.pr}/comments?per_page=100`], opts)));
+      if (!Array.isArray(pages) || !view || typeof view.headRefOid !== 'string' || !view.headRefOid.trim()) throw new Error('unreadable live PR');
+      const comments = pages.flat().map((c) => ({ author: { login: c.user?.login ?? '' }, body: c.body ?? '', createdAt: c.created_at }));
+      const reasons = humanReviewHold({ number: item.pr, headRefOid: view.headRefOid, labels: view.labels ?? [], comments }, now,
+        { fixClaimLive: fixClaimLive(item.repo, item.pr) });
+      if (reasons.length) { held.push({ item, reasons }); return; }
+      // Publish the head that was actually checked, not a stale one from the report or a later lookup.
+      out[index] = { ...item, head: view.headRefOid };
+    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = item; }
+  };
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => { while (next < items.length) await judge(next++); }));
+  const kept = out.filter(Boolean);
+  kept.incomplete = items.incomplete;
+  return { kept, held };
+}
 export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled, home = homedir(), now = new Date(), checkoutRoot = CHECKOUT_ROOT,
-  env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true } = {}) {
+  env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true,
+  liveGate = true } = {}) {
   logSettings(settings, log);
   assertProducerCheckout(checkoutRoot, { env, settings });
   let stdout, failedRead = false;
@@ -180,7 +227,9 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   const report = JSON.parse(String(stdout));
   if (!report || typeof report !== 'object' || !Array.isArray(report.ready)) throw new Error('needs-you-feed: invalid operator-queue report');
   if (failedRead) report.incomplete = true;
-  const items = itemsFromReport(report);
+  const gated = !liveGate ? { kept: itemsFromReport(report), held: [] } : await gateReadyItems(itemsFromReport(report), report, { gh, cwd: checkoutRoot, now: new Date(now).getTime(), log });
+  for (const { item, reasons } of gated.held) log(`needs-you-feed ${item.repo}#${item.pr} held back from your review: ${reasons.join('; ')}`);
+  const items = gated.kept;
   // Resolve before locking: gh admission/network waits must not hold the feed-state lock.
   for (const item of items) if (!item.head) {
     try {
@@ -194,12 +243,20 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     }
   }
   const path = checkedFeedPath(settings.path.value), statePath = statePathOf(path);
+  const stallSettings = resolveStallSweepSettings({ env, log: () => {} });
+  // A settings failure cannot establish that the producer was disabled; keep honoring its open items.
+  const honorStalled = stallSettings.settingsUnreadable || (stallSettings.value.mode !== 'off' && stallSettings.value.digest);
   mkdirSync(dirname(statePath), { recursive: true });
   // Serialization prevents concurrent once/loop calls from duplicating the same transition.
   return withFileLock(`${statePath}.lock`, () => {
     if (!owns()) return { lines: [], superseded: true };
     const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
-    const result = diffFeed(prev.openKeys, items, now, { clearKinds: REPORT_KINDS });
+    // The PR stall sweep's open `stalled` item already asks about this PR head: a NEW queue item for it is not
+    // published twice (one already open stays, so it is never cleared by this filter).
+    const stalled = honorStalled ? prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length)) : [];
+    const asked = i => !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
+    const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
+    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;

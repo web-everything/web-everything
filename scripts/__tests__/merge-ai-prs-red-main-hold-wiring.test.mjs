@@ -6,6 +6,7 @@
  * legacy-marker migration) is defended at the `gh pr merge` call: a held PR must never reach it.
  * The child env clears VITEST/WE_UNDER_TEST, because the record readers return null under them.
  */
+import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
@@ -118,7 +119,7 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     const mqSettings = join(dir, 'merge-queue.json');
     writeFileSync(mqSettings, JSON.stringify({ mergeQueue: { enabled: false }, mergeFreshness: { enabled: false } }));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.RMH_HOME; syncBuiltinESMExports();");
-    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, RMH_FIXTURE: fixture, RMH_HOME: dir, WE_COORDINATION_ROOT: coord,
+    const env = { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, RMH_FIXTURE: fixture, RMH_HOME: dir, WE_COORDINATION_ROOT: coord,
       ...(freeze === 'sibling' ? {} : { WE_RED_MAIN_FREEZE_LEGACY: legacyMarker }), WE_MERGE_QUEUE_SETTINGS_FILE: mqSettings,
       // VITEST is cleared below, so pin the merge-delivery tool layer to a file with no `mergeDelivery` (drain-direct), not the live one.
       WE_MERGE_DELIVERY_SETTINGS_FILE: mqSettings,

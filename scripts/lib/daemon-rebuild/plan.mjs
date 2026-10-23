@@ -614,13 +614,13 @@ export async function planRebuild({
         });
         conflictFiles.set(ref, files);
         const refused = dropOrRefuse('conflict', resolution ? { files: resolution.files } : {});
-        if (refused) return refused;
+        if (refused) return retryPins(refused);
         continue;
       }
     }
     if (mt.status !== 0 && !resolution?.ok) {
       const refused = dropOrRefuse('merge-tree-failed');
-      if (refused) return refused;
+      if (refused) return retryPins(refused);
       continue;
     }
 
@@ -651,7 +651,7 @@ export async function planRebuild({
     const newSha = String(ct.stdout ?? '').trim();
     if (ct.status !== 0 || !newSha) {
       const refused = dropOrRefuse('commit-tree-failed');
-      if (refused) return refused;
+      if (refused) return retryPins(refused);
       continue;
     }
     cur = newSha;
@@ -784,47 +784,66 @@ export async function planRebuild({
   const plan = {
     ok: true, mainSha, finalSha: cur, applied, decisions, alerts, inputsKey, upToDate: cur === headSha, establishedLost,
   };
-  // A pin is applied in place, so the ordinary retry never offers its NEW tip a second chance after later overlays.
-  // Keep the combined retry and give every pin an independent retry while retaining its siblings. Also consider
-  // joint subsets: two new tips can need each other while a third overlay must remain pinned. Always compare to
-  // the original plan; accepting an intermediate held plan can lock in a new tip that blocks a carried overlay.
-  const pinnedRefs = decisions.filter((d) => d.pinned).map((d) => d.ref);
-  if (pinnedRefs.length > 0 && noPin.size === 0) {
-    function* retryPinGroups() {
-      yield pinnedRefs;
-      if (pinnedRefs.length === 1) return;
-      for (const ref of pinnedRefs) yield [ref];
-      // Lazy, deterministic combinations; never build a powerset or recursively branch through planners.
-      // All pins and every singleton are always tried. Limit extra joint subsets to 64 replans per tick;
-      // exhaustion conservatively retains the original pins/hold. This exhausts all subsets for <=6 pins.
-      let remaining = 64;
-      for (let size = 2; size < pinnedRefs.length; size++) {
-        const indices = Array.from({ length: size }, (_, i) => i);
-        for (;;) {
-          if (remaining-- === 0) return;
-          yield indices.map((i) => pinnedRefs[i]);
-          let i = size - 1;
-          while (i >= 0 && indices[i] === pinnedRefs.length - size + i) i--;
-          if (i < 0) break;
-          indices[i]++;
-          for (let j = i + 1; j < size; j++) indices[j] = indices[j - 1] + 1;
+  return retryPins(plan);
+
+  // A temporary adopted-head pin can cause a later explicit pin to refuse before the ordinary retry pass.
+  // Explore the same alternatives from that partial pass, but preserve the original refusal if none is safe.
+  async function retryPins(original) {
+    if (!original.ok && original.reason !== 'pinned-overlay-conflict') return original;
+    // A pin is applied in place, so the ordinary retry never offers its NEW tip a second chance after later overlays.
+    // Keep the combined retry and give every pin an independent retry while retaining its siblings. Also consider
+    // joint subsets: two new tips can need each other while a third overlay must remain pinned. Always compare to
+    // the original plan; accepting an intermediate held plan can lock in a new tip that blocks a carried overlay.
+    const explicitRefs = new Set(listed.filter((o) => o?.pinned === true).map((o) => o.ref));
+    const pinnedRefs = decisions.filter((d) => d.pinned && !explicitRefs.has(d.ref)).map((d) => d.ref);
+    if (pinnedRefs.length > 0 && noPin.size === 0) {
+      function* retryPinGroups() {
+        yield pinnedRefs;
+        if (pinnedRefs.length === 1) return;
+        for (const ref of pinnedRefs) yield [ref];
+        // Lazy, deterministic combinations; never build a powerset or recursively branch through planners.
+        // All pins and every singleton are always tried. Limit extra joint subsets to 64 replans per tick;
+        // exhaustion conservatively retains the original pins/hold. This exhausts all subsets for <=6 pins.
+        let remaining = 64;
+        for (let size = 2; size < pinnedRefs.length; size++) {
+          const indices = Array.from({ length: size }, (_, i) => i);
+          for (;;) {
+            if (remaining-- === 0) return;
+            yield indices.map((i) => pinnedRefs[i]);
+            let i = size - 1;
+            while (i >= 0 && indices[i] === pinnedRefs.length - size + i) i--;
+            if (i < 0) break;
+            indices[i]++;
+            for (let j = i + 1; j < size; j++) indices[j] = indices[j - 1] + 1;
+          }
         }
       }
+      for (const refs of retryPinGroups()) {
+        const alt = await planRebuild({
+          git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
+          keepIndependent, noPin: new Set(refs),
+        });
+        if (!alt.ok || alt.establishedLost.length > 0) continue;
+        const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));
+        if (!original.ok) {
+          // Never accept a plan that discards a flag-pinned overlay, including one after the refusal point.
+          // An explicit pin may survive at its adopted head, through a stack top, or already in main.
+          const keepsExplicit = [...explicitRefs].every((ref) => {
+            if (altApplied.has(ref)) return true;
+            const sha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
+            return !!sha && git(['merge-base', '--is-ancestor', sha, alt.finalSha]).status === 0;
+          });
+          if (keepsExplicit) return alt;
+          continue;
+        }
+        // A retried stack top can carry an original base without its own applied row (or at a newer sha).
+        // Retain that plan only with ancestry proof for the original head; a genuinely dropped head still fails.
+        if (refs.every((ref) => altApplied.has(ref) && !altApplied.get(ref).pinnedFrom)
+          && applied.every((a) => (altApplied.has(a.ref)
+            && (a.pinnedFrom || (!altApplied.get(a.ref).pinnedFrom && altApplied.get(a.ref).sha === a.sha)))
+            || git(['merge-base', '--is-ancestor', a.sha, alt.finalSha]).status === 0)) return alt;
+      }
     }
-    for (const refs of retryPinGroups()) {
-      const alt = await planRebuild({
-        git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-        keepIndependent, noPin: new Set(refs),
-      });
-      if (!alt.ok || alt.establishedLost.length > 0) continue;
-      const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));
-      // A retried stack top can carry an original base without its own applied row (or at a newer sha).
-      // Retain that plan only with ancestry proof for the original head; a genuinely dropped head still fails.
-      if (refs.every((ref) => altApplied.has(ref) && !altApplied.get(ref).pinnedFrom)
-        && applied.every((a) => (altApplied.has(a.ref)
-          && (a.pinnedFrom || (!altApplied.get(a.ref).pinnedFrom && altApplied.get(a.ref).sha === a.sha)))
-          || git(['merge-base', '--is-ancestor', a.sha, alt.finalSha]).status === 0)) return alt;
-    }
+    return original;
   }
-  return plan;
 }

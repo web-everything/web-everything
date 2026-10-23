@@ -79,7 +79,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
-import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
+import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
@@ -90,6 +90,8 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
 import { parseEscalationReason } from '../../scripts/review-detail.mjs';
 import { dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
+import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
+import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
@@ -204,8 +206,15 @@ export function operatorHoldsFromPlan(plan) {
   for (const row of Array.isArray(plan?.refusals) ? plan.refusals : []) {
     const prNumber = Number(row?.prNumber);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue;
-    for (const kind of [row?.kind, row?.reviewRefusal?.kind]) {
-      if (OPERATOR_HOLD_KINDS.includes(kind)) seen.set(`${prNumber}|${kind}`, { prNumber, kind });
+    for (const refusal of [row, row?.reviewRefusal]) {
+      const kind = refusal?.kind;
+      if (!OPERATOR_HOLD_KINDS.includes(kind)) continue;
+      // A referral persist that failed with retries left is still owned by automation (it resumes on its own at the
+      // hold's `retryAt`), so it is not yet waiting on a person; only an exhausted budget is (live #5752).
+      const hold = refusal.referralHold;
+      if (kind === 'review-referrals-pending' && hold?.persistenceFailed === true && hold.exhausted === false
+        && Number.isFinite(hold.retryAt)) continue;
+      seen.set(`${prNumber}|${kind}`, { prNumber, kind });
     }
   }
   return [...seen.values()].sort((a, b) => a.prNumber - b.prNumber || a.kind.localeCompare(b.kind));
@@ -371,6 +380,11 @@ export function runReviewTick({
   refreshScopeBloat = null,
   postRefreshMarker = null,
   acquirableLanes = () => Infinity,
+  // verify-admission (2026-10-20) — host-level admission for new review sessions: `() => {admitted, reason,
+  // maxPerTick?}`. Not admitted ⇒ nothing is dispatched this tick (every review stays owed: queued, never dropped);
+  // admitted ⇒ at most `maxPerTick` new sessions. The default admits everything so pure-function callers are unchanged;
+  // the real daemon wires {@link defaultReviewHostAdmission} (host load + memory headroom, cascade-sourced).
+  hostAdmission = () => ({ admitted: true, reason: 'not checked', maxPerTick: Infinity }),
   // EMERGENCY 2026-10-20 — `{left:number}` shared by every repo of one daemon tick (see
   // {@link liveReviewRoundBudget}); `null` (the default) never caps, so pure-function callers are unchanged.
   liveReviewBudget = null,
@@ -406,6 +420,11 @@ export function runReviewTick({
   // existing caller unchanged; the real daemon wires `promoteDraftsGuarded`. `notePromotions` reports the rows.
   promoteDrafts = null,
   notePromotions = null,
+  // #5771 — `({repo, pr, headSha}) => {ok, reason}`: execute this pass's `restore-review-label` stale-accept rows through
+  // the guarded re-arm, then re-plan so the new head's review goes out THIS pass. `null` (the default) keeps every
+  // existing caller unchanged; the real daemon wires `rearmStaleAcceptanceGuarded`. `noteRearms` reports the rows.
+  rearmStaleAccepts = null,
+  noteRearms = null,
   onPlan = null,
   // One-line failure causes (status sweep / status tag). The real daemon wires `log.error`; tests inject a spy.
   log = () => {},
@@ -526,6 +545,17 @@ export function runReviewTick({
     replanError = out.replanError ?? null;
     if (out.promotions.length) { try { notePromotions?.({ repo, promotions: out.promotions, replanError: out.replanError }); } catch { /* report only */ } }
   }
+  if (typeof rearmStaleAccepts === 'function') {
+    const out = rearmStaleAcceptsThenReplan({
+      plan, rawPrs, repo, rearm: rearmStaleAccepts,
+      replan: (prs) => (sharedReads && prs
+        ? reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => rawAgents })
+        : reconcile({ repo, defaultBranch })),
+    });
+    ({ plan, rawPrs } = out);
+    replanError = replanError ?? out.replanError ?? null;
+    if (out.rearms.length) { try { noteRearms?.({ repo, rearms: out.rearms, replanError: out.replanError }); } catch { /* report only */ } }
+  }
   try { onPlan?.({ repo, plan, rawPrs }); } catch { /* observation never breaks a tick */ }
   // Captured at plan completion, never at log-read time. Only a plan that survived (re)planning is evidence.
   const operatorHolds = replanError ? null : { observedAt: now(), holds: operatorHoldsFromPlan(plan) };
@@ -572,6 +602,11 @@ export function runReviewTick({
   reviews.splice(0, reviews.length, ...orderReviewsForDispatch(reviews, { labelsByPr, plan }));
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
+  let host = { admitted: true, maxPerTick: Infinity };
+  if (!paused && reviews.length) {
+    try { host = hostAdmission() ?? host; } catch (e) { host = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
+  }
+  const hostLimit = !host.admitted ? 0 : Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : Infinity;
   const remainingReviewCapacity = () => liveReviewBudget && Number.isFinite(liveReviewBudget.left)
     ? Math.max(0, liveReviewBudget.left) : Infinity;
   const dispatchable = [];
@@ -622,7 +657,7 @@ export function runReviewTick({
   // and `onTick` reads both shapes.
   const notStarted = [];
   for (const d of reviews) {
-    if (paused || occupiedLanes >= acquirable || remainingReviewCapacity() <= 0) break;
+    if (paused || !host.admitted || occupiedLanes >= hostLimit || occupiedLanes >= acquirable || remainingReviewCapacity() <= 0) break;
     dispatchable.push(d);
     // Reserve only this start. A confirmed refusal releases the seat for the next PR (including later
     // repos). A throw may follow a successful spawn, so its reservation must remain until the next ps read.
@@ -653,8 +688,10 @@ export function runReviewTick({
         ...(result?.mode ? { mode: result.mode } : {}), ...(Number.isInteger(result?.jobPid) ? { jobPid: result.jobPid } : {}),
       });
       occupiedLanes++;
+      if (typeof host.take === 'function') host.take(1);
     } catch (e) {
       occupiedLanes++;
+      if (typeof host.take === 'function') host.take(1);
       failed.push({ prNumber: d.prNumber, error: String((e && e.message) || e).split('\n')[0] });
       continue; // no round tag when the dispatch result is unknown
     }
@@ -664,15 +701,19 @@ export function runReviewTick({
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
   const liveCap = remainingReviewCapacity();
-  const capBound = !paused && liveCap < acquirable - occupiedLanes;
+  const hostBound = !paused && (!host.admitted || (hostLimit < acquirable && hostLimit - occupiedLanes <= liveCap));
+  const capBound = !paused && !hostBound && liveCap < acquirable - occupiedLanes;
   const deferredTotal = reviews.length - dispatchable.length;
+  const deferredForHost = hostBound ? deferredTotal : 0;
   const deferredForCap = capBound ? deferredTotal : 0;
-  const deferredForLanes = paused || capBound ? 0 : deferredTotal;
+  const deferredForLanes = paused || hostBound || capBound ? 0 : deferredTotal;
   const deferredForAuth = paused ? deferredTotal : 0;
   const deferReason = paused ? 'review owed, but dispatch is paused (Claude login)'
+    : hostBound ? `review owed, but held by host admission (${host.reason ?? 'per-tick dispatch budget exhausted'})`
     : capBound ? `review owed, but held by the live-review cap (${liveReviewBudget?.reason ?? `maxLiveReviewRounds, ${liveCap} left`}; ${acquirable} lane(s) acquirable)`
       : `review owed, but no acquirable lane this tick (${acquirable} acquirable)`;
   if (deferredForCap && liveReviewBudget?.reason) process.stderr.write(`review-daemon: ${deferredForCap} owed review(s) queued — ${liveReviewBudget.reason}\n`);
+  if (deferredForHost) process.stderr.write(`review-daemon: ${deferredForHost} owed review(s) queued — ${deferReason}\n`);
   if (poolExhaustion && !paused) {
     try {
       if (acquirable === 0 && deferredForLanes > 0) poolExhaustion.exhausted({ repo, lanePoolRepo: poolExhaustionLanePoolRepo(repo), deferred: deferredForLanes });
@@ -720,7 +761,7 @@ export function runReviewTick({
       prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused, deferReason,
     }),
     reconcileError: null, deferredForLanes, deferredForCap, deferredForCapReason: deferredForCap ? (liveReviewBudget?.reason ?? null) : null,
-    deferredForAuth, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
+    deferredForAuth, deferredForHost, operatorHolds, staleStatusSwept, staleConflictStatusCleared,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
     ...(scopeBloatRefreshed.length ? { scopeBloatRefreshed } : {}),
@@ -774,6 +815,21 @@ export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
  *     flagged?:string[], flagReason?:string, error?:string, fetchError?:string, repo:string}>,
  *   holdReconcileFailed:Array<{repo:string, error:string}>}}
  */
+/** Wrap a host admission so it is evaluated once and its `maxPerTick` is a budget shared by every caller: each
+ *  call returns the SAME verdict with what is left, and `take(n)` spends it. A throwing check fails closed. */
+export function sharedHostBudget(hostAdmission) {
+  let verdict = null;
+  let left = 0;
+  return () => {
+    if (!verdict) {
+      try { verdict = hostAdmission() ?? { admitted: false, reason: 'host admission returned nothing' }; }
+      catch (e) { verdict = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
+      left = verdict.admitted ? (Number.isFinite(verdict.maxPerTick) && verdict.maxPerTick >= 1 ? verdict.maxPerTick : Infinity) : 0;
+    }
+    return { ...verdict, maxPerTick: left, take: (n) => { left = Math.max(0, left - n); } };
+  };
+}
+
 export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
@@ -784,6 +840,9 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   const authGate = authGateOverride ? authGateOverride()
     : (tick === runReviewTick ? planClaudeAuthDispatchGate() : { paused: false, reason: null });
   const perRepoMs = {};
+  // verify-admission (audit) — ONE host verdict and ONE dispatch budget per daemon tick, shared by every repo, so
+  // the per-tick cap is host-wide (never cap × repos).
+  if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission);
   const perRepo = forEachRepo(repos, (repo) => {
     const started = Date.now();
     try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }
@@ -1134,6 +1193,45 @@ export function priorityNamesForLiveProcessPrs(liveProcessPrs) {
     }
   }
   return names;
+}
+
+/** verify-admission (2026-10-20) — the real daemon's review host admission: the shared background-work check
+ *  (we:scripts/lib/host-load.mjs — host load per core, then free memory + swap headroom) plus the per-tick
+ *  dispatch cap, all from the host-overload cascade (sources logged by the loader). Fails closed: an unreadable
+ *  policy or host reading admits nothing, so owed reviews wait for the next tick. */
+export function defaultReviewHostAdmission({ env = process.env, admission = hostLoadAdmission, loadPolicy = loadHostOverloadSettings } = {}) {
+  let policy;
+  try { policy = loadPolicy({ env }); } catch (e) { return { admitted: false, reason: `host policy unreadable: ${String(e?.message ?? e).split('\n')[0]}` }; }
+  const verdict = admission({ policy, env, interactive: false });
+  return { ...verdict, maxPerTick: policy.settings.host.maxReviewDispatchPerTick };
+}
+
+/** The real effects the CLI daemon's review pass runs with (the default `runReview` of {@link buildCliDaemonEffects}
+ *  spreads these under its per-tick opts). Builds nothing that does IO until a tick calls it. */
+export function cliReviewTickOpts({ log = console } = {}) {
+  const factsProvider = withFactsLabels(createGhProvider());
+  return {
+    log: line => log.error(line),
+    acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
+    hostAdmission: defaultReviewHostAdmission,
+    liveReviewBudget: liveReviewRoundBudget(),
+    poolExhaustion: DAEMON_POOL_EXHAUSTION,
+    refreshScopeBloat: refreshScopeBloatedPr,
+    postRefreshMarker: defaultPostRebaseComment,
+    promoteDrafts: promoteDraftsGuarded,
+    rearmStaleAccepts: rearmStaleAcceptanceGuarded,
+    noteRearms: ({ repo, rearms, replanError }) => {
+      for (const r of rearms) log.error(`review-daemon: ${repo}#${r.pr} stale-accept re-arm ${r.ok ? 'done' : 'refused'} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
+      if (replanError) log.error(`review-daemon: ${repo} post-re-arm re-plan failed (review goes out next pass): ${replanError}`);
+    },
+    notePromotions: ({ repo, promotions, replanError }) => {
+      for (const r of promotions) log.error(`review-daemon: ${repo}#${r.pr} same-pass promote ${r.action} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
+      if (replanError) log.error(`review-daemon: ${repo} same-pass re-plan failed (review goes out next pass): ${replanError}`);
+    },
+    dispatch: (o) => dispatchReviewByMode({ ...o, ciGate: readReviewCiGateFactsFirst }),
+    tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
+    tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
+  };
 }
 
 /**
@@ -1487,6 +1585,8 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
   reapSessions = defaultReapSessions,
+  // Keep the production runReview closure testable without replacing its executor bindings.
+  tick = runReviewTick,
   // #3383 bug 3 — the real daemon wires the real `acquirableLanes` effect through by default, so production
   // dispatch is bounded by lane reality; `runReviewTick`'s OWN default stays unbounded (`() => Infinity`) so
   // every pre-existing test of it (which fakes reconcile/dispatch directly, never this) is unaffected.
@@ -1496,26 +1596,9 @@ export function buildCliDaemonEffects({
   // C1c — PR facts (head SHA, labels, completed checks) come from the shared store first (`WE_REVIEW_FACTS=0`
   // turns that off). The dispatch gate re-reads the live head after its checks and falls back to GitHub when the
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
-  runReview = (opts) => {
-    const factsProvider = withFactsLabels(createGhProvider());
-    return runReviewTickAllRepos({
-      log: line => log.error(line),
-      acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
-      liveReviewBudget: liveReviewRoundBudget(),
-      poolExhaustion: DAEMON_POOL_EXHAUSTION,
-      refreshScopeBloat: refreshScopeBloatedPr,
-      postRefreshMarker: defaultPostRebaseComment,
-      promoteDrafts: promoteDraftsGuarded,
-      notePromotions: ({ repo, promotions, replanError }) => {
-        for (const r of promotions) log.error(`review-daemon: ${repo}#${r.pr} same-pass promote ${r.action} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
-        if (replanError) log.error(`review-daemon: ${repo} same-pass re-plan failed (review goes out next pass): ${replanError}`);
-      },
-      dispatch: (o) => dispatchReviewByMode({ ...o, ciGate: readReviewCiGateFactsFirst }),
-      tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
-      tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
-      ...opts,
-    });
-  },
+  // The real review-pass effects ({@link cliReviewTickOpts}); injectable so a test can drive this default `runReview`.
+  reviewTickOpts = cliReviewTickOpts,
+  runReview = (opts) => runReviewTickAllRepos({ tick, ...reviewTickOpts({ log }), ...opts }),
   // #xconv1 — the SAME shared-reads optimization `runReview` above opts into, wired the same way for its own
   // separate, additive async stage (see `runConvertAdvisoryTick`'s own doc for why this is not folded into
   // `runReview`/`runReviewTick`).

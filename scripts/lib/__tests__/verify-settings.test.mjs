@@ -11,7 +11,7 @@ import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, veri
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
   matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'], skipLocalForCardOnly: false,
-  revertRed: 'enforce', revertRedSince: '2026-01-01', revertRedMaxFiles: 10, selection: 'pr' };
+  revertRed: 'enforce', revertRedSince: '2026-01-01', revertRedMaxFiles: 10, selection: 'pr', phaseTimeoutMs: 600_000, slotHeartbeatMs: 120_000 };
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function file(contents) {
@@ -56,10 +56,10 @@ describe('verify settings', () => {
       WE_VERIFY_PHASE_ADMISSION: '1', WE_VERIFY_FAST_TARGETS: '0', WE_VERIFY_MATCH_REQUEST_VARIANTS: '1',
       WE_VERIFY_SUPERSEDE: 'any', WE_VERIFY_RESTART_IN_FLIGHT: 'adopt', WE_VERIFY_RUN_ALL_PHASES: '1',
       WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1', WE_VERIFY_ALWAYS_RUN_TESTS: 'x/y.test.mjs, z.test.mjs', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1',
-      WE_VERIFY_REVERT_RED: 'warn', WE_VERIFY_REVERT_RED_SINCE: '2026-10-08', WE_VERIFY_REVERT_RED_MAX_FILES: '7', WE_VERIFY_SELECTION: 'since-last-green' };
+      WE_VERIFY_REVERT_RED: 'warn', WE_VERIFY_REVERT_RED_SINCE: '2026-10-08', WE_VERIFY_REVERT_RED_MAX_FILES: '7', WE_VERIFY_SELECTION: 'since-last-green', WE_VERIFY_PHASE_TIMEOUT_MS: '90000', WE_VERIFY_SLOT_HEARTBEAT_MS: '60000' };
     const values = { relatedMode: 'all', testTimeoutFactor: 2.5, standards: 'auto', phaseAdmission: true, fastTargets: 0,
       matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', relatedMaxTests: 5, relatedDepth: 1, alwaysRunTests: ['x/y.test.mjs', 'z.test.mjs'], skipLocalForCardOnly: true,
-      revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 7, selection: 'since-last-green' };
+      revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 7, selection: 'since-last-green', phaseTimeoutMs: 90_000, slotHeartbeatMs: 60_000 };
     expect(resolveVerifySettings({ fileConfig: custom, env })).toEqual({ values, sources: allSources('env') });
     expect(resolveVerifySettings({ fileConfig: custom, env: { WE_VERIFY_RELATED: 'all' } }))
       .toEqual({ values: { ...custom, relatedMode: 'all' }, sources: { ...allSources('file'), relatedMode: 'env' } });
@@ -100,6 +100,35 @@ describe('verify settings', () => {
         expect(resolveVerifySettings({ fileConfig: config }).sources[key]).toBe('default');
       }
     }
+  });
+
+  it('phaseTimeoutMs: a hard per-phase ceiling, 30 min built in, file/env tunable within 1 s..6 h, never off (a short ceiling only fails closed)', () => {
+    expect(BUILT_IN_VERIFY_SETTINGS.phaseTimeoutMs).toBe(30 * 60_000);
+    expect(resolveVerifySettings({ fileConfig: null, env: { WE_VERIFY_PHASE_TIMEOUT_MS: '120000' } }))
+      .toMatchObject({ values: { phaseTimeoutMs: 120_000 }, sources: { phaseTimeoutMs: 'env' } });
+    for (const bad of ['0', '999', '-1', 'NaN', String(6 * 60 * 60_000 + 1), '1.5e5x']) {
+      expect(resolveVerifySettings({ fileConfig: custom, env: { WE_VERIFY_PHASE_TIMEOUT_MS: bad } }))
+        .toMatchObject({ values: { phaseTimeoutMs: 600_000 }, sources: { phaseTimeoutMs: 'file' } });
+    }
+    for (const bad of [0, null, 'x', 999, 1.5]) expect(validateVerifySettings({ phaseTimeoutMs: bad }).phaseTimeoutMs).toBe(30 * 60_000);
+  });
+
+  it('slotHeartbeatMs: 5 min built in, file/env tunable within 1 s..30 min (half the 60-min slot lease)', () => {
+    expect(BUILT_IN_VERIFY_SETTINGS.slotHeartbeatMs).toBe(5 * 60_000);
+    expect(resolveVerifySettings({ fileConfig: null, env: { WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' } }))
+      .toMatchObject({ values: { slotHeartbeatMs: 1_000 }, sources: { slotHeartbeatMs: 'env' } });
+    for (const bad of ['0', '999', '-1', 'NaN', String(30 * 60_000 + 1), '1.5e5x']) {
+      expect(resolveVerifySettings({ fileConfig: custom, env: { WE_VERIFY_SLOT_HEARTBEAT_MS: bad } }))
+        .toMatchObject({ values: { slotHeartbeatMs: 120_000 }, sources: { slotHeartbeatMs: 'file' } });
+    }
+    for (const bad of [0, null, 'x', 999, 1.5]) expect(validateVerifySettings({ slotHeartbeatMs: bad }).slotHeartbeatMs).toBe(5 * 60_000);
+  });
+
+  it('slotHeartbeatMs: the largest accepted interval is at most half the heavy-admission slot lease', async () => {
+    const { ADMISSION_LEASE_MINUTES } = await import('../../readiness/heavy-admission.mjs');
+    expect(validateVerifySettings({ slotHeartbeatMs: 30 * 60_000 }).slotHeartbeatMs).toBe(30 * 60_000);
+    expect(validateVerifySettings({ slotHeartbeatMs: 30 * 60_000 + 1 }).slotHeartbeatMs).toBe(5 * 60_000);
+    expect(30 * 60_000).toBeLessThanOrEqual(ADMISSION_LEASE_MINUTES * 60_000 / 2);
   });
 
   it('ignores invalid env values, falling back to file then built-ins', () => {

@@ -61,7 +61,7 @@ callers, and it is the main source of both slowness and memory pressure.
 
 **Evidence.**
 - 2026-10-19 22:09: mergeCascade was slow because the red-team evidence read re-read **6,474 run files (1.5 GB)
-  on every call** — about 9 s per call and 200–600 s per pass. Epic `x5wqxb3` (red-team evidence; operator ruled
+  on every call** — about 9 s per call and 200–600 s per pass. Epic `6786` (red-team evidence; operator ruled
   Option A on 2026-10-20 07:31).
 - Four separate speed-ups of that same read were each audited WEAKENED that night (22:22, 22:41, 22:52, 23:00),
   because a per-caller cache has to re-prove freshness on every call. A single writer-kept index removes that

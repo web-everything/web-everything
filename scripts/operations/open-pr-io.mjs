@@ -22,7 +22,7 @@ import { classifySubmit } from './open-pr.mjs';
 import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { buildGhShimSettingsEnv, defaultShimDir, ghShimPathOverride, shimGhPath, resolveOrgAwareShimDir, pathWithOrgAwareShim } from '../lib/gh-app-shim.mjs';
+import { buildGhShimSettingsEnv, defaultShimDir, shimGhPath, resolveOrgAwareShimDir, pathWithOrgAwareShim, isDaemonCaller } from '../lib/gh-app-shim.mjs';
 
 /**
  * #81 — a lane's ref, when the caller did not name one. `lane/<slug>` from the lane lease's `purpose`
@@ -42,23 +42,39 @@ export function deriveLaneRef({
  * #79 — the credential the rest of the conveyor uses. A background subagent has no app-token shim on PATH, so
  * `gh` ran unauthenticated and pr-land reported a false "no credential". Prefer this checkout's shim (App
  * opted in), else the shared shim dir if it exists and is not already first on PATH; else leave env alone.
+ *
+ * Card 6931 — a DAEMON caller never falls back: the guarded shim is its auth boundary, and neither fallback below
+ * carries the refusal guard. A builder that throws (no real gh, failed shim write) or returns no PATH throws here.
  */
 export function resolveGhCredentialEnv({ env = process.env, exists = existsSync, build = buildGhShimSettingsEnv, orgShimDir = () => resolveOrgAwareShimDir({ exists }) } = {}) {
+  const daemon = isDaemonCaller(env);
+  let built = null;
   try {
-    const built = build({ env, pathEnv: env.PATH || '' });
-    if (built?.PATH) return { ...env, ...built };
-  } catch { /* fall through */ }
+    built = build({ env, pathEnv: env.PATH || '' });
+  } catch (e) {
+    if (daemon) throw e;
+  }
+  if (built?.PATH) return { ...env, ...built, PATH: pathWithShimFirst(built.PATH.split(':')[0], env.PATH || '') };
+  if (daemon) throw new Error('gh-shim: refusing daemon gh call without the gh auth guard (the shim builder returned no PATH)');
   // xpd70wx — the target repo may live in ANY constellation org (plateauapp, frontier-ui, web-everything). The
   // legacy shared shim has no owner map and cannot see plateauapp, so prefer the daemons' org-aware shim.
   try {
-    const orgPath = pathWithOrgAwareShim({ pathEnv: env.PATH || '', orgDir: orgShimDir() });
+    const orgDir = orgShimDir();
+    // Already first: keep it there — the legacy branch below must never push it out of first place.
+    if (orgDir && (env.PATH || '').split(':')[0] === orgDir) return env;
+    const orgPath = pathWithOrgAwareShim({ pathEnv: env.PATH || '', orgDir });
     if (orgPath) return { ...env, PATH: orgPath };
   } catch { /* fall through */ }
   const dir = defaultShimDir();
-  if (exists(shimGhPath(dir)) && !(env.PATH || '').split(':').includes(dir)) {
-    return { ...env, PATH: ghShimPathOverride({ dir, currentPath: env.PATH || '' }) };
+  if (exists(shimGhPath(dir)) && (env.PATH || '').split(':')[0] !== dir) {
+    return { ...env, PATH: pathWithShimFirst(dir, env.PATH || '') };
   }
   return env;
+}
+
+/** PURE: `dir` as PATH's first entry, later copies dropped. A shim guards only as the FIRST gh on PATH. */
+function pathWithShimFirst(dir, pathEnv) {
+  return [dir, ...pathEnv.split(':').filter((d) => d && d !== dir)].join(':');
 }
 import { checkPrePrReview, loadPrePrSettings, renderBypassNote, codeSpan } from '../lib/pre-pr-review.mjs';
 import { prepareItemFromRef, preparePrTitle, verifyPreparePr, prepareBatchIds, verifyPrepareBatchPr } from './prepare-pr.mjs';
@@ -110,12 +126,19 @@ function failedGate(e, loadSettings) {
  * The runner the declaration is injected with. ONE spawn; `spawn` is injected so every branch of
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
  */
-export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(), env = resolveGhCredentialEnv(),
+export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(),
+  // Card 6931 — the credential env is resolved per run, inside the runner, so a daemon's guard refusal is a refused
+  // outcome before any gh call (never a crash where run.mjs builds the sinks). An explicit `env` skips resolution;
+  // a caller that injected `spawn` is a rehearsal/test and writes no shim.
+  env: envOpt, resolveEnv = spawn !== spawnSync ? () => process.env : resolveGhCredentialEnv,
   git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
-  dupBornAs = spawn !== spawnSync ? () => [] : (opts) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
+  dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
 } = {}) {
   return ({ argv, skipPrePrReview = '', actor = '', operatorInstruction = '' }) => {
+    let env;
+    try { env = envOpt ?? resolveEnv(); }
+    catch (e) { return { outcome: 'refused', reason: 'gh-auth-guard-unavailable', detail: String(e?.message || e) }; }
     let r;
     let cleanupBody = () => {}; // removes the temp PR-body copy a bypass writes; called on every path out
     const arg = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
@@ -143,7 +166,7 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       let dups = [];
       // xbdzt01 — the scan must skip THIS PR. open-pr always hands pr-land `--ref=` (never `--branch=`), so the head
       // ref is `ref`; reading only `branch` excluded nothing and flagged every card as "also in" the PR itself.
-      try { dups = dupBornAs({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD', branch: arg('ref') || arg('branch') || '' }) || []; } catch { dups = []; }
+      try { dups = dupBornAs({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD', branch: arg('ref') || arg('branch') || '', env }) || []; } catch { dups = []; }
       for (const w of dups) process.stderr.write(`open-pr: WARNING — duplicate card: ${w}\n`);
     }
     let item;
