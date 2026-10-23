@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -37,6 +37,9 @@ describe('cleanupEligibility (pure)', () => {
     expect(cleanupEligibility({ dir: d, poolRoot, nowMs, realCommonDir: `${d}/.git`, realObjectsDir: '/h/workspace/webeverything/.git/objects' }).reason).toMatch(/object store/);
   });
   it('refuses a lane with a gc.recentObjectsHook', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, gcHooks: ['x'] }).ok).toBe(false));
+  it('refuses a lane with config-defined hooks', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, configHooks: ['hook.x.command', 'hook.x.event'] }))
+    .toEqual({ ok: false, reason: 'config-defined hooks configured (hook.x.command, hook.x.event; core.hooksPath does not stop them)' }));
+  it('refuses an unreadable common dir', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, realCommonDir: null }).ok).toBe(false));
   it('refuses a lane with per-ref reflog expiry', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, gcReflogPatterns: ['gc.refs/heads/*.reflogexpire'] }))
     .toEqual({ ok: false, reason: 'per-ref reflog expiry configured (gc.refs/heads/*.reflogexpire)' }));
   it('refuses a live lease', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, lease: fresh, nowMs })).toMatchObject({ ok: false, reason: expect.stringMatching(/live lease/) }));
@@ -242,6 +245,10 @@ describe('real git: cleanup CLI', () => {
     || readFileSync(join(dir, '.git', 'packed-refs'), 'utf8').includes('refs/remotes/origin/ops/review-requests');
   const hook = (dir, ran) => git(dir, 'config', 'gc.recentObjectsHook', `touch '${ran}'`);
   const commondir = (dir, target) => writeFileSync(join(dir, '.git', 'commondir'), `${target}\n`);
+  const configHook = (dir, ran) => {
+    git(dir, 'config', 'hook.attack.event', 'reference-transaction');
+    git(dir, 'config', 'hook.attack.command', `touch '${ran}'`);
+  };
 
   // Each startup refusal through the CLI (both modes): the lane, and any repo it points into, stay untouched.
   it.each([
@@ -260,6 +267,13 @@ describe('real git: cleanup CLI', () => {
     // A per-ref setting beats the generic `never` the gc pins, so it must never reach a gc.
     ['per-ref reflogExpire', (dir) => git(dir, 'config', 'gc.refs/heads/*.reflogExpire', 'now'), 'per-ref reflog expiry configured (gc.refs/heads/*.reflogexpire)'],
     ['per-ref reflogExpireUnreachable', (dir) => git(dir, 'config', 'gc.HEAD.reflogExpireUnreachable', 'now'), 'per-ref reflog expiry configured (gc.HEAD.reflogexpireunreachable)'],
+    // Config-defined hooks ignore core.hooksPath: the ops-ref delete (update-ref) would run this one.
+    ['config-defined reference-transaction hook', (dir, other, ran) => configHook(dir, ran), 'config-defined hooks configured (hook.attack.event, hook.attack.command; core.hooksPath does not stop them)'],
+    // Git keeps the trailing space of a commondir path: `<lane>/.git ` is another store, not the lane's own `.git`.
+    ['trailing-space commondir', (dir) => {
+      cpSync(join(dir, '.git'), join(dir, '.git '), { recursive: true });
+      commondir(dir, join(dir, '.git '));
+    }, /^git common dir is redirected/],
     ['absolute commondir',(dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
     ['relative commondir', (dir, other) => commondir(dir, relative(join(dir, '.git'), join(other, '.git'))), /^git common dir is redirected/],
     ['redirected object store', (dir, other) => {
@@ -325,6 +339,11 @@ describe('real git: cleanup CLI', () => {
     ['gc.recentObjectsHook', (dir, other, ran) => hook(dir, ran), 'gc.recentObjectsHook configured (gc would run it)'],
     ['GC repack filter', (dir) => git(dir, 'config', 'gc.repackFilter', 'blob:none'), /^GC repack filtering configured/],
     ['per-ref reflog expiry', (dir) => git(dir, 'config', 'gc.refs/remotes/*.reflogExpireUnreachable', 'now'), 'per-ref reflog expiry configured (gc.refs/remotes/*.reflogexpireunreachable)'],
+    ['config-defined hook', (dir, other, ran) => configHook(dir, ran), /^config-defined hooks configured \(hook\.attack\./],
+    ['trailing-space common dir', (dir) => {
+      cpSync(join(dir, '.git'), join(dir, '.git '), { recursive: true });
+      commondir(dir, join(dir, '.git '));
+    }, /^git common dir is redirected/],
     ['redirected common dir',(dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
     ['symlinked .git/info', (dir, other) => {
       rmSync(join(dir, '.git', 'info'), { recursive: true, force: true });
@@ -531,6 +550,8 @@ describe('real git: cleanup CLI', () => {
     ['GIT_CONFIG_COUNT / KEY_n / VALUE_n', () => ({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'gc.repackFilter', GIT_CONFIG_VALUE_0: 'blob:none' })],
     ['GIT_CONFIG_GLOBAL', ({ file }) => ({ GIT_CONFIG_GLOBAL: file('[gc]\n\trepackFilter = blob:none\n') })],
     ['GIT_CONFIG_SYSTEM', ({ file }) => ({ GIT_CONFIG_NOSYSTEM: undefined, GIT_CONFIG_SYSTEM: file('[gc]\n\trepackFilter = blob:none\n') })],
+    // A shallow file naming the ops tip makes its history look unreachable to gc.
+    ['GIT_SHALLOW_FILE', ({ file, dir }) => ({ GIT_SHALLOW_FILE: file(`${git(dir, 'rev-parse', 'refs/remotes/origin/ops/review-requests^')}\n`) })],
   ])('inherited %s reaches neither the lane cleanup nor another repo', (_, inherit) => {
     const dir = lane(10);
     const decoy = join(root, 'env-decoy');
@@ -541,7 +562,7 @@ describe('real git: cleanup CLI', () => {
     const decoyBefore = snapshot(decoy);
     try {
       const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=10', '--json'], {
-        env: { ...env, ...inherit({ decoy, file }) }, encoding: 'utf8',
+        env: { ...env, ...inherit({ decoy, file, dir }) }, encoding: 'utf8',
       }));
       expect(out.rows[0]).toMatchObject({ lane: 10, mode: 'apply' });
       expect(git(dir, 'config', '--get-all', 'remote.origin.fetch').split('\n')).toEqual([LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH]);
@@ -549,6 +570,21 @@ describe('real git: cleanup CLI', () => {
       expect(snapshot(decoy)).toEqual(decoyBefore);
     } finally {
       for (const path of [dir, decoy, ...files]) rmSync(path, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('an inherited GIT_REF_PARANOIA=0 cannot make gc skip a broken ref, so the commit only it names survives', () => {
+    const dir = lane(10);
+    git(root, 'clone', '-q', up, dir);
+    const side = git(dir, 'commit-tree', git(dir, 'rev-parse', 'HEAD^{tree}'), '-p', 'HEAD', '-m', 'side work');
+    writeFileSync(join(dir, '.git', 'refs', 'heads', 'bad..name'), `${side}\n`); // an invalid name git refuses to write
+    try {
+      execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=10', '--json'], {
+        env: { ...env, GIT_REF_PARANOIA: '0' }, encoding: 'utf8',
+      });
+      expect(git(dir, 'cat-file', '-t', side)).toBe('commit');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   }, 60_000);
 

@@ -45,15 +45,17 @@ const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
 /** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line. */
 export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => ['-c', `${k}=${v}`]);
 
-/** Inherited git env that redirects the repository or injects config from outside it. */
+/** Inherited git env that redirects the repository, injects config from outside it, or changes what is reachable
+ *  (a shallow or graft file hides history; `GIT_REF_PARANOIA=0` lets gc/prune skip a broken ref's objects). */
 export const GIT_REPO_ENV_KEYS = Object.freeze(['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
   'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES',
   'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL',
-  'GIT_CONFIG_SYSTEM']);
+  'GIT_CONFIG_SYSTEM', 'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE', 'GIT_QUARANTINE_PATH', 'GIT_REF_PARANOIA']);
 
 /**
- * A copy of `env` without {@link GIT_REPO_ENV_KEYS} or any `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`. Run it BEFORE
- * {@link laneGitHardeningEnv}: the pins are appended after any inherited `GIT_CONFIG_COUNT` entries, which would survive.
+ * A copy of `env` without {@link GIT_REPO_ENV_KEYS} or any `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`, with
+ * `GIT_REF_PARANOIA=1` (a broken ref aborts instead of being skipped). Run it BEFORE {@link laneGitHardeningEnv}: the
+ * pins are appended after any inherited `GIT_CONFIG_COUNT` entries, which would survive.
  * @param {Record<string,string|undefined>} env
  * @returns {Record<string,string|undefined>}
  */
@@ -61,6 +63,7 @@ export function scrubGitRepoEnv(env) {
   const out = { ...env };
   for (const key of Object.keys(out)) if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) delete out[key];
   for (const key of GIT_REPO_ENV_KEYS) delete out[key];
+  out.GIT_REF_PARANOIA = '1';
   return out;
 }
 
@@ -130,7 +133,7 @@ export function hardenLaneGitArgs(args) {
 /** Lane-local config keys that name a command, proxy, remote rewrite or credential source and are NOT pinned inert
  *  (a pin to a fixed value would break legitimate auth). A lane whose local/worktree scope defines one is refused
  *  BEFORE the agent runs and again before the push — a baseline an earlier agent poisoned is not trusted. Pure. */
-export const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+)$/i;
+export const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+|hook\..+)$/i;
 export const SAFE_REMOTE_URL_RE = /^(https:\/\/|ssh:\/\/|git@[\w.-]+:)/i;
 export function riskyLaneConfig(listOutput) {
   const parts = String(listOutput ?? '').split('\0');

@@ -92,8 +92,9 @@ it('scrubGitRepoEnv drops every inherited repo redirect and env config source, a
   const inherited = Object.fromEntries([...GIT_REPO_ENV_KEYS.map(key => [key, '/elsewhere']),
     ['GIT_CONFIG_KEY_0', 'gc.reflogExpire'], ['GIT_CONFIG_VALUE_0', 'now'], ['GIT_CONFIG_KEY_99', 'x.y'], ['GIT_CONFIG_VALUE_99', 'z'],
     ['PATH', '/bin'], ['GIT_TERMINAL_PROMPT', '0']]);
-  expect(scrubGitRepoEnv(inherited)).toEqual({ PATH: '/bin', GIT_TERMINAL_PROMPT: '0' });
-  for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM']) {
+  // GIT_REF_PARANOIA=0 would let gc/prune skip a broken ref's objects: it is forced back on.
+  expect(scrubGitRepoEnv(inherited)).toEqual({ PATH: '/bin', GIT_TERMINAL_PROMPT: '0', GIT_REF_PARANOIA: '1' });
+  for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE']) {
     expect(GIT_REPO_ENV_KEYS).toContain(key);
   }
   expect(inherited.GIT_DIR).toBe('/elsewhere'); // a copy, never the caller's object
@@ -102,4 +103,12 @@ it('scrubGitRepoEnv drops every inherited repo redirect and env config source, a
   expect(env.GIT_CONFIG_KEY_0).toBe(LANE_GIT_CONFIG_PINS[0][0]);
   expect(env.GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));
   expect(env.GIT_CONFIG_KEY_99).toBeUndefined();
+});
+it('scrubs config-defined hooks, which run whatever core.hooksPath says', () => {
+  const { dir, git } = repo();
+  git(['config', 'hook.attack.event', 'reference-transaction']);
+  git(['config', 'hook.attack.command', 'touch ran']);
+  expect(riskyLaneConfig(git([...LANE_CONFIG_LIST_ARGS]))).toEqual(['hook.attack.event', 'hook.attack.command']);
+  expect(scrubRiskyLaneConfig(dir, { log: () => {} }).removed).toEqual(['hook.attack.event', 'hook.attack.command']);
+  expect(riskyLaneConfig(git([...LANE_CONFIG_LIST_ARGS]))).toEqual([]);
 });
