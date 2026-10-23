@@ -512,6 +512,68 @@ export function collectAndClearRolloutQuota({
 export const defaultExecFn = (bin, args, opts = {}) =>
   execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 50 * 1024 * 1024, ...opts });
 
+/** Detached gates must yield to signal handlers, including while npm's descendants run. */
+export function detachedGateExecFn(bin, args, opts = {}) {
+  return new Promise((resolveExec, reject) => {
+    const { timeout = DEFAULT_TIMEOUT_MS, maxBuffer = 50 * 1024 * 1024, ...spawnOpts } = opts;
+    const child = nodeSpawn(bin, args, { ...spawnOpts, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const output = { stdout: [], stderr: [] };
+    const sizes = { stdout: 0, stderr: 0 };
+    let failure;
+    let timer;
+    const killGroup = () => {
+      try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    };
+    const removeListeners = () => {
+      clearTimeout(timer);
+      process.removeListener('SIGINT', onSigint);
+      process.removeListener('SIGTERM', onSigterm);
+    };
+    const cancel = signal => {
+      killGroup();
+      removeListeners();
+      process.kill(process.pid, signal);
+    };
+    const onSigint = () => cancel('SIGINT');
+    const onSigterm = () => cancel('SIGTERM');
+    const fail = error => { failure ??= error; killGroup(); };
+    for (const stream of ['stdout', 'stderr']) {
+      child[stream].on('data', chunk => {
+        if (failure) return;
+        const bytes = Buffer.from(chunk);
+        sizes[stream] += bytes.length;
+        if (sizes[stream] > maxBuffer) {
+          fail(new Error(`gate ${stream} exceeded maxBuffer (${maxBuffer} bytes)`));
+        } else output[stream].push(bytes);
+      });
+    }
+    child.once('error', error => {
+      removeListeners();
+      fail(error);
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      removeListeners();
+      const stdout = Buffer.concat(output.stdout).toString('utf8');
+      const stderr = Buffer.concat(output.stderr).toString('utf8');
+      if (failure || code !== 0 || signal) {
+        const error = failure ?? new Error(`gate exited ${signal ?? code}`);
+        reject(Object.assign(error, { stdout, stderr: stderr || error.message }));
+      } else resolveExec(stdout);
+    });
+    // A failed parent can exit before descendants close their inherited pipes.
+    child.once('exit', (code, signal) => { if (code !== 0 || signal) killGroup(); });
+    if (timeout > 0) {
+      timer = setTimeout(() => fail(new Error(`gate timed out after ${timeout}ms`)), timeout);
+      timer.unref();
+    }
+    // Run before the internal-job listener exits and writes the failed job record.
+    process.prependListener('SIGINT', onSigint);
+    process.prependListener('SIGTERM', onSigterm);
+  });
+}
+
 /**
  * Make a fresh, isolated scratch clone of `repoRoot` and install its deps — the default target when the
  * caller names no existing directory. Injectable `execFn`/`mkTempDir`/`existsFn` for testing without a real
@@ -541,6 +603,7 @@ export const defaultExecFn = (bin, args, opts = {}) =>
  * @param {(path: string) => boolean} [opts.existsFn]
  * @param {boolean} [opts.installDeps] - default true; a caller in a hurry for a task that touches no code
  *   dependent on `node_modules` may pass false.
+ * @param {string|Array} [opts.installStdio] - defaults to inherit; JSON callers redirect stdout to stderr.
  * @param {boolean} [opts.wireOriginToRemote] - default false (#3782). When true, opts back into the pre-#3782
  *   behavior: rewrite the clone's `origin` to the real remote so a human can push straight from it. Best-effort
  *   either way — an offline/no-remote `repoRoot` (e.g. a test fixture) just leaves `realOrigin` null.
@@ -553,6 +616,7 @@ export function setupScratchClone({
   execFn = defaultExecFn,
   existsFn = existsSync,
   installDeps = true,
+  installStdio = 'inherit',
   wireOriginToRemote = false,
 } = {}) {
   if (typeof repoRoot !== 'string' || !repoRoot.trim()) {
@@ -578,7 +642,7 @@ export function setupScratchClone({
   }
 
   const depsInstall = installDeps ? planDepsInstall(dest, existsFn) : null;
-  if (depsInstall) execFn(depsInstall.bin, depsInstall.args, { cwd: dest, stdio: 'inherit' });
+  if (depsInstall) execFn(depsInstall.bin, depsInstall.args, { cwd: dest, stdio: installStdio });
   return { dest, cloned: true, depsInstall, realOrigin, originWired };
 }
 
@@ -628,6 +692,7 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
  *   - `'full'` (default for edit tasks): verify-lane whole unit tier plus standards.
  * `full` and `related` need this repo's `scripts/verify-lane.mjs`; a checkout without it (a sibling repo's `--dir`)
  * gets the named failed outcome `unavailable: 'gate-unavailable'`, never a pass.
+ * With `asyncExecFn`, an executed gate returns a Promise; synchronous callers keep the existing contract.
  * @param {object} opts
  * @param {string} opts.dir
  * @param {'none'|'standards'|'related'|'full'} opts.mode
@@ -635,7 +700,7 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
  * @param {(path: string) => boolean} [opts.existsFn]
  * @returns {{ran: boolean, mode: string, steps: {cmd: string, pass: boolean, output: string}[], pass: boolean, unavailable?: string}}
  */
-export function runGate({ dir, mode, execFn = defaultExecFn, env = process.env, existsFn = existsSync }) {
+export function runGate({ dir, mode, execFn = defaultExecFn, asyncExecFn, env = process.env, existsFn = existsSync }) {
   if (mode === 'none' || !mode) return { ran: false, mode: 'none', steps: [], pass: true };
   if (!['full', 'related', 'standards'].includes(mode)) throw new Error('invalid build gate');
   if (mode !== 'standards' && !existsFn(join(dir, 'scripts', 'verify-lane.mjs'))) {
@@ -647,19 +712,19 @@ export function runGate({ dir, mode, execFn = defaultExecFn, env = process.env, 
     : mode === 'related' ? [['node', ['scripts/verify-lane.mjs', 'run']]]
       : [['npm', ['run', 'check:standards']]];
   const gateEnv = mode === 'related' ? { ...env, WE_BUILD_FINAL_GATE: 'related' } : env;
-  const steps = [];
-  for (const [bin, args] of plan) {
-    let output = '';
-    let pass = true;
-    try {
-      output = execFn(bin, args, { cwd: dir, env: gateEnv });
-    } catch (e) {
-      pass = false;
-      output = `${e.stdout ?? ''}${e.stderr ?? e.message ?? ''}`;
-    }
-    steps.push({ cmd: `${bin} ${args.join(' ')}`, pass, output });
+  const [bin, args] = plan[0];
+  const result = (pass, output) => ({ ran: true, mode, pass,
+    steps: [{ cmd: `${bin} ${args.join(' ')}`, pass, output }] });
+  const failed = e => result(false, `${e.stdout ?? ''}${e.stderr ?? e.message ?? ''}`);
+  if (asyncExecFn) {
+    return Promise.resolve().then(() => asyncExecFn(bin, args, { cwd: dir, env: gateEnv }))
+      .then(output => result(true, output), failed);
   }
-  return { ran: true, mode, steps, pass: steps.every((s) => s.pass) };
+  try {
+    return result(true, execFn(bin, args, { cwd: dir, env: gateEnv }));
+  } catch (e) {
+    return failed(e);
+  }
 }
 
 // ── impure: the real codex exec spawn, streaming JSONL to a log file + (optionally) stdout ─────────
@@ -838,11 +903,13 @@ export async function codexDirectTask({
   logFile,
   stream = true,
   installDeps = true,
+  installStdio = 'inherit',
   wireOriginToRemote = false,
   clearRolloutAfterRun = false,
   review = false,
   env = process.env,
   execFn = defaultExecFn,
+  gateExecFn,
   spawnFn = nodeSpawn,
   mkTempDir = (prefix) => mkdtempSync(prefix),
   existsFn = existsSync,
@@ -883,7 +950,7 @@ export async function codexDirectTask({
       throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${repoRoot} does not have; pass --gate=standards or --gate=none`);
     }
     scratch = setupScratchClone({
-      repoRoot, mkTempDir, execFn, existsFn, installDeps, wireOriginToRemote,
+      repoRoot, mkTempDir, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
     });
     targetDir = scratch.dest;
   } else if (!existsFn(targetDir)) {
@@ -918,7 +985,8 @@ export async function codexDirectTask({
   let lastMessage = null;
   try { lastMessage = readFileSync(run.outputLastMessageFile, 'utf8'); } catch { lastMessage = null; }
 
-  let gateResult = review ? runGate({ mode: 'none' }) : runGate({ dir: targetDir, mode: gate, execFn, env, existsFn });
+  const executeGate = () => runGate({ dir: targetDir, mode: gate, execFn, asyncExecFn: gateExecFn, env, existsFn });
+  let gateResult = review ? runGate({ mode: 'none' }) : await executeGate();
   const selfReview = !review && run.code === 0 && !run.timedOut && gateResult.pass ? await runBuildSelfReview({
     policy, dir: targetDir, env, ...(selfReviewFn ? { review: selfReviewFn } : {}),
     readDiff: () => boundedSelfReviewDiff(() => captureDiff({ dir: targetDir, startSha, execFn }).diff),
@@ -933,7 +1001,7 @@ export async function codexDirectTask({
       summary = summarizeEvents(events);
       try { lastMessage = readFileSync(fixed.outputLastMessageFile, 'utf8'); } catch { lastMessage = null; }
     },
-    gate: () => { gateResult = runGate({ dir: targetDir, mode: gate, execFn, env, existsFn }); return gateResult.pass; },
+    gate: async () => { gateResult = await executeGate(); return gateResult.pass; },
   }) : { skipped: true, rounds: 0, notes: [] };
   const diff = captureDiff({ dir: targetDir, startSha, execFn });
 
@@ -1285,6 +1353,8 @@ async function main() {
       logFile: flags.log ? resolve(flags.log) : undefined,
       stream: !flags['no-stream'],
       installDeps: !flags['no-install'],
+      installStdio: flags.json ? ['ignore', 2, 2] : 'inherit',
+      gateExecFn: flags.job ? detachedGateExecFn : undefined,
       wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
       clearRolloutAfterRun: Boolean(flags['clear-rollout-after-run']),
       review: Boolean(flags.review),

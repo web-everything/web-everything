@@ -35,6 +35,7 @@ import {
   parseJsonlEvents,
   summarizeEvents,
   defaultExecFn,
+  detachedGateExecFn,
   setupScratchClone,
   captureDiff,
   runGate,
@@ -674,6 +675,30 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
 });
 
 describe('runGate — none/standards/full, never commits', () => {
+  it.each(['standards', 'related', 'full'])('awaits async %s gate success and failure', async mode => {
+    const execFn = vi.fn(() => { throw new Error('synchronous gate must not run'); });
+    const asyncExecFn = vi.fn(async () => 'gate output');
+    const options = { dir: '/d', mode, execFn, asyncExecFn, existsFn: () => true };
+    expect(await runGate(options)).toMatchObject({ pass: true, steps: [{ output: 'gate output' }] });
+    asyncExecFn.mockRejectedValueOnce(Object.assign(new Error('failed'), { stdout: 'gate failed', stderr: '' }));
+    expect(await runGate(options)).toMatchObject({ pass: false, steps: [{ output: 'gate failed' }] });
+    expect(execFn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: 'success', script: 'console.log("gate output")' },
+    { label: 'failure', script: 'process.exit(7)', rejects: true },
+    { label: 'timeout', script: 'setInterval(() => {}, 1000)', options: { timeout: 100 }, rejects: true },
+    { label: 'output limit', script: 'console.log("x".repeat(4096))', options: { maxBuffer: 1024 }, rejects: true },
+    { label: 'spawn error', bin: 'missing-codex-gate-executable', rejects: true },
+  ])('async gate cleans signal listeners after $label', async ({ script, options, rejects, bin }) => {
+    const counts = ['SIGINT', 'SIGTERM'].map(signal => process.listenerCount(signal));
+    const pending = detachedGateExecFn(bin ?? process.execPath, ['-e', script ?? ''], options);
+    if (rejects) await expect(pending).rejects.toThrow();
+    else expect(await pending).toContain('gate output');
+    expect(['SIGINT', 'SIGTERM'].map(signal => process.listenerCount(signal))).toEqual(counts);
+  });
+
   it('mode "none" runs nothing and passes', () => {
     const execFn = vi.fn();
     const r = runGate({ dir: '/d', mode: 'none', execFn });
@@ -728,6 +753,27 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     };
     return { fn, seen };
   }
+
+  it('awaits the async gate again after a self-review repair', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-regate-'));
+    const { fn: spawnFn } = fakeSpawn('{"type":"thread.started","thread_id":"builder"}\n');
+    const gateExecFn = vi.fn(async () => 'gate output');
+    const selfReviewFn = vi.fn().mockResolvedValueOnce(['repair fixture']).mockResolvedValueOnce([]);
+    const execFn = (bin, args) => {
+      if (bin !== 'git') throw new Error('synchronous gate must not run');
+      return args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
+    };
+    try {
+      const report = await codexDirectTask({ task: 'fixture', dir, gate: 'standards', selfReview: true,
+        stream: false, log: false, execFn, gateExecFn, spawnFn, selfReviewFn,
+        readQuotaFn: () => ({ quota: null, rolloutFile: null }) });
+      expect(gateExecFn).toHaveBeenCalledTimes(2);
+      expect(report.selfReview.rounds).toBe(1);
+      expect(report.gate).toMatchObject({ pass: true, steps: [{ output: 'gate output' }] });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it.each([
     ['SIGINT', false], ['SIGINT', true], ['SIGTERM', false], ['SIGTERM', true],
@@ -1976,7 +2022,9 @@ describe('detached jobs', () => {
     { flags: ['--no-stream'], runCode: 0 },
     { flags: ['--no-stream='], runCode: 0 },
     { flags: [], runCode: 7 },
-  ])('detached CLI writes one JSON report and logs events with $flags and exit $runCode', async ({ flags, runCode }) => {
+    { flags: [], runCode: 0, install: 'ci' },
+    { flags: [], runCode: 0, install: 'install' },
+  ])('detached CLI writes one JSON report and logs events with $flags and exit $runCode and install $install', async ({ flags, runCode, install }) => {
     const preload = join(jobsDir, 'result-preload.mjs');
     const logFile = join(jobsDir, 'events.jsonl');
     writeFileSync(preload, `
@@ -1984,9 +2032,20 @@ describe('detached jobs', () => {
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
       import { join } from 'node:path';
+      import { writeFileSync } from 'node:fs';
       const spawn = cp.spawn;
-      cp.execFileSync = (bin, args) => args.includes('--absolute-git-dir')
-        ? join(process.env.CODEX_JOBS_DIR, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
+      const execFileSync = cp.execFileSync;
+      cp.execFileSync = (bin, args, options) => {
+        if (bin === 'git' && args[0] === 'clone') {
+          const dest = args.at(-1);
+          writeFileSync(join(dest, 'package.json'), '{}');
+          if (${JSON.stringify(install)} === 'ci') writeFileSync(join(dest, 'package-lock.json'), '{}');
+        }
+        if (bin === 'npm') return execFileSync(process.execPath,
+          ['-e', 'console.log("added 1 package"); console.error("installer diagnostic")'], options);
+        return args.includes('--absolute-git-dir')
+          ? join(process.env.CODEX_JOBS_DIR, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
+      };
       cp.spawn = (bin, args, options) => {
         if (bin === process.execPath) return spawn(bin, args, options);
         const child = new EventEmitter();
@@ -2001,7 +2060,8 @@ describe('detached jobs', () => {
       syncBuiltinESMExports();
     `);
     const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
-      '--task=fixture', `--dir=${jobsDir}`, '--gate=none', '--no-self-review', `--log=${logFile}`, ...flags], {
+      '--task=fixture', ...(install ? [`--repo-root=${jobsDir}`] : [`--dir=${jobsDir}`]),
+      '--gate=none', '--no-self-review', `--log=${logFile}`, ...flags], {
       encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
       env: { ...process.env, CODEX_JOBS_DIR: jobsDir, NODE_OPTIONS: `--import=${preload}` },
     });
@@ -2013,13 +2073,78 @@ describe('detached jobs', () => {
         status: runCode === 0 ? 'done' : 'failed', exitCode: runCode, code: runCode,
       });
       expect(readFileSync(logFile, 'utf8')).toContain('{"type":"turn.completed"}');
-      expect(JSON.parse(readFileSync(job.resultPath, 'utf8'))).toMatchObject({
+      const result = JSON.parse(readFileSync(job.resultPath, 'utf8'));
+      expect(result).toMatchObject({
         exitCode: runCode, events: { terminal: 'turn.completed' },
       });
+      if (install) {
+        expect(result.scratch.depsInstall.args).toEqual([install]);
+        expect(readFileSync(join(jobsDir, `${job.id}.stderr.log`), 'utf8')).toContain('added 1 package');
+        rmSync(result.dir, { recursive: true, force: true });
+      }
     } finally {
       try { process.kill(job.pid, 'SIGTERM'); } catch { /* already stopped */ }
     }
   }, 20000);
+
+  it.each(['standards', 'related', 'full'].flatMap(mode => ['SIGINT', 'SIGTERM'].map(signal => ({ mode, signal }))))(
+    'detached CLI cancellation by $signal during $mode gate stops the gate group and records failure', async ({ mode, signal }) => {
+      const preload = join(jobsDir, 'gate-preload.mjs');
+      const worker = join(jobsDir, 'gate-worker.cjs');
+      const ready = join(jobsDir, 'gate.ready');
+      const completed = join(jobsDir, 'gate.completed');
+      weCheckout(jobsDir);
+      writeFileSync(worker, `
+        const { writeFileSync } = require('node:fs');
+        const { spawn } = require('node:child_process');
+        if (process.argv[2] === 'descendant') {
+          writeFileSync(${JSON.stringify(ready)}, String(process.pid));
+          setTimeout(() => writeFileSync(${JSON.stringify(completed)}, 'completed'), 1500);
+        } else {
+          spawn(process.execPath, [__filename, 'descendant'], { stdio: 'inherit' });
+        }
+      `);
+      writeFileSync(preload, `
+        import cp from 'node:child_process';
+        import { syncBuiltinESMExports } from 'node:module';
+        import { EventEmitter } from 'node:events';
+        import { join } from 'node:path';
+        const { spawn, execFileSync } = cp;
+        const isGate = bin => bin === 'npm' || bin === 'node';
+        cp.execFileSync = (bin, args, options) => isGate(bin)
+          ? execFileSync(process.execPath, [${JSON.stringify(worker)}], options)
+          : args.includes('--absolute-git-dir') ? join(process.env.CODEX_JOBS_DIR, 'metadata')
+            : args.includes('rev-parse') ? 'sha' : '';
+        cp.spawn = (bin, args, options) => {
+          if (bin === process.execPath) return spawn(bin, args, options);
+          if (isGate(bin)) return spawn(process.execPath, [${JSON.stringify(worker)}], options);
+          const child = new EventEmitter();
+          child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+          child.stdin = { on() {}, end() { setImmediate(() => child.emit('close', 0)); } };
+          child.kill = () => {};
+          return child;
+        };
+        syncBuiltinESMExports();
+      `);
+      const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
+        `--dir=${jobsDir}`, '--task=fixture', `--gate=${mode}`, '--no-self-review'], {
+        encoding: 'utf8', timeout: 10000,
+        env: { ...process.env, CODEX_JOBS_DIR: jobsDir, NODE_OPTIONS: `--import=${preload}` },
+      });
+      expect(launcher.status, launcher.stderr).toBe(0);
+      const job = readJobRecord(JSON.parse(launcher.stdout).id, { jobsDir });
+      try {
+        await vi.waitFor(() => expect(readFileSync(ready, 'utf8')).toMatch(/^\d+$/), { timeout: 10000 });
+        expect(process.kill(job.pid, signal)).toBe(true);
+        const result = await waitForJob({ jobId: job.id, jobsDir, maxMs: 10000, pollMs: 20 });
+        expect(result).toMatchObject({ status: 'failed', exitCode: signal === 'SIGINT' ? 130 : 143 });
+        await new Promise(resolve => setTimeout(resolve, 1700));
+        expect(() => readFileSync(completed)).toThrow();
+      } finally {
+        try { process.kill(job.pid, 'SIGKILL'); } catch { /* exited */ }
+        try { process.kill(Number(readFileSync(ready, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
+      }
+    }, 20000);
 
   it('spawn errors reject without publishing a running job', async () => {
     const spawnFn = () => {
@@ -2217,9 +2342,14 @@ describe('detached jobs', () => {
         return args.includes('--absolute-git-dir')
           ? join(process.env.CODEX_JOBS_DIR, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
       };
-      cp.spawn = () => {
+      cp.spawn = (bin) => {
         const child = new EventEmitter();
         child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+        if (bin === 'npm' || bin === 'node') {
+          child.kill = () => {};
+          setImmediate(() => child.emit('close', scenario.gateFails ? 1 : 0));
+          return child;
+        }
         let completion;
         child.stdin = { on() {}, end() {
           if (scenario.timeout) completion = setTimeout(() => child.emit('close', 0), 1000);
