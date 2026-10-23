@@ -18,6 +18,7 @@ import { liveResultGateState, gateRoundCap, gateRoundGrants, readRedTeamDisposit
 import { referralFindingKey } from '../lib/jury-core.mjs';
 import { findingDefectClass } from '../lib/review-round-rules.mjs';
 import { resolveRoundCap } from '../conveyor/reconcile-core.mjs';
+import { citedGrantHeads } from '../conveyor/standing-ruling-mark.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { openReferralFindings } from './record-referral-ruling.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -179,15 +180,19 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       try {
         const comments = readComments({ number: p.number, repo, exec: commentsExec });
         if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string' || !c.author?.login || !Number.isFinite(Date.parse(c.createdAt)))) throw failure('comments incomplete');
-        const view = { ...p, repo, comments };
-        const state = liveResultGateState(comments, p.number, headSha, repo);
+        // List + comments cannot verify the ruling issue, comment edits, and card-only heads.
+        // Explicitly withhold automatic grant credit and surface the missing evidence.
+        const standingRuling = null;
+        if (citedGrantHeads(comments).length) evidenceErrors.push('standing ruling unverified; inspect ruling and grant scope before judging');
+        const view = { ...p, repo, comments, standingRuling };
+        const state = liveResultGateState(comments, p.number, headSha, repo, standingRuling);
         const ruling = redTeamRulingRow(repo, view);
-        const disposition = readRedTeamDisposition({ comments, pr: p.number, head: headSha, repo, setting: CONFIRMED_BREAKS_DEFAULTS });
+        const disposition = readRedTeamDisposition({ comments, pr: p.number, head: headSha, repo, setting: CONFIRMED_BREAKS_DEFAULTS, standingRuling });
         const blocked = ruling || disposition.held.length || disposition.sendBack.length;
         result.redTeam = { state: blocked ? 'blocked' : labels.includes('red-team:pending') ? 'pending' : state.result ? 'clear' : 'unknown',
           latestResultId: state.resultId, latestOutcome: state.sendBackOutcome ?? [...state.outcomes].at(-1) ?? null };
         if (!state.result && redTeamJudgmentLabel) evidenceErrors.push('red-team label lacks live result evidence');
-        const grants = gateRoundGrants(comments, p.number, repo);
+        const grants = gateRoundGrants(comments, p.number, repo, standingRuling);
         result.cap = gateRoundCap({ cap: baseCap, grants, roundAt: (at, g) => readReviewRoundAsOf({ repo, pr: p.number, at,
           head: Number.isInteger(state.headReviewIndex) && state.headReviewIndex < g.index ? headSha : null, readLedgerRows: () => mine }) });
         if (labels.includes('status:at-round-limit') && (round === null || round < result.cap - 1)) evidenceErrors.push('round-limit label disagrees with round evidence');
