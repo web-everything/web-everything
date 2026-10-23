@@ -12,7 +12,7 @@ PR #5829 review identified unprotected coverage promises in operation IO sinks. 
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- scripts/lib/__tests__/operation-io-fidelity.test.mjs` detects an uncovered unsafe-reference refusal in a sink fixture and accepts a fixture with a named negative test asserting zero writes.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/operation-io-fidelity.test.mjs` detects an uncovered unsafe-reference refusal in a sink fixture and accepts a fixture with a named negative test asserting zero writes.
 - [A2] **Executable** — The same suite detects a multi-post effect missing fault injection at one post, and accepts coverage of every post with a recoverable end state.
 - [A3] **Executable** — The same suite distinguishes omitted standing-ruling scope in operation gate calls from explicitly supplied verified scope; coordinate the broader call-site rule with #6842.
 

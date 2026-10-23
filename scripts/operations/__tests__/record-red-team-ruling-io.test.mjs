@@ -1,5 +1,7 @@
 /** Live existing-card reader, sink and CLI subset; all IO injected. */
 import { readFileSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
@@ -94,10 +96,10 @@ function extendedThread({ grantRepo = repo, grantPr = PR, author = OP, sent = tr
 describe('existing-card IO', () => {
   it('operation IO rulableBreaks and liveResultGateState call sites pass standing-ruling scope explicitly', async () => {
     const { default: ts } = await import('typescript');
-    const dir = new URL('../', import.meta.url);
+    const dir = dirname(dirname(fileURLToPath(import.meta.url)));
     const calls = [], missingScope = [];
     for (const file of readdirSync(dir).filter(name => name.endsWith('-io.mjs'))) {
-      const source = ts.createSourceFile(file, readFileSync(new URL(file, dir), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      const source = ts.createSourceFile(file, readFileSync(join(dir, file), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
       const visit = node => {
         if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
           const name = node.expression.text;
@@ -192,7 +194,7 @@ describe('existing-card IO', () => {
     'we:backlog/x.mdwe:backlog/y.md', 'we:backlog/x.md@pr0',
   ])('unsafe card reference %j throws before posting anything', cardRef => {
     const f = fake();
-    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT]({ ...payloadFor(), cardRef })).toThrow(/unsafe reference.*nothing written/);
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT]({ ...payloadFor(), cardRef })).toThrow(/unsafe reference.*nothing written/s);
     expect(f.posted).toEqual([]);
     expect(f.labelSyncs).toEqual([]);
   });
