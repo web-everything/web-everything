@@ -3,16 +3,19 @@
  * @description Hermetic command transcripts for scope, lane, repair and publication gates.
  */
 import { it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
+import { fileURLToPath } from 'node:url';
+import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
+import { registerScope, releaseScope, assessFreeScope } from '../free-scope.mjs';
 
 const flags = ['--brief=brief.md', '--purpose=example', '--scope=we:scripts/a.mjs,we:scripts/lib/', '--tests=scripts/a.test.mjs', '--repo=/repo'];
 const ok = (stdout = '') => ({ status: 0, stdout, stderr: '' });
 const red = (stdout = 'failure output') => ({ status: 1, stdout, stderr: 'test error' });
 const report = (extra = {}) => ok(`progress\n${JSON.stringify({ exitCode: 0, timedOut: false, lastMessage: 'NOT WEAKENED', ...extra })}\n`);
+const loaderHelp = '--branch= --sha= --daemon= --why= --tests-run= --audit= --json\n';
 function fixture(rules = [], { ready = true } = {}) {
   const calls = [], writes = [], logs = [], output = [];
   const counts = new Map();
@@ -31,8 +34,11 @@ function fixture(rules = [], { ready = true } = {}) {
       if (call.text.includes('lane-pool.mjs release')) return ok();
       if (call.text.includes('codex-direct-task.mjs')) return report();
       if (call.text.includes('heavy-admission.mjs')) return ok();
+      if (args.includes('prototype-load') && args.includes('--help')) return ok(loaderHelp);
       if (call.text.includes('fix-ready.mjs') || call.text.includes('scripts/operations/run.mjs prototype-load')) return ok();
       if (cmd === 'git') {
+        if (args.includes('config')) return ok();
+        if (args.includes('write-tree') || args.some(a => a.endsWith('^{tree}'))) return ok('a'.repeat(40) + '\n');
         if (args.includes('--show-toplevel')) return ok('/repo\n');
         if (args.includes('rev-parse')) return ok('abc123\n');
         if (args.includes('diff') && args.includes('--quiet')) return ok();
@@ -64,8 +70,165 @@ function fixture(rules = [], { ready = true } = {}) {
   return { io, calls, writes, logs, output, run };
 }
 const released = f => expect(f.calls.some(c => c.text.includes('lane-pool.mjs release --lane=4 --session=session'))).toBe(true);
-const scopeReleased = f => expect(f.calls.some(c => c.text.includes('free-scope-cli.mjs release --agent=example --owner=example-job'))).toBe(true);
+const scopeReleased = f => {
+  const claim = f.calls.find(c => c.text.includes('free-scope-cli.mjs register'));
+  expect(claim).toBeDefined();
+  expect(f.calls.find(c => c.text.includes('free-scope-cli.mjs release')).args.slice(2)).toEqual(claim.args.slice(2, 4));
+};
 const codexCalls = f => f.calls.filter(c => c.text.includes('codex-direct-task.mjs') && !c.args.includes('--review'));
+
+it('pins executable Git configuration on every lane Git command', async () => {
+  const f = fixture();
+  await f.run();
+  for (const call of f.calls.filter(c => c.cmd === 'git' && c.args.includes('/lane'))) {
+    const count = Number(call.env?.GIT_CONFIG_COUNT ?? 0);
+    const config = Object.fromEntries(Array.from({ length: count }, (_, i) =>
+      [call.env[`GIT_CONFIG_KEY_${i}`], call.env[`GIT_CONFIG_VALUE_${i}`]]));
+    expect(config['core.fsmonitor']).toBe('false');
+    expect(config['core.hooksPath']).toBe('/dev/null');
+  }
+});
+
+it('neutralizes inherited fsmonitor commands on a real read-only Git diff', async () => {
+  const names = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
+  const saved = names.map(name => process.env[name]);
+  const repo = fileURLToPath(new URL('../../../', import.meta.url));
+  const results = [];
+  try {
+    process.env.GIT_CONFIG_COUNT = '1';
+    process.env.GIT_CONFIG_KEY_0 = 'core.fsmonitor';
+    process.env.GIT_CONFIG_VALUE_0 = 'echo CODEX_JOB_HOST_EXECUTION >&2; :';
+    const state = { opts: { repo, scope: ['we:scripts/operations/'] }, lane: { path: repo }, startSha: 'HEAD', io: {
+      exec: async (cmd, args, options) => {
+        const r = spawnSync(cmd, args, { ...options, encoding: 'utf8' });
+        results.push(r);
+        return r;
+      },
+    } };
+    // The diff can be empty on a committed verify checkout; it must never run the helper.
+    try { await checkDiffScope(state); } catch (error) { expect(error.stopReason).toBe('no-changes'); }
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.every(r => r.status === 0 && !r.stderr.includes('CODEX_JOB_HOST_EXECUTION'))).toBe(true);
+  } finally {
+    names.forEach((name, i) => { if (saved[i] === undefined) delete process.env[name]; else process.env[name] = saved[i]; });
+  }
+});
+
+it('refuses risky config introduced by a worker, tests or audit before another Git command', async () => {
+  for (const boundary of ['codex-direct-task.mjs --task-file', 'heavy-admission', 'codex-direct-task.mjs --review']) {
+    for (const key of ['filter.host.clean', 'filter.host.process', 'credential.helper', 'remote.origin.receivepack', 'url.host.insteadof']) {
+      let poisoned = false;
+      const f = fixture([
+        [boundary, () => { poisoned = true; return boundary.includes('codex') ? report() : ok(); }],
+        ['config --show-scope', () => ok(poisoned ? `local\0${key}\necho HOST_EXECUTION\0` : '')],
+      ]);
+      const { result } = await f.run();
+      expect(result.stopReason).toBe('unsafe-git-config');
+      expect(f.calls.some(c => c.args.includes('add') || c.args.includes('push'))).toBe(false);
+      released(f); scopeReleased(f);
+    }
+  }
+});
+
+it('refuses unreadable or truncated lane configuration', async () => {
+  for (const response of [red(), { status: 0 }, ok('local\0filter.host.clean\ncommand')]) {
+    const f = fixture([['config --show-scope', response]]);
+    expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
+    expect(f.calls.some(c => c.args.includes('reset') || c.args.includes('push'))).toBe(false);
+    released(f); scopeReleased(f);
+  }
+});
+
+it('refuses an unavailable edge loader before acquiring or publishing a lane', async () => {
+  const f = fixture([['prototype-load --help', { status: 2, stderr: 'unknown operation' }]]);
+  const { result } = await f.run(['--edge-clone=control']);
+  expect(result.ok).toBe(false);
+  expect(result.stopReason).toBe('register-failed');
+  expect(f.calls.some(c => c.args.includes('push') || c.text.includes('lane-pool.mjs acquire'))).toBe(false);
+});
+
+it('requires the edge loader CLI contract, including bracketed optional flags', async () => {
+  for (const response of [red(), { status: 0 }, { status: null, error: new Error('timeout') }, ok('x'.repeat(1024 * 1024) + loaderHelp), ok(loaderHelp.replace('--audit=', '--auditing=')), ok(loaderHelp.replace('--sha=', '--sha256=')), ok(loaderHelp.replace('--sha=', '--other--sha='))]) {
+    const f = fixture([['prototype-load --help', response]]);
+    const { result } = await f.run(['--edge-clone=control']);
+    expect(result.stopReason).toBe('register-failed');
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]).toMatchObject({ timeout: 30000, maxBuffer: 1024 * 1024 });
+  }
+  const f = fixture([['prototype-load --help', ok('[--branch=x] --sha=x [--daemon=x] --why=x --tests-run=x [--audit=x] [--json]')]]);
+  await expect(preflightEdge({ opts: { edgeClone: 'control', repo: '/repo' }, io: f.io })).resolves.toBeUndefined();
+});
+
+it('preflights the installed operation CLI before any lane or publication effects', async () => {
+  const repo = fileURLToPath(new URL('../../../', import.meta.url));
+  const f = fixture();
+  f.io.exec = async (cmd, args, options) => {
+    expect(args).toEqual(['scripts/operations/run.mjs', 'prototype-load', '--help']);
+    return spawnSync(cmd, args, { ...options, cwd: repo, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+  };
+  // This head has no registered prototype-load operation. Missing dependencies
+  // are also an unavailable prerequisite and must refuse before a lane is leased.
+  const { result } = await f.run(['--edge-clone=control']);
+  expect(result).toMatchObject({ ok: false, stopReason: 'register-failed', sha: null });
+  expect(result.lane).toBeUndefined();
+});
+
+it('checks the actual committed content before publishing hook changes', async () => {
+  const f = fixture([['rev-parse abc123^{tree}', ok('b'.repeat(40) + '\n')]]);
+  const { result } = await f.run();
+  expect(result.ok).toBe(false);
+  expect(result.stopReason).toBe('changed-after-audit');
+  expect(f.calls.some(c => c.args.includes('commit'))).toBe(true);
+  expect(f.calls.find(c => c.args.includes('abc123^{tree}')).args).toContain('--no-replace-objects');
+  expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
+});
+
+it('fails closed on missing snapshots and unreadable committed-tree evidence', async () => {
+  for (const command of ['write-tree', 'rev-parse abc123^{tree}']) {
+    for (const response of [red(), { status: 0 }, ok('invalid-tree')]) {
+      const f = fixture([[command, response]]);
+      const { result } = await f.run();
+      expect(result.stopReason).toBe(command === 'write-tree' ? 'commit-failed' : 'changed-after-audit');
+      expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
+      released(f); scopeReleased(f);
+    }
+  }
+});
+
+it('publishes the checked commit SHA when HEAD moves during remote branch selection', async () => {
+  let head = 'abc123', published;
+  const f = fixture([
+    ['ls-remote', () => { head = 'different-commit'; return ok(); }],
+    ['push origin', call => {
+      const source = call.args.at(-1).split(':')[0];
+      published = source === 'HEAD' ? head : source;
+      return ok();
+    }],
+  ]);
+  const { result } = await f.run();
+  expect(result.ok).toBe(true);
+  expect(published).toBe('abc123');
+});
+
+it('uses a distinct scope claim identity for concurrent jobs with the same purpose', async () => {
+  const a = fixture(), b = fixture();
+  await Promise.all([a.run(), b.run()]);
+  const claim = f => f.calls.find(c => c.args.includes('register')).args.filter(x => /^--(agent|owner)=/.test(x));
+  expect(claim(a)).not.toEqual(claim(b));
+  for (const f of [a, b]) {
+    expect(f.calls.find(c => c.args.includes('release') && c.text.includes('free-scope-cli')).args)
+      .toEqual(expect.arrayContaining(claim(f)));
+  }
+  const identity = f => Object.fromEntries(claim(f).map(arg => arg.slice(2).split('=')));
+  const now = new Date().toISOString();
+  let entries = registerScope([], { ...identity(a), purpose: 'example', files: ['we:scripts/a.mjs'] }, now);
+  entries = registerScope(entries, { ...identity(b), purpose: 'example', files: ['we:scripts/b.mjs'] }, now);
+  expect(entries).toHaveLength(2);
+  entries = releaseScope(entries, identity(a).agent, identity(a).owner).entries;
+  expect(entries).toHaveLength(1);
+  expect(assessFreeScope({ files: ['we:scripts/b.mjs'], agents: entries, prs: [], nowMs: Date.parse(now) }).status).toBe('occupied');
+  expect(releaseScope(entries, identity(a).agent, identity(a).owner).entries).toEqual(entries);
+});
 
 it('happy path orders gates, captures one JSON line, uses session env and releases all resources', async () => {
   const f = fixture();
@@ -75,13 +238,14 @@ it('happy path orders gates, captures one JSON line, uses session env and releas
   expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1);
   expect(f.output).toHaveLength(1);
   expect(f.output[0].split('\n')).toHaveLength(2);
-  const expected = ['free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'reset --hard', 'rev-parse HEAD', 'rev-parse origin/main', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'diff --binary', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'diff --binary', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'diff --binary', 'add --', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --', 'diff --name-only', 'ls-files', 'diff --binary', 'commit -m', 'rev-parse HEAD', 'ls-remote', 'push origin', 'fix-ready.mjs mark', 'scripts/operations/run.mjs prototype-load', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
-  expect(f.calls).toHaveLength(expected.length);
-  expected.forEach((part, i) => expect(f.calls[i].text).toContain(part));
+  const expected = ['scripts/operations/run.mjs prototype-load --help', 'free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'reset --hard', 'rev-parse HEAD', 'rev-parse origin/main', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'diff --binary', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'diff --binary', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'diff --binary', 'add --', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --', 'diff --name-only', 'ls-files', 'diff --binary', 'write-tree', 'commit -m', 'rev-parse HEAD', 'rev-parse abc123^{tree}', 'ls-remote', 'push origin', 'fix-ready.mjs mark', 'scripts/operations/run.mjs prototype-load', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
+  const commands = f.calls.filter(c => !(c.cmd === 'git' && c.args.includes('config')));
+  expect(commands).toHaveLength(expected.length);
+  expected.forEach((part, i) => expect(commands[i].text).toContain(part));
   expect(f.calls.every(c => c.args.every(a => !a.includes('--force') && !a.includes('--allow-conflict')))).toBe(true);
   expect(f.calls.some(c => c.args.includes('checkout'))).toBe(false);
   for (const part of ['reset --hard', 'commit -m']) expect(f.calls.find(c => c.text.includes(part)).env.LANE_SESSION).toBe('session');
-  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/lane', 'push', 'origin', 'HEAD:refs/heads/lane/example']);
+  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/lane', 'push', 'origin', 'abc123:refs/heads/lane/example']);
   const add = f.calls.find(c => c.args.includes('add') && c.cmd === 'git');
   expect(add.args).toEqual(['-C', '/lane', 'add', '--', 'scripts/a.mjs']);
   expect(f.calls.find(c => c.args.includes('commit')).args).toContain('Build the example');
@@ -95,7 +259,7 @@ it('invokes prototype-load with job evidence and never invokes daemon-overlay', 
   const f = fixture();
   const { code, result } = await f.run(['--edge-clone=control']);
   expect(code).toBe(0);
-  const loads = f.calls.filter(c => c.args.includes('prototype-load'));
+  const loads = f.calls.filter(c => c.args.includes('prototype-load') && !c.args.includes('--help'));
   expect(loads).toHaveLength(1);
   expect(loads[0]).toMatchObject({ cmd: 'node', cwd: '/repo', args: [
     'scripts/operations/run.mjs', 'prototype-load', '--branch=lane/example',
@@ -134,7 +298,7 @@ const failures = [
   ['commit-failed', 50, [['commit -m', red()]], true],
   ['push-failed', 51, [['push origin', red()]], true],
   ['branch-name-exhausted', 52, [['ls-remote', ok('abc refs/heads/occupied')]], true],
-  ['register-failed', 60, [['scripts/operations/run.mjs prototype-load', red('overlay conflict')]], true],
+  ['register-failed', 60, [['scripts/operations/run.mjs prototype-load', c => c.args.includes('--help') ? ok(loaderHelp) : red('overlay conflict')]], true],
   ['internal-error', 99, [['diff --name-only', () => { throw new Error('boom'); }]], true],
 ];
 for (const [reason, expectedCode, rules, laneHeld] of failures) {
@@ -495,8 +659,8 @@ it('uses branch suffix -2 on collision and never forces the push', async () => {
   const f = fixture([['ls-remote', (_, n) => n ? ok() : ok('existing')]]);
   const { result } = await f.run(['--edge-clone=/edge']);
   expect(result.branch).toBe('lane/example-2');
-  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/lane', 'push', 'origin', 'HEAD:refs/heads/lane/example-2']);
-  expect(f.calls.find(c => c.text.includes('run.mjs prototype-load')).args).toContain('--branch=lane/example-2');
+  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/lane', 'push', 'origin', 'abc123:refs/heads/lane/example-2']);
+  expect(f.calls.find(c => c.text.includes('run.mjs prototype-load') && !c.args.includes('--help')).args).toContain('--branch=lane/example-2');
 });
 it('skips missing fix-ready and omits prototype-load without edge-clone', async () => {
   const f = fixture([], { ready: false }); const { result } = await f.run();

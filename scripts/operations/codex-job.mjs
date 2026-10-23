@@ -5,22 +5,23 @@
  * All process and filesystem effects are injectable; main accepts an optional stdout sink.
  */
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstatSync, readlinkSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { laneGitHardeningEnv, hardenLaneGitArgs, LANE_CONFIG_LIST_ARGS, riskyLaneConfig } from '../lib/lane-git-hardening.mjs';
 
 export const EXIT_CODES = Object.freeze({
   'bad-args': 2, 'scope-occupied': 10, 'scope-unknown': 11,
   'lane-acquire-failed': 12, 'lane-reset-failed': 13, 'codex-failed': 20,
-  'no-changes': 21, 'diff-out-of-scope': 22, 'changed-after-audit': 23, 'tests-red': 30, 'tests-deferred': 31,
+  'no-changes': 21, 'diff-out-of-scope': 22, 'changed-after-audit': 23, 'unsafe-git-config': 24, 'tests-red': 30, 'tests-deferred': 31,
   'audit-weakened': 40, 'audit-failed': 41, 'commit-failed': 50,
   'push-failed': 51, 'branch-name-exhausted': 52, 'register-failed': 60,
   'internal-error': 99,
 });
 export const STOP_REASONS = Object.freeze(Object.fromEntries(Object.keys(EXIT_CODES).map(k => [k, k])));
 const defaults = {
-  exec: (cmd, args, options) => spawnSync(cmd, args, { ...options, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
+  exec: (cmd, args, options) => spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options }),
   readFile: file => readFileSync(file, 'utf8'),
   lstat: file => lstatSync(file),
   readlink: file => readlinkSync(file, { encoding: 'buffer' }),
@@ -76,12 +77,24 @@ export function pathsWithinScope(files, scopeEntries) {
     return file === scope || (scope.endsWith('/') && file.startsWith(scope));
   }));
 }
-const exec = (s, cmd, args, lane = false, session = false) => s.io.exec(cmd, args, {
+const exec = (s, cmd, args, lane = false, session = false, options = {}) => s.io.exec(cmd, args, {
   cwd: lane ? s.lane.path : s.opts.repo,
-  ...(session ? { env: { ...process.env, LANE_SESSION: s.lane.holder } } : {}),
+  env: laneGitHardeningEnv({ ...process.env, ...(session ? { LANE_SESSION: s.lane.holder } : {}) }),
+  ...options,
 });
-const git = (s, args, session = false) => exec(s, 'git', ['-C', s.lane.path, ...args], true, session);
-const scopeArgs = s => [`--agent=${s.opts.purpose}`, `--owner=${s.opts.purpose}-job`];
+const git = async (s, args, session = false) => {
+  // Re-read after every worker/test/audit boundary. Reading config executes no helpers.
+  const config = await exec(s, 'git', ['-C', s.lane.path, ...LANE_CONFIG_LIST_ARGS], true);
+  if (!good(config) || typeof config.stdout !== 'string' ||
+      (config.stdout && !config.stdout.endsWith('\0')) || riskyLaneConfig(config.stdout).length) {
+    fail('unsafe-git-config', 'Cannot trust lane Git configuration; inspect its local/worktree configuration before retrying');
+  }
+  const hardened = hardenLaneGitArgs(args);
+  const missing = hardened.slice(1).filter(a => !args.includes(a));
+  const end = args.includes('--') ? args.indexOf('--') : args.length;
+  return exec(s, 'git', ['-C', s.lane.path, ...args.slice(0, end), ...missing, ...args.slice(end)], true, session);
+};
+const scopeArgs = s => [`--agent=${s.claimId}`, `--owner=${s.claimId}`];
 
 export async function checkFreeScope(s) {
   const args = ['scripts/operations/free-scope-cli.mjs'];
@@ -245,10 +258,18 @@ export async function commitAndPush(s) {
   // Commit consumes the whole index, including anything staged by subprocesses.
   await checkStagedScope(s);
   await checkAuditedFiles(s);
+  const tree = await git(s, ['write-tree']);
+  if (!good(tree) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})\n?$/.test(tree.stdout ?? '')) fail('commit-failed', 'Cannot snapshot the audited index');
   if (!good(await git(s, ['commit', '-m', title, '-m', 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>'], true))) fail('commit-failed');
   const sha = await git(s, ['rev-parse', 'HEAD']);
   if (!good(sha) || !sha.stdout?.trim()) fail('commit-failed');
   s.result.sha = sha.stdout.trim();
+  // Hooks or another writer may have replaced the index during commit. Check the
+  // immutable committed tree, including added paths, modes, deletions and link blobs.
+  const committedTree = await git(s, ['--no-replace-objects', 'rev-parse', `${s.result.sha}^{tree}`]);
+  if (!good(committedTree) || committedTree.stdout?.trim() !== tree.stdout.trim()) {
+    fail('changed-after-audit', 'Committed tree differs from the audited index; inspect the local commit before retrying');
+  }
   let branch;
   for (let n = 1; n <= 9; n++) {
     const name = `lane/${s.opts.purpose}${n === 1 ? '' : `-${n}`}`;
@@ -258,7 +279,7 @@ export async function commitAndPush(s) {
   }
   if (!branch) fail('branch-name-exhausted');
   s.result.branch = branch;
-  if (!good(await git(s, ['push', 'origin', `HEAD:refs/heads/${branch}`], true))) fail('push-failed');
+  if (!good(await git(s, ['push', 'origin', `${s.result.sha}:refs/heads/${branch}`], true))) fail('push-failed');
 }
 export async function markReady(s) {
   try { await s.io.readFile(path.join(s.lane.path, 'scripts/fix-ready.mjs')); }
@@ -273,6 +294,16 @@ const prototypeLoadArgs = s => ['scripts/operations/run.mjs', 'prototype-load',
   `--branch=${s.result.branch}`, `--sha=${s.result.sha ?? '<sha>'}`, `--daemon=${s.opts.edgeClone}`,
   `--why=codex-job ${s.opts.purpose}`, `--tests-run=${s.result.tests ? JSON.stringify(s.result.tests) : '<test-summary>'}`,
   ...(s.result.audit ? [`--audit=${s.result.audit}`] : []), '--json'];
+export async function preflightEdge(s) {
+  if (!s.opts.edgeClone) return;
+  const r = await exec(s, 'node', ['scripts/operations/run.mjs', 'prototype-load', '--help'], false, false,
+    { timeout: 30000, maxBuffer: 1024 * 1024 });
+  const help = typeof r.stdout === 'string' ? r.stdout : '';
+  if (!good(r) || help.length > 1024 * 1024 || ['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'json'].some(flag =>
+    !new RegExp(`(?:^|\\s|\\[)--${flag}(?==|\\s|\\]|$)`).test(help))) {
+    fail('register-failed', 'prototype-load is unavailable or lacks the required CLI flags; install the edge loader before retrying');
+  }
+}
 export async function registerEdge(s) {
   if (!s.opts.edgeClone) return;
   const r = await exec(s, 'node', prototypeLoadArgs(s));
@@ -301,21 +332,23 @@ function plan(s) {
     'git diff --quiet --exit-code --no-ext-diff --no-textconv -- (require the complete index to match the worktree)',
     'Recheck audited file list and content fingerprint immediately before commit',
     'git commit -m <brief title> -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"',
+    'Verify committed tree equals the audited index snapshot before publishing its pinned SHA',
     'git ls-remote --heads origin <branch> (try suffixes -2 through -9 if occupied)',
-    `git push origin HEAD:refs/heads/${s.result.branch}`,
+    `git push origin <checked-sha>:refs/heads/${s.result.branch}`,
     'node scripts/fix-ready.mjs mark --branch=<branch> --sha=<sha> (if present)',
     ...(s.opts.edgeClone ? [show('node', prototypeLoadArgs(s))] : [])];
 }
 export async function runJob(opts, io = {}) {
-  const s = { opts: { ...opts }, io: { ...defaults, ...io }, result: { ok: false, branch: opts.purpose ? `lane/${opts.purpose}` : null, sha: null, tests: null, audit: null, registered: opts.edgeClone ? false : null, stopReason: null } };
+  const s = { claimId: `codex-job-${randomUUID()}`, opts: { ...opts }, io: { ...defaults, ...io }, result: { ok: false, branch: opts.purpose ? `lane/${opts.purpose}` : null, sha: null, tests: null, audit: null, registered: opts.edgeClone ? false : null, stopReason: null } };
   try {
     if (!s.opts.repo) {
-      const r = await s.io.exec('git', ['rev-parse', '--show-toplevel'], {});
+      const r = await s.io.exec('git', ['rev-parse', '--show-toplevel'], { env: laneGitHardeningEnv() });
       if (!good(r) || !r.stdout?.trim()) fail('bad-args', 'Cannot resolve repository');
       s.opts.repo = r.stdout.trim();
     }
     s.opts.brief = path.resolve(s.opts.repo, s.opts.brief);
     s.brief = await s.io.readFile(s.opts.brief);
+    await preflightEdge(s);
     await checkFreeScope(s); await acquireLane(s); await resetLane(s);
     if (s.opts.dryRun) { s.result.dryRun = true; s.result.plan = plan(s); }
     else {
