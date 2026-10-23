@@ -5,6 +5,7 @@ import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, l
 import { planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
+import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
 
 const repo = 'o/r';
 const PR = 5530;
@@ -103,11 +104,51 @@ describe('cap-only existing-card declaration', () => {
       ? planRedTeamRuling(read({ comments, standingRuling }), input())
       : rulableBreaks(scope)).toThrow(/no red-team break is held/);
   });
-  it('preserves the verified grant in the returned gate state while the break is still held', () => {
-    const comments = sentBackAfterGrant(false, standingRuling).slice(0, -1);
-    const { state } = rulableBreaks({ comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, standingRuling });
-    expect(state).toMatchObject({ sendBackOutcome: 'round-cap', reopened: true });
+  it.each([
+    ['human', false, null], ['human', true, null],
+    ['standing ruling', false, standingRuling], ['standing ruling', true, standingRuling],
+  ])('refuses a pending %s grant before automation consumes it (late cap: %s)', async (_name, lateCap, scope) => {
+    const comments = sentBackAfterGrant(lateCap, scope).filter(c => !c.body.includes('outcome=sent-back'));
+    const context = { comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, standingRuling: scope };
+    expect(liveResultGateState(comments, PR, HEAD, repo, scope))
+      .toMatchObject({ sendBackOutcome: 'round-cap', reopened: true });
+    // The reader still holds the break until a gate action records who owns it.
+    expect(readRedTeamDisposition(context).held.map(f => f.index)).toEqual([1]);
+    const io = {
+      readPr: () => ({ headRefOid: HEAD, comments, labels: ['review:accepted'] }),
+      readGrantScope: () => scope,
+      readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }),
+      readRound: () => 3,
+      readRoundAsOf: () => 3,
+    };
+    // Exercise the real gate planner: this pending grant will return #1 to the fixer.
+    expect(await applyRedTeamGate({ repo, pr: PR, dryRun: true }, io))
+      .toMatchObject({ status: 'dry-run', reopened: true, wouldSendBack: true, cap: 4 });
+    expect(() => planRedTeamRuling(read({ comments, standingRuling: scope }), input()))
+      .toThrow(/pending round extension/);
+    expect(() => rulableBreaks(context)).toThrow(/pending round extension/);
   });
+  it.each([['human', null], ['standing ruling', standingRuling]])(
+    'allows a ruling after the gate consumes a %s grant and keeps the cap', async (_name, scope) => {
+      const comments = sentBackAfterGrant(false, scope).slice(0, -1);
+      const context = { comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, standingRuling: scope };
+      const io = {
+        readPr: () => ({ headRefOid: HEAD, comments, labels: ['review:accepted'] }),
+        readGrantScope: () => scope,
+        readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }),
+        readRound: () => 4,
+        readRoundAsOf: () => 3,
+        postComment: ({ body }) => comments.push(bot(body, '2026-10-21T00:00:00Z')),
+      };
+      expect(await applyRedTeamGate({ repo, pr: PR }, io)).toMatchObject({ status: 'applied', outcome: 'round-cap' });
+      expect(rulableBreaks(context).state).toMatchObject({ sendBackOutcome: 'round-cap', reopened: false });
+      const plan = planRedTeamRuling(read({ comments, standingRuling: scope }), input());
+      comments.push({ author: OP, createdAt: '2026-10-21T00:01:00Z', body:
+        `${redTeamGateMarker(PR, HEAD, 'operator-card', plan.resultId)}\n- 1 finding(s) carded by the operator to \`${CARD}\` (#1).` });
+      expect(readRedTeamDisposition(context)).toMatchObject({ held: [], sendBack: [] });
+      expect(await applyRedTeamGate({ repo, pr: PR }, io)).toMatchObject({ status: 'already-acted' });
+      expect(readRedTeamDisposition(context)).toMatchObject({ held: [], sendBack: [] });
+    });
   it.each([
     ['missing', undefined],
     ['wrong ruling', { ...standingRuling, id: `${repo}#6001` }],
