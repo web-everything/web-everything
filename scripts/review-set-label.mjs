@@ -1815,15 +1815,20 @@ export function runReviewLabelCli({
     if (live !== expectedHead) fail('live head differs from --expect-head; nothing written', 1);
   }
 
-  // Missing-only rearm rechecks before any write and again at the label swap: clearance can arrive during the comment.
-  let removals = presentRemoveLabels(decision.removeLabels, currentLabels);
-  const recheckMissingRearm = () => {
-    if (onlyIf !== 'missing') return;
+  const recheckRearmClearance = () => {
     let fresh;
     try { fresh = provider.readPrState(repo, pr); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (!Array.isArray(fresh.comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
     if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
     const freshComments = fullThread(fresh.comments).filter(isTrustedMarkerAuthor);
+    if (headEverHumanCleared(freshComments, fresh.headRefOid.trim())) refuseRearm('head carries a human clearance — a rearm never undoes it');
+    return { fresh, freshComments };
+  };
+  // Missing-only rearm rechecks before any write and again at the label swap: clearance can arrive during the comment.
+  let removals = presentRemoveLabels(decision.removeLabels, currentLabels);
+  const recheckMissingRearm = () => {
+    if (onlyIf !== 'missing') return;
+    const { fresh, freshComments } = recheckRearmClearance();
     const freshDecision = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: fresh.labels,
       acceptanceStillCoversHead: parseReviewedSha(freshComments) === fresh.headRefOid,
       humanClearedHead: headEverHumanCleared(freshComments, fresh.headRefOid.trim()) });
@@ -1922,6 +1927,7 @@ export function runReviewLabelCli({
       fail(ghErr(e, 'gh pr edit failed'), 1);
     }
     recheckMissingRearm();
+    if (to === 'rearm') recheckRearmClearance();
     try {
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
     } catch (e) {

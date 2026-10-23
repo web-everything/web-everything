@@ -3187,6 +3187,16 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     expect(result.payload.reason).toBe('head unreadable — cannot prove no human clearance');
   });
 
+  it('ordinary rearm refuses the label swap when the second read carries a current-head clearance', () => {
+    const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } }];
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { freshState: { comments } });
+    expect(result.readPrState).toHaveBeenCalledTimes(2);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual(['postComment']);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
   const missingArgs = ['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`];
   it('missing-only rearm refuses the label swap when clearance arrives during the comment write', () => {
     const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
