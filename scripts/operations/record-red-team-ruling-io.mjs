@@ -54,6 +54,7 @@ export function createRecordRedTeamRulingReader({ env = process.env, readThread 
 
 export function createRecordRedTeamRulingSinks({ env = process.env, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
+  resolveCard = resolveCardDefault,
   resolveIdentity = () => resolveOperatorIdentity({ env }),
   post = (repo, pr, body) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env),
   syncLabels = ({ repo, pr, head }) => syncRedTeamStatusLabels({ repo, pr, head, env }),
@@ -112,6 +113,13 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
       const record = operatorRecord(p, OPERATOR_CARD_OUTCOME, `- ${p.indices.length} finding(s) carded by the operator to \`${p.cardRef}\` ${indexList(p)}.`);
       post(p.repo, p.pr, reasonBody(p, `Carded to the existing card \`${p.cardRef}\`; no new card is filed.`));
       recheck(p, 'reason posted; no release record written'); // Re-read changes made while posting the reason.
+      // The reason POST may outlive the card. Validate the exact planned reference at the release boundary.
+      let card;
+      try { card = resolveCard(p.cardRef, { repo: p.repo, pr: p.pr, head: p.head }); }
+      catch { throw new Error(`--card ${p.cardRef} could not be re-read; reason posted; no release record written`); }
+      if (!card?.readable || card.ref !== p.cardRef) {
+        throw new Error(`--card ${p.cardRef} no longer resolves to the same readable backlog card; reason posted; no release record written`);
+      }
       post(p.repo, p.pr, record);
       proveReleased(p, 'the operator-card record', record);
       return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };

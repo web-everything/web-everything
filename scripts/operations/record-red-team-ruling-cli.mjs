@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { createRegistry } from './registry.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
 import { createFileCallLogStore } from './call-log-store.mjs';
-import { runOperationCli, buildCliSpec } from './cli-adapter.mjs';
+import { runOperationCli, buildCliSpec, parseOperationArgv } from './cli-adapter.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { recordRedTeamRulingEntry } from './record-red-team-ruling-io.mjs';
 
@@ -22,7 +22,7 @@ export async function main(argv, { entry = recordRedTeamRulingEntry, stores } = 
   if (argv.includes('--help')) { writeAllSync(1, `${buildCliSpec(declaration).usage}\n`); return 0; }
   const registry = createRegistry();
   registry.register(declaration);
-  const preview = argv.includes('--preview');
+  const preview = parseOperationArgv(declaration, argv).input.preview === true;
   const outcome = await runOperationCli({
     declaration, argv, registry, sinks,
     store: stores?.store ?? (preview ? createMemoryRunStore() : createFileRunStore()),

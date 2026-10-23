@@ -36,6 +36,7 @@ function fake({ liveHead = HEAD, labels = [], identity = OP, author = 'chalbert'
   const sinks = createRecordRedTeamRulingSinks({
     readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
     resolveIdentity: () => identity,
+    resolveCard: () => card,
     readStandingRulingScope,
     post: (r, n, body) => {
       if (++attempts === failPost) throw new Error('transient post failure');
@@ -96,11 +97,38 @@ function extendedThread({ grantRepo = repo, grantPr = PR, author = OP, sent = tr
 }
 
 describe('existing-card IO', () => {
+  it.each(['missing', 'unknown', 'read error', 'different reference'])('keeps the break held when the backing card becomes %s while posting the reason', failure => {
+    const comments = thread(), posted = [], resolutions = [], labelSyncs = [];
+    const plan = payloadFor();
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, comments: [...comments] }),
+      readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      resolveCard: (ref, context) => {
+        resolutions.push([ref, context, posted.length]);
+        if (!posted.length) return card;
+        if (failure === 'read error') throw new Error('card read failed');
+        if (failure === 'unknown') return null;
+        return failure === 'missing' ? { ...card, readable: false } : { ...card, ref: 'we:backlog/other.md' };
+      },
+      post: (_repo, _pr, body) => {
+        posted.push(body);
+        comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body });
+      },
+      syncLabels: args => labelSyncs.push(args), warn: () => {},
+    });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](plan)).toThrow(/card.*no release record written/);
+    expect(resolutions.at(-1)).toEqual([CARD, { repo, pr: PR, head: HEAD }, 1]);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).not.toContain('outcome=operator-card');
+    expect(heldAfter(comments)).toHaveLength(1);
+    expect(labelSyncs).toEqual([]);
+  });
   it('a throwing syncLabels is warned, not fatal', () => {
     const comments = thread(), posted = [], warnings = [], labelSyncs = [];
     const sinks = createRecordRedTeamRulingSinks({
       readThread: () => ({ headRefOid: HEAD, comments: [...comments] }),
       resolveIdentity: () => OP,
+      resolveCard: () => card,
       readStandingRulingScope: () => null,
       post: (_repo, _pr, body) => {
         posted.push(body);
@@ -318,6 +346,7 @@ describe('existing-card IO', () => {
     ]) {
       let n = 0;
       const sinks = createRecordRedTeamRulingSinks({ readThread: () => n++ < 2 ? { headRefOid: HEAD, comments: thread() } : after,
+        resolveCard: () => card,
         resolveIdentity: () => OP, post: () => {}, warn: () => {}, syncLabels: () => null });
       expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/head moved|not in the read-back|result changed/);
     }
@@ -335,6 +364,30 @@ describe('existing-card IO', () => {
 });
 
 describe('standalone CLI', () => {
+  it.each([
+    [['--preview'], true], [['--preview=true'], true], [['--preview=1'], true],
+    [['--preview=false'], false], [['--preview=0'], false],
+    [['--preview', '--preview=false'], false], [['--preview=false', '--preview=1'], true],
+  ])('selects stores using the parsed preview value for %j', async (flags, preview) => {
+    const { main } = await import('../record-red-team-ruling-cli.mjs');
+    const runStores = await import('../run-store.mjs');
+    const callLogs = await import('../call-log-store.mjs');
+    const { vi } = await import('vitest');
+    const f = fake();
+    const entry = () => ({ declaration: recordRedTeamRulingOperation({ readRulingContext: () => read() }), sinks: f.sinks });
+    // Observe the actual default-store branch without writing persistent run data.
+    const fileStore = vi.spyOn(runStores, 'createFileRunStore').mockImplementation(() => runStores.createMemoryRunStore());
+    const fileLog = vi.spyOn(callLogs, 'createFileCallLogStore').mockImplementation(() => callLogs.createMemoryCallLogStore());
+    const output = vi.spyOn(await import('../../lib/write-all-sync.mjs'), 'writeAllSync').mockImplementation(() => {});
+    try {
+      expect(await main(['--pr=5530', '--repo=o/r', '--break=1', '--ruling=card', `--card=${CARD}`,
+        '--actor=chalbert', '--channel=chat', '--reason=ok', ...flags], { entry })).toBe(0);
+      expect(fileStore).toHaveBeenCalledTimes(preview ? 0 : 1);
+      expect(fileLog).toHaveBeenCalledTimes(preview ? 0 : 1);
+      expect(f.posted).toHaveLength(preview ? 0 : 2);
+      expect(heldAfter(f.comments)).toHaveLength(preview ? 1 : 0);
+    } finally { fileStore.mockRestore(); fileLog.mockRestore(); output.mockRestore(); }
+  });
   it.each([false, true])('live CLI refuses a break sent back under a verified standing ruling (late cap: %s)', async lateCap => {
     const { main } = await import('../record-red-team-ruling-cli.mjs');
     const { createMemoryRunStore } = await import('../run-store.mjs');
