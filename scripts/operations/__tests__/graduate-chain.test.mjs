@@ -68,6 +68,61 @@ const released = calls => calls.some(c => c.args[1] === 'release');
 const prs = n => Array.from({ length: n }, (_, i) => ({ number: i + 1, author: { login: 'me' }, headRefName: `lane/${i}` }));
 
 describe('graduate-chain', () => {
+  for (const source of ['lane/source', 'old..new']) {
+    for (const dryRun of [false, true]) {
+      it(`excludes commits reachable from the stack base: ${source}, dryRun=${dryRun}`, () => {
+        const ancestor = 'c'.repeat(40);
+        const { result, calls } = fixture({ over: { source, stackOn: '7', dryRun }, change: (cmd, args) => {
+          if (cmd === 'git' && args[0] === 'merge-base') return reply(ancestor);
+          if (cmd === 'git' && args[0] === 'rev-list') return reply(args.includes(`^${base}`) ? sha : `${base}\n${sha}`);
+        } });
+        expect(result.ok).toBe(true);
+        expect(calls.find(c => c.args[0] === 'rev-list').args).toContain(`^${base}`);
+        if (dryRun) expect(result.steps.find(s => s.step === 'cherry-pick').would).toBe(`apply ${sha} over ${base}`);
+        else {
+          expect(calls.find(c => c.args[0] === 'cherry-pick').args).toEqual(['cherry-pick', sha]);
+          expect(calls.find(c => c.args[0] === 'log').args).toEqual(['log', '--oneline', '--no-walk', sha]);
+        }
+      });
+    }
+  }
+  it('sizes a dry-run against the selected base using the quarantined merged tree', () => {
+    const ancestor = 'c'.repeat(40), tree = 'd'.repeat(40);
+    const mergeEnv = { GIT_OBJECT_DIRECTORY: '/quarantine' };
+    const { result, calls } = fixture({ over: { stackOn: '7', dryRun: true },
+      options: { mergeEnvironment: () => mergeEnv }, change: (cmd, args) => {
+        if (cmd === 'git' && args[0] === 'merge-base') return reply(ancestor);
+        if (cmd === 'git' && args[0] === 'merge-tree') return reply(tree);
+        if (cmd === 'git' && args[1] === '--numstat') return reply(args.at(-1) === `${base}..${tree}` ? '1\t0\tslice.mjs' : '301\t0\tparent.mjs');
+      } });
+    expect(result).toMatchObject({ ok: true, size: { nonTest: 1, test: 0, files: 1 } });
+    expect(calls.find(c => c.args[1] === '--numstat').env).toMatchObject(mergeEnv);
+  });
+  it('refuses a source wholly reachable from the stack base and releases the lane', () => {
+    const { result, calls } = fixture({ over: { stackOn: '7' }, change: (cmd, args) =>
+      cmd === 'git' && args[0] === 'rev-list' && reply(args.includes(`^${base}`) ? '' : base) });
+    expect(result).toMatchObject({ ok: false, stopReason: 'empty-source' });
+    expect(released(calls)).toBe(true);
+  });
+  it('selects the slice in the acquired lane after fetching a base absent from the source checkout', () => {
+    const { result, calls } = fixture({ over: { stackOn: '7' }, change: (cmd, args, opts) =>
+      cmd === 'git' && args[0] === 'rev-list' && opts.cwd !== '/lane' && reply('missing base object', 128) });
+    expect(result.ok).toBe(true);
+    const selection = calls.findIndex(c => c.args[0] === 'rev-list');
+    expect(calls[selection].cwd).toBe('/lane');
+    expect(calls.slice(0, selection).some(c => c.args[0] === 'fetch' && c.args.includes(base))).toBe(true);
+  });
+  it('delegates publication to open-pr so a foreign fix claim can refuse it', () => {
+    const { result, calls } = fixture({ over: { source: 'old..new', stackOn: '7', purpose: 'victim' },
+      change: (cmd, args) => cmd === 'node' && args[1] === 'open-pr'
+        && reply({ findings: { submit: { effects: [{ result: { outcome: 'refused', reason: 'fix-claimed', pr: 7 } }] } } }, 1) });
+    expect(result).toMatchObject({ ok: false, stopReason: 'open-pr' });
+    expect(calls.filter(c => c.cmd === 'git' && c.args[0] === 'push')).toEqual([]);
+    expect(calls.find(c => c.args[1] === 'open-pr').args).toEqual(expect.arrayContaining([
+      '--ref=lane/victim', `--sha=${sha}`, '--base=lane/parent',
+    ]));
+    expect(released(calls)).toBe(true);
+  });
   it('real dry-run merge preserves repository refs, index and objects', async () => {
     await withBareOrigin(ctx => {
       ctx.seedOriginBranch('lane/source', { 'source.mjs': 'export const source = 1;\n' });
@@ -92,6 +147,25 @@ describe('graduate-chain', () => {
       expect(snapshot()).toEqual(before);
     });
   });
+  it('real linear stack selects only B over A and excludes the large parent from dry-run sizing', async () => {
+    await withBareOrigin(ctx => {
+      ctx.seedOriginBranch('lane/stack', { 'parent.mjs': 'export const parent = 1;\n'.repeat(301) });
+      ctx.seedOriginBranch('lane/source', { 'slice.mjs': 'export const slice = 1;\n' }, 'lane/stack');
+      for (const ref of ['lane/source', 'lane/stack']) ctx.git(['fetch', 'origin', `refs/heads/${ref}:refs/remotes/origin/${ref}`]);
+      const stackSha = ctx.git(['rev-parse', 'origin/lane/stack']).trim();
+      const sourceSha = ctx.git(['rev-parse', 'origin/lane/source']).trim();
+      const exec = (cmd, args, opts) => {
+        if (cmd === 'gh') return reply(args[0] === 'api' ? { login: 'me' } : args[1] === 'view'
+          ? { headRefName: 'lane/stack', headRefOid: stackSha, isCrossRepository: false } : []);
+        if (cmd !== 'git') throw Error('dry-run attempted mutation');
+        return spawnSync(cmd, args, { ...opts, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      };
+      const result = createGraduateChainRunner({ exec, cwd: ctx.clone, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } })(
+        { ...input, source: 'origin/lane/source', stackOn: '7', dryRun: true });
+      expect(result).toMatchObject({ ok: true, size: { nonTest: 1, test: 0, files: 1 } });
+      expect(result.steps.find(s => s.step === 'cherry-pick').would).toBe(`apply ${sourceSha} over ${stackSha}`);
+    });
+  });
   it('IO isolates merge objects and cleans temporary files with fake exec', () => {
     const f = fixture();
     f.calls.length = 0;
@@ -108,18 +182,20 @@ describe('graduate-chain', () => {
     expect(result).toMatchObject({ ok: true, pr: 42, branch: 'lane/slice', sha, stopReason: null,
       capSources: { callerMax: 'standard', repoMax: 'standard' }, size: { nonTest: 15, test: 5, files: 2 } });
     expect(calls.filter(c => c.args[1] === 'verify')).toHaveLength(1);
-    for (const c of calls.filter(c => ['reset', 'cherry-pick', 'push'].includes(c.args[0]))) expect(c.env.LANE_SESSION).toBe('held');
-    expect(calls.find(c => c.args[0] === 'push').args).toEqual(['push', 'origin', 'HEAD:refs/heads/lane/slice']);
-    expect(calls.find(c => c.args[1] === 'open-pr').args).toContain('--title=A slice $(inert)');
+    for (const c of calls.filter(c => ['reset', 'cherry-pick'].includes(c.args[0]) || c.args[1] === 'open-pr')) expect(c.env.LANE_SESSION).toBe('held');
+    expect(calls.some(c => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
+    expect(calls.find(c => c.args[1] === 'open-pr').args).toEqual(expect.arrayContaining([
+      '--title=A slice $(inert)', '--ref=lane/slice', `--sha=${sha}`,
+    ]));
     expect(bodies[0]).toContain('verify: pass');
     expect(released(calls)).toBe(true); expect(cleaned).toBe(true);
   });
-  it('dry-run runs caps, merge-tree and source numstat without mutation', () => {
+  it('dry-run runs caps, merge-tree and selected slice numstat without mutation', () => {
     const { result, calls, bodies } = fixture({ over: { dryRun: true } });
     expect(result.ok).toBe(true);
     expect(calls.every(c => c.cmd !== 'node')).toBe(true);
     expect(calls.some(c => ['fetch', 'reset', 'cherry-pick', 'push', 'checkout', 'switch'].includes(c.args[0]))).toBe(false);
-    expect(result.steps.filter(s => s.would).map(s => s.step)).toEqual(['acquire', 'cherry-pick', 'import-check', 'verify', 'body', 'push', 'open-pr', 'release']);
+    expect(result.steps.filter(s => s.would).map(s => s.step)).toEqual(['acquire', 'cherry-pick', 'import-check', 'verify', 'body', 'open-pr', 'release']);
     expect(bodies).toEqual([]);
   });
   it('uses stack head and an explicit source range', () => {
@@ -142,7 +218,8 @@ describe('graduate-chain', () => {
     ['caps-unreadable', (c, a) => c === 'gh' && a[0] === 'api' && reply({}), false],
     ['conflict', (c, a) => a[0] === 'merge-tree' && reply(`${sha}\nfile.mjs\n\nconflict`, 1), true],
     ['merge-tree', (c, a) => a[0] === 'merge-tree' && reply('', 128), true],
-    ['empty-source', (c, a) => a[0] === 'rev-list' && reply(''), false],
+    ['empty-source', (c, a) => a[0] === 'rev-list' && reply(''), true],
+    ['source', (c, a) => a[0] === 'rev-list' && reply('', 128), true],
     ['too-large', (c, a) => a[1] === '--numstat' && reply('301\t0\tscripts/big.mjs'), true],
     ['size-unreadable', (c, a) => a[1] === '--numstat' && reply('-\t-\timage.png'), true],
     ['import-check', (c, a) => a[0].endsWith('graduation-import-check.mjs') && reply({ findings: [{}] }), true],
@@ -160,7 +237,7 @@ describe('graduate-chain', () => {
       expect(result.suggestedSplit.every(g => g.nonTest <= 300)).toBe(true);
     }
   });
-  for (const step of ['acquire', 'fetch', 'reset', 'cherry-pick', 'push']) it(`releases after ${step} command failure`, () => {
+  for (const step of ['acquire', 'fetch', 'reset', 'cherry-pick', 'open-pr']) it(`releases after ${step} command failure`, () => {
     const { result, calls } = fixture({ change: (c, a) => (a[0] === step || a[1] === step) && reply('', 1) });
     expect(result.ok).toBe(false); expect(released(calls)).toBe(step !== 'acquire');
   });

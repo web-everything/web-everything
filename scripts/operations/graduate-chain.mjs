@@ -89,8 +89,6 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
     const start = parts.length === 2 ? git('source', ['rev-parse', '--verify', `${parts[0]}^{commit}`])
       : git('source', ['merge-base', 'origin/main', tip]);
     const range = `${start}..${tip}`;
-    const commits = lines(git('source', ['rev-list', '--reverse', '--topo-order', range]));
-    if (!commits.length) stop('empty-source');
     if (!input.dryRun) {
       lane = json(node('acquire', ['scripts/lane-pool.mjs', 'acquire', `--purpose=${input.purpose}`, '--json']));
       if (!Number.isInteger(lane.lane) || !lane.path || !lane.holder) stop('acquire-invalid');
@@ -99,11 +97,16 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
       git('fetch', ['fetch', cwd, ...(input.stackOn ? [] : [base]), start, tip], lane.path, session);
     } else would('acquire', 'acquire a lane');
     const checkCwd = lane?.path || cwd;
+    // The selected base may only exist locally after the lane fetch. Exclude all
+    // of its reachable commits from both branch sources and explicit ranges.
+    const commits = lines(git('source', ['rev-list', '--reverse', '--topo-order', range, `^${base}`], checkCwd));
+    if (!commits.length) stop('empty-source');
+    const mergeEnv = mergeEnvironment(git('merge-objects', ['rev-parse', '--git-path', 'objects'], checkCwd), checkCwd);
     const merged = command('merge-tree', 'git', ['merge-tree', '--write-tree', '--name-only', `--merge-base=${start}`, base, tip],
-      checkCwd, mergeEnvironment(git('merge-objects', ['rev-parse', '--git-path', 'objects'], checkCwd), checkCwd), true);
+      checkCwd, mergeEnv, true);
     if (merged.status === 1) stop('conflict', { files: lines(merged.stdout.split('\n\n')[0]).slice(1) });
     if (merged.status !== 0 || !/^[0-9a-f]{40,64}$/.test(lines(merged.stdout)[0] || '')) stop('merge-tree');
-    let sizeRange = range;
+    let sizeRange = `${base}..${lines(merged.stdout)[0]}`;
     if (!input.dryRun) {
       const session = { LANE_SESSION: lane.holder };
       git('base', ['reset', '--hard', base], lane.path, session);
@@ -111,12 +114,12 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
       out.sha = git('sha', ['rev-parse', 'HEAD'], lane.path);
       sizeRange = `${base}..${out.sha}`;
     } else { out.sha = tip; would('cherry-pick', `apply ${commits.join(' ')} over ${base}`); }
-    const measured = measureSize(git('size', ['diff', '--numstat', '--no-renames', sizeRange], lane?.path || cwd));
+    const measured = measureSize(git('size', ['diff', '--numstat', '--no-renames', sizeRange], checkCwd, input.dryRun ? mergeEnv : {}));
     const { entries, ...size } = measured; out.size = size;
     if (size.nonTest > 300) stop('too-large', { suggestedSplit: suggestedSplit(entries),
       fallback: 'Split the source into smaller ranges; oversized files require a manual hunk split.' });
     if (input.dryRun) {
-      for (const step of ['import-check', 'verify', 'body', 'push', 'open-pr', 'release']) would(step, step);
+      for (const step of ['import-check', 'verify', 'body', 'open-pr', 'release']) would(step, step);
       out.ok = true;
     } else {
       const imported = command('import-check', 'node', ['scripts/graduation-import-check.mjs', `--snapshot=${out.sha}`, '--json'], lane.path, {}, true);
@@ -131,11 +134,12 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
       if (!verdict || !Array.isArray(verdict.checks) || !verdict.checks.length || verdict.checks.some(c => !['pass', 'fail'].includes(c.outcome))) stop('verify-unrun');
       if (verdict.checks.some(c => c.outcome === 'fail')) stop('verify-red');
       if (verified.status !== 0 || verdict.ok !== true) stop('verify-unrun');
-      const values = { commits: git('body', ['log', '--oneline', range]),
+      const values = { commits: git('body', ['log', '--oneline', '--no-walk', ...commits], lane.path),
         diffStat: git('body', ['diff', '--stat', sizeRange], lane.path), testResult: 'verify: pass', audit: input.audit || 'not supplied' };
       const template = input.bodyTemplate ? readTemplate(input.bodyTemplate) : 'Commits:\n{{commits}}\n\n{{diffStat}}\n\nTests: {{testResult}}\nAudit: {{audit}}\n';
       const bodyFile = writeBody(template.replace(/\{\{(commits|diffStat|testResult|audit)\}\}/g, (_, key) => values[key]));
-      git('push', ['push', 'origin', `HEAD:refs/heads/${out.branch}`], lane.path, { LANE_SESSION: lane.holder });
+      // open-pr owns publication, including the shared fix-claim guard before
+      // pr-land pushes this pinned SHA. Never publish ahead of that guard.
       const opened = command('open-pr', 'node', ['scripts/operations/run.mjs', 'open-pr', `--ref=${out.branch}`, `--base=${baseRef}`,
         `--title=${input.title}`, `--bodyFile=${bodyFile}`, `--sha=${out.sha}`, '--json'], lane.path, { LANE_SESSION: lane.holder }, true);
       const submitted = extractSubmitResult(json(opened));
