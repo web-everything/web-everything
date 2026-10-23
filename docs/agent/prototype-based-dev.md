@@ -115,3 +115,9 @@ session is CONFIRMED gone (absent from a successful `claude agents --json` read,
 or a listed terminal state) — never on a guess, and never while a listing read is merely failing. A session
 still confirmed alive at timeout is left for the resident `we:scripts/conveyor/session-reaper.mjs` to reap in
 the ordinary course, exactly as it already does for every other finished dispatch's scratch cwd.
+
+## Loading a fix on a daemon prototype (`prototype-load`)
+
+A green + Codex-audited (NOT WEAKENED) daemon fix goes live through ONE declared operation, never a hand-built combined top:
+`node scripts/operations/run.mjs prototype-load --branch=<lane/x> --sha=<sha> --daemon=<name> [--dry-run] [--why=<text>]`.
+It resolves the clone from `scripts/settings/prototype-load.json`, gates on the ready record, keeps main intact, checks the clone's current registrations (reporting a `stale-registration` by name), swaps add-before-remove through the sanctioned `daemon-overlay.mjs` loader, waits for adoption, and logs one line to `prototype-loads.jsonl`. Front door: [skills-src/prototype-load/SKILL.md](../../skills-src/prototype-load/SKILL.md). Why it exists: on 2026-10-22 improvised loads cost about 6.5 hours, reverted main fixes three times, and one loader removed old registrations before the new one was accepted.
