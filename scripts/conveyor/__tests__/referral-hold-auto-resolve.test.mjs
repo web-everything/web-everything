@@ -398,13 +398,6 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
     expect(log).toHaveBeenCalledTimes(1);
     expect(log.mock.calls[0][0]).toMatch(/referral-hold auto-resolve kept the pause .*"why":"x"/);
   });
-  it('a resume on a PR that is not review:human stays paused (no second verdict on an unchanged head)', () => {
-    const p0 = enrich(fx);
-    const p = plan({ ...p0, labels: [{ name: 'review:pending' }] });
-    expect(p.dispatch.filter(d => d.kind === 'review')).toEqual([]);
-    const row = p.refusals.find(r => r.kind === 'review-referrals-pending');
-    expect(row?.referralHoldAutoResolve).toMatchObject({ outcome: 'stay' });
-  });
   it('a resume on a PR that is not review:human clears the hold and dispatches review even with a current advisory', () => {
     const p0 = enrich(fx);
     const pr = { ...p0, labels: [{ name: 'review:pending' }] };
