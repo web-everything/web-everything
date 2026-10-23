@@ -32,6 +32,7 @@
  * {@link runOrphanFixRoundPass}, run by the fix daemon inside its stuck-fixer reclaim step.
  */
 import { execFileSync } from 'node:child_process';
+import { stripVTControlCharacters } from 'node:util';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -169,8 +170,23 @@ async function defaultOwned(repoKey, number) {
 }
 
 export function defaultRearm({ slug, pr, head, exec = execFileSync }) {
-  exec('node', [resolve(ROOT, 'scripts', 'conveyor', 'rearm-review.mjs'), String(pr), `--repo=${slug}`,
-    '--actor=conveyor orphan-guard', ...(head ? [`--expect-head=${head}`] : [])], { ...ghOpts(), cwd: ROOT });
+  try {
+    exec('node', [resolve(ROOT, 'scripts', 'conveyor', 'rearm-review.mjs'), String(pr), `--repo=${slug}`,
+      '--actor=conveyor orphan-guard', ...(head ? [`--expect-head=${head}`] : [])], { ...ghOpts(), cwd: ROOT });
+  } catch (error) {
+    const sanitize = (value) => stripVTControlCharacters(String(value ?? '')).split(/\r?\n/)
+      .map((line) => line.replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).filter(Boolean);
+    const stderr = sanitize(error.stderr).join('; ').slice(0, 300);
+    let stdout = String(error.stdout ?? '');
+    try {
+      const parsed = JSON.parse(stdout);
+      if (typeof parsed?.reason === 'string') stdout = parsed.reason;
+      else if (typeof parsed?.error === 'string') stdout = parsed.error;
+    } catch { /* Non-JSON output uses its first non-empty line. */ }
+    stdout = (sanitize(stdout)[0] ?? '').slice(0, 300);
+    const detail = [stderr, stdout].filter(Boolean).join('; ');
+    throw new Error(`orphan-guard re-arm failed: ${detail || 'child failed without stderr or stdout'}`, { cause: error });
+  }
   return { ok: true };
 }
 
