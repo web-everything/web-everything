@@ -1,6 +1,33 @@
 import { it, expect, vi } from 'vitest';
 import { runRedTeamOnSkip } from '../../../scripts/lib/review-red-team-on-skip.mjs';
 import { runReviewTick, sharedHostBudget } from '../review-daemon.mjs';
+import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
+import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
+
+it.each(['fresh', 'resume'])('real reconcile recovers a queued accepted head in %s mode', mode => {
+  const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
+  const rawPr = { number: pr, state: 'OPEN', headRefName: 'lane/accepted', headRefOid: head,
+    baseRefName: 'main', mergeStateStatus: 'CLEAN',
+    labels: ['review:accepted', 'ready-to-merge', 'red-team:pending'].map(name => ({ name })),
+    comments: [{ body: buildReviewedShaMarker(head), author: { login: 'web-everything' } }],
+    statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }] };
+  const reconcile = options => planReconcile({ repo: 'we', prs: options.readPrs(), agents: [],
+    reviewTiming: { startAfter: 'ci-green' }, requiredChecks: ['gate'] });
+  expect(reconcile({ readPrs: () => [rawPr] }).refusals).toEqual([
+    expect.objectContaining({ kind: 'nothing-owed', phase: 'queued', prNumber: pr }),
+  ]);
+  const dispatch = vi.fn(() => ({ jobPid: 42 }));
+  const readEvidence = vi.fn(() => ({ recorded: mode === 'resume', loopPayload: {
+    verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } } }));
+  const out = runReviewTick({ repo, readPrs: () => [rawPr], readAgents: () => [], reconcile,
+    holdReconcile: () => [], acquirableLanes: () => 1, tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
+    redTeamOnSkip: options => runRedTeamOnSkip({ ...options, dispatch, readEvidence,
+      readStatus: () => mode === 'resume' ? { status: 'finished', result: 'ran' } : null,
+      setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map() }),
+  });
+  expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head });
+  expect(out.redTeamOnSkip.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode }]);
+});
 
 it('already-reviewed heads get one recovery hook with remaining capacity; null and paused preserve existing behavior', () => {
   const repo = 'web-everything/web-everything', head = 'a'.repeat(40);
@@ -25,14 +52,16 @@ it('already-reviewed heads get one recovery hook with remaining capacity; null a
   expect(redTeamOnSkip).not.toHaveBeenCalled();
 });
 
-function recoveryTickFixture({ ordinary = false } = {}) {
+function recoveryTickFixture({ ordinary = false, queued = false } = {}) {
   const repo = 'web-everything/web-everything', head = 'a'.repeat(40);
   const recoveryDispatch = vi.fn(() => ({ jobPid: 42 }));
   return { recoveryDispatch, options: {
     repo, readPrs: () => [5762, 5763].map(number => ({ number, headRefOid: head, comments: [], labels: [] })),
     readAgents: () => [], holdReconcile: () => [], acquirableLanes: () => 5,
     reconcile: () => ({ dispatch: ordinary ? [{ kind: 'review', prNumber: 5764 }] : [],
-      refusals: [5762, 5763].map(prNumber => ({ kind: 'already-reviewed-head', prNumber, headSha: head })) }),
+      refusals: [5762, 5763].map(prNumber => queued
+        ? { kind: 'nothing-owed', phase: 'queued', prNumber, headRefOid: head }
+        : { kind: 'already-reviewed-head', prNumber, headSha: head }) }),
     dispatch: vi.fn(() => ({ jobPid: 43 })), tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
     redTeamOnSkip: options => runRedTeamOnSkip({ ...options, dispatch: recoveryDispatch,
       readEvidence: () => ({ recorded: false, loopPayload: {
@@ -41,8 +70,9 @@ function recoveryTickFixture({ ordinary = false } = {}) {
   } };
 }
 
-it.each([false, true])('host denial blocks recovery starts (ordinary reviews: %s)', ordinary => {
-  const { options, recoveryDispatch } = recoveryTickFixture({ ordinary });
+it.each([false, true].flatMap(ordinary => [false, true].map(queued => ({ ordinary, queued }))))(
+  'host denial blocks recovery starts (ordinary: $ordinary, queued: $queued)', ({ ordinary, queued }) => {
+  const { options, recoveryDispatch } = recoveryTickFixture({ ordinary, queued });
   const take = vi.fn(), hostAdmission = vi.fn(() => ({ admitted: false, reason: 'host overloaded', take }));
   const out = runReviewTick({ ...options, hostAdmission });
   expect(hostAdmission).toHaveBeenCalledTimes(1);
@@ -50,6 +80,19 @@ it.each([false, true])('host denial blocks recovery starts (ordinary reviews: %s
   expect(recoveryDispatch).not.toHaveBeenCalled();
   expect(out.redTeamOnSkip.dispatched).toEqual([]);
   expect(take).not.toHaveBeenCalled();
+});
+
+it.each([
+  { kind: 'nothing-owed', phase: 'open' },
+  { kind: 'nothing-owed', phase: 'landed' },
+  { kind: 'owed-elsewhere', phase: 'queued' },
+  { kind: 'referral-hold', phase: 'queued' },
+])('does not adapt $kind/$phase refusals into recovery candidates', refusal => {
+  const { options, recoveryDispatch } = recoveryTickFixture();
+  options.reconcile = () => ({ dispatch: [], refusals: [{ ...refusal, prNumber: 5762 }] });
+  const out = runReviewTick(options);
+  expect(out.redTeamOnSkip.rows).toEqual([]);
+  expect(recoveryDispatch).not.toHaveBeenCalled();
 });
 
 it('a throwing host check blocks recovery-only starts', () => {

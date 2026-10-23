@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
-import { runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs } from '../review-job.mjs';
+import { recordRedTeamStatus, readRedTeamStatus, readDrainRedTeamEvidence } from '../../lib/drain-red-team-evidence.mjs';
+import { runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
@@ -115,9 +116,11 @@ describe('red-team-only review job', () => {
     expect(io.releaseLane).toHaveBeenCalledOnce(); expect(io.unclaim).toHaveBeenCalledOnce();
   });
   it.each([
-    ['recorded-result recovery finishes missing comment and miss rows with zero model invocations', false],
-    ['two consecutive recovery attempts retry a failed comment then succeed with zero model invocations', true],
-  ])('%s', (_name, failFirstComment) => {
+    ['recorded-result recovery finishes missing comment and miss rows with zero model invocations', null],
+    ['two consecutive recovery attempts retry a failed comment then succeed with zero model invocations', 'comment'],
+    ['a transient production scorecard EIO preserves resume eligibility and retries with zero model invocations', 'store'],
+  ])('%s', (_name, failure) => {
+    const failFirstComment = failure === 'comment';
     const loopPayload = payload();
     Object.assign(loopPayload.findings.read, { title: 'Recover stored result', netChangedFiles: ['scripts/example.mjs'],
       diffText: 'diff --git a/scripts/example.mjs b/scripts/example.mjs\n+export const example = true;\n' });
@@ -130,6 +133,7 @@ describe('red-team-only review job', () => {
     let status = { status: 'finished', result: { status: 'ran', comment: 'error' } };
     const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }), readRedTeamRecords: () => [prior, ...(observed?.rows ?? [])],
       readRedTeamStatus: () => status,
+      recordRedTeamQueued: vi.fn(input => { status = { status: input.status, result: input.result ?? null }; }),
       redTeamStatus: vi.fn(input => { status = { status: input.status, result: input.result }; }),
       runRedTeam: input => {
         // Mirror the production synchronous job hook's child-process boundary, while running the REAL
@@ -137,12 +141,16 @@ describe('red-team-only review job', () => {
         const source = `
           import { readFileSync } from 'node:fs';
           import { runRedTeam } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
-          const { input, prior, saved, failComment } = JSON.parse(readFileSync(0, 'utf8'));
+          import { readStore } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/run-scorecard-store.mjs')).href)};
+          const { input, prior, saved, failComment, failStore } = JSON.parse(readFileSync(0, 'utf8'));
           const comments = saved?.comments ?? [], rows = saved?.rows ?? [];
           const calls = { model: 0, recheck: 0, reserve: 0, provider: 0 };
           const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
           const result = await runRedTeam({ ...input, resumeOnly: input.redTeamMode === 'resume', env: {} }, {
-            now: () => 1_000, log: () => {}, readRecords: () => [prior, ...rows],
+            now: () => 1_000, log: () => {}, readRecords: () => failStore
+              ? readStore({ path: '/injected/scorecards.json', exists: () => true,
+                read: () => { throw Object.assign(Error('temporary store failure'), { code: 'EIO' }); } }).records
+              : [prior, ...rows],
             cliAvailable: forbid('provider'), reserveCalls: forbid('reserve'),
             runSeat: forbid('model'), runRecheck: forbid('recheck'),
             listComments: () => comments,
@@ -155,8 +163,10 @@ describe('red-team-only review job', () => {
           process.stdout.write(JSON.stringify({ result, comments, rows, calls }));
         `;
         observed = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
-          input: JSON.stringify({ input, prior, saved: observed, failComment: failFirstComment && attempt++ === 0 }), encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+          input: JSON.stringify({ input, prior, saved: observed, failComment: failFirstComment && attempt === 0,
+            failStore: failure === 'store' && attempt === 0 }), encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
         }));
+        attempt++;
         return observed.result;
       },
     });
@@ -171,6 +181,13 @@ describe('red-team-only review job', () => {
     });
     const recovery = recover(1_000);
     expect(recovery.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'resume' }]);
+    if (failure === 'store') {
+      expect(job).toMatchObject({ outcome: 'red-team-only', redTeam: { status: 'skipped' } });
+      expect(observed.calls).toEqual({ model: 0, recheck: 0, reserve: 0, provider: 0 });
+      expect(observed.comments).toEqual([]);
+      expect(recover(1_001).dispatched).toEqual([]);
+      expect(recover(1_801_000).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'resume' }]);
+    }
     expect(job).toMatchObject({ outcome: 'red-team-only', redTeam: { status: 'resumed' } });
     if (failFirstComment) {
       expect(observed.result).toMatchObject({ status: 'resumed', comment: { status: 'error' }, rowsWritten: 2 });
@@ -189,9 +206,9 @@ describe('red-team-only review job', () => {
     expect(observed.rows.map(row => row.missRole).sort()).toEqual(['accepting-review', 'builder']);
     expect(observed.rows.every(row => row.redTeamCallId === prior.callId && row.rev === head)).toBe(true);
     expect(io.runRedTeamGate).toHaveBeenCalledWith({ pr, repo });
-    expect(io.recordRedTeamQueued).toHaveBeenCalledTimes(failFirstComment ? 2 : 1);
+    expect(io.recordRedTeamQueued).toHaveBeenCalledTimes(failure ? 2 : 1);
     expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(
-      failFirstComment ? ['finished', 'finished'] : ['finished']);
+      failure ? ['finished', 'finished'] : ['finished']);
     expect(recover(3_601_000).dispatched).toEqual([]);
     expect(io.runLoop).not.toHaveBeenCalled(); expect(io.runExtraSeats).not.toHaveBeenCalled();
   });
@@ -205,6 +222,97 @@ describe('red-team-only review job', () => {
     expect(io.releaseLane).toHaveBeenCalledOnce(); expect(io.unclaim).toHaveBeenCalledOnce();
   });
   const cleanRow = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', pr, repo, rev: head };
+  it.each(['final-write', 'queued-readback'].flatMap(failure =>
+    ['ran', { status: 'resumed', comment: 'error' }].map(prior => ({ failure, prior }))))(
+    'recovers a durable queued resume after $failure fails and the writer dies: $prior', ({ failure, prior }) => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-dead-resume-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      const write = input => recordRedTeamStatus(input, { env });
+      const rawStatus = () => readRedTeamStatus({ repo, pr, head, env });
+      let live = true;
+      const evidence = () => readDrainRedTeamEvidence({ repo, pr, head, env,
+        list: () => [], readScorecards: () => [cleanRow], isAlive: () => live });
+      const status = () => readRedTeamRecoveryStatus({ repo, pr, head, env }, {
+        readStatus: rawStatus, readEvidence: evidence,
+      });
+      try {
+        write({ repo, pr, loopPayload: payload(), status: 'finished', result: prior });
+        const io = fakeIo({ readRedTeamStatus: status, readRedTeamRecords: () => [cleanRow],
+          recordRedTeamQueued: input => {
+            write(input);
+            if (failure === 'queued-readback') throw Error('transient readback failure');
+          },
+          redTeamStatus: vi.fn(),
+          runRedTeam: () => ({ status: 'skipped' }),
+        });
+        runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'resume' }, io);
+        expect(rawStatus()).toMatchObject({ status: 'queued', result: prior });
+        expect(status().status).toBe('queued');
+        expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'resume' }, io).outcome).toBe('red-team-not-owed');
+        live = false;
+        io.recordRedTeamQueued = write;
+        const retry = runRedTeamOnSkip({ repo,
+          plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+          rawPrs: [{ number: pr, headRefOid: head, comments: [] }],
+          readEvidence: evidence, readStatus: status, capacity: { lanes: 1 },
+          setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
+          dispatch: options => {
+            expect(options.redTeamMode).toBe('resume');
+            expect(runReviewJob(options, io).outcome).toBe('red-team-only');
+            return { jobPid: 42 };
+          },
+        });
+        expect(retry.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'resume' }]);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  it.each([null, {}, { inFlight: true }, { inFlight: false, queued: true }])(
+    'does not recover a queued resume on live or unknown liveness %j', evidence => {
+      const status = { status: 'queued', result: 'ran', pid: 42 };
+      expect(readRedTeamRecoveryStatus({ repo, pr, head }, {
+        readStatus: () => status, readEvidence: () => evidence,
+      })).toBe(status);
+    });
+  it('fails closed when queued resume liveness is unreadable', () => {
+    expect(() => readRedTeamRecoveryStatus({ repo, pr, head }, {
+      readStatus: () => ({ status: 'queued', result: 'ran', pid: 42 }),
+      readEvidence: () => { throw Error('unreadable'); },
+    })).toThrow('unreadable');
+  });
+  it.each(['skipped', 'error', 'disabled', 'not-owed', 'null', 'undefined', 'throw'].flatMap(failure =>
+    ['ran', { status: 'resumed', comment: { status: 'error' } }].map(prior => ({ failure, prior }))))(
+    'preserves durable clean result $prior after a resume child returns $failure', ({ failure, prior }) => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-resume-status-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      const store = input => recordRedTeamStatus(input, { env });
+      const status = () => readRedTeamStatus({ repo, pr, head, env });
+      try {
+        store({ repo, pr, loopPayload: payload(), status: 'finished', result: prior });
+        const io = fakeIo({ readRedTeamStatus: status, readRedTeamRecords: () => [cleanRow],
+          recordRedTeamQueued: vi.fn(input => {
+            store(input);
+            expect(status()).toMatchObject({ status: 'queued', pid: process.pid });
+          }),
+          redTeamStatus: vi.fn(store),
+          runRedTeam: vi.fn(() => {
+            if (failure === 'throw') throw Error('temporary child failure');
+            return failure === 'null' ? null : failure === 'undefined' ? undefined : { status: failure };
+          }),
+        });
+        expect(runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode: 'resume' }, io).outcome).toBe('red-team-only');
+        expect(status()).toMatchObject({ status: 'finished', result: prior });
+        const retry = runRedTeamOnSkip({ repo,
+          plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+          rawPrs: [{ number: pr, headRefOid: head, comments: [] }],
+          readEvidence: () => ({ loopPayload: payload(), recorded: true }), readStatus: status,
+          setting: { enabled: true, retryCooldownMin: 30 }, now: () => 1_801_000,
+          lastDispatch: new Map([[`${repo}#${pr}@${head}`, 1_000]]), capacity: { lanes: 1 },
+          dispatch: () => ({ jobPid: 42 }),
+        });
+        expect(retry.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'resume' }]);
+        expect(io.report).not.toHaveBeenCalled();
+        expect(io.runLoop).not.toHaveBeenCalled(); expect(io.runExtraSeats).not.toHaveBeenCalled();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
   it.each(['ran', { status: 'ran', comment: 'error' }, 'resumed', { status: 'resumed', comment: 'error' }])('resumes both production result shapes %j with a clean stored row', result => {
     const io = fakeIo({ readRedTeamStatus: () => ({ status: 'finished', result }), readRedTeamRecords: () => [cleanRow] });
     expect(runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode: 'resume' }, io).outcome).toBe('red-team-only');

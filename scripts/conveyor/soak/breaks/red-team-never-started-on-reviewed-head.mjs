@@ -3,11 +3,12 @@
  * started its owed post-accept red team. No result appeared, so the PR sat indefinitely.
  *
  * Light replay of review-red-team-on-skip.test.mjs and review-daemon-red-team-on-skip.test.mjs:
- * production runReviewTick -> runRedTeamOnSkip, with injected PR/evidence/status readers and
- * dispatch/tag IO. #5762/#5530 resume a finished pass whose comment failed; #5759 starts fresh.
+ * production planReconcile -> runReviewTick -> runRedTeamOnSkip, with injected PR/evidence/status readers
+ * and dispatch/tag IO. #5762/#5530 resume a finished pass whose comment failed; #5759 starts fresh.
+ * Queued accepted heads (#5759 plus a synthetic resume) must reach the same evidence checks.
  * Five ticks cover cooldown, an in-flight pass, posted-but-not-visible, then a trusted result.
  * Controls never owe a start. No processes or network; all production imports use sourceRoot.
- * A pre-fix tree has no recovery hook: its real tick still runs and leaves all three stranded.
+ * A pre-fix tree has no recovery hook or omits queued heads: the real tick leaves owed heads stranded.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -47,6 +48,8 @@ export default {
       const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
       const repo = CONSTELLATION_REPOS.we.slug;
       const { runReviewTick } = await load(DAEMON);
+      const { planReconcile } = await load('scripts/conveyor/reconcile-core.mjs');
+      const { buildReviewedShaMarker } = await load('scripts/lib/review-escalation.mjs');
       const { renderRedTeamComment } = await load('scripts/operations/review-extra-seats.mjs');
       const recovery = existsSync(join(sourceRoot, RECOVERY)) ? await load(RECOVERY) : null;
       const head = 'a'.repeat(40);
@@ -60,29 +63,33 @@ export default {
           status: { status: 'finished', result: { status: 'ran', comment: 'error' } } },
         { number: 5530, mode: 'resume', evidence: evidence({ recorded: true }),
           status: { status: 'finished', result: 'ran' } },
-        { number: 5759, mode: 'fresh', evidence: evidence(), status: null },
+        { number: 5759, queued: true, mode: 'fresh', evidence: evidence(), status: null },
+        { number: 5760, queued: true, mode: 'resume', evidence: evidence({ recorded: true }),
+          status: { status: 'finished', result: 'ran' } },
         // Synthetic controls reproduce the unit tests' no-start boundaries on already-reviewed heads.
-        { number: 9001, evidence: evidence({ loopPayload: payload('changes') }), status: null },
-        { number: 9002, evidence: evidence({ loopPayload: null }), status: null },
-        { number: 9003, evidence: evidence(), status: null, comments: [comment(9003)] },
-        { number: 9004, evidence: evidence({ queued: true }), status: null },
-        { number: 9005, evidence: evidence({ recorded: true }),
+        { number: 9001, queued: true, evidence: evidence({ loopPayload: payload('changes') }), status: null },
+        { number: 9002, queued: true, evidence: evidence({ loopPayload: null }), status: null },
+        { number: 9003, queued: true, evidence: evidence(), status: null, comments: [comment(9003)] },
+        { number: 9004, queued: true, evidence: evidence({ queued: true }), status: null },
+        { number: 9005, queued: true, evidence: evidence({ recorded: true }),
           status: { status: 'finished', result: { status: 'error' } } },
-        { number: 9006, evidence: evidence({ recorded: true }), status: null },
+        { number: 9006, queued: true, evidence: evidence({ recorded: true }), status: null },
       ];
       const byPr = new Map(cases.map(c => [c.number, c]));
       const history = new Map(), starts = [];
       let at = 2_000_000;
       const setting = { enabled: true, retryCooldownMin: 30 };
       const tick = phase => {
-        const rawPrs = cases.map(c => ({ number: c.number, headRefOid: head,
-          comments: c.comments ?? [], labels: [] }));
-        const plan = { dispatch: [], refusals: cases.map(c => ({
-          kind: 'already-reviewed-head', prNumber: c.number, headSha: head,
-        })) };
+        const rawPrs = cases.map(c => ({ number: c.number, headRefOid: head, state: 'OPEN',
+          headRefName: 'lane/soak-accepted', baseRefName: 'main', mergeStateStatus: 'CLEAN',
+          statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
+          comments: [{ body: buildReviewedShaMarker(head), author: { login: 'web-everything' } }, ...(c.comments ?? [])],
+          labels: (c.queued ? ['review:accepted', 'ready-to-merge', 'red-team:pending'] : ['review:pending']).map(name => ({ name })) }));
+        const plan = planReconcile({ repo: 'we', prs: rawPrs, agents: [],
+          reviewTiming: { startAfter: 'ci-green' }, requiredChecks: ['gate'] });
         const out = runReviewTick({ repo, reconcile: () => plan,
           readPrs: () => rawPrs, readAgents: () => [], holdReconcile: () => [],
-          acquirableLanes: () => 3, liveReviewBudget: { left: 3 }, now: () => at,
+          acquirableLanes: () => 4, liveReviewBudget: { left: 4 }, now: () => at,
           tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
           dispatch: args => { violations.push(`${phase}: unexpected full review for #${args.pr}`); return { skipped: 'soak' }; },
           redTeamOnSkip: recovery ? options => recovery.runRedTeamOnSkip({ ...options,

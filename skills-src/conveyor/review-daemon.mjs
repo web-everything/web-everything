@@ -89,7 +89,7 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // report → release, no Claude wrapper session); `WE_REVIEW_DISPATCH_MODE=session` keeps the old `claude --bg`
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
 import { parseEscalationReason } from '../../scripts/review-detail.mjs';
-import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
+import { dispatchReviewJob, dispatchReviewByMode, readRedTeamRecoveryStatus } from '../../scripts/operations/review-job.mjs';
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
 import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
@@ -703,7 +703,15 @@ export function runReviewTick({
   let redTeamOnSkipResult;
   if (!paused && typeof redTeamOnSkip === 'function') {
     try {
-      redTeamOnSkipResult = redTeamOnSkip({ repo, plan, rawPrs,
+      // Accepted heads normally reconcile as nothing-owed/queued, before the same-head review
+      // guard. For red-team recovery they are also already reviewed; the recovery planner still
+      // requires an accepting, head-bound payload and checks comments, status and cooldown.
+      // Keep the reconcile plan intact for status/hold consumers and never adapt other refusals.
+      const recoveryRefusals = (plan.refusals ?? []).map(row =>
+        row.kind === 'nothing-owed' && row.phase === 'queued'
+          ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
+          : row);
+      redTeamOnSkipResult = redTeamOnSkip({ repo, plan: { ...plan, refusals: recoveryRefusals }, rawPrs,
         capacity: { lanes: Math.max(0, acquirable - occupiedLanes), budget: liveReviewBudget,
           remainingStarts: Math.max(0, hostLimit - occupiedLanes),
           take: () => { if (typeof host.take === 'function') host.take(1); } }, paused });
@@ -1227,7 +1235,8 @@ export function cliReviewTickOpts({ log = console } = {}) {
     acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     liveReviewBudget: liveReviewRoundBudget(),
-    redTeamOnSkip: o => runRedTeamOnSkip({ ...o, dispatch: d => dispatchReviewJob(d), log: line => log.error(line) }),
+    redTeamOnSkip: o => runRedTeamOnSkip({ ...o, readStatus: readRedTeamRecoveryStatus,
+      dispatch: d => dispatchReviewJob(d), log: line => log.error(line) }),
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,
     postRefreshMarker: defaultPostRebaseComment,

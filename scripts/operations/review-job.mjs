@@ -277,6 +277,21 @@ export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode })
   ];
 }
 
+/** A crashed resume keeps its clean prior result in the queued record. Only a confirmed dead
+ * writer can expose that result as finished again; live/unknown liveness still blocks recovery.
+ * Both daemon planning and job admission use this reader, followed by their existing row guards.
+ */
+export function readRedTeamRecoveryStatus(input, {
+  readStatus = readRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+} = {}) {
+  const status = readStatus(input);
+  const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
+  if (status?.status !== 'queued' || !Number.isInteger(status.pid) || status.pid <= 0
+    || !['ran', 'resumed'].includes(priorResult) || priorComment === 'posted') return status;
+  const evidence = readEvidence(input);
+  return evidence?.inFlight === false && !evidence.queued ? { ...status, status: 'finished' } : status;
+}
+
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
@@ -311,7 +326,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     root,
     readRedTeamRecords: () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records,
-    readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
+    readRedTeamStatus: input => readRedTeamRecoveryStatus({ ...input, env }),
     readRedTeamComments: ({ pr, repo }) => readCompletePrComments(pr, { repo,
       exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) }),
     readRedTeamOnlyPayload: ({ pr, repo }) => {
@@ -728,7 +743,13 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         ...(gate?.plan ? { sendBack: gate.plan.sendBack.length, card: gate.plan.card.length, advisory: gate.plan.advisory.length } : {}) };
     }
   }
-  if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam?.status ?? null });
+  if (accepted) {
+    // A resume only retries effects of an already-clean pass. A transient child/store failure
+    // must not replace that admission evidence with skipped/error and strand the next retry.
+    const result = seatsBox.redTeamResumeResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
+      ? seatsBox.redTeamResumeResult : out.redTeam?.status ?? null;
+    io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result });
+  }
   else if (spec && seatsBox.input) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
   return out;
 }
@@ -872,12 +893,13 @@ function runReviewArc({
       const input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode };
       // Publish admission before finally drops the job slot, so another recovery cannot enter the gap.
       try {
-        io.recordRedTeamQueued({ ...input, status: 'queued' });
+        io.recordRedTeamQueued({ ...input, status: 'queued', ...(redTeamMode === 'resume' ? { result: status.result } : {}) });
       } catch {
         return refuse('queued red-team status could not be persisted');
       }
       seatsBox.input = input;
       seatsBox.redTeamQueued = true;
+      if (redTeamMode === 'resume') seatsBox.redTeamResumeResult = status.result;
       classified = { outcome: 'red-team-only' };
       return result({ ...classified, lanePath });
     }
