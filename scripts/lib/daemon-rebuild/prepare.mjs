@@ -24,7 +24,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
-import { assertSwapReplacementAdopted } from '../overlay-swap.mjs';
+import { assertSwapRemovalAdopted } from '../overlay-swap.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
@@ -340,7 +340,7 @@ export async function prepareRebuild({
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove')) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
-      try { assertSwapReplacementAdopted({ root, ref: d.ref, run, env }); } catch (error) {
+      try { assertSwapRemovalAdopted({ root, ref: d.ref, run, env }); } catch (error) {
         deferredRemovals.add(d.ref);
         alert('overlay-removal-deferred', { ref: d.ref, reason: error.message });
         continue;

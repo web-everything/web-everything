@@ -155,9 +155,33 @@ describe('manual predecessor removal guard', () => {
       ['-C', 'clone', 'fetch', '--no-tags', 'origin', '+refs/heads/old:refs/remotes/origin/old'],
       ['-C', 'clone', 'rev-parse', '--verify', 'refs/remotes/origin/old^{commit}'],
       ['-C', 'clone', 'merge-base', '--is-ancestor', oldSha, sha],
+      ['-C', 'clone', 'merge-base', '--is-ancestor', sha, 'HEAD'],
     ]);
     assertSwapRemovalAdopted({ root: 'clone', ref: 'unrelated', readOverlays, run });
-    expect(run).toHaveBeenCalledTimes(4);
+    expect(run).toHaveBeenCalledTimes(5);
+  });
+  it.each([1, 128, null])('refuses removal if adoption disappears or becomes unknown during fetch (status %s)', status => {
+    let fetched = false;
+    const run = vi.fn(args => {
+      if (args.includes('fetch')) { fetched = true; return { status: 0 }; }
+      if (args.includes('rev-parse')) return { status: 0, stdout: oldSha };
+      return { status: args.at(-1) === 'HEAD' && fetched ? status : 0 };
+    });
+    const remove = vi.fn();
+    expect(() => {
+      assertSwapRemovalAdopted({ root: 'clone', ref: 'old', run, env: {},
+        readOverlays: () => [{ ref: 'old', replacedBy: { ref: 'new', sha } }],
+      });
+      remove();
+    }).toThrow(/no longer adopted|unavailable/);
+    expect(run.mock.calls.map(([args]) => args)).toEqual([
+      ['-C', 'clone', 'merge-base', '--is-ancestor', sha, 'HEAD'],
+      ['-C', 'clone', 'fetch', '--no-tags', 'origin', '+refs/heads/old:refs/remotes/origin/old'],
+      ['-C', 'clone', 'rev-parse', '--verify', 'refs/remotes/origin/old^{commit}'],
+      ['-C', 'clone', 'merge-base', '--is-ancestor', oldSha, sha],
+      ['-C', 'clone', 'merge-base', '--is-ancestor', sha, 'HEAD'],
+    ]);
+    expect(remove).not.toHaveBeenCalled();
   });
   it.each(['advanced', 'fetch-failed', 'unreadable-tip', 'unknown-containment'])('refuses manual removal with %s predecessor evidence', stage => {
     const run = vi.fn(args => {

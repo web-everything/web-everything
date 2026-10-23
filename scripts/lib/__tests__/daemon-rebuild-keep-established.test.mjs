@@ -84,6 +84,34 @@ const passSmoke = () => vi.fn(async () => ({
 }));
 
 describe('swap predecessor removal during rebuild preparation', () => {
+  it.each(['CLOSED', 'MERGED'])('retains a predecessor whose origin advances after the initial fetch despite replacement adoption (%s)', async state => {
+    const f = fixture(), ref = 'lane/swap-old';
+    const oldSha = f.push(ref, f.init, { 'swap-old.txt': 'old\n' });
+    const newSha = f.push('lane/swap-new', oldSha, { 'swap-new.txt': 'new\n' });
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    gitOk(f.clone, ['reset', '--hard', newSha]);
+    addOverlay(f.clone, { ref, pr: 777 }, { env: f.env });
+    addOverlay(f.clone, { ref: 'lane/swap-new', pr: 778 }, { env: f.env });
+    recordOverlayReplacement(f.clone, ref, { ref: 'lane/swap-new', sha: newSha }, { env: f.env });
+    const before = readOverlays(f.clone, { env: f.env });
+    let advanced;
+    const result = await prepareRebuild({ root: f.clone, env: f.env, now: Date.now,
+      run: gitRun, prBaseChain: async () => null, log: { error: () => {} },
+      prState: async pr => {
+        if (pr !== 777) return 'OPEN';
+        advanced = f.push(ref, oldSha, { 'swap-late.txt': 'late predecessor change\n' });
+        return state;
+      },
+    });
+    expect(result.plan.decisions).toContainEqual(expect.objectContaining({ ref, action: 'remove' }));
+    expect(result.alerts).toContainEqual({ kind: 'overlay-removal-deferred', detail: {
+      ref, reason: expect.stringMatching(/replacement does not contain its current origin tip/),
+    } });
+    expect(result.alerts.some(a => a.kind === 'overlay-auto-dropped' && a.detail.ref === ref)).toBe(false);
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(before);
+    expect(gitOk(f.clone, ['rev-parse', `refs/remotes/origin/${ref}`]).trim()).toBe(advanced);
+    expect(gitOk(f.clone, ['rev-parse', 'HEAD']).trim()).toBe(newSha);
+  });
   it.each(['CLOSED', 'MERGED', 'unknown-sha', 'malformed-marker', 'ancestry-error'])('defers a remove decision until replacement adoption (%s)', async state => {
     const f = fixture(), ref = 'lane/swap-old';
     const oldSha = f.push(ref, f.init, { 'swap-old.txt': 'old\n' });

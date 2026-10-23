@@ -8,8 +8,11 @@
 only an adopted replacement containing each predecessor's freshly fetched origin tip
 may retire that predecessor. Manual removal also fetches the predecessor's current
 origin tip and refuses pending, unknown or incomplete replacement adoption. Rebuild
-preparation defers marked predecessors' removal until adoption, logging
-`overlay-removal-deferred`. Timeout and pre-swap rebuild failures restore complete
+preparation uses the same full guard, logging `overlay-removal-deferred` on refusal.
+Both recheck adoption after fetch and containment, immediately before removal.
+Residual window: the list mutex is private and `removeOverlay` has no guard callback;
+HEAD can still move between the final check and deletion, including while waiting for that mutex.
+Timeout and pre-swap rebuild failures restore complete
 registrations, including `replacedBy` and all guard fields, with fresh per-entry reads
 and insertion under the registry lock that preserves concurrent entries.
 `swapAfterAdopt.timeoutMs` resolves through the policy cascade

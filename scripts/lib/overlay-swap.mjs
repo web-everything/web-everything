@@ -46,7 +46,7 @@ export function originTip({ root, ref, run = overlayGitRun, env = process.env })
   return sha;
 }
 
-/** Shared with rebuild preparation: unknown evidence is a refusal, including legacy markers. */
+/** Unknown evidence is a refusal, including legacy markers. */
 export function assertSwapReplacementAdopted({ root, ref, readOverlays = readSwapOverlays, run = overlayGitRun, env = process.env }) {
   const entry = readOverlays(root, { env }).find(o => o.ref === ref);
   if (!entry || !Object.hasOwn(entry, 'replacedBy')) return;
@@ -62,6 +62,7 @@ export function assertSwapReplacementAdopted({ root, ref, readOverlays = readSwa
   return sha;
 }
 
+/** Full guard shared by manual removal and rebuild preparation; call immediately before removal. */
 export function assertSwapRemovalAdopted(options) {
   const sha = assertSwapReplacementAdopted(options);
   if (!sha) return;
@@ -69,6 +70,9 @@ export function assertSwapRemovalAdopted(options) {
   const tip = originTip({ root, ref, run, env });
   if (!ancestor(root, run, env, tip, sha)) {
     throw new Error(`overlay-swap: refusing to remove ${ref}: replacement does not contain its current origin tip; update the replacement and retry`);
+  }
+  if (!ancestor(root, run, env, sha, 'HEAD')) {
+    throw new Error('overlay-swap: replacement no longer adopted; retain registrations and retry');
   }
 }
 
