@@ -66,6 +66,9 @@ export function readSavedRedTeamResult({ repo, pr, head, env = process.env, runs
 }
 
 
+/** The gate's reader of a withheld saved result: the identical, fully-checked reader (provenance, setting, completeness). */
+export const readSavedRedTeamGateResult = readSavedRedTeamResult;
+
 /**
  * A pass that ran on this head, usable or not (errored, unparseable, not posted). Not a result, but never a
  * "never scheduled" head either: it stays held until a usable result exists.
