@@ -24,6 +24,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
@@ -38,7 +39,7 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -66,6 +67,8 @@ export async function prepareRebuild({
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
+
+  try { await autoRebase.finishPendingSwaps({ root, env, run, removeOverlay, appendOverlayEvent }); } catch { /* best effort; preserve pending evidence */ }
 
   // ── Step 0: recovery ──────────────────────────────────────────────────────────────────────────────────
   const indexLockPath = join(root, '.git', 'index.lock');
@@ -319,6 +322,12 @@ export async function prepareRebuild({
       refs: lost.map((l) => l.ref), lost,
       message: `${lost.length} overlay(s) in the running build would be lost (${lost.map((l) => l.ref).join(', ')}) — holding on the last-good build; rebase them onto main (or merge main into the stack top) and re-register`,
     };
+    let setting;
+    try { setting = autoRebase.resolveAutoRebaseSwitch(env); } catch { setting = { enabled: false, source: 'unavailable' }; detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
+    if (setting.enabled) {
+      try { detail.autoRebase = { ...await autoRebase.kickAutoRebase({ root, env, lost }), source: setting.source }; }
+      catch { detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
+    }
     alert('established-overlay-hold', detail);
     if (state.adopted?.head && state.adopted.head === prevHead) {
       state.held = {

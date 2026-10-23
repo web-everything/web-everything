@@ -59,6 +59,7 @@ function fixture() {
   };
   const env = {
     ...process.env,
+    WE_DAEMON_AUTO_REBASE: '0',
     WE_DAEMON_STATE_DIR: mktemp('we-keep-est-state-'),
     WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-keep-est-lock-'),
     WE_DAEMON_OVERLAY_DIR: mktemp('we-keep-est-overlay-'),
