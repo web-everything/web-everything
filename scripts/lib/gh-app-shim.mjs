@@ -850,6 +850,10 @@ function unsupportedTargetHost(argv, env) {
         return (publicHost(host) || (api && host === 'api.github.com')) ? null : host;
       } catch { return 'invalid URL'; }
     }
+    // gh reads a port-qualified host (github.com:443/o/r) as its own, enterprise host and picks the
+    // enterprise token; read as SCP it would wrongly look like github.com. Never a public target.
+    const port = /^(?:[^@/]+@)?([^/:]+):([0-9]+)(?:[/]|$)/.exec(s);
+    if (port) return port[1] + ':' + port[2];
     const scp = /^(?:[^@/]+@)?([^/:]+):[^/]/.exec(s);
     if (scp) return publicHost(scp[1]) ? null : scp[1];
     const parts = s.split('/');

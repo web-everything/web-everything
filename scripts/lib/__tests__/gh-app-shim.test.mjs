@@ -1383,6 +1383,8 @@ require(${JSON.stringify(shim)});
     [{}, ['pr', 'list', '--repo=https://github.com:443/web-everything/repo']],
     [{}, ['pr', 'list', '--repo=https://%67ithub.com/web-everything/repo']],
     [{}, ['pr', 'list', '--repo=https://ｇｉｔｈｕｂ.com/web-everything/repo']],
+    [{ GH_REPO: 'github.com:443/web-everything/repo' }, ['pr', 'list']],
+    [{ GH_HOST: 'github.com:443' }, ['pr', 'list']],
   ])('refuses enterprise credentials even with trusted public-host provenance (%j, %j)', async (extra, argv) => {
     const { createHash } = await import('node:crypto');
     const f = fixture();
@@ -1453,6 +1455,18 @@ require(${JSON.stringify(shim)});
     ['cache', 'delete', '--all', '--succeed-on-no-caches', '--repo', 'github.corp.example/o/r'],
     // A value option of another command is not this command's: --notes is release content, not pr view's.
     ['pr', 'view', '--notes', 'https://github.corp.example/o/r/pull/1'],
+    // PR #5729 red team (931fb275a46568e8 #1): gh reads a port-qualified host as its own (enterprise)
+    // host and picks GH_ENTERPRISE_TOKEN; the SCP reading must not turn github.com:443 into github.com.
+    ['pr', 'list', '-R', 'github.com:443/web-everything/web-everything', '--limit', '1'],
+    ['pr', 'list', '-Rgithub.com:443/web-everything/web-everything'],
+    ['pr', 'list', '-R=github.com:443/web-everything/web-everything'],
+    ['pr', 'list', '--repo', 'github.com:443/web-everything/web-everything'],
+    ['pr', 'list', '--repo=GitHub.com:8443/web-everything/web-everything'],
+    ['pr', 'checkout', '-qRgithub.com:443/web-everything/web-everything', '1'],
+    ['repo', 'view', 'github.com:443/web-everything/web-everything'],
+    ['repo', 'view', 'git@github.com:443/web-everything/web-everything'],
+    ['repo', 'view', '--', 'github.com:443/web-everything/web-everything'],
+    ['secret', 'set', 'NAME', '--repos', 'web-everything/a,github.com:443/web-everything/b'],
   ])('refuses enterprise hosts before using a fresh public App cache: %j', (...argv) => {
     const f = fixture({ fresh: true });
     try {
