@@ -18,7 +18,8 @@
  * The pure decision half (marker shape + the gate decision `pr-land` calls) lives in `scripts/lib/lane-verify.mjs`.
  *
  * The default build.finalGate is full: the whole unit tier plus standards, through heavy admission.
- * Set build.finalGate=related to retain the diff-driven selection in lib/verify-lane-gate.mjs.
+ * build.finalGate=related selects related tests; build.finalGateStandards defaults to always,
+ * retaining standards on every diff. Set finalGateStandards=selected for the verify-settings selection.
  * Explicit --gate commands retain precedence. Settings and their sources are logged through policy-cascade.
  *
  * Usage:
@@ -98,7 +99,7 @@ Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run] [flags]
   check     read-only verdict for HEAD (--wait=<ms> blocks until it settles)
   reset     clear a stale marker
   run       synchronous marker-less run
-Flags: --repo=<dir> --json --require-verified --help/-h
+Flags: --repo=<dir> --json --require-verified --dry-run (print default gate only) --help/-h
 Exit: 0 ok, 2 red, 3 usage/refused. Full docs: the header of scripts/verify-lane.mjs.
 `);
   process.exit(0);
@@ -122,7 +123,7 @@ const { requireVerified: REQUIRE_VERIFIED, breakGlass: VERIFY_BREAK_GLASS } = re
 // commands nor any other child we spawn can read it. Later in-band queue markers echo it (see `timedRunGate`).
 const MARKER_NONCE_SUFFIX = markerNonceSuffix(process.env[VERIFY_MARKER_NONCE_ENV]);
 delete process.env[VERIFY_MARKER_NONCE_ENV];
-const MODE = positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
+const MODE = flags['dry-run'] ? 'print-gate' : positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
   : positionals[0] === 'request' ? 'request' : positionals[0] === 'run' ? 'run' : 'verify';
 
 // The lane is agent-writable, and the fix daemon runs `request` against it: its `.git/config` must never be able to execute
@@ -350,8 +351,17 @@ resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
 // changed files for red-cause attribution. It runs no selected-test half (`testCommand`), so no phase, scan or
 // isolated retry built for a selection applies. Any other policy keeps the diff-driven selection.
 function resolveBuildDefaultGate(env) {
-  if (resolveBuildPolicy({ env }).finalGate !== 'full') {
-    return resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
+  const policy = resolveBuildPolicy({ env });
+  if (policy.finalGate !== 'full') {
+    const always = policy.finalGateStandards === 'always';
+    const gateEnv = always ? { ...env, WE_VERIFY_STANDARDS: 'always', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '0' } : env;
+    const gate = resolveDefaultGate({ runGit: git, env: gateEnv, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
+    const source = always ? `build.finalGateStandards (${policy.sources.finalGateStandards})` : gate.decision.settingsSource.standards;
+    gate.decision.standards.source = source;
+    const reason = `build.finalGateStandards=${policy.finalGateStandards} (${policy.sources.finalGateStandards}); standards=${gate.decision.standards.policy} (${source})`;
+    gate.gateReasons.push(reason);
+    gate.decision.reasons = [...gate.decision.reasons, reason];
+    return gate;
   }
   const scripts = readCheckoutScripts();
   const tests = !scripts || scripts.includes('test:unit') ? 'npm run test:unit' : 'npm test';
@@ -366,6 +376,13 @@ function resolveBuildDefaultGate(env) {
   const reason = 'build.finalGate=full — the whole unit tier plus standards';
   return { command, gateReasons: [reason], decision: { mode: 'full', reasons: [reason], changedFiles,
     selectionMode: { mode: 'pr', reason: 'build.finalGate=full' } } };
+}
+// Preview resolves the same default as verify, before any gate, admission or marker writes.
+if (MODE === 'print-gate') {
+  const gate = resolveBuildDefaultGate(process.env);
+  writeAllSync(1, JSON.stringify({ command: gate.command, reasons: [...gate.decision.reasons, ...gate.gateReasons],
+    standards: gate.decision.standards ?? null, decision: gate.decision }) + '\n');
+  process.exit(0);
 }
 let GATE;
 let resolvedGate;
