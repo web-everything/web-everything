@@ -441,11 +441,25 @@ if (!resolvedGate && typeof flags.gate === 'string') {
     // setting): a stamped selection under our `full`, or a stamped full gate under our `related`, is still a default.
     else if (MODE === 'verify' && typeof flags['run-id'] === 'string') {
       const variants = verifySetting('matchRequestVariants', process.env);
-      const ours = resolveBuildPolicy({ env: process.env }).finalGate === 'full' ? 'full' : 'related';
+      const policy = resolveBuildPolicy({ env: process.env });
+      const ours = policy.finalGate === 'full' ? 'full' : 'related';
+      const theirStandards = policy.finalGateStandards === 'always' ? 'selected' : 'always';
+      const { WE_VERIFY_STANDARDS: ownVerifyStandards, ...unpinned } = process.env;
       for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {
         const env = finalGate === ours ? process.env : { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
         const base = finalGate === ours ? resolved : resolveUnder(env);
         resolvedGate = (base.command === GATE ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
+        if (resolvedGate) break;
+        if (finalGate === 'full') continue; // build.finalGateStandards shapes only the related gate
+        // #5831 — the requester may also resolve the other build.finalGateStandards. `always` pins WE_VERIFY_STANDARDS,
+        // so the matcher's standards probes cannot reproduce a `selected` stamp under ours (and vice versa). Every probe
+        // pins WE_VERIFY_STANDARDS, so a pinned resolution is a probe and resolves under THEIR policy; the base and the
+        // plan carry no pin and resolve under OURS, so the recognized selection still runs our standards half.
+        const ownPin = ownVerifyStandards === undefined ? {} : { WE_VERIFY_STANDARDS: ownVerifyStandards };
+        const theirEnv = finalGate === ours ? unpinned : { ...unpinned, WE_BUILD_FINAL_GATE: finalGate };
+        const underTheirs = (e) => Object.hasOwn(e, 'WE_VERIFY_STANDARDS')
+          ? resolveUnder({ ...e, WE_BUILD_FINAL_GATE_STANDARDS: theirStandards }) : resolveUnder({ ...e, ...ownPin });
+        resolvedGate = matchRequestedDefaultGate({ gate: GATE, env: theirEnv, resolved: base, resolveUnder: underTheirs, variants }) ?? undefined;
         if (resolvedGate) break;
       }
     }
