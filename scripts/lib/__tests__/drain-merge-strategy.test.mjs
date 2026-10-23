@@ -692,6 +692,8 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
       // A completed retry on the same head releases the persisted hold at the next allowed probe.
       writeFileSync(path, JSON.stringify({ version: 1, records: [{ dispatchKind: 'review-seat', seat: 'red-team',
         repo: LOCAL, pr: 5283, rev: HEAD, status: 'ok', recheckStatus: 'ok', findings: [], confirmedMissCount: 0 }] }));
+      // The writer re-saves provenance with the new row, as the review job does; a stale hash is rightly refused.
+      saveProvenanceFixtures(env);
       clock = next.state().redTeamPending['cwd#5283'].retryAt;
       expect(next.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
     } finally { rmSync(root, { recursive: true, force: true }); }
