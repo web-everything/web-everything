@@ -171,6 +171,52 @@ describe('runRedTeamOnSkip', () => {
   it.each([{ lanes: 0 }, { lanes: 1, budget: { left: 0 } }])('does not dispatch with exhausted capacity %j', capacity => {
     const o = runFixture({ capacity }); runRedTeamOnSkip(o); expect(o.dispatch).not.toHaveBeenCalled();
   });
+  it('host-denied capacity blocks recovery without consuming lanes, budget or host starts', () => {
+    const take = vi.fn(), capacity = { lanes: 3, budget: { left: 3 }, remainingStarts: 0, take };
+    const o = runFixture({ capacity });
+    const out = runRedTeamOnSkip(o);
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(out.dispatched).toEqual([]);
+    expect(out.rows[0].why).toBe('no review capacity left');
+    expect(capacity).toEqual({ lanes: 3, budget: { left: 3 }, remainingStarts: 0, take });
+    expect(take).not.toHaveBeenCalled();
+    expect(o.lastDispatch.size).toBe(0);
+  });
+  it('bounds recovery by the remaining shared host cap despite spare lanes and live-review budget', () => {
+    const take = vi.fn();
+    const o = runFixture({ capacity: { lanes: 5, budget: { left: 5 }, remainingStarts: 1, take } });
+    for (const prNumber of [5530, 5531, 5532]) {
+      o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber, headSha: head });
+      o.rawPrs.push({ number: prNumber, headRefOid: head, comments: [] });
+    }
+    const out = runRedTeamOnSkip(o);
+    expect(out.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
+    expect(o.dispatch).toHaveBeenCalledTimes(1);
+    expect(o.capacity).toEqual({ lanes: 4, budget: { left: 4 }, remainingStarts: 0, take });
+    expect(take).toHaveBeenCalledTimes(1);
+    expect(out.notStarted).toHaveLength(3);
+  });
+  it.each(['dry-run', 'skipped', 'no-job'])('%s consumes no host start', kind => {
+    const take = vi.fn();
+    const o = runFixture({ capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+      dryRun: kind === 'dry-run',
+      dispatch: vi.fn(() => kind === 'skipped' ? { skipped: 'lane-cooloff' } : {}) });
+    expect(runRedTeamOnSkip(o).dispatched).toEqual([]);
+    expect(o.capacity.remainingStarts).toBe(1);
+    expect(take).not.toHaveBeenCalled();
+  });
+  it('a throwing recovery dispatch consumes host capacity because a spawn may have occurred', () => {
+    const take = vi.fn();
+    const o = runFixture({ capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+      dispatch: vi.fn(() => { throw Error('unknown start'); }) });
+    o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: 5530, headSha: head });
+    o.rawPrs.push({ number: 5530, headRefOid: head, comments: [] });
+    const out = runRedTeamOnSkip(o);
+    expect(out.rows[0].why).toBe('dispatch failed; start unknown');
+    expect(o.dispatch).toHaveBeenCalledTimes(1);
+    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 }, remainingStarts: 0, take });
+    expect(take).toHaveBeenCalledTimes(1);
+  });
   it('dispatches the existing job, spends capacity and records cooldown only for starts', () => {
     const log = vi.fn(), o = runFixture({ log, preferLane: 7 }); const out = runRedTeamOnSkip(o);
     expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh', preferLane: 7 });

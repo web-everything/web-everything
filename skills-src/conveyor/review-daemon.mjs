@@ -605,7 +605,7 @@ export function runReviewTick({
   const lanes = paused ? 0 : acquirableLanes({ repo });
   const acquirable = Math.max(0, (Array.isArray(lanes) ? lanes.length : Number(lanes)) || 0);
   let host = { admitted: true, maxPerTick: Infinity };
-  if (!paused && reviews.length) {
+  if (!paused && (reviews.length || typeof redTeamOnSkip === 'function')) {
     try { host = hostAdmission() ?? host; } catch (e) { host = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
   }
   const hostLimit = !host.admitted ? 0 : Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : Infinity;
@@ -704,7 +704,9 @@ export function runReviewTick({
   if (!paused && typeof redTeamOnSkip === 'function') {
     try {
       redTeamOnSkipResult = redTeamOnSkip({ repo, plan, rawPrs,
-        capacity: { lanes: Math.max(0, acquirable - occupiedLanes), budget: liveReviewBudget }, paused });
+        capacity: { lanes: Math.max(0, acquirable - occupiedLanes), budget: liveReviewBudget,
+          remainingStarts: Math.max(0, hostLimit - occupiedLanes),
+          take: () => { if (typeof host.take === 'function') host.take(1); } }, paused });
     } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
   }
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later

@@ -68,7 +68,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
 const lastDispatch = new Map();
 const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 
-/** Bounded recovery, sharing review capacity. Errors never abort the daemon tick. */
+/** Bounded recovery, sharing lane, live-review and host start capacity. Errors never abort the daemon tick.
+ * `capacity.remainingStarts` caps starts after ordinary dispatches; `capacity.take()` consumes one shared
+ * host start on success or an unknown outcome. Both are optional for standalone callers.
+ */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
   env = process.env, setting, readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   now = Date.now, lastDispatch: history = lastDispatch, preferLane } = {}) {
@@ -83,7 +86,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       let started = false;
       if (row.action === 'dispatch') {
         const budget = capacity?.budget;
-        if (!(capacity?.lanes > 0) || (budget && !(budget.left > 0))) row.why = 'no review capacity left';
+        if (!(capacity?.lanes > 0) || (budget && !(budget.left > 0))
+          || (capacity.remainingStarts != null && !(capacity.remainingStarts > 0))) row.why = 'no review capacity left';
         else if (dryRun) row.why = `dry run (${row.mode})`;
         else {
           const reserved = budget && Number.isFinite(budget.left);
@@ -98,6 +102,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               row.why = result?.skipped ?? 'job did not start';
             } else {
               capacity.lanes--;
+              if (capacity.remainingStarts != null) capacity.remainingStarts--;
+              capacity.take?.();
               history.set(`${repo}#${row.prNumber}@${row.head}`, at);
               dispatched.push({ prNumber: row.prNumber, jobPid: result.jobPid, mode: row.mode });
               started = true;
@@ -105,6 +111,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           } catch {
             // A throw may follow a spawn: retain its reservation until the next live process read.
             capacity.lanes--;
+            if (capacity.remainingStarts != null) capacity.remainingStarts--;
+            capacity.take?.();
             row.why = 'dispatch failed; start unknown';
           }
         }
