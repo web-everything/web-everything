@@ -6452,8 +6452,10 @@ collection`, `count wins simultaneous count and age thresholds`, `every stream v
 source logged`, `high and urgent bypass with shipped defaults`, `follow-up and expedite origins route to filing`)
 and x7nf3f5 (`ruling ships enabled with 8/60 defaults`, `disabled ruling refuses kind-disabled, not unknown kind`);
 rule 4 by xf1z2w3 (`extracted member cannot re-enter a collector`); rule 5 by x1mmp60 (`numbering failure retains
-the hold and never reaches ready`); rule 6 by x5nmdnt, one case per PR state (open stays sealed, merged, closed by
-a split, closed otherwise with its members archived and surfaced, unreadable), plus the fault-injection case
+the hold and never reaches ready`); rule 6 by x5nmdnt, one case per PR state (`open sealed PR stays sealed and keeps
+refusing batch-sealed`, `retires a sealed state whose PR merged on the next admission`, `split-closed batch retires
+and surfaces nothing`, `closed-unmerged batch is archived, retired and surfaced`, `unreadable PR state stays sealed
+and held`; their `sealed/` archive counterparts are listed in x5nmdnt's edge case 6), plus the fault-injection case
 `archive failure preserves the active slot and retry preserves every member`.
 
 **Lineage:** `#x5ioz96` (ruled 2026-10-18). Epic x87psvt.

@@ -40,6 +40,6 @@ One line per class: either the handling, or `n/a: <why>`.
 2. **Truncated reads** — an invalid or partial policy is refused `invalid-policy`, as today.
 3. **Shared state files** — n/a: the policy is read-only config.
 4. **Fail closed** — a disabled stream refuses `kind-disabled`, distinct from an unknown kind (case `disabled ruling refuses kind-disabled, not unknown kind`).
-5. **Identity scoping** — each stream has its own policy block; routing is by the card's origin.
+5. **Identity scoping** — each stream has its own policy block; routing is by the card's origin (cases `ruling is declared with disabled 8/60 defaults`, `follow-up and expedite origins route to filing`).
 6. **State over time** — n/a: no stored state.
 7. **Who wrote it** — n/a: config and routing only; who may file a ruling card is x7nf3f5's.

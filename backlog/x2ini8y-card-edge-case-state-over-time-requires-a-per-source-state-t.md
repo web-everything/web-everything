@@ -36,6 +36,8 @@ PR 5608's round-4 review owed more guards of the same kind (a card promises a gu
   - `default flip without the replaced sibling cases is refused` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs).
   - `statute rule with no cited case and no unpinned mark is refused` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs) — for an entry the diff adds or changes.
   - `untouched statute entry without cited cases only warns` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs).
+  - `refusal names only the failing card and entry` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs) — with two open cards and two changed decision entries, one of each failing, the refusal names only the failing card and the failing entry anchor; the passing card and entry are not listed.
+  - `resolved or Planned-cases-free card only warns` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs) — a resolved card and an open card without a Planned cases block, each with a TODO acceptance line, are listed as warnings and not refused.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -53,6 +55,6 @@ One line per class: either the handling, or `n/a: <why>`.
 2. **Truncated reads** — n/a: whole committed files are read; a read error fails the lint.
 3. **Shared state files** — n/a: the lint is read-only.
 4. **Fail closed** — a card the lint cannot classify is refused, not passed.
-5. **Identity scoping** — rules apply per card; rule 7 applies per decision entry anchor.
-6. **State over time** — the rules refuse only open cards with a Planned cases block, and only decision entries the diff adds or changes; older and resolved cards and untouched entries are listed as warnings, not refused.
+5. **Identity scoping** — rules apply per card; rule 7 applies per decision entry anchor (case `refusal names only the failing card and entry`).
+6. **State over time** — the rules refuse only open cards with a Planned cases block, and only decision entries the diff adds or changes; older and resolved cards and untouched entries are listed as warnings, not refused (cases `resolved or Planned-cases-free card only warns`, `untouched statute entry without cited cases only warns`).
 7. **Who wrote it** — n/a: the rules apply equally to any author.
