@@ -1,4 +1,5 @@
 /** #4389 — exercise the real drain with hermetic git/gh shims; no real PRs are touched. */
+import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
@@ -67,7 +68,7 @@ function runCli({ failAll = false, watch = false } = {}) {
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', '--json',
       ...(watch ? ['--watch', '--interval=1', '--max-idle=1'] : [])], {
       cwd: dir, encoding: 'utf8', timeout: 30000,
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, ISOLATION_FIXTURE: fixture,
+      env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, ISOLATION_FIXTURE: fixture,
         ISOLATION_HOME: dir, ISOLATION_FAIL_ALL: failAll ? '1' : '0' },
     });
     expect(r.error, r.stderr).toBeUndefined();

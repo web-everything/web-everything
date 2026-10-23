@@ -30,6 +30,36 @@ const carried = bot([
 ].join('\n'), '2026-10-21T21:00:00Z');
 
 describe('operator card release at the cap (shared reader)', () => {
+  it.each([
+    ['accepts a trusted human operator-card after a trusted cap', { login: 'chalbert', type: 'User' }, true],
+    ['rejects an unregistered human operator-card after a trusted cap', { login: 'mallory', type: 'User' }, false],
+    ['rejects a bot operator-card after a trusted cap', { login: 'web-everything', type: 'Bot' }, false],
+  ])('%s across reader, queue and labels', (_, user, releases) => {
+    const card = gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z');
+    const comments = [...live, { ...card, user }];
+    expect(held(disp(comments))).toEqual(releases ? [] : [1]);
+    const hold = redTeamEnqueueHold({ comments, pr: P, head: H, env: {} });
+    if (releases) expect(hold).toBeNull();
+    else expect(hold).not.toBeNull();
+    expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['red-team:blocked'], env: {} }))
+      .toEqual(releases ? { add: 'red-team:clear', remove: ['red-team:blocked'] } : { add: null, remove: [] });
+  });
+  it('keeps an identical re-posted result held when the operator card predates it', () => {
+    const card = gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z');
+    const comments = [...live, card];
+    expect(held(disp(comments))).toEqual([]);
+    const repost = { ...result, created_at: '2026-10-21T21:00:00Z' };
+    expect(liveResultGateState([repost], P, H).resultId).toBe(rid);
+    // A marker-only new cap must not mask a stale release by overwriting its action with `held`.
+    comments.push(repost, gate(bot, 'round-cap', '', '2026-10-21T21:10:00Z'));
+    expect(liveResultGateState(comments, P, H).resultId).toBe(rid);
+    expect(held(disp(comments))).toEqual([1]);
+    expect(redTeamEnqueueHold({ comments, pr: P, head: H, env: {} })).not.toBeNull();
+    expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['red-team:blocked'], env: {} }))
+      .toEqual({ add: null, remove: [] });
+    comments.push(gate(human, 'operator-card', cardLine([1]), '2026-10-21T21:30:00Z'));
+    expect(held(disp(comments))).toEqual([]);
+  });
   it.each(['missing', 'sent-back', 'wrong result', 'wrong head', 'untrusted', 'later'])('rejects an operator card with a %s round-cap handover across reader, queue and labels', (variant) => {
     const cap = gate(bot, 'round-cap', '', '2026-10-21T17:12:20Z');
     const before = {

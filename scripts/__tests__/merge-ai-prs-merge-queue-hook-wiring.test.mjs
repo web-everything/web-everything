@@ -3,6 +3,7 @@
  * (the #4389 isolation harness). Proves the merge-site wiring, not just the pure rule: a stale-pass PR is never
  * handed to `gh pr merge`, a fresh one merges unchanged, and with the hook off both merge (today).
  */
+import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
@@ -119,7 +120,7 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     const r = spawnSync(process.execPath, ['--import', preload, script, approvedHeadPlan?.repo ? `--repos=${approvedHeadPlan.repo}` : '--this-repo', '--label=ready-to-merge',
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', ...(approvedHeadPlan ? ['--dry-run'] : ['--json'])], {
       cwd, encoding: 'utf8', timeout: 30000,
-      env: { ...process.env, WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
+      env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
         // hook OFF = no settings file at all: the built-in default (a test run never reads the live file)
         ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), ...(mainFixPr ? { WE_MERGE_QUEUE_MAIN_FIX_FILE: mainFixFile } : {}),
         WE_COORDINATION_ROOT: coord,
@@ -339,7 +340,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
       '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
       cwd: dir, encoding: 'utf8', timeout: 60000,
-      env: { ...process.env, WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord, ...extraEnv },
+      env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord, ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
     const read = (s) => (existsSync(fixture + s) ? readFileSync(fixture + s, 'utf8').trim().split('\n').filter(Boolean) : []);

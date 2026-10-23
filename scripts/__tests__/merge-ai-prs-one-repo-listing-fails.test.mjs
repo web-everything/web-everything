@@ -3,6 +3,7 @@
  * to resolve and nothing merged in ANY repo). The failed repo is logged and the others proceed; only when every
  * repo fails is it still the exit-4 hard-fail.
  */
+import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
@@ -61,7 +62,7 @@ describe('merge-ai-prs CLI - one failing repo does not kill the pass', () => {
   });
   const runCli = (failRepos, gw504Repos = '') => spawnSync('node', [script, '--repos=web-everything/web-everything,frontier-ui/frontierui,plateauapp/plateau-app', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
     cwd: repoDir, encoding: 'utf8',
-    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GH_FAIL_REPOS: failRepos, GH_504_REPOS: gw504Repos },
+    env: { ...process.env, ...daemonAppEnv(repoDir), PATH: `${shimDir}:${process.env.PATH}`, GH_FAIL_REPOS: failRepos, GH_504_REPOS: gw504Repos },
   });
 
   it('frontier-ui failing is reported as failed and the pass still completes', () => {
