@@ -5,8 +5,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { withRealRepo } from './helpers/real-repo.mjs';
+import { withRealRepo, withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import { createRegistry } from '../registry.mjs';
@@ -14,6 +15,7 @@ import { startRun, advance } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
+import { overlaySafetySettings } from '../../lib/daemon-load-overlay.mjs';
 const SHA = 'a'.repeat(40), TREE = 'b'.repeat(40), MERGE = 'c'.repeat(40);
 const BASE = { branch: 'lane/new', sha: SHA, daemon: 'control' };
 const settings = {
@@ -22,13 +24,14 @@ const settings = {
   loaderCli: 'scripts/daemon-overlay.mjs', adoption: { timeoutMs: 30, pollMs: 10 },
 };
 function fixture(options = {}) {
+  const candidateSha = options.sha || SHA;
   const calls = [], records = [], sleeps = [], reads = [], cloneRoots = [];
   let clock = 0;
-  let remoteTip = SHA;
+  let remoteTip = candidateSha;
   let tipReads = 0;
   const admitted = [];
   const env = { HOME: '/home/test', USER: 'tester', PATH: '/bin', GH_TOKEN: 'secret', NODE_OPTIONS: 'unsafe', WE_ALLOW_NO_PR: '1', ...options.env };
-  const ready = { ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' };
+  const ready = { ref: BASE.branch, sha: candidateSha, tests: 'green', audit: 'NOT WEAKENED' };
   const fs = {
     readFileSync(p) {
       reads.push(p);
@@ -44,12 +47,15 @@ function fixture(options = {}) {
   const exec = (cmd, args, config) => {
     calls.push({ cmd, args, config });
     expect(args.join(' ')).not.toMatch(/--allow-conflict|--force|--allow-no-pr/);
-    expect(Object.keys(config.env).sort()).toEqual(['HOME', 'PATH', 'USER', ...(env.WE_DAEMON_OVERLAY_DIR ? ['WE_DAEMON_OVERLAY_DIR'] : [])]);
+    expect(Object.keys(config.env).sort()).toEqual(['HOME', 'PATH', 'USER', ...(env.WE_DAEMON_OVERLAY_DIR ? ['WE_DAEMON_OVERLAY_DIR'] : []), ...(env.WE_OVERLAY_NO_PR?.trim() === 'refuse' ? ['WE_OVERLAY_NO_PR'] : [])]);
     if (options.execFailure === args[0]) throw Object.assign(new Error('maxBuffer exceeded; inspect full output separately'), { code: 'ENOBUFS' });
     if (cmd === 'plutil') return JSON.stringify({ WorkingDirectory: '/home/test/workspace/review' });
     if (cmd === 'node') {
       const action = args[1], ref = args.find((a) => a.startsWith('--ref='))?.slice(6);
       if (action === 'list') return options.listRaw ?? JSON.stringify({ list: (options.list || []).map((ref) => ({ ref })) });
+      if (action === 'add' && overlaySafetySettings(config.env, { readSettings: () => options.safetySettings || {} }).noPr === 'refuse') {
+        return fail(3, JSON.stringify({ check: { ok: false, reason: 'no-pr' }, wouldRegister: false }));
+      }
       if (args.includes('--check')) {
         if (options.checkRaw) return options.checkRaw;
         if (options.unverifiable === ref) return fail(1, JSON.stringify({ check: { ok: false } }));
@@ -60,14 +66,24 @@ function fixture(options = {}) {
       }
       if (action === 'add' && options.addFails) return fail(1);
       if (action === 'add') {
+        if (options.advanceDuringAdd) remoteTip = TREE;
+        const expected = args.find((a) => a.startsWith('--expected-sha='))?.slice(15);
+        if (expected && expected !== remoteTip) return fail(3, JSON.stringify({ conflictCheck: { ok: false, reason: 'sha-moved', candSha: remoteTip } }));
         admitted.push({ ref });
-        return '{}';
+        return options.addRaw ?? JSON.stringify({ conflictCheck: { ok: true, clean: true, candSha: remoteTip } });
       }
       if (action === 'remove' && options.removeFails === ref) return fail(1);
       return '{}';
     }
     if (args[0] === '-C') {
-      expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', options.behind ? MERGE : SHA, 'HEAD']);
+      if (options.adoptionExec) return options.adoptionExec(args, config);
+      if (args[2] === 'rev-parse') {
+        if (args.at(-1) === 'HEAD^{commit}') return options.badHead ? fail(1) : SHA;
+        return options.missingCandidate ? fail(1, '', '') : SHA;
+      }
+      expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', options.behind ? MERGE : candidateSha, 'HEAD']);
+      if (options.missingCandidate && (options.missingForever || sleeps.length === 0)) return fail(128, '', 'Not a valid commit name');
+      if (options.adoptionError) return fail(options.adoptionError);
       return options.timeout ? fail(1) : '';
     }
     if (args[0] === 'fetch') return '';
@@ -89,8 +105,8 @@ function fixture(options = {}) {
   };
   const load = createPrototypeLoader({ exec, fs, env, settings: structuredClone(settings), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
-    sleep: async (ms) => { sleeps.push(ms); clock += ms; } });
-  return { calls, records, sleeps, admitted, reads, cloneRoots, run: (input = {}) => load({ ...BASE, ...input }) };
+    sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
+  return { calls, records, sleeps, admitted, reads, cloneRoots, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('prototype-load', () => {
@@ -172,6 +188,77 @@ describe('prototype-load', () => {
   it('adoption-timeout bounds injected polling and retains registration', async () => {
     const f = fixture({ timeout: true }); const r = await f.run(); expect(r.stopReason).toBe('adoption-timeout'); expect(r.registered).toBe(true); expect(r.adopted).toBe(false); expect(f.sleeps).toEqual([10, 10, 10]);
   });
+  it('waits for a missing daemon commit to become available before adoption', async () => {
+    const f = fixture({ missingCandidate: true });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true, adopted: true });
+    expect(f.sleeps).toEqual([10]);
+  });
+  it('a missing daemon commit remains pending until the adoption deadline', async () => {
+    const f = fixture({ missingCandidate: true, missingForever: true });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'adoption-timeout', registered: true, adopted: false });
+    expect(f.sleeps).toEqual([10, 10, 10]);
+  });
+  it.each([false, true])('real Git keeps a fresh origin commit pending until daemon fetch/adoption or deadline (adopts: %s)', async (adopts) => {
+    await withBareOrigin(async ({ origin, clone, seedOriginBranch, git }) => {
+      seedOriginBranch(BASE.branch, { 'fresh.txt': 'fresh fix\n' });
+      const sha = git(['rev-parse', `refs/heads/${BASE.branch}`], { cwd: origin }).trim();
+      const initial = () => execFileSync('git', ['-C', clone, 'merge-base', '--is-ancestor', sha, 'HEAD'], { encoding: 'utf8', stdio: 'pipe' });
+      expect(initial).toThrow(/Command failed/);
+      const f = fixture({ sha,
+        adoptionExec: (args, config) => execFileSync('git', ['-C', clone, ...args.slice(2)], config),
+        onSleep: () => { if (adopts) { git(['fetch', 'origin', BASE.branch]); git(['merge', '--ff-only', 'FETCH_HEAD']); } },
+      });
+      expect(await f.run()).toMatchObject(adopts
+        ? { ok: true, registered: true, adopted: true }
+        : { ok: false, registered: true, adopted: false, stopReason: 'adoption-timeout' });
+      expect(f.sleeps).toEqual(adopts ? [10] : [10, 10, 10]);
+    });
+  });
+  it.each([{ adoptionError: 128 }, { adoptionError: -1 }, { missingCandidate: true, badHead: true }])('fails closed on unrelated adoption probe failures: %j', async (options) => {
+    const f = fixture(options);
+    expect((await f.run()).stopReason).toBe('check-unverifiable');
+    expect(f.sleeps).toEqual([]);
+  });
+  it.each([0, 1])('retries ancestry when a daemon fetch completes during missing-object diagnosis (retry exit: %s)', async (retryCode) => {
+    let probes = 0;
+    const f = fixture({ adoptionExec: (args) => {
+      if (args[2] === 'rev-parse') return SHA;
+      probes++;
+      if (probes === 1) throw Object.assign(new Error('missing before fetch'), { status: 128 });
+      if (retryCode === 1) throw Object.assign(new Error('not adopted yet'), { status: 1 });
+      return '';
+    } });
+    expect(await f.run()).toMatchObject(retryCode === 0
+      ? { ok: true, registered: true, adopted: true }
+      : { ok: false, stopReason: 'adoption-timeout', registered: true, adopted: false });
+    expect(probes).toBe(retryCode === 0 ? 2 : 5);
+    expect(f.sleeps).toEqual(retryCode === 0 ? [] : [10, 10, 10]);
+  });
+  it.each([false, true])('binds add admission to the approved SHA despite a racing branch advance (merge: %s)', async (behind) => {
+    const f = fixture({ behind, advanceDuringAdd: true, list: ['lane/old'], contained: ['lane/old'] });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'register-failed', adopted: false });
+    expect(f.admitted).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.calls.some((c) => c.args[0] === '-C')).toBe(false);
+  });
+  it.each(['{}', '{broken', JSON.stringify({ conflictCheck: { ok: true, clean: true, candSha: TREE } })])('refuses incomplete or mismatched add evidence before replacing prior registrations: %s', async (addRaw) => {
+    const f = fixture({ addRaw, list: ['lane/old'], contained: ['lane/old'] });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'register-failed', adopted: false });
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it.each(['refuse', ' refuse '])('preserves restrictive no-PR policy through the real resolver: %s', async (value) => {
+    const f = fixture({ env: { WE_OVERLAY_NO_PR: value } });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable', registered: false, adopted: false });
+    expect(f.admitted).toEqual([]);
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(f.calls.find((c) => c.cmd === 'node').config.env.WE_OVERLAY_NO_PR).toBe('refuse');
+  });
+  it.each(['warn', '', 'invalid'])('does not forward a weaker no-PR override over a restrictive file policy: %s', async (value) => {
+    const f = fixture({ env: { WE_OVERLAY_NO_PR: value }, safetySettings: { overlaySafety: { noPr: 'refuse' } } });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false });
+    expect(f.admitted).toEqual([]);
+    expect(f.calls.every((call) => !Object.hasOwn(call.config.env, 'WE_OVERLAY_NO_PR'))).toBe(true);
+  });
   it.each(['alerts', 'events'])('adoption-refused reads %s and stops even if HEAD contains candidate', async (file) => {
     const f = fixture({ [file]: JSON.stringify({ at: new Date(0).toISOString(), ref: BASE.branch, kind: 'conflict-dropped' }) }); expect((await f.run()).stopReason).toBe('adoption-refused');
   });
@@ -189,10 +276,10 @@ describe('prototype-load', () => {
     const calls = f.calls.filter((c) => c.cmd === 'node').map((c) => c.args.slice(1));
     const clone = '--clone=/home/test/workspace/wev-control';
     expect(calls).toEqual([
-      ['add', clone, '--ref=lane/new', '--check', '--json'],
+      ['add', clone, '--ref=lane/new', '--check', `--expected-sha=${SHA}`, '--json'],
       ['list', clone, '--json'],
       ['add', clone, '--ref=lane/old', '--check', '--json'],
-      ['add', clone, '--ref=lane/new', '--reason=tested change', '--by=tester', '--json'],
+      ['add', clone, '--ref=lane/new', `--expected-sha=${SHA}`, '--reason=tested change', '--by=tester', '--json'],
       ['remove', clone, '--ref=lane/old', '--reason=prototype-load: replaced by lane/new'],
     ]);
     const addIndex = f.calls.findIndex((c) => c.cmd === 'node' && c.args.includes('--by=tester'));

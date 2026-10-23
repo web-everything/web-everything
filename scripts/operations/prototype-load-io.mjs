@@ -27,6 +27,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
   const config = policy.value;
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
+  // Preserve a stricter caller policy without forwarding overrides that could weaken file policy.
+  if (env.WE_OVERLAY_NO_PR?.trim() === 'refuse') childEnv.WE_OVERLAY_NO_PR = 'refuse';
   // A state location is safe configuration, unlike credential or admission-bypass variables.
   if (env.WE_DAEMON_OVERLAY_DIR) childEnv.WE_DAEMON_OVERLAY_DIR = expand(env.WE_DAEMON_OVERLAY_DIR);
   const execute = (command, args) => {
@@ -38,14 +40,15 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
   const ancestor = (tip, sha) => { const r = git('merge-base', '--is-ancestor', tip, sha); if (![0, 1].includes(r.code)) throw new Error(r.error || 'ancestry unverifiable'); return r.code === 0; };
   const loader = (action, clone, ref, extra = []) => execute('node', [resolve(repo, config.loaderCli), action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])]);
   const lastJson = (r) => { try { return JSON.parse(r.stdout.trim().split(/\r?\n/).at(-1)); } catch { return null; } };
-  const check = (clone, ref) => {
-    const result = loader('add', clone, ref, ['--check']);
+  const check = (clone, ref, expectedSha) => {
+    const result = loader('add', clone, ref, ['--check', ...(expectedSha ? [`--expected-sha=${expectedSha}`] : [])]);
     const data = lastJson(result);
     if (![0, 3].includes(result.code) || data?.check?.ok !== true || typeof data.check.clean !== 'boolean'
       // A clean check carries no `files`/`conflicting` (the loader only adds them on a conflict); default them.
       || (data.check.files !== undefined && (!Array.isArray(data.check.files) || !data.check.files.every((file) => typeof file === 'string')))
       || (data.check.conflicting !== undefined && !Array.isArray(data.check.conflicting))
       || (!data.check.clean && (!Array.isArray(data.check.files) || !Array.isArray(data.check.conflicting)))
+      || (expectedSha && data.check.candSha !== expectedSha)
       || result.code !== (data.check.clean ? 0 : 3)) return { ok: false, ...result, reason: data?.check?.reason || 'incomplete loader check' };
     return { files: [], conflicting: [], ...data.check, exit: result.code, wouldRegister: data.wouldRegister };
   };
@@ -107,7 +110,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         requireGit('push', 'origin', `${commit}:refs/heads/${out.wouldMerge.ref}`);
         out.effectiveRef = out.wouldMerge.ref; out.effectiveSha = commit;
       }
-      out.check = check(out.clone, out.effectiveRef);
+      out.check = check(out.clone, out.effectiveRef, out.effectiveSha);
       const listing = loader('list', out.clone);
       const rows = lastJson(listing)?.list;
       if (listing.code !== 0 || !Array.isArray(rows) || rows.some((r) => !safeRegistrationRef(r?.ref))) return stop('check-unverifiable', { listing });
@@ -138,10 +141,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       if (movedTip !== out.effectiveSha) return stop('no-ready', { detail: 'sha-moved', tip: movedTip });
       stage = 'register-failed';
       if (out.registered !== 'already') {
-        const result = loader('add', out.clone, out.effectiveRef, [`--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
+        const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
         out.registration = result;
         if (result.code !== 0) return stop('register-failed');
         out.registered = true;
+        const evidence = lastJson(result)?.conflictCheck;
+        if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
+          return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
+        }
       }
       for (const ref of contained) {
         const result = loader('remove', out.clone, ref, [`--reason=prototype-load: replaced by ${out.effectiveRef}`]);
@@ -159,10 +166,21 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
           || refusal(jsonLines(read(rebuildAlerts)), out.effectiveRef, registeredAt, true)
           || refusal(jsonLines(read(`${state}.events.jsonl`)), out.effectiveRef, registeredAt);
         if (alerts) return stop('adoption-refused', { adoption: { refusal: alerts } });
-        const probe = git('-C', out.clone, 'merge-base', '--is-ancestor', out.effectiveSha, 'HEAD');
-        out.adoption = { code: probe.code, at: new Date(now()).toISOString() };
+        let probe = git('-C', out.clone, 'merge-base', '--is-ancestor', out.effectiveSha, 'HEAD');
+        let missing = false;
+        if (probe.code === 128) {
+          // A newly admitted commit need not exist in the daemon clone until its next fetch.
+          // Quiet verification distinguishes that pending object from execution/repository errors.
+          const candidate = git('-C', out.clone, 'rev-parse', '--verify', '--quiet', `${out.effectiveSha}^{commit}`);
+          if ([0, 1].includes(candidate.code) && git('-C', out.clone, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}').code === 0) {
+            missing = candidate.code === 1;
+            // Fetch may have completed between the ancestry failure and diagnostic verification.
+            if (!missing) probe = git('-C', out.clone, 'merge-base', '--is-ancestor', out.effectiveSha, 'HEAD');
+          }
+        }
+        out.adoption = { code: probe.code, at: new Date(now()).toISOString(), ...(missing ? { pending: 'candidate-object-missing' } : {}) };
         if (probe.code === 0) { out.ok = true; out.adopted = true; return out; }
-        if (probe.code !== 1) return stop('check-unverifiable', { adoption: probe });
+        if (probe.code !== 1 && !missing) return stop('check-unverifiable', { adoption: probe });
         const remaining = deadline - now();
         if (remaining <= 0) return stop('adoption-timeout');
         await sleep(Math.min(config.adoption.pollMs, remaining));
