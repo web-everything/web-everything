@@ -66,7 +66,10 @@
  * `we:docs/agent/prototype-based-dev.md`'s "mocking the spawn is the exact seam every real bug lived in" lesson.
  *
  * Runs inline by default. --detach launches a persistent background job with stdout/stderr files;
- * wait --job=<id> polls its record for up to 540000 ms (exit 75 means still running).
+ * wait --job=<id>: poll until the requested deadline (exit 75 means still running).
+ * Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.
+ * Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.
+ * All IO shares that single requested deadline; no floor or additional grace.
  * Records live in CODEX_JOBS_DIR or ~/workspace/.operations/coordination/codex-jobs.
  *
  * USAGE
@@ -93,7 +96,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { withFileLock } from './lib/atomic-json-file.mjs';
+import { writeLineSync } from './lib/write-all-sync.mjs';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
 import { resolveBuildPolicy, appendBuildRequirements } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
@@ -102,6 +105,7 @@ import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
 } from 'node:fs';
+import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -991,6 +995,14 @@ export async function codexDirectTask({
 
 // ── detached jobs ────────────────────────────────────────────────────────────────────────────────
 export const MAX_JOB_WAIT_MS = 540000;
+const MIN_JOB_WAIT_MS = 250;
+function jobWaitBudget(maxMs = MAX_JOB_WAIT_MS) {
+  const requested = Number(maxMs);
+  if (!Number.isFinite(requested) || requested < MIN_JOB_WAIT_MS) {
+    throw new RangeError(`codex-direct-task wait: --max-ms must be between ${MIN_JOB_WAIT_MS} and ${MAX_JOB_WAIT_MS}`);
+  }
+  return Math.min(requested, MAX_JOB_WAIT_MS);
+}
 const jobFs = { mkdirSync, readFileSync, writeFileSync, renameSync, openSync, closeSync };
 export function resolveJobsDir(env = process.env) {
   return resolve(env.CODEX_JOBS_DIR || join(homedir(), 'workspace', '.operations', 'coordination', 'codex-jobs'));
@@ -1006,7 +1018,9 @@ export function writeJobRecord(record, { jobsDir = resolveJobsDir(), fsDeps = jo
   fsDeps.renameSync(tmp, path);
 }
 export function readJobRecord(id, { jobsDir = resolveJobsDir(), fsDeps = jobFs } = {}) {
-  const record = JSON.parse(fsDeps.readFileSync(jobRecordPath(jobsDir, id), 'utf8'));
+  return validateJobRecord(JSON.parse(fsDeps.readFileSync(jobRecordPath(jobsDir, id), 'utf8')), id);
+}
+function validateJobRecord(record, id) {
   if (record.id !== id || !['running', 'done', 'failed'].includes(record.status)
     || typeof record.resultPath !== 'string' || !record.resultPath
     || !Number.isInteger(record.pid) || record.pid <= 0
@@ -1017,21 +1031,6 @@ export function readJobRecord(id, { jobsDir = resolveJobsDir(), fsDeps = jobFs }
     throw new Error('incomplete job record');
   }
   return record;
-}
-/** Synchronous read-modify-write: all terminal writers share this per-job lock.
- * Lock acquisition errors propagate; waiters use a nonblocking attempt and retry on contention.
- */
-export function updateJobRecord(jobId, update, {
-  jobsDir = resolveJobsDir(), readRecord = id => readJobRecord(id, { jobsDir }),
-  writeRecord = record => writeJobRecord(record, { jobsDir }), withLock = withFileLock, lockOptions = {},
-} = {}) {
-  return withLock(`${jobRecordPath(jobsDir, jobId)}.lock`, () => {
-    const current = readRecord(jobId);
-    if (current.status !== 'running') return current;
-    const updated = update(current);
-    writeRecord(updated);
-    return updated;
-  }, lockOptions);
 }
 export async function startDetachedJob({
   args = process.argv.slice(2), spawnFn = nodeSpawn, fsDeps = jobFs, now = Date.now,
@@ -1070,37 +1069,73 @@ function jobIsAlive(pid) {
     throw error;
   }
 }
-/** The wait bound is best effort for synchronous fs calls, which cannot be interrupted. */
 export async function waitForJob({
   jobId, maxMs = MAX_JOB_WAIT_MS,
-  readRecord = id => readJobRecord(id, { jobsDir }),
-  writeRecord = record => writeJobRecord(record, { jobsDir }),
+  readRecord,
+  writeRecord,
   isAlive = jobIsAlive, sleep = jobSleep, now = Date.now, pollMs = 1000,
   jobsDir = resolveJobsDir(),
-  updateRecord = (id, update) => updateJobRecord(id, update, { jobsDir, readRecord, writeRecord, lockOptions: { timeoutMs: 0 } }),
+  updateRecord,
 } = {}) {
-  const requested = Number(maxMs);
-  const budget = Number.isFinite(requested) ? Math.max(0, Math.min(requested, MAX_JOB_WAIT_MS)) : MAX_JOB_WAIT_MS;
+  const budget = jobWaitBudget(maxMs);
   const deadline = now() + budget;
+  readRecord ??= async id => validateJobRecord(
+    JSON.parse(await jobAsyncFs.readFile(jobRecordPath(jobsDir, id), 'utf8')), id);
   const expired = Symbol('wait budget exhausted');
-  // Synchronous snapshots need no timer (including a zero-budget status check).
-  // Bound asynchronous IO by the SAME deadline, cancelling each losing timer so
-  // an immediate result cannot keep the CLI alive for the rest of the budget.
+  // Every read, probe, mutation, cleanup and poll shares the requested deadline.
   const withinBudget = async operation => {
+    if (now() >= deadline) return expired;
     const pending = operation();
-    if (!pending || typeof pending.then !== 'function') return pending;
+    if (!pending || typeof pending.then !== 'function') return now() >= deadline ? expired : pending;
     const remaining = deadline - now();
     if (remaining <= 0) {
-      // Observe late rejections even when the budget was consumed invoking IO.
       Promise.resolve(pending).catch(() => {});
       return expired;
     }
-    const controller = new AbortController();
+    let timer;
     try {
-      return await Promise.race([pending, sleep(remaining, { signal: controller.signal }).then(() => expired)]);
+      const value = await Promise.race([pending, new Promise(resolveTimer => {
+        timer = setTimeout(() => resolveTimer(expired), remaining);
+      })]);
+      return now() >= deadline ? expired : value;
+    } catch (error) {
+      if (now() >= deadline) return expired;
+      throw error;
     } finally {
-      controller.abort();
+      clearTimeout(timer);
     }
+  };
+  const budgeted = async operation => {
+    if (now() >= deadline) throw expired;
+    const value = await withinBudget(operation);
+    if (value === expired) throw expired;
+    return value;
+  };
+  // Cleanup may depend on IO that never settles. Observe it in the background;
+  // callers may wait only for the remainder of the same job-wait budget.
+  const cleanupAfter = (pending, cleanup) => Promise.resolve(pending).catch(() => {}).then(cleanup).catch(() => {});
+  writeRecord ??= async record => {
+    const path = jobRecordPath(jobsDir, record.id);
+    const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    let pending;
+    try {
+      await budgeted(() => (pending = jobAsyncFs.writeFile(tmp, `${JSON.stringify(record)}\n`, { mode: 0o600 })));
+      await budgeted(() => (pending = jobAsyncFs.rename(tmp, path)));
+    } finally {
+      // Remove the temporary file only after in-flight IO settles; cleanup must
+      // not hold up the result beyond the deadline either.
+      const cleanup = cleanupAfter(pending, () => jobAsyncFs.rm(tmp, { force: true }));
+      if (await withinBudget(() => cleanup) === expired) throw expired;
+    }
+  };
+  updateRecord ??= async (id, update) => {
+    // A dead PID cannot write again, but its terminal record may have landed
+    // since the liveness probe. Re-read before deciding to mark it failed.
+    const current = await budgeted(() => readRecord(id));
+    if (current.status !== 'running') return current;
+    const updated = update(current);
+    await budgeted(() => writeRecord(updated));
+    return updated;
   };
   let record = { status: 'running', exitCode: null, resultPath: null };
   const result = () => ({ status: record.status, exitCode: record.exitCode, resultPath: record.resultPath });
@@ -1125,16 +1160,14 @@ export async function waitForJob({
         if (snapshot === expired) return { ...result(), code: 75 };
         record = snapshot;
       } catch (e) {
-        // A contended lock leaves the record running; exit 75 lets the operator wait again.
-        if (!e?.message?.startsWith('withFileLock: timed out waiting for ')) {
-          return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 };
-        }
+        if (e === expired) return { ...result(), code: 75 };
+        return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 };
       }
     }
     if (record.status !== 'running') return { ...result(), code: record.status === 'done' ? 0 : record.exitCode || 1 };
     const remaining = deadline - now();
     if (remaining <= 0) return { ...result(), code: 75 };
-    await sleep(Math.min(Math.max(1, pollMs), remaining));
+    if (await withinBudget(() => sleep(Math.min(Math.max(1, pollMs), remaining))) === expired) return { ...result(), code: 75 };
   }
 }
 
@@ -1181,6 +1214,9 @@ async function main() {
       + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json] [--detach]\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
+      + '    Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.\n'
+      + '    Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.\n'
+      + '    All IO shares that single requested deadline; no floor or additional grace.\n'
       + '  CODEX_JOBS_DIR overrides ~/workspace/.operations/coordination/codex-jobs.\n'
       + '  --review (#4194): a READ-ONLY review task — Codex runs under `-s read-only` and is told to answer in its '
       + 'final message (the report\'s `lastMessage`) instead of editing files.\n'
@@ -1195,10 +1231,16 @@ async function main() {
     return;
   }
   if (isWaitInvocation(args)) {
-    const { code, ...result } = await waitForJob({ jobId: flags.job, maxMs: flags['max-ms'] });
-    console.log(JSON.stringify(result));
-    process.exitCode = code;
-    return;
+    let maxMs;
+    try { maxMs = jobWaitBudget(flags['max-ms']); }
+    catch (error) {
+      writeLineSync(2, error.message);
+      process.exit(2);
+    }
+    const { code, ...result } = await waitForJob({ jobId: flags.job, maxMs });
+    // Pending filesystem requests must not keep a timed-out wait CLI alive.
+    writeLineSync(1, JSON.stringify(result));
+    process.exit(code);
   }
   if (flags.detach) {
     const job = await startDetachedJob({ args });
@@ -1287,8 +1329,11 @@ if (isMain) {
   let finished = false;
   const finish = code => {
     if (!internalJob || finished) return;
-    updateJobRecord(flags.job, record => ({ ...record, status: code === 0 ? 'done' : 'failed', exitCode: code,
-      finishedAt: new Date().toISOString() }));
+    const record = readJobRecord(flags.job);
+    if (record.status === 'running') {
+      writeJobRecord({ ...record, status: code === 0 ? 'done' : 'failed', exitCode: code,
+        finishedAt: new Date().toISOString() });
+    }
     finished = true;
   };
   // Synchronous exit bookkeeping also covers uncaught exceptions and explicit process.exit().
