@@ -9,11 +9,13 @@
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import fsPromises from 'node:fs/promises';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import {
-  startDetachedJob, waitForJob, readJobRecord, writeJobRecord, updateJobRecord, cliExitCode,
+  startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode,
   CODEX_CLI,
   DEFAULT_TIMEOUT_MS,
   CODEX_EFFORT_MAP,
@@ -1268,6 +1270,234 @@ describe('detached jobs', () => {
     expect(f.sleep).not.toHaveBeenCalled();
   });
 
+  it.each([0, 20, 100, 249, 249.9, 'abc', -1, NaN, Infinity, ''])('rejects invalid maxMs=%s before any IO in the exported wait', async maxMs => {
+    const f = fixture();
+    const isAlive = vi.fn();
+    const updateRecord = vi.fn();
+    const now = vi.fn();
+    await expect(waitForJob({ ...f.options, maxMs, isAlive, updateRecord, now }))
+      .rejects.toThrow('codex-direct-task wait: --max-ms must be between 250 and 540000');
+    expect(f.options.readRecord).not.toHaveBeenCalled();
+    expect(isAlive).not.toHaveBeenCalled();
+    expect(updateRecord).not.toHaveBeenCalled();
+    expect(f.writeRecord).not.toHaveBeenCalled();
+    expect(f.sleep).not.toHaveBeenCalled();
+    expect(now).not.toHaveBeenCalled();
+  });
+
+  it.each(['0', '20', '100', '249', 'abc', '-1', '', 'NaN', 'Infinity', null])('wait CLI reports a usage error for --max-ms=%s without job IO', maxMs => {
+    const preload = `
+      import fs from 'node:fs';
+      import asyncFs from 'node:fs/promises';
+      import { syncBuiltinESMExports } from 'node:module';
+      for (const api of [fs, asyncFs]) {
+        for (const [name, original] of Object.entries(api)) {
+          if (typeof original !== 'function') continue;
+          api[name] = Object.assign((...args) => {
+            if (args.some(arg => typeof arg === 'string' && arg.startsWith(process.env.CODEX_JOBS_DIR))) {
+              process.stderr.write('unexpected job IO: ' + name + '\\n');
+              throw new Error('unexpected job IO');
+            }
+            return original(...args);
+          }, original);
+        }
+      }
+      process.kill = () => { process.stderr.write('unexpected PID probe\\n'); throw new Error('unexpected PID probe'); };
+      syncBuiltinESMExports();`;
+    const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+      'scripts/codex-direct-task.mjs', 'wait', '--job=blocked', maxMs === null ? '--max-ms' : `--max-ms=${maxMs}`], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(2);
+    expect(child.stdout).toBe('');
+    expect(child.stderr).toBe('codex-direct-task wait: --max-ms must be between 250 and 540000\n');
+  });
+
+  it.each(['250', '540000', '1080000', undefined])('wait CLI accepts max-ms=%s and reports a completed job', maxMs => {
+    const record = { id: 'accepted', pid: process.pid, status: 'done', exitCode: 0, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait', '--job=accepted',
+      ...(maxMs === undefined ? [] : [`--max-ms=${maxMs}`])], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    expect(child.stderr).toBe('');
+    expect(JSON.parse(child.stdout)).toEqual({ status: 'done', exitCode: 0, resultPath: record.resultPath });
+  });
+
+  it('bounds a never-resolving reader by the requested 250 ms deadline', async () => {
+    const maxMs = 250;
+    const readRecord = vi.fn(() => new Promise(() => {}));
+    const started = performance.now();
+    expect(await waitForJob({ jobId: 'blocked', jobsDir, readRecord, maxMs }))
+      .toEqual({ status: 'running', exitCode: null, resultPath: null, code: 75 });
+    // Literal bound: the requested 250 ms plus 50 ms for host scheduling, never another grace window.
+    const elapsed = performance.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(240);
+    expect(elapsed).toBeLessThan(300);
+    expect(readRecord).toHaveBeenCalledOnce();
+  });
+
+  it('reads a real temporary record through the default async path', async () => {
+    const record = { id: 'async-read', pid: process.pid, status: 'done', exitCode: 0, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    const read = vi.spyOn(fsPromises, 'readFile');
+    try {
+      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 1000 }))
+        .toEqual({ status: 'done', exitCode: 0, resultPath: record.resultPath, code: 0 });
+      expect(read).toHaveBeenCalledWith(join(jobsDir, `${record.id}.json`), 'utf8');
+    } finally { read.mockRestore(); }
+  });
+
+  it('bounds a blocked default async filesystem read by the requested 250 ms budget', async () => {
+    const read = vi.spyOn(fsPromises, 'readFile').mockImplementation(() => new Promise(() => {}));
+    const started = performance.now();
+    try {
+      expect(await waitForJob({ jobId: 'blocked', jobsDir, maxMs: 250 }))
+        .toEqual({ status: 'running', exitCode: null, resultPath: null, code: 75 });
+      expect(performance.now() - started).toBeLessThan(300);
+      expect(read).toHaveBeenCalledOnce();
+    } finally { read.mockRestore(); }
+  });
+
+  it('wait CLI exits 75 at max-ms=250 when an async reader leaves an active handle', () => {
+    const maxMs = 250;
+    const preload = `
+      import fs from 'node:fs/promises';
+      import { register } from 'node:module';
+      // Keep the loader's own reads in its worker. The blanket override below
+      // must stall application IO, rather than prevent the CLI from loading.
+      register('data:text/javascript,export {}');
+      fs.readFile = () => {
+        ${keepAliveScript({ maxLifetimeMs: 10000 })}
+        return new Promise(() => {});
+      };`;
+    const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+      'scripts/codex-direct-task.mjs', 'wait', '--job=blocked', `--max-ms=${maxMs}`], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(75);
+    expect(JSON.parse(child.stdout)).toEqual({ status: 'running', exitCode: null, resultPath: null });
+  });
+
+  it('wait CLI bounds a stuck job-record read at max-ms=250 without intercepting module-loader reads', () => {
+    const maxMs = 250;
+    const preload = `
+      import fs from 'node:fs/promises';
+      const readFile = fs.readFile;
+      fs.readFile = (...args) => {
+        if (String(args[0]).endsWith('/blocked.json')) {
+          ${keepAliveScript({ maxLifetimeMs: 10000 })}
+          return new Promise(() => {});
+        }
+        return readFile(...args);
+      };`;
+    const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+      'scripts/codex-direct-task.mjs', 'wait', '--job=blocked', `--max-ms=${maxMs}`], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(75);
+    expect(JSON.parse(child.stdout)).toEqual({ status: 'running', exitCode: null, resultPath: null });
+  });
+
+  it('bounds a never-settling poll sleep by the same deadline', async () => {
+    const f = fixture();
+    const sleep = vi.fn(() => new Promise(() => {}));
+    const started = performance.now();
+    expect(await waitForJob({ ...f.options, now: Date.now, sleep, maxMs: 250 }))
+      .toMatchObject({ status: 'running', code: 75 });
+    expect(performance.now() - started).toBeLessThan(300);
+    expect(sleep).toHaveBeenCalledOnce();
+  });
+
+  it('persists a dead PID through the default async atomic writer', async () => {
+    const record = { id: 'async-write', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    const write = vi.spyOn(fsPromises, 'writeFile');
+    const rename = vi.spyOn(fsPromises, 'rename');
+    try {
+      expect(await waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 1000 }))
+        .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
+      const path = join(jobsDir, `${record.id}.json`);
+      expect(write).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/), expect.any(String), { mode: 0o600 });
+      expect(rename).toHaveBeenCalledWith(write.mock.calls[0][0], path);
+      expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
+    } finally {
+      write.mockRestore();
+      rename.mockRestore();
+    }
+  });
+
+  it('clears the budget timer after an immediate asynchronous read', async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      f.child.emit('exit', 0);
+      expect(await waitForJob({ ...f.options, readRecord: async () => f.options.readRecord() }))
+        .toMatchObject({ status: 'done', code: 0 });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('bounds a stalled async write without renaming after the deadline', async () => {
+    const record = { id: 'blocked-write', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    let settleWrite;
+    const write = vi.spyOn(fsPromises, 'writeFile').mockImplementation(() => new Promise(resolveWrite => { settleWrite = resolveWrite; }));
+    const rename = vi.spyOn(fsPromises, 'rename');
+    const rm = vi.spyOn(fsPromises, 'rm');
+    const started = performance.now();
+    try {
+      expect(await waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 250 }))
+        .toMatchObject({ status: 'running', code: 75 });
+      expect(performance.now() - started).toBeLessThan(300);
+      expect(write).toHaveBeenCalledOnce();
+      expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
+      expect(rm).not.toHaveBeenCalled();
+      settleWrite();
+      await vi.waitFor(() => expect(rm).toHaveBeenCalledWith(write.mock.calls[0][0], { force: true }));
+      expect(rename).not.toHaveBeenCalled();
+      expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
+    } finally {
+      settleWrite?.();
+      write.mockRestore();
+      rename.mockRestore();
+      rm.mockRestore();
+    }
+  });
+
+  it('returns at the deadline during stuck tmp removal', async () => {
+    const record = { id: 'stuck-cleanup', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    let finishCleanup;
+    const gate = new Promise(resolveCleanup => { finishCleanup = resolveCleanup; });
+    const originalRm = fsPromises.rm;
+    const rm = vi.spyOn(fsPromises, 'rm').mockImplementation(async (...args) => {
+      await gate;
+      return originalRm(...args);
+    });
+    const started = performance.now();
+    try {
+      expect(await waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 250 }))
+        .toMatchObject({ status: 'running', code: 75 });
+      expect(performance.now() - started).toBeLessThan(300);
+      expect(rm).toHaveBeenCalledOnce();
+      expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
+    } finally {
+      finishCleanup();
+      await Promise.all(rm.mock.results.map(result => result.value));
+      rm.mockRestore();
+    }
+  });
+
   it('timeout-then-done: first wait returns running/75 and a later wait returns done/0', async () => {
     const f = fixture();
     expect(await waitForJob({ ...f.options, maxMs: 1500 })).toMatchObject({ status: 'running', exitCode: null, code: 75 });
@@ -1319,32 +1549,178 @@ describe('detached jobs', () => {
     } finally { kill.mockRestore(); }
   });
 
-  it('max-ms=0 returns promptly without probing a dead PID or trying its contended lock', async () => {
-    const f = fixture();
-    writeFileSync(join(jobsDir, 'test-job.json.lock'), `${process.pid}\n`);
-    const isAlive = vi.fn(() => false);
+  it.each([
+    ['done', 0, { status: 'done', exitCode: 0, resultPath: 'result.json', code: 0 }],
+    ['failed', 23, { status: 'failed', exitCode: 23, resultPath: 'result.json', code: 23 }],
+    ['running', null, { status: 'running', exitCode: null, resultPath: 'result.json', code: 75 }],
+    ['missing', null, { status: 'failed', exitCode: null, resultPath: null, code: 2 }],
+  ])('max-ms=250 reports a %s job through the default async reader within the requested deadline', async (status, exitCode, expected) => {
+    const record = { id: 'minimum-budget', pid: process.pid, status, exitCode, resultPath: 'result.json' };
+    if (status !== 'missing') writeJobRecord(record, { jobsDir });
+    const read = vi.spyOn(fsPromises, 'readFile');
+    const isAlive = vi.fn(() => true);
     const updateRecord = vi.fn();
     const started = performance.now();
-    expect(await waitForJob({ ...f.options, maxMs: 0, isAlive, updateRecord }))
-      .toMatchObject({ status: 'running', exitCode: null, code: 75 });
-    expect(performance.now() - started).toBeLessThan(1000);
+    try {
+      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 250, isAlive, updateRecord }))
+        .toEqual(expected);
+      expect(performance.now() - started).toBeLessThan(status === 'running' ? 300 : 200);
+      expect(read).toHaveBeenCalledOnce();
+      expect(read).toHaveBeenCalledWith(join(jobsDir, `${record.id}.json`), 'utf8');
+      expect(isAlive).toHaveBeenCalledTimes(status === 'running' ? 1 : 0);
+      expect(updateRecord).not.toHaveBeenCalled();
+    } finally {
+      // A missing record's late rejection must be observed too.
+      await Promise.allSettled(read.mock.results.map(result => result.value));
+      read.mockRestore();
+    }
+  });
+
+  it('max-ms=250 returns running/75 at the requested deadline with a blocked reader and no probes or writes', async () => {
+    const maxMs = 250;
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      const readRecord = vi.fn(() => new Promise(() => {}));
+      const isAlive = vi.fn(() => false);
+      const updateRecord = vi.fn();
+      let result;
+      const waiting = waitForJob({ ...f.options, readRecord, maxMs, isAlive, updateRecord, now: Date.now })
+        .then(value => { result = value; });
+      await vi.advanceTimersByTimeAsync(249);
+      expect(result).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      await waiting;
+      expect(result).toEqual({ status: 'running', exitCode: null, resultPath: null, code: 75 });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(readRecord).toHaveBeenCalledOnce();
+      expect(isAlive).not.toHaveBeenCalled();
+      expect(updateRecord).not.toHaveBeenCalled();
+      expect(f.sleep).not.toHaveBeenCalled();
+      expect(f.writeRecord).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['done', 'failed', 'missing'])('max-ms=250 observes a %s snapshot resolving before the requested deadline', async status => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      const readRecord = vi.fn(async () => {
+        await new Promise(resolveRead => setTimeout(resolveRead, 200));
+        if (status === 'missing') throw new Error('unknown job');
+        return { ...f.options.readRecord(), status, exitCode: status === 'done' ? 0 : 23 };
+      });
+      const isAlive = vi.fn();
+      let result;
+      const waiting = waitForJob({ ...f.options, readRecord, isAlive, maxMs: 250, now: Date.now })
+        .then(value => { result = value; });
+      await vi.advanceTimersByTimeAsync(199);
+      expect(result).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      await waiting;
+      expect(result).toEqual(status === 'missing'
+        ? { status: 'failed', exitCode: null, resultPath: null, code: 2 }
+        : { status, exitCode: status === 'done' ? 0 : 23, resultPath: 'test-job.result.json', code: status === 'done' ? 0 : 23 });
+      expect(readRecord).toHaveBeenCalledOnce();
+      expect(isAlive).not.toHaveBeenCalled();
+      expect(f.sleep).not.toHaveBeenCalled();
+      expect(f.writeRecord).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['done', 'failed', 'missing'])('max-ms=250 ignores a %s snapshot settling at the requested deadline', async status => {
+    const f = fixture();
+    const readRecord = vi.fn(async () => {
+      await f.sleep(250);
+      if (status === 'missing') throw new Error('unknown job');
+      return { ...f.options.readRecord(), status, exitCode: status === 'done' ? 0 : 23 };
+    });
+    const isAlive = vi.fn();
+    expect(await waitForJob({ ...f.options, readRecord, isAlive, maxMs: 250 }))
+      .toEqual({ status: 'running', exitCode: null, resultPath: null, code: 75 });
+    expect(readRecord).toHaveBeenCalledOnce();
     expect(isAlive).not.toHaveBeenCalled();
-    expect(updateRecord).not.toHaveBeenCalled();
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it.each([250, 500])('does not start another read when polling reaches the %s ms deadline', async maxMs => {
+    const f = fixture();
+    expect(await waitForJob({ ...f.options, maxMs }))
+      .toMatchObject({ status: 'running', code: 75 });
+    expect(f.sleep.mock.calls).toEqual([[maxMs]]);
+    expect(f.options.readRecord).toHaveBeenCalledOnce();
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it('documents usage errors, the default, the cap and the single deadline in --help and the header', () => {
+    const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--help'], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    for (const documentation of [child.stdout, readFileSync('scripts/codex-direct-task.mjs', 'utf8')]) {
+      expect(documentation).toContain('Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.');
+      expect(documentation).toContain('Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.');
+      expect(documentation).toContain('All IO shares that single requested deadline; no floor or additional grace.');
+    }
+  });
+
+  it('max-ms=250 observes an already-resolved async terminal read', async () => {
+    const f = fixture();
+    f.child.emit('exit', 0);
+    expect(await waitForJob({ ...f.options, readRecord: async () => f.options.readRecord(), maxMs: 250 }))
+      .toEqual({ status: 'done', exitCode: 0, resultPath: 'test-job.result.json', code: 0 });
     expect(f.sleep).not.toHaveBeenCalled();
     expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it.each([250, 1000])('uses no synchronous filesystem calls in the default wait path with maxMs=%s', maxMs => {
+    const record = { id: 'no-sync', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    const boot = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      let waiting = false;
+      for (const name of Object.keys(fs)) {
+        if (name.endsWith('Sync') && typeof fs[name] === 'function') {
+          const original = fs[name];
+          fs[name] = Object.assign((...args) => {
+            if (waiting) throw new Error('unexpected synchronous fs: ' + name);
+            return original(...args);
+          }, original);
+        }
+      }
+      syncBuiltinESMExports();
+      // Install before import so captured defaults (including jobFs) are guarded,
+      // but allow the module loader's startup IO until the wait actually begins.
+      const { waitForJob } = await import('./scripts/codex-direct-task.mjs');
+      waiting = true;
+      const result = await waitForJob({ jobId: 'no-sync', jobsDir: process.env.CODEX_JOBS_DIR,
+        maxMs: ${maxMs}, isAlive: () => false });
+      process.stdout.write(JSON.stringify(result));
+      process.exit(result.code);`;
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', boot], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(1);
+    expect(JSON.parse(child.stdout)).toEqual({ status: 'failed', exitCode: 1, resultPath: record.resultPath, code: 1 });
+    expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
   });
 
   it('checks the deadline again after a dead-PID probe before updating its record', async () => {
     const f = fixture();
     const updateRecord = vi.fn();
-    expect(await waitForJob({ ...f.options, maxMs: 10, updateRecord,
-      isAlive: async () => { await f.sleep(10); return false; },
+    expect(await waitForJob({ ...f.options, maxMs: 250, updateRecord,
+      isAlive: async () => { await f.sleep(250); return false; },
     })).toMatchObject({ status: 'running', code: 75 });
     expect(updateRecord).not.toHaveBeenCalled();
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
 
-  it.each(['readRecord', 'isAlive', 'updateRecord'])('bounds a delayed %s by maxMs=5 using the injected clock and sleep', async operation => {
+  it.each(['readRecord', 'isAlive', 'updateRecord', 'writeRecord'])('bounds a delayed %s by the requested 250 ms budget using the injected clock and sleep', async operation => {
     vi.useFakeTimers();
     try {
       const f = fixture();
@@ -1357,15 +1733,47 @@ describe('detached jobs', () => {
         return f.options.readRecord();
       });
       let result;
-      const waiting = waitForJob({ ...f.options, maxMs: 5, now: Date.now, sleep,
+      const waiting = waitForJob({ ...f.options, maxMs: 250, now: Date.now, sleep,
         isAlive: () => false, [operation]: pending,
       }).then(value => { result = value; });
-      await vi.advanceTimersByTimeAsync(5);
+      await vi.advanceTimersByTimeAsync(249);
+      expect(result).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
       expect(result).toMatchObject({ status: 'running', exitCode: null, code: 75 });
       expect(pending).toHaveBeenCalledOnce();
       expect(completed).not.toHaveBeenCalled();
       expect(f.writeRecord).not.toHaveBeenCalled();
       await waiting;
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['timeout', 'rejection'])('dead-PID fresh read fails closed on %s without writing', async outcome => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      const pending = new Promise((resolveRead, rejectRead) => {
+        setTimeout(() => {
+          if (outcome === 'rejection') rejectRead(new Error('fresh record unavailable'));
+          else resolveRead(f.options.readRecord());
+        }, outcome === 'rejection' ? 1 : 1000);
+      });
+      const readRecord = vi.fn()
+        .mockImplementationOnce(f.options.readRecord)
+        .mockImplementationOnce(() => pending);
+      const waiting = waitForJob({ ...f.options, readRecord, isAlive: () => false, maxMs: 250, now: Date.now });
+      await vi.advanceTimersByTimeAsync(250);
+      expect(await waiting).toMatchObject(outcome === 'timeout'
+        ? { status: 'running', exitCode: null, code: 75 }
+        : { status: 'failed', exitCode: null, code: 2 });
+      expect(readRecord).toHaveBeenCalledTimes(2);
+      expect(f.writeRecord).not.toHaveBeenCalled();
+      if (outcome === 'timeout') {
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(f.writeRecord).not.toHaveBeenCalled();
+      }
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1379,11 +1787,13 @@ describe('detached jobs', () => {
       const sleep = ms => new Promise(resolveSleep => setTimeout(resolveSleep, ms));
       const updateRecord = vi.fn(async () => { await sleep(1000); return f.options.readRecord(); });
       let result;
-      const waiting = waitForJob({ ...f.options, maxMs: 5, now: Date.now, sleep,
-        readRecord: async () => { await sleep(2); return f.options.readRecord(); },
-        isAlive: async () => { await sleep(2); return false; }, updateRecord,
+      const waiting = waitForJob({ ...f.options, maxMs: 250, now: Date.now, sleep,
+        readRecord: async () => { await sleep(100); return f.options.readRecord(); },
+        isAlive: async () => { await sleep(100); return false; }, updateRecord,
       }).then(value => { result = value; });
-      await vi.advanceTimersByTimeAsync(5);
+      await vi.advanceTimersByTimeAsync(249);
+      expect(result).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
       expect(result).toMatchObject({ status: 'running', code: 75 });
       expect(updateRecord).toHaveBeenCalledOnce();
       expect(f.writeRecord).not.toHaveBeenCalled();
@@ -1394,27 +1804,12 @@ describe('detached jobs', () => {
     }
   });
 
-  it.each(['readRecord', 'isAlive', 'updateRecord'])('fails closed with exit 2 when asynchronous %s rejects', async operation => {
+  it.each(['readRecord', 'isAlive', 'updateRecord', 'writeRecord'])('fails closed with exit 2 when asynchronous %s rejects', async operation => {
     const f = fixture();
-    expect(await waitForJob({ ...f.options, maxMs: 100, now: Date.now, sleep: undefined,
+    expect(await waitForJob({ ...f.options, maxMs: 250, now: Date.now, sleep: undefined,
       isAlive: () => false, [operation]: async () => { throw new Error('IO unavailable'); },
     })).toMatchObject({ status: 'failed', exitCode: null, code: 2 });
     expect(f.writeRecord).not.toHaveBeenCalled();
-  });
-
-  it('dead-PID lock contention stays within the wait budget and returns 75; a later wait can retry', async () => {
-    const f = fixture();
-    const lockPath = join(jobsDir, 'test-job.json.lock');
-    writeFileSync(lockPath, `${process.pid}\n`);
-    const started = performance.now();
-    expect(await waitForJob({ ...f.options, maxMs: 10, isAlive: () => false }))
-      .toMatchObject({ status: 'running', exitCode: null, code: 75 });
-    expect(performance.now() - started).toBeLessThan(1000);
-    expect(f.sleep.mock.calls).toEqual([[10]]);
-    expect(f.writeRecord).not.toHaveBeenCalled();
-    rmSync(lockPath);
-    expect(await waitForJob({ ...f.options, isAlive: () => false }))
-      .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
   });
 
   it('unreadable dead-PID bookkeeping fails closed with exit 2', async () => {
@@ -1425,71 +1820,56 @@ describe('detached jobs', () => {
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
 
-  it('preserves completion when child exits between record read and liveness check', async () => {
+  it('dead-PID update does not overwrite a record that became done between probe and write', async () => {
     const running = { id: 'completion-race', pid: 123, status: 'running',
       startedAt: new Date(0).toISOString(), resultPath: 'result.json', exitCode: null };
     writeJobRecord(running, { jobsDir });
     const completed = { ...running, status: 'done', exitCode: 0, finishedAt: new Date(1000).toISOString() };
-    const result = await waitForJob({
-      jobId: running.id, jobsDir,
-      readRecord: id => readJobRecord(id, { jobsDir }),
-      writeRecord: record => writeJobRecord(record, { jobsDir }),
-      isAlive: () => {
-        // Commit the child's completion after the waiter's stale running snapshot.
-        updateJobRecord(running.id, () => completed, { jobsDir });
-        return false;
-      },
-      sleep: vi.fn(() => { throw new Error('unexpected sleep'); }), now: () => 2000,
-    });
-    expect(result).toEqual({ status: 'done', exitCode: 0, resultPath: running.resultPath, code: 0 });
-    expect(readJobRecord(running.id, { jobsDir })).toEqual(completed);
+    const read = vi.spyOn(fsPromises, 'readFile');
+    const originalWrite = fsPromises.writeFile;
+    const write = vi.spyOn(fsPromises, 'writeFile');
+    const rename = vi.spyOn(fsPromises, 'rename');
+    try {
+      const result = await waitForJob({
+        jobId: running.id, jobsDir,
+        isAlive: async () => {
+          // Land the child's terminal record after the running snapshot and probe.
+          await originalWrite(join(jobsDir, `${running.id}.json`), JSON.stringify(completed));
+          return false;
+        },
+        sleep: vi.fn(() => { throw new Error('unexpected sleep'); }), maxMs: 1000,
+      });
+      expect(result).toEqual({ status: 'done', exitCode: 0, resultPath: running.resultPath, code: 0 });
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(write).not.toHaveBeenCalled();
+      expect(rename).not.toHaveBeenCalled();
+      expect(readJobRecord(running.id, { jobsDir })).toEqual(completed);
+    } finally {
+      read.mockRestore();
+      write.mockRestore();
+      rename.mockRestore();
+    }
   });
 
-  it('holds the shared job lock throughout the fresh read, mutation and atomic write', () => {
-    let locked = false;
-    const running = { id: 'locked', status: 'running' };
-    const readRecord = vi.fn(() => { expect(locked).toBe(true); return running; });
-    const update = vi.fn(record => { expect(locked).toBe(true); return { ...record, status: 'done' }; });
-    const writeRecord = vi.fn(() => { expect(locked).toBe(true); });
-    const withLock = vi.fn((_path, fn) => {
-      locked = true;
-      try { return fn(); } finally { locked = false; }
-    });
-    expect(updateJobRecord('locked', update, { jobsDir, readRecord, writeRecord, withLock })).toEqual({ id: 'locked', status: 'done' });
-    expect(withLock).toHaveBeenCalledWith(join(jobsDir, 'locked.json.lock'), expect.any(Function), {});
-    expect(readRecord).toHaveBeenCalledWith('locked');
-    expect(writeRecord).toHaveBeenCalledWith({ id: 'locked', status: 'done' });
-  });
-
-  it('refuses bookkeeping when the shared lock cannot be acquired; retry after contention clears', () => {
-    const readRecord = vi.fn();
-    const writeRecord = vi.fn();
-    expect(() => updateJobRecord('locked', () => ({}), { jobsDir, readRecord, writeRecord,
-      withLock: () => { throw new Error('lock timeout'); },
-    })).toThrow('lock timeout');
-    expect(readRecord).not.toHaveBeenCalled();
-    expect(writeRecord).not.toHaveBeenCalled();
-  });
-
-  it('clamps oversized waits to 540000 ms; exit 75 allows the operator to wait again', async () => {
+  it.each([undefined, 540000 * 2])('defaults or clamps maxMs=%s to 540000 ms; exit 75 allows the operator to wait again', async maxMs => {
     const f = fixture();
-    expect(await waitForJob({ ...f.options, maxMs: 540000 * 2, pollMs: 540000 }))
+    expect(await waitForJob({ ...f.options, maxMs, pollMs: 540000 }))
       .toMatchObject({ status: 'running', code: 75 });
     expect(f.sleep.mock.calls).toEqual([[540000]]);
   });
 
-  it('unknown and unreadable jobs fail closed with exit 2', async () => {
+  it.each([250, undefined])('unknown and unreadable jobs fail closed with exit 2 at maxMs=%s', async maxMs => {
     for (const jobId of ['missing', '../escape', undefined]) {
-      expect(await waitForJob({ jobId, readRecord: id => readJobRecord(id, { jobsDir }) }))
+      expect(await waitForJob({ jobId, jobsDir, maxMs }))
         .toEqual({ status: 'failed', exitCode: null, resultPath: null, code: 2 });
     }
     writeFileSync(join(jobsDir, 'broken.json'), '{');
-    expect(await waitForJob({ jobId: 'broken', readRecord: id => readJobRecord(id, { jobsDir }) })).toMatchObject({ code: 2 });
+    expect(await waitForJob({ jobId: 'broken', jobsDir, maxMs })).toMatchObject({ code: 2 });
   });
 
-  it('rejects incomplete persisted records rather than declaring success', async () => {
+  it.each([250, undefined])('rejects incomplete persisted records rather than declaring success at maxMs=%s', async maxMs => {
     writeFileSync(join(jobsDir, 'incomplete.json'), JSON.stringify({ id: 'incomplete', status: 'done' }));
-    expect(await waitForJob({ jobId: 'incomplete', readRecord: id => readJobRecord(id, { jobsDir }) })).toMatchObject({ code: 2 });
+    expect(await waitForJob({ jobId: 'incomplete', jobsDir, maxMs })).toMatchObject({ code: 2 });
   });
 
   it.each(['--detach', '--detach=true'])('detach %s writes a running record, redirects files, unrefs and returns before child completion', async detachFlag => {
