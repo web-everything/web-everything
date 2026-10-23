@@ -24,9 +24,13 @@ import { admissionLockRoot, slotPath } from '../readiness/heavy-admission.mjs';
 import { readLockEntry } from '../readiness/file-locks.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
+import { CARD_ONLY_SKIP_GATE } from '../lib/verify-lane-gate.mjs';
 
 // Selection fixtures retain the historical related gate explicitly.
-beforeEach(() => vi.stubEnv('WE_BUILD_FINAL_GATE', 'related'));
+beforeEach(() => {
+  vi.stubEnv('WE_BUILD_FINAL_GATE', 'related');
+  vi.stubEnv('WE_BUILD_FINAL_GATE_STANDARDS', 'selected');
+});
 afterEach(() => vi.unstubAllEnvs());
 
 const VERIFY_LANE = resolve(process.cwd(), 'scripts/verify-lane.mjs');
@@ -801,6 +805,15 @@ describe('verify-lane request/verify — a cache hit on an UNCHANGED working tre
     expect(json.sha).toBe(headSha());
 
     expect(readFileSync(marker(), 'utf8')).toBe(beforeOnDisk); // byte-identical — never rewritten to `running`
+  });
+
+  it('a legacy green without the executed command requires a fresh run', () => {
+    expect(runVerify('true').json.status).toBe('green');
+    const legacy = JSON.parse(readFileSync(marker(), 'utf8'));
+    delete legacy.executedGate;
+    writeFileSync(marker(), JSON.stringify(legacy));
+    expect(runRequest('true').json.status).toBe('requested');
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).status).toBe('running');
   });
 
   // #4473 review findings 2/3 — the cache key must include the GATE COMMAND, not just sha+treeHash. A green
@@ -1934,7 +1947,103 @@ describe('item 98 — --help prints usage without running the gate', () => {
   }
 });
 
+describe('build finalGateStandards preview', () => {
+  beforeEach(() => {
+    const preferences = join(dir, '.git', 'platform-preferences.json');
+    writeFileSync(preferences, '{}');
+    vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', preferences);
+  });
+  const git = (...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: dir, encoding: 'utf8' });
+  function seed() {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: {
+      'test:unit': 'exit 99', 'check:standards': 'exit 99',
+    } }));
+    git('add', '-A'); git('commit', '-qm', 'scripts');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+  }
+  function change(path) {
+    mkdirSync(join(dir, path.split('/').slice(0, -1).join('/')), { recursive: true });
+    writeFileSync(join(dir, path), 'fixture\n');
+  }
+  function preview(finalGate, standards, extra = {}) {
+    const env = { ...process.env, WE_BUILD_FINAL_GATE: finalGate,
+      WE_VERIFY_STANDARDS: 'auto', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1',
+      WE_VERIFY_SELECTION: 'pr', ...extra };
+    if (standards === undefined) delete env.WE_BUILD_FINAL_GATE_STANDARDS;
+    else env.WE_BUILD_FINAL_GATE_STANDARDS = standards;
+    const result = spawnSync('node', [VERIFY_LANE, '--dry-run'], { cwd: dir, env, encoding: 'utf8', timeout: 20_000 });
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(marker())).toBe(false);
+    expect(existsSync(join(dir, '.git', '.lane-verify.previous'))).toBe(false);
+    return JSON.parse(result.stdout);
+  }
+  it.each(['always', 'selected'])('full is unchanged with %s', (standards) => {
+    seed(); change('scripts/example.mjs');
+    expect(preview('full', standards).command).toBe('npm run test:unit && npm run check:standards');
+  });
+  it.each([
+    ['always', 'scripts/example.mjs'], ['always', 'backlog/123-card.md'],
+    ['selected', 'scripts/example.mjs'], ['selected', 'backlog/123-card.md'],
+  ])('related with %s on %s', (standards, path) => {
+    seed(); change(path);
+    const gate = preview('related', standards);
+    if (standards === 'always') {
+      expect(gate.command).toContain('npm run check:standards');
+      expect(gate.command).toContain('vitest related');
+      expect(gate.command).not.toContain('local gate skipped');
+      expect(gate.decision.mode).toBe('shrink');
+      expect(gate.standards).toMatchObject({ policy: 'always', run: true, source: 'build.finalGateStandards (env)' });
+      if (path.startsWith('scripts/')) expect(gate.command).toContain('--local --files=');
+    } else if (path.startsWith('backlog/')) {
+      expect(gate.decision.mode).toBe('card-only-skip');
+      expect(gate.command).toContain('local gate skipped');
+    } else {
+      expect(gate.command).not.toContain('check:standards');
+      expect(gate.standards).toMatchObject({ policy: 'auto', run: false });
+    }
+    expect(gate.reasons.join(' ')).toContain(`build.finalGateStandards=${standards} (env)`);
+  });
+  it('defaults to always and reports the standard source', () => {
+    seed(); change('backlog/123-card.md');
+    const gate = preview('related');
+    expect(gate.command).toContain('npm run check:standards');
+    expect(gate.standards.source).toBe('build.finalGateStandards (standard)');
+  });
+  it('keeps standards when deletion leaves no related-test target', () => {
+    seed(); change('backlog/123-card.md');
+    git('add', '-A'); git('commit', '-qm', 'card');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    rmSync(join(dir, 'backlog/123-card.md'));
+    const gate = preview('related', 'always');
+    expect(gate.command).toContain('npm run check:standards');
+    expect(gate.decision.targets).toEqual([]);
+    expect(gate.decision.mode).toBe('shrink');
+  });
+  it.each(['scripts/fix.mjs', 'backlog/123-card.md'])('since-last-green keeps standards for %s', (path) => {
+    seed(); change('scripts/first.mjs');
+    git('add', '-A'); git('commit', '-qm', 'first change');
+    const green = headSha();
+    const ledgerDir = join(dir, '.git', 'preview-ledger');
+    mkdirSync(ledgerDir);
+    writeFileSync(join(ledgerDir, `${green}.json`), JSON.stringify({ sha: green, status: 'green' }));
+    change(path);
+    // The ledger selection requires a strict ancestor of HEAD, not a green at HEAD itself.
+    git('add', '-A'); git('commit', '-qm', 'fix after green');
+    const gate = preview('related', 'always', { WE_VERIFY_SELECTION: 'since-last-green', WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir });
+    expect(gate.decision.selectionMode).toMatchObject({ mode: 'since-last-green', base: green });
+    expect(gate.command).toContain('npm run check:standards');
+    expect(gate.decision.mode).toBe('shrink');
+    expect(gate.standards).toMatchObject({ policy: 'always', run: true });
+    expect(gate.decision.changedFiles).toEqual([path]);
+  });
+});
+
 describe('full build gate default', () => {
+  beforeEach(() => {
+    const preferences = join(dir, '.git', 'platform-preferences.json');
+    writeFileSync(preferences, '{}');
+    vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', preferences);
+  });
   it('runs both whole-unit and standards scripts without a gate flag', () => {
     const scripts = {
       'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
@@ -1943,9 +2052,11 @@ describe('full build gate default', () => {
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
     const env = { ...process.env };
     delete env.WE_BUILD_FINAL_GATE;
+    delete env.WE_BUILD_FINAL_GATE_STANDARDS;
     const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
     expect(r.status, r.stderr).toBe(0);
     expect(r.stderr).toContain('finalGate="full" (standard)');
+    expect(r.stderr).toContain('finalGateStandards="always" (standard)');
     expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
     expect(readFileSync(join(dir, 'standards-ran'), 'utf8')).toBe('yes');
   });
@@ -1982,9 +2093,9 @@ describe('full build gate default', () => {
       mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
       writeFileSync(join(dir, 'scripts', 'lib', 'zz-full.mjs'), 'export {};\n');
       git('add', '-A'); git('commit', '-qm', 'full gate fixture');
-      const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir,
-        WE_PLATFORM_PREFERENCES_FILE: join(tmpdir(), 'no-such-platform-preferences.json') };
+      const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir };
       delete env.WE_BUILD_FINAL_GATE;
+      delete env.WE_BUILD_FINAL_GATE_STANDARDS;
       const r = spawnSync('node', [VERIFY_LANE, 'verify', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
       expect(JSON.parse(r.stdout.trim().split('\n').pop()), r.stderr).toMatchObject({ status: 'green' });
       expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
@@ -2015,8 +2126,7 @@ describe('full build gate default', () => {
       mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
       writeFileSync(join(dir, 'scripts', 'lib', 'zz-cross.mjs'), 'export {};\n');
       git('add', '-A'); git('commit', '-qm', 'cross-policy fixture');
-      const env = (finalGate) => ({ ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate,
-        WE_PLATFORM_PREFERENCES_FILE: join(tmpdir(), 'no-such-platform-preferences.json') });
+      const env = (finalGate) => ({ ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate });
       const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(requester), timeout: 60_000 });
       const suites = JSON.parse(readFileSync(marker(), 'utf8')).suites;
       expect(suites, request.stderr).toBeTruthy();
@@ -2024,5 +2134,68 @@ describe('full build gate default', () => {
       expect(run.stderr).toMatch(new RegExp(`selection @ \\w+ ${mode.source}`));
       expect(run.stderr).not.toContain('mode=explicit');
       expect(run.stderr).not.toContain('whole-gate admission');
+    });
+
+  // #5831 red team: a gate stamped under finalGateStandards=selected omits standards (or, on a card-only diff, is the
+  // skip echo). A child under `always` — or one with the card-only skip off — must still recognize it as the default
+  // gate and run it under its own policy, never the stamped command as-is.
+  it.each([
+    ['selected', 'always', 'scripts/lib/zz-std.mjs', '1', true, false], ['selected', 'always', 'backlog/123-card.md', '1', true, false],
+    ['selected', 'always', 'backlog/123-card.md', '0', true, false], ['selected', 'selected', 'backlog/123-card.md', '0', true, false],
+    ['always', 'selected', 'scripts/lib/zz-std.mjs', '1', false, false],
+    ['selected', 'always', 'scripts/lib/zz-std.mjs', '1', true, true],
+  ])(
+    'a child under finalGateStandards=%2$s runs its own standards policy for a gate stamped under %1$s (%3$s, child skip=%4$s, requester verified=%6$s)', (requester, child, path, childSkip, standardsRun, requesterVerified = false) => {
+      const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
+      writeFileSync(join(dir, 'node_modules', '.bin', 'vitest'), '#!/bin/sh\nexit 0\n');
+      chmodSync(join(dir, 'node_modules', '.bin', 'vitest'), 0o755);
+      writeFileSync(join(dir, 'mark-standards.cjs'), "require('fs').writeFileSync('standards-ran', 'yes');\n");
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'exit 0', 'check:standards': 'node mark-standards.cjs' } }));
+      writeFileSync(join(dir, '.gitignore'), 'node_modules/\nstandards-ran\n');
+      git('add', '-A'); git('commit', '-qm', 'standards fixture');
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      mkdirSync(join(dir, path.split('/').slice(0, -1).join('/')), { recursive: true });
+      writeFileSync(join(dir, path), 'export {};\n');
+      git('add', '-A'); git('commit', '-qm', 'standards policy fixture');
+      const env = (standards, skip) => ({ ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: 'related',
+        WE_BUILD_FINAL_GATE_STANDARDS: standards, WE_VERIFY_STANDARDS: 'auto', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: skip, WE_VERIFY_SELECTION: 'pr' });
+      const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(requester, '1'), timeout: 60_000 });
+      expect(request.status, request.stderr).toBe(0);
+      const suites = JSON.parse(readFileSync(marker(), 'utf8')).suites;
+      expect(suites, request.stderr).toBeTruthy();
+      if (requester === 'selected' && path.startsWith('backlog/')) {
+        expect(suites).toBe(CARD_ONLY_SKIP_GATE);
+      } else {
+        expect(suites).toMatch(/^npx vitest related /);
+      }
+      // The skip echo mentions check:standards; only an npm command executes it.
+      expect(suites.includes('npm run check:standards')).toBe(requester === 'always');
+      if (requesterVerified) {
+        // A completed code-only selection can also leave a green for the same stamp without running standards.
+        const warm = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=requester-child', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(requester, '1'), timeout: 60_000 });
+        expect(JSON.parse(warm.stdout.trim().split('\n').pop()), warm.stderr).toMatchObject({ status: 'green' });
+        expect(existsSync(join(dir, 'standards-ran'))).toBe(false);
+      }
+      const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=standards-child', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(child, childSkip), timeout: 60_000 });
+      expect(run.stderr).not.toContain('mode=explicit');
+      expect(run.stderr).not.toContain('whole-gate admission');
+      const verdict = JSON.parse(run.stdout.trim().split('\n').pop());
+      expect(verdict, run.stderr).toMatchObject({ status: 'green' });
+      expect(verdict.reason).not.toBe('card-only-skip');
+      expect(verdict.reason).not.toBe('cached');
+      expect(existsSync(join(dir, 'standards-ran'))).toBe(standardsRun);
+      // The completed child plan is reusable, even when its command differs from the requester's stamp.
+      const repeat = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=standards-repeat', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(child, childSkip), timeout: 60_000 });
+      expect(JSON.parse(repeat.stdout.trim().split('\n').pop()), repeat.stderr).toMatchObject({ status: 'green', reason: 'cached' });
+      if (requester === 'always' && child === 'selected') {
+        // Returning to the stronger stamped policy must not reuse the child's narrower execution.
+        const restored = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=standards-restored', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(requester, '1'), timeout: 60_000 });
+        const restoredVerdict = JSON.parse(restored.stdout.trim().split('\n').pop());
+        expect(restoredVerdict, restored.stderr).toMatchObject({ status: 'green' });
+        expect(restoredVerdict.reason).not.toBe('cached');
+        expect(existsSync(join(dir, 'standards-ran'))).toBe(true);
+      }
     });
 });
