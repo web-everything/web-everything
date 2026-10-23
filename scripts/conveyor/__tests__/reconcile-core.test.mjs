@@ -1039,7 +1039,7 @@ describe('bounced PR CI repair — real required failures on the fixer head (#57
     const options = { prs: [pr], agents: [], requiredChecks: ['gate'], now: NOW, roundCap: 6,
       fixTiming: { joinCiAndReview } };
     const plan = planReconcile(options);
-    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced', attempts: 10,
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced', findings: 2, attempts: 10,
       operatorSendBackRound: { sendBackId: 'operator', used: 0, allowance: 1,
         setting: 'fix.operatorRulingExtraRounds', source: 'standard' } })]);
     expect(plan.refusals).not.toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
@@ -1054,12 +1054,16 @@ describe('bounced PR CI repair — real required failures on the fixer head (#57
       expect(denied.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
     }
     // At the list-reader page boundary, completeness must be proved before any cap decision.
-    const page = [...comments, ...Array.from({ length: 100 - comments.length }, () => ({ body: '' }))];
+    const page = [...comments, ...Array.from({ length: 100 - comments.length },
+      (_, i) => finding(`Additional review finding ${i + 1}`))];
+    expect(page).toHaveLength(100);
     const truncated = planReconcile({ ...options, prs: [{ ...pr, comments: page }] });
     expect(truncated.dispatch).toEqual([]);
     expect(truncated.refusals).toEqual([expect.objectContaining({ kind: 'thread-truncated', prNumber: 5729 })]);
     const complete = planReconcile({ ...options, prs: [{ ...pr, comments: page, commentsComplete: true }] });
-    expect(complete.dispatch).toEqual(plan.dispatch);
+    // Ten re-arm markers are bookkeeping; the other 90 comments are findings.
+    // Completing the page preserves the repair grant while carrying every added finding.
+    expect(complete.dispatch).toEqual(plan.dispatch.map(row => ({ ...row, findings: 90 })));
     expect(complete.refusals).toEqual(plan.refusals);
     const disabled = planReconcile({ ...options, operatorRulingExtraRounds: { value: 0, source: 'repo' } });
     expect(disabled.dispatch).toEqual([]);
