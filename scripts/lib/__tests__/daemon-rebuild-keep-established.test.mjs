@@ -84,6 +84,42 @@ const passSmoke = () => vi.fn(async () => ({
 }));
 
 describe('swap predecessor removal during rebuild preparation', () => {
+  it.each(['fallback', 'dispatch'])('%s smoke removal defers an unadopted predecessor but permits removing the failing replacement', async kind => {
+    for (const target of ['predecessor', 'replacement']) {
+      const f = fixture(), oldRef = 'lane/swap-old', newRef = 'lane/swap-new';
+      const oldSha = f.push(oldRef, f.init, { 'swap-old.txt': 'old\n' });
+      const newSha = f.push(newRef, oldSha, { 'swap-new.txt': 'new\n' });
+      gitOk(f.clone, ['fetch', '-q', 'origin']);
+      const ref = target === 'predecessor' ? oldRef : newRef;
+      addOverlay(f.clone, { ref, pr: 777 }, { env: f.env });
+      if (target === 'predecessor') recordOverlayReplacement(f.clone, ref, { ref: newRef, sha: newSha }, { env: f.env });
+      const before = readOverlays(f.clone, { env: f.env }), logs = [];
+      const runSmoke = kind === 'dispatch' ? passSmoke() : vi.fn(async ({ root }) => existsSync(join(root, 'swap-old.txt'))
+        ? { verdict: 'code', attempts: 1, smoke: { results: [{ name: 'regression', ok: false, mayBeTransient: false, detail: 'fixture failure' }] } }
+        : { verdict: 'pass', attempts: 1, smoke: { results: [] } });
+      const dispatchRun = vi.fn(async () => ({ ok: false, reason: 'commands-denied' }));
+      const result = await rebuildClone({ root: f.clone, env: f.env, runSmoke, prState: async () => 'OPEN',
+        log: { error: m => logs.push(m) }, dispatchSmoke: {
+          settings: { dispatchSmoke: kind === 'dispatch' ? 'on' : 'off', dispatchPaths: ['swap-old.txt'] },
+          run: dispatchRun, match: files => files.filter(file => file === 'swap-old.txt'),
+        } });
+      expect(result.reason).toBe(kind === 'dispatch' ? 'dispatch-smoke-failed' : 'fallback-plain-main');
+      if (kind === 'dispatch') expect(dispatchRun).toHaveBeenCalledTimes(1);
+      else expect(runSmoke.mock.calls.length).toBeGreaterThanOrEqual(2);
+      const droppedKind = kind === 'dispatch' ? 'overlay-dropped-dispatch-smoke-failed' : 'overlay-dropped-smoke-failed';
+      if (target === 'predecessor') {
+        expect(readOverlays(f.clone, { env: f.env })).toEqual(before);
+        expect(result.alerts).toContainEqual({ kind: 'overlay-removal-deferred', detail: {
+          ref, reason: expect.stringMatching(/replacement is not adopted/),
+        } });
+        expect(logs.join('\n')).toContain('overlay-removal-deferred');
+        expect(result.alerts.some(a => a.kind === droppedKind)).toBe(false);
+      } else {
+        expect(readOverlays(f.clone, { env: f.env })).toEqual([]);
+        expect(result.alerts).toContainEqual({ kind: droppedKind, detail: expect.objectContaining({ ref }) });
+      }
+    }
+  });
   it.each(['CLOSED', 'MERGED'])('retains a predecessor whose origin advances after the initial fetch despite replacement adoption (%s)', async state => {
     const f = fixture(), ref = 'lane/swap-old';
     const oldSha = f.push(ref, f.init, { 'swap-old.txt': 'old\n' });

@@ -20,11 +20,11 @@ import {
   pruneLandedBacklogSidecars,
 } from './local-state.mjs';
 import {
-  readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
+  readOverlayState, overlayFilePath, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
-import { assertSwapRemovalAdopted } from '../overlay-swap.mjs';
+import { removeGuardedOverlay } from '../overlay-swap.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
@@ -340,12 +340,10 @@ export async function prepareRebuild({
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove')) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
-      try { assertSwapRemovalAdopted({ root, ref: d.ref, run, env }); } catch (error) {
+      if (removeGuardedOverlay({ root, ref: d.ref, run, env, why: d.reason, alert }).deferred) {
         deferredRemovals.add(d.ref);
-        alert('overlay-removal-deferred', { ref: d.ref, reason: error.message });
         continue;
       }
-      removeOverlay(root, d.ref, { env, why: d.reason });
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {
@@ -428,7 +426,7 @@ export async function prepareRebuild({
           lease: { token: ready.token ?? null },
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
-              root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
+              root, env, run, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
             })
             : undefined,
         });

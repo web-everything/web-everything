@@ -18,11 +18,25 @@ export async function withSwapRemovalLock(root, env, fn) {
 }
 
 export async function removeAdoptedOverlay({ removeOverlay = remove, why = 'operator', ...options }) {
-  const { root, ref, env = process.env } = options;
+  const { root, env = process.env } = options;
   return withSwapRemovalLock(root, env, () => {
     assertSwapRemovalAdopted(options);
-    return removeOverlay(root, ref, { env, why });
+    return removeGuardedOverlay({ ...options, removeOverlay, env, why });
   });
+}
+
+/** Check the CURRENT marker under the removal's list mutex. Callers serialize HEAD separately. */
+export function removeGuardedOverlay({ removeOverlay = remove, alert, why, ...options }) {
+  const { root, ref, env = process.env } = options;
+  try {
+    return removeOverlay(root, ref, { env, why, beforeRemove: entry => {
+      assertSwapRemovalAdopted({ ...options, readOverlays: () => [entry] });
+    } });
+  } catch (error) {
+    if (!alert) throw error;
+    alert('overlay-removal-deferred', { ref, reason: error.message });
+    return { removed: false, deferred: true };
+  }
 }
 
 // Preserve null exit statuses: a failed spawn must never become 'not yet adopted'.
@@ -82,7 +96,7 @@ export function assertSwapReplacementAdopted({ root, ref, readOverlays = readSwa
   return sha;
 }
 
-/** Full guard shared by manual removal and rebuild preparation; call immediately before removal. */
+/** Full guard shared by manual and automatic removal; evaluate inside the list mutation. */
 export function assertSwapRemovalAdopted(options) {
   const sha = assertSwapReplacementAdopted(options);
   if (!sha) return;
@@ -145,7 +159,10 @@ export async function swapAfterAdopt({
       }
       if (!ancestor(root, run, env, newSha, 'HEAD')) throw new Error('overlay-swap: replacement no longer adopted; retain registrations and retry');
       if (!readOverlays(root, { env }).some(o => o.ref === ref)) continue;
-      if (removeOverlay(root, ref, { env, why: `replaced by ${newRef}` }).removed) {
+      const result = removeGuardedOverlay({ root, ref, run, env, removeOverlay, why: `replaced by ${newRef}`,
+        alert: (kind, detail) => log(`${kind}: ${detail.ref}: ${detail.reason}`) });
+      if (result.deferred) retained.push(ref);
+      if (result.removed) {
         removed.push(ref);
         appendOverlayEvent(root, { kind: 'swap-removed', ref, replacedBy: newRef, newSha }, { env });
       }

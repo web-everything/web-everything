@@ -304,16 +304,18 @@ export function recordEdgeResolution(root, ref, {
  * {@link appendOverlayEvent} when the removal should be recorded.
  * @param {string} root
  * @param {string} ref
- * @param {{env?:NodeJS.ProcessEnv, why?:string}} [o]
+ * `beforeRemove` runs on the current entry under the list mutex; throwing retains the entry.
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, beforeRemove?:(entry:object)=>void}} [o]
  * @returns {{removed:boolean, list:Array<object>}}
  */
-export function removeOverlay(root, ref, { env = process.env, why } = {}) {
+export function removeOverlay(root, ref, { env = process.env, why, beforeRemove } = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
     pause();
     const idx = list.findIndex((o) => o && o.ref === ref);
     if (idx === -1) return { removed: false, list };
+    beforeRemove?.(list[idx]);
     const next = list.slice(0, idx).concat(list.slice(idx + 1));
     writeOverlays(root, next, { env });
     return { removed: true, list: next };

@@ -11,7 +11,8 @@ import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
-import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { appendOverlayEvent } from '../daemon-overlays.mjs';
+import { removeGuardedOverlay, withSwapRemovalLock } from '../overlay-swap.mjs';
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -526,7 +527,9 @@ export async function smokeAndAdopt({
     if (definite && !mainOnly) {
       for (const s of suspects) {
         try {
-          removeOverlay(root, s.ref, { env, why });
+          const removal = await withSwapRemovalLock(root, env, () =>
+            removeGuardedOverlay({ root, ref: s.ref, env, run, why, alert }));
+          if (removal.deferred) continue;
           appendOverlayEvent(root, {
             kind: 'dropped-dispatch-smoke-failed', ref: s.ref, pr: s.pr, reason: why,
           }, { env });
@@ -748,7 +751,7 @@ export async function smokeAndAdopt({
         if (!a2.worktreeFailed && !a2.threw && a2.smokeResult?.verdict === 'pass' && (!a2.dispatch || a2.dispatch.result.ok)) {
           if (a2.dispatch) dispatchPassedAlert(a2.dispatch);
           const dropCulprits = ({ alert: finAlert }) => dropSuspectOverlays({
-            root, env, suspects: culprits, failed: failedNames, alert: finAlert,
+            root, env, run, suspects: culprits, failed: failedNames, alert: finAlert,
           });
           const fin = await finalize(planA2, dropCulprits, {
             kind: 'fallback', forInputsKey: plan.inputsKey,
@@ -777,7 +780,7 @@ export async function smokeAndAdopt({
       });
       const failedNames = failedA.map((r) => r.name).join(',');
       const dropSuspects = ({ alert: finAlert }) => dropSuspectOverlays({
-        root, env, suspects: suspectInfo, failed: failedNames, alert: finAlert,
+        root, env, run, suspects: suspectInfo, failed: failedNames, alert: finAlert,
       });
       const fallbackReady = {
         // Each suspect's failing sha rides along, so a later adoption after main moved can tell that the suspect

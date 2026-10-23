@@ -5,7 +5,8 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
-import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { appendOverlayEvent } from '../daemon-overlays.mjs';
+import { removeGuardedOverlay } from '../overlay-swap.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
@@ -127,10 +128,10 @@ export function readyBuildVerified({
 /** Drop the suspect overlays a passing plain-main fallback proved bad (shared by the direct finalize and by a
  *  later adoption of the same fallback from its ready record). */
 export function dropSuspectOverlays({
-  root, env, suspects, failed, alert,
+  root, env, suspects, failed, alert, run,
 }) {
   for (const s of suspects) {
-    removeOverlay(root, s.ref, { env, why: 'smoke-failed' });
+    if (removeGuardedOverlay({ root, ref: s.ref, env, run, why: 'smoke-failed', alert }).deferred) continue;
     appendOverlayEvent(root, {
       kind: 'dropped-smoke-failed', ref: s.ref, pr: s.pr, reason: failed,
     }, { env });

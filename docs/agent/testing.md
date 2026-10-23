@@ -9,6 +9,10 @@ only an adopted replacement containing each predecessor's freshly fetched origin
 may retire that predecessor. Manual removal also fetches the predecessor's current
 origin tip and refuses pending, unknown or incomplete replacement adoption. Rebuild
 preparation uses the same full guard, logging `overlay-removal-deferred` on refusal.
+All automatic removals, including fallback and dispatch-smoke suspect drops, share
+that guard. Removal re-reads the current `replacedBy` inside the list mutation;
+a concurrent marker naming another pending replacement retains the entry. A failing
+replacement itself may still be removed; load recovery restores its predecessors.
 Swap and manual removal hold the clone write lock across adoption, containment,
 registry reads and removal, including the wait for the list mutex. Lock acquisition
 waits at most one second for readers; a busy writer or exhausted wait refuses removal.

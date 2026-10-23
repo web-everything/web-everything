@@ -1,7 +1,7 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { addOverlay, recordOverlayReplacement, overlayFilePath, restoreOverlay, writeOverlays } from '../daemon-overlays.mjs';
+import { addOverlay, recordOverlayReplacement, overlayFilePath, restoreOverlay, writeOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { readSwapOverlays } from '../overlay-swap.mjs';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { swapAfterAdopt, swapTimeout, assertSwapRemovalAdopted, removeAdoptedOverlay } from '../overlay-swap.mjs';
@@ -32,7 +32,11 @@ function fixture() {
     root: 'clone', newRef: 'new', newSha: sha, replaces: ['old'], env: { WE_DAEMON_CLONE_LOCK_ROOT: lockRoot() }, run,
     readOverlays: vi.fn(() => list.map(o => ({ ...o }))),
     addOverlay: vi.fn((root, entry) => { order.push('add'); list.push(entry); }),
-    removeOverlay: vi.fn((root, ref) => { order.push('remove'); list = list.filter(o => o.ref !== ref); return { removed: true }; }),
+    removeOverlay: vi.fn((root, ref, { beforeRemove } = {}) => {
+      const entry = list.find(o => o.ref === ref);
+      if (entry) beforeRemove?.(entry);
+      order.push('remove'); list = list.filter(o => o.ref !== ref); return { removed: true };
+    }),
     appendOverlayEvent: vi.fn((root, event) => events.push(event)),
     now: () => time, sleep: vi.fn(async ms => { time += ms; }), timeoutMs: 10, pollMs: 5, log: vi.fn(),
   };
@@ -210,6 +214,41 @@ describe.each(['swap', 'manual'])('%s removal clone lock', mode => {
   function removal(f) {
     return mode === 'swap' ? swapAfterAdopt(f.options) : removeAdoptedOverlay({ ...f.options, ref: 'old' });
   }
+  it.each(['pending', 'legacy-pending', 'incomplete', 'adopted'])('checks a concurrent %s replacement marker inside the list mutation', async state => {
+    const root = lockRoot(), otherSha = 'c'.repeat(40);
+    const env = { WE_DAEMON_OVERLAY_DIR: join(root, 'registry'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
+    addOverlay(root, { ref: 'old', pr: 42, pinned: true }, { env });
+    recordOverlayReplacement(root, 'old', { ref: 'new', sha }, { env });
+    const currentMarker = state === 'legacy-pending' ? 'other' : { ref: 'other', sha: otherSha };
+    let checkedInside = false;
+    const run = args => {
+      if (args.includes('fetch')) return { status: 0 };
+      if (args.includes('rev-parse')) return { status: 0, stdout: args.at(-1).includes('/other') ? otherSha : oldSha };
+      if (args.at(-2) === otherSha || args.at(-1) === otherSha) {
+        expect(existsSync(`${overlayFilePath(root, env)}.lock`)).toBe(true);
+        checkedInside = true;
+        if (args.at(-1) === 'HEAD') return { status: state.endsWith('pending') ? 1 : 0 };
+        return { status: state === 'incomplete' ? 1 : 0 };
+      }
+      return { status: 0 };
+    };
+    const options = { root, ref: 'old', newRef: 'new', newSha: sha, replaces: ['old'], env, run, timeoutMs: 0,
+      log: vi.fn(), removeOverlay: (root, ref, opts) => {
+        // The marker changes AFTER the caller's preflight, BEFORE the list mutex is acquired.
+        if (state === 'legacy-pending') {
+          writeOverlays(root, readSwapOverlays(root, { env }).map(o => ({ ...o, replacedBy: currentMarker })), { env });
+        } else recordOverlayReplacement(root, ref, currentMarker, { env });
+        return removeOverlay(root, ref, opts);
+      } };
+    const pending = mode === 'swap' ? swapAfterAdopt(options) : removeAdoptedOverlay(options);
+    if (state === 'adopted') await pending;
+    else if (mode === 'manual') await expect(pending).rejects.toThrow(/replacement is not adopted|current origin tip/);
+    else expect(await pending).toMatchObject({ removed: [], retained: ['old'] });
+    expect(checkedInside).toBe(true);
+    const entries = readSwapOverlays(root, { env });
+    if (state === 'adopted') expect(entries).toEqual([]);
+    else expect(entries).toEqual([expect.objectContaining({ ref: 'old', pr: 42, pinned: true, replacedBy: currentMarker })]);
+  });
   it('holds the rebuild lock across adoption, containment, registry read and removal', async () => {
     const f = fixture(); f.adopt();
     f.setList([{ ...f.list()[0], replacedBy: { ref: 'new', sha } }]);
