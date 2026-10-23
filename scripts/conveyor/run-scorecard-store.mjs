@@ -302,15 +302,19 @@ function serializeStore(store) {
  * On the first real read of the DEFAULT store in a process (no `path`, no injected `read`), the one-time
  * {@link migrateLegacyStore} runs first, so no reader ever sees the history the old tracked file held go
  * missing. An explicit `path` or injected IO reads exactly what it is given.
+ * `strict` preserves read/parse failures for admission checks; absence remains an empty store.
  */
-export function readStore({ path, read, exists } = {}) {
+export function readStore({ path, read, exists, strict = false } = {}) {
   ensureMigrated({ path, read, exists });
   const target = path ?? resolveScorecardStorePath();
   const doRead = read ?? ((p) => readFileSync(p, 'utf8'));
   try {
-    if (!(exists ?? existsSync)(target)) return { version: 1, records: [] };
-    return parseStoreText(doRead(target)) ?? { version: 1, records: [] };
-  } catch {
+    if ((!strict || exists) && !(exists ?? existsSync)(target)) return { version: 1, records: [] };
+    const parsed = parseStoreText(doRead(target));
+    if (!parsed && strict) throw new Error('scorecard store malformed');
+    return parsed ?? { version: 1, records: [] };
+  } catch (error) {
+    if (strict && error.code !== 'ENOENT') throw error;
     return { version: 1, records: [] };
   }
 }

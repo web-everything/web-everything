@@ -54,3 +54,30 @@ describe('GitHub auth policy', () => {
     expect(settings.github.personalExceptions ?? {}).not.toHaveProperty('reads');
   });
 });
+
+describe('ghAuth.personalFallback policy (independent of github.*)', () => {
+  it('defaults to refusal for daemons and allow for interactive callers', async () => {
+    const { resolveGhAuthPolicy } = await import('../github-auth-policy.mjs');
+    expect(resolveGhAuthPolicy({ daemon: true })).toEqual({ personalFallback: 'refuse', source: { personalFallback: 'default' } });
+    expect(resolveGhAuthPolicy()).toEqual({ personalFallback: 'allow', source: { personalFallback: 'default' } });
+  });
+
+  it('cascades default, platform, tool, env and ignores invalid overrides', async () => {
+    const { resolveGhAuthPolicy } = await import('../github-auth-policy.mjs');
+    const platform = { personalFallback: 'allow' };
+    expect(resolveGhAuthPolicy({ daemon: true, platform })).toEqual({ personalFallback: 'allow', source: { personalFallback: 'platform' } });
+    const tool = { personalFallback: 'refuse' };
+    expect(resolveGhAuthPolicy({ platform, tool })).toEqual({ personalFallback: 'refuse', source: { personalFallback: 'tool' } });
+    expect(resolveGhAuthPolicy({ platform, tool, env: { WE_GH_AUTH_PERSONAL_FALLBACK: 'allow' } })).toEqual({ personalFallback: 'allow', source: { personalFallback: 'env' } });
+    expect(resolveGhAuthPolicy({ platform, tool, env: { WE_GH_AUTH_PERSONAL_FALLBACK: 'invalid' } }).personalFallback).toBe('refuse');
+    expect(resolveGhAuthPolicy({ daemon: true, platform: { personalFallback: 'invalid' }, tool: null }).personalFallback).toBe('refuse');
+  });
+
+  it('reads the separate top-level settings namespace and ships refusal', async () => {
+    const { readGhAuthPolicy } = await import('../github-auth-policy.mjs');
+    expect(readGhAuthPolicy({ env: {}, read: () => ({ ghAuth: { personalFallback: 'refuse' }, github: { auth: 'personal' } }) }))
+      .toEqual({ personalFallback: 'refuse', source: { personalFallback: 'tool' } });
+    expect(JSON.parse(readFileSync('scripts/settings/github-auth.json', 'utf8')).ghAuth.personalFallback).toBe('refuse');
+    expect(readGhAuthPolicy({ daemon: true, env: {}, read: () => { throw Error('unreadable'); } }).personalFallback).toBe('refuse');
+  });
+});

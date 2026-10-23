@@ -29,6 +29,7 @@ import { readSharedOpenPrs } from './pr-snapshot.mjs';
 import { meteredPrCommits } from './gh-metered-reads.mjs';
 import { readGitPrCommits } from './git-pr-commits.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
+// Pure cap readers accept already-resolved pr.realFiles; they do not fetch on the admission hot path.
 import { isCardOnlyDiff } from '../ci-card-only.mjs'; // THE one definition of card-only (backlog/ only, fail-closed) — never re-derived here
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
@@ -131,7 +132,8 @@ export function readPrLimitScope({ env = process.env, read = readSettings } = {}
 
 /** Is this `gh pr list --json files` row card-only? A row with no file list is NOT (fail-closed: it counts). PURE. */
 export function isCardOnlyPr(pr) {
-  const files = Array.isArray(pr?.files) ? pr.files.map((f) => (typeof f === 'string' ? f : f?.path)).filter(Boolean) : null;
+  const list = pr && Object.hasOwn(pr, 'realFiles') ? pr.realFiles : pr?.files;
+  const files = Array.isArray(list) ? list.map((f) => (typeof f === 'string' ? f : f?.path)).filter(Boolean) : null;
   return isCardOnlyDiff(files);
 }
 
