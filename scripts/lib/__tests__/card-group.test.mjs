@@ -685,7 +685,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
   describe('after the combined PR merged: a push racing the source close never closes unverified work', () => {
     // Main after the merge carries source 1's head A. `views[n]` is the sequence of live reads of source n (the last
     // repeats); a read after a `pr close` reports CLOSED with the head GitHub recorded.
-    function mergedRace(views, { closedAt, reopenFails = false } = {}) {
+    function mergedRace(views, { closedAt, reopenFails = false, closeThrows = false } = {}) {
       const t = setup();
       const statePath = join(tmp(), 's.json');
       git(t.cwd, 'checkout', '-q', '-b', 'merged', t.base);
@@ -707,13 +707,13 @@ describe('createCardGrouping — claim under the land mutex, close on current he
           const v = seq[Math.min(i++, seq.length - 1)];
           return JSON.stringify({ state: closed ? 'CLOSED' : v.state ?? 'OPEN', isDraft: false, headRefOid: v.head, headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
         }
-        if (args[0] === 'pr' && args[1] === 'close') { closed = true; return ''; }
+        if (args[0] === 'pr' && args[1] === 'close') { closed = true; if (closeThrows) throw new Error('gh: timed out'); return ''; }
         if (args[0] === 'pr' && args[1] === 'reopen') { if (reopenFails) throw new Error('gh: 502'); closed = false; return ''; }
         if (args[0] === 'pr' && args[1] === 'comment') return '';
         throw new Error(`unexpected ${args.join(' ')}`);
       };
       const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => mainAfter), exec, statePath, settings, log: { write() {} } });
-      return { r: g.reconcile({ force: true }), calls, state: readGroupState(statePath), t, aNew };
+      return { r: g.reconcile({ force: true }), calls, state: readGroupState(statePath), t, aNew, again: () => g.reconcile({ force: true }), statePath };
     }
 
     it('a push between verification and the close: not closed, the group is kept and the new head re-verified next pass', () => {
@@ -740,6 +740,28 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       const { r, state } = mergedRace(h => [{ state: 'CLOSED', head: h.aNew }], { closedAt: 'a', reopenFails: true });
       expect(r.done).toEqual([]);
       expect(state.groups.map(x => x.id)).toEqual(['g']);
+    });
+
+    it('reopen keeps failing: after 3 tries the source is commented and released, never held forever', () => {
+      const { r, again, calls, statePath } = mergedRace(h => [{ state: 'CLOSED', head: h.aNew }], { closedAt: 'a', reopenFails: true });
+      expect(r.done).toEqual([]);
+      expect(again().done).toEqual([]);
+      expect(again().done).toEqual(['g']);
+      expect(calls.filter(c => c.startsWith('pr reopen 1 '))).toHaveLength(3);
+      expect(calls.some(c => c.startsWith('pr comment 1 ') && /reopening it failed 3 times/.test(c))).toBe(true);
+      expect(readGroupState(statePath).groups).toEqual([]);
+    });
+
+    it('an unreadable head after the close is never read as a move: no reopen, retried', () => {
+      const { r, calls } = mergedRace(h => [{ head: h.a }, { head: h.a }, { head: '' }]);
+      expect(calls.some(c => c.startsWith('pr reopen'))).toBe(false);
+      expect(r.done).toEqual([]);
+    });
+
+    it('a close that throws but did close (timeout) is still checked: a moved head is reopened', () => {
+      const { r, calls } = mergedRace(h => [{ head: h.a }, { head: h.a }, { head: h.aNew }], { closeThrows: true });
+      expect(calls.some(c => c.startsWith('pr reopen 1 '))).toBe(true);
+      expect(r.done).toEqual(['g']);
     });
 
     it('an unmoved source closes once and is never reopened', () => {
@@ -1263,6 +1285,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       ['sent back: ready-to-merge removed (review:accepted kept)', { combined: { state: 'OPEN', labels: [{ name: 'review:accepted' }], statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] } }, /combined PR sent back \(ready-to-merge was removed\)/, true],
       ['sent back: made draft', { combined: { state: 'OPEN', isDraft: true, labels: waiting } }, /combined PR sent back \(made draft\)/, true],
       ['retargeted off main', { combined: { state: 'OPEN', baseRefName: 'lane/other', labels: waiting } }, /combined PR retargeted \(base is lane\/other\)/, true],
+      ['retargeted to a base name carrying markup (sanitized in every comment)', { combined: { state: 'OPEN', baseRefName: 'x`$(id)`\n@team', labels: waiting } }, /combined PR retargeted \(base is x\?\?\?id\?\?\?\?team\)/, true],
       ['required check failed', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] } }, /combined PR failed the required check/, true],
       ['required check timed out (status context)', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ context: 'test', state: 'TIMED_OUT' }] } }, /combined PR failed the required check/, true],
       ['required check needs action (ACTION_REQUIRED)', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'ACTION_REQUIRED' }] } }, /combined PR failed the required check/, true],
@@ -1308,6 +1331,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
         { name: 'test', conclusion: 'FAILURE', startedAt: '2026-10-21T10:00:00Z', completedAt: '2026-10-21T10:05:00Z' },
         { name: 'test', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-10-21T10:10:00Z', completedAt: '0001-01-01T00:00:00Z' }] } }],
       ['a source read fails (fail closed: held)', { readFails: [2] }],
+      ['the combined PR labels read is not a list (unknown, never "ready-to-merge removed")', { combined: { state: 'OPEN', labels: null } }],
       ['closing the combined PR fails (held, retried)', { combined: { state: 'OPEN', labels: [{ name: 'review:changes' }] }, closeFails: true }],
       ['the combined PR read fails', { combined: 'throw' }],
     ])('keeps the group (sources stay held) when %s', (_, c) => {
