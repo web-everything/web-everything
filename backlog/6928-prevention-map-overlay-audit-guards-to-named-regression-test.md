@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/", "we:scripts/lib/__tests__/", "we:scripts/check-standards-rules.mjs", "we:backlog/x3vn7kd-follow-up-overlay-review-named-test-mappings.md", "we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md"]
+scope: ["we:scripts/lib/daemon-rebuild/", "we:scripts/lib/__tests__/", "we:scripts/check-standards-rules.mjs", "we:backlog/6936-follow-up-overlay-review-named-test-mappings.md", "we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md"]
 dateOpened: "2026-10-21"
 tags: []
 ---
@@ -19,7 +19,7 @@ PR #5809 review found guard guarantees without named tests. Add a scoped check t
 - [A2] Enumerate smoke fallback alert kinds and require named failing-smoke cases for planA2 and planB, including loss of a carried overlay. Reject missing or stale test names.
 - [A3] Document which references are behavioral regression pins and which have verified revert-red evidence. Existing guards must not be weakened to obtain proof.
 
-PR #5809 review follow-up (2026-10-22): A1 must also require one named test per conjunct of a compound admission refusal predicate, with its other conditions satisfied. Until the checker exists, the review lens must ask which named test breaks if each fails-closed or never guard is removed. The direct behavioral cases below exercise the checker itself; the card-mapping fixtures in `we:backlog/x3vn7kd-follow-up-overlay-review-named-test-mappings.md` A3 only check that these mappings are present and cannot substitute for these cases.
+PR #5809 review follow-up (2026-10-22): A1 must also require one named test per conjunct of a compound admission refusal predicate, with its other conditions satisfied. Until the checker exists, the review lens must ask which named test breaks if each fails-closed or never guard is removed. The direct behavioral cases below exercise the checker itself; the card-mapping fixtures in `we:backlog/6936-follow-up-overlay-review-named-test-mappings.md` A3 only check that these mappings are present and cannot substitute for these cases.
 
 ### Planned behavioral tests for the coverage checker
 
