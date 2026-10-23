@@ -250,6 +250,16 @@ export function recordOverlayReplacement(root, ref, replacedBy, { env = process.
   });
 }
 
+/** Restore a complete saved registration only if absent, without overwriting concurrent metadata. */
+export function restoreOverlay(root, { now, ...entry }, { env = process.env } = {}) {
+  if (!isSafeBranchName(entry.ref)) throw new TypeError('daemon-overlays: unsafe restoration ref');
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env);
+    if (list.some(o => o.ref === entry.ref)) return list;
+    return writeOverlays(root, [...list, entry], { env });
+  });
+}
+
 /**
  * Record WHO approved WHICH `origin/edge/<ref>` tip as the conflict resolution for a registered overlay
  * (`edgeResolution: {sha, by, at, reason?}` on its entry). The rebuild adopts an edge branch only when its tip

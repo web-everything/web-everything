@@ -27,6 +27,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { runDaemonLoadOverlay, mergeOverlayRef, dryRunOverlay, overlayInstalled } from '../daemon-load-overlay.mjs';
+import { addOverlay, removeOverlay, recordOverlayReplacement, writeOverlays } from '../daemon-overlays.mjs';
+import { readSwapOverlays, assertSwapRemovalAdopted } from '../overlay-swap.mjs';
 import finalizeWaitBreak from '../../conveyor/soak/breaks/overlay-admission-finalize-wait.mjs';
 
 it('preserves the real rebuild finalize wait on first admission, late retries, and starvation', async () => {
@@ -1449,7 +1451,9 @@ describe('contained overlay replacement wiring', () => {
     const order = [];
     const predecessor = { ref: 'lane/old', pr: 7, pinned: true, reason: 'original', addedBy: 'author' };
     const sha = 'a'.repeat(40);
-    const swap = vi.fn(async o => { order.push('swap'); expect(o.originalEntries).toEqual([predecessor]); return { ok: true, removed: ['lane/old'] }; });
+    const swap = vi.fn(async o => { order.push('swap'); expect(o.originalEntries).toEqual([
+      { ...predecessor, replacedBy: { ref: 'lane/new', sha } },
+    ]); return { ok: true, removed: ['lane/old'] }; });
     const result = await runDaemonLoadOverlay({ clone: 'clone', ref: 'lane/new', pr: 8, replaces: 'lane/old', versions: null,
       run: a => ({ status: 0, stdout: a.includes('rev-parse') ? sha : '' }),
       recordReplacement: (root, ref, target) => { order.push(`mark:${ref}`); expect(target).toEqual({ ref: 'lane/new', sha }); },
@@ -1466,6 +1470,41 @@ describe('contained overlay replacement wiring', () => {
     await runDaemonLoadOverlay({ clone: 'clone', ref: 'lane/new', replaces: 'lane/old', dryRun: true,
       dryRunRebuildFn: async () => ({}), swap, run, readOverlaysFn });
     expect(swap).not.toHaveBeenCalled(); expect(run).not.toHaveBeenCalled(); expect(readOverlaysFn).not.toHaveBeenCalled();
+  });
+  it.each(['throws', 'times out'])('restores guarded predecessors when the rebuild %s before replacement adoption', async mode => {
+    const root = mkdtempSync(join(tmpdir(), 'we-load-swap-restore-'));
+    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'registry'), WE_OVERLAY_SWAP_TIMEOUT_MS: '0' };
+    const sha = 'a'.repeat(40), appendEventFn = vi.fn();
+    const run = args => ({ status: args.includes('merge-base') ? 1 : 0, stdout: sha });
+    try {
+      addOverlay(root, { ref: 'lane/old', pr: 7, reason: 'before snapshot', addedBy: 'owner' }, { env });
+      const original = readSwapOverlays(root, { env })[0];
+      const guarded = { ...original, reason: 'latest metadata', pinned: true, stackBases: ['lane/base'],
+        edgeResolution: { sha, by: 'operator' }, futureGuard: { held: true } };
+      const pending = runDaemonLoadOverlay({ clone: root, ref: 'lane/new', pr: 8, replaces: ['lane/old'], env, run,
+        versions: null, settings: { dispatchSmoke: 'off' }, appendEventFn,
+        recordReplacement: (clone, ref, marker, opts) => {
+          writeOverlays(root, readSwapOverlays(root, { env }).map(o => o.ref === ref ? guarded : o), { env });
+          return recordOverlayReplacement(clone, ref, marker, opts);
+        },
+        rebuild: async () => {
+          expect(readSwapOverlays(root, { env })[0]).toEqual({ ...guarded, replacedBy: { ref: 'lane/new', sha } });
+          removeOverlay(root, 'lane/old', { env });
+          addOverlay(root, { ref: 'lane/concurrent', pr: 99 }, { env });
+          if (mode === 'throws') throw new Error('rebuild failed before swap');
+          return { moved: false, adopted: false };
+        }, installed: () => ({ inHead: false, tip: sha }),
+      });
+      if (mode === 'throws') await expect(pending).rejects.toThrow('rebuild failed before swap');
+      else expect(await pending).toMatchObject({ swap: { ok: false, restored: ['lane/old'], reason: 'adoption-timeout' } });
+      const entries = readSwapOverlays(root, { env });
+      expect(entries.map(o => o.ref)).toEqual(['lane/new', 'lane/concurrent', 'lane/old']);
+      expect(entries[2]).toEqual({ ...guarded, replacedBy: { ref: 'lane/new', sha } });
+      expect(() => assertSwapRemovalAdopted({ root, ref: 'lane/old', env, run })).toThrow(/replacement is not adopted/);
+      expect(appendEventFn).toHaveBeenCalledWith(root, {
+        kind: mode === 'throws' ? 'swap-rebuild-failed-restored' : 'swap-timeout-restored', ref: 'lane/new', restored: ['lane/old'],
+      }, { env });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

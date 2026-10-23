@@ -12,7 +12,8 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { planRebuild, rebuildClone } from '../daemon-rebuild.mjs';
-import { addOverlay } from '../daemon-overlays.mjs';
+import { addOverlay, recordOverlayReplacement, readOverlays } from '../daemon-overlays.mjs';
+import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
 
@@ -81,6 +82,41 @@ function fixture() {
 const passSmoke = () => vi.fn(async () => ({
   verdict: 'pass', attempts: 1, smoke: { results: [{ name: 'reconcile-dry-run', ok: true, ms: 148_000 }, { name: 'lane-acquire-release', ok: true, ms: 32_000 }] },
 }));
+
+describe('swap predecessor removal during rebuild preparation', () => {
+  it.each(['CLOSED', 'MERGED', 'unknown-sha', 'malformed-marker', 'ancestry-error'])('defers a remove decision until replacement adoption (%s)', async state => {
+    const f = fixture(), ref = 'lane/swap-old';
+    const oldSha = f.push(ref, f.init, { 'swap-old.txt': 'old\n' });
+    const newSha = f.push('lane/swap-new', oldSha, { 'swap-new.txt': 'new\n' });
+    addOverlay(f.clone, { ref, pr: 777 }, { env: f.env });
+    addOverlay(f.clone, { ref: 'lane/swap-new', pr: 778 }, { env: f.env });
+    const marker = { ref: 'lane/swap-new', sha: state === 'unknown-sha' ? 'f'.repeat(40) : newSha };
+    recordOverlayReplacement(f.clone, ref, marker, { env: f.env });
+    if (state === 'malformed-marker') {
+      const { writeOverlays } = await import('../daemon-overlays.mjs');
+      writeOverlays(f.clone, readOverlays(f.clone, { env: f.env }).map(o => o.ref === ref ? { ...o, replacedBy: null } : o), { env: f.env });
+    }
+    const logs = [];
+    const options = { root: f.clone, env: f.env, now: Date.now,
+      run: (args, opts) => state === 'ancestry-error' && args.includes('-C') && args.includes('merge-base')
+        ? { status: null } : gitRun(args, opts),
+      prState: async pr => pr === 777 ? state === 'MERGED' ? 'MERGED' : 'CLOSED' : 'OPEN',
+      prBaseChain: async () => null, log: { error: message => logs.push(message) } };
+    const before = readOverlays(f.clone, { env: f.env });
+    const result = await prepareRebuild(options);
+    expect(result.plan.decisions).toContainEqual(expect.objectContaining({ ref, action: 'remove' }));
+    expect(result.alerts).toContainEqual({ kind: 'overlay-removal-deferred', detail: { ref, reason: expect.any(String) } });
+    expect(logs.join('\n')).toContain('overlay-removal-deferred');
+    expect(result.alerts.some(a => a.kind === 'overlay-auto-dropped' && a.detail.ref === ref)).toBe(false);
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(before);
+    expect(gitOk(f.clone, ['rev-parse', 'HEAD']).trim()).toBe(f.init);
+    if (state !== 'CLOSED' && state !== 'MERGED') return;
+    gitOk(f.clone, ['reset', '--hard', newSha]);
+    const adopted = await prepareRebuild(options);
+    expect(adopted.alerts).toContainEqual({ kind: 'overlay-auto-dropped', detail: { ref, reason: state === 'MERGED' ? 'pr-merged' : 'pr-closed' } });
+    expect(readOverlays(f.clone, { env: f.env }).some(o => o.ref === ref)).toBe(false);
+  });
+});
 
 describe('x5059uu — rebuild keeps established overlays and parks the conflicting newcomer', () => {
   it('replays 19:54:32Z: #4658/#4663 stay in HEAD, #4643\'s new head is parked with the conflicting file named', async () => {

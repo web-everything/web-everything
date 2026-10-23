@@ -66,8 +66,8 @@ import {
 import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
-import { addOverlay, removeOverlay, appendOverlayEvent, recordOverlayReplacement } from './daemon-overlays.mjs';
-import { swapAfterAdopt, originTip, readSwapOverlays, overlayGitRun } from './overlay-swap.mjs';
+import { addOverlay, removeOverlay, appendOverlayEvent, recordOverlayReplacement, restoreOverlay } from './daemon-overlays.mjs';
+import { swapAfterAdopt, originTip, readSwapOverlays, overlayGitRun, restoreSwapPredecessors } from './overlay-swap.mjs';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
 import { DEFAULT_REBUILD_LOCK_WAIT_MS, REBUILD_LOCK_WAIT_ENV } from './daemon-rebuild/lease.mjs';
 import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
@@ -645,17 +645,27 @@ export async function runDaemonLoadOverlay(options) {
   const originalEntries = readOverlaysFn(root, { env }).map(o => ({ ...o }));
   const newSha = originTip({ root, ref: options.ref, run, env });
   const add = options.addOverlayFn ?? addOverlay;
-  const result = await loadOverlay({ ...options, addOverlayFn: (...args) => {
-    const list = add(...args);
-    for (const entry of originalEntries.filter(o => refs.includes(o.ref))) {
-      recordReplacement(root, entry.ref, { ref: options.ref, sha: newSha }, { env });
-    }
-    return list;
-  } });
+  const markedEntries = [];
+  const recovery = { root, newRef: options.ref, newSha, readOverlays: readOverlaysFn,
+    addOverlay: options.addOverlayFn ?? restoreOverlay, appendOverlayEvent: options.appendEventFn ?? appendOverlayEvent, env };
+  let result;
+  try {
+    result = await loadOverlay({ ...options, addOverlayFn: (...args) => {
+      const list = add(...args);
+      for (const entry of originalEntries.filter(o => refs.includes(o.ref))) {
+        const replacedBy = { ref: options.ref, sha: newSha };
+        const marked = recordReplacement(root, entry.ref, replacedBy, { env });
+        markedEntries.push(marked?.find(o => o.ref === entry.ref) ?? { ...entry, replacedBy });
+      }
+      return list;
+    } });
+  } catch (error) {
+    restoreSwapPredecessors({ ...recovery, originalEntries: markedEntries, kind: 'swap-rebuild-failed-restored' });
+    throw error;
+  }
   if (result.refused || result.rolledBack) return result;
-  const swapped = await swap({ root, newRef: options.ref, newSha, replaces: refs, run, env, originalEntries,
-    readOverlays: readOverlaysFn, addOverlay: add, removeOverlay: options.removeOverlayFn ?? removeOverlay,
-    appendOverlayEvent: options.appendEventFn ?? appendOverlayEvent,
+  const swapped = await swap({ ...recovery, replaces: refs, run, originalEntries: markedEntries,
+    removeOverlay: options.removeOverlayFn ?? removeOverlay,
   });
   return { ...result, swap: swapped, ...(swapped.ok ? {} : { adopted: false, timedOut: true, reason: swapped.reason }) };
 }

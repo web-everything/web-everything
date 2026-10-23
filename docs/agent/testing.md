@@ -6,9 +6,13 @@
 `replacedBy: {ref, sha}` under the registry lock after registering the replacement.
 `scripts/lib/overlay-swap.mjs` polls ancestry in the daemon clone after the rebuild;
 only an adopted replacement containing each predecessor's freshly fetched origin tip
-may retire that predecessor. Manual removal refuses pending or unknown adoption.
-Timeout restoration uses the original registration metadata and fresh per-entry reads,
-never a saved list. `swapAfterAdopt.timeoutMs` resolves through the policy cascade
+may retire that predecessor. Manual removal also fetches the predecessor's current
+origin tip and refuses pending, unknown or incomplete replacement adoption. Rebuild
+preparation defers marked predecessors' removal until adoption, logging
+`overlay-removal-deferred`. Timeout and pre-swap rebuild failures restore complete
+registrations, including `replacedBy` and all guard fields, with fresh per-entry reads
+and insertion under the registry lock that preserves concurrent entries.
+`swapAfterAdopt.timeoutMs` resolves through the policy cascade
 (default ten minutes, tool file `scripts/lib/daemon-rebuild-settings.json`, environment
 `WE_OVERLAY_SWAP_TIMEOUT_MS`) and logs its effective value and source. A Git error
 retains registrations; repair Git and retry. A timeout restores missing registrations;

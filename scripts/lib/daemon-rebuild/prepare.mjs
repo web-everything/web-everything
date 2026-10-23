@@ -24,6 +24,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { assertSwapReplacementAdopted } from '../overlay-swap.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
@@ -335,9 +336,15 @@ export async function prepareRebuild({
     }
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
+  const deferredRemovals = new Set();
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove')) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
+      try { assertSwapReplacementAdopted({ root, ref: d.ref, run, env }); } catch (error) {
+        deferredRemovals.add(d.ref);
+        alert('overlay-removal-deferred', { ref: d.ref, reason: error.message });
+        continue;
+      }
       removeOverlay(root, d.ref, { env, why: d.reason });
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
@@ -371,7 +378,7 @@ export async function prepareRebuild({
       // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
       // NOT wanted), plus overlays that left because main now has them. A mainOnly rebuild wants no overlay.
       const registeredRefs = new Set((overlaysBefore || []).map((o) => o?.ref));
-      for (const d of plan.decisions) if (d.action === 'remove') registeredRefs.delete(d.ref);
+      for (const d of plan.decisions) if (d.action === 'remove' && !deferredRemovals.has(d.ref)) registeredRefs.delete(d.ref);
       const wantedRefs = new Set(mainOnly ? [] : registeredRefs);
       for (const d of plan.decisions) {
         if (d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')) wantedRefs.add(d.ref);

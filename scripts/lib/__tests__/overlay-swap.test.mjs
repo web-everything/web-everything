@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { addOverlay, recordOverlayReplacement, overlayFilePath } from '../daemon-overlays.mjs';
+import { addOverlay, recordOverlayReplacement, overlayFilePath, restoreOverlay, writeOverlays } from '../daemon-overlays.mjs';
 import { readSwapOverlays } from '../overlay-swap.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { swapAfterAdopt, swapTimeout, assertSwapRemovalAdopted } from '../overlay-swap.mjs';
@@ -23,7 +23,7 @@ function fixture() {
     addOverlay: vi.fn((root, entry) => { order.push('add'); list.push(entry); }),
     removeOverlay: vi.fn((root, ref) => { order.push('remove'); list = list.filter(o => o.ref !== ref); return { removed: true }; }),
     appendOverlayEvent: vi.fn((root, event) => events.push(event)),
-    now: () => time, sleep: vi.fn(async ms => { time += ms; }), timeoutMs: 10, pollMs: 5,
+    now: () => time, sleep: vi.fn(async ms => { time += ms; }), timeoutMs: 10, pollMs: 5, log: vi.fn(),
   };
   return { options, events, order, list: () => list, setList: value => { list = value; }, adopt: () => { adopted = true; } };
 }
@@ -47,6 +47,7 @@ describe('swapAfterAdopt', () => {
     f.options.run.mockImplementation(a => a.at(-1) === sha ? { status: 1 } : base(a));
     expect(await swapAfterAdopt(f.options)).toMatchObject({ retained: ['old'], removed: [] });
     expect(f.options.removeOverlay).not.toHaveBeenCalled();
+    expect(f.options.log).toHaveBeenCalledWith(expect.stringMatching(/refusing to remove old.*current origin tip.*retry/));
   });
   it('timeout restores missing originals with all original fields and preserves concurrent registrations', async () => {
     const f = fixture();
@@ -78,6 +79,19 @@ describe('swapAfterAdopt', () => {
     expect(await swapAfterAdopt(f.options)).toMatchObject({ restored: [] });
     expect(f.options.addOverlay).not.toHaveBeenCalled();
     expect(f.options.removeOverlay).not.toHaveBeenCalled();
+  });
+  it('restores the current marker and all guard fields rather than a pre-marker snapshot', async () => {
+    const f = fixture();
+    const originalEntries = f.list().map(o => ({ ...o }));
+    const guarded = { ...originalEntries[0], replacedBy: { ref: 'new', sha }, stackBases: ['base'],
+      edgeResolution: { sha: oldSha, by: 'operator' }, futureGuard: { approved: false } };
+    f.setList([guarded]);
+    const advance = f.options.sleep.getMockImplementation();
+    f.options.sleep.mockImplementation(async ms => { await advance(ms); f.setList([]); });
+    expect(await swapAfterAdopt({ ...f.options, originalEntries })).toMatchObject({ restored: ['old'] });
+    expect(f.list()).toEqual([{ ...guarded, now: guarded.addedAt }]);
+    expect(() => assertSwapRemovalAdopted({ root: 'clone', ref: 'old',
+      readOverlays: f.options.readOverlays, run: f.options.run })).toThrow(/replacement is not adopted/);
   });
   it('treats a null git exit status as an error rather than pending adoption', async () => {
     const f = fixture(); f.options.run.mockReturnValue({ status: null });
@@ -133,13 +147,45 @@ describe('manual predecessor removal guard', () => {
     })).toThrow(/refusing|unavailable/);
   });
   it('permits an adopted replacement and unrelated removals', () => {
-    const run = vi.fn(() => ({ status: 0 }));
+    const run = vi.fn(() => ({ status: 0, stdout: oldSha }));
     const readOverlays = () => [{ ref: 'old', replacedBy: { ref: 'new', sha } }];
     assertSwapRemovalAdopted({ root: 'clone', ref: 'old', readOverlays, run });
-    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls.map(([args]) => args)).toEqual([
+      ['-C', 'clone', 'merge-base', '--is-ancestor', sha, 'HEAD'],
+      ['-C', 'clone', 'fetch', '--no-tags', 'origin', '+refs/heads/old:refs/remotes/origin/old'],
+      ['-C', 'clone', 'rev-parse', '--verify', 'refs/remotes/origin/old^{commit}'],
+      ['-C', 'clone', 'merge-base', '--is-ancestor', oldSha, sha],
+    ]);
     assertSwapRemovalAdopted({ root: 'clone', ref: 'unrelated', readOverlays, run });
-    expect(run).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledTimes(4);
   });
+  it.each(['advanced', 'fetch-failed', 'unreadable-tip', 'unknown-containment'])('refuses manual removal with %s predecessor evidence', stage => {
+    const run = vi.fn(args => {
+      if (args.includes('fetch')) return { status: stage === 'fetch-failed' ? 128 : 0 };
+      if (args.includes('rev-parse')) return { status: 0, stdout: stage === 'unreadable-tip' ? '' : oldSha };
+      return { status: args.at(-1) === 'HEAD' ? 0 : stage === 'unknown-containment' ? null : 1 };
+    });
+    expect(() => assertSwapRemovalAdopted({ root: 'clone', ref: 'old', run, env: {},
+      readOverlays: () => [{ ref: 'old', replacedBy: { ref: 'new', sha } }],
+    })).toThrow(/current origin tip|retain registrations/);
+  });
+});
+
+it('locked restoration preserves every saved field and leaves a concurrently restored registration untouched', () => {
+  const root = mkdtempSync(join(tmpdir(), 'we-overlay-restore-'));
+  const env = { WE_DAEMON_OVERLAY_DIR: root };
+  const saved = { ref: 'old', pr: 42, addedAt: '2026-01-01', pinned: true, stackBases: ['base'],
+    edgeResolution: { sha: oldSha, by: 'operator' }, replacedBy: { ref: 'new', sha }, futureGuard: { held: true } };
+  try {
+    restoreOverlay(root, { ...saved, now: saved.addedAt }, { env });
+    expect(readSwapOverlays(root, { env })).toEqual([saved]);
+    const concurrent = { ...saved, reason: 'changed concurrently', replacedBy: { ref: 'other', sha: oldSha } };
+    writeOverlays(root, [concurrent, { ref: 'unrelated' }], { env });
+    restoreOverlay(root, saved, { env });
+    expect(readSwapOverlays(root, { env })).toEqual([concurrent, { ref: 'unrelated' }]);
+    writeFileSync(overlayFilePath(root, env), 'corrupt');
+    expect(() => restoreOverlay(root, saved, { env })).toThrow(/corrupt/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 

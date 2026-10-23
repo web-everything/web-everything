@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
-import { addOverlay as add, removeOverlay as remove, readOverlayState, appendOverlayEvent as append } from './daemon-overlays.mjs';
+import { restoreOverlay as restore, removeOverlay as remove, readOverlayState, appendOverlayEvent as append } from './daemon-overlays.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 
 // Preserve null exit statuses: a failed spawn must never become 'not yet adopted'.
@@ -46,8 +46,8 @@ export function originTip({ root, ref, run = overlayGitRun, env = process.env })
   return sha;
 }
 
-/** Shared by manual removal: unknown evidence is a refusal, including legacy markers. */
-export function assertSwapRemovalAdopted({ root, ref, readOverlays = readSwapOverlays, run = overlayGitRun, env = process.env }) {
+/** Shared with rebuild preparation: unknown evidence is a refusal, including legacy markers. */
+export function assertSwapReplacementAdopted({ root, ref, readOverlays = readSwapOverlays, run = overlayGitRun, env = process.env }) {
   const entry = readOverlays(root, { env }).find(o => o.ref === ref);
   if (!entry || !Object.hasOwn(entry, 'replacedBy')) return;
   const target = entry.replacedBy;
@@ -59,32 +59,53 @@ export function assertSwapRemovalAdopted({ root, ref, readOverlays = readSwapOve
   if (!/^[a-f0-9]{40}$/.test(sha ?? '') || !ancestor(root, run, env, sha, 'HEAD')) {
     throw new Error(`overlay-swap: refusing to remove ${ref}: replacement is not adopted; wait for adoption or repair the replacement`);
   }
+  return sha;
+}
+
+export function assertSwapRemovalAdopted(options) {
+  const sha = assertSwapReplacementAdopted(options);
+  if (!sha) return;
+  const { root, ref, run = overlayGitRun, env = process.env } = options;
+  const tip = originTip({ root, ref, run, env });
+  if (!ancestor(root, run, env, tip, sha)) {
+    throw new Error(`overlay-swap: refusing to remove ${ref}: replacement does not contain its current origin tip; update the replacement and retry`);
+  }
+}
+
+/** Timeout and pre-swap rebuild failures recover through the same per-entry, locked insertion. */
+export function restoreSwapPredecessors({
+  root, newRef, newSha, originalEntries, readOverlays = readSwapOverlays, addOverlay = restore,
+  appendOverlayEvent = append, env = process.env, kind = 'swap-timeout-restored',
+}) {
+  const restored = [];
+  for (const entry of originalEntries) {
+    if (!readOverlays(root, { env }).some(o => o.ref === entry.ref)) {
+      addOverlay(root, { ...entry, replacedBy: { ref: newRef, sha: newSha }, now: entry.addedAt }, { env });
+      restored.push(entry.ref);
+    }
+  }
+  appendOverlayEvent(root, { kind, ref: newRef, restored }, { env });
+  return restored;
 }
 
 export async function swapAfterAdopt({
-  root, newRef, newSha, replaces, run = overlayGitRun, removeOverlay = remove, addOverlay = add,
+  root, newRef, newSha, replaces, run = overlayGitRun, removeOverlay = remove, addOverlay = restore,
   readOverlays = readSwapOverlays, appendOverlayEvent = append, now = Date.now,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), timeoutMs, pollMs = 1000, env = process.env,
-  originalEntries,
+  originalEntries, log = console.error,
 }) {
   if (!isSafeBranchName(newRef) || !/^[a-f0-9]{40}$/.test(newSha) || !Array.isArray(replaces)
     || replaces.some(ref => !isSafeBranchName(ref) || ref === newRef)) throw new TypeError('overlay-swap: invalid replacement');
   const setting = timeoutMs === undefined ? swapTimeout({ env }) : { timeoutMs, source: 'argument' };
   if (!Number.isSafeInteger(setting.timeoutMs) || setting.timeoutMs < 0 || !Number.isSafeInteger(pollMs) || pollMs <= 0) throw new TypeError('overlay-swap: invalid wait bounds');
   const initial = readOverlays(root, { env });
-  const originals = new Map(replaces.map(ref => [ref, { ...(originalEntries?.find(o => o.ref === ref) ?? initial.find(o => o.ref === ref)), ref }]));
+  const originals = [...new Set(replaces)].map(ref => initial.find(o => o.ref === ref)
+    ?? originalEntries?.find(o => o.ref === ref)).filter(Boolean);
   const deadline = now() + setting.timeoutMs;
   while (!ancestor(root, run, env, newSha, 'HEAD')) {
     if (now() >= deadline) {
-      const restored = [];
-      for (const ref of new Set(replaces)) {
-        if (!readOverlays(root, { env }).some(o => o.ref === ref)) {
-          const entry = originals.get(ref);
-          addOverlay(root, { ...entry, now: entry.addedAt }, { env });
-          restored.push(ref);
-        }
-      }
-      appendOverlayEvent(root, { kind: 'swap-timeout-restored', ref: newRef, restored }, { env });
+      const restored = restoreSwapPredecessors({ root, newRef, newSha, originalEntries: originals,
+        readOverlays, addOverlay, appendOverlayEvent, env });
       return { ok: false, reason: 'adoption-timeout', restored };
     }
     await sleep(Math.min(pollMs, deadline - now()));
@@ -92,7 +113,10 @@ export async function swapAfterAdopt({
   const removed = [], retained = [];
   for (const ref of new Set(replaces)) {
     const tip = originTip({ root, ref, run, env });
-    if (!ancestor(root, run, env, tip, newSha)) { retained.push(ref); continue; }
+    if (!ancestor(root, run, env, tip, newSha)) {
+      log(`overlay-swap: refusing to remove ${ref}: replacement does not contain its current origin tip; update the replacement and retry`);
+      retained.push(ref); continue;
+    }
     if (!ancestor(root, run, env, newSha, 'HEAD')) throw new Error('overlay-swap: replacement no longer adopted; retain registrations and retry');
     if (!readOverlays(root, { env }).some(o => o.ref === ref)) continue;
     if (removeOverlay(root, ref, { env, why: `replaced by ${newRef}` }).removed) {
