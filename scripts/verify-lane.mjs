@@ -516,13 +516,18 @@ if (preStart && !preStart.corrupt && (['green', 'red', 'infrastructure-failure']
 // weaker `--gate=` override (e.g. `--gate=true`) must never satisfy a LATER request for a different/stronger
 // gate on the same unchanged tree — that would silently skip the real verification the caller actually asked
 // for. Only a green produced by the SAME gate command can answer a cache hit.
+// A dispatched default gate can keep the requester's stamped GATE while resolving a different command under
+// the child's policy. That stamp alone cannot prove the child's checks ran (the requester may have skipped
+// them entirely). Also compare the command that actually ran with this execution plan. Legacy records without
+// that evidence miss the cache once; the next completed run records it.
 const treeHashNow = () => computeWorkingTreeHash({ runGit: git, fileMode: (f) => lstatSync(join(REPO, f)).mode });
 const currentTreeHash = MODE === 'run' ? null : treeHashNow();
 const cacheHit = MODE !== 'run' && preStart && !preStart.corrupt
   && preStart.status === 'green'
   && preStart.sha === headSha
   && currentTreeHash != null && preStart.treeHash === currentTreeHash
-  && preStart.suites === GATE;
+  && preStart.suites === GATE
+  && preStart.executedGate === (resolvedGate?.command ?? GATE);
 
 if (cacheHit) {
   const cachedDetail = `green for ${headSha.slice(0, 8)} — working tree unchanged since that verification (content hash + gate match); no new run needed.${describeIsolatedRetry(preStart)}`;
@@ -556,7 +561,7 @@ if (resolvedGate?.decision?.mode === 'card-only-skip') {
   const now = new Date().toISOString();
   const detail = `card-only diff (CI's definition) - local gate skipped for ${headSha.slice(0, 8)}; CI's check:standards stays the merge authority.`;
   writeMarker({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: now, treeHash: currentTreeHash }),
-    { finishedAt: now, exitCode: 0, sha: headSha, suites: GATE, treeHash: currentTreeHash }), skipped: 'card-only' });
+    { finishedAt: now, exitCode: 0, sha: headSha, suites: GATE, treeHash: currentTreeHash }), skipped: 'card-only', executedGate: resolvedGate.command });
   maybeRecordGreen({ status: 'green', treeHash: currentTreeHash, skipped: 'card-only' });
   emit({ sha: headSha, status: 'green', reason: 'card-only-skip', exitCode: 0, detail }, 0);
 }
@@ -984,7 +989,7 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker({ ...finished, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
+writeMarker({ ...finished, executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);

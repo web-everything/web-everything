@@ -1787,6 +1787,10 @@ running a gate or writing markers. `selfReview.enabled` defaults true and `selfR
 Environment overrides are `WE_BUILD_FINAL_GATE`, `WE_BUILD_FINAL_GATE_STANDARDS`, `WE_BUILD_SELF_REVIEW_ENABLED`,
 `WE_BUILD_SELF_REVIEW_MAX_ROUNDS`, and `WE_BUILD_REVIEWER_EXPECTATIONS_ENABLED`.
 
+The verify cache checks both the requested command (`suites`) and the executed command (`executedGate`).
+A child's standards policy can change the execution plan while keeping the requester's stamp. An earlier
+green cannot replace that changed plan; legacy markers without `executedGate` require one fresh run.
+
 A green build gets one cheap correctness/security review of its net diff. Each repair resumes the
 original builder and re-runs the gate; at most `maxRounds` repairs occur, with a final observation
 and remaining notes carried into the PR body. The cheap self-check opens to independent review,

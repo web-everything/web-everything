@@ -807,6 +807,15 @@ describe('verify-lane request/verify — a cache hit on an UNCHANGED working tre
     expect(readFileSync(marker(), 'utf8')).toBe(beforeOnDisk); // byte-identical — never rewritten to `running`
   });
 
+  it('a legacy green without the executed command requires a fresh run', () => {
+    expect(runVerify('true').json.status).toBe('green');
+    const legacy = JSON.parse(readFileSync(marker(), 'utf8'));
+    delete legacy.executedGate;
+    writeFileSync(marker(), JSON.stringify(legacy));
+    expect(runRequest('true').json.status).toBe('requested');
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).status).toBe('running');
+  });
+
   // #4473 review findings 2/3 — the cache key must include the GATE COMMAND, not just sha+treeHash. A green
   // recorded under a weaker/narrower `--gate=` (e.g. `true`) must never satisfy a LATER request for a different
   // gate on the same unchanged tree: that would silently skip the real verification the caller actually asked
@@ -2131,11 +2140,12 @@ describe('full build gate default', () => {
   // skip echo). A child under `always` — or one with the card-only skip off — must still recognize it as the default
   // gate and run it under its own policy, never the stamped command as-is.
   it.each([
-    ['selected', 'always', 'scripts/lib/zz-std.mjs', '1', true], ['selected', 'always', 'backlog/123-card.md', '1', true],
-    ['selected', 'always', 'backlog/123-card.md', '0', true], ['selected', 'selected', 'backlog/123-card.md', '0', true],
-    ['always', 'selected', 'scripts/lib/zz-std.mjs', '1', false],
+    ['selected', 'always', 'scripts/lib/zz-std.mjs', '1', true, false], ['selected', 'always', 'backlog/123-card.md', '1', true, false],
+    ['selected', 'always', 'backlog/123-card.md', '0', true, false], ['selected', 'selected', 'backlog/123-card.md', '0', true, false],
+    ['always', 'selected', 'scripts/lib/zz-std.mjs', '1', false, false],
+    ['selected', 'always', 'scripts/lib/zz-std.mjs', '1', true, true],
   ])(
-    'a child under finalGateStandards=%2$s runs its own standards policy for a gate stamped under %1$s (%3$s, child skip=%4$s)', (requester, child, path, childSkip, standardsRun) => {
+    'a child under finalGateStandards=%2$s runs its own standards policy for a gate stamped under %1$s (%3$s, child skip=%4$s, requester verified=%6$s)', (requester, child, path, childSkip, standardsRun, requesterVerified = false) => {
       const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
       mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
@@ -2162,12 +2172,30 @@ describe('full build gate default', () => {
       }
       // The skip echo mentions check:standards; only an npm command executes it.
       expect(suites.includes('npm run check:standards')).toBe(requester === 'always');
+      if (requesterVerified) {
+        // A completed code-only selection can also leave a green for the same stamp without running standards.
+        const warm = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=requester-child', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(requester, '1'), timeout: 60_000 });
+        expect(JSON.parse(warm.stdout.trim().split('\n').pop()), warm.stderr).toMatchObject({ status: 'green' });
+        expect(existsSync(join(dir, 'standards-ran'))).toBe(false);
+      }
       const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=standards-child', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(child, childSkip), timeout: 60_000 });
       expect(run.stderr).not.toContain('mode=explicit');
       expect(run.stderr).not.toContain('whole-gate admission');
       const verdict = JSON.parse(run.stdout.trim().split('\n').pop());
       expect(verdict, run.stderr).toMatchObject({ status: 'green' });
       expect(verdict.reason).not.toBe('card-only-skip');
+      expect(verdict.reason).not.toBe('cached');
       expect(existsSync(join(dir, 'standards-ran'))).toBe(standardsRun);
+      // The completed child plan is reusable, even when its command differs from the requester's stamp.
+      const repeat = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=standards-repeat', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(child, childSkip), timeout: 60_000 });
+      expect(JSON.parse(repeat.stdout.trim().split('\n').pop()), repeat.stderr).toMatchObject({ status: 'green', reason: 'cached' });
+      if (requester === 'always' && child === 'selected') {
+        // Returning to the stronger stamped policy must not reuse the child's narrower execution.
+        const restored = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=standards-restored', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(requester, '1'), timeout: 60_000 });
+        const restoredVerdict = JSON.parse(restored.stdout.trim().split('\n').pop());
+        expect(restoredVerdict, restored.stderr).toMatchObject({ status: 'green' });
+        expect(restoredVerdict.reason).not.toBe('cached');
+        expect(existsSync(join(dir, 'standards-ran'))).toBe(true);
+      }
     });
 });
