@@ -109,7 +109,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     for (const row of rows) {
       let started = false;
       if (row.action === 'apply-gate') {
-        if (gateAttempted) row.why = 'gate application limit reached; retry next tick';
+        if (at - (gateHistory.get(gateKey(row)) ?? -Infinity) < resolved.retryCooldownMin * 60_000) row.why = 'retry cooldown active';
+        else if (gateAttempted) row.why = 'gate application limit reached; retry next tick';
         else if (dryRun) row.why = 'dry run (saved gate application)';
         else {
           gateAttempted = true;

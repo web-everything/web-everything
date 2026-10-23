@@ -282,3 +282,25 @@ describe('runRedTeamOnSkip', () => {
     expect(runRedTeamOnSkip(o).dispatched).toHaveLength(1); expect(o.dispatch).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('withheld saved red-team result (live #5759 shape)', () => {
+  const withheld = { status: 'finished', result: { status: 'ran', foldedVerdict: 'changes', comment: { status: 'withheld' } }, updatedAtMs: 1 };
+  const live = { readStatus: () => withheld, readRecoveryRows: () => ({ verifiedRow: null, freshAttempts: 2 }),
+    readSavedResult: () => ({ pr, rev: head, findings: [] }) };
+  it('applies the gate from the saved result instead of reporting attempts exhausted', () => {
+    expect(decide(live)).toMatchObject({ action: 'apply-gate' });
+  });
+  it('fails closed when the saved result is missing or for another head', () => {
+    expect(decide({ ...live, readSavedResult: () => null }).action).toBe('skip');
+    expect(decide({ ...live, readSavedResult: () => ({ pr, rev: 'b'.repeat(40), findings: [] }) }).action).toBe('skip');
+  });
+  it('never dispatches a fresh pass for it, and respects the retry cooldown between gate applications', () => {
+    const applyGate = vi.fn(() => ({ status: 'applied' })), dispatch = vi.fn(), history = new Map();
+    const run = at => runRedTeamOnSkip({ repo, plan: { refusals: fixture().refusals }, rawPrs: fixture().rawPrs, capacity: { lanes: 1 }, dispatch, applyGate,
+      readEvidence: () => ({ loopPayload: payload() }), readStatus: live.readStatus, readRecoveryRows: live.readRecoveryRows, readSavedResult: live.readSavedResult,
+      now: () => at, setting: fixture().setting, history, lastDispatch: new Map() });
+    run(2_000_000); run(2_000_000 + 60_000);
+    expect(applyGate).toHaveBeenCalledTimes(1);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+});
