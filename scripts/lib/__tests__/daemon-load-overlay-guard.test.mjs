@@ -68,6 +68,43 @@ function fixture() {
 }
 
 describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before registering', () => {
+  it.each([false, true])('refuses a carried conflicting tip when the full plan drops an existing overlay; still registered=%s', async (stillRegistered) => {
+    const f = fixture();
+    Object.assign(f.env, {
+      WE_DAEMON_STATE_DIR: mktemp('we-drop-state-'),
+      WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-drop-lock-'),
+      WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0',
+      WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
+    });
+    removeOverlay(f.clone, 'lane/fix-procedure', { env: f.env });
+    const a0 = f.push('lane/a', { 'a.txt': 'A\n', 'shared.mjs': 'export const X = 1;\n' });
+    addOverlay(f.clone, { ref: 'lane/a' }, { env: f.env });
+    expect(await rebuildClone({
+      root: f.clone, env: f.env, prState: async () => 'OPEN',
+      runSmoke: async () => ({ verdict: 'pass', smoke: { results: [] } }),
+    })).toMatchObject({ adopted: true });
+    if (!stillRegistered) removeOverlay(f.clone, 'lane/a', { env: f.env });
+    addOverlay(f.clone, { ref: 'lane/fix-procedure' }, { env: f.env });
+    const registered = readOverlays(f.clone, { env: f.env });
+    const live = await dryRunRebuild({
+      root: f.clone, env: f.env, prState: async () => 'OPEN', extraOverlays: [{ ref: 'lane/a' }],
+    });
+    expect(live.plan).toMatchObject({ ok: true, establishedLost: [] });
+    expect(live.plan.applied).toContainEqual(expect.objectContaining({ ref: 'lane/a', sha: a0 }));
+    expect(live.plan.decisions).toContainEqual(expect.objectContaining({ ref: 'lane/fix-procedure', action: 'drop', reason: 'conflict' }));
+
+    // The CLI passes the whole registry; load-overlay already filters the candidate out.
+    const check = await stackAwareOverlayCheck({
+      root: f.clone, ref: 'lane/a', existingOverlays: registered, env: f.env,
+    });
+    expect(check).toMatchObject({ ok: true, clean: false, files: ['shared.mjs'] });
+    const result = await f.load({ ref: 'lane/a', pr: null });
+    expect(result).toMatchObject({ registered: false, refused: true, reason: 'conflict' });
+    expect(result.conflictCheck).toMatchObject({ ok: true, clean: false, files: ['shared.mjs'] });
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(registered);
+    expect(f.rebuild).not.toHaveBeenCalled();
+  }, 60_000);
+
   it.each([
     { name: 'planner is not ok', ok: false, establishedLost: [] },
     { name: 'establishedLost is non-empty', ok: true, establishedLost: [{ ref: 'lane/fix-procedure', reason: 'conflict' }] },
@@ -87,7 +124,7 @@ describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before r
       expect(options.overlays.map(o => o.ref)).toEqual(['lane/fix-procedure', ref]);
       return {
         ok, reason: ok ? undefined : 'pinned-overlay-conflict',
-        applied: [{ ref, sha }], establishedLost,
+        applied: [{ ref: 'lane/fix-procedure', sha: gitOk(f.clone, ['rev-parse', 'origin/lane/fix-procedure']).trim() }, { ref, sha }], establishedLost,
       };
     });
 

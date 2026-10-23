@@ -80,6 +80,40 @@ function fixture() {
 }
 
 describe('overlay-pin — a moving overlay whose new tip conflicts stays at its adopted head', () => {
+  it('persists pin notices before a later overlay refuses the plan and deduplicates repeated refused ticks', async () => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+    expect(await f.tick()).toMatchObject({ adopted: true });
+    const live = f.head();
+    const tip = f.push('lane/moving', f.mOld, { [DAEMON]: lines({ 2: 'moving conflict' }) });
+    f.push('lane/refusal', f.init, { [DAEMON]: lines({ 8: 'refusal conflict' }) });
+    addOverlay(f.clone, { ref: 'lane/refusal', pinned: true }, { env: f.env });
+    const registered = readOverlays(f.clone, { env: f.env });
+    f.smoke.mockClear();
+
+    for (let i = 0; i < 3; i++) {
+      expect(await f.tick()).toMatchObject({ moved: false, reason: 'pinned-overlay-conflict' });
+      expect(readRebuildState(f.clone, f.env).pinnedNotified).toEqual({ 'lane/moving': tip });
+    }
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(registered);
+    // An earlier refusal has an incomplete alert list: it cannot prove the previous pin cleared.
+    removeOverlay(f.clone, 'lane/moving', { env: f.env });
+    addOverlay(f.clone, { ref: 'lane/moving', pr: 5793 }, { env: f.env });
+    const early = await f.tick();
+    expect(early).toMatchObject({ moved: false, reason: 'pinned-overlay-conflict' });
+    expect(early.alerts.some(a => a.kind === 'overlay-pinned')).toBe(false);
+    expect(readRebuildState(f.clone, f.env).pinnedNotified).toEqual({ 'lane/moving': tip });
+    expect(f.head()).toBe(live);
+    expect(f.smoke).not.toHaveBeenCalled();
+    removeOverlay(f.clone, 'lane/refusal', { env: f.env });
+    const recovered = await f.tick();
+    expect(recovered.adopted || recovered.reason === 'up-to-date').toBe(true);
+    expect(f.pinnedLogs()).toHaveLength(1);
+    expect(isAncestor(f.clone, f.mOld, f.head())).toBe(true);
+    expect(readOverlays(f.clone, { env: f.env }).map(o => o.ref).sort())
+      .toEqual(registered.filter(o => o.ref !== 'lane/refusal').map(o => o.ref).sort());
+  }, 60_000);
+
   it('refuses to pin when the adopted head also conflicts', async () => {
     const f = fixture();
     f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';

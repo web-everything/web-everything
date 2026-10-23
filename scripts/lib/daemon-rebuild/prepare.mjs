@@ -269,9 +269,12 @@ export async function prepareRebuild({
     try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
   }
   // overlay-pin — `overlay-pinned` is logged ONCE per (ref, new tip), not every tick the pin holds; the record
-  // (`state.pinnedNotified`: ref → the new tip last reported) is pruned to the refs still pinned this plan.
+  // (`state.pinnedNotified`: ref → the new tip last reported) is pruned only after a complete plan.
   const pinnedBefore = state.pinnedNotified && typeof state.pinnedNotified === 'object' ? state.pinnedNotified : {};
   const pinnedNow = Object.create(null);
+  // A refusal can stop before visiting other pins. Keep their notices and persist any new ones
+  // already emitted, even though this plan will not be adopted.
+  if (!plan.ok) Object.assign(pinnedNow, pinnedBefore);
   for (const event of plan.alerts || []) {
     if (event.kind === 'overlay-pinned') {
       const { ref, pr, newTip, files } = event.detail;
@@ -291,7 +294,7 @@ export async function prepareRebuild({
       markOverlayConflictWake(env, { pr, ref, files, collidesWith, at: nowIso(), clone: root });
     }
   }
-  if (plan.ok && JSON.stringify(pinnedBefore) !== JSON.stringify(pinnedNow)) {
+  if (JSON.stringify(pinnedBefore) !== JSON.stringify(pinnedNow)) {
     state.pinnedNotified = Object.keys(pinnedNow).length ? pinnedNow : null;
     writeState();
   }

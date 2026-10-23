@@ -186,6 +186,9 @@ export async function previewOverlayConflict({
   root, ref, pr = null, existingOverlays, env = process.env, originUrl, run = gitRun,
 } = {}) {
   if (!isSafeBranchName(ref)) return { ok: false, reason: 'unsafe-ref' };
+  // Re-registration must compare the candidate against the other overlays. Including it here can
+  // let its established priority drop a peer before even reaching the candidate conflict check.
+  existingOverlays = existingOverlays.filter((o) => o.ref !== ref);
   const rootGit = makeGit({ run, cwd: root, env, extraEnv: { GIT_OPTIONAL_LOCKS: '0' } });
   const head = verifyRev(rootGit, 'HEAD');
   if (!head) return { ok: false, reason: 'head-unresolved' };
@@ -272,7 +275,11 @@ export async function previewOverlayConflict({
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
       });
-      if (planCandidate.ok && planCandidate.applied.some((o) => o.ref === ref && !o.pinnedFrom)
+      const candidate = planCandidate.ok && planCandidate.applied.find((o) => o.ref === ref);
+      // establishedLost covers adopted content; admission must also retain overlays that the
+      // existing-only plan applies, including registrations not yet adopted by the running clone.
+      if (candidate && !candidate.pinnedFrom
+        && planExisting.applied.every((o) => planCandidate.applied.some((a) => a.ref === o.ref))
         && planCandidate.establishedLost.length === 0) {
         return { ok: true, clean: true, mainSha, cur, candSha, setAside };
       }
