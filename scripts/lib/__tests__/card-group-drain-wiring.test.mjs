@@ -86,6 +86,10 @@ function world(fn) {
         ...(!heal ? ['--no-heal-collision'] : []), ...(!rebase ? ['--no-rebase-drop'] : [])], {
         cwd: dir, encoding: 'utf8', timeout: 120_000,
         env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GROUP_PR: fixture, GROUP_LOG: log, GROUP_COMBINED_STATE: combinedState, GROUP_CLOSE_FAIL: closeFail ? '1' : '0',
+          // This world supplies its own gh, with no App credentials or token-cache dependency.
+          // Pin both auth setup and throttle routing so an inherited host shim cannot replace it.
+          WE_GITHUB_AUTH: 'personal', WE_GH_THROTTLE_GH_BIN: join(bin, 'gh'),
+          WE_GH_THROTTLE_LOCK_ROOT: mkdtempSync(join(dir, 'throttle-')),
           WE_DRAIN_CARD_GROUP_STATE: statePath, WE_DRAIN_GROUP_ENABLED: 'on', WE_COORDINATION_ROOT: join(dir, 'coord'),
           LANE_POOL_ROOT: dir, WE_MERGE_DELIVERY_SETTINGS_FILE: settings, WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'off',
           WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'off', WE_DRAIN_WORKFLOW_EDIT_HUMAN: 'off', WE_REVIEW_LEDGER_MODE: 'off',
