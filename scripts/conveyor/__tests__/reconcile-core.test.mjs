@@ -1004,6 +1004,60 @@ describe('case 5j — requiredChecks makes a NEW advisory check\'s red never rea
   });
 });
 
+describe('bounced PR CI repair — real required failures on the fixer head (#5729)', () => {
+  const HEAD = '5729'.repeat(10);
+  const requiredChecks = ['test', 'test-shard (2)', 'review-gate', 'merge-gate'];
+  const failed = name => ({ name, status: 'completed', conclusion: 'failure' });
+  const bounced = (over = {}) => pr1563({
+    number: 5729, headRefOid: HEAD,
+    statusCheckRollup: [failed('test-shard (2)'), failed('review-gate'), failed('merge-gate')],
+    ...over,
+  });
+  const planFor = pr => planReconcile({ prs: [pr], agents: [], requiredChecks, now: NOW });
+  const escalation = headSha => ({
+    body: buildCiHealEscalationComment({ headSha, outcome: 'needs-human', reason: 'requires human judgment' }),
+    author: AUTOMATION,
+  });
+
+  it.each(['test-shard (2)', 'test'])('dispatches ci-heal for bounced + required red %s with no escalation', name => {
+    const plan = planFor(bounced({ statusCheckRollup: [failed(name), failed('review-gate'), failed('merge-gate')] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', phase: 'bounced', prNumber: 5729 })]);
+  });
+
+  it('bounced real-red ci-heal still honours the review-fix round cap', () => {
+    const plan = planReconcile({ prs: [bounced()], agents: [], requiredChecks, now: NOW, roundCap: 0 });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', prNumber: 5729 }));
+  });
+
+  it('refuses ci-heal-escalated for an escalation on THIS bounced head', () => {
+    const plan = planFor(bounced({ comments: [finding(), escalation(HEAD)] }));
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated', headSha: HEAD }));
+  });
+
+  it('an escalation for an OLDER head does not suppress bounced real-red ci-heal', () => {
+    const plan = planFor(bounced({ comments: [finding(), escalation('abcd'.repeat(10))] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', phase: 'bounced' })]);
+    expect(plan.refusals.map(row => row.kind)).not.toContain('ci-heal-escalated');
+  });
+
+  it('bounced with only review-gate/merge-gate red keeps its review-findings fix', () => {
+    const plan = planFor(bounced({ statusCheckRollup: [failed('review-gate'), failed('merge-gate')] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced' })]);
+  });
+
+  it('bounced + conflict label keeps its conflict fix despite real red CI', () => {
+    const plan = planFor(bounced({ labels: lbl('review:changes', 'merge-status:conflicting') }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced', isConflict: true })]);
+  });
+
+  it('bounced with only a non-required real failure keeps its review-findings fix', () => {
+    const plan = planFor(bounced({ statusCheckRollup: [failed('optional-test'), failed('review-gate')] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced' })]);
+  });
+});
+
 // we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — LIVE INCIDENT, web-everything/web-everything: of
 // ~10 ci-heal sessions dispatched inside one hour, 7 (PRs #2782/#2778/#2772/#2779/…) ended "no change needed".
 // Real measured shape (`gh api repos/web-everything/web-everything/branches/main/protection`, `gh run list --branch
