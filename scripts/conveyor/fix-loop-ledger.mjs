@@ -65,7 +65,7 @@ function validRow(row) {
   return !isStubSession(row?.session) && row?.v === 1 && typeof row.repo === 'string' && Number.isInteger(row.pr) && row.pr > 0
     && ['ci-heal', 'fix', 'rearm', 'park', 'outcome'].includes(row.kind)
     && (row.kind !== 'outcome' || (typeof row.session === 'string' && row.session.trim().length > 0
-      && ['pushed', 'no-change', 'failed'].includes(row.outcome) && typeof row.infra === 'boolean'
+      && ['pushed', 'no-change', 'no-change-unproven', 'failed'].includes(row.outcome) && typeof row.infra === 'boolean'
       && (row.reason === undefined || typeof row.reason === 'string')))
     && (!['rearm', 'park'].includes(row.kind) || typeof row.reason === 'string') && /^[a-f\d]{40}$/i.test(row.head ?? '')
     && typeof row.at === 'string' && Number.isFinite(Date.parse(row.at));
@@ -126,7 +126,7 @@ export function isInfraFixRunOutcome(outcome, reason) {
   return outcome === 'failed' && FIX_RUN_INFRA_PATTERNS.some(pattern => pattern.test(String(reason ?? '')));
 }
 export function classifyFixRunOutcome(line) {
-  const match = /^fix-run: PR #(\d+) (failed|no-change|pushed) \((.*)\); claim/.exec(line);
+  const match = /^fix-run: PR #(\d+) (failed|no-change|no-change-unproven|pushed) \((.*)\); claim/.exec(line);
   if (!match) return null;
   const [, pr, outcome, reason] = match;
   return { pr: Number(pr), outcome, reason, infra: isInfraFixRunOutcome(outcome, reason) };

@@ -1,3 +1,4 @@
+import { yieldToWaitingSendBack } from '../conveyor/fix-waiting-priority.mjs';
 /**
  * @file scripts/lib/dispatch-throttle.mjs
  * @description Declared dispatch-throttle settings + the two DEFER-ONLY launch gates (live incident 2026-10-06:
@@ -126,11 +127,12 @@ export function gateHost({
   const usable = s?.ok && Number.isFinite(s.idlePct);
   let load; let cores;
   if (!usable) { try { load = loadavg(); cores = cpuCount(); } catch { /* fail open */ } }
-  return hostLoadGate({
+  const result = hostLoadGate({
     kind, load, cores, maxLoadPerCore: resolveMaxLoadPerCore({ env }),
     cpuIdlePct: usable ? s.idlePct : undefined, memFreePct: usable ? s.memFreePct ?? undefined : undefined,
     minIdlePct: resolveCpuIdleMinPct(kind, { env }), minMemFreePct: resolveMemFreeMinPct({ env }),
   });
+  return yieldToWaitingSendBack(result, { kind, env });
 }
 
 /** Is `pid` a running process? EPERM means it exists (owned by someone else); ESRCH / bad input means it does not. */

@@ -5,13 +5,14 @@ import { ensureCommitReadable } from './carry-equivalence.mjs';
 import { parseReviewedSha, findAcceptVerdictComment } from './review-escalation.mjs';
 import { latestAcceptRecord, isLaterVerdictBody } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
-import { gateOutcomesForHead, parseRedTeamGateMarker, parseRedTeamComment, breakClass, RED_TEAM_COMMENT_MARKER } from './red-team-gate.mjs';
-import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
+import { gateOutcomesForHead, parseRedTeamGateMarker, parseRedTeamComment, breakClass, RED_TEAM_COMMENT_MARKER,
+  liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from './red-team-gate.mjs';
+import { parseVerdictCarriedMarker, buildVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 const HEX = /^[0-9a-f]{40}$/;
 
 // Only consume complete, known provenance shapes. A marker proves where a
 // record belongs; it does not make arbitrary surrounding text informational.
-function informationalProvenance(body, sha, pr) {
+export function informationalProvenance(body, sha, pr) {
   let rest = String(body ?? '').replace(/\r\n?|\u2028|\u2029/g, '\n').trim();
   const sameRecord = record => record?.rev === sha && record.pr === Number(pr);
   const gate = parseRedTeamGateMarker(rest);
@@ -46,7 +47,9 @@ function informationalProvenance(body, sha, pr) {
     || line === 'The red team tried to break this change and reported nothing.'
     || line === "A confirmed break is recorded as a miss for the accepting review and for the builder's model."
     || parseRedTeamComment(`${rest.slice(0, rest.indexOf('-->') + 3)}\n${line}`)?.findings.length === 1
-    || /^ {3}- (?:Scenario|Re-check): [^\n]*$/.test(line));
+    // review-extra-seats.mjs#renderRedTeamComment's three sub-lines; `Files read` was missing, so every real advisory
+    // read as a hold and no carry could ever fire after a red team (live #5779, 2026-10-21).
+    || /^ {3}- (?:Scenario|Re-check|Files read): [^\n]*$/.test(line));
 }
 
 /** IO: compare whitespace-sensitive net patches; missing objects get one fetch. Never throws. */
@@ -62,11 +65,30 @@ export function contributionPatchId({ exec, sha, base = 'origin/main' } = {}) {
   } catch { return null; }
 }
 
+/**
+ * The exact re-arm `rearm-review.mjs#buildRearmComment` renders when an ACCEPTED PR's head was re-pushed (no bounce,
+ * no human hold). It records only "the head moved, so a re-review is owed" — the very debt an identical-net-patch carry
+ * answers — so the carry does not treat it as a superseding verdict. Any other re-arm (a repaired `review:changes`
+ * bounce, a human-hold re-arm, a conflict round) still supersedes. Whole-body match: appended prose is never neutral.
+ */
+const ACCEPTED_REARM_RE = /^🔧 conveyor fix — re-armed for re-review\n\nThe previously accepted PR was re-pushed and its acceptance is being re-armed for review by [^\n;]{1,120}; the PR is re-armed `review:pending` \(an independent re-review is owed\)\.\n\nThe fix agent did NOT clear the review — a human `\/review` \(or the drain AI-review convergence pass\) re-verdicts\.$/;
+export function isAcceptedRearmBody(body) {
+  return ACCEPTED_REARM_RE.test(String(body ?? '').replace(/\r\n?/g, '\n').trim());
+}
 /** PURE: a trusted accept survives only without a superseding verdict or unknown hold. */
+// Only the LATEST reviewed head is a candidate. An older-candidate path (carry from the reviewed head when the drain
+// re-stamped onto different content, live #5779) was built and withdrawn on 2026-10-21: three Codex audits showed a
+// trusted comment shaped like an accept or a restamp could reset the hold boundary. Not worth the residual.
 export function findCarriableVerdict({ comments, headSha, pr } = {}) {
   if (!HEX.test(headSha ?? '')) return null;
-  const trusted = (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor);
+  const all = Array.isArray(comments) ? comments : [];
+  const trusted = all.filter(isTrustedMarkerAuthor);
   const sha = parseReviewedSha(trusted);
+  if (!HEX.test(sha ?? '')) return null;
+  return findCarriableVerdictFor({ comments: all, trusted, sha, headSha, pr });
+}
+
+function findCarriableVerdictFor({ comments, trusted, sha, headSha, pr }) {
   const gates = trusted.map(c => parseRedTeamGateMarker(c.body)).filter(m => m && m.rev === sha && (pr == null || m.pr === Number(pr)));
   const advisories = trusted.map(c => {
     const carried = parseVerdictCarriedMarker(c.body);
@@ -82,11 +104,17 @@ export function findCarriableVerdict({ comments, headSha, pr } = {}) {
   // Only this carry path treats trusted, same-sha provenance as informational.
   // Keep every other comment for the shared approval guard, including untrusted holds.
   const verdictComments = (Array.isArray(comments) ? comments : []).filter(c => {
+    // The proof below (identical net patch) is exactly what this re-arm asked for; see ACCEPTED_REARM_RE.
+    if (isTrustedMarkerAuthor(c) && isAcceptedRearmBody(c?.body)) return false;
     if (!isTrustedMarkerAuthor(c) || String(c?.body ?? '').split('\n').some(isLaterVerdictBody)) return true;
     return !informationalProvenance(c?.body, sha, number);
   });
   const record = latestAcceptRecord(verdictComments);
-  if (!HEX.test(sha ?? '') || sha === headSha || !record || record.laterVerdict || record.laterBodyDerivedHold) return null;
+  // A body-derived hold anywhere after the accept counts on the UNFILTERED thread: neutral shapes are never a way to
+  // hide one (Codex re-audit #3, finding 1).
+  if (latestAcceptRecord(comments)?.laterBodyDerivedHold) return null;
+  // The record judged must be the candidate's own: a later record left in place means holds after the candidate were not read.
+  if (!HEX.test(sha ?? '') || sha === headSha || !record || record.sha !== sha || record.laterVerdict || record.laterBodyDerivedHold) return null;
   return { ...record, ...findAcceptVerdictComment(trusted, sha), sha,
     gateOutcomes: [...gateOutcomesForHead(trusted, number, sha)], advisory: advisory?.parsed ?? null, advisoryBody: advisory?.body ?? null };
 }
@@ -98,6 +126,62 @@ export function decideRebaseVerdictCarry({ setting, prior, priorPatchId, headPat
 }
 
 export { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
+
+/**
+ * IO SHELL (injected): carry a trusted accept onto the live head when its net change is provably identical, writing
+ * the existing restamp (`review-set-label --to=restamp`) and the existing `review-verdict-carried` comment. Shared by
+ * the review job (before it spends a round) and the fix launcher (before it re-arms an accepted PR, so a repair that
+ * only restored reviewed content consumes no round). Proof = BOTH the whitespace-sensitive contribution patch-id
+ * (`contributionPatchId`) AND `identical-net-patch.mjs#proveIdenticalNetPatch` (patch-id --stable + changed bytes +
+ * paths/modes/positions); a missing proof reader refuses. Red-team records stay tied to a head: only the carried
+ * head's posted gate outcomes are re-keyed, exactly as before. Never throws; anything unproven returns carried:false.
+ * io: { carryAcrossRebaseSetting, readCarryEvidence, contributionPatchId, proveIdenticalNetPatch, readSavedResult?,
+ *       restampVerdict, postCarryComment, log? }
+ * @returns {{carried:boolean, reason:string, fromSha?:string, headSha?:string, patchId?:string}}
+ */
+export function attemptVerdictCarry(io, { pr, repo, expectHead = null } = {}) {
+  const log = line => { try { io?.log?.(line); } catch { /* best effort */ } };
+  try {
+    const setting = io.carryAcrossRebaseSetting();
+    log(`verdict-carry: carryAcrossRebase=${setting.value} (${setting.source})`);
+    if (setting.value !== 'on') return { carried: false, reason: 'carryAcrossRebase is off' };
+    if (typeof io.proveIdenticalNetPatch !== 'function') return { carried: false, reason: 'no net-patch proof reader' };
+    const evidence = io.readCarryEvidence({ pr, repo });
+    if (!HEX.test(evidence?.headSha ?? '') || !Array.isArray(evidence?.comments)) throw Error('carry evidence unreadable');
+    if (expectHead && evidence.headSha !== expectHead) return { carried: false, reason: `live head ${evidence.headSha.slice(0, 9)} is not the pushed head` };
+    let why = 'no carriable trusted accept';
+    for (const prior of [findCarriableVerdict({ ...evidence, pr })].filter(Boolean)) {
+      const sha = prior.sha;
+      // A gate decision made on SAVED evidence has no posted result to re-key onto the new head (PR #5551 red team).
+      if (!prior.advisory && prior.gateOutcomes.length && (!io.readSavedResult || io.readSavedResult({ pr, repo, head: prior.sha }))) {
+        why = `the red-team result on ${sha.slice(0, 9)} is saved, not posted`; continue;
+      }
+      const priorPatchId = io.contributionPatchId({ sha: prior.sha, repo });
+      const headPatchId = io.contributionPatchId({ sha: evidence.headSha, repo });
+      const decision = decideRebaseVerdictCarry({ setting: setting.value, prior, priorPatchId, headPatchId });
+      if (!decision.carry) { why = `${decision.reason} (from ${sha.slice(0, 9)})`; continue; }
+      const proof = io.proveIdenticalNetPatch({ fromSha: prior.sha, toSha: evidence.headSha, repo });
+      if (!proof?.ok) { why = `net patch not proven identical from ${sha.slice(0, 9)}: ${proof?.reason ?? 'unreadable'}`; continue; }
+      const stamped = io.restampVerdict({ pr, repo, newHead: evidence.headSha,
+        reason: `${decision.reason}; ${proof.reason}; from ${prior.sha}; patch-id ${headPatchId}` });
+      if (!stamped?.ok) return { carried: false, reason: `restamp refused: ${stamped?.reason ?? 'unknown error'}` };
+      // Carry only the gate decisions made on the result being carried, named by that result (PR #5482).
+      const decided = prior.advisory ? liveResultGateState(evidence.comments, pr, prior.sha) : null;
+      const gate = !decided ? prior.gateOutcomes.map(outcome => redTeamGateMarker(pr, evidence.headSha, outcome))
+        : decided.resultId !== redTeamResultId(prior.advisory) ? []
+          : [...decided.outcomes].map(outcome => redTeamGateMarker(pr, evidence.headSha, outcome, decided.resultId));
+      const body = [...gate, buildVerdictCarriedMarker({ fromSha: prior.sha, toSha: evidence.headSha, patchId: headPatchId }),
+        'Review verdict carried across an identical contribution.',
+        ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(pr, prior.sha), redTeamMarker(pr, evidence.headSha))] : [])].join('\n');
+      io.postCarryComment({ pr, repo, body });
+      log(`verdict-carry: PR #${pr} carried ${prior.sha} → ${evidence.headSha} (patch-id ${headPatchId}); no round consumed`);
+      return { carried: true, reason: decision.reason, fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId };
+    }
+    return { carried: false, reason: why };
+  } catch (e) {
+    return { carried: false, reason: String(e?.message ?? e).split('\n')[0].slice(0, 300) };
+  }
+}
 
 /** IO: env > review settings > off; invalid values fall through. */
 export function resolveCarryAcrossRebase({ env = process.env, readFile = readFileSync } = {}) {

@@ -31,7 +31,7 @@
 import { describe, it, expect } from 'vitest';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
-  staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs,
+  staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions,
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
@@ -4069,5 +4069,69 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     const result = plan({ comments }, options);
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toMatchObject([{ kind: 'cap-exhausted', capKind: 'stale-base-rebase' }]);
+  });
+});
+
+// ── PR #5492 (2026-10-20) — a bg-spare session outlived its RELEASED fix claim and froze the PR ──────────────
+describe('released fix claim + live pid is not live work (PR #5492 replay)', () => {
+  const SHA = pr1563().headRefOid;
+  const RELEASED_AT = '2026-10-20T22:47:11Z';
+  const STARTED_BEFORE = Date.parse('2026-10-20T21:30:00Z');
+  const begin = { author: AUTOMATION, createdAt: '2026-10-20T21:40:00Z', body: buildFixBeginComment({ who: 'fix-1563', why: 'x', branch: 'lane/x', headSha: SHA, ttlMinutes: 60 }) };
+  const end = { author: AUTOMATION, createdAt: RELEASED_AT, body: buildFixEndComment({ who: 'fix-1563', headSha: SHA }) };
+  // the bg-spare shape: no review-/fix- name, bound by its dispatch dir's lane head.
+  const spare = (over = {}) => ({ sessionId: 's-spare', cwd: '/dispatch/ad7088e2', pid: 10793, pidAlive: true, laneHeadOid: SHA, startedAt: STARTED_BEFORE, ...over });
+  const run = (comments, agents) => planReconcile({ prs: [pr1563({ comments: [finding(), ...comments] })], agents, durableCounts: {}, now: Date.parse('2026-10-20T23:30:00Z') });
+
+  it('released claim at this head + live pid started before the release: NOT live-process, decision logged', () => {
+    const plan = run([begin, end], [spare()]);
+    expect(plan.refusals.some((r) => r.kind === 'live-process')).toBe(false);
+    expect(plan.notes.find((n) => n.kind === 'released-claim-session-ignored')).toMatchObject({ prNumber: 1563, pid: 10793 });
+    expect(plan.notes.find((n) => n.kind === 'released-claim-session-ignored').text).toContain('fix claim was released');
+  });
+
+  it('the note carries the reaper evidence: listing handle, release time, start time', () => {
+    const plan = run([begin, end], [spare({ id: 'abc123' })]);
+    expect(plan.notes.find((n) => n.kind === 'released-claim-session-ignored')).toMatchObject({
+      handle: 'abc123', releasedAtMs: Date.parse(RELEASED_AT), startedAt: STARTED_BEFORE, cwd: '/dispatch/ad7088e2',
+    });
+  });
+
+  it('UNRELEASED claim (fix-begin after the fix-end) + live pid: still live-process', () => {
+    const again = { ...begin, createdAt: '2026-10-20T23:00:00Z' };
+    const plan = run([begin, end, again], [spare()]);
+    expect(plan.refusals[0]).toMatchObject({ kind: 'live-process', pid: 10793 });
+  });
+
+  it('only a fix-begin, never released + live pid: still live-process', () => {
+    expect(run([begin], [spare()]).refusals[0]).toMatchObject({ kind: 'live-process' });
+  });
+
+  it('fails closed: release at a different head, untrusted author, unreadable startedAt, session started after release, reviewer, permission prompt', () => {
+    const other = { ...end, body: buildFixEndComment({ who: 'fix-1563', headSha: 'deadbeef1' }) };
+    expect(run([begin, other], [spare()]).refusals[0].kind).toBe('live-process');
+    expect(run([begin, { ...end, author: { login: 'someone-else' } }], [spare()]).refusals[0].kind).toBe('live-process');
+    expect(run([begin, end], [spare({ startedAt: undefined })]).refusals[0].kind).toBe('live-process');
+    expect(run([begin, end], [spare({ startedAt: Date.parse('2026-10-20T23:00:00Z') })]).refusals[0].kind).toBe('live-process');
+    expect(run([begin, end], [spare({ name: 'review-1563' })]).refusals[0].kind).toBe('live-process');
+    expect(run([begin, end], [spare({ status: 'waiting', waitingFor: 'permission prompt' })]).refusals[0].kind).toBe('awaiting-permission');
+  });
+
+  it('audit holes stay live: unknown pid, tied timestamps, permissionBlocked flag, reviewer via sessionSlug with empty name', () => {
+    const tied = { ...begin, createdAt: RELEASED_AT };
+    expect(releasedFixClaim(pr1563({ comments: [tied, end] }))).toBeNull();
+    expect(releasedFixClaim(pr1563({ comments: [end, tied] }))).toBeNull();
+    const rel = releasedFixClaim(pr1563({ comments: [begin, end] }));
+    expect(isReleasedClaimSession(spare({ pidAlive: undefined }), rel)).toBe(false);
+    expect(isReleasedClaimSession(spare({ permissionBlocked: true }), rel)).toBe(false);
+    expect(isReleasedClaimSession(spare({ name: '', sessionSlug: 'review-1563' }), rel)).toBe(false);
+    expect(isReleasedClaimSession(spare(), rel)).toBe(true);
+  });
+
+  it('helpers: releasedFixClaim reads only the latest marker; assessLiveness without a release is unchanged', () => {
+    expect(releasedFixClaim(pr1563({ comments: [begin, end] }))).toMatchObject({ releasedAtMs: Date.parse(RELEASED_AT) });
+    expect(releasedFixClaim(pr1563({ comments: [end, { ...begin, createdAt: '2026-10-20T23:00:00Z' }] }))).toBeNull(); // ordered by createdAt, not array position
+    expect(isReleasedClaimSession(spare(), null)).toBe(false);
+    expect(assessLiveness([{ agent: spare(), cwd: '/d', sha: SHA }])).toMatchObject({ kind: 'live-process' });
   });
 });
