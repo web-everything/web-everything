@@ -1,7 +1,9 @@
 /** Cap-only shared-reader subset: human card records, author/wrapper and head/result binding. */
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, gateRoundGrants, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
+import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 
@@ -28,6 +30,61 @@ const carried = bot([
 ].join('\n'), '2026-10-21T21:00:00Z');
 
 describe('operator card release at the cap (shared reader)', () => {
+  it.each(['missing', 'sent-back', 'wrong result', 'wrong head', 'untrusted', 'later'])('rejects an operator card with a %s round-cap handover across reader, queue and labels', (variant) => {
+    const cap = gate(bot, 'round-cap', '', '2026-10-21T17:12:20Z');
+    const before = {
+      missing: [],
+      'sent-back': [gate(bot, 'sent-back', '- 1 confirmed break(s) sent back to the fixer (#1).', '2026-10-21T17:12:20Z')],
+      'wrong result': [gate(bot, 'round-cap', '', cap.created_at, '0123456789abcdef')],
+      'wrong head': [gate(bot, 'round-cap', '', cap.created_at, rid, N)],
+      untrusted: [{ ...cap, user: { login: 'mallory', type: 'User' } }],
+      later: [],
+    }[variant];
+    const comments = [result, ...before, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'),
+      ...(variant === 'later' ? [cap] : [])];
+    const d = disp(comments);
+    expect(held(d)).toEqual([1]);
+    expect(redTeamEnqueueHold({ comments, pr: P, head: H, env: {} })).not.toBeNull();
+    expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['red-team:blocked'], env: {} }))
+      .toEqual({ add: null, remove: [] });
+  });
+  it('does not treat a held action in an operator record as a round-cap handover', () => {
+    const d = disp([result, gate(human, 'operator-card', '- 1 confirmed break(s) NOT sent back: cap (#1).\n' + cardLine([1]), '2026-10-21T20:30:00Z')]);
+    expect(held(d)).toEqual([1]);
+  });
+  it.each(['human', 'standing ruling'])('rejects cards after pending or consumed %s grants, including stale cap posts', (kind) => {
+    const repo = 'o/r';
+    const standingRuling = kind === 'standing ruling' ? { ok: true, id: `${repo}#6000`, author: 'chalbert', by: 1,
+      maxPerPr: 3, repos: [repo], cardOnlyHeads: { [H]: true }, uneditedComments: ['IC_auto'] } : null;
+    const at = '2026-10-21T18:00:00Z';
+    const grant = { id: 'IC_auto', author: { login: standingRuling ? 'web-everything[bot]' : 'chalbert', type: standingRuling ? 'Bot' : 'User' },
+      createdAt: at, body: buildRoundExtensionComment({ repo, pr: P, by: 1, actor: 'chalbert', channel: 'chat', reason: 'one more round', at,
+        ...(standingRuling ? { standingRuling: standingRuling.id, head: H, episode: `${repo}#${P}@${H}:review:12/12` } : {}) }) };
+    const ids = gateRoundGrants([grant], P, repo, standingRuling).map(g => g.id);
+    expect(ids).toHaveLength(1);
+    const cap = bot(redTeamGateMarker(P, H, 'round-cap', rid, []), '2026-10-21T17:12:20Z');
+    const sent = bot(`${redTeamGateMarker(P, H, 'sent-back', rid, ids)}\n- 1 confirmed break(s) sent back to the fixer (#1).`, at);
+    const card = gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z');
+    for (const prefix of [[result, cap, grant], [result, grant, cap], [result, cap, grant, sent], [result, grant, sent, cap]]) {
+      const comments = [...prefix, card];
+      const context = { comments, pr: P, head: H, repo, standingRuling, env: {} };
+      expect(held(readRedTeamDisposition(context))).toEqual([1]);
+      expect(redTeamEnqueueHold(context)).not.toBeNull();
+      expect(planRedTeamStatusLabels({ ...context, labels: ['red-team:blocked'] })).toEqual({ add: null, remove: [] });
+    }
+  });
+  it('does not let a later grant retroactively invalidate a valid operator card', () => {
+    const repo = 'o/r';
+    const at = '2026-10-21T21:00:00Z';
+    const grant = human(buildRoundExtensionComment({ repo, pr: P, by: 1, actor: 'chalbert', channel: 'chat', reason: 'another round', at }), at);
+    const comments = [...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), grant];
+    expect(held(readRedTeamDisposition({ comments, repo, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS }))).toEqual([]);
+  });
+  it('keeps fixer-owned breaks sent back without any gate record', () => {
+    const d = disp([result]);
+    expect(d.sendBack.map((f) => f.index)).toEqual([1]);
+    expect(d.held).toEqual([]);
+  });
   it('a human operator card record for this result releases #1', () => {
     const d = disp([...live, gate(human, 'operator-card', cardLine([1, 2, 3]), '2026-10-21T20:30:00Z')]);
     expect(d.sendBack).toEqual([]);
