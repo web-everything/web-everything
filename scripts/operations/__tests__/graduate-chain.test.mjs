@@ -4,7 +4,6 @@ import { join } from 'node:path';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createGraduateChainRunner, createGraduateChainSinks } from '../graduate-chain-io.mjs';
 import { cascadePolicy } from '../../lib/policy-cascade.mjs';
-import { extractSubmitResult } from '../open-pr.mjs';
 import { describe, it, expect } from 'vitest';
 import { runGraduateChain, graduateChainOperation, measureSize, suggestedSplit, finishGraduateChain } from '../graduate-chain.mjs';
 import { driveRun, parseOperationArgv } from '../cli-adapter.mjs';
@@ -17,6 +16,19 @@ const sha = 'a'.repeat(40), base = 'b'.repeat(40);
 const input = { source: 'lane/source', purpose: 'slice', title: 'A slice $(inert)' };
 const goodVerify = { verdict: { ok: true, checks: [{ outcome: 'pass' }] } };
 const opened = { findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 42 } }] } } };
+// Parse the stubbed submit response locally: this suite exercises graduate-chain's
+// git mechanism, so importing open-pr would falsely credit its network IO too.
+function extractSubmitResult(payload) {
+  const result = payload?.findings?.submit?.effects?.[0]?.result;
+  if (result && typeof result === 'object') return result;
+  return {
+    outcome: 'unrun',
+    reason: payload?.error
+      ?? `open-pr: run ${JSON.stringify(payload?.stopped ?? 'unknown')} never reached its submit step — no PR was opened`,
+    pr: null,
+    url: null,
+  };
+}
 function fixture({ change = () => undefined, over = {}, options = {} } = {}) {
   const calls = [], bodies = [];
   let cleaned = false;

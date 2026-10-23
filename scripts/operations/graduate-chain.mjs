@@ -70,7 +70,9 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
       valid: v => Number.isSafeInteger(v) && v > 0,
     });
     out.capSources = caps.sources; out.caps = caps.value;
-    const prs = json(command('caps', 'gh', ['pr', 'list', '--state', 'open', '--json', 'number,author,headRefName', '--limit', '1000']));
+    const repo = command('repository', 'gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']).stdout.trim();
+    if (!repo) stop('repository');
+    const prs = json(command('caps', 'gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--json', 'number,author,headRefName', '--limit', '1000']));
     const user = json(command('caps', 'gh', ['api', 'user']));
     if (!Array.isArray(prs) || prs.length >= 1000 || !user.login || prs.some(p => !p.author?.login)) stop('caps-unreadable');
     if (prs.filter(p => p.author.login === user.login).length >= caps.value.callerMax) stop('cap-caller');
@@ -78,7 +80,7 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
     let baseRef = 'main';
     let base = git('source', ['rev-parse', '--verify', 'origin/main^{commit}']);
     if (input.stackOn) {
-      const pr = json(command('source', 'gh', ['pr', 'view', String(input.stackOn), '--json', 'headRefName,headRefOid,isCrossRepository']));
+      const pr = json(command('source', 'gh', ['pr', 'view', String(input.stackOn), '--repo', repo, '--json', 'headRefName,headRefOid,isCrossRepository']));
       if (!pr.headRefName || !/^[0-9a-f]{40,64}$/.test(pr.headRefOid) || pr.isCrossRepository !== false) stop('stack-base');
       baseRef = pr.headRefName; base = pr.headRefOid;
     }
