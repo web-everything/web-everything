@@ -149,7 +149,7 @@ async function worktreeFingerprint(s, untracked, reason) {
   if (!good(diff) || typeof diff.stdout !== 'string') {
     fail(reason, 'Cannot read worktree fingerprint; inspect the lane diff before retrying');
   }
-  const regular = [], links = [];
+  const regular = [], modes = [], links = [];
   try {
     for (const file of untracked) {
       const fullPath = path.join(s.lane.path, file);
@@ -160,8 +160,12 @@ async function worktreeFingerprint(s, untracked, reason) {
         if (!Buffer.isBuffer(target) || !target.length) throw new Error('Unreadable link target');
         const hash = createHash('sha256').update(`blob ${target.length}\0`).update(target).digest('hex');
         links.push([file, hash]);
-      } else if (stat.isFile()) regular.push(file);
-      else throw new Error('Unsupported untracked entry');
+      } else if (stat.isFile()) {
+        if (!Number.isInteger(stat.mode) || stat.mode < 0) throw new Error('Unreadable file mode');
+        regular.push(file);
+        // Git records only the owner's execute bit for regular files.
+        modes.push([file, stat.mode & 0o100 ? '100755' : '100644']);
+      } else throw new Error('Unsupported untracked entry');
     }
   } catch {
     fail(reason, 'Cannot read untracked audit entries; inspect the lane diff before retrying');
@@ -176,7 +180,7 @@ async function worktreeFingerprint(s, untracked, reason) {
     }
     hashes = r.stdout;
   }
-  return createHash('sha256').update(JSON.stringify([diff.stdout, untracked, hashes, links])).digest('hex');
+  return createHash('sha256').update(JSON.stringify([diff.stdout, untracked, hashes, modes, links])).digest('hex');
 }
 export async function checkDiffScope(s) {
   const { files, untracked } = await changedFiles(s);

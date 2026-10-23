@@ -4,7 +4,7 @@
  */
 import { it, expect } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,7 +49,7 @@ function fixture(rules = [], { ready = true } = {}) {
       }
       throw new Error(`Unscripted command: ${call.text}`);
     },
-    lstat: () => ({ isSymbolicLink: () => false, isFile: () => true }),
+    lstat: () => ({ mode: 0o100644, isSymbolicLink: () => false, isFile: () => true }),
     readFile: async file => {
       if (file.endsWith('fix-ready.mjs')) {
         if (!ready) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
@@ -76,6 +76,25 @@ const scopeReleased = f => {
   expect(f.calls.find(c => c.text.includes('free-scope-cli.mjs release')).args.slice(2)).toEqual(claim.args.slice(2, 4));
 };
 const codexCalls = f => f.calls.filter(c => c.text.includes('codex-direct-task.mjs') && !c.args.includes('--review'));
+
+it.each([false, true])('passes exact lane argv with --gate=none to initial, repair and audit Codex invocations (repair=%s)', async repair => {
+  const f = fixture(repair ? [['heavy-admission', (_, n) => n === 0 ? red() : ok()]] : []);
+  expect((await f.run()).result.ok).toBe(true);
+  const calls = f.calls.filter(c => c.args[0] === 'scripts/codex-direct-task.mjs');
+  const tasks = [
+    { file: '/repo/brief.md', review: false },
+    ...(repair ? [{ file: '/lane/.git/codex-job-example-1234-repair.md', review: false }] : []),
+    { file: '/lane/.git/codex-job-example-1234-audit.md', review: true },
+  ];
+  expect(calls).toHaveLength(tasks.length);
+  tasks.forEach(({ file, review }, i) => {
+    expect(calls[i]).toMatchObject({ cmd: 'node', cwd: '/repo' });
+    expect(calls[i].args).toEqual([
+      'scripts/codex-direct-task.mjs', ...(review ? ['--review'] : []),
+      `--task-file=${file}`, '--dir=/lane', '--gate=none', '--no-stream', '--json',
+    ]);
+  });
+});
 
 it('pins executable Git configuration on every lane Git command', async () => {
   const f = fixture();
@@ -433,14 +452,22 @@ it.each([
   { untracked: false, change: true },
   { untracked: true, change: true },
   { untracked: true, change: false },
+  { untracked: true, change: true, mode: 0o644, nextMode: 0o755, name: 'chmod executable' },
+  { untracked: true, change: true, mode: 0o755, nextMode: 0o644, name: 'chmod non-executable' },
+  { untracked: false, change: true, mode: 0o644, nextMode: 0o755, name: 'tracked chmod executable' },
+  { untracked: false, change: true, mode: 0o755, nextMode: 0o644, name: 'tracked chmod non-executable' },
+  { untracked: true, change: false, mode: 0o755, name: 'unchanged executable' },
+  { untracked: true, change: false, mode: 0o644, nextMode: 0o600, name: 'non-Git permission change' },
+  { untracked: true, change: false, mode: 0o644, nextMode: 0o654, name: 'group execute bit is not a Git mode change' },
   { untracked: true, change: false, link: 'missing-target', name: 'dangling symlink' },
   { untracked: true, change: false, link: '../target-directory', name: 'directory symlink' },
   { untracked: true, change: true, link: 'missing-target', name: 'changed dangling symlink' },
-])('fingerprints audited content before staging: untracked=$untracked, changed=$change, $name (real Git)', async ({ untracked, change, link }) => {
+])('fingerprints audited content before staging: untracked=$untracked, changed=$change, $name (real Git)', async ({ untracked, change, link, mode, nextMode }) => {
   const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-audit-'));
   const git = args => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
   try {
     git(['init', '--quiet']);
+    git(['config', 'core.fileMode', 'true']);
     mkdirSync(path.join(repo, 'scripts'), { recursive: true });
     writeFileSync(path.join(repo, 'scripts/a.mjs'), 'original\n');
     git(['add', '--', 'scripts/a.mjs']);
@@ -453,8 +480,10 @@ it.each([
       mkdirSync(path.join(repo, 'target-directory'));
       symlinkSync(link, path.join(repo, 'scripts/a.mjs'));
     } else writeFileSync(path.join(repo, 'scripts/a.mjs'), 'tested and audited\n');
+    if (mode !== undefined) chmodSync(path.join(repo, 'scripts/a.mjs'), mode);
     const f = fixture([['codex-direct-task.mjs --review', () => {
-      if (change) {
+      if (nextMode !== undefined) chmodSync(path.join(repo, 'scripts/a.mjs'), nextMode);
+      else if (change) {
         if (link) {
           rmSync(path.join(repo, 'scripts/a.mjs'));
           symlinkSync('changed-target', path.join(repo, 'scripts/a.mjs'));
@@ -489,6 +518,8 @@ it.each([
       if (link) {
         expect(git(['ls-files', '--stage'])).toMatch(/^120000 /);
         expect(git(['show', ':scripts/a.mjs'])).toBe(link);
+      } else if (mode !== undefined) {
+        expect(git(['ls-files', '--stage'])).toMatch(mode === 0o755 ? /^100755 / : /^100644 /);
       }
     }
     released(f); scopeReleased(f);
@@ -516,12 +547,28 @@ it('fails closed when untracked audit entry metadata or symlink targets cannot b
     released(f); scopeReleased(f);
   }
 });
-it('rechecks the content fingerprint immediately before committing', async () => {
+it.each([undefined, -1, NaN, '100644', 0.5])('fails closed on invalid untracked regular-file mode %s after audit', async mode => {
+  let audited = false;
+  const f = fixture([
+    ['ls-files', ok('scripts/a.mjs\0')],
+    ['codex-direct-task.mjs --review', () => { audited = true; return report(); }],
+  ]);
+  f.io.lstat = () => ({ mode: audited ? mode : 0o100644, isSymbolicLink: () => false, isFile: () => true });
+  const { code, result } = await f.run();
+  expect(code).toBe(23);
+  expect(result.stopReason).toBe('changed-after-audit');
+  expect(result.detail).toContain('Cannot read untracked audit entries');
+  expect(f.calls.some(c => ['add', 'commit', 'push'].some(v => c.args.includes(v)))).toBe(false);
+  released(f); scopeReleased(f);
+});
+it.each(['content', 'mode'])('rechecks the %s fingerprint immediately before committing', async change => {
   let changed = false;
   const f = fixture([
+    ['ls-files', ok('scripts/a.mjs\0')],
     ['diff --quiet', () => { changed = true; return ok(); }],
-    ['diff --binary', () => ok(changed ? 'changed contents at the same path' : 'audited contents')],
+    ['diff --binary', () => ok(changed && change === 'content' ? 'changed contents at the same path' : 'audited contents')],
   ]);
+  f.io.lstat = () => ({ mode: changed && change === 'mode' ? 0o100755 : 0o100644, isSymbolicLink: () => false, isFile: () => true });
   const { code, result } = await f.run();
   expect(code).toBe(23); expect(result.stopReason).toBe('changed-after-audit');
   expect(f.calls.some(c => c.args.includes('add'))).toBe(true);
