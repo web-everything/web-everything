@@ -1321,7 +1321,7 @@ export function runReviewLabelCli({
     process.exit(1);
   };
   if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
-  if (to === 'rearm' && !headSha) refuseRearm('head unreadable — cannot prove no human clearance');
+  if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
   if ((guardedRestamp || pinnedAccept || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
@@ -1445,7 +1445,7 @@ export function runReviewLabelCli({
       return fail(ghErr(e, 'complete comment thread unreadable'), 1);
     }
     if (to === 'rearm' && !Array.isArray(comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
-    return comments;
+    return to === 'rearm' ? [...page, ...comments] : comments;
   };
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
@@ -1821,6 +1821,7 @@ export function runReviewLabelCli({
     let fresh;
     try { fresh = provider.readPrState(repo, pr); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (!Array.isArray(fresh.comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
+    if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
     const freshComments = fullThread(fresh.comments).filter(isTrustedMarkerAuthor);
     const freshDecision = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: fresh.labels,
       acceptanceStillCoversHead: parseReviewedSha(freshComments) === fresh.headRefOid,

@@ -3177,6 +3177,42 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
   });
 
   const missingArgs = ['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`];
+  it('rearm refuses whitespace and non-hex heads on both initial and missing-only fresh reads before any write', () => {
+    for (const fresh of [false, true]) {
+      for (const headRefOid of ['', null, {}, ' \t\n', 'not-a-sha', 'a'.repeat(6), 'a'.repeat(41)]) {
+        const result = fresh
+          ? run(missingArgs, [], { freshState: { headRefOid } })
+          : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { headRefOid });
+        expect(result.readPrState).toHaveBeenCalledTimes(fresh ? 2 : 1);
+        expect(result.exitCode).toBe(1);
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+        expect(result.payload.reason).toBe('head unreadable — cannot prove no human clearance');
+      }
+    }
+  });
+
+  it('rearm preserves embedded-page clearance when pagination is empty or partial on initial and missing-only fresh reads', () => {
+    const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } };
+    const comments = [clearance, ...Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, () => ({ body: 'discussion' }))];
+    for (const fresh of [false, true]) {
+      for (const pagedComments of [[], [{ body: 'partial discussion' }]]) {
+        const readComments = vi.fn(() => pagedComments);
+        const result = fresh
+          ? run(missingArgs, [], { readComments, freshState: { comments } })
+          : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+        expect(result.readPrState).toHaveBeenCalledTimes(fresh ? 2 : 1);
+        expect(readComments).toHaveBeenCalledTimes(1);
+        expect(readComments).toHaveBeenCalledWith('o/n', '9');
+        expect(result.exitCode).toBe(1);
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+        expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+      }
+    }
+  });
+
   it.each([undefined, null, {}, 'unreadable'])('missing-only rearm fails closed without writes when fresh comments are not an array (%j)', (comments) => {
     const result = run(missingArgs, [], { freshState: { comments } });
     expect(result.readPrState).toHaveBeenCalledTimes(2);
