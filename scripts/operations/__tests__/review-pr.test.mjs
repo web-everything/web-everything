@@ -1,4 +1,5 @@
 import { reviewSeatOptionsForRun } from '../review-pr.mjs';
+import { CARD_CLASS_STANDARD } from '../../lib/review-seat-settings.mjs';
 import { ADVISORY_NOTE_MARKER, countAdvisoryComments } from '../../conveyor/advisory-round-count.mjs';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -71,6 +72,7 @@ import {
   renderEarnedShortfall,
   // #3540 — the shared record-decision core and the record-verdict vocabulary mapping.
   planRecordDecision,
+  openSendBackBounceReason,
   confirmAnswerFor,
   // #xqa9ttq — the opt-in third (Codex, advisory) seat.
   ADVISORY_JUDGE_LENS,
@@ -1291,6 +1293,105 @@ describe('#3540 the stageVerdict step stages the write-up alone, ahead of the la
 });
 
 describe('#3540 planRecordDecision and confirmAnswerFor — the shared pure core', () => {
+  const openSendBacks = [
+    { id: 'send-back-5809-a', at: '2026-10-22T12:00:00Z', body: 'Repair the evidence gap. ' + 'x'.repeat(200) + 'OMITTED_TAIL' },
+    { id: 'send-back-5809-b', at: '2026-10-22T13:00:00Z', body: 'Explain the remaining failure.' },
+  ];
+  function bounceView(openOperatorSendBacks, reason) {
+    return {
+      input: { ...BASE_INPUT, actor: 'reviewer', reason },
+      findings: {
+        confirm: 'changes',
+        read: { ...shapeReadFinding(stubReader({})({ pr: 1234, repo: BASE_INPUT.repo }), BASE_INPUT), openOperatorSendBacks },
+      },
+      verdict: { verdict: 'changes', findings: [], lenses: [DEFAULT_LENS] },
+    };
+  }
+
+  it('plans a zero-finding changes verdict with actionable evidence instructions for every open send-back', () => {
+    const plan = planRecordDecision(bounceView(openSendBacks));
+    expect(plan.to).toBe('changes');
+    for (const item of openSendBacks) {
+      expect(plan.body).toContain(item.id);
+      expect(plan.body).toContain(item.at);
+      expect(plan.body).toContain(`\`Send-back ${item.id} at ${item.at}: ${item.body.slice(0, 160)}\``);
+      expect(plan.body).toContain(`\`<!-- addresses-operator-send-back: ${item.id} -->\``);
+    }
+    expect(plan.body).toContain('## Fix evidence');
+    expect(plan.body).toContain('Head: `<fixed head sha>`');
+    expect(plan.body).not.toContain('OMITTED_TAIL');
+  });
+
+  it.each([
+    undefined, [], {}, [{}], [null], [{ id: '' }], [{ id: '  ' }],
+    [{ id: '<>' }], [{ id: 'only-id' }], [{ id: 'metadata', at: {}, body: {} }],
+    [{ ...openSendBacks[0], id: 'bad`<img>\n[id](url)' }],
+    [{ ...openSendBacks[0], at: 'invalid-date' }],
+    [{ ...openSendBacks[0], at: 0 }],
+    [{ ...openSendBacks[0], body: {} }],
+    [{ ...openSendBacks[0], body: ' \n ' }],
+    ...['<>', '\u200b\u200b', '   ', '\u0000\u200c\u200d\u2060', '!!!', '!'.repeat(160) + 'Repair']
+      .map(body => [{ ...openSendBacks[0], body }]),
+  ].map(open => [open]))('still refuses a zero-finding changes verdict without a reason or open send-backs (%j)', open => {
+    expect(openSendBackBounceReason({ openOperatorSendBacks: open })).toBe('');
+    expect(() => planRecordDecision(bounceView(open))).toThrow(/no stated reason/);
+  });
+
+  it('refuses malformed send-backs with non-string metadata', () => {
+    const open = [null, {}, { id: '' }, { id: 12 }, { id: 'metadata', at: {}, body: {} }];
+    expect(openSendBackBounceReason({ openOperatorSendBacks: open })).toBe('');
+    expect(() => planRecordDecision(bounceView(open))).toThrow(/no stated reason/);
+  });
+
+  it('renders only valid send-backs in a mixed list and preserves their ids unchanged', () => {
+    const valid = { ...openSendBacks[0], id: 'IC_kwDORBt1-c8AAAABedLjDQ' };
+    const open = [valid, { id: 'metadata', at: {}, body: {} },
+      ...['<>', '\u200b\u200b', '   ', '!!!'].map(body => ({ ...openSendBacks[1], body }))];
+    const reason = openSendBackBounceReason({ openOperatorSendBacks: open });
+    expect(reason).toBe(openSendBackBounceReason({ openOperatorSendBacks: [valid] }));
+    expect(reason).toContain(`\`<!-- addresses-operator-send-back: ${valid.id} -->\``);
+  });
+
+  it('validates and renders the sanitised send-back excerpt with letters or digits', () => {
+    const plan = planRecordDecision(bounceView([{
+      ...openSendBacks[0], body: ' <>\u200b Répa\u0000ir\u200d\t 42\n ',
+    }]));
+    expect(plan.body).toContain(`\`Send-back ${openSendBacks[0].id} at ${openSendBacks[0].at}: Répair 42\``);
+    expect(plan.body).not.toMatch(/[\u0000\u200b\u200d]/u);
+  });
+
+  it('neutralises HTML and Markdown in single-line code spans for body', () => {
+    const plan = planRecordDecision(bounceView([{
+      ...openSendBacks[0],
+      body: '<img src=x>\n[click](https://example.com) `escape` > quote ' + 'x'.repeat(200),
+    }]));
+    expect(plan.body).toContain(`\`Send-back ${openSendBacks[0].id} at ${openSendBacks[0].at}: `);
+    expect(plan.body).toContain("img src=x [click](https://example.com) 'escape' quote ");
+    expect(plan.body).not.toContain('<img');
+    const reason = openSendBackBounceReason({ openOperatorSendBacks: [{ ...openSendBacks[0], body: 'x'.repeat(200) }] });
+    expect(reason).toContain(`: ${'x'.repeat(160)}\``);
+    expect(reason).not.toContain('x'.repeat(161));
+    const outsideCode = plan.body.replace(/`[^`\n]*`/g, '');
+    expect(outsideCode).not.toMatch(/<img|\]\(|<!-- addresses-operator-send-back:|<fixed head sha>/);
+  });
+
+  it('bounds the send-back list and marker list to five and reports how many remain', () => {
+    const open = Array.from({ length: 8 }, (_, i) => ({ ...openSendBacks[0], id: `bounded-${i}` }));
+    const plan = planRecordDecision(bounceView(open));
+    expect(plan.body).toContain('and 3 more');
+    expect(plan.body.match(/`Send-back /g)).toHaveLength(5);
+    expect(plan.body.match(/`<!-- addresses-operator-send-back:/g)).toHaveLength(5);
+    expect(plan.body).toContain('bounded-4');
+    expect(plan.body).not.toMatch(/bounded-[567]/);
+  });
+
+  it('uses an explicit reason instead of deriving one from open send-backs', () => {
+    const plan = planRecordDecision(bounceView(openSendBacks, '  Repair the failing probe first.  '));
+    expect(plan.body).toContain('> Repair the failing probe first.');
+    expect(plan.body).not.toContain('send-back-5809-a');
+    expect(plan.body).not.toContain('## Fix evidence');
+  });
+
   it('confirmAnswerFor maps record-verdict\'s vocabulary to review-pr\'s, and clear-human to nothing', () => {
     expect(confirmAnswerFor('accepted')).toBe('accept');
     expect(confirmAnswerFor('changes')).toBe('changes');
@@ -4856,6 +4957,64 @@ describe('card-only light review', () => {
     expect(Object.keys(requests)).toEqual(['judge', 'judgeSecurity']);
     expect(requests.judge.providerName).toBe('codex');
     expect(requests.judgeSecurity.providerName).toBeUndefined();
+  });
+  describe('card review class: test-plan COVERAGE becomes a card suggestion', () => {
+    const CARD = 'backlog/1-card.md';
+    const cardDiff = (front) => [`diff --git a/${CARD} b/${CARD}`, 'new file mode 100644', '--- /dev/null', `+++ b/${CARD}`,
+      `@@ -0,0 +1,${front.length + 3} @@`, '+---', ...front.map((l) => `+${l}`), '+---', '+body', ''].join('\n');
+    function cardRegistry({ front = ['kind: story'], coverageRoute = 'card-suggestion', settings } = {}) {
+      const readPr = input => {
+        const r = stubReader({ netRev: 'c'.repeat(40) })(input);
+        return { ...r, net: { ...r.net, paths: [CARD] }, diff: { text: cardDiff(front), scored: true } };
+      };
+      const cardClassSettings = settings === undefined ? { ...CARD_CLASS_STANDARD, coverageRoute } : settings;
+      const declaration = reviewPrOperation({ readPr, cardOnlyLight: true, securitySeat: false, cardClassSettings });
+      const registry = createRegistry(); registry.register(declaration);
+      return registry;
+    }
+    const finding = (category) => ({ summary: 'a risk has no named planned test', file: CARD, line: 3, category, disposition: 'blocker' });
+    const answer = (...findings) => ({ summary: 'card read', findings });
+    it('card-only story: COVERAGE is deferred, the verdict accepts, and the mandate names the focus', () => {
+      const { run, requests } = atConfirm({ registry: cardRegistry(), input: BASE_INPUT, answer: answer(finding('COVERAGE')) });
+      expect(run.findings.read.cardReview).toMatchObject({ class: 'card', coverageRoute: 'card-suggestion', redTeam: 'off', lenses: ['correctness'] });
+      expect(run.findings.reduce.verdict).toBe('accept');
+      expect(run.findings.reduce.deferredAdvisory).toHaveLength(1);
+      expect(run.findings.reduce.deferredAdvisory[0].deferred).toMatch(/card-review-class/);
+      expect(requests.judge.mandate).toMatch(/CARD TEXT ONLY/);
+    });
+    it('a contradiction on a card still blocks', () => {
+      const { run } = atConfirm({ registry: cardRegistry(), input: BASE_INPUT, answer: answer(finding('COVERAGE'), finding('CORRECTNESS')) });
+      expect(run.findings.reduce.verdict).toBe('changes');
+      expect(run.findings.reduce.deferredAdvisory).toHaveLength(1);
+    });
+    it('a decision card keeps today routing: COVERAGE still blocks, no focus text', () => {
+      const { run, requests } = atConfirm({ registry: cardRegistry({ front: ['kind: decision'] }), input: BASE_INPUT, answer: answer(finding('COVERAGE')) });
+      expect(run.findings.read.cardReview.class).toBe('full');
+      expect(run.findings.reduce.verdict).toBe('changes');
+      expect(requests.judge.mandate).not.toMatch(/CARD TEXT ONLY/);
+    });
+    it('coverageRoute: referral, the kill switch, and no resolved settings all keep today routing', () => {
+      for (const registry of [cardRegistry({ coverageRoute: 'referral' }), cardRegistry({ settings: { ...CARD_CLASS_STANDARD, enabled: false } }), cardRegistry({ settings: null })]) {
+        const { run, requests } = atConfirm({ registry, input: BASE_INPUT, answer: answer(finding('COVERAGE')) });
+        expect(run.findings.reduce.verdict).toBe('changes');
+        expect(run.findings.reduce.deferredAdvisory ?? []).toHaveLength(0);
+        expect(requests.judge.mandate).not.toMatch(/CARD TEXT ONLY/);
+      }
+    });
+    it('a run classified card but reduced under the kill switch (resume after enabled:false) keeps today routing', () => {
+      const r = cardRegistry();
+      let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'cc-resume', input: BASE_INPUT, registry: r }), { registry: r });
+      expect(run.findings.read.cardReview.class).toBe('card');
+      const off = createRegistry();
+      off.register(reviewPrOperation({ readPr: () => { throw new Error('no re-read'); }, cardOnlyLight: true, securitySeat: false,
+        cardClassSettings: { ...CARD_CLASS_STANDARD, enabled: false } }));
+      while (runStatus(run, { registry: off }) === 'awaiting-judge') run = advanceWhileRunning(run, { registry: off, resume: { value: answer(finding('COVERAGE')) } });
+      expect(run.findings.reduce.verdict).toBe('changes');
+    });
+    it('a full-roster run (not the light lane) never records a card class', () => {
+      const { run } = atConfirm({ registry: registryFor({}).registry, input: BASE_INPUT });
+      expect(run.findings.read.cardReview).toBeUndefined();
+    });
   });
   it('refuses a light roster when the pinned net diff includes code', () => {
     const { registry } = registryForCards({ files: ['backlog/1-card.md', 'scripts/code.mjs'] });

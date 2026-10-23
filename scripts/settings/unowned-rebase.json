@@ -1,0 +1,6 @@
+{
+  "$comment": "operator 2026-10-18: reset after infra failures were miscounted as attempts (#5697/#5655/#5652 at 3/3 on 2026-10-19 01:10Z); remove after graduation",
+  "unownedRebase": {
+    "countSince": "2026-10-19T01:15:12Z"
+  }
+}

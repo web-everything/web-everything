@@ -46,8 +46,13 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
   const failing = (n) => {
     let pushes = 0;
     const run = (args) => {
-      if (args[0] === 'push') { pushes += 1; if (pushes <= n) throw new Error('! [rejected] non-fast-forward'); }
-      return args[0] === 'diff' ? 'verdict-ledger/x.jsonl' : '';
+      if (args[0] === 'push') {
+        pushes += 1;
+        // A real lost race: git's `--porcelain` status record for the ledger ref, on stdout.
+        if (pushes <= n) throw Object.assign(new Error('Command failed'), { stdout: `!\tHEAD:refs/heads/ops/review-requests\t[rejected] (non-fast-forward)\n`, stderr: 'error: failed to push some refs\n', status: 1 });
+      }
+      // The plumbing append (2026-10-21): every object-producing call answers an object id; nothing else matters.
+      return ['rev-parse', 'hash-object', 'write-tree', 'commit-tree'].includes(args[0]) ? `${'a'.repeat(40)}\n` : '';
     };
     return { run, pushes: () => pushes };
   };
@@ -106,7 +111,9 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
       const run = (args, o) => { calls.push(args); return f.run(args, o); };
       appendLedgerRows(base({ run }));
       const push = calls.find((a) => a[0] === 'push');
-      expect(push).toEqual(['push', '--quiet', 'origin', 'HEAD:refs/heads/ops/review-requests']);
+      // A plumbing commit pushed by its object id to the ONE full ref (2026-10-21); no local branch, no worktree.
+      expect(push).toEqual(['push', '--porcelain', '--no-follow-tags', 'origin', `${'a'.repeat(40)}:refs/heads/ops/review-requests`]);
+      expect(calls.some((a) => a[0] === 'worktree' || a[0] === 'checkout')).toBe(false);
       for (const a of calls.filter((c) => c[0] === 'push').flat()) expect(a).not.toMatch(/^(-f|--force.*|\+.*)$/);
     });
 
@@ -192,7 +199,8 @@ describe('real git', () => {
   it('an unreachable transport makes append throw loudly', async () => {
     await withBareOrigin(async (ctx) => {
       git(['remote', 'set-url', 'origin', join(ctx.tmp, 'does-not-exist.git')], { cwd: ctx.clone });
-      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], attempts: 2, sleep: noSleep }))
+      // The DIRECT path (CI) throws; the outbox path keeps the row durably queued instead (verdict-ledger-outbox.test).
+      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], attempts: 2, sleep: noSleep, outbox: false }))
         .toThrow(LedgerAppendExhaustedError);
     });
   });

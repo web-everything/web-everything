@@ -119,6 +119,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/backlog/__tests__/number-at-birth-cli.test.mjs': 'lists the backlog in a throwaway scaffold CLI fixture, not the repo; this is a CLI behavior test, not a repository rule scan',
   'scripts/__tests__/stdout-flush.test.mjs': 'its one-home drain-loop guard lives in a test the default vitest config excludes (runs under vitest.integration.config.ts with real child processes), so `vitest run <file>` cannot select it; CI runs it',
   'scripts/__tests__/check-standards.test.mjs': 'asserts over the real tracked tree via check-standards itself; the verify gate already runs `check:standards --local --files=<changed>`',
   'bun-trial/scripts/lib/__tests__/standards-sections.test.mjs': 'native bun:test copy of the entry below, run only by the bun trial (we:bun-trial/), never by vitest; vitest stays the gate',

@@ -1,13 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { saveProvenanceFixtures } from '../lib/__tests__/fixtures/saved-red-team-provenance.mjs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment, defaultReadHumanOnlyHold, reassertHumanClearance, isHumanSurfacePark, HUMAN_SURFACE_REPARK_RE, buildMechanicalHandoffMarker, withdrawParkOnLiveClearance } from '../review-set-label.mjs';
 import { buildHumanSurfaceReparkComment } from '../conveyor/human-surface-repark.mjs';
 import { buildClearedHumanMarker, buildReviewedShaMarker } from '../lib/review-escalation.mjs';
 import { renderRedTeamComment } from '../operations/review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, readRedTeamDisposition, redTeamGateMarker, redTeamRulingNeeded } from '../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, readRedTeamDisposition, redTeamGateMarker, redTeamResultId, redTeamRulingNeeded } from '../lib/red-team-gate.mjs';
+import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { readSavedRedTeamResult, savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
 const head = 'a'.repeat(40);
 const labels = ['review:accepted', 'ready-to-merge'];
 const clearance = { author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` };
@@ -119,6 +122,43 @@ describe('clear-human CLI hold ceremony', () => {
       const r = run(false, labels, page, [...page, result, capped]);
       expect(r.exitCode).toBe(0);
       expect(r.provider.postComment).toHaveBeenCalled();
+    });
+    // PR #5551 red team: the gate can hold a break decided on SAVED evidence (its comment withheld). The advertised
+    // ruling must clear that too, through the same CLI, reading the same scorecard store the gate read.
+    describe('decided on saved evidence (no posted red-team comment)', () => {
+      const savedRow = { dispatchKind: 'review-seat', seat: 'red-team', repo: 'o/n', pr: 7, rev: head, status: 'ok', recheckStatus: 'ok',
+        scoredAt: '2026-10-18T01:00:00Z', confirmedMissCount: 1,
+        findings: [{ summary: 'two writers', category: 'edge-case', impactIfUnfixed: 'broken', file: 'a.mjs', line: 1, confirmedByRecheck: true }] };
+      function savedCap(store = JSON.stringify({ version: 1, records: [savedRow] })) {
+        vi.stubEnv('CONVEYOR_STATE_ROOT', join(dir, 'state'));
+        vi.stubEnv('OPERATION_RUNS_DIR', join(dir, 'runs'));
+        vi.stubEnv('WE_SHARED_RUNS_DIR', join(dir, 'runs'));
+        const path = resolveScorecardStorePath(process.env);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, JSON.stringify({ version: 1, records: [savedRow] }));
+        saveProvenanceFixtures(process.env);
+        const id = redTeamResultId(readSavedRedTeamResult({ repo: 'o/n', pr: 7, head }));
+        writeFileSync(path, store);
+        return { ...bot, createdAt: '2026-10-18T02:00:00Z', body: redTeamGateMarker(7, head, 'round-cap', id) };
+      }
+      it('clears it through the advertised command, and the posted ruling releases the saved held break', () => {
+        const savedCapped = savedCap();
+        const readSaved = savedRedTeamFallback({ repo: 'o/n', pr: 7, head });
+        expect(redTeamRulingNeeded(pr([savedCapped]), CONFIRMED_BREAKS_DEFAULTS, { readSaved })).not.toBeNull();
+        const r = run(false, labels, [savedCapped]);
+        expect(r.exitCode).toBe(0);
+        expect(r.provider.setLabels).toHaveBeenCalled();
+        const ruling = { ...bot, createdAt: '2026-10-18T03:00:00Z', body: r.provider.postComment.mock.calls[0][2] };
+        expect(redTeamRulingNeeded(pr([savedCapped, ruling]), CONFIRMED_BREAKS_DEFAULTS, { readSaved })).toBeNull();
+      });
+      it('refuses without writing when the saved evidence is unreadable', () => {
+        const savedCapped = savedCap('{truncated');
+        const r = run(false, labels, [savedCapped]);
+        expect(r.exitCode).toBe(1);
+        expect(r.payload.error).toContain('saved red-team evidence unreadable');
+        expect(r.provider.postComment).not.toHaveBeenCalled();
+        expect(r.provider.setLabels).not.toHaveBeenCalled();
+      });
     });
     it('still refuses with no held break, under review:changes, or where no acceptance exists to keep', () => {
       for (const [prLabels, comments] of [[labels, [result]], [labels, [result, { ...capped, author: { login: 'mallory' } }]], [['review:changes'], [result, capped]],

@@ -23,6 +23,8 @@
  */
 import { readGit } from '../lib/proc-read.mjs';
 import { resolve } from 'node:path';
+import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
+import { acceptanceCoversHead } from '../lib/review-escalation.mjs';
 import { decideSetLabel, runReviewLabelCli, presentRemoveLabels } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -83,6 +85,39 @@ export function countRearmComments(comments) {
  */
 export function decideRearm({ currentLabels = [] } = {}) {
   return decideSetLabel({ to: 'rearm', currentLabels });
+}
+
+/** #5771: a stable token for the RECORDED accept (reviewed sha + diff + contribution fingerprints), so a release proved for one accept
+ * is never honoured for a replacement accept comment. `null` when there is no trusted record. */
+export function acceptEvidenceToken(comments) {
+  const rec = latestAcceptRecord(comments);
+  return rec ? `${rec.sha}/${rec.diff ?? ''}/${rec.contribution ?? ''}` : null;
+}
+
+/** #5771: on the planner's FRESH snapshot, is the recorded accept still the PROVED one and unsuperseded (same evidence token, no
+ * later verdict/hold comment, no pending review, not human-cleared)? A release key is honoured only while this holds. Comments only
+ * (the planner carries no formal reviews); the tick re-proves (incl. formal reviews) right after the re-plan, and the merge gate
+ * re-reads everything independently. */
+export function acceptStillUnsupersededOnSnapshot(pr, evidence) {
+  const names = (pr.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+  if (names.includes('review:pending') || !evidence || acceptEvidenceToken(pr.comments) !== evidence) return false;
+  const rec = latestAcceptRecord(pr.comments);
+  return !!rec && !rec.humanCleared && !rec.laterVerdict && !rec.laterBodyDerivedHold;
+}
+
+/** #5628: nominate moved agent accepts for a live check, or prove re-arm is owed.
+ * The writer requires proof; the planner can nominate without fetching a diff. */
+export function staleAcceptanceOwed(pr, { requireProof = true } = {}) {
+  const names = (pr.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+  if (pr.isDraft || (pr.state ?? 'OPEN') !== 'OPEN' || !names.includes('review:accepted')
+      || names.some(l => l.startsWith('review:') && l !== 'review:accepted' && l !== 'review:pending')) return false;
+  const accept = latestAcceptRecord(pr.comments);
+  if (!accept || accept.humanCleared) return false;
+  const coverage = acceptanceCoversHead({ acceptedSha: accept.sha, headSha: pr.headRefOid,
+    acceptedDiff: accept.diff, acceptedContribution: accept.contribution,
+    headDiff: pr.headDiff, headContribution: pr.headContribution,
+    headReadFailed: pr.headDiff == null && pr.headContribution == null });
+  return !coverage.covers && (coverage.staleVerified === true || !requireProof);
 }
 
 /**

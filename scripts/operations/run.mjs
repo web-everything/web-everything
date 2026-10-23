@@ -55,6 +55,7 @@ import { graduationProgressReportOperation, GRADUATION_PROGRESS_REPORT_OP } from
 import { createScorecardReader, createPromotionsReader, createProbationReader } from './graduation-progress-report-io.mjs';
 import { selectSupervisionLevel, DEFAULT_BACKDOWN_THRESHOLDS } from '../lib/provider-routing.mjs';
 import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
+import { resolveCardClassSettings } from '../lib/review-seat-settings.mjs';
 import { prStatusOperation, PR_STATUS_OP } from './pr-status.mjs';
 import { createPrReader } from './pr-status-io.mjs';
 import { staleStateOperation, STALE_STATE_OP } from './stale-state.mjs';
@@ -106,7 +107,7 @@ import { createResolveReader, createResolveSinks } from './resolve-io.mjs';
 import { scaffoldOperation, SCAFFOLD_OP } from './scaffold.mjs';
 import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
 import { fileItemOperation, FILE_ITEM_OP } from './file-item.mjs';
-import { createFileItemReader, createFileItemSinks } from './file-item-io.mjs';
+import { createFileItemReader, createFileItemSinks, fileItemRoot } from './file-item-io.mjs';
 import { openPrOperation, OPEN_PR_OP } from './open-pr.mjs';
 import { createOpenPrSinks, deriveLaneRef } from './open-pr-io.mjs';
 import { PARK_LABELS } from '../pr-land.mjs';
@@ -214,7 +215,9 @@ export const OPERATIONS = Object.freeze({
       antigravityReview: antigravityReviewFromEnv() };
     // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
     const seats = savedRun?.op === REVIEW_PR_OP
-      ? reviewSeatOptionsForRun(savedRun, seatSettings, live) : { securitySeat, cardOnlyLight, ...live, seatSettings };
+      ? { ...reviewSeatOptionsForRun(savedRun, seatSettings, live),
+        cardClassSettings: savedRun.findings?.read?.cardOnlyLight === true ? resolveCardClassSettings().value : null }
+      : { securitySeat, cardOnlyLight, cardClassSettings: cardOnlyLight ? resolveCardClassSettings().value : null, ...live, seatSettings };
     return {
       declaration: reviewPrOperation({
         ...seats,
@@ -310,10 +313,13 @@ export const OPERATIONS = Object.freeze({
   // wraps scaffold's own read/plan/write (unchanged) and adds the clear-for-build hand-off as a second effect,
   // so filing an item has ONE declared call end to end instead of a card + a separately-remembered gesture.
   // Graduated from `origin/lane/mechanical-dispatcher` (#3548); see `file-item.mjs`'s own header.
-  [FILE_ITEM_OP]: () => ({
-    declaration: fileItemOperation({ readScaffoldContext: createFileItemReader() }),
-    sinks: createFileItemSinks(),
-  }),
+  [FILE_ITEM_OP]: () => {
+    const root = fileItemRoot(); // WE_FILE_ITEM_ROOT, else this checkout — see file-item-io.mjs
+    return {
+      declaration: fileItemOperation({ readScaffoldContext: createFileItemReader({ root }) }),
+      sinks: createFileItemSinks({ root }),
+    };
+  },
   [SUGGEST_NEXT_OP]: () => ({
     declaration: suggestNextOperation({
       loadBoard: createBoardReader(),
