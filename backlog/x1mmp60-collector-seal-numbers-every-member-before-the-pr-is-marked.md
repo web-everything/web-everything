@@ -4,7 +4,7 @@ size: 3
 parent: "x87psvt"
 status: open
 blockedBy: ["x5nmdnt"]
-scope: ["we:scripts/operations/card-batch-seal.mjs", "we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/operations/__tests__/card-batch-seal.test.mjs", "we:scripts/operations/__tests__/card-batch-seal-io.test.mjs"]
+scope: ["we:scripts/operations/card-batch-seal.mjs", "we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/operations/card-batch-extract.mjs", "we:scripts/operations/__tests__/card-batch-seal.test.mjs", "we:scripts/operations/__tests__/card-batch-seal-io.test.mjs", "we:scripts/operations/__tests__/card-batch-extract.test.mjs"]
 dateOpened: "2026-10-18"
 tags: []
 ---
@@ -13,11 +13,14 @@ tags: []
 
 Per decision x5ioz96 fork 5 (statute backlog-ids-numbered-before-publish): add a number-members seal step after record-sealed and before verify, calling the declared numbering operation once over the whole branch so sibling references resolve together. It fails closed: if numbering fails the batch stays held and never reaches ready.
 
+The `number-members` step must record each member's old->new path map in the batch journal. Member attribution in `we:scripts/operations/card-batch-extract.mjs` (the `cardPath` derivation at lines 199-207) must resolve a member by either its admission path or its numbered path, applying the journal map or following the rename with `git diff-tree -M`. Findings citing the numbered path must still be attributed to the original member.
+
 ## Acceptance
 
-- [A1] **Executable** — `node --test we:scripts/operations/__tests__/card-batch-seal.test.mjs we:scripts/operations/__tests__/card-batch-seal-io.test.mjs` fails before this item lands and passes after. Planned cases:
+- [A1] **Executable** — `node --test we:scripts/operations/__tests__/card-batch-seal.test.mjs we:scripts/operations/__tests__/card-batch-seal-io.test.mjs we:scripts/operations/__tests__/card-batch-extract.test.mjs` fails before this item lands and passes after. Planned cases:
   - `seal steps run record-sealed, number-members, verify, remove-hold, ready, label-on-green` (we:scripts/operations/__tests__/card-batch-seal.test.mjs).
   - `numbers all siblings in one pass so cross-references resolve` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — two members that name each other both carry the new numbers.
+  - `findings on a numbered member's new path are attributed to that member` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — admit `we:backlog/xabc123-card.md` plus a sibling, number that member to `we:backlog/6500-card.md` at seal, and assert that the batch journal records its old->new path map. Run `attributeFindings` with a finding citing `we:backlog/6500-card.md` (use repo-relative paths in the fixture); it must return `extract` for that member, not `hold`. Also check that a finding citing its admission path still resolves to the same member.
   - `numbering failure retains the hold and never reaches ready` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs).
   - `seal step changes card text only through the numbering operation` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — with the numbering operation stubbed to rename files only, every member's content is byte-identical after `number-members` except for the lines that operation rewrote; the seal step itself edits no card text.
   - `members are numbered through the batch repo's own operation` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — a batch for a sibling repo calls that repo's declared numbering operation with that repo's checkout, never WE's, and a WE batch calls WE's.
