@@ -25,6 +25,112 @@ const IN_FLIGHT_PATHS = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'REBAS
   'rebase-merge/head-name', 'rebase-apply/next', 'sequencer/todo', 'worktrees/w/REBASE_HEAD', 'NOTES_MERGE_PARTIAL', 'NOTES_MERGE_REF', 'NOTES_MERGE_WORKTREE/x'];
 const inFlightName = (path) => path.split('/')[path.startsWith('worktrees/') ? 2 : 0];
 
+describe('CLI gc and prune retention guarantees', () => {
+  const old = new Date('2000-01-01T00:00:00Z');
+  // Each case gets independent, old objects: neither another root nor the prune grace period can save them.
+  function fixture(run) {
+    const root = mkdtempSync(join(tmpdir(), 'lane-diet-retention-'));
+    const poolRoot = join(root, '.lanes');
+    const dir = join(poolRoot, 'web-everything', 'lane-1');
+    mkdirSync(dir, { recursive: true });
+    const inputGit = (args, input) => execFileSync('git', args, { cwd: dir, env, input, encoding: 'utf8' }).trim();
+    const age = (oid) => utimesSync(join(dir, '.git', 'objects', oid.slice(0, 2), oid.slice(2)), old, old);
+    const graph = (text, parent) => {
+      const blob = inputGit(['hash-object', '-w', '--stdin'], text);
+      const tree = inputGit(['mktree'], `100644 blob ${blob}\tretained.txt\n`);
+      const commit = git(dir, 'commit-tree', tree, ...(parent ? ['-p', parent] : []), '-m', text);
+      for (const oid of [blob, tree, commit]) age(oid);
+      return { blob, tree, commit };
+    };
+    try {
+      git(dir, 'init', '-q', '-b', 'main');
+      git(dir, 'config', 'core.logAllRefUpdates', 'false');
+      const base = graph('base');
+      git(dir, 'update-ref', 'refs/heads/main', base.commit);
+      const retained = graph('retained');
+      const garbage = graph('unprotected control');
+      const apply = () => {
+        const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`,
+          '--apply', '--lanes=1', '--json'], { env, encoding: 'utf8' }));
+        expect(out.rows).toHaveLength(1);
+        expect(out.rows[0]).toMatchObject({ mode: 'apply' }); // A refusal/error must not masquerade as preservation.
+        for (const oid of Object.values(garbage)) expect(() => git(dir, 'cat-file', '-e', oid)).toThrow();
+      };
+      run({ dir, root, base, retained, graph, apply });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+  const expectGraph = (dir, graph) => {
+    expect(git(dir, 'cat-file', '-t', graph.commit)).toBe('commit');
+    expect(git(dir, 'cat-file', '-t', graph.tree)).toBe('tree');
+    expect(git(dir, 'cat-file', '-p', graph.blob)).toBe('retained');
+  };
+
+  it.each(['ref', 'index', 'detached HEAD'])('prune keeps old objects reachable only from %s', (root) => fixture(({ dir, retained, apply }) => {
+    if (root === 'ref') git(dir, 'update-ref', 'refs/keep/retained', retained.commit);
+    if (root === 'index') git(dir, 'update-index', '--add', '--cacheinfo', `100644,${retained.blob},retained.txt`);
+    if (root === 'detached HEAD') git(dir, 'update-ref', '--no-deref', 'HEAD', retained.commit);
+    expect(existsSync(join(dir, '.git', 'logs'))).toBe(false);
+    if (root !== 'ref') expect(refs(dir, 'refs/')).toEqual(['refs/heads/main']);
+    const headBefore = readFileSync(join(dir, '.git', 'HEAD'), 'utf8');
+    const indexBefore = root === 'index' ? readFileSync(join(dir, '.git', 'index')) : null;
+    apply();
+    expect(readFileSync(join(dir, '.git', 'HEAD'), 'utf8')).toBe(headBefore);
+    if (root === 'index') {
+      expect(readFileSync(join(dir, '.git', 'index'))).toEqual(indexBefore);
+      expect(git(dir, 'show', ':retained.txt')).toBe('retained');
+      expect(() => git(dir, 'cat-file', '-e', retained.commit)).toThrow(); // Only the staged blob is rooted.
+    } else {
+      expectGraph(dir, retained);
+      expect(git(dir, 'rev-parse', root === 'ref' ? 'refs/keep/retained' : 'HEAD')).toBe(retained.commit);
+    }
+  }), 60_000);
+
+  it.each([
+    ['gc.reflogExpire', 'reachable'],
+    ['gc.reflogExpireUnreachable', 'unreachable'],
+  ])('%s=never preserves old %s reflog entries despite repo expiry=now', (setting, reachability) => fixture(({ dir, base, retained, graph, apply }) => {
+    // Isolate each pin: the other expiry setting cannot account for this case staying green.
+    git(dir, 'config', 'gc.reflogExpire', 'never');
+    git(dir, 'config', 'gc.reflogExpireUnreachable', 'never');
+    git(dir, 'config', setting, 'now');
+    const tip = reachability === 'reachable' ? graph('descendant', retained.commit).commit : base.commit;
+    for (const oid of [retained.commit, tip]) execFileSync('git', ['update-ref', '--create-reflog', '-m', 'retention probe', 'refs/heads/history', oid], {
+      cwd: dir, env: { ...env, GIT_COMMITTER_DATE: old.toISOString() }, stdio: 'pipe',
+    });
+    const log = join(dir, '.git', 'logs', 'refs', 'heads', 'history');
+    const before = readFileSync(log, 'utf8');
+    expect(before).toContain(retained.commit);
+    // A dry run proves this fixture is eligible for expiry without altering any production guard.
+    expect(git(dir, 'reflog', 'expire', '--dry-run', '--verbose', 'refs/heads/history')).toContain('prune retention probe');
+    expect(refs(dir, 'refs/')).toEqual(['refs/heads/history', 'refs/heads/main']);
+    expect(existsSync(join(dir, '.git', 'index'))).toBe(false);
+    apply();
+    expect(readFileSync(log, 'utf8')).toBe(before);
+    expectGraph(dir, retained);
+  }), 60_000);
+
+  it('gc.worktreePruneExpire=never keeps stale linked-worktree metadata and its HEAD-only history despite repo expiry=now', () => fixture(({ dir, root, retained, apply }) => {
+    const linked = join(root, 'offline-worktree');
+    git(dir, 'worktree', 'add', '--detach', linked, retained.commit);
+    const admin = git(linked, 'rev-parse', '--absolute-git-dir');
+    // Model an unmounted worktree whose only remaining reachability root is its administrative HEAD.
+    rmSync(linked, { recursive: true });
+    rmSync(join(admin, 'logs'), { recursive: true, force: true });
+    rmSync(join(admin, 'index'));
+    utimesSync(join(admin, 'gitdir'), old, old);
+    git(dir, 'config', 'gc.worktreePruneExpire', 'now');
+    expect(git(dir, 'worktree', 'prune', '--dry-run', '--verbose', '--expire=now')).toContain('offline-worktree');
+    expect(refs(dir, 'refs/')).toEqual(['refs/heads/main']);
+    expect(existsSync(join(dir, '.git', 'logs'))).toBe(false);
+    const headBefore = readFileSync(join(admin, 'HEAD'), 'utf8');
+    const gitdirBefore = readFileSync(join(admin, 'gitdir'), 'utf8');
+    apply();
+    expect(readFileSync(join(admin, 'HEAD'), 'utf8')).toBe(headBefore);
+    expect(readFileSync(join(admin, 'gitdir'), 'utf8')).toBe(gitdirBefore);
+    expectGraph(dir, retained);
+  }), 60_000);
+});
+
 describe('in-flight refusal coverage', () => {
   it('every name in the CLI IN_FLIGHT set is planted at the top level by a named CLI refusal test', () => {
     const src = readFileSync(CLI, 'utf8').match(/const IN_FLIGHT = new Set\(\[([^\]]*)\]\)/);
