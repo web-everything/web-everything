@@ -167,6 +167,8 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
           ? `${head}\n\n${pushed} BUT your parallel self-review has not reported (${record.pendingResume.selfReviewOverdue}). Do not hand back yet: if it is still running, wait for its report; if it was lost, run it again now (blocking). Record its verdict with \`node "${ROOT}/scripts/conveyor/await-verify.mjs" self-review clean|must-fix --repo=${record.repo} --pr=${record.pr} --who=${record.who}\`. must-fix → repair with a NEW commit, \`verify-lane.mjs request\`, mark again (same --attempt) and end your turn. clean → continue your ${brief(record)} from the step after the push. fix-end refuses a hand-back release while the self-review is open.`
           : `${head}\n\n${pushed} Continue your ${brief(record)} from the step after the push: post the before/after evidence comment (cite this green verdict), then the hand-back and the closing completion report + fix-end.`;
     }
+    case 'no-new-commit':
+      return `${head}\n\nThe remote branch (${record.ref}) already had this exact sha when the harness tried to push it (upToDate). Do NOT re-mark. Post the durable evidence comment now, starting with the standalone heading \`## Fix evidence\`, with \`Head: ${record.sha}\`, one \`<!-- addresses-operator-send-back: <id> -->\` marker per open operator send-back you addressed, and file:line citations. Then follow your fix brief's hand-back, closing completion report and fix-end.`;
     case 'push-rejected':
       return isCiHeal(record)
         ? `${head}\n\nVerify is GREEN, but the harness could NOT push ${record.sha} to ${record.ref}: ${detail}. The remote moved: follow your ${brief(record)}'s non-fast-forward path — reconcile with the current PR head, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Never force-push, and do not exit yet.`
@@ -282,7 +284,8 @@ function runEarlyPush({ io, record, nowMs, policy, persist }) {
   const at = new Date(nowMs).toISOString();
   // A non-transient refusal is not retried early: the green push re-tries it and routes the outcome as it does today.
   const done = !!pushed.ok || !pushed.transient;
-  persist({ ...record, earlyPush: { sha: record.sha, attempts, done, ok: !!pushed.ok, at: pushed.ok ? at : null, ...(pushed.ok ? {} : { reason: String(pushed.reason ?? 'push failed').slice(0, 300) }) } });
+  // A later tick's no-op may be our own push whose success was never persisted.
+  persist({ ...record, earlyPush: { sha: record.sha, attempts, done, ok: !!pushed.ok, ...(attempts === 1 && pushed.ok && pushed.upToDate ? { upToDate: true } : {}), at: pushed.ok ? at : null, ...(pushed.ok ? {} : { reason: String(pushed.reason ?? 'push failed').slice(0, 300) }) } });
   return pushed.ok
     ? { ...base, result: `sent ${String(record.sha).slice(0, 8)} to ${record.ref} at ${at}, before the verify verdict; fix claim still held` }
     : { ...base, result: `not sent (${pushed.reason ?? 'push failed'})${done ? '' : '; retry next tick'}` };
@@ -349,7 +352,7 @@ export async function runAwaitVerifyPass({
       }
       const lane = isHarnessRecord(record) && !record.pendingResume ? io.laneState(record.lane, { hashDirty: isNoPushRecord(record) }) : null;
       const marker = lane ? io.readMarker(record.lane) : null;
-      const d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits });
+      let d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits });
       Object.assign(row, { action: d.action, reason: d.reason });
       // Every counter that bounds an effect is persisted BEFORE the effect, and a failed write skips the effect: a store that
       // went unwritable would otherwise reload the old counters every tick and repeat the request / push / resume forever.
@@ -390,6 +393,12 @@ export async function runAwaitVerifyPass({
         const early = runEarlyPush({ io, record, nowMs, policy, persist: (next) => (io.writeRecord(next)?.ok === true ? ((record = next), true) : false) });
         // `record` now carries `earlyPush`; the rest of this record's handling (re-request, resume) keeps it.
         if (early) rows.push({ key, pr: record.pr, repo: record.repo, sha: record.sha, ...early });
+      }
+      if (record?.kind === 'fix' && !record.pendingResume && record.earlyPush?.ok && record.earlyPush.upToDate
+        && (record.attempt ?? 1) === 1 && record.earlyPush.attempts === 1
+        && lower(record.earlyPush.sha) === lower(record.sha) && (d.action === 'wait' || d.action === 'rerequest')) {
+        d = { action: 'resume', reason: 'no-new-commit', resume: 'no-new-commit' };
+        Object.assign(row, { action: d.action, reason: d.reason });
       }
       if (d.action === 'skip' || d.action === 'wait') { rows.push(row); continue; }
       if (d.action === 'rerequest') {
@@ -605,12 +614,16 @@ export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileS
       return { state: 'diverged', head };
     };
     let reconciled = false;
+    let upToDate = false;
     for (let attempt = 1; ; attempt += 1) {
       try {
-        run(['push', url, `${sha}:refs/heads/${ref}`]);
+        const stdout = run(['push', '--porcelain', url, `${sha}:refs/heads/${ref}`]);
+        // A retry may find our own lost-response push already applied; only the first attempt proves a no-op.
+        upToDate = attempt === 1 && /^=\t[^\t\r\n]+:[^\t\r\n]+\t\[up to date\]\r?$/m.test(stdout);
         break;
       } catch (e) {
-        const kind = classifyPushFailure(String(e?.stderr ?? e?.message ?? e), { killed: !!(e?.killed || e?.code === 'ETIMEDOUT') });
+        // --porcelain moves the per-ref status lines (`! [rejected]`, `(fetch first)`) to stdout; classify on both.
+        const kind = classifyPushFailure(`${String(e?.stderr ?? e?.message ?? e)}\n${String(e?.stdout ?? '')}`, { killed: !!(e?.killed || e?.code === 'ETIMEDOUT') });
         const last = attempt >= tuning.attempts;
         if (kind === 'transient') {
           if (last) throw tagged(e, 'transient', { attempts: attempt });
@@ -631,7 +644,7 @@ export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileS
     }
     let remote = '';
     try { remote = run(['ls-remote', url, `refs/heads/${ref}`]).split(/\s/)[0]; } catch { /* the push itself succeeded; a failed read-back is not a rejection */ }
-    return { remote };
+    return { remote, ...(upToDate ? { upToDate: true } : {}) };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -775,9 +788,10 @@ export async function defaultAwaitVerifyIo({
       try { laneGitDir = git(lane, ['rev-parse', '--absolute-git-dir']).trim(); } catch { return { ok: false, transient: true, reason: `could not read the git dir of ${lane}` }; }
       try {
         // Never --force, so a moved branch is rejected, not overwritten; never the lane's own `origin` (see pushShaFromScratch).
-        const { remote, alreadyThere } = pushShaFromScratch({ laneGitDir, url: head.remoteUrl, sha, ref, exec, env, timeout: 180_000, sleep });
+        const { remote, alreadyThere, upToDate } = pushShaFromScratch({ laneGitDir, url: head.remoteUrl, sha, ref, exec, env, timeout: 180_000, sleep });
         // An empty read-back (ls-remote failed after a push that succeeded) is not a rejection; only a DIFFERENT sha is.
         if (!alreadyThere && remote && lower(remote) !== lower(sha)) return { ok: false, moved: true, reason: `remote ${ref} is ${remote.slice(0, 8)} after push` };
+        return upToDate ? { ok: true, upToDate: true } : { ok: true };
       } catch (e) {
         const stderr = String(e?.stderr ?? e?.message ?? e);
         const detail = stderr.trim().split('\n').filter((l) => l.trim() && !/^hint:/i.test(l)).slice(-3).join(' ').slice(0, 300);
@@ -787,7 +801,6 @@ export async function defaultAwaitVerifyIo({
         const rejected = kind === 'moved' || kind === 'rejected';
         return { ok: false, reason: detail, transient: kind === 'unknown', moved: rejected };
       }
-      return { ok: true };
     },
     // ── salvage of a green-verified sha GitHub kept refusing (see verified-push-salvage.mjs) ──
     listSalvage: () => listSalvage(),
