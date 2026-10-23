@@ -82,6 +82,7 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
     if (input.stackOn) {
       const pr = json(command('source', 'gh', ['pr', 'view', String(input.stackOn), '--repo', repo, '--json', 'headRefName,headRefOid,isCrossRepository']));
       if (!pr.headRefName || !/^[0-9a-f]{40,64}$/.test(pr.headRefOid) || pr.isCrossRepository !== false) stop('stack-base');
+      if (out.branch === pr.headRefName) stop('stack-destination');
       baseRef = pr.headRefName; base = pr.headRefOid;
     }
     const parts = input.source.split('..');

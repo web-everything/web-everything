@@ -70,6 +70,20 @@ const prs = n => Array.from({ length: n }, (_, i) => ({ number: i + 1, author: {
 describe('graduate-chain', () => {
   for (const source of ['lane/source', 'old..new']) {
     for (const dryRun of [false, true]) {
+      it(`refuses the parent destination before any mutation (${source}, dryRun=${dryRun})`, () => {
+        const { result, calls, bodies, cleaned } = fixture({ over: { source, dryRun, stackOn: '7', purpose: 'parent' },
+          change: (cmd, args) => cmd === 'node' && args[1] === 'open-pr'
+            && reply({ findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 7 } }] } } }) });
+        expect(result).toMatchObject({ ok: false, pr: null, stopReason: 'stack-destination' });
+        expect(calls.some(c => c.cmd === 'node')).toBe(false);
+        expect(calls.some(c => ['fetch', 'reset', 'cherry-pick', 'push'].includes(c.args[0]))).toBe(false);
+        expect(bodies).toEqual([]);
+        expect(cleaned).toBe(true);
+      });
+    }
+  }
+  for (const source of ['lane/source', 'old..new']) {
+    for (const dryRun of [false, true]) {
       it(`excludes commits reachable from the stack base: ${source}, dryRun=${dryRun}`, () => {
         const ancestor = 'c'.repeat(40);
         const { result, calls } = fixture({ over: { source, stackOn: '7', dryRun }, change: (cmd, args) => {
@@ -318,9 +332,10 @@ describe('graduate-chain', () => {
       expect(() => plan.fn({ input: { ...input, ...over } })).toThrow('input');
     });
   }
-  for (const reason of [null, 'verify-red', 'release']) {
+  for (const reason of [null, 'verify-red', 'release', 'stack-destination']) {
     it(`exposes the full effect result as the CLI verdict: ${reason ?? 'success'}`, async () => {
-      const result = fixture({ change: (c, a) => reason === 'verify-red' && a[1] === 'verify'
+      const result = fixture({ over: reason === 'stack-destination' ? { stackOn: '7', purpose: 'parent' } : {},
+        change: (c, a) => reason === 'verify-red' && a[1] === 'verify'
         ? reply({ verdict: { ok: false, checks: [{ outcome: 'fail' }] } }, 1)
         : reason === 'release' && a[1] === 'release' && reply('', 1) }).result;
       const registry = createRegistry();
