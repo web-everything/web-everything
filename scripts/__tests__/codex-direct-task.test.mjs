@@ -1953,6 +1953,115 @@ describe('detached jobs', () => {
   });
 
   const jsonTaskArgs = ['--task=fixture', '--json', '--no-stream', '--no-self-review'];
+  it.each(['SIGINT', 'SIGTERM'])('detached CLI cancellation by %s during startup records failure', async signal => {
+    const preload = join(jobsDir, 'startup-preload.mjs');
+    const ready = join(jobsDir, 'startup.ready');
+    writeFileSync(preload, `
+      import { writeFileSync } from 'node:fs';
+      process.on('newListener', signal => {
+        if (signal === 'SIGTERM') setImmediate(() => writeFileSync(${JSON.stringify(ready)}, 'ready'));
+      });
+    `);
+    const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach', '--task=fixture'], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir, CODEX_DIRECT_TASK_TEST_CHILD_DELAY_MS: '10000',
+        NODE_OPTIONS: `--import=${preload}` },
+    });
+    expect(launcher.error).toBeUndefined();
+    expect(launcher.status, launcher.stderr).toBe(0);
+    const job = JSON.parse(launcher.stdout);
+    const { pid } = readJobRecord(job.id, { jobsDir });
+    try {
+      // A live startup-delay child has the job handler but no worker cleanup handler yet.
+      const deadline = Date.now() + 5000;
+      while (true) {
+        try { if (readFileSync(ready, 'utf8') === 'ready') break; } catch { /* child is importing */ }
+        if (Date.now() >= deadline) throw new Error('startup signal handler did not become ready');
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      process.kill(pid, signal);
+      const result = await waitForJob({ jobId: job.id, jobsDir, maxMs: 5000 });
+      const exitCode = signal === 'SIGINT' ? 130 : 143;
+      expect(result).toMatchObject({ status: 'failed', exitCode, code: exitCode });
+      expect(readJobRecord(job.id, { jobsDir })).toMatchObject({ finishedAt: expect.any(String) });
+    } finally {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ }
+    }
+  }, 15000);
+
+  it.each(['SIGINT', 'SIGTERM'])('detached CLI cancellation by %s stops the worker and its descendants before recording failure', async signal => {
+    // Exercise the real launcher, CLI signal listeners and process group. Only git and Codex are substituted.
+    const preload = join(jobsDir, 'cancel-preload.mjs');
+    const worker = join(jobsDir, 'worker.cjs');
+    writeFileSync(worker, `
+      const { appendFileSync, writeFileSync } = require('node:fs');
+      const { spawn } = require('node:child_process');
+      const { join } = require('node:path');
+      const root = process.env.CODEX_JOBS_DIR;
+      const role = process.argv[2];
+      writeFileSync(join(root, role + '.pid'), String(process.pid));
+      const beat = () => appendFileSync(join(root, role + '.beats'), '.');
+      beat();
+      setInterval(beat, 20);
+      if (role === 'worker') spawn(process.execPath, [__filename, 'descendant'], { stdio: 'ignore' });
+    `);
+    writeFileSync(preload, `
+      import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { join } from 'node:path';
+      const spawn = cp.spawn;
+      cp.execFileSync = (bin, args) => args.includes('--absolute-git-dir')
+        ? join(process.env.CODEX_JOBS_DIR, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
+      cp.spawn = (bin, args, options) => bin === process.execPath ? spawn(bin, args, options)
+        : spawn(process.execPath, [${JSON.stringify(worker)}, 'worker'], options);
+      syncBuiltinESMExports();
+    `);
+    const options = { encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir, NODE_OPTIONS: `--import=${preload}` } };
+    const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const until = async predicate => {
+      const deadline = Date.now() + 10000;
+      while (!predicate()) {
+        if (Date.now() >= deadline) throw new Error('cancellation fixture did not become ready');
+        await pause(20);
+      }
+    };
+    let job;
+    let wrapperPid;
+    try {
+      const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
+        `--dir=${jobsDir}`, '--task=fixture', '--gate=none', '--no-self-review', '--no-stream'], options);
+      expect(launcher.error).toBeUndefined();
+      expect(launcher.status, launcher.stderr).toBe(0);
+      job = JSON.parse(launcher.stdout);
+      wrapperPid = readJobRecord(job.id, { jobsDir }).pid;
+      await until(() => {
+        try { return readFileSync(join(jobsDir, 'descendant.beats'), 'utf8').length > 0; }
+        catch { return false; }
+      });
+      process.kill(wrapperPid, signal);
+      await until(() => readJobRecord(job.id, { jobsDir }).status !== 'running');
+      const exitCode = signal === 'SIGINT' ? 130 : 143;
+      expect(readJobRecord(job.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode,
+        finishedAt: expect.any(String) });
+      expect(await waitForJob({ jobId: job.id, jobsDir })).toMatchObject({ status: 'failed', exitCode, code: exitCode });
+      const beats = () => ['worker', 'descendant'].map(role => readFileSync(join(jobsDir, `${role}.beats`), 'utf8'));
+      const atExit = beats();
+      await pause(250);
+      expect(beats(), 'worker and descendant must stop executing after cancellation').toEqual(atExit);
+    } finally {
+      // Also reap the deliberately orphaned workers on the pre-fix red run.
+      for (const role of ['worker', 'descendant']) {
+        try {
+          const pid = Number(readFileSync(join(jobsDir, `${role}.pid`), 'utf8'));
+          if (role === 'worker') { try { process.kill(-pid, 'SIGKILL'); } catch { /* already stopped */ } }
+          process.kill(pid, 'SIGKILL');
+        } catch { /* already stopped or never started */ }
+      }
+      if (wrapperPid) { try { process.kill(wrapperPid, 'SIGKILL'); } catch { /* already stopped */ } }
+    }
+  }, 20000);
+
   it.each([
     { label: 'validation failure', args: [], processCode: 2, recordCode: 2 },
     { label: 'success', args: [...jsonTaskArgs, '--review'], processCode: 0, recordCode: 0,

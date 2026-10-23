@@ -749,8 +749,10 @@ export async function runCodexDirectExec({
       removeSignalListeners();
       resolvePromise(r);
     };
-    process.on('SIGINT', onSigint);
-    process.on('SIGTERM', onSigterm);
+    // Job bookkeeping installs an exit handler before execution starts. Kill the worker group
+    // first, before that handler can exit the wrapper and leave its detached worker running.
+    process.prependListener('SIGINT', onSigint);
+    process.prependListener('SIGTERM', onSigterm);
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         killed = true;
