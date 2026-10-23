@@ -49,6 +49,98 @@ function fake({ liveHead = HEAD, labels = [], identity = OP, author = 'chalbert'
 const payloadFor = (over = {}, readOver = {}) => planRedTeamRuling(read(readOver), input(over));
 const heldAfter = comments => readRedTeamDisposition({ comments, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).held;
 
+describe('published backing cards at the production reader and release boundary', () => {
+  const file = '6935-prevention-require-named-refusal-and-post-failure-coverage-f.md';
+  const ref = `we:backlog/${file}`;
+  const text = '---\nbornAs: xabc123\nstatus: open\n---\n# Published card\n';
+  const root = join(dirname(fileURLToPath(import.meta.url)), '../../..');
+  const main = (files = {}, fail = '') => {
+    const calls = [];
+    const runGit = args => {
+      calls.push(args);
+      if (args[0] === fail) throw new Error('main unavailable');
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'ls-tree') return Object.keys(files).join('\n');
+      if (args[0] === 'show' && args[1].startsWith('origin/main:backlog/')) {
+        const name = args[1].slice('origin/main:backlog/'.length);
+        if (Object.hasOwn(files, name)) return files[name];
+        throw new Error('absent from origin/main');
+      }
+      throw new Error(`unexpected git arguments: ${JSON.stringify(args)}`);
+    };
+    return { runGit, calls };
+  };
+  const reader = options => createRecordRedTeamRulingReader({ assertFresh: () => {},
+    readThread: () => ({ headRefOid: HEAD, labels: [], comments: thread() }),
+    readStandingRulingScope: () => null, readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }),
+    resolveIdentity: () => OP, ...options });
+
+  it.each([ref, '6935'])('refuses checkout-only card %s as unpublished on main', ask => {
+    expect(readFileSync(join(root, 'backlog', file), 'utf8')).toMatch(/^---/);
+    const io = main();
+    const context = reader(io)(input({ card: ask }));
+    expect(context.card.readable).toBe(false);
+    expect(context.card.reason).toMatch(/has it landed on main.*cite it as we:backlog\/<file>\.md@pr<N>/);
+    expect(() => planRedTeamRuling(context, input({ card: ask }))).toThrow(/does not resolve to a readable backlog card/);
+    expect(io.calls[0]).toEqual(['fetch', '--no-tags', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+  });
+
+  it('refuses a checkout-only card in the sink recheck without posting an operator-card release', () => {
+    const io = main();
+    const comments = thread(), posted = [];
+    const sinks = createRecordRedTeamRulingSinks({ ...io,
+      readThread: () => ({ headRefOid: HEAD, comments: [...comments] }),
+      readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      post: (_repo, _pr, body) => { posted.push(body); comments.push({ author: OP, body }); },
+      syncLabels: () => { throw new Error('must remain held'); },
+    });
+    const plan = payloadFor({ card: ref }, { card: { ...card, ref } });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](plan)).toThrow(/no release record written/);
+    expect(posted).toHaveLength(1);
+    expect(posted.some(body => body.includes(redTeamGateMarker(PR, HEAD, 'operator-card', plan.resultId)))).toBe(false);
+    expect(heldAfter(comments)).toHaveLength(1);
+    expect(io.calls[0]).toEqual(['fetch', '--no-tags', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+  });
+
+  it.each([ref, '6935', 'xabc123'])('resolves %s using main content and enumeration', ask => {
+    const io = main({ [file]: text });
+    expect(reader(io)(input({ card: ask })).card).toMatchObject({ ref, foundIn: 'main', readable: true });
+    expect(io.calls.filter(args => args[0] === 'fetch')).toHaveLength(1);
+    expect(io.calls).toContainEqual(['show', `origin/main:backlog/${file}`]);
+  });
+
+  it('keeps renumbered provisional full references backed by main frontmatter', () => {
+    const oldRef = 'we:backlog/xabc123-follow-up.md';
+    expect(reader(main({ [file]: text }))(input({ card: oldRef })).card)
+      .toMatchObject({ ref: oldRef, readable: true, foundIn: 'main' });
+    expect(reader(main())(input({ card: oldRef })).card.readable).toBe(false);
+  });
+
+  it.each(['fetch', 'show', 'ls-tree'])('fails closed when main %s fails', fail => {
+    const context = reader(main({ [file]: text }, fail))(input({ card: fail === 'ls-tree' ? '6935' : ref }));
+    expect(context.card.readable).toBe(false);
+  });
+
+  it('rejects malformed main content even when the checkout has valid frontmatter', () => {
+    expect(reader(main({ [file]: '# No frontmatter' }))(input({ card: ref })).card.readable).toBe(false);
+  });
+
+  it('keeps explicit open-PR references on the PR readability path', () => {
+    const reads = [];
+    const io = main();
+    const context = reader({ ...io, readOnPr: (name, pr) => { reads.push([name, pr]); return text; } })(input({ card: `${ref}@pr5829` }));
+    expect(context.card).toMatchObject({ ref: `${ref}@pr5829`, foundIn: 'pr-head', readable: true });
+    expect(reads).toEqual([[file, '5829']]);
+    expect(io.calls).toEqual([]);
+  });
+
+  it('does not fall back to main when an explicitly cited PR card is unreadable', () => {
+    const io = main({ [file]: text });
+    expect(reader({ ...io, readOnPr: () => null })(input({ card: `${ref}@pr5829` })).card.readable).toBe(false);
+    expect(io.calls).toEqual([]);
+  });
+});
+
 // Exercise production issue verification and scope construction; only GitHub reads are offline.
 const rulingIssue = { number: 6000, state: 'OPEN', author: OP, lastEditedAt: null,
   body: buildStandingRulingBody({ repos: [repo], ruledAt: '2026-10-19', confirmedAt: '2026-10-20', words: 'one more round' }) };

@@ -82,10 +82,16 @@ export default {
         const { createMemoryCallLogStore } = await load('scripts/operations/call-log-store.mjs');
         const readThread = () => JSON.parse(JSON.stringify(state));
         const resolveIdentity = () => ({ login: actor, type: 'User' });
+        // Offline published-tree fixture shared by the production reader and final sink recheck.
+        const runGit = args => {
+          if (args[0] === 'fetch') return '';
+          if (args[0] === 'show' && args[1] === `origin/main:${cardPath}`) return readFileSync(join(sourceRoot, cardPath), 'utf8');
+          throw new Error(`unexpected backlog read: ${JSON.stringify(args)}`);
+        };
         const reader = createRecordRedTeamRulingReader({ assertFresh: () => {}, readThread, resolveIdentity,
           readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), now: () => '2026-10-21T13:00:00Z',
-          resolveCard: requested => ({ requested, ref: card, readable: requested === card && existsSync(join(sourceRoot, cardPath)), reason: 'fixture card on main' }) });
-        const sinks = createRecordRedTeamRulingSinks({ readThread, resolveIdentity,
+          runGit });
+        const sinks = createRecordRedTeamRulingSinks({ readThread, resolveIdentity, runGit,
           post: (_repo, _pr, body) => state.comments.push(human(body)), syncLabels: () => tick(), warn: () => {} });
         const code = await main([`--pr=${pr}`, `--repo=${repo}`, '--break=1', '--ruling=card', `--card=${card}`,
           `--actor=${actor}`, '--channel=soak-replay', '--reason=card the confirmed break and release this head'], {

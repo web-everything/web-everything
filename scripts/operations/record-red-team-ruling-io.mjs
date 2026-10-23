@@ -3,11 +3,13 @@
  * @description Live reader and existing-card sink for cap-held operator rulings. IO is injectable.
  */
 import { spawnSync } from 'node:child_process';
-import { dirname, resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { liveResultGateState, readConfirmedBreaks, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { openPrHeadBacklog, resolveCardRef } from './record-referral-ruling-io.mjs';
+import { resolveCardRef } from './record-referral-ruling-io.mjs';
+import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
+import { trackingRefspec } from '../lib/git-transport-branch.mjs';
 import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
@@ -29,16 +31,59 @@ export const readLiveThread = ({ repo, pr }) => ({
   comments: readCompletePrComments(Number(pr), { repo }),
 });
 
-/** `--card` resolved exactly as `record-referral-ruling` resolves it (main, else `@pr<N>` on the ruled PR's head). */
-const resolveCardDefault = (card, { repo, pr, head }) => {
-  let opened;
-  const prHead = { list: () => (opened ??= openPrHeadBacklog({ repo, pr, head })).list(), read: (f) => (opened ??= openPrHeadBacklog({ repo, pr, head })).read(f) };
-  return resolveCardRef(card, { pr, prHead });
+const git = args => {
+  const r = spawnSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8', timeout: 60_000,
+    maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+  if (r.status !== 0) throw new Error('could not read the published backlog on origin/main');
+  return String(r.stdout ?? '');
+};
+
+/** Unsuffixed references mean published on main, never the feature checkout. Each resolution (including
+ * the final sink recheck) fetches afresh; failed refreshes cannot fall back to stale local evidence.
+ * Open-PR cards require the explicit @pr<N> form and retain the shared PR-state/readability checks. */
+const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead } = {}) => {
+  let attempted = false, fetchError;
+  const main = args => {
+    if (!attempted) {
+      attempted = true;
+      try { runGit(['fetch', '--no-tags', '--quiet', 'origin', trackingRefspec('main')]); }
+      catch (e) { fetchError = e; }
+    }
+    if (fetchError) throw fetchError;
+    return runGit(args);
+  };
+  const listFiles = () => main(['ls-tree', '--name-only', 'origin/main:backlog']).split('\n')
+    .filter(file => CARD_REF_RE.test(`we:backlog/${file}`) && !file.includes('@'));
+  const readText = path => main(['show', `origin/main:backlog/${basename(path)}`]);
+  const hasFrontmatter = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
+  const readable = ref => {
+    if (!CARD_REF_RE.test(ref)) return false;
+    if (/@pr\d+$/.test(ref)) return referralCardReadable(ref, REPO_ROOT, { readOnPr });
+    try { return hasFrontmatter(readText(ref)); }
+    catch {
+      // Preserve references to provisional cards renumbered on landing, using only main's content.
+      const born = /^we:backlog\/(x[a-z0-9]{6})-/.exec(ref)?.[1];
+      if (!born) return false;
+      try {
+        return listFiles().some(file => {
+          if (!/^\d+-/.test(file)) return false;
+          const text = readText(file);
+          return hasFrontmatter(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
+        });
+      } catch { return false; }
+    }
+  };
+  const result = resolveCardRef(card, { listFiles, readText, readable });
+  if (result && !result.readable && !/@pr\d+$/.test(String(card).trim())) {
+    result.reason += '; has it landed on main? cite it as we:backlog/<file>.md@pr<N> for a card on an open PR';
+  }
+  return result;
 };
 
 export function createRecordRedTeamRulingReader({ env = process.env, readThread = readLiveThread, readSetting = () => readConfirmedBreaks({ env }),
   readStandingRulingScope = standingRulingScope,
-  resolveCard = resolveCardDefault,
+  runGit = git, readOnPr = readCardAtPrHead,
+  resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = () => resolveOperatorIdentity({ env }), now = () => new Date().toISOString(),
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-red-team-ruling', env }) } = {}) {
   return ({ repo, pr, card }) => {
@@ -54,7 +99,8 @@ export function createRecordRedTeamRulingReader({ env = process.env, readThread 
 
 export function createRecordRedTeamRulingSinks({ env = process.env, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
-  resolveCard = resolveCardDefault,
+  runGit = git, readOnPr = readCardAtPrHead,
+  resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = () => resolveOperatorIdentity({ env }),
   post = (repo, pr, body) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env),
   syncLabels = ({ repo, pr, head }) => syncRedTeamStatusLabels({ repo, pr, head, env }),
@@ -118,7 +164,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
       try { card = resolveCard(p.cardRef, { repo: p.repo, pr: p.pr, head: p.head }); }
       catch { throw new Error(`--card ${p.cardRef} could not be re-read; reason posted; no release record written`); }
       if (!card?.readable || card.ref !== p.cardRef) {
-        throw new Error(`--card ${p.cardRef} no longer resolves to the same readable backlog card; reason posted; no release record written`);
+        throw new Error(`--card ${p.cardRef} no longer resolves to the same readable backlog card (${card?.reason ?? 'unreadable'}); reason posted; no release record written`);
       }
       post(p.repo, p.pr, record);
       proveReleased(p, 'the operator-card record', record);
