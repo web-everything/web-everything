@@ -98,6 +98,7 @@ const failures = [
   ['diff-out-of-scope', 22, [['diff --name-only', ok('other.mjs\0')]], true],
   ['changed-after-audit', 23, [['diff --name-only', (_, n) => ok(n === 2 ? 'scripts/lib/new.mjs\0' : 'scripts/a.mjs\0')]], true],
   ['tests-red', 30, [['heavy-admission', red()]], true],
+  ['tests-deferred', 31, [['heavy-admission', { status: 75, stderr: 'host overloaded' }]], true],
   ['audit-weakened', 40, [['codex-direct-task.mjs --review', report({ lastMessage: 'WEAKENED: deleted guard' })]], true],
   ['audit-failed', 41, [['codex-direct-task.mjs --review', red()]], true],
   ['commit-failed', 50, [['commit -m', red()]], true],
@@ -128,6 +129,45 @@ it('bad-args exits 2 without acquiring a lane or invoking any process', async ()
   const f = fixture(); const code = await main([], f.io);
   expect(code).toBe(2); expect(JSON.parse(f.output[0]).stopReason).toBe('bad-args'); expect(f.calls).toEqual([]);
 });
+it('stops immediately on deferred admission with bounded output and no repair or publication', async () => {
+  const response = { status: 75, stdout: 'old output'.repeat(100), stderr: 'DEFER: host overloaded / wait budget exhausted' };
+  const f = fixture([['heavy-admission', response]]);
+  const { code, result } = await f.run();
+  expect(code).toBe(31);
+  expect(STOP_REASONS['tests-deferred']).toBe('tests-deferred');
+  expect(EXIT_CODES['tests-deferred']).toBe(31);
+  expect(result).toMatchObject({ ok: false, stopReason: 'tests-deferred', tests: { status: 'deferred', repaired: false } });
+  expect(result.detail).toBe(`${response.stdout}\n${response.stderr}`.slice(-400));
+  expect(result.detail).toHaveLength(400);
+  expect(codexCalls(f)).toHaveLength(1);
+  expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1);
+  expect(f.writes).toHaveLength(0);
+  expect(f.calls.some(c => c.args.includes('--review') || c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+  released(f); scopeReleased(f);
+});
+it('reports the last 400 characters of the final red test output after one repair', async () => {
+  const response = { status: 1, stdout: 'final failure'.repeat(100), stderr: 'assertion failed' };
+  const f = fixture([['heavy-admission', (_, n) => n ? response : red('initial failure')]]);
+  const { code, result } = await f.run();
+  expect(code).toBe(30);
+  expect(result).toMatchObject({ ok: false, stopReason: 'tests-red', tests: { status: 'red', repaired: true } });
+  expect(result.detail).toBe(`${response.stdout}\n${response.stderr}`.slice(-400));
+  expect(result.detail).toHaveLength(400);
+  expect(codexCalls(f)).toHaveLength(2);
+  expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(2);
+  released(f); scopeReleased(f);
+});
+it('stops on deferred admission after a repair without another repair round', async () => {
+  const f = fixture([['heavy-admission', (_, n) => n ? { status: 75, stderr: 'DEFER: wait budget exhausted' } : red()]]);
+  const { code, result } = await f.run();
+  expect(code).toBe(31);
+  expect(result).toMatchObject({ stopReason: 'tests-deferred', tests: { status: 'deferred', repaired: false }, detail: '\nDEFER: wait budget exhausted' });
+  expect(codexCalls(f)).toHaveLength(2);
+  expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(2);
+  expect(f.writes).toHaveLength(1);
+  expect(f.calls.some(c => c.args.includes('--review') || c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+  released(f); scopeReleased(f);
+});
 it('repairs red tests once, includes bounded failure data, and passes on green', async () => {
   const f = fixture([['heavy-admission', (_, n) => n ? ok() : red('x'.repeat(10000))]]);
   const { result } = await f.run();
@@ -144,6 +184,8 @@ it('repair Codex failure stops before a second test run', async () => {
   const f = fixture([['heavy-admission', red()], ['codex-direct-task.mjs --task-file', (_, n) => n ? red() : report()]]);
   const { code, result } = await f.run();
   expect(code).toBe(20); expect(result.stopReason).toBe('codex-failed'); expect(codexCalls(f)).toHaveLength(2);
+  expect(result.tests).toEqual({ status: 'red', repaired: true });
+  expect(result.detail).toBe('codex-failed\nfailure output\ntest error');
   expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1); released(f);
 });
 it('rechecks scope after a repair or green tests before auditing', async () => {
