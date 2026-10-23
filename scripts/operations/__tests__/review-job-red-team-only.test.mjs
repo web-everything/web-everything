@@ -119,18 +119,21 @@ describe('red-team-only review job', () => {
     ['recorded-result recovery finishes missing comment and miss rows with zero model invocations', null],
     ['two consecutive recovery attempts retry a failed comment then succeed with zero model invocations', 'comment'],
     ['a transient production scorecard EIO preserves resume eligibility and retries with zero model invocations', 'store'],
+    ['card-only recovery publishes a recorded result after the skip setting is restored', 'card-only'],
   ])('%s', (_name, failure) => {
     const failFirstComment = failure === 'comment';
+    const cardOnly = failure === 'card-only';
+    const needsRetry = failure === 'comment' || failure === 'store';
     const loopPayload = payload();
-    Object.assign(loopPayload.findings.read, { title: 'Recover stored result', netChangedFiles: ['scripts/example.mjs'],
-      diffText: 'diff --git a/scripts/example.mjs b/scripts/example.mjs\n+export const example = true;\n' });
+    Object.assign(loopPayload.findings.read, { title: 'Recover stored result', netChangedFiles: [cardOnly ? 'backlog/123-card.md' : 'scripts/example.mjs'],
+      diffText: cardOnly ? '+card update' : 'diff --git a/scripts/example.mjs b/scripts/example.mjs\n+export const example = true;\n' });
     const prior = { dispatchKind: 'review-seat', seat: 'red-team', lens: 'red-team', status: 'ok',
-      pr, repo, rev: head, callId: 'recorded-call', provider: 'codex', model: 'm', foldedVerdict: 'changes',
-      changedFiles: ['scripts/example.mjs'], findings: [{ summary: 'Stored confirmed break', category: 'failing-input',
+      pr, repo, rev: head, callId: 'recorded-call', provider: 'codex', model: 'm', foldedVerdict: cardOnly ? 'accept' : 'changes',
+      changedFiles: loopPayload.findings.read.netChangedFiles, findings: cardOnly ? [] : [{ summary: 'Stored confirmed break', category: 'failing-input',
         file: 'scripts/example.mjs', line: 1, impactIfUnfixed: 'degraded', confirmedByRecheck: true,
         recheckReason: 'demonstrated break' }] };
     let observed, job, attempt = 0;
-    let status = { status: 'finished', result: { status: 'ran', comment: 'error' } };
+    let status = { status: 'finished', result: cardOnly ? 'ran' : { status: 'ran', comment: 'error' } };
     const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }), readRedTeamRecords: () => [prior, ...(observed?.rows ?? [])],
       readRedTeamStatus: () => status,
       recordRedTeamQueued: vi.fn(input => { status = { status: input.status, result: input.result ?? null }; }),
@@ -146,7 +149,8 @@ describe('red-team-only review job', () => {
           const comments = saved?.comments ?? [], rows = saved?.rows ?? [];
           const calls = { model: 0, recheck: 0, reserve: 0, provider: 0 };
           const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
-          const result = await runRedTeam({ ...input, resumeOnly: input.redTeamMode === 'resume', env: {} }, {
+          const result = await runRedTeam({ ...input, resumeOnly: input.redTeamMode === 'resume',
+            env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' } }, {
             now: () => 1_000, log: () => {}, readRecords: () => failStore
               ? readStore({ path: '/injected/scorecards.json', exists: () => true,
                 read: () => { throw Object.assign(Error('temporary store failure'), { code: 'EIO' }); } }).records
@@ -199,16 +203,16 @@ describe('red-team-only review job', () => {
       expect(recover(1_801_000).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'resume' }]);
       expect(job).toMatchObject({ outcome: 'red-team-only', redTeam: { status: 'resumed' } });
     }
-    expect(observed.result).toMatchObject({ status: 'resumed', comment: { status: 'posted' }, rowsWritten: failFirstComment ? 0 : 2 });
+    expect(observed.result).toMatchObject({ status: 'resumed', comment: { status: 'posted' }, rowsWritten: failFirstComment || cardOnly ? 0 : 2 });
     expect(observed.calls).toEqual({ model: 0, recheck: 0, reserve: 0, provider: 0 });
     expect(observed.comments).toHaveLength(1);
     expect(redTeamForHead(observed.comments, pr, head)).toMatchObject({ pr, rev: head });
-    expect(observed.rows.map(row => row.missRole).sort()).toEqual(['accepting-review', 'builder']);
+    expect(observed.rows.map(row => row.missRole).sort()).toEqual(cardOnly ? [] : ['accepting-review', 'builder']);
     expect(observed.rows.every(row => row.redTeamCallId === prior.callId && row.rev === head)).toBe(true);
     expect(io.runRedTeamGate).toHaveBeenCalledWith({ pr, repo });
-    expect(io.recordRedTeamQueued).toHaveBeenCalledTimes(failure ? 2 : 1);
+    expect(io.recordRedTeamQueued).toHaveBeenCalledTimes(needsRetry ? 2 : 1);
     expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(
-      failure ? ['finished', 'finished'] : ['finished']);
+      needsRetry ? ['finished', 'finished'] : ['finished']);
     expect(recover(3_601_000).dispatched).toEqual([]);
     expect(io.runLoop).not.toHaveBeenCalled(); expect(io.runExtraSeats).not.toHaveBeenCalled();
   });

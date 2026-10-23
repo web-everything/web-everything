@@ -50,7 +50,7 @@ export default {
       const { runReviewTick } = await load(DAEMON);
       const { planReconcile } = await load('scripts/conveyor/reconcile-core.mjs');
       const { buildReviewedShaMarker } = await load('scripts/lib/review-escalation.mjs');
-      const { renderRedTeamComment } = await load('scripts/operations/review-extra-seats.mjs');
+      const { renderRedTeamComment, runRedTeam } = await load('scripts/operations/review-extra-seats.mjs');
       const recovery = existsSync(join(sourceRoot, RECOVERY)) ? await load(RECOVERY) : null;
       const head = 'a'.repeat(40);
       const payload = verdict => ({ verdict: { verdict }, findings: { read: { netBasis: { rev: head } } } });
@@ -65,6 +65,11 @@ export default {
           status: { status: 'finished', result: 'ran' } },
         { number: 5759, queued: true, mode: 'fresh', evidence: evidence(), status: null },
         { number: 5760, queued: true, mode: 'resume', evidence: evidence({ recorded: true }),
+          status: { status: 'finished', result: 'ran' } },
+        // #5838: the original call ran with card-only probes enabled; policy changed before recovery.
+        { number: 5838, queued: true, mode: 'resume', evidence: evidence({ recorded: true,
+          loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head },
+            netChangedFiles: ['backlog/123-card.md'], diffText: '+card update' } } } }),
           status: { status: 'finished', result: 'ran' } },
         // Synthetic controls reproduce the unit tests' no-start boundaries on already-reviewed heads.
         { number: 9001, queued: true, evidence: evidence({ loopPayload: payload('changes') }), status: null },
@@ -89,7 +94,7 @@ export default {
           reviewTiming: { startAfter: 'ci-green' }, requiredChecks: ['gate'] });
         const out = runReviewTick({ repo, reconcile: () => plan,
           readPrs: () => rawPrs, readAgents: () => [], holdReconcile: () => [],
-          acquirableLanes: () => 4, liveReviewBudget: { left: 4 }, now: () => at,
+          acquirableLanes: () => 5, liveReviewBudget: { left: 5 }, now: () => at,
           tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
           dispatch: args => { violations.push(`${phase}: unexpected full review for #${args.pr}`); return { skipped: 'soak' }; },
           redTeamOnSkip: recovery ? options => recovery.runRedTeamOnSkip({ ...options,
@@ -113,6 +118,25 @@ export default {
         }
       };
       tick('accepted skip');
+      const card = byPr.get(5838);
+      const recoveryComments = [];
+      const result = await runRedTeam({ pr: card.number, repo, loopPayload: card.evidence.loopPayload,
+        resumeOnly: true, env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' } }, {
+        now: () => at, log: () => {},
+        readRecords: () => [{ dispatchKind: 'review-seat', seat: 'red-team', status: 'ok',
+          pr: card.number, repo, rev: head, callId: 'stored-card-call', provider: 'codex', model: 'soak',
+          findings: [], foldedVerdict: 'accept' }],
+        listComments: () => recoveryComments,
+        postComment: ({ body }) => recoveryComments.push({ body, author: { login: 'web-everything' } }),
+        append: () => {},
+        cliAvailable: () => { throw Error('recovery selected a provider'); },
+        reserveCalls: () => { throw Error('recovery reserved a call'); },
+        runSeat: () => { throw Error('recovery launched a model'); },
+        runRecheck: () => { throw Error('recovery launched a re-check'); },
+      });
+      check(result.status === 'resumed' && result.comment?.status === 'posted' && recoveryComments.length === 1,
+        '#5838: current card-only skip stranded a recorded result instead of publishing its recovery');
+      card.comments = recoveryComments;
       at += 120_000;
       tick('next tick within cooldown');
       for (const c of cases.filter(c => c.mode)) c.evidence = evidence({ recorded: true, inFlight: true });

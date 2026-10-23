@@ -1420,13 +1420,6 @@ export async function speculateRedTeam({
     const rev = read.netBasis?.rev;
     if (!isPinnedRev(rev)) return { status: 'skipped', reason: 'the review printed no pinned head commit (netBasis.rev)' };
     const settings = readRedTeamProbes({ env, log: io.log });
-    // The net path list names only rename/copy destinations. Include sources so
-    // moving executable code into backlog/ cannot turn the probe off. Unknown
-    // or empty destination lists and malformed source lists must still probe.
-    if (settings.value.skipCardOnly && redTeamCardOnly(read)) {
-      io.log('red team skipped: card-only');
-      return { status: 'skipped', reason: 'red team skipped: card-only' };
-    }
     const now = io.now();
     let records = [];
     try { records = io.readRecords(); } catch (e) {
@@ -1439,6 +1432,14 @@ export async function speculateRedTeam({
     // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
     if (prior && !resume) return { status: 'prior-row', reason: `a clean red-team row already exists for #${pr} at ${rev.slice(0, 12)}` };
     if (prior) return await resumeRedTeam({ pr, repo, rev, title: read.title, prior, records, post, record }, io);
+    // Launch policy applies only to new calls: a recorded pass must finish its effects even if policy changed.
+    // The net path list names only rename/copy destinations. Include sources so
+    // moving executable code into backlog/ cannot turn the probe off. Unknown
+    // or empty destination lists and malformed source lists must still probe.
+    if (settings.value.skipCardOnly && redTeamCardOnly(read)) {
+      io.log('red team skipped: card-only');
+      return { status: 'skipped', reason: 'red team skipped: card-only' };
+    }
     // Card xn2wf9t — each provider's OWN cap, same treatment as `runExtraSeats`: a provider already at its cap is
     // excluded from `available` up front, so `selectReviewSeatProvider` picks whichever else has budget rather
     // than the pass giving up outright. The reservation loop below still guards the rare RACE (a concurrent pass

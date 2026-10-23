@@ -34,5 +34,37 @@ for (const entry of [runRedTeam, speculateRedTeam]) {
       expect(io.postComment).toHaveBeenCalledOnce();
       noCalls(io);
     });
+    it.each([true, false])('restores a recorded card-only result before applying the current skip (resumeOnly=%s)', async resumeOnly => {
+      const cardRead = { ...read, netChangedFiles: ['backlog/123-card.md'] };
+      const io = fakeIo(() => [prior]);
+      expect(await entry({ pr, repo, read: cardRead,
+        loopPayload: { ...loopPayload, findings: { read: cardRead } },
+        env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' }, resumeOnly }, io)).toMatchObject({
+        status: 'resumed', callId: prior.callId, comment: { status: 'posted' },
+      });
+      expect(io.postComment).toHaveBeenCalledOnce();
+      noCalls(io);
+    });
+    it('still skips a fresh card-only call before provider selection or reservation', async () => {
+      const cardRead = { ...read, netChangedFiles: ['backlog/123-card.md'] };
+      const io = fakeIo(() => []);
+      expect(await entry({ pr, repo, read: cardRead,
+        loopPayload: { ...loopPayload, findings: { read: cardRead } },
+        env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' } }, io)).toEqual({
+        status: 'skipped', reason: 'red team skipped: card-only',
+      });
+      expect(io.postComment).not.toHaveBeenCalled();
+      noCalls(io);
+    });
+    if (entry === speculateRedTeam) {
+      it('reports a recorded card-only result without publishing before the verdict', async () => {
+        const io = fakeIo(() => [prior]);
+        expect(await entry({ pr, repo, read: { ...read, netChangedFiles: ['backlog/123-card.md'] },
+          env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' }, resume: false }, io)).toMatchObject({ status: 'prior-row' });
+        expect(io.postComment).not.toHaveBeenCalled();
+        expect(io.append).not.toHaveBeenCalled();
+        noCalls(io);
+      });
+    }
   });
 }
