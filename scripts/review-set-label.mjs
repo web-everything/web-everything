@@ -1459,7 +1459,7 @@ export function runReviewLabelCli({
     humanOnlyHold,
     redTeamRulingHold,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
-    humanClearedHead: to === 'rearm' && headEverHumanCleared(fullThread(), headSha),
+    humanClearedHead: to === 'rearm' && headEverHumanCleared(fullThread(), headSha.trim()),
   });
   if (!decision.allowed && !restampAcrossHold) {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
@@ -1815,9 +1815,10 @@ export function runReviewLabelCli({
     if (live !== expectedHead) fail('live head differs from --expect-head; nothing written', 1);
   }
 
-  // Missing-only rearm must re-check clearance before ANY write, including the comment and shadow ledger.
+  // Missing-only rearm rechecks before any write and again at the label swap: clearance can arrive during the comment.
   let removals = presentRemoveLabels(decision.removeLabels, currentLabels);
-  if (onlyIf === 'missing') {
+  const recheckMissingRearm = () => {
+    if (onlyIf !== 'missing') return;
     let fresh;
     try { fresh = provider.readPrState(repo, pr); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (!Array.isArray(fresh.comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
@@ -1825,7 +1826,7 @@ export function runReviewLabelCli({
     const freshComments = fullThread(fresh.comments).filter(isTrustedMarkerAuthor);
     const freshDecision = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: fresh.labels,
       acceptanceStillCoversHead: parseReviewedSha(freshComments) === fresh.headRefOid,
-      humanClearedHead: headEverHumanCleared(freshComments, fresh.headRefOid) });
+      humanClearedHead: headEverHumanCleared(freshComments, fresh.headRefOid.trim()) });
     if (!freshDecision.allowed) refuseRearm(freshDecision.reason);
     // A producer can restore readiness after our missing-routing observation. That new
     // decision supersedes this recovery, even without a reviewed-sha marker. Readiness
@@ -1836,7 +1837,8 @@ export function runReviewLabelCli({
       fail('missing review handoff refused: state, draft status, head, readiness or review family changed before write', 1);
     }
     removals = presentRemoveLabels(decision.removeLabels, fresh.labels);
-  }
+  };
+  recheckMissingRearm();
 
   const ledgerVerdict = verdictForLabelTarget(to);
   let clearingLedgerMiss = false;
@@ -1916,6 +1918,11 @@ export function runReviewLabelCli({
           removals = [...removals, REVIEW_LABELS.human];
         }
       }
+    } catch (e) {
+      fail(ghErr(e, 'gh pr edit failed'), 1);
+    }
+    recheckMissingRearm();
+    try {
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
     } catch (e) {
       fail(ghErr(e, 'gh pr edit failed'), 1);

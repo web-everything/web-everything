@@ -3052,11 +3052,12 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     rmSync(`${ledgerDir}-locks`, { recursive: true, force: true });
   });
   // The caller read `accepted`; by the child's own read a reviewer has flipped it to `changes`.
-  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), freshState = {} } = {}) {
+  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), freshState = {}, swapState = freshState } = {}) {
     const calls = [];
     const initial = { labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '',
       ...(omitComments ? {} : { comments }) };
-    const readPrState = vi.fn().mockReturnValueOnce(initial).mockReturnValue({ ...initial, ...freshState });
+    const readPrState = vi.fn().mockReturnValueOnce(initial).mockReturnValueOnce({ ...initial, ...freshState })
+      .mockReturnValue({ ...initial, ...swapState });
     const provider = {
       name: 'stub',
       currentRepo: () => 'o/n',
@@ -3126,6 +3127,16 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
   });
 
+  it('CLI rearm preserves human clearance with a whitespace-padded valid head', () => {
+    const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } }];
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, headRefOid: ` \t${'A'.repeat(40)}\n` });
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
   it.each([{ omitComments: true }, { comments: null }, { comments: {} }, { comments: 'unreadable' }])('CLI rearm fails closed without writes when initial comments are not an array (%j)', (options) => {
     const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], options);
     expect(result.exitCode).toBe(1);
@@ -3177,6 +3188,16 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
   });
 
   const missingArgs = ['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`];
+  it('missing-only rearm refuses the label swap when clearance arrives during the comment write', () => {
+    const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } }];
+    const result = run(missingArgs, [], { swapState: { comments } });
+    expect(result.readPrState).toHaveBeenCalledTimes(3);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual(['postComment']);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
   it('rearm refuses whitespace and non-hex heads on both initial and missing-only fresh reads before any write', () => {
     for (const fresh of [false, true]) {
       for (const headRefOid of ['', null, {}, ' \t\n', 'not-a-sha', 'a'.repeat(6), 'a'.repeat(41)]) {
