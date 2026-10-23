@@ -18,7 +18,8 @@ export default {
   },
   fixPresent(root) {
     return ['scripts/conveyor/await-verify-loop.mjs', 'skills-src/conveyor/pass-daemon.mjs']
-      .every((path) => readFileSync(join(root, path), 'utf8').includes('isGithubAppAuthGuardError(error)'));
+      .every((path) => readFileSync(join(root, path), 'utf8').includes('isGithubAppAuthGuardError(error)'))
+      && readFileSync(join(root, 'scripts/lib/github-app-auth-env.mjs'), 'utf8').includes("'guard-config-invalid'");
   },
   async run({ log } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-gh-guard-'));
@@ -59,6 +60,37 @@ export default {
         const invoked = existsSync(marker);
         log?.(`${loop} failAt=${failAt}: rejected=${rejected}, work=${work}, unguardedGh=${invoked}`);
         if (!rejected || work !== failAt - 1 || invoked) violations.push(`${loop} failAt=${failAt}: guard refusal swallowed (work=${work}, unguardedGh=${invoked})`);
+      }
+      // Red team on 07ea5585e: a malformed delivery.identity threw a TypeError BEFORE the guard was installed,
+      // the loop swallowed it as a transient refresh error, and the cycle ran on the personal token.
+      const malformedIdentity = JSON.stringify({ worker: { appId: '1', key: { file: '/fixture.pem' }, installations: { 'web-everything': { toString: null } } } });
+      for (const loop of ['pass', 'verify']) {
+        rmSync(marker, { force: true });
+        const env = { HOME: dir, PATH: dir, GH_TOKEN: 'fixture-personal', WE_DELIVERY_IDENTITY: malformedIdentity };
+        let work = 0;
+        let rejected = false;
+        const refresh = () => ensureFreshGithubAppEnv({
+          env, daemon: true, caller: 'soak-guard-config', policy: { auth: 'app' },
+          writeStatus: () => {}, writeCallerStatus: () => {}, log: { error() {} },
+          installShim: async () => ({ ok: true }),
+        });
+        const cycle = async () => {
+          work++;
+          spawnSync('gh', ['repo', 'view'], { env, timeout: 2000, stdio: 'ignore' });
+          return { code: 0 };
+        };
+        try {
+          if (loop === 'pass') {
+            await runPassDaemonLoop({ refreshAuth: refresh, runPass: cycle, intervalMs: 1, maxRuns: 1, sleep: async () => {} });
+          } else {
+            await runLoopCycle({ ensureAuth: refresh, cycle });
+          }
+        } catch (error) {
+          rejected = /refusing to run daemon without the gh auth guard/.test(error.message);
+        }
+        const invoked = existsSync(marker);
+        log?.(`${loop} malformed identity: rejected=${rejected}, work=${work}, unguardedGh=${invoked}`);
+        if (!rejected || work !== 0 || invoked) violations.push(`${loop} malformed identity: pre-guard config error swallowed (work=${work}, unguardedGh=${invoked})`);
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
     return { violations };

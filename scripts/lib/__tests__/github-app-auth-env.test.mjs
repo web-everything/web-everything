@@ -666,6 +666,45 @@ describe('daemon refresh lookahead and legacy fallback liveness', () => {
     expect(work).not.toHaveBeenCalled();
   });
 
+  // PR #5729 red team: a config read that throws BEFORE the guard is installed (a malformed
+  // delivery.identity, an unreadable auth policy) must still stop the daemon, never fall through to its cycle.
+  const PRE_GUARD_FAILURES = {
+    'malformed identity env': {
+      env: { WE_DELIVERY_IDENTITY: JSON.stringify({ worker: { appId: '1', key: { file: '/fixture.pem' }, installations: { 'web-everything': { toString: null } } } }) },
+      opts: { policy: { auth: 'app' } },
+    },
+    'identity that throws on read': {
+      opts: { policy: { auth: 'app' }, identity: { get callerRoles() { throw TypeError('fixture malformed identity'); } } },
+    },
+    'policy that throws on read': {
+      opts: { identity: {}, policy: { get auth() { throw TypeError('fixture malformed policy'); } } },
+    },
+  };
+  it.each(['pass', 'verify'].flatMap((loop) => Object.keys(PRE_GUARD_FAILURES).map((failure) => [loop, failure])))
+  ('stops the real %s loop when a pre-guard config read throws (%s)', async (loop, failure) => {
+    const { env: extraEnv = {}, opts } = PRE_GUARD_FAILURES[failure];
+    const env = { PATH: '/usr/bin:/bin', GH_TOKEN: 'fixture-personal', ...extraEnv };
+    const work = vi.fn(async () => ({ code: 0 }));
+    const writeCallerStatus = vi.fn();
+    const refresh = () => ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, writeCallerStatus, env, daemon: true, caller: 'guard-config-test', ...opts,
+      installShim: async () => ({ ok: true }), log: { error() {} },
+    });
+    const attempt = loop === 'pass'
+      ? runPassDaemonLoop({ refreshAuth: refresh, runPass: work, sleep: async () => {}, intervalMs: 1, maxRuns: 1 })
+      : runLoopCycle({ ensureAuth: refresh, cycle: work });
+    await expect(attempt).rejects.toThrow('refusing to run daemon without the gh auth guard');
+    expect(work).not.toHaveBeenCalled();
+    expect(writeCallerStatus).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ applied: false, reason: 'guard-config-invalid' }));
+  });
+
+  it('a non-daemon caller still sees the original config error (no guard to protect)', async () => {
+    await expect(ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env: {}, daemon: false, caller: 'interactive', policy: { auth: 'app' },
+      identity: { get callerRoles() { throw TypeError('fixture malformed identity'); } }, log: { error() {} },
+    })).rejects.toThrow('fixture malformed identity');
+  });
+
   it('installs the daemon refusal shim before a failed early refresh and before the tick', async () => {
     const { resolveDeliveryIdentity } = await import('../github-app-identity.mjs');
     const now = Date.now();

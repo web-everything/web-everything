@@ -423,28 +423,47 @@ export async function ensureFreshGithubAppEnv({
     return result;
   };
 
-  // `github.auth: personal` is an explicit, host-wide choice — honoured, recorded, never a silent fallback.
-  const authPolicy = policy ?? readGithubAuthPolicy({ env });
-  if (authPolicy.auth === 'personal') {
+  // Every config read before the guard is installed fails closed for a daemon: an unclassified throw here
+  // (a malformed delivery.identity, an unreadable policy) would otherwise reach the daemon loop, which only
+  // stops on GithubAppAuthGuardError, and its cycle would run on inherited personal credentials.
+  let authPolicy;
+  let personal;
+  let identity;
+  let requested;
+  let chain;
+  try {
+    // `github.auth: personal` is an explicit, host-wide choice — honoured, recorded, never a silent fallback.
+    authPolicy = policy ?? readGithubAuthPolicy({ env });
+    personal = authPolicy.auth === 'personal';
+    if (!personal) {
+      // PER-ROLE IDENTITY (we:scripts/lib/github-app-identity.mjs). With no role configured the chain is only today's
+      // App and everything below behaves exactly as before. Once ANY role is configured, this process's role App is
+      // tried first, then the worker App, then today's App, and every step down is logged and recorded loudly (the
+      // github-app-config smell reads the caller file) — never a silent fallback.
+      identity = identityOpt ?? readDeliveryIdentity({ env });
+      requested = resolveRequestedRole({ role: roleOpt, env, caller, callerRoles: identity.callerRoles });
+      chain = buildIdentityChain({ requestedRole: requested.role, identity, env, cachePath });
+      if (chain.loud) env[ROLE_ENV] = requested.role; // the gh shim and every child process pick the App by it
+    }
+  } catch (e) {
+    if (!daemon) throw e;
+    let why = 'unreadable error';
+    try { why = String((e && e.message) || e); } catch { /* keep the generic text */ }
+    try { log.error?.(`github-app-auth-env: ${caller} could not read its GitHub auth config before installing the gh guard: ${why}`); } catch { /* logging never reopens the path */ }
+    try { record({ applied: false, reason: 'guard-config-invalid' }); } catch { /* the refusal must still throw */ }
+    throw new GithubAppAuthGuardError();
+  }
+  if (personal) {
     warnOnce(log, `policy-personal:${caller}`, `github-app-auth-env: github.auth=personal (${authPolicy.source?.auth ?? '?'}) — ${caller} uses the operator's personal gh login by policy.`);
     return record({ applied: false, reason: 'policy-personal' }, { shared: false });
   }
-
-  // PER-ROLE IDENTITY (we:scripts/lib/github-app-identity.mjs). With no role configured the chain is only today's
-  // App and everything below behaves exactly as before. Once ANY role is configured, this process's role App is
-  // tried first, then the worker App, then today's App, and every step down is logged and recorded loudly (the
-  // github-app-config smell reads the caller file) — never a silent fallback.
-  const identity = identityOpt ?? readDeliveryIdentity({ env });
-  const requested = resolveRequestedRole({ role: roleOpt, env, caller, callerRoles: identity.callerRoles });
-  const chain = buildIdentityChain({ requestedRole: requested.role, identity, env, cachePath });
-  if (chain.loud) env[ROLE_ENV] = requested.role; // the gh shim and every child process pick the App by it
   // Install the refusal boundary BEFORE any cache/key/mint/access-check failure can return.
   // Without it a first tick can reach the real gh with inherited personal credentials.
   let daemonShim;
   if (daemon) {
     try { daemonShim = await installShim(env, { cachePath, identity }); } catch { /* fail closed below */ }
     if (!daemonShim?.ok) {
-      record({ applied: false, reason: 'shim-failed' });
+      try { record({ applied: false, reason: 'shim-failed' }); } catch { /* the refusal must still throw */ }
       throw new GithubAppAuthGuardError();
     }
   }
