@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH } from '../lane-git-diet.mjs';
-import { cleanupEligibility, parseCountObjects, projectedFreedBytes } from '../lane-git-diet-cleanup.mjs';
+import { cleanupEligibility, CLEANUP_POOLS, parseCountObjects, projectedFreedBytes } from '../lane-git-diet-cleanup.mjs';
 
 const REPO = join(import.meta.dirname, '..', '..', '..');
 const CLI = join(REPO, 'scripts', 'lane-git-diet.mjs');
@@ -109,6 +109,24 @@ describe('CLI repack and prune retention guarantees', () => {
     expectGraph(dir, retained);
   }), 60_000);
 
+  // `apply` passes no --prune-expire, so this pins the default 1.hour.ago window from both sides.
+  it('default prune grace keeps recent unreachable objects and drops ones older than an hour', () => fixture(({ dir, apply }) => {
+    const write = (text) => execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: dir, env, input: text, encoding: 'utf8' }).trim();
+    const backdate = (oid, ms) => {
+      const at = new Date(Date.now() - ms);
+      utimesSync(join(dir, '.git', 'objects', oid.slice(0, 2), oid.slice(2)), at, at);
+    };
+    const fresh = write('fresh unreachable');
+    const halfHour = write('half-hour unreachable');
+    const twoHours = write('two-hour unreachable');
+    backdate(halfHour, 30 * 60_000);
+    backdate(twoHours, 2 * 60 * 60_000);
+    apply();
+    expect(git(dir, 'cat-file', '-p', fresh)).toBe('fresh unreachable');
+    expect(git(dir, 'cat-file', '-p', halfHour)).toBe('half-hour unreachable');
+    expect(() => git(dir, 'cat-file', '-e', twoHours)).toThrow();
+  }), 60_000);
+
   it('repack keeps stale linked-worktree metadata and its HEAD-only history despite repo expiry=now', () => fixture(({ dir, root, retained, apply }) => {
     const linked = join(root, 'offline-worktree');
     git(dir, 'worktree', 'add', '--detach', linked, retained.commit);
@@ -153,7 +171,8 @@ describe('cleanupEligibility (pure)', () => {
   const nowMs = Date.parse('2026-10-21T15:00:00Z');
   const fresh = { acquiredAt: '2026-10-21T14:50:00Z', purpose: 'x' };
   const stale = { acquiredAt: '2026-10-20T00:00:00Z' };
-  it('allows an unleased pool lane', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs }).ok).toBe(true));
+  // Every allow-listed pool gets a positive case, so a pool added to CLEANUP_POOLS is covered automatically.
+  it.each(CLEANUP_POOLS)('allows an unleased lane in the %s pool', (pool) => expect(cleanupEligibility({ dir: `${poolRoot}/${pool}/lane-5`, poolRoot, nowMs }).ok).toBe(true));
   it('refuses even a stale lease marker (the cleanup only claims an ABSENT marker, O_EXCL)', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, lease: stale, nowMs })).toMatchObject({ ok: false, reason: expect.stringMatching(/stale lease marker/) }));
   it('refuses a lane another repo borrows objects from', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-13`, poolRoot, nowMs, borrowers: ['/x/lane-48'] })).toMatchObject({ ok: false, reason: expect.stringMatching(/borrowed by/) }));
   it('refuses a symlink alias or a .git that resolves elsewhere', () => {
@@ -588,6 +607,28 @@ describe('real git: cleanup CLI', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 
+  it('a borrower appearing during the repack, before prune, skips prune and keeps the old object it borrows', async () => {
+    const dir = lane(24);
+    const borrower = join(root, 'repack-borrower');
+    git(root, 'clone', '-q', up, dir);
+    const borrowed = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: dir, env, input: 'borrowed during repack', encoding: 'utf8' }).trim();
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(join(dir, '.git', 'objects', borrowed.slice(0, 2), borrowed.slice(2)), old, old);
+    try {
+      const out = await runPaused(24, 'before-prune', () => {
+        git(root, 'init', '-q', borrower);
+        writeFileSync(join(borrower, '.git', 'objects', 'info', 'alternates'), `${join(dir, '.git', 'objects')}\n`);
+      });
+      // The scan root is realpath'd (macOS /var → /private/var), so match the borrower by its tail.
+      expect(out.rows[0].skipped).toMatch(/^objects borrowed by .*\/repack-borrower \(repack done, prune skipped\)$/);
+      expect(git(borrower, 'cat-file', '-p', borrowed)).toBe('borrowed during repack');
+      expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    } finally {
+      rmSync(borrower, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   // An operation that starts mid-run names a commit gc does not keep: the same audit must stop gc or prune.
   it.each([
     ['MERGE_HEAD', 'before-gc', '(config + ref cleanup done, gc skipped)'],
@@ -892,6 +933,52 @@ describe('real git: cleanup CLI', () => {
       rmSync(borrower, { recursive: true, force: true });
       rmSync(dir, { recursive: true, force: true });
       rmSync(alias, { force: true });
+    }
+  }, 60_000);
+});
+
+describe('CLI pools and per-lane failure isolation', () => {
+  let root;
+  let up;
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'lane-diet-pools-'));
+    up = join(root, 'up');
+    mkdirSync(up);
+    git(up, 'init', '-q', '-b', 'main');
+    writeFileSync(join(up, 'a.txt'), 'a');
+    git(up, 'add', 'a.txt');
+    git(up, 'commit', '-qm', 'a');
+  }, 60_000);
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  const cli = (poolRoot, ...args) => JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--json', ...args], { env, encoding: 'utf8' }));
+
+  // One lane per pool, each with its own number, so a `--pool` the CLI ignores lists the wrong lane.
+  it('--pool reads only that pool\'s lanes, for every allow-listed pool', () => {
+    const poolRoot = join(root, 'pools');
+    CLEANUP_POOLS.forEach((pool, i) => git(root, 'clone', '-q', up, join(poolRoot, pool, `lane-${i + 1}`)));
+    for (const [i, pool] of CLEANUP_POOLS.entries()) {
+      const out = cli(poolRoot, `--pool=${pool}`);
+      expect(out).toMatchObject({ mode: 'dry-run', pool });
+      expect(out.rows).toEqual([expect.objectContaining({ lane: i + 1, mode: 'dry-run' })]);
+    }
+    expect(cli(poolRoot).rows).toEqual([expect.objectContaining({ lane: CLEANUP_POOLS.indexOf('web-everything') + 1, mode: 'dry-run' })]);
+    expect(spawnSync('node', [CLI, `--pool-root=${poolRoot}`, '--pool=we-drain-daemon'], { env, encoding: 'utf8' }).status).toBe(2);
+  }, 60_000);
+
+  it('a lane whose git config cannot be read gets an error row, and the lanes around it are still cleaned', () => {
+    const poolRoot = join(root, 'isolation');
+    const lane = (n) => join(poolRoot, 'web-everything', `lane-${n}`);
+    for (const n of [1, 2, 3]) git(root, 'clone', '-q', up, lane(n));
+    writeFileSync(join(lane(2), '.git', 'config'), `${readFileSync(join(lane(2), '.git', 'config'), 'utf8')}[[[\n`);
+    for (const mode of [[], ['--prune-expire=now', '--apply', '--lanes=1,2,3']]) {
+      const out = cli(poolRoot, ...mode);
+      const want = mode.length ? 'apply' : 'dry-run';
+      expect(out.rows).toEqual([
+        expect.objectContaining({ lane: 1, mode: want }),
+        { lane: 2, error: expect.stringMatching(/bad config/) },
+        expect.objectContaining({ lane: 3, mode: want }),
+      ]);
+      expect(existsSync(join(lane(2), '.git', '.lane-lease'))).toBe(false);
     }
   }, 60_000);
 });

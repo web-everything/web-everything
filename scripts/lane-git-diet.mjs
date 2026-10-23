@@ -184,10 +184,12 @@ const rows = [];
 let total = 0;
 for (const n of lanes) {
   const dir = join(poolDir, `lane-${n}`);
-  if (!existsSync(join(dir, '.git')) || !statSync(join(dir, '.git')).isDirectory()) { rows.push({ lane: n, skipped: 'no .git dir' }); continue; }
-  const e = eligible(dir);
-  if (!e.ok) { rows.push({ lane: n, skipped: e.reason }); continue; }
+  // The eligibility reads are inside the try: one unreadable lane (e.g. a corrupt config, git exit 128) is refused
+  // as its own error row, never a crash that drops the report for lanes already changed and skips the rest.
   try {
+    if (!existsSync(join(dir, '.git')) || !statSync(join(dir, '.git')).isDirectory()) { rows.push({ lane: n, skipped: 'no .git dir' }); continue; }
+    const e = eligible(dir);
+    if (!e.ok) { rows.push({ lane: n, skipped: e.reason }); continue; }
     const refs = opsRefs(dir);
     const counts = parseCountObjects(git(dir, ['count-objects', '-v']));
     if (!APPLY) {
