@@ -23,29 +23,29 @@ describe('adoption matrix', () => {
     ]);
   });
 
-  it('uses supplied SHAs, runs only rev-parse in clones and resolves ancestry in the primary repo', () => {
+  it('uses supplied SHAs and runs only merge-base --is-ancestor inside clones', () => {
     const calls = [];
     const read = createAdoptionMatrixReader({ ...defaults, run: (bin, argv, options) => {
-      calls.push({ argv, cwd: options.cwd });
+      calls.push(argv);
       expect(bin).toBe('git');
       expect(options.cwd).toBe('/repo');
-      if (argv[0] === '-C') {
-        expect(argv.slice(2)).toEqual(['rev-parse', 'HEAD']);
-        return { status: 0, stdout: `h-${argv[1].split('/').pop()}\n` };
-      }
       if (argv[0] === 'rev-parse') return { status: 0, stdout: 'dddd\n' };
-      expect(argv.slice(0, 2)).toEqual(['merge-base', '--is-ancestor']);
-      expect(argv[2]).toMatch(/^(bbbb|dddd)$/);
-      return { status: argv[3] === 'h-yes' ? 0 : argv[3] === 'h-no' ? 1 : 128 };
+      expect(argv[0]).toBe('-C');
+      expect(argv.slice(2)).toEqual(['merge-base', '--is-ancestor', expect.stringMatching(/^(bbbb|dddd)$/), 'HEAD']);
+      return { status: argv[1].endsWith('/yes') ? 0 : argv[1].endsWith('/no') ? 1 : 128 };
     } });
     const result = read();
     const byName = row => Object.fromEntries(result.clones.map((clone, i) => [clone.name, row.cells[i]]));
     expect(result.rows.map(row => row.tipSha)).toEqual(['bbbb', 'dddd']);
     for (const row of result.rows) {
-      expect(byName(row)).toEqual({ yes: 'yes', no: 'no', error: 'unknown (clone-local build)', missing: '?' });
+      expect(byName(row)).toEqual({ yes: 'yes', no: 'no', error: 'no (not in clone)', missing: '?' });
     }
-    expect(calls.filter(c => c.argv[0] === '-C').every(c => c.argv[2] === 'rev-parse')).toBe(true);
-    expect(calls.some(c => c.argv.includes('/clones/missing'))).toBe(false);
+    expect(calls.some(argv => argv.includes('/clones/missing'))).toBe(false);
+  });
+
+  it('other exit codes stay unknown', () => {
+    const result = createAdoptionMatrixReader({ ...defaults, run: () => ({ status: 2 }) })();
+    expect(result.rows[0].cells).toEqual(['?', '?', '?', '?']);
   });
 
   it('explicit branches bypass the log, prefer origin then local, and unresolved tips yield unknown rows', () => {
@@ -100,7 +100,7 @@ describe('adoption matrix', () => {
       },
       exec: (_bin, argv) => JSON.stringify({ WorkingDirectory: argv.at(-1).includes('excluded') ? '/excluded' : '/shared' }),
       isDirectory: () => true,
-      run: (_bin, argv) => (argv[0] === 'rev-parse' || argv[0] === '-C') ? { status: 0, stdout: 'dddd' } : { status: 0 },
+      run: (_bin, argv) => argv[0] === 'rev-parse' ? { status: 0, stdout: 'dddd' } : { status: 0 },
     })();
     expect(seen).toEqual(['/settings', '/fixes']);
     expect(result.clones).toEqual([
