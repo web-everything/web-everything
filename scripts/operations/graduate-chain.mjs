@@ -47,8 +47,8 @@ export function suggestedSplit(entries) {
 }
 
 /** All command IO is injected; filesystem resources are supplied by the tiny IO shell. */
-export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPlatform, buildPolicy,
-  cascadePolicy, resolveBuildPolicy, extractSubmitResult, readTemplate, writeBody, mergeEnvironment = () => ({}), cleanup = () => {} }) {
+export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPlatform,
+  cascadePolicy, extractSubmitResult, readTemplate, writeBody, mergeEnvironment = () => ({}), cleanup = () => {} }) {
   const out = { ok: false, pr: null, branch: `lane/${input.purpose}`, sha: null,
     stopReason: null, steps: [], size: { nonTest: 0, test: 0, files: 0 } };
   let lane;
@@ -121,11 +121,9 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
       let imports;
       try { imports = json(imported); } catch { stop('import-check'); }
       if (imported.status !== 0 || !Array.isArray(imports.findings) || imports.findings.length) stop('import-check');
-      const policy = buildPolicy ?? resolveBuildPolicy({ env });
-      const gate = policy.sources.finalGate === 'standard' ? 'related' : policy.finalGate;
-      out.buildPolicy = { finalGate: gate, source: policy.sources.finalGate === 'standard' ? 'graduate-chain' : policy.sources.finalGate };
+      // build.finalGate comes from the settings cascade inside verify; no override is set here.
       const verified = command('verify-unrun', 'node', ['scripts/operations/run.mjs', 'verify', `--checkout=${lane.path}`, '--json'], lane.path,
-        { WE_BUILD_FINAL_GATE: gate, WE_HEAVY_ADMISSION_CEILING_MS: env.WE_HEAVY_ADMISSION_CEILING_MS || '7200000' }, true);
+        { WE_HEAVY_ADMISSION_CEILING_MS: env.WE_HEAVY_ADMISSION_CEILING_MS || '7200000' }, true);
       let verdict;
       try { verdict = json(verified).verdict; } catch { stop('verify-unrun'); }
       if (!verdict || !Array.isArray(verdict.checks) || !verdict.checks.length || verdict.checks.some(c => !['pass', 'fail'].includes(c.outcome))) stop('verify-unrun');
