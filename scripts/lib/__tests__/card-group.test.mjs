@@ -708,7 +708,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     // Main after the merge carries source 1's head A. `views[n]` is the sequence of live reads of source n (the last
     // repeats); a read after a `pr close` reports CLOSED with the head GitHub recorded.
     // `second`: add source #2 (head B, not on main) whose reads fail, so the group keeps retrying.
-    function mergedRace(views, { closedAt, reopenFails = false, closeThrows = false, second = false } = {}) {
+    function mergedRace(views, { closedAt, reopenFails = false, closeThrows = false, second = false, stacked = [] } = {}) {
       const t = setup();
       const statePath = join(tmp(), 's.json');
       git(t.cwd, 'checkout', '-q', '-b', 'merged', t.base);
@@ -722,7 +722,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
         sources: [{ num: 1, headSha: t.a }, ...(second ? [{ num: 2, headSha: t.b }] : [])], ...(closedAt ? { closedAt: { 1: closedAt === 'a' ? t.a : closedAt } } : {}) }], failed: {} }));
       const seq = views({ a: t.a, aNew });
       let i = 0, closed = false;
-      const calls = [];
+      const calls = [], out = [];
       const exec = (cmd, args) => {
         calls.push(args.join(' '));
         if (args[0] === 'pr' && args[1] === 'view') {
@@ -731,14 +731,66 @@ describe('createCardGrouping — claim under the land mutex, close on current he
           const v = seq[Math.min(i++, seq.length - 1)];
           return JSON.stringify({ state: v.state ?? (closed ? 'CLOSED' : 'OPEN'), isDraft: false, headRefOid: v.head, headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
         }
+        if (args[0] === 'pr' && args[1] === 'list') {
+          expect(args).toEqual(['pr', 'list', '--state', 'open', '--base', 'lane/x', '--repo', 'o/r', '--json', 'number,baseRefName']);
+          return JSON.stringify(stacked.filter(p => p.base === 'lane/x').map(p => ({ number: p.number })));
+        }
+        if (args[0] === 'pr' && args[1] === 'edit') {
+          const child = stacked.find(p => String(p.number) === args[2]);
+          expect(args).toEqual(['pr', 'edit', args[2], '--repo', 'o/r', '--base', 'main']);
+          if (!child || child.fail) throw new Error('gh: retarget failed');
+          child.base = 'main';
+          return '';
+        }
         if (args[0] === 'pr' && args[1] === 'close') { closed = true; if (closeThrows) throw new Error('gh: timed out'); return ''; }
         if (args[0] === 'pr' && args[1] === 'reopen') { if (reopenFails) throw new Error('gh: 502'); closed = false; return ''; }
         if (args[0] === 'pr' && args[1] === 'comment') return '';
         throw new Error(`unexpected ${args.join(' ')}`);
       };
-      const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => mainAfter), exec, statePath, settings, log: { write() {} } });
-      return { r: g.reconcile({ force: true }), calls, state: readGroupState(statePath), t, aNew, again: () => g.reconcile({ force: true }), statePath, g };
+      const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => mainAfter), exec, statePath, settings, log: { write: s => out.push(s) } });
+      return { r: g.reconcile({ force: true }), calls, out, state: readGroupState(statePath), t, aNew, again: () => g.reconcile({ force: true }), statePath, g };
     }
+
+    it('retargets an open stacked child to main before closing its landed source', () => {
+      const child = { number: 101, base: 'lane/x' };
+      const { r, calls, out } = mergedRace(h => [{ head: h.a }], { stacked: [child] });
+      expect(child.base).toBe('main');
+      expect(calls.filter(c => /^pr (edit|close) /.test(c))).toEqual([
+        'pr edit 101 --repo o/r --base main', expect.stringMatching(/^pr close 1 /),
+      ]);
+      expect(out.join('')).toContain('retargeted #101 off lane/x to main before closing source #1');
+      expect(r.done).toEqual(['g']);
+    });
+
+    it('a failed child retarget keeps the source open and retries before closing on a later pass', () => {
+      const child = { number: 101, base: 'lane/x', fail: true };
+      const { r, calls, out, state, again, statePath } = mergedRace(h => [{ head: h.a }], { stacked: [child] });
+      expect(r.done).toEqual([]);
+      expect(calls.some(c => c.startsWith('pr close '))).toBe(false);
+      expect(child.base).toBe('lane/x');
+      expect(state.groups[0].mergedRetries).toBe(1);
+      expect(state.groups[0].settled?.['1']).toBeUndefined();
+      expect(out.join('')).toContain('could not retarget #101 off source #1');
+      child.fail = false;
+      expect(again().done).toEqual(['g']);
+      expect(child.base).toBe('main');
+      expect(calls.filter(c => /^pr (edit|close) /.test(c))).toEqual([
+        'pr edit 101 --repo o/r --base main', 'pr edit 101 --repo o/r --base main', expect.stringMatching(/^pr close 1 /),
+      ]);
+      expect(readGroupState(statePath).groups).toEqual([]);
+    });
+
+    it('persistent child retarget failure releases the source open after the bounded merged retries', () => {
+      const child = { number: 101, base: 'lane/x', fail: true };
+      const { r, calls, again, statePath } = mergedRace(h => [{ head: h.a }], { stacked: [child] });
+      expect(r.done).toEqual([]);
+      for (let pass = 2; pass < 10; pass++) expect(again().done).toEqual([]);
+      expect(again().done).toEqual(['g']);
+      expect(calls.filter(c => c.startsWith('pr edit 101 '))).toHaveLength(10);
+      expect(calls.some(c => c.startsWith('pr close '))).toBe(false);
+      expect(calls.some(c => c.startsWith('pr comment 1 ') && c.includes('10 tries'))).toBe(true);
+      expect(readGroupState(statePath).groups).toEqual([]);
+    });
 
     it('a push between verification and the close: not closed, the group is kept and the new head re-verified next pass', () => {
       const { r, calls, state } = mergedRace(h => [{ head: h.a }, { head: h.aNew }]);

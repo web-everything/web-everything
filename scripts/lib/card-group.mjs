@@ -62,6 +62,7 @@ import { bornAsIndexFromItems } from '../conveyor/queue-store.mjs';
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './constellation-repos.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { retargetStackedPrs } from './pr-merge-gate.mjs';
 
 export const CARD_GROUP_BRANCH_PREFIX = 'lane/card-group-';
 export const CARD_GROUP_MARKER = 'we-card-group';
@@ -864,6 +865,17 @@ export function createCardGrouping({
                 const marked = mutate(st2 => { const x = st2.groups.find(y => isLocalGroupSnapshot(y, g)); if (!x) return false; x.closedAt = { ...x.closedAt, [String(s.num)]: s.headSha }; return true; });
                 if (!marked?.ok || marked.result !== true) { say(`${tag}: could not record source #${s.num}'s verified head — retried`); retry = true; continue; }
                 g.closedAt = { ...g.closedAt, [String(s.num)]: s.headSha };
+                const headRef = pre.headRefName ?? sp.headRefName;
+                const retargeted = retargetStackedPrs({
+                  repo: localSlug, headRef, defaultBranch: 'main', exec,
+                  onRetarget: n => say(`${tag}: retargeted #${n} off ${headRef} to main before closing source #${s.num}`),
+                  onFailed: n => say(`${tag}: could not retarget #${n} off source #${s.num}`),
+                });
+                if (retargeted.failed.length > 0) {
+                  say(`${tag}: source #${s.num} left open because stacked PR retargeting failed — retried`);
+                  retry = true;
+                  continue;
+                }
                 let closeError = null;
                 try {
                   gh(['pr', 'close', String(s.num), '--repo', localSlug, '--comment',
