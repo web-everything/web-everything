@@ -10,7 +10,8 @@ import { describe, expect, it } from 'vitest';
 import * as realFs from 'node:fs';
 import { readFileSync, mkdtempSync, rmSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { withRealRepo } from '../../operations/__tests__/helpers/real-repo.mjs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
@@ -375,9 +376,11 @@ const escape = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript()
 escape.unref();
 writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({ leader: process.pid, escape: escape.pid }));
 ${leaderCloses ? '' : keepAliveScript()}`;
+    // These are Node module URLs; keep Vite's browser asset transform out of their resolution.
+    const libDir = join(dirname(fileURLToPath(import.meta.url)), '..');
     const args = ['-e', BOUNDED_RUN_SHIM, JSON.stringify({ argv: [process.execPath, '-e', script], ms,
-      watchdogModule: new URL('../tree-watchdog.mjs', import.meta.url).href,
-      killModule: new URL('../bounded-child.mjs', import.meta.url).href,
+      watchdogModule: pathToFileURL(join(libDir, 'tree-watchdog.mjs')).href,
+      killModule: pathToFileURL(join(libDir, 'bounded-child.mjs')).href,
       markerKey: 'WE_TEST_REVERT_CLEANUP', marker: dir })];
     const parentScript = `const { spawn } = require('node:child_process');
 const shim = spawn(process.execPath, ${JSON.stringify(args)}, { stdio: 'ignore' });
