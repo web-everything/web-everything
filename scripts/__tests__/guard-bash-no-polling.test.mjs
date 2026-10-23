@@ -146,6 +146,12 @@ describe('pollingLoopReason / decide — no polling', () => {
     expect(r).toMatch(/check --wait=540000/);
     expect(r).toMatch(/report what is still pending/);
   });
+  // heavy-run-wait — agents gave up after ~3 exit-75 retries; both advice texts name the one bounded wait call.
+  it.each([false, true])('names `heavy-admission.mjs run --wait-ms=540000` for an exit 75 (agentSession=%s)', (agentSession) => {
+    const r = pollingLoopReason(INCIDENT, { agentSession });
+    expect(r).toContain('node scripts/readiness/heavy-admission.mjs run --wait-ms=540000 -- <cmd>');
+    expect(r).toMatch(/exits 75/);
+  });
   // Incident: two background subagents obeyed "END YOUR TURN and let the harness resume you" and sat idle for
   // hours — nothing resumes a subagent. An agent session must be told: ONE bounded check, then CONTINUE or finish.
   it('an AGENT session is never told to end its turn and wait; it is told to check once, continue, or finish', () => {

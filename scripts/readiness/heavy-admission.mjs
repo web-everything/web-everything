@@ -218,16 +218,29 @@ const REAP_LOG = 'reaped.jsonl';
 export const ADMISSION_DEFERRED_EXIT = 75; // EX_TEMPFAIL: re-queue; the command did not run.
 export const ADMISSION_POLICY_STANDARD = Object.freeze({
   cap: DEFAULT_ADMISSION_CAP, fastSlots: 1, onTimeout: 'defer',
+  // heavy-run-wait — how long `run` keeps re-trying admission (load gate + slot queue) before exiting 75. 0 = today's
+  // behavior (defer at once on host load). Per caller: it only bounds this caller's own wait, never shared capacity.
+  runWaitMs: 0,
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
 });
+
+/** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
+export const MAX_RUN_WAIT_MS = 24 * 60 * 60_000;
+/** A valid `run` wait budget: a whole number of ms in [0, {@link MAX_RUN_WAIT_MS}]. */
+export function isValidRunWaitMs(v) { return Number.isInteger(v) && v >= 0 && v <= MAX_RUN_WAIT_MS; }
+/** While a `run` waits on its budget, how often it logs one progress line to stderr. */
+export const RUN_WAIT_PROGRESS_MS = 60_000;
+/** While a `run` waits on host load, the base re-check interval; each sleep adds up to the same again as jitter. */
+export const RUN_WAIT_HOST_POLL_MS = 5_000;
 
 /** Upper bound on any slot count: a typo like `cap: 1e9` would otherwise make every scan walk a billion lock entries. */
 const ADMISSION_MAX_SLOTS = 256;
 const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min && v <= ADMISSION_MAX_SLOTS;
 const ADMISSION_VALID = {
   cap: admissionInt(1), fastSlots: admissionInt(0), onTimeout: (v) => v === 'defer' || v === 'run',
+  runWaitMs: (v) => isValidRunWaitMs(v),
   'fastScale.maxSlots': (v) => v === null || admissionInt(0)(v),
   'fastScale.minShortWaiters': admissionInt(1),
   'fastScale.minShortShare': (v) => Number.isFinite(v) && v >= 0 && v <= 1,
@@ -238,10 +251,11 @@ const ADMISSION_VALID = {
 };
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
+  runWaitMs: 'WE_HEAVY_ADMISSION_RUN_WAIT_MS',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
 /** Leaves that only shape this caller's timeout response, never shared capacity or queue ordering. */
-const PER_CALLER_LEAVES = new Set(['onTimeout']);
+const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs']);
 /** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
@@ -1143,6 +1157,12 @@ let admissionPolicyLogged = false;
  * host.maxWaitMs elapses (default 15 minutes), then proceed through normal slot admission. Interactive
  * operators bypass the host-load check. The host wait never permits bypassing occupied slots.
  * WE_HEAVY_ADMISSION=off is checked before touching the lock root and returns a disabled pass-through.
+ * heavy-run-wait — `waitMs` (> 0, only with `canDefer`) is a re-queueable caller's own wait budget: instead of
+ * deferring at once on host load, it keeps re-checking load (jittered sleeps) and the slot queue until admitted or
+ * the budget elapses, then defers exactly as before. Its waiting marker stays in place the whole time, so it keeps
+ * its first-come-first-served position. The budget is capped at `ceilingMs`, its expiry is checked BEFORE each slot
+ * attempt and before the ceiling, and it only ever ends in a deferral: it never runs unslotted (whatever onTimeout
+ * says), never bypasses the load gate, and never lengthens the ceiling. One progress line per {@link RUN_WAIT_PROGRESS_MS}.
  * @param {object} opts
  * @param {string} opts.lockRoot
  * @param {number} opts.cap
@@ -1167,9 +1187,17 @@ export async function acquireSlotBlocking({
   policy = loadAdmissionPolicy({ env }), canDefer = false, readResourceSnapshot = readSnapshot,
   hostAdmission = (o) => env[ADMISSION_HELD_ENV] === '1'
     ? { admitted: true, reason: 'host admission already held' } : hostLoadAdmission(o),
-  interactive = !!process.stdin.isTTY, ...seams
+  interactive = !!process.stdin.isTTY, waitMs = 0, waitSource = 'standard', random = Math.random, ...seams
 }) {
   if (isAdmissionOff(env)) return { ok: false, slot: null, timedOut: false, disabled: true, waitedMs: 0 };
+  // heavy-run-wait — a wait budget applies only to a caller that would otherwise defer; anything else is unchanged.
+  // The ceiling still caps it: a budget never waits past `ceilingMs`, and since the budget expiry is checked before the
+  // ceiling, a budgeted caller only ever DEFERS there — never takes the onTimeout=run unslotted fallback (Codex audit).
+  // A ceiling that is not a positive number (0 / negative / NaN) never shrinks or disables the budget (2nd audit).
+  const ceilingCap = Number.isFinite(ceilingMs) && ceilingMs > 0 ? ceilingMs : Infinity;
+  const budgetMs = canDefer && Number.isFinite(waitMs) && waitMs > 0 ? Math.max(1, Math.floor(Math.min(waitMs, ceilingCap))) : 0;
+  const budgetSrc = `wait budget ${budgetMs}ms (${waitSource})`;
+  if (budgetMs > 0) stillWaitingLogMs = Math.min(stillWaitingLogMs, RUN_WAIT_PROGRESS_MS);
 
   if (!admissionPolicyLogged && (policy.ignored?.length || policy.invalid?.length)) {
     admissionPolicyLogged = true;
@@ -1213,15 +1241,28 @@ export async function acquireSlotBlocking({
   let hostMaxWaitMs = DEFAULT_HOST_MAX_WAIT_MS;
   let hostWaitSource = 'standard';
   let hostLoadBypassed = false;
+  let lastProgressAt = startedAt;
   try {
     for (;;) {
-      const attempt = now();
+      let attempt = now();
       const host = hostLoadBypassed ? { admitted: true } : hostAdmission({ env, interactive, log: (m) => {
         if (!hostPolicyLogged) { log(`${m}\n`); hostPolicyLogged = true; }
       } });
       if (!host.admitted) {
+        // A slow rejected host check counts against the budget too (3rd audit): re-read the clock. Budget mode only.
+        if (canDefer && budgetMs > 0) attempt = now();
+        const waited = attempt - startedAt;
+        if (canDefer && budgetMs > 0 && waited < budgetMs) {
+          // heavy-run-wait — re-check host load after a jittered sleep; the waiting marker keeps our queue position.
+          if (attempt - lastProgressAt >= RUN_WAIT_PROGRESS_MS) {
+            log(`heavy-command admission: waiting for host load after ${Math.round(waited / 1000)}s: ${host.reason}; ${Math.round((budgetMs - waited) / 1000)}s of ${budgetSrc} left\n`);
+            lastProgressAt = attempt;
+          }
+          await sleep(Math.max(1, Math.min(budgetMs - waited, RUN_WAIT_HOST_POLL_MS + Math.floor(random() * RUN_WAIT_HOST_POLL_MS))));
+          continue;
+        }
         if (canDefer) {
-          log(`heavy-command admission deferred: ${host.reason}\n`);
+          log(`heavy-command admission deferred: ${host.reason}${budgetMs > 0 ? ` — gave up after waiting ${Math.round(waited / 1000)}s (${budgetSrc})` : ''}\n`);
           return { ok: false, slot: null, timedOut: false, deferred: true, waitedMs: attempt - startedAt, reason: host.reason };
         }
         if (hostWaitStartedAt === null) {
@@ -1245,6 +1286,15 @@ export async function acquireSlotBlocking({
         }
         hostLoadBypassed = true;
         log(`heavy-command admission: proceeding despite host load: ${host.reason}; mandatory caller reached host.maxWaitMs=${hostMaxWaitMs} (${hostWaitSource}); still requires a free slot\n`);
+      }
+      // A host check can take real time (macOS memory reads spawn a subprocess): re-read the clock so the expiry
+      // check and the slot attempt below never use a stale timestamp (2nd audit). Budget mode only.
+      if (budgetMs > 0) attempt = now();
+      // heavy-run-wait — budget expiry is checked BEFORE the slot attempt (no late admission) and BEFORE the ceiling
+      // (so a budgeted caller never reaches the onTimeout=run fallback): the budget ends in a DEFERRAL only.
+      if (budgetMs > 0 && attempt - startedAt >= budgetMs) {
+        log(`⚠ heavy-command admission-deferred: no slot after waiting ${Math.round((attempt - startedAt) / 1000)}s (cap=${cap}, ${budgetSrc}) — NOT running unslotted; the caller re-queues (exit ${ADMISSION_DEFERRED_EXIT})\n`);
+        return { ok: false, slot: null, timedOut: true, deferred: true, waitBudgetHit: true, waitedMs: attempt - startedAt };
       }
       reapStaleWaiters({ lockRoot, nowMs: attempt, apply: true, ...seams });
       let snapshot = null;
@@ -1279,7 +1329,7 @@ export async function acquireSlotBlocking({
         ceilingChecked = true;
         const m = Math.round(ceilingMs / 60_000);
         const result = { ok: false, slot: null, timedOut: true, ceilingHit: true, waitedMs: attempt - startedAt };
-        if (onTimeout === 'run') {
+        if (onTimeout === 'run' && budgetMs === 0) { // a budgeted caller never takes the unslotted fallback
           log(`⚠⚠ heavy-command admission: HARD CEILING of ${m}m exceeded waiting for capacity (cap=${cap}) — a slot holder may be wedged; proceeding unslotted. Escape hatch: WE_HEAVY_ADMISSION=off. [${src}]\n`);
           return result;
         }
@@ -1290,10 +1340,12 @@ export async function acquireSlotBlocking({
         log(`heavy-command admission: still queued past the ${m}m ceiling (cap=${cap}) — this caller cannot defer, so it keeps waiting; never runs unslotted [${src}]\n`);
       }
       if (attempt - lastLoggedAt >= stillWaitingLogMs) {
-        log(`heavy-command admission: still waiting for a free slot (cap=${cap}) after ${Math.round((attempt - startedAt) / 60_000)}m — every held slot's holder still appears alive; will ${onTimeout === 'run' ? 'proceed unslotted' : 'defer'} at the ${Math.round(ceilingMs / 60_000)}m ceiling.\n`);
+        log(budgetMs > 0
+          ? `heavy-command admission: still waiting for a free slot (cap=${cap}) after ${Math.round((attempt - startedAt) / 1000)}s; ${Math.round((budgetMs - (attempt - startedAt)) / 1000)}s of ${budgetSrc} left, then defer (exit ${ADMISSION_DEFERRED_EXIT}).\n`
+          : `heavy-command admission: still waiting for a free slot (cap=${cap}) after ${Math.round((attempt - startedAt) / 60_000)}m — every held slot's holder still appears alive; will ${onTimeout === 'run' ? 'proceed unslotted' : 'defer'} at the ${Math.round(ceilingMs / 60_000)}m ceiling.\n`);
         lastLoggedAt = attempt;
       }
-      await sleep(pollMs);
+      await sleep(budgetMs > 0 ? Math.max(1, Math.min(pollMs + Math.floor(random() * pollMs / 2), budgetMs - (now() - startedAt))) : pollMs);
     }
   } finally {
     clearWaiting({ lockRoot, owner });
@@ -1622,7 +1674,7 @@ export async function runUnderAdmission({
   lockRoot, cap, owner, lane = null, num = null, repo = null, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
   kind = null, command, cwd = process.cwd(), exec = (cmd, o) => execSync(cmd, o), log = (m) => process.stderr.write(m),
   now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }),
+  bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard',
 }) {
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
@@ -1637,7 +1689,7 @@ export async function runUnderAdmission({
   // `WE_HEAVY_ADMISSION=off` check apply to the `run` wrapper's wait too, not just this function's own messages.
   // Card xkyw1x4 — the kind is read off the wrapped command itself unless the caller names it.
   const runKind = kind ?? classifyCommandKind(command, env);
-  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true });
+  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true, waitMs, waitSource });
   if (admission.deferred) return { exitCode: ADMISSION_DEFERRED_EXIT, admission };
   if (admission.timedOut) {
     log(`⚠ heavy-command admission: timed out after ${admission.waitedMs}ms waiting for capacity (cap=${cap}) — proceeding unslotted.\n`);
@@ -1822,7 +1874,7 @@ async function main(argv) {
   }
   if (mode === 'run') {
     if (dashDashIdx === -1 || dashDashIdx === argv.length - 1) {
-      process.stderr.write(`usage: heavy-admission.mjs run [--repo=] [--cap=] [--owner=] [--lane=] [--num=] [--kind=] [--ceiling-ms=] [--container] [--container-node-modules] -- <command…>\n`);
+      process.stderr.write(`usage: heavy-admission.mjs run [--repo=] [--cap=] [--owner=] [--lane=] [--num=] [--kind=] [--ceiling-ms=] [--wait-ms=] [--container] [--container-node-modules] -- <command…>\n`);
       process.exit(3);
     }
     const command = argv.slice(dashDashIdx + 1).map(shellQuoteWord).join(' ');
@@ -1830,6 +1882,20 @@ async function main(argv) {
     const ceilingMs = flags['ceiling-ms'] != null ? Number(flags['ceiling-ms'])
       : flags['timeout-ms'] != null ? Number(flags['timeout-ms'])
       : resolveCeilingMs(process.env);
+    // heavy-run-wait — the wait budget: `--wait-ms=` wins, else heavyAdmission.runWaitMs from the settings cascade
+    // (platform → tool → env WE_HEAVY_ADMISSION_RUN_WAIT_MS). 0 (the standard) defers at once, as before.
+    let waitMs = policy.settings.runWaitMs ?? 0;
+    let waitSource = `heavyAdmission.runWaitMs (${policy.sources.runWaitMs ?? 'standard'})`;
+    if (flags['wait-ms'] != null) {
+      const raw = flags['wait-ms'];
+      const v = typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : NaN; // bare / empty / non-digit → usage error
+      if (!isValidRunWaitMs(v)) {
+        process.stderr.write(`✗ heavy-admission run: --wait-ms=${flags['wait-ms']} must be a whole number of ms between 0 and ${MAX_RUN_WAIT_MS}\n`);
+        process.exit(3);
+      }
+      waitMs = v; waitSource = 'flag --wait-ms';
+    }
+    if (waitMs > 0) process.stderr.write(`heavy-admission run: wait budget ${waitMs}ms from ${waitSource} — re-tries host load and the slot queue until admitted, else exit ${ADMISSION_DEFERRED_EXIT}\n`);
     // #3621 sequencing note (tracked on #3383) — the heavy-command-pool container POC. Opt-in ONLY: a caller
     // must explicitly ask for real OS-level isolation via `--container` or `WE_HEAVY_ADMISSION_CONTAINER=1`;
     // every existing caller (and the bare default here) still runs on the host, byte-identical to before this
@@ -1865,12 +1931,12 @@ async function main(argv) {
       process.exit(1);
     }
     const bypass = admissionBypassReason({ env: process.env, poolExists: existsSync(poolRootOf(lockRoot)) });
-    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null };
+    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     const { exitCode } = await runUnderAdmission(runOpts);
     process.exit(exitCode);
   }
-  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [-- <command…>]\n`);
+  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [-- <command…>]\n`);
   process.exit(3);
 }
 
