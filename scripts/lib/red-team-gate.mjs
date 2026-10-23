@@ -526,6 +526,9 @@ function firstReviewIndex(records, pr, head) {
  * head. A carried result defers to the ruling on the head it was carried from, read from the thread before the carry.
  * PURE.
  */
+/** Gate decisions that (re)hold a break: a clearance before any of them never approves it. An operator `block`
+ *  (`operator-block`) is one, so a block after a clear-human ceremony re-holds (any author: it only adds a hold). */
+const HOLDING_OUTCOMES = Object.freeze([GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK, 'operator-block']);
 function operatorRuled(records, pr, head) {
   const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
@@ -553,9 +556,9 @@ function operatorRuled(records, pr, head) {
     const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
       && reviewed(recordBody(r)));
     if (cap && cleared && !reaccepted && cleared.at > result.at && gates.every(r =>
-      ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
+      !HOLDING_OUTCOMES.includes(r.gate.outcome) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
-    if (gates.some(r => !r.from && [GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome))) return false;
+    if (gates.some(r => !r.from && HOLDING_OUTCOMES.includes(r.gate.outcome))) return false;
     if (!result.from) return false;
     rs = rs.filter(r => r.at < result.at);
     sha = result.from;
