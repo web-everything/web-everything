@@ -322,7 +322,7 @@ function readEntry({ ref, path, cwd, run, norm }) {
 }
 /** PURE: what a source sets beyond its lines: `mode` / `eol` when its head differs from its merge base (else null). */
 const metaChange = (from, to) => ({ mode: from?.mode === to.mode ? null : to.mode, eol: from && from.eol === to.eol ? null : to.eol,
-  bom: (from?.bom ?? false) === to.bom ? null : to.bom });
+  bom: from ? (from.bom === to.bom ? null : to.bom) : to.bom });
 /** PURE: `head`'s lines (in order) that `target` still has — the order a source wants kept. */
 const keptOrder = (head, target) => { const have = new Set(target); return head.filter(l => have.has(l)); };
 

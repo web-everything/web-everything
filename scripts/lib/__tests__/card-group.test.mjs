@@ -229,6 +229,27 @@ describe('buildCombined + verifyUnion (real git)', () => {
       expect(verifyUnion({ base: seeded, combined: seeded, sources: [{ num: 1, headSha: src }], cwd: r.cwd }).ok).toBe(false);
       expect(verifyUnion({ base: seeded, combined: src, sources: [{ num: 1, headSha: src }], cwd: r.cwd }).ok).toBe(true);
     });
+    it.each([
+      ['new BOM-less file rejects an introduced BOM in union and closure', false],
+      ['new BOM-bearing file rejects a removed BOM in union and closure', true],
+    ])('%s', (_, sourceHasBom) => {
+      const r = repo();
+      const path = 'backlog/7004-new-bom.md';
+      const body = card([5]);
+      const contents = hasBom => `${hasBom ? '\ufeff' : ''}${body}`;
+      const src = r.branch('src', () => writeFileSync(join(r.cwd, path), contents(sourceHasBom)));
+      const changed = r.branch('changed', () => writeFileSync(join(r.cwd, path), contents(!sourceHasBom)));
+      const matching = r.branch('matching', () => writeFileSync(join(r.cwd, path), contents(sourceHasBom)));
+      const source = { num: 1, headSha: src };
+      const proof = verifyUnion({ base: r.base, combined: changed, sources: [source], cwd: r.cwd });
+      expect.soft(proof.ok).toBe(false);
+      expect.soft(proof.missing.map(m => m.line).join(' ')).toMatch(/byte-order mark/);
+      expect.soft(sourceLanded({ ref: changed, source, cwd: r.cwd })).toMatchObject({
+        ok: false, reason: expect.stringMatching(/byte-order mark/),
+      });
+      expect(verifyUnion({ base: r.base, combined: matching, sources: [source], cwd: r.cwd }).ok).toBe(true);
+      expect(sourceLanded({ ref: matching, source, cwd: r.cwd }).ok).toBe(true);
+    });
     it('two sources that set different modes on one file disagree', () => {
       const r = repo();
       git(r.cwd, 'config', 'core.fileMode', 'true');
