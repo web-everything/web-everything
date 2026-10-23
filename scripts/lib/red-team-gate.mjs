@@ -601,6 +601,10 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
           // Operator card releases bind to the exact head/result; verdict carries cannot inherit them.
           if (!first || r.from || r.gate.result !== want) continue;
           if (!r.gate.outcome.startsWith('operator-') || !isHumanOperatorComment(r.c)) continue;
+          // Validate ownership when the ruling was posted, not against later handovers or grants.
+          // Use the same grant-aware decision as the writer: a pending extension belongs to automation.
+          const prior = sendBackStepState(gates.filter(g => g.at < r.at), grants.filter(g => g.index < r.at));
+          if (r.at <= hit.at || prior.outcome !== GATE_OUTCOMES.ROUND_CAP || prior.reopened) continue;
           action = 'card';
         }
         // Only a human operator may release a break held at the round cap; automation lines release only what the gate itself decided.
