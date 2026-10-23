@@ -396,7 +396,7 @@ function collectCompletePrTimeline(repo, pr, { gh, comments, env }) {
 }
 
 // Shared local serialization, with dead-process recovery, using the existing lease primitive.
-import { reserve, readLockEntry, releaseLockDirIf, heartbeatOwn, DEFAULT_LEASE_MINUTES } from '../readiness/file-locks.mjs';
+import { reserve, releaseLockDirIf, heartbeatOwn, DEFAULT_LEASE_MINUTES } from '../readiness/file-locks.mjs';
 import { hostname } from 'node:os';
 /** Heartbeat lease, not a fixed TTL: a live owner refreshes its heartbeat (timer plus `beat()`
  * between items) so it keeps the lock however long it runs; a dead local owner is reclaimed at
@@ -410,14 +410,21 @@ export async function withCoronerLock(dir, fn, { clock = Date.now, leaseMinutes 
     try { process.kill(entry.pid,0); return 'alive'; } catch(e) { return e.code === 'ESRCH' ? 'dead' : 'unknown'; }
   }, leaseMinutes, null, true);
   if (!result.ok) throw Error('coroner postmortem is already running');
-  const entry = readLockEntry(root,key);
   let lost = false;
   const beat = () => {
     if (lost || !heartbeatOwn(root,key,owner,new Date(clock()).toISOString())) { lost = true; throw Error('coroner lock lost; heartbeat lease was reclaimed'); }
   };
   const timer = beatMs > 0 ? setInterval(() => { try { beat(); } catch { /* recorded in `lost`; the next beat() call stops the work */ } },beatMs) : null;
   timer?.unref();
-  try { return await fn({ beat }); } finally { if (timer) clearInterval(timer); releaseLockDirIf(root,key,entry); }
+  let value, failure, failed = false;
+  try { value = await fn({ beat }); } catch (error) { failed = true; failure = error; }
+  if (timer) clearInterval(timer);
+  // Owner-only match: a beat moves heartbeatAt, so matching the pre-beat entry would never release.
+  // A deposed owner leaves the new owner's lock standing and learns of it here, not as success.
+  const released = releaseLockDirIf(root,key,{ owner });
+  if (failed) throw failure;
+  if (!released || lost) throw Error('coroner lock lost; heartbeat lease was reclaimed');
+  return value;
 }
 if (process.argv[1] && resolve(process.argv[1]) === SELF) {
   try {

@@ -79,17 +79,18 @@ export async function runPostmortemPass({ repo, dir = coronerStateDir(), now = n
         } else {
           errors.push(`PR ${p.number}: ${failure.error}`);
         }
-        atomicJson(file,state);
+        beat(); atomicJson(file,state); // fence every write: a reclaimed owner must not overwrite the new owner's state
         continue;
       }
       // Storage/publication failures are pass failures, never poison-item quarantines.
+      beat();
       if (shouldPostmortem(r,config)) { publishPostmortem(r,{dir}); published++; }
       delete state.failures[p.number];
       state.done.push(p.number); state.done.sort((a,b) => a-b);
-      atomicJson(file,state);
+      beat(); atomicJson(file,state);
     }
     if (errors.length) throw Error(`postmortem incomplete; cursor retained: ${errors.join('; ')}`);
-    state.cursor = now; atomicJson(file,state);
+    beat(); state.cursor = now; atomicJson(file,state);
     return { published, cursor:state.cursor, done:state.done.length, quarantined:state.quarantined };
   });
 }

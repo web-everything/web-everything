@@ -42,10 +42,15 @@ export async function lockLeaseScenario() {
   try {
     await withCoronerLock(dir,async ({beat}) => {
       for (let i = 0; i < 20; i++) { now += 10*60000; beat(); if (await rival() !== 'coroner postmortem is already running') violations.push('live heartbeating owner lost the lock'); }
-      now += 16*60000; // heartbeat lapses with no beat: a reclaimer may take over and the old owner is fenced
-      await withCoronerLock(dir,() => { try { beat(); violations.push('reclaimed owner was not fenced'); } catch {} },{clock,beatMs:0});
     },{clock,beatMs:0});
     if (second) violations.push('rival ran while the owner was live');
+    if (await rival() !== undefined || second !== 1) violations.push('lock not released after a heartbeating owner finished');
+    let fenced = false;
+    await withCoronerLock(dir,async ({beat}) => {
+      now += 16*60000; // heartbeat lapses with no beat: a reclaimer may take over and the old owner is fenced
+      await withCoronerLock(dir,() => { try { beat(); violations.push('reclaimed owner was not fenced'); } catch {} },{clock,beatMs:0});
+    },{clock,beatMs:0}).catch(() => { fenced = true; });
+    if (!fenced) violations.push('deposed owner reported success');
     return violations;
   } finally { fs.rmSync(dir,{recursive:true,force:true}); }
 }

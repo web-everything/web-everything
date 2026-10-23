@@ -630,10 +630,18 @@ describe('per PR postmortem', () => {
   it('fences an owner whose heartbeat lapsed and was reclaimed', async () => {
     const dir = temp(); let now = Date.parse(at(0)); const clock = () => now;
     try {
-      await withCoronerLock(dir,async ({beat}) => {
+      let rival = 0;
+      // The deposed owner finishing normally must not report success, and must leave the rival's lock standing.
+      await expect(withCoronerLock(dir,async ({beat}) => {
         now += 16*60000; // heartbeat lease (15 min) lapsed without a beat
-        await withCoronerLock(dir,() => { expect(() => beat()).toThrow('lock lost'); },{clock,beatMs:0});
-      },{clock,beatMs:0});
+        await withCoronerLock(dir,async () => {
+          expect(() => beat()).toThrow('lock lost');
+          await expect(withCoronerLock(dir,() => {rival++;},{clock,beatMs:0})).rejects.toThrow('already running');
+        },{clock,beatMs:0});
+      },{clock,beatMs:0})).rejects.toThrow('lock lost');
+      expect(rival).toBe(0);
+      await withCoronerLock(dir,() => {rival++;},{clock,beatMs:0});
+      expect(rival).toBe(1);
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
   it('counts an approval lost after a carried approval and requires the postmortem', () => {
