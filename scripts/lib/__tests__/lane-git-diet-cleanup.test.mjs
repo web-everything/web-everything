@@ -119,7 +119,13 @@ describe('CLI gc and prune retention guarantees', () => {
     rmSync(join(admin, 'index'));
     utimesSync(join(admin, 'gitdir'), old, old);
     git(dir, 'config', 'gc.worktreePruneExpire', 'now');
-    expect(git(dir, 'worktree', 'prune', '--dry-run', '--verbose', '--expire=now')).toContain('offline-worktree');
+    // Git versions differ in which stream carries verbose worktree-prune diagnostics.
+    const prune = spawnSync('git', ['worktree', 'prune', '--dry-run', '--verbose', '--expire=now'], {
+      cwd: dir, env, encoding: 'utf8', timeout: 10_000,
+    });
+    expect(prune.error).toBeUndefined();
+    expect(prune.status, prune.stderr).toBe(0);
+    expect(prune.stdout + prune.stderr).toContain('offline-worktree');
     expect(refs(dir, 'refs/')).toEqual(['refs/heads/main']);
     expect(existsSync(join(dir, '.git', 'logs'))).toBe(false);
     const headBefore = readFileSync(join(admin, 'HEAD'), 'utf8');
