@@ -1047,13 +1047,20 @@ describe('bounced PR CI repair — real required failures on the fixer head (#57
     const invalidGrants = [
       { comments: [...comments, { author: AUTOMATION, body: FIX_END_MARKER }] },
       { comments: comments.map(c => c === sendBack ? { ...c, author: AUTOMATION } : c) },
-      { comments: [...comments, ...Array.from({ length: 100 - comments.length }, () => ({ body: '' }))] },
     ];
     for (const over of invalidGrants) {
       const denied = planReconcile({ ...options, prs: [{ ...pr, ...over }] });
       expect(denied.dispatch).toEqual([]);
       expect(denied.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
     }
+    // At the list-reader page boundary, completeness must be proved before any cap decision.
+    const page = [...comments, ...Array.from({ length: 100 - comments.length }, () => ({ body: '' }))];
+    const truncated = planReconcile({ ...options, prs: [{ ...pr, comments: page }] });
+    expect(truncated.dispatch).toEqual([]);
+    expect(truncated.refusals).toEqual([expect.objectContaining({ kind: 'thread-truncated', prNumber: 5729 })]);
+    const complete = planReconcile({ ...options, prs: [{ ...pr, comments: page, commentsComplete: true }] });
+    expect(complete.dispatch).toEqual(plan.dispatch);
+    expect(complete.refusals).toEqual(plan.refusals);
     const disabled = planReconcile({ ...options, operatorRulingExtraRounds: { value: 0, source: 'repo' } });
     expect(disabled.dispatch).toEqual([]);
     expect(disabled.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
