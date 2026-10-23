@@ -131,7 +131,8 @@ it('flags a ref store kept in another repository, never a bare format', () => {
   const list = (...entries) => entries.map(([scope, key, value]) => `${scope}\0${key}\n${value}`).join('\0') + '\0';
   expect(riskyLaneConfig(list(['local', 'extensions.refstorage', 'files:///other/.git']))).toEqual(['extensions.refstorage']);
   expect(riskyLaneConfig(list(['worktree', 'extensions.refStorage', 'reftable://../x']))).toEqual(['extensions.refStorage']);
-  expect(riskyLaneConfig(list(['local', 'extensions.refstorage', 'reftable']))).toEqual(['extensions.refstorage']); // hides a files lane's refs
+  // A bare format stays: the scrub would unset it, hiding every ref of a lane that really is reftable.
+  expect(riskyLaneConfig(list(['local', 'extensions.refstorage', 'reftable']))).toEqual([]);
   expect(riskyLaneConfig(list(['local', 'extensions.refstorage', 'files']))).toEqual([]);
 });
 it('scrubs config-defined hooks, which run whatever core.hooksPath says', () => {

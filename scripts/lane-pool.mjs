@@ -266,7 +266,7 @@ const defaultGitTimeoutOpt = () => ({ timeout: resolveChildTimeoutMs(), killSign
 const git = (args, cwd, opts = {}) =>
   readGit(laneTransportArgs(args), { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim(); // #74d: throws on failure/oversize
 const gitQuiet = (args, cwd, opts = {}) =>
-  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts });
+  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', env: LANE_GIT_ENV, ...opts });
 const tryGit = (args, cwd, opts = {}) => {
   try {
     return git(args, cwd, opts);

@@ -162,9 +162,9 @@ export function riskyLaneConfig(listOutput) {
     const [key, ...rest] = parts[i + 1].split('\n');
     if (RISKY_LANE_CONFIG_RE.test(key)) found.push(key);
     else if (/^remote\..+\.url$/i.test(key) && !SAFE_REMOTE_URL_RE.test(rest.join('\n'))) found.push(key);
-    // Pool lanes use the files ref store. `<format>://<path>` puts the refs in another repository (every ref write
-    // lands there); a bare `reftable` on a files lane hides every ref, so gc/prune would see all history unreachable.
-    else if (/^extensions\.refstorage$/i.test(key) && rest.join('\n') !== 'files') found.push(key);
+    // `<format>://<path>` puts the refs in another repository: every ref write lands there. A bare format is never
+    // flagged: the scrub unsets flagged keys, and unsetting a real reftable lane's format would hide all its refs.
+    else if (/^extensions\.refstorage$/i.test(key) && rest.join('\n').includes('://')) found.push(key);
   }
   return found;
 }
