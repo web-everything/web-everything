@@ -70,7 +70,7 @@ export const NON_READ_OPERATIONS = Object.freeze([
   'agent-activity', 'item-activity', 'daemon-status', 'heavy-queue', 'review-seat-caps', 'gate-health', 'telemetry-summary',
   'graduation-progress-report', 'graduate-chain', 'route-pr-outcome', 'dispatch-lane', 'claim', 'open-pr', 'explore', 'stage-pr-view',
   'docket-refresh', 'restart-runner', 'priority-sync', 'live-state', 'live-work', 'sessions', 'record-referral-ruling', 'extend-rounds',
-  'free-scope', 'operator-session-bootstrap', 'maintenance', 'perf-snapshot', 'pre-pr-check', 'resource-status',
+  'free-scope', 'operator-session-bootstrap', 'maintenance', 'perf-snapshot', 'pre-pr-check', 'resource-status', 'prototype-load',
   'unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim',
 ]);
 

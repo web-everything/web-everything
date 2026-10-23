@@ -16,6 +16,7 @@ import { buildRoundExtensionComment, countGrantedRoundExtensions } from '../../c
 import { createGhProvider, GH_ARGV } from '../../lib/review-label-provider.mjs';
 import { redTeamRulingHeld, runReviewLabelCli } from '../../review-set-label.mjs';
 import { readReviewRound, readReviewRoundAsOf } from '../review-pr-io.mjs';
+import { diffFeed, parseFeedLine } from '../needs-you-feed.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'ea117e881164c3b6366b0bb78a3660c9a00503b1';
@@ -30,7 +31,9 @@ const comment = (findings, rev = HEAD) => ({
 // records exactly as it would on GitHub.
 function fakeIo({ comments, labels = ['review:accepted'], head = HEAD, liveHead = head, round = 1, setting = CONFIRMED_BREAKS_DEFAULTS, ...over } = {}) {
   const calls = [];
+  const feedItems = [];
   const io = {
+    publishNeedsYou: item => { feedItems.push(item); },
     readPr: () => ({ headRefOid: head, labels: labels.map((name) => ({ name })), comments }),
     readHead: () => liveHead,
     readSetting: () => ({ value: setting }),
@@ -43,13 +46,62 @@ function fakeIo({ comments, labels = ['review:accepted'], head = HEAD, liveHead 
     log: () => {},
     ...over,
   };
-  return { io, calls };
+  return { io, calls, feedItems };
 }
 const kinds = (calls) => calls.map((c) => c[0]);
 // Every record the gate writes names the result it decided (PR #5482).
 const namedGate = (outcome) => redTeamGateMarker(4722, HEAD, outcome).replace(/ -->$/, ' result=');
 
 describe('applyRedTeamGate', () => {
+  it('round-cap publishes exactly one needs-you item after the comment, with result identity and feed time', async () => {
+    const comments = [comment([F(), F({ summary: 'second break' })])];
+    const resultId = redTeamResultId(parseRedTeamComment(comments[0].body));
+    const { io, calls, feedItems } = fakeIo({ comments, round: 5 });
+    const publish = io.publishNeedsYou;
+    io.publishNeedsYou = item => {
+      expect(kinds(calls)).toEqual(['comment']);
+      publish(item);
+    };
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'round-cap' });
+    expect(feedItems).toHaveLength(1);
+    expect(feedItems[0]).toMatchObject({ pr: 4722, repo: REPO, head: HEAD, kind: 'at-round-limit',
+      outcome: 'round-cap', result: resultId, title: '' });
+    expect(feedItems[0].reason).toContain('outcome=round-cap');
+    expect(feedItems[0].reason).toContain(resultId);
+    expect(feedItems[0].reason).toContain('2 unsent confirmed break(s)');
+    const at = '2026-10-23T12:00:00.000Z';
+    const { lines } = diffFeed([], feedItems, at);
+    expect(lines).toHaveLength(1);
+    expect(parseFeedLine(lines[0])).toMatchObject({ pr: 4722, head: HEAD, outcome: 'round-cap', result: resultId, at });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('already-acted');
+    expect(feedItems).toHaveLength(1);
+  });
+
+  it.each([
+    ['sent-back', [F()]],
+    ['no-send-back', [F({ impactIfUnfixed: 'degraded' })]],
+  ])('%s publishes no needs-you items (including card-queued)', async (outcome, findings) => {
+    const { io, feedItems } = fakeIo({ comments: [comment(findings)] });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome });
+    expect(feedItems).toEqual([]);
+  });
+
+  it('a failed round-cap comment publishes no needs-you item', async () => {
+    const { io, feedItems } = fakeIo({ comments: [comment([F()])], round: 5,
+      postComment: () => { throw new Error('gh down'); } });
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('send-back-record-failed');
+    expect(feedItems).toEqual([]);
+  });
+
+  it.each([false, true])('a needs-you publisher failure is logged without changing gate status (async: %s)', async asynchronous => {
+    const logs = [];
+    const fail = () => { throw new Error('feed unavailable'); };
+    const { io } = fakeIo({ comments: [comment([F()])], round: 5,
+      publishNeedsYou: asynchronous ? async () => fail() : fail, log: line => logs.push(line) });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied', outcome: 'round-cap', marker: 'posted' });
+    expect(logs).toEqual([expect.stringMatching(/needs-you.*feed unavailable/)]);
+  });
+
   it('broken → send-back through review-set-label + ledger event + gate record', async () => {
     const { io, calls } = fakeIo({ comments: [comment([F({ summary: 'two writers' })])] });
     const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
