@@ -96,6 +96,30 @@ function extendedThread({ grantRepo = repo, grantPr = PR, author = OP, sent = tr
 }
 
 describe('existing-card IO', () => {
+  it('a throwing syncLabels is warned, not fatal', () => {
+    const comments = thread(), posted = [], warnings = [], labelSyncs = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, comments: [...comments] }),
+      resolveIdentity: () => OP,
+      readStandingRulingScope: () => null,
+      post: (_repo, _pr, body) => {
+        posted.push(body);
+        comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body });
+      },
+      syncLabels: args => { labelSyncs.push(args); throw new Error('label service unavailable'); },
+      warn: message => warnings.push(message),
+    });
+
+    expect(heldAfter(comments)).toHaveLength(1);
+    const result = sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor());
+
+    expect(result).toEqual({ ruling: 'card', head: HEAD, indices: [1], card: { ref: CARD }, labels: null });
+    expect(posted).toHaveLength(2);
+    expect(heldAfter(comments)).toEqual([]);
+    expect(readRedTeamDisposition({ comments, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).sendBack).toEqual([]);
+    expect(labelSyncs).toEqual([{ repo, pr: PR, head: HEAD }]);
+    expect(warnings).toEqual([`red-team-status-label-miss: ${repo}#${PR}: label service unavailable`]);
+  });
   it('operation IO rulableBreaks and liveResultGateState call sites pass standing-ruling scope explicitly', async () => {
     const { default: ts } = await import('typescript');
     const dir = dirname(dirname(fileURLToPath(import.meta.url)));

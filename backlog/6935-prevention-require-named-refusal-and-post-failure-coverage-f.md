@@ -16,6 +16,7 @@ PR #5829 review identified unprotected coverage promises in operation IO sinks. 
 - [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/operation-io-fidelity.test.mjs` detects an uncovered unsafe-reference refusal in a sink fixture and accepts a fixture with a named negative test asserting zero writes.
 - [A2] **Executable** — The same suite detects a multi-post effect missing fault injection at one post, and accepts coverage of every post with a recoverable end state.
 - [A3] **Executable** — The same suite distinguishes omitted standing-ruling scope in operation gate calls from explicitly supplied verified scope; coordinate the broader call-site rule with #6842.
+- [A4] **Executable** — Extend the fault-injection ratchet in `scripts/lib/__tests__/operation-io-fidelity.test.mjs` to report each catch that logs and continues, or dependency described as "never fatal", without a sibling test that makes that dependency throw. Accept coverage only when the test asserts successful completion, the intended durable state, and the warning; a test title or a dependency that only returns a value is insufficient. Include uncovered and covered fixtures. PR #5829's label-sync case is pinned by `a throwing syncLabels is warned, not fatal` in `scripts/operations/__tests__/record-red-team-ruling-io.test.mjs`.
 
 ## Non-goals
 
@@ -30,3 +31,4 @@ PR #5829 review identified unprotected coverage promises in operation IO sinks. 
 5. **Identity scoping** — Bound checks to sibling operation tests; do not credit unrelated test names.
 6. **State over time** — Fault injection must exercise each post boundary and retry, including the final release post.
 7. **Who wrote it** — Fixtures are repository-owned source; no model or comment body may declare its own coverage sufficient.
+8. **Nonfatal dependency failure** — Inject a throwing label sync after the release record is posted; assert the sink succeeds, the break remains released, and `red-team-status-label-miss` is warned. Apply the same rule to sibling catches that log and continue, including promises expressed in "never fatal" comments.
