@@ -24,6 +24,7 @@ import { admissionLockRoot, slotPath } from '../readiness/heavy-admission.mjs';
 import { readLockEntry } from '../readiness/file-locks.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
+import { CARD_ONLY_SKIP_GATE } from '../lib/verify-lane-gate.mjs';
 
 // Selection fixtures retain the historical related gate explicitly.
 beforeEach(() => {
@@ -2151,9 +2152,16 @@ describe('full build gate default', () => {
       const env = (standards, skip) => ({ ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: 'related',
         WE_BUILD_FINAL_GATE_STANDARDS: standards, WE_VERIFY_STANDARDS: 'auto', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: skip, WE_VERIFY_SELECTION: 'pr' });
       const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(requester, '1'), timeout: 60_000 });
+      expect(request.status, request.stderr).toBe(0);
       const suites = JSON.parse(readFileSync(marker(), 'utf8')).suites;
       expect(suites, request.stderr).toBeTruthy();
-      expect(suites.includes('check:standards')).toBe(requester === 'always');
+      if (requester === 'selected' && path.startsWith('backlog/')) {
+        expect(suites).toBe(CARD_ONLY_SKIP_GATE);
+      } else {
+        expect(suites).toMatch(/^npx vitest related /);
+      }
+      // The skip echo mentions check:standards; only an npm command executes it.
+      expect(suites.includes('npm run check:standards')).toBe(requester === 'always');
       const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=standards-child', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(child, childSkip), timeout: 60_000 });
       expect(run.stderr).not.toContain('mode=explicit');
       expect(run.stderr).not.toContain('whole-gate admission');
