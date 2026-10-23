@@ -9,7 +9,7 @@
  *          --gc-timeout-ms=N  --prune-expire=<git date, default 1.hour.ago>
  *
  * Eligibility (`cleanupEligibility`): a real, non-symlinked `<pool>/lane-N` with its own `.git` dir, NO lease
- * marker, no git lock file, no other repository borrowing its objects (alternates under --scan-root/* and the pool
+ * marker, no git lock file anywhere under `.git` (`*.lock`, gc.pid), no other repository borrowing its objects (alternates under --scan-root/* and the pool
  * root, following alternate chains), and no `gc.recentObjectsHook` or GC repack filtering. Per eligible lane, on --apply:
  *   0. CLAIM the lane: write its lease marker with O_EXCL (the same move as `lane-pool trim`), so a concurrent
  *      acquirer sees a live lease and moves on, and we never act on a lane someone else just took; before any write
@@ -60,8 +60,6 @@ const GIT_ENV = laneGitHardeningEnv(Object.fromEntries(Object.entries(process.en
 const git = (dir, args, timeout = 120_000, encoding = 'utf8') => execFileSync('git', args, { cwd: dir, env: GIT_ENV, encoding, stdio: ['ignore', 'pipe', 'pipe'], timeout, maxBuffer: 64 * 1024 * 1024 });
 const leaseFile = (dir) => join(dir, '.git', LEASE_FILENAME);
 const readLease = (dir) => { try { return JSON.parse(readFileSync(leaseFile(dir), 'utf8')); } catch { return existsSync(leaseFile(dir)) ? { unreadable: true } : null; } };
-const LOCK_NAMES = ['index.lock', 'HEAD.lock', 'packed-refs.lock', 'gc.pid', 'shallow.lock', 'config.lock'];
-const locksIn = (dir) => LOCK_NAMES.filter((f) => existsSync(join(dir, '.git', f)));
 const duBytes = (p) => { try { return Number(execFileSync('du', ['-sk', p], { encoding: 'utf8', timeout: 300_000 }).split(/\s+/)[0]) * 1024; } catch { return NaN; } };
 const opsRefs = (dir) => git(dir, ['for-each-ref', '--format=%(refname)', 'refs/remotes/origin/ops/']).split('\n').filter(Boolean);
 const gcHooks = (dir) => { try { return git(dir, ['config', '--get-all', 'gc.recentObjectsHook']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
@@ -103,17 +101,20 @@ function borrowerMap() {
   return map;
 }
 const BORROWERS = borrowerMap();
-// Audit the whole Git directory: GC's write paths extend beyond config, refs, logs and objects.
-const symlinkedGitPaths = (dir) => {
+// Audit the whole Git directory: GC's write paths extend beyond config, refs, logs and objects, and any `*.lock`
+// anywhere (e.g. a prepared update-ref transaction's refs/heads/<name>.lock) or gc.pid means an op is mid-flight.
+const auditGitDir = (dir) => {
   const links = [];
+  const locks = [];
   const visit = (path) => {
     let entry;
     try { entry = lstatSync(join(dir, '.git', path)); } catch (err) { if (err.code === 'ENOENT') return; throw err; }
     if (entry.isSymbolicLink()) { links.push(path); return; } // Never traverse even a dangling link.
+    if (path.endsWith('.lock') || path === 'gc.pid') locks.push(path);
     if (entry.isDirectory()) for (const name of readdirSync(join(dir, '.git', path))) visit(join(path, name));
   };
   visit('');
-  return links;
+  return { symlinkedGitPaths: links, locks };
 };
 const commonDir = (dir) => { try { return real(resolve(dir, git(dir, ['rev-parse', '--git-common-dir']).trim())); } catch { return null; } };
 
@@ -121,8 +122,8 @@ const eligible = (dir) => {
   const realGitDir = real(join(dir, '.git'));
   const objects = realGitDir ? real(join(realGitDir, 'objects')) : null;
   return cleanupEligibility({
-    dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir, realCommonDir: realGitDir ? commonDir(dir) : undefined, realObjectsDir: objects ?? undefined, symlinkedGitPaths: symlinkedGitPaths(dir),
-    lease: readLease(dir), nowMs: Date.now(), locks: locksIn(dir),
+    dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir, realCommonDir: realGitDir ? commonDir(dir) : undefined, realObjectsDir: objects ?? undefined, ...auditGitDir(dir),
+    lease: readLease(dir), nowMs: Date.now(),
     borrowers: (objects && BORROWERS.get(objects)) || [], gcHooks: realGitDir ? gcHooks(dir) : [], gcRepackFilters: realGitDir ? gcRepackFilters(dir) : [],
   });
 };
@@ -179,7 +180,7 @@ for (const n of lanes) {
       testPause('after-claim');
       // Re-read ownership before any write: a marker rewritten or removed by another holder means the claim is lost.
       if (readLease(dir)?.holder !== holder) { rows.push({ lane: n, skipped: 'claim lost (lease marker is no longer ours)' }); continue; }
-      const recheck = cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), symlinkedGitPaths: symlinkedGitPaths(dir), lease: null, nowMs: Date.now(), locks: locksIn(dir), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir) });
+      const recheck = cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: null, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir) });
       if (!recheck.ok) { rows.push({ lane: n, skipped: recheck.reason }); continue; }
       const before = duBytes(join(dir, '.git'));
       const applied = applyLaneDietConfig((args) => git(dir, args));

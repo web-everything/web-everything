@@ -244,6 +244,11 @@ describe('real git: cleanup CLI', () => {
   // Each startup refusal through the CLI (both modes): the lane, and any repo it points into, stay untouched.
   it.each([
     ...['index.lock', 'HEAD.lock', 'packed-refs.lock', 'gc.pid', 'shallow.lock', 'config.lock'].map((name) => [`git lock ${name}`, (dir) => writeFileSync(join(dir, '.git', name), ''), `git lock present (${name})`]),
+    // Nested locks: a pending ref transaction, a reflog write, a reftable stack update, a commit-graph write.
+    ...['refs/heads/x.lock', 'refs/remotes/origin/ops/review-requests.lock', 'logs/refs/heads/main.lock', 'reftable/tables.list.lock', 'objects/info/commit-graphs/commit-graph-chain.lock'].map((path) => [`git lock ${path}`, (dir) => {
+      mkdirSync(join(dir, '.git', path, '..'), { recursive: true });
+      writeFileSync(join(dir, '.git', path), '');
+    }, `git lock present (${path})`]),
     ['gc.recentObjectsHook', (dir, other, ran) => hook(dir, ran), 'gc.recentObjectsHook configured (gc would run it)'],
     ['absolute commondir', (dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
     ['relative commondir', (dir, other) => commondir(dir, relative(join(dir, '.git'), join(other, '.git'))), /^git common dir is redirected/],
@@ -341,6 +346,38 @@ describe('real git: cleanup CLI', () => {
       expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
     } finally {
       for (const path of [dir, other, ran]) rmSync(path, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('a prepared update-ref transaction blocks gc, so the commit it is about to publish survives', async () => {
+    const dir = lane(19);
+    git(root, 'clone', '-q', up, dir);
+    // An old commit reachable from nothing yet: exactly what a pending transaction is about to reference.
+    const tree = git(dir, 'rev-parse', 'HEAD^{tree}');
+    const rescue = git(dir, 'commit-tree', tree, '-p', 'HEAD', '-m', 'rescue');
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(join(dir, '.git', 'objects', rescue.slice(0, 2), rescue.slice(2)), old, old);
+    const tx = spawn('git', ['update-ref', '--stdin'], { cwd: dir, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const closed = new Promise((done) => tx.on('close', done));
+    try {
+      tx.stdin.write(`start\nupdate refs/heads/rescue ${rescue}\nprepare\n`);
+      const lock = join(dir, '.git', 'refs', 'heads', 'rescue.lock');
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(lock)) {
+        if (Date.now() > deadline) throw new Error('update-ref never prepared');
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=19', '--json'], { env, encoding: 'utf8' }));
+      expect(out.rows[0].skipped).toBe('git lock present (refs/heads/rescue.lock)');
+      tx.stdin.end('commit\n');
+      expect(await closed).toBe(0);
+      expect(git(dir, 'rev-parse', 'refs/heads/rescue')).toBe(rescue);
+      expect(git(dir, 'cat-file', '-t', rescue)).toBe('commit');
+      expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    } finally {
+      tx.kill();
+      await closed;
+      rmSync(dir, { recursive: true, force: true });
     }
   }, 60_000);
 
