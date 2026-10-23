@@ -132,7 +132,7 @@ import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } fro
 // #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
 // beside `latestRequiredCheck`) for why `collapseRollupToLatestPerName`/`rollupRowKind` now live in their own
 // dependency-free `./lib/rollup-collapse.mjs` rather than here.
-import { collapseRollupToLatestPerName, rollupRowKind } from './lib/rollup-collapse.mjs';
+import { collapseRollupToLatestPerName, rollupRowKind, latestCheckNamed, isFailedCheckRow } from './lib/rollup-collapse.mjs';
 import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
@@ -450,9 +450,7 @@ export function syncPrimaryOnLand({ exec, primary, hinted = false, isCwd = () =>
  */
 export function latestRequiredCheck(pr, requiredCheck = 'test') {
   if (pr?.requiredCheckReadError) return null;
-  const roll = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
-  const collapsed = collapseRollupToLatestPerName(roll);
-  return collapsed.find((c) => (c?.name || c?.context) === requiredCheck) || null;
+  return latestCheckNamed(pr?.statusCheckRollup, requiredCheck);
 }
 
 /**
@@ -541,10 +539,7 @@ export function isRequiredCheckGreen(pr, requiredCheck = 'test') {
  *  is NOT failed — it reads as in-flight (`checking`), never `ci:failed`; only a check GitHub has actually
  *  concluded red counts. */
 export function isRequiredCheckFailed(pr, requiredCheck = 'test') {
-  const check = latestRequiredCheck(pr, requiredCheck);
-  if (!check) return false;
-  const concl = String(check.conclusion || check.state || '').toUpperCase();
-  return ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(concl);
+  return isFailedCheckRow(latestRequiredCheck(pr, requiredCheck));
 }
 
 /**
@@ -4650,7 +4645,7 @@ async function runCli() {
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
-  const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
+  const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }),
     readQueue: () => readQueueFacts({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }),
     readQueueFiles: () => readQueueEntryFiles({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }) });

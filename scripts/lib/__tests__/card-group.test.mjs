@@ -10,7 +10,7 @@ import {
   resolveCardGroupStatePath, cardGroupStatePath, isSubsequence, inCardGroup, queueBlocksGroup,
   cardGroupCandidates, runCardGroupPass,
 } from '../card-group.mjs';
-import { planLabelDrain } from '../../merge-ai-prs.mjs';
+import { planLabelDrain, isRequiredCheckFailed } from '../../merge-ai-prs.mjs';
 import { overlapRowKey } from '../../conveyor/land-overlap-yield.mjs';
 import { withLandWriteLock } from '../../readiness/drain-lock.mjs';
 import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
@@ -1036,7 +1036,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     // A live combined PR carries ready-to-merge + review:pending (it is re-reviewed); that alone must never dissolve it.
     const waiting = [{ name: 'ready-to-merge' }, { name: 'review:pending' }];
     function reconcileCase({ combined = { state: 'OPEN', labels: waiting }, sources = {}, readFails = [], closeFails = false, pr = 77, list = [], listThrows = false, at = T0,
-      repo = 'o/r', localSlug = 'o/r', extraGroups = [], files = undefined, mainFixPrs = undefined, force = true, stamp = undefined } = {}) {
+      repo = 'o/r', localSlug = 'o/r', extraGroups = [], files = undefined, mainFixPrs = undefined, force = true, stamp = undefined, requiredCheck = undefined } = {}) {
       const statePath = join(tmp(), 's.json');
       writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo, pr, branch: 'lane/card-group-g', createdAt: T0, ...(files ? { files } : {}), sources: [{ num: 1, headSha: A }, { num: 2, headSha: B }] }, ...extraGroups], failed: {},
         ...(stamp ? { lastReconcileAt: { [String(localSlug).toLowerCase()]: stamp } } : {}) }));
@@ -1057,7 +1057,8 @@ describe('createCardGrouping — claim under the land mutex, close on current he
         throw new Error(`unexpected ${args.join(' ')}`);
       };
       const out = [];
-      const g = createCardGrouping({ localSlug, cwd: tmp(), run: () => { throw new Error('no git on this path'); }, exec, statePath, settings, log: { write: l => out.push(l) }, now: () => at });
+      const g = createCardGrouping({ localSlug, cwd: tmp(), run: () => { throw new Error('no git on this path'); }, exec, statePath, settings, log: { write: l => out.push(l) }, now: () => at,
+        ...(requiredCheck ? { requiredCheck } : {}) });
       const r = g.reconcile({ force, ...(mainFixPrs ? { mainFixPrs } : {}) });
       return { r, calls, out: out.join(''), state: readGroupState(statePath), g, unchanged: readFileSync(statePath, 'utf8') === before };
     }
@@ -1192,6 +1193,8 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       ['sent back: review:human', { combined: { state: 'OPEN', labels: [{ name: 'review:human' }] } }, /combined PR sent back \(review:human\)/, true],
       ['required check failed', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] } }, /combined PR failed the required check/, true],
       ['required check timed out (status context)', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ context: 'test', state: 'TIMED_OUT' }] } }, /combined PR failed the required check/, true],
+      ['required check needs action (ACTION_REQUIRED)', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'ACTION_REQUIRED' }] } }, /combined PR failed the required check/, true],
+      ['required check failed to start (STARTUP_FAILURE)', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'STARTUP_FAILURE' }] } }, /combined PR failed the required check/, true],
       ['the latest required run failed after an older success', { combined: { state: 'OPEN', labels: accepted, statusCheckRollup: [
         { name: 'test', conclusion: 'FAILURE', startedAt: '2026-10-21T10:06:00Z', completedAt: '2026-10-21T10:20:00Z' },
         { name: 'test', conclusion: 'SUCCESS', startedAt: '2026-10-21T10:00:00Z', completedAt: '2026-10-21T10:05:00Z' }] } }, /combined PR failed the required check/, true],
@@ -1241,6 +1244,27 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(state.groups.map(x => x.id)).toEqual(['g']);
       expect(g.holdFor({ num: 1 })).toMatchObject({ kind: 'card-grouped' });
       expect(calls.some(x => x.startsWith('pr comment'))).toBe(false);
+    });
+
+    // Parity with the drain: the group dissolves on exactly the required-check results the drain reads as failed,
+    // so a terminal failure the drain will never land can never keep the sources held across reconciles.
+    it.each([
+      ['FAILURE'], ['ERROR'], ['CANCELLED'], ['TIMED_OUT'], ['ACTION_REQUIRED'], ['STARTUP_FAILURE'],
+      ['SUCCESS'], ['SKIPPED'], ['NEUTRAL'], ['STALE'], [''],
+    ])('dissolves on a %s required run exactly when the drain reads it as failed', concl => {
+      const row = { name: 'test', status: concl ? 'COMPLETED' : 'IN_PROGRESS', conclusion: concl };
+      const failed = isRequiredCheckFailed({ statusCheckRollup: [row] });
+      expect(failed).toBe(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(concl));
+      const { r, state, g } = reconcileCase({ combined: { state: 'OPEN', labels: waiting, statusCheckRollup: [row] } });
+      expect(r.dissolved ?? []).toEqual(failed ? ['g'] : []);
+      expect(state.groups.length).toBe(failed ? 0 : 1);
+      expect(g.holdFor({ num: 1 })).toEqual(failed ? null : expect.objectContaining({ kind: 'card-grouped' }));
+    });
+
+    it('reads the drain\'s configured required check name, not a hard-coded "test"', () => {
+      const rollup = [{ name: 'ci', status: 'COMPLETED', conclusion: 'ACTION_REQUIRED' }, { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+      expect(reconcileCase({ requiredCheck: 'ci', combined: { state: 'OPEN', labels: waiting, statusCheckRollup: rollup } }).r.dissolved).toEqual(['g']);
+      expect(reconcileCase({ combined: { state: 'OPEN', labels: waiting, statusCheckRollup: rollup } }).r.dissolved ?? []).toEqual([]);
     });
 
     it('interrupted creation: a PR recorded by the forming pass after the snapshot is never dropped', () => {

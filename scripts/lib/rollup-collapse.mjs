@@ -81,6 +81,29 @@ export function collapseRollupToLatestPerName(rollup) {
 }
 
 /**
+ * The latest run of ONE named check ({@link collapseRollupToLatestPerName}, then a by-name lookup), or `null` when
+ * that check has not reported. `we:scripts/merge-ai-prs.mjs#latestRequiredCheck` and the card group's combined-PR
+ * reconcile (`we:scripts/lib/card-group.mjs`) both read the required check through this one lookup. Pure.
+ * @param {Array<object>|null|undefined} rollup
+ * @param {string} name
+ * @returns {object|null}
+ */
+export function latestCheckNamed(rollup, name) {
+  return collapseRollupToLatestPerName(rollup).find((c) => (c?.name || c?.context) === name) || null;
+}
+
+/** Every conclusion (or legacy StatusContext `state`) that means a check DEFINITIVELY failed. The one list the
+ *  drain's `isRequiredCheckFailed` and the card group's dissolve read (xym8nt4: a copy of it in card-group.mjs
+ *  missed ACTION_REQUIRED/STARTUP_FAILURE, so a combined PR the drain would never land kept its sources held). */
+export const FAILED_CHECK_CONCLUSIONS = Object.freeze(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
+
+/** Did this (already latest) check row definitively fail? `null`/missing is not failed. Pure. */
+export function isFailedCheckRow(c) {
+  if (!c) return false;
+  return FAILED_CHECK_CONCLUSIONS.includes(String(c.conclusion || c.state || '').toUpperCase());
+}
+
+/**
  * The latest run among several runs of ONE check. PR #2894 review (CONFIRMED live): the two feeds this module
  * serves disagree on order — `gh pr view --json statusCheckRollup` is oldest→newest (creation order,
  * #xkfv491), but the REST `commits/<sha>/check-runs` feed (`we:scripts/operations/pr-status-io.mjs#checksArgv`)

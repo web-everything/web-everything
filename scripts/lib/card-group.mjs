@@ -55,7 +55,7 @@ import { readSettings } from './settings-files.mjs';
 import { gitRun, hashObjectVerified } from './git-run.mjs';
 import { isCardPath, isCardOnlyDiff } from '../ci-card-only.mjs';
 import { resolveRaisedByConflict, loadCardConflictSettings } from './card-conflict-resolve.mjs';
-import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+import { latestCheckNamed, isFailedCheckRow } from './rollup-collapse.mjs';
 import { mapHashReferences } from '../backlog/id.mjs';
 import { bornAsIndexFromItems } from '../conveyor/queue-store.mjs';
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './constellation-repos.mjs';
@@ -622,6 +622,8 @@ export function createCardGrouping({
   // Is `c` a published main-red repair PR per this pass's LIVE red-main signal? Never read from a candidate field
   // (a cached candidate would carry it past the red window). Such a PR is neither held nor treated as a member.
   isMainFix = () => false,
+  // The drain's required check name (its `--check` flag): a combined PR is dissolved when THAT check fails.
+  requiredCheck = 'test',
 } = {}) {
   const say = line => { if (!quiet) log.write(`  card-group: ${line}\n`); };
   const isLocalGroup = g => sameRepo(g.repo, localSlug);
@@ -673,11 +675,10 @@ export function createCardGrouping({
   };
   // Only the LATEST run of the required check counts: a superseded failure (a cancelled run, then a green or still
   // queued rerun) must never close a currently green combined PR. The shared per-name collapse is the one reading
-  // of "latest" (a queued or running rerun is the newest; CheckRun outranks a status context).
-  const requiredFailed = pr => {
-    const latest = collapseRollupToLatestPerName(pr?.statusCheckRollup).find(c => c?.name === 'test' || c?.context === 'test');
-    return !!latest && ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'].includes(String(latest.conclusion || latest.state || '').toUpperCase());
-  };
+  // of "latest" (a queued or running rerun is the newest; CheckRun outranks a status context). The lookup and the
+  // failed set are the drain's own (`isRequiredCheckFailed`), so every terminal failure the drain will never land
+  // (ACTION_REQUIRED, STARTUP_FAILURE included) dissolves the group instead of holding its sources.
+  const requiredFailed = pr => isFailedCheckRow(latestCheckNamed(pr?.statusCheckRollup, requiredCheck));
 
   const api = {
     setting,
