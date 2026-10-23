@@ -60,14 +60,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
-    // Once the replacement is registered, every failure names the prior registrations still in place
-    // and any stale ones already removed before adoption, with the tip to rebase and re-add.
+    // Once the replacement is registered, failures name the retained registrations and explain
+    // how to recover if a stale registration prevents the daemon from adopting the replacement.
     const keptNote = () => {
       if (!out.registered) return '';
       const kept = (out.contained || []).filter((ref) => !out.removed.includes(ref));
-      const early = out.adopted ? [] : Object.entries(out.removedTips);
+      const stale = out.adopted ? [] : kept.filter((ref) => out.stale.includes(ref));
       return (kept.length ? ` Prior registrations retained: ${kept.join(', ')}.` : '')
-        + (early.length ? ` Removed before adoption (stale; rebase onto main and re-add): ${early.map(([ref, tip]) => `${ref}@${tip}`).join(', ')}.` : '');
+        + (stale.length ? ` If stale registrations block adoption, rebase and retest them, include their new tips in a tested replacement, and rerun: ${stale.join(', ')}.` : '');
     };
     try {
       const daemon = Object.hasOwn(config.daemons || {}, input.daemon) ? config.daemons[input.daemon] : null;
@@ -181,14 +181,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         out.swap = { contained, removed: out.removed };
         return null;
       };
-      // A clean contained registration stays until the daemon has adopted the replacement: a refused
-      // or unadopted replacement must leave the working build's registrations in place (red team, round 3).
-      // A STALE one conflicts with main, so a pinned or independently applied copy would refuse or hold
-      // every rebuild and the replacement could never be adopted. Its live code cannot survive a
-      // plain-main fallback either, so it goes first and failures name its tip for a rebase and re-add.
-      stage = 'swap-remove-failed';
-      const halted = removeContained(contained.filter((ref) => out.stale.includes(ref)));
-      if (halted) return halted;
+      // A stale preview is not proof that the replacement can pass live smoke. Keep every prior
+      // registration until adoption; a blocked rebuild times out with recovery guidance below.
       stage = 'check-unverifiable';
       const state = join(expand(env.WE_DAEMON_OVERLAY_DIR || join(env.HOME, '.claude/daemon-overlays')), keyForClone(out.clone));
       const deadline = registeredAt + config.adoption.timeoutMs;
@@ -220,7 +214,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         await sleep(Math.min(config.adoption.pollMs, remaining));
       }
       stage = 'swap-remove-failed';
-      const unswapped = removeContained(contained.filter((ref) => !out.removed.includes(ref)));
+      const unswapped = removeContained(contained);
       if (unswapped) return unswapped;
       out.ok = true;
       return out;
