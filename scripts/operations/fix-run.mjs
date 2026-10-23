@@ -37,7 +37,12 @@ import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecu
 import { appendFixLoopRow, isInfraFixRunOutcome } from '../conveyor/fix-loop-ledger.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { riskyLaneConfig, LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
+import { buildFixEvidenceComment, sendBackItems, renderRequiredCitations } from '../lib/fix-evidence-post.mjs';
+import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
+import { resolveCoordinationRoot } from './coordination-root.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
 // `dispatch-lane-io.mjs` -> `dispatch-provider-registry.mjs`, so a static import here is a cycle that makes the
@@ -48,6 +53,39 @@ const resolveDeliveryAgentProvider = async (name) => (await import('./deliver-it
 // LAZY too: the complete (paginated) comment reader — a plain `--json comments` read truncates a long thread.
 const readAllComments = async (pr, o) => (await import('../conveyor/pr-comments-complete.mjs')).readCompletePrComments(pr, o);
 const releaseBorrowedClaim = async (o) => (await import('../conveyor/fix-dispatch-claim.mjs')).releaseSessionFixDispatchClaims(o);
+
+/**
+ * IO (injectable as `carryVerdict`): before re-arming a pushed repair, carry the PR's accept when the pushed head's net
+ * change is provably identical to a reviewed head — the shared rebase-verdict-carry.mjs#attemptVerdictCarry, the same
+ * decision and writers the review job uses. Only an ACCEPTED PR is considered (a bounce has nothing to carry, and the
+ * restamp writer refuses anything else, `review:human` included). Never throws; `carried:false` means "re-arm as today".
+ * Live case: #5777/#5779 (2026-10-21), where a CI heal restored exactly the accepted tree and still spent a full round.
+ */
+export async function carryAcceptedPush({ repo, pr, head, lanePath, weRoot, run = sh, write = () => {}, readComments = readAllComments }) {
+  const view = JSON.parse(run('gh', ['pr', 'view', String(pr), ...(repo ? [`--repo=${repo}`] : []), '--json', 'headRefOid,labels'], { cwd: weRoot }) || '{}');
+  const labels = (Array.isArray(view?.labels) ? view.labels : []).map(l => (typeof l === 'string' ? l : l?.name));
+  if (!labels.includes('review:accepted')) return { carried: false, reason: '' };
+  if (view.headRefOid !== head) return { carried: false, reason: `live head ${String(view.headRefOid).slice(0, 9)} is not the pushed head` };
+  const { attemptVerdictCarry, contributionPatchId, resolveCarryAcrossRebase } = await import('../lib/rebase-verdict-carry.mjs');
+  const { proveIdenticalNetPatch } = await import('../lib/identical-net-patch.mjs');
+  const comments = await readComments(pr, { repo });
+  const laneGit = (f, a, o) => run(f, a, { ...o, cwd: lanePath });
+  return attemptVerdictCarry({
+    log: line => write(`fix-run: ${line}\n`),
+    carryAcrossRebaseSetting: () => resolveCarryAcrossRebase(),
+    readCarryEvidence: () => ({ headSha: view.headRefOid, comments }),
+    contributionPatchId: ({ sha }) => contributionPatchId({ sha, exec: laneGit }),
+    proveIdenticalNetPatch: ({ fromSha, toSha }) => proveIdenticalNetPatch({ fromSha, toSha, cwd: lanePath, exec: execFileSync }),
+    restampVerdict: ({ newHead, reason }) => {
+      try {
+        run('node', [resolve(weRoot, 'scripts', 'review-set-label.mjs'), String(pr), ...(repo ? [`--repo=${repo}`] : []), '--to=restamp',
+          '--actor=review-carry', `--new-head=${newHead}`, `--reason=${reason}`], { cwd: lanePath });
+        return { ok: true };
+      } catch (e) { return { ok: false, reason: String(e?.stderr || e?.stdout || e?.message || e).split('\n')[0] }; }
+    },
+    postCarryComment: ({ body }) => run('gh', ['pr', 'comment', String(pr), ...(repo ? ['--repo', repo] : []), '--body', body], { cwd: weRoot }),
+  }, { pr: Number(pr), repo, expectHead: head });
+}
 
 export { FIX_RUN_EXECUTORS };
 
@@ -74,9 +112,11 @@ export const defaultPendingRearm = (dir = pendingRearmDir()) => ({
       return v && typeof v.sha === 'string' && now - Number(v.at) < PENDING_REARM_MAX_AGE_MS ? v : null;
     } catch { return null; }
   },
-  write(repo, pr, sha, now = Date.now()) {
+  // `conflictRound` survives a crash so a retried hand-back keeps its round class (a conflict round never carries
+  // and never spends an ordinary round).
+  write(repo, pr, sha, now = Date.now(), { conflictRound = false, mainRef = null } = {}) {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now }), { mode: 0o600 });
+    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now, ...(conflictRound ? { conflictRound: true, ...(mainRef ? { mainRef } : {}) } : {}) }), { mode: 0o600 });
   },
   clear(repo, pr) { try { unlinkSync(join(dir, pendingKey(repo, pr))); } catch { /* already gone */ } },
 });
@@ -123,6 +163,7 @@ export const SANDBOX_PREAMBLE = [
   'already done for you: take the latest changes-requested (or advisory) comment in that section as the authoritative ask.',
   'The sandbox forbids ALL `.git` writes. Edit files only; do NOT run git add, commit, merge, checkout, reset, stash or rebase.',
   'You may write a commit message to .fix-commit-msg.txt. The launcher stages, commits, pushes and re-arms review after you exit.',
+  'Write your fix evidence to .fix-evidence.md at the lane root (gitignored), including for each open operator send-back item a line: - send-back <id> item <n>: <file:line>. Cite tests by file:line too (e.g. scripts/x/__tests__/y.test.mjs:24).',
   '',
   '---',
   '',
@@ -183,6 +224,23 @@ export function unstagedPaths(porcelain) {
     if (code[1] !== ' ' || UNMERGED_CODES.has(code)) paths.push(row.slice(3));
   }
   return [...new Set(paths.filter(p => p && !SCRATCH_RE.test(basename(p))))];
+}
+
+/**
+ * PURE (#xkmu3gv cap path, 2026-10-21 operator brief). Is this repair a MECHANICAL conflict round — the dispatcher
+ * planned a merge onto the base (`--merge-onto`, a conflict or restack), it is not a CI heal, and the only new content
+ * is that merge: either git merged cleanly and the agent changed nothing, or the agent edited ONLY the conflicted
+ * files. Such a round re-arms through `rearm-review.mjs --round=conflict` (its own smaller cap) instead of spending an
+ * ordinary review round. The label swap is identical either way, so the PR is still re-reviewed; any other edit, or an
+ * unknown state, is an ordinary round (the fail-safe direction: it only spends a round).
+ * @param {{mergeOnto?:string|null, repairKind?:string, conflicted?:boolean, unmerged?:string[], unstaged?:string[],
+ *   mergeCommitted?:boolean, agentPaths?:string[]}} facts
+ */
+export function isMechanicalConflictRound({ mergeOnto = null, repairKind = 'fix', conflicted = false, unmerged = [],
+  unstaged = [], mergeCommitted = false, agentPaths = [] } = {}) {
+  if (!mergeOnto || repairKind !== 'fix') return false;
+  if (conflicted) return unmerged.length > 0 && unstaged.every(p => unmerged.includes(p));
+  return mergeCommitted && agentPaths.length === 0;
 }
 
 // NUL porcelain preserves spaces/newlines and includes both sides of a rename.
@@ -437,10 +495,86 @@ export function renderCiHealContext(inputs) {
 
 /** Lane path = last non-empty stdout line of `lane-pool acquire` (it prints the path last). */
 export function parseAcquiredLanePath(stdout) {
+  try {
+    const parsed = JSON.parse(String(stdout));
+    if (typeof parsed.path === 'string' && parsed.path.startsWith('/')) return parsed.path;
+  } catch { /* legacy path-only output */ }
   const lines = String(stdout ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
   const path = lines.filter((l) => l.startsWith('/')).pop();
   if (!path) throw new Error(`fix-run: lane-pool acquire printed no lane path (got ${JSON.stringify(lines.slice(-2))})`);
   return path;
+}
+
+/** Read the allocator's marker, never infer ownership from the ambient session. */
+export function readLaneLease(lanePath) {
+  try { return JSON.parse(readFileSync(join(lanePath, '.git', LEASE_FILENAME), 'utf8')); }
+  catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+}
+
+/** Pure decision; clean must be positively observed before a reset can be proposed. */
+export function laneHeadCheck({ laneHead, prHead, lease, holder, clean = false }) {
+  const mismatch = `${laneHead?.slice(0, 9) || 'unknown'}, not PR head ${prHead?.slice(0, 9) || 'unknown'}`;
+  const location = laneHead && laneHead === prHead ? `at PR head ${prHead.slice(0, 9)}` : `at ${mismatch}`;
+  const why = !holder || !lease?.holder || lease.holder !== holder
+    ? `${location}; lease now held by ${lease?.holder || 'unknown (missing lease/holder)'} (expected ${holder || 'unknown'})`
+    : !laneHead || !prHead ? 'cannot resolve lane HEAD or PR head'
+    : laneHead === prHead ? 'lease is ours and HEAD matches'
+    : `at ${mismatch}${clean ? '; clean lane with our lease' : '; lane is dirty or cleanliness is unproven'}`;
+  const action = !holder || !lease?.holder || lease.holder !== holder || !laneHead || !prHead ? 'refuse'
+    : laneHead === prHead ? 'ok' : clean ? 'reset' : 'refuse';
+  return { ok: action === 'ok', action, why };
+}
+
+/** Thin read-only IO shared by recovery and the live probe. */
+export function inspectLaneHead({ lanePath, prHead, holder, run = sh, readLease = readLaneLease }) {
+  const opts = { cwd: lanePath, env: { ...laneGitHardeningEnv(process.env), LANE_SESSION: holder || '', GIT_OPTIONAL_LOCKS: '0' } };
+  const config = run('git', [...LANE_CONFIG_LIST_ARGS], opts);
+  if (riskyLaneConfig(config).length) throw new LauncherError('unsafe lane git config; refusing lane head inspection');
+  const laneHead = run('git', [...HARDENED_GIT_ARGS, 'rev-parse', '--verify', 'HEAD'], opts).trim();
+  const clean = !run('git', [...HARDENED_GIT_ARGS, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], opts).trim();
+  const lease = readLease(lanePath);
+  return { laneHead, prHead, holder: holder || null, lease, clean,
+    ...laneHeadCheck({ laneHead, prHead, lease, holder, clean }) };
+}
+
+export function assertLaneLease({ lanePath, holder, readLease = readLaneLease, phase = 'start the agent' }) {
+  try {
+    const lease = readLease(lanePath);
+    if (!holder || lease?.holder !== holder) throw new Error(`lease now held by ${lease?.holder || 'unknown'} (expected ${holder || 'unknown'})`);
+  } catch (e) {
+    throw new LauncherError(`fix-run: ${basename(lanePath)} ${e.message}; refusing to ${phase}`);
+  }
+}
+
+/** Recover only a clean, still-owned lane. A launcher merge must never be discarded. */
+export function ensureLaneHead({ lanePath, prHead, holder, sessionSlug, ref, laneRepo, weRoot, run = sh, readLease = readLaneLease, allowReset = true }) {
+  try {
+    const options = { lanePath, prHead, holder, run, readLease };
+    let check = inspectLaneHead(options);
+    if (check.action === 'reset' && allowReset) {
+      if (!sessionSlug || !ref || !weRoot) throw new Error('missing lane-pool recovery context');
+      // The allocator re-verifies pushed containment and the hold rule immediately before reset.
+      // Re-acquiring our own lease preserves its holder; foreign leases are refused above and by the pool.
+      run('node', [
+        resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'acquire',
+        `--lane=${basename(lanePath).replace(/^lane-/, '')}`, `--session=${sessionSlug}`,
+        ...(typeof holder === 'string' && holder.length > 0 ? [`--expect-holder=${holder}`] : []),
+        '--purpose=conveyor-fix', `--base=${ref}`, ...(laneRepo ? [`--repo=${laneRepo}`] : []),
+      ], { cwd: weRoot, env: { ...laneGitHardeningEnv(process.env), LANE_SESSION: holder } });
+      check = inspectLaneHead(options);
+    }
+    if (!check.ok) throw new Error(`${check.why}${!allowReset ? '; launcher merge preparation must be preserved' : ''}`);
+    return check;
+  } catch (e) {
+    throw new LauncherError(`fix-run: ${basename(lanePath)} ${e.message}; refusing to start the agent`);
+  }
+}
+
+/** No fetch, acquire, reset, release or other writes. Supply the ORIGINAL acquire holder to prove ownership. */
+export function probeLaneHead({ lanePath, pr, repo, holder, run = sh, readLease = readLaneLease }) {
+  const { headRefOid: prHead } = JSON.parse(run('gh', ['pr', 'view', String(pr), '--json', 'headRefOid',
+    ...(repo ? [`--repo=${repo}`] : [])], { cwd: lanePath }));
+  return inspectLaneHead({ lanePath, prHead, holder, run, readLease });
 }
 
 export function isNothingToRearmRefusal(err) {
@@ -506,12 +640,21 @@ export async function runFixCli(argv = [], {
   resolveProvider = resolveFixProvider,
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
+  carryVerdict = carryAcceptedPush,
   readCiHeal = readCiHealInputs,
   appendLoopRow = appendFixLoopRow,
   releaseClaim = releaseBorrowedClaim,
   recordOutcome = recordBorrowOutcome,
   recordRouted = recordRoutedOutcome,
+  readLease = readLaneLease,
   readFile = readLaneFileSafe,
+  persistEvidence = ({ repoKey, pr, text }) => {
+    const dir = join(resolveCoordinationRoot(), 'fix-evidence');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `${repoKey}-${pr}.md`);
+    writeFileSync(file, text, { mode: 0o600 });
+    nodeFs.chmodSync(file, 0o600);
+  },
   stageEntry = laneStageEntry,
   fileExists = existsSync,
   weRoot = REPO_ROOT,
@@ -588,6 +731,7 @@ export async function runFixCli(argv = [], {
     if (mergeOnto && !target) throw new LauncherError('cannot resolve PR base for conflict merge');
     if (mergeConflictingBase) write(`fix-run: PR #${pr} conflicts with ${target}; launcher merges origin/${target} first\n`);
     let prContext;
+    let openSendBacks = [];
     let repeatPlan = { action: 'patch' };
     if (launch.repairKind === 'ci-heal') {
       const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
@@ -595,6 +739,7 @@ export async function runFixCli(argv = [], {
       prContext = renderCiHealContext(inputs);
     } else {
       const comments = await readComments(pr, { repo: launch.repo });
+      openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
       const safety = resolveFixSafety();
       for (const k of ['alertAtRoundCap', 'resetOnRepeatedFinding']) write(`policy · fix.${k}=${safety.value[k]} (${safety.sources[k]})\n`);
       repeatPlan = repeatedFindingPlan(comments, { enabled: safety.value.resetOnRepeatedFinding });
@@ -611,26 +756,35 @@ export async function runFixCli(argv = [], {
     write(`fix-run: lane acquire wait ${acquireWait.ms}ms (${acquireWait.source})\n`);
     const poolArgs = [
       resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'acquire', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
-      `--wait-ms=${acquireWait.ms}`, '--purpose=conveyor-fix', `--session=${sessionSlug}`, ...(launch.scope ? [`--scope=${launch.scope}`] : []), `--base=${ref}`,
+      `--wait-ms=${acquireWait.ms}`, '--purpose=conveyor-fix', '--json', `--session=${sessionSlug}`, ...(launch.scope ? [`--scope=${launch.scope}`] : []), `--base=${ref}`,
     ];
-    const lanePath = parseAcquiredLanePath(run('node', poolArgs, { cwd: weRoot }));
+    const acquired = run('node', poolArgs, { cwd: weRoot });
+    const lanePath = parseAcquiredLanePath(acquired);
     const laneNum = basename(lanePath).replace(/^lane-/, '');
-    laneRelease = () => run('node', [
-      resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'release', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
-      `--lane=${laneNum}`, `--session=${sessionSlug}`,
-    ], { cwd: weRoot });
-    const gitEnv = { ...laneGitHardeningEnv(process.env), GIT_LITERAL_PATHSPECS: '1' };
+    let releaseHolder = null;
+    laneRelease = () => {
+      if (releaseHolder) assertLaneLease({ lanePath, holder: releaseHolder, readLease, phase: 'release the lane' });
+      return run('node', [
+        resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'release', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
+        `--lane=${laneNum}`, `--session=${releaseHolder || sessionSlug}`,
+      ], { cwd: weRoot });
+    };
+    const holder = JSON.parse(acquired).holder;
+    if (typeof holder !== 'string' || !holder) throw new LauncherError('fix-run: acquire returned no holder slug; refusing to start the agent');
+    releaseHolder = holder;
+    const gitEnv = { ...laneGitHardeningEnv(process.env), GIT_LITERAL_PATHSPECS: '1', LANE_SESSION: holder };
+    const checkLane = (head, allowReset = true) => ensureLaneHead({ lanePath, prHead: head, holder, sessionSlug, ref, laneRepo: launch.laneRepo, weRoot, run, readLease, allowReset });
     const laneConfig = () => run('git', [...LANE_CONFIG_LIST_ARGS], { cwd: lanePath, env: gitEnv });
-    before = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
     const configBefore = laneConfig();
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
-    const rearm = head => {
-      // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
-      try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
-      catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
+    before = checkLane(prHeadSha).laneHead;
+    const rearmReview = ({ conflictRound = false, mainRef = null } = {}) => {
       try {
-        return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
+        return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : []),
+          // A conflict round records what it resolved against: the merge target, read in the lane that just fetched it.
+          ...(conflictRound ? ['--round=conflict', `--main-ref=${mainRef || target || String(prHead.baseRefName ?? '').trim() || 'main'}`] : [])],
+        { cwd: conflictRound ? lanePath : weRoot });
       } catch (e) {
         const policy = resolveRearmRefusalPolicy();
         if (policy.mode === 'noop' && isNothingToRearmRefusal(e)) {
@@ -640,12 +794,34 @@ export async function runFixCli(argv = [], {
         throw e;
       }
     };
+    const rearm = async (head, { conflictRound = false, mainRef = null } = {}) => {
+      // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
+      try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
+      catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
+      // An ACCEPTED PR whose pushed head has a provably identical net change keeps its accept (the existing restamp +
+      // carried marker, rebase-verdict-carry.mjs#attemptVerdictCarry) — no re-arm comment, so no review round is spent.
+      // Anything unproven falls through to the re-arm exactly as before. A conflict round never carries: it is a bounce.
+      if (!conflictRound) {
+        let carry;
+        try { carry = await carryVerdict({ repo: launch.repo, pr, head, lanePath, weRoot, run, write, readComments }); }
+        catch (e) { carry = { carried: false, reason: String(e?.message ?? e).split('\n')[0] }; }
+        if (carry?.carried) {
+          write(`fix-run: PR #${pr} accept carried ${carry.fromSha} → ${head} (identical net patch, patch-id ${carry.patchId}); no re-arm, no round consumed\n`);
+          return 'carried';
+        }
+        if (carry?.reason) write(`fix-run: PR #${pr} no accept carry (${carry.reason}) — re-arming\n`);
+      }
+      return rearmReview({ conflictRound, mainRef });
+    };
     // A prior run pushed this exact tip and then failed to re-arm (this lane opened AT that tip): finish the hand-back
     // now, before spending a whole agent run on it.
-    if (pendingRearm.read(launch.repo, pr)?.sha === before) {
-      rearm(before);
+    const pending = pendingRearm.read(launch.repo, pr);
+    if (pending?.sha === before) {
+      const handBack = await rearm(before, { conflictRound: pending.conflictRound === true, mainRef: typeof pending.mainRef === 'string' ? pending.mainRef : null });
       pendingRearm.clear(launch.repo, pr);
-      const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
+      const result = handBack === 'carried'
+        ? `PR #${pr} (already pushed ${before.slice(0, 9)}; accept carried — identical net patch — after a failed earlier hand-back)`
+        : `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
       outcome = 'pushed'; reason = 'finished an earlier push';
       write(`fix-run: PR #${pr} finished - ${result}\n`);
       return { code: 0, result };
@@ -712,7 +888,10 @@ export async function runFixCli(argv = [], {
       .map(entry => /^(\d+) ([0-9a-f]+) ([0-3])\t([\s\S]*)$/.exec(entry))
       .filter(m => m && OID_RE.test(m[2]) && m[4] === path)
       .map(m => ({ mode: m[1], oid: m[2], stage: m[3] }));
+    let preparedHead = before;
     let unmerged = [];
+    let mergeCommitted = false;
+    let conflictRound = false;
     let mergePrompt = '';
     if (target) {
       if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(target)) throw new LauncherError(`invalid merge ref: ${target}`);
@@ -721,6 +900,7 @@ export async function runFixCli(argv = [], {
       // Runs from the catch after the agent may have rewritten the lane config: `merge --abort` checks files out through
       // any smudge filter, so re-verify the config first and, on a mismatch, leave the lane to be discarded instead.
       abortMerge = () => {
+        assertLaneLease({ lanePath, holder, readLease, phase: 'abort merge' });
         if (!inMerge()) return;
         const now = laneConfig();
         if (now !== configBefore || riskyLaneConfig(now).length) throw new LauncherError('lane git config changed; not running merge --abort in it');
@@ -741,7 +921,11 @@ export async function runFixCli(argv = [], {
         }
         unmerged = conflicts.map(c => c.path);
       }
-      if (!unmerged.length && inMerge()) commitMerge();
+      if (!unmerged.length && inMerge()) {
+        commitMerge();
+        mergeCommitted = true;
+        preparedHead = git('rev-parse', '--verify', 'HEAD').trim();
+      }
       if (unmerged.length) mergePrompt = `The launcher has ALREADY started git merge origin/${target}; the conflicted files are: ${unmerged.join(', ')}. Resolve them by editing the files only. Do NOT run any git command that writes (merge, add, commit, checkout, reset, stash, rebase) — the sandbox forbids .git writes; the launcher stages and commits after you exit.\n\n`;
     }
     // Capture emitted widths before the agent runs: the merge itself may already have changed .gitattributes. Widths come
@@ -788,11 +972,14 @@ export async function runFixCli(argv = [], {
       finalMessage = `repeated finding: restored scope-baseline ${reset.baseline} plus ${reset.replay.length} in-scope commits`;
       write(`fix-run: ${finalMessage}\n`);
     } else try {
+      checkLane(unmerged.length ? before : preparedHead, !target);
       spawned = await provider.spawn({
         taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
         sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
           ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
-          : SANDBOX_PREAMBLE) + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
+          : SANDBOX_PREAMBLE) + (openSendBacks.length
+            ? `## Required fix-evidence citations\nCopy these keys into .fix-evidence.md and replace each <file:line> with a changed, tracked file and its line at HEAD.\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', renderRequiredCitations(openSendBacks))}\n\n`
+            : '') + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
         ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
       }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
         spawnAgent: async (...args) => {
@@ -808,10 +995,13 @@ export async function runFixCli(argv = [], {
       throw e;
     }
     finalMessage = agentFinalMessage(spawned) || finalMessage;
+    assertLaneLease({ lanePath, holder, readLease, phase: 'push or stage files' });
     const configAfterAgent = laneConfig();
     if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new LauncherError('lane git config changed while the agent ran; refusing to push');
     const statusAfterAgent = git('status', '--porcelain=v1', '-z', '--untracked-files=all');
     const paths = changedPaths(statusAfterAgent);
+    conflictRound = isMechanicalConflictRound({ mergeOnto: launch.mergeOnto, repairKind: launch.repairKind,
+      conflicted: inMerge(), unmerged, unstaged: unstagedPaths(statusAfterAgent), mergeCommitted, agentPaths: paths });
     if (inMerge()) {
       // Every conflicted path is a text UU/AA conflict (checked above), so it must still exist as a regular file in the
       // lane with no conflict markers; a missing, symlinked, hardlinked or escaping path counts as unresolved.
@@ -849,10 +1039,64 @@ export async function runFixCli(argv = [], {
       withMessageFile(`${message.trim()}\n\n${trailer}\n`, file => git('commit', '-F', file));
     }
     const after = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
+    let evidenceText = null, evidencePersisted = false;
+    try { evidenceText = readFile(join(lanePath, '.fix-evidence.md'), lanePath); }
+    catch (e) { writeErr(`fix-run: could not read fix evidence: ${singleLine(e?.message ?? e)}\n`); }
+    if (evidenceText != null) {
+      const repoKey = String(launch.claimRepo ?? launch.repo ?? 'we').replace(/[^\w.-]/g, '_');
+      try { await persistEvidence({ repoKey, pr, text: evidenceText }); evidencePersisted = true; }
+      catch (e) { writeErr(`fix-run: could not persist fix evidence: ${singleLine(e?.message ?? e)}\n`); }
+    }
+    const allItems = () => openSendBacks.flatMap(item => sendBackItems(item).map(({ n }) => `${item.id}#${n}`));
+    const baseRef = String(prHead.baseRefName ?? '').trim();
+    let changedAtHead = null;
+    const verifyCitation = ({ path, line }) => {
+      try {
+        if (!baseRef) return false;
+        if (changedAtHead === null) {
+          const mergeBase = git('merge-base', `origin/${baseRef}`, 'HEAD').trim();
+          if (!OID_RE.test(mergeBase)) return false;
+          changedAtHead = new Set(git('diff', '--name-only', '-z', `${mergeBase}..HEAD`).split('\0').filter(Boolean));
+        }
+        if (!changedAtHead.has(path)) return false;
+        const entry = /^(\d{6}) blob ([0-9a-f]+)\t([^\0]+)\0$/.exec(git('ls-tree', '-z', 'HEAD', '--', path));
+        if (!entry || !REGULAR_MODES.has(entry[1]) || !OID_RE.test(entry[2]) || entry[3] !== path) return false;
+        const text = blob(`HEAD:${path}`);
+        const lineCount = text ? text.split('\n').length - Number(text.endsWith('\n')) : 0;
+        return line >= 1 && line <= lineCount;
+      } catch { return false; }
+    };
+    const postEvidence = async head => {
+      if (launch.repairKind === 'ci-heal') return { posted: false, missing: [] };
+      try {
+        const comments = await readComments(pr, { repo: launch.repo });
+        openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
+        if (evidenceText != null && !evidencePersisted) return { posted: false, missing: allItems(), reason: 'fix evidence persistence failed' };
+        if (!openSendBacks.length) return { posted: false, missing: [] };
+        if (!evidenceText) return { posted: false, missing: allItems() };
+        const evidence = buildFixEvidenceComment({ openSendBacks, evidenceText, head, verifyCitation });
+        if (!evidence.ok) return { posted: false, missing: evidence.missing };
+        withMessageFile(evidence.body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
+        return { posted: true, missing: [] };
+      } catch (e) {
+        writeErr(`fix-run: could not post fix evidence: ${singleLine(e?.message ?? e)}\n`);
+        return { posted: false, missing: allItems(), reason: 'fix evidence comment read or post failed' };
+      }
+    };
     let result;
     if (after === before) {
       outcome = 'no-change'; reason = finalMessage || 'agent committed nothing';
-      result = `no-change (${singleLine(reason)}; claim released, PR is re-planned)`;
+      const evidence = await postEvidence(after);
+      if (openSendBacks.length || evidence.reason) {
+        if (evidence.posted) {
+          rearmReview();
+          reason = `evidence posted for send-back(s) ${openSendBacks.map(item => item.id).join(', ')}; review re-armed: ${finalMessage}`;
+        } else {
+          outcome = 'no-change-unproven';
+          reason = evidence.reason ?? `missing or unverified fix evidence: ${evidence.missing.join(', ')}`;
+        }
+      }
+      result = `${outcome} (${singleLine(reason)}; claim released, PR is re-planned)`;
     } else {
       // Defense in depth (config was already re-checked right after the agent): this push runs outside the sandbox with
       // our credentials, so refuse again if the repo-local config (remote URL, sshCommand, insteadOf, credential helper, includes...) changed or is now
@@ -862,11 +1106,14 @@ export async function runFixCli(argv = [], {
         throw new LauncherError('lane git config changed while the agent ran; refusing to push');
       }
       // Record the owed re-arm BEFORE the push (best effort): a crash anywhere after the push must not lose it.
-      try { pendingRearm.write(launch.repo, pr, after); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
+      try { pendingRearm.write(launch.repo, pr, after, undefined, { conflictRound, mainRef: target || null }); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
+      assertLaneLease({ lanePath, holder, readLease, phase: 'push' });
       run('git', [...HARDENED_GIT_ARGS, 'push', '--no-verify', 'origin', `HEAD:refs/heads/${ref}`], { cwd: lanePath, env: gitEnv }); // never --force
-      rearm(after);
+      await postEvidence(after);
+      const handBack = await rearm(after, { conflictRound });
       pendingRearm.clear(launch.repo, pr);
-      result = `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending)`;
+      result = handBack === 'carried' ? `PR #${pr} (pushed ${after.slice(0, 9)}, accept carried — identical net patch)`
+        : `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending${conflictRound ? ' — mechanical conflict round' : ''})`;
       outcome = 'pushed'; reason = finalMessage || `pushed ${after.slice(0, 9)}`;
     }
     write(`fix-run: PR #${pr} finished - ${result}\n`);
@@ -888,6 +1135,17 @@ export async function runFixCli(argv = [], {
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
-  const { code } = await runFixCli(process.argv.slice(2));
-  process.exitCode = code;
+  if (process.argv.includes('--probe-lane-head')) {
+    try {
+      const flags = Object.fromEntries(process.argv.slice(2).filter(a => a.includes('=')).map(a => {
+        const i = a.indexOf('='); return [a.slice(2, i), a.slice(i + 1)];
+      }));
+      if (!flags['lane-path'] || !flags.pr) throw new Error('--lane-path and --pr are required');
+      console.log(JSON.stringify(probeLaneHead({ lanePath: resolve(flags['lane-path']), pr: flags.pr,
+        repo: flags.repo, holder: flags.holder }), null, 2));
+    } catch (e) { console.error(`fix-run: probe failed: ${e.message}`); process.exitCode = 1; }
+  } else {
+    const { code } = await runFixCli(process.argv.slice(2));
+    process.exitCode = code;
+  }
 }

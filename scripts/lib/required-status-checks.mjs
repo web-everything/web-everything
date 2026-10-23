@@ -314,6 +314,7 @@ function withPartialChecks(error, partialChecks) {
  * @param {object} o
  * @param {string} o.repo - `owner/name` slug (branch protection is repo-scoped).
  * @param {string} [o.branch] - defaults to `'main'`.
+ * @param {boolean} [o.readOnly] - skip cache persistence (diagnostic planner).
  * @param {string} [o.cachePath] - defaults to {@link defaultCachePath}.
  * @param {number} [o.now] - epoch ms; defaults to `Date.now()`.
  * @param {number} [o.ttlMs] - how long a cached read is trusted before a fresh live fetch is attempted again;
@@ -325,6 +326,7 @@ function withPartialChecks(error, partialChecks) {
  */
 export function getRequiredStatusChecks({
   repo,
+  readOnly = false,
   branch = 'main',
   cachePath = defaultCachePath(),
   now = Date.now(),
@@ -349,7 +351,7 @@ export function getRequiredStatusChecks({
 
   const save = (checks, source, classic) => {
     let winner = null;
-    if (repo) {
+    if (repo && !readOnly) {
       try {
         mkdirSync(dirname(cachePath), { recursive: true });
         // Many daemons share this file: re-read inside the lock and merge, so two repos' writes never clobber each

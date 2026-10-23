@@ -6,6 +6,28 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 import { cascadePolicy, formatCascadeSourcesLine, platformPreference } from './policy-cascade.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
+export const CODEX_TASK_RULES = [
+  'Task rules (fixed; follow them exactly):',
+  '- If the test queue is busy, wait ONCE with heavy-admission\'s own `--wait-ms` (`--ceiling-ms` where --wait-ms is unsupported), then stop and report. Never use while/for/until/sleep loops or polling.',
+  '- Scratch files go in `$TMPDIR` (set per task), never /tmp.',
+  '- No gh, curl, or git fetch/push: this brief carries the facts you need.',
+  '- Read with `rg -n` plus `sed -n` ranges of at most 200 lines; never cat a whole file over 200 lines, and never re-read a file you already read.',
+  '- Run only the tests your change affects, via `npm run test:unit -- <files>` or heavy-admission. Never the full suite unless this brief says so.',
+  '- Retry a failing command at most twice, with a change in between.',
+].join('\n');
+
+export const CODEX_REVIEW_TASK_RULES = [
+  'Task rules (fixed; follow them exactly):',
+  '- No gh, curl, or git fetch/push: this brief carries the facts you need.',
+  '- Read with `rg -n` plus `sed -n` ranges of at most 200 lines; never cat a whole file over 200 lines, and never re-read a file you already read.',
+  '- Never use while/for/until/sleep loops or polling.',
+  '- Retry a failing command at most twice, with a change in between.',
+].join('\n');
+
+export function renderCodexTaskRules({ review }) {
+  return review ? CODEX_REVIEW_TASK_RULES : CODEX_TASK_RULES;
+}
+
 export function resolveBuildPolicy({ env = process.env, tool, platform, readFile = readFileSync, log } = {}) {
   if (tool === undefined) {
     try { tool = JSON.parse(readFile(join(HERE, '../settings/build.json'), 'utf8')); }
