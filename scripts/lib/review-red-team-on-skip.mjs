@@ -2,10 +2,26 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readDrainRedTeamEvidence, readRedTeamStatus } from './drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, readRedTeamStatus, readFreshRedTeamAttempts } from './drain-red-team-evidence.mjs';
 import { redTeamForHead } from './red-team-gate.mjs';
 import { redTeamOwedFor } from './review-red-team-policy.mjs';
+import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { verifiedPriorRedTeamRow } from '../operations/review-extra-seats.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+
+/** Strict snapshot shared by recovery admission; provenance is exactly the child's predicate. */
+export function redTeamRecoveryRows(records, { repo, pr, head, env = process.env, readAttempts = readFreshRedTeamAttempts }) {
+  if (!Array.isArray(records)) throw Error('invalid scorecard records');
+  const attempts = readAttempts({ repo, pr, head, env });
+  if (!Array.isArray(attempts)) throw Error('invalid fresh red-team attempts');
+  return {
+    verifiedRow: verifiedPriorRedTeamRow(records, { repo, pr, rev: head, env }),
+    freshAttempts: attempts.length,
+  };
+}
+export function readRedTeamRecoveryRows({ env = process.env, ...input }) {
+  return redTeamRecoveryRows(readStore({ path: resolveScorecardStorePath(env), strict: true }).records, { ...input, env });
+}
 
 /** Normalize both persisted production result shapes at the recovery boundary. */
 export function normalizeRedTeamResult(result) {
@@ -18,19 +34,21 @@ export function normalizeRedTeamResult(result) {
 export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = readFileSync,
   toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/review-red-team-on-skip.json') } = {}) {
   let tool;
-  try { const data = JSON.parse(readFile(toolPath, 'utf8')); tool = { enabled: data.enabled, retryCooldownMin: data.retryCooldownMin }; } catch { /* lower layers */ }
+  try { const data = JSON.parse(readFile(toolPath, 'utf8')); tool = { enabled: data.enabled, retryCooldownMin: data.retryCooldownMin, maxFreshPerHead: data.maxFreshPerHead }; } catch { /* lower layers */ }
   const raw = env.WE_REVIEW_RED_TEAM_ON_SKIP;
   const cooldown = env.WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN;
+  const maxFresh = env.WE_REVIEW_RED_TEAM_ON_SKIP_MAX_FRESH_PER_HEAD;
   return cascadePolicy('reviewRedTeamOnSkip', tool, {
-    env, log, standard: { enabled: true, retryCooldownMin: 30 },
+    env, log, standard: { enabled: true, retryCooldownMin: 30, maxFreshPerHead: 2 },
     envValues: { enabled: raw === '0' ? false : raw === '1' ? true : raw || undefined,
-      retryCooldownMin: typeof cooldown === 'string' && /^\d+$/.test(cooldown) ? Number(cooldown) : cooldown || undefined },
-    valid: { enabled: v => typeof v === 'boolean', retryCooldownMin: v => Number.isSafeInteger(v) && v >= 0 },
+      retryCooldownMin: typeof cooldown === 'string' && /^\d+$/.test(cooldown) ? Number(cooldown) : cooldown || undefined,
+      maxFreshPerHead: typeof maxFresh === 'string' && /^\d+$/.test(maxFresh) ? Number(maxFresh) : maxFresh || undefined },
+    valid: { maxFreshPerHead: v => Number.isSafeInteger(v) && v >= 0, enabled: v => typeof v === 'boolean', retryCooldownMin: v => Number.isSafeInteger(v) && v >= 0 },
   });
 }
 
 /** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
-export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
+export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, readRecoveryRows, now,
   setting, lastDispatch }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
@@ -49,18 +67,15 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
       const status = readStatus({ repo, pr, head });
-      const { priorResult: prior, priorComment: comment } = normalizeRedTeamResult(status?.result);
-      let mode;
+      const { priorComment: comment } = normalizeRedTeamResult(status?.result);
       if (comment === 'posted') return skip('result posted; comment not visible yet');
-      // Any seat row (including an error) counts as recorded. Only a finished, clean
-      // pass can resume effects without risking another model call.
-      if (status?.status === 'finished' && ['ran', 'resumed'].includes(prior) && evidence.recorded === true) {
-        mode = 'resume';
-      } else if (status == null && evidence.recorded === false) mode = 'fresh';
-      else return skip(`prior result ${typeof prior === 'string' ? prior : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
-      const last = lastDispatch.get(`${repo}#${pr}@${head}`);
+      const recovery = readRecoveryRows({ repo, pr, head });
+      if (!recovery || !Number.isSafeInteger(recovery.freshAttempts) || recovery.freshAttempts < 0) throw Error('invalid recovery evidence');
+      const mode = recovery.verifiedRow ? 'resume' : 'fresh';
+      if (mode === 'fresh' && recovery.freshAttempts >= (setting.maxFreshPerHead ?? 2)) return skip('fresh attempts exhausted for head');
+      const last = Math.max(lastDispatch.get(`${repo}#${pr}@${head}`) ?? -Infinity, status?.updatedAtMs ?? -Infinity);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
-      return { ...row, action: 'dispatch', mode, why: mode === 'resume' ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' };
+      return { ...row, action: 'dispatch', mode, why: mode === 'resume' ? 'recorded pass needs its result comment/effects' : 'head has no verified red-team pass' };
     } catch { return skip('red-team evidence unreadable; inspect stored evidence before retrying'); }
   });
 }
@@ -70,15 +85,15 @@ const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, 
 
 /** Bounded recovery, sharing review capacity. Errors never abort the daemon tick. */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
-  env = process.env, setting, readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
+  env = process.env, setting, readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus, readRecoveryRows = readRedTeamRecoveryRows,
   now = Date.now, lastDispatch: history = lastDispatch, preferLane } = {}) {
   const rows = [], dispatched = [], notStarted = [];
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
   try {
     const at = now();
     const resolved = setting ?? resolveReviewRedTeamOnSkip({ env, log: note }).value;
-    rows.push(...planRedTeamOnSkip({ repo, refusals: plan?.refusals, rawPrs, readEvidence, readStatus,
-      now: at, setting: resolved, lastDispatch: history }));
+    rows.push(...planRedTeamOnSkip({ repo, refusals: plan?.refusals, rawPrs, readEvidence: input => readEvidence({ ...input, env }), readStatus: input => readStatus({ ...input, env }),
+      readRecoveryRows: input => readRecoveryRows({ ...input, env }), now: at, setting: resolved, lastDispatch: history }));
     for (const row of rows) {
       let started = false;
       if (row.action === 'dispatch') {

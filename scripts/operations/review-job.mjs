@@ -4,7 +4,7 @@ import { finishDrainRedTeamRequest } from '../lib/drain-red-team-requests.mjs';
 import { readReviewEvidenceAtHead } from '../lib/review-evidence-at-head.mjs';
 import { formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { acquireRedTeamAdmissionLock, recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, reserveFreshRedTeamAttempt, readFreshRedTeamAttempts } from '../lib/drain-red-team-evidence.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
@@ -92,7 +92,7 @@ import { contributionPatchId, attemptVerdictCarry, resolveCarryAcrossRebase, git
 import { proveIdenticalNetPatch } from '../lib/identical-net-patch.mjs';
 import { readRedTeamTiming, readRedTeamProbes, readConfirmedBreaks, planRedTeamActions, redTeamForHead } from '../lib/red-team-gate.mjs';
 import { savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
-import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
+import { normalizeRedTeamResult, redTeamRecoveryRows, resolveReviewRedTeamOnSkip } from '../lib/review-red-team-on-skip.mjs';
 import { readStore } from '../conveyor/run-scorecard-store.mjs';
 
 import { randomUUID } from 'node:crypto';
@@ -116,7 +116,7 @@ import { ACTOR_ENV } from '../lib/review-independence.mjs';
 import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import {
-  createRedTeamIo, priorRedTeamRow, extraSeatsEnabled, readVerifiedPriorRedTeamEvidence, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs,
+  createRedTeamIo, extraSeatsEnabled, readVerifiedPriorRedTeamEvidence, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs,
 } from './review-extra-seats.mjs';
 import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
@@ -297,6 +297,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
   return {
+    reserveFreshRedTeamAttempt: input => reserveFreshRedTeamAttempt(input, { env }),
+    readFreshRedTeamAttempts: input => readFreshRedTeamAttempts({ ...input, env }),
     recordRedTeamQueued: input => {
       recordRedTeamStatus(input, { env });
       const head = input.loopPayload?.findings?.read?.netBasis?.rev;
@@ -324,6 +326,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     readDrainRedTeamCi: ({ repo, pr }) => readReviewCiGate({ repo, pr, policy: resolveTimingPolicy({ env }).review }),
     readDrainRedTeamState: ({ repo, pr }) => JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,state,isDraft,labels'], { cwd: root, env })),
     readDrainRedTeamReview: input => readReviewEvidenceAtHead({ ...input, env }),
+    env,
+    readRedTeamRecoveryEvidence: input => readDrainRedTeamEvidence({ ...input, env }),
     readRedTeamRecords: () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records,
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
     readRedTeamComments: ({ pr, repo }) => readCompletePrComments(pr, { repo,
@@ -893,48 +897,72 @@ function runReviewArc({
         classified = { outcome: 'red-team-not-owed', reason: pinned ? 'stored review does not owe a red team' : 'stored review does not match live head' };
         return result({ ...classified, lanePath });
       }
-      const status = io.readRedTeamStatus({ pr: planned.pr, repo: planned.repo, head });
-      const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
       const refuse = reason => {
         classified = { outcome: 'red-team-not-owed', reason };
         return result({ ...classified, lanePath });
       };
-      if (!['resume', 'fresh'].includes(redTeamMode)) return refuse('unknown red-team mode; inspect stored evidence before retrying');
-      let records;
-      try {
-        records = io.readRedTeamRecords();
-        if (!Array.isArray(records)) throw Error('invalid records');
-      } catch {
-        return refuse('scorecard store unreadable; inspect stored evidence before retrying');
-      }
-      if (redTeamMode === 'resume') {
-        if (status?.status !== 'finished' || !['ran', 'resumed'].includes(priorResult) || priorComment === 'posted') {
-          return refuse(`prior result ${typeof priorResult === 'string' ? priorResult : 'unknown'}; not re-run`);
-        }
-        if (!priorRedTeamRow(records.filter(row => row?.repo === planned.repo), planned.pr, head)) {
-          return refuse('no clean prior red-team row; inspect stored evidence before retrying');
-        }
-      } else {
-        if (status != null) return refuse(`prior result ${typeof priorResult === 'string' ? priorResult : 'unknown'}; not re-run`);
-        if (records.some(row => row?.dispatchKind === 'review-seat' && row.seat === 'red-team'
-          && row.repo === planned.repo && Number(row.pr) === planned.pr && row.rev === head)) {
-          return refuse('prior red-team seat row; not re-run');
-        }
-      }
-      let comments;
-      try {
-        comments = io.readRedTeamComments({ pr: planned.pr, repo: planned.repo });
-        if (!Array.isArray(comments)) throw Error('invalid comments');
-      } catch {
-        return refuse('PR comments unreadable');
-      }
-      if (redTeamForHead(comments, planned.pr, head)) return refuse('red-team result already on head');
+      const admission = acquireRedTeamAdmissionLock({ repo: planned.repo, pr: planned.pr, head, env: io.env });
+      if (!admission.ok) return refuse(admission.reason);
       const input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode };
-      // Publish admission before finally drops the job slot, so another recovery cannot enter the gap.
       try {
-        io.recordRedTeamQueued({ ...input, status: 'queued' });
-      } catch {
-        return refuse('queued red-team status could not be persisted');
+        const status = io.readRedTeamStatus({ pr: planned.pr, repo: planned.repo, head });
+        const { priorComment } = normalizeRedTeamResult(status?.result);
+        if (!['resume', 'fresh'].includes(redTeamMode)) return refuse('unknown red-team mode; inspect stored evidence before retrying');
+        let records;
+        try {
+          records = io.readRedTeamRecords();
+          if (!Array.isArray(records)) throw Error('invalid records');
+        } catch {
+          return refuse('scorecard store unreadable; inspect stored evidence before retrying');
+        }
+        if (priorComment === 'posted') return refuse('result posted; comment not visible yet');
+        const evidence = io.readRedTeamRecoveryEvidence({ repo: planned.repo, pr: planned.pr, head });
+        if (evidence.inFlight || evidence.queued) return refuse('red-team pass in flight');
+        let recovery;
+        try {
+          recovery = redTeamRecoveryRows(records, { repo: planned.repo, pr: planned.pr, head, env: io.env,
+            readAttempts: io.readFreshRedTeamAttempts });
+        } catch {
+          return refuse('red-team evidence unreadable; inspect stored evidence before retrying');
+        }
+        if (redTeamMode === 'resume' && !recovery.verifiedRow) {
+          return refuse('no verified prior red-team row; inspect stored evidence before retrying');
+        }
+        const setting = resolveReviewRedTeamOnSkip({ env: io.env, log: io.log }).value;
+        if (status?.updatedAtMs != null && io.now() - status.updatedAtMs < setting.retryCooldownMin * 60_000) return refuse('retry cooldown active');
+        if (redTeamMode === 'fresh') {
+          if (recovery.verifiedRow) return refuse('verified prior red-team row; use resume mode');
+          if (recovery.freshAttempts >= setting.maxFreshPerHead) return refuse('fresh attempts exhausted for head');
+        }
+        let comments;
+        try {
+          comments = io.readRedTeamComments({ pr: planned.pr, repo: planned.repo });
+          if (!Array.isArray(comments)) throw Error('invalid comments');
+        } catch {
+          return refuse('PR comments unreadable');
+        }
+        if (redTeamForHead(comments, planned.pr, head)) return refuse('red-team result already on head');
+        if (redTeamMode === 'fresh') {
+          const attempt = { at: io.now(), pid: process.pid };
+          const identity = { repo: planned.repo, pr: planned.pr, head };
+          try {
+            if (!admission.stillHeld()) return refuse('red-team admission lost');
+            const index = io.reserveFreshRedTeamAttempt({ ...identity, ...attempt, maxFreshPerHead: setting.maxFreshPerHead });
+            if (index === null) return refuse('fresh attempts exhausted for head');
+            if (!Number.isSafeInteger(index) || index < 0 || index >= setting.maxFreshPerHead) throw Error('attempt missing');
+          } catch {
+            return refuse('fresh attempt could not be recorded');
+          }
+        }
+        // Publish queued status before finally drops the job slot.
+        try {
+          if (!admission.stillHeld()) return refuse('red-team admission lost');
+          io.recordRedTeamQueued({ ...input, status: 'queued' });
+        } catch {
+          return refuse('queued red-team status could not be persisted');
+        }
+      } finally {
+        admission.release();
       }
       seatsBox.input = input;
       seatsBox.redTeamQueued = true;

@@ -1024,7 +1024,7 @@ export function priorRedTeamRow(records, pr, rev) {
 }
 
 /** Saved rows can replace a model call only when a completed review job attests this snapshot. */
-function verifiedPriorRedTeamRow(records, { repo, pr, rev, env }) {
+export function verifiedPriorRedTeamRow(records, { repo, pr, rev, env = process.env }) {
   const prior = priorRedTeamRow(records, pr, rev);
   return prior && !verifySavedRedTeamProvenance({ repo, pr, head: rev,
     path: resolveScorecardStorePath(env), records, index: records.indexOf(prior), env }) ? prior : null;

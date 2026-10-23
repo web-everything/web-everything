@@ -1,6 +1,7 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { mkdirSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
@@ -17,6 +18,140 @@ export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDi
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env),
   `${encodeURIComponent(String(repo).toLowerCase())}-${Number(pr)}-${String(head).toLowerCase()}.json`);
 
+// Every acquisition, stale-owner inspection/rename and release shares this short guard.
+// Held for milliseconds; reclaim a guard older than 60 seconds and retry creation once.
+function withAdmissionMutation(path, mutate, now) {
+  const guard = path + '.guard';
+  let fd;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { fd = openSync(guard, 'wx'); break; }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      if (attempt !== 0) return { ok: false, reason: 'red-team admission in progress' };
+      try {
+        const mtime = statSync(guard).mtimeMs;
+        if (now() - mtime <= 60_000) {
+          return { ok: false, reason: 'red-team admission in progress' };
+        }
+        const renamed = guard + '.stale-' + process.pid + '-' + randomUUID();
+        renameSync(guard, renamed);
+        rmSync(renamed, { force: true });
+      } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    }
+  }
+  try {
+    try { writeSync(fd, JSON.stringify({ pid: process.pid, at: now() })); }
+    finally { closeSync(fd); }
+    return mutate();
+  } finally {
+    try { unlinkSync(guard); }
+    catch (e) { if (e.code !== 'ENOENT') throw e; }
+  }
+}
+
+/** Serialize admission until queued is durable; stale admission owners can be reclaimed. */
+export function acquireRedTeamAdmissionLock({ repo, pr, head, env = process.env,
+  now = Date.now, isAlive = pidAlive, readPidStart = pidStartTime }) {
+  const path = statusPath({ repo, pr, head }, env) + '.admission.lock';
+  const busy = () => ({ ok: false, reason: 'red-team admission in progress' });
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    return withAdmissionMutation(path, () => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let fd;
+        try { fd = openSync(path, 'wx'); }
+        catch (e) {
+          if (e.code !== 'EEXIST') throw e;
+          if (attempt !== 0) return busy();
+          let owner;
+          let content;
+          try { content = readFileSync(path, 'utf8'); }
+          catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+          try { owner = JSON.parse(content); } catch { /* incomplete owner */ }
+          let mtime;
+          try { mtime = statSync(path).mtimeMs; }
+          catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+          const parsed = Number.isSafeInteger(owner?.pid) && owner.pid > 0
+            && Number.isFinite(owner?.at) && Object.hasOwn(owner, 'pidStart');
+          const age = now() - mtime;
+          const start = parsed && owner.pidStart != null ? readPidStart(owner.pid) : null;
+          const stale = parsed
+            ? !isAlive(owner.pid) || (owner.pidStart != null && start != null && owner.pidStart !== start)
+              // An unknown birth time cannot distinguish the owner from a reused pid.
+              || ((owner.pidStart == null || start == null) && age > 600_000)
+            : age > 60_000;
+          if (!stale) return busy();
+          const renamed = path + '.stale-' + process.pid + '-' + randomUUID();
+          try { renameSync(path, renamed); }
+          catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+          rmSync(renamed, { force: true });
+          continue;
+        }
+        let owner;
+        try {
+          owner = { pid: process.pid, pidStart: readPidStart(process.pid), at: now() };
+          writeSync(fd, JSON.stringify(owner));
+        } finally { closeSync(fd); }
+        return { ok: true, stillHeld() {
+          try {
+            const current = JSON.parse(readFileSync(path, 'utf8'));
+            return current?.pid === owner.pid && current?.at === owner.at;
+          } catch { return false; }
+        }, release() {
+          return withAdmissionMutation(path, () => {
+            try {
+              const current = JSON.parse(readFileSync(path, 'utf8'));
+              if (current?.pid === owner.pid && current?.at === owner.at) unlinkSync(path);
+            } catch (e) {
+              if (e.code !== 'ENOENT' && !(e instanceof SyntaxError)) throw e;
+            }
+          }, now);
+        } };
+      }
+      return busy();
+    }, now);
+  } catch {
+    return { ok: false, reason: 'red-team admission lock unavailable' };
+  }
+}
+
+const freshAttemptPrefix = (input, env) => statusPath(input, env).replace(/\.json$/, '.fresh-attempt-');
+const validFreshAttempt = attempt => Number.isSafeInteger(attempt?.at) && attempt.at >= 0
+  && Number.isSafeInteger(attempt?.pid) && attempt.pid > 0;
+
+/** List used head-bound attempt slots regardless of their contents; only directory reads can throw. */
+export function readFreshRedTeamAttempts({ repo, pr, head, env = process.env } = {}) {
+  const prefix = freshAttemptPrefix({ repo, pr, head }, env);
+  const dir = dirname(prefix), namePrefix = prefix.slice(dir.length + 1);
+  let names;
+  try { names = readdirSync(dir); }
+  catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  return names.filter(name => name.startsWith(namePrefix) && /^(0|[1-9]\d*)\.json$/.test(name.slice(namePrefix.length)))
+    .sort((a, b) => Number(a.slice(namePrefix.length, -5)) - Number(b.slice(namePrefix.length, -5)));
+}
+
+/** Exclusive creation is the admission boundary, independent of the per-job slot claim.
+ * Return the first reserved index, or null when all slots exist. Failed writes retain
+ * their slot: an interrupted admission must never make another attempt available.
+ */
+export function reserveFreshRedTeamAttempt({ repo, pr, head, at, pid, maxFreshPerHead }, { env = process.env, writeFile = writeFileSync } = {}) {
+  const attempt = { at, pid };
+  if (!validFreshAttempt(attempt) || !Number.isSafeInteger(maxFreshPerHead) || maxFreshPerHead < 0) {
+    throw Error('invalid fresh red-team attempt');
+  }
+  const prefix = freshAttemptPrefix({ repo, pr, head }, env);
+  mkdirSync(dirname(prefix), { recursive: true });
+  for (let i = 0; i < maxFreshPerHead; i++) {
+    let fd;
+    try { fd = openSync(`${prefix}${i}.json`, 'wx'); }
+    catch (e) { if (e.code === 'EEXIST') continue; throw e; }
+    try { writeFile(fd, JSON.stringify(attempt)); }
+    finally { closeSync(fd); }
+    return i;
+  }
+  return null;
+}
+
 /** How long a local `running` record with a dead pid is kept as "attempted" before it is read as over. Env override in minutes. */
 export const STALE_RUNNING_TTL_MIN = 30;
 export function staleRunningTtlMs(env = process.env) {
@@ -29,7 +164,7 @@ export function readRedTeamStatus({ repo, pr, head, env = process.env } = {}) {
   try {
     const status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
     if (!status || status.repo !== repo || Number(status.pr) !== Number(pr) || status.head !== head) throw Error('red-team status identity mismatch');
-    return status;
+    return { ...status, updatedAtMs: statSync(statusPath({ repo, pr, head }, env)).mtimeMs };
   } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
 }
 

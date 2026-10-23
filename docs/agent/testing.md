@@ -262,15 +262,63 @@ picked up, retains the 45-minute never-scheduled recovery path; live passes and 
 cannot use it.
 
 Already-reviewed heads with an owed result can use the existing review job's `--red-team-only`
-mode (`--red-team-only=resume|fresh`; the bare flag retains fresh guards). A recorded scorecard row plus a finished status whose `result` string or `result.status` is `ran` or `resumed`
-resumes its missing comment/effects without another model call; a failed recovery persists `resumed` and remains eligible after cooldown, subject to the same clean-row guards;
-only a head with neither status nor row starts fresh. A trusted result comment, live pass,
-non-accept, unreadable evidence, recorded row without a status, or any prior result other than `ran` or `resumed`
-prevents dispatch. The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying. Recovery
-shares the tick's lane/live-review capacity and defaults to a 30-minute retry cooldown through
-`reviewRedTeamOnSkip` (tool: `scripts/settings/review-red-team-on-skip.json`; environment:
-`WE_REVIEW_RED_TEAM_ON_SKIP`, `WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN`). Focused cases
-live in `review-red-team-on-skip.test.mjs` and `review-job-red-team-only.test.mjs`.
+mode (`--red-team-only=resume|fresh`; the bare flag retains fresh guards). Planner, job,
+and child use `verifiedPriorRedTeamRow`: only a clean row attested by a completed review
+job can resume its missing comment/effects with `--resume-only`. Without that provenance,
+a fresh pass is allowed even after a finished skipped/error result or an unattested ok row.
+A trusted result comment (or a posted result awaiting visibility), live queued/running pass,
+non-accept, unreadable evidence, or retry cooldown prevents dispatch. The job re-reads these
+guards before admission; head status mtime supplies a persisted cooldown across daemon restarts.
+Recovery shares the tick's lane/live-review capacity and defaults to a 30-minute retry cooldown
+and `maxFreshPerHead: 2` through `reviewRedTeamOnSkip` (tool:
+`scripts/settings/review-red-team-on-skip.json`; environment: `WE_REVIEW_RED_TEAM_ON_SKIP`,
+`WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN`, `WE_REVIEW_RED_TEAM_ON_SKIP_MAX_FRESH_PER_HEAD`).
+Count only per-head `.fresh-attempt-<i>.json` files beside the red-team status; the replaced
+append ledger is no longer read. Fresh admission tries each index below `maxFreshPerHead`
+with exclusive create (`wx`), writes `{at, pid}`, and owns the first created index. Existing
+slots are skipped; all slots existing refuses as exhausted. Other filesystem errors refuse
+with `fresh attempt could not be recorded`. Every existing slot counts as a used attempt,
+regardless of content, including partial or unreadable files; only directory-read errors other
+than ENOENT throw in the reader. Failed writes retain their slots. This bound does not depend on the
+non-atomic job slot claim. Historical seat/discard rows do not consume the cap. Resume
+never reserves a fresh slot. At or above the cap, recovery skips
+with `fresh attempts exhausted for head`: an operator must inspect the stored evidence and
+resolve the failure or deliberately adjust the cap before retrying. Verified resume remains
+available at the cap. Focused cases live in `review-red-team-on-skip.test.mjs` and
+`review-job-red-team-only.test.mjs`.
+Hermetic recovery fixtures must set `WE_SHARED_RUNS_DIR` to their temporary runs directory:
+status, admission locks and attempt slots use its parent. `OPERATION_RUNS_DIR` alone only
+redirects operation records; `CONVEYOR_STATE_ROOT` does not redirect this shared state.
+Omitting the shared override makes fixtures collide on locks and consume each other's slots,
+and can turn a storage-error setup into EISDIR when the shared status directory already exists.
+Red-team-only jobs exclusively create `<head-key>.json.admission.lock` beside the status
+with `{pid, pidStart, at}` before reading status, recovery evidence, cooldown or comments.
+They release immediately after the strict queued write or on refusal, unlinking only when
+pid+at still match. A live holder refuses with `red-team admission in progress`.
+A dead PID or known PID birth-time mismatch permits reclaim; unparsable ownership permits
+reclaim after 60 seconds by file mtime. A live admission holder whose birth time is known on both sides never expires by age;
+when either birth time is unknown, the lock expires after 10 minutes.
+`stillHeld()` reads the lock and requires our pid+at, returning false for unreadable ownership.
+Admission checks it immediately before fresh-attempt reservation and the strict queued write;
+lost ownership refuses with `red-team admission lost` and zero red-team calls. Loss before
+reservation creates no attempt slot; loss afterward retains the consumed slot. Inspect the
+current owner and stored evidence before retrying. Reclaim renames to a unique stale path, removes it and retries
+exclusive creation once. A missing source also retries once; other filesystem errors refuse
+with `red-team admission lock unavailable`. Inspect filesystem access and retry on that refusal.
+A short Node fs `wx` guard at `<head-key>.json.admission.lock.guard` covers every
+acquisition, stale-owner inspection, rename/retry and release. Guard contention refuses
+before reading admission ownership when the guard is at most 60 seconds old by file mtime.
+A guard older than 60 seconds is reclaimed by renaming to a unique stale path and removing
+it, then retrying exclusive creation once; ENOENT during reclaim also permits that retry.
+The guard records `{pid, at}` using the injected clock and is removed in `finally`, ignoring
+ENOENT. Release leaves ownership untouched if the guard is busy. As an accepted bound,
+a guard older than 60 seconds may be reclaimed even while its stalled holder is still alive;
+serialization is not guaranteed beyond that bound.
+Focused cases cover live refusal with zero red-team calls, dead PID, PID reuse, fresh and
+aged malformed owners, live-old refusal, lost ownership before reserve/queued, concurrent admission-owner reclaimers, fresh guards,
+abandoned and live-holder guards older than 60 seconds, release contention, sequential
+acquisition, filesystem errors, release after queued and refusal, and preserving replacement
+locks with either identity field changed. Normal review claiming is unchanged.
 Red-team-only admission strictly persists `queued` and reads back that status with the current
 process's pid before releasing the job slot. A write/read failure or mismatch refuses with
 `red-team-not-owed` and `queued red-team status could not be persisted`, without running the
