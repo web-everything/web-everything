@@ -697,7 +697,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       writeFileSync(join(t.cwd, CARD), card([1, 2, 10, 12])); git(t.cwd, 'add', '-A'); git(t.cwd, 'commit', '-qm', 'a-new');
       const aNew = git(t.cwd, 'rev-parse', 'HEAD');
       git(t.cwd, 'checkout', '-q', 'main');
-      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr: 77, branch: 'lane/card-group-g',
+      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr: 77, branch: 'lane/card-group-g', files: [CARD],
         sources: [{ num: 1, headSha: t.a }, ...(second ? [{ num: 2, headSha: t.b }] : [])], ...(closedAt ? { closedAt: { 1: closedAt === 'a' ? t.a : closedAt } } : {}) }], failed: {} }));
       const seq = views({ a: t.a, aNew });
       let i = 0, closed = false;
@@ -777,7 +777,9 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     it('a settled source is released at once and never re-commented while another source keeps the group retrying; the retries are bounded', () => {
       const { r, again, calls, g, statePath } = mergedRace(h => [{ head: h.aNew }], { second: true });
       expect(r.done).toEqual([]);
-      expect(g.holdFor({ num: 1 })).toBeNull();
+      // Released, and the merged group no longer reserves its card for the released source or anyone else.
+      expect(g.holdFor({ num: 1, listedFilesComplete: true, listedFiles: [CARD] })).toBeNull();
+      expect(g.holdFor({ num: 9, listedFilesComplete: true, listedFiles: [CARD] })).toBeNull();
       expect(g.holdFor({ num: 2 })).toMatchObject({ kind: 'card-grouped' });
       const notClosed = () => calls.filter(c => c.startsWith('pr comment 1 ')).length;
       expect(notClosed()).toBe(1);

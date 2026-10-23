@@ -509,11 +509,13 @@ export function cardGroupHold(state, { num, repo, localSlug, files = null, mainF
       continue; // the combined PR itself lands normally
     }
     const where = g.pr ? `#${g.pr}` : `pending card group ${g.id}`;
-    // A source a merged group already settled (released, reopened, gave up) is no longer held by it.
+    // A source a merged group already settled (closed, released, reopened, gave up) is no longer held by it.
     if (g.sources?.some(s => Number(s.num) === Number(num) && !g.settled?.[String(s.num)]))
       return { kind: 'card-grouped', reason: `grouped into ${where} (lands with it; drain.group)` };
     // An open group RESERVES its card files: no other PR touching them may land first (it would make the
     // combined PR conflict). Unknown file lists cannot be judged here; the group then dissolves on conflict.
+    // A merged group (still settling its sources) reserves nothing: the combined PR can no longer conflict.
+    if (g.merged === true) continue;
     const shared = paths.filter(p => (g.files ?? []).includes(p));
     if (shared.length) return { kind: 'card-grouped', reason: `${shared[0]} is reserved by open card group ${where} (drain.group)` };
   }
@@ -838,7 +840,8 @@ export function createCardGrouping({
                 // raced the close is unlanded work, so the source is reopened and released.
                 const verified = g.closedAt?.[String(recorded.num)];
                 if (sp.state === 'CLOSED' && verified && sp.headRefOid !== verified) { if (!reopenMoved(g, tag, recorded.num, verified, sp.headRefOid)) retry = true; continue; }
-                if (!verified || sp.headRefOid === verified) say(`${tag}: source #${recorded.num} is ${sp.state} — nothing to close`);
+                recordOn(g, 'settled', recorded.num, `already ${String(sp.state).toLowerCase()}`);
+                say(`${tag}: source #${recorded.num} is ${sp.state} — nothing to close`);
                 continue;
               }
               const s = { num: recorded.num, headSha: sp.headRefOid };
@@ -873,9 +876,11 @@ export function createCardGrouping({
                 // A close that succeeded can still read open for a moment: re-checked next pass, never released early.
                 if (post.state === 'OPEN') { say(`${tag}: source #${s.num} still reads open after its close — re-checked next pass`); retry = true; continue; }
                 if (post.headRefOid !== s.headSha) { if (!reopenMoved(g, tag, s.num, s.headSha, post.headRefOid)) retry = true; continue; }
+                recordOn(g, 'settled', s.num, 'closed');
                 say(`${tag}: closed source #${s.num} — landed via #${g.pr}`);
               } else {
-                comment(s.num, `The combined card PR #${g.pr} merged, but this PR's lines were not all found on main (${landed.reason}). It stays open and is released back to the normal drain path. (drain.group, card xym8nt4)`);
+                // Settled only once the author is told; a failed comment is retried (within the pass bound below).
+                if (!comment(s.num, `The combined card PR #${g.pr} merged, but this PR's lines were not all found on main (${landed.reason}). It stays open and is released back to the normal drain path. (drain.group, card xym8nt4)`)) { retry = true; continue; }
                 recordOn(g, 'settled', s.num, 'released');
                 say(`${tag}: source #${s.num} NOT closed (${landed.reason}) — released`);
               }
@@ -885,13 +890,16 @@ export function createCardGrouping({
               // MERGED_RETRY_PASSES passes each unsettled source is told it could not be confirmed and is released.
               const passes = Number(g.mergedRetries ?? 0) + 1;
               if (passes < MERGED_RETRY_PASSES) {
-                mutate(st2 => { const x = st2.groups.find(y => isLocalGroupSnapshot(y, g)); if (x) x.mergedRetries = passes; });
+                // `merged`: the combined PR has landed, so its card files are no longer reserved (cardGroupHold).
+                mutate(st2 => { const x = st2.groups.find(y => isLocalGroupSnapshot(y, g)); if (x) { x.mergedRetries = passes; x.merged = true; } });
                 say(`${tag}: merged — retried (pass ${passes}/${MERGED_RETRY_PASSES})`);
                 continue;
               }
               for (const recorded of g.sources) {
                 if (g.settled?.[String(recorded.num)]) continue;
-                comment(recorded.num, `The combined card PR #${g.pr} merged, but whether this PR's current head landed on main could not be confirmed after ${passes} tries. It is released back to the normal drain path${g.closedAt?.[String(recorded.num)] ? '. The drain closed it: if its head is not on main, reopen it by hand' : ''}. (drain.group, card xym8nt4)`);
+                if (!comment(recorded.num, `The combined card PR #${g.pr} merged, but whether this PR's current head landed on main could not be confirmed after ${passes} tries. It is released back to the normal drain path${g.closedAt?.[String(recorded.num)] ? '. The drain may have closed it: if it is closed and its head is not on main, reopen it by hand' : ''}. (drain.group, card xym8nt4)`)) {
+                  say(`${tag}: ⚠ source #${recorded.num} released unconfirmed and its comment failed — check it by hand`);
+                }
               }
               say(`${tag}: merged — could not settle every source after ${passes} passes; commented and released`);
             }
