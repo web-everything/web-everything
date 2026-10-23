@@ -81,6 +81,7 @@ describe('runner freshness policy', () => {
         "health-respond",
         "heavy-queue",
         "item-activity",
+        "judge-sweep-facts",
         "land-advance",
         "land-human-only",
         "live-state",
