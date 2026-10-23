@@ -1521,6 +1521,81 @@ describe('detached jobs', () => {
     expect(await waitForJob(f.options)).toMatchObject({ status: 'failed', code: exitCode || 1 });
   });
 
+  it('reserves process exit 75 for running jobs, including completion during a poll', async () => {
+    const f = fixture();
+    expect(await waitForJob({ ...f.options, sleep: async ms => {
+      await f.sleep(ms);
+      f.child.emit('exit', 75);
+    } })).toMatchObject({ status: 'failed', exitCode: 75, code: 1 });
+    expect(await waitForJob(f.options)).toMatchObject({ status: 'failed', exitCode: 75, code: 1 });
+  });
+
+  it('wait CLI reports terminal exit 75 as failure on successive calls without rewriting the task code', () => {
+    const record = { id: 'terminal-75', pid: process.pid, status: 'failed', exitCode: 75,
+      resultPath: 'result.json', finishedAt: new Date(0).toISOString() };
+    writeJobRecord(record, { jobsDir });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait',
+        `--job=${record.id}`, '--max-ms=250'], {
+        encoding: 'utf8', timeout: 5000, env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+      });
+      expect(child.error).toBeUndefined();
+      expect(JSON.parse(child.stdout)).toEqual({ status: 'failed', exitCode: 75, resultPath: record.resultPath });
+      expect(child.status, child.stderr).toBe(1);
+      expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
+    }
+  });
+
+  it('maps exit 75 discovered by the dead-PID recovery reread to terminal failure', async () => {
+    const f = fixture();
+    const readRecord = vi.fn().mockImplementationOnce(f.options.readRecord).mockImplementation(() => {
+      f.child.emit('exit', 75);
+      return f.options.readRecord();
+    });
+    expect(await waitForJob({ ...f.options, isAlive: () => false, readRecord }))
+      .toMatchObject({ status: 'failed', exitCode: 75, code: 1 });
+    expect(readRecord).toHaveBeenCalledTimes(2);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it.each([null, 'SIGINT', 'SIGTERM', 'after startup'])('unowned --job invocation leaves a live owner record intact on %s', signal => {
+    const record = { id: 'other-owner', pid: process.pid, status: 'running', exitCode: null,
+      resultPath: 'result.json', startedAt: new Date(0).toISOString() };
+    writeJobRecord(record, { jobsDir });
+    const preload = join(jobsDir, 'unowned-preload.mjs');
+    writeFileSync(preload, signal === 'after startup' ? `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const read = fs.readFileSync;
+      let first = true;
+      fs.readFileSync = function (path, ...args) {
+        const value = read.call(this, path, ...args);
+        if (first && String(path).endsWith('other-owner.json')) {
+          first = false;
+          return JSON.stringify({ ...JSON.parse(value), pid: process.pid });
+        }
+        return value;
+      };
+      syncBuiltinESMExports();
+    ` : signal ? `
+      const original = process.once;
+      process.once = function (name, listener) {
+        const result = original.call(this, name, listener);
+        if (name === ${JSON.stringify(signal)}) setImmediate(() => process.kill(process.pid, name));
+        return result;
+      };
+    ` : '');
+    const child = spawnSync(process.execPath, ['--import', preload, 'scripts/codex-direct-task.mjs',
+      `--job=${record.id}`], {
+      encoding: 'utf8', timeout: 10000, env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : signal === 'after startup' ? 2 : 1);
+    if (!signal) expect(child.stderr).toContain('job record was not initialized by launcher');
+    expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
+    process.kill(record.pid, 0);
+  }, 12000);
+
   it('dead PID while running becomes failed/1 and persists its finish time', async () => {
     const f = fixture();
     expect(await waitForJob({ ...f.options, isAlive: () => false })).toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
@@ -2068,6 +2143,8 @@ describe('detached jobs', () => {
       report: { exitCode: 0, timedOut: false, gate: { pass: true } } },
     { label: 'nonzero task in JSON mode', args: [...jsonTaskArgs, '--gate=none'], processCode: 0, recordCode: 7, runCode: 7,
       report: { exitCode: 7, timedOut: false, gate: { pass: true } } },
+    { label: 'task exit 75 in JSON mode', args: [...jsonTaskArgs, '--gate=none'], processCode: 0, recordCode: 75, runCode: 75,
+      report: { exitCode: 75, timedOut: false, gate: { pass: true } } },
     { label: 'timeout in JSON mode', args: [...jsonTaskArgs, '--gate=none', '--timeout-ms=10'], processCode: 0, recordCode: 1, timeout: true,
       report: { exitCode: null, timedOut: true, gate: { pass: true } } },
     { label: 'failed gate in JSON mode', args: [...jsonTaskArgs, '--gate=standards'], processCode: 0, recordCode: 1, gateFails: true,
@@ -2122,7 +2199,7 @@ describe('detached jobs', () => {
     expect(readJobRecord('cli-job', { jobsDir })).toMatchObject({ status: recordCode === 0 ? 'done' : 'failed', exitCode: recordCode,
       finishedAt: expect.any(String) });
     expect(await waitForJob({ jobId: 'cli-job', jobsDir })).toMatchObject({
-      status: recordCode === 0 ? 'done' : 'failed', exitCode: recordCode, code: recordCode,
+      status: recordCode === 0 ? 'done' : 'failed', exitCode: recordCode, code: recordCode === 75 ? 1 : recordCode,
     });
   });
 

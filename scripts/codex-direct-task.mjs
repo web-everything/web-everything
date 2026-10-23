@@ -67,6 +67,7 @@
  *
  * Runs inline by default. --detach launches a persistent background job with stdout/stderr files;
  * wait --job=<id>: poll until the requested deadline (exit 75 means still running).
+ * A terminal task exit 75 is preserved in JSON but wait exits 1, so callers stop retrying.
  * Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.
  * Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.
  * All IO shares that single requested deadline; no floor or additional grace.
@@ -1141,13 +1142,18 @@ export async function waitForJob({
   };
   let record = { status: 'running', exitCode: null, resultPath: null };
   const result = () => ({ status: record.status, exitCode: record.exitCode, resultPath: record.resultPath });
+  const terminalResult = () => {
+    const code = record.status === 'done' ? 0 : record.exitCode || 1;
+    // Exit 75 is exclusively the wait-again signal; retain the task code in JSON.
+    return { ...result(), code: code === 75 ? 1 : code };
+  };
   for (;;) {
     let snapshot;
     try { snapshot = await withinBudget(() => readRecord(jobId)); }
     catch { return { status: 'failed', exitCode: null, resultPath: null, code: 2 }; }
     if (snapshot === expired) return { ...result(), code: 75 };
     record = snapshot;
-    if (record.status !== 'running') return { ...result(), code: record.status === 'done' ? 0 : record.exitCode || 1 };
+    if (record.status !== 'running') return terminalResult();
     if (now() >= deadline) return { ...result(), code: 75 };
     let alive;
     try { alive = await withinBudget(() => isAlive(record.pid)); }
@@ -1166,7 +1172,7 @@ export async function waitForJob({
         return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 };
       }
     }
-    if (record.status !== 'running') return { ...result(), code: record.status === 'done' ? 0 : record.exitCode || 1 };
+    if (record.status !== 'running') return terminalResult();
     const remaining = deadline - now();
     if (remaining <= 0) return { ...result(), code: 75 };
     if (await withinBudget(() => sleep(Math.min(Math.max(1, pollMs), remaining))) === expired) return { ...result(), code: 75 };
@@ -1216,6 +1222,7 @@ async function main() {
       + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json] [--detach]\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
+      + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
       + '    Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.\n'
       + '    Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.\n'
       + '    All IO shares that single requested deadline; no floor or additional grace.\n'
@@ -1332,7 +1339,7 @@ if (isMain) {
   const finish = code => {
     if (!internalJob || finished) return;
     const record = readJobRecord(flags.job);
-    if (record.status === 'running') {
+    if (record.status === 'running' && record.pid === process.pid) {
       writeJobRecord({ ...record, status: code === 0 ? 'done' : 'failed', exitCode: code,
         finishedAt: new Date().toISOString() });
     }
