@@ -1,9 +1,11 @@
 /**
  * @file scripts/operations/record-red-team-ruling-io.mjs
- * @description Live reader and existing-card sink for cap-held operator rulings. IO is injectable.
+ * @description Live reader and retry-safe card sink for cap-held operator rulings. IO is injectable.
  */
 import { spawnSync } from 'node:child_process';
-import { basename, dirname, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { liveResultGateState, readConfirmedBreaks, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
@@ -11,10 +13,14 @@ import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
 import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
+import { automationStateRoot } from '../lib/automation-home.mjs';
+import { defaultSpawnDetached } from './detached-dispatch.mjs';
+import { preventionCardLandingLogPath, spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
+import { buildGateComment } from './red-team-gate-apply.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
-import { OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulableBreaks } from './record-red-team-ruling.mjs';
+import { CARD_PENDING_OUTCOME, conflictingPendingCardJobs, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulableBreaks } from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
@@ -97,11 +103,109 @@ export function createRecordRedTeamRulingReader({ env = process.env, readThread 
   };
 }
 
+/**
+ * A local, atomic claim per card job, in numbered GENERATIONS (`<key>.<n>.claim`, each made with `wx`). Taking over an
+ * expired claim means creating generation n+1, which only one caller can do. The spawn PROOF is a separate receipt
+ * (`<key>.spawned`) written only after the child's start was confirmed (a pid), never the landing job's log file
+ * (that is opened before the spawn, so it proves nothing).
+ */
+export function createFileClaims({ dir = join(automationStateRoot(), 'red-team-ruling-claims'), nowMs = Date.now } = {}) {
+  const latest = (key) => {
+    let gen = -1, at = 0;
+    for (const f of readdirSync(dir)) {
+      const m = f.startsWith(`${key}.`) ? /\.(\d+)\.claim$/.exec(f) : null;
+      if (m && Number(m[1]) > gen) { gen = Number(m[1]); try { at = Number(JSON.parse(readFileSync(join(dir, f), 'utf8')).at) || 0; } catch { at = 0; } }
+    }
+    return { gen, at };
+  };
+  const make = (key, gen) => {
+    try { writeFileSync(join(dir, `${key}.${gen}.claim`), JSON.stringify({ at: nowMs() }), { flag: 'wx' }); return true; }
+    catch (e) { if (e?.code === 'EEXIST') return false; throw e; }
+  };
+  return {
+    claim(key) {
+      mkdirSync(dir, { recursive: true });
+      const cur = latest(key);
+      if (cur.gen < 0 && make(key, 0)) return { created: true, gen: 0, at: nowMs() };
+      const seen = latest(key);
+      return { created: false, gen: seen.gen, at: seen.at };
+    },
+    /** Take over the claim observed at `gen`. Exactly one caller wins generation gen+1. */
+    reclaim(key, gen) { return make(key, gen + 1); },
+    /** Reserve the entire selection under one lock and in one file. Legacy per-break claims still bind.
+     * A rejected selection writes nothing, so it cannot strand its otherwise unowned breaks. */
+    claimBreak(breakKey, jobKey, breakKeys = [breakKey]) {
+      mkdirSync(dir, { recursive: true });
+      const lock = join(dir, 'break-selection.lock');
+      try { mkdirSync(lock); }
+      catch (e) {
+        if (e?.code !== 'EEXIST') throw e;
+        throw new Error('break selection is locked; retry later. If it persists, verify no ruling invocation is running before removing break-selection.lock from the claims directory');
+      }
+      try {
+        const keys = [...new Set(breakKeys)].sort();
+        if (!keys.includes(breakKey)) throw new Error('break selection does not include the requested break; nothing claimed');
+        // Read every owner before writing anything. Corrupt persisted evidence refuses the entire selection.
+        for (const key of keys) {
+          const f = join(dir, `${key}.break`);
+          let text;
+          try { text = readFileSync(f, 'utf8'); }
+          catch (e) { if (e?.code === 'ENOENT') continue; throw e; }
+          const owner = JSON.parse(text).jobKey;
+          if (typeof owner !== 'string' || !owner) throw new Error('unreadable legacy break owner; inspect the claims directory before retrying');
+          if (owner !== jobKey) return owner;
+        }
+        for (const name of readdirSync(dir).filter((f) => f.endsWith('.selection'))) {
+          const saved = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+          if (typeof saved.jobKey !== 'string' || !saved.jobKey || name !== `${saved.jobKey}.selection` || !Array.isArray(saved.keys)
+            || !saved.keys.length || saved.keys.some((k) => typeof k !== 'string' || !k)) {
+            throw new Error('unreadable break selection; inspect the claims directory before retrying');
+          }
+          if (saved.jobKey !== jobKey && saved.keys.some((key) => keys.includes(key))) return saved.jobKey;
+          if (saved.jobKey === jobKey && JSON.stringify(saved.keys) !== JSON.stringify(keys)) {
+            throw new Error('card job already owns a different break selection; retry with its exact selection');
+          }
+        }
+        const f = join(dir, `${jobKey}.selection`);
+        try { writeFileSync(f, JSON.stringify({ jobKey, keys, at: nowMs() }), { flag: 'wx' }); }
+        catch (e) { if (e?.code !== 'EEXIST') throw e; }
+        return jobKey;
+      } finally { rmSync(lock, { recursive: true }); }
+    },
+    spawned(key) { return existsSync(join(dir, `${key}.spawned`)); },
+    attempted(key) { return existsSync(join(dir, `${key}.attempt`)); },
+    /** Exclusive (`wx`): exactly one invocation ever holds a job's attempt; false when another already does. */
+    markAttempt(key) {
+      mkdirSync(dir, { recursive: true });
+      try { writeFileSync(join(dir, `${key}.attempt`), JSON.stringify({ at: nowMs() }), { flag: 'wx' }); return true; }
+      catch (e) { if (e?.code === 'EEXIST') return false; throw e; }
+    },
+    clearAttempt(key) { rmSync(join(dir, `${key}.attempt`), { force: true }); },
+    markSpawned(key, info) { writeFileSync(join(dir, `${key}.spawned`), JSON.stringify({ ...info, at: nowMs() })); },
+    now: nowMs,
+  };
+}
+
+/** The claim key binding ONE break of one result to its card job. PURE. */
+export const breakClaimKey = (p, index) => createHash('sha256').update(JSON.stringify(['break-v1', p.repo, Number(p.pr), p.head, p.resultId, Number(index)])).digest('hex').slice(0, 16);
+
+/** How long a claim with no spawned job counts as another invocation still working. */
+export const CLAIM_IN_PROGRESS_MS = 120_000;
+
+/** Spawn the landing job under a STABLE session, so the job (and its log) is identified by the ruling, not by a fresh random slug. */
+const spawnStableCardJob = (input, session) => {
+  const logPath = preventionCardLandingLogPath(session);
+  const r = spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-ruling-card',
+    spawnDetached: (argv, o) => defaultSpawnDetached(argv.map((a) => (a.startsWith('--session=') ? `--session=${session}` : a)), { ...o, logPath }) });
+  return r.ok ? { ...r, session } : r;
+};
+
 export function createRecordRedTeamRulingSinks({ env = process.env, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
   runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = () => resolveOperatorIdentity({ env }),
+  claims = createFileClaims(), fileCard = spawnStableCardJob,
   post = (repo, pr, body) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env),
   syncLabels = ({ repo, pr, head }) => syncRedTeamStatusLabels({ repo, pr, head, env }),
   warn = (m) => process.stderr.write(`${m}\n`) } = {}) {
@@ -151,24 +255,79 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
   const operatorRecord = (p, outcome, line) => `${redTeamGateMarker(p.pr, p.head, outcome, p.resultId)}\n`
     + `**Red-team gate** operator ruling (\`record-red-team-ruling\`) on head \`${p.head.slice(0, 12)}\`:\n${line}`;
   const indexList = (p) => `(${p.indices.map((i) => `#${i}`).join(', ')})`;
+  const intentBody = (p) => `${redTeamGateMarker(p.pr, p.head, CARD_PENDING_OUTCOME, p.resultId)}\n`
+    + `Operator card ruling pending (job ${p.jobKey}, break(s) ${p.indices.map((i) => `#${i}`).join(', ')}); the break stays held until the card is queued and recorded.`;
   return {
     [RED_TEAM_RULING_CARD_EFFECT]: (p) => {
-      recheck(p);
-      // Persist the reason before release: either failed POST leaves the break held and retryable.
-      if (!/^we:backlog\/[A-Za-z0-9][A-Za-z0-9._-]*\.md(?:@pr[1-9]\d{0,8})?$/.test(p.cardRef)) throw new Error(`--card resolved to an unsafe reference ${JSON.stringify(p.cardRef)}; nothing written`);
-      const record = operatorRecord(p, OPERATOR_CARD_OUTCOME, `- ${p.indices.length} finding(s) carded by the operator to \`${p.cardRef}\` ${indexList(p)}.`);
-      post(p.repo, p.pr, reasonBody(p, `Carded to the existing card \`${p.cardRef}\`; no new card is filed.`));
-      recheck(p, 'reason posted; no release record written'); // Re-read changes made while posting the reason.
-      // The reason POST may outlive the card. Validate the exact planned reference at the release boundary.
-      let card;
-      try { card = resolveCard(p.cardRef, { repo: p.repo, pr: p.pr, head: p.head }); }
-      catch { throw new Error(`--card ${p.cardRef} could not be re-read; reason posted; no release record written`); }
-      if (!card?.readable || card.ref !== p.cardRef) {
-        throw new Error(`--card ${p.cardRef} no longer resolves to the same readable backlog card (${card?.reason ?? 'unreadable'}); reason posted; no release record written`);
+      const { comments } = recheck(p);
+      if (!p.cardRef) {
+        const pending = conflictingPendingCardJobs(comments, p);
+        if (pending.length) throw new Error(`a different card job (${pending.map((j) => j.jobKey).join(', ')}) is already pending for an overlapping break; nothing written — re-run with that exact selection`);
       }
+      if (p.cardRef) {
+        // Persist the reason before release: either failed POST leaves the break held and retryable.
+        if (!/^we:backlog\/[A-Za-z0-9][A-Za-z0-9._-]*\.md(?:@pr[1-9]\d{0,8})?$/.test(p.cardRef)) throw new Error(`--card resolved to an unsafe reference ${JSON.stringify(p.cardRef)}; nothing written`);
+        const record = operatorRecord(p, OPERATOR_CARD_OUTCOME, `- ${p.indices.length} finding(s) carded by the operator to \`${p.cardRef}\` ${indexList(p)}.`);
+        post(p.repo, p.pr, reasonBody(p, `Carded to the existing card \`${p.cardRef}\`; no new card is filed.`));
+        recheck(p, 'reason posted; no release record written'); // Re-read changes made while posting the reason.
+        // The reason POST may outlive the card. Validate the exact planned reference at the release boundary.
+        let card;
+        try { card = resolveCard(p.cardRef, { repo: p.repo, pr: p.pr, head: p.head }); }
+        catch { throw new Error(`--card ${p.cardRef} could not be re-read; reason posted; no release record written`); }
+        if (!card?.readable || card.ref !== p.cardRef) {
+          throw new Error(`--card ${p.cardRef} no longer resolves to the same readable backlog card (${card?.reason ?? 'unreadable'}); reason posted; no release record written`);
+        }
+        post(p.repo, p.pr, record);
+        proveReleased(p, 'the operator-card record', record);
+        return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
+      }
+      const session = p.session;
+      // 0. Each selected BREAK belongs to at most one card job (atomic, local): an overlapping concurrent selection loses.
+      const breakKeys = p.indices.map((i) => breakClaimKey(p, i));
+      const owners = p.indices.map((i, n) => ({ i, owner: claims.claimBreak(breakKeys[n], p.jobKey, breakKeys) })).filter((o) => o.owner !== p.jobKey);
+      if (owners.length) {
+        throw new Error(`break(s) ${owners.map((o) => `#${o.i}`).join(', ')} already belong to another card job (${[...new Set(owners.map((o) => o.owner || 'unreadable'))].join(', ')}); `
+          + 'nothing written — re-run with that job\'s exact --break selection');
+      }
+      // 1. Serialize: one atomic claim per (PR, head, result, breaks); taking over an expired one is atomic too.
+      const claim = claims.claim(p.jobKey);
+      const spawned = claims.spawned(p.jobKey);
+      if (!claim.created && !spawned) {
+        if (claims.now() - claim.at < CLAIM_IN_PROGRESS_MS) {
+          throw new Error(`another invocation holds the claim for job ${p.jobKey} and has not spawned it yet; wait ${Math.round(CLAIM_IN_PROGRESS_MS / 1000)}s and re-run`);
+        }
+        if (!claims.reclaim(p.jobKey, claim.gen)) throw new Error(`another invocation just took over the claim for job ${p.jobKey}; re-run later`);
+      }
+      // 2. The bare intent marker, BEFORE the spawn (no action line, so the hold stands). Written once per job.
+      const hasIntent = comments.some((c) => String(c?.body ?? '').includes(`outcome=${CARD_PENDING_OUTCOME} result=${p.resultId}`) && String(c?.body ?? '').includes(`job ${p.jobKey}`));
+      if (!hasIntent) post(p.repo, p.pr, intentBody(p));
+      // 3. Spawn exactly once: a job with a spawn receipt is reconciled, never spawned again.
+      let card = { ok: true, session };
+      if (!spawned) {
+        // AT MOST ONCE: an attempt marker is written BEFORE the spawn and cleared only when the spawn reported that it
+        // did not start. A marker with no receipt means a child MAY be running (a crash between the spawn and the
+        // receipt), so a re-run refuses instead of spawning a second filing.
+        if (claims.attempted(p.jobKey) || !claims.markAttempt(p.jobKey)) {
+          throw new Error(`an earlier attempt of card job ${p.jobKey} may have started its landing job (no spawn receipt was recorded); nothing written. `
+            + `Check the landing log for session ${session}; the job is owed, not lost`);
+        }
+        card = fileCard(p.cardInput, session);
+        if (!card?.ok) {
+          claims.clearAttempt(p.jobKey); // the spawn itself reported no child
+          throw new Error(`the follow-up card was not queued (${card?.error ?? 'unknown'}); the intent is recorded and a re-run retries the same job`);
+        }
+        // The proof of a spawn is the child's confirmed start (a pid), recorded durably; the job's log file proves nothing.
+        if (!/^pid:\d+$/.test(String(card.handle ?? ''))) throw new Error('the landing job reported no confirmed child start; not recorded as spawned, and not retried automatically (a child may be running)');
+        claims.markSpawned(p.jobKey, { session, handle: card.handle });
+      }
+      // 4. The release record, only now that the job is accepted. Its failure is retry-safe: the next run sees the spawned job.
+      const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
+        plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card });
+      post(p.repo, p.pr, reasonBody(p, `Follow-up card queued through the prevention landing job (${session}); filing may be paused, in which case it is owed in the spool.`));
+      recheck(p, 'card queued and reason posted; no release record written');
       post(p.repo, p.pr, record);
       proveReleased(p, 'the operator-card record', record);
-      return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
+      return { ruling: 'card', head: p.head, indices: p.indices, card: { session, reconciled: spawned }, labels: resync(p) };
     },
   };
 }
