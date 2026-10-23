@@ -473,6 +473,9 @@ the gate-red hard stop below. A red the gate classifies as load-only → the mes
 exit below. `infrastructure-failure` or no verdict → the harness re-requests on its own; after repeated failures
 the message tells you to report the stalled request with the blocked-on-infra exit (the signal/ceiling evidence,
 without claiming a test failure). A moved or dirty lane → re-commit, `request`, `mark` again.
+
+- `no-new-commit` → the remote branch already had this exact sha when the harness tried to push it (`upToDate`). Do not re-mark: post step 6's durable `## Fix evidence` comment, then finish the hand-back, completion report and fix-end.
+
 Other statuses follow [we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md).
 
 After the harness pushes, do not wait on CI or the merge — finish the hand-back, report and exit.
