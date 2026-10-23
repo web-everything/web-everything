@@ -219,9 +219,13 @@ export async function markReady(s) {
   } catch { s.result.ready = 'failed'; }
   if (s.result.ready === 'failed') s.io.log('fix-ready mark failed');
 }
+const prototypeLoadArgs = s => ['scripts/operations/run.mjs', 'prototype-load',
+  `--branch=${s.result.branch}`, `--sha=${s.result.sha ?? '<sha>'}`, `--daemon=${s.opts.edgeClone}`,
+  `--why=codex-job ${s.opts.purpose}`, `--tests-run=${s.result.tests ? JSON.stringify(s.result.tests) : '<test-summary>'}`,
+  ...(s.result.audit ? [`--audit=${s.result.audit}`] : []), '--json'];
 export async function registerEdge(s) {
   if (!s.opts.edgeClone) return;
-  const r = await exec(s, 'node', ['scripts/daemon-overlay.mjs', 'add', `--clone=${s.opts.edgeClone}`, `--ref=${s.result.branch}`, `--reason=codex-job ${s.opts.purpose}`, '--by=codex-job', '--json']);
+  const r = await exec(s, 'node', prototypeLoadArgs(s));
   s.result.registered = good(r);
   if (!good(r)) fail('register-failed', (r.stdout ?? '').slice(-6000));
 }
@@ -249,7 +253,7 @@ function plan(s) {
     'git ls-remote --heads origin <branch> (try suffixes -2 through -9 if occupied)',
     `git push origin HEAD:refs/heads/${s.result.branch}`,
     'node scripts/fix-ready.mjs mark --branch=<branch> --sha=<sha> (if present)',
-    ...(s.opts.edgeClone ? [show('node', ['scripts/daemon-overlay.mjs', 'add', `--clone=${s.opts.edgeClone}`, `--ref=${s.result.branch}`, `--reason=codex-job ${s.opts.purpose}`, '--by=codex-job', '--json'])] : [])];
+    ...(s.opts.edgeClone ? [show('node', prototypeLoadArgs(s))] : [])];
 }
 export async function runJob(opts, io = {}) {
   const s = { opts: { ...opts }, io: { ...defaults, ...io }, result: { ok: false, branch: opts.purpose ? `lane/${opts.purpose}` : null, sha: null, tests: null, audit: null, registered: opts.edgeClone ? false : null, stopReason: null } };

@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { main, runJob, parseArgs, parseReport, pathsWithinScope, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
+import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
 
 const flags = ['--brief=brief.md', '--purpose=example', '--scope=we:scripts/a.mjs,we:scripts/lib/', '--tests=scripts/a.test.mjs', '--repo=/repo'];
 const ok = (stdout = '') => ({ status: 0, stdout, stderr: '' });
@@ -31,7 +31,7 @@ function fixture(rules = [], { ready = true } = {}) {
       if (call.text.includes('lane-pool.mjs release')) return ok();
       if (call.text.includes('codex-direct-task.mjs')) return report();
       if (call.text.includes('heavy-admission.mjs')) return ok();
-      if (call.text.includes('fix-ready.mjs') || call.text.includes('daemon-overlay.mjs')) return ok();
+      if (call.text.includes('fix-ready.mjs') || call.text.includes('scripts/operations/run.mjs prototype-load')) return ok();
       if (cmd === 'git') {
         if (args.includes('--show-toplevel')) return ok('/repo\n');
         if (args.includes('rev-parse')) return ok('abc123\n');
@@ -72,7 +72,7 @@ it('happy path orders gates, captures one JSON line, uses session env and releas
   expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1);
   expect(f.output).toHaveLength(1);
   expect(f.output[0].split('\n')).toHaveLength(2);
-  const expected = ['free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'reset --hard', 'rev-parse HEAD', 'rev-parse origin/main', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'add --', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --', 'commit -m', 'rev-parse HEAD', 'ls-remote', 'push origin', 'fix-ready.mjs mark', 'daemon-overlay.mjs add', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
+  const expected = ['free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'reset --hard', 'rev-parse HEAD', 'rev-parse origin/main', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'add --', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --', 'commit -m', 'rev-parse HEAD', 'ls-remote', 'push origin', 'fix-ready.mjs mark', 'scripts/operations/run.mjs prototype-load', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
   expect(f.calls).toHaveLength(expected.length);
   expected.forEach((part, i) => expect(f.calls[i].text).toContain(part));
   expect(f.calls.every(c => c.args.every(a => !a.includes('--force') && !a.includes('--allow-conflict')))).toBe(true);
@@ -86,6 +86,33 @@ it('happy path orders gates, captures one JSON line, uses session env and releas
   expect(f.calls.find(c => c.text.includes('codex-direct-task')).cwd).toBe('/repo');
   expect(f.writes[0].data).toContain('against abc123');
   released(f); scopeReleased(f);
+});
+
+it('invokes prototype-load with job evidence and never invokes daemon-overlay', async () => {
+  const f = fixture();
+  const { code, result } = await f.run(['--edge-clone=control']);
+  expect(code).toBe(0);
+  const loads = f.calls.filter(c => c.args.includes('prototype-load'));
+  expect(loads).toHaveLength(1);
+  expect(loads[0]).toMatchObject({ cmd: 'node', cwd: '/repo', args: [
+    'scripts/operations/run.mjs', 'prototype-load', '--branch=lane/example',
+    `--sha=${result.sha}`, '--daemon=control', '--why=codex-job example',
+    `--tests-run=${JSON.stringify(result.tests)}`, '--audit=NOT WEAKENED', '--json',
+  ] });
+  expect(f.calls.some(c => c.text.includes('daemon-overlay.mjs'))).toBe(false);
+});
+it('omits audit evidence when registerEdge has no audit result', async () => {
+  for (const audit of [null, undefined, '']) {
+    const f = fixture();
+    const result = { branch: 'lane/example', sha: 'abc123', tests: { status: 'green', repaired: true }, audit };
+    await registerEdge({ opts: { edgeClone: 'drain', purpose: 'example', repo: '/repo' }, result, io: f.io });
+    expect(result.registered).toBe(true);
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0].args).toEqual([
+      'scripts/operations/run.mjs', 'prototype-load', '--branch=lane/example', '--sha=abc123',
+      '--daemon=drain', '--why=codex-job example', '--tests-run={"status":"green","repaired":true}', '--json',
+    ]);
+  }
 });
 
 const failures = [
@@ -104,7 +131,7 @@ const failures = [
   ['commit-failed', 50, [['commit -m', red()]], true],
   ['push-failed', 51, [['push origin', red()]], true],
   ['branch-name-exhausted', 52, [['ls-remote', ok('abc refs/heads/occupied')]], true],
-  ['register-failed', 60, [['daemon-overlay.mjs add', red('overlay conflict')]], true],
+  ['register-failed', 60, [['scripts/operations/run.mjs prototype-load', red('overlay conflict')]], true],
   ['internal-error', 99, [['diff --name-only', () => { throw new Error('boom'); }]], true],
 ];
 for (const [reason, expectedCode, rules, laneHeld] of failures) {
@@ -348,12 +375,12 @@ it('uses branch suffix -2 on collision and never forces the push', async () => {
   const { result } = await f.run(['--edge-clone=/edge']);
   expect(result.branch).toBe('lane/example-2');
   expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/lane', 'push', 'origin', 'HEAD:refs/heads/lane/example-2']);
-  expect(f.calls.find(c => c.text.includes('daemon-overlay')).args).toContain('--ref=lane/example-2');
+  expect(f.calls.find(c => c.text.includes('run.mjs prototype-load')).args).toContain('--branch=lane/example-2');
 });
-it('skips missing fix-ready and omits overlay without edge-clone', async () => {
+it('skips missing fix-ready and omits prototype-load without edge-clone', async () => {
   const f = fixture([], { ready: false }); const { result } = await f.run();
   expect(result.ready).toBe('skipped'); expect(result.registered).toBeNull();
-  expect(f.calls.some(c => /fix-ready|daemon-overlay/.test(c.text))).toBe(false);
+  expect(f.calls.some(c => /fix-ready|prototype-load|daemon-overlay/.test(c.text))).toBe(false);
 });
 it('mark failure is logged but is not fatal', async () => {
   const f = fixture([['fix-ready.mjs', red()]]); const { result } = await f.run();
@@ -363,7 +390,9 @@ it('dry-run only checks scope, acquires/resets/releases lane, and describes late
   const f = fixture(); const { result, code } = await f.run(['--dry-run', '--edge-clone=/edge']);
   expect(code).toBe(0); expect(result).toMatchObject({ ok: true, dryRun: true, stopReason: null });
   expect(result.plan.join('\n')).toContain('codex-direct-task.mjs');
-  expect(result.plan.join('\n')).toContain('heavy-admission'); expect(result.plan.join('\n')).toContain('daemon-overlay');
+  expect(result.plan.join('\n')).toContain('heavy-admission'); expect(result.plan.join('\n')).toContain('prototype-load');
+  expect(result.plan.join('\n')).not.toContain('daemon-overlay');
+  expect(result.plan.at(-1)).toBe(['node', 'scripts/operations/run.mjs', 'prototype-load', '--branch=lane/example', '--sha=<sha>', '--daemon=/edge', '--why=codex-job example', '--tests-run=<test-summary>', '--json'].map(a => JSON.stringify(a)).join(' '));
   expect(f.calls.some(c => /codex-direct-task|heavy-admission|free-scope-cli.mjs register/.test(c.text) || c.args.includes('commit') || c.args.includes('push'))).toBe(false);
   expect(f.writes).toHaveLength(0); released(f);
   expect(f.calls.some(c => c.text.includes('free-scope-cli.mjs release'))).toBe(false);
