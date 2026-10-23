@@ -18,6 +18,7 @@ import {
   startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode,
   CODEX_CLI,
   DEFAULT_TIMEOUT_MS,
+  DEFAULT_INSTALL_TIMEOUT_MS,
   CODEX_EFFORT_MAP,
   CODEX_MODEL,
   CODEX_TIER_EFFORT,
@@ -485,6 +486,58 @@ describe('#x8wbivt Fork 4 — the ratified quota signal: locate, parse, read, an
 });
 
 describe('setupScratchClone — clones locally and installs deps, over injected execFn/mkTempDir/existsFn', () => {
+  it('returns scratch metadata only after async installation succeeds, with a bounded default', async () => {
+    let finishInstall;
+    const installExecFn = vi.fn(() => new Promise(resolve => { finishInstall = resolve; }));
+    const pending = setupScratchClone({
+      repoRoot: '/repo', mkTempDir: () => '/scratch', existsFn: () => true,
+      execFn: () => '', installExecFn,
+    });
+    expect(pending).toBeInstanceOf(Promise);
+    let settled = false;
+    pending.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(installExecFn.mock.calls[0][2].timeout).toBe(DEFAULT_INSTALL_TIMEOUT_MS);
+    expect(DEFAULT_INSTALL_TIMEOUT_MS).toBe(5 * 60 * 1000);
+    finishInstall('installed');
+    await expect(pending).resolves.toMatchObject({ dest: '/scratch', depsInstall: { bin: 'npm', args: ['ci'] } });
+  });
+
+  it('fails the task on a real async install timeout before starting Codex', async () => {
+    const dest = mkdtempSync(join(tmpdir(), 'codex-install-timeout-'));
+    const spawnFn = vi.fn();
+    try {
+      await expect(codexDirectTask({
+        task: 'fixture', repoRoot: '/repo', mkTempDir: () => dest, existsFn: () => true,
+        execFn: () => '', spawnFn, gate: 'none', selfReview: false, log: false,
+        installTimeoutMs: 100,
+        installExecFn: (_bin, _args, options) => detachedGateExecFn(process.execPath,
+          ['-e', keepAliveScript({ maxLifetimeMs: 10000 })], options),
+      })).rejects.toThrow('timed out after 100ms');
+      expect(spawnFn).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dest, { recursive: true, force: true });
+    }
+  });
+
+  it('awaits an optional install runner with an explicit timeout and propagates failure', async () => {
+    let finishInstall;
+    const execFn = vi.fn(() => '');
+    const installExecFn = vi.fn(() => new Promise((resolve, reject) => { finishInstall = reject; }));
+    const pending = setupScratchClone({
+      repoRoot: '/repo', mkTempDir: () => '/scratch', existsFn: () => true,
+      execFn, installExecFn, installTimeoutMs: 100, installStdio: ['ignore', 2, 2],
+    });
+    expect(pending).toBeInstanceOf(Promise);
+    expect(installExecFn).toHaveBeenCalledWith('npm', ['ci'], {
+      cwd: '/scratch', stdio: ['ignore', 2, 2], timeout: 100,
+    });
+    expect(execFn.mock.calls.every(([bin]) => bin === 'git')).toBe(true);
+    finishInstall(new Error('install timed out'));
+    await expect(pending).rejects.toThrow('install timed out');
+  });
+
   it('#3782: clones from repoRoot, LEAVES origin at the local clone source by default, and REPORTS the real remote without wiring it in', () => {
     const calls = [];
     const execFn = (bin, args, opts) => {
@@ -2027,6 +2080,7 @@ describe('detached jobs', () => {
   ])('detached CLI writes one JSON report and logs events with $flags and exit $runCode and install $install', async ({ flags, runCode, install }) => {
     const preload = join(jobsDir, 'result-preload.mjs');
     const logFile = join(jobsDir, 'events.jsonl');
+    const installed = join(jobsDir, 'installed');
     writeFileSync(preload, `
       import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
@@ -2035,6 +2089,8 @@ describe('detached jobs', () => {
       import { writeFileSync } from 'node:fs';
       const spawn = cp.spawn;
       const execFileSync = cp.execFileSync;
+      const installScript = 'console.log("added 1 package"); console.error("installer diagnostic");'
+        + 'require("node:fs").writeFileSync(' + ${JSON.stringify(JSON.stringify(installed))} + ', "installed")';
       cp.execFileSync = (bin, args, options) => {
         if (bin === 'git' && args[0] === 'clone') {
           const dest = args.at(-1);
@@ -2042,12 +2098,13 @@ describe('detached jobs', () => {
           if (${JSON.stringify(install)} === 'ci') writeFileSync(join(dest, 'package-lock.json'), '{}');
         }
         if (bin === 'npm') return execFileSync(process.execPath,
-          ['-e', 'console.log("added 1 package"); console.error("installer diagnostic")'], options);
+          ['-e', installScript], options);
         return args.includes('--absolute-git-dir')
           ? join(process.env.CODEX_JOBS_DIR, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
       };
       cp.spawn = (bin, args, options) => {
         if (bin === process.execPath) return spawn(bin, args, options);
+        if (bin === 'npm') return spawn(process.execPath, ['-e', installScript], options);
         const child = new EventEmitter();
         child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
         child.stdin = { on() {}, end() { setImmediate(() => {
@@ -2079,13 +2136,98 @@ describe('detached jobs', () => {
       });
       if (install) {
         expect(result.scratch.depsInstall.args).toEqual([install]);
-        expect(readFileSync(join(jobsDir, `${job.id}.stderr.log`), 'utf8')).toContain('added 1 package');
+        expect(readFileSync(installed, 'utf8')).toBe('installed');
         rmSync(result.dir, { recursive: true, force: true });
       }
     } finally {
       try { process.kill(job.pid, 'SIGTERM'); } catch { /* already stopped */ }
     }
   }, 20000);
+
+  it.each(['ci', 'install'].flatMap(install => ['SIGINT', 'SIGTERM', 'timeout'].map(signal => ({ install, signal }))))(
+    'detached CLI $signal during npm $install stops the install group without corrupting results', async ({ install, signal }) => {
+      const preload = join(jobsDir, 'install-preload.mjs');
+      const worker = join(jobsDir, 'install-worker.cjs');
+      const ready = join(jobsDir, 'install.ready');
+      const completed = join(jobsDir, 'install.completed');
+      const scratchPath = join(jobsDir, 'scratch.path');
+      writeFileSync(worker, `
+        const { writeFileSync } = require('node:fs');
+        const { spawn } = require('node:child_process');
+        if (process.argv[2] === 'descendant') {
+          console.log('INSTALL_STDOUT'); console.error('INSTALL_STDERR');
+          writeFileSync(${JSON.stringify(ready)}, String(process.pid));
+          setTimeout(() => writeFileSync(${JSON.stringify(completed)}, 'INSTALL_COMPLETED_AFTER_CANCEL'), 1200);
+        } else {
+          spawn(process.execPath, [__filename, 'descendant'], { stdio: 'inherit' });
+        }
+      `);
+      writeFileSync(preload, `
+        import cp from 'node:child_process';
+        import { syncBuiltinESMExports } from 'node:module';
+        import { EventEmitter } from 'node:events';
+        import { writeFileSync } from 'node:fs';
+        import { join } from 'node:path';
+        const { spawn, execFileSync } = cp;
+        // Shorten only the explicit install deadline so the CLI timeout path stays hermetic and fast.
+        if (${JSON.stringify(signal)} === 'timeout') {
+          const schedule = globalThis.setTimeout;
+          globalThis.setTimeout = (fn, ms, ...args) => schedule(fn,
+            ms === ${DEFAULT_INSTALL_TIMEOUT_MS} ? 200 : ms, ...args);
+        }
+        cp.execFileSync = (bin, args, options) => {
+          if (bin === 'npm') return execFileSync(process.execPath, [${JSON.stringify(worker)}], options);
+          if (bin === 'git' && args[0] === 'clone') {
+            const dest = args.at(-1);
+            writeFileSync(${JSON.stringify(scratchPath)}, dest);
+            writeFileSync(join(dest, 'package.json'), '{}');
+            if (${JSON.stringify(install)} === 'ci') writeFileSync(join(dest, 'package-lock.json'), '{}');
+          }
+          return args.includes('--absolute-git-dir') ? join(process.env.CODEX_JOBS_DIR, 'metadata')
+            : args.includes('rev-parse') ? 'sha' : '';
+        };
+        cp.spawn = (bin, args, options) => {
+          if (bin === process.execPath) return spawn(bin, args, options);
+          if (bin === 'npm') return spawn(process.execPath, [${JSON.stringify(worker)}], options);
+          const child = new EventEmitter();
+          child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+          child.stdin = { on() {}, end() { setImmediate(() => child.emit('close', 0)); } };
+          child.kill = () => {};
+          return child;
+        };
+        syncBuiltinESMExports();
+      `);
+      const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
+        `--repo-root=${jobsDir}`, '--task=fixture', '--gate=none', '--no-self-review'], {
+        encoding: 'utf8', timeout: 10000,
+        env: { ...process.env, CODEX_JOBS_DIR: jobsDir, NODE_OPTIONS: `--import=${preload}` },
+      });
+      expect(launcher.status, launcher.stderr).toBe(0);
+      const job = readJobRecord(JSON.parse(launcher.stdout).id, { jobsDir });
+      try {
+        if (signal !== 'timeout') {
+          await vi.waitFor(() => expect(readFileSync(ready, 'utf8')).toMatch(/^\d+$/), { timeout: 10000 });
+          expect(process.kill(job.pid, signal)).toBe(true);
+        }
+        const exitCode = signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1;
+        const result = await waitForJob({ jobId: job.id, jobsDir, maxMs: 10000, pollMs: 20 });
+        expect(result).toMatchObject({ status: 'failed', exitCode });
+        await new Promise(resolve => setTimeout(resolve, 1400));
+        expect(() => readFileSync(completed)).toThrow();
+        expect(readJobRecord(job.id, { jobsDir })).toMatchObject({
+          status: 'failed', exitCode,
+        });
+        expect(readFileSync(job.resultPath, 'utf8')).toBe('');
+        if (signal === 'timeout') {
+          expect(readFileSync(join(jobsDir, `${job.id}.stderr.log`), 'utf8'))
+            .toContain(`timed out after ${DEFAULT_INSTALL_TIMEOUT_MS}ms`);
+        }
+      } finally {
+        try { process.kill(job.pid, 'SIGKILL'); } catch { /* exited */ }
+        try { process.kill(Number(readFileSync(ready, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
+        try { rmSync(readFileSync(scratchPath, 'utf8'), { recursive: true, force: true }); } catch { /* no clone */ }
+      }
+    }, 20000);
 
   it.each(['standards', 'related', 'full'].flatMap(mode => ['SIGINT', 'SIGTERM'].map(signal => ({ mode, signal }))))(
     'detached CLI cancellation by $signal during $mode gate stops the gate group and records failure', async ({ mode, signal }) => {

@@ -130,6 +130,7 @@ export const REVIEW_MODE_SUFFIX = 'This is a READ-ONLY review. Do not edit, crea
   + '`git commit`/`git push`/`git add`, do not install dependencies, and do not open a pull request. Read what you '
   + 'need, then put your whole answer in your final message.';
 export const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000; // 30 min — an open-ended coding task, not a quick judge call.
+export const DEFAULT_INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * #x8wbivt (`#3635`)'s ratified routing constants are RE-EXPORTED here, not defined here.
@@ -604,11 +605,13 @@ export function detachedGateExecFn(bin, args, opts = {}) {
  * @param {boolean} [opts.installDeps] - default true; a caller in a hurry for a task that touches no code
  *   dependent on `node_modules` may pass false.
  * @param {string|Array} [opts.installStdio] - defaults to inherit; JSON callers redirect stdout to stderr.
+ * @param {Function} [opts.installExecFn] - optional async installer; only this path returns a Promise.
+ * @param {number} [opts.installTimeoutMs] - async install deadline, default five minutes.
  * @param {boolean} [opts.wireOriginToRemote] - default false (#3782). When true, opts back into the pre-#3782
  *   behavior: rewrite the clone's `origin` to the real remote so a human can push straight from it. Best-effort
  *   either way — an offline/no-remote `repoRoot` (e.g. a test fixture) just leaves `realOrigin` null.
  * @returns {{dest: string, cloned: true, depsInstall: {bin: string, args: string[]}|null, realOrigin:
- *   string|null, originWired: boolean}}
+ *   string|null, originWired: boolean}|Promise<object>}
  */
 export function setupScratchClone({
   repoRoot,
@@ -617,6 +620,8 @@ export function setupScratchClone({
   existsFn = existsSync,
   installDeps = true,
   installStdio = 'inherit',
+  installExecFn,
+  installTimeoutMs = DEFAULT_INSTALL_TIMEOUT_MS,
   wireOriginToRemote = false,
 } = {}) {
   if (typeof repoRoot !== 'string' || !repoRoot.trim()) {
@@ -642,8 +647,14 @@ export function setupScratchClone({
   }
 
   const depsInstall = installDeps ? planDepsInstall(dest, existsFn) : null;
+  const result = { dest, cloned: true, depsInstall, realOrigin, originWired };
+  if (depsInstall && installExecFn) {
+    return Promise.resolve(installExecFn(depsInstall.bin, depsInstall.args, {
+      cwd: dest, stdio: installStdio, timeout: installTimeoutMs,
+    })).then(() => result);
+  }
   if (depsInstall) execFn(depsInstall.bin, depsInstall.args, { cwd: dest, stdio: installStdio });
-  return { dest, cloned: true, depsInstall, realOrigin, originWired };
+  return result;
 }
 
 /**
@@ -874,6 +885,8 @@ export async function runCodexDirectExec({
  * @param {string} [opts.logFile]
  * @param {boolean} [opts.stream]
  * @param {boolean} [opts.installDeps]
+ * @param {Function} [opts.installExecFn] - async install runner, awaited before starting Codex.
+ * @param {number} [opts.installTimeoutMs] - async install deadline, default five minutes.
  * @param {boolean} [opts.wireOriginToRemote] - #3782: default false — forwarded to `setupScratchClone`. Only
  *   meaningful when `dir` is omitted (a scratch clone is actually made); ignored for a caller-named `--dir`.
  * @param {boolean} [opts.clearRolloutAfterRun] - #x8wbivt Fork 4: when true, use the ratified read-then-delete
@@ -904,6 +917,8 @@ export async function codexDirectTask({
   stream = true,
   installDeps = true,
   installStdio = 'inherit',
+  installExecFn,
+  installTimeoutMs = DEFAULT_INSTALL_TIMEOUT_MS,
   wireOriginToRemote = false,
   clearRolloutAfterRun = false,
   review = false,
@@ -949,8 +964,9 @@ export async function codexDirectTask({
     if (!review && (gate === 'full' || gate === 'related') && !existsFn(join(repoRoot, 'scripts', 'verify-lane.mjs'))) {
       throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${repoRoot} does not have; pass --gate=standards or --gate=none`);
     }
-    scratch = setupScratchClone({
+    scratch = await setupScratchClone({
       repoRoot, mkTempDir, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
+      installExecFn, installTimeoutMs,
     });
     targetDir = scratch.dest;
   } else if (!existsFn(targetDir)) {
@@ -1354,6 +1370,8 @@ async function main() {
       stream: !flags['no-stream'],
       installDeps: !flags['no-install'],
       installStdio: flags.json ? ['ignore', 2, 2] : 'inherit',
+      installExecFn: flags.job ? detachedGateExecFn : undefined,
+      installTimeoutMs: DEFAULT_INSTALL_TIMEOUT_MS,
       gateExecFn: flags.job ? detachedGateExecFn : undefined,
       wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
       clearRolloutAfterRun: Boolean(flags['clear-rollout-after-run']),
