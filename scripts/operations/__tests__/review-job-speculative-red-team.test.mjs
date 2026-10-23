@@ -3,10 +3,11 @@
  * and keeps it only when the review accepts. No real process, model, git or GitHub call: every effect is a fake.
  */
 import { describe, it, expect } from 'vitest';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnKeepAlive } from '../../lib/test-keepalive.mjs';
 
 import { createReviewJobIo, runReviewJob, settleSpeculativeRedTeam } from '../review-job.mjs';
 import {
@@ -18,7 +19,8 @@ import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../../lib/drain-red-team-evidence.mjs';
 import { newRunRecord, writeRun } from '../run-store.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { liveResultGateState, redTeamGateMarker } from '../../lib/red-team-gate.mjs';
+import { liveResultGateState, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
+import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 
 const REPO = 'web-everything/web-everything';
 const REV = 'a'.repeat(40);
@@ -113,6 +115,30 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
     const carded = bot(redTeamGateMarker(10, REV, 'card-queued'));
     expect(run([bot(`<!-- reviewed-sha: ${REV} -->`), bot(degraded('old')), carded, bot(degraded('new'))])).toEqual([]);
     expect(run([bot(`<!-- reviewed-sha: ${REV} -->`), bot(degraded('old')), carded])).toEqual(['card-queued']);
+  });
+
+  // Codex guard audit of the round-grant fix: one carry comment would flatten record order and lose a grant's position
+  // between a round-cap and a later sent-back. The carry never moves a send-back step record at all, so it cannot.
+  it('a send-back step record (round-cap, grant-backed sent-back) is never carried, so the grant position survives', () => {
+    const head = 'b'.repeat(40);
+    const broken = renderRedTeamComment({ pr: 10, rev: REV, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', file: 'x.mjs', line: 1, confirmedByRecheck: true }] });
+    const bot = body => ({ author: { login: 'web-everything' }, body });
+    const grant = { author: { login: 'chalbert' }, body: buildRoundExtensionComment({ repo: REPO, pr: 10, by: 1, actor: 'chalbert', channel: 'test', reason: 'Yes', at: '2026-10-19T00:00:00Z' }) };
+    const id = redTeamResultId(parseRedTeamComment(broken));
+    const base = [bot(`<!-- reviewed-sha: ${REV} -->`), bot(broken), bot(redTeamGateMarker(10, REV, 'round-cap', id)), grant];
+    for (const comments of [base, [...base, bot(redTeamGateMarker(10, REV, 'sent-back', id))]]) {
+      const posted = [];
+      const { io } = jobIo({ over: {
+        carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
+        readCarryEvidence: () => ({ headSha: head, comments }),
+        contributionPatchId: () => 'c'.repeat(40),
+        restampVerdict: () => ({ ok: true }),
+        postCarryComment: a => posted.push(a),
+      } });
+      expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).outcome).not.toBe('carried');
+      expect(posted).toEqual([]);
+    }
   });
 
   it.each([true, false])('records the pass as queued before the added seats and the dispatch, then finished (speculative=%s)', enabled => {
@@ -454,7 +480,7 @@ const exited = (child) => new Promise((resolveExit) => { if (child.exitCode !== 
 
 describe('calling a speculative pass off kills real processes', () => {
   it('killActiveSeats kills a running seat CLI\'s own (detached) process group', async () => {
-    const seat = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+    const seat = spawnKeepAlive({ detached: true });
     ACTIVE_SEAT_PIDS.add(seat.pid);
     killActiveSeats('SIGKILL');
     await exited(seat);

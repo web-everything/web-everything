@@ -11,6 +11,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { keepAliveScript, spawnKeepAlive } from '../test-keepalive.mjs';
 
 import {
   JOB_ATTEMPT_ENV, JOB_ID_ENV, createJobStore, enqueueJob, hostName, launchJob, localHostAliases, probeHandle, readProcStart,
@@ -34,8 +35,7 @@ async function waitFor(fn, timeoutMs = 10_000) {
 }
 
 function spawnSleeper() {
-  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
-  return child;
+  return spawnKeepAlive();
 }
 
 const noop = defineJobKind({ kind: 'noop', entry: 'job.mjs' });
@@ -371,14 +371,17 @@ describe('reattachTick deadlines', () => {
 
 describe('stopping a job that owns subprocesses', () => {
   it.each([
-    ['a wrapper that exits on SIGTERM', '', 'setInterval(() => {}, 1000)', 'SIGTERM'],
-    ['a tree that ignores SIGTERM', "process.on('SIGTERM', () => {});", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)", 'SIGKILL'],
-    ['a child left running after its wrapper exits', '', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)", 'SIGTERM'],
+    // Every keep-alive is anchored to THIS test runner (not its wrapper), so a wrapper's death never ends
+    // the child on its own — the group kill under test must.
+    ['a wrapper that exits on SIGTERM', '', keepAliveScript(), 'SIGTERM'],
+    ['a tree that ignores SIGTERM', "process.on('SIGTERM', () => {});", keepAliveScript({ prelude: "process.on('SIGTERM', () => {});" }), 'SIGKILL'],
+    ['a child left running after its wrapper exits', '', keepAliveScript({ prelude: "process.on('SIGTERM', () => {});" }), 'SIGTERM'],
   ])('stops the whole detached process group, not only the wrapper pid: %s', async (_name, parentTrap, childCode, signal) => {
     const parent = spawn(process.execPath, ['-e', [
       parentTrap,
       `const c = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childCode)}], { stdio: 'ignore' });`,
-      'console.log(c.pid); setInterval(() => {}, 1000);',
+      'console.log(c.pid);',
+      keepAliveScript(),
     ].join('\n')], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
     let out = '';
     parent.stdout.on('data', (b) => { out += b; });
@@ -397,8 +400,9 @@ describe('stopping a job that owns subprocesses', () => {
 
   it('kills the leftover process group of a job that died on its own before requeuing it', async () => {
     const parent = spawn(process.execPath, ['-e', [
-      "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
-      'c.unref(); console.log(c.pid); setInterval(() => {}, 1000);',
+      `const c = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript())}], { stdio: 'ignore' });`,
+      'c.unref(); console.log(c.pid);',
+      keepAliveScript(),
     ].join('\n')], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
     let out = '';
     parent.stdout.on('data', (b) => { out += b; });

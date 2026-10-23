@@ -55,7 +55,17 @@ it('unsets worktree keys in worktree scope', () => {
   expect(riskyLaneConfig(git([...LANE_CONFIG_LIST_ARGS]))).toEqual([]);
 });
 it('reports runner errors without throwing', () => {
-  expect(scrubRiskyLaneConfig('unused', { run: () => { throw new Error('read failed'); } }).kept.join()).toContain('read failed');
+  const onConfig = vi.fn();
+  expect(scrubRiskyLaneConfig('unused', { run: () => { throw new Error('read failed'); }, onConfig }).kept.join()).toContain('read failed');
+  expect(onConfig).not.toHaveBeenCalled();
+});
+
+it('shares the successful listing without adding git spawns', () => {
+  const output = 'local\0remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0';
+  const run = vi.fn(() => output), onConfig = vi.fn();
+  expect(scrubRiskyLaneConfig('unused', { run, onConfig })).toEqual({ removed: [], kept: [] });
+  expect(onConfig).toHaveBeenCalledWith(output);
+  expect(run).toHaveBeenCalledTimes(1);
 });
 
 it.each(['primary', 'Origin', 'ORIGIN'])('falls back to removing the local %s remote section if remote remove fails', name => {

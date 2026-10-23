@@ -1,31 +1,52 @@
 ---
 bornAs: xgj8yvn
 kind: story
-size: 5
+size: 3
 parent: "3383"
 status: open
-blockedBy: ["4281"]
 relatedTo: ["4075", "4282", "4284", "3007"]
 
 dateOpened: "2026-10-04"
 tags: []
+scope: ["we:scripts/conveyor/pr-lifecycle.mjs", "we:scripts/conveyor/__tests__/pr-lifecycle.test.mjs", "we:scripts/lib/pr-state.mjs", "we:scripts/lib/pr-state/__tests__/pr-state.test.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
 ---
 
 # Declare the PR lifecycle as data over ledger state (states, next states, owner, max time, label rendering)
 
-Epic 4075 (webhooks-not-polling) is moving PR state off GitHub: per-PR state is derived from webhook events (4281), the verdict ledger is the merge authority (3007), and labels become display-only mirrors (4284). This card therefore defines the lifecycle over LEDGER STATE, not GitHub labels. Write one data file declaring each PR state, its allowed next states, the single owning daemon, a max time in state, and how the state renders to labels. States derive from ledger events (head sha, draft, check conclusion per name per sha, review/verdict, merged/closed), the shape 4281 serves; labels are a mirror computed from the state, never an input. Provider-neutral: GitHub is one event source and one mirror target, never the state store; the map names no GitHub-only concept. Daemons keep running; this is the map they must agree with, not a new runner. Done when: (1) we:scripts/conveyor/pr-lifecycle.mjs exports the state table with fields state, derivedFrom (ledger event kinds and fields, not label names), next[], owner (a daemon id that exists in we:skills-src/conveyor/daemon-manifest.mjs), maxTimeInState, and renderLabels (the label set the mirror writes for that state, e.g. review:pending, review:human, ci:failed, ready-to-merge); (2) a pure derive function maps a PR's ledger events to exactly one state, and every state combination handled in we:scripts/conveyor/reconcile-core.mjs maps to a declared state; (3) MIGRATION ADAPTER: while labels are still the live store, a single adapter function (labelsToLedgerState) reads labels plus check status and yields the same state the ledger derive would; nothing else in the map reads labels. The adapter is removed once card 4284 (labels display-only) lands, in that card's follow-up or the first change after it, and a test fails if the adapter is still imported after 4284 is resolved; (4) a unit test in we:scripts/conveyor/__tests__/pr-lifecycle.test.mjs checks every owner is a real manifest daemon, every next[] target is a declared state, and every state has a renderLabels entry (a pure function state to labels, so the mirror is computed from it); (5) the review:human + red required check case is a declared state with an owner. Order: blocked by 4281 (event-derived state is the substrate). Not blocked by 4282, 4283 or 4284; 4284 consumes this map's renderLabels, and the adapter removal follows 4284. Incidents 2026-10-03/04: (a) review outage loop, where every review job ended blocked-on-infra in under 2s and about 20 PRs sat at review:pending, re-dispatched repeatedly with only a medium health-watch stall after 20 min; (b) #3771 re-reviewed on an unchanged head because two branches in we:scripts/conveyor/reconcile-core.mjs emitted review directly and skipped the hold; (c) a review:human PR with a red required check that no daemon owned until a ci-heal fix on 10-04; (d) silent ruling waits where a dispatch sat blocked for days with nobody told. Research: the claude.ai research page "Graph Engineering vs Our Conveyor" (4 Oct 2026). Root cause: the PR lifecycle is implicit across daemons. Keep the daemons; do not port to LangGraph/Temporal or a central orchestrator.
+The lifecycle table, ledger derivation and migration adapter have shipped; the remaining contract is what the single owner means when a human-held PR also has failing CI. Complete that ownership contract against the existing reconcile outcomes, retaining a provider-neutral state table and label rendering as output. The proposed approach is an accountable coordinator per state, with executable recovery actions remaining in reconcile; it requires the ownership choice below before implementation. Size 3 covers the table/derive contract and cross-contract tests, not a new lifecycle engine.
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+Commands use the Bash helper `we() { command "${@#we:}"; }` to strip repository prefixes from arguments.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+- [A1] **Executable** — `we node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/conveyor/__tests__/pr-lifecycle.test.mjs`: add a regression requiring an explicit owner-role contract (proposed `ownerRole: coordinator|operator`) on every row, with coordinator semantics for HUMAN-HOLD-CI-RED. This fails against the current table, which only declares owner names. If the state-splitting option is selected, replace this assertion with distinct owner/state cases before build.
+- [A2] A table-driven comparison with reconcile covers ordinary red required CI (ci-heal), review-gate-only red (no ci-heal), exhausted heal budget (operator escalation), restored green CI while a human hold remains, and merged/closed PRs. Each case yields one declared lifecycle state and an accountable owner without implying that owner executes every recovery action.
+- [A3] Preserve the existing manifest/resident/operator owner validation, declared next-state edges, positive nonterminal time budgets and label renderings. Derivation remains repo/PR/head scoped and labels remain output; contradictory or incomplete evidence cannot yield READY-TO-MERGE.
+- [A4] Keep the label migration adapter until its authority migration actually completes; add a source/import regression preventing new consumers from bypassing the ledger derive. Do not treat #4281 as an unmet blocker: its card is resolved and the substrate is present.
 
-## Findings (standalone worker, 2026-10-09)
+## Non-goals
 
-The build-dispatch daemon held #5052 with:
+- [N1] No central orchestrator, new runner, automatic human approval, or changes to CI-heal budgets.
+- [N2] No authority flip or label-adapter deletion as part of this ownership clarification.
 
-> worker-declined: **could-not-prepare** — an ownership design choice remains. No files changed or stamped. Commit '2a786ea24' delivered the lifecycle table and ledger derivation, but 'HUMAN-HOLD-CI-RED' names one recovery watcher ('we:scripts/conveyor/pr-lifecycle.mjs:36') while reconcile supports CI healing, review-gate refusal, and exhausted-budget escalation ('we:scripts/conveyor/__tests__/reconcile-core.test.mjs:816'). The unresolved choice is whether to split that state by responsible owner or define 'owner' as an accountable coordinator distinct from the executor. Preparing the remaining contract would requ…
+## Edge cases this change must handle
 
-`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
-a prepare pass re-scopes it against the finding.
+1. **Untrusted text** — Event text and label strings cannot invent state/owner identifiers or inject commands; the table supplies the vocabulary.
+2. **Truncated reads** — Incomplete ledger/fact reads yield a held state, not a green merge state; preserve existing unreadable-ledger behavior.
+3. **Shared state files** — n/a: this table and derive are pure; no new shared state writer is introduced.
+4. **Fail closed** — Unknown scope, malformed rows and derivation failure retain a named hold; no owner mapping may clear it.
+5. **Identity scoping** — Repo, PR and head bind review/check evidence; identical PR numbers across repos and old-head approvals remain isolated.
+6. **State over time** — Test head replacement, check recovery, exhausted retry budget, ruling arrival and terminal closure; stale evidence cannot revive readiness.
+7. **Who wrote it** — Preserve upstream ledger provenance checks; a label or comment claiming acceptance is not new authority.
+
+## Grounding
+
+- we:scripts/conveyor/pr-lifecycle.mjs:18 already exports the table; :36 assigns HUMAN-HOLD-CI-RED to ci-red-recovery-watch; :51 explicitly includes resident owners and the operator.
+- we:scripts/conveyor/__tests__/pr-lifecycle.test.mjs:17 validates owners, :22 validates edges, and :37 pins the human/red state to that watcher.
+- we:scripts/lib/pr-state.mjs:86 guards ledger derivation, :125 renders the lifecycle output and :140 implements labelsToLedgerState.
+- we:scripts/conveyor/__tests__/reconcile-core.test.mjs:818 dispatches ci-heal for human-held/red CI, :824 excludes review-gate-only failures and :832 escalates exhausted healing.
+- Commit 2a786ea24e delivered the table/derive slice; we:backlog/4281-pr-ledger-slice-2a-derive-per-pr-state-from-the-webhook-even.md:6 is resolved. The former blockedBy edge is therefore removed.
+
+## Open questions
+
+Does owner mean (a) one accountable coordinator, with reconcile choosing an executor/escalation, or (b) the exclusive next-action executor, requiring HUMAN-HOLD-CI-RED to split into healable, review-gate-held and exhausted states? **Pick (a)**: it preserves the existing phase vocabulary and separates responsibility from execution, but must document the watcher-to-operator escalation explicitly. Option (b) gives a more literal dispatch map at the cost of new states/transitions. This preparation does not ratify either meaning.

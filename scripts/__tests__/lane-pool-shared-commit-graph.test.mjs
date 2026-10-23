@@ -29,8 +29,14 @@ function gitShimDir() {
   const dir = join(base, 'shim');
   mkdirSync(dir, { recursive: true });
   const real = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  // The subcommand, past any leading `-c k=v` / `-C dir` (lane-pool's fetch carries `-c protocol.ext.allow=never`).
   const sh = `#!/bin/bash
-if [ "$1" = fetch ] && ! ${JSON.stringify(real)} -C ${JSON.stringify(referenceDir)} commit-graph verify >/dev/null 2>&1; then
+sub=""; skip=0
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case "$a" in -c|-C) skip=1 ;; -*) ;; *) sub="$a"; break ;; esac
+done
+if [ "$sub" = fetch ] && ! ${JSON.stringify(real)} -C ${JSON.stringify(referenceDir)} commit-graph verify >/dev/null 2>&1; then
   echo "fatal: You are attempting to fetch 28b0385ec6ee18314feaad2c31c979a6eea0f95f, which is in the commit graph file but not in the object database." >&2
   echo "This is probably due to repo corruption." >&2
   exit 128

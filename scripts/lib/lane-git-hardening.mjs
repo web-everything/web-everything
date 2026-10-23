@@ -22,6 +22,24 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.attributesFile', '/dev/null'],
   ['core.sshCommand', 'ssh'],
   ['commit.gpgsign', 'false'],
+  // PR #5775 self-review: `log.showSignature` makes every `git log` run `gpg.program` (lane-chosen) on a commit the
+  // agent gave a gpgsig header, and puts signature lines in output callers parse. A `--reference` lane has alternates,
+  // so a lane-set `core.alternateRefsCommand` runs on every fetch; `true` prints no refs (objects still resolve).
+  ['log.showSignature', 'false'],
+  ['gpg.program', 'gpg'],
+  ['gpg.ssh.program', 'ssh-keygen'],
+  ['gpg.x509.program', 'gpgsm'],
+  ['core.alternateRefsCommand', 'true'],
+]);
+
+// Remote proofs use a restricted transport policy. Ordinary hardened callers also fetch/clone
+// from local and HTTP origins, so changing their transport policy here would break those callers.
+const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
+  ['protocol.allow', 'never'],
+  ['protocol.https.allow', 'always'],
+  ['protocol.http.allow', 'always'],
+  ['protocol.git.allow', 'always'],
+  ['protocol.ssh.allow', 'always'],
 ]);
 
 /** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line. */
@@ -31,18 +49,22 @@ export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => 
  * `env` with the pins appended to git's environment config list. An existing `GIT_CONFIG_COUNT` is preserved (the pins
  * come AFTER its entries, so they win). `GIT_EXTERNAL_DIFF` is dropped: an inherited one would run on every `git diff`.
  * @param {Record<string,string|undefined>} env
+ * @param {{remoteProbe?: boolean}} options Restrict transports only for an isolated remote proof.
  * @returns {Record<string,string|undefined>}
  */
-export function laneGitHardeningEnv(env = process.env) {
-  const out = { ...env };
+export function laneGitHardeningEnv(env = process.env, { remoteProbe = false } = {}) {
+  // No lazy fetch: a lane declaring itself a partial clone of a promisor remote would fetch a missing object through
+  // its own `remote.<name>.uploadpack` on a plain `show` / `diff` / `cat-file` (PR #5775 self-review).
+  const out = { ...env, GIT_NO_LAZY_FETCH: '1' };
   delete out.GIT_EXTERNAL_DIFF;
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
-  LANE_GIT_CONFIG_PINS.forEach(([k, v], i) => {
+  const pins = remoteProbe ? [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS] : LANE_GIT_CONFIG_PINS;
+  pins.forEach(([k, v], i) => {
     out[`GIT_CONFIG_KEY_${start + i}`] = k;
     out[`GIT_CONFIG_VALUE_${start + i}`] = v;
   });
-  out.GIT_CONFIG_COUNT = String(start + LANE_GIT_CONFIG_PINS.length);
+  out.GIT_CONFIG_COUNT = String(start + pins.length);
   return out;
 }
 
@@ -108,15 +130,19 @@ export function riskyLaneConfig(listOutput) {
 /**
  * Repair only lane-owned unsafe config before hand-out. Only exact `origin` is always retained; the
  * launch guard still refuses anything the scrub could not remove. Runner signature: (args, opts).
+ * `onConfig` receives the successful scoped listing so callers can reuse settings the scrub never changes.
  */
 export function scrubRiskyLaneConfig(dir, {
   run = (args, opts) => execFileSync('git', args, { ...opts, encoding: 'utf8', env: laneGitHardeningEnv(), timeout: 30000, maxBuffer: 16 * 1024 * 1024 }),
   log = () => {},
+  onConfig = () => {},
 } = {}) {
   const removed = [], kept = [];
   const opts = { cwd: dir };
   try {
-    const parts = String(run([...LANE_CONFIG_LIST_ARGS], opts)).split('\0');
+    const output = String(run([...LANE_CONFIG_LIST_ARGS], opts));
+    onConfig(output);
+    const parts = output.split('\0');
     const sections = new Set();
     for (let i = 0; i + 1 < parts.length; i += 2) {
       const scope = parts[i], entry = parts[i + 1];

@@ -50,6 +50,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
  * cannot corrupt anything, and a lease taken inside a one-shot read is a lease nothing releases when the process
  * is killed.
  */
+import { enrichPrsWithStandingRulingGrants } from './standing-ruling-io.mjs';
 import { enrichPrsWithOwedMainRule, resolveRefreshSettings } from '../lib/renamed-pr-refresh.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -111,7 +112,7 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 // `systemFixRef` PRs reconcile-core.mjs's own escalation branch will independently re-derive from the same data.
 import { latestCiHealEscalationForHead, enrichPrsWithEscalationBaseFacts } from './ci-heal-escalation-mark.mjs';
 import { readLiveFixClaim } from './fix-procedure.mjs';
-import { enrichPrsWithReferralHolds } from './review-referral-hold.mjs';
+import { enrichPrsWithReferralHolds, enrichPrsWithReferralHoldAutoResolve } from './review-referral-hold.mjs';
 import { ledgerHoldStep, failClosedHolds, ledgerDeciding, renderLedgerShadowSummary } from './review-hold-ledger-shadow.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
@@ -1455,6 +1456,9 @@ export function runReconcilePass({
   enrichFixClaims = enrichPrsWithFixClaims,
   enrichTimeouts = enrichPrsWithTimeoutEvidence,
   enrichReferralHolds = enrichPrsWithReferralHolds,
+  // stale-hold-resume — a pause whose every live-head finding is already ruled resolves itself (send-back or resume).
+  // Runs AFTER the ledger step, which can replace the pause. Injectable like every other enrich step.
+  enrichReferralAutoResolve = enrichPrsWithReferralHoldAutoResolve,
   // Ledger plan slice H (card xqh3tkh): the same hold decisions derived from the verdict ledger, per family
   // (`verdictLedger.readSource.<family>`, default `both` = shadow: today's decision stands and disagreements are
   // journaled). Injectable like every other enrich step; see {@link enrichPrsWithLedgerHolds}.
@@ -1462,6 +1466,8 @@ export function runReconcilePass({
   enrichRulings = enrichPrsWithIgnoredRulings,
   enrichScopeBloat = enrichPrsWithScopeBloat, // card x29vm8a
   enrichCodeQL = enrichPrsWithCodeQL, // card x8cnbii — the drain's CodeQL hold is owed a ci-heal
+  // Standing-ruling round grants (operator option B, 2026-10-20): verify the ruling + cited heads at read time.
+  enrichStandingRulingGrants = enrichPrsWithStandingRulingGrants,
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
@@ -1539,15 +1545,16 @@ export function runReconcilePass({
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
-    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
+  const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralAutoResolve(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { repo: CONSTELLATION_REPOS[repoKey].slug, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   if (repoKey === 'we') enrichOwedMainRule(prsBeforeMechanical, { repo: CONSTELLATION_REPOS[repoKey].slug, settings: resolveRefreshSettings({ env }) });
   const mechanicalSetting = mechanicalRoundsSetting(loadMechanicalRoundsSetting, env);
   // The git evidence is read in THIS checkout, so only for the repo it is a clone of (WE); elsewhere no PR carries
   // facts and the normal cap applies. Skipped entirely when mechanical rounds count toward the cap.
-  const prs = repoKey === 'we' && mechanicalSetting.mechanicalRoundsCountTowardCap === false
+  const prsBeforeRulings = repoKey === 'we' && mechanicalSetting.mechanicalRoundsCountTowardCap === false
     ? enrichMechanicalRound(prsBeforeMechanical, { defaultBranch }) : prsBeforeMechanical;
+  const prs = enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug });
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });

@@ -16,6 +16,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawnToCompletion } from '../spawn-to-completion.mjs';
+import { keepAliveScript } from '../test-keepalive.mjs';
 
 const NODE = process.execPath;
 
@@ -58,7 +59,7 @@ describe('spawnToCompletion — timeout/killSignal (the execFileSync timeout con
   it('kills a wedged child after `timeout` ms and rejects with .signal/.killed set, same as a timed-out '
     + 'execFileSync call', async () => {
     // Never exits on its own — proves the timeout, not a lucky race.
-    const script = 'setInterval(() => {}, 1000);';
+    const script = keepAliveScript();
     let caught;
     try {
       await spawnToCompletion(NODE, ['-e', script], { encoding: 'utf8', timeout: 150, killSignal: 'SIGKILL' });

@@ -7,9 +7,9 @@
  *   window meant acquire could wipe the last local copy of commits that, by the time of the actual reset,
  *   exist on no remote at all.
  *
- *   This test simulates the race deterministically: a `git` PATH shim makes the pick-time `ls-remote --heads
- *   origin` LIE that a since-deleted `lane/*` ref is still live (exactly what a snapshot taken a moment
- *   before the real deletion would have seen), while the real `git fetch --prune` that runs moments later
+ *   This test simulates the race deterministically: a `git` PATH shim makes the isolated pick-time
+ *   `ls-remote --heads -- <origin path>` LIE that a since-deleted `lane/*` ref is still live (exactly what a
+ *   snapshot taken a moment before the real deletion would have seen), while the real `git fetch --prune` that runs moments later
  *   (unshimmed) correctly prunes the now-gone remote-tracking ref. The fix re-verifies containment on
  *   FRESH post-fetch local refs (`localRemoteShas`, network-free) immediately before the reset and refuses
  *   when the earlier proof no longer holds.
@@ -17,7 +17,7 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -67,9 +67,9 @@ afterEach(() => {
 
 const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=reverify', '--branch=trunk', '--no-install'];
 
-// Builds a PATH-shimmed `git` that lies on `ls-remote --heads origin` (prepends one extra, now-stale
-// `sha\trefs/heads/<ref>` line to the real output) but passes every other invocation straight to the real
-// binary — including the `fetch --prune` that must see the TRUE, already-pruned state.
+// Prepend a stale `sha\trefs/heads/<ref>` line only to the isolated probe of this fixture's canonical
+// origin path. All other invocations, including fetch --prune, see the real state. Assert snapshot-used
+// below so a changed probe invocation cannot silently disable the simulated race.
 function shimLsRemoteToLie(staleSha, staleRef) {
   const shimDir = join(base, 'bin');
   mkdirSync(shimDir, { recursive: true });
@@ -77,7 +77,14 @@ function shimLsRemoteToLie(staleSha, staleRef) {
   writeFileSync(
     join(shimDir, 'git'),
     `#!/bin/bash\n` +
-      `if [ "$1" = "ls-remote" ] && [ "$2" = "--heads" ] && [ "$3" = "origin" ]; then\n` +
+      `if (\n` +
+      `  while [ "$1" = "-c" ]; do shift 2; done\n` +
+      `  [ "$1" = "ls-remote" ] || exit 1\n` +
+      `  shift\n` +
+      `  case "$1" in --upload-pack=*) shift ;; esac\n` +
+      `  [ "$1" = "--heads" ] && [ "$2" = "--" ] && [ "$3" = "${originDir}" ]\n` +
+      `); then\n` +
+      `  touch "${join(shimDir, 'snapshot-used')}"\n` +
       `  echo -e "${staleSha}\\trefs/heads/${staleRef}"\n` +
       `fi\n` +
       `exec "${realGit}" "$@"\n`,
@@ -114,11 +121,13 @@ describe('acquire re-verifies containment on fresh post-fetch refs before the de
     const shimDir = shimLsRemoteToLie(landedSha, 'lane/landed');
 
     const acquire = runPool(['acquire', ...poolArgs(), '--session=picker'], { PATH: `${shimDir}:${process.env.PATH}` });
+    expect(existsSync(join(shimDir, 'snapshot-used'))).toBe(true);
     expect(acquire.code).not.toBe(0);
     expect(acquire.err).toMatch(/no longer provably safe to reset/);
     expect(acquire.err).toMatch(/#2924/);
     // The lane's commit must survive — this is the destroyed-work failure mode the item names as unrecoverable.
     expect(git(['cat-file', '-e', landedSha], lane)).toBe('');
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(landedSha);
   });
 
   it('--force still proceeds through the re-verification, same documented override as every other guard here', () => {
@@ -139,6 +148,7 @@ describe('acquire re-verifies containment on fresh post-fetch refs before the de
     const shimDir = shimLsRemoteToLie(landedSha, 'lane/landed');
 
     const acquire = runPool(['acquire', ...poolArgs(), '--session=picker', '--force'], { PATH: `${shimDir}:${process.env.PATH}` });
+    expect(existsSync(join(shimDir, 'snapshot-used'))).toBe(true);
     expect(acquire.code).toBe(0);
     expect(acquire.out.trim()).toBe(lane);
   });

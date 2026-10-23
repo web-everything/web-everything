@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, assertProducerCheckout, monitorCommand, main } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
@@ -17,6 +17,27 @@ afterEach(() => {
 const at = '2026-10-15T12:00:00.000Z';
 const item = { repo: 'owner/repo', pr: 12, head: 'abc', kind: 'needs-you', reason: 'ready', pick: 'pick 12' };
 describe('feed', () => {
+  it('sanitizes every feed text field, including nested arrays and legacy evidence', () => {
+    const unsafe = '\r\n\u0000\u001b\u009b\u2028\u2029\u202e\u200b';
+    const text = 'safe `quote` "text" --flag ../path ';
+    const dirty = Object.fromEntries(['repo', 'head', 'kind', 'was', 'reason', 'title', 'pick', 'command', 'state', 'template']
+      .map(field => [field, text + unsafe]));
+    const payload = { ...item, ...dirty, evidence: [text + unsafe, [text + unsafe], { detail: text + unsafe }], extra: { lines: [text + unsafe], count: 3 }, flag: true, empty: null };
+    const clean = value => {
+      if (typeof value === 'string') {
+        expect(value).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+      } else if (value && typeof value === 'object') Object.values(value).forEach(clean);
+    };
+    const line = diffFeed([], [payload], at).lines[0];
+    const persisted = JSON.parse(line.slice(line.lastIndexOf(' {"at":') + 1));
+    clean(persisted);
+    expect(persisted.evidence[0]).toContain(text);
+    expect(persisted).toMatchObject({ pr: 12, flag: true, empty: null, extra: { count: 3 } });
+    const path = join(temp(), 'legacy.jsonl');
+    appendLines(path, [`NEEDS-YOU legacy ${JSON.stringify({ at, ...payload })}`]);
+    clean(replay({ path }));
+    expect(replay({ path })[0].evidence).toEqual(persisted.evidence);
+  });
   it('strips controls and bounds untrusted titles and other fields in opening and cleared lines', () => {
     const unsafe = '\r\n\t\u0000\u001b[31m\u007f\u0085\u009b\u2028\u2029\u202e\u200b';
     const title = 'NEEDS-YOU ruling-needed: run `cmd` "quoted" --flag ../path ' + unsafe + 'x'.repeat(5000);
@@ -37,7 +58,7 @@ describe('feed', () => {
   it('changing feed filename publishes open items with independent state and acknowledgement cursors', async () => {
     const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
     const first = feedPath({ home, env: {} }), second = join(dirname(first), 'other-events.jsonl');
-    const opts = { home, checkoutRoot, now: at, log: vi.fn(),
+    const opts = { home, checkoutRoot, now: at, log: vi.fn(), liveGate: false,
       exec: () => JSON.stringify({ ready: [{ repo: item.repo, number: item.pr, head: item.head }] }) };
     const poll = path => runOnce({ ...opts, env: { WE_NEEDS_YOU_FEED: path } });
     expect((await poll(first)).lines).toHaveLength(1);
@@ -134,7 +155,7 @@ describe('feed', () => {
       { repo: 'r', number: 1, title: 'Lookup' }, { repo: 'r', number: 2, head: 'supplied' },
     ] }));
     const gh = vi.fn(() => JSON.stringify({ headRefOid: 'resolved' }));
-    const opts = { exec, gh, home, checkoutRoot, env: {}, now: at, log: vi.fn() };
+    const opts = { exec, gh, home, checkoutRoot, env: {}, now: at, log: vi.fn(), liveGate: false };
     const first = await runOnce(opts);
     expect(gh).toHaveBeenCalledTimes(1);
     expect(gh).toHaveBeenCalledWith('gh', ['pr', 'view', '1', '--repo', 'r', '--json', 'headRefOid'],
@@ -153,7 +174,7 @@ describe('feed', () => {
       return failure === 'invalid JSON' ? 'invalid' : '{}';
     }).mockReturnValue(JSON.stringify({ headRefOid: 'second' }));
     const log = vi.fn();
-    const result = await runOnce({ exec, gh, home, checkoutRoot, env: {}, now: at, log });
+    const result = await runOnce({ exec, gh, home, checkoutRoot, env: {}, now: at, log, liveGate: false });
     expect(result.openKeys).toEqual(['r#1@:needs-you', 'r#2@second:needs-you']);
     expect(parseFeedLine(result.lines[0]).head).toBe('');
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/r#1.*head lookup failed/));
@@ -182,7 +203,7 @@ describe('feed', () => {
     const path = feedPath({ home, env: {} });
     vi.stubEnv('WE_NEEDS_YOU_FEED', path);
     const existing = { repo: item.repo, number: item.pr, head: item.head };
-    const opts = { home, checkoutRoot, env: {}, now: at, log: vi.fn() };
+    const opts = { home, checkoutRoot, env: {}, now: at, log: vi.fn(), liveGate: false };
     await runOnce({ ...opts, exec: () => JSON.stringify({ ready: [existing] }) });
     let resume, entered;
     const paused = new Promise(resolve => { resume = resolve; });
@@ -247,7 +268,7 @@ describe('feed', () => {
   it('runs queue from producer checkout, consumes exit-1 JSON and persists partial state', async () => {
     const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
     const exec = vi.fn(() => JSON.stringify({ ready: [{ repo: 'r', number: 1, head: 'h' }] }));
-    const opts = { exec, home, checkoutRoot, env: {}, now: at, log: vi.fn() };
+    const opts = { exec, home, checkoutRoot, env: {}, now: at, log: vi.fn(), liveGate: false };
     await runOnce(opts);
     expect(exec.mock.calls[0][1]).toEqual([join(checkoutRoot, 'scripts/operations/operator-queue.mjs'), '--json']);
     expect(exec.mock.calls[0][2].cwd).toBe(checkoutRoot);
@@ -284,4 +305,103 @@ describe('feed', () => {
 it('keeps round-cap operator notes in the feed while the cap still needs a person', () => {
   expect(Array.from(itemsFromReport({ needsPerson: [{ repo: 'o/r', number: 5403, kind: 'round-cap-exhausted', detail: 'round cap exhausted' }] })))
     .toEqual([expect.objectContaining({ pr: 5403, kind: 'at-round-limit', reason: 'round cap exhausted' })]);
+});
+
+describe('gateReadyItems: "your review" is re-checked against the live PR (#5768)', () => {
+  const repo = 'o/r';
+  const head = '18088fcad0000000000000000000000000000000';
+  const report = { ready: [{ repo, number: 5768, title: 't' }], needsYourMerge: [{ repo, number: 9, title: 'm' }] };
+  const gate = (view, comments) => async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify(view));
+  const items = () => itemsFromReport(report);
+
+  it('drops a ready item whose live PR is red-team:blocked + review:changes, and says why', async () => {
+    const gh = gate({ headRefOid: head, labels: [{ name: 'review:changes' }, { name: 'red-team:blocked' }] }, []);
+    const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });
+    expect(kept.map((i) => i.pr)).toEqual([9]);
+    expect(held[0].reasons).toEqual(expect.arrayContaining(['the red team blocked the live head', 'it was sent back (review:changes)']));
+  });
+  it('keeps a ready item whose live PR is clean, and never judges needs-your-merge rows', async () => {
+    const gh = gate({ headRefOid: head, labels: [{ name: 'red-team:clear' }] }, []);
+    const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });
+    expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(held).toEqual([]);
+  });
+  it('keeps the item (never suppresses an alert) when the live PR cannot be read, and logs it', async () => {
+    const logs = [];
+    const { kept } = await gateReadyItems(items(), report, { gh: async () => { throw new Error('rate limited'); }, log: (l) => logs.push(l) });
+    expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(logs.join()).toMatch(/live gate unreadable, keeping: rate limited/);
+  });
+  it('runOnce applies the gate by default and logs what it held back', async () => {
+    const home = temp(), checkoutRoot = join(home, 'workspace/.lanes/we/lane-1');
+    const exec = () => JSON.stringify({ ready: [{ repo: 'r', number: 5768, head, title: 't' }] });
+    const gh = async (_f, args) => (args[0] === 'api' ? '[[]]' : JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] }));
+    const log = vi.fn();
+    const result = await runOnce({ exec, gh, home, checkoutRoot, env: {}, now: at, log });
+    expect(result.openKeys).toEqual([]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('r#5768 held back from your review: the red team blocked the live head'));
+  });
+  it('publishes the head it CHECKED, not a stale one from the report or a later lookup', async () => {
+    const stale = [{ repo, number: 5768, head: 'stale' }];
+    const r2 = { ready: stale };
+    const { kept } = await gateReadyItems(itemsFromReport(r2), r2, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    expect(kept[0].head).toBe(head);
+  });
+  it('the real fix-claim lease overrides the comment heuristic (expired lease = not claimed; live lease = claimed)', async () => {
+    const created_at = new Date(Date.now() - 600000).toISOString();
+    const body = '🔒 conveyor fix-begin — fix claim held';
+    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[{ user: { login: 'plateau-worker[bot]' }, body, created_at }]]) : JSON.stringify({ headRefOid: head, labels: [] }));
+    const live = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => true });
+    expect(live.held[0].reasons).toEqual(['a fix claim is open']);
+    const expired = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => false });
+    expect(expired.held).toEqual([]);
+  });
+  it('a pass-wide deadline keeps (never drops) the items it could not judge in time', async () => {
+    const logs = [];
+    const gh = async () => JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] });
+    const { kept, held } = await gateReadyItems(items(), report, { gh, log: (l) => logs.push(l), deadlineMs: -1 });
+    expect(held).toEqual([]);
+    expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(logs.join()).toMatch(/gate deadline/);
+  });
+  it('keeps the incomplete flag the diff uses', async () => {
+    const withFlag = Object.assign(items(), { incomplete: true });
+    const { kept } = await gateReadyItems(withFlag, report, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    expect(kept.incomplete).toBe(true);
+  });
+});
+
+describe('stall sweep coexistence', () => {
+  it.each([
+    { WE_PR_STALL_SWEEP_MODE: 'off' },
+    { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'false' },
+  ])('ignores stale stalled keys before cleanup when the producer is disabled: %j', async env => {
+    const path = join(temp(), 'needs-you-events.jsonl');
+    const repo = 'web-everything/web-everything', head = 'a'.repeat(40);
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [`${repo}#5@${head}:stalled`] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ env, settings, liveGate: false, log: () => {},
+      exec: () => JSON.stringify({ ready: [{ repo, number: 5, head }] }) });
+    expect(result.lines).toHaveLength(1);
+    expect(replay({ path })[0]).toMatchObject({ pr: 5, kind: 'needs-you' });
+  });
+  it.each([
+    { name: 'a new queue item for a head with an open stalled item is not published twice', queueOpen: false },
+    { name: 'an already-open queue item is retained when the same head also has an open stalled item', queueOpen: true },
+  ])('$name', async ({ queueOpen }) => {
+    const path = join(temp(), 'needs-you-events.jsonl');
+    const head = 'a'.repeat(40); const repo = 'web-everything/web-everything';
+    const stalledKey = `${repo}#5@${head}:stalled`;
+    const queueKey = `${repo}#5@${head}:ruling-needed`;
+    const openKeys = [stalledKey, ...(queueOpen ? [queueKey] : [])];
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys }));
+    const report = { ready: [], rulingNeeded: [{ repo, number: 5, head, reason: 'parked' }] };
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ exec: async () => JSON.stringify(report), settings,
+      env: { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'true' }, liveGate: false, log: () => {} });
+    expect(result.lines).toEqual([]);
+    expect(result.openKeys).toEqual(openKeys);
+    expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual(openKeys);
+    expect(replay({ path })).toEqual([]);
+  });
 });

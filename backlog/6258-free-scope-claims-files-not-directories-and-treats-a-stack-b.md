@@ -10,7 +10,7 @@ tags: []
 
 # Free-scope claims files, not directories, and treats a stack base's files as available to its child
 
-Free-scope registers whole directories, so two builders in the same folder block each other, and a child PR stacked on a base PR sees the base's files as taken. Fix: register exact files, and when the claimant is the child of a stacked base, treat the base's files as available. Links, does not duplicate: stacked-PR policy epic xejcrh1, slice xdqe5hm. [A1] Executable: node --test we:scripts/operations/__tests__/free-scope.test.mjs, with a case for two files in one directory (both free) and a stack child over its base (free). Priority: top (operator 2026-10-17).
+Free-scope registers whole directories, so two builders in the same folder block each other, and a child PR stacked on a base PR sees the base's files as taken. Fix: register exact files, and when the claimant is the child of a stacked base, treat the base's files as available. Links, does not duplicate: stacked-PR policy epic 6899, slice 6898. [A1] Executable: node --test we:scripts/operations/__tests__/free-scope.test.mjs, with a case for two files in one directory (both free) and a stack child over its base (free). Priority: top (operator 2026-10-17).
 
 ## Acceptance
 

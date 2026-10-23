@@ -6220,6 +6220,11 @@ and #4284. Full reasoning: [#3216](/backlog/3216-revisit-the-ledger-write-miss-p
 These are already enforced/written elsewhere; listed here so the platform's rules are findable from
 one place:
 
+- **Standing ruling — automatic +1 review round for card-only PRs** (operator 2026-10-19, confirmed 2026-10-20,
+  capped at 3 per PR) → recorded as operator-authored issue
+  [web-everything/web-everything#5751](https://github.com/web-everything/web-everything/issues/5751); enforced by
+  `scripts/conveyor/standing-ruling-mark.mjs` + `round-extension-mark.mjs` (close the issue to revoke).
+
 - **Design-first / materialization** → [design-first.md](design-first.md): document in JSON/njk
   before implementing; plan → discrete homes (reports + JSON + research topics).
 - **Native-first default; config extends a platform default** → [conventions.md](conventions.md),
@@ -6281,7 +6286,7 @@ Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:
 (`#6268`).** The operator's words: *"we should have the option to use a db for settings instead of in code, at least as
 override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-platform-default](#config-extends-platform-default)
 (the new layer is one more cascade layer, each value with its source logged) and the settings-edit authority decision
-`#xugqjw1` (cited by id).
+`#6239` (cited by id).
 
 **The rule:**
 1. **One new top layer, `operator-override`.** Order: standard < platform < tool < env < operator-override (Fork 2 = a).
@@ -6428,6 +6433,55 @@ Each slice's Test plan and the decision's risk mapping identify repository-quali
 as implementation destinations.
 
 **Lineage:** `#6239` (ruled 2026-10-17). Reference: the operator's review stringency proposal artifact.
+
+### Stacking a PR on another PR is a configurable cascade policy; a fixed safety floor protects guard and merge-path code {#stacked-pr-policy-configurable}
+
+**Ratified 2026-10-17 by the operator (Nicolas Gilbert), in conversation, both forks at the card's default
+(`#6903`).** The operator's words: *"Ok, make sure the stacking is a configurable policy"*. Composes with
+[review-stringency-classified-outcomes](#review-stringency-classified-outcomes) (the guard and low-risk classes are read
+from its class list) and the drain's existing proof-of-land gate (base lands first).
+
+**The rule:**
+1. **The whole policy is a cascade policy, each value with its source logged.** That covers every matrix cell (base
+   state by child class), the safety floor, the urgent classes, `stack.smallChildMaxLines` (50),
+   `stack.lowRiskClasses` (cards, settings, docs), `stack.maxDepth` (1), `stack.onBaseHeadMove` (restack, then
+   re-review only the child's delta) and the closed or rejected base handling. Home: `we:scripts/settings/stack.json`.
+2. **Default matrix.** Small and low-risk children stack on any base state. Normal children stack on an approved-waiting
+   base, on an approved-held base only when urgent, on an in-review or fixing base only in an operator-flagged
+   emergency. Guard or merge-path children stack on an approved-waiting base, on an approved-held base only when
+   urgent, and never on an in-review or fixing base.
+3. **Safety floor (Fork 1 = a).** Guard or merge-path code never stacks on an in-review or fixing base. The class is read
+   from the touched paths, not from the card label. Any path under `we:scripts/settings/` that feeds drain, review or
+   merge gates counts as guard, even though settings is a default low-risk class. Guard or merge-path classification
+   takes precedence over low-risk membership, including a child mixing docs or other low-risk files with guard files.
+   "Emergency" is operator-flagged only. The floor can be changed only
+   by an operator-sourced setting, never by an agent. Unknown state, unknown class or a missing proof gate means no
+   stacking (fail closed).
+4. **Base first.** The drain lands the base before the child. Review judges the child's own delta. When the base head
+   moves, the child is restacked and only its delta is re-reviewed; the hold marker moves only when the delta
+   fingerprint is unchanged and the base's new commits touch none of the child's files.
+5. **Closed or rejected base (Fork 2 = a).** A low-risk child rebases onto main by itself only when the rebase is clean
+   and its delta fingerprint is unchanged. Every other child goes to the operator. The cascade default enables
+   auto-rebase; an unset repo-layer value uses that default. No resolved cascade value (including no default), or an
+   unreadable cascade result, goes to the operator. Gate-feeding settings and mixed guard children remain guard class
+   here too. Rebase grants no `review:accepted` label or carried approval; review, CI and proof-of-land gates must
+   still pass for the new head. The auto-rebase clears both drain holds on the old base. It retargets the child PR to
+   its repo's default branch (GitHub retargets only when a base merges), and it removes the closed base from the
+   child's `stackParents` edge in the PR-body lane manifest, after first copying a legacy head-ref manifest into the
+   body with the edge intact (the drain reads the body first). The handler holds the child's fix claim for the whole
+   recovery, and the edge it keeps until last stops the drain landing the child mid-recovery. The order is retarget, then a push leased on the old head, so the new head's CI runs against the
+   default branch; the edge removal is last, only after the new base and the rebased head are both confirmed on the
+   remote. If the retarget, the push or the removal fails, the child goes to the operator. A child sent to the
+   operator keeps its edge and is never left targeting the default branch on its edge alone: it stays on, or is
+   retargeted back to, the closed base's branch, or is parked `review:human`. A later pass finishes or escalates a
+   recovery that a crash interrupted; a recovery read it cannot complete parks the child `review:human`. Independently
+   of the claim and every marker, the drain refuses to land any child whose head still carries a closed (unmerged)
+   base's commits that are not on the default branch, read from the base history of the child's head branch (force-
+   pushed base heads included), and an ancestry read it cannot complete also refuses to land.
+6. **Free-scope.** The caller names the intended base PR (`--stack-on=<n>`); free-scope applies the matrix and excludes
+   only PR holders in that chain, never agent-registry holders. A cell that may not stack still reports OCCUPIED.
+
+**Lineage:** `#6903` (ruled 2026-10-17). Instance of [config-extends-platform-default](#config-extends-platform-default).
 
 ### Collector PRs batch card-only filings per stream; the coordinator owns each batch and heals it from GitHub {#collector-pr-card-batching-streams}
 

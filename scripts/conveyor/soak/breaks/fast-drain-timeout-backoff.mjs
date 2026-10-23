@@ -9,6 +9,7 @@ import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { keepAliveScript } from '../../../lib/test-keepalive.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 const REPO = 'example-owner/example-repo';
@@ -61,7 +62,7 @@ export default {
         attempts++;
         check(args.includes(`--only=${NUM}`), 'the replay spawned a full drain instead of the target PR');
         if (hang) {
-          const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], options);
+          const child = spawn(process.execPath, ['-e', keepAliveScript()], options);
           const kill = child.kill.bind(child);
           child.kill = signal => { kills++; return kill(signal); };
           return child;

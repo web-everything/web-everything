@@ -22,10 +22,11 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { keepAliveScript } from '../../../lib/test-keepalive.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
 const DAEMON = 'scripts/conveyor/resource-sampler-daemon.mjs';
-const IDLE_CHILD = "process.once('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000);";
+const IDLE_CHILD = keepAliveScript({ prelude: "process.once('SIGTERM',()=>process.exit(0));" });
 const OLD_SHA = 'b'.repeat(40);
 const NEW_SHA = 'a'.repeat(40);
 const AT = '2026-10-10T12:00:00.000Z';

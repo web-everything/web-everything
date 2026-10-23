@@ -9,6 +9,11 @@
 # IMPORTANT: each gate must fail-fast to preserve its own exit code — in sh, the script exits with the
 # last command's exit code, so sequencing without fail-fast silently swallows earlier failures. Use
 # `|| exit $?` after each gate so the first failure stops the hook and propagates the right exit code.
+
+# Placeholder git author guard (2026-10-05..20 incident: every lane commit was authored "test"). Lane clones
+# only; refuses only a placeholder/missing author or committer — a real identity always passes.
+node scripts/guard-git-identity.mjs || exit $?
+
 npm run --silent lint:locus || exit $?
 
 # Inventory write-time regen (#3071-adjacent incident, PR #1404 — a research topic was added without

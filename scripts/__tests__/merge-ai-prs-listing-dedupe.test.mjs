@@ -22,6 +22,7 @@
  *     matched CLIENT-SIDE (`filterOpenPrsByBase`), exactly like `--label`, so the raw fetch stays base-
  *     unfiltered and safe to reuse.
  */
+import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
@@ -154,7 +155,7 @@ describe('merge-ai-prs CLI — #4108 one `gh pr list` per repo per pass (RECONCI
   ], {
     cwd: repoDir,
     encoding: 'utf8',
-    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GH_CALL_LOG: callLog, ...extraEnv },
+    env: { ...process.env, ...daemonAppEnv(repoDir), PATH: `${shimDir}:${process.env.PATH}`, GH_CALL_LOG: callLog, ...extraEnv },
   });
 
   const ghPrListCalls = () => {
@@ -236,7 +237,7 @@ describe('merge-ai-prs CLI — #4108 one `gh pr list` per repo per pass (RECONCI
     const r = spawnSync('node', [script, '--this-repo', '--dry-run', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
       cwd: repoDir,
       encoding: 'utf8',
-      env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GH_CALL_LOG: callLog, GH_FIXTURE_PRS: JSON.stringify([]), WE_DRAIN_WORKFLOW_EDIT_HUMAN: workflowEditHuman },
+      env: { ...process.env, ...daemonAppEnv(repoDir), PATH: `${shimDir}:${process.env.PATH}`, GH_CALL_LOG: callLog, GH_FIXTURE_PRS: JSON.stringify([]), WE_DRAIN_WORKFLOW_EDIT_HUMAN: workflowEditHuman },
     });
     expect(r.status).toBe(0);
     const calls = ghPrListCalls();
