@@ -818,9 +818,12 @@ export async function planRebuild({
       });
       if (!alt.ok || alt.establishedLost.length > 0) continue;
       const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));
+      // A retried stack top can carry an original base without its own applied row (or at a newer sha).
+      // Retain that plan only with ancestry proof for the original head; a genuinely dropped head still fails.
       if (refs.every((ref) => altApplied.has(ref) && !altApplied.get(ref).pinnedFrom)
-        && applied.every((a) => altApplied.has(a.ref)
-          && (a.pinnedFrom || (!altApplied.get(a.ref).pinnedFrom && altApplied.get(a.ref).sha === a.sha)))) return alt;
+        && applied.every((a) => (altApplied.has(a.ref)
+          && (a.pinnedFrom || (!altApplied.get(a.ref).pinnedFrom && altApplied.get(a.ref).sha === a.sha)))
+          || git(['merge-base', '--is-ancestor', a.sha, alt.finalSha]).status === 0)) return alt;
     }
   }
   return plan;
