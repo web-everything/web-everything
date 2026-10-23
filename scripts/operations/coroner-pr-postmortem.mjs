@@ -155,11 +155,21 @@ export function buildPostmortem(input, { benchmarks = SETTINGS.handoffP90Minutes
   }
   const approvals = sorted((verdicts ?? []).filter(v => ['accept','accepted','clear-human'].includes(v.verdict ?? v.action)).map(v => ({ at: v.at, head: v.coverage?.headSha ?? v.head, evidence: v.id ?? v.at })));
   for (const m of marks.filter(m => m.kind === 'accepted' || m.kind === 'clearance')) if (!approvals.some(a => Math.abs(time(a.at)-time(m.at)) < 60000)) approvals.push({ at: m.at, head: heads.filter(h => time(h.at) <= time(m.at)).at(-1)?.sha, evidence: m.evidence });
+  // A carried approval now stands on the new head, so follow it: each later head change is
+  // judged against the LATEST head the approval was carried to, until a change is not carried.
   const changes = approvals.flatMap(a => {
-    const next = heads.find(h => time(h.at) > time(a.at) && !same(a.head,h.sha));
-    if (!next || !a.head) return [];
-    const carry = trusted.find(c => { const m = parseVerdictCarriedMarker(c.body); return m && same(m.fromSha,a.head) && same(m.toSha,next.sha); });
-    return [{ ...a, nextHead: next.sha, changedAt: next.at, carryApplied: carry ? true : null, carryEvidence: carry?.ref ?? null }];
+    const out = [];
+    let head = a.head, since = a.at;
+    while (head) {
+      const cur = head, from = since;
+      const next = heads.find(h => time(h.at) > time(from) && !same(cur,h.sha));
+      if (!next) break;
+      const carry = trusted.find(c => { const m = parseVerdictCarriedMarker(c.body); return m && same(m.fromSha,cur) && same(m.toSha,next.sha); });
+      out.push({ ...a, head: cur, nextHead: next.sha, changedAt: next.at, carryApplied: carry ? true : null, carryEvidence: carry?.ref ?? null });
+      if (!carry) break;
+      head = next.sha; since = next.at;
+    }
+    return out;
   });
   const falseFindings = falseFindingsForPr({ repo, pr: Number(pr), comments, window: { since: openedAt, until: new Date(time(mergedAt)+1).toISOString() } });
   const standDowns = trusted.filter(c => /stood down|STAND-DOWN|not-a-ci-break/i.test(c.body.split('\n')[0])).map(c => ({ at: c.at, evidence: c.ref }));
@@ -386,18 +396,28 @@ function collectCompletePrTimeline(repo, pr, { gh, comments, env }) {
 }
 
 // Shared local serialization, with dead-process recovery, using the existing lease primitive.
-import { reserve, readLockEntry, releaseLockDirIf } from '../readiness/file-locks.mjs';
+import { reserve, readLockEntry, releaseLockDirIf, heartbeatOwn, DEFAULT_LEASE_MINUTES } from '../readiness/file-locks.mjs';
 import { hostname } from 'node:os';
-export async function withCoronerLock(dir, fn) {
+/** Heartbeat lease, not a fixed TTL: a live owner refreshes its heartbeat (timer plus `beat()`
+ * between items) so it keeps the lock however long it runs; a dead local owner is reclaimed at
+ * once; an owner whose heartbeat lapses (other host, reused pid, hung) is reclaimed after the lease.
+ * `fn` receives `{ beat }`; `beat()` throws when the lock was reclaimed, so a deposed owner stops. */
+export async function withCoronerLock(dir, fn, { clock = Date.now, leaseMinutes = DEFAULT_LEASE_MINUTES, beatMs = leaseMinutes*60000/5 } = {}) {
   fs.mkdirSync(dir,{recursive:true});
   const owner = `${hostname()}:${process.pid}:${randomUUID()}`, root = join(dir,'locks'), key = 'coroner-postmortem';
-  const result = reserve(root,key,owner,Date.now(),new Date().toISOString(),process.pid, entry => {
+  const result = reserve(root,key,owner,clock(),new Date(clock()).toISOString(),process.pid, entry => {
     if (!entry.owner?.startsWith(`${hostname()}:`)) return 'unknown';
     try { process.kill(entry.pid,0); return 'alive'; } catch(e) { return e.code === 'ESRCH' ? 'dead' : 'unknown'; }
-  }, 120, null, true);
+  }, leaseMinutes, null, true);
   if (!result.ok) throw Error('coroner postmortem is already running');
   const entry = readLockEntry(root,key);
-  try { return await fn(); } finally { releaseLockDirIf(root,key,entry); }
+  let lost = false;
+  const beat = () => {
+    if (lost || !heartbeatOwn(root,key,owner,new Date(clock()).toISOString())) { lost = true; throw Error('coroner lock lost; heartbeat lease was reclaimed'); }
+  };
+  const timer = beatMs > 0 ? setInterval(() => { try { beat(); } catch { /* recorded in `lost`; the next beat() call stops the work */ } },beatMs) : null;
+  timer?.unref();
+  try { return await fn({ beat }); } finally { if (timer) clearInterval(timer); releaseLockDirIf(root,key,entry); }
 }
 if (process.argv[1] && resolve(process.argv[1]) === SELF) {
   try {

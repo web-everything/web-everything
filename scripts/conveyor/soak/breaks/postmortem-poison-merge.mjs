@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runPostmortemPass, listMergedSince } from '../../pass-daemons/pr-postmortem-pass.mjs';
-import { DEFAULTS } from '../../../operations/coroner-pr-postmortem.mjs';
+import { DEFAULTS, withCoronerLock } from '../../../operations/coroner-pr-postmortem.mjs';
 
 const SOURCE = 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs';
 export async function shiftedListingScenario(moved = 101) {
@@ -34,6 +34,21 @@ export async function shiftedListingScenario(moved = 101) {
     return violations;
   } finally { fs.rmSync(dir,{recursive:true,force:true}); }
 }
+/** A live owner heartbeating past the old fixed 2h TTL keeps the lock; a lapsed owner is fenced. */
+export async function lockLeaseScenario() {
+  const dir = fs.mkdtempSync(join(tmpdir(),'soak-coroner-lock-'));
+  let now = Date.UTC(2026,9,17), second = 0; const clock = () => now, violations = [];
+  const rival = () => withCoronerLock(dir,() => { second++; },{clock,beatMs:0}).catch(e => e.message);
+  try {
+    await withCoronerLock(dir,async ({beat}) => {
+      for (let i = 0; i < 20; i++) { now += 10*60000; beat(); if (await rival() !== 'coroner postmortem is already running') violations.push('live heartbeating owner lost the lock'); }
+      now += 16*60000; // heartbeat lapses with no beat: a reclaimer may take over and the old owner is fenced
+      await withCoronerLock(dir,() => { try { beat(); violations.push('reclaimed owner was not fenced'); } catch {} },{clock,beatMs:0});
+    },{clock,beatMs:0});
+    if (second) violations.push('rival ran while the owner was live');
+    return violations;
+  } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+}
 export default {
   id: 'postmortem-poison-merge',
   title: 'postmortem watcher delays quarantine and retries operator recovery across restarts',
@@ -41,7 +56,7 @@ export default {
   fixedBy: { sha:'HEAD', where:'lane/pr-postmortem', paths:[SOURCE] },
   fixPresent(root) {
     const source = fs.readFileSync(join(root,SOURCE),'utf8');
-    return source.includes('MIN_COLLECTION_FAILURE_SPAN_MS') && source.includes('listing shifted; cursor retained');
+    return source.includes('MIN_COLLECTION_FAILURE_SPAN_MS') && source.includes('listing shifted; cursor retained') && source.includes('beat()');
   },
   async run() {
     const dir = fs.mkdtempSync(join(tmpdir(),'soak-poison-merge-'));
@@ -76,6 +91,7 @@ export default {
       if (reads.join(',') !== '2,3,2,2,2,2' || !fs.existsSync(join(dir,'postmortem-example%2Frepo-2.md'))) violations.push('operator quarantine removal did not recover publication');
       violations.push(...await shiftedListingScenario());
       violations.push(...await shiftedListingScenario(1));
+      violations.push(...await lockLeaseScenario());
       return {violations};
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   },

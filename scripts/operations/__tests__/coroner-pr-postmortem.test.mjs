@@ -612,6 +612,51 @@ describe('per PR postmortem', () => {
     }));
     expect(raw.completeness.card).toBe('incomplete'); expect(raw.scope).toBeNull(); expect(raw.prepares).toEqual([]);
   });
+  it('keeps the publication lock for a heartbeating live owner past two hours', async () => {
+    const dir = temp(); let now = Date.parse(at(0)); const clock = () => now;
+    try {
+      let called = 0;
+      await withCoronerLock(dir,async ({beat}) => {
+        for (let i = 0; i < 20; i++) { // 200 minutes, past the old fixed 2h TTL
+          now += 10*60000; beat();
+          await expect(withCoronerLock(dir,() => {called++;},{clock,beatMs:0})).rejects.toThrow('already running');
+        }
+      },{clock,beatMs:0});
+      expect(called).toBe(0);
+      await withCoronerLock(dir,() => {called++;},{clock,beatMs:0}); // released afterwards
+      expect(called).toBe(1);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('fences an owner whose heartbeat lapsed and was reclaimed', async () => {
+    const dir = temp(); let now = Date.parse(at(0)); const clock = () => now;
+    try {
+      await withCoronerLock(dir,async ({beat}) => {
+        now += 16*60000; // heartbeat lease (15 min) lapsed without a beat
+        await withCoronerLock(dir,() => { expect(() => beat()).toThrow('lock lost'); },{clock,beatMs:0});
+      },{clock,beatMs:0});
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+  it('counts an approval lost after a carried approval and requires the postmortem', () => {
+    const config = {minLeadHours:1000,minFixRounds:1000,minLostApprovals:1,onStandDown:false};
+    const carried = () => { // approve a -> carry a to b
+      const f = fixture();
+      f.comments.push(comment(80,`<!-- review-verdict-carried from=${'a'.repeat(40)} to=${'b'.repeat(40)} patch-id=${'d'.repeat(40)} -->`));
+      return f;
+    };
+    const control = buildPostmortem(carried());
+    expect(control.approvals.lost).toBe(0);
+    expect(shouldPostmortem(control,config)).toBe(false);
+    const f = carried(); // ... then lose it on head c, which is not carried
+    f.commits.push({sha:'c'.repeat(40),commit:{committer:{date:at(90)},message:'late fix'}});
+    const r = buildPostmortem(f);
+    expect(r.approvals.headChanges.map(c => [c.head,c.nextHead,c.carryApplied])).toEqual([
+      ['a'.repeat(40),'b'.repeat(40),true], ['b'.repeat(40),'c'.repeat(40),null]]);
+    expect(r.approvals.lost).toBe(1);
+    expect(shouldPostmortem(r,config)).toBe(true);
+    // A carry chain a -> b -> c is never lost.
+    f.comments.push(comment(95,`<!-- review-verdict-carried from=${'b'.repeat(40)} to=${'c'.repeat(40)} patch-id=${'e'.repeat(40)} -->`));
+    expect(buildPostmortem(f).approvals.lost).toBe(0);
+  });
   it('reclaims a dead local owner and preserves a live owner', async () => {
     const dir = temp(); const root = join(dir,'locks'); const key = 'coroner-postmortem';
     try {

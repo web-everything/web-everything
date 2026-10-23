@@ -40,7 +40,8 @@ export function listMergedSince(repo, since, until, { gh = ghJson, maxPages = 10
 export async function runPostmortemPass({ repo, dir = coronerStateDir(), now = new Date().toISOString(),
   settings = resolvePostmortemSettings(), listMerged = listMergedSince, collect = collectPrTimeline } = {}) {
   validateSubject(repo,1);
-  return withCoronerLock(dir, async () => {
+  return withCoronerLock(dir, async ({ beat }) => {
+    beat();
     const file = join(dir,`merge-cursor-${repoFilenameKey(repo)}.json`);
     const state = readOptionalJson(file,{ cursor:new Date(Date.parse(now)-86400000).toISOString(), done:[] });
     if (!Array.isArray(state.done) || !Number.isFinite(Date.parse(state.cursor)) || Date.parse(now) < Date.parse(state.cursor)) throw Error('invalid merge cursor');
@@ -61,6 +62,7 @@ export async function runPostmortemPass({ repo, dir = coronerStateDir(), now = n
     for (const pr of Object.keys(state.failures)) if (!pending.has(Number(pr))) pending.set(Number(pr),{number:Number(pr)});
     const errors = [];
     for (const p of pending.values()) {
+      beat(); // fence: stop if a reclaimer took the lock while the previous item ran
       if (state.done.includes(p.number) || state.quarantined.some(q => q.pr === p.number)) continue;
       let r;
       try {
