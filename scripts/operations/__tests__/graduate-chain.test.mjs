@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { withBareOrigin } from './helpers/real-repo.mjs';
+import { FIXTURE_SLUG, withBareOrigin } from './helpers/real-repo.mjs';
 import { createGraduateChainRunner, createGraduateChainSinks } from '../graduate-chain-io.mjs';
 import { cascadePolicy } from '../../lib/policy-cascade.mjs';
 import { extractSubmitResult } from '../open-pr.mjs';
@@ -14,6 +14,7 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 
 const sha = 'a'.repeat(40), base = 'b'.repeat(40);
+const repo = 'example/source-repo';
 const input = { source: 'lane/source', purpose: 'slice', title: 'A slice $(inert)' };
 const goodVerify = { verdict: { ok: true, checks: [{ outcome: 'pass' }] } };
 const opened = { findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 42 } }] } } };
@@ -26,6 +27,7 @@ function fixture({ change = () => undefined, over = {}, options = {} } = {}) {
     if (override) return override;
     const value = v => ({ status: 0, stdout: typeof v === 'string' ? v : JSON.stringify(v), stderr: '' });
     if (cmd === 'gh') {
+      if (args[0] === 'repo') return value(repo);
       if (args[0] === 'api') return value({ login: 'me' });
       if (args[1] === 'view') return value({ headRefName: 'lane/parent', headRefOid: base, isCrossRepository: false });
       return value([]);
@@ -68,6 +70,7 @@ describe('graduate-chain', () => {
       const calls = [];
       const exec = (cmd, args, opts) => {
         calls.push({ cmd, args });
+        if (cmd === 'gh' && args[0] === 'repo') return reply(FIXTURE_SLUG);
         if (cmd === 'gh') return reply(args[0] === 'api' ? { login: 'me' } : args[1] === 'view'
           ? { headRefName: 'lane/stack', headRefOid: stackSha, isCrossRepository: false } : []);
         if (cmd !== 'git') throw Error('dry-run attempted mutation');
@@ -96,6 +99,12 @@ describe('graduate-chain', () => {
     expect(result).toMatchObject({ ok: true, pr: 42, branch: 'lane/slice', sha, stopReason: null,
       capSources: { callerMax: 'standard', repoMax: 'standard' }, size: { nonTest: 15, test: 5, files: 2 } });
     expect(calls.filter(c => c.args[1] === 'verify')).toHaveLength(1);
+    expect(calls.find(c => c.cmd === 'gh' && c.args[0] === 'repo').args).toEqual([
+      'repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner',
+    ]);
+    expect(calls.find(c => c.cmd === 'gh' && c.args[1] === 'list').args).toEqual([
+      'pr', 'list', '--repo', repo, '--state', 'open', '--json', 'number,author,headRefName', '--limit', '1000',
+    ]);
     for (const c of calls.filter(c => ['reset', 'cherry-pick', 'push'].includes(c.args[0]))) expect(c.env.LANE_SESSION).toBe('held');
     expect(calls.find(c => c.args[0] === 'push').args).toEqual(['push', 'origin', 'HEAD:refs/heads/lane/slice']);
     expect(calls.find(c => c.args[1] === 'open-pr').args).toContain('--title=A slice $(inert)');
@@ -113,9 +122,21 @@ describe('graduate-chain', () => {
   it('uses stack head and an explicit source range', () => {
     const { result, calls } = fixture({ over: { source: 'old..new', stackOn: '7', bodyTemplate: 'body.md', audit: 'clear' } });
     expect(result.ok).toBe(true);
+    expect(calls.find(c => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view').args).toEqual([
+      'pr', 'view', '7', '--repo', repo, '--json', 'headRefName,headRefOid,isCrossRepository',
+    ]);
     expect(calls.find(c => c.args[1] === 'open-pr').args).toContain('--base=lane/parent');
     expect(calls.find(c => c.args[0] === 'merge-tree').args).toContain(`--merge-base=${sha}`);
   });
+  for (const response of [reply('', 1), reply(''), reply('invalid')]) {
+    it('refuses unreadable repo identity before reading PRs or leasing', () => {
+      const { result, calls } = fixture({ change: (c, a) => c === 'gh' && a[0] === 'repo' && response });
+      expect(result).toMatchObject({ ok: false, stopReason: 'repo' });
+      expect(calls.map(c => [c.cmd, c.args])).toEqual([
+        ['gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']],
+      ]);
+    });
+  }
   it('honours environment cap provenance and leaves the final gate to the cascade', () => {
     const { result, calls } = fixture({ options: { env: { WE_GRADUATION_CALLER_MAX: '6' } } });
     expect(result.capSources.callerMax).toBe('env');
@@ -189,7 +210,7 @@ describe('graduate-chain', () => {
     expect(result.stopReason).toBe('input'); expect(calls).toEqual([]);
   });
   it('refuses missing stack evidence', () => {
-    expect(fixture({ over: { stackOn: '1' }, change: (c, a) => a[1] === 'view' && reply({}) }).result.stopReason).toBe('stack-base');
+    expect(fixture({ over: { stackOn: '1' }, change: (c, a) => c === 'gh' && a[0] === 'pr' && a[1] === 'view' && reply({}) }).result.stopReason).toBe('stack-base');
   });
   it('releases when evidence cannot parse or template IO throws', () => {
     expect(fixture({ change: (c, a) => a[1] === 'verify' && reply('broken') }).result.stopReason).toBe('verify-unrun');
