@@ -699,12 +699,13 @@ async function loadOverlay({
   // the daemon's in-tick updater's input; `--wait` blocks on its result file instead of on a clone lock.
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
   let triggeredRequestId;
-  if (!wait) {
+  if (!wait || vctx) {
     try {
       // Reuse the version request protocol; legacy clones rebuild immediately below.
-      triggeredRequestId = await (triggerFn ?? (({ versions: ctx }) => ctx ? submit(ctx, { ref, pr, by }) : null))({ root, ref, pr, by, env, versions: vctx });
+      triggeredRequestId = wait ? await submit(vctx, { ref, pr, by })
+        : await (triggerFn ?? (({ versions: ctx }) => ctx ? submit(ctx, { ref, pr, by }) : null))({ root, ref, pr, by, env, versions: vctx });
     } catch (e) {
-      loadState.triggerError = redactDetail(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, '');
+      loadState.triggerError = redactDetail(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, '') || 'rebuild trigger failed';
       log.error?.(`daemon-load-overlay: rebuild trigger failed: ${loadState.triggerError}`);
     }
   }
@@ -745,14 +746,16 @@ async function loadOverlay({
   };
 
   if (vctx) {
-    const requestId = wait ? submit(vctx, { ref, pr, by }) : triggeredRequestId;
+    const requestId = triggeredRequestId;
     // The in-tick updater is the one that builds and adopts, so this CLI can only smoke what a --wait result reports
     // adopted. Without --wait nothing has been built yet: say so loudly rather than let "registered" read as "smoked".
-    if (!wait) {
-      if (smokeOn) notRun("it is queued for the versioned clone's in-tick updater and nothing here will smoke it; re-run with --wait to smoke the adopted version");
+    if (!wait || loadState.triggerError) {
+      if (smokeOn) notRun(loadState.triggerError ? 'the rebuild request failed; retry the load to request a rebuild'
+        : "it is queued for the versioned clone's in-tick updater and nothing here will smoke it; re-run with --wait to smoke the adopted version");
       return {
         root, ref, homeBranch: base, registered: true, versioned: true, requestId, requestQueued: !!requestId, pending: true, warnings,
-        ...(smokeOn ? { dispatchSmoke: { ran: false, skipped: 'versioned-no-wait' } } : {}),
+        ...(loadState.triggerError ? { adopted: false } : {}),
+        ...(smokeOn ? { dispatchSmoke: { ran: false, skipped: loadState.triggerError ? 'trigger-failed' : 'versioned-no-wait' } } : {}),
       };
     }
     const result = await waitFor(vctx, requestId, waitMs != null ? { timeoutMs: waitMs } : {});

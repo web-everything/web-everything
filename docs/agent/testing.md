@@ -2011,5 +2011,11 @@ cannot prove a red run. Git-read errors are reported as unknown rather than evid
 coordination state. The writer uses prototype-load's `recordPath`, or
 `WE_PROTOTYPE_LOAD_RECORD`, and returns `pathSource`; oversized rows retain the core outcome
 with `detailsTruncated: true` (full details remain in the load's `--json` output).
-Legacy clones rebuild immediately in the load command. Versioned clones use `submitRequest`;
+Every string value, including nested diagnostics and writer errors, is scrubbed for GitHub
+credentials, Bearer/Basic tokens, URL userinfo, secret assignments and long opaque tokens
+before truncation. Regression fixtures pin redaction and readable clone/ref/outcome fields.
+Legacy clones already rebuild synchronously in this CLI; that behavior is unchanged.
+Versioned clones use `submitRequest`;
 that request is consumed on a daemon tick and does not itself wake a sleeping daemon.
+Submission failures (including `--wait`) retain registration, record `triggerError`, and return
+a pending, not-adopted result without waiting on an unqueued request; retry the load to submit again.

@@ -1546,6 +1546,36 @@ describe('load outcome audit and registration trigger', () => {
     expect(opts.recordFn.mock.calls[0][0].record).toMatchObject({ triggerError: 'request write failed' });
   });
 
+  it.each(['throw', 'reject', 'empty error'])('a --wait submission %s records triggerError and returns pending without adoption', async (failure) => {
+    const error = new Error(failure === 'empty error' ? '\n\u001b' : 'request write failed ghp_secret123\n\u001b');
+    const triggerError = failure === 'empty error' ? 'rebuild trigger failed' : 'request write failed ghp_<redacted>';
+    const opts = { ...options(), versions: {}, wait: true, waitFor: vi.fn(),
+      settings: { noPr: 'refuse', dispatchSmoke: 'on' }, dispatchSmoke: vi.fn(),
+      submit: vi.fn(() => {
+        expect(opts.addOverlayFn).toHaveBeenCalledTimes(1);
+        if (failure !== 'reject') throw error;
+        return Promise.reject(error);
+      }),
+    };
+    const result = await runDaemonLoadOverlay(opts);
+    expect(result).toMatchObject({ registered: true, versioned: true, pending: true, adopted: false,
+      requestQueued: false, triggerError,
+      dispatchSmoke: { ran: false, skipped: 'trigger-failed' },
+    });
+    expect(result.requestId).toBeUndefined();
+    expect(opts.submit).toHaveBeenCalledTimes(1);
+    expect(opts.submit).toHaveBeenCalledWith(opts.versions, { ref: opts.ref, pr: opts.pr, by: null });
+    expect(opts.waitFor).not.toHaveBeenCalled();
+    expect(opts.triggerFn).not.toHaveBeenCalled();
+    expect(opts.rebuild).not.toHaveBeenCalled();
+    expect(opts.dispatchSmoke).not.toHaveBeenCalled();
+    expect(opts.recordFn).toHaveBeenCalledTimes(1);
+    expect(opts.recordFn.mock.calls[0][0].record).toMatchObject({
+      outcome: 'versioned/pending', registered: true, pending: true, adopted: false,
+      requestQueued: false, triggerError,
+    });
+  });
+
   it('the default legacy path rebuilds immediately without submitting a versioned request', async () => {
     const opts = { ...options(), triggerFn: undefined, submit: vi.fn() };
     await runDaemonLoadOverlay(opts);
