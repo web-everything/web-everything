@@ -43,7 +43,9 @@ describe('cleanupEligibility (pure)', () => {
     expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, refStorage: ['files:///x/.git'] }))
       .toEqual({ ok: false, reason: 'ref store is redirected (extensions.refStorage=files:///x/.git)' });
     expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, refStorage: ['files'] }).ok).toBe(true);
-    expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, refStorage: ['reftable'] }).ok).toBe(true);
+    // Pool lanes are files-format: a bare `reftable` on one hides every ref, so prune would see no history at all.
+    expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, refStorage: ['reftable'] }))
+      .toEqual({ ok: false, reason: 'ref store is redirected (extensions.refStorage=reftable)' });
   });
   it('refuses an unreadable common dir', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, realCommonDir: null }).ok).toBe(false));
   it('refuses a lane with per-ref reflog expiry', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, gcReflogPatterns: ['gc.refs/heads/*.reflogexpire'] }))
@@ -281,6 +283,10 @@ describe('real git: cleanup CLI', () => {
     // Config-defined hooks ignore core.hooksPath: the ops-ref delete (update-ref) would run this one.
     ['config-defined reference-transaction hook', (dir, other, ran) => configHook(dir, ran), 'config-defined hooks configured (hook.attack.event, hook.attack.command; core.hooksPath does not stop them)'],
     ['ref store in another repo', (dir, other) => foreignRefStore(dir, other), /^ref store is redirected \(extensions\.refStorage=files:\/\//],
+    ['bare reftable on a files lane (every ref hidden)', (dir) => {
+      git(dir, 'config', 'core.repositoryformatversion', '1');
+      git(dir, 'config', 'extensions.refStorage', 'reftable');
+    }, 'ref store is redirected (extensions.refStorage=reftable)'],
     // Git keeps the trailing space of a commondir path: `<lane>/.git ` is another store, not the lane's own `.git`.
     ['trailing-space commondir', (dir) => {
       cpSync(join(dir, '.git'), join(dir, '.git '), { recursive: true });

@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { scrubRiskyLaneConfig, riskyLaneConfig, LANE_CONFIG_LIST_ARGS, GIT_REPO_ENV_KEYS, LANE_GIT_CONFIG_PINS, laneGitHardeningEnv, scrubGitRepoEnv } from '../lane-git-hardening.mjs';
+import { scrubRiskyLaneConfig, riskyLaneConfig, LANE_CONFIG_LIST_ARGS, GIT_REPO_ENV_KEYS, GIT_REPO_LOCATION_ENV_KEYS, LANE_GIT_CONFIG_PINS, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
@@ -104,11 +104,35 @@ it('scrubGitRepoEnv drops every inherited repo redirect and env config source, a
   expect(env.GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));
   expect(env.GIT_CONFIG_KEY_99).toBeUndefined();
 });
+it('scrubGitLocationEnv drops every repo/ref/reachability redirect but keeps env config (lane-pool git calls)', () => {
+  const config = { GIT_CONFIG_GLOBAL: '/hermetic', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'a.b', GIT_CONFIG_VALUE_0: 'c' };
+  const inherited = { ...Object.fromEntries(GIT_REPO_LOCATION_ENV_KEYS.map(key => [key, '/elsewhere'])), ...config, PATH: '/bin' };
+  expect(scrubGitLocationEnv(inherited)).toEqual({ ...config, PATH: '/bin', GIT_REF_PARANOIA: '1' });
+  for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CONFIG', 'GIT_REFERENCE_BACKEND', 'GIT_SHALLOW_FILE']) {
+    expect(GIT_REPO_LOCATION_ENV_KEYS).toContain(key);
+  }
+});
+it('the default scrub runner ignores an inherited GIT_REFERENCE_BACKEND, so it never deletes another repo\'s refs', () => {
+  const { dir, git } = repo();
+  const other = repo();
+  other.git(['commit', '--allow-empty', '-qm', 'x']);
+  other.git(['update-ref', 'refs/remotes/evil/x', 'HEAD']);
+  git(['remote', 'add', 'evil', join(tmpdir(), 'evil-checkout')]);
+  vi.stubEnv('GIT_REFERENCE_BACKEND', `files://${join(other.dir, '.git')}`);
+  try {
+    expect(scrubRiskyLaneConfig(dir).removed).toEqual(['remote.evil.url']);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+  expect(git(['remote'])).toBe('');
+  expect(other.git(['for-each-ref', '--format=%(refname)', 'refs/remotes/evil/'])).toBe('refs/remotes/evil/x\n');
+});
 it('flags a ref store kept in another repository, never a bare format', () => {
   const list = (...entries) => entries.map(([scope, key, value]) => `${scope}\0${key}\n${value}`).join('\0') + '\0';
   expect(riskyLaneConfig(list(['local', 'extensions.refstorage', 'files:///other/.git']))).toEqual(['extensions.refstorage']);
   expect(riskyLaneConfig(list(['worktree', 'extensions.refStorage', 'reftable://../x']))).toEqual(['extensions.refStorage']);
-  expect(riskyLaneConfig(list(['local', 'extensions.refstorage', 'reftable']))).toEqual([]);
+  expect(riskyLaneConfig(list(['local', 'extensions.refstorage', 'reftable']))).toEqual(['extensions.refstorage']); // hides a files lane's refs
+  expect(riskyLaneConfig(list(['local', 'extensions.refstorage', 'files']))).toEqual([]);
 });
 it('scrubs config-defined hooks, which run whatever core.hooksPath says', () => {
   const { dir, git } = repo();

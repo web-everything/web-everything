@@ -68,8 +68,9 @@ export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCom
   if (locks.length) return { ok: false, reason: `git lock present (${locks.join(', ')})` };
   if (borrowers.length) return { ok: false, reason: `objects borrowed by ${borrowers.join(', ')}` };
   if (gcHooks.length) return { ok: false, reason: 'gc.recentObjectsHook configured (gc would run it)' };
-  // Only a bare format keeps the refs in the lane's own `.git`; `<format>://<path>` stores them elsewhere.
-  const foreignRefs = refStorage.filter((v) => !/^(files|reftable)$/i.test(String(v).trim()));
+  // Pool lanes use the files ref store. `<format>://<path>` stores the refs in another repo; a bare `reftable` on a
+  // files lane hides every ref, so gc/prune would treat all history as unreachable.
+  const foreignRefs = refStorage.filter((v) => v !== 'files');
   if (foreignRefs.length) return { ok: false, reason: `ref store is redirected (extensions.refStorage=${foreignRefs.join(', ')})` };
   if (configHooks.length) return { ok: false, reason: `config-defined hooks configured (${configHooks.join(', ')}; core.hooksPath does not stop them)` };
   if (gcRepackFilters.length) return { ok: false, reason: `GC repack filtering configured (${gcRepackFilters.join(', ')})` };
