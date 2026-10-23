@@ -9,10 +9,11 @@ only an adopted replacement containing each predecessor's freshly fetched origin
 may retire that predecessor. Manual removal also fetches the predecessor's current
 origin tip and refuses pending, unknown or incomplete replacement adoption. Rebuild
 preparation uses the same full guard, logging `overlay-removal-deferred` on refusal.
-Both recheck adoption after fetch and containment, immediately before removal.
-Residual window: the list mutex is private and `removeOverlay` has no guard callback;
-HEAD can still move between the final check and deletion, including while waiting for that mutex.
-Timeout and pre-swap rebuild failures restore complete
+Swap and manual removal hold the clone write lock across adoption, containment,
+registry reads and removal, including the wait for the list mutex. Lock acquisition
+waits at most one second for readers; a busy writer or exhausted wait refuses removal.
+Retain registrations and retry after the clone is idle.
+Timeout, rebuild refusal/rollback/errors and swap exceptions restore complete
 registrations, including `replacedBy` and all guard fields, with fresh per-entry reads
 and insertion under the registry lock that preserves concurrent entries.
 `swapAfterAdopt.timeoutMs` resolves through the policy cascade

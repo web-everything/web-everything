@@ -1,9 +1,29 @@
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
 import { restoreOverlay as restore, removeOverlay as remove, readOverlayState, appendOverlayEvent as append } from './daemon-overlays.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { defaultOwner, withWriteLock } from './daemon-clone-lock.mjs';
+
+// Removal is metadata-only, but its evidence depends on HEAD staying put. Never remove unlocked.
+export async function withSwapRemovalLock(root, env, fn) {
+  const locked = await withWriteLock(root, fn, {
+    owner: `${defaultOwner()}-overlay-removal-${randomUUID()}`,
+    lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, waitMs: 1000, pollMs: 50,
+  });
+  if (!locked.ok) throw new Error(`overlay-swap: clone lock unavailable (${locked.reason}); retain registrations and retry after the clone is idle`);
+  return locked.value;
+}
+
+export async function removeAdoptedOverlay({ removeOverlay = remove, why = 'operator', ...options }) {
+  const { root, ref, env = process.env } = options;
+  return withSwapRemovalLock(root, env, () => {
+    assertSwapRemovalAdopted(options);
+    return removeOverlay(root, ref, { env, why });
+  });
+}
 
 // Preserve null exit statuses: a failed spawn must never become 'not yet adopted'.
 export const overlayGitRun = (args, options) => spawnSync('git', args, { encoding: 'utf8', ...options });
@@ -114,19 +134,22 @@ export async function swapAfterAdopt({
     }
     await sleep(Math.min(pollMs, deadline - now()));
   }
-  const removed = [], retained = [];
-  for (const ref of new Set(replaces)) {
-    const tip = originTip({ root, ref, run, env });
-    if (!ancestor(root, run, env, tip, newSha)) {
-      log(`overlay-swap: refusing to remove ${ref}: replacement does not contain its current origin tip; update the replacement and retry`);
-      retained.push(ref); continue;
-    }
+  return withSwapRemovalLock(root, env, () => {
+    const removed = [], retained = [];
     if (!ancestor(root, run, env, newSha, 'HEAD')) throw new Error('overlay-swap: replacement no longer adopted; retain registrations and retry');
-    if (!readOverlays(root, { env }).some(o => o.ref === ref)) continue;
-    if (removeOverlay(root, ref, { env, why: `replaced by ${newRef}` }).removed) {
-      removed.push(ref);
-      appendOverlayEvent(root, { kind: 'swap-removed', ref, replacedBy: newRef, newSha }, { env });
+    for (const ref of new Set(replaces)) {
+      const tip = originTip({ root, ref, run, env });
+      if (!ancestor(root, run, env, tip, newSha)) {
+        log(`overlay-swap: refusing to remove ${ref}: replacement does not contain its current origin tip; update the replacement and retry`);
+        retained.push(ref); continue;
+      }
+      if (!ancestor(root, run, env, newSha, 'HEAD')) throw new Error('overlay-swap: replacement no longer adopted; retain registrations and retry');
+      if (!readOverlays(root, { env }).some(o => o.ref === ref)) continue;
+      if (removeOverlay(root, ref, { env, why: `replaced by ${newRef}` }).removed) {
+        removed.push(ref);
+        appendOverlayEvent(root, { kind: 'swap-removed', ref, replacedBy: newRef, newSha }, { env });
+      }
     }
-  }
-  return { ok: true, removed, retained };
+    return { ok: true, removed, retained };
+  });
 }

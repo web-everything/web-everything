@@ -6,7 +6,10 @@
  *   `main` plus an explicit overlay list kept in a per-clone state file OUTSIDE the clone. This is the
  *   add/remove/list surface a person (or a future automated caller) uses to register/drop an overlay ref.
  *
- * THIS CLI NEVER TOUCHES THE CLONE'S WRITE LOCK (#4229/#2760 follow-up, epic #3383/#4075, 2026-09-26).
+ * Adds only mutate metadata; removal takes the clone write lock for at most a 1s acquisition wait,
+ * then holds it across replacement-adoption evidence and registry removal. A busy clone refuses removal;
+ * retry after it is idle. This closes the check/removal race with rebuild adoption.
+ * HISTORY (#4229/#2760 follow-up, epic #3383/#4075, 2026-09-26):
  * add/remove ONLY register/drop an entry in the overlay STORE (`~/.claude/daemon-overlays/<hash>.json`) and
  * return — the next automatic rebuild (`daemon-rebuild.mjs`'s object-DB build: main + overlays, smoke-gated,
  * falls back to last-good on a failed smoke) is what actually applies the overlay to the clone's tree. That
@@ -94,9 +97,9 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, statSync, rmSync, renameSync } from 'node:fs';
 import {
-  addOverlay, removeOverlay, readOverlayState, appendOverlayEvent, overlayFilePath, recordEdgeResolution,
+  addOverlay, readOverlayState, appendOverlayEvent, overlayFilePath, recordEdgeResolution,
 } from './lib/daemon-overlays.mjs';
-import { assertSwapRemovalAdopted } from './lib/overlay-swap.mjs';
+import { removeAdoptedOverlay } from './lib/overlay-swap.mjs';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
@@ -544,8 +547,7 @@ async function main() {
         : { ok: false, reason: 'no-origin-url' };
     }
   } else if (cmd === 'remove') {
-    assertSwapRemovalAdopted({ root, ref: flags.ref, env });
-    const { removed, list } = removeOverlay(root, flags.ref, { env, why: reason || 'operator' });
+    const { removed, list } = await removeAdoptedOverlay({ root, ref: flags.ref, env, why: reason || 'operator' });
     if (removed) appendOverlayEvent(root, { kind: 'removed', ref: flags.ref, by, reason }, { env });
     output = { removed, list };
   } else if (cmd === 'approve-edge') {

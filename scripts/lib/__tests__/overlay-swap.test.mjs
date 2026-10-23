@@ -3,8 +3,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { addOverlay, recordOverlayReplacement, overlayFilePath, restoreOverlay, writeOverlays } from '../daemon-overlays.mjs';
 import { readSwapOverlays } from '../overlay-swap.mjs';
-import { describe, it, expect, vi } from 'vitest';
-import { swapAfterAdopt, swapTimeout, assertSwapRemovalAdopted } from '../overlay-swap.mjs';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { swapAfterAdopt, swapTimeout, assertSwapRemovalAdopted, removeAdoptedOverlay } from '../overlay-swap.mjs';
+
+import { acquireWrite, acquireRead, defaultOwner, inspectCloneLock } from '../daemon-clone-lock.mjs';
+import { execFileSync } from 'node:child_process';
+
+const tempDirs = [];
+afterEach(() => { for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+function lockRoot() {
+  const dir = mkdtempSync(join(tmpdir(), 'we-swap-lock-'));
+  tempDirs.push(dir);
+  return dir;
+}
 
 const sha = 'a'.repeat(40), oldSha = 'b'.repeat(40);
 function fixture() {
@@ -18,7 +29,7 @@ function fixture() {
     return { status: 0 };
   });
   const options = {
-    root: 'clone', newRef: 'new', newSha: sha, replaces: ['old'], env: {}, run,
+    root: 'clone', newRef: 'new', newSha: sha, replaces: ['old'], env: { WE_DAEMON_CLONE_LOCK_ROOT: lockRoot() }, run,
     readOverlays: vi.fn(() => list.map(o => ({ ...o }))),
     addOverlay: vi.fn((root, entry) => { order.push('add'); list.push(entry); }),
     removeOverlay: vi.fn((root, ref) => { order.push('remove'); list = list.filter(o => o.ref !== ref); return { removed: true }; }),
@@ -57,7 +68,7 @@ describe('swapAfterAdopt', () => {
       f.setList([{ ref: 'concurrent', pr: 999 }]);
     });
     expect(await swapAfterAdopt(f.options)).toMatchObject({ ok: false, reason: 'adoption-timeout', restored: ['old'] });
-    expect(f.options.addOverlay).toHaveBeenCalledWith('clone', expect.objectContaining({ ref: 'old', pr: 42, pinned: true, addedBy: 'original', reason: 'keep', now: '2026-01-01' }), { env: {} });
+    expect(f.options.addOverlay).toHaveBeenCalledWith('clone', expect.objectContaining({ ref: 'old', pr: 42, pinned: true, addedBy: 'original', reason: 'keep', now: '2026-01-01' }), { env: f.options.env });
     expect(f.list().map(o => o.ref)).toEqual(['concurrent', 'old']);
     expect(f.options.removeOverlay).not.toHaveBeenCalled();
     expect(f.events[0].kind).toBe('swap-timeout-restored');
@@ -71,7 +82,7 @@ describe('swapAfterAdopt', () => {
     });
     expect(f.options.addOverlay).toHaveBeenCalledWith('clone', expect.objectContaining({
       pr: 42, pinned: true, reason: 'keep', addedBy: 'original',
-    }), { env: {} });
+    }), { env: f.options.env });
     expect(f.options.removeOverlay).not.toHaveBeenCalled();
   });
   it('timeout leaves present registrations unchanged and removes nothing', async () => {
@@ -193,6 +204,76 @@ describe('manual predecessor removal guard', () => {
       readOverlays: () => [{ ref: 'old', replacedBy: { ref: 'new', sha } }],
     })).toThrow(/current origin tip|retain registrations/);
   });
+});
+
+describe.each(['swap', 'manual'])('%s removal clone lock', mode => {
+  function removal(f) {
+    return mode === 'swap' ? swapAfterAdopt(f.options) : removeAdoptedOverlay({ ...f.options, ref: 'old' });
+  }
+  it('holds the rebuild lock across adoption, containment, registry read and removal', async () => {
+    const f = fixture(); f.adopt();
+    f.setList([{ ...f.list()[0], replacedBy: { ref: 'new', sha } }]);
+    const opts = { lockRoot: f.options.env.WE_DAEMON_CLONE_LOCK_ROOT, owner: 'competing-rebuild' };
+    const contenders = [], phases = [];
+    const checkLocked = phase => {
+      phases.push(phase);
+      expect(inspectCloneLock('clone', opts).writerLive).toBe(true);
+      contenders.push(acquireWrite('clone', opts));
+    };
+    const run = f.options.run.getMockImplementation();
+    f.options.run.mockImplementation(args => {
+      // Swap's polling probe is outside the critical section; every later probe must be protected.
+      if (mode === 'manual' || f.options.run.mock.calls.length > 1) {
+        checkLocked(args.includes('fetch') ? 'fetch' : args.at(-1) === 'HEAD' ? 'adoption' : 'containment');
+      }
+      return run(args);
+    });
+    const read = f.options.readOverlays.getMockImplementation();
+    f.options.readOverlays.mockImplementation(() => {
+      if (mode === 'manual' || f.options.readOverlays.mock.calls.length > 1) checkLocked('registry');
+      return read();
+    });
+    const remove = f.options.removeOverlay.getMockImplementation();
+    f.options.removeOverlay.mockImplementation((...args) => { checkLocked('removal'); return remove(...args); });
+    await removal(f);
+    expect(phases).toEqual(expect.arrayContaining(['adoption', 'fetch', 'containment', 'registry', 'removal']));
+    for (const result of await Promise.all(contenders)) expect(result).toMatchObject({ ok: false, reason: 'concurrent-mover' });
+    expect(inspectCloneLock('clone', opts).writer).toBeNull();
+    expect(f.list()).toEqual([]);
+  });
+  it.each(['writer', 'reader'])('refuses removal when a %s prevents taking the clone lock within the short bound', async blocker => {
+    const f = fixture(); f.adopt();
+    const opts = { lockRoot: f.options.env.WE_DAEMON_CLONE_LOCK_ROOT, owner: defaultOwner() };
+    expect(await (blocker === 'writer' ? acquireWrite('clone', opts) : acquireRead('clone', opts))).toMatchObject({ ok: true });
+    const started = Date.now();
+    await expect(removal(f)).rejects.toThrow(/clone lock unavailable.*retain registrations and retry after the clone is idle/);
+    expect(Date.now() - started).toBeLessThan(2500);
+    expect(f.options.removeOverlay).not.toHaveBeenCalled();
+    expect(f.list().map(o => o.ref)).toEqual(['old']);
+  });
+  it('releases the clone lock when evidence fails', async () => {
+    const f = fixture(); f.adopt();
+    f.setList([{ ...f.list()[0], replacedBy: { ref: 'new', sha } }]);
+    const run = f.options.run.getMockImplementation();
+    f.options.run.mockImplementation(args => args.includes('fetch') ? { status: 128 } : run(args));
+    await expect(removal(f)).rejects.toThrow(/origin fetch failed/);
+    expect(inspectCloneLock('clone', { lockRoot: f.options.env.WE_DAEMON_CLONE_LOCK_ROOT }).writer).toBeNull();
+    expect(f.options.removeOverlay).not.toHaveBeenCalled();
+  });
+});
+
+it('manual remove CLI refuses a busy rebuild lock and preserves the registry', async () => {
+  const root = lockRoot();
+  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'registry'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
+  addOverlay(root, { ref: 'old' }, { env });
+  expect(await acquireWrite(root, { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, owner: 'rebuild' })).toMatchObject({ ok: true });
+  let failure;
+  try {
+    execFileSync(process.execPath, ['scripts/daemon-overlay.mjs', 'remove', `--clone=${root}`, '--ref=old'], { env, encoding: 'utf8', stdio: 'pipe', timeout: 10_000 });
+  } catch (error) { failure = error; }
+  expect(failure?.status).toBe(1);
+  expect(failure?.stderr).toMatch(/clone lock unavailable.*retry after the clone is idle/);
+  expect(readSwapOverlays(root, { env }).map(o => o.ref)).toEqual(['old']);
 });
 
 it('locked restoration preserves every saved field and leaves a concurrently restored registration untouched', () => {

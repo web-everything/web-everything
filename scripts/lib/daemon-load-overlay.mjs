@@ -648,9 +648,9 @@ export async function runDaemonLoadOverlay(options) {
   const markedEntries = [];
   const recovery = { root, newRef: options.ref, newSha, readOverlays: readOverlaysFn,
     addOverlay: options.addOverlayFn ?? restoreOverlay, appendOverlayEvent: options.appendEventFn ?? appendOverlayEvent, env };
-  let result;
+  let failureKind = 'swap-rebuild-failed-restored';
   try {
-    result = await loadOverlay({ ...options, addOverlayFn: (...args) => {
+    const result = await loadOverlay({ ...options, addOverlayFn: (...args) => {
       const list = add(...args);
       for (const entry of originalEntries.filter(o => refs.includes(o.ref))) {
         const replacedBy = { ref: options.ref, sha: newSha };
@@ -659,15 +659,19 @@ export async function runDaemonLoadOverlay(options) {
       }
       return list;
     } });
+    if (result.refused || result.rolledBack) {
+      restoreSwapPredecessors({ ...recovery, originalEntries: markedEntries, kind: failureKind });
+      return result;
+    }
+    failureKind = 'swap-failed-restored';
+    const swapped = await swap({ ...recovery, replaces: refs, run, originalEntries: markedEntries,
+      removeOverlay: options.removeOverlayFn ?? removeOverlay,
+    });
+    return { ...result, swap: swapped, ...(swapped.ok ? {} : { adopted: false, timedOut: true, reason: swapped.reason }) };
   } catch (error) {
-    restoreSwapPredecessors({ ...recovery, originalEntries: markedEntries, kind: 'swap-rebuild-failed-restored' });
+    restoreSwapPredecessors({ ...recovery, originalEntries: markedEntries, kind: failureKind });
     throw error;
   }
-  if (result.refused || result.rolledBack) return result;
-  const swapped = await swap({ ...recovery, replaces: refs, run, originalEntries: markedEntries,
-    removeOverlay: options.removeOverlayFn ?? removeOverlay,
-  });
-  return { ...result, swap: swapped, ...(swapped.ok ? {} : { adopted: false, timedOut: true, reason: swapped.reason }) };
 }
 
 async function loadOverlay({
@@ -883,6 +887,8 @@ async function loadOverlay({
   const out = {
     root, ref, homeBranch: base, registered: true, mergedAnything: !!rebuildResult.moved,
     adopted: !!rebuildResult.adopted && check.inHead, reason: rebuildResult.reason, alerts, head: rebuildResult.head,
+    ...(rebuildResult.rolledBack ? { rolledBack: true } : {}),
+    ...(rebuildResult.refused ? { refused: true } : {}),
     overlayInHead: check.inHead, installedCheck: check, followUps,
     ...(waited ? { waitedMs: Math.max(0, clock() - started) } : {}),
     ...(staleAdopt ? { staleAdopt } : {}),
