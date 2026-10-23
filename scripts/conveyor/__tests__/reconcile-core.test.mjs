@@ -1030,6 +1030,35 @@ describe('bounced PR CI repair — real required failures on the fixer head (#57
     expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', prNumber: 5729 }));
   });
 
+  it.each([false, true])('keeps an unused operator repair round ahead of bounced CI healing (joined=%s)', joinCiAndReview => {
+    const round = () => ({ author: AUTOMATION, body: REARM_COMMENT_MARKER });
+    const sendBack = { id: 'operator', author: { login: 'chalbert' }, createdAt: '2026-08-26T16:00:00Z',
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via chat.\n\nRepair at head aaaaaaa.' };
+    const comments = [finding(), ...Array.from({ length: 8 }, round), sendBack, round(), round()];
+    const pr = bounced({ headRefOid: 'a'.repeat(40), comments, statusCheckRollup: [failed('gate')] });
+    const options = { prs: [pr], agents: [], requiredChecks: ['gate'], now: NOW, roundCap: 6,
+      fixTiming: { joinCiAndReview } };
+    const plan = planReconcile(options);
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced', attempts: 10,
+      operatorSendBackRound: { sendBackId: 'operator', used: 0, allowance: 1,
+        setting: 'fix.operatorRulingExtraRounds', source: 'standard' } })]);
+    expect(plan.refusals).not.toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+
+    const invalidGrants = [
+      { comments: [...comments, { author: AUTOMATION, body: FIX_END_MARKER }] },
+      { comments: comments.map(c => c === sendBack ? { ...c, author: AUTOMATION } : c) },
+      { comments: [...comments, ...Array.from({ length: 100 - comments.length }, () => ({ body: '' }))] },
+    ];
+    for (const over of invalidGrants) {
+      const denied = planReconcile({ ...options, prs: [{ ...pr, ...over }] });
+      expect(denied.dispatch).toEqual([]);
+      expect(denied.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+    }
+    const disabled = planReconcile({ ...options, operatorRulingExtraRounds: { value: 0, source: 'repo' } });
+    expect(disabled.dispatch).toEqual([]);
+    expect(disabled.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+  });
+
   it('refuses ci-heal-escalated for an escalation on THIS bounced head', () => {
     const plan = planFor(bounced({ comments: [finding(), escalation(HEAD)] }));
     expect(plan.dispatch).toEqual([]);

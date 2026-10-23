@@ -2740,7 +2740,10 @@ export function planReconcile({
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
     };
     const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red') || bouncedRealRed;
+    // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
+    // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
+    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
+      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap));
     if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
