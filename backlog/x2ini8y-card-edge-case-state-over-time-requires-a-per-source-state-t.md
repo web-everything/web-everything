@@ -36,6 +36,7 @@ PR 5608's round-4 review owed more guards of the same kind (a card promises a gu
   - `default flip without the replaced sibling cases is refused` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs).
   - `statute rule with no cited case and no unpinned mark is refused` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs) — for an entry the diff adds or changes.
   - `untouched statute entry without cited cases only warns` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs).
+  - `unparseable card section is refused by name` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs) — an open card with a Planned cases block whose (a) Edge cases section has a numbered line the lint cannot classify and (b) Acceptance section has no parseable case list is refused, naming the card and the section; it is never passed or skipped.
   - `refusal names only the failing card and entry` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs) — with two open cards and two changed decision entries, one of each failing, the refusal names only the failing card and the failing entry anchor; the passing card and entry are not listed.
   - `resolved or Planned-cases-free card only warns` (we:scripts/backlog/__tests__/edge-case-classes.test.mjs) — a resolved card and an open card without a Planned cases block, each with a TODO acceptance line, are listed as warnings and not refused.
 
@@ -51,10 +52,10 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — card markdown is parsed section by section; a section the lint cannot parse is refused by name, never skipped.
+1. **Untrusted text** — card markdown is parsed section by section; a section the lint cannot parse is refused by name, never skipped (case `unparseable card section is refused by name`).
 2. **Truncated reads** — n/a: whole committed files are read; a read error fails the lint.
 3. **Shared state files** — n/a: the lint is read-only.
-4. **Fail closed** — a card the lint cannot classify is refused, not passed.
+4. **Fail closed** — a card the lint cannot classify is refused, not passed (case `unparseable card section is refused by name`).
 5. **Identity scoping** — rules apply per card; rule 7 applies per decision entry anchor (case `refusal names only the failing card and entry`).
 6. **State over time** — the rules refuse only open cards with a Planned cases block, and only decision entries the diff adds or changes; older and resolved cards and untouched entries are listed as warnings, not refused (cases `resolved or Planned-cases-free card only warns`, `untouched statute entry without cited cases only warns`).
 7. **Who wrote it** — n/a: the rules apply equally to any author.

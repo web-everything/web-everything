@@ -60,10 +60,10 @@ Proof required: before/after on the live 327-card spool draining into a fresh ba
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — the PR state comes from GitHub; an unknown state is treated as unreadable (fail closed).
-2. **Truncated reads** — a failed or partial GitHub read is unreadable, never "closed"; the batch stays sealed and held.
+1. **Untrusted text** — the PR state comes from GitHub; an unknown state is treated as unreadable (fail closed; cases `unreadable PR state stays sealed and held`, `unreadable archive PR stays unmarked`).
+2. **Truncated reads** — a failed or partial GitHub read is unreadable, never "closed"; the batch stays sealed and held (same cases as Untrusted text).
 3. **Shared state files** — retirement and archiving run under the existing per-kind lease with the expected-head check; a concurrent admission is refused `lease-held`. The archive is written before the active slot is retired, so a crash between the two leaves the batch sealed and retried, never lost (case `archive failure preserves the active slot and retry preserves every member`). The extract step's final audit write (under its per-PR lock, not the lease) can overwrite an archive's terminal marker from a stale copy; the next scan re-marks it, costing one extra GitHub read, never a card (case `stale extract audit write is re-marked by the next scan`).
-4. **Fail closed** — an unreadable PR state keeps the batch sealed and held, never retires.
+4. **Fail closed** — an unreadable PR state keeps the batch sealed and held, never retires (cases `unreadable PR state stays sealed and held`, `unreadable archive PR stays unmarked`).
 5. **Identity scoping** — state and archives are keyed by repo and kind; the split check matches the remainder's `extractedFrom.pr`, and the extract journal, to this PR in the same repo and kind. A remainder or journal from another repo or kind with the same PR number is not a split (case `remainder from another kind or repo is not a split`).
 6. **State over time** — the five PR-state rows above (open, merged, split by remainder manifest or, with no planned remainder, by journal, closed otherwise, unreadable), one named case each in [A1], for both the active slot and `sealed/` archives. Only merged, split and closed-otherwise are terminal; anything else, including a valid `open`, never retires. Row by surface:
 
