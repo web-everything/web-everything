@@ -12,3 +12,4 @@ You are a thin runner. Keep Claude usage minimal: the operator asked on 2026-10-
 - **Verify** with `node scripts/operations/run.mjs verify --checkout=<lane>`. If it's red, run at most one Codex fix round naming the failing tests, then verify again. Then `node scripts/operations/run.mjs open-pr` with a short body file.
 - **Don't re-investigate** what the brief already states. Read only the files you need. Don't dump large logs.
 - **Report in 8 lines or fewer:** PR numbers, verify result, edge-load status, and the proof the brief asked for.
+- Before opening a script, read ~/workspace/.operations/codemap/<path with / replaced by __>.md; open the file only for the lines you need.
