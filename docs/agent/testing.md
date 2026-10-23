@@ -2003,3 +2003,13 @@ ON. They resolve through the shared policy cascade: standard → platform → re
 with each source logged. Dispatch strips disabled brief sections. The verify step's first-commit
 check applies to build lane branches and delivery leases on local `main`, and warns if no test was added or updated; this advisory
 cannot prove a red run. Git-read errors are reported as unknown rather than evidence of compliance.
+
+## Manual overlay load audit
+
+`runDaemonLoadOverlay` records every exit, including previews and exceptions, through
+`overlay-load-record.mjs`. Inject `recordFn` in loader fixtures to avoid writing operator
+coordination state. The writer uses prototype-load's `recordPath`, or
+`WE_PROTOTYPE_LOAD_RECORD`, and returns `pathSource`; oversized rows retain the core outcome
+with `detailsTruncated: true` (full details remain in the load's `--json` output).
+Legacy clones rebuild immediately in the load command. Versioned clones use `submitRequest`;
+that request is consumed on a daemon tick and does not itself wake a sleeping daemon.

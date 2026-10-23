@@ -70,6 +70,7 @@ import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
 import { DEFAULT_REBUILD_LOCK_WAIT_MS, REBUILD_LOCK_WAIT_ENV } from './daemon-rebuild/lease.mjs';
 import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
+import { appendLoadRecord } from './overlay-load-record.mjs';
 import { resolveVersionedContext, submitRequest, waitForResult } from './daemon-version-runtime.mjs';
 import { switchCurrent as switchCurrentVersion, status as versionStatus } from './daemon-version-switch.mjs';
 
@@ -625,12 +626,43 @@ export function withDispatchSmoke({
  * @param {{clone:string, ref:string, pr?:number|null, base?:string, dryRun?:boolean, env?:NodeJS.ProcessEnv,
  *   log?:Console, addedBy?:string|null, reason?:string|null, now?:string,
  *   addOverlayFn?:typeof addOverlay, rebuild?:typeof rebuildClone, dryRunRebuildFn?:typeof dryRunRebuild,
+ *   recordFn?:typeof appendLoadRecord, triggerFn?:(request:object)=>any,
  *   installed?:typeof overlayInstalled, followUpRebuilds?:number, clock?:()=>number, sleep?:(ms:number)=>Promise<void>}} o
  * @returns {Promise<object>}
  */
-export async function runDaemonLoadOverlay({
+export async function runDaemonLoadOverlay(options = {}) {
+  const { recordFn = appendLoadRecord, env = process.env } = options;
+  const loadState = { registered: false };
+  let result;
+  let error;
+  let threw = false;
+  try {
+    result = await loadOverlay({ ...options, loadState });
+    if (loadState.triggerError) result.triggerError = loadState.triggerError;
+    return result;
+  } catch (e) {
+    threw = true;
+    error = e;
+    throw e;
+  } finally {
+    const outcome = threw ? 'error' : result?.dryRun ? 'dry-run' : result?.refused ? 'refused'
+      : result?.reason === 'dispatch-smoke-failed' ? 'dispatch-smoke-failed'
+        : result?.timedOut ? 'timeout' : result?.pending ? (result.versioned ? 'versioned/pending' : 'pending')
+          : result?.adopted ? 'adopted' : result?.adopted === false ? 'not-adopted' : 'registered';
+    try {
+      await recordFn({ env, record: {
+        ...result, clone: result?.root ?? options.clone ?? null, ref: options.ref ?? null,
+        pr: options.pr ?? null, registered: result?.registered ?? loadState.registered, outcome,
+        ...(threw ? { error: redactDetail(error?.message ?? error) } : {}),
+        ...(loadState.triggerError ? { triggerError: loadState.triggerError } : {}),
+      } });
+    } catch { /* A failed audit sink must never change the load result or original exception. */ }
+  }
+}
+
+async function loadOverlay({
   clone, ref, pr = null, base = 'main', dryRun = false, env = process.env, log = console,
-  addedBy, reason = null, now,
+  addedBy, reason = null, now, loadState, triggerFn,
   addOverlayFn = addOverlay, rebuild = rebuildClone, dryRunRebuildFn = dryRunRebuild,
   wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult, rollbackVersionFn = rollbackVersionIfCurrent,
   settings, baseSmoke = runLiveSmokeWithRetry, dispatchSmoke = runRealDispatchSmoke, inspect = overlayDispatchFiles,
@@ -662,9 +694,20 @@ export async function runDaemonLoadOverlay({
   addOverlayFn(root, {
     ref, pr, addedBy: by, reason, now,
   }, { env });
+  loadState.registered = true;
   // Card 89 S5: a versioned clone has no lock to take and is never rebuilt from this CLI. The request file is
   // the daemon's in-tick updater's input; `--wait` blocks on its result file instead of on a clone lock.
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
+  let triggeredRequestId;
+  if (!wait) {
+    try {
+      // Reuse the version request protocol; legacy clones rebuild immediately below.
+      triggeredRequestId = await (triggerFn ?? (({ versions: ctx }) => ctx ? submit(ctx, { ref, pr, by }) : null))({ root, ref, pr, by, env, versions: vctx });
+    } catch (e) {
+      loadState.triggerError = redactDetail(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, '');
+      log.error?.(`daemon-load-overlay: rebuild trigger failed: ${loadState.triggerError}`);
+    }
+  }
   const smokeOn = safety.dispatchSmoke === 'on';
 
   const smokeTree = (tree) => runDispatchSmokeSafely(dispatchSmoke, { tree, env, settings: safety, log });
@@ -702,13 +745,13 @@ export async function runDaemonLoadOverlay({
   };
 
   if (vctx) {
-    const requestId = submit(vctx, { ref, pr, by });
+    const requestId = wait ? submit(vctx, { ref, pr, by }) : triggeredRequestId;
     // The in-tick updater is the one that builds and adopts, so this CLI can only smoke what a --wait result reports
     // adopted. Without --wait nothing has been built yet: say so loudly rather than let "registered" read as "smoked".
     if (!wait) {
       if (smokeOn) notRun("it is queued for the versioned clone's in-tick updater and nothing here will smoke it; re-run with --wait to smoke the adopted version");
       return {
-        root, ref, homeBranch: base, registered: true, versioned: true, requestId, pending: true, warnings,
+        root, ref, homeBranch: base, registered: true, versioned: true, requestId, requestQueued: !!requestId, pending: true, warnings,
         ...(smokeOn ? { dispatchSmoke: { ran: false, skipped: 'versioned-no-wait' } } : {}),
       };
     }
@@ -899,7 +942,9 @@ if (IS_CLI) {
           + `wouldDo=${result.wouldDo} finalSha=${result.plan?.finalSha ?? 'n/a'}\n`,
         );
       } else if (result.versioned) {
-        process.stdout.write(result.pending
+        process.stdout.write(result.triggerError
+          ? `daemon-load-overlay: registered ${ref} — rebuild request failed: ${result.triggerError}; retry the load to request a rebuild (${result.root})\n`
+          : result.pending
           ? `daemon-load-overlay: registered ${ref} — versioned clone, request ${result.requestId} queued for the in-tick updater (use --wait to block on its result) (${result.root})\n`
           : `daemon-load-overlay: registered ${ref} — versioned request ${result.requestId} ${result.timedOut ? 'TIMED OUT' : `answered: ${result.reason}`} (${result.root})\n`);
       } else if (result.staleAdopt && !result.adopted) {

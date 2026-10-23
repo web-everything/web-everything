@@ -26,6 +26,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+vi.mock('../overlay-load-record.mjs', () => ({ appendLoadRecord: vi.fn(() => ({ ok: true })) }));
 import { runDaemonLoadOverlay, mergeOverlayRef, dryRunOverlay, overlayInstalled } from '../daemon-load-overlay.mjs';
 import finalizeWaitBreak from '../../conveyor/soak/breaks/overlay-admission-finalize-wait.mjs';
 
@@ -1441,5 +1442,123 @@ describe('legacy explicit load — bounded busy wait', () => {
     await runDaemonLoadOverlay({ ...options, rebuild, versions: {}, wait: true, submit: () => 'req', waitFor: async () => busy });
     expect(rebuild).not.toHaveBeenCalled();
     expect(sleep).not.toHaveBeenCalled();
+  });
+});
+
+describe('load outcome audit and registration trigger', () => {
+  const options = () => ({
+    clone: '/c', ref: 'lane/record', pr: 42, env: {}, versions: null,
+    settings: { noPr: 'refuse', dispatchSmoke: 'off' }, log: { error: vi.fn() },
+    addOverlayFn: vi.fn(), rebuild: vi.fn(async () => ({ moved: false, adopted: false, reason: 'up-to-date' })),
+    installed: () => ({ inHead: true, reason: 'in-head' }),
+    recordFn: vi.fn(() => ({ ok: true })), triggerFn: vi.fn(() => 'req'),
+  });
+
+  it.each([
+    ['dry-run', { dryRun: true, dryRunRebuildFn: async () => ({}) }],
+    ['refused', { pr: null }],
+    ['versioned/pending', { versions: {} }],
+    ['adopted', { rebuild: async () => ({ moved: true, adopted: true }) }],
+    ['not-adopted', {}],
+    ['timeout', { versions: {}, wait: true, submit: () => 'req', waitFor: async () => ({ status: 'timeout' }) }],
+    ['not-adopted', { versions: {}, wait: true, submit: () => 'req', waitFor: async () => ({ status: 'rejected' }) }],
+  ])('records exactly once for %s', async (outcome, overrides) => {
+    const opts = { ...options(), ...overrides };
+    const result = await runDaemonLoadOverlay(opts);
+    expect(opts.recordFn).toHaveBeenCalledTimes(1);
+    expect(opts.recordFn).toHaveBeenCalledWith({ env: opts.env, record: expect.objectContaining({
+      clone: '/c', ref: 'lane/record', pr: opts.pr, outcome, registered: result.registered ?? false,
+    }) });
+  });
+
+  it('records dispatch-smoke failure and rollback together', async () => {
+    const opts = { ...options(), versions: { dir: '/versions' }, wait: true,
+      settings: { noPr: 'refuse', dispatchSmoke: 'on', dispatchPaths: [] },
+      submit: () => 'req', waitFor: async () => ({ adopted: true, moved: true, versionId: 'v1' }),
+      inspect: () => ({ inTree: true, required: true, matched: ['dispatch.mjs'] }),
+      dispatchSmoke: async () => ({ ok: false, reason: 'commands-denied' }),
+      removeOverlayFn: vi.fn(), appendEventFn: vi.fn(), rollbackVersionFn: async () => ({ status: 'switched' }),
+    };
+    await runDaemonLoadOverlay(opts);
+    expect(opts.recordFn).toHaveBeenCalledTimes(1);
+    expect(opts.recordFn.mock.calls[0][0].record).toMatchObject({
+      outcome: 'dispatch-smoke-failed', rolledBack: true, registered: false, rollback: { adopted: true },
+    });
+  });
+
+  it.each(['validation', 'registration', 'rebuild', 'preview', 'wait'])('records %s exceptions then rethrows the original error', async (stage) => {
+    const error = new Error('failed ghp_secret123');
+    const fail = () => { throw error; };
+    const opts = { ...options(), ...({
+      validation: { clone: null }, registration: { addOverlayFn: fail }, rebuild: { rebuild: fail },
+      preview: { dryRun: true, dryRunRebuildFn: fail },
+      wait: { versions: {}, wait: true, submit: () => 'req', waitFor: fail },
+    })[stage] };
+    if (stage === 'validation') await expect(runDaemonLoadOverlay(opts)).rejects.toThrow('--clone');
+    else await expect(runDaemonLoadOverlay(opts)).rejects.toBe(error);
+    expect(opts.recordFn).toHaveBeenCalledTimes(1);
+    expect(opts.recordFn.mock.calls[0][0].record).toMatchObject({
+      outcome: 'error', registered: ['rebuild', 'wait'].includes(stage),
+    });
+    expect(opts.recordFn.mock.calls[0][0].record.error).not.toContain('secret123');
+  });
+
+  it.each([() => ({ ok: false, error: 'disk full' }), () => { throw new Error('disk full'); },
+    async () => { throw new Error('disk full'); }])('record failure never breaks results or masks original errors', async (recordFn) => {
+    await expect(runDaemonLoadOverlay({ ...options(), recordFn })).resolves.toMatchObject({ registered: true });
+    const original = new Error('rebuild failed');
+    await expect(runDaemonLoadOverlay({ ...options(), recordFn, rebuild: () => { throw original; } })).rejects.toBe(original);
+  });
+
+  it('triggers once after successful registration and before the immediate legacy rebuild', async () => {
+    const opts = options();
+    const order = [];
+    opts.addOverlayFn = () => { order.push('register'); };
+    opts.triggerFn.mockImplementation(() => { order.push('trigger'); });
+    opts.rebuild.mockImplementation(async () => { order.push('rebuild'); return { adopted: false }; });
+    await runDaemonLoadOverlay(opts);
+    expect(order).toEqual(['register', 'trigger', 'rebuild']);
+    expect(opts.triggerFn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([{ dryRun: true, dryRunRebuildFn: async () => ({}) }, { pr: null },
+    { wait: true }, { addOverlayFn: () => { throw new Error('registration failed'); } }])('never triggers for dry-run, refusal, wait or failed registration: %j', async (override) => {
+    const opts = { ...options(), ...override };
+    try { await runDaemonLoadOverlay(opts); } catch { /* expected registration error */ }
+    expect(opts.triggerFn).not.toHaveBeenCalled();
+  });
+
+  it('uses exactly one existing versioned request when no trigger is injected', async () => {
+    const opts = { ...options(), triggerFn: undefined, versions: {}, submit: vi.fn(() => 'request-id') };
+    const result = await runDaemonLoadOverlay(opts);
+    expect(opts.submit).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ pending: true, requestId: 'request-id' });
+    expect(opts.rebuild).not.toHaveBeenCalled();
+  });
+
+  it('a failed default versioned submission stays registered and is never reported queued', async () => {
+    const opts = { ...options(), triggerFn: undefined, versions: {},
+      submit: vi.fn(() => { throw new Error('request write failed'); }) };
+    await expect(runDaemonLoadOverlay(opts)).resolves.toMatchObject({
+      registered: true, pending: true, requestQueued: false, triggerError: 'request write failed',
+    });
+    expect(opts.submit).toHaveBeenCalledTimes(1);
+    expect(opts.recordFn.mock.calls[0][0].record).toMatchObject({ triggerError: 'request write failed' });
+  });
+
+  it('the default legacy path rebuilds immediately without submitting a versioned request', async () => {
+    const opts = { ...options(), triggerFn: undefined, submit: vi.fn() };
+    await runDaemonLoadOverlay(opts);
+    expect(opts.submit).not.toHaveBeenCalled();
+    expect(opts.rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([null, {}])('trigger failure is recorded and never fails the load (versions=%j)', async (versions) => {
+    const opts = { ...options(), versions, triggerFn: vi.fn(async () => { throw new Error('wake failed ghp_secret123\n\u001b'); }) };
+    const result = await runDaemonLoadOverlay(opts);
+    expect(result).toMatchObject({ registered: true, triggerError: 'wake failed ghp_<redacted>' });
+    expect(opts.triggerFn).toHaveBeenCalledTimes(1);
+    expect(opts.recordFn.mock.calls[0][0].record).toMatchObject({ triggerError: 'wake failed ghp_<redacted>' });
+    expect(opts.rebuild).toHaveBeenCalledTimes(versions ? 0 : 1);
   });
 });
