@@ -10,6 +10,8 @@ import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
 const repo = 'o/r';
 const PR = 5530;
 const HEAD = 'd3bee7370' + '0'.repeat(31);
+// The scenarios below sit at review round 3, so they pin the gate's base cap to 3 instead of inheriting the shared default (5).
+const GATE_CAP = 3;
 const OTHER = 'e'.repeat(40);
 const bot = (body, createdAt) => ({ author: { login: 'web-everything' }, createdAt, body });
 const redTeam = (rev = HEAD, findings) => bot(renderRedTeamComment({ pr: PR, rev, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
@@ -122,7 +124,7 @@ describe('cap-only existing-card declaration', () => {
       readRoundAsOf: () => 3,
     };
     // Exercise the real gate planner: this pending grant will return #1 to the fixer.
-    expect(await applyRedTeamGate({ repo, pr: PR, dryRun: true }, io))
+    expect(await applyRedTeamGate({ repo, pr: PR, dryRun: true, cap: GATE_CAP }, io))
       .toMatchObject({ status: 'dry-run', reopened: true, wouldSendBack: true, cap: 4 });
     expect(() => planRedTeamRuling(read({ comments, standingRuling: scope }), input()))
       .toThrow(/pending round extension/);
@@ -140,13 +142,13 @@ describe('cap-only existing-card declaration', () => {
         readRoundAsOf: () => 3,
         postComment: ({ body }) => comments.push(bot(body, '2026-10-21T00:00:00Z')),
       };
-      expect(await applyRedTeamGate({ repo, pr: PR }, io)).toMatchObject({ status: 'applied', outcome: 'round-cap' });
+      expect(await applyRedTeamGate({ repo, pr: PR, cap: GATE_CAP }, io)).toMatchObject({ status: 'applied', outcome: 'round-cap' });
       expect(rulableBreaks(context).state).toMatchObject({ sendBackOutcome: 'round-cap', reopened: false });
       const plan = planRedTeamRuling(read({ comments, standingRuling: scope }), input());
       comments.push({ author: OP, createdAt: '2026-10-21T00:01:00Z', body:
         `${redTeamGateMarker(PR, HEAD, 'operator-card', plan.resultId)}\n- 1 finding(s) carded by the operator to \`${CARD}\` (#1).` });
       expect(readRedTeamDisposition(context)).toMatchObject({ held: [], sendBack: [] });
-      expect(await applyRedTeamGate({ repo, pr: PR }, io)).toMatchObject({ status: 'already-acted' });
+      expect(await applyRedTeamGate({ repo, pr: PR, cap: GATE_CAP }, io)).toMatchObject({ status: 'already-acted' });
       expect(readRedTeamDisposition(context)).toMatchObject({ held: [], sendBack: [] });
     });
   it.each([
