@@ -250,7 +250,7 @@ describe('real git: cleanup CLI', () => {
       writeFileSync(join(dir, '.git', path), '');
     }, `git lock present (${path})`]),
     // Unfinished operations: gc does not keep the commits these name.
-    ...['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'rebase-merge/head-name', 'sequencer/todo', 'worktrees/w/REBASE_HEAD'].map((path) => [`in-flight ${path}`, (dir) => {
+    ...['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'rebase-merge/head-name', 'sequencer/todo', 'worktrees/w/REBASE_HEAD', 'NOTES_MERGE_PARTIAL', 'NOTES_MERGE_WORKTREE/x'].map((path) => [`in-flight ${path}`, (dir) => {
       mkdirSync(join(dir, '.git', path, '..'), { recursive: true });
       writeFileSync(join(dir, '.git', path), `${git(dir, 'rev-parse', 'HEAD')}\n`);
     }, `git lock present (${path.split('/').slice(0, path.startsWith('worktrees/') ? 3 : 1).join('/')})`]),

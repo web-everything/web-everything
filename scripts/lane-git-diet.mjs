@@ -104,8 +104,8 @@ function borrowerMap() {
 const BORROWERS = borrowerMap();
 // Audit the whole Git directory: GC's write paths extend beyond config, refs, logs and objects, and any `*.lock`
 // anywhere (e.g. a prepared update-ref transaction's refs/heads/<name>.lock) or gc.pid means an op is mid-flight.
-// So does an unfinished merge/rebase/cherry-pick/bisect: gc does not keep the commits these pseudorefs name.
-const IN_FLIGHT = new Set(['gc.pid', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'REBASE_HEAD', 'AUTO_MERGE', 'BISECT_HEAD', 'BISECT_START', 'rebase-merge', 'rebase-apply', 'sequencer']);
+// So does an unfinished merge/rebase/cherry-pick/bisect/notes merge: gc does not keep the commits these pseudorefs name.
+const IN_FLIGHT = new Set(['gc.pid', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'REBASE_HEAD', 'AUTO_MERGE', 'BISECT_HEAD', 'BISECT_START', 'rebase-merge', 'rebase-apply', 'sequencer', 'NOTES_MERGE_PARTIAL', 'NOTES_MERGE_REF', 'NOTES_MERGE_WORKTREE']);
 const auditGitDir = (dir) => {
   const links = [];
   const locks = [];
