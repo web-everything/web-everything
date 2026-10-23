@@ -18,6 +18,23 @@ const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 't', GI
 delete env.GIT_DIR; delete env.GIT_WORK_TREE; delete env.LANE_SESSION;
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const refs = (cwd, prefix = 'refs/remotes/origin/') => git(cwd, 'for-each-ref', '--format=%(refname)', prefix).split('\n').filter(Boolean);
+// Planted by the CLI startup-refusal test below. The guard holds them to the CLI's own IN_FLIGHT set, so every
+// in-flight name the CLI refuses on has a named test, and a name added there without one fails here.
+const TOP_LOCK_NAMES = ['index.lock', 'HEAD.lock', 'packed-refs.lock', 'gc.pid', 'shallow.lock', 'config.lock'];
+const IN_FLIGHT_PATHS = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'REBASE_HEAD', 'AUTO_MERGE', 'BISECT_HEAD', 'BISECT_START',
+  'rebase-merge/head-name', 'rebase-apply/next', 'sequencer/todo', 'worktrees/w/REBASE_HEAD', 'NOTES_MERGE_PARTIAL', 'NOTES_MERGE_REF', 'NOTES_MERGE_WORKTREE/x'];
+const inFlightName = (path) => path.split('/')[path.startsWith('worktrees/') ? 2 : 0];
+
+describe('in-flight refusal coverage', () => {
+  it('every name in the CLI IN_FLIGHT set is planted at the top level by a named CLI refusal test', () => {
+    const src = readFileSync(CLI, 'utf8').match(/const IN_FLIGHT = new Set\(\[([^\]]*)\]\)/);
+    expect(src).not.toBeNull();
+    const names = [...src[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
+    expect(names.length).toBeGreaterThan(0);
+    const topLevel = new Set([...TOP_LOCK_NAMES, ...IN_FLIGHT_PATHS.filter((p) => !p.startsWith('worktrees/')).map(inFlightName)]);
+    expect(names.filter((name) => !topLevel.has(name))).toEqual([]);
+  });
+});
 
 describe('cleanupEligibility (pure)', () => {
   const poolRoot = '/h/workspace/.lanes';
@@ -265,14 +282,14 @@ describe('real git: cleanup CLI', () => {
 
   // Each startup refusal through the CLI (both modes): the lane, and any repo it points into, stay untouched.
   it.each([
-    ...['index.lock', 'HEAD.lock', 'packed-refs.lock', 'gc.pid', 'shallow.lock', 'config.lock'].map((name) => [`git lock ${name}`, (dir) => writeFileSync(join(dir, '.git', name), ''), `git lock present (${name})`]),
+    ...TOP_LOCK_NAMES.map((name) => [`git lock ${name}`, (dir) => writeFileSync(join(dir, '.git', name), ''), `git lock present (${name})`]),
     // Nested locks: a pending ref transaction, a reflog write, a reftable stack update, a commit-graph write.
     ...['refs/heads/x.lock', 'refs/remotes/origin/ops/review-requests.lock', 'logs/refs/heads/main.lock', 'reftable/tables.list.lock', 'objects/info/commit-graphs/commit-graph-chain.lock'].map((path) => [`git lock ${path}`, (dir) => {
       mkdirSync(join(dir, '.git', path, '..'), { recursive: true });
       writeFileSync(join(dir, '.git', path), '');
     }, `git lock present (${path})`]),
     // Unfinished operations: gc does not keep the commits these name.
-    ...['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'rebase-merge/head-name', 'sequencer/todo', 'worktrees/w/REBASE_HEAD', 'NOTES_MERGE_PARTIAL', 'NOTES_MERGE_WORKTREE/x'].map((path) => [`in-flight ${path}`, (dir) => {
+    ...IN_FLIGHT_PATHS.map((path) => [`in-flight ${path}`, (dir) => {
       mkdirSync(join(dir, '.git', path, '..'), { recursive: true });
       writeFileSync(join(dir, '.git', path), `${git(dir, 'rev-parse', 'HEAD')}\n`);
     }, `git lock present (${path.split('/').slice(0, path.startsWith('worktrees/') ? 3 : 1).join('/')})`]),
