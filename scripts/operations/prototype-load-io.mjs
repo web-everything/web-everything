@@ -1,7 +1,8 @@
 /**
  * @file Injected prototype admission transaction.
- * WHY (incident 2026-10-22): preserve main, reject incomplete evidence, and accept a replacement
- * before removing contained registrations. Never mutate a daemon worktree. Real deps bind only in defaultDeps.
+ * WHY (incident 2026-10-22): preserve main, reject incomplete evidence, and remove contained
+ * registrations only after the daemon adopts their replacement. Never mutate a daemon worktree.
+ * Real deps bind only in defaultDeps.
  */
 import { execFileSync } from 'node:child_process';
 import nodeFs from 'node:fs';
@@ -59,6 +60,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
+    // Once the replacement is registered, every failure names the prior registrations still in place.
+    const keptNote = () => {
+      const kept = out.registered ? (out.contained || []).filter((ref) => !out.removed.includes(ref)) : [];
+      return kept.length ? ` Prior registrations retained: ${kept.join(', ')}.` : '';
+    };
     try {
       const daemon = Object.hasOwn(config.daemons || {}, input.daemon) ? config.daemons[input.daemon] : null;
       if (!daemon) return stop('unknown-daemon');
@@ -150,6 +156,39 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
           return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
         }
       }
+      // Contained registrations stay until the daemon has adopted the replacement: a refused or
+      // unadopted replacement must leave the working build's registrations in place (red team, round 3).
+      // The rebuild sets a contained base aside behind its top, so keeping it registered never blocks adoption.
+      stage = 'check-unverifiable';
+      const state = join(expand(env.WE_DAEMON_OVERLAY_DIR || join(env.HOME, '.claude/daemon-overlays')), keyForClone(out.clone));
+      const deadline = registeredAt + config.adoption.timeoutMs;
+      // Rebuilds currently emit to the self-sync state directory. Also read the requested overlay
+      // sibling trail, so both the loader events and rebuild refusals are observed.
+      const rebuildAlerts = join(env.WE_DAEMON_STATE_DIR || join(env.HOME, '.claude/daemon-self-sync-state'), `${basename(state)}.alerts.jsonl`);
+      for (;;) {
+        const alerts = refusal(jsonLines(read(`${state}.alerts.jsonl`)), out.effectiveRef, registeredAt, true)
+          || refusal(jsonLines(read(rebuildAlerts)), out.effectiveRef, registeredAt, true)
+          || refusal(jsonLines(read(`${state}.events.jsonl`)), out.effectiveRef, registeredAt);
+        if (alerts) return stop('adoption-refused', { adoption: { refusal: alerts }, fallback: `Fix the refused replacement and rerun.${keptNote()}` });
+        let probe = git('-C', out.clone, 'merge-base', '--is-ancestor', out.effectiveSha, 'HEAD');
+        let missing = false;
+        if (probe.code === 128) {
+          // A newly admitted commit need not exist in the daemon clone until its next fetch.
+          // Quiet verification distinguishes that pending object from execution/repository errors.
+          const candidate = git('-C', out.clone, 'rev-parse', '--verify', '--quiet', `${out.effectiveSha}^{commit}`);
+          if ([0, 1].includes(candidate.code) && git('-C', out.clone, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}').code === 0) {
+            missing = candidate.code === 1;
+            // Fetch may have completed between the ancestry failure and diagnostic verification.
+            if (!missing) probe = git('-C', out.clone, 'merge-base', '--is-ancestor', out.effectiveSha, 'HEAD');
+          }
+        }
+        out.adoption = { code: probe.code, at: new Date(now()).toISOString(), ...(missing ? { pending: 'candidate-object-missing' } : {}) };
+        if (probe.code === 0) { out.adopted = true; break; }
+        if (probe.code !== 1 && !missing) return stop('check-unverifiable', { adoption: probe, fallback: `Inspect the daemon clone adoption probe and rerun.${keptNote()}` });
+        const remaining = deadline - now();
+        if (remaining <= 0) return stop('adoption-timeout', { fallback: `Check the daemon rebuild for the replacement and rerun.${keptNote()}` });
+        await sleep(Math.min(config.adoption.pollMs, remaining));
+      }
       stage = 'swap-remove-failed';
       for (const ref of contained) {
         // The preview predates the real add (which can fetch newer, cleanly merging tips).
@@ -164,41 +203,13 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
             fallback: 'Retain the remaining registrations; include their current tips in a new tested replacement and retry.' });
         }
         const result = loader('remove', out.clone, ref, [`--reason=prototype-load: replaced by ${out.effectiveRef}`]);
-        if (result.code !== 0) return stop('swap-remove-failed', { swap: { contained, removed: out.removed, failed: ref, result } });
+        if (result.code !== 0) return stop('swap-remove-failed', { swap: { contained, removed: out.removed, failed: ref, result }, fallback: `Inspect the loader removal failure and retry it.${keptNote()}` });
         out.removed.push(ref);
       }
       out.swap = { contained, removed: out.removed };
-      stage = 'check-unverifiable';
-      const state = join(expand(env.WE_DAEMON_OVERLAY_DIR || join(env.HOME, '.claude/daemon-overlays')), keyForClone(out.clone));
-      const deadline = registeredAt + config.adoption.timeoutMs;
-      // Rebuilds currently emit to the self-sync state directory. Also read the requested overlay
-      // sibling trail, so both the loader events and rebuild refusals are observed.
-      const rebuildAlerts = join(env.WE_DAEMON_STATE_DIR || join(env.HOME, '.claude/daemon-self-sync-state'), `${basename(state)}.alerts.jsonl`);
-      for (;;) {
-        const alerts = refusal(jsonLines(read(`${state}.alerts.jsonl`)), out.effectiveRef, registeredAt, true)
-          || refusal(jsonLines(read(rebuildAlerts)), out.effectiveRef, registeredAt, true)
-          || refusal(jsonLines(read(`${state}.events.jsonl`)), out.effectiveRef, registeredAt);
-        if (alerts) return stop('adoption-refused', { adoption: { refusal: alerts } });
-        let probe = git('-C', out.clone, 'merge-base', '--is-ancestor', out.effectiveSha, 'HEAD');
-        let missing = false;
-        if (probe.code === 128) {
-          // A newly admitted commit need not exist in the daemon clone until its next fetch.
-          // Quiet verification distinguishes that pending object from execution/repository errors.
-          const candidate = git('-C', out.clone, 'rev-parse', '--verify', '--quiet', `${out.effectiveSha}^{commit}`);
-          if ([0, 1].includes(candidate.code) && git('-C', out.clone, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}').code === 0) {
-            missing = candidate.code === 1;
-            // Fetch may have completed between the ancestry failure and diagnostic verification.
-            if (!missing) probe = git('-C', out.clone, 'merge-base', '--is-ancestor', out.effectiveSha, 'HEAD');
-          }
-        }
-        out.adoption = { code: probe.code, at: new Date(now()).toISOString(), ...(missing ? { pending: 'candidate-object-missing' } : {}) };
-        if (probe.code === 0) { out.ok = true; out.adopted = true; return out; }
-        if (probe.code !== 1 && !missing) return stop('check-unverifiable', { adoption: probe });
-        const remaining = deadline - now();
-        if (remaining <= 0) return stop('adoption-timeout');
-        await sleep(Math.min(config.adoption.pollMs, remaining));
-      }
-    } catch (e) { return stop(stage, { error: String(e.message || e), fallback: 'Inspect the failed step evidence and rerun after resolving it.' }); }
+      out.ok = true;
+      return out;
+    } catch (e) { return stop(stage, { error: String(e.message || e), fallback: `Inspect the failed step evidence and rerun after resolving it.${keptNote()}` }); }
     finally {
       const record = { at: new Date(now()).toISOString(), ...out };
       try { const file = expand(config.recordPath); fs.mkdirSync(dirname(file), { recursive: true }); fs.appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8'); }

@@ -19,9 +19,9 @@ What it does, in order, stopping at the first failure (`stopReason`):
 2. Gate: ready record for that exact sha, else refuses `no-ready`.
 3. Keeps main intact: a branch behind main is merged onto main and pushed as `<branch>-m<N>`. Conflicts stop as `behind-main-conflict`; a diff that touches more than the branch's own files stops as `reverts-main`.
 4. Checks against the clone's current registrations with the loader's `add --check`. A registration that conflicts with main is reported as `stale-registration: <name>`; the cure is a rebuilt replacement that contains it (swap), never a removal alone.
-5. Swap: adds the new overlay first, removes the ones it contains only after the add succeeded.
-6. Registers through `scripts/daemon-overlay.mjs` only. Never `--allow-conflict`, never an operator credential.
-7. Waits (bounded) for the daemon clone to adopt the sha, and reads the rebuild alerts for refusals.
+5. Registers the new overlay through `scripts/daemon-overlay.mjs` only. Never `--allow-conflict`, never an operator credential.
+6. Waits (bounded) for the daemon clone to adopt the sha, and reads the rebuild alerts for refusals.
+7. Swap: removes the registrations the new overlay contains only after the daemon adopted it. A refused, timed-out or unverifiable adoption keeps them, and the result names them.
 8. Appends one line to `~/workspace/.operations/coordination/prototype-loads.jsonl` and prints `{ok, daemon, clone, registered, adopted, stopReason}`.
 
 On `behind-main-conflict`: have Codex resolve the conflict, re-run only the touched test files, write a fresh ready record, then run again. Do not re-test anything else.

@@ -1,6 +1,6 @@
 /**
  * @file Hermetic prototype admission proofs.
- * WHY (incident 2026-10-22): pin main preservation, ready evidence, add-before-remove, stale
+ * WHY (incident 2026-10-22): pin main preservation, ready evidence, adopt-before-remove, stale
  * replacement, and adoption refusal with injected doubles, plus real filesystem refusal persistence.
  */
 import { describe, it, expect } from 'vitest';
@@ -41,6 +41,7 @@ function fixture(options = {}) {
       reads.push(p);
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p === '/home/test/ready') return options.ready ?? `bad line\n${JSON.stringify(ready)}\n`;
+      if (options.alertsReadError && p.endsWith('.alerts.jsonl')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('.alerts.jsonl')) return options.alerts || '';
       if (p.endsWith('.events.jsonl')) return options.events || '';
       const e = new Error('missing'); e.code = 'ENOENT'; throw e;
@@ -183,16 +184,38 @@ describe('prototype-load', () => {
   it('contained stale registration is replaced by an ordered swap', async () => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'] }); const r = await f.run(); expect(r.ok).toBe(true); expect(r.stale).toEqual(['lane/old']); expect(r.removed).toEqual(['lane/old', 'lane/also']);
     const index = f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check'));
-    for (const remove of mutations(f, 'remove')) expect(f.calls.indexOf(remove)).toBeGreaterThan(index);
+    const adopted = f.calls.findIndex((c) => c.args[0] === '-C');
+    expect(adopted).toBeGreaterThan(index);
+    for (const remove of mutations(f, 'remove')) expect(f.calls.indexOf(remove)).toBeGreaterThan(adopted);
+  });
+  // Red-team (PR #5832 round 3): a replacement that fails live adoption must not have already
+  // removed the working registrations it was meant to replace.
+  const refusedAlert = JSON.stringify({ at: new Date(0).toISOString(), ref: BASE.branch, kind: 'overlay-dropped-smoke-failed' });
+  it.each([
+    ['refusal alert', { alerts: refusedAlert }, 'adoption-refused'],
+    ['refusal event', { events: refusedAlert }, 'adoption-refused'],
+    ['timeout', { timeout: true }, 'adoption-timeout'],
+    ['probe error 128', { adoptionError: 128 }, 'check-unverifiable'],
+    ['probe error -1', { adoptionError: -1 }, 'check-unverifiable'],
+    ['unreadable refusal trail', { alertsReadError: true }, 'check-unverifiable'],
+  ])('retains every prior registration until the replacement is adopted: %s', async (_, options, stopReason) => {
+    for (const conflicts of [[], ['lane/old']]) {
+      const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts, ...options });
+      const r = await f.run();
+      expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
+      expect(mutations(f, 'remove')).toEqual([]);
+      expect(r.fallback).toContain('lane/old');
+    }
   });
   it.each([false, true])('retains an established branch that advances beyond the replacement during add (merge: %s)', async (behind) => {
     const f = fixture({ behind, list: ['lane/old'], contained: ['lane/old'], advanceEstablishedDuringAdd: true });
     const r = await f.run();
     expect(mutations(f, 'remove')).toEqual([]);
-    expect(r).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', detail: 'replacement-not-contained', registered: true, adopted: false, removed: [] });
+    // Removal now waits for adoption, so the replacement is adopted before the refresh refuses removal.
+    expect(r).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', detail: 'replacement-not-contained', registered: true, adopted: true, removed: [] });
     expect(r.swap).toMatchObject({ failed: 'lane/old', tip: TREE });
     expect(r.fallback).toContain('Retain');
-    expect(f.calls.some(c => c.args[0] === '-C')).toBe(false);
+    expect(f.calls.some(c => c.args[0] === '-C')).toBe(true);
   });
   it('refreshes each registration after earlier removals rather than precomputing the swap', async () => {
     const f = fixture({ list: ['lane/first', 'lane/old'], contained: ['lane/first', 'lane/old'], advanceEstablishedAfterRemove: true });
@@ -207,7 +230,8 @@ describe('prototype-load', () => {
   });
   it.each(['fetch', 'tip', 'invalid-tip', 'ancestry'])('retains prior registrations when fresh containment cannot be proved: %s', async (refreshError) => {
     const f = fixture({ list: ['lane/old'], contained: ['lane/old'], refreshError });
-    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', registered: true, adopted: false, removed: [] });
+    // Adoption precedes removal; the unprovable containment still blocks every removal.
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', registered: true, adopted: true, removed: [] });
     expect(mutations(f, 'remove')).toEqual([]);
   });
   it('permits an advanced registration whose current tip is still contained', async () => {
