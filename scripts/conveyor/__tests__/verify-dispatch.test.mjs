@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync
 import { resolve, join } from 'node:path';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { tmpdir } from 'node:os';
-import { resolveGateCeiling, runLaneGate, laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist, killOrphanGroup, dispatchedRunState, killAdoptedGroup } from '../verify-dispatch.mjs';
+import { resolveGateCeiling, runLaneGate, laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, resolveMaxInFlightSetting, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist, killOrphanGroup, dispatchedRunState, killAdoptedGroup } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY, buildCliDaemonEffects, wireGateJobs } from '../../../skills-src/conveyor/verify-daemon.mjs';
@@ -520,7 +520,7 @@ describe('runVerifyDispatch — concurrent dispatch, never awaiting between lane
   it('fires spawnGate for a SECOND pending lane before the FIRST lane\'s promise has resolved (no await between lanes)', async () => {
     const lane2Dir = makeLane(join(poolDir, 'lane-2'));
     expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
-    expect(runVerifyLane(['request', `--repo=${lane2Dir}`, '--gate=true', '--json'], lane2Dir).code).toBe(0);
+    expect(runVerifyLane(['request', `--repo=${lane2Dir}`, '--gate=echo lane2', '--json'], lane2Dir).code).toBe(0);
 
     const calls = [];
     const releasers = [];
@@ -546,7 +546,7 @@ describe('runVerifyDispatch — concurrent dispatch, never awaiting between lane
   it('one lane\'s spawnGate rejection does not block another lane\'s own dispatched/failures entry (Promise.allSettled, not Promise.all)', async () => {
     const lane2Dir = makeLane(join(poolDir, 'lane-2'));
     expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
-    expect(runVerifyLane(['request', `--repo=${lane2Dir}`, '--gate=true', '--json'], lane2Dir).code).toBe(0);
+    expect(runVerifyLane(['request', `--repo=${lane2Dir}`, '--gate=echo lane2', '--json'], lane2Dir).code).toBe(0);
 
     const spawnGate = (args) => {
       if (args[1].includes('lane-1')) {
@@ -643,7 +643,7 @@ describe('runVerifyDispatch — real cap-bounded execution (#4373)', () => {
 
       const result = await withEnv(
         { LANE_POOL_ROOT: poolRoot, WE_HEAVY_ADMISSION_CAP: String(CAP), WE_HEAVY_ADMISSION: undefined, CI: undefined, WE_HEAVY_ADMISSION_HELD: undefined },
-        () => runVerifyDispatch({ poolRoot }),
+        () => runVerifyDispatch({ poolRoot, maxInFlight: n }),
       );
 
       const peak = peakOverlap(logFile);
@@ -913,7 +913,7 @@ describe('2026-10-05 hung gate starvation', () => {
 
   it('leaves excess requests untouched for a later tick', async () => {
     const lane2 = makeLane(join(poolDir, 'lane-2'));
-    for (const dir of [laneDir, lane2]) runVerifyLane(['request', `--repo=${dir}`, '--gate=true'], dir);
+    for (const [i, dir] of [laneDir, lane2].entries()) runVerifyLane(['request', `--repo=${dir}`, `--gate=echo ${i}`], dir);
     const before = readFileSync(join(lane2, '.git', '.lane-verify'), 'utf8');
     const result = await runVerifyDispatch({ poolRoot, inFlight: new Map(), awaitSettle: false,
       maxInFlight: 1, spawnGate: () => new Promise(() => {}) });
@@ -921,6 +921,48 @@ describe('2026-10-05 hung gate starvation', () => {
     expect(result.deferred).toMatchObject([{ pool: 'flagtest', lane: 2, reason: 'max-in-flight' }]);
     expect(readFileSync(join(lane2, '.git', '.lane-verify'), 'utf8')).toBe(before);
   }, 2000);
+
+  it('cap two defers the third unique job and leaves its request untouched', async () => {
+    const lanes = [laneDir, makeLane(join(poolDir, 'lane-2')), makeLane(join(poolDir, 'lane-3'))];
+    for (const [i, dir] of lanes.entries()) runVerifyLane(['request', `--repo=${dir}`, `--gate=echo ${i}`], dir);
+    const before = readFileSync(join(lanes[2], '.git', '.lane-verify'), 'utf8');
+    const result = await runVerifyDispatch({ poolRoot, inFlight: new Map(), awaitSettle: false,
+      maxInFlight: 2, launchGate: () => ({ id: 'fake' }) });
+    expect(result.dispatched.map(e => e.lane)).toEqual([1, 2]);
+    expect(result.deferred).toMatchObject([{ lane: 3, reason: 'max-in-flight' }]);
+    expect(readFileSync(join(lanes[2], '.git', '.lane-verify'), 'utf8')).toBe(before);
+  });
+
+  it('dedupes pool/sha/suites within a sweep and against in-flight jobs without spending budget', async () => {
+    const lane2 = makeLane(join(poolDir, 'lane-2'));
+    // Pin identical commit identity even across a wall-clock second boundary.
+    git(['fetch', laneDir, 'HEAD'], lane2);
+    git(['reset', '--hard', 'FETCH_HEAD'], lane2);
+    const lane3 = makeLane(join(poolDir, 'lane-3'));
+    for (const dir of [laneDir, lane2]) runVerifyLane(['request', `--repo=${dir}`, '--gate=true'], dir);
+    runVerifyLane(['request', `--repo=${lane3}`, '--gate=echo different'], lane3);
+    const inFlight = new Map();
+    const opts = { poolRoot, inFlight, awaitSettle: false, maxInFlight: 2, launchGate: () => ({ id: 'fake' }) };
+    const first = await runVerifyDispatch(opts);
+    expect(first.dispatched.map(e => e.lane)).toEqual([1, 3]);
+    expect(first.deferred).toMatchObject([{ lane: 2, reason: 'duplicate' }]);
+    expect((await runVerifyDispatch(opts)).deferred).toMatchObject([{ lane: 2, reason: 'duplicate' }]);
+    inFlight.clear();
+    writeFileSync(join(laneDir, '.git', '.lane-verify'), JSON.stringify({ status: 'green', sha: git(['rev-parse', 'HEAD'], laneDir) }));
+    writeFileSync(join(lane3, '.git', '.lane-verify'), JSON.stringify({ status: 'green', sha: git(['rev-parse', 'HEAD'], lane3) }));
+    expect((await runVerifyDispatch(opts)).dispatched.map(e => e.lane)).toEqual([2]);
+  });
+
+  it('resolves cap provenance, gives the legacy override precedence and passes the cap into daemon ticks', async () => {
+    expect(resolveMaxInFlightSetting({ WE_VERIFY_DAEMON_MAX_IN_FLIGHT: '5' })).toEqual({ value: 5, source: 'env' });
+    expect(resolveMaxInFlightSetting({ WE_VERIFY_DAEMON_MAX_IN_FLIGHT: '5', VERIFY_DISPATCH_MAX_IN_FLIGHT: '3' }))
+      .toEqual({ value: 3, source: 'VERIFY_DISPATCH_MAX_IN_FLIGHT' });
+    expect(resolveMaxInFlight({ WE_VERIFY_DAEMON_MAX_IN_FLIGHT: '65' })).toBe(2);
+    const runVerify = vi.fn(async () => ({ dispatched: [], deferred: [], failures: [] }));
+    const effects = buildCliDaemonEffects({ maxInFlight: 5, runVerify, isDraining: () => false });
+    await effects.tickOnce();
+    expect(runVerify).toHaveBeenCalledWith(expect.objectContaining({ maxInFlight: 5, awaitSettle: false }));
+  });
 
   it('recognizes only a different run and request that still needs dispatch', () => {
     const entry = { runId: 'old', requestStartedAt: 'before' };
@@ -931,9 +973,9 @@ describe('2026-10-05 hung gate starvation', () => {
     expect(inFlightSuperseded(entry, marker, 'other')).toBe(false);
   });
 
-  it('resolves a positive integer concurrency limit, otherwise eight', () => {
+  it('resolves a positive integer concurrency limit, otherwise the verify setting (default two)', () => {
     for (const value of [undefined, '0', '-1', '1.5', 'nope']) {
-      expect(resolveMaxInFlight({ VERIFY_DISPATCH_MAX_IN_FLIGHT: value })).toBe(8);
+      expect(resolveMaxInFlight({ VERIFY_DISPATCH_MAX_IN_FLIGHT: value })).toBe(2);
     }
     expect(resolveMaxInFlight({ VERIFY_DISPATCH_MAX_IN_FLIGHT: '3' })).toBe(3);
   });
@@ -1332,11 +1374,14 @@ describe('PR 4764 round 10 — a held lane never spends the global in-flight bud
 
   it('a hold-only registry entry (a claim holder, a survivor, a settled leader\'s leftover group) leaves the slot to a healthy lane', async () => {
     const lane2 = makeLane(join(poolDir, 'lane-2'));
+    git(['fetch', laneDir, 'HEAD'], lane2);
+    git(['reset', '--hard', 'FETCH_HEAD'], lane2);
     request(lane2);
     for (const hold of [{ jobId: 'lane-claim:x', pid: null, heldBy: 'job j1 holds the lane' }, { runId: 'r', pid: 999999, leaderSettled: true },
       { runId: 'r', pid: 999999, adopted: true, ceilingKilled: true }]) {
       const spawnGate = vi.fn(() => new Promise(() => {}));
-      const inFlight = new Map([[laneDir, { pool: 'flagtest', lane: 1, dir: laneDir, startedMs: Date.now(), ...hold }]]);
+      const inFlight = new Map([[laneDir, { pool: 'flagtest', lane: 1, dir: laneDir, startedMs: Date.now(),
+        sha: git(['rev-parse', 'HEAD'], laneDir), suites: 'true', ...hold }]]);
       const result = await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: false, maxInFlight: 1, spawnGate });
       expect(result.deferred).toEqual([]);
       expect(result.dispatched).toMatchObject([{ lane: 2, launched: true }]);
@@ -1368,8 +1413,73 @@ describe('PR 4764 round 10 — a held lane never spends the global in-flight bud
     expect(launchGate).toHaveBeenCalledTimes(1);
   });
 
+  it('a held twin does not reserve its dedupe key and suppress a runnable twin, in both modes', async () => {
+    const lane2 = makeLane(join(poolDir, 'lane-2'));
+    git(['fetch', laneDir, 'HEAD'], lane2);
+    git(['reset', '--hard', 'FETCH_HEAD'], lane2);
+    request(laneDir);
+    request(lane2);
+    const before = readFileSync(join(laneDir, '.git', '.lane-verify'), 'utf8');
+    for (const jobMode of [false, true]) {
+      const spawnGate = vi.fn(() => new Promise(() => {}));
+      const launchGate = vi.fn(() => ({ id: 'twin' }));
+      const result = await runVerifyDispatch({ poolRoot, inFlight: new Map(), awaitSettle: false,
+        maxInFlight: 1, spawnGate, ...(jobMode ? { launchGate } : {}),
+        laneHeld: d => d === laneDir ? 'held by another job' : null });
+      expect(result.dispatched).toMatchObject([{ lane: 2, launched: true }]);
+      expect(result.deferred).toEqual([expect.objectContaining({ lane: 1, reason: 'lane-held' })]);
+      expect(jobMode ? launchGate : spawnGate).toHaveBeenCalledTimes(1);
+      expect(readFileSync(join(laneDir, '.git', '.lane-verify'), 'utf8')).toBe(before);
+    }
+  });
+
+  it('a failed launch leaves its dedupe key and budget available to a runnable twin, in both modes', async () => {
+    const lane2 = makeLane(join(poolDir, 'lane-2'));
+    git(['fetch', laneDir, 'HEAD'], lane2);
+    git(['reset', '--hard', 'FETCH_HEAD'], lane2);
+    request(laneDir);
+    request(lane2);
+    for (const jobMode of [false, true]) {
+      const inFlight = new Map();
+      const spawnGate = vi.fn(args => {
+        if (args.includes(`--repo=${laneDir}`)) throw new Error('spawn failed');
+        return Promise.resolve({ pid: null });
+      });
+      const launchGate = vi.fn(({ dir }) => {
+        if (dir === laneDir) throw new Error('job store unavailable');
+        return { id: 'twin' };
+      });
+      const result = await runVerifyDispatch({ poolRoot, inFlight, maxInFlight: 1,
+        spawnGate, ...(jobMode ? { launchGate } : {}) });
+      expect(result.dispatched).toMatchObject([{ lane: 2 }]);
+      expect(result.failures).toMatchObject([{ lane: 1 }]);
+      expect(result.deferred).toEqual([]);
+      expect(inFlight.has(laneDir)).toBe(false);
+      expect(jobMode ? launchGate : spawnGate).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it('twins deferred at the cap both remain max-in-flight rather than reserving a duplicate key', async () => {
+    const lane2 = makeLane(join(poolDir, 'lane-2'));
+    git(['fetch', laneDir, 'HEAD'], lane2);
+    git(['reset', '--hard', 'FETCH_HEAD'], lane2);
+    request(laneDir);
+    request(lane2);
+    const before = [laneDir, lane2].map(dir => readFileSync(join(dir, '.git', '.lane-verify'), 'utf8'));
+    const launchGate = vi.fn(() => ({ id: 'twin' }));
+    for (const dryRun of [false, true]) {
+      const result = await runVerifyDispatch({ poolRoot, inFlight: new Map(), maxInFlight: 0, launchGate, dryRun });
+      expect(result.dispatched).toEqual([]);
+      expect(result.deferred).toMatchObject([{ lane: 1, reason: 'max-in-flight' }, { lane: 2, reason: 'max-in-flight' }]);
+    }
+    expect(launchGate).not.toHaveBeenCalled();
+    expect([laneDir, lane2].map(dir => readFileSync(join(dir, '.git', '.lane-verify'), 'utf8'))).toEqual(before);
+  });
+
   it('wiring: a finished job\'s surviving gate, synced by the real job store, holds its lane without blocking another lane', async () => {
     const lane2 = makeLane(join(poolDir, 'lane-2'));
+    git(['fetch', laneDir, 'HEAD'], lane2);
+    git(['reset', '--hard', 'FETCH_HEAD'], lane2);
     request(lane2);
     mkdirSync(join(base, 'jobs'), { recursive: true });
     const store = createJobStore(join(base, 'jobs'));

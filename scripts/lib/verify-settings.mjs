@@ -54,6 +54,10 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   // waits do not count: the timer starts once the phase holds its slot. 30 min sits above the p99 whole-gate
   // hold (22.6 min under load) and matches verify-dispatch's own gate ceiling.
   phaseTimeoutMs: 30 * 60_000,
+  // Whole-run wall clock, starting after initial admission; full-suite gates get the larger budget.
+  runTimeoutRelatedMs: 45 * 60_000,
+  runTimeoutFullMs: 120 * 60_000,
+  daemonMaxInFlight: 2,
   // How often verify-lane refreshes the heavy-admission slot it holds while the gate runs. Capped at half the
   // 60-min slot lease (ADMISSION_LEASE_MINUTES), so a live gate always beats before its lease can expire.
   slotHeartbeatMs: 5 * 60_000,
@@ -84,6 +88,9 @@ const rules = {
   revertRedMaxFiles: value => Number.isSafeInteger(value) && value >= 1 && value <= 200,
   selection: value => ['since-last-green', 'pr'].includes(value),
   phaseTimeoutMs: value => Number.isSafeInteger(value) && value >= 1_000 && value <= 6 * 60 * 60_000,
+  runTimeoutRelatedMs: value => Number.isSafeInteger(value) && value >= 1_000 && value <= 6 * 60 * 60_000,
+  runTimeoutFullMs: value => Number.isSafeInteger(value) && value >= 1_000 && value <= 6 * 60 * 60_000,
+  daemonMaxInFlight: value => Number.isSafeInteger(value) && value >= 1 && value <= 64,
   slotHeartbeatMs: value => Number.isSafeInteger(value) && value >= 1_000 && value <= 30 * 60_000,
   alwaysRunTests: value => Array.isArray(value) && value.length <= 50
     // Each entry becomes a vitest file argument: it must start with a word character (never `-`, so `-u` / `--bail`
@@ -99,6 +106,8 @@ const envKeys = {
   relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH',
   alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS', skipLocalForCardOnly: 'WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY',
   revertRed: 'WE_VERIFY_REVERT_RED', revertRedSince: 'WE_VERIFY_REVERT_RED_SINCE', revertRedMaxFiles: 'WE_VERIFY_REVERT_RED_MAX_FILES',
+  runTimeoutRelatedMs: 'WE_VERIFY_RUN_TIMEOUT_RELATED_MS', runTimeoutFullMs: 'WE_VERIFY_RUN_TIMEOUT_FULL_MS',
+  daemonMaxInFlight: 'WE_VERIFY_DAEMON_MAX_IN_FLIGHT',
   selection: 'WE_VERIFY_SELECTION', phaseTimeoutMs: 'WE_VERIFY_PHASE_TIMEOUT_MS', slotHeartbeatMs: 'WE_VERIFY_SLOT_HEARTBEAT_MS',
 };
 const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants', 'runAllPhases', 'skipLocalForCardOnly']);
@@ -140,7 +149,7 @@ export function resolveVerifySettings({ fileConfig, env = {} } = {}) {
     sources[key] = fileKeys.get(validated).has(key) ? 'file' : 'default';
     let value = env?.[envKeys[key]];
     if (booleanKeys.has(key)) value = value === '0' ? false : value === '1' ? true : undefined;
-    else if (['testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth', 'revertRedMaxFiles', 'phaseTimeoutMs', 'slotHeartbeatMs'].includes(key)) {
+    else if (['testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth', 'revertRedMaxFiles', 'phaseTimeoutMs', 'slotHeartbeatMs', 'runTimeoutRelatedMs', 'runTimeoutFullMs', 'daemonMaxInFlight'].includes(key)) {
       value = value != null && String(value).trim() !== '' ? Number(value) : undefined;
     }
     else if (key === 'alwaysRunTests') {

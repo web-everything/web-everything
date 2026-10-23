@@ -1,5 +1,32 @@
 # Testing — Three-Tier Strategy
 
+## Verify run budgets and dispatch cap
+
+Verify settings (`scripts/lib/verify-settings.mjs`, tool layer `scripts/verify-settings.json`) bound the whole
+run after initial admission: `runTimeoutRelatedMs` defaults to 45 minutes and `runTimeoutFullMs` to 120 minutes.
+The resolved full-suite gate uses the full budget; every other gate uses the related budget. Override with
+`WE_VERIFY_RUN_TIMEOUT_RELATED_MS` / `WE_VERIFY_RUN_TIMEOUT_FULL_MS` (integer 1000 ms through 6 hours).
+Each child gets the smaller of `phaseTimeoutMs` and the remaining run budget, using the watchdog thread so
+blocked output cannot defeat the kill. Later admission waits spend the run budget too. Run expiry stops later
+phases, kills the process tree, and records **red**, `redCause: timeout`, exit 2. Inspect the gate log before
+explicitly retrying or raising a budget; expiry never grants a green verdict.
+The revert probe uses `BOUNDED_RUN_SHIM` for this ceiling as well as its own admitted-run ceiling. Preserve its
+SIGTERM/SIGINT/SIGHUP and parent-death cleanup when extending it. Leader close must finish any fired watchdog
+sweeps and kill marked survivors before returning to the transaction's restore (`verify-revert-red.test.mjs`).
+
+`daemonMaxInFlight` defaults to 2 (integer 1–64; `WE_VERIFY_DAEMON_MAX_IN_FLIGHT`). The legacy
+`VERIFY_DISPATCH_MAX_IN_FLIGHT` override takes precedence. The daemon logs the effective cap and source at boot.
+Dispatch defers excess requests as `max-in-flight`, and matching `(pool, sha, suites)` requests as `duplicate`
+without spending budget. Requests remain pending for later ticks; no green is inferred from a duplicate.
+Reserve a dedupe key only for an outstanding dispatch or a successful launch this sweep. Hold-only registry
+entries, held lanes, cap deferrals, and failed launches leave the key unreserved and spend no launch budget.
+The regression tests live in `verify-lane.test.mjs`, `verify-settings.test.mjs`, and `verify-dispatch.test.mjs`.
+Run them through the host heavy-admission queue.
+The named regression **spends the remaining run budget waiting for later admission and never starts that command**
+fills both heavy and fast slots in its private fixture pool after initial admission, using the shared slot helpers
+and a live holder PID. It checks the later admission deferral, absence of subsequent commands, and persisted
+red/timeout/exit 2 verdict. Keep this separate from the phase-execution budget test, which disables phase admission.
+
 ## Daemon entry boot smoke
 
 Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`

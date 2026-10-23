@@ -56,22 +56,35 @@ const stripAnsi = (s) => s.replace(/\[[0-9;]*[A-Za-z]/g, '');
  * granted, so the clock starts then. The shim runs the command in its own process group and kills the WHOLE group on the
  * ceiling (or on SIGTERM/SIGINT/SIGHUP to itself): vitest's workers must not keep running against a tree that is about to
  * be restored. It exits 124 and writes {@link BOUNDED_RUN_MARKER} to stderr so the caller can tell a ceiling from a crash.
- * One line, no single quotes: the wrapper re-quotes its argv into a shell command.
+ * Verify may also supply watchdog/kill module URLs and an inherited marker: its shared run budget then uses the
+ * watchdog thread, and cleanup sweeps marked survivors even after the leader closes. The signal and parent-death
+ * reaper remains active in both modes. One line, no single quotes: the wrapper re-quotes its argv into a shell command.
  */
 export const BOUNDED_RUN_MARKER = 'revert-red-timeout:';
 /** Output cap for one captured test run (a broad fix's reverted run can print tens of thousands of FAIL lines). */
 const RUN_MAX_BUFFER = 64 * 1024 * 1024;
 export const BOUNDED_RUN_SHIM = [
-  'const{spawn}=require("node:child_process");const{argv,ms}=JSON.parse(process.argv[1]);',
-  'const c=spawn(argv[0],argv.slice(1),{stdio:"inherit",detached:true});',
-  'const kill=()=>{try{process.kill(-c.pid,"SIGKILL")}catch{}};',
-  `const t=setTimeout(()=>{process.stderr.write("${BOUNDED_RUN_MARKER} run exceeded "+ms+"ms and was killed\\n");kill()},ms);`,
-  'for(const s of["SIGTERM","SIGINT","SIGHUP"])process.on(s,()=>{kill();process.exit(143)});',
+  '(async()=>{const{spawn}=require("node:child_process");const ppid=process.ppid;const{argv,ms,watchdogModule,killModule,markerKey,marker}=JSON.parse(process.argv[1]);',
+  // Verify adds a threaded run-budget ceiling without dropping this shim's signal/parent-death reaper.
+  'const startTreeWatchdog=watchdogModule?(await import(watchdogModule)).startTreeWatchdog:null;',
+  'const killProcessTree=killModule?(await import(killModule)).killProcessTree:null;',
+  'const c=spawn(argv[0],argv.slice(1),{stdio:"inherit",detached:true,env:markerKey?{...process.env,[markerKey]:marker}:process.env});',
+  'const kill=()=>{try{process.kill(-c.pid,"SIGKILL")}catch{};if(killProcessTree&&c.pid)killProcessTree(c.pid,"SIGKILL",{marker:markerKey+"="+marker})};',
+  `const announce=()=>{process.stderr.write("${BOUNDED_RUN_MARKER} run exceeded "+ms+"ms and was killed\\n")};`,
+  'let timedOut=false;let finishing=false;',
+  'const watchdog=c.pid&&startTreeWatchdog?startTreeWatchdog({pid:c.pid,timeoutMs:ms,kill:{marker:markerKey+"="+marker},onFire:announce}):null;',
+  'const t=watchdog?null:setTimeout(()=>{timedOut=true;announce();kill()},ms);',
+  // Leader close is not proof the descendants are gone. Complete fired escape sweeps, then kill survivors
+  // by the inherited marker even on a clean close, before returning to the transaction's restore.
+  'const finish=async(code)=>{if(finishing)return;finishing=true;clearTimeout(t);clearInterval(w);watchdog?.stop();',
+  'if(watchdog?.fired())await watchdog.settled();kill();process.exit(timedOut||watchdog?.fired()?124:code)};',
+  'for(const s of["SIGTERM","SIGINT","SIGHUP"])process.on(s,()=>{void finish(143)});',
   // A shim whose parent died (a SIGKILLed wrapper cannot forward a signal) would leave vitest running on a tree that is
   // about to be restored: when the parent changes, kill the group.
-  'const ppid=process.ppid;const w=setInterval(()=>{if(process.ppid!==ppid){kill();process.exit(143)}},1000);w.unref();',
-  'c.on("error",()=>{clearTimeout(t);process.exit(127)});',
-  'c.on("exit",(code)=>{clearTimeout(t);process.exit(code??124)});',
+  'const w=setInterval(()=>{if(process.ppid!==ppid)void finish(143)},1000);w.unref();',
+  'c.on("error",()=>{void finish(127)});',
+  'c.on("close",(code)=>{void finish(code??124)});',
+  '})().catch(()=>{process.exit(127)});',
 ].join('');
 
 export function runSuite({ cwd, suite, run, maxFailures = 20, timeoutMs = 0 }) {

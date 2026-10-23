@@ -13,9 +13,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { withRealRepo } from '../../operations/__tests__/helpers/real-repo.mjs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createMutationProbe, createRevertProbe, runSuite, BOUNDED_RUN_SHIM } from '../../operations/mutation-check-io.mjs';
 import { runRevertRedCheck, revertRedForVerify, appendRevertRedLog, parseNameStatusZ, recoverRevertRed, textOrNull, REVERT_JOURNAL, REVERT_MAX_AGE_MS, applyRevertRedToVerdict } from '../verify-revert-red.mjs';
+import { keepAliveScript } from '../test-keepalive.mjs';
 
 const SRC = 'scripts/x/guard.mjs';
 const TEST = 'scripts/x/__tests__/guard.test.mjs';
@@ -346,6 +347,100 @@ describe('the verify-lane entry decides from the fix role\'s own record', () => 
       expect(v).toMatchObject({ status: 'skipped', reason: 'mode-off' });
     });
   });
+});
+
+describe('bounded revert runner cleanup', () => {
+  async function waitFor(check) {
+    const deadline = Date.now() + 20_000;
+    while (!check()) {
+      if (Date.now() >= deadline) throw new Error('bounded runner did not settle');
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
+
+  function alive(pid) {
+    try { process.kill(pid, 0); } catch { return false; }
+    // An adopted process can remain a zombie briefly on Linux; it is no longer executing against the tree.
+    const state = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8', timeout: 2000 });
+    return state.status !== 0 || !state.stdout.trim().startsWith('Z');
+  }
+
+  async function withShim({ leaderCloses = false, orphan = false, ms = 60_000 } = {}, check) {
+    const dir = mkdtempSync(join(tmpdir(), 'revert-runner-cleanup-'));
+    const pidFile = join(dir, 'pids.json');
+    const shimFile = join(dir, 'shim.pid');
+    const script = `const { spawn } = require('node:child_process');
+const { writeFileSync } = require('node:fs');
+const escape = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript())}], { detached: true, stdio: 'ignore' });
+escape.unref();
+writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({ leader: process.pid, escape: escape.pid }));
+${leaderCloses ? '' : keepAliveScript()}`;
+    const args = ['-e', BOUNDED_RUN_SHIM, JSON.stringify({ argv: [process.execPath, '-e', script], ms,
+      watchdogModule: new URL('../tree-watchdog.mjs', import.meta.url).href,
+      killModule: new URL('../bounded-child.mjs', import.meta.url).href,
+      markerKey: 'WE_TEST_REVERT_CLEANUP', marker: dir })];
+    const parentScript = `const { spawn } = require('node:child_process');
+const shim = spawn(process.execPath, ${JSON.stringify(args)}, { stdio: 'ignore' });
+require('node:fs').writeFileSync(${JSON.stringify(shimFile)}, String(shim.pid));
+${keepAliveScript()}`;
+    const runner = spawn(process.execPath, orphan ? ['-e', parentScript] : args, { stdio: 'ignore' });
+    let closed = false;
+    let code;
+    runner.once('close', value => { closed = true; code = value; });
+    let pids;
+    let shimPid;
+    try {
+      await waitFor(() => {
+        try { pids = JSON.parse(readFileSync(pidFile, 'utf8')); return pids.leader > 1 && pids.escape > 1; }
+        catch { return false; }
+      });
+      shimPid = orphan ? Number(readFileSync(shimFile, 'utf8')) : runner.pid;
+      await check({ runner, pids, shimPid, waitClosed: async () => {
+        await waitFor(() => closed);
+        return code;
+      } });
+    } finally {
+      if (!closed) runner.kill('SIGKILL');
+      if (!pids && existsSync(pidFile)) pids = JSON.parse(readFileSync(pidFile, 'utf8'));
+      for (const pid of [pids?.leader, pids?.escape, shimPid]) {
+        if (pid > 1 && alive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it.each(['SIGTERM', 'SIGINT', 'SIGHUP'])('the threaded shim still reaps its child and escaped descendants on %s', async signal => {
+    await withShim({}, async ({ runner, pids, waitClosed }) => {
+      expect(alive(pids.leader)).toBe(true);
+      expect(alive(pids.escape)).toBe(true);
+      runner.kill(signal);
+      expect(await waitClosed()).toBe(143);
+      await waitFor(() => !alive(pids.leader) && !alive(pids.escape));
+    });
+  }, 60_000);
+
+  it('the threaded shim reaps descendants when its parent dies without forwarding a signal', async () => {
+    await withShim({ orphan: true }, async ({ runner, pids, shimPid }) => {
+      expect(alive(pids.escape)).toBe(true);
+      runner.kill('SIGKILL');
+      await waitFor(() => !alive(shimPid) && !alive(pids.leader) && !alive(pids.escape));
+    });
+  }, 60_000);
+
+  it('a clean leader close kills marked survivors before the revert runner returns', async () => {
+    await withShim({ leaderCloses: true }, async ({ pids, waitClosed }) => {
+      expect(await waitClosed()).toBe(0);
+      expect(alive(pids.escape)).toBe(false);
+    });
+  }, 60_000);
+
+  it('the threaded run-budget ceiling settles escaped descendants before returning timeout', async () => {
+    await withShim({ ms: 3000 }, async ({ pids, waitClosed }) => {
+      expect(await waitClosed()).toBe(124);
+      expect(alive(pids.leader)).toBe(false);
+      expect(alive(pids.escape)).toBe(false);
+    });
+  }, 60_000);
 });
 
 describe('parts', () => {

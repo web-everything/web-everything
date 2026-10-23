@@ -14,13 +14,14 @@
  *   scan                   a repo-scanning or always-run guard phase was red
  *   killed-superseded      the gate process was killed by a signal (a newer request, daemon restart)
  *   refused                the gate was refused before it ran
+ *   timeout                the whole-run wall-clock budget expired
  *   infra                  the verification infrastructure failed (dispatcher ceiling, no verdict)
  */
 import { posix } from 'node:path';
 import { FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION } from './gate-timeout-retry.mjs';
 
 export const RED_CAUSES = Object.freeze(['in-diff-failure', 'out-of-diff-flaky', 'out-of-diff-still-red', 'test-timeout',
-  'standards', 'scan', 'killed-superseded', 'refused', 'infra', 'pre-existing-on-main']);
+  'standards', 'scan', 'killed-superseded', 'refused', 'infra', 'timeout', 'pre-existing-on-main']);
 
 const TIMEOUT = /timed out in \d+\s*ms|Test timed out/i;
 const filesOf = (details) => [...new Set((details?.tests ?? []).map(t => t.file))];
@@ -94,13 +95,14 @@ export function testReachesChanged(a) {
 /**
  * @param {{exitCode?: number|null, signal?: string|null, infrastructure?: {reason?: string}|null,
  *   phaseResults?: {phase: string, result: {exitCode: number, signal?: string|null, failureDetails?: object}}[],
- *   isolatedRetry?: string|null, retriedFailures?: {file: string}[], changedFiles?: string[]|null, refused?: boolean,
+ *   isolatedRetry?: string|null, retriedFailures?: {file: string}[], changedFiles?: string[]|null, refused?: boolean, runTimedOut?: boolean,
  *   touchesDiff?: (file: string) => boolean}} a  `touchesDiff` says an UNEDITED failing test reaches the diff (see
  *   `testReachesChanged`): such a failure is the change's own regression, not one "outside the diff".
  * @returns {{redCause: string, redCauseFiles: string[]}|null} null when nothing was red (and no flake was absorbed)
  */
-export function classifyRedCause({ exitCode, signal, infrastructure, phaseResults = [], isolatedRetry, retriedFailures = [], changedFiles, refused, touchesDiff } = {}) {
+export function classifyRedCause({ exitCode, signal, infrastructure, phaseResults = [], isolatedRetry, retriedFailures = [], changedFiles, refused, touchesDiff, runTimedOut = false } = {}) {
   const retried = (retriedFailures ?? []).map(f => f.file);
+  if (runTimedOut) return { redCause: 'timeout', redCauseFiles: [] };
   if (refused) return { redCause: 'refused', redCauseFiles: [] };
   if (infrastructure) {
     const killed = infrastructure.reason === 'verify-signal';

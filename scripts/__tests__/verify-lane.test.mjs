@@ -196,6 +196,29 @@ try {
     expect(() => process.kill(grandchild, 0)).toThrow();
   }, 70_000);
 
+  it('whole-run timeout records red with timeout cause and kills the grandchild tree', () => {
+    const pidFile = join(dir, 'run-grandchild.pid');
+    const gateScript = join(dir, 'run-hang.mjs');
+    writeFileSync(gateScript, `import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const g = spawn('sleep', ['120'], { stdio: 'ignore' });
+writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));
+${keepAliveScript()}`);
+    let pid;
+    try {
+      const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], {
+        cwd: dir, encoding: 'utf8', timeout: 60_000,
+        env: { ...process.env, WE_VERIFY_PHASE_TIMEOUT_MS: '60000', WE_VERIFY_RUN_TIMEOUT_RELATED_MS: '1000' },
+      });
+      pid = Number(readFileSync(pidFile, 'utf8'));
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('run timeout 1000ms (runTimeoutRelatedMs, env)');
+      expect(JSON.parse(r.stdout.trim().split('\n').pop())).toMatchObject({ status: 'red', redCause: 'timeout' });
+      expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'red', exitCode: 2, redCause: 'timeout' });
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally { if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} } }
+  }, 70_000);
+
   it('also kills a descendant reparented out of the tree that still holds the output pipe (audit finding 1)', () => {
     // The gate double-forks a sleeper (its parent exits at once, so it is reparented to init but keeps stdout open),
     // then hangs. Before: tree discovery missed it and 'close' never fired, so the run outlived its ceiling.
@@ -248,7 +271,7 @@ ${keepAliveScript()}
   // PR #5768 red team break 1 — verify-lane forwards gate output synchronously, so a reader that stops reading blocks its
   // event loop. Before: neither the ceiling nor the slot heartbeat ran while blocked. The watchdog runs on its own
   // thread: the ceiling still fires, the heartbeat keeps the slot until then, and stops once the phase is killed.
-  it('enforces the ceiling and keeps the slot heartbeat while its own stdout is not being read, then stops refreshing', async () => {
+  it.each(['phase', 'run'])('enforces the %s ceiling and keeps the slot heartbeat while stdout is unread, then stops refreshing', async (ceiling) => {
     const pidFile = join(dir, 'chatty.pid');
     const gateScript = join(dir, 'chatty.mjs');
     writeFileSync(gateScript, `import { writeFileSync } from 'node:fs';
@@ -258,7 +281,8 @@ for (let i = 0; i < 64; i++) process.stdout.write(chunk);
 ${keepAliveScript()}
 `);
     const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
-      WE_VERIFY_PHASE_TIMEOUT_MS: '4000', WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' };
+      WE_VERIFY_PHASE_TIMEOUT_MS: ceiling === 'phase' ? '4000' : '60000',
+      WE_VERIFY_RUN_TIMEOUT_RELATED_MS: ceiling === 'run' ? '4000' : '60000', WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' };
     const slotLockRoot = admissionLockRoot(dir, env);
     const verify = spawn('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
@@ -295,8 +319,14 @@ ${keepAliveScript()}
       expect(Date.parse(beforeCeiling), 'the slot heartbeat must keep running while stdout is unread').toBeGreaterThan(Date.parse(early));
       expect(later, 'the heartbeat must stop once the phase is killed').toBe(afterKill);
       expect(code).not.toBe(0);
-      expect(stderr).toContain('phase exceeded phaseTimeoutMs=4000 (env)');
-      expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
+      if (ceiling === 'phase') {
+        expect(stderr).toContain('phase exceeded phaseTimeoutMs=4000 (env)');
+        expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
+      } else {
+        expect(code).toBe(2);
+        expect(stderr).toContain('run exceeded runTimeoutRelatedMs=4000 (env)');
+        expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'red', redCause: 'timeout' });
+      }
     } finally {
       verify.stdout.resume();
       if (verify.exitCode === null) { try { verify.kill('SIGKILL'); } catch { /* gone */ } }
@@ -1374,7 +1404,7 @@ it('an unscopable default request refuses before stamping a runnable marker', ()
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true } = {}) {
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, contendAfterRelated = false } = {}) {
     const files = truncated ? Array.from({ length: 21 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
@@ -1405,16 +1435,28 @@ it('first attempt times out', async () => {
     const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
     const fake = `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from 'node:fs';
-import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
+import { admissionLockRoot, heldSlots, releaseOwnedSlot, tryAcquireSlot } from ${JSON.stringify(admissionModule)};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
 appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null }) + '\\n');
+if (process.env.WE_TEST_GATE_DELAY_MS) await new Promise(r => setTimeout(r, Number(process.env.WE_TEST_GATE_DELAY_MS)));
 if (${live} && args[0] === 'vitest') {
   const { spawnSync } = await import('node:child_process');
   const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(args[1] === 'related' ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
   process.exit(result.status ?? 2);
 }
 if (args[0] === 'vitest' && args[1] === 'related') {
+  if (${contendAfterRelated}) {
+    // Replace this phase's holder only after proving initial admission; keep both private-pool slots
+    // occupied by the live test process so the next phase has to wait instead of reclaiming a dead child.
+    const lockRoot = admissionLockRoot(process.cwd());
+    const released = held.length === 1 && releaseOwnedSlot({ lockRoot, cap: 1, fastSlots: 1,
+      owner: held[0].owner, pid: held[0].pid });
+    const acquired = [0, 1].map(slot => tryAcquireSlot({ lockRoot, cap: 1, slots: [slot],
+      owner: 'admission-contender', pid: Number(process.env.WE_TEST_ADMISSION_HOLDER_PID),
+      nowMs: Date.now(), nowIso: new Date().toISOString() }));
+    writeFileSync('contention.json', JSON.stringify({ released, acquired, held: heldSlots({ lockRoot, cap: 1, fastSlots: 1 }) }));
+  }
   process.stdout.write('passed file\\n'.repeat(148));
   process.stderr.write(${JSON.stringify(stderr)});
   process.stdout.write(${JSON.stringify(stdout)});
@@ -1441,18 +1483,78 @@ process.exit(${standardsExit});
       writeFileSync(join(dir, 'bin', name), fake); chmodSync(join(dir, 'bin', name), 0o755);
     }
     // Keep fixture infrastructure out of the change's own edited set.
-    writeFileSync(join(dir, '.gitignore'), 'calls.jsonl\npool/\n*.attempt\n');
+    writeFileSync(join(dir, '.gitignore'), 'calls.jsonl\ncontention.json\npool/\n*.attempt\n');
     execFileSync('git', ['add', '.'], { cwd: dir });
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'baseline'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, edited ? files[0] : 'source.mjs'), '// changed\n');
     const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
-    function invoke(args = [], extraEnv = {}) {
-      const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
+    function invoke(args = [], extraEnv = {}, options = {}) {
+      const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8', ...options });
       return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout, stderr: result.stderr };
     }
     return { files, invoke, calls: () => readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
   }
+
+  it('shares the run budget across phases and starts no standards phase after expiry', () => {
+    const f = fixture({ scan: true });
+    const r = f.invoke([], { WE_VERIFY_RUN_TIMEOUT_RELATED_MS: '2000', WE_VERIFY_PHASE_TIMEOUT_MS: '60000',
+      WE_TEST_GATE_DELAY_MS: '1200', WE_VERIFY_ISOLATED_RETRY: 'off', WE_VERIFY_RUN_ALL_PHASES: '1',
+      WE_VERIFY_PHASE_ADMISSION: '0' });
+    expect(r.code).toBe(2);
+    expect(r.json).toMatchObject({ status: 'red', redCause: 'timeout' });
+    const calls = f.calls();
+    expect(calls).toHaveLength(2);
+    expect(calls[0].args.slice(0, 2)).toEqual(['vitest', 'related']);
+    expect(calls.some(c => c.args.includes('check:standards'))).toBe(false);
+  }, 70_000);
+
+  it('spends the remaining run budget waiting for later admission and never starts that command', () => {
+    const f = fixture({ phaseAdmission: '1', scan: true, contendAfterRelated: true });
+    const runTimeoutMs = 4000;
+    const initialPhaseDelayMs = 1000;
+    const r = f.invoke([], {
+      WE_VERIFY_RUN_TIMEOUT_RELATED_MS: String(runTimeoutMs), WE_VERIFY_PHASE_TIMEOUT_MS: '60000',
+      WE_VERIFY_ISOLATED_RETRY: 'off', WE_VERIFY_RUN_ALL_PHASES: '1', WE_TEST_GATE_DELAY_MS: String(initialPhaseDelayMs),
+      WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_FAST_SLOTS: '1',
+      WE_PLATFORM_PREFERENCES: join(dir, 'no-platform-preferences.json'),
+      WE_TEST_ADMISSION_HOLDER_PID: String(process.pid),
+    }, { timeout: 20_000 });
+    const calls = f.calls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args.slice(0, 2)).toEqual(['vitest', 'related']);
+    expect(calls[0].held).toHaveLength(1);
+    const contention = JSON.parse(readFileSync(join(dir, 'contention.json'), 'utf8'));
+    expect(contention.released).toMatchObject({ released: true });
+    expect(contention.acquired).toMatchObject([{ ok: true, slot: 0 }, { ok: true, slot: 1 }]);
+    expect(contention.held).toHaveLength(2);
+    for (const held of contention.held) expect(held).toMatchObject({ owner: 'admission-contender', pid: process.pid });
+    expect(r.stderr).toContain('gate queueing for admission (phase: scan)');
+    expect(r.stderr).toContain('admission-deferred: no slot after waiting');
+    // A fresh whole-run budget at each admission would also end red: prove the wait received only
+    // the remainder after the first command, without relying on a tight upper bound on wall time.
+    const waitBudgetMs = Number(r.stderr.match(/wait budget (\d+)ms/)?.[1]);
+    expect(waitBudgetMs).toBeGreaterThan(0);
+    expect(waitBudgetMs).toBeLessThan(runTimeoutMs - initialPhaseDelayMs / 2);
+    expect(r.code).toBe(2);
+    expect(r.json).toMatchObject({ status: 'red', redCause: 'timeout', exitCode: 2 });
+    const recorded = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(recorded).toMatchObject({ status: 'red', redCause: 'timeout', exitCode: 2,
+      phases: { admissionMode: 'phase', standardsMs: null,
+        admissionPhases: { scan: { timedOut: true, slot: null } } } });
+    expect(recorded.phases.admissionPhases.scan.waitedMs).toBeGreaterThanOrEqual(waitBudgetMs);
+  }, 30_000);
+
+  it('selects the full run timeout from the resolved full-suite gate', () => {
+    const f = fixture();
+    const r = f.invoke([], { WE_BUILD_FINAL_GATE: 'full', WE_VERIFY_RUN_TIMEOUT_FULL_MS: '1000',
+      WE_VERIFY_RUN_TIMEOUT_RELATED_MS: '60000', WE_VERIFY_PHASE_TIMEOUT_MS: '60000', WE_TEST_GATE_DELAY_MS: '5000' });
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('run timeout 1000ms (runTimeoutFullMs, env)');
+    expect(r.json).toMatchObject({ status: 'red', redCause: 'timeout' });
+    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'red', redCause: 'timeout' });
+    expect(f.calls()).toHaveLength(1);
+  }, 70_000);
 
   // #verify-phase-admission — real slots across the related run, retry, and standards.
   it.each([undefined, '0'])('records phase admission or the opt-out (%s)', phaseAdmission => {

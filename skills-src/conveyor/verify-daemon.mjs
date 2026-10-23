@@ -68,7 +68,7 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { runVerifyDispatch, recordKilledVerification, killOrphanGroup, killAdoptedGroup, dispatchedRunState, countDispatchesInFlight } from '../../scripts/conveyor/verify-dispatch.mjs';
+import { runVerifyDispatch, resolveMaxInFlightSetting, recordKilledVerification, killOrphanGroup, killAdoptedGroup, dispatchedRunState, countDispatchesInFlight } from '../../scripts/conveyor/verify-dispatch.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from '../../scripts/lib/verify-settings.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
 import { createVerifyGateJobs, resolveGateAsJob } from '../../scripts/conveyor/verify-gate-job.mjs';
@@ -357,7 +357,7 @@ export function reconcileInFlight(inFlight, {
  *  its own clock, independent of this factory's caller). Kept as its own factory (mirroring
  *  `buildCliDaemonEffects` in the sibling daemons) so `main()` stays a thin wire-up. */
 export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch, isDraining = defaultIsDraining,
-  processIsAlive = pidAlive, groupAlive, killGroup, now = Date.now, spawnGraceMs = 120_000, gateJobs = null, gateAsJob = true,
+  processIsAlive = pidAlive, groupAlive, killGroup, now = Date.now, spawnGraceMs = 120_000, gateJobs = null, gateAsJob = true, maxInFlight = resolveMaxInFlightSetting().value,
 } = {}) {
   const inFlight = new Map();
   // `awaitSettle:false` returns before any gate settles, so `result.failures` is always empty here: failures
@@ -382,7 +382,7 @@ export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAliv
       if (gateJobs) await gateJobs.sync(inFlight);
       const result = isDraining()
         ? { dispatched: [], deferred: [], failures: [], draining: true }
-        : await runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled,
+        : await runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled, maxInFlight,
           // A superseded job entry is killed only after the store re-probes its gate handle (both modes hold job entries).
           ...(gateJobs ? { killJobGate: (e) => gateJobs.killJobGate(e) } : {}),
           // No gate starts on a lane whose previous gate is not confirmed gone. Rollback also scans the lane's processes
@@ -608,7 +608,9 @@ async function main() {
   let settle = () => {};
   const { gateJobs, gateAsJob } = wireGateJobs(process.env,
     (o) => createVerifyGateJobs({ ...o, log: (m) => console.error(m), onSettled: (f) => settle(f) }));
-  const effects = buildCliDaemonEffects({ isAlive, gateJobs, gateAsJob });
+  const cap = resolveMaxInFlightSetting(process.env);
+  console.error(`verify-daemon: max in flight ${cap.value} (daemonMaxInFlight, ${cap.source})`);
+  const effects = buildCliDaemonEffects({ isAlive, gateJobs, gateAsJob, maxInFlight: cap.value });
   settle = effects.onSettled;
   const cleanup = createCleanup({
     inFlight: effects.inFlight,

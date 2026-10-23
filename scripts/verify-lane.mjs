@@ -80,7 +80,7 @@ import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitest
 import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
-import { createRevertProbe } from './operations/mutation-check-io.mjs';
+import { BOUNDED_RUN_SHIM, createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
@@ -615,16 +615,19 @@ const retryableGate = SELECTED_TEST_COMMAND.test(resolvedGate?.testCommand ?? ''
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
-async function acquireAdmission(phase) {
+async function acquireAdmission(phase, remainingMs = null) {
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
   }) : { kind: classifyCommandKind(GATE) };
   const acquired = await acquireSlotBlocking({
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
+    ...(remainingMs === null ? {} : { canDefer: true, waitMs: Math.max(1, Math.ceil(remainingMs)), ceilingMs: Math.max(1, Math.ceil(remainingMs)) }),
   });
   if (acquired.timedOut) {
     process.stderr.write(`⚠ heavy-command admission: timed out after ${acquired.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);
+  } else if (acquired.deferred) {
+    process.stderr.write(`verify-lane: run budget exhausted waiting for ${phase} admission — no further phases\n`);
   } else if (acquired.waitedMs > 0) {
     process.stderr.write(`heavy-command admission: acquired slot-${acquired.slot} after waiting ${acquired.waitedMs}ms (cap=${ADMISSION_CAP}).\n`);
   }
@@ -652,6 +655,16 @@ const PHASE_TIMEOUT_MS = verifySetting('phaseTimeoutMs', process.env);
 const PHASE_TIMEOUT_SOURCE = verifySettingSource('phaseTimeoutMs', process.env);
 process.stderr.write(`verify-lane: phase timeout ${PHASE_TIMEOUT_MS}ms (phaseTimeoutMs, ${PHASE_TIMEOUT_SOURCE})\n`);
 let phaseTimeout = null;
+const RUN_TIMEOUT_KEY = resolvedGate?.decision?.mode === 'full' ? 'runTimeoutFullMs' : 'runTimeoutRelatedMs';
+const RUN_TIMEOUT_MS = verifySetting(RUN_TIMEOUT_KEY, process.env);
+const RUN_TIMEOUT_SOURCE = verifySettingSource(RUN_TIMEOUT_KEY, process.env);
+process.stderr.write(`verify-lane: run timeout ${RUN_TIMEOUT_MS}ms (${RUN_TIMEOUT_KEY}, ${RUN_TIMEOUT_SOURCE})\n`);
+let runTimedOut = false;
+let runDeadline;
+const runTimeoutResult = () => {
+  runTimedOut = true;
+  return { exitCode: 2, signal: 'SIGKILL', runTimedOut: true };
+};
 // Named per verify-lane process, so a nested verify-lane (a test of this file) adds its own marker instead of replacing ours.
 const GATE_PHASE_MARKER_ENV = `WE_VERIFY_GATE_PHASE_${process.pid}`;
 const HEAVY_ADMISSION_MODULE = new URL('./readiness/heavy-admission.mjs', import.meta.url).href;
@@ -668,6 +681,7 @@ const HEAVY_ADMISSION_MODULE = new URL('./readiness/heavy-admission.mjs', import
 // a worker editing while this run queued or ran means the gate did not see the start-of-run tree.
 const preGateTreeHash = MODE === 'run' ? null : treeHashNow();
 process.stderr.write(`⏱ gate execution starting (suites: ${GATE})\n`);
+runDeadline = performance.now() + RUN_TIMEOUT_MS;
 let exitCode = 0;
 let signal = null;
 let failureDetails;
@@ -677,8 +691,12 @@ let editedDuringRun = [];
 let baseCandidate = null;
 let baseFailures = null;
 const infrastructureNow = (exitCode, signal) => verificationInfrastructureFailure({ exitCode, signal });
-async function runGate(command, args) {
-  const collector = createFailureCollector({ cwd: REPO });
+async function runGate(command, args, { cwd = REPO } = {}) {
+  const remainingMs = runDeadline - performance.now();
+  if (runTimedOut || remainingMs <= 0) return runTimeoutResult();
+  const runLimited = remainingMs <= PHASE_TIMEOUT_MS;
+  const ceilingMs = Math.max(1, Math.ceil(Math.min(PHASE_TIMEOUT_MS, remainingMs)));
+  const collector = createFailureCollector({ cwd });
   const output = { stdout: '', stderr: '' };
   let bytes = 0;
   // xaipsbs — the gate's own `npm run test:unit` / `check:standards` are wrapped in `heavy-admission.mjs run`;
@@ -687,7 +705,7 @@ async function runGate(command, args) {
   const phaseToken = randomBytes(8).toString('hex');
   const phaseMarker = `${GATE_PHASE_MARKER_ENV}=${phaseToken}`;
   const result = await new Promise((resolveGate, reject) => {
-    const child = spawn(command, args ?? [], { shell: !args, cwd: REPO, stdio: ['inherit', 'pipe', 'pipe'],
+    const child = spawn(command, args ?? [], { shell: !args, cwd, stdio: ['inherit', 'pipe', 'pipe'],
       env: { ...process.env, [ADMISSION_HELD_ENV]: '1', [GATE_PHASE_MARKER_ENV]: phaseToken } });
     for (const [name, fd] of [['stdout', 1], ['stderr', 2]]) {
       child[name].setEncoding('utf8');
@@ -712,6 +730,10 @@ async function runGate(command, args) {
     const announce = () => {
       if (announced) return;
       announced = true;
+      if (runLimited) {
+        process.stderr.write(`\n✗ verify-lane: run exceeded ${RUN_TIMEOUT_KEY}=${RUN_TIMEOUT_MS} (${RUN_TIMEOUT_SOURCE}) — killed its process tree (pid ${child.pid}); recorded red (timeout); inspect the gate log before retrying\n`);
+        return;
+      }
       process.stderr.write(`\n✗ verify-lane: phase exceeded phaseTimeoutMs=${PHASE_TIMEOUT_MS} (${PHASE_TIMEOUT_SOURCE}) — killed its process tree (pid ${child.pid}); recorded as a timeout, not a test verdict\n`);
     };
     const finish = (code, closeSignal) => {
@@ -721,14 +743,15 @@ async function runGate(command, args) {
       clearTimeout(grace);
       const timedOut = Boolean(watchdog?.fired());
       if (timedOut) announce();
-      const result = { exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) };
+      if (timedOut && runLimited) runTimedOut = true;
+      const result = { exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true, runTimedOut: runLimited } : {}) };
       // The tree can close before the escape sweeps finish (an escapee that holds no pipe): the phase, and with it the
       // slot, is not over until they ran.
       if (timedOut && watchdog) watchdog.settled().then(() => resolveGate(result));
       else resolveGate(result);
     };
     const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
-      pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,
+      pid: child.pid, timeoutMs: ceilingMs,
       kill: { orphansOfOwnGroup: true, marker: phaseMarker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter((fd) => Number.isInteger(fd) && fd > 2) },
       heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS },
       onFire: () => {
@@ -748,6 +771,29 @@ async function runGate(command, args) {
   });
   return { ...result, failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
 }
+// The revert probe restores files synchronously in finally. Keep that transaction intact while its child
+// gets the same threaded tree kill as every other phase (including its admission wait in the run budget).
+function runRevertCommand(file, args, options) {
+  const remainingMs = runDeadline - performance.now();
+  if (runTimedOut || remainingMs <= 0 || phaseTimeout) {
+    if (!phaseTimeout) runTimeoutResult();
+    throw Object.assign(new Error('verify run budget exhausted'), { status: 2 });
+  }
+  const runLimited = remainingMs <= PHASE_TIMEOUT_MS;
+  try {
+    return execFileSync(process.execPath, ['-e', BOUNDED_RUN_SHIM,
+      JSON.stringify({ argv: [file, ...args], ms: Math.ceil(Math.min(PHASE_TIMEOUT_MS, remainingMs)),
+        watchdogModule: new URL('./lib/tree-watchdog.mjs', import.meta.url).href,
+        killModule: new URL('./lib/bounded-child.mjs', import.meta.url).href,
+        markerKey: GATE_PHASE_MARKER_ENV, marker: randomBytes(8).toString('hex') })], options);
+  } catch (error) {
+    if (error.status === 124) {
+      if (runLimited) runTimeoutResult();
+      else phaseTimeout = { phase: 'revert', ceilingMs: PHASE_TIMEOUT_MS };
+    }
+    throw error;
+  }
+}
 // #5141 — retain null for phases never run; retries and multiple scans accumulate wall time.
 const phaseMs = { vitestMs: null, scanMs: null, standardsMs: null };
 const outcomes = {};
@@ -760,6 +806,7 @@ function recordOutcome(key, outcome) {
 // `outcomeKey` separates the always-run guard's outcome from the scanners' (it shares the `scan` admission kind).
 async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   const kind = phase?.replace(/Ms$/, '');
+  if (runTimedOut || performance.now() >= runDeadline) return runTimeoutResult();
   let acquired = null;
   if (phaseAdmission && firstPhaseAdmission) acquired = firstPhaseAdmission;
   else if (phaseAdmission) {
@@ -768,14 +815,14 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
     // step with `GATE_QUEUED_MARKER` / `GATE_STARTED_MARKER` in `verify-dispatch.mjs`.
     // The leading newline keeps the marker at a line start even when the previous phase's output stopped mid-line.
     process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
-    acquired = await acquireAdmission(kind);
+    acquired = await acquireAdmission(kind, runDeadline - performance.now());
     process.stderr.write(`⏱ gate execution starting (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
   }
   firstPhaseAdmission = null;
   const started = performance.now();
   try {
-    const result = await runGate(command, args);
-    if (result.timedOut && !phaseTimeout) phaseTimeout = { phase: kind || 'gate', ceilingMs: PHASE_TIMEOUT_MS };
+    const result = acquired?.deferred ? runTimeoutResult() : await runGate(command, args);
+    if (result.timedOut && !result.runTimedOut && !phaseTimeout) phaseTimeout = { phase: kind || 'gate', ceilingMs: PHASE_TIMEOUT_MS };
     if (kind) recordOutcome(outcomeKey ?? kind, buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }));
     return result;
   } catch (error) {
@@ -804,7 +851,7 @@ const alwaysRun = retryableGate
   ? alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: (p) => existsSync(join(REPO, p)),
     scanCommands: resolvedGate.scanCommands ?? [], testTimeoutFactor: resolvedGate.decision?.testTimeoutFactor ?? 1, reportFile: alwaysRunReport })
   : { command: null, declared: [], files: [], skipped: [] };
-const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
+const continueAfter = (r) => !runTimedOut && (r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r)));
 try {
   let result = await timedRunGate(retryableGate ? 'vitestMs' : null,
     // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (`npm test`, a skipped-vitest echo)
@@ -888,7 +935,7 @@ try {
   if (baseSha) {
     process.stderr.write(`Comparing ${baseCandidate.files.length} failing file(s) outside the diff with origin/main @ ${baseSha.slice(0, 8)}\n`);
     baseFailures = await measureBaseFailures({ baseSha, files: baseCandidate.files, cacheDir: join(tmpdir(), 'we-verify-base-failures'),
-      runBase: (files) => runVitestOnBase({ git, repo: REPO, baseSha, files, tmp: tmpdir(), spawnFn: spawn, collectorFactory: createFailureCollector, fs: nodeFs }) });
+      runBase: (files) => runVitestOnBase({ git, repo: REPO, baseSha, files, tmp: tmpdir(), spawnFn: spawn, collectorFactory: createFailureCollector, fs: nodeFs, run: (command, args, options) => runGate(command, args, options) }) });
   }
 } catch (e) {
   signal = e?.signal || null;
@@ -908,7 +955,7 @@ try {
 // `enforce` turns a flagged or execution-unproven result red (a structural unproven is recorded, never blocking). Its
 // vitest runs queue on the heavy pool like every gate phase; their ceiling starts only once a slot is granted.
 let revertRed = null;
-if (exitCode === 0 && !signal && !verificationInfrastructureFailure({ exitCode, signal }) && headSha && MODE !== 'check') {
+if (exitCode === 0 && !signal && !runTimedOut && performance.now() < runDeadline && !verificationInfrastructureFailure({ exitCode, signal }) && headSha && MODE !== 'check') {
   const revertRedMode = verifySetting('revertRed', process.env);
   if (revertRedMode !== 'off') {
     const started = performance.now();
@@ -916,7 +963,7 @@ if (exitCode === 0 && !signal && !verificationInfrastructureFailure({ exitCode, 
       revertRed = await revertRedForVerify({
         repo: REPO, headSha, record: readAwaitVerifyRecord(REPO),
         settings: { mode: revertRedMode, maxFiles: verifySetting('revertRedMaxFiles', process.env) },
-        probe: createRevertProbe(),
+        probe: createRevertProbe({ run: runRevertCommand, timeoutMs: 0 }),
       });
     } catch (error) {
       revertRed = { mode: revertRedMode, status: 'unproven', reason: `check-crashed: ${String(error?.message ?? error).slice(0, 200)}`,
@@ -937,15 +984,17 @@ const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'pha
   alwaysRun: alwaysRun.declared.length ? alwaysRun : null });
 const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
 
+if (runTimedOut || performance.now() >= runDeadline) { runTimedOut = true; exitCode = 2; signal = null; }
+else if (phaseTimeout) { exitCode = 2; signal = 'SIGKILL'; }
 const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
-const infrastructure = verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) });
+const infrastructure = runTimedOut ? null : verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) });
 // The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
 const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
 // An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).
-const redCauseFields = classifyRedCause({ exitCode, signal, infrastructure, phaseResults, isolatedRetry, retriedFailures, changedFiles: diffFiles,
+const redCauseFields = classifyRedCause({ exitCode, signal, infrastructure, runTimedOut, phaseResults, isolatedRetry, retriedFailures, changedFiles: diffFiles,
   touchesDiff: (file) => { const r = reachesChanged({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }); return r === 'unknown' ? 'unknown' : r === 'reaches'; } }) ?? {};
 // Perf 42 — `out-of-diff-still-red` where every failing (file, name) also fails on main's tip becomes `pre-existing-on-main`.
 Object.assign(redCauseFields, classifyPreExisting({ cause: redCauseFields, candidate: baseCandidate, base: baseFailures }) ?? {});

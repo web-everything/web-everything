@@ -102,6 +102,12 @@ describe('classifyRedCause (item 99)', () => {
     });
   });
   it('every emitted value is declared', () => {
-    for (const c of ['in-diff-failure', 'out-of-diff-flaky', 'out-of-diff-still-red', 'test-timeout', 'standards', 'scan', 'killed-superseded', 'refused', 'infra']) expect(RED_CAUSES).toContain(c);
+    for (const c of ['in-diff-failure', 'out-of-diff-flaky', 'out-of-diff-still-red', 'test-timeout', 'standards', 'scan', 'killed-superseded', 'refused', 'infra', 'timeout']) expect(RED_CAUSES).toContain(c);
   });
+});
+
+it('classifies a whole-run timeout before signal, infrastructure or earlier test failures', () => {
+  expect(classifyRedCause({ runTimedOut: true, exitCode: 2, signal: 'SIGKILL',
+    infrastructure: { reason: 'verify-timeout' }, phaseResults: [red('vitest')] }))
+    .toEqual({ redCause: 'timeout', redCauseFiles: [] });
 });

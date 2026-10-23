@@ -11,7 +11,7 @@ import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, veri
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
   matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'], skipLocalForCardOnly: false,
-  revertRed: 'enforce', revertRedSince: '2026-01-01', revertRedMaxFiles: 10, selection: 'pr', phaseTimeoutMs: 600_000, slotHeartbeatMs: 120_000 };
+  revertRed: 'enforce', revertRedSince: '2026-01-01', revertRedMaxFiles: 10, selection: 'pr', runTimeoutRelatedMs: 300_000, runTimeoutFullMs: 900_000, daemonMaxInFlight: 4, phaseTimeoutMs: 600_000, slotHeartbeatMs: 120_000 };
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function file(contents) {
@@ -56,10 +56,10 @@ describe('verify settings', () => {
       WE_VERIFY_PHASE_ADMISSION: '1', WE_VERIFY_FAST_TARGETS: '0', WE_VERIFY_MATCH_REQUEST_VARIANTS: '1',
       WE_VERIFY_SUPERSEDE: 'any', WE_VERIFY_RESTART_IN_FLIGHT: 'adopt', WE_VERIFY_RUN_ALL_PHASES: '1',
       WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1', WE_VERIFY_ALWAYS_RUN_TESTS: 'x/y.test.mjs, z.test.mjs', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1',
-      WE_VERIFY_REVERT_RED: 'warn', WE_VERIFY_REVERT_RED_SINCE: '2026-10-08', WE_VERIFY_REVERT_RED_MAX_FILES: '7', WE_VERIFY_SELECTION: 'since-last-green', WE_VERIFY_PHASE_TIMEOUT_MS: '90000', WE_VERIFY_SLOT_HEARTBEAT_MS: '60000' };
+      WE_VERIFY_REVERT_RED: 'warn', WE_VERIFY_REVERT_RED_SINCE: '2026-10-08', WE_VERIFY_REVERT_RED_MAX_FILES: '7', WE_VERIFY_SELECTION: 'since-last-green', WE_VERIFY_RUN_TIMEOUT_RELATED_MS: '120000', WE_VERIFY_RUN_TIMEOUT_FULL_MS: '240000', WE_VERIFY_DAEMON_MAX_IN_FLIGHT: '3', WE_VERIFY_PHASE_TIMEOUT_MS: '90000', WE_VERIFY_SLOT_HEARTBEAT_MS: '60000' };
     const values = { relatedMode: 'all', testTimeoutFactor: 2.5, standards: 'auto', phaseAdmission: true, fastTargets: 0,
       matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', relatedMaxTests: 5, relatedDepth: 1, alwaysRunTests: ['x/y.test.mjs', 'z.test.mjs'], skipLocalForCardOnly: true,
-      revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 7, selection: 'since-last-green', phaseTimeoutMs: 90_000, slotHeartbeatMs: 60_000 };
+      revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 7, selection: 'since-last-green', runTimeoutRelatedMs: 120_000, runTimeoutFullMs: 240_000, daemonMaxInFlight: 3, phaseTimeoutMs: 90_000, slotHeartbeatMs: 60_000 };
     expect(resolveVerifySettings({ fileConfig: custom, env })).toEqual({ values, sources: allSources('env') });
     expect(resolveVerifySettings({ fileConfig: custom, env: { WE_VERIFY_RELATED: 'all' } }))
       .toEqual({ values: { ...custom, relatedMode: 'all' }, sources: { ...allSources('file'), relatedMode: 'env' } });
@@ -230,5 +230,28 @@ describe('revert-red settings (#5466)', () => {
     }
     for (const bad of ['2026-13-40', 'yesterday', 20261008]) expect(validateVerifySettings({ revertRedSince: bad }).revertRedSince).toBe(null);
     for (const bad of [0, -1, 1.5, 201, '9']) expect(validateVerifySettings({ revertRedMaxFiles: bad }).revertRedMaxFiles).toBe(40);
+  });
+});
+
+
+describe('run and daemon bounds', () => {
+  it.each([
+    ['runTimeoutRelatedMs', 'WE_VERIFY_RUN_TIMEOUT_RELATED_MS', 45 * 60_000, 1000, 6 * 60 * 60_000],
+    ['runTimeoutFullMs', 'WE_VERIFY_RUN_TIMEOUT_FULL_MS', 120 * 60_000, 1000, 6 * 60 * 60_000],
+    ['daemonMaxInFlight', 'WE_VERIFY_DAEMON_MAX_IN_FLIGHT', 2, 1, 64],
+  ])('%s defaults, accepts bounds and falls back on invalid or oversized values', (key, envKey, fallback, min, max) => {
+    const resolve = (env = {}, fileConfig = {}) => resolveVerifySettings({ fileConfig, env });
+    expect(resolve().values[key]).toBe(fallback);
+    expect(resolve().sources[key]).toBe('default');
+    for (const value of [min, max]) {
+      expect(resolve({ [envKey]: String(value) }).values[key]).toBe(value);
+      expect(resolve({ [envKey]: String(value) }).sources[key]).toBe('env');
+      expect(resolve({}, { [key]: value }).values[key]).toBe(value);
+    }
+    for (const value of [min - 1, max + 1, 1.5, 'nope', '']) {
+      expect(resolve({ [envKey]: String(value) }).values[key]).toBe(fallback);
+      expect(resolve({}, { [key]: value }).values[key]).toBe(fallback);
+      expect(resolve({ [envKey]: String(value) }, { [key]: max }).values[key]).toBe(max);
+    }
   });
 });

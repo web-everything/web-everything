@@ -60,7 +60,7 @@ export function classifyPreExisting({ cause, candidate, base }) {
  * `{ ok, tests }`; `ok:false` for any setup/runner error, a signal, a timeout, or a truncated failure list.
  * Runs inside the caller's already-held heavy slot (no second admission).
  */
-export async function runVitestOnBase({ git, repo, baseSha, files, tmp, timeoutMs = 10 * 60_000, spawnFn, collectorFactory, fs }) {
+export async function runVitestOnBase({ git, repo, baseSha, files, tmp, timeoutMs = 10 * 60_000, spawnFn, collectorFactory, fs, run }) {
   const { mkdtempSync, rmSync, symlinkSync, existsSync } = fs;
   const dir = mkdtempSync(join(tmp, 'verify-base-'));
   const wt = join(dir, 'wt');
@@ -69,6 +69,11 @@ export async function runVitestOnBase({ git, repo, baseSha, files, tmp, timeoutM
     git(['worktree', 'add', '--detach', wt, baseSha]);
     added = true;
     if (existsSync(join(repo, 'node_modules'))) symlinkSync(join(repo, 'node_modules'), join(wt, 'node_modules'), 'dir');
+    if (run) {
+      const result = await run('npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', ...files.map(f => `./${f}`)], { cwd: wt });
+      if (result.signal || result.failureDetails?.truncated || ![0, 1].includes(result.exitCode)) return { ok: false, tests: [] };
+      return { ok: true, tests: result.failureDetails?.tests ?? [] };
+    }
     const collector = collectorFactory({ cwd: wt });
     const { code, signal } = await new Promise((resolve, reject) => {
       const child = spawnFn('npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', ...files.map(f => `./${f}`)],

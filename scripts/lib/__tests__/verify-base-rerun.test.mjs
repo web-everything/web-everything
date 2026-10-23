@@ -75,3 +75,24 @@ describe('perf 42 — pre-existing on main', () => {
     expect(res.tests).toEqual([{ file: 'x/a.test.mjs', name: 'boom' }]);
   }, 60_000);
 });
+
+it('base comparison uses the shared bounded runner and refuses a timed-out result', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'bounded-base-'));
+  const calls = [];
+  const git = (args) => calls.push(args);
+  let cwd;
+  try {
+    const result = await runVitestOnBase({ git, repo: root, baseSha: 'base', files: ['x.test.mjs'], tmp: root, fs,
+      run: async (command, args, options) => {
+        cwd = options.cwd;
+        expect(command).toBe('npx');
+        expect(args).toContain('./x.test.mjs');
+        return { exitCode: 2, signal: 'SIGKILL', runTimedOut: true };
+      } });
+    expect(result).toEqual({ ok: false, tests: [] });
+    expect(cwd.startsWith(root)).toBe(true);
+    expect(calls).toContainEqual(['worktree', 'remove', '--force', cwd]);
+    expect(verifyGateDecision({ record: { sha: 'h', status: 'red', exitCode: 2, redCause: 'timeout' },
+      headSha: 'h', requireVerified: true })).toMatchObject({ ok: false, reason: 'verify-red' });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

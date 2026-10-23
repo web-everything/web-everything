@@ -238,9 +238,17 @@ export function laneInQueueScope(branch, { enabled = false, ids = [] } = {}) {
  * @param {Record<string, string|undefined>} env
  * @returns {number}
  */
-export function resolveMaxInFlight(env) {
+export function resolveMaxInFlight(env = process.env) {
+  return resolveMaxInFlightSetting(env).value;
+}
+
+export function resolveMaxInFlightSetting(env = process.env) {
   const value = Number(env.VERIFY_DISPATCH_MAX_IN_FLIGHT);
-  return Number.isInteger(value) && value > 0 ? value : 8;
+  if (Number.isSafeInteger(value) && value > 0) {
+    return { value, source: 'VERIFY_DISPATCH_MAX_IN_FLIGHT' };
+  }
+  const { values, sources } = resolveVerifySettings({ fileConfig: loadVerifySettingsFile(undefined, { env }), env });
+  return { value: values.daemonMaxInFlight, source: sources.daemonMaxInFlight };
 }
 
 /** PR 4764 round 10 — does this registry entry only HOLD its lane (no dispatch of ours runs there)? `heldBy` (a lane
@@ -732,7 +740,11 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
   //    walk is exactly as serial as it always was; only the dispatch step below (2) goes concurrent.
   const pending = [];
   // Read before any start of this sweep adds an entry. A lane that only holds its slot is no outstanding dispatch.
-  const budget = inFlight ? maxInFlight - countDispatchesInFlight(inFlight) : Infinity;
+  const budget = maxInFlight - (inFlight ? countDispatchesInFlight(inFlight) : 0);
+  const jobKey = (pool, sha, suites) => JSON.stringify([pool, sha, suites ?? null]);
+  // A scanned candidate has reserved nothing: only outstanding dispatches and successful starts suppress twins.
+  const seen = new Set([...(inFlight?.values() ?? [])]
+    .filter(e => !entryHoldsLaneOnly(e)).map(e => jobKey(e.pool, e.sha, e.suites)));
   for (const pool of poolsToScan(poolRoot)) {
     const poolDir = join(poolRoot, pool);
     for (const lane of laneIndicesIn(poolDir)) {
@@ -778,12 +790,18 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
         }
         continue;
       }
+      const key = jobKey(pool, headSha, marker.suites);
+      if (seen.has(key)) {
+        deferred.push({ pool, lane, sha: headSha, reason: 'duplicate' });
+        continue;
+      }
       if (dryRun) {
         if (dispatched.length >= budget) {
           deferred.push({ pool, lane, sha: headSha, reason: 'max-in-flight' });
           continue;
         }
         log(`  would dispatch verify for ${pool}/lane-${lane} @ ${String(headSha).slice(0, 8)} (suites: ${marker.suites || 'default'})`);
+        seen.add(key);
         dispatched.push({ pool, lane, sha: headSha });
         continue;
       }
@@ -800,9 +818,15 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
   //    call site), so offering several candidates at once here is sufficient to bound real concurrent gate
   //    execution at the cap.
   // PR 4764 round 10 — the budget is spent only by gates actually started this sweep: a lane deferred as held below
-  // takes no slot from the healthy lane after it. Once the budget is full the rest wait for a later tick unchecked.
+  // takes neither a slot nor a dedupe key from the healthy lane after it. Failed launches reserve neither.
+  // Once the budget is full the rest wait for a later tick unchecked.
   let started = 0;
   const settlements = pending.map(({ pool, lane, dir, headSha, suites, marker }) => {
+    const key = jobKey(pool, headSha, suites);
+    if (seen.has(key)) {
+      deferred.push({ pool, lane, sha: headSha, reason: 'duplicate' });
+      return Promise.resolve();
+    }
     if (started >= budget) {
       deferred.push({ pool, lane, sha: headSha, reason: 'max-in-flight' });
       return Promise.resolve();
@@ -819,7 +843,6 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
         return Promise.resolve();
       }
     }
-    started += 1;
     const runId = randomUUID();
     const entry = { pool, lane, dir, runId, pid: null, sha: headSha, suites: marker.suites, treeHash: marker.treeHash ?? null,
       requestStartedAt: marker.startedAt ?? null, startedMs: Date.now(), logPath: null };
@@ -830,6 +853,8 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
       inFlight?.set(dir, entry);
       try {
         const job = launchGate({ pool, lane, dir, headSha, marker, runId });
+        started += 1;
+        seen.add(key);
         Object.assign(entry, { jobId: job?.id ?? null });
         dispatched.push({ pool, lane, sha: headSha, launched: true, jobId: job?.id ?? null });
         log(`  queued verify job ${job?.id ?? '?'} for ${pool}/lane-${lane} @ ${String(headSha).slice(0, 8)} (suites: ${suites || 'default'})`);
@@ -841,11 +866,20 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
       return Promise.resolve();
     }
     inFlight?.set(dir, entry);
-    if (!awaitSettle) dispatched.push({ pool, lane, sha: headSha, launched: true });
     log(`  dispatching verify for ${pool}/lane-${lane} @ ${String(headSha).slice(0, 8)} (suites: ${suites || 'default'})…`);
     const gateCeiling = resolveGateCeiling();
-    const gate = runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate, log, gateCeiling,
+    let launchFailed = false;
+    const gate = runLaneGate({ pool, lane, dir, headSha, marker, runId,
+      spawnGate: (...args) => {
+        try { return spawnGate(...args); }
+        catch (error) { launchFailed = true; throw error; }
+      }, log, gateCeiling,
       onSpawn: (pid, path) => { entry.pid = pid; entry.logPath = path; } });
+    if (!launchFailed) {
+      started += 1;
+      seen.add(key);
+      if (!awaitSettle) dispatched.push({ pool, lane, sha: headSha, launched: true });
+    } else if (inFlight?.get(dir) === entry) inFlight.delete(dir);
     return gate.then(
       value => settle({ status: 'fulfilled', value }, { pool, lane, dir, headSha, gateCeiling }),
       reason => settle({ status: 'rejected', reason }, { pool, lane, dir, headSha, gateCeiling }),
