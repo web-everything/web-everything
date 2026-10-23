@@ -95,6 +95,8 @@ export function resolveCardGroupStatePath(env = process.env) {
 const STANDARD = { enabled: false, maxSize: 8, eligibility: 'card-only', reconcileSec: 120, retryMin: 30 };
 // Failed reopens of a source closed at a since-moved head before it is commented and released (reconcile).
 const REOPEN_TRIES = 3;
+// Reconcile passes a merged group may retry undecided sources before it releases them with a comment.
+const MERGED_RETRY_PASSES = 10;
 const intIn = (lo, hi) => v => Number.isInteger(v) && v >= lo && v <= hi;
 
 /** Resolve `drain.group.*`. Never throws. */
@@ -507,7 +509,8 @@ export function cardGroupHold(state, { num, repo, localSlug, files = null, mainF
       continue; // the combined PR itself lands normally
     }
     const where = g.pr ? `#${g.pr}` : `pending card group ${g.id}`;
-    if (g.sources?.some(s => Number(s.num) === Number(num)))
+    // A source a merged group already settled (released, reopened, gave up) is no longer held by it.
+    if (g.sources?.some(s => Number(s.num) === Number(num) && !g.settled?.[String(s.num)]))
       return { kind: 'card-grouped', reason: `grouped into ${where} (lands with it; drain.group)` };
     // An open group RESERVES its card files: no other PR touching them may land first (it would make the
     // combined PR conflict). Unknown file lists cannot be judged here; the group then dissolves on conflict.
@@ -686,24 +689,30 @@ export function createCardGrouping({
     if (base !== 'main') return `combined PR retargeted (base is ${base.replace(/[^\w./-]/g, '?').slice(0, 80)})`;
     return null;
   };
+  // Per-source bookkeeping on the group record (kept by readGroupState): `field[num] = value`, also on the snapshot.
+  const recordOn = (g, field, num, value) => {
+    mutate(st2 => { const x = st2.groups.find(y => isLocalGroupSnapshot(y, g)); if (x) x[field] = { ...x[field], [String(num)]: value }; });
+    g[field] = { ...g[field], [String(num)]: value };
+  };
   // A source closed as landed whose head moved past the verified one holds unlanded work: reopen it, released to the
   // normal drain path. False means "retry next reconcile" (the caller keeps the group): an unreadable head (never
   // proof of a move) or a failed reopen. After REOPEN_TRIES failed reopens the source gets a comment naming the
   // unverified head and is released, so a PR that cannot be reopened (deleted or force-pushed branch) never holds
-  // the group forever.
+  // the group forever. A settled source is recorded, so a later retry pass never reopens or comments on it again.
   const reopenMoved = (g, tag, num, verified, head) => {
     if (!SHA.test(String(head ?? ''))) { say(`${tag}: source #${num} head unreadable after its close — retried`); return false; }
     try {
       gh(['pr', 'reopen', String(num), '--repo', localSlug, '--comment',
         `Reopened: this PR was closed as landed at ${String(verified).slice(0, 10)}, but its head is now ${head.slice(0, 10)}, which was not verified on main. It goes back to the normal drain path. (drain.group, card xym8nt4)`]);
+      recordOn(g, 'settled', num, 'reopened');
       say(`${tag}: source #${num} head moved past the verified ${String(verified).slice(0, 10)} — reopened and released`);
       return true;
     } catch (e) {
       const tries = Number(g.reopenTries?.[String(num)] ?? 0) + 1;
-      mutate(st2 => { const x = st2.groups.find(y => isLocalGroupSnapshot(y, g)); if (x) x.reopenTries = { ...x.reopenTries, [String(num)]: tries }; });
-      g.reopenTries = { ...g.reopenTries, [String(num)]: tries };
+      recordOn(g, 'reopenTries', num, tries);
       if (tries < REOPEN_TRIES) { say(`${tag}: reopening source #${num} failed (${firstLine(e)}, try ${tries}/${REOPEN_TRIES}) — retried`); return false; }
-      comment(num, `This PR was closed as landed at ${String(verified).slice(0, 10)}, but its head is now ${head.slice(0, 10)}, which was not verified on main, and reopening it failed ${tries} times (${firstLine(e).slice(0, 200)}). Reopen it by hand to land the remaining work. (drain.group, card xym8nt4)`);
+      if (!comment(num, `This PR was closed as landed at ${String(verified).slice(0, 10)}, but its head is now ${head.slice(0, 10)}, which was not verified on main, and reopening it failed ${tries} times (${firstLine(e).slice(0, 200)}). Reopen it by hand to land the remaining work. (drain.group, card xym8nt4)`)) return false;
+      recordOn(g, 'settled', num, 'reopen-failed');
       say(`${tag}: reopening source #${num} failed ${tries} times — commented and released`);
       return true;
     }
@@ -818,9 +827,12 @@ export function createCardGrouping({
             const refs = readReferenceMap({ base, cwd, run });
             let retry = false;
             for (const recorded of g.sources) {
+              // Settled on an earlier pass (released, reopened, gave up): a retry pass for another source never
+              // comments on or reopens it again.
+              if (g.settled?.[String(recorded.num)]) continue;
               // Re-read the source NOW: only its CURRENT head's lines on main may close it.
               let sp;
-              try { sp = readPr(recorded.num); } catch (e) { say(`${tag}: source #${recorded.num} re-read failed (${firstLine(e)}) — retried`); retry = true; break; }
+              try { sp = readPr(recorded.num); } catch (e) { say(`${tag}: source #${recorded.num} re-read failed (${firstLine(e)}) — retried`); retry = true; continue; }
               if (sp.state !== 'OPEN') {
                 // A source this group closed must still sit at the head that was verified on main; a push that
                 // raced the close is unlanded work, so the source is reopened and released.
@@ -853,18 +865,36 @@ export function createCardGrouping({
                 } catch (e) { closeError = e; }
                 let post;
                 try { post = readPr(s.num); } catch (e) { say(`${tag}: source #${s.num} post-close re-read failed (${firstLine(e)}) — retried`); retry = true; continue; }
-                if (post.state === 'OPEN') {
-                  say(`${tag}: source #${s.num} still open after the close${closeError ? ` (${firstLine(closeError)})` : ''} — it is released and lands or no-ops on its own`);
+                if (post.state === 'OPEN' && closeError) {
+                  recordOn(g, 'settled', s.num, 'close-failed');
+                  say(`${tag}: close #${s.num} failed (${firstLine(closeError)}) — it is released and lands or no-ops on its own`);
                   continue;
                 }
+                // A close that succeeded can still read open for a moment: re-checked next pass, never released early.
+                if (post.state === 'OPEN') { say(`${tag}: source #${s.num} still reads open after its close — re-checked next pass`); retry = true; continue; }
                 if (post.headRefOid !== s.headSha) { if (!reopenMoved(g, tag, s.num, s.headSha, post.headRefOid)) retry = true; continue; }
                 say(`${tag}: closed source #${s.num} — landed via #${g.pr}`);
               } else {
                 comment(s.num, `The combined card PR #${g.pr} merged, but this PR's lines were not all found on main (${landed.reason}). It stays open and is released back to the normal drain path. (drain.group, card xym8nt4)`);
+                recordOn(g, 'settled', s.num, 'released');
                 say(`${tag}: source #${s.num} NOT closed (${landed.reason}) — released`);
               }
             }
-            if (retry) continue;
+            if (retry) {
+              // Every "cannot decide yet" (an unreadable read, a moving head, a failed reopen) shares one bound: after
+              // MERGED_RETRY_PASSES passes each unsettled source is told it could not be confirmed and is released.
+              const passes = Number(g.mergedRetries ?? 0) + 1;
+              if (passes < MERGED_RETRY_PASSES) {
+                mutate(st2 => { const x = st2.groups.find(y => isLocalGroupSnapshot(y, g)); if (x) x.mergedRetries = passes; });
+                say(`${tag}: merged — retried (pass ${passes}/${MERGED_RETRY_PASSES})`);
+                continue;
+              }
+              for (const recorded of g.sources) {
+                if (g.settled?.[String(recorded.num)]) continue;
+                comment(recorded.num, `The combined card PR #${g.pr} merged, but whether this PR's current head landed on main could not be confirmed after ${passes} tries. It is released back to the normal drain path${g.closedAt?.[String(recorded.num)] ? '. The drain closed it: if its head is not on main, reopen it by hand' : ''}. (drain.group, card xym8nt4)`);
+              }
+              say(`${tag}: merged — could not settle every source after ${passes} passes; commented and released`);
+            }
             mutate(s => { s.groups = s.groups.filter(y => !isLocalGroupSnapshot(y, g)); });
             done.push(g.id);
             continue;

@@ -666,12 +666,13 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     git(t.cwd, 'checkout', '-q', 'main');
     writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr: 77, branch: 'lane/card-group-g', sources: [{ num: 1, headSha: t.a }, { num: 2, headSha: t.b }] }], failed: {} }));
     const heads = { 1: t.a, 2: bNew };
-    const calls = [];
+    const calls = [], closed = new Set();
     const exec = (cmd, args) => {
       calls.push(args.join(' '));
       if (args[0] === 'pr' && args[1] === 'view') return args[2] === '77' ? JSON.stringify({ state: 'MERGED', labels: [] })
-        : JSON.stringify({ state: 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
-      if (args[0] === 'pr' && ['comment', 'close'].includes(args[1])) return '';
+        : JSON.stringify({ state: closed.has(args[2]) ? 'CLOSED' : 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
+      if (args[0] === 'pr' && args[1] === 'close') { closed.add(args[2]); return ''; }
+      if (args[0] === 'pr' && args[1] === 'comment') return '';
       throw new Error(`unexpected ${args.join(' ')}`);
     };
     const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => mainAfter), exec, statePath, settings, log: { write() {} } });
@@ -685,7 +686,8 @@ describe('createCardGrouping — claim under the land mutex, close on current he
   describe('after the combined PR merged: a push racing the source close never closes unverified work', () => {
     // Main after the merge carries source 1's head A. `views[n]` is the sequence of live reads of source n (the last
     // repeats); a read after a `pr close` reports CLOSED with the head GitHub recorded.
-    function mergedRace(views, { closedAt, reopenFails = false, closeThrows = false } = {}) {
+    // `second`: add source #2 (head B, not on main) whose reads fail, so the group keeps retrying.
+    function mergedRace(views, { closedAt, reopenFails = false, closeThrows = false, second = false } = {}) {
       const t = setup();
       const statePath = join(tmp(), 's.json');
       git(t.cwd, 'checkout', '-q', '-b', 'merged', t.base);
@@ -696,7 +698,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       const aNew = git(t.cwd, 'rev-parse', 'HEAD');
       git(t.cwd, 'checkout', '-q', 'main');
       writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr: 77, branch: 'lane/card-group-g',
-        sources: [{ num: 1, headSha: t.a }], ...(closedAt ? { closedAt: { 1: closedAt === 'a' ? t.a : closedAt } } : {}) }], failed: {} }));
+        sources: [{ num: 1, headSha: t.a }, ...(second ? [{ num: 2, headSha: t.b }] : [])], ...(closedAt ? { closedAt: { 1: closedAt === 'a' ? t.a : closedAt } } : {}) }], failed: {} }));
       const seq = views({ a: t.a, aNew });
       let i = 0, closed = false;
       const calls = [];
@@ -704,8 +706,9 @@ describe('createCardGrouping — claim under the land mutex, close on current he
         calls.push(args.join(' '));
         if (args[0] === 'pr' && args[1] === 'view') {
           if (args[2] === '77') return JSON.stringify({ state: 'MERGED', labels: [] });
+          if (args[2] === '2') throw new Error('gh: 502');
           const v = seq[Math.min(i++, seq.length - 1)];
-          return JSON.stringify({ state: closed ? 'CLOSED' : v.state ?? 'OPEN', isDraft: false, headRefOid: v.head, headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
+          return JSON.stringify({ state: v.state ?? (closed ? 'CLOSED' : 'OPEN'), isDraft: false, headRefOid: v.head, headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
         }
         if (args[0] === 'pr' && args[1] === 'close') { closed = true; if (closeThrows) throw new Error('gh: timed out'); return ''; }
         if (args[0] === 'pr' && args[1] === 'reopen') { if (reopenFails) throw new Error('gh: 502'); closed = false; return ''; }
@@ -713,7 +716,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
         throw new Error(`unexpected ${args.join(' ')}`);
       };
       const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => mainAfter), exec, statePath, settings, log: { write() {} } });
-      return { r: g.reconcile({ force: true }), calls, state: readGroupState(statePath), t, aNew, again: () => g.reconcile({ force: true }), statePath };
+      return { r: g.reconcile({ force: true }), calls, state: readGroupState(statePath), t, aNew, again: () => g.reconcile({ force: true }), statePath, g };
     }
 
     it('a push between verification and the close: not closed, the group is kept and the new head re-verified next pass', () => {
@@ -762,6 +765,28 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       const { r, calls } = mergedRace(h => [{ head: h.a }, { head: h.a }, { head: h.aNew }], { closeThrows: true });
       expect(calls.some(c => c.startsWith('pr reopen 1 '))).toBe(true);
       expect(r.done).toEqual(['g']);
+    });
+
+    it('a close that succeeded but still reads open is re-checked, never released early', () => {
+      const { r, calls, state } = mergedRace(h => [{ head: h.a }, { head: h.a }, { state: 'OPEN', head: h.a }]);
+      expect(calls.filter(c => c.startsWith('pr close 1 '))).toHaveLength(1);
+      expect(r.done).toEqual([]);
+      expect(state.groups[0].settled).toBeUndefined();
+    });
+
+    it('a settled source is released at once and never re-commented while another source keeps the group retrying; the retries are bounded', () => {
+      const { r, again, calls, g, statePath } = mergedRace(h => [{ head: h.aNew }], { second: true });
+      expect(r.done).toEqual([]);
+      expect(g.holdFor({ num: 1 })).toBeNull();
+      expect(g.holdFor({ num: 2 })).toMatchObject({ kind: 'card-grouped' });
+      const notClosed = () => calls.filter(c => c.startsWith('pr comment 1 ')).length;
+      expect(notClosed()).toBe(1);
+      for (let pass = 2; pass < 10; pass++) expect(again().done).toEqual([]);
+      expect(notClosed()).toBe(1);
+      expect(again().done).toEqual(['g']);
+      expect(calls.some(c => c.startsWith('pr comment 2 ') && /could not be confirmed after 10 tries/.test(c))).toBe(true);
+      expect(notClosed()).toBe(1);
+      expect(readGroupState(statePath).groups).toEqual([]);
     });
 
     it('an unmoved source closes once and is never reopened', () => {
