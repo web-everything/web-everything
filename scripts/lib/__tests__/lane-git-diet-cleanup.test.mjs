@@ -371,6 +371,7 @@ describe('real git: cleanup CLI', () => {
   // Every input of the under-claim recheck, planted after the startup check passed.
   it.each([
     ['git lock', (dir) => writeFileSync(join(dir, '.git', 'index.lock'), ''), 'git lock present (index.lock)'],
+    ['in-flight merge', (dir) => writeFileSync(join(dir, '.git', 'MERGE_HEAD'), `${git(dir, 'rev-parse', 'HEAD')}\n`), 'git lock present (MERGE_HEAD)'],
     ['gc.recentObjectsHook', (dir, other, ran) => hook(dir, ran), 'gc.recentObjectsHook configured (gc would run it)'],
     ['GC repack filter', (dir) => git(dir, 'config', 'gc.repackFilter', 'blob:none'), /^GC repack filtering configured/],
     ['per-ref reflog expiry', (dir) => git(dir, 'config', 'gc.refs/remotes/*.reflogExpireUnreachable', 'now'), 'per-ref reflog expiry configured (gc.refs/remotes/*.reflogexpireunreachable)'],
@@ -470,6 +471,29 @@ describe('real git: cleanup CLI', () => {
     try {
       const out = await runPaused(21, 'before-prune', () => writeFileSync(join(dir, '.git', 'refs', 'heads', 'mid.lock'), `${rescue}\n`));
       expect(out.rows[0].skipped).toBe('git lock present (refs/heads/mid.lock) (repack done, prune skipped)');
+      expect(git(dir, 'cat-file', '-t', rescue)).toBe('commit');
+      expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  // An operation that starts mid-run names a commit gc does not keep: the same audit must stop gc or prune.
+  it.each([
+    ['MERGE_HEAD', 'before-gc', '(config + ref cleanup done, gc skipped)'],
+    ['MERGE_HEAD', 'before-prune', '(repack done, prune skipped)'],
+    ['rebase-merge/stopped-sha', 'before-gc', '(config + ref cleanup done, gc skipped)'],
+    ['rebase-merge/stopped-sha', 'before-prune', '(repack done, prune skipped)'],
+  ])('an in-flight %s that appears at %s skips the rest and keeps the old unreachable commit it names', async (path, stage, suffix) => {
+    const dir = lane(23);
+    git(root, 'clone', '-q', up, dir);
+    const rescue = git(dir, 'commit-tree', git(dir, 'rev-parse', 'HEAD^{tree}'), '-p', 'HEAD', '-m', `in-flight rescue ${path} ${stage}`);
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(join(dir, '.git', 'objects', rescue.slice(0, 2), rescue.slice(2)), old, old);
+    try {
+      const out = await runPaused(23, stage, () => {
+        mkdirSync(join(dir, '.git', path, '..'), { recursive: true });
+        writeFileSync(join(dir, '.git', path), `${rescue}\n`);
+      });
+      expect(out.rows[0].skipped).toBe(`git lock present (${path.split('/')[0]}) ${suffix}`);
       expect(git(dir, 'cat-file', '-t', rescue)).toBe('commit');
       expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
