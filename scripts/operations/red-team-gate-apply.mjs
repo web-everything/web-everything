@@ -52,6 +52,8 @@ import { appendLedgerEvents } from './record-referral-ruling-io.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
+import { publishAttention } from './needs-you-feed.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(THIS_FILE), '..', '..');
@@ -237,6 +239,12 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
       }
       if (outcome === GATE_OUTCOMES.SENT_BACK) io.dequeueSentBack({ repo, pr, reason: 'post-accept red team sent back to review:changes' });
       marker = record(outcome, { ...plan, card: [] }, { sendBackResult });
+      if (marker === 'posted' && outcome === GATE_OUTCOMES.ROUND_CAP) {
+        try {
+          await io.publishNeedsYou?.({ pr, repo, head, kind: 'at-round-limit', outcome, result: resultId,
+            reason: `outcome=round-cap: ${plan.sendBack.length} unsent confirmed break(s); result=${resultId}`, title: '' });
+        } catch (e) { io.log?.(`red-team gate: needs-you publication failed for #${pr}: ${e.message}`); }
+      }
       // The label is written but its record is not: without it the operator queue never learns the fixer owns the break.
       // Retry-safe: the next run sees review:changes, takes the `already` path (no second label write) and records.
       if (marker !== 'posted') return { status: 'send-back-record-failed', head, ...ancestry, round, outcome, plan, sendBack: sendBackResult, marker, error: marker };
@@ -278,6 +286,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT, readC
   };
   const safety = readDrainQueueSafety({ env, log: line => process.stderr.write(`${line}\n`) });
   return {
+    publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
     syncStatusLabels: ({ repo, pr, head }) => head ? syncRedTeamStatusLabels({ repo, pr, head, env,
       log: line => process.stderr.write(`${line}\n`) }) : null,
     signalFix: signalFixDispatch,
