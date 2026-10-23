@@ -13,6 +13,8 @@ import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mj
 import { writeRun } from '../../operations/run-store.mjs';
 import { reviewPrOperation } from '../../operations/review-pr.mjs';
 import { isComplete } from '../../operations/engine.mjs';
+import { reviewPrStepNames } from '../../operations/review-pr-completion.mjs';
+import { verifySavedRedTeamProvenance } from '../saved-red-team-provenance.mjs';
 import { provenanceRun } from './fixtures/saved-red-team-provenance.mjs';
 
 const repo = 'web-everything/web-everything', pr = 6212, head = 'a'.repeat(40);
@@ -82,6 +84,45 @@ function queue(f) {
 }
 
 describe('saved red-team provenance', () => {
+  function parkedFixture() {
+    const f = fixture();
+    f.run.cursor = reviewPrStepNames().indexOf('confirm');
+    f.run.pending = { kind: 'confirm', step: 'confirm', stepIndex: f.run.cursor };
+    f.run.verdict = { verdict: 'needs-human', humanRequired: true };
+    f.verify = () => verifySavedRedTeamProvenance({ ...f.input,
+      path: resolveScorecardStorePath(f.input.env), records: f.rows, index: 0 });
+    return f;
+  }
+  it.each([false, true])('accepts valid proof parked at human confirm (custom roster: %s)', custom => {
+    const f = parkedFixture();
+    if (custom) {
+      f.run.findings.read.seatSteps = ['judge'];
+      f.run.findings.read.referralVerifierDeclared = false;
+      f.run.cursor = reviewPrStepNames(['judge'], false).indexOf('confirm'); f.run.pending.stepIndex = f.run.cursor;
+    }
+    f.saveRun();
+    expect(f.verify()).toBeNull();
+    expect(f.read()).toMatchObject({ pr, rev: head, findings: [] });
+  });
+  it.each(['earlier step', 'earlier cursor', 'other pending kind', 'missing pending', 'missing verdict'])(
+    'rejects parked proof with %s as review-pr run incomplete', kind => {
+      const f = parkedFixture();
+      if (kind === 'earlier step') { f.run.pending.step = 'advise'; f.run.cursor--; f.run.pending.stepIndex = f.run.cursor; }
+      if (kind === 'earlier cursor') f.run.cursor--;
+      if (kind === 'other pending kind') f.run.pending.kind = 'effect';
+      if (kind === 'missing pending') f.run.pending = null;
+      if (kind === 'missing verdict') delete f.run.verdict;
+      f.saveRun();
+      expect(f.verify()).toBe('review-pr run incomplete');
+    });
+  it('rejects a tampered hash even when parked at human confirm', () => {
+    const f = parkedFixture();
+    f.run.findings.savedRedTeamResult.sha256 = '0'.repeat(64);
+    f.saveRun();
+    expect(f.verify()).toBe('result hash mismatch');
+    expectIgnored(f, /result hash mismatch/);
+  });
+
   it('ignores and logs a forged row with no review-pr run, preserving the drain hold', () => {
     expectIgnored(fixture(), /run|referenc|provenance/i);
   });

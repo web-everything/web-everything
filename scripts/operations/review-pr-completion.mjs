@@ -12,3 +12,11 @@ export function isCompletedReviewPr(run) {
   const names = reviewPrStepNames(read?.seatSteps, read?.referralVerifierDeclared);
   return isComplete(run, { registry: { get: () => ({ steps: names.map(name => ({ name })) }) } });
 }
+
+/** The cursor proves earlier steps finished; only the verdict's confirm boundary is eligible. */
+export function isParkedAtConfirm(run) {
+  const read = run.findings?.read;
+  return run.pending?.kind === 'confirm' && run.pending.step === 'confirm'
+    && run.cursor === reviewPrStepNames(read?.seatSteps, read?.referralVerifierDeclared).indexOf('confirm')
+    && Boolean(run.verdict);
+}

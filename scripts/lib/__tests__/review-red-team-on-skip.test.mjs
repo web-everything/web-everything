@@ -4,7 +4,12 @@ import { renderRedTeamComment, RED_TEAM_DISCARD_DISPATCH_KIND } from '../../oper
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence, readFreshRedTeamAttempts, reserveFreshRedTeamAttempt, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { provenanceRun } from './fixtures/saved-red-team-provenance.mjs';
+import { reviewPrStepNames } from '../../operations/review-pr-completion.mjs';
+import { writeRun } from '../../operations/run-store.mjs';
+import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
+import { readSavedRedTeamGateResult } from '../drain-saved-red-team.mjs';
 import { tmpdir } from 'node:os';
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
@@ -289,6 +294,26 @@ describe('withheld saved red-team result (live #5759 shape)', () => {
     readSavedResult: () => ({ pr, rev: head, findings: [] }) };
   it('applies the gate from the saved result instead of reporting attempts exhausted', () => {
     expect(decide(live)).toMatchObject({ action: 'apply-gate' });
+  });
+  it('applies the gate for a withheld finished result with valid parked-at-confirm provenance', () => {
+    const root = mkdtempSync(join(tmpdir(), 'withheld-parked-red-team-'));
+    try {
+      const runsDir = join(root, 'runs'); mkdirSync(runsDir);
+      const env = { CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: runsDir,
+        WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'true' };
+      const rows = [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head,
+        status: 'ok', recheckStatus: 'ok', confirmedMissCount: 0, findings: [] }];
+      const path = resolveScorecardStorePath(env); mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ version: 1, records: rows }));
+      const run = provenanceRun({ env, rows });
+      run.cursor = reviewPrStepNames().indexOf('confirm');
+      run.pending = { kind: 'confirm', step: 'confirm', stepIndex: run.cursor };
+      run.verdict = { verdict: 'needs-human', humanRequired: true };
+      writeRun(run, runsDir);
+      expect(decide({ ...live,
+        readSavedResult: input => readSavedRedTeamGateResult({ ...input, env }),
+      })).toMatchObject({ action: 'apply-gate' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it('fails closed when the saved result is missing or for another head', () => {
     expect(decide({ ...live, readSavedResult: () => null }).action).toBe('skip');
