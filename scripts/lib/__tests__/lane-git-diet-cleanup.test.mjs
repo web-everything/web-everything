@@ -39,6 +39,12 @@ describe('cleanupEligibility (pure)', () => {
   it('refuses a lane with a gc.recentObjectsHook', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, gcHooks: ['x'] }).ok).toBe(false));
   it('refuses a lane with config-defined hooks', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, configHooks: ['hook.x.command', 'hook.x.event'] }))
     .toEqual({ ok: false, reason: 'config-defined hooks configured (hook.x.command, hook.x.event; core.hooksPath does not stop them)' }));
+  it('refuses a ref store that lives in another repository, and allows a bare format', () => {
+    expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, refStorage: ['files:///x/.git'] }))
+      .toEqual({ ok: false, reason: 'ref store is redirected (extensions.refStorage=files:///x/.git)' });
+    expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, refStorage: ['files'] }).ok).toBe(true);
+    expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, refStorage: ['reftable'] }).ok).toBe(true);
+  });
   it('refuses an unreadable common dir', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, realCommonDir: null }).ok).toBe(false));
   it('refuses a lane with per-ref reflog expiry', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, gcReflogPatterns: ['gc.refs/heads/*.reflogexpire'] }))
     .toEqual({ ok: false, reason: 'per-ref reflog expiry configured (gc.refs/heads/*.reflogexpire)' }));
@@ -245,6 +251,11 @@ describe('real git: cleanup CLI', () => {
     || readFileSync(join(dir, '.git', 'packed-refs'), 'utf8').includes('refs/remotes/origin/ops/review-requests');
   const hook = (dir, ran) => git(dir, 'config', 'gc.recentObjectsHook', `touch '${ran}'`);
   const commondir = (dir, target) => writeFileSync(join(dir, '.git', 'commondir'), `${target}\n`);
+  // Keep the lane's refs in `other`: every ref write (the ops-ref delete) and gc's reachability walk would act there.
+  const foreignRefStore = (dir, other) => {
+    git(dir, 'config', 'core.repositoryformatversion', '1');
+    git(dir, 'config', 'extensions.refStorage', `files://${join(other, '.git')}`);
+  };
   const configHook = (dir, ran) => {
     git(dir, 'config', 'hook.attack.event', 'reference-transaction');
     git(dir, 'config', 'hook.attack.command', `touch '${ran}'`);
@@ -269,6 +280,7 @@ describe('real git: cleanup CLI', () => {
     ['per-ref reflogExpireUnreachable', (dir) => git(dir, 'config', 'gc.HEAD.reflogExpireUnreachable', 'now'), 'per-ref reflog expiry configured (gc.HEAD.reflogexpireunreachable)'],
     // Config-defined hooks ignore core.hooksPath: the ops-ref delete (update-ref) would run this one.
     ['config-defined reference-transaction hook', (dir, other, ran) => configHook(dir, ran), 'config-defined hooks configured (hook.attack.event, hook.attack.command; core.hooksPath does not stop them)'],
+    ['ref store in another repo', (dir, other) => foreignRefStore(dir, other), /^ref store is redirected \(extensions\.refStorage=files:\/\//],
     // Git keeps the trailing space of a commondir path: `<lane>/.git ` is another store, not the lane's own `.git`.
     ['trailing-space commondir', (dir) => {
       cpSync(join(dir, '.git'), join(dir, '.git '), { recursive: true });
@@ -340,6 +352,7 @@ describe('real git: cleanup CLI', () => {
     ['GC repack filter', (dir) => git(dir, 'config', 'gc.repackFilter', 'blob:none'), /^GC repack filtering configured/],
     ['per-ref reflog expiry', (dir) => git(dir, 'config', 'gc.refs/remotes/*.reflogExpireUnreachable', 'now'), 'per-ref reflog expiry configured (gc.refs/remotes/*.reflogexpireunreachable)'],
     ['config-defined hook', (dir, other, ran) => configHook(dir, ran), /^config-defined hooks configured \(hook\.attack\./],
+    ['ref store in another repo', (dir, other) => foreignRefStore(dir, other), /^ref store is redirected/],
     ['trailing-space common dir', (dir) => {
       cpSync(join(dir, '.git'), join(dir, '.git '), { recursive: true });
       commondir(dir, join(dir, '.git '));
@@ -550,6 +563,8 @@ describe('real git: cleanup CLI', () => {
     ['GIT_CONFIG_COUNT / KEY_n / VALUE_n', () => ({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'gc.repackFilter', GIT_CONFIG_VALUE_0: 'blob:none' })],
     ['GIT_CONFIG_GLOBAL', ({ file }) => ({ GIT_CONFIG_GLOBAL: file('[gc]\n\trepackFilter = blob:none\n') })],
     ['GIT_CONFIG_SYSTEM', ({ file }) => ({ GIT_CONFIG_NOSYSTEM: undefined, GIT_CONFIG_SYSTEM: file('[gc]\n\trepackFilter = blob:none\n') })],
+    // The decoy holds the ops ref: a ref store redirected there would have it deleted.
+    ['GIT_REFERENCE_BACKEND at a decoy repo', ({ decoy }) => ({ GIT_REFERENCE_BACKEND: `files://${join(decoy, '.git')}` })],
     // A shallow file naming the ops tip makes its history look unreachable to gc.
     ['GIT_SHALLOW_FILE', ({ file, dir }) => ({ GIT_SHALLOW_FILE: file(`${git(dir, 'rev-parse', 'refs/remotes/origin/ops/review-requests^')}\n`) })],
   ])('inherited %s reaches neither the lane cleanup nor another repo', (_, inherit) => {

@@ -44,11 +44,11 @@ export function parseGitAlternates(text) {
  * could expire and be pruned).
  * @param {{dir: string, poolRoot: string, realDir?: string, realGitDir?: string, lease?: object|null, nowMs: number,
  *   realCommonDir?: string, realObjectsDir?: string, ttlMs?: number, locks?: string[], borrowers?: string[],
- *   gcHooks?: string[], gcRepackFilters?: string[], gcReflogPatterns?: string[], configHooks?: string[], symlinkedGitPaths?: string[]}} o  `realCommonDir`/`realObjectsDir` = resolved `git rev-parse --git-common-dir` and
+ *   gcHooks?: string[], gcRepackFilters?: string[], gcReflogPatterns?: string[], configHooks?: string[], refStorage?: string[], symlinkedGitPaths?: string[]}} o  `realCommonDir`/`realObjectsDir` = resolved `git rev-parse --git-common-dir` and
  *   `<git dir>/objects`: a `commondir` file or symlinked object store would redirect the cleanup into another repo.
  * @returns {{ok: true} | {ok: false, reason: string}}
  */
-export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCommonDir, realObjectsDir, symlinkedGitPaths = [], lease = null, nowMs, ttlMs, locks = [], borrowers = [], gcHooks = [], gcRepackFilters = [], gcReflogPatterns = [], configHooks = [] }) {
+export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCommonDir, realObjectsDir, symlinkedGitPaths = [], lease = null, nowMs, ttlMs, locks = [], borrowers = [], gcHooks = [], gcRepackFilters = [], gcReflogPatterns = [], configHooks = [], refStorage = [] }) {
   const root = String(poolRoot || '').replace(/\/+$/, '');
   const rel = String(dir || '').startsWith(`${root}/`) ? String(dir).slice(root.length + 1) : null;
   const m = rel && /^([^/]+)\/lane-(\d+)\/?$/.exec(rel);
@@ -68,6 +68,9 @@ export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCom
   if (locks.length) return { ok: false, reason: `git lock present (${locks.join(', ')})` };
   if (borrowers.length) return { ok: false, reason: `objects borrowed by ${borrowers.join(', ')}` };
   if (gcHooks.length) return { ok: false, reason: 'gc.recentObjectsHook configured (gc would run it)' };
+  // Only a bare format keeps the refs in the lane's own `.git`; `<format>://<path>` stores them elsewhere.
+  const foreignRefs = refStorage.filter((v) => !/^(files|reftable)$/i.test(String(v).trim()));
+  if (foreignRefs.length) return { ok: false, reason: `ref store is redirected (extensions.refStorage=${foreignRefs.join(', ')})` };
   if (configHooks.length) return { ok: false, reason: `config-defined hooks configured (${configHooks.join(', ')}; core.hooksPath does not stop them)` };
   if (gcRepackFilters.length) return { ok: false, reason: `GC repack filtering configured (${gcRepackFilters.join(', ')})` };
   if (gcReflogPatterns.length) return { ok: false, reason: `per-ref reflog expiry configured (${gcReflogPatterns.join(', ')})` };

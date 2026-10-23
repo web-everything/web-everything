@@ -11,7 +11,8 @@
  * Eligibility (`cleanupEligibility`): a real, non-symlinked `<pool>/lane-N` with its own `.git` dir, NO lease
  * marker, no git lock file anywhere under `.git` (`*.lock`, gc.pid), no other repository borrowing its objects (alternates under --scan-root/* and the pool
  * root, following alternate chains), no `gc.recentObjectsHook` or config-defined `hook.*` (neither obeys the
- * core.hooksPath pin), a common dir that is exactly the lane's own `.git`, no GC repack filtering, and no per-ref
+ * core.hooksPath pin), a common dir that is exactly the lane's own `.git`, a plain ref store (no `<format>://<path>`
+ * `extensions.refStorage`; inherited GIT_REFERENCE_BACKEND is scrubbed), no GC repack filtering, and no per-ref
  * `gc.<pattern>.reflogExpire[Unreachable]` (it would override the gc's `never` pins). Per eligible lane, on --apply:
  *   0. CLAIM the lane: write its lease marker with O_EXCL (the same move as `lane-pool trim`), so a concurrent
  *      acquirer sees a live lease and moves on, and we never act on a lane someone else just took; before any write
@@ -72,6 +73,8 @@ const gcRepackFilters = (dir) => { try { return git(dir, ['config', '--name-only
 const gcReflogPatterns = (dir) => { try { return git(dir, ['config', '--name-only', '--get-regexp', '^gc\\..*\\.reflogexpire(unreachable)?$']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
 // `hook.<name>.command` runs on its `hook.<name>.event` (e.g. reference-transaction on update-ref) whatever core.hooksPath says.
 const configHooks = (dir) => { try { return git(dir, ['config', '--name-only', '--get-regexp', '^hook\\.']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
+// `extensions.refStorage=<format>://<path>` keeps the refs in another repo: update-ref, gc and prune would act there.
+const refStorage = (dir) => { try { return git(dir, ['config', '--get-all', 'extensions.refstorage']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
 // A path git prints, byte-exact: whitespace is a legal path byte, so only the one trailing newline is git's.
 const gitPath = (dir, args) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(git(dir, args, 120_000, null)).replace(/\n$/, '');
 
@@ -142,10 +145,11 @@ const eligible = (dir) => {
     lease: readLease(dir), nowMs: Date.now(),
     borrowers: (objects && BORROWERS.get(objects)) || [], gcHooks: realGitDir ? gcHooks(dir) : [], gcRepackFilters: realGitDir ? gcRepackFilters(dir) : [],
     gcReflogPatterns: realGitDir ? gcReflogPatterns(dir) : [], configHooks: realGitDir ? configHooks(dir) : [],
+    refStorage: realGitDir ? refStorage(dir) : [],
   });
 };
 // Every eligibility input re-read while we hold the claim (our own marker is the lease, so `lease: null`).
-const recheckUnderClaim = (dir) => cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: null, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir), gcReflogPatterns: gcReflogPatterns(dir), configHooks: configHooks(dir) });
+const recheckUnderClaim = (dir) => cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: null, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir), gcReflogPatterns: gcReflogPatterns(dir), configHooks: configHooks(dir), refStorage: refStorage(dir) });
 
 // O_EXCL claim, same marker shape as `lane-pool` (so `acquire` reads it as a live lease and skips the lane).
 function claim(dir) {

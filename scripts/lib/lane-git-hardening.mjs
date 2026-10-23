@@ -50,7 +50,8 @@ export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => 
 export const GIT_REPO_ENV_KEYS = Object.freeze(['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
   'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES',
   'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL',
-  'GIT_CONFIG_SYSTEM', 'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE', 'GIT_QUARANTINE_PATH', 'GIT_REF_PARANOIA']);
+  'GIT_CONFIG_SYSTEM', 'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE', 'GIT_QUARANTINE_PATH', 'GIT_REF_PARANOIA',
+  'GIT_REFERENCE_BACKEND']);
 
 /**
  * A copy of `env` without {@link GIT_REPO_ENV_KEYS} or any `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`, with
@@ -144,6 +145,8 @@ export function riskyLaneConfig(listOutput) {
     const [key, ...rest] = parts[i + 1].split('\n');
     if (RISKY_LANE_CONFIG_RE.test(key)) found.push(key);
     else if (/^remote\..+\.url$/i.test(key) && !SAFE_REMOTE_URL_RE.test(rest.join('\n'))) found.push(key);
+    // `<format>://<path>` puts the lane's refs in another repository: every ref write would land there.
+    else if (/^extensions\.refstorage$/i.test(key) && rest.join('\n').includes('://')) found.push(key);
   }
   return found;
 }

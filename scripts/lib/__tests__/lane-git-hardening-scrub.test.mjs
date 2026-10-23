@@ -104,6 +104,12 @@ it('scrubGitRepoEnv drops every inherited repo redirect and env config source, a
   expect(env.GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));
   expect(env.GIT_CONFIG_KEY_99).toBeUndefined();
 });
+it('flags a ref store kept in another repository, never a bare format', () => {
+  const list = (...entries) => entries.map(([scope, key, value]) => `${scope}\0${key}\n${value}`).join('\0') + '\0';
+  expect(riskyLaneConfig(list(['local', 'extensions.refstorage', 'files:///other/.git']))).toEqual(['extensions.refstorage']);
+  expect(riskyLaneConfig(list(['worktree', 'extensions.refStorage', 'reftable://../x']))).toEqual(['extensions.refStorage']);
+  expect(riskyLaneConfig(list(['local', 'extensions.refstorage', 'reftable']))).toEqual([]);
+});
 it('scrubs config-defined hooks, which run whatever core.hooksPath says', () => {
   const { dir, git } = repo();
   git(['config', 'hook.attack.event', 'reference-transaction']);
