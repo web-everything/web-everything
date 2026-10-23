@@ -22,6 +22,7 @@ Per decision x5ioz96 forks 1 to 3: add ruling to CARD_BATCH_KINDS with policy en
   - `disabled ruling refuses kind-disabled, not unknown kind` (we:scripts/operations/__tests__/card-batch-file.test.mjs).
   - `follow-up and expedite origins route to filing` (we:scripts/operations/__tests__/card-batch-file.test.mjs).
   - `high and urgent bypass with shipped defaults` (we:scripts/operations/__tests__/card-batch-file.test.mjs).
+  - `expedite origin is collected unless its priority bypasses` (we:scripts/operations/__tests__/card-batch-file.test.mjs) — statute rules 1 and 3 together: an expedite-origin card with (a) ordinary priority and (b) no priority is admitted into `filing`; with (c) high and (d) urgent priority it bypasses the collector. Bypass is decided by priority alone, never by origin.
   - `code changes refuse collection` (we:scripts/operations/__tests__/card-batch-file.test.mjs) — statute rule 1: a non-card change is refused `ineligible-change`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
@@ -40,6 +41,6 @@ One line per class: either the handling, or `n/a: <why>`.
 2. **Truncated reads** — an invalid or partial policy is refused `invalid-policy`, as today.
 3. **Shared state files** — n/a: the policy is read-only config.
 4. **Fail closed** — a disabled stream refuses `kind-disabled`, distinct from an unknown kind (case `disabled ruling refuses kind-disabled, not unknown kind`).
-5. **Identity scoping** — each stream has its own policy block; routing is by the card's origin (cases `ruling is declared with disabled 8/60 defaults`, `follow-up and expedite origins route to filing`).
+5. **Identity scoping** — each stream has its own policy block; routing is by the card's origin, and bypass by its priority alone (cases `ruling is declared with disabled 8/60 defaults`, `follow-up and expedite origins route to filing`, `expedite origin is collected unless its priority bypasses`).
 6. **State over time** — n/a: no stored state.
 7. **Who wrote it** — n/a: config and routing only; who may file a ruling card is x7nf3f5's.

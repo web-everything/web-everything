@@ -19,6 +19,7 @@ Per decision x5ioz96 fork 5 (statute backlog-ids-numbered-before-publish): add a
   - `seal steps run record-sealed, number-members, verify, remove-hold, ready, label-on-green` (we:scripts/operations/__tests__/card-batch-seal.test.mjs).
   - `numbers all siblings in one pass so cross-references resolve` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — two members that name each other both carry the new numbers.
   - `numbering failure retains the hold and never reaches ready` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs).
+  - `seal step changes card text only through the numbering operation` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — with the numbering operation stubbed to rename files only, every member's content is byte-identical after `number-members` except for the lines that operation rewrote; the seal step itself edits no card text.
   - `members are numbered through the batch repo's own operation` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — a batch for a sibling repo calls that repo's declared numbering operation with that repo's checkout, never WE's, and a WE batch calls WE's.
   - `partial numbering output retains the hold` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — the numbering operation exits 0 but numbers 7 of 8 members (one keeps its hash name): the step counts as failed, the batch stays held, and verify and ready never run.
   - `crash after the numbering push and before the head is recorded resumes without head-mismatch` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — fault injection: the numbering commit is on the remote but `headSha` is still the pre-numbering head; the next run adopts the numbered head (or re-records it) and continues to verify, never refusing `head-mismatch` and never numbering twice.
@@ -35,7 +36,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — card bodies are rewritten only by the declared numbering operation; the seal step does no text substitution of its own.
+1. **Untrusted text** — card bodies are rewritten only by the declared numbering operation; the seal step does no text substitution of its own (case `seal step changes card text only through the numbering operation`).
 2. **Truncated reads** — numbering output that does not cover every member counts as a failure; the batch stays held (case `partial numbering output retains the hold`).
 3. **Shared state files** — the step runs under the seal lease on the collector branch; the rewritten head is recorded before verify runs on it (case `crash after the numbering push and before the head is recorded resumes without head-mismatch`).
 4. **Fail closed** — any numbering failure keeps the batch held and never reaches ready (case `numbering failure retains the hold and never reaches ready`).

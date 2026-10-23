@@ -6439,7 +6439,8 @@ as implementation destinations.
    declared and disabled until a filer routes to it. Code PRs never join a collector.
 2. **Flush.** Count and age, whichever first, count wins a tie. Defaults: prevention 10 cards / 120 min, ruling
    8 / 60, filing 10 / 60. Every value is a cascade setting with its source logged.
-3. **Expedite.** High and urgent cards bypass the collector (`highPriorityBypass`).
+3. **Expedite.** High and urgent cards bypass the collector (`highPriorityBypass`). Bypass is decided by priority
+   alone: an expedite-origin card with ordinary or no priority is collected into `filing` under rule 1.
 4. **Ejection.** A card with a blocking finding is extracted to its own PR and is never re-queued into a
    collector.
 5. **Numbering.** Every member is numbered once at seal, before the PR is marked ready; numbering failure keeps
@@ -6449,7 +6450,8 @@ as implementation destinations.
 
 **Defended by (planned cases, named in each slice's [A1]):** rules 1 to 3 by xpabefb (`code changes refuse
 collection`, `count wins simultaneous count and age thresholds`, `every stream value is a cascade setting with its
-source logged`, `high and urgent bypass with shipped defaults`, `follow-up and expedite origins route to filing`)
+source logged`, `high and urgent bypass with shipped defaults`, `follow-up and expedite origins route to filing`, `expedite origin is
+collected unless its priority bypasses`)
 and x7nf3f5 (`ruling ships enabled with 8/60 defaults`, `disabled ruling refuses kind-disabled, not unknown kind`);
 rule 4 by xf1z2w3 (`extracted member cannot re-enter a collector`); rule 5 by x1mmp60 (`numbering failure retains
 the hold and never reaches ready`); rule 6 by x5nmdnt, one case per PR state (`open sealed PR stays sealed and keeps
