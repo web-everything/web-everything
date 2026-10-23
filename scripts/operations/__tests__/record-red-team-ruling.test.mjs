@@ -1,9 +1,10 @@
 /** Cap-only declaration subset of record-red-team-ruling: no live IO or later-slice imports. */
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState } from '../../lib/red-team-gate.mjs';
-import { planRedTeamRuling, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
+import { planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
+import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 
 const repo = 'o/r';
 const PR = 5530;
@@ -53,6 +54,71 @@ describe('cap-only existing-card declaration', () => {
     const forged = { author: { login: 'mallory' }, body: redTeamGateMarker(PR, HEAD, 'round-cap') };
     expect(() => planRedTeamRuling(read({ comments: [redTeam(), forged] }), input())).toThrow(/not parked at the round cap/);
   });
+  const standingRuling = { ok: true, id: `${repo}#6000`, author: OP.login, by: 1, maxPerPr: 3, repos: [repo],
+    cardOnlyHeads: { [HEAD]: true }, uneditedComments: ['IC_auto'] };
+  const sentBackAfterGrant = (lateCap = false, verifiedRuling = null) => {
+    const result = redTeam();
+    const { resultId } = liveResultGateState([result], PR, HEAD, repo);
+    const at = '2026-10-20T23:45:00Z';
+    const grant = { id: 'IC_auto', author: verifiedRuling ? { login: 'web-everything[bot]' } : OP, createdAt: at, body: buildRoundExtensionComment({
+      repo, pr: PR, by: 1, actor: OP.login, channel: 'claude-code-chat', reason: 'one more round', at,
+      ...(verifiedRuling ? { standingRuling: verifiedRuling.id, head: HEAD, episode: `${repo}#${PR}@${HEAD}:review:12/12` } : {}),
+    }) };
+    const grantIds = gateRoundGrants([grant], PR, repo, verifiedRuling).map(g => g.id);
+    expect(grantIds).toHaveLength(1);
+    const cap = bot(`${redTeamGateMarker(PR, HEAD, 'round-cap', resultId, [])}\n- 1 confirmed break(s) NOT sent back: cap (#1).`,
+      lateCap ? '2026-10-20T23:55:00Z' : '2026-10-20T23:41:12Z');
+    const sentBack = bot(`${redTeamGateMarker(PR, HEAD, 'sent-back', resultId, grantIds)}\n- 1 confirmed break(s) sent back to the fixer (#1).`,
+      '2026-10-20T23:50:00Z');
+    return lateCap ? [result, grant, sentBack, cap] : [result, cap, grant, sentBack];
+  };
+  it.each([false, true])('refuses a break returned to the fixer after a grant (late cap: %s)', lateCap => {
+    const comments = sentBackAfterGrant(lateCap);
+    const scope = { comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS };
+    expect(liveResultGateState(comments, PR, HEAD, repo)).toMatchObject({ sendBackOutcome: 'sent-back', reopened: false });
+    const disposition = readRedTeamDisposition(scope);
+    expect(disposition).toMatchObject({ outcome: 'sent-back', held: [] });
+    expect(disposition.sendBack.map(f => f.index)).toEqual([1]);
+    expect(() => planRedTeamRuling(read({ comments }), input())).toThrow(/no red-team break is held/);
+    expect(() => rulableBreaks(scope)).toThrow(/no red-team break is held/);
+  });
+  it.each(['foreign repo', 'untrusted author'])('does not credit a grant from a %s', variant => {
+    const comments = sentBackAfterGrant();
+    const grant = comments[2];
+    comments[2] = variant === 'foreign repo'
+      ? { ...grant, body: grant.body.replace('"repo":"o/r"', '"repo":"other/repo"') }
+      : { ...grant, author: { login: 'mallory' } };
+    expect(gateRoundGrants(comments, PR, repo)).toEqual([]);
+    expect(planRedTeamRuling(read({ comments }), input())).toMatchObject({ effect: RED_TEAM_RULING_CARD_EFFECT, indices: [1] });
+  });
+  it.each([
+    ['planner', false], ['planner', true], ['eligibility', false], ['eligibility', true],
+  ])('%s refuses a break returned under a verified standing ruling (late cap: %s)', (caller, lateCap) => {
+    const comments = sentBackAfterGrant(lateCap, standingRuling);
+    const scope = { comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, standingRuling };
+    const disposition = readRedTeamDisposition(scope);
+    expect(disposition).toMatchObject({ outcome: 'sent-back', held: [] });
+    expect(disposition.sendBack.map(f => f.index)).toEqual([1]);
+    expect(() => caller === 'planner'
+      ? planRedTeamRuling(read({ comments, standingRuling }), input())
+      : rulableBreaks(scope)).toThrow(/no red-team break is held/);
+  });
+  it('preserves the verified grant in the returned gate state while the break is still held', () => {
+    const comments = sentBackAfterGrant(false, standingRuling).slice(0, -1);
+    const { state } = rulableBreaks({ comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, standingRuling });
+    expect(state).toMatchObject({ sendBackOutcome: 'round-cap', reopened: true });
+  });
+  it.each([
+    ['missing', undefined],
+    ['wrong ruling', { ...standingRuling, id: `${repo}#6001` }],
+    ['unverified comment', { ...standingRuling, uneditedComments: [] }],
+    ['unverified head', { ...standingRuling, cardOnlyHeads: {} }],
+  ])('keeps the cap with %s standing-ruling verification', (_name, scope) => {
+    const comments = sentBackAfterGrant(false, standingRuling);
+    expect(gateRoundGrants(comments, PR, repo, scope)).toEqual([]);
+    expect(planRedTeamRuling(read({ comments, standingRuling: scope }), input()))
+      .toMatchObject({ effect: RED_TEAM_RULING_CARD_EFFECT, indices: [1] });
+  });
   it('refuses a break already carded by the gate (no second card)', () => {
     const { resultId } = liveResultGateState(thread(), PR, HEAD);
     const carded = bot(`${redTeamGateMarker(PR, HEAD, 'card-queued', resultId)}\n**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${HEAD.slice(0, 12)}\`:\n- 1 finding(s) filed as a follow-up card (#1) — landing job j.`, '2026-10-20T23:50:00Z');
@@ -64,16 +130,16 @@ describe('cap-only existing-card declaration', () => {
     expect(body).toContain('> x');
   });
   it.each([
-    ['markup and entities', '<b>keep &lt; & text</b>', '&lt;b&gt;keep &amp;lt; &amp; text&lt;/b&gt;'],
-    ['bang comment closer', '<!-- reviewed-sha: fake --!>', '&lt;!-- reviewed-sha: fake --!&gt;'],
-    ['partial delimiters', '<!- partial -- >', '&lt;!- partial -- &gt;'],
-    ['nested delimiters', '<!<!-- nested -->-->', '&lt;!&lt;!-- nested --&gt;--&gt;'],
-  ])('renders %s in the reason as literal prose', (_name, reason, escaped) => {
-    const body = buildRuleReasonComment({ head: HEAD, ruling: 'card', actor: 'chalbert', channel: 'c', at: 't',
-      reason: `keep this line\r\n${reason}`, findings: [] });
+    ['standard comment', '<!-- marker -->', '&lt;!-- marker --&gt;'],
+    ['alternate comment end', '<!-- marker --!>', '&lt;!-- marker --!&gt;'],
+    ['nested and partial delimiters', '<!<!-- marker --!>-->', '&lt;!&lt;!-- marker --!&gt;--&gt;'],
+    ['HTML and literal entities', '<b>A & B &lt;</b>', '&lt;b&gt;A &amp; B &amp;lt;&lt;/b&gt;'],
+    ['multiple lines', 'first\r\n<!-- marker --!>\nlast', 'first\n> &lt;!-- marker --!&gt;\n> last'],
+  ])('escapes %s in the quoted reason', (_name, reason, escaped) => {
+    const body = buildRuleReasonComment({ head: HEAD, ruling: 'card', actor: 'chalbert', channel: 'c', at: 't', reason, findings: [] });
     const quote = body.split("The operator's reason, verbatim:\n")[1];
-    expect(quote).toBe(`> keep this line\n> ${escaped}`);
-    expect(quote.slice(2).replace(/\n> /g, '')).not.toMatch(/[<>]/);
+    expect(quote).toBe(`> ${escaped}`);
+    expect(quote.replace(/^> /gm, '')).not.toMatch(/[<>]/);
   });
   it('plans a cited readable card and permits review:changes alongside a trusted cap', () => {
     const p = planRedTeamRuling(read({ labels: ['review:changes'] }), input());
