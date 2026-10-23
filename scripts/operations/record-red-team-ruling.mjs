@@ -65,6 +65,11 @@ export function rulableBreaks({ comments, repo, pr, head, setting, standingRulin
   if (!state.outcomes.has(GATE_OUTCOMES.ROUND_CAP)) {
     throw new Error(`the red-team result on head ${head.slice(0, 9)} was not parked at the round cap (no trusted \`round-cap\` gate record decides it)`);
   }
+  // A grant unseen by the cap record returns the decision to automation. The reader
+  // still reports held until that decision is recorded, so held alone is not enough.
+  if (state.reopened) {
+    throw new Error('a pending round extension reopened the red-team gate; let the gate consume the grant before ruling on a break');
+  }
   const held = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling }).held;
   if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)');
   return { state, rulable: held, noun: 'held for the operator' };
