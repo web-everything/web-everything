@@ -1960,7 +1960,7 @@ describe('detached jobs', () => {
     const { recordPath, ...record } = job;
     expect(readJobRecord(job.id, { jobsDir })).toEqual(record);
     expect(child.unref).toHaveBeenCalledOnce();
-    expect(spawnFn).toHaveBeenCalledWith('node', ['scripts/codex-direct-task.mjs', args[0], args[2], '--json', '--job=0-random'],
+    expect(spawnFn).toHaveBeenCalledWith('node', ['scripts/codex-direct-task.mjs', args[0], args[2], '--json', '--no-stream', '--job=0-random'],
       { detached: true, stdio: ['ignore', expect.any(Number), expect.any(Number)], env: { CODEX_JOBS_DIR: jobsDir } });
     const spawnOptions = spawnFn.mock.calls[0][2];
     expect(spawnOptions.detached).toBe(true);
@@ -1970,6 +1970,56 @@ describe('detached jobs', () => {
     expect(readFileSync(join(jobsDir, '0-random.stderr.log'), 'utf8')).toBe('');
     expect(args).toContain(detachFlag);
   });
+
+  it.each([
+    { flags: [], runCode: 0 },
+    { flags: ['--no-stream'], runCode: 0 },
+    { flags: ['--no-stream='], runCode: 0 },
+    { flags: [], runCode: 7 },
+  ])('detached CLI writes one JSON report and logs events with $flags and exit $runCode', async ({ flags, runCode }) => {
+    const preload = join(jobsDir, 'result-preload.mjs');
+    const logFile = join(jobsDir, 'events.jsonl');
+    writeFileSync(preload, `
+      import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { EventEmitter } from 'node:events';
+      import { join } from 'node:path';
+      const spawn = cp.spawn;
+      cp.execFileSync = (bin, args) => args.includes('--absolute-git-dir')
+        ? join(process.env.CODEX_JOBS_DIR, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
+      cp.spawn = (bin, args, options) => {
+        if (bin === process.execPath) return spawn(bin, args, options);
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+        child.stdin = { on() {}, end() { setImmediate(() => {
+          child.stdout.emit('data', Buffer.from('{"type":"turn.completed"}\\n'));
+          child.emit('close', ${runCode});
+        }); } };
+        child.kill = () => {};
+        return child;
+      };
+      syncBuiltinESMExports();
+    `);
+    const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
+      '--task=fixture', `--dir=${jobsDir}`, '--gate=none', '--no-self-review', `--log=${logFile}`, ...flags], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir, NODE_OPTIONS: `--import=${preload}` },
+    });
+    expect(launcher.error).toBeUndefined();
+    expect(launcher.status, launcher.stderr).toBe(0);
+    const job = readJobRecord(JSON.parse(launcher.stdout).id, { jobsDir });
+    try {
+      expect(await waitForJob({ jobId: job.id, jobsDir, maxMs: 10000 })).toMatchObject({
+        status: runCode === 0 ? 'done' : 'failed', exitCode: runCode, code: runCode,
+      });
+      expect(readFileSync(logFile, 'utf8')).toContain('{"type":"turn.completed"}');
+      expect(JSON.parse(readFileSync(job.resultPath, 'utf8'))).toMatchObject({
+        exitCode: runCode, events: { terminal: 'turn.completed' },
+      });
+    } finally {
+      try { process.kill(job.pid, 'SIGTERM'); } catch { /* already stopped */ }
+    }
+  }, 20000);
 
   it('spawn errors reject without publishing a running job', async () => {
     const spawnFn = () => {

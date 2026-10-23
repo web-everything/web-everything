@@ -1049,7 +1049,7 @@ export async function startDetachedJob({
   try {
     fds.push(fsDeps.openSync(resultPath, 'w', 0o600));
     fds.push(fsDeps.openSync(join(jobsDir, `${id}.stderr.log`), 'w', 0o600));
-    const child = spawnFn(nodePath, [scriptPath, ...args.filter(a => a !== '--detach' && !a.startsWith('--detach=')), '--json', `--job=${id}`], {
+    const child = spawnFn(nodePath, [scriptPath, ...args.filter(a => a !== '--detach' && !a.startsWith('--detach=')), '--json', '--no-stream', `--job=${id}`], {
       detached: true, stdio: ['ignore', ...fds], env: { ...env, CODEX_JOBS_DIR: jobsDir },
     });
     await new Promise((resolveSpawn, reject) => {
