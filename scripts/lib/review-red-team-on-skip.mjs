@@ -87,7 +87,7 @@ const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, 
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
   env = process.env, setting, readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus, readRecoveryRows = readRedTeamRecoveryRows,
   now = Date.now, lastDispatch: history = lastDispatch, preferLane } = {}) {
-  const rows = [], dispatched = [], notStarted = [];
+  const rows = [], dispatched = [], uncertain = [], notStarted = [];
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
   try {
     const at = now();
@@ -121,6 +121,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             // A throw may follow a spawn: retain its reservation until the next live process read.
             capacity.lanes--;
             row.why = 'dispatch failed; start unknown';
+            uncertain.push({ prNumber: row.prNumber, reason: row.why });
           }
         }
         if (!started) { row.action = 'skip'; notStarted.push({ prNumber: row.prNumber, reason: row.why }); }
@@ -131,5 +132,5 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     rows.push({ prNumber: null, head: null, action: 'skip', why: 'red-team recovery inputs unreadable' });
     note(`review-daemon: ${repo}#? already-reviewed-head — red team not dispatched for head unknown: red-team recovery inputs unreadable`);
   }
-  return { rows, dispatched, notStarted };
+  return { rows, dispatched, uncertain, notStarted };
 }

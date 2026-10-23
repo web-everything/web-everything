@@ -537,7 +537,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     expect(tagRound).toHaveBeenCalledWith({ pr: 10, repo: expect.any(String), round: 2 }); // attempts+1
     expect(out).toEqual({
       reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], notStarted: [], refusals: 0,
-      pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForCap: 0, deferredForCapReason: null, deferredForAuth: 0, authPaused: false, authPauseReason: null,
+      pendingNotDispatched: [], reconcileError: null, deferredForLanes: 0, deferredForCap: 0, deferredForCapReason: null, deferredForAuth: 0, deferredForHost: 0, authPaused: false, authPauseReason: null,
       staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: [], holdReconcileError: null, liveProcessPrs: [], operatorHolds: { observedAt: 7, holds: [] },
     });
@@ -856,6 +856,159 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     });
     expect(dispatch).not.toHaveBeenCalled();
     expect(out.deferredForLanes).toBe(3);
+  });
+
+  it('host admission (verify-admission): not admitted → dispatches nothing, every review stays owed (queued, never dropped)', () => {
+    const dispatch = vi.fn();
+    const out = runReviewTick({
+      reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10,
+      hostAdmission: () => ({ admitted: false, reason: 'host memory headroom 1785MB (free+swap); host.minMemoryHeadroomMb=2048 (standard)' }),
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.reviewsOwed).toBe(3);
+    expect(out.deferredForHost).toBe(3);
+    expect(out.deferredForLanes).toBe(0);
+  });
+
+  it('host admission (verify-admission): admitted → at most maxPerTick new sessions; a throwing check fails closed', () => {
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const out = runReviewTick({
+      reconcile: () => reviewsPlan(5), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, hostAdmission: () => ({ admitted: true, reason: 'ok', maxPerTick: 2 }),
+    });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(out.reviewsOwed).toBe(5);
+    const closed = vi.fn();
+    const failed = runReviewTick({
+      reconcile: () => reviewsPlan(2), dispatch: closed, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, hostAdmission: () => { throw Error('vm_stat timed out'); },
+    });
+    expect(closed).not.toHaveBeenCalled();
+    expect(failed.deferredForHost).toBe(2);
+  });
+
+  it('host admission (verify-admission audit): one shared per-tick budget across repos, evaluated once', async () => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
+    const hostAdmission = sharedHostBudget(check);
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    for (let i = 0; i < 3; i++) {
+      runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+        statusCandidates: () => [], acquirableLanes: () => 10, hostAdmission });
+    }
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(check).toHaveBeenCalledTimes(1);
+  });
+
+  it('host admission (verify-admission): runReviewTickAllRepos wraps one check into a host-wide budget across every repo', () => {
+    const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const tick = (opts) => runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, ...opts });
+    runReviewTickAllRepos({ repos: ['repo-a', 'repo-b', 'repo-c'], tick, hostAdmission: check,
+      authGateOverride: () => ({ paused: false, reason: null }) });
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it('defaultReviewHostAdmission (verify-admission): host verdict + the cascade per-tick cap, non-interactive; fails closed on an unreadable policy', async () => {
+    const { defaultReviewHostAdmission } = await import('../review-daemon.mjs');
+    const { loadHostOverloadSettings } = await import('../../../scripts/lib/host-overload-settings.mjs');
+    const env = { ...process.env, WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '3' };
+    const admission = vi.fn(() => ({ admitted: true, reason: 'host load ok' }));
+    expect(defaultReviewHostAdmission({ env, admission, loadPolicy: loadHostOverloadSettings }))
+      .toEqual({ admitted: true, reason: 'host load ok', maxPerTick: 3 });
+    expect(admission).toHaveBeenCalledWith({ env, interactive: false,
+      policy: expect.objectContaining({ sources: expect.objectContaining({ 'host.maxReviewDispatchPerTick': 'env' }) }) });
+    // A not-admitted host verdict flows through the tick: nothing dispatched, every review stays owed.
+    const low = () => defaultReviewHostAdmission({ env, loadPolicy: loadHostOverloadSettings,
+      admission: () => ({ admitted: false, reason: 'host memory headroom 900MB (free+swap)' }) });
+    expect(low()).toMatchObject({ admitted: false, maxPerTick: 3 });
+    const dispatch = vi.fn();
+    const out = runReviewTick({ reconcile: () => reviewsPlan(2), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, hostAdmission: low });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.deferredForHost).toBe(2);
+    // An unreadable policy admits nothing, and the host is never sampled.
+    const sampled = vi.fn();
+    expect(defaultReviewHostAdmission({ env, admission: sampled, loadPolicy: () => { throw Error('host-overload: bad json\nmore'); } }))
+      .toEqual({ admitted: false, reason: 'host policy unreadable: host-overload: bad json' });
+    expect(sampled).not.toHaveBeenCalled();
+  });
+
+  it('host admission (verify-admission): the CLI daemon\'s review pass is wired to defaultReviewHostAdmission', async () => {
+    const { cliReviewTickOpts, defaultReviewHostAdmission } = await import('../review-daemon.mjs');
+    const opts = cliReviewTickOpts({ log: { error: () => {} } });
+    expect(typeof defaultReviewHostAdmission).toBe('function');
+    expect(opts.hostAdmission).toBe(defaultReviewHostAdmission);
+    // The default runReview of buildCliDaemonEffects runs with those opts, and the host check it hands every repo's
+    // tick is the real one (real host-load + memory readers; the Vitest host seams stand in for the machine).
+    vi.stubEnv('WE_REVIEW_FACTS', '0');
+    try {
+      const seen = [];
+      const tick = vi.fn((o) => { seen.push(o); return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }; });
+      const effects = buildCliDaemonEffects({ owner: 'test', log: { error: () => {} }, reapSessions: () => null,
+        runPrepReview: noPrepReview, convertAdvisoryEnabled: false,
+        reviewTickOpts: (args) => ({ ...cliReviewTickOpts(args), tick, repos: ['repo-a'], authGateOverride: () => ({ paused: false, reason: null }) }) });
+      await effects.tickOnce();
+      expect(tick).toHaveBeenCalledTimes(1);
+      expect(seen[0].hostAdmission()).toMatchObject({ admitted: true, maxPerTick: 2 });
+      vi.stubEnv('WE_TEST_HOST_LOAD1', '999');
+      await effects.tickOnce();
+      expect(seen[1].hostAdmission()).toMatchObject({ admitted: false, reason: expect.stringContaining('host load 999.00/') });
+      vi.stubEnv('WE_TEST_HOST_LOAD1', '0');
+      vi.stubEnv('WE_TEST_HOST_MEMORY_MB', '10');
+      expect(defaultReviewHostAdmission()).toMatchObject({ admitted: false, reason: expect.stringContaining('host memory headroom 10MB') });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each([[1, 3, 1], [3, 1, 1], [2, 2, 2]])('combines the host per-tick cap %i and live-review capacity %i across repos', (maxPerTick, left, expected) => {
+    const liveReviewBudget = { left };
+    const hostAdmission = vi.fn(() => ({ admitted: true, reason: 'host ok', maxPerTick }));
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], liveReviewBudget, hostAdmission,
+      reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10, holdReconcile: () => [],
+      authGateOverride: () => ({ paused: false, reason: null }),
+    });
+    expect(dispatch).toHaveBeenCalledTimes(expected);
+    expect(liveReviewBudget.left).toBe(left - expected);
+    expect(hostAdmission).toHaveBeenCalledTimes(1);
+  });
+
+  it('a confirmed non-start preserves both budgets for a later repo, while an uncertain start spends both', () => {
+    for (const uncertain of [false, true]) {
+      const liveReviewBudget = { left: 1 };
+      const dispatch = vi.fn(({ repo }) => {
+        if (repo === 'repo-b') return { agentId: 'healthy' };
+        if (uncertain) throw Error('job record write failed after spawn');
+        return { skipped: 'unreadable-ci' };
+      });
+      const out = runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], liveReviewBudget,
+        hostAdmission: () => ({ admitted: true, reason: 'host ok', maxPerTick: 1 }),
+        reconcile: () => reviewsPlan(1), dispatch, tagRound: () => {}, tagStatus: () => {},
+        statusCandidates: () => [], acquirableLanes: () => 10, holdReconcile: () => [],
+        authGateOverride: () => ({ paused: false, reason: null }),
+      });
+      expect(dispatch).toHaveBeenCalledTimes(uncertain ? 1 : 2);
+      expect(out.dispatched).toEqual(uncertain ? [] : [{ prNumber: 100, agentId: 'healthy', repo: 'repo-b' }]);
+      expect(liveReviewBudget.left).toBe(0);
+    }
+  });
+
+  it('host denial preserves live-review capacity and explains the pending review without reporting lane starvation', () => {
+    const dispatch = vi.fn();
+    const liveReviewBudget = { left: 2 };
+    const out = runReviewTick({ reconcile: () => reviewsPlan(1), dispatch, liveReviewBudget,
+      hostAdmission: () => ({ admitted: false, reason: 'host memory low' }),
+      readPrs: () => [{ number: 100, labels: ['review:pending'] }], readAgents: () => [],
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 10,
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(liveReviewBudget.left).toBe(2);
+    expect(out).toMatchObject({ deferredForHost: 1, deferredForCap: 0, deferredForLanes: 0 });
+    expect(out.pendingNotDispatched[0].reasons.join('\n')).toContain('held by host admission (host memory low)');
   });
 
   it('EMERGENCY live-review cap: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {

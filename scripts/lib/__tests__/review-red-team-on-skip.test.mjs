@@ -268,7 +268,11 @@ describe('runRedTeamOnSkip', () => {
   });
   it('a throw retains the reservation and becomes a row, never an exception', () => {
     const o = runFixture({ dispatch: () => { throw Error('failed'); } });
-    expect(runRedTeamOnSkip(o).rows[0].why).toBe('dispatch failed; start unknown');
+    const out = runRedTeamOnSkip(o);
+    expect(out.rows[0].why).toBe('dispatch failed; start unknown');
+    expect(out.uncertain).toEqual([{ prNumber: pr, reason: 'dispatch failed; start unknown' }]);
+    expect(out.dispatched).toEqual([]);
+    expect(o.capacity.lanes).toBe(0);
     expect(o.capacity.budget.left).toBe(0); expect(o.lastDispatch.size).toBe(0);
   });
   it('bounds starts across multiple refusals', () => {
