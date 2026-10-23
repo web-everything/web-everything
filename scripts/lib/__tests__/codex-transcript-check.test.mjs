@@ -22,7 +22,7 @@ describe('checkTranscriptText fixture rollouts', () => {
     expect(checkTranscriptText(patch).flags[0].kind).toBe('tmp-write');
     expect(checkTranscriptText(edit).flags[0].kind).toBe('tmp-write');
   });
-  it.each(['gh issue list', 'curl https://example.test', 'git fetch origin', 'git push origin HEAD'])('flags network: %s', command => {
+  it.each(['gh issue list', 'curl https://example.test', 'git fetch origin', 'git push origin HEAD', 'git -C repo fetch origin', 'git -C /srv/repo push origin HEAD', 'curl', 'curl https://example.test | grep ok'])('flags network: %s', command => {
     expect(check(command).flags.map(flag => flag.kind)).toContain('network');
   });
   it.each(['echo x > "$TMPDIR/x"', 'echo x > /private/tmp/claude-task/x', 'mktemp -p "$TMPDIR"', 'TMPDIR="$TMPDIR" mktemp', 'cat /tmp/x', 'rg "gh " file', 'grep "curl " file', 'for x in a b; do echo "$x"; done', 'sleep 1', 'echo gh issue list'])('does not flag %s', command => {
