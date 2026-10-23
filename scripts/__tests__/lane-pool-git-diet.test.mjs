@@ -10,17 +10,17 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync,
 import { join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runReclaimCase } from '../conveyor/soak/breaks/lane-reset-symbolic-ops-proof.mjs';
-import { laneGitHardeningEnv, laneGitConfigArgs } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, laneGitConfigArgs, scrubGitRepoEnv } from '../lib/lane-git-hardening.mjs';
 
 // These regressions exercise production functions without invoking the CLI or writing .git.
 const repoSource = /function resolveRepo\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
 function resolvePool(command, extra = {}) {
   return new Function('flags', 'cmd', 'resolve', 'expandHome', 'CWD_TOP_LEVEL', 'CHECKOUT_ROOT',
-    'tryGit', 'LOCAL_GIT_TIMEOUT_MS', 'fail', 'basename', 'join', 'POOL_ROOT', 'resolveReal', 'sep', 'laneGitHardeningEnv',
+    'tryGit', 'LOCAL_GIT_TIMEOUT_MS', 'fail', 'basename', 'join', 'POOL_ROOT', 'resolveReal', 'sep', 'laneGitHardeningEnv', 'scrubGitRepoEnv',
     `${repoSource}; return resolveRepo();`)(
     { pool: 'existing', reference: '/reference', ...extra }, command, resolve, p => p,
     null, '/reference', () => null, 1000, message => { throw Error(message); },
-    p => p.split('/').at(-1), join, '/pool', resolve, sep, laneGitHardeningEnv,
+    p => p.split('/').at(-1), join, '/pool', resolve, sep, laneGitHardeningEnv, scrubGitRepoEnv,
   );
 }
 it.each(['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim', 'list'])(
@@ -71,7 +71,7 @@ it.each([
   const calls = [], removed = [];
   const inherited = { GIT_DIR: '/lane/.git', GIT_COMMON_DIR: '/lane/.git', GIT_WORK_TREE: '/lane',
     GIT_CONFIG: '/lane/.git/config', GIT_CONFIG_PARAMETERS: "'protocol.allow=always'" };
-  const probe = new Function('tryGit', 'mkdtempSync', 'tmpdir', 'join', 'dirname', 'rmSync', 'laneGitHardeningEnv', 'process', 'resolve',
+  const probe = new Function('tryGit', 'mkdtempSync', 'tmpdir', 'join', 'dirname', 'rmSync', 'laneGitHardeningEnv', 'process', 'resolve', 'scrubGitRepoEnv',
     `${source}; return liveRemoteShasProbe;`)(
     (...args) => {
       calls.push(args);
@@ -82,7 +82,7 @@ it.each([
     (dir) => removed.push(dir), laneGitHardeningEnv, { env: { ...inherited,
       GIT_ALLOW_PROTOCOL: 'ext:file:http', GIT_CONFIG_COUNT: '1',
       GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'always',
-    } }, resolve,
+    } }, resolve, scrubGitRepoEnv,
   );
   const repo = { originUrl };
   expect(probe(repo)).toEqual({ ok: supported, shas: new Set(supported ? ['abc'] : []) });
@@ -109,11 +109,11 @@ it.each(['missing origin', 'failed Git read', 'failed isolation'])(
   'remote probe fails closed on %s', (failure) => {
   const source = /function liveRemoteShasProbe\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
   const calls = [], removed = [];
-  const probe = new Function('tryGit', 'mkdtempSync', 'tmpdir', 'join', 'dirname', 'rmSync', 'laneGitHardeningEnv', 'resolve',
+  const probe = new Function('tryGit', 'mkdtempSync', 'tmpdir', 'join', 'dirname', 'rmSync', 'laneGitHardeningEnv', 'resolve', 'scrubGitRepoEnv',
     `${source}; return liveRemoteShasProbe;`)(
     (...args) => { calls.push(args); return null; },
     () => { if (failure === 'failed isolation') throw Error('unavailable'); return '/isolated/probe'; },
-    () => '/isolated', join, () => '/isolated', (dir) => removed.push(dir), laneGitHardeningEnv, resolve,
+    () => '/isolated', join, () => '/isolated', (dir) => removed.push(dir), laneGitHardeningEnv, resolve, scrubGitRepoEnv,
   );
   expect(probe({ originUrl: failure === 'missing origin' ? null : 'https://example.com/pool.git' }))
     .toEqual({ ok: false, shas: new Set() });

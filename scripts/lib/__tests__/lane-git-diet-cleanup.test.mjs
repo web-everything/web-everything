@@ -37,6 +37,8 @@ describe('cleanupEligibility (pure)', () => {
     expect(cleanupEligibility({ dir: d, poolRoot, nowMs, realCommonDir: `${d}/.git`, realObjectsDir: '/h/workspace/webeverything/.git/objects' }).reason).toMatch(/object store/);
   });
   it('refuses a lane with a gc.recentObjectsHook', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, gcHooks: ['x'] }).ok).toBe(false));
+  it('refuses a lane with per-ref reflog expiry', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, gcReflogPatterns: ['gc.refs/heads/*.reflogexpire'] }))
+    .toEqual({ ok: false, reason: 'per-ref reflog expiry configured (gc.refs/heads/*.reflogexpire)' }));
   it('refuses a live lease', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, lease: fresh, nowMs })).toMatchObject({ ok: false, reason: expect.stringMatching(/live lease/) }));
   it('refuses a reserved lease even when old', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, lease: { ...stale, reserved: true }, nowMs })).toMatchObject({ ok: false, reason: 'reserved lease' }));
   it('refuses a lane with a git lock', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, locks: ['index.lock'] }).ok).toBe(false));
@@ -255,7 +257,10 @@ describe('real git: cleanup CLI', () => {
       writeFileSync(join(dir, '.git', path), `${git(dir, 'rev-parse', 'HEAD')}\n`);
     }, `git lock present (${path.split('/').slice(0, path.startsWith('worktrees/') ? 3 : 1).join('/')})`]),
     ['gc.recentObjectsHook', (dir, other, ran) => hook(dir, ran), 'gc.recentObjectsHook configured (gc would run it)'],
-    ['absolute commondir', (dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
+    // A per-ref setting beats the generic `never` the gc pins, so it must never reach a gc.
+    ['per-ref reflogExpire', (dir) => git(dir, 'config', 'gc.refs/heads/*.reflogExpire', 'now'), 'per-ref reflog expiry configured (gc.refs/heads/*.reflogexpire)'],
+    ['per-ref reflogExpireUnreachable', (dir) => git(dir, 'config', 'gc.HEAD.reflogExpireUnreachable', 'now'), 'per-ref reflog expiry configured (gc.HEAD.reflogexpireunreachable)'],
+    ['absolute commondir',(dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
     ['relative commondir', (dir, other) => commondir(dir, relative(join(dir, '.git'), join(other, '.git'))), /^git common dir is redirected/],
     ['redirected object store', (dir, other) => {
       rmSync(join(dir, '.git', 'objects'), { recursive: true, force: true });
@@ -319,7 +324,8 @@ describe('real git: cleanup CLI', () => {
     ['git lock', (dir) => writeFileSync(join(dir, '.git', 'index.lock'), ''), 'git lock present (index.lock)'],
     ['gc.recentObjectsHook', (dir, other, ran) => hook(dir, ran), 'gc.recentObjectsHook configured (gc would run it)'],
     ['GC repack filter', (dir) => git(dir, 'config', 'gc.repackFilter', 'blob:none'), /^GC repack filtering configured/],
-    ['redirected common dir', (dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
+    ['per-ref reflog expiry', (dir) => git(dir, 'config', 'gc.refs/remotes/*.reflogExpireUnreachable', 'now'), 'per-ref reflog expiry configured (gc.refs/remotes/*.reflogexpireunreachable)'],
+    ['redirected common dir',(dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
     ['symlinked .git/info', (dir, other) => {
       rmSync(join(dir, '.git', 'info'), { recursive: true, force: true });
       symlinkSync(join(other, '.git', 'info'), join(dir, '.git', 'info'));
@@ -516,6 +522,53 @@ describe('real git: cleanup CLI', () => {
     const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=6', '--json'], { env, encoding: 'utf8' }));
     expect(out.rows[0].skipped).toMatch(/symlinked git paths \(config\)/);
     expect(readFileSync(join(primary, '.git', 'config'), 'utf8')).toBe(before);
+  }, 60_000);
+
+  // Inherited git env must neither redirect the run nor change what the safety checks read from the lane's config.
+  it.each([
+    ['GIT_DIR + GIT_WORK_TREE at a decoy repo', ({ decoy }) => ({ GIT_DIR: join(decoy, '.git'), GIT_WORK_TREE: decoy })],
+    ['GIT_CONFIG_PARAMETERS', () => ({ GIT_CONFIG_PARAMETERS: "'gc.repackfilter'='blob:none'" })],
+    ['GIT_CONFIG_COUNT / KEY_n / VALUE_n', () => ({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'gc.repackFilter', GIT_CONFIG_VALUE_0: 'blob:none' })],
+    ['GIT_CONFIG_GLOBAL', ({ file }) => ({ GIT_CONFIG_GLOBAL: file('[gc]\n\trepackFilter = blob:none\n') })],
+    ['GIT_CONFIG_SYSTEM', ({ file }) => ({ GIT_CONFIG_NOSYSTEM: undefined, GIT_CONFIG_SYSTEM: file('[gc]\n\trepackFilter = blob:none\n') })],
+  ])('inherited %s reaches neither the lane cleanup nor another repo', (_, inherit) => {
+    const dir = lane(10);
+    const decoy = join(root, 'env-decoy');
+    const files = [];
+    const file = (text) => { const path = join(root, `env-config-${files.length}`); writeFileSync(path, text); files.push(path); return path; };
+    git(root, 'clone', '-q', up, dir);
+    git(root, 'clone', '-q', up, decoy);
+    const decoyBefore = snapshot(decoy);
+    try {
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=10', '--json'], {
+        env: { ...env, ...inherit({ decoy, file }) }, encoding: 'utf8',
+      }));
+      expect(out.rows[0]).toMatchObject({ lane: 10, mode: 'apply' });
+      expect(git(dir, 'config', '--get-all', 'remote.origin.fetch').split('\n')).toEqual([LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH]);
+      expect(git(dir, 'cat-file', '-p', 'HEAD:a.txt')).toBe('a');
+      expect(snapshot(decoy)).toEqual(decoyBefore);
+    } finally {
+      for (const path of [dir, decoy, ...files]) rmSync(path, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('an inherited GIT_CONFIG cannot hide the lane\'s own gc.recentObjectsHook from the check', () => {
+    const dir = lane(10);
+    const empty = join(root, 'env-empty-config');
+    const ran = join(root, 'env-hook-ran');
+    git(root, 'clone', '-q', up, dir);
+    hook(dir, ran);
+    writeFileSync(empty, '');
+    try {
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=10', '--json'], {
+        env: { ...env, GIT_CONFIG: empty }, encoding: 'utf8',
+      }));
+      expect(out.rows[0].skipped).toBe('gc.recentObjectsHook configured (gc would run it)');
+      expect(existsSync(ran)).toBe(false);
+      expect(readFileSync(empty, 'utf8')).toBe('');
+    } finally {
+      for (const path of [dir, empty, ran]) rmSync(path, { recursive: true, force: true });
+    }
   }, 60_000);
 
   it.each([false, true])('a borrower that appears after startup stops gc (quoted alternate: %s)', (quoted) => {

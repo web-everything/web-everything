@@ -10,7 +10,8 @@
  *
  * Eligibility (`cleanupEligibility`): a real, non-symlinked `<pool>/lane-N` with its own `.git` dir, NO lease
  * marker, no git lock file anywhere under `.git` (`*.lock`, gc.pid), no other repository borrowing its objects (alternates under --scan-root/* and the pool
- * root, following alternate chains), and no `gc.recentObjectsHook` or GC repack filtering. Per eligible lane, on --apply:
+ * root, following alternate chains), no `gc.recentObjectsHook`, no GC repack filtering, and no per-ref
+ * `gc.<pattern>.reflogExpire[Unreachable]` (it would override the gc's `never` pins). Per eligible lane, on --apply:
  *   0. CLAIM the lane: write its lease marker with O_EXCL (the same move as `lane-pool trim`), so a concurrent
  *      acquirer sees a live lease and moves on, and we never act on a lane someone else just took; before any write
  *      the marker is re-read (still ours?) and every eligibility input is re-checked;
@@ -21,7 +22,8 @@
  *      and HEAD, and older than the grace window, are dropped (the old ledger blobs);
  *   4. drop the claim marker (only if it is still ours).
  * Never `reset`, `clean` or `checkout`; never a working-tree write. Never the primary checkout, `~/workspace/wev-*`,
- * or `.lanes/we-drain-daemon`. Git runs with GIT_DIR-style overrides scrubbed and the lane hardening pins applied.
+ * or `.lanes/we-drain-daemon`. Git runs with inherited GIT_DIR-style and GIT_CONFIG* overrides scrubbed
+ * (`scrubGitRepoEnv`) and the lane hardening pins applied.
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -29,7 +31,7 @@ import { homedir, hostname, tmpdir } from 'node:os';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { LEASE_FILENAME } from './lib/lane-lease.mjs';
-import { laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
 import { applyLaneDietConfig } from './lib/lane-git-diet.mjs';
 import {
   cleanupEligibility, CLEANUP_POOLS, formatBytes, parseCountObjects, parseGitAlternates, projectedFreedBytes,
@@ -56,8 +58,8 @@ const PRUNE_EXPIRE = typeof flags['prune-expire'] === 'string' ? flags['prune-ex
 const ONLY = typeof flags.lanes === 'string' ? new Set(flags.lanes.split(',').map((s) => Number(s.trim())).filter(Number.isInteger)) : null;
 if (APPLY && !ONLY) { process.stderr.write('--apply needs an explicit --lanes=N,M list (the full apply is the operator\'s call)\n'); process.exit(2); }
 
-// Git env: no inherited repo redirection, plus the lane hardening pins (no fsmonitor/hooks run from lane config).
-const GIT_ENV = laneGitHardeningEnv(Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^GIT_(DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM)$/.test(k))));
+// Git env: no inherited repo redirection or env-injected config, plus the lane hardening pins (no fsmonitor/hooks run from lane config).
+const GIT_ENV = laneGitHardeningEnv(scrubGitRepoEnv(process.env));
 const git = (dir, args, timeout = 120_000, encoding = 'utf8') => execFileSync('git', args, { cwd: dir, env: GIT_ENV, encoding, stdio: ['ignore', 'pipe', 'pipe'], timeout, maxBuffer: 64 * 1024 * 1024 });
 const leaseFile = (dir) => join(dir, '.git', LEASE_FILENAME);
 const readLease = (dir) => { try { return JSON.parse(readFileSync(leaseFile(dir), 'utf8')); } catch { return existsSync(leaseFile(dir)) ? { unreadable: true } : null; } };
@@ -65,6 +67,8 @@ const duBytes = (p) => { try { return Number(execFileSync('du', ['-sk', p], { en
 const opsRefs = (dir) => git(dir, ['for-each-ref', '--format=%(refname)', 'refs/remotes/origin/ops/']).split('\n').filter(Boolean);
 const gcHooks = (dir) => { try { return git(dir, ['config', '--get-all', 'gc.recentObjectsHook']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
 const gcRepackFilters = (dir) => { try { return git(dir, ['config', '--name-only', '--get-regexp', '^gc\\.repackfilter(to)?$']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
+// `gc.<pattern>.reflogExpire*` beats the generic keys the gc pins to `never`.
+const gcReflogPatterns = (dir) => { try { return git(dir, ['config', '--name-only', '--get-regexp', '^gc\\..*\\.reflogexpire(unreachable)?$']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
 
 // Who borrows whose objects: repos under <scan-root>/* and <pool-root>/*/*, including Gitfile/common-dir stores.
 function borrowerMap() {
@@ -132,10 +136,11 @@ const eligible = (dir) => {
     dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir, realCommonDir: realGitDir ? commonDir(dir) : undefined, realObjectsDir: objects ?? undefined, ...auditGitDir(dir),
     lease: readLease(dir), nowMs: Date.now(),
     borrowers: (objects && BORROWERS.get(objects)) || [], gcHooks: realGitDir ? gcHooks(dir) : [], gcRepackFilters: realGitDir ? gcRepackFilters(dir) : [],
+    gcReflogPatterns: realGitDir ? gcReflogPatterns(dir) : [],
   });
 };
 // Every eligibility input re-read while we hold the claim (our own marker is the lease, so `lease: null`).
-const recheckUnderClaim = (dir) => cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: null, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir) });
+const recheckUnderClaim = (dir) => cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: null, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir), gcReflogPatterns: gcReflogPatterns(dir) });
 
 // O_EXCL claim, same marker shape as `lane-pool` (so `acquire` reads it as a live lease and skips the lane).
 function claim(dir) {

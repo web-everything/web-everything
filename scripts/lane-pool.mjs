@@ -181,7 +181,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
-import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
 import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
@@ -347,14 +347,7 @@ function resolveRepo() {
   // An inherited lane Git context must not override an explicitly selected primary.
   // Scrub BEFORE hardening: the hardening appends its pins after any inherited GIT_CONFIG_COUNT entries, so an
   // inherited GIT_CONFIG_KEY_n=remote.origin.url would otherwise survive as the "canonical" origin.
-  const inherited = { ...process.env, GIT_OPTIONAL_LOCKS: '0' };
-  for (const key of Object.keys(inherited)) {
-    if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) delete inherited[key];
-  }
-  for (const key of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
-    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS',
-    'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_NAMESPACE']) delete inherited[key];
-  const env = laneGitHardeningEnv(inherited);
+  const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
   const gitOptions = { timeout: LOCAL_GIT_TIMEOUT_MS, env };
   const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, gitOptions) || referencePath;
   const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
@@ -1252,9 +1245,7 @@ function liveRemoteShasProbe(repo) {
     // No lane config, including worktree config or includes, may affect a live proof. A literal
     // URL alone is insufficient: url.*.insteadOf can rewrite it to an executable remote helper.
     probeDir = mkdtempSync(join(tmpdir(), 'lane-remote-probe-'));
-    const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CEILING_DIRECTORIES: dirname(probeDir) }, { remoteProbe: true });
-    for (const key of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
-      'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS']) delete env[key];
+    const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0', GIT_CEILING_DIRECTORIES: dirname(probeDir) }, { remoteProbe: true });
     // Explicit local pool origins are supported too. Permit file transport only for that canonical
     // path, in this isolated process; lane protocol settings never participate in this decision.
     // GIT_ALLOW_PROTOCOL overrides even per-protocol inherited config and a parent's wider allowlist.

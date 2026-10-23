@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { scrubRiskyLaneConfig, riskyLaneConfig, LANE_CONFIG_LIST_ARGS } from '../lane-git-hardening.mjs';
+import { scrubRiskyLaneConfig, riskyLaneConfig, LANE_CONFIG_LIST_ARGS, GIT_REPO_ENV_KEYS, LANE_GIT_CONFIG_PINS, laneGitHardeningEnv, scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
@@ -87,4 +87,19 @@ it('reports failed unsets as kept', () => {
     return git(args);
   };
   expect(scrubRiskyLaneConfig(dir, { run })).toEqual({ removed: [], kept: ['alias.x (write failed)'] });
+});
+it('scrubGitRepoEnv drops every inherited repo redirect and env config source, and keeps the rest', () => {
+  const inherited = Object.fromEntries([...GIT_REPO_ENV_KEYS.map(key => [key, '/elsewhere']),
+    ['GIT_CONFIG_KEY_0', 'gc.reflogExpire'], ['GIT_CONFIG_VALUE_0', 'now'], ['GIT_CONFIG_KEY_99', 'x.y'], ['GIT_CONFIG_VALUE_99', 'z'],
+    ['PATH', '/bin'], ['GIT_TERMINAL_PROMPT', '0']]);
+  expect(scrubGitRepoEnv(inherited)).toEqual({ PATH: '/bin', GIT_TERMINAL_PROMPT: '0' });
+  for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM']) {
+    expect(GIT_REPO_ENV_KEYS).toContain(key);
+  }
+  expect(inherited.GIT_DIR).toBe('/elsewhere'); // a copy, never the caller's object
+  // Hardening after the scrub starts its pins at index 0, with no inherited entry left in front of them.
+  const env = laneGitHardeningEnv(scrubGitRepoEnv(inherited));
+  expect(env.GIT_CONFIG_KEY_0).toBe(LANE_GIT_CONFIG_PINS[0][0]);
+  expect(env.GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));
+  expect(env.GIT_CONFIG_KEY_99).toBeUndefined();
 });
