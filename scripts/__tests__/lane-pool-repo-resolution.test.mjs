@@ -64,8 +64,8 @@ function resolveOrigin({ command = 'reclaim', cwd = '/pool/project/lane-1', flag
       calls.push({ args, dir, options });
       const effectiveEnv = options.env || env;
       // Git prints these relative to the queried directory for an ordinary checkout, absolute for a linked worktree.
-      if (args[1] === '--git-dir') return gitDirs.gitDir ?? '.git';
-      if (args[1] === '--git-common-dir') return gitDirs.commonDir ?? '.git';
+      if (args[1] === '--git-dir') return 'gitDir' in gitDirs ? gitDirs.gitDir : '.git';
+      if (args[1] === '--git-common-dir') return 'commonDir' in gitDirs ? gitDirs.commonDir : '.git';
       if (args[0] === 'rev-parse') return effectiveEnv.GIT_WORK_TREE || topLevel || dir;
       if (args[0] === 'remote') return effectiveEnv.GIT_DIR ? 'https://attacker.example/project.git' : remote;
       throw new Error(`unexpected git call: ${args.join(' ')}`);
@@ -96,6 +96,9 @@ describe('canonical origin cannot be inferred from a lane', () => {
       gitDirs: { gitDir: '/other-pool/p/lane-3/.git/worktrees/x', commonDir: '/other-pool/p/lane-3/.git' } }],
     ['common dir symlinked into the pool', { cwd: '/ws/scratch-proof', realPaths: { '/alias/.git': '/pool/project/lane-1/.git' },
       gitDirs: { gitDir: '/alias/.git', commonDir: '/alias/.git' } }],
+    // A failed owner read must fail closed, not fall back to the path-only check.
+    ['unreadable git dir', { cwd: '/ws/scratch-proof', gitDirs: { gitDir: null } }],
+    ['unreadable common dir', { cwd: '/ws/scratch-proof', gitDirs: { commonDir: null } }],
     ['any linked worktree, even of a non-lane repository', { cwd: '/ws/scratch-proof',
       gitDirs: { gitDir: '/primary/.git/worktrees/scratch-proof', commonDir: '/primary/.git' } }],
   ];
@@ -135,6 +138,20 @@ describe('canonical origin cannot be inferred from a lane', () => {
     for (const { options } of calls) {
       for (const key of Object.keys(env)) expect(options.env[key]).toBeUndefined();
       expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
+    }
+  });
+
+  it('inherited environment git config cannot supply or alter the canonical origin read', () => {
+    const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'remote.origin.url', GIT_CONFIG_VALUE_0: 'https://evil.example/p.git',
+      GIT_CONFIG_GLOBAL: '/pool/project/lane-1/gitconfig', GIT_CONFIG_SYSTEM: '/pool/project/lane-1/gitconfig', GIT_NAMESPACE: 'x' };
+    const { run, calls } = resolveOrigin({ cwd: '/primary', env, remote: '/canonical/project.git' });
+    run();
+    expect(calls.length).toBeGreaterThan(0);
+    for (const { options } of calls) {
+      for (const key of ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_NAMESPACE']) expect(options.env[key]).toBeUndefined();
+      const entries = Array.from({ length: Number(options.env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [options.env[`GIT_CONFIG_KEY_${i}`], options.env[`GIT_CONFIG_VALUE_${i}`]]);
+      expect(entries.some(([k, v]) => k === 'remote.origin.url' || v === 'https://evil.example/p.git')).toBe(false);
     }
   });
 

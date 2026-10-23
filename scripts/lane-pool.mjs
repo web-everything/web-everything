@@ -345,9 +345,16 @@ function resolveRepo() {
   const repoPath = resolve(expandHome(flags.repo) || (CWD_TOP_LEVEL ? process.cwd() : CHECKOUT_ROOT));
   const referencePath = resolve(expandHome(flags.reference) || repoPath);
   // An inherited lane Git context must not override an explicitly selected primary.
-  const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' });
+  // Scrub BEFORE hardening: the hardening appends its pins after any inherited GIT_CONFIG_COUNT entries, so an
+  // inherited GIT_CONFIG_KEY_n=remote.origin.url would otherwise survive as the "canonical" origin.
+  const inherited = { ...process.env, GIT_OPTIONAL_LOCKS: '0' };
+  for (const key of Object.keys(inherited)) {
+    if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) delete inherited[key];
+  }
   for (const key of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
-    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS']) delete env[key];
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS',
+    'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_NAMESPACE']) delete inherited[key];
+  const env = laneGitHardeningEnv(inherited);
   const gitOptions = { timeout: LOCAL_GIT_TIMEOUT_MS, env };
   const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, gitOptions) || referencePath;
   const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
@@ -357,13 +364,14 @@ function resolveRepo() {
     // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
     // (the git dir and the common dir) is checked too; a worktree whose git dir differs from its common
     // dir is never a canonical source, wherever it sits on disk.
+    // An unreadable owner is refused too: a failed read must not fall back to the path-only check.
     let linkedWorktree = false;
     const gitOwnerPaths = [referencePath, topLevel].flatMap((dir) => {
       const [gitDir, commonDir] = ['--git-dir', '--git-common-dir'].map((arg) => {
         const out = tryGit(['rev-parse', arg], dir, gitOptions);
         return out ? resolve(dir, out) : null;
       });
-      if (gitDir && commonDir && resolveReal(gitDir) !== resolveReal(commonDir)) linkedWorktree = true;
+      if (!gitDir || !commonDir || resolveReal(gitDir) !== resolveReal(commonDir)) linkedWorktree = true;
       return [gitDir, commonDir, commonDir && dirname(commonDir)].filter(Boolean);
     });
     const originSourcePaths = [referencePath, topLevel, ...gitOwnerPaths].flatMap(path => [resolve(path), resolveReal(path)]);
