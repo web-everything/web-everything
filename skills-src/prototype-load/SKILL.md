@@ -21,7 +21,7 @@ What it does, in order, stopping at the first failure (`stopReason`):
 4. Checks against the clone's current registrations with the loader's `add --check`. A registration that conflicts with main is reported as `stale-registration: <name>`; the cure is a rebuilt replacement that contains it (swap), never a removal alone.
 5. Registers the new overlay through `scripts/daemon-overlay.mjs` only. Never `--allow-conflict`, never an operator credential.
 6. Waits (bounded) for the daemon clone to adopt the sha, and reads the rebuild alerts for refusals.
-7. Swap: removes the registrations the new overlay contains only after the daemon adopted it. A refused, timed-out or unverifiable adoption keeps them, and the result names them.
+7. Swap: removes the clean registrations the new overlay contains only after the daemon adopted it; a refused, timed-out or unverifiable adoption keeps them, and the result names them. A contained `stale-registration` is removed before the wait, because it would block the rebuild; on a failed adoption the result names its tip to rebase and re-add.
 8. Appends one line to `~/workspace/.operations/coordination/prototype-loads.jsonl` and prints `{ok, daemon, clone, registered, adopted, stopReason}`.
 
 On `behind-main-conflict`: have Codex resolve the conflict, re-run only the touched test files, write a fresh ready record, then run again. Do not re-test anything else.

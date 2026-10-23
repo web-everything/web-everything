@@ -184,9 +184,16 @@ describe('prototype-load', () => {
   it('contained stale registration is replaced by an ordered swap', async () => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'] }); const r = await f.run(); expect(r.ok).toBe(true); expect(r.stale).toEqual(['lane/old']); expect(r.removed).toEqual(['lane/old', 'lane/also']);
     const index = f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check'));
-    const adopted = f.calls.findIndex((c) => c.args[0] === '-C');
-    expect(adopted).toBeGreaterThan(index);
-    for (const remove of mutations(f, 'remove')) expect(f.calls.indexOf(remove)).toBeGreaterThan(adopted);
+    // The stale contained registration goes before the adoption wait; the clean one only after the
+    // successful (last) adoption probe.
+    const firstProbe = f.calls.findIndex((c) => c.args[0] === '-C');
+    const adopted = f.calls.findLastIndex((c) => c.args[0] === '-C');
+    const [stale, clean] = mutations(f, 'remove').map((c) => f.calls.indexOf(c));
+    expect(f.calls[stale].args).toContain('--ref=lane/old');
+    expect(stale).toBeGreaterThan(index);
+    expect(stale).toBeLessThan(firstProbe);
+    expect(f.calls[clean].args).toContain('--ref=lane/also');
+    expect(clean).toBeGreaterThan(adopted);
   });
   // Red-team (PR #5832 round 3): a replacement that fails live adoption must not have already
   // removed the working registrations it was meant to replace.
@@ -198,14 +205,26 @@ describe('prototype-load', () => {
     ['probe error 128', { adoptionError: 128 }, 'check-unverifiable'],
     ['probe error -1', { adoptionError: -1 }, 'check-unverifiable'],
     ['unreadable refusal trail', { alertsReadError: true }, 'check-unverifiable'],
-  ])('retains every prior registration until the replacement is adopted: %s', async (_, options, stopReason) => {
-    for (const conflicts of [[], ['lane/old']]) {
-      const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts, ...options });
-      const r = await f.run();
-      expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
-      expect(mutations(f, 'remove')).toEqual([]);
-      expect(r.fallback).toContain('lane/old');
-    }
+  ])('retains every clean prior registration until the replacement is adopted: %s', async (_, options, stopReason) => {
+    const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], ...options });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
+  });
+  // A stale contained registration would make a pinned or independent rebuild refuse or hold, so it is
+  // removed before the wait; a failed adoption names its tip for a rebase and re-add.
+  it.each([
+    ['refusal alert', { alerts: refusedAlert }, 'adoption-refused'],
+    ['timeout', { timeout: true }, 'adoption-timeout'],
+    ['unreadable refusal trail', { alertsReadError: true }, 'check-unverifiable'],
+  ])('removes only the stale contained registration before a failed adoption: %s', async (_, options, stopReason) => {
+    const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'], ...options });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: ['lane/old'] });
+    expect(mutations(f, 'remove').map((c) => c.args.find((arg) => arg.startsWith('--ref=')))).toEqual(['--ref=lane/old']);
+    expect(r.fallback).toContain('Prior registrations retained: lane/also.');
+    expect(r.fallback).toMatch(/Removed before adoption \(stale; rebase onto main and re-add\): lane\/old@d{39}0\./);
   });
   it.each([false, true])('retains an established branch that advances beyond the replacement during add (merge: %s)', async (behind) => {
     const f = fixture({ behind, list: ['lane/old'], contained: ['lane/old'], advanceEstablishedDuringAdd: true });

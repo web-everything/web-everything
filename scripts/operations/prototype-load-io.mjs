@@ -56,14 +56,18 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
   return async function load(input) {
     const out = { ok: false, daemon: input.daemon, clone: null, cloneSource: null, registered: false, adopted: false,
       stopReason: null, branch: input.branch, sha: input.sha, effectiveRef: input.branch, effectiveSha: input.sha,
-      dryRun: !!input.dryRun, stale: [], removed: [], why: input.why || '',
+      dryRun: !!input.dryRun, stale: [], removed: [], removedTips: {}, why: input.why || '',
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
-    // Once the replacement is registered, every failure names the prior registrations still in place.
+    // Once the replacement is registered, every failure names the prior registrations still in place
+    // and any stale ones already removed before adoption, with the tip to rebase and re-add.
     const keptNote = () => {
-      const kept = out.registered ? (out.contained || []).filter((ref) => !out.removed.includes(ref)) : [];
-      return kept.length ? ` Prior registrations retained: ${kept.join(', ')}.` : '';
+      if (!out.registered) return '';
+      const kept = (out.contained || []).filter((ref) => !out.removed.includes(ref));
+      const early = out.adopted ? [] : Object.entries(out.removedTips);
+      return (kept.length ? ` Prior registrations retained: ${kept.join(', ')}.` : '')
+        + (early.length ? ` Removed before adoption (stale; rebase onto main and re-add): ${early.map(([ref, tip]) => `${ref}@${tip}`).join(', ')}.` : '');
     };
     try {
       const daemon = Object.hasOwn(config.daemons || {}, input.daemon) ? config.daemons[input.daemon] : null;
@@ -156,9 +160,35 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
           return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
         }
       }
-      // Contained registrations stay until the daemon has adopted the replacement: a refused or
-      // unadopted replacement must leave the working build's registrations in place (red team, round 3).
-      // The rebuild sets a contained base aside behind its top, so keeping it registered never blocks adoption.
+      const removeContained = (refs) => {
+        for (const ref of refs) {
+          // The preview predates the real add (which can fetch newer, cleanly merging tips).
+          // Refresh each registration at its removal boundary; prove containment using the
+          // immutable fetched SHA, never the earlier preview or a subsequently moving ref.
+          out.swap = { contained, removed: out.removed, failed: ref };
+          requireGit('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
+          const currentTip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${ref}^{commit}`);
+          if (!validSha(currentTip)) throw new Error(`invalid current tip for ${ref}`);
+          if (!ancestor(currentTip, out.effectiveSha)) {
+            return stop('swap-remove-failed', { detail: 'replacement-not-contained', swap: { ...out.swap, tip: currentTip },
+              fallback: `Retain the remaining registrations; include their current tips in a new tested replacement and retry.${keptNote()}` });
+          }
+          const result = loader('remove', out.clone, ref, [`--reason=prototype-load: replaced by ${out.effectiveRef}`]);
+          if (result.code !== 0) return stop('swap-remove-failed', { swap: { contained, removed: out.removed, failed: ref, result }, fallback: `Inspect the loader removal failure and retry it.${keptNote()}` });
+          out.removed.push(ref);
+          out.removedTips[ref] = currentTip;
+        }
+        out.swap = { contained, removed: out.removed };
+        return null;
+      };
+      // A clean contained registration stays until the daemon has adopted the replacement: a refused
+      // or unadopted replacement must leave the working build's registrations in place (red team, round 3).
+      // A STALE one conflicts with main, so a pinned or independently applied copy would refuse or hold
+      // every rebuild and the replacement could never be adopted. Its live code cannot survive a
+      // plain-main fallback either, so it goes first and failures name its tip for a rebase and re-add.
+      stage = 'swap-remove-failed';
+      const halted = removeContained(contained.filter((ref) => out.stale.includes(ref)));
+      if (halted) return halted;
       stage = 'check-unverifiable';
       const state = join(expand(env.WE_DAEMON_OVERLAY_DIR || join(env.HOME, '.claude/daemon-overlays')), keyForClone(out.clone));
       const deadline = registeredAt + config.adoption.timeoutMs;
@@ -190,23 +220,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         await sleep(Math.min(config.adoption.pollMs, remaining));
       }
       stage = 'swap-remove-failed';
-      for (const ref of contained) {
-        // The preview predates the real add (which can fetch newer, cleanly merging tips).
-        // Refresh each registration at its removal boundary; prove containment using the
-        // immutable fetched SHA, never the earlier preview or a subsequently moving ref.
-        out.swap = { contained, removed: out.removed, failed: ref };
-        requireGit('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
-        const currentTip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${ref}^{commit}`);
-        if (!validSha(currentTip)) throw new Error(`invalid current tip for ${ref}`);
-        if (!ancestor(currentTip, out.effectiveSha)) {
-          return stop('swap-remove-failed', { detail: 'replacement-not-contained', swap: { ...out.swap, tip: currentTip },
-            fallback: 'Retain the remaining registrations; include their current tips in a new tested replacement and retry.' });
-        }
-        const result = loader('remove', out.clone, ref, [`--reason=prototype-load: replaced by ${out.effectiveRef}`]);
-        if (result.code !== 0) return stop('swap-remove-failed', { swap: { contained, removed: out.removed, failed: ref, result }, fallback: `Inspect the loader removal failure and retry it.${keptNote()}` });
-        out.removed.push(ref);
-      }
-      out.swap = { contained, removed: out.removed };
+      const unswapped = removeContained(contained.filter((ref) => !out.removed.includes(ref)));
+      if (unswapped) return unswapped;
       out.ok = true;
       return out;
     } catch (e) { return stop(stage, { error: String(e.message || e), fallback: `Inspect the failed step evidence and rerun after resolving it.${keptNote()}` }); }
