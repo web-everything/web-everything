@@ -1,7 +1,7 @@
 /** Repository resolution must not spend a git spawn discovering an explicitly supplied branch. */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { basename, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 
@@ -19,7 +19,7 @@ function resolveWith(branch, remoteHead) {
     CWD_TOP_LEVEL: '/checkout', CHECKOUT_ROOT: '/checkout', POOL_ROOT: '/pool',
     LOCAL_GIT_TIMEOUT_MS: 1000,
     expandHome: (path) => path,
-    resolve, basename, join, sep, resolveReal: resolve, laneGitHardeningEnv,
+    resolve, basename, dirname, join, sep, resolveReal: resolve, laneGitHardeningEnv,
     fail: (message) => { throw new Error(message); },
     tryGit: (args) => {
       calls.push(args);
@@ -52,17 +52,20 @@ describe('lane-pool repository branch resolution', () => {
 // Keep this proof read-only: exercise the production resolver with a lane origin that
 // would advertise unique work, without starting the pool CLI or writing Git metadata.
 function resolveOrigin({ command = 'reclaim', cwd = '/pool/project/lane-1', flags = {},
-  realPaths = {}, topLevel = null, env = {}, remote = 'https://attacker.example/project.git' } = {}) {
+  realPaths = {}, topLevel = null, env = {}, remote = 'https://attacker.example/project.git', gitDirs = {} } = {}) {
   const calls = [];
   const run = () => runInNewContext(`${resolver}\nresolveRepo();`, {
     flags: { branch: 'main', ...flags }, cmd: command,
     process: { cwd: () => cwd, env }, CWD_TOP_LEVEL: cwd, CHECKOUT_ROOT: cwd, POOL_ROOT: '/pool',
     LOCAL_GIT_TIMEOUT_MS: 1000, expandHome: p => p,
-    resolve, basename, join, sep, resolveReal: p => realPaths[p] || resolve(p), laneGitHardeningEnv,
+    resolve, basename, dirname, join, sep, resolveReal: p => realPaths[p] || resolve(p), laneGitHardeningEnv,
     fail: message => { throw new Error(message); },
     tryGit: (args, dir, options) => {
       calls.push({ args, dir, options });
       const effectiveEnv = options.env || env;
+      // Git prints these relative to the queried directory for an ordinary checkout, absolute for a linked worktree.
+      if (args[1] === '--git-dir') return 'gitDir' in gitDirs ? gitDirs.gitDir : '.git';
+      if (args[1] === '--git-common-dir') return 'commonDir' in gitDirs ? gitDirs.commonDir : '.git';
       if (args[0] === 'rev-parse') return effectiveEnv.GIT_WORK_TREE || topLevel || dir;
       if (args[0] === 'remote') return effectiveEnv.GIT_DIR ? 'https://attacker.example/project.git' : remote;
       throw new Error(`unexpected git call: ${args.join(' ')}`);
@@ -84,6 +87,20 @@ describe('canonical origin cannot be inferred from a lane', () => {
     ['Git redirects the work tree', { topLevel: '/elsewhere/checkout' }],
     ['renamed checkout under pool root', { cwd: '/pool/project/checkout' }],
     ['another pool root', { cwd: '/other-pool/project/lane-2' }],
+    // The linked worktree itself sits outside the pool; only its shared git dir leads back to the lane.
+    ['external linked worktree of a lane', { cwd: '/ws/scratch-proof',
+      gitDirs: { gitDir: '/pool/project/lane-1/.git/worktrees/scratch-proof', commonDir: '/pool/project/lane-1/.git' } }],
+    ['external linked worktree, explicit repo', { cwd: '/primary', flags: { repo: '/ws/scratch-proof' },
+      gitDirs: { gitDir: '/pool/project/lane-1/.git/worktrees/scratch-proof', commonDir: '/pool/project/lane-1/.git' } }],
+    ['external linked worktree, common dir under another pool root', { cwd: '/ws/scratch-proof',
+      gitDirs: { gitDir: '/other-pool/p/lane-3/.git/worktrees/x', commonDir: '/other-pool/p/lane-3/.git' } }],
+    ['common dir symlinked into the pool', { cwd: '/ws/scratch-proof', realPaths: { '/alias/.git': '/pool/project/lane-1/.git' },
+      gitDirs: { gitDir: '/alias/.git', commonDir: '/alias/.git' } }],
+    // A failed owner read must fail closed, not fall back to the path-only check.
+    ['unreadable git dir', { cwd: '/ws/scratch-proof', gitDirs: { gitDir: null } }],
+    ['unreadable common dir', { cwd: '/ws/scratch-proof', gitDirs: { commonDir: null } }],
+    ['any linked worktree, even of a non-lane repository', { cwd: '/ws/scratch-proof',
+      gitDirs: { gitDir: '/primary/.git/worktrees/scratch-proof', commonDir: '/primary/.git' } }],
   ];
   for (const command of ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim', 'list']) {
     it.each(variants)(`${command} refuses an implicit lane origin via %s`, (_label, options) => {
@@ -121,6 +138,20 @@ describe('canonical origin cannot be inferred from a lane', () => {
     for (const { options } of calls) {
       for (const key of Object.keys(env)) expect(options.env[key]).toBeUndefined();
       expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
+    }
+  });
+
+  it('inherited environment git config cannot supply or alter the canonical origin read', () => {
+    const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'remote.origin.url', GIT_CONFIG_VALUE_0: 'https://evil.example/p.git',
+      GIT_CONFIG_GLOBAL: '/pool/project/lane-1/gitconfig', GIT_CONFIG_SYSTEM: '/pool/project/lane-1/gitconfig', GIT_NAMESPACE: 'x' };
+    const { run, calls } = resolveOrigin({ cwd: '/primary', env, remote: '/canonical/project.git' });
+    run();
+    expect(calls.length).toBeGreaterThan(0);
+    for (const { options } of calls) {
+      for (const key of ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_NAMESPACE']) expect(options.env[key]).toBeUndefined();
+      const entries = Array.from({ length: Number(options.env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [options.env[`GIT_CONFIG_KEY_${i}`], options.env[`GIT_CONFIG_VALUE_${i}`]]);
+      expect(entries.some(([k, v]) => k === 'remote.origin.url' || v === 'https://evil.example/p.git')).toBe(false);
     }
   });
 
