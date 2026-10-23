@@ -56,7 +56,8 @@ const verifiedScope = ({ repo: slug, pr }) => standingRulingScope({ repo: slug, 
   cardOnly: () => true, unedited: () => ['IC_auto'],
 });
 
-function standingThread(lateCap = false, sent = true) {
+// `consumed`: the gate re-recorded the cap with the grant listed, so the grant no longer reopens the gate.
+function standingThread(lateCap = false, sent = true, consumed = false) {
   const comments = thread();
   const { resultId } = liveResultGateState(comments, PR, HEAD);
   const cap = bot(`${redTeamGateMarker(PR, HEAD, 'round-cap', resultId, [])}\n- 1 confirmed break(s) NOT sent back: round cap (#1).`,
@@ -68,6 +69,7 @@ function standingThread(lateCap = false, sent = true) {
   const scope = verifiedScope({ repo, pr: { number: PR, headRefOid: HEAD, comments } });
   const ids = gateRoundGrants(operatorBoundComments(comments), PR, repo, scope).map(g => g.id);
   expect(ids).toHaveLength(1);
+  if (consumed) comments[1] = bot(`${redTeamGateMarker(PR, HEAD, 'round-cap', resultId, ids)}\n- 1 confirmed break(s) NOT sent back: round cap (#1).`, '2026-10-20T23:46:00Z');
   if (sent) comments.push(bot(`${redTeamGateMarker(PR, HEAD, 'sent-back', resultId, ids)}\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-10-20T23:46:00Z'));
   if (lateCap) { comments.splice(1, 1); comments.push(cap); }
   return comments;
@@ -147,7 +149,7 @@ describe('existing-card IO', () => {
   });
   it('read-back uses a fresh standing scope for result and disposition proof', () => {
     const calls = [];
-    const f = fake({ initial: standingThread(false, false), readStandingRulingScope: args => { calls.push(args); return verifiedScope(args); } });
+    const f = fake({ initial: standingThread(false, false, true), readStandingRulingScope: args => { calls.push(args); return verifiedScope(args); } });
     expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toMatchObject({ indices: [1] });
     expect(calls.length).toBeGreaterThanOrEqual(2);
     expect(calls.at(-1).pr.comments.some(c => c.body.includes('outcome=operator-card'))).toBe(true);
@@ -215,11 +217,11 @@ describe('existing-card IO', () => {
     it.each([
       ['authenticated grant and send-back', {}, true],
       ['cap POST arriving after send-back', { lateCap: true }, true],
-      ['grant awaiting send-back', { sent: false }, false],
+      ['grant awaiting send-back', { sent: false }, false, true],
       ['grant for another repo', { grantRepo: 'other/repo' }, false],
       ['grant for another PR', { grantPr: PR + 1 }, false],
       ['automation-posted grant without a verified standing ruling', { author: { login: 'web-everything', type: 'Bot' } }, false],
-    ])(`${phase}: %s preserves the current owner`, (_name, options, fixerOwns) => {
+    ])(`${phase}: %s preserves the current owner`, (_name, options, fixerOwns, pendingGrant = false) => {
       const plan = payloadFor(); // Plan while the break is still cap-held.
       const comments = extendedThread(options);
       const d = readRedTeamDisposition({ comments: operatorBoundComments(comments), repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS });
@@ -228,7 +230,12 @@ describe('existing-card IO', () => {
       expect(d.sendBack.map(f => f.index)).toEqual(fixerOwns ? [1] : []);
       const f = fake({ initial: comments });
       const act = phase === 'planning' ? () => payloadFor({}, { comments }) : () => f.sinks[RED_TEAM_RULING_CARD_EFFECT](plan);
-      if (fixerOwns) {
+      if (pendingGrant) {
+        // The reader still holds the break, but the gate has not consumed the grant: a ruling now would race the send-back.
+        expect(act).toThrow(phase === 'planning' ? /pending round extension/ : /pending round extension.*nothing written/);
+        expect(f.posted).toEqual([]);
+        expect(f.labelSyncs).toEqual([]);
+      } else if (fixerOwns) {
         expect(act).toThrow(phase === 'planning' ? /no red-team break is held/ : /no red-team break is held.*nothing written/);
         expect(f.posted).toEqual([]);
         expect(f.labelSyncs).toEqual([]);
