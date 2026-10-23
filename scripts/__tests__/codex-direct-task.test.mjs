@@ -38,6 +38,7 @@ import {
   runGate,
   runCodexDirectExec,
   codexDirectTask,
+  cliExitCode,
 } from '../codex-direct-task.mjs';
 
 // Historical orchestration fixtures isolate the new independently tested self-review.
@@ -1077,6 +1078,40 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
   }
 
   describe('#x8wbivt Fork 4 — codexDirectTask wires the quota signal into its report', () => {
+    it.each(['warn', 'fail', 'missing'])('reports own transcript before quota deletion and preserves warn exit status (%s)', async mode => {
+      const dir = mkdtempSync(join(tmpdir(), 'we-codex-transcript-test-'));
+      const sessions = join(dir, 'sessions');
+      mkdirSync(sessions);
+      const rollout = join(sessions, 'rollout-t1.jsonl');
+      const fixture = JSON.stringify({ payload: { type: 'function_call', name: 'exec_command', arguments: '{"cmd":"gh issue list"}' } });
+      if (mode !== 'missing') writeFileSync(rollout, fixture);
+      // A different run must never be inspected, even when this run has no rollout.
+      writeFileSync(join(sessions, 'rollout-other.jsonl'), fixture);
+      vi.stubEnv('WE_COORDINATION_ROOT', join(dir, 'coordination'));
+      const { fn: spawnFn } = fakeSpawn('{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n');
+      const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'git-metadata') : args.includes('rev-parse') ? 'sha0\n' : '';
+      const collectQuotaFn = vi.fn(() => {
+        if (mode !== 'missing') {
+          expect(JSON.parse(readFileSync(join(dir, 'coordination', 'codex-transcript-check.jsonl'), 'utf8')).threadId).toBe('t1');
+          rmSync(rollout);
+        }
+        return { quota: null, rolloutFile: rollout, deleted: mode !== 'missing' };
+      });
+      const log = vi.fn();
+      try {
+        const report = await codexDirectTask({ task: 'fixture', dir, gate: 'none', stream: false, spawnFn, execFn, collectQuotaFn, clearRolloutAfterRun: true, log,
+          env: { ...process.env, CODEX_HOME: dir, WE_CODEX_TRANSCRIPT_CHECK_MODE: mode === 'fail' ? 'fail' : 'warn' } });
+        expect(collectQuotaFn).toHaveBeenCalledOnce();
+        if (mode === 'missing') expect(report.transcriptCheck.error).toMatch(/not found/);
+        else {
+          expect(report.transcriptCheck).toMatchObject({ mode, rolloutFile: rollout, verdict: mode, flags: [{ kind: 'network', detail: 'gh issue list' }] });
+          expect(log).toHaveBeenCalledWith(`codex-transcript-check · verdict=${mode} flags=network`);
+        }
+        expect(cliExitCode(report)).toBe(mode === 'fail' ? 1 : 0);
+        expect(cliExitCode(report, { json: true })).toBe(mode === 'fail' ? 1 : 0);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
     it('surfaces quotaUsedPercent/quotaWindowMinutes/quotaResetsAt/quotaPlanType via the injected readQuotaFn (default: read-only)', async () => {
       const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
       const { fn: spawnFn } = fakeSpawn(stdout);

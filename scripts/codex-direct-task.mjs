@@ -109,6 +109,7 @@ import {
   CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort, parseRolloutUsageBucket,
 } from './lib/codex-model-routing.mjs';
 import { resolveCodexTaskRoute } from './lib/codex-task-route.mjs';
+import { checkRunTranscript } from './lib/codex-transcript-check.mjs';
 
 // ── constants ─────────────────────────────────────────────────────────────────────────────────────
 export const CODEX_CLI = 'codex';
@@ -932,8 +933,10 @@ export async function codexDirectTask({
   let quota = null;
   let quotaRolloutFile = null;
   let quotaRolloutCleared = false;
+  let transcriptCheck = null;
   if (!ephemeral && summary.threadId) {
     const codexHome = resolveCodexHome(env);
+    transcriptCheck = checkRunTranscript({ codexHome, threadId: summary.threadId, findRolloutFile, env, emit });
     const lookup = clearRolloutAfterRun
       ? collectQuotaFn({ codexHome, threadId: summary.threadId })
       : readQuotaFn({ codexHome, threadId: summary.threadId });
@@ -973,6 +976,7 @@ export async function codexDirectTask({
     gate: gateResult,
     selfReview,
     buildPolicy: policy,
+    transcriptCheck,
     // #x8wbivt Fork 4 — the ratified budget signal, mirroring `judge-spawn.mjs`/`judge-panel.mjs`'s
     // `costUsd`/timing reporting shape on the Claude side (no USD figure exists here; this is the real
     // consumption analogue Codex actually offers).
@@ -988,6 +992,7 @@ export async function codexDirectTask({
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────
 /** Process exit status for a completed run; see the file header's "Exit status". PURE. */
 export function cliExitCode(report, { json = false } = {}) {
+  if (report.transcriptCheck?.verdict === 'fail') return 1;
   if (json) return 0;
   return report.exitCode !== 0 || report.timedOut || !report.gate.pass ? 1 : 0;
 }

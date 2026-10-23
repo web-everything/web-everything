@@ -1,0 +1,4 @@
+{
+  "$comment": "Post-run Codex transcript diagnostics. Cascade: standard → platform transcriptCheck → this file → WE_CODEX_TRANSCRIPT_CHECK_MODE / WE_CODEX_TRANSCRIPT_TOKEN_CAP. Warn preserves exit status; fail rejects flagged runs.",
+  "transcriptCheck": { "mode": "warn", "tokenCap": 3000000 }
+}
