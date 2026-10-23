@@ -19,6 +19,9 @@ import { join, resolve } from 'node:path';
 import { acquireRunnerLease, makeOwner, heartbeatRunnerLease, RUNNER_LEASE_MINUTES } from '../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
+import { keepAliveScript } from '../lib/test-keepalive.mjs';
+import { admissionLockRoot, slotPath } from '../readiness/heavy-admission.mjs';
+import { readLockEntry } from '../readiness/file-locks.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
 
@@ -110,6 +113,222 @@ describe('verify-lane writer — overlapping-runs race (#2833 finding 1)', () =>
     expect(kept.sha).toBe(OTHER_SHA);
     expect(kept.status).toBe('green');
   });
+});
+
+describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)', () => {
+  it('non-leader timeout does not sweep unrelated group orphans', () => {
+    // Isolate the shared group from Vitest/the agent shell. The supervisor leads it; verify-lane and an
+    // unrelated, reparented sleeper share it. Removing the caller's leader guard kills this survivor.
+    const supervisor = join(dir, 'shared-group.mjs');
+    writeFileSync(supervisor, `import { execFileSync, spawn, spawnSync } from 'node:child_process';
+const snapshot = (pid) => execFileSync('ps', ['-o', 'pid=,ppid=,pgid=,stat=', '-p', String(pid)], { encoding: 'utf8' }).trim().split(/\\s+/);
+const sleeper = spawnSync(process.execPath, ['-e', "const c = require('node:child_process').spawn('sleep', ['120'], { stdio: 'ignore' }); console.log(c.pid); c.unref();"], { encoding: 'utf8', timeout: 10_000 });
+const orphan = Number(sleeper.stdout.trim());
+if (sleeper.status !== 0 || !Number.isInteger(orphan) || orphan <= 1) throw new Error('could not start unrelated sleeper');
+let verify;
+try {
+  let before;
+  const deadline = Date.now() + 10_000;
+  do {
+    before = snapshot(orphan);
+    if (Number(before[1]) === 1) break;
+    await new Promise((r) => setTimeout(r, 20));
+  } while (Date.now() < deadline);
+  verify = spawn(process.execPath, [${JSON.stringify(VERIFY_LANE)}, '--gate=sleep 120', '--json'], {
+    cwd: ${JSON.stringify(dir)}, detached: false, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const closed = new Promise((resolve, reject) => { verify.once('error', reject); verify.once('close', (code, signal) => resolve({ code, signal })); });
+  let stdout = '', stderr = '';
+  verify.stdout.on('data', (chunk) => { stdout += chunk; });
+  verify.stderr.on('data', (chunk) => { stderr += chunk; });
+  const verifier = snapshot(verify.pid);
+  const result = await closed;
+  let after = null;
+  try { process.kill(orphan, 0); after = snapshot(orphan); } catch {}
+  console.log(JSON.stringify({ leader: process.pid, before, verifier, after, ...result, stdout, stderr }));
+} finally {
+  try { process.kill(orphan, 'SIGKILL'); } catch {}
+  if (verify && verify.exitCode === null) { try { verify.kill('SIGKILL'); } catch {} }
+}
+`);
+    const r = spawnSync(process.execPath, [supervisor], {
+      cwd: dir, detached: true, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
+        WE_VERIFY_PHASE_TIMEOUT_MS: '2000' },
+    });
+    expect(r.error).toBeUndefined();
+    expect(r.status, r.stderr).toBe(0);
+    const result = JSON.parse(r.stdout.trim());
+    expect(Number(result.before[1])).toBe(1);
+    expect(Number(result.before[2])).toBe(result.leader);
+    expect(Number(result.verifier[2])).toBe(result.leader);
+    expect(Number(result.verifier[0])).not.toBe(result.leader);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain('phase exceeded phaseTimeoutMs=2000 (env)');
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
+    expect(result.after, 'unrelated orphan must survive the non-leader timeout').not.toBeNull();
+    expect(result.after[3]).not.toMatch(/^Z/); // A killed but unreaped zombie is not a survivor.
+    expect(result.after.slice(0, 3)).toEqual(result.before.slice(0, 3));
+  }, 70_000);
+
+  it('kills a hung gate phase and its whole process tree at phaseTimeoutMs, recording a timeout (never green)', () => {
+    // The gate forks a grandchild that would outlive a plain kill of the shell, then hangs (the 8h42m vitest case).
+    const pidFile = join(dir, 'grandchild.pid');
+    const gateScript = join(dir, 'hang.mjs');
+    writeFileSync(gateScript, `import { spawn } from 'node:child_process';\nimport { writeFileSync } from 'node:fs';\nconst g = spawn('sleep', ['120'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(pidFile)}, String(g.pid));\n${keepAliveScript()}\n`);
+    const started = Date.now();
+    const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+    expect(Date.now() - started).toBeLessThan(45_000);
+    expect(r.stderr).toContain('phase timeout 2000ms (phaseTimeoutMs, env)');
+    expect(r.stderr).toMatch(/phase exceeded phaseTimeoutMs=2000 \(env\)/);
+    const json = JSON.parse(r.stdout.trim().split('\n').pop());
+    expect(json.status).not.toBe('green');
+    const onDisk = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(onDisk.status).not.toBe('green');
+    expect(onDisk.infrastructure).toMatchObject({ reason: 'verify-timeout', ceilingMs: 2000, signal: 'SIGKILL' });
+    expect(onDisk.infrastructure.detail).toContain('verify-lane killed the process tree');
+    const grandchild = Number(readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(grandchild, 0)).toThrow();
+  }, 70_000);
+
+  it('also kills a descendant reparented out of the tree that still holds the output pipe (audit finding 1)', () => {
+    // The gate double-forks a sleeper (its parent exits at once, so it is reparented to init but keeps stdout open),
+    // then hangs. Before: tree discovery missed it and 'close' never fired, so the run outlived its ceiling.
+    const pidFile = join(dir, 'orphan.pid');
+    const gateScript = join(dir, 'orphan.sh');
+    writeFileSync(gateScript, `( sleep 120 & echo $! > ${JSON.stringify(pidFile)} ) ; sleep 120\n`);
+    const started = Date.now();
+    const r = spawnSync('node', [VERIFY_LANE, `--gate=sh ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000, detached: true,
+      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+    expect(Date.now() - started).toBeLessThan(45_000);
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
+    const orphan = Number(readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(orphan, 0)).toThrow();
+    expect(r.status).not.toBe(0);
+  }, 70_000);
+
+  // PR #5768 red team break 2 — a detached descendant (its own session/group, reparented to init) is in neither the tree
+  // nor verify-lane's group. Before: it survived the timeout and admission was released while it ran. It is found by
+  // the gate output pipe it inherited, or by the per-phase env marker every gate descendant inherits.
+  it.each([
+    ['node, inheriting the output pipes', 'node', 'inherit'],
+    ['sleep, inheriting the output pipes', 'sleep', 'inherit'],
+    ['node, with its stdio ignored (env marker only)', 'node', 'ignore'],
+  ])('kills a detached, reparented descendant in its own session: %s', (_label, kind, stdio) => {
+    const pidFile = join(dir, 'detached.pid');
+    const gateScript = join(dir, 'detach.mjs');
+    const [cmd, args] = kind === 'node' ? [process.execPath, ['-e', keepAliveScript()]] : ['sleep', ['120']];
+    const mid = `const c = require('node:child_process').spawn(${JSON.stringify(cmd)}, ${JSON.stringify(args)}, { detached: true, stdio: ${JSON.stringify(stdio)} });`
+      + ` require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); c.unref();`;
+    writeFileSync(gateScript, `import { spawn } from 'node:child_process';
+const mid = spawn(process.execPath, ['-e', ${JSON.stringify(mid)}], { stdio: 'inherit' });
+await new Promise((r) => mid.once('exit', r));
+${keepAliveScript()}
+`);
+    let detached = null;
+    try {
+      const started = Date.now();
+      const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
+        env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+      expect(Date.now() - started).toBeLessThan(45_000);
+      detached = Number(readFileSync(pidFile, 'utf8'));
+      expect(r.status).not.toBe(0);
+      expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
+      expect(() => process.kill(detached, 0), 'the detached descendant must not survive the timeout').toThrow();
+    } finally {
+      if (detached) { try { process.kill(detached, 'SIGKILL'); } catch { /* gone */ } }
+    }
+  }, 70_000);
+
+  // PR #5768 red team break 1 — verify-lane forwards gate output synchronously, so a reader that stops reading blocks its
+  // event loop. Before: neither the ceiling nor the slot heartbeat ran while blocked. The watchdog runs on its own
+  // thread: the ceiling still fires, the heartbeat keeps the slot until then, and stops once the phase is killed.
+  it('enforces the ceiling and keeps the slot heartbeat while its own stdout is not being read, then stops refreshing', async () => {
+    const pidFile = join(dir, 'chatty.pid');
+    const gateScript = join(dir, 'chatty.mjs');
+    writeFileSync(gateScript, `import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+const chunk = 'x'.repeat(64 * 1024);
+for (let i = 0; i < 64; i++) process.stdout.write(chunk);
+${keepAliveScript()}
+`);
+    const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
+      WE_VERIFY_PHASE_TIMEOUT_MS: '4000', WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' };
+    const slotLockRoot = admissionLockRoot(dir, env);
+    const verify = spawn('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    verify.stderr.on('data', (c) => { stderr += c; });
+    const closed = new Promise((r) => verify.once('close', (code) => r(code)));
+    const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+    const heartbeatAt = () => [0, 1, 2, 3, 4, 5, 6, 7].map((i) => readLockEntry(slotLockRoot, slotPath(i))).find((e) => e && e.pid === verify.pid)?.heartbeatAt ?? null;
+    // The gate is verify-lane's direct child (the shell execs node), so once killed it stays a zombie until the blocked
+    // parent reaps it: dead means gone OR state Z.
+    const alive = (pid) => {
+      try { process.kill(pid, 0); } catch { return false; }
+      const stat = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim();
+      return stat !== '' && !stat.startsWith('Z');
+    };
+    let gate = null;
+    try {
+      for (let i = 0; i < 200 && !existsSync(pidFile); i++) await pause(50);
+      gate = Number(readFileSync(pidFile, 'utf8'));
+      await pause(100);
+      const early = heartbeatAt();
+      await pause(2_900);
+      const beforeCeiling = heartbeatAt();
+      const aliveBeforeCeiling = alive(gate);
+      await pause(3_000);
+      const aliveWhileBlocked = alive(gate);
+      const afterKill = heartbeatAt();
+      await pause(1_500);
+      const later = heartbeatAt();
+      verify.stdout.resume();
+      const code = await closed;
+      expect(aliveBeforeCeiling).toBe(true);
+      expect(aliveWhileBlocked, `the gate must be killed at the ceiling even while stdout is unread\n${stderr}`).toBe(false);
+      expect(early).toEqual(expect.any(String));
+      expect(Date.parse(beforeCeiling), 'the slot heartbeat must keep running while stdout is unread').toBeGreaterThan(Date.parse(early));
+      expect(later, 'the heartbeat must stop once the phase is killed').toBe(afterKill);
+      expect(code).not.toBe(0);
+      expect(stderr).toContain('phase exceeded phaseTimeoutMs=4000 (env)');
+      expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
+    } finally {
+      verify.stdout.resume();
+      if (verify.exitCode === null) { try { verify.kill('SIGKILL'); } catch { /* gone */ } }
+      if (gate) { try { process.kill(gate, 'SIGKILL'); } catch { /* gone */ } }
+    }
+  }, 70_000);
+});
+
+describe('verify-lane — slot heartbeat while the gate runs (verify-admission, 2026-10-20)', () => {
+  it('refreshes the held admission slot every slotHeartbeatMs, so a long gate keeps its slot', () => {
+    // The gate itself samples the slot verify-lane holds for it: once at start, once after ~2.5 heartbeats.
+    // Before: no refresh, so heartbeatAt stayed at acquire time and the lease expired under a long gate.
+    const samples = join(dir, 'samples.json');
+    const gateScript = join(dir, 'sample.mjs');
+    const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    const locksModule = resolve(process.cwd(), 'scripts/readiness/file-locks.mjs');
+    writeFileSync(gateScript, `import { writeFileSync } from 'node:fs';
+import { admissionLockRoot, slotPath } from ${JSON.stringify(admissionModule)};
+import { readLockEntry } from ${JSON.stringify(locksModule)};
+const lockRoot = admissionLockRoot(process.cwd());
+const held = () => [0, 1, 2, 3].map((i) => readLockEntry(lockRoot, slotPath(i))).find((e) => e && e.pid === process.ppid);
+const first = held();
+await new Promise((r) => setTimeout(r, 2_600));
+const second = held();
+writeFileSync(${JSON.stringify(samples)}, JSON.stringify({ first: first?.heartbeatAt ?? null, second: second?.heartbeatAt ?? null }));
+`);
+    // Replace the gate shell so process.ppid identifies verify-lane on shells that do not exec the last command.
+    const r = spawnSync('node', [VERIFY_LANE, `--gate=exec node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
+        WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' } });
+    expect(r.stderr).toContain('slot heartbeat every 1000ms (slotHeartbeatMs, env)');
+    const { first, second } = JSON.parse(readFileSync(samples, 'utf8'));
+    expect(first).toEqual(expect.any(String));
+    expect(second).toEqual(expect.any(String));
+    expect(Date.parse(second)).toBeGreaterThan(Date.parse(first));
+  }, 70_000);
 });
 
 describe('verify-lane — card-only diff skips the local gate (skipLocalForCardOnly)', () => {
