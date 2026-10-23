@@ -43,7 +43,7 @@
  *
  * USAGE:
  *   node scripts/daemon-overlay.mjs add    --clone=<path> --ref=<branch> [--pr=N] [--pinned|--unpinned] [--reason=..] [--by=..] [--json]
- *                                          [--check] [--allow-conflict --reason=..] [--allow-no-pr --reason=..]
+ *                                          [--check] [--expected-sha=<40-hex>] [--allow-conflict --reason=..] [--allow-no-pr --reason=..]
  *   node scripts/daemon-overlay.mjs remove --clone=<path> --ref=<branch> [--reason=..] [--by=..] [--json]
  *   node scripts/daemon-overlay.mjs list   --clone=<path> [--json]
  *   node scripts/daemon-overlay.mjs approve-edge --clone=<path> --ref=<branch> --sha=<40-hex> [--by=..] [--reason=..] [--json]
@@ -63,6 +63,7 @@
  * THE NO-PR WARNING (xkhtg2a, incident 2026-10-08 — overlays without review or a merge link).
  * Adding without --pr warns loudly; overlaySafety.noPr=refuse (or WE_OVERLAY_NO_PR=refuse) refuses with exit 3
  * before the conflict guard or its lock. Override with --allow-no-pr --reason=<why>; --check warns too.
+ * `--expected-sha` refuses (exit 3) a different fetched candidate under the add lock, before registration.
  *
  * THE OVERLAY-CONFLICT GUARD (epic #3383/#4075, live incident 2026-09-27: `lane/promote-stale-green`/#2826 was
  * registered while KNOWINGLY conflicting with `lane/fix-procedure`/#2821 in `review-status-tag.mjs` — nothing
@@ -379,6 +380,9 @@ async function main() {
   if (cmd === 'approve-edge' && typeof flags.sha !== 'string') {
     return fail('--sha=<full 40-hex tip of origin/edge/<ref>> is required for approve-edge');
   }
+  if (cmd === 'add' && Object.hasOwn(flags, 'expected-sha') && !/^[a-f0-9]{40}$/.test(flags['expected-sha'])) {
+    return fail('--expected-sha=<full lowercase 40-hex approved tip> is required when supplied');
+  }
 
   let pr = null;
   if (typeof flags.pr === 'string') {
@@ -438,7 +442,12 @@ async function main() {
     const runGuard = async () => {
       const overlayState = readOverlayState(root, { env });
       if (overlayState.corrupt) return { ok: false, reason: 'overlay-store-corrupt', corruptStore: true };
-      return stackAwareOverlayCheck({ root, ref: flags.ref, pr, existingOverlays: overlayState.overlays, env });
+      const check = await stackAwareOverlayCheck({ root, ref: flags.ref, pr, existingOverlays: overlayState.overlays, env });
+      // Compare the guard's fetched candidate INSIDE the add lock, before any registration write.
+      if (check.ok && flags['expected-sha'] && check.candSha !== flags['expected-sha']) {
+        return { ...check, ok: false, reason: 'sha-moved', expectedSha: flags['expected-sha'] };
+      }
+      return check;
     };
 
     const reportStackConflict = (check) => {
@@ -466,7 +475,7 @@ async function main() {
           + `would be REFUSED${allowConflict ? ' (but --allow-conflict is set, so it would register anyway)' : ''}.\n`);
       }
       if (check.ok && !check.clean && !allowConflict) process.exitCode = 3;
-      else if (!check.ok) process.exitCode = 1;
+      else if (!check.ok) process.exitCode = check.reason === 'sha-moved' ? 3 : 1;
       return;
     }
 
@@ -487,7 +496,8 @@ async function main() {
         // CLOSED: refuse rather than register on an unproven merge. `--allow-conflict` names a KNOWN conflict it
         // is safe to override; it does not cover "the check itself could not run".
         process.stderr.write(`daemon-overlay: could not verify ${flags.ref} merges clean (${describeFailure(check)}) — refusing to register. Pass --allow-conflict --reason=... only for a CONFIRMED conflict this guard itself reported.\n`);
-        process.exitCode = 1;
+        if (asJson) process.stdout.write(`${JSON.stringify({ conflictCheck: check })}\n`);
+        process.exitCode = check.reason === 'sha-moved' ? 3 : 1;
         return null;
       }
       if (!check.clean) {

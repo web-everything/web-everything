@@ -89,6 +89,40 @@ function overlayStateFile(overlayDir, cloneDir) {
   return names.length ? JSON.parse(readFileSync(join(overlayDir, names[0]), 'utf8')) : null;
 }
 
+describe('daemon-overlay.mjs add — expected SHA admission', () => {
+  it.each([false, true])('refuses an advanced branch before registration (check: %s)', (check) => {
+    const f = makeFixture();
+    const ref = 'lane/sha-bound';
+    pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'first.txt', 'approved\n'));
+    const approved = gitOk(f.originDir, ['rev-parse', `refs/heads/${ref}`]).trim();
+    pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'second.txt', 'unapproved\n'), { base: `origin/${ref}` });
+    const advanced = gitOk(f.originDir, ['rev-parse', `refs/heads/${ref}`]).trim();
+    const r = runCli(['add', `--clone=${f.cloneDir}`, `--ref=${ref}`, `--expected-sha=${approved}`, '--json', ...(check ? ['--check'] : [])], { ...f.env, WE_OVERLAY_NO_PR: 'warn' });
+    expect(r.status).toBe(3);
+    expect(JSON.parse(r.stdout)[check ? 'check' : 'conflictCheck']).toMatchObject({ ok: false, reason: 'sha-moved', candSha: advanced, expectedSha: approved });
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+    expect(readdirSync(f.overlayDir).filter((name) => name.endsWith('.events.jsonl'))).toEqual([]);
+  });
+
+  it('accepts the exact approved SHA and returns its admission evidence', () => {
+    const f = makeFixture();
+    pushBranch(f.originDir, 'lane/approved', (dir) => writeFile(dir, 'approved.txt', 'approved\n'));
+    const sha = gitOk(f.originDir, ['rev-parse', 'refs/heads/lane/approved']).trim();
+    const r = runCli(['add', `--clone=${f.cloneDir}`, '--ref=lane/approved', `--expected-sha=${sha}`, '--json'], { ...f.env, WE_OVERLAY_NO_PR: 'warn' });
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout).conflictCheck).toMatchObject({ ok: true, clean: true, candSha: sha });
+    expect(overlayStateFile(f.overlayDir, f.cloneDir).overlays.map((row) => row.ref)).toEqual(['lane/approved']);
+  });
+
+  it.each(['short', '', 'A'.repeat(40)])('rejects malformed expected SHA without registration: %s', (sha) => {
+    const f = makeFixture();
+    const r = runCli(['add', `--clone=${f.cloneDir}`, '--ref=lane/missing', `--expected-sha=${sha}`, '--json'], f.env);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('--expected-sha');
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+  });
+});
+
 describe('daemon-overlay.mjs add — the no-PR warning (xkhtg2a)', () => {
   function fixture(mode) {
     const f = makeFixture();
