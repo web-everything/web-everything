@@ -98,6 +98,10 @@ describe('free-scope core', () => {
     expect(parseExcludePr(undefined)).toEqual({ repo: 'web-everything/web-everything', number: 0 });
     for (const bad of ['bad', '-1', '1.5', 'nope#3', '#3', 'we#x']) expect(() => parseExcludePr(bad)).toThrow(TypeError);
   });
+  it('parses empty and padded exclude-pr input', () => {
+    expect(parseExcludePr('')).toEqual({ repo: 'web-everything/web-everything', number: 0 });
+    expect(parseExcludePr(' 12 ')).toEqual({ repo: 'web-everything/web-everything', number: 12 });
+  });
   it('never declares a partial snapshot free and rejects empty scope', () => {
     const unreadable = [{ repo: 'bad/repo', error: 'unavailable' }];
     expect(assess({ unreadable })).toMatchObject({ status: 'unknown', headline: 'UNKNOWN — could not read open PRs for bad/repo' });
