@@ -36,6 +36,7 @@ import {
 } from '../heavy-admission.mjs';
 import { utcDayKey } from '../../operations/telemetry-summary-io.mjs';
 import { readLockEntry } from '../file-locks.mjs';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 
 // In-process fixtures use a no-op; subprocess fixtures inherit the explicit off switch.
 vi.mock('../../lib/resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn(), decideAdmission: vi.fn(), readSnapshot: vi.fn() }));
@@ -2228,7 +2229,7 @@ describe('heavy-run-wait — a wait budget re-tries the load gate and the slot q
     // A detached grandchild, so its exit is reaped by init (a direct child would linger as a zombie, still "alive",
     // while this test process sits blocked in spawnSync).
     const pid = Number(execFileSync(process.execPath, ['-e',
-      "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 1500)'], { detached: true, stdio: 'ignore' }); c.unref(); process.stdout.write(String(c.pid));"],
+      `const c = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript({ maxLifetimeMs: 1500 }))}], { detached: true, stdio: 'ignore' }); c.unref(); process.stdout.write(String(c.pid));`],
     { encoding: 'utf8' }));
     tryAcquireSlot({ lockRoot: root, cap: 2, owner: 'H0', nowMs: Date.now(), nowIso: new Date().toISOString(), pid, slots: [0] });
     tryAcquireSlot({ lockRoot: root, cap: 2, owner: 'H1', nowMs: Date.now(), nowIso: new Date().toISOString(), pid, slots: [1] });
