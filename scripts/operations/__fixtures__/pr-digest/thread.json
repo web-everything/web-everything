@@ -1,0 +1,15 @@
+{
+  "pr": {
+    "number": 42,
+    "title": "Summarize conveyor review state",
+    "body": "<!-- internal marker -->\n# Why\n\nMake review state readable.\nKeep the GitHub thread intact.\nDO NOT COPY THIS THIRD PURPOSE LINE",
+    "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "labels": [{"name": "review:changes"}]
+  },
+  "comments": [
+    {"id": 101, "body": "## review — changes requested\nRound 2 of 4\n[\"judge\",\"scripts/example.mjs\",33,\"NEVER PASTE FINDING BODY\"]\n- (edge-case, broken) `scripts/other.mjs:24`", "author": {"login": "chalbert"}},
+    {"id": 102, "body": "Mandatory review owner: judge\nHead: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n- [\"judge\",\"scripts/example.mjs\",33,\"NEVER PASTE FINDING BODY\"]: needs ruling\nRulings: [{\"key\":\"[\\\"judge\\\",\\\"scripts/example.mjs\\\",33,\\\"NEVER PASTE FINDING BODY\\\"]\",\"result\":\"card\"}]", "author": {"login": "chalbert"}},
+    {"id": 103, "body": "## review — changes requested\nround 3/4\n- (edge-case, broken) `scripts/other.mjs:24`\n[\"judge\",\"scripts/example.mjs\",33,\"NEVER PASTE FINDING BODY\"]", "author": {"login": "chalbert"}},
+    {"id": 104, "body": "<!-- we:red-team-advisory pr=42 rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->\n### Post-accept red team — 2 possible break(s), 1 confirmed by Claude's re-check\n1. [**confirmed**] (edge-case, broken) `scripts/red.mjs:8` — NEVER PASTE SUMMARY\n   - Scenario: A missing key crashes. DO NOT PASTE SECOND SENTENCE.\n2. [unconfirmed] (normal, broken) `scripts/not.mjs:9`\n   - Scenario: Do not copy this.", "author": {"login": "chalbert"}}
+  ]
+}

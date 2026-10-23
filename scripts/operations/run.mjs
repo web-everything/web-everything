@@ -62,6 +62,8 @@ import { createStaleStateReader } from './stale-state-io.mjs';
 import { prReconcileOperation, PR_RECONCILE_OP } from './pr-reconcile.mjs';
 import { createPrReconcileReader } from './pr-status-io.mjs';
 import { runnerActivityOperation, RUNNER_ACTIVITY_OP } from './runner-activity.mjs';
+import { prDigestOperation, PR_DIGEST_OP, finishPrDigest } from './pr-digest.mjs';
+import { createPrDigestReader } from './pr-digest-io.mjs';
 import { prOwnershipOperation, PR_OWNERSHIP_OP } from './pr-ownership.mjs';
 import { createPrOwnershipReader } from './pr-ownership-io.mjs';
 import { createRunnerActivityReader, createRunnerActivityCliStores } from './runner-activity-io.mjs';
@@ -347,6 +349,11 @@ export const OPERATIONS = Object.freeze({
   [PR_RECONCILE_OP]: () => ({
     declaration: prReconcileOperation({ readPrs: createPrReconcileReader() }),
     sinks: {},
+  }),
+  [PR_DIGEST_OP]: () => ({
+    declaration: prDigestOperation({ readDigest: createPrDigestReader() }),
+    sinks: {},
+    finish: finishPrDigest,
   }),
   [RUNNER_ACTIVITY_OP]: () => ({
     declaration: runnerActivityOperation({ readActivity: createRunnerActivityReader() }),
@@ -726,7 +733,7 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: controlPolicy.zeroWrites || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_DIGEST_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
@@ -736,7 +743,7 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_DIGEST_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,
