@@ -1,5 +1,54 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runRedTeam, speculateRedTeam } from '../review-extra-seats.mjs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+describe('red-team CLI --resume-only', () => {
+  it.each([
+    ['missing', ['--resume-only']],
+    ['unreadable', ['--resume-only']],
+    ['missing', []],
+  ])('guards fresh calls with %s scorecards and flags %j', (store, flags) => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-cli-'));
+    try {
+      const payloadPath = join(dir, 'loop.json');
+      writeFileSync(payloadPath, JSON.stringify(loopPayload));
+      // Execute the production CLI handler in a child. Only effect IO is replaced;
+      // argv parsing, payload reading and the real runRedTeam guard all execute.
+      const source = `
+        import { runExtraSeatsCli } from ${JSON.stringify(new URL('../review-extra-seats.mjs', import.meta.url).href)};
+        const calls = { provider: 0, reserve: 0, model: 0, recheck: 0 };
+        const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
+        await runExtraSeatsCli(process.argv.slice(1), { redTeamIo: {
+          now: () => 1000, log: () => {},
+          readRecords: () => { ${store === 'unreadable' ? "throw Error('EIO');" : 'return [];'} },
+          cliAvailable: forbid('provider'), reserveCalls: forbid('reserve'),
+          runSeat: forbid('model'), runRecheck: forbid('recheck'),
+        } });
+        process.stdout.write(JSON.stringify(calls) + '\\n');
+      `;
+      const output = execFileSync(process.execPath, ['--input-type=module', '-e', source,
+        'red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${dir}`, `--loop-json=${payloadPath}`, ...flags], {
+        encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+        env: { PATH: '', WE_REVIEW_EXTRA_SEATS: '1', WE_REVIEW_RED_TEAM: '1', WE_RED_TEAM_SKIP_CARD_ONLY: '0' },
+      });
+      const [result, calls] = output.trim().split('\n').map(line => JSON.parse(line));
+      if (!flags.length) {
+        // Positive control: the same valid input reaches provider selection without
+        // the CLI guard. The fake throws before any provider can actually execute.
+        expect(result).toEqual({ status: 'error', reason: 'unexpected provider' });
+        expect(calls).toEqual({ provider: 1, reserve: 0, model: 0, recheck: 0 });
+        return;
+      }
+      expect(result).toEqual({ status: 'skipped', reason: store === 'unreadable'
+        ? 'resume-only: scorecard store unreadable — no call launched'
+        : 'resume-only: no clean prior red-team row — no call launched' });
+      expect(calls).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 const pr = 5762, repo = 'web-everything/web-everything', rev = 'a'.repeat(40);
 const read = { netBasis: { rev }, netChangedFiles: ['scripts/example.mjs'], diffText: '+export const example = true;' };

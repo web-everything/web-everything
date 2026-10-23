@@ -1785,9 +1785,9 @@ export function replayPayload({ view, diffText }) {
 
 // ── CLI ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
-if (IS_CLI) {
-  const [sub, ...rest] = process.argv.slice(2);
+/** CLI boundary; injected red-team effects keep recovery tests free of paid calls. */
+export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {}) {
+  const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
@@ -1803,7 +1803,7 @@ if (IS_CLI) {
     runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() })
       .then((result) => emit(result, renderSeatSummary));
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
-    runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only') })
+    return runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only') }, redTeamIo)
       .then((result) => emit(result, renderRedTeamSummary));
   } else if (sub === 'red-team-speculate' && flag('pr') && flag('repo') && flag('lane') && flag('read-sink') && flag('out')) {
     // Card xbizuci — THE SPECULATIVE RED TEAM, started by the review job beside the review loop. It waits for the
@@ -1870,3 +1870,6 @@ if (IS_CLI) {
     process.exitCode = 2;
   }
 }
+
+const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
+if (IS_CLI) runExtraSeatsCli();

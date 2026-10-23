@@ -11,6 +11,28 @@ import { runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, rea
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+
+describe('review-job CLI --red-team-only', () => {
+  it.each([
+    [[], false, 'fresh'],
+    [['--red-team-only'], true, 'fresh'],
+    [['--red-team-only=fresh'], true, 'fresh'],
+    [['--red-team-only=resume'], true, 'resume'],
+    [['--red-team-only=unknown'], true, 'unknown'],
+    [['--red-team-only='], true, ''],
+  ])('passes %j to the job without losing its recovery mode', (flags, redTeamOnly, redTeamMode) => {
+    const source = `
+      import { runReviewJobCli } from ${JSON.stringify(new URL('../review-job.mjs', import.meta.url).href)};
+      runReviewJobCli(process.argv.slice(1), { runJob: options => options });
+    `;
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', source,
+      'run', '--pr=5762', '--repo=web-everything/web-everything', '--prefer-lane=7', ...flags], {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
+    });
+    expect(JSON.parse(output)).toEqual({ pr: '5762', repo, preferLane: 7, redTeamOnly, redTeamMode });
+  });
+});
+
 function fakeIo(over = {}) {
   return { root: '/daemon', now: () => 1_000, newActorId: () => 'actor',
     readPrevCompletion: () => null, claim: vi.fn(() => ({ ok: true })),

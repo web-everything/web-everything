@@ -1153,9 +1153,9 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
 
 // ── CLI ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
-if (IS_CLI) {
-  const [sub, ...rest] = process.argv.slice(2);
+/** CLI boundary; runJob injection observes the options passed to the real job. */
+export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob } = {}) {
+  const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
@@ -1172,7 +1172,7 @@ if (IS_CLI) {
       // Bare legacy flag is fresh-guarded; explicit modes survive detached dispatch.
       const redTeamMode = flag('red-team-only') ?? 'fresh';
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
-      const out = runReviewJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode,
+      const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode,
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       writeAllSync(1, `${JSON.stringify(out)}\n`);
       // #4075/run-rating slice 1 — mechanical grading for this now-finished job-mode review, read back from
@@ -1188,3 +1188,6 @@ if (IS_CLI) {
     }
   }
 }
+
+const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
+if (IS_CLI) runReviewJobCli();
