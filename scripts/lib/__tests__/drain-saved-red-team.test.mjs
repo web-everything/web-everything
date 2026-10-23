@@ -111,7 +111,9 @@ describe('saved red-team admission', () => {
     });
     // Main adds a generated digest to gate markers. `result=<hex>` can trip the opaque-token heuristic;
     // remove only this exact computed metadata field, while checking every finding and composed output.
-    const scrub = text => scrubPublish(text.replaceAll(` result=${resultId} -->`, ' -->'));
+    // Only the known computed result id and empty grant snapshot are metadata; every finding field stays checked.
+    const scrub = text => scrubPublish(text.replaceAll(` result=${resultId} grants=none -->`, ' -->')
+      .replaceAll(` result=${resultId} -->`, ' -->'));
     return { result, writes, scrub };
   }
   const publishableFinding = impactIfUnfixed => ({ confirmedByRecheck: true, impactIfUnfixed,
@@ -293,7 +295,7 @@ describe('saved round-cap break: RULING NEEDED and the clear-human ruling (PR #5
     expect(redTeamRulingNeeded(subject, setting, { readSaved })).toBeNull();
     expect(hold(env, { comments, confirmedBreaks: setting })).toBeNull();
   });
-  it('posting an already-ruled saved result with an identical result id does not reinstate the operator hold', async () => {
+  it('a posted copy requires a human ruling even when its saved result was already ruled', async () => {
     const { env, comments, subject, readSaved } = await roundCapped();
     const { redTeamRulingNeeded, redTeamMarker, parseRedTeamComment } = await import('../red-team-gate.mjs');
     const posted = summary => ({ author: { login: 'web-everything' }, createdAt: '2026-10-17T10:05:00Z', body: [
@@ -303,8 +305,14 @@ describe('saved round-cap break: RULING NEEDED and the clear-human ruling (PR #5
     comments.push(cleared('2026-10-17T10:02:00Z'));
     for (const shape of [c => c, c => ({ user: { login: c.author.login }, created_at: c.createdAt, body: c.body })]) {
       const thread = [...comments, posted('two writers race')].map(shape);
-      expect(redTeamRulingNeeded({ ...subject, comments: thread }, setting, { readSaved })).toBeNull();
-      expect(hold(env, { comments: thread, confirmedBreaks: setting })).toBeNull();
+      // The trusted bot ceremony suffices only while evidence is saved-only. Posting the result restores main's
+      // human-author guard, even for the same digest. A later human ruling releases this exact result.
+      expect(redTeamRulingNeeded({ ...subject, comments: thread }, setting, { readSaved })).not.toBeNull();
+      expect(hold(env, { comments: thread, confirmedBreaks: setting })).toMatch(/requiring send-back/);
+      const humanClearance = { ...cleared('2026-10-17T10:06:00Z'), author: { login: 'chalbert', type: 'User' } };
+      const humanThread = [...thread, shape(humanClearance)];
+      expect(redTeamRulingNeeded({ ...subject, comments: humanThread }, setting, { readSaved })).toBeNull();
+      expect(hold(env, { comments: humanThread, confirmedBreaks: setting })).toBeNull();
       // A different result posted after the ruling is a new decision: it is not covered by the ruling.
       const other = [...comments, posted('a different break')].map(shape);
       expect(hold(env, { comments: other, confirmedBreaks: setting })).toMatch(/requiring send-back/);

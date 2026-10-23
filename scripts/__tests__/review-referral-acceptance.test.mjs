@@ -46,7 +46,7 @@ describe('current-head mandatory referral acceptance', () => {
   });
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
-  it.each([...new Set(['scripts/operations/review-dispatch.mjs', ...DAEMON_ENTRY_MODULES, ...conveyorEntryModules])])('loads %s in a fresh process without an initialization cycle', entry => {
+  it.each([...new Set(['scripts/operations/review-dispatch.mjs', 'scripts/conveyor/review-hold-ledger-shadow.mjs', ...DAEMON_ENTRY_MODULES, ...conveyorEntryModules])])('loads %s in a fresh process without an initialization cycle', entry => {
     const result = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(`./${entry}`)})`],
       { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '../..'), encoding: 'utf8', timeout: 10000 });
     expect(result.status, result.stderr).toBe(0);

@@ -1691,7 +1691,7 @@ pass also holds with the note. Release needs a result on that head, a proven-ide
 through the red-team ruling path, or a card-only diff. The retired `drain.enqueueWhenRedTeamNeverScheduled` is
 ignored; only the operator's env `WE_RED_TEAM_DEADLINE_ACTION=merge-without-result` with a named
 `WE_RED_TEAM_DEADLINE_OVERRIDE_BY` enqueues without a result, logged on every use. Test restarts, head resets,
-request-once, note dedupe and failed publication, policy provenance and comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
+request-once (a refused or throwing hook is tried once per head, then holds), note dedupe and failed publication, policy provenance and comment-read backoff before the deadline. Review jobs publish head-bound running/finished evidence
 in the shared operations sidecar. Store the host, PID namespace (where available) and process birth time with the pid: a live pid
 with a different birth time is a reused process, not an active red team. An unavailable birth-time
 probe preserves the conservative liveness result. Normalize the birth-time probe to UTC and the C
@@ -2301,3 +2301,16 @@ homes and ledgers, and injected minters. Cover `chalbert/web-everything` via `-R
 paths, and a real temporary clone's SSH origin: each selects the worker installation for
 canonical owner `web-everything`. Run the touched `gh-app-shim`, `github-app-auth-env`,
 `github-app-per-owner-routing`, and `github-auth-policy` suites through heavy admission.
+
+## Prototype drain merge recovery
+
+Missing-result recovery retains main's durable one-attempt-per-head guard, including
+refused/throwing hooks and requests while queue-overlap deferred. Prototype prompt recovery
+never waives the admission hold. Saved-only round-cap evidence accepts the trusted
+clear-human ceremony; posted results still require the human operator's own comment,
+and both paths retain result/hold chronology and carried-restamp restrictions.
+
+The referral hold marker lives in `scripts/conveyor/review-referral-hold-marker.mjs`
+and is re-exported by the writer. Reconcile imports the leaf to avoid the
+needs-you-feed → stall sweep → reconcile → hold-writer initialization cycle.
+`review-referral-acceptance.test.mjs` probes the hold-ledger shadow in a fresh Node process.

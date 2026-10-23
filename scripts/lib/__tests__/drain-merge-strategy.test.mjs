@@ -17,6 +17,12 @@ import { saveProvenanceFixtures } from './fixtures/saved-red-team-provenance.mjs
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { withLandWriteLock } from '../../readiness/drain-lock.mjs';
+import { publishAttention } from '../../operations/needs-you-feed.mjs';
+import { isUnderTest } from '../under-test.mjs';
+
+// The real operator feed is never written from this file: every test either injects a publisher or relies on the
+// test-run guard, and the guard's own tests assert against this stand-in.
+vi.mock('../../operations/needs-you-feed.mjs', async importOriginal => ({ ...(await importOriginal()), publishAttention: vi.fn() }));
 
 const HEAD = 'b'.repeat(40);
 const BASE_TIP = 'e'.repeat(40);
@@ -856,7 +862,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(overdue.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(requests).toEqual([]);
   });
-  it('a head with no red team ever scheduled gets one request, once, with a cooldown', () => {
+  it('a head with no red team ever scheduled gets one request attempt per head even if dispatch becomes available later', () => {
     let clock = 1000;
     const requests = [];
     let available = false;
@@ -873,16 +879,17 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(requests).toHaveLength(1);
     available = true;
     clock += 1;
-    expect(next.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, redTeamRequested: true });
-    expect(requests).toHaveLength(2);
+    expect(next.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(requests).toHaveLength(1);
     expect(next.logs.join('')).toContain('redTeamRequestCooldownMin=2 (env)');
     clock += 200 * 60_000;
     const restarted = harness({ ...options, initial: next.state() });
     expect(restarted.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
-    expect(requests).toHaveLength(2);
+    expect(requests).toHaveLength(1);
     const newHead = 'c'.repeat(40);
     const moved = harness({ ...options, initial: restarted.state(), ghView: { 5485: { headRefOid: newHead, labels: options.labels } } });
     expect(moved.s.enqueue({ num: 5485 }, newHead)).toMatchObject({ enqueued: false, redTeamRequested: true });
+    expect(requests).toHaveLength(2);
     expect(requests.at(-1).head).toBe(newHead);
   });
   it('replays #5461: old-head break, live head with no scheduled work requests and stays pending', () => {
@@ -1407,6 +1414,123 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
     expect(enqueuedAny(h)).toBe(false);
   });
+
+  const OVERRIDE_ENV = { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: 'chalbert' };
+  it.each(['inFlight', 'queued', 'recorded'])('the operator override never waives a %s run (held, never enqueued)', field => {
+    const { h, clock } = pastDeadline({ env: OVERRIDE_ENV,
+      evidence: { loopPayload: { verdict: { verdict: 'accept' } }, [field]: true, scheduled: true } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    clock.t += 10 * 60 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(enqueuedAny(h)).toBe(false);
+    expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
+  });
+
+  it('the operator override never waives a confirmed break, even with no run evidence at all', async () => {
+    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+    }) }];
+    // No in-flight, queued or recorded run: only the break's own send-back routing stands between it and the override.
+    const { h, clock } = pastDeadline({ env: OVERRIDE_ENV, liveComments: thread,
+      evidence: { loopPayload: { verdict: { verdict: 'accept' } }, scheduled: true, inFlight: false, queued: false, recorded: false } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false, kind: 'red-team-pending',
+      reason: expect.stringContaining('requiring send-back') });
+    clock.t += 10 * 60 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false });
+    expect(enqueuedAny(h)).toBe(false);
+    expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
+  });
+
+  it.each([
+    ['returns requested:false', () => ({ requested: false })],
+    ['throws', () => { throw new Error('dispatch unavailable'); }],
+  ])('a re-request hook that %s is tried ONCE for the head, then the PR holds with one note (never re-called)', (_name, hook) => {
+    let attempts = 0;
+    const requestRedTeam = input => { attempts++; return hook(input); };
+    const { h, clock, notes } = pastDeadline({ requestRedTeam });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true,
+      reason: expect.stringContaining('the one re-request was not accepted') });
+    expect(attempts).toBe(1);
+    // Every backoff recheck (and a drain restart) keeps the hold without calling the hook again.
+    for (let i = 0; i < 3; i++) { clock.t += 301_000; expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true }); }
+    const restarted = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t, initial: h.state(), requestRedTeam, publishNeedsYou: item => notes.push(item) });
+    clock.t += 301_000;
+    expect(restarted.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(attempts).toBe(1);
+    expect(notes).toHaveLength(1);
+    expect(enqueuedAny(h) || enqueuedAny(restarted)).toBe(false);
+  });
+
+  it('the re-request attempt is saved BEFORE the hook runs: a crash inside the hook never re-requests the head', () => {
+    let attempts = 0, h, atHookTime;
+    // The drain dies inside the hook: only what was on disk when the hook started survives.
+    const crash = () => { attempts++; atHookTime ??= structuredClone(h.state()); throw new Error('drain process killed'); };
+    const started = pastDeadline({ requestRedTeam: crash });
+    h = started.h;
+    const { clock, notes } = started;
+    h.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    expect(atHookTime.redTeamPending['cwd#5283']).toMatchObject({ headSha: HEAD, requestAttemptedAt: clock.t });
+    const restarted = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t + 301_000, initial: atHookTime,
+      requestRedTeam: crash, publishNeedsYou: item => notes.push(item) });
+    expect(restarted.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(attempts).toBe(1);
+  });
+
+  it('a refused attempt is per head: a NEW live head gets its own one re-request', () => {
+    const requests = [];
+    const NEXT = 'f'.repeat(40);
+    const { h, clock } = pastDeadline({ requestRedTeam: input => { requests.push(input.head); return { requested: false }; } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ deadlineHeld: true });
+    const moved = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, now: () => clock.t, initial: h.state(),
+      ghView: { 5283: { state: 'OPEN', headRefOid: NEXT, labels: ACCEPTED, id: 'PR_NODE' } },
+      requestRedTeam: input => { requests.push(input.head); return { requested: false }; }, publishNeedsYou: () => {} });
+    expect(moved.s.enqueue({ num: 5283 }, NEXT, { comments: [] })).toMatchObject({ healthSmell: false });
+    expect(moved.state().redTeamPending['cwd#5283'].requestAttemptedAt).toBeUndefined();
+    clock.t += 45 * 60_000;
+    expect(moved.s.enqueue({ num: 5283 }, NEXT, { comments: [] })).toMatchObject({ deadlineHeld: true,
+      reason: expect.stringContaining('the one re-request was not accepted') });
+    expect(requests).toEqual([HEAD, NEXT]);
+  });
+
+  it('suppresses the real needs-you feed when only process.env marks the test run', () => {
+    expect(isUnderTest(process.env)).toBe(true);
+    publishAttention.mockClear();
+    // An injected env WITHOUT test markers and no injected publisher: process.env alone must keep the real feed unwritten.
+    const { h } = pastDeadline({ env: {}, publishNeedsYou: undefined });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(publishAttention).not.toHaveBeenCalled();
+  });
+
+  it('outside a test run the default publisher IS the real needs-you feed (positive control for the guard above)', () => {
+    vi.stubEnv('VITEST', '');
+    vi.stubEnv('WE_UNDER_TEST', '');
+    try {
+      publishAttention.mockClear();
+      const { h } = pastDeadline({ env: {}, publishNeedsYou: undefined });
+      expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+      expect(publishAttention).toHaveBeenCalledTimes(1);
+      expect(publishAttention).toHaveBeenCalledWith(expect.objectContaining({ pr: 5283, head: HEAD, kind: 'red-team-deadline-held' }));
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
+
+describe('redTeam.deadlineAction resolver: an invalid higher layer preserves the lower layer and its provenance', () => {
+  it.each([
+    ['file merge-without-result over platform hold', { platform: { deadlineAction: 'hold' }, file: { redTeam: { deadlineAction: 'merge-without-result' } } }, 'platform', 'tool.deadlineAction'],
+    ['env merge-without-result (no operator) over file hold', { file: { redTeam: { deadlineAction: 'hold' } }, env: { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result' } }, 'tool', 'env.deadlineAction'],
+    ['env typo over file hold', { file: { redTeam: { deadlineAction: 'hold' } }, env: { WE_RED_TEAM_DEADLINE_ACTION: 'hodl' } }, 'tool', 'env.deadlineAction'],
+    ['platform merge-without-result over nothing keeps the standard', { platform: { deadlineAction: 'merge-without-result' } }, 'standard', 'platform.deadlineAction'],
+    ['env merge-without-result with a blank operator over platform hold', { platform: { deadlineAction: 'hold' }, env: { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: '  ' } }, 'platform', 'env.deadlineAction'],
+  ])('%s', async (_name, layers, source, rejected) => {
+    const { resolveRedTeamDeadlineAction } = await import('../red-team-gate.mjs');
+    const r = resolveRedTeamDeadlineAction(layers);
+    expect(r.value.deadlineAction).toBe(source === 'standard' ? 'requeue-then-hold' : 'hold');
+    expect(r.sources.deadlineAction).toBe(source);
+    expect(r.invalid.join(' ')).toContain(rejected);
+    expect(r.operatorOverride).toBeNull();
+  });
 });
 
 describe('queue safeguard overrides and untracked queue entries', () => {
@@ -1616,7 +1740,7 @@ describe('orphaned accepted panel-seat recovery', () => {
     expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(h.requests).toHaveLength(0);
   });
-  it('respects cooldown for failed stale-row requests and never falls through to enqueue', () => {
+  it('never retries a failed stale-row request on the same head or falls through to enqueue', () => {
     const h = setup({ evidence: stale });
     h.s.enqueue({ num: 5485 }, HEAD);
     expect(h.requests).toHaveLength(1);
@@ -1625,7 +1749,7 @@ describe('orphaned accepted panel-seat recovery', () => {
     expect(h.requests).toHaveLength(1);
     h.advance(60_000);
     h.s.enqueue({ num: 5485 }, HEAD);
-    expect(h.requests).toHaveLength(2);
+    expect(h.requests).toHaveLength(1);
     h.advance(60 * 60_000);
     expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
@@ -1652,7 +1776,7 @@ describe('orphaned accepted panel-seat recovery', () => {
     expect(() => h.s.enqueue({ num: 5485 }, HEAD)).toThrow('enqueue refused in dry run');
     expect(h.requests).toHaveLength(0);
   });
-  it('requests an unseated accepted head promptly, retries on cooldown, and holds until a usable result', () => {
+  it('requests an unseated accepted head promptly once and holds until a usable result', () => {
     const h = setup();
     expect(h.s.enqueue({ num: 5485 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(h.requests).toHaveLength(1);
@@ -1661,7 +1785,7 @@ describe('orphaned accepted panel-seat recovery', () => {
     expect(h.requests).toHaveLength(1);
     h.advance(60_000);
     h.s.enqueue({ num: 5485 }, HEAD);
-    expect(h.requests).toHaveLength(2);
+    expect(h.requests).toHaveLength(1);
     expect(h.logs.join('')).toContain('requesting red team for #5485');
     expect(h.logs.join('')).not.toContain('red team never scheduled');
     expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
@@ -1973,7 +2097,7 @@ describe('red-team requests while queue-file-overlap deferred', () => {
     expect(hasEnqueueMutation(h)).toBe(false);
   });
 
-  it('respects request cooldown for a non-local repo', () => {
+  it('never repeats a refused request for a non-local repo', () => {
     const requestRedTeam = vi.fn(() => ({ requested: false }));
     const h = setup({ requestRedTeam });
     expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
@@ -1982,7 +2106,7 @@ describe('red-team requests while queue-file-overlap deferred', () => {
     expect(requestRedTeam).toHaveBeenCalledTimes(1);
     h.advance(60_000);
     expect(h.s.requestRedTeamWhileDeferred(sibling, HEAD)).toEqual({ requested: false });
-    expect(requestRedTeam).toHaveBeenCalledTimes(2);
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
     expect(h.s.recordedHold(sibling, HEAD)).toBeNull();
     expect(hasEnqueueMutation(h)).toBe(false);
   });
@@ -2060,7 +2184,7 @@ describe('red-team requests while queue-file-overlap deferred', () => {
     expect(hasEnqueueMutation(h)).toBe(false);
   });
 
-  it('persists failed attempts before dispatch and retries only after cooldown', () => {
+  it('persists failed attempts before dispatch and never retries the same head', () => {
     let h;
     const requestRedTeam = vi.fn(() => {
       expect(h.state().redTeamPending[key].requestAttemptedAt).toBeDefined();
@@ -2073,7 +2197,7 @@ describe('red-team requests while queue-file-overlap deferred', () => {
     expect(requestRedTeam).toHaveBeenCalledTimes(1);
     h.advance(60_000);
     h.s.requestRedTeamWhileDeferred(c, HEAD);
-    expect(requestRedTeam).toHaveBeenCalledTimes(2);
+    expect(requestRedTeam).toHaveBeenCalledTimes(1);
     expect(h.state().redTeamPending[key].requestedAt).toBeUndefined();
     expect(hasEnqueueMutation(h)).toBe(false);
   });
@@ -2719,7 +2843,7 @@ describe('the wired red-team re-request (card 6267): a request is never a result
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('request write/start fails → still held, operator alerted with the reason, retried at the next recheck', async () => {
+  it('request write/start fails → still held, operator alerted with the reason, never retried on the same head', async () => {
     let fail = true;
     const spawned = [];
     const { dir, requestRedTeam, list } = await setup({ spawnJob: o => { if (fail) throw new Error('EACCES spawn'); spawned.push(o); return 99; } });
@@ -2736,8 +2860,11 @@ describe('the wired red-team re-request (card 6267): a request is never a result
     expect(h.state().redTeamPending['cwd#5283'].requestedAt).toBeUndefined();
     fail = false;
     clock.t += 300_000;
-    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, redTeamRequested: true });
-    expect(spawned).toHaveLength(1);
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true,
+      reason: expect.stringContaining('EACCES spawn') });
+    expect(spawned).toHaveLength(0);
+    expect(list()).toHaveLength(0);
+    expect(notes).toHaveLength(1);
     expect(enqueuedAny(h)).toBe(false);
     rmSync(dir, { recursive: true, force: true });
   });

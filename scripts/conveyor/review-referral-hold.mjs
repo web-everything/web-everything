@@ -22,11 +22,14 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
+import { REFERRAL_HOLD_MARKER } from './review-referral-hold-marker.mjs';
+
+export { REFERRAL_HOLD_MARKER };
 
 // Match we:scripts/conveyor/rearm-review.mjs#REARM_COMMENT_MARKER locally: importing it closes a daemon boot cycle.
 // The equality test keeps this first-line matcher tied to the canonical marker.
 export const REFERRAL_REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-review';
-export const REFERRAL_HOLD_MARKER = 'review paused:';
+
 export const GH_LIST_COMMENT_CAP = 100;
 export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing']));
 export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
