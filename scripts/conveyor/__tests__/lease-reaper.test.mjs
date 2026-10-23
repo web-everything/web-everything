@@ -41,6 +41,7 @@ import {
   fetchPrStatesForRepo,
   restPullToPrStateShape,
   detachedWrapperPidsBySession,
+  liveWrapperSessionsFromPs,
   readDetachedWrapperPids,
   laneBranchItemNum,
   laneQuietSincePr,
@@ -885,6 +886,130 @@ describe('sessionPidAliveByName — #3383 real process-liveness per session, reu
   });
 });
 
+describe('live dispatcher wrappers without run-store effects', () => {
+  const nowMs = Date.parse('2026-10-23T15:48:26Z');
+  const psLine = (script, session) => `user 12345 0.0 0.1 123456 1234 ?? S 11:46AM 0:01.00 node /repo/scripts/operations/${script} --pr=5502 --session=${session}`;
+  const staleRows = (session, state = 'done') => [{ kind: 'background', name: session, state, sessionId: 'dead-earlier-session-id' }];
+  const signals = (session, rows, psOutput, extra = {}) => {
+    const exec = vi.fn((cmd) => {
+      if (cmd === 'claude') return JSON.stringify(rows);
+      if (cmd === 'ps') {
+        if (psOutput === null) throw new Error('ps unavailable');
+        return psOutput;
+      }
+      throw new Error(`unexpected command: ${cmd}`);
+    });
+    const fetched = fetchSessionSignals({}, { exec });
+    const lease = fresh({ session, acquiredAt: '2026-10-23T15:46:37Z' });
+    const candidate = { lease, dir: '/unused', lane: 27, pool: 'web-everything' };
+    const signalsFor = buildLeaseSignalsFor({
+      prStatesByRepo: new Map(), sessionStates: fetched.states, sessionPidAlive: fetched.pidAlive,
+      sessionAgents: fetched.agents, wrapperPids: new Map(), liveWrapperSessions: fetched.liveWrapperSessions,
+      nowMs, ...extra,
+    });
+    return { fetched, exec, signal: signalsFor(candidate), plan: reapPlan([candidate], { nowMs, signalsFor }) };
+  };
+
+  it('extracts only exact wrapper script and --session= arguments, deduplicating sessions', () => {
+    const output = [
+      psLine('fix-run.mjs', 'fix-5502'), psLine('fix-run.mjs', 'fix-5502'),
+      psLine('deliver-item-run.mjs', 'conveyor-123'), psLine('ci-heal-run.mjs', 'ci-heal-5829'),
+      psLine('other.mjs', 'fix-999'), psLine('not-fix-run.mjs', 'fix-998'),
+      psLine('fix-run.mjs.bak', 'fix-997'), psLine('fix-run.mjs', ''),
+      psLine('fix-run.mjs', 'fix-996').replace('--session=', '--other-session='),
+      'node /repo/scripts/operations/fix-run.mjs --pr=5502',
+    ].join('\n');
+    expect([...liveWrapperSessionsFromPs(output)]).toEqual(['fix-5502', 'conveyor-123', 'ci-heal-5829']);
+    expect([...liveWrapperSessionsFromPs(null)]).toEqual([]);
+    expect([...liveWrapperSessionsFromPs('')]).toEqual([]);
+  });
+
+  it.each([
+    'vim /repo/scripts/operations/fix-run.mjs --session=fix-5502',
+    'node --eval x fix-run.mjs --session=fix-5502',
+    'grep fix-run.mjs --session=fix-5502',
+    'tail -f fix-run.mjs.log --session=x',
+    'vim node fix-run.mjs --session=fix-5502',
+    'node other.mjs fix-run.mjs --session=fix-5502',
+    'node --session=fix-5502 fix-run.mjs',
+    'nodejs fix-run.mjs --session=fix-5502',
+    'node fix-run.mjs --session=fix-5502 --session=fix-9999',
+  ])('ignores non-wrapper command: %s', command => {
+    expect([...liveWrapperSessionsFromPs(`user 12345 0.0 0.1 123456 1234 ?? S 11:46AM 0:01.00 ${command}`)]).toEqual([]);
+  });
+
+  it.each([
+    'node fix-run.mjs',
+    '/usr/local/bin/node /repo/scripts/operations/fix-run.mjs',
+    'node deliver-item-run.mjs',
+    '/usr/bin/node ci-heal-run.mjs',
+  ])('accepts a Node wrapper command: %s', command => {
+    expect([...liveWrapperSessionsFromPs(`  user 12345 0.0 0.1 123456 1234 ?? S 11:46AM 0:01.00   ${command} --pr=5502 --session=fix-5502`)]).toEqual(['fix-5502']);
+  });
+
+  it.each([
+    ['fix-run.mjs', 'fix-5502', 'done'],
+    ['fix-run.mjs', 'fix-5608', 'stopped'],
+    ['ci-heal-run.mjs', 'ci-heal-5829', 'done'],
+    ['deliver-item-run.mjs', 'conveyor-123', 'done'],
+  ])('%s --session=%s preserves a live wrapper despite stale %s rows', (script, session, state) => {
+    const { fetched, exec, signal, plan } = signals(session, staleRows(session, state), psLine(script, session));
+    expect(fetched.pidAlive.get(session)).toBe(false); // the earlier Claude process really is gone
+    expect(fetched.liveWrapperSessions.has(session)).toBe(true);
+    expect(exec.mock.calls.filter(([cmd]) => cmd === 'ps')).toHaveLength(1);
+    expect(signal.sessionGone).toBe(false);
+    expect(plan.reap).toHaveLength(0);
+    expect(plan.keep).toHaveLength(1);
+  });
+
+  it('a foreign wrapper session does not protect a stale listed session', () => {
+    const { signal, plan } = signals('fix-5502', staleRows('fix-5502'), psLine('fix-run.mjs', 'fix-5608'));
+    expect(signal.sessionGone).toBe(true);
+    expect(plan.reap[0].reason).toBe('session-gone');
+  });
+
+  it('no matching ps line leaves stale done rows session-gone', () => {
+    const { signal, plan } = signals('fix-5502', staleRows('fix-5502'), '');
+    expect(signal.sessionGone).toBe(true);
+    expect(plan.reap[0].reason).toBe('session-gone');
+  });
+
+  it('a live wrapper also overrides a stale row with a dead explicit pid', () => {
+    const rows = [{ ...staleRows('fix-5502')[0], pid: 2147483647 }];
+    const { fetched, signal } = signals('fix-5502', rows, psLine('fix-run.mjs', 'fix-5502'));
+    expect(fetched.pidAlive.get('fix-5502')).toBe(false);
+    expect(signal.sessionGone).toBe(false);
+  });
+
+  it('omitting the optional argv signal preserves the existing listing-only behavior', () => {
+    const { signal } = signals('fix-5502', staleRows('fix-5502'), psLine('fix-run.mjs', 'fix-5502'), {
+      liveWrapperSessions: undefined,
+    });
+    expect(signal.sessionGone).toBe(true);
+  });
+
+  it('an unlisted session without a matching process still reaps after the listing grace', () => {
+    const session = 'fix-5502';
+    const { signal, plan } = signals(session, staleRows('fix-5608'), '', { nowMs: nowMs + GRACE_MS });
+    expect(signal.sessionGone).toBe(true);
+    expect(plan.reap[0].reason).toBe('session-gone');
+  });
+
+  it.each(['done', 'working'])('null psOutput preserves existing %s-row behavior without inventing death', state => {
+    const { fetched, signal } = signals('fix-5502', staleRows('fix-5502', state), null);
+    expect(fetched.liveWrapperSessions.size).toBe(0);
+    expect(fetched.pidAlive.get('fix-5502')).toBe(null);
+    expect(signal.sessionGone).toBe(state === 'done');
+  });
+
+  it('an existing run-store wrapper pid retains precedence over the argv fallback', () => {
+    const { signal } = signals('fix-5502', staleRows('fix-5502'), psLine('fix-run.mjs', 'fix-5502'), {
+      wrapperPids: new Map([['fix-5502', 2147483647]]),
+    });
+    expect(signal.sessionGone).toBe(true);
+  });
+});
+
 describe('fetchSessionSignals — #xbk2is9 the three-way `agents` null contract (round-6 convergence standards-conformance finding: this was previously undefended)', () => {
   it('a failed `claude` call → states/agents both null, pidAlive empty', () => {
     const exec = () => { throw new Error('claude: command not found'); };
@@ -892,12 +1017,14 @@ describe('fetchSessionSignals — #xbk2is9 the three-way `agents` null contract 
     expect(result.states).toBe(null);
     expect(result.agents).toBe(null);
     expect(result.pidAlive.size).toBe(0);
+    expect(result.liveWrapperSessions.size).toBe(0);
   });
   it('--no-check-sessions disables the axis with no exec call at all — states/agents both null', () => {
     const exec = () => { throw new Error('must not be called'); };
     const result = fetchSessionSignals({ 'no-check-sessions': true }, { exec });
     expect(result.states).toBe(null);
     expect(result.agents).toBe(null);
+    expect(result.liveWrapperSessions.size).toBe(0);
   });
   it('a valid listing with interactive rows but ZERO background rows → `states` degrades to null (#1921), but `agents` is the REAL array — the whole reason this function returns both', () => {
     const exec = (cmd) => {
