@@ -26,7 +26,9 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-vi.mock('../overlay-load-record.mjs', () => ({ appendLoadRecord: vi.fn(() => ({ ok: true })) }));
+vi.mock('../overlay-load-record.mjs', async (importOriginal) => ({
+  ...await importOriginal(), appendLoadRecord: vi.fn(() => ({ ok: true })),
+}));
 import { runDaemonLoadOverlay, mergeOverlayRef, dryRunOverlay, overlayInstalled } from '../daemon-load-overlay.mjs';
 import finalizeWaitBreak from '../../conveyor/soak/breaks/overlay-admission-finalize-wait.mjs';
 
@@ -1501,6 +1503,38 @@ describe('load outcome audit and registration trigger', () => {
       outcome: 'error', registered: ['rebuild', 'wait'].includes(stage),
     });
     expect(opts.recordFn.mock.calls[0][0].record.error).not.toContain('secret123');
+  });
+
+  it.each([
+    ['rebuild error', 'error', null],
+    ['legacy trigger error', 'triggerError', null],
+    ['versioned trigger error', 'triggerError', {}],
+  ])('sanitizes the full %s before truncation so no credential fragment reaches the record or result', async (_label, field, versions) => {
+    const { appendLoadRecord } = await vi.importActual('../overlay-load-record.mjs');
+    const prefix = 'context '.repeat(61); // The credential starts at offset 488, crossing the 500-char bound.
+    const credential = '0123456789abcdef0123456789abcdef01234567';
+    const error = new Error(`${prefix}${credential} trailing context`);
+    const clean = `${prefix}<redacted> trailing context`.slice(0, 500);
+    const fs = { mkdirSync: vi.fn(), appendFileSync: vi.fn() };
+    const opts = { ...options(), versions, env: { WE_PROTOTYPE_LOAD_RECORD: 'records.jsonl' },
+      recordFn: vi.fn((args) => appendLoadRecord({ ...args, fs })),
+    };
+    if (field === 'error') {
+      opts.rebuild.mockRejectedValue(error);
+      await expect(runDaemonLoadOverlay(opts)).rejects.toBe(error);
+    } else {
+      opts.triggerFn.mockRejectedValue(error);
+      const result = await runDaemonLoadOverlay(opts);
+      expect(result.triggerError).toBe(clean);
+      expect(opts.log.error).toHaveBeenCalledWith(`daemon-load-overlay: rebuild trigger failed: ${clean}`);
+      expect(opts.rebuild).toHaveBeenCalledTimes(versions ? 0 : 1);
+    }
+    expect(opts.recordFn).toHaveBeenCalledTimes(1);
+    expect(opts.recordFn.mock.calls[0][0].record[field]).toBe(clean);
+    expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
+    const line = fs.appendFileSync.mock.calls[0][1];
+    expect(JSON.parse(line)[field]).toBe(clean);
+    expect(line).not.toContain(credential.slice(0, 12));
   });
 
   it.each([() => ({ ok: false, error: 'disk full' }), () => { throw new Error('disk full'); },

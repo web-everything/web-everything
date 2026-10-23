@@ -8,7 +8,7 @@ const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings',
 export const MAX_LOAD_RECORD_BYTES = 16_384;
 
 /** Scrub before bounding: truncating first can leave a short, unrecognizable secret fragment. */
-function sanitize(value) {
+export function sanitize(value) {
   return redactDetail(String(value ?? '').replace(/[\p{Cc}\p{Cf}]/gu, (c) => /\s/u.test(c) ? c : '')
     .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/@]+@/gi, (url) => `${url.slice(0, url.indexOf('://') + 3)}<redacted>@`)
     .replace(/\b(Bearer|Basic)\s+[^\s,;"'<>]+/gi, '$1 <redacted>')

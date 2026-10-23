@@ -70,7 +70,7 @@ import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
 import { DEFAULT_REBUILD_LOCK_WAIT_MS, REBUILD_LOCK_WAIT_ENV } from './daemon-rebuild/lease.mjs';
 import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
-import { appendLoadRecord } from './overlay-load-record.mjs';
+import { appendLoadRecord, sanitize } from './overlay-load-record.mjs';
 import { resolveVersionedContext, submitRequest, waitForResult } from './daemon-version-runtime.mjs';
 import { switchCurrent as switchCurrentVersion, status as versionStatus } from './daemon-version-switch.mjs';
 
@@ -653,7 +653,7 @@ export async function runDaemonLoadOverlay(options = {}) {
       await recordFn({ env, record: {
         ...result, clone: result?.root ?? options.clone ?? null, ref: options.ref ?? null,
         pr: options.pr ?? null, registered: result?.registered ?? loadState.registered, outcome,
-        ...(threw ? { error: redactDetail(error?.message ?? error) } : {}),
+        ...(threw ? { error: sanitize(error?.message ?? error) } : {}),
         ...(loadState.triggerError ? { triggerError: loadState.triggerError } : {}),
       } });
     } catch { /* A failed audit sink must never change the load result or original exception. */ }
@@ -705,7 +705,7 @@ async function loadOverlay({
       triggeredRequestId = wait ? await submit(vctx, { ref, pr, by })
         : await (triggerFn ?? (({ versions: ctx }) => ctx ? submit(ctx, { ref, pr, by }) : null))({ root, ref, pr, by, env, versions: vctx });
     } catch (e) {
-      loadState.triggerError = redactDetail(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, '') || 'rebuild trigger failed';
+      loadState.triggerError = sanitize(e?.message ?? e) || 'rebuild trigger failed';
       log.error?.(`daemon-load-overlay: rebuild trigger failed: ${loadState.triggerError}`);
     }
   }
