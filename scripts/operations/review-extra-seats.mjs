@@ -422,6 +422,16 @@ function publishable(text) {
   return scrubPublish(String(text)).length ? '[withheld: failed the secret scrub]' : clip(text);
 }
 
+/** Scrub the full error before bounding it for stored summaries and terminal output. */
+export function scrubCommentReason(value) {
+  const raw = String(value ?? '');
+  const clean = raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, '');
+  if (scrubPublish(raw).length || scrubPublish(clean).length) {
+    return 'comment error (reason withheld by secret scrub)';
+  }
+  return clean.trim().slice(0, 300);
+}
+
 /**
  * The evidence rows for one call — one per seat. PURE (the caller stamps nothing but `scoredAt`).
  * @returns {Array<object>}
@@ -1351,7 +1361,7 @@ async function finishRedTeamEffects({
       if (redTeamCommentPosted(io.listComments({ pr, repo }), pr, rev)) comment = { status: 'deduped', body };
       else { io.postComment({ pr, repo, body }); comment = { status: 'posted', body }; }
     } catch (e) {
-      comment = { status: 'error', reason: String(e?.message ?? e).slice(0, 300), body };
+      comment = { status: 'error', reason: scrubCommentReason(e?.message ?? e), body };
     }
   }
   const failed = rowErrors > 0 || /^(error|store-write-failed)/.test(delegationTrial) || comment.status === 'error';
@@ -1732,17 +1742,17 @@ export function recordDiscardedRedTeam({ pr, repo, pass = null, reserved = null,
 export function renderRedTeamSummary(r) {
   if (!r || r.status !== 'ran') return [`red team: ${r?.status ?? 'none'}${r?.reason ? ` — ${r.reason}` : ''}`];
   const lines = [`red team: ${r.provider}/${r.model} → ${r.seat.status}${r.seat.status === 'ok' ? ` (${r.findings.length} break(s), ${r.confirmedMissCount} confirmed; recorded verdict ${r.foldedVerdict})` : ` — ${r.seat.error ?? ''}`}; `
-    + `re-check ${r.recheckStatus}; ${r.rowsWritten} evidence row(s); delegation trial ${r.delegationTrial}; comment ${r.comment.status}; calls today ${r.callsUsedToday}/${r.dailyCap}`];
+    + `re-check ${r.recheckStatus}; ${r.rowsWritten} evidence row(s); delegation trial ${r.delegationTrial}; comment ${r.comment.status}${r.comment.status === 'error' ? ` (comment: ${scrubCommentReason(r.comment.reason)})` : ''}; calls today ${r.callsUsedToday}/${r.dailyCap}`];
   for (const f of r.findings) lines.push(`  - [${f.confirmedByRecheck ? 'CONFIRMED' : f.recheckOutcome ?? 'unconfirmed'}] ${f.file ? `${f.file}${f.line ? `:${f.line}` : ''} — ` : ''}${f.summary}`);
   return lines;
 }
 
 /** The red team's effects: the added seats' io, plus the Claude re-check, the head message and the PR comment. */
-export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, ...rest } = {}) {
+export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, spawnGh = spawnSync, ...rest } = {}) {
   const base = createExtraSeatsIo({ env, root, storePath, ...rest });
   const gh = (args, input) => {
-    const r = spawnSync('gh', args, { env, encoding: 'utf8', timeout: 60_000, input, stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
-    if (r.status !== 0) throw new Error(`gh ${args[0]} ${args[1]} failed: ${String(r.stderr ?? r.error?.message ?? '').trim().slice(0, 300)}`);
+    const r = spawnGh('gh', args, { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024, input, stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    if (r.status !== 0) throw new Error(scrubCommentReason(`gh ${args[0]} ${args[1]} failed${r.error?.code ? ` (${r.error.code})` : ''}: ${String(r.stderr ?? r.error?.message ?? '')}`));
     return String(r.stdout ?? '');
   };
   return {

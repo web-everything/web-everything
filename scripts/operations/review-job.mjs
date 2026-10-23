@@ -116,7 +116,7 @@ import { ACTOR_ENV } from '../lib/review-independence.mjs';
 import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import {
-  createRedTeamIo, extraSeatsEnabled, readVerifiedPriorRedTeamEvidence, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs,
+  createRedTeamIo, scrubCommentReason, extraSeatsEnabled, readVerifiedPriorRedTeamEvidence, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs,
 } from './review-extra-seats.mjs';
 import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
@@ -669,6 +669,7 @@ export function summarizeRedTeam(r) {
       recheckStatus: r.recheckStatus ?? null, confirmedMissCount: r.confirmedMissCount ?? 0,
       findings: (r.findings ?? []).map((f) => ({ summary: f.summary, file: f.file ?? null, line: f.line ?? null, category: f.category ?? null, confirmed: f.confirmedByRecheck === true })),
       delegationTrial: r.delegationTrial ?? null, comment: r.comment?.status ?? null, rowsWritten: r.rowsWritten ?? 0,
+      ...(r.comment?.status === 'error' ? { commentReason: scrubCommentReason(r.comment?.reason) } : {}),
     } : {}),
   };
 }
@@ -800,7 +801,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     }
     if (out.redTeamSpeculative) delete out.redTeamSpeculative.result;
     io.log(`review-job ${out.sessionSlug}: red team — ${redTeam?.status ?? 'none'}${redTeam?.reason ? ` (${redTeam.reason})` : ''}`
-      + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
+      + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}${redTeam.comment?.status === 'error' ? ` (comment: ${scrubCommentReason(redTeam.comment.reason)})` : ''}` : ''}`);
     recordSeats(redTeam?.seat ? [redTeam.seat] : []);
     out.redTeam = summarizeRedTeam(redTeam);
     attestSavedRedTeam(io, out.runId, seatsBox.input, redTeam);

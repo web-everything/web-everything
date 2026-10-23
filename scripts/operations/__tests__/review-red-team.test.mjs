@@ -16,7 +16,7 @@ import { parseRedTeamComment } from '../../lib/red-team-gate.mjs';
 
 import {
   createRedTeamIo, speculateRedTeam, completeRedTeam, finishSpeculativeRedTeam, runRedTeam, redTeamEnabled, redTeamMarker, redTeamCommentPosted, redTeamAlreadyRan, resolveBuilder,
-  buildRedTeamTask, buildRecheckRequest, applyRecheck, buildMissRows, renderRedTeamComment, replayPayload,
+  buildRedTeamTask, buildRecheckRequest, applyRecheck, buildMissRows, renderRedTeamComment, renderRedTeamSummary, replayPayload,
   reserveSeatCalls, RED_TEAM_ENV, EXTRA_SEATS_ENV, DAILY_CAP_ENV, PROVIDER_CAP_ENV, RED_TEAM_SEAT, RED_TEAM_MODELS,
   RED_TEAM_MISS_DISPATCH_KIND, ACCEPTING_SEAT_MODEL, DEFAULT_PROBE_INTERVAL_MS,
 } from '../review-extra-seats.mjs';
@@ -495,6 +495,23 @@ describe('x00g3tt — briefs and replay input', () => {
   });
 });
 
+describe('red-team GitHub comment reads', () => {
+  it('reads threads larger than 1 MiB with an explicit buffer of at least 64 MiB', () => {
+    const comments = [{ body: 'x'.repeat(1500 * 1024) }];
+    const spawnGh = vi.fn(() => ({ status: 0, stdout: JSON.stringify({ comments }) }));
+    const io = createRedTeamIo({ spawnGh });
+    expect(io.listComments({ pr: 5, repo: REPO })).toEqual(comments);
+    expect(spawnGh).toHaveBeenCalledWith('gh', ['pr', 'view', '5', `--repo=${REPO}`, '--json', 'comments'], expect.objectContaining({ maxBuffer: expect.any(Number) }));
+    expect(spawnGh.mock.calls[0][2].maxBuffer).toBeGreaterThanOrEqual(64 * 1024 * 1024);
+  });
+
+  it('throws with the spawn error code when the comment read exceeds its buffer', () => {
+    const spawnGh = vi.fn(() => ({ status: null, stderr: '', error: Object.assign(new Error('spawnSync gh ENOBUFS'), { code: 'ENOBUFS' }) }));
+    const io = createRedTeamIo({ spawnGh });
+    expect(() => io.listComments({ pr: 5, repo: REPO })).toThrow('gh pr view failed (ENOBUFS)');
+  });
+});
+
 describe('x00g3tt — review-job: the red team is the post-accept hook, after the seats', () => {
   function jobIo(loop, over = {}) {
     const calls = [];
@@ -539,6 +556,54 @@ describe('x00g3tt — review-job: the red team is the post-accept hook, after th
     const out = runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io);
     expect(out.outcome).toBe('auto-cleared');
     expect(out.redTeam).toMatchObject({ status: 'error', reason: expect.stringMatching(/boom/) });
+  });
+
+  it.each(['error', 'posted', 'skipped'])('keeps the comment reason only for error and logs it: %s', status => {
+    const reason = 'gh pr view failed (ENOBUFS)';
+    const log = vi.fn();
+    const { io } = jobIo(payload('accept'), { log });
+    const result = { ...io.runRedTeam(), comment: { status, reason } };
+    io.runRedTeam = () => result;
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io);
+    const summary = summarizeRedTeam(result);
+    if (status === 'error') {
+      expect(summary.commentReason).toBe(reason);
+      expect(out.redTeam.commentReason).toBe(reason);
+    } else {
+      expect(summary).not.toHaveProperty('commentReason');
+      expect(out.redTeam).not.toHaveProperty('commentReason');
+    }
+    const jobLine = log.mock.calls.map(([line]) => line).find(line => line.includes('red team — ran'));
+    const childLine = renderRedTeamSummary(result)[0];
+    for (const line of [jobLine, childLine]) {
+      expect(line).toContain(`comment ${status}`);
+      if (status === 'error') expect(line).toContain(`(comment: ${reason})`);
+      else expect(line).not.toContain(reason);
+    }
+  });
+
+  it.each([
+    ['fake token', 'ghp_' + 'FakeToken1234567890abcdef', 'comment error (reason withheld by secret scrub)'],
+    ['token past the display limit', 'x '.repeat(200) + 'ghp_' + 'FakeToken1234567890abcdef', 'comment error (reason withheld by secret scrub)'],
+    ['control characters', 'network\u0000\n\r\t\u001b\u007f\u009b failure', 'gh pr view failed: network failure'],
+  ])('scrubs gh stderr before storing or logging the comment error: %s', async (_label, stderr, expected) => {
+    const ghIo = createRedTeamIo({ spawnGh: () => ({ status: 1, stderr }) });
+    const { io: redTeamIo } = fakeIo({ listComments: ghIo.listComments });
+    const result = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' } }, redTeamIo);
+    expect(result.comment).toMatchObject({ status: 'error', reason: expected });
+
+    // Also cover old/injected results that have not passed through the gh seam.
+    const rawResult = { ...result, comment: { ...result.comment, reason: `gh pr view failed: ${stderr}` } };
+    const log = vi.fn();
+    const { io } = jobIo(payload('accept'), { log, runRedTeam: () => rawResult });
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io);
+    expect(summarizeRedTeam(rawResult).commentReason).toBe(expected);
+    expect(out.redTeam.commentReason).toBe(expected);
+    const jobLine = log.mock.calls.map(([line]) => line).find(line => line.includes('red team — ran'));
+    for (const line of [jobLine, renderRedTeamSummary(rawResult)[0]]) {
+      expect(line).toContain(`(comment: ${expected})`);
+      expect(line).not.toMatch(/ghp_|[\u0000-\u001f\u007f-\u009f]/);
+    }
   });
 
   it('summarizeRedTeam keeps the essentials', () => {
