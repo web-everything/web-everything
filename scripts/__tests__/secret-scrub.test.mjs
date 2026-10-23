@@ -90,6 +90,38 @@ describe('scrubPublish — PASSES ordinary, correct backlog/memory prose', () =>
   pass('a plain generalized sentence', 'the lane gate is too coarse for docs-only diffs');
 });
 
+describe('scrubPublish — narrow red-team marker hex exemption', () => {
+  const rev = '9f3c07b5d1c84b62f0937d5bc18f43b6d2c05f19'; // vowel-poor: 'rev=<sha>' trips the opaque rule outside the marker
+  const opaque = 'qzxkvbnmtrplqzxkvbnmtrplqz';
+  const marker = `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=pass result=0123456789abcdef -->`;
+
+  it.each([
+    ['the real gate marker', marker],
+    ['an advisory marker with a hex grant', `<!-- we:red-team-advisory pr=5759 rev=${rev} grants=${rev} -->`],
+    ['comma-separated hex grants', `<!-- we:red-team-advisory pr=5759 rev=${rev} grants=${rev},bcdf0123bcdf4567 -->`],
+    ['an opaque-looking 16-hex result', `<!-- we:red-team-gate pr=5759 rev=${rev} result=bcdf0123bcdf4567 -->`],
+    ['a marker amid prose lines', `Review follows.\n${marker}\nReview ends.`],
+  ])('passes %s', (_label, value) => {
+    expect(scrubPublish(value)).toEqual([]);
+  });
+
+  it.each([
+    ['rev in prose', `Review rev=${rev} is ready.`],
+    ['a trailing word', `${marker} extra`],
+    ['a different prefix', marker.replace('we:red-team-gate', 'we:other-gate')],
+    ['an extra opaque field', `<!-- we:red-team-gate pr=5759 rev=${rev} note=${opaque} -->`],
+    ['an opaque outcome', `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=${opaque} -->`],
+    ['a non-hex result', `<!-- we:red-team-gate pr=5759 rev=${rev} result=${opaque} -->`],
+    ['a result longer than 16 hex', `<!-- we:red-team-gate pr=5759 rev=${rev} result=bcdf0123bcdf45678 -->`],
+    ['a non-hex grant', `<!-- we:red-team-advisory pr=5759 rev=${rev} grants=${opaque} -->`],
+    ['a duplicated rev field', `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=pass rev=${rev} -->`],
+    ['a duplicated result field', `<!-- we:red-team-gate pr=5759 rev=${rev} result=none result=bcdf0123bcdf4567 -->`],
+    ['an opaque token on another line', `${marker}\n${opaque}`],
+  ])('rejects %s with only the opaque-token rule', (_label, value) => {
+    expect(scrubPublish(value)).toEqual(['opaque token (unpronounceable ≥20-char key/secret)']);
+  });
+});
+
 describe('scrubPublish vs scrubReasons — the widths differ ON PURPOSE (#3015)', () => {
   const narrowedAway = [
     ['fenced code', '```js\nconst x = 1;\n```'],
