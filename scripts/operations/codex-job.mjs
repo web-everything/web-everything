@@ -99,9 +99,7 @@ export async function acquireLane(s) {
   s.result.lane = s.lane.lane;
 }
 export async function resetLane(s) {
-  for (const args of [['reset', '--hard', s.opts.base], ['checkout', '-B', s.result.branch]]) {
-    if (!good(await git(s, args, true))) fail('lane-reset-failed');
-  }
+  if (!good(await git(s, ['reset', '--hard', s.opts.base], true))) fail('lane-reset-failed');
   const head = await git(s, ['rev-parse', 'HEAD']);
   const base = await git(s, ['rev-parse', s.opts.base]);
   if (!good(head) || !good(base) || !head.stdout?.trim() || head.stdout.trim() !== base.stdout?.trim()) fail('lane-reset-failed');

@@ -37,7 +37,7 @@ function fixture(rules = [], { ready = true } = {}) {
         if (args.includes('rev-parse')) return ok('abc123\n');
         if (args.includes('diff') && args.includes('--quiet')) return ok();
         if (args.includes('diff')) return ok('scripts/a.mjs\0');
-        if (['reset', 'checkout', 'ls-files', 'add', 'commit', 'ls-remote', 'push'].some(x => args.includes(x))) return ok();
+        if (['reset', 'ls-files', 'add', 'commit', 'ls-remote', 'push'].some(x => args.includes(x))) return ok();
       }
       throw new Error(`Unscripted command: ${call.text}`);
     },
@@ -72,11 +72,13 @@ it('happy path orders gates, captures one JSON line, uses session env and releas
   expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1);
   expect(f.output).toHaveLength(1);
   expect(f.output[0].split('\n')).toHaveLength(2);
-  const expected = ['free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'reset --hard', 'checkout -B', 'rev-parse HEAD', 'rev-parse origin/main', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'add --', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --', 'commit -m', 'rev-parse HEAD', 'ls-remote', 'push origin', 'fix-ready.mjs mark', 'daemon-overlay.mjs add', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
+  const expected = ['free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'reset --hard', 'rev-parse HEAD', 'rev-parse origin/main', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'add --', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --', 'commit -m', 'rev-parse HEAD', 'ls-remote', 'push origin', 'fix-ready.mjs mark', 'daemon-overlay.mjs add', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
   expect(f.calls).toHaveLength(expected.length);
   expected.forEach((part, i) => expect(f.calls[i].text).toContain(part));
   expect(f.calls.every(c => c.args.every(a => !a.includes('--force') && !a.includes('--allow-conflict')))).toBe(true);
-  for (const part of ['reset --hard', 'checkout -B', 'commit -m']) expect(f.calls.find(c => c.text.includes(part)).env.LANE_SESSION).toBe('session');
+  expect(f.calls.some(c => c.args.includes('checkout'))).toBe(false);
+  for (const part of ['reset --hard', 'commit -m']) expect(f.calls.find(c => c.text.includes(part)).env.LANE_SESSION).toBe('session');
+  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/lane', 'push', 'origin', 'HEAD:refs/heads/lane/example']);
   const add = f.calls.find(c => c.args.includes('add') && c.cmd === 'git');
   expect(add.args).toEqual(['-C', '/lane', 'add', '--', 'scripts/a.mjs']);
   expect(f.calls.find(c => c.args.includes('commit')).args).toContain('Build the example');
