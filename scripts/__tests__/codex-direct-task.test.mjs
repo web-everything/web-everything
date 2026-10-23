@@ -61,7 +61,7 @@ function flagValue(argv, flag) {
 
 describe('codex-runner detached wait contract', () => {
   it('retries only on exit 75 and stops and reports terminal nonzero exits', () => {
-    const runner = readFileSync(new URL('../../.claude/agents/codex-runner.md', import.meta.url), 'utf8');
+    const runner = readFileSync(join(process.cwd(), '.claude/agents/codex-runner.md'), 'utf8');
     const instruction = runner.split('\n').find(line => line.startsWith('- **Long Codex tasks:**'));
     expect(instruction).toContain('codex-direct-task wait --job=<id>');
     expect(instruction).toContain('Repeat only on exit 75 (still running).');
