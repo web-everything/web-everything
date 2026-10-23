@@ -13,6 +13,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  startDetachedJob, waitForJob, readJobRecord, writeJobRecord, updateJobRecord, cliExitCode,
   CODEX_CLI,
   DEFAULT_TIMEOUT_MS,
   CODEX_EFFORT_MAP,
@@ -1188,8 +1189,9 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
   it.each([
     ['a green gate with --no-self-review exits 0', true, ['--no-self-review'], 0],
     ['a red gate in text mode exits 1', false, ['--no-self-review'], 1],
+    ['a task exiting 7 in foreground text mode exits 1', true, ['--no-self-review'], 1, 7],
     ['--ephemeral without --no-self-review is refused while self-review is on', true, [], 1],
-  ])('%s', (_name, gateGreen, flags, status) => {
+  ])('%s', (_name, gateGreen, flags, status, runCode = 0) => {
     const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-exit-'));
     weCheckout(dir);
     const preload = `import cp from 'node:child_process';
@@ -1204,7 +1206,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
         child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
         child.stdin = { on() {}, end() { setTimeout(() => {
           child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'turn.completed' }) + '\\n'));
-          child.emit('close', 0);
+          child.emit('close', ${runCode});
         }, 0); } };
         child.kill = () => {};
         return child;
@@ -1216,8 +1218,435 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
       { encoding: 'utf8', env: { ...process.env, WE_CODEX_MODEL_BY_TASK: '{}', WE_BUILD_SELF_REVIEW_ENABLED: 'true' } });
       expect(run.status, run.stderr).toBe(status);
       if (status === 0) expect(run.stdout).toContain('gate (standards): PASS');
+      else if (runCode) expect(run.stdout).toContain(`exit: ${runCode}`);
       else if (flags.length) expect(run.stdout).toContain('gate (standards): FAIL');
       else expect(run.stderr).toContain('--ephemeral requires self-review off');
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([{ flags: [] }, { flags: ['--json'] }])('an unreadable foreground task file exits 1 with flags $flags and ignores the child-delay hook', ({ flags }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-unreadable-'));
+    try {
+      const run = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs',
+        `--task-file=${join(dir, 'missing-task.txt')}`, ...flags], {
+        encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, CODEX_DIRECT_TASK_TEST_CHILD_DELAY_MS: '10000' },
+      });
+      expect(run.error).toBeUndefined();
+      expect(run.status, run.stderr).toBe(1);
+      expect(run.stderr).toContain('ENOENT');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('detached jobs', () => {
+  let jobsDir;
+  beforeEach(() => { jobsDir = mkdtempSync(join(tmpdir(), 'codex-jobs-test-')); });
+  afterEach(() => { rmSync(jobsDir, { recursive: true, force: true }); });
+
+  function fixture() {
+    let time = 0;
+    let record = { id: 'test-job', pid: 123, status: 'running', startedAt: new Date(0).toISOString(),
+      resultPath: 'test-job.result.json', exitCode: null };
+    const child = new EventEmitter();
+    child.pid = 123;
+    child.unref = vi.fn();
+    child.on('exit', code => { record = { ...record, status: code === 0 ? 'done' : 'failed', exitCode: code }; });
+    const readRecord = vi.fn(() => ({ ...record }));
+    const writeRecord = vi.fn(updated => { record = updated; });
+    const sleep = vi.fn(async ms => { time += ms; });
+    const options = { jobId: record.id, jobsDir, readRecord, writeRecord, isAlive: () => true,
+      sleep, now: () => time, pollMs: 1000 };
+    return { child, options, sleep, writeRecord };
+  }
+
+  it('done: fake child completion returns done/0 without sleeping', async () => {
+    const f = fixture();
+    f.child.emit('exit', 0);
+    expect(await waitForJob(f.options)).toEqual({ status: 'done', exitCode: 0, resultPath: 'test-job.result.json', code: 0 });
+    expect(f.sleep).not.toHaveBeenCalled();
+  });
+
+  it('timeout-then-done: first wait returns running/75 and a later wait returns done/0', async () => {
+    const f = fixture();
+    expect(await waitForJob({ ...f.options, maxMs: 1500 })).toMatchObject({ status: 'running', exitCode: null, code: 75 });
+    expect(f.sleep.mock.calls).toEqual([[1000], [500]]);
+    f.child.emit('exit', 0);
+    expect(await waitForJob(f.options)).toMatchObject({ status: 'done', exitCode: 0, code: 0 });
+  });
+
+  it('polls again and observes completion during a wait', async () => {
+    const f = fixture();
+    expect(await waitForJob({ ...f.options, sleep: async ms => { await f.sleep(ms); f.child.emit('exit', 0); } }))
+      .toMatchObject({ status: 'done', code: 0 });
+    expect(f.sleep).toHaveBeenCalledOnce();
+  });
+
+  it.each([7, 0, null])('failed: propagates exit code %s with fallback 1', async exitCode => {
+    const f = fixture();
+    f.child.emit('exit', exitCode);
+    // A failed record with a legacy zero code must never report success.
+    if (exitCode === 0) f.options.readRecord = () => ({ status: 'failed', exitCode, resultPath: 'result' });
+    expect(await waitForJob(f.options)).toMatchObject({ status: 'failed', code: exitCode || 1 });
+  });
+
+  it('dead PID while running becomes failed/1 and persists its finish time', async () => {
+    const f = fixture();
+    expect(await waitForJob({ ...f.options, isAlive: () => false })).toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
+    expect(f.writeRecord).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', exitCode: 1, finishedAt: new Date(0).toISOString() }));
+  });
+
+  it.each([
+    ['EPERM', 'running', null, 75],
+    ['ESRCH', 'failed', 1, 1],
+    ['EIO', 'failed', null, 2],
+  ])('default PID probe receiving %s returns %s with code %s/%s', async (errorCode, status, exitCode, code) => {
+    const f = fixture();
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error(errorCode), { code: errorCode });
+    });
+    try {
+      expect(await waitForJob({ ...f.options, isAlive: undefined, maxMs: 1000 }))
+        .toMatchObject({ status, exitCode, code });
+      expect(kill).toHaveBeenCalledTimes(1);
+      expect(kill).toHaveBeenCalledWith(123, 0);
+      if (errorCode === 'ESRCH') {
+        expect(f.writeRecord).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', exitCode: 1 }));
+      } else {
+        expect(f.writeRecord).not.toHaveBeenCalled();
+      }
+    } finally { kill.mockRestore(); }
+  });
+
+  it('max-ms=0 returns promptly without probing a dead PID or trying its contended lock', async () => {
+    const f = fixture();
+    writeFileSync(join(jobsDir, 'test-job.json.lock'), `${process.pid}\n`);
+    const isAlive = vi.fn(() => false);
+    const updateRecord = vi.fn();
+    const started = performance.now();
+    expect(await waitForJob({ ...f.options, maxMs: 0, isAlive, updateRecord }))
+      .toMatchObject({ status: 'running', exitCode: null, code: 75 });
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(isAlive).not.toHaveBeenCalled();
+    expect(updateRecord).not.toHaveBeenCalled();
+    expect(f.sleep).not.toHaveBeenCalled();
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it('checks the deadline again after a dead-PID probe before updating its record', async () => {
+    const f = fixture();
+    const updateRecord = vi.fn();
+    expect(await waitForJob({ ...f.options, maxMs: 10, updateRecord,
+      isAlive: async () => { await f.sleep(10); return false; },
+    })).toMatchObject({ status: 'running', code: 75 });
+    expect(updateRecord).not.toHaveBeenCalled();
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it.each(['readRecord', 'isAlive', 'updateRecord'])('bounds a delayed %s by maxMs=5 using the injected clock and sleep', async operation => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      const completed = vi.fn();
+      const sleep = vi.fn(ms => new Promise(resolveSleep => setTimeout(resolveSleep, ms)));
+      const pending = vi.fn(async () => {
+        await sleep(1000);
+        completed();
+        if (operation === 'isAlive') return false;
+        return f.options.readRecord();
+      });
+      let result;
+      const waiting = waitForJob({ ...f.options, maxMs: 5, now: Date.now, sleep,
+        isAlive: () => false, [operation]: pending,
+      }).then(value => { result = value; });
+      await vi.advanceTimersByTimeAsync(5);
+      expect(result).toMatchObject({ status: 'running', exitCode: null, code: 75 });
+      expect(pending).toHaveBeenCalledOnce();
+      expect(completed).not.toHaveBeenCalled();
+      expect(f.writeRecord).not.toHaveBeenCalled();
+      await waiting;
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('shares the remaining budget across asynchronous reads, probes and updates', async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      const sleep = ms => new Promise(resolveSleep => setTimeout(resolveSleep, ms));
+      const updateRecord = vi.fn(async () => { await sleep(1000); return f.options.readRecord(); });
+      let result;
+      const waiting = waitForJob({ ...f.options, maxMs: 5, now: Date.now, sleep,
+        readRecord: async () => { await sleep(2); return f.options.readRecord(); },
+        isAlive: async () => { await sleep(2); return false; }, updateRecord,
+      }).then(value => { result = value; });
+      await vi.advanceTimersByTimeAsync(5);
+      expect(result).toMatchObject({ status: 'running', code: 75 });
+      expect(updateRecord).toHaveBeenCalledOnce();
+      expect(f.writeRecord).not.toHaveBeenCalled();
+      await waiting;
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['readRecord', 'isAlive', 'updateRecord'])('fails closed with exit 2 when asynchronous %s rejects', async operation => {
+    const f = fixture();
+    expect(await waitForJob({ ...f.options, maxMs: 100, now: Date.now, sleep: undefined,
+      isAlive: () => false, [operation]: async () => { throw new Error('IO unavailable'); },
+    })).toMatchObject({ status: 'failed', exitCode: null, code: 2 });
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it('dead-PID lock contention stays within the wait budget and returns 75; a later wait can retry', async () => {
+    const f = fixture();
+    const lockPath = join(jobsDir, 'test-job.json.lock');
+    writeFileSync(lockPath, `${process.pid}\n`);
+    const started = performance.now();
+    expect(await waitForJob({ ...f.options, maxMs: 10, isAlive: () => false }))
+      .toMatchObject({ status: 'running', exitCode: null, code: 75 });
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(f.sleep.mock.calls).toEqual([[10]]);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+    rmSync(lockPath);
+    expect(await waitForJob({ ...f.options, isAlive: () => false }))
+      .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
+  });
+
+  it('unreadable dead-PID bookkeeping fails closed with exit 2', async () => {
+    const f = fixture();
+    expect(await waitForJob({ ...f.options, isAlive: () => false,
+      updateRecord: () => { throw new Error('record unreadable'); },
+    })).toMatchObject({ status: 'failed', code: 2 });
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it('preserves completion when child exits between record read and liveness check', async () => {
+    const running = { id: 'completion-race', pid: 123, status: 'running',
+      startedAt: new Date(0).toISOString(), resultPath: 'result.json', exitCode: null };
+    writeJobRecord(running, { jobsDir });
+    const completed = { ...running, status: 'done', exitCode: 0, finishedAt: new Date(1000).toISOString() };
+    const result = await waitForJob({
+      jobId: running.id, jobsDir,
+      readRecord: id => readJobRecord(id, { jobsDir }),
+      writeRecord: record => writeJobRecord(record, { jobsDir }),
+      isAlive: () => {
+        // Commit the child's completion after the waiter's stale running snapshot.
+        updateJobRecord(running.id, () => completed, { jobsDir });
+        return false;
+      },
+      sleep: vi.fn(() => { throw new Error('unexpected sleep'); }), now: () => 2000,
+    });
+    expect(result).toEqual({ status: 'done', exitCode: 0, resultPath: running.resultPath, code: 0 });
+    expect(readJobRecord(running.id, { jobsDir })).toEqual(completed);
+  });
+
+  it('holds the shared job lock throughout the fresh read, mutation and atomic write', () => {
+    let locked = false;
+    const running = { id: 'locked', status: 'running' };
+    const readRecord = vi.fn(() => { expect(locked).toBe(true); return running; });
+    const update = vi.fn(record => { expect(locked).toBe(true); return { ...record, status: 'done' }; });
+    const writeRecord = vi.fn(() => { expect(locked).toBe(true); });
+    const withLock = vi.fn((_path, fn) => {
+      locked = true;
+      try { return fn(); } finally { locked = false; }
+    });
+    expect(updateJobRecord('locked', update, { jobsDir, readRecord, writeRecord, withLock })).toEqual({ id: 'locked', status: 'done' });
+    expect(withLock).toHaveBeenCalledWith(join(jobsDir, 'locked.json.lock'), expect.any(Function), {});
+    expect(readRecord).toHaveBeenCalledWith('locked');
+    expect(writeRecord).toHaveBeenCalledWith({ id: 'locked', status: 'done' });
+  });
+
+  it('refuses bookkeeping when the shared lock cannot be acquired; retry after contention clears', () => {
+    const readRecord = vi.fn();
+    const writeRecord = vi.fn();
+    expect(() => updateJobRecord('locked', () => ({}), { jobsDir, readRecord, writeRecord,
+      withLock: () => { throw new Error('lock timeout'); },
+    })).toThrow('lock timeout');
+    expect(readRecord).not.toHaveBeenCalled();
+    expect(writeRecord).not.toHaveBeenCalled();
+  });
+
+  it('clamps oversized waits to 540000 ms; exit 75 allows the operator to wait again', async () => {
+    const f = fixture();
+    expect(await waitForJob({ ...f.options, maxMs: 540000 * 2, pollMs: 540000 }))
+      .toMatchObject({ status: 'running', code: 75 });
+    expect(f.sleep.mock.calls).toEqual([[540000]]);
+  });
+
+  it('unknown and unreadable jobs fail closed with exit 2', async () => {
+    for (const jobId of ['missing', '../escape', undefined]) {
+      expect(await waitForJob({ jobId, readRecord: id => readJobRecord(id, { jobsDir }) }))
+        .toEqual({ status: 'failed', exitCode: null, resultPath: null, code: 2 });
+    }
+    writeFileSync(join(jobsDir, 'broken.json'), '{');
+    expect(await waitForJob({ jobId: 'broken', readRecord: id => readJobRecord(id, { jobsDir }) })).toMatchObject({ code: 2 });
+  });
+
+  it('rejects incomplete persisted records rather than declaring success', async () => {
+    writeFileSync(join(jobsDir, 'incomplete.json'), JSON.stringify({ id: 'incomplete', status: 'done' }));
+    expect(await waitForJob({ jobId: 'incomplete', readRecord: id => readJobRecord(id, { jobsDir }) })).toMatchObject({ code: 2 });
+  });
+
+  it.each(['--detach', '--detach=true'])('detach %s writes a running record, redirects files, unrefs and returns before child completion', async detachFlag => {
+    const child = new EventEmitter();
+    child.pid = 321;
+    child.unref = vi.fn();
+    const spawnFn = vi.fn(() => { queueMicrotask(() => child.emit('spawn')); return child; });
+    const args = ['--task=literal $(no-shell)', detachFlag, '--dir=checkout'];
+    const job = await startDetachedJob({ args, jobsDir, spawnFn, now: () => 0, random: () => 'random',
+      nodePath: 'node', scriptPath: 'scripts/codex-direct-task.mjs', env: {} });
+    expect(job).toEqual({ id: '0-random', pid: 321, status: 'running', startedAt: new Date(0).toISOString(),
+      resultPath: join(jobsDir, '0-random.result.json'), exitCode: null, recordPath: join(jobsDir, '0-random.json') });
+    const { recordPath, ...record } = job;
+    expect(readJobRecord(job.id, { jobsDir })).toEqual(record);
+    expect(child.unref).toHaveBeenCalledOnce();
+    expect(spawnFn).toHaveBeenCalledWith('node', ['scripts/codex-direct-task.mjs', args[0], args[2], '--json', '--job=0-random'],
+      { detached: true, stdio: ['ignore', expect.any(Number), expect.any(Number)], env: { CODEX_JOBS_DIR: jobsDir } });
+    const spawnOptions = spawnFn.mock.calls[0][2];
+    expect(spawnOptions.detached).toBe(true);
+    expect(spawnOptions.stdio).not.toBe('pipe');
+    expect(spawnOptions.stdio).not.toContain('pipe');
+    expect(readFileSync(job.resultPath, 'utf8')).toBe('');
+    expect(readFileSync(join(jobsDir, '0-random.stderr.log'), 'utf8')).toBe('');
+    expect(args).toContain(detachFlag);
+  });
+
+  it('spawn errors reject without publishing a running job', async () => {
+    const spawnFn = () => {
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('error', new Error('spawn unavailable')));
+      return child;
+    };
+    await expect(startDetachedJob({ jobsDir, spawnFn, now: () => 0, random: () => 'error' })).rejects.toThrow('spawn unavailable');
+    expect(() => readJobRecord('0-error', { jobsDir })).toThrow();
+  });
+
+  it('parent survival: real detach exits 0 promptly while its child is running with a live PID, then wait completes it', () => {
+    const options = { encoding: 'utf8', maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir, CODEX_DIRECT_TASK_TEST_CHILD_DELAY_MS: '6000' } };
+    let job;
+    try {
+      const started = performance.now();
+      const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
+        `--task-file=${join(jobsDir, 'nonexistent-task.txt')}`], { ...options, timeout: 4000 });
+      const elapsed = performance.now() - started;
+      expect(launcher.error).toBeUndefined();
+      expect(launcher.status, launcher.stderr).toBe(0);
+      job = JSON.parse(launcher.stdout);
+      expect(job.id).toMatch(/^[A-Za-z0-9][A-Za-z0-9_-]*$/);
+      expect(job.recordPath).toBe(join(jobsDir, `${job.id}.json`));
+      expect(elapsed).toBeLessThan(4000);
+      const running = readJobRecord(job.id, { jobsDir });
+      expect(running).toMatchObject({ status: 'running', exitCode: null });
+      expect(() => process.kill(running.pid, 0)).not.toThrow();
+      const waiter = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait',
+        `--job=${job.id}`, '--max-ms=20000'], { ...options, timeout: 25000 });
+      expect(waiter.error).toBeUndefined();
+      expect(waiter.status, waiter.stderr).toBe(1);
+      expect(JSON.parse(waiter.stdout)).toMatchObject({ status: 'failed', exitCode: 1 });
+      expect(readJobRecord(job.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1,
+        finishedAt: expect.any(String) });
+    } finally {
+      if (job) {
+        const record = readJobRecord(job.id, { jobsDir });
+        if (record.status === 'running') {
+          try { process.kill(record.pid, 'SIGTERM'); } catch { /* child already exited */ }
+        }
+      }
+    }
+  }, 35000);
+
+  it.each([
+    { exitCode: 7, timedOut: false, pass: true, expected: 1 },
+    { exitCode: 7, timedOut: true, pass: false, expected: 1 },
+    { exitCode: 0, timedOut: true, pass: true, expected: 1 },
+    { exitCode: 0, timedOut: false, pass: false, expected: 1 },
+  ])('foreground maps task exit $exitCode with timeout=$timedOut and gate=$pass to $expected', ({ exitCode, timedOut, pass, expected }) => {
+    const report = { exitCode, timedOut, gate: { pass } };
+    expect(cliExitCode(report)).toBe(expected);
+    expect(cliExitCode(report, { json: true })).toBe(0);
+  });
+
+  const jsonTaskArgs = ['--task=fixture', '--json', '--no-stream', '--no-self-review'];
+  it.each([
+    { label: 'validation failure', args: [], processCode: 2, recordCode: 2 },
+    { label: 'success', args: [...jsonTaskArgs, '--review'], processCode: 0, recordCode: 0,
+      report: { exitCode: 0, timedOut: false, gate: { pass: true } } },
+    { label: 'nonzero task in JSON mode', args: [...jsonTaskArgs, '--gate=none'], processCode: 0, recordCode: 7, runCode: 7,
+      report: { exitCode: 7, timedOut: false, gate: { pass: true } } },
+    { label: 'timeout in JSON mode', args: [...jsonTaskArgs, '--gate=none', '--timeout-ms=10'], processCode: 0, recordCode: 1, timeout: true,
+      report: { exitCode: null, timedOut: true, gate: { pass: true } } },
+    { label: 'failed gate in JSON mode', args: [...jsonTaskArgs, '--gate=standards'], processCode: 0, recordCode: 1, gateFails: true,
+      report: { exitCode: 0, timedOut: false, gate: { ran: true, pass: false } } },
+    { label: 'unreadable task file', args: ['--task-file=missing-detached-task-fixture'], processCode: 1, recordCode: 1 },
+  ])('CLI $label atomically records the internal job outcome', async ({ args, processCode, recordCode, runCode = 0, timeout = false, gateFails = false, report }) => {
+    // Bootstrap the record with the actual child PID; task execution and gates stay hermetic.
+    const boot = `
+      import { writeFileSync } from 'node:fs';
+      import { join, resolve } from 'node:path';
+      import { pathToFileURL } from 'node:url';
+      import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { EventEmitter } from 'node:events';
+      const scenario = JSON.parse(process.env.TEST_JOB_SCENARIO);
+      cp.execFileSync = (bin, args) => {
+        if (bin === 'npm' && args.includes('check:standards') && scenario.gateFails) {
+          throw Object.assign(new Error('standards failed'), { status: 1 });
+        }
+        return args.includes('--absolute-git-dir')
+          ? join(process.env.CODEX_JOBS_DIR, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
+      };
+      cp.spawn = () => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+        let completion;
+        child.stdin = { on() {}, end() {
+          if (scenario.timeout) completion = setTimeout(() => child.emit('close', 0), 1000);
+          else queueMicrotask(() => child.emit('close', scenario.runCode));
+        } };
+        child.kill = () => { clearTimeout(completion); queueMicrotask(() => child.emit('close', null)); };
+        return child;
+      };
+      syncBuiltinESMExports();
+      const script = resolve('scripts/codex-direct-task.mjs');
+      writeFileSync(join(process.env.CODEX_JOBS_DIR, 'cli-job.json'), JSON.stringify({
+        id: 'cli-job', pid: process.pid, status: 'running', startedAt: new Date().toISOString(),
+        resultPath: 'cli-result.json', exitCode: null,
+      }));
+      process.argv = [process.execPath, script, '--job=cli-job', '--dir=' + process.env.CODEX_JOBS_DIR, ...JSON.parse(process.env.TEST_JOB_ARGS)];
+      await import(pathToFileURL(script).href);
+    `;
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', boot], {
+      encoding: 'utf8', timeout: 10000,
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir, TEST_JOB_ARGS: JSON.stringify(args),
+        TEST_JOB_SCENARIO: JSON.stringify({ runCode, timeout, gateFails }) },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(processCode);
+    if (report) expect(JSON.parse(child.stdout)).toMatchObject(report);
+    expect(readJobRecord('cli-job', { jobsDir })).toMatchObject({ status: recordCode === 0 ? 'done' : 'failed', exitCode: recordCode,
+      finishedAt: expect.any(String) });
+    expect(await waitForJob({ jobId: 'cli-job', jobsDir })).toMatchObject({
+      status: recordCode === 0 ? 'done' : 'failed', exitCode: recordCode, code: recordCode,
+    });
+  });
+
+  it('atomic updates persist terminal records', () => {
+    const record = { id: 'atomic', pid: 123, status: 'failed', startedAt: new Date(0).toISOString(),
+      resultPath: 'result.json', exitCode: 9, finishedAt: new Date(1000).toISOString() };
+    const fsDeps = { writeFileSync: vi.fn(), renameSync: vi.fn() };
+    writeJobRecord(record, { jobsDir, fsDeps });
+    const [temp, contents] = fsDeps.writeFileSync.mock.calls[0];
+    expect(JSON.parse(contents)).toEqual(record);
+    expect(temp).toMatch(/\.tmp$/);
+    expect(fsDeps.renameSync).toHaveBeenCalledWith(temp, join(jobsDir, 'atomic.json'));
+    writeJobRecord(record, { jobsDir });
+    expect(readJobRecord('atomic', { jobsDir })).toEqual(record);
   });
 });
