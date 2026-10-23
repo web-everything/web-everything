@@ -131,6 +131,11 @@ export const REVIEW_MODE_SUFFIX = 'This is a READ-ONLY review. Do not edit, crea
   + 'need, then put your whole answer in your final message.';
 export const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000; // 30 min — an open-ended coding task, not a quick judge call.
 export const DEFAULT_INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
+export const DEFAULT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
+/** Deadline for each local git read (status/diff/log/rev-parse) so a hung one fails the run. */
+export const GIT_STEP_TIMEOUT_MS = 5 * 60 * 1000;
+/** Bytes of a piped clone/install step's output relayed to stderr, so diagnostics survive without flooding it. */
+export const EXEC_DIAGNOSTIC_TAIL_BYTES = 16 * 1024;
 
 /**
  * #x8wbivt (`#3635`)'s ratified routing constants are RE-EXPORTED here, not defined here.
@@ -605,8 +610,11 @@ export function detachedGateExecFn(bin, args, opts = {}) {
  * @param {boolean} [opts.installDeps] - default true; a caller in a hurry for a task that touches no code
  *   dependent on `node_modules` may pass false.
  * @param {string|Array} [opts.installStdio] - defaults to inherit; JSON callers redirect stdout to stderr.
- * @param {Function} [opts.installExecFn] - optional async installer; only this path returns a Promise.
+ * @param {Function} [opts.installExecFn] - optional async installer; returns a Promise when given.
  * @param {number} [opts.installTimeoutMs] - async install deadline, default five minutes.
+ * @param {Function} [opts.cloneExecFn] - optional async `git clone` runner; returns a Promise when given.
+ * @param {number} [opts.cloneTimeoutMs] - async clone deadline, default ten minutes.
+ * @param {(text: string) => void} [opts.diagnosticFn] - where async clone/install output is relayed (stderr).
  * @param {boolean} [opts.wireOriginToRemote] - default false (#3782). When true, opts back into the pre-#3782
  *   behavior: rewrite the clone's `origin` to the real remote so a human can push straight from it. Best-effort
  *   either way — an offline/no-remote `repoRoot` (e.g. a test fixture) just leaves `realOrigin` null.
@@ -622,13 +630,54 @@ export function setupScratchClone({
   installStdio = 'inherit',
   installExecFn,
   installTimeoutMs = DEFAULT_INSTALL_TIMEOUT_MS,
+  cloneExecFn,
+  cloneTimeoutMs = DEFAULT_CLONE_TIMEOUT_MS,
+  diagnosticFn = text => process.stderr.write(text),
   wireOriginToRemote = false,
 } = {}) {
   if (typeof repoRoot !== 'string' || !repoRoot.trim()) {
     throw new TypeError('codex-direct-task: `repoRoot` must be a non-empty path');
   }
   const dest = mkTempDir(join(tmpdir(), 'we-codex-direct-'));
-  execFn('git', buildScratchCloneArgv({ repoRoot, dest }));
+  const cloneArgs = buildScratchCloneArgv({ repoRoot, dest });
+  const afterClone = () => finishScratchClone({
+    repoRoot, dest, execFn, existsFn, installDeps, installStdio, installExecFn, installTimeoutMs, diagnosticFn,
+    wireOriginToRemote,
+  });
+  if (cloneExecFn) {
+    return runDiagnosedStep(cloneExecFn, 'scratch clone (git clone)', 'git', cloneArgs,
+      { timeout: cloneTimeoutMs }, diagnosticFn).then(afterClone);
+  }
+  execFn('git', cloneArgs);
+  return afterClone();
+}
+
+/** Relay a bounded tail of a piped step's output, so a detached job's stderr log keeps its diagnostics. */
+function relayStepOutput(diagnosticFn, ...texts) {
+  for (const text of texts) {
+    const s = typeof text === 'string' ? text : Buffer.isBuffer(text) ? text.toString('utf8') : '';
+    if (!s) continue;
+    const tail = s.length > EXEC_DIAGNOSTIC_TAIL_BYTES ? `…${s.slice(-EXEC_DIAGNOSTIC_TAIL_BYTES)}` : s;
+    diagnosticFn(tail.endsWith('\n') ? tail : `${tail}\n`);
+  }
+}
+
+/** Await an async exec step; relay its output and name the step in any failure. */
+function runDiagnosedStep(runner, label, bin, args, opts, diagnosticFn) {
+  // Start synchronously so the runner's signal listeners attach before any queued signal is dispatched.
+  let pending;
+  try { pending = Promise.resolve(runner(bin, args, opts)); } catch (error) { pending = Promise.reject(error); }
+  return pending.then(stdout => { relayStepOutput(diagnosticFn, stdout); return stdout; }, error => {
+    relayStepOutput(diagnosticFn, error?.stdout, error?.stderr);
+    const reason = String(error?.message ?? error).replace(/^gate /, '');
+    throw new Error(`${label} failed: ${reason}`, { cause: error });
+  });
+}
+
+function finishScratchClone({
+  repoRoot, dest, execFn, existsFn, installDeps, installStdio, installExecFn, installTimeoutMs, diagnosticFn,
+  wireOriginToRemote,
+}) {
   // Resolve the real push remote so it can be REPORTED — never silently wired in by default (#3782). Best-
   // effort: an offline/no-remote repoRoot (e.g. a test fixture) just leaves `realOrigin` null; `origin` in the
   // clone stays at the local `repoRoot` path (git clone's own default), which is not push-capable to anywhere
@@ -649,9 +698,9 @@ export function setupScratchClone({
   const depsInstall = installDeps ? planDepsInstall(dest, existsFn) : null;
   const result = { dest, cloned: true, depsInstall, realOrigin, originWired };
   if (depsInstall && installExecFn) {
-    return Promise.resolve(installExecFn(depsInstall.bin, depsInstall.args, {
-      cwd: dest, stdio: installStdio, timeout: installTimeoutMs,
-    })).then(() => result);
+    return runDiagnosedStep(installExecFn, `dependency install (${depsInstall.bin} ${depsInstall.args.join(' ')})`,
+      depsInstall.bin, depsInstall.args, { cwd: dest, stdio: installStdio, timeout: installTimeoutMs }, diagnosticFn)
+      .then(() => result);
   }
   if (depsInstall) execFn(depsInstall.bin, depsInstall.args, { cwd: dest, stdio: installStdio });
   return result;
@@ -681,7 +730,7 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
   // Codex can write this checkout's git config: the shared lane pins apply, diff drivers and textconv stay off, and a
   // checkout that defines a filter driver (which `status`/`diff` would run on worktree content) is refused first.
   const git = (args) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
-    { env: laneGitHardeningEnv() });
+    { env: laneGitHardeningEnv(), timeout: GIT_STEP_TIMEOUT_MS });
   assertNoLaneFilterDrivers(git);
   const status = git(['status', '--porcelain', '-z']);
   const untracked = status.split('\0').filter((l) => l.startsWith('?? ')).map((l) => l.slice(3));
@@ -887,6 +936,8 @@ export async function runCodexDirectExec({
  * @param {boolean} [opts.installDeps]
  * @param {Function} [opts.installExecFn] - async install runner, awaited before starting Codex.
  * @param {number} [opts.installTimeoutMs] - async install deadline, default five minutes.
+ * @param {Function} [opts.cloneExecFn] - async scratch-clone runner, awaited before installing.
+ * @param {number} [opts.cloneTimeoutMs] - async clone deadline, default ten minutes.
  * @param {boolean} [opts.wireOriginToRemote] - #3782: default false — forwarded to `setupScratchClone`. Only
  *   meaningful when `dir` is omitted (a scratch clone is actually made); ignored for a caller-named `--dir`.
  * @param {boolean} [opts.clearRolloutAfterRun] - #x8wbivt Fork 4: when true, use the ratified read-then-delete
@@ -919,6 +970,8 @@ export async function codexDirectTask({
   installStdio = 'inherit',
   installExecFn,
   installTimeoutMs = DEFAULT_INSTALL_TIMEOUT_MS,
+  cloneExecFn,
+  cloneTimeoutMs = DEFAULT_CLONE_TIMEOUT_MS,
   wireOriginToRemote = false,
   clearRolloutAfterRun = false,
   review = false,
@@ -966,7 +1019,7 @@ export async function codexDirectTask({
     }
     scratch = await setupScratchClone({
       repoRoot, mkTempDir, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
-      installExecFn, installTimeoutMs,
+      installExecFn, installTimeoutMs, cloneExecFn, cloneTimeoutMs,
     });
     targetDir = scratch.dest;
   } else if (!existsFn(targetDir)) {
@@ -977,10 +1030,10 @@ export async function codexDirectTask({
     throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${targetDir} does not have; pass --gate=standards or --gate=none`);
   }
 
-  const startSha = execFn('git', ['-C', targetDir, 'rev-parse', 'HEAD']).trim();
+  const startSha = execFn('git', ['-C', targetDir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
   // Same `.git/`-hiding reasoning as `outputLastMessageFile` above — the default log file must never leak
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
-  const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir']).trim();
+  const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
   const resolvedLogFile = logFile || join(gitDir, review ? `codex-self-review-${randomUUID()}.jsonl` : 'codex-direct-task.jsonl');
   mkdirSync(dirname(resolvedLogFile), { recursive: true });
 
@@ -1371,6 +1424,8 @@ async function main() {
       installDeps: !flags['no-install'],
       installStdio: flags.json ? ['ignore', 2, 2] : 'inherit',
       installExecFn: flags.job ? detachedGateExecFn : undefined,
+      cloneExecFn: flags.job ? detachedGateExecFn : undefined,
+      cloneTimeoutMs: DEFAULT_CLONE_TIMEOUT_MS,
       installTimeoutMs: DEFAULT_INSTALL_TIMEOUT_MS,
       gateExecFn: flags.job ? detachedGateExecFn : undefined,
       wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
