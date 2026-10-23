@@ -99,7 +99,10 @@ resumes its missing comment/effects without another model call; a failed recover
 only a head with neither status nor row starts fresh. A trusted result comment, live pass,
 non-accept, unreadable evidence, recorded row without a status, or any prior result other than `ran` or `resumed`
 prevents dispatch. The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying. Recovery
-shares the tick's lane/live-review capacity and defaults to a 30-minute retry cooldown through
+shares the tick's lane/live-review capacity and host admission (including recovery-only ticks).
+Ordinary and recovery starts share the remaining host per-tick allowance; confirmed starts and
+unknown outcomes consume the cross-repo host budget, while confirmed non-starts do not.
+Recovery defaults to a 30-minute retry cooldown through
 `reviewRedTeamOnSkip` (tool: `scripts/settings/review-red-team-on-skip.json`; environment:
 `WE_REVIEW_RED_TEAM_ON_SKIP`, `WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN`). Focused cases
 live in `review-red-team-on-skip.test.mjs` and `review-job-red-team-only.test.mjs`.
