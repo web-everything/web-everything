@@ -92,7 +92,7 @@ it('pins executable Git configuration on every lane Git command', async () => {
 it('neutralizes inherited fsmonitor commands on a real read-only Git diff', async () => {
   const names = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
   const saved = names.map(name => process.env[name]);
-  const repo = fileURLToPath(new URL('../../../', import.meta.url));
+  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
   const results = [];
   try {
     process.env.GIT_CONFIG_COUNT = '1';
@@ -160,7 +160,7 @@ it('requires the edge loader CLI contract, including bracketed optional flags', 
 });
 
 it('preflights the installed operation CLI before any lane or publication effects', async () => {
-  const repo = fileURLToPath(new URL('../../../', import.meta.url));
+  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
   const f = fixture();
   f.io.exec = async (cmd, args, options) => {
     expect(args).toEqual(['scripts/operations/run.mjs', 'prototype-load', '--help']);
