@@ -111,6 +111,11 @@ describe('operator ruling in any state (shared reader)', () => {
     const next = bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [F(159, 'broken')] }), '2026-10-21T21:00:00Z');
     expect(sent(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), next], true, N))).toEqual([1]);
   });
+  it('an operator-block after the card re-holds', () => {
+    const comments = [...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'),
+      gate(human, 'operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).', '2026-10-21T20:40:00Z')];
+    expect(sent(disp(comments))).toEqual([1]);
+  });
   it('kill switch off: never overrides a live send-back, still releases a break handed over at the cap', () => {
     const op = gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z');
     expect(sent(disp([...live, op], false))).toEqual([1]);

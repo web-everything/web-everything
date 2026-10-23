@@ -1,10 +1,13 @@
 /**
  * @file scripts/operations/record-red-team-ruling-io.mjs
- * @description Live reader and retry-safe card sink for scope-bound operator rulings. IO is injectable.
+ * @description The IMPURE half of `record-red-team-ruling` (see `./record-red-team-ruling.mjs`): the reader (live
+ *   head, labels, the COMPLETE comment thread, the `redTeam.confirmedBreaks` setting) and the sinks (card, block,
+ *   not-real). Every collaborator is injectable so the tests run with no network.
  */
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { liveResultGateState, readConfirmedBreaks, readOperatorRulings, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
@@ -14,11 +17,16 @@ import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments, ope
 import { automationStateRoot } from '../lib/automation-home.mjs';
 import { defaultSpawnDetached } from './detached-dispatch.mjs';
 import { preventionCardLandingLogPath, spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
+import { EVENT_TYPES, buildLedgerEvent } from '../lib/verdict-ledger.mjs';
+import { appendLedgerEvents } from './record-referral-ruling-io.mjs';
 import { buildGateComment } from './red-team-gate-apply.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
-import { CARD_PENDING_OUTCOME, conflictingPendingCardJobs, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulableBreaks } from './record-red-team-ruling.mjs';
+import {
+  CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_CARD_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_CARD_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT,
+  buildRuleReasonComment, conflictingPendingCardJobs, recordRedTeamRulingOperation, rulableBreaks,
+} from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
@@ -28,6 +36,8 @@ const gh = (args, input, env = process.env) => {
   if (r.status !== 0) throw new Error(`gh ${args.slice(0, 2).join(' ')} failed: ${String(r.stderr ?? r.error?.message ?? '').trim().slice(0, 300)}`);
   return String(r.stdout ?? '');
 };
+
+const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
 
 /** The default thread reader: head + labels + the complete (paginated) comments. */
 export const readLiveThread = ({ repo, pr }) => ({
@@ -130,12 +140,13 @@ const spawnStableCardJob = (input, session) => {
   return r.ok ? { ...r, session } : r;
 };
 
-export function createRecordRedTeamRulingSinks({ env = process.env, readThread = readLiveThread,
+export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_ROOT, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
   resolveIdentity = () => resolveOperatorIdentity({ env }), claims = createFileClaims(), fileCard = spawnStableCardJob,
   post = (repo, pr, body) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env),
+  runSetLabel = execFileSync, appendEvents = appendLedgerEvents,
   syncLabels = ({ repo, pr, head }) => syncRedTeamStatusLabels({ repo, pr, head, env }),
-  warn = (m) => process.stderr.write(`${m}\n`) } = {}) {
+  warn = (m) => process.stderr.write(`${m}\n`), now = () => new Date().toISOString() } = {}) {
   /** Right before any write: the poster, the head, the SAME result, and every selected break still rulable the same way
    *  the plan found it (the same `rulableBreaks` rule, so the cap and held-break checks apply here too). */
   const recheck = (p, noWrite = 'nothing written') => {
@@ -171,6 +182,21 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
     if (still.length) throw new Error(`${what} was posted but the gate still holds break(s) ${still.map((i) => `#${i}`).join(', ')} `
       + '(not authored by the operator account, or an altered body); inspect the thread before retrying');
     return after;
+  };
+  /** After a block: same head and result, our record is in the thread, and the gate now holds or sends back EVERY selected break. */
+  const proveHeld = (p, record) => {
+    const after = readThread({ repo: p.repo, pr: p.pr });
+    const head = String(after.headRefOid ?? '').toLowerCase();
+    if (head !== p.head) throw new Error(`the operator-block record was posted but PR #${p.pr}'s head moved to ${head}; inspect the thread`);
+    const comments = operatorBoundComments(after.comments);
+    const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...after, number: p.pr, headRefOid: head } });
+    if (liveResultGateState(comments, p.pr, head, p.repo, standingRuling).resultId !== p.resultId) throw new Error('the operator-block record was posted but the live red-team result changed; inspect the thread');
+    if (!comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isHumanOperatorComment(c))) {
+      throw new Error("the operator-block record is not in the read-back as a human operator's comment; inspect the thread before retrying");
+    }
+    const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: p.scope, standingRuling });
+    const free = p.indices.filter((i) => !d.held.some((f) => f.index === i) && !d.sendBack.some((f) => f.index === i));
+    if (free.length) throw new Error(`the operator-block record was posted but the gate does not hold break(s) ${free.map((i) => `#${i}`).join(', ')}; inspect the thread`);
   };
   /** The derived `red-team:*` label follows the disposition; a failed sync is reported, never fatal (the record is what counts). */
   const resync = (p) => {
@@ -247,6 +273,47 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
       post(p.repo, p.pr, record);
       proveReleased(p, 'the operator-card record', record);
       return { ruling: 'card', head: p.head, indices: p.indices, card: { session, reconciled: spawned }, labels: resync(p) };
+    },
+    [RED_TEAM_RULING_NOT_REAL_EFFECT]: (p) => {
+      recheck(p);
+      const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_NOT_REAL_OUTCOME, round: null, result: p.resultId,
+        plan: { sendBack: [], card: [], advisory: p.findings } });
+      post(p.repo, p.pr, record);
+      post(p.repo, p.pr, reasonBody(p, 'Recorded as not real: the break stays advisory. This does not clear `review:human` or approve the PR.'));
+      proveReleased(p, 'the not-real record', record);
+      return { ruling: 'not-real', head: p.head, indices: p.indices, cause: p.cause ?? null, labels: resync(p) };
+    },
+    [RED_TEAM_RULING_BLOCK_EFFECT]: async (p) => {
+      const { labels } = recheck(p);
+      // The hold first (adding a hold is always safe): the send-back line re-holds a break an earlier ruling released.
+      const record = operatorRecord(p, OPERATOR_BLOCK_OUTCOME, `- ${p.indices.length} confirmed break(s) sent back to the fixer ${indexList(p)}.`);
+      post(p.repo, p.pr, record);
+      post(p.repo, p.pr, reasonBody(p, 'Blocked: the break(s) go back to the fixer.'));
+      proveHeld(p, record);
+      if (labelNames(labels).includes('review:changes')) {
+        return { ruling: 'block', head: p.head, indices: p.indices, sentBack: true, alreadyUnderChanges: true, labels: resync(p) };
+      }
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-ruling-'));
+      try {
+        const path = join(dir, 'body.md');
+        writeFileSync(path, p.sendBackBody, 'utf8');
+        let stdout;
+        try {
+          stdout = await runSetLabel(process.execPath, [join(root, 'scripts/review-set-label.mjs'), String(p.pr), `--repo=${p.repo}`,
+            '--to=changes', `--body-file=${path}`, `--actor=${p.actor}`, `--channel=${p.channel}`], { encoding: 'utf8', timeout: 120_000 });
+        } catch (error) {
+          let message;
+          try { message = JSON.parse(String(error.stdout)).error; } catch { /* keep the process error */ }
+          throw new Error(message || error.message);
+        }
+        const result = JSON.parse(String(stdout).trim().split('\n').filter(Boolean).at(-1) ?? '{}');
+        if (result.error || result.ok !== true) throw new Error(result.error || 'review-set-label did not confirm the send-back');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+      try {
+        await appendEvents([buildLedgerEvent({ type: EVENT_TYPES.SEND_BACK, repo: p.repo, pr: p.pr, at: now(),
+          source: 'record-red-team-ruling', declaredActor: p.actor, channel: p.channel, cause: 'block-ruling' })]);
+      } catch (e) { warn(`ledger-write-miss: send-back of ${p.repo}#${p.pr} was applied but not recorded in the verdict ledger: ${String(e?.message ?? e)}`); }
+      return { ruling: 'block', head: p.head, indices: p.indices, sentBack: true, labels: resync(p) };
     },
   };
 }
