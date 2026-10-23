@@ -541,10 +541,18 @@ describe('chain dispatch and critical scope', () => {
   const chain = {value:['codex','codex-alt','argon','claude'],source:'repo'};
   const options = {setting,chain,fixSettings:{strongerModelFromRound:3},loadLadder:()=>null,readRouted:()=>({}),launcherAvailable:()=>true};
   it.each([{}, {scope:[]}, {scope:['we:scripts/lib/critical-work.mjs']}])('fails closed for critical scope %j', scope => {
-    expect(routeFixExecutor({pr:42,strongerModel:true,...scope},options)).toMatchObject({executor:'claude',reason:'critical work never leaves Claude'});
+    for (const trigger of [{takeover:true}, {rulingNotAddressed:true}]) {
+      expect(routeFixExecutor({pr:42,...trigger,...scope},options)).toMatchObject({executor:'claude',reason:'critical work never leaves Claude'});
+    }
+  });
+  it('routes critical stronger-model work through the configured threshold', () => {
+    const planned = {pr:42,strongerModel:true,scope:['we:scripts/lib/critical-work.mjs']};
+    expect(routeFixExecutor(planned,options)).toMatchObject({executor:'codex',rung:'codex-alt'});
+    expect(routeFixExecutor(planned,{...options,chain:{...chain,criticalClaudeFromRung:1,criticalClaudeFromRungSource:'repo'}}))
+      .toMatchObject({executor:'claude',reason:'critical work reaches Claude from rung 1 (criticalClaudeFromRung=1, source=repo)'});
   });
   it('uses the injected critical verdict and fails closed on errors', () => {
-    const planned = {pr:42,strongerModel:true,scope:['we:x.ts']};
+    const planned = {pr:42,takeover:true,scope:['we:x.ts']};
     const criticalFor = vi.fn(()=>false);
     expect(routeFixExecutor(planned,{...options,criticalFor}).rung).toBe('codex-alt');
     expect(criticalFor).toHaveBeenCalledWith(planned);
