@@ -665,6 +665,37 @@ describe('per PR postmortem', () => {
     f.comments.push(comment(95,`<!-- review-verdict-carried from=${'b'.repeat(40)} to=${'c'.repeat(40)} patch-id=${'e'.repeat(40)} -->`));
     expect(buildPostmortem(f).approvals.lost).toBe(0);
   });
+  it('counts each approval lost after its own carry chain, so two losses meet the default threshold', () => {
+    const sha = c => c.repeat(40);
+    const f = fixture();
+    f.labels = []; f.checks = []; f.fixLoop = [];
+    f.comments = [
+      comment(15,`<!-- review-verdict-carried from=${sha('a')} to=${sha('b')} patch-id=${sha('1')} -->`),
+      comment(35,`<!-- review-verdict-carried from=${sha('c')} to=${sha('d')} patch-id=${sha('2')} -->`)];
+    f.commits = [['a',0],['b',10],['c',20],['d',30],['e',40]].map(([c,m]) => ({ sha: sha(c), commit: { committer: { date: at(m) }, message: c } }));
+    f.verdicts = [[5,'a'],[25,'c'],[45,'e']].map(([m,c]) => ({ at: at(m), verdict: 'accept', coverage: { headSha: sha(c) } }));
+    f.verdicts.push({ at: at(15), verdict: 'restamped', coverage: { headSha: sha('b') } }, { at: at(35), verdict: 'restamped', coverage: { headSha: sha('d') } });
+    const r = buildPostmortem(f);
+    expect(r.approvals.headChanges.map(c => [c.head[0],c.nextHead[0],c.carryApplied])).toEqual([
+      ['a','b',true], ['b','c',null], ['c','d',true], ['d','e',null]]);
+    expect(r.approvals.lost).toBe(2);
+    expect(shouldPostmortem({ ...r, leadHours: 0, rounds: [], standDowns: [] },{ minLeadHours:1000, minFixRounds:1000, minLostApprovals:2, onStandDown:false })).toBe(true);
+  });
+  it('fences every publication write, so a reclaimed owner writes nothing', async () => {
+    const dir = temp();
+    try {
+      const r = { ...buildPostmortem(fixture()), settings: {} };
+      let beats = 0;
+      publishPostmortem(r,{dir,beat:() => { beats++; }});
+      expect(beats).toBe(3); // journal append, report json, report markdown
+      const other = temp();
+      try {
+        const lost = () => { throw Error('coroner lock lost'); };
+        expect(() => publishPostmortem(r,{dir:other,beat:lost})).toThrow('lock lost');
+        expect(fs.readdirSync(other)).toEqual([]);
+      } finally { fs.rmSync(other,{recursive:true,force:true}); }
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
   it('reclaims a dead local owner and preserves a live owner', async () => {
     const dir = temp(); const root = join(dir,'locks'); const key = 'coroner-postmortem';
     try {

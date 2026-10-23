@@ -264,8 +264,10 @@ function readPublicationJournal(path) {
 }
 /** Journal-first publication: event IDs deduplicate partial publication after process death.
  * The caller serializes publication with withCoronerLock. Direct CLI does the same.
+ * `beat` is that lock's fence: it runs before every write, so an owner whose lease was
+ * reclaimed while it was suspended stops instead of writing next to the new owner.
  */
-export function publishPostmortem(r, { dir = coronerStateDir() } = {}) {
+export function publishPostmortem(r, { dir = coronerStateDir(), beat = () => {} } = {}) {
   fs.mkdirSync(dir,{recursive:true});
   const path = join(dir,'incidents.jsonl');
   const rows = readPublicationJournal(path);
@@ -304,9 +306,10 @@ export function publishPostmortem(r, { dir = coronerStateDir() } = {}) {
       lastCandidate = time(row.at);
     }
   }
-  if (pending.length) fs.appendFileSync(path, pending.map(row => JSON.stringify(row)).join('\n')+'\n');
+  if (pending.length) { beat(); fs.appendFileSync(path, pending.map(row => JSON.stringify(row)).join('\n')+'\n'); }
   const name = `postmortem-${repoFilenameKey(r.repo)}-${r.pr}`;
-  atomicJson(join(dir,`${name}.json`),r); atomicText(join(dir,`${name}.md`),renderPostmortem(r));
+  beat(); atomicJson(join(dir,`${name}.json`),r);
+  beat(); atomicText(join(dir,`${name}.md`),renderPostmortem(r));
   return { report: `${name}.md`, incidents: pending.length };
 }
 export const ghJson = args => JSON.parse(execFileSyncThrottled('gh',args,{encoding:'utf8',timeout:60000,maxBuffer:32*1024*1024}));
@@ -431,10 +434,10 @@ if (process.argv[1] && resolve(process.argv[1]) === SELF) {
     const { values } = parseArgs({ options: { repo:{type:'string'}, pr:{type:'string'}, json:{type:'boolean'}, out:{type:'string'} } });
     validateSubject(values.repo,values.pr);
     const dir = values.out ?? coronerStateDir();
-    await withCoronerLock(dir, () => {
+    await withCoronerLock(dir, ({ beat }) => {
       const settings = resolvePostmortemSettings();
       const report = { ...buildPostmortem(collectPrTimeline(values.repo,Number(values.pr))), settings };
-      publishPostmortem(report,{dir});
+      publishPostmortem(report,{dir,beat});
       console.log(values.json ? JSON.stringify(report) : renderPostmortem(report));
     });
   } catch(e) { console.error(`coroner-pr-postmortem: ${e.message}`); process.exitCode = 1; }

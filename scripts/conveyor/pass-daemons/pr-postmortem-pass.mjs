@@ -84,7 +84,7 @@ export async function runPostmortemPass({ repo, dir = coronerStateDir(), now = n
       }
       // Storage/publication failures are pass failures, never poison-item quarantines.
       beat();
-      if (shouldPostmortem(r,config)) { publishPostmortem(r,{dir}); published++; }
+      if (shouldPostmortem(r,config)) { publishPostmortem(r,{dir,beat}); published++; }
       delete state.failures[p.number];
       state.done.push(p.number); state.done.sort((a,b) => a-b);
       beat(); atomicJson(file,state);
