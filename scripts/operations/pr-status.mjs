@@ -312,7 +312,7 @@ export function shapeReadFinding(raw) {
  * outranks one whose checks failed, because the failure is at least known and someone can act on it. A
  * silently unchecked PR is the one that costs twelve hours.
  */
-export function assessPrs(finding) {
+export function assessPrs(finding, { table = false } = {}) {
   const prs = finding.prs.map((pr) => {
     const check = reduceCheckState(pr.checks);
     return {
@@ -337,7 +337,7 @@ export function assessPrs(finding) {
     red: red.length,
     unchecked: unchecked.length,
     prs,
-    table: prs.map((pr) => {
+    ...(table ? { table: prs.map((pr) => {
       const updated = Date.parse(pr.updatedAt);
       return {
         pr: pr.number,
@@ -348,7 +348,7 @@ export function assessPrs(finding) {
         redTeam: pr.labels.find(label => label.startsWith('red-team:'))?.slice(9) || '-',
         round: pr.labels.map(label => /^review-round:(\d+)$/.exec(label)).find(Boolean)?.[1] ?? '-',
       };
-    }),
+    }) } : {}),
     blocking: [
       ...unchecked.map((p) => ({ pr: p.number, why: 'unchecked', detail: `${p.headSha.slice(0, 8)} — ${p.why}` })),
       ...red.map((p) => ({ pr: p.number, why: 'red', detail: `${p.headSha.slice(0, 8)} — ${p.why}` })),
@@ -380,6 +380,7 @@ export function prStatusOperation({ readPrs } = {}) {
       // One PR, or every open one. REQUIRED to be explicit about which: defaulting to "all" would make a
       // caller asking about #1518 quietly pay for a repo-wide sweep.
       pr: { type: 'number', required: false, default: 0 },
+      table: { type: 'boolean', required: false, default: false },
     },
     verdictFrom: 'assess',
 
@@ -389,8 +390,8 @@ export function prStatusOperation({ readPrs } = {}) {
     }),
 
     assess: compute({
-      reads: ['findings.read'],
-      fn: (view) => assessPrs(view.findings.read),
+      reads: ['findings.read', 'input.table'],
+      fn: (view) => assessPrs(view.findings.read, { table: view.input.table === true }),
     }),
   });
 }
@@ -406,5 +407,5 @@ export function renderPrTable(rows) {
 }
 
 export function finishPrStatus({ run, code, lines, json = false }) {
-  return json || !run?.verdict ? { code, lines } : { code, lines: [renderPrTable(run.verdict.table)] };
+  return json || !Array.isArray(run?.verdict?.table) ? { code, lines } : { code, lines: [renderPrTable(run.verdict.table)] };
 }

@@ -367,7 +367,7 @@ describe('the declaration', () => {
     expect(() => prStatusOperation({})).toThrow(/needs a `readPrs\(\)` reader/);
     const decl = prStatusOperation({ readPrs: () => ({ repo: 'o/r', prs: [] }) });
     expect(decl.name).toBe(PR_STATUS_OP);
-    expect(Object.keys(decl.input)).toEqual(['repo', 'pr']);
+    expect(Object.keys(decl.input)).toEqual(['repo', 'pr', 'table']);
     expect(decl.input.repo.required).toBe(true);
   });
 
@@ -498,7 +498,7 @@ describe('PR status compact table', () => {
 
   it('reports elapsed whole minutes, a 40-character title, existing state and label suffixes', () => {
     const finding = shapeReadFinding({ repo: 'o/r', nowMs, prs: [row({})] });
-    const verdict = assessPrs(finding);
+    const verdict = assessPrs(finding, { table: true });
     expect(verdict.table).toEqual([{ pr: 42, minutesSinceUpdate: 2, title: 'A'.repeat(40),
       state: 'green', redTeam: 'clear', round: '3' }]);
     expect(verdict.prs[0].title).toHaveLength(50);
@@ -507,16 +507,16 @@ describe('PR status compact table', () => {
 
   it('handles missing timestamps, clock and labels without consulting a clock in the core', () => {
     for (const updatedAt of ['', 'invalid', undefined]) {
-      const verdict = assessPrs(shapeReadFinding({ nowMs, prs: [row({ updatedAt, labels: [], checks: [] })] }));
+      const verdict = assessPrs(shapeReadFinding({ nowMs, prs: [row({ updatedAt, labels: [], checks: [] })] }), { table: true });
       expect(verdict.table[0]).toMatchObject({ minutesSinceUpdate: '-', state: 'unchecked', redTeam: '-', round: '-' });
     }
-    expect(assessPrs(shapeReadFinding({ prs: [row({})] })).table[0].minutesSinceUpdate).toBe('-');
-    expect(assessPrs(shapeReadFinding({ nowMs, prs: [row({ updatedAt: '2026-10-22T13:00:00Z' })] })).table[0].minutesSinceUpdate).toBe(0);
-    expect(assessPrs(shapeReadFinding({ nowMs, prs: [row({ labels: ['review-round:bad'] })] })).table[0].round).toBe('-');
+    expect(assessPrs(shapeReadFinding({ prs: [row({})] }), { table: true }).table[0].minutesSinceUpdate).toBe('-');
+    expect(assessPrs(shapeReadFinding({ nowMs, prs: [row({ updatedAt: '2026-10-22T13:00:00Z' })] }), { table: true }).table[0].minutesSinceUpdate).toBe(0);
+    expect(assessPrs(shapeReadFinding({ nowMs, prs: [row({ labels: ['review-round:bad'] })] }), { table: true }).table[0].round).toBe('-');
   });
 
   it('renders aligned headers and rows without prose, and finishes text or full JSON', () => {
-    const table = assessPrs(shapeReadFinding({ nowMs, prs: [row({ title: 'fix' })] })).table;
+    const table = assessPrs(shapeReadFinding({ nowMs, prs: [row({ title: 'fix' })] }), { table: true }).table;
     const rendered = renderPrTable(table);
     expect(rendered).toBe([
       'PR      MIN     TITLE                                     STATE      RT        RND',
@@ -526,6 +526,9 @@ describe('PR status compact table', () => {
     const outcome = { run: { verdict: { table } }, code: 0, lines: ['full json'] };
     expect(finishPrStatus(outcome)).toEqual({ code: 0, lines: [rendered] });
     expect(finishPrStatus({ ...outcome, json: true })).toEqual({ code: 0, lines: ['full json'] });
+    expect(assessPrs(shapeReadFinding({ nowMs, prs: [row({})] }))).not.toHaveProperty('table');
+    expect(finishPrStatus({ ...outcome, run: { verdict: {} } })).toEqual({ code: 0, lines: ['full json'] });
     expect(finishPrStatus({ ...outcome, run: null })).toEqual({ code: 0, lines: ['full json'] });
   });
 });
+
