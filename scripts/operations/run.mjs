@@ -55,8 +55,10 @@ import { graduationProgressReportOperation, GRADUATION_PROGRESS_REPORT_OP } from
 import { createScorecardReader, createPromotionsReader, createProbationReader } from './graduation-progress-report-io.mjs';
 import { selectSupervisionLevel, DEFAULT_BACKDOWN_THRESHOLDS } from '../lib/provider-routing.mjs';
 import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
-import { prStatusOperation, PR_STATUS_OP } from './pr-status.mjs';
+import { prStatusOperation, PR_STATUS_OP, finishPrStatus } from './pr-status.mjs';
 import { createPrReader } from './pr-status-io.mjs';
+import { adoptionMatrixOperation, ADOPTION_MATRIX_OP, finishAdoptionMatrix } from './adoption-matrix.mjs';
+import { createAdoptionMatrixReader } from './adoption-matrix-io.mjs';
 import { staleStateOperation, STALE_STATE_OP } from './stale-state.mjs';
 import { createStaleStateReader } from './stale-state-io.mjs';
 import { prReconcileOperation, PR_RECONCILE_OP } from './pr-reconcile.mjs';
@@ -333,9 +335,11 @@ export const OPERATIONS = Object.freeze({
     declaration: staleStateOperation({ readState: createStaleStateReader() }),
     sinks: {},
   }),
+  [ADOPTION_MATRIX_OP]: () => ({ declaration: adoptionMatrixOperation({ collect: createAdoptionMatrixReader() }), sinks: {}, finish: finishAdoptionMatrix }),
   [PR_STATUS_OP]: () => ({
     declaration: prStatusOperation({ readPrs: createPrReader() }),
     sinks: {},
+    finish: finishPrStatus,
   }),
   // #3856 — plan only, no sinks. Every effect the plan can call for (dispatching a delivery agent, a
   // CI-heal repair, a review, queueing an item) lives behind `land-advance-io.mjs`'s sinks, which this
