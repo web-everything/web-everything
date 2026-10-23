@@ -1777,9 +1777,14 @@ separate shadow count and read completeness.
 Builder, fixer and Codex briefs quote `reviewer-expectations.md` inside a data fence (it is derived
 from untrusted PR and CI text). The coroner proposes its concrete examples from recurring findings by PR. `scripts/settings/build.json` overrides the platform's `build` block:
 `finalGate` defaults to `full` (whole unit tier plus standards through heavy admission), with `related`
-and `none` escape settings; `selfReview.enabled` defaults true and `selfReview.maxRounds` defaults 2
+and `none` escape settings. `finalGateStandards` defaults to `always`: non-full gates keep related-test
+selection but run standards on every diff, including code-only and card-only changes (scoped where safe),
+and disable the local card-only skip, including since-last-green selection. Set it to `selected` to retain
+`verify-settings.json` standards selection and card-only skipping. `full` is unchanged by this setting.
+`node scripts/verify-lane.mjs --dry-run` prints the default command, reasons and standards decision without
+running a gate or writing markers. `selfReview.enabled` defaults true and `selfReview.maxRounds` defaults 2
 (0–10). `reviewerExpectations.enabled` defaults true. Sources use the shared policy-cascade formatter.
-Environment overrides are `WE_BUILD_FINAL_GATE`, `WE_BUILD_SELF_REVIEW_ENABLED`,
+Environment overrides are `WE_BUILD_FINAL_GATE`, `WE_BUILD_FINAL_GATE_STANDARDS`, `WE_BUILD_SELF_REVIEW_ENABLED`,
 `WE_BUILD_SELF_REVIEW_MAX_ROUNDS`, and `WE_BUILD_REVIEWER_EXPECTATIONS_ENABLED`.
 
 A green build gets one cheap correctness/security review of its net diff. Each repair resumes the

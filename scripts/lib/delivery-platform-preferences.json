@@ -5,5 +5,9 @@
     "maxGroupWaitMinutes": 5,
     "mergeMethod": "merge",
     "redMainFreezeBranch": "ops/red-main-freeze"
+  },
+  "build": {
+    "finalGate": "related",
+    "note": "Operator \"Ok\" (2026-10-22): the normal verify gate runs related tests; CI keeps the full suite."
   }
 }
