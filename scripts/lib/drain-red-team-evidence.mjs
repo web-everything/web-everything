@@ -168,15 +168,6 @@ export function readRedTeamStatus({ repo, pr, head, env = process.env } = {}) {
   } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
 }
 
-/** Read the head-bound status; unreadable evidence is an error, absence is null. */
-export function readRedTeamStatus({ repo, pr, head, env = process.env } = {}) {
-  try {
-    const status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
-    if (!status || status.repo !== repo || Number(status.pr) !== Number(pr) || status.head !== head) throw Error('red-team status identity mismatch');
-    return status;
-  } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
-}
-
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
 export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = null }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
