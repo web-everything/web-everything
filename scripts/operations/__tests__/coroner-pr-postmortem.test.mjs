@@ -696,6 +696,26 @@ describe('per PR postmortem', () => {
       } finally { fs.rmSync(other,{recursive:true,force:true}); }
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
+  it('fences journal repair writes, and a retry after a fenced failure repairs the same state', () => {
+    const r = { ...buildPostmortem(fixture()), settings: {} };
+    const lost = () => { throw Error('coroner lock lost'); };
+    for (const tail of ['{"id":"partial', JSON.stringify({id:'complete-without-newline',kind:'x',at:r.mergedAt,repo:'o/r',pr:9,cause:'c'})]) {
+      const dir = temp(), file = join(dir,'incidents.jsonl');
+      try {
+        const head = `${JSON.stringify({id:'receipt',kind:'x',at:r.mergedAt,repo:'o/r',pr:8,cause:'c'})}\n`;
+        fs.writeFileSync(file,head+tail);
+        expect(() => publishPostmortem(r,{dir,beat:lost})).toThrow('lock lost');
+        expect(fs.readFileSync(file,'utf8')).toBe(head+tail); // a deposed owner repaired nothing
+        // A fence failing after the journal append leaves a partial publication; a retry completes it once.
+        let beats = 0;
+        expect(() => publishPostmortem(r,{dir,beat:() => { if (++beats === 3) lost(); }})).toThrow('lock lost');
+        publishPostmortem(r,{dir});
+        const ids = fs.readFileSync(file,'utf8').trim().split('\n').map(l => JSON.parse(l).id);
+        expect(new Set(ids).size).toBe(ids.length);
+        expect(fs.readdirSync(dir).filter(n => n.startsWith('postmortem-')).length).toBe(2);
+      } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+    }
+  });
   it('reclaims a dead local owner and preserves a live owner', async () => {
     const dir = temp(); const root = join(dir,'locks'); const key = 'coroner-postmortem';
     try {

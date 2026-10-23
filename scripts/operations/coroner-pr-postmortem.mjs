@@ -225,7 +225,7 @@ export function renderPostmortem(r) {
 /** Read every receipt under the publication lock; only an unterminated final
  * fragment may be discarded. Keep byte offsets so UTF-8 and blank lines survive.
  */
-function readPublicationJournal(path) {
+function readPublicationJournal(path, beat = () => {}) {
   let fd;
   try { fd = fs.openSync(path,'r+'); }
   catch (e) { if (e.code === 'ENOENT') return []; throw e; }
@@ -251,12 +251,13 @@ function readPublicationJournal(path) {
       catch {
         // A failed append can leave complete receipts followed by a JSON prefix.
         // Truncation is repeatable after a crash and never rewrites valid receipts.
-        fs.ftruncateSync(fd,start);
+        beat(); fs.ftruncateSync(fd,start);
         return rows;
       }
       rows.push(tail);
       // A complete receipt may have landed without its newline. Retain it for
       // deduplication and finish the delimiter before appending another record.
+      beat();
       if (fs.writeSync(fd,'\n',data.length,'utf8') !== 1) throw Error('incidents journal delimiter write incomplete');
     }
     return rows;
@@ -270,7 +271,7 @@ function readPublicationJournal(path) {
 export function publishPostmortem(r, { dir = coronerStateDir(), beat = () => {} } = {}) {
   fs.mkdirSync(dir,{recursive:true});
   const path = join(dir,'incidents.jsonl');
-  const rows = readPublicationJournal(path);
+  const rows = readPublicationJournal(path,beat);
   const key = `${r.repo}#${r.pr}`;
   const grouped = new Map();
   for (const c of r.causes) { const g = grouped.get(c.cause) ?? []; g.push(c); grouped.set(c.cause,g); }
