@@ -1,9 +1,9 @@
 /** Cap-only shared-reader subset: human card records, author/wrapper and head/result binding. */
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, unknownOperatorOutcomes, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
-import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 
 const H = '61782334289124cd4fcb51d0bdadb6ef3c795e82';
 const P = 5502;
@@ -183,5 +183,19 @@ describe('latest operator action deduplication', () => {
     expect([...fresh.ruled]).toEqual([]);
     expect([...fresh.carded]).toEqual([]);
     expect(operatorRulingsOnLiveResult([], P, H).resultId).toBeNull();
+  });
+});
+
+describe('label writers never re-derive over an operator ruling they cannot read', () => {
+  it('a trusted operator-* outcome this reader does not know skips the sync (no label write)', () => {
+    const future = gate(human, 'operator-defer', '- 1 finding(s) left advisory (#1).', '2026-10-21T20:30:00Z');
+    expect(unknownOperatorOutcomes([...live, future], P, H)).toEqual(['operator-defer']);
+    expect(unknownOperatorOutcomes([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z')], P, H)).toEqual([]);
+    const writes = [];
+    const provider = { readPrState: () => ({ headRefOid: H, labels: [{ name: 'red-team:clear' }] }), readComments: () => [...live, future],
+      ensureLabel: () => {}, setLabels: (...a) => writes.push(a) };
+    const out = syncRedTeamStatusLabels({ repo: 'web-everything/web-everything', pr: P, head: H, env: {}, provider, standingRuling: null, savedResult: null });
+    expect(out.skipped).toBe('unknown-operator-outcome');
+    expect(writes).toEqual([]);
   });
 });

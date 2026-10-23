@@ -7,6 +7,9 @@ import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-i
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { createRecordRedTeamRulingSinks } from '../record-red-team-ruling-io.mjs';
 import { cardJobKey, conflictingPendingCardJobs } from '../record-red-team-ruling.mjs';
+import { redTeamRulingCommands } from '../operator-queue-red-team-ruling.mjs';
+import { createBoundRecordReferralRulingSinks } from '../record-referral-ruling-bound.mjs';
+import { OPERATOR_RULING_POST_EFFECT } from '../record-referral-ruling.mjs';
 import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
 
 const repo = 'o/r';
@@ -865,4 +868,26 @@ describe('block and not-real rulings', () => {
     });
   });
 
+});
+
+describe('operator queue commands', () => {
+  it('the queue suggestions name the declared operation', () => {
+    const c = redTeamRulingCommands(repo, PR);
+    expect(c.card).toContain('run.mjs record-red-team-ruling --pr=5530 --repo=o/r');
+    expect(Object.values(c).join(' ')).not.toContain('clear-human');
+    expect(Object.keys(c).sort()).toEqual(['block', 'card', 'notReal']);
+  });
+});
+
+describe('bound referral identity', () => {
+  it('record-referral-ruling, bound: a bot or mismatched poster is refused before anything is read or posted', async () => {
+    const payload = { repo, pr: 7, head: HEAD, body: 'b', actor: 'chalbert', channel: 'c', rulings: [] };
+    const readJson = () => { throw new Error('inner reached'); };
+    const mk = (identity) => createBoundRecordReferralRulingSinks({ resolveIdentity: () => identity, readJson, post: () => { throw new Error('posted'); } })[OPERATOR_RULING_POST_EFFECT];
+    await expect(mk({ login: 'web-everything[bot]', type: 'Bot' })(payload)).rejects.toThrow(/not a human account/);
+    await expect(mk({ login: 'mallory', type: 'User' })(payload)).rejects.toThrow(/not a registered operator/);
+    await expect(mk(OP)({ ...payload, actor: 'someone-else' })).rejects.toThrow(/does not match the authenticated poster/);
+    await expect(mk(OP)(payload)).rejects.toThrow(/inner reached/);
+    await expect(mk({ login: 'web-everything[bot]', type: 'Bot' })({ ...payload, actor: 'auto-policy' })).rejects.toThrow(/inner reached/);
+  });
 });
