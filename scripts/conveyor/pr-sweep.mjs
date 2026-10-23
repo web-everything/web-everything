@@ -18,6 +18,7 @@ import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
 import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession } from './pr-sweep-core.mjs';
 import { runStallSweep } from './pr-stall-sweep.mjs';
+import { publishStalledDigest } from './pr-stall-digest.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
@@ -133,7 +134,7 @@ export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = 
 }
 export async function runPrSweep({ now = Date.now(), dryRun = false, env = process.env, dir = healthDir(undefined, env), config,
   settings, sourceRoot = ROOT, readPrs, readQueue, readSignals = collectOwnerSignals, readPrevious,
-  notify = notifyDesktopChecked, diagnose, persist, append, flush = flushDigest, stallSweep = runStallSweep } = {}) {
+  notify = notifyDesktopChecked, diagnose, persist, append, flush = flushDigest, stallSweep = runStallSweep, stallDigest = publishStalledDigest } = {}) {
   const errors = [];
   const safe = async (name, fn, fallback) => { try { return await fn(); } catch (e) { errors.push(`${name}: ${e.message}`); return fallback; } };
   if (!config && !settings) config = await safe('health config', () => JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')), {});
@@ -191,6 +192,12 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       report.stallSweep = { mode: out.mode, skipped: out.skipped ?? null, wouldDo: out.act?.length ?? 0, incomplete: out.incomplete ?? null,
         lanes: Object.fromEntries(['system', 'policy', 'operator'].map((l) => [l, (out.items ?? []).filter((i) => i.lane === l).length])) };
       errors.push(...(out.errors ?? []).map((e) => `stall sweep: ${e}`));
+      // Operator items go to the needs-you feed (kind `stalled`) and one quiet-hours-gated alert per pass.
+      if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
+        const d = stallDigest(out, { now, env, stateDir: out.dir, notify, enabled: out.mode !== 'off' && out.digest !== false });
+        report.stallSweep.digest = { published: d.lines?.length ?? 0, alerted: d.fresh?.length ?? 0, notified: !!d.notified };
+        errors.push(...(d.errors ?? []).map((e) => `stall digest: ${e}`));
+      }
       return true;
     }, false);
     if (stalled || errors.some((e) => e.startsWith('stall sweep'))) await write();
