@@ -1314,12 +1314,14 @@ export function runReviewLabelCli({
     fail(ghErr(e, 'gh pr view failed'), 1);
   }
 
-  if (to === 'rearm' && !prCommentsReadable) {
+  const refuseRearm = (reason) => {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: {
-      allowed: false, reason: 'comments unreadable — cannot prove no human clearance',
+      allowed: false, reason,
     } }))}\n`);
     process.exit(1);
-  }
+  };
+  if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
+  if (to === 'rearm' && !headSha) refuseRearm('head unreadable — cannot prove no human clearance');
 
   if ((guardedRestamp || pinnedAccept || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
@@ -1435,9 +1437,15 @@ export function runReviewLabelCli({
   // PR #5482: RULING NEEDED advertises this ceremony as the not-real ruling on a red-team break held at the round cap.
   // On an accepted PR the ceremony's comment is that ruling. It never manufactures an acceptance: a PR without
   // `review:accepted` still owes its review first. A round-capped thread is long, so read all of it when the page is full.
-  const fullThread = () => {
-    if (prComments.length < PR_COMMENTS_PAGE_SIZE) return prComments;
-    try { return provider.readComments(repo, pr); } catch (e) { return fail(ghErr(e, 'complete comment thread unreadable'), 1); }
+  const fullThread = (page = prComments) => {
+    if (page.length < PR_COMMENTS_PAGE_SIZE) return page;
+    let comments;
+    try { comments = provider.readComments(repo, pr); } catch (e) {
+      if (to === 'rearm') return refuseRearm('comments unreadable — cannot prove no human clearance');
+      return fail(ghErr(e, 'complete comment thread unreadable'), 1);
+    }
+    if (to === 'rearm' && !Array.isArray(comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
+    return comments;
   };
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
@@ -1807,6 +1815,28 @@ export function runReviewLabelCli({
     if (live !== expectedHead) fail('live head differs from --expect-head; nothing written', 1);
   }
 
+  // Missing-only rearm must re-check clearance before ANY write, including the comment and shadow ledger.
+  let removals = presentRemoveLabels(decision.removeLabels, currentLabels);
+  if (onlyIf === 'missing') {
+    let fresh;
+    try { fresh = provider.readPrState(repo, pr); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
+    if (!Array.isArray(fresh.comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
+    const freshComments = fullThread(fresh.comments).filter(isTrustedMarkerAuthor);
+    const freshDecision = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: fresh.labels,
+      acceptanceStillCoversHead: parseReviewedSha(freshComments) === fresh.headRefOid,
+      humanClearedHead: headEverHumanCleared(freshComments, fresh.headRefOid) });
+    if (!freshDecision.allowed) refuseRearm(freshDecision.reason);
+    // A producer can restore readiness after our missing-routing observation. That new
+    // decision supersedes this recovery, even without a reviewed-sha marker. Readiness
+    // already present on the initial read still follows the stale-head re-arm policy.
+    const readinessArrived = (expectNoReadiness || !hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL))
+      && hasReviewLabel(fresh.labels, READY_TO_MERGE_LABEL);
+    if (fresh.state !== 'OPEN' || fresh.isDraft !== false || fresh.headRefOid !== expectedHead || readinessArrived) {
+      fail('missing review handoff refused: state, draft status, head, readiness or review family changed before write', 1);
+    }
+    removals = presentRemoveLabels(decision.removeLabels, fresh.labels);
+  }
+
   const ledgerVerdict = verdictForLabelTarget(to);
   let clearingLedgerMiss = false;
   try {
@@ -1872,7 +1902,6 @@ export function runReviewLabelCli({
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SWAP: add the verdict label, remove the stale ones
   // (argv array, no shell). Intersect the decision's removals with the labels the PR ACTUALLY carries so
   // `gh pr edit --remove-label` is never handed an absent label (which errors).
-  let removals = presentRemoveLabels(decision.removeLabels, currentLabels);
   const applySwap = () => {
     try {
       if (['accepted', 'restamp', 'clear-human'].includes(to)) {
@@ -1885,21 +1914,6 @@ export function runReviewLabelCli({
           && isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) {
           removals = [...removals, REVIEW_LABELS.human];
         }
-      }
-      if (onlyIf === 'missing') {
-        const fresh = provider.readPrState(repo, pr);
-        // A producer can restore readiness after our missing-routing observation. That new
-        // decision supersedes this recovery, even without a reviewed-sha marker. Readiness
-        // already present on the initial read still follows the stale-head re-arm policy.
-        const readinessArrived = (expectNoReadiness || !hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL))
-          && hasReviewLabel(fresh.labels, READY_TO_MERGE_LABEL);
-        if (fresh.state !== 'OPEN' || fresh.isDraft !== false || fresh.headRefOid !== expectedHead
-          || readinessArrived
-          || !decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: fresh.labels,
-            acceptanceStillCoversHead: parseReviewedSha((fresh.comments ?? []).filter(isTrustedMarkerAuthor)) === fresh.headRefOid }).allowed) {
-          throw new Error('missing review handoff refused: state, draft status, head, readiness or review family changed before write');
-        }
-        removals = presentRemoveLabels(decision.removeLabels, fresh.labels);
       }
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
     } catch (e) {

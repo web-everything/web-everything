@@ -3039,14 +3039,28 @@ describe('decideSetLabel — rearm requireLive (#4333)', () => {
 });
 
 describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => {
+  let ledgerDir, savedLedgerDir;
+  beforeEach(() => {
+    ledgerDir = mkdtempSync(join(tmpdir(), 'rearm-clearance-'));
+    savedLedgerDir = process.env.WE_VERDICT_LEDGER_DIR;
+    process.env.WE_VERDICT_LEDGER_DIR = ledgerDir;
+  });
+  afterEach(() => {
+    if (savedLedgerDir === undefined) delete process.env.WE_VERDICT_LEDGER_DIR;
+    else process.env.WE_VERDICT_LEDGER_DIR = savedLedgerDir;
+    rmSync(ledgerDir, { recursive: true, force: true });
+    rmSync(`${ledgerDir}-locks`, { recursive: true, force: true });
+  });
   // The caller read `accepted`; by the child's own read a reviewer has flipped it to `changes`.
-  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40) } = {}) {
+  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), freshState = {} } = {}) {
     const calls = [];
+    const initial = { labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '',
+      ...(omitComments ? {} : { comments }) };
+    const readPrState = vi.fn().mockReturnValueOnce(initial).mockReturnValue({ ...initial, ...freshState });
     const provider = {
       name: 'stub',
       currentRepo: () => 'o/n',
-      readPrState: () => ({ labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', body: '',
-        ...(omitComments ? {} : { comments }) }),
+      readPrState,
       readComments,
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: () => { calls.push('setLabels'); },
@@ -3064,7 +3078,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       });
     } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; }
     finally { process.exit = realExit; }
-    return { exitCode, calls, payload: JSON.parse(chunks.join('') || '{}') };
+    return { exitCode, calls, readPrState, ledgerWrites: readdirSync(ledgerDir), payload: JSON.parse(chunks.join('') || '{}') };
   }
 
   it('interleaving: only-if=accepted, child\'s read returns changes → refused, setLabels never called', () => {
@@ -3140,7 +3154,90 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     expect(readComments).toHaveBeenCalledWith('o/n', '9');
     expect(result.exitCode).toBe(1);
     expect(result.calls).toEqual([]);
-    expect(result.payload.error).toBe('thread unavailable');
+    expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+  });
+
+  it.each([undefined, null, {}, 'unreadable'])('CLI rearm fails closed without writes when paged comments are not an array (%j)', (pagedComments) => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
+    const readComments = vi.fn(() => pagedComments);
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+  });
+
+  it.each(['', null, {}])('CLI rearm fails closed without writes when the head is empty or unreadable (%j)', (headRefOid) => {
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { headRefOid });
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('head unreadable — cannot prove no human clearance');
+  });
+
+  const missingArgs = ['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`];
+  it.each([undefined, null, {}, 'unreadable'])('missing-only rearm fails closed without writes when fresh comments are not an array (%j)', (comments) => {
+    const result = run(missingArgs, [], { freshState: { comments } });
+    expect(result.readPrState).toHaveBeenCalledTimes(2);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+  });
+
+  it('missing-only rearm refuses without writes when clearance arrives beyond the fresh embedded comment page', () => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
+    const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } };
+    const readComments = vi.fn().mockReturnValueOnce(comments).mockReturnValue([...comments, clearance]);
+    const result = run(missingArgs, [], { comments, readComments, freshState: { comments } });
+    expect(result.readPrState).toHaveBeenCalledTimes(2);
+    expect(readComments.mock.calls).toEqual([['o/n', '9'], ['o/n', '9']]);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
+  it.each([
+    ['undefined', undefined], ['null', null], ['object', {}], ['string', 'unreadable'], ['throw', new Error('thread unavailable')],
+  ])('missing-only rearm fails closed without writes when the fresh paginated thread is unreadable (%s)', (_name, pagedComments) => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
+    const readComments = vi.fn().mockReturnValueOnce(comments).mockImplementation(() => {
+      if (pagedComments instanceof Error) throw pagedComments;
+      return pagedComments;
+    });
+    const result = run(missingArgs, [], { comments, readComments, freshState: { comments } });
+    expect(result.readPrState).toHaveBeenCalledTimes(2);
+    expect(readComments).toHaveBeenCalledTimes(2);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+  });
+
+  it.each([
+    ['trusted current-head clearance', 'a'.repeat(40), { login: 'web-everything' }, false],
+    ['trusted stale-head clearance', 'b'.repeat(40), { login: 'web-everything' }, true],
+    ['untrusted current-head marker', 'a'.repeat(40), { login: 'drive-by' }, true],
+    ['current-head marker with no author', 'a'.repeat(40), undefined, true],
+  ])('missing-only rearm rechecks fresh %s before any write, even after a plain accept', (_name, headSha, author, allowed) => {
+    const comments = [
+      { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), author },
+      { body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: 'a'.repeat(40) }), author: { login: 'web-everything' } },
+    ];
+    const result = run(missingArgs, [], { freshState: { comments } });
+    if (allowed) expect(result.readPrState.mock.calls.length).toBeGreaterThanOrEqual(2); // the post-write verify read adds one
+    else expect(result.readPrState).toHaveBeenCalledTimes(2);
+    // the stub never mutates labels, so an allowed write ends at the post-write verify (exit 1) after both writes
+    if (!allowed) expect(result.exitCode).toBe(1);
+    if (allowed) expect(result.calls).toEqual(['postComment', 'setLabels']);
+    else {
+      expect(result.calls).toEqual([]);
+      expect(result.ledgerWrites).toEqual([]);
+      expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+    }
   });
 
   it('only-if fails closed on any value other than accepted, before any write', () => {
