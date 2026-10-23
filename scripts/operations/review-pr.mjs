@@ -2035,6 +2035,32 @@ export function renderVerdictWriteUp({ read, verdict, answer, actor, reason = ''
   ].join('\n');
 }
 
+/** Pure fallback reason when an open operator send-back, rather than a juror finding, requires changes. */
+export function openSendBackBounceReason(read) {
+  const items = read?.openOperatorSendBacks;
+  const plain = value => (typeof value === 'string' ? value : '')
+    .replace(/`/g, "'").replace(/\s/g, ' ').replace(/[<>\p{Cc}\p{Cf}]/gu, '')
+    .replace(/\s+/g, ' ').trim();
+  const open = Array.isArray(items)
+    ? items.filter(item => item && typeof item === 'object'
+      && typeof item.id === 'string' && /^[A-Za-z0-9_.:=-]+$/.test(item.id)
+      && typeof item.at === 'string' && Number.isFinite(Date.parse(item.at))
+      && typeof item.body === 'string')
+      .map(item => ({ ...item, body: plain(item.body).slice(0, 160) }))
+      .filter(item => /[\p{L}\p{N}]/u.test(item.body))
+    : [];
+  if (open.length === 0) return '';
+  const shown = open.slice(0, 5);
+  return [
+    'Operator send-backs remain open:',
+    ...shown.map(item => `\`Send-back ${item.id} at ${plain(item.at)}: ${item.body}\``),
+    ...(open.length > shown.length ? [`and ${open.length - shown.length} more`] : []),
+    'The fixer must post a comment starting with `## Fix evidence`, containing Head: `<fixed head sha>` for the repaired head '
+      + 'and the following marker for each open send-back:',
+    ...shown.map(item => `\`<!-- addresses-operator-send-back: ${item.id} -->\``),
+  ].join('\n');
+}
+
 /**
  * #3540 — THE record DECISION, DERIVED ONCE. PURE. Both `stageVerdict` and `record` call this so the write-up
  * `stageVerdict` stages LOCALLY and the label swap `record` posts from disk can never compute two different
@@ -2089,12 +2115,15 @@ export function planRecordDecision(view) {
   // ships a comment that reads "✅ pass — no blocking findings" beside "Decision: `changes`". The author lane
   // is then bounced with nothing to act on and comes back for another round having changed whatever it
   // guessed at. Refuse it here, in the pure core, so no caller can post one: either the juror named findings,
-  // or the operator names a reason.
+  // or the operator names a reason, or an open operator send-back supplies one.
   //
   // The check is deliberately narrow. A bounce that CARRIES juror findings needs no `--reason` — the findings
   // are the reason, and they are already rendered. This only binds the empty case.
-  const overrideReason = typeof view.input.reason === 'string' ? view.input.reason.trim() : '';
+  let overrideReason = typeof view.input.reason === 'string' ? view.input.reason.trim() : '';
   const jurorFindings = Array.isArray(verdict.findings) ? verdict.findings.length : 0;
+  if (answer === 'changes' && jurorFindings === 0 && overrideReason === '') {
+    overrideReason = openSendBackBounceReason(read);
+  }
   if (answer === 'changes' && jurorFindings === 0 && overrideReason === '') {
     throw new Error(
       `review-pr.record: refusing to record \`changes\` on ${repo}#${pr} with no stated reason — the `
