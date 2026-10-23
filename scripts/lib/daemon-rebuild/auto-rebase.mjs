@@ -1,6 +1,6 @@
 /** Detached, fail-closed repair of established overlays; registration precedes adoption cleanup. */
 import * as fs from 'node:fs';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +30,7 @@ export function resolveAutoRebaseSwitch(env = process.env, { settingsPath = SETT
   return value;
 }
 
-function reportNeedsYou({ root, env, ref, stage, error, io = fs, event = overlays.appendOverlayEvent, now = () => new Date().toISOString() }) {
+export function reportNeedsYou({ root, env, ref, stage, error, io = fs, event = overlays.appendOverlayEvent, now = () => new Date().toISOString() }) {
   const detail = { ref, stage, reason: String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 240) };
   try { event(root, { kind: 'auto-rebase-needs-you', ...detail }, { env }); } catch { /* alert still attempted */ }
   try {
@@ -38,6 +38,7 @@ function reportNeedsYou({ root, env, ref, stage, error, io = fs, event = overlay
     io.mkdirSync(dirname(file), { recursive: true });
     io.appendFileSync(file, `${JSON.stringify({ at: now(), kind: 'auto-rebase-needs-you', detail })}\n`);
   } catch { /* best-effort audit trail */ }
+  return detail;
 }
 
 export function kickAutoRebase({ root, env = process.env, lost, spawnFn = spawn }) {
@@ -72,6 +73,11 @@ export function kickAutoRebase({ root, env = process.env, lost, spawnFn = spawn 
 }
 
 const execute = (bin, args, opts) => spawnSync(bin, args, { encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024, ...opts });
+// Long-running agents and tests must leave the event loop free to heartbeat the lock.
+const executeAsync = (bin, args, opts) => new Promise(resolve => {
+  execFile(bin, args, { encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024, ...opts },
+    (error, stdout, stderr) => resolve({ status: error ? 1 : 0, error, stdout, stderr }));
+});
 const requireOk = r => { if (r?.status !== 0 || r?.error) throw new Error('command failed or incomplete'); return String(r.stdout ?? '').trim(); };
 const requireAgentSuccess = result => {
   const report = JSON.parse(requireOk(result));
@@ -84,16 +90,28 @@ const writePending = (io, file, data) => {
   io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file);
 };
 
-export async function runAutoRebase({ root, ref, env = process.env, deps = {} }) {
+export async function runAutoRebase({ root, ref, token, env = process.env, deps = {} }) {
   const io = deps.io ?? fs, exec = deps.exec ?? execute, now = deps.now ?? (() => new Date().toISOString());
+  const execAsync = deps.exec ?? executeAsync;
   const git = (args, cwd = root) => (deps.git ?? ((a, o) => exec('git', a, o)))(args,
     { cwd, env: { ...env, ...REBUILD_IDENTITY_ENV }, timeout: 60_000 });
   const add = deps.addOverlay ?? overlays.addOverlay, event = deps.appendOverlayEvent ?? overlays.appendOverlayEvent;
   const p = paths(root, env, ref);
-  let scratch, stage = 'registration';
+  let scratch, heartbeat, stage = 'registration';
   const reportFailure = error => reportNeedsYou({ root, env, ref, stage, error, io, event, now });
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe ref');
+    if (token) {
+      heartbeat = setInterval(() => {
+        try {
+          if (io.readFileSync(p.marker, 'utf8') === token) {
+            const time = new Date();
+            io.utimesSync(p.marker, time, time);
+          }
+        } catch (error) { reportNeedsYou({ root, env, ref, stage: 'heartbeat', error, io, event, now }); }
+      }, 60_000);
+      heartbeat.unref();
+    }
     const state = (deps.readOverlayState ?? overlays.readOverlayState)(root, { env });
     const old = state.overlays?.find(o => o.ref === ref);
     if (state.corrupt || !old) throw new Error('old registration unavailable');
@@ -124,7 +142,7 @@ export async function runAutoRebase({ root, ref, env = process.env, deps = {} })
       io.writeFileSync(task, `${FENCED_DATA_RULE}\n${text}\n${fenceUntrusted('material', JSON.stringify({ ref, conflicts, oldSha, mainSha }))}`);
       const args = ['scripts/codex-direct-task.mjs', `--task-file=${task}`, `--dir=${scratch}`, '--gate=none', '--task-kind=fix', '--no-self-review', '--no-stream', '--json', '--timeout-ms=600000', ...(review ? ['--review'] : [])];
       const agentFn = review ? deps.auditor : deps.codex;
-      return agentFn ? await agentFn({ root: scratch, args, taskFile: task }) : exec(process.execPath, args, { cwd: root, env });
+      return agentFn ? await agentFn({ root: scratch, args, taskFile: task }) : execAsync(process.execPath, args, { cwd: root, env });
     };
     if (conflicts.length) {
       stage = 'resolve';
@@ -151,7 +169,7 @@ export async function runAutoRebase({ root, ref, env = process.env, deps = {} })
     io.statSync(join(root, 'node_modules'));
     io.symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
     const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected];
-    requireOk(await (deps.testRunner ?? ((o) => exec(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }));
+    requireOk(await (deps.testRunner ?? ((o) => execAsync(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }));
     stage = 'audit';
     const audit = await agent(true, 'Read-only audit: inspect the merge against BOTH parent tips, especially conflict resolutions, tests and guards. Answer exactly NOT WEAKENED only if neither side’s intent, tests nor guards were weakened; otherwise report failure.');
     if (requireAgentSuccess(audit).lastMessage !== 'NOT WEAKENED') throw new Error('audit did not certify NOT WEAKENED');
@@ -168,6 +186,7 @@ export async function runAutoRebase({ root, ref, env = process.env, deps = {} })
     reportFailure(e);
     throw e;
   } finally {
+    clearInterval(heartbeat);
     if (scratch) try { io.rmSync(scratch, { recursive: true, force: true }); }
     catch (e) { stage = 'cleanup'; reportFailure(e); throw e; }
   }
@@ -178,30 +197,33 @@ export function finishPendingSwaps({ root, env = process.env, run, removeOverlay
   let names;
   try { names = fs.readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return; throw e; }
   for (const name of names.filter(n => n.endsWith('.json'))) {
-    const file = join(dir, name), swap = readPending(fs, file);
-    if (!isSafeBranchName(swap.old) || !isSafeBranchName(swap.new) || !/^[a-f0-9]{40}$/.test(swap.newSha)) throw new Error('invalid pending swap');
-    const git = args => run(args, { cwd: root, env, timeout: 60_000 });
-    const adopted = git(['merge-base', '--is-ancestor', swap.newSha, 'HEAD']);
-    if (adopted.status !== 0 || adopted.error) continue;
+    const file = join(dir, name);
+    let ref = name;
     try {
+      const swap = readPending(fs, file);
+      if (!isSafeBranchName(swap?.old) || !isSafeBranchName(swap?.new) || typeof swap?.newSha !== 'string' || !/^[a-f0-9]{40}$/.test(swap.newSha)) throw new Error('invalid pending swap');
+      ref = swap.old;
+      const git = args => run(args, { cwd: root, env, timeout: 60_000 });
+      const adopted = git(['merge-base', '--is-ancestor', swap.newSha, 'HEAD']);
+      if (adopted.status !== 0 || adopted.error) continue;
       requireOk(git(['fetch', 'origin', `+refs/heads/${swap.old}:refs/remotes/origin/${swap.old}`]));
       const currentOld = requireOk(git(['rev-parse', '--verify', `refs/remotes/origin/${swap.old}`]));
       if (!/^[a-f0-9]{40}$/.test(currentOld)) throw new Error('current origin tip unavailable');
       const containsCurrentTip = git(['merge-base', '--is-ancestor', currentOld, swap.newSha]);
       if (containsCurrentTip.status !== 0 || containsCurrentTip.error) throw new Error('replacement does not contain the current origin tip; both registrations retained');
+      removeOverlay(root, swap.old, { env, why: `auto-rebase adopted ${swap.new}` });
+      appendOverlayEvent(root, { kind: 'auto-rebase-swapped', ...swap }, { env });
+      fs.unlinkSync(file);
     } catch (error) {
-      reportNeedsYou({ root, env, ref: swap.old, stage: 'swap', error, event: appendOverlayEvent });
-      continue; // Keep both registrations and pending evidence for human recovery.
+      reportNeedsYou({ root, env, ref, stage: 'swap', error, event: appendOverlayEvent });
+      continue; // Retain the pending evidence and keep processing unrelated swaps.
     }
-    removeOverlay(root, swap.old, { env, why: `auto-rebase adopted ${swap.new}` });
-    appendOverlayEvent(root, { kind: 'auto-rebase-swapped', ...swap }, { env });
-    fs.unlinkSync(file);
   }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === SELF) {
   const flags = Object.fromEntries(process.argv.slice(2).map(a => { const i = a.indexOf('='); return [a.slice(2, i), a.slice(i + 1)]; }));
-  runAutoRebase({ root: flags.clone, ref: flags.ref }).then(() => {
+  runAutoRebase({ root: flags.clone, ref: flags.ref, token: flags.token }).then(() => {
     const { marker } = paths(flags.clone, process.env, flags.ref);
     try { if (fs.readFileSync(marker, 'utf8') === flags.token) fs.unlinkSync(marker); } catch { /* stale or replaced */ }
   }).catch(() => { process.exitCode = 1; }); // Failed jobs retain the marker: retry at most once per 30 minutes.

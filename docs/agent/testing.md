@@ -7,10 +7,15 @@ The detached worker in `scripts/lib/daemon-rebuild/auto-rebase.mjs` merges main 
 until the verified adopted HEAD contains the replacement SHA and the replacement contains a freshly
 fetched origin tip of the old ref. An advanced or unreadable old tip retains both registrations and
 escalates through `auto-rebase-needs-you`. Per-ref JSON sidecars next to the overlay
-list survive ticks; per-ref markers expire after 30 minutes. Failed workers retain their
+list survive ticks; per-ref markers expire after 30 minutes without a heartbeat. Live detached
+workers touch their own token's marker every minute with an unrefed interval, cleared in `finally`.
+Long-running agents and tests use asynchronous child processes so they cannot starve that timer.
+Test liveness past expiry with a fake clock and injected filesystem touch. Failed workers retain their
 marker until expiry to bound retry cost. `WE_DAEMON_AUTO_REBASE=0` disables
 new jobs and pending-swap cleanup. Cleanup follows interrupted-build recovery and requires
-`state.adopted.head === HEAD`. Launch failures write both the needs-you event and alert.
+`state.adopted.head === HEAD`. Launch and pending-swap failures write both the needs-you event and alert.
+Pending files are isolated: unreadable JSON, invalid swaps and failed removal retain the evidence
+and leave later files eligible for cleanup. Unexpected scan failures also escalate from prepare.
 Both Codex JSON reports must carry exit code zero, no timeout, and terminal `turn.completed`;
 the wrapper process exiting zero alone is insufficient. The source of the switch is logged on consultation. Missing related tests, incomplete
 reads, more than 100 selected tests, failed tests, or an audit without the exact verdict
