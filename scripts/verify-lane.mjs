@@ -77,7 +77,7 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
-import { alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
@@ -443,23 +443,25 @@ if (!resolvedGate && typeof flags.gate === 'string') {
       const variants = verifySetting('matchRequestVariants', process.env);
       const policy = resolveBuildPolicy({ env: process.env });
       const ours = policy.finalGate === 'full' ? 'full' : 'related';
-      const theirStandards = policy.finalGateStandards === 'always' ? 'selected' : 'always';
       const { WE_VERIFY_STANDARDS: ownVerifyStandards, ...unpinned } = process.env;
+      const cardOnlyStamp = GATE === CARD_ONLY_SKIP_GATE;
       for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {
         const env = finalGate === ours ? process.env : { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
         const base = finalGate === ours ? resolved : resolveUnder(env);
         resolvedGate = (base.command === GATE ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
         if (resolvedGate) break;
-        if (finalGate === 'full') continue; // build.finalGateStandards shapes only the related gate
-        // #5831 — the requester may also resolve the other build.finalGateStandards. `always` pins WE_VERIFY_STANDARDS,
-        // so the matcher's standards probes cannot reproduce a `selected` stamp under ours (and vice versa). Every probe
-        // pins WE_VERIFY_STANDARDS, so a pinned resolution is a probe and resolves under THEIR policy; the base and the
-        // plan carry no pin and resolve under OURS, so the recognized selection still runs our standards half.
+        // #5831 — the requester may have stamped under build.finalGateStandards=selected (no standards half) or with the
+        // card-only skip on. `always` pins WE_VERIFY_STANDARDS and the skip, so the matcher's probes cannot reproduce
+        // that stamp under ours, and the child would run it as-is. Every probe pins WE_VERIFY_STANDARDS, so a pinned
+        // resolution is a probe and resolves under the requester's `selected` policy (with the skip for a card-only
+        // stamp); the base and the plan carry no pin and resolve under OURS, so the run never drops our checks. Only a
+        // child that would run MORE than the stamp probes this way; build.finalGateStandards shapes only the related gate.
+        if (finalGate === 'full' || (policy.finalGateStandards !== 'always' && !cardOnlyStamp)) continue;
         const ownPin = ownVerifyStandards === undefined ? {} : { WE_VERIFY_STANDARDS: ownVerifyStandards };
-        const theirEnv = finalGate === ours ? unpinned : { ...unpinned, WE_BUILD_FINAL_GATE: finalGate };
-        const underTheirs = (e) => Object.hasOwn(e, 'WE_VERIFY_STANDARDS')
-          ? resolveUnder({ ...e, WE_BUILD_FINAL_GATE_STANDARDS: theirStandards }) : resolveUnder({ ...e, ...ownPin });
-        resolvedGate = matchRequestedDefaultGate({ gate: GATE, env: theirEnv, resolved: base, resolveUnder: underTheirs, variants }) ?? undefined;
+        const probePin = { WE_BUILD_FINAL_GATE_STANDARDS: 'selected', ...(cardOnlyStamp ? { WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1' } : {}) };
+        const requesterEnv = finalGate === ours ? unpinned : { ...unpinned, WE_BUILD_FINAL_GATE: finalGate };
+        const underRequester = (e) => Object.hasOwn(e, 'WE_VERIFY_STANDARDS') ? resolveUnder({ ...e, ...probePin }) : resolveUnder({ ...e, ...ownPin });
+        resolvedGate = matchRequestedDefaultGate({ gate: GATE, env: requesterEnv, resolved: base, resolveUnder: underRequester, variants }) ?? undefined;
         if (resolvedGate) break;
       }
     }

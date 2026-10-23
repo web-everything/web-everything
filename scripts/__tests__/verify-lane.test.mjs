@@ -2126,10 +2126,15 @@ describe('full build gate default', () => {
       expect(run.stderr).not.toContain('whole-gate admission');
     });
 
-  // #5831 red team: a gate stamped under finalGateStandards=selected omits standards. A child under `always` must
-  // still recognize it as the default gate and run it under its own policy, never the stamped command as-is.
-  it.each([['selected', 'always', 'scripts/lib/zz-std.mjs'], ['selected', 'always', 'backlog/123-card.md'], ['always', 'selected', 'scripts/lib/zz-std.mjs']])(
-    'a child under finalGateStandards=%2$s runs its own standards policy for a gate stamped under %1$s (%3$s)', (requester, child, path) => {
+  // #5831 red team: a gate stamped under finalGateStandards=selected omits standards (or, on a card-only diff, is the
+  // skip echo). A child under `always` — or one with the card-only skip off — must still recognize it as the default
+  // gate and run it under its own policy, never the stamped command as-is.
+  it.each([
+    ['selected', 'always', 'scripts/lib/zz-std.mjs', '1', true], ['selected', 'always', 'backlog/123-card.md', '1', true],
+    ['selected', 'always', 'backlog/123-card.md', '0', true], ['selected', 'selected', 'backlog/123-card.md', '0', true],
+    ['always', 'selected', 'scripts/lib/zz-std.mjs', '1', false],
+  ])(
+    'a child under finalGateStandards=%2$s runs its own standards policy for a gate stamped under %1$s (%3$s, child skip=%4$s)', (requester, child, path, childSkip, standardsRun) => {
       const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
       mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
@@ -2143,16 +2148,18 @@ describe('full build gate default', () => {
       mkdirSync(join(dir, path.split('/').slice(0, -1).join('/')), { recursive: true });
       writeFileSync(join(dir, path), 'export {};\n');
       git('add', '-A'); git('commit', '-qm', 'standards policy fixture');
-      const env = (standards) => ({ ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: 'related',
-        WE_BUILD_FINAL_GATE_STANDARDS: standards, WE_VERIFY_STANDARDS: 'auto', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1', WE_VERIFY_SELECTION: 'pr' });
-      const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(requester), timeout: 60_000 });
+      const env = (standards, skip) => ({ ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: 'related',
+        WE_BUILD_FINAL_GATE_STANDARDS: standards, WE_VERIFY_STANDARDS: 'auto', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: skip, WE_VERIFY_SELECTION: 'pr' });
+      const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(requester, '1'), timeout: 60_000 });
       const suites = JSON.parse(readFileSync(marker(), 'utf8')).suites;
       expect(suites, request.stderr).toBeTruthy();
       expect(suites.includes('check:standards')).toBe(requester === 'always');
-      const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=standards-child', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(child), timeout: 60_000 });
+      const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=standards-child', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(child, childSkip), timeout: 60_000 });
       expect(run.stderr).not.toContain('mode=explicit');
       expect(run.stderr).not.toContain('whole-gate admission');
-      expect(JSON.parse(run.stdout.trim().split('\n').pop()), run.stderr).toMatchObject({ status: 'green' });
-      expect(existsSync(join(dir, 'standards-ran'))).toBe(child === 'always');
+      const verdict = JSON.parse(run.stdout.trim().split('\n').pop());
+      expect(verdict, run.stderr).toMatchObject({ status: 'green' });
+      expect(verdict.reason).not.toBe('card-only-skip');
+      expect(existsSync(join(dir, 'standards-ran'))).toBe(standardsRun);
     });
 });
