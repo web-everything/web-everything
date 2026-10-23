@@ -55,7 +55,7 @@ import { readSettings } from './settings-files.mjs';
 import { gitRun, hashObjectVerified } from './git-run.mjs';
 import { isCardPath, isCardOnlyDiff } from '../ci-card-only.mjs';
 import { resolveRaisedByConflict, loadCardConflictSettings } from './card-conflict-resolve.mjs';
-import { latestCheckNamed, isFailedCheckRow } from './rollup-collapse.mjs';
+import { latestCheckNamed, isFailedCheckRow, requiredCheckReadNeeded, requiredCheckRunsEndpoint, mergeRequiredCheckRuns } from './rollup-collapse.mjs';
 import { mapHashReferences } from '../backlog/id.mjs';
 import { bornAsIndexFromItems } from '../conveyor/queue-store.mjs';
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './constellation-repos.mjs';
@@ -677,8 +677,23 @@ export function createCardGrouping({
   // queued rerun) must never close a currently green combined PR. The shared per-name collapse is the one reading
   // of "latest" (a queued or running rerun is the newest; CheckRun outranks a status context). The lookup and the
   // failed set are the drain's own (`isRequiredCheckFailed`), so every terminal failure the drain will never land
-  // (ACTION_REQUIRED, STARTUP_FAILURE included) dissolves the group instead of holding its sources.
-  const requiredFailed = pr => isFailedCheckRow(latestCheckNamed(pr?.statusCheckRollup, requiredCheck));
+  // (ACTION_REQUIRED, STARTUP_FAILURE included) dissolves the group instead of holding its sources. A capped or
+  // check-less rollup is re-read from REST first, as the drain does: the newest run may sit past gh's 100-context
+  // cap. A failed re-read is unknown, never a failure: the group is kept and the read retried next reconcile.
+  const requiredFailed = pr => {
+    let rollup = pr?.statusCheckRollup;
+    if (requiredCheckReadNeeded(pr, requiredCheck)) {
+      try {
+        if (!SHA.test(String(pr?.headRefOid || ''))) throw new Error('PR head SHA is missing');
+        rollup = mergeRequiredCheckRuns(pr, requiredCheck,
+          gh(['api', requiredCheckRunsEndpoint(localSlug, pr.headRefOid, requiredCheck), '--paginate', '--slurp'], { maxBuffer: 64 * 1024 * 1024 }));
+      } catch (e) {
+        say(`combined PR #${pr?.number ?? '?'} required check "${requiredCheck}" read failed; kept (${firstLine(e)})`);
+        return false;
+      }
+    }
+    return isFailedCheckRow(latestCheckNamed(rollup, requiredCheck));
+  };
 
   const api = {
     setting,

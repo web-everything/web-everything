@@ -132,7 +132,10 @@ import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } fro
 // #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
 // beside `latestRequiredCheck`) for why `collapseRollupToLatestPerName`/`rollupRowKind` now live in their own
 // dependency-free `./lib/rollup-collapse.mjs` rather than here.
-import { collapseRollupToLatestPerName, rollupRowKind, latestCheckNamed, isFailedCheckRow } from './lib/rollup-collapse.mjs';
+import {
+  collapseRollupToLatestPerName, latestCheckNamed, isFailedCheckRow,
+  requiredCheckReadNeeded, requiredCheckRunsEndpoint, mergeRequiredCheckRuns,
+} from './lib/rollup-collapse.mjs';
 import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
@@ -477,32 +480,15 @@ export function isCodeQLFailed(pr) {
  * Read failures are unknown, not CI failures, and must be retried next pass.
  */
 export async function resolveRequiredCheck(pr, { repo = null, requiredCheck = 'test', exec = execFileP, onDeferred = () => {} } = {}) {
-  const rollup = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
-  if (!pr?.requiredCheckReadError && rollup.length < 100 && latestRequiredCheck(pr, requiredCheck)) return pr;
+  if (!requiredCheckReadNeeded(pr, requiredCheck)) return pr;
   const resolved = { ...pr };
   delete resolved.requiredCheckReadError;
   try {
     if (!pr?.headRefOid) throw new Error('PR head SHA is missing');
-    const endpoint = `repos/${repo || '{owner}/{repo}'}/commits/${encodeURIComponent(pr.headRefOid)}/check-runs?check_name=${encodeURIComponent(requiredCheck)}&filter=latest&per_page=100`;
-    const { stdout } = await exec('gh', ['api', endpoint, '--paginate', '--slurp'], {
+    const { stdout } = await exec('gh', ['api', requiredCheckRunsEndpoint(repo, pr.headRefOid, requiredCheck), '--paginate', '--slurp'], {
       encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
     });
-    const pages = JSON.parse(stdout);
-    if (!Array.isArray(pages) || !pages.length || pages.some((page) => !Array.isArray(page?.check_runs))) {
-      throw new Error('invalid check-runs response');
-    }
-    const runs = pages.flatMap((page) => page.check_runs);
-    if (runs.some((run) => run?.name !== requiredCheck || run.head_sha !== pr.headRefOid
-      || !Number.isSafeInteger(run.id) || run.id <= 0 || typeof run.status !== 'string')) {
-      throw new Error('invalid check-run evidence for the requested head/name');
-    }
-    // The REST read replaces only CheckRun evidence. A legacy commit status of the same name is a different
-    // source the check-runs endpoint never returns, so dropping it would delete the only verdict when the head
-    // has no check-run; it stays listed and `latestRequiredCheck` ranks any CheckRun above it.
-    resolved.statusCheckRollup = [
-      ...rollup.filter((row) => (row?.name || row?.context) !== requiredCheck || rollupRowKind(row) === 'StatusContext'),
-      ...runs.map((run) => ({ ...run, __typename: 'CheckRun', conclusion: run.status === 'completed' ? run.conclusion : null })),
-    ];
+    resolved.statusCheckRollup = mergeRequiredCheckRuns(pr, requiredCheck, stdout);
   } catch (error) {
     resolved.requiredCheckReadError = `required check "${requiredCheck}" direct read failed; deferred this pass: ${String(error.message || error).split('\n')[0]}`;
     onDeferred(resolved.requiredCheckReadError);

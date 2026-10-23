@@ -1036,7 +1036,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     // A live combined PR carries ready-to-merge + review:pending (it is re-reviewed); that alone must never dissolve it.
     const waiting = [{ name: 'ready-to-merge' }, { name: 'review:pending' }];
     function reconcileCase({ combined = { state: 'OPEN', labels: waiting }, sources = {}, readFails = [], closeFails = false, pr = 77, list = [], listThrows = false, at = T0,
-      repo = 'o/r', localSlug = 'o/r', extraGroups = [], files = undefined, mainFixPrs = undefined, force = true, stamp = undefined, requiredCheck = undefined } = {}) {
+      repo = 'o/r', localSlug = 'o/r', extraGroups = [], files = undefined, mainFixPrs = undefined, force = true, stamp = undefined, requiredCheck = undefined, checkRuns = undefined } = {}) {
       const statePath = join(tmp(), 's.json');
       writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo, pr, branch: 'lane/card-group-g', createdAt: T0, ...(files ? { files } : {}), sources: [{ num: 1, headSha: A }, { num: 2, headSha: B }] }, ...extraGroups], failed: {},
         ...(stamp ? { lastReconcileAt: { [String(localSlug).toLowerCase()]: stamp } } : {}) }));
@@ -1052,6 +1052,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
           return JSON.stringify(live[args[2]]);
         }
         if (args[0] === 'pr' && args[1] === 'list') { if (listThrows) throw new Error('gh: 502'); return JSON.stringify(list); }
+        if (args[0] === 'api' && checkRuns !== undefined) { if (checkRuns === 'throw') throw new Error('gh: 502'); return JSON.stringify(checkRuns); }
         if (args[0] === 'pr' && args[1] === 'close' && closeFails) throw new Error('gh: 502');
         if (args[0] === 'pr' && ['comment', 'close'].includes(args[1])) return '';
         throw new Error(`unexpected ${args.join(' ')}`);
@@ -1265,6 +1266,33 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       const rollup = [{ name: 'ci', status: 'COMPLETED', conclusion: 'ACTION_REQUIRED' }, { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }];
       expect(reconcileCase({ requiredCheck: 'ci', combined: { state: 'OPEN', labels: waiting, statusCheckRollup: rollup } }).r.dissolved).toEqual(['g']);
       expect(reconcileCase({ combined: { state: 'OPEN', labels: waiting, statusCheckRollup: rollup } }).r.dissolved ?? []).toEqual([]);
+    });
+
+    describe('a capped or check-less rollup is re-read from REST, as the drain does', () => {
+      const H = 'c'.repeat(40);
+      const capped = [...Array.from({ length: 100 }, (_, i) => ({ name: `lint-${i}`, status: 'COMPLETED', conclusion: 'SUCCESS' })),
+        { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-21T10:05:00Z' }];
+      const restRun = (conclusion, extra = {}) => [{ check_runs: [{ id: 9, name: 'test', head_sha: H, status: 'completed', conclusion, ...extra }] }];
+      const combined = rollup => ({ number: 77, state: 'OPEN', labels: waiting, headRefOid: H, statusCheckRollup: rollup });
+
+      it.each([
+        ['the newest run is past the 100-context cap', capped, restRun('action_required')],
+        ['the required check is missing from the rollup', [{ name: 'lint', status: 'COMPLETED', conclusion: 'SUCCESS' }], restRun('startup_failure')],
+      ])('dissolves when %s and REST shows a terminal failure', (_, rollup, runs) => {
+        const t = reconcileCase({ combined: combined(rollup), checkRuns: runs });
+        expect(t.r.dissolved).toEqual(['g']);
+        expect(t.calls).toContainEqual(expect.stringMatching(new RegExp(`^api repos/o/r/commits/${H}/check-runs\\?check_name=test&filter=latest`)));
+      });
+
+      it.each([
+        ['REST shows the newest run green', restRun('success')],
+        ['the REST read fails (unknown, never a failure)', 'throw'],
+        ['REST returns a run for another head', restRun('failure', { head_sha: 'd'.repeat(40) })],
+      ])('keeps the group when %s', (_, runs) => {
+        const t = reconcileCase({ combined: combined([...capped.slice(0, 100), { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }]), checkRuns: runs });
+        expect(t.r.dissolved ?? []).toEqual([]);
+        expect(t.state.groups.map(x => x.id)).toEqual(['g']);
+      });
     });
 
     it('interrupted creation: a PR recorded by the forming pass after the snapshot is never dropped', () => {
