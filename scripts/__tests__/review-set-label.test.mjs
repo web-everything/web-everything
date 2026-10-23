@@ -47,6 +47,7 @@ import {
 import { parseClearerActorId, parseAuthorActorId, readAuthorActorStamps } from '../lib/review-independence.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS, parseAdvisories } from '../lib/advisory-labels.mjs';
+import { PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
 
 // HERMETIC (card xcu4cqf): on an accept/clear-human/restamp the CLI reads the PR's net diff with `git fetch origin
 // +main:refs/remotes/origin/main <head>` + `merge-base`/`diff` against `origin/...` in the PROCESS's git repo, which
@@ -3039,12 +3040,13 @@ describe('decideSetLabel — rearm requireLive (#4333)', () => {
 
 describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => {
   // The caller read `accepted`; by the child's own read a reviewer has flipped it to `changes`.
-  function run(argv, labels) {
+  function run(argv, labels, { comments = [], readComments = () => comments, headRefOid = 'a'.repeat(40) } = {}) {
     const calls = [];
     const provider = {
       name: 'stub',
       currentRepo: () => 'o/n',
-      readPrState: () => ({ labels: labels.map((name) => ({ name })), headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '', comments: [] }),
+      readPrState: () => ({ labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', body: '', comments }),
+      readComments,
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: () => { calls.push('setLabels'); },
       postComment: () => { calls.push('postComment'); },
@@ -3081,6 +3083,46 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     const { exitCode, calls } = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes]);
     expect(exitCode).toBe(0);
     expect(calls).toContain('setLabels');
+  });
+
+  it.each([
+    ['trusted current-head clearance', 'a'.repeat(40), { login: 'web-everything' }, false],
+    ['trusted stale-head clearance', 'b'.repeat(40), { login: 'web-everything' }, true],
+    ['untrusted current-head marker', 'a'.repeat(40), { login: 'drive-by' }, true],
+    ['current-head marker with no author', 'a'.repeat(40), undefined, true],
+  ])('CLI rearm respects %s with a mixed-case live head', (_name, headSha, author, allowed) => {
+    const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), author }];
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, headRefOid: 'A'.repeat(40) });
+    expect(result.exitCode).toBe(allowed ? 0 : 1);
+    if (allowed) expect(result.calls).toEqual(['postComment', 'setLabels']);
+    else {
+      expect(result.calls).toEqual([]);
+      expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+    }
+  });
+
+  it('CLI rearm preserves a trusted current-head clearance beyond the initial comment page', () => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
+    const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } };
+    const readComments = vi.fn(() => [...comments, clearance]);
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+    expect(readComments).toHaveBeenCalledTimes(1);
+    expect(readComments).toHaveBeenCalledWith('o/n', '9');
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
+  it('CLI rearm fails closed without writes when the full comment thread is unreadable', () => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
+    const readComments = vi.fn(() => { throw new Error('thread unavailable'); });
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+    expect(readComments).toHaveBeenCalledTimes(1);
+    expect(readComments).toHaveBeenCalledWith('o/n', '9');
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.payload.error).toBe('thread unavailable');
   });
 
   it('only-if fails closed on any value other than accepted, before any write', () => {

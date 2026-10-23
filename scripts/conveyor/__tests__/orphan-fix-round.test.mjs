@@ -46,6 +46,20 @@ describe('planOrphanFixRound — the #4715 shapes', () => {
     expect(planOrphanFixRound({ pr: cleared, nowMs: NOW }).decision).toBe('none');
   });
 
+  it.each([
+    ['trusted current-head clearance', HEAD, BOT, 'none'],
+    ['trusted stale-head clearance', 'd9829f557f3f264ac885722cb9afef18bd91ca7f', BOT, 'rearm'],
+    ['untrusted current-head marker', HEAD, { login: 'drive-by' }, 'rearm'],
+    ['current-head marker with no author', HEAD, null, 'rearm'],
+  ])('orphan guard respects %s with a mixed-case live head', (_name, headSha, author, decision) => {
+    const pr = pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END,
+      c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), author),
+    ], { headRefOid: HEAD.toUpperCase() });
+    const plan = planOrphanFixRound({ pr, nowMs: NOW });
+    expect(plan.decision).toBe(decision);
+    if (decision === 'none') expect(plan).toEqual({ decision: 'none', reason: 'human-cleared head — final' });
+  });
+
   it('re-dispatches a restack-only round that never addressed the review', () => {
     const p = planOrphanFixRound({ pr: pr4715([VERDICT, BEGIN, RESTACK, END]), nowMs: NOW });
     expect(p.decision).toBe('redispatch');
