@@ -63,6 +63,15 @@ describe('auto-block plan', () => {
     expect(parseLatestHumanClearedSha(cleared.comments)).toBe(cleared.headRefOid);
     expect(planAutoBlock(cleared, opts)).toBeNull();
   });
+  it('clear-human then a same-head plain accept remains protected from auto-block', () => {
+    const pr = parked();
+    pr.comments.push(
+      { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: H1 }), author: { login: 'web-everything' } },
+      { body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: H1 }), author: { login: 'web-everything' } },
+    );
+    expect(parseLatestHumanClearedSha(pr.comments)).toBeNull();
+    expect(planAutoBlock(pr, { mode: 'auto-block', cardReadable, isJudgment: () => false })).toBeNull();
+  });
   it.each([
     ['trusted current-head clearance', H2, { login: 'web-everything' }, true],
     ['trusted stale-head clearance', H1, { login: 'web-everything' }, false],

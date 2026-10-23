@@ -83,7 +83,7 @@ import {
   // `cleared-human` markers to the SAME comment (see its own docstring), so the SHA it returns IS
   // `parseReviewedSha`'s answer whenever it is non-null; a second independent parse would only ever agree.
   parseReviewedSha, parseReviewedDiff, parseReviewedContribution, parseOperatorClearance,
-  parseLatestHumanClearedSha, acceptanceCoversHead,
+  parseLatestHumanClearedSha, headEverHumanCleared, acceptanceCoversHead,
   // #x9krtkc (mutual-exclusivity fix, #2766/#2767) — the automated-escalation park decision and its detector,
   // re-exported below for the same reason `REASONLESS_BOUNCE_REFUSAL` is: this file is the SINGLE label home
   // (#2644), so a reader looks HERE for what governs a label swap even though the pure decision itself lives
@@ -1281,6 +1281,7 @@ export function runReviewLabelCli({
   let prTitle = '';
   let prCreatedAt = '';
   let prComments = [];
+  let prCommentsReadable = false;
   // #4708 — set when the referral gate accepted this head on an earlier head's carried clean review (see
   // `referralEvidenceCarry`); the durable comment then records which head, which run and which diff fingerprint.
   let referralCarry = null;
@@ -1307,9 +1308,17 @@ export function runReviewLabelCli({
     // #x9krtkb — the restamp path's own read-back (see the import note above). Read unconditionally, off the
     // SAME call, for every target: it costs nothing extra to parse a field already in the response, and a
     // conditional read here would be the second copy of "which targets need comments" for no reason.
-    prComments = Array.isArray(parsed.comments) ? parsed.comments : [];
+    prCommentsReadable = Array.isArray(parsed.comments);
+    prComments = prCommentsReadable ? parsed.comments : [];
   } catch (e) {
     fail(ghErr(e, 'gh pr view failed'), 1);
+  }
+
+  if (to === 'rearm' && !prCommentsReadable) {
+    emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: {
+      allowed: false, reason: 'comments unreadable — cannot prove no human clearance',
+    } }))}\n`);
+    process.exit(1);
   }
 
   if ((guardedRestamp || pinnedAccept || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
@@ -1442,7 +1451,7 @@ export function runReviewLabelCli({
     humanOnlyHold,
     redTeamRulingHold,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
-    humanClearedHead: to === 'rearm' && parseLatestHumanClearedSha(fullThread().filter(isTrustedMarkerAuthor))?.toLowerCase() === String(headSha).toLowerCase(),
+    humanClearedHead: to === 'rearm' && headEverHumanCleared(fullThread(), headSha),
   });
   if (!decision.allowed && !restampAcrossHold) {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);

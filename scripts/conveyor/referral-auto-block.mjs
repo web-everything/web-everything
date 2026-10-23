@@ -22,8 +22,7 @@ import { AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
 import { ignoredRulings, rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { resolveReviewSettings } from '../lib/review-settings.mjs';
-import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { parseLatestHumanClearedSha } from '../lib/review-escalation.mjs';
+import { headEverHumanCleared } from '../lib/review-escalation.mjs';
 import { defaultReadPr } from './advisory-label-sweep.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -42,8 +41,7 @@ export const isJudgmentCall = (finding) => finding?.judgmentCall === true;
 export function planAutoBlock(pr, { mode = 'operator', cardReadable = (ref) => referralCardReadable(ref, REPO_ROOT),
   isJudgment = isJudgmentCall, humanAt } = {}) {
   if (mode !== 'auto-block') return null;
-  if (parseLatestHumanClearedSha((Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor))?.toLowerCase()
-    === String(pr?.headRefOid ?? '').toLowerCase()) return null;
+  if (headEverHumanCleared(pr?.comments, pr?.headRefOid)) return null;
   const need = rulingNeeded(pr, { cardReadable, ...(humanAt === undefined ? {} : { humanAt }) });
   if (!need) return null;
   // `reason: 'dispute'` findings are NEVER ruled here: they are the operator's.

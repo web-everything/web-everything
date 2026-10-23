@@ -34,7 +34,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { parseLatestHumanClearedSha } from '../lib/review-escalation.mjs';
+import { headEverHumanCleared } from '../lib/review-escalation.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
@@ -75,8 +75,7 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   const none = (reason) => ({ decision: 'none', reason });
   const labels = labelNames(pr?.labels);
   if (!labels.includes('review:changes')) return none('not bounced (no review:changes)');
-  if (parseLatestHumanClearedSha((Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor))?.toLowerCase()
-    === String(pr?.headRefOid ?? '').toLowerCase()) return none('human-cleared head — final');
+  if (headEverHumanCleared(pr?.comments, pr?.headRefOid)) return none('human-cleared head — final');
   if (pr?.isDraft) return none('draft — the draft-promotion path owns it');
   if (owned) return none('owned — a live fix or dispatch claim holds it');
   const trusted = (Array.isArray(pr?.comments) ? pr.comments : []).filter((c) => isTrustedMarkerAuthor(c) && atMs(c) != null);

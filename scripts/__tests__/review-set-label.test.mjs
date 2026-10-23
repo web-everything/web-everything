@@ -3040,12 +3040,13 @@ describe('decideSetLabel — rearm requireLive (#4333)', () => {
 
 describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => {
   // The caller read `accepted`; by the child's own read a reviewer has flipped it to `changes`.
-  function run(argv, labels, { comments = [], readComments = () => comments, headRefOid = 'a'.repeat(40) } = {}) {
+  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40) } = {}) {
     const calls = [];
     const provider = {
       name: 'stub',
       currentRepo: () => 'o/n',
-      readPrState: () => ({ labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', body: '', comments }),
+      readPrState: () => ({ labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', body: '',
+        ...(omitComments ? {} : { comments }) }),
       readComments,
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: () => { calls.push('setLabels'); },
@@ -3099,6 +3100,23 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       expect(result.calls).toEqual([]);
       expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
     }
+  });
+
+  it('CLI rearm preserves human clearance after a same-head plain accept', () => {
+    const comments = ['clear-human', 'accepted'].map((to) => ({
+      body: buildVerdictComment({ to, actor: 'operator', headSha: 'a'.repeat(40) }), author: { login: 'web-everything' },
+    }));
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments });
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
+  it.each([{ omitComments: true }, { comments: null }, { comments: {} }, { comments: 'unreadable' }])('CLI rearm fails closed without writes when initial comments are not an array (%j)', (options) => {
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], options);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
   });
 
   it('CLI rearm preserves a trusted current-head clearance beyond the initial comment page', () => {

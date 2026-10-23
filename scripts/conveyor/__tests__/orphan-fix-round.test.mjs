@@ -46,6 +46,15 @@ describe('planOrphanFixRound — the #4715 shapes', () => {
     expect(planOrphanFixRound({ pr: cleared, nowMs: NOW }).decision).toBe('none');
   });
 
+  it('clear-human then a same-head plain accept remains protected from orphan rearm', () => {
+    const pr = pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END,
+      c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: HEAD })),
+      c('2026-10-10T15:23:00Z', buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: HEAD })),
+    ]);
+    expect(parseLatestHumanClearedSha(pr.comments)).toBeNull();
+    expect(planOrphanFixRound({ pr, nowMs: NOW })).toEqual({ decision: 'none', reason: 'human-cleared head — final' });
+  });
+
   it.each([
     ['trusted current-head clearance', HEAD, BOT, 'none'],
     ['trusted stale-head clearance', 'd9829f557f3f264ac885722cb9afef18bd91ca7f', BOT, 'rearm'],
