@@ -107,7 +107,8 @@ import { reviewStartGate, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecisi
 import { roundExtensionGrants } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
-import { filterFixerReferrals, REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
+import { filterFixerReferrals } from './review-referral-hold.mjs';
+import { REFERRAL_HOLD_MARKER } from './review-referral-hold-marker.mjs';
 import { rulingDisputeText, rulingAuthority, noticedRungs } from '../lib/ruling-ledger.mjs';
 import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';

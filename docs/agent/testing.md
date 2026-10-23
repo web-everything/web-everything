@@ -558,6 +558,9 @@ rebuild boot smoke in a separate eval-mode Node child, without invoking daemon m
 Keep this in the unit tier: shared-process imports can hide ordering-dependent ESM cycles.
 Process liveness helpers shared by drain evidence and review jobs live in the dependency-free
 `scripts/lib/pid-alive.mjs`; importing the job store for a helper pulls in dispatch and reconcile.
+The referral hold marker lives in `scripts/conveyor/review-referral-hold-marker.mjs` and is
+re-exported by the hold writer. Reconcile must read it from the leaf: the writer imports
+needs-you-feed, whose stall-sweep settings import reaches reconcile before the writer initializes.
 
 ## Smoke sentinel worker isolation
 
