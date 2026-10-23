@@ -437,14 +437,30 @@ it('includes untracked paths and safely stages filenames as literal argv', async
   expect((await f.run()).result.ok).toBe(true);
   expect(f.calls.find(c => c.cmd === 'git' && c.args.includes('add')).args).toContain('scripts/lib/$(touch secret).mjs');
 });
-it('resolves repo from git when omitted and uses explicit heavy path and wait setting', async () => {
-  const f = fixture([['/lane/custom.mjs', ok()]]);
-  const code = await main([...flags.filter(x => !x.startsWith('--repo=')), '--wait-ms=42', '--heavy-admission=custom.mjs'], f.io);
+it('resolves repo from git when omitted and uses the fixed lane heavy path and explicit wait setting', async () => {
+  const f = fixture();
+  const code = await main([...flags.filter(x => !x.startsWith('--repo=')), '--wait-ms=42'], f.io);
   expect(code).toBe(0);
   expect(f.calls[0].args).toEqual(['rev-parse', '--show-toplevel']); released(f);
-  const g = fixture([['/lane/custom.mjs', ok()]]);
-  expect(await main([...flags, '--wait-ms=42', '--heavy-admission=custom.mjs'], g.io)).toBe(0);
-  expect(g.calls.find(c => c.args.includes('/lane/custom.mjs')).args).toContain('--wait-ms=42');
+  const g = fixture();
+  expect(await main([...flags, '--wait-ms=42'], g.io)).toBe(0);
+  for (const job of [f, g]) {
+    expect(job.calls.find(c => c.text.includes('heavy-admission')).args).toEqual([
+      '/lane/scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=42', '--',
+      'npx', 'vitest', 'run', 'scripts/a.test.mjs',
+    ]);
+  }
+});
+it('rejects the legacy heavy-admission flag as a usage error before any job effects', async () => {
+  for (const flag of ['--heavy-admission=custom.mjs', '--heavy-admission=/tmp/custom.mjs', '--heavy-admission']) {
+    expect(() => parseArgs([...flags, flag])).toThrow('bad-args');
+    const f = fixture();
+    const { code, result } = await f.run([flag]);
+    expect(code).toBe(2);
+    expect(result).toMatchObject({ ok: false, stopReason: 'bad-args', detail: `Invalid argument: ${flag}` });
+    expect(f.calls).toHaveLength(0);
+    expect(f.writes).toHaveLength(0);
+  }
 });
 it('exports a frozen reason vocabulary and exit codes', () => {
   expect(Object.isFrozen(STOP_REASONS)).toBe(true); expect(Object.isFrozen(EXIT_CODES)).toBe(true);

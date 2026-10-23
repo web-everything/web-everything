@@ -31,9 +31,9 @@ const good = r => r.status === 0;
 const lines = s => String(s ?? '').split('\n').filter(Boolean);
 
 export function parseArgs(argv) {
-  const opts = { base: 'origin/main', waitMs: 7200000, heavyAdmission: 'scripts/readiness/heavy-admission.mjs', dryRun: false };
+  const opts = { base: 'origin/main', waitMs: 7200000, dryRun: false };
   const keys = { brief: 'brief', purpose: 'purpose', scope: 'scope', tests: 'tests', base: 'base',
-    'edge-clone': 'edgeClone', 'wait-ms': 'waitMs', 'heavy-admission': 'heavyAdmission', repo: 'repo' };
+    'edge-clone': 'edgeClone', 'wait-ms': 'waitMs', repo: 'repo' };
   const seen = new Set();
   for (const arg of argv) {
     if (arg === '--dry-run' && !seen.has('dry-run')) { opts.dryRun = true; seen.add('dry-run'); continue; }
@@ -129,7 +129,7 @@ export async function checkDiffScope(s) {
   const outside = s.files.filter(f => !pathsWithinScope([f], s.opts.scope));
   if (outside.length) fail('diff-out-of-scope', outside);
 }
-const heavyPath = s => path.resolve(s.lane.path, s.opts.heavyAdmission);
+const heavyPath = s => path.resolve(s.lane.path, 'scripts/readiness/heavy-admission.mjs');
 const testArgs = s => [heavyPath(s), 'run', `--wait-ms=${s.opts.waitMs}`, '--', 'npx', 'vitest', 'run', ...s.opts.tests];
 // Keep generated task files outside the worktree, while staying inside the owned lane.
 const taskPath = (s, kind) => path.join(s.lane.path, '.git', `codex-job-${s.opts.purpose}-${s.io.now()}-${kind}.md`);
