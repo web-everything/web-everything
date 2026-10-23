@@ -3,7 +3,7 @@
  */
 
 import { gitRun } from '../main-staleness.mjs';
-import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
+import { makeGit, verifyRev, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { findUnsafeLocalState, knownInputsOf } from './local-state.mjs';
 import { overlayFilePath, readOverlayState } from '../daemon-overlays.mjs';
 import { readRebuildState } from './state.mjs';
@@ -278,8 +278,12 @@ export async function previewOverlayConflict({
       const candidate = planCandidate.ok && planCandidate.applied.find((o) => o.ref === ref);
       // establishedLost covers adopted content; admission must also retain overlays that the
       // existing-only plan applies, including registrations not yet adopted by the running clone.
+      // Ref identity alone permits rolling an existing tip back to its adopted pin. Require the
+      // same commit or a descendant; an unreadable ancestry check cannot authorize admission.
       if (candidate && !candidate.pinnedFrom
-        && planExisting.applied.every((o) => planCandidate.applied.some((a) => a.ref === o.ref))
+        && planExisting.applied.every((o) => planCandidate.applied.some((a) => a.ref === o.ref
+          && FULL_SHA_RE.test(o.sha ?? '') && FULL_SHA_RE.test(a.sha ?? '')
+          && (a.sha === o.sha || scratchGit(['merge-base', '--is-ancestor', o.sha, a.sha]).status === 0)))
         && planCandidate.establishedLost.length === 0) {
         return { ok: true, clean: true, mainSha, cur, candSha, setAside };
       }

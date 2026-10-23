@@ -19,6 +19,18 @@ PR #5809 review identified repeated bounded subset replanning while pins persist
 - [A2] Preserve the six-pin exhaustive search and the seven-pin limit of 64 extra joint retries; cache exhaustion as a conservative outcome without changing retry parity.
 - [A3] Prove invalidation for changed main, carried heads, new conflicting tip, overlay membership/order, pin policy, stack mode and approved resolution edge; bound cache size and discard incompatible state versions.
 
+### Planned behavioral mappings
+
+Every case below is planned in `we:scripts/lib/__tests__/daemon-rebuild-retry-pass.test.mjs`; these are implementation requirements, not passing-test claims.
+
+| Acceptance | Named case | Fixture and observable assertion |
+| --- | --- | --- |
+| A1 | `reuses retry outcomes on unchanged pinned ticks` | Run two pinned ticks with identical planning inputs; count planner entries and assert the second performs no subset search and preserves the same applied heads. |
+| A1, A3 | `invalidates retry cache for each planning input` | Change main, carried heads, conflicting tip, registration membership/order, pin policy, stack mode and approved edge individually; each change starts a fresh search. |
+| A2 | `cached exhaustion preserves six-pin exhaustive search and seven-pin budget` | Compare cold and cached six/seven-pin fixtures; assert identical conservative outcomes, all full-set/singleton attempts, exhaustive six-pin subsets and at most 64 extra seven-pin joint attempts. |
+| A3 | `bounds retry cache and discards corrupt or incompatible entries` | Overflow the declared cache bound and inject malformed and old-version entries; assert bounded state and fresh planning rather than adoption from invalid entries. |
+| A3 | `serializes retry cache writers and recovers interrupted writes` | Interleave two clone-lock holders, interrupt before atomic rename, then resume an expired holder; assert reread after lock acquisition, no stale overwrite and fresh planning from the last valid state. |
+
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
 Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.

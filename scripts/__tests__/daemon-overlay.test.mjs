@@ -225,7 +225,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     expect(state.overlays.map((o) => o.ref)).toEqual(['lane/fix-procedure']); // #2826 never registered
   });
 
-  it('--allow-conflict --reason=... registers anyway, and PRINTS which overlay/file conflicts', () => {
+  it.each(['yes register 2826', 'yes register 2826 despite the conflict'])('--allow-conflict accepts three or more words (%s) and prints the conflict', (instruction) => {
     const { originDir, cloneDir, overlayDir, env } = makeFixture();
     advanceMain(originDir, (dir) => writeFile(dir, 'shared.mjs', 'export const X = 1;\n'));
     pushBranch(originDir, 'lane/fix-procedure', (dir) => writeFile(dir, 'shared.mjs', 'export const X = 2;\n'));
@@ -234,7 +234,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
 
     const r = runCli([
       'add', `--clone=${cloneDir}`, '--ref=lane/promote-stale-green', '--pr=2826',
-      '--allow-conflict', '--reason=operator-approved override', '--operator-instruction=yes register 2826 despite the conflict',
+      '--allow-conflict', '--reason=operator-approved override', `--operator-instruction=${instruction}`,
     ], asGhLogin(env, 'chalbert'));
     expect(r.status).toBe(0);
     expect(r.stderr).toMatch(/registering DESPITE a known conflict/);
@@ -244,7 +244,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     expect(state.overlays.map((o) => o.ref).sort()).toEqual(['lane/fix-procedure', 'lane/promote-stale-green']);
     // the operator's own words are stored on the registration
     expect(state.overlays.find((o) => o.ref === 'lane/promote-stale-green').conflictOverride).toMatchObject({
-      instruction: 'yes register 2826 despite the conflict', actor: 'chalbert', files: ['shared.mjs'],
+      instruction, actor: 'chalbert', files: ['shared.mjs'],
     });
   });
 
@@ -254,6 +254,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     ['an agent-typed --actor=operator under another human credential', ['--operator-instruction=yes register 2826 despite the conflict', '--actor=operator', '--by=chalbert'], 'someone-else'],
     ['an agent-typed --actor=operator when no credential can be read', ['--operator-instruction=yes register 2826 despite the conflict', '--actor=operator'], null],
     ['a one-word instruction', ['--operator-instruction=ok'], 'chalbert'],
+    ['a two-word instruction', ['--operator-instruction=yes register'], 'chalbert'],
     ['an operator instruction over the 1000-character cap', [`--operator-instruction=yes register ${'x'.repeat(988)}`], 'chalbert'],
   ])('--allow-conflict with %s is refused (exit 2) and registers nothing', (_label, extra, login) => {
     const { originDir, cloneDir, overlayDir, env } = makeFixture();

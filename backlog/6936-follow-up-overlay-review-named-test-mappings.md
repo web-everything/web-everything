@@ -33,6 +33,8 @@ Apply the acceptance mapping gate tracked by `we:backlog/5360-prevention-add-a-c
 
 The four later-round suggestions in PR #5809's 2026-10-22T20:25:03Z review repeat the cache and credential mapping gaps already filed here as A1 and A2. Both lens reports remain owed under those entries; this round does not implement caching or trusted credentials.
 
+The four later-round suggestions from the 2026-10-23T21:23:20Z review (simplicity and codex-correctness, each naming cards 6926 and 6927) are also filed under A1/A2. The mandatory mapping finding supplied concrete planned behavioral mappings in those cards; implementing their features and this card's mapping-check fixtures remains outstanding. The deterministic per-acceptance gate remains tracked in `we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md`.
+
 ### Adopted-head regression
 
 - [A4] `refuses to pin when the adopted head also conflicts` is now implemented in `we:scripts/lib/__tests__/daemon-rebuild-overlay-pin.test.mjs`: it establishes an adopted overlay, makes both its moving tip and adopted head conflict with the new stack, and asserts no pin alert, no smoke, unchanged HEAD/registration and an established-overlay hold. Execution and sanctioned mutation evidence remain owed to the launcher; the repair sandbox forbids all `.git` writes, including those needed by the real-git fixtures. Do not weaken guards by hand to obtain proof.

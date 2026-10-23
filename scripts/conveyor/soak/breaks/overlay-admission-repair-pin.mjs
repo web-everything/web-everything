@@ -124,6 +124,32 @@ export default {
         if (dropped.registered || dropped.reason !== 'conflict') {
           api.violation('existing-overlay-dropped', 'carried candidate was admitted by dropping an existing overlay');
         }
+
+        // An existing ref is not enough: the candidate must also preserve its applied SHA.
+        removeOverlay(w.simCloneRoot, 'lane/existing', { env: w.env });
+        const rollback0 = branch('lane/rollback', m1, { 'rollback.txt': 'old\n' });
+        addOverlay(w.simCloneRoot, { ref: 'lane/rollback' }, { env: w.env });
+        addOverlay(w.simCloneRoot, { ref: 'lane/carried' }, { env: w.env });
+        if (!(await rebuild()).adopted) throw new Error('rollback base and candidate must be carried');
+        removeOverlay(w.simCloneRoot, 'lane/carried', { env: w.env });
+        const rollback1 = branch('lane/rollback', rollback0, { 'admission.txt': 'existing\n' });
+        const before = await dryRunRebuild({ root: w.simCloneRoot, env: w.env, prState: async () => 'OPEN' });
+        const after = await dryRunRebuild({
+          root: w.simCloneRoot, env: w.env, prState: async () => 'OPEN', extraOverlays: [{ ref: 'lane/carried' }],
+        });
+        if (!before.plan.applied.some(o => o.ref === 'lane/rollback' && o.sha === rollback1)
+          || !after.plan.ok || after.plan.establishedLost.length
+          || !after.plan.applied.some(o => o.ref === 'lane/rollback' && o.sha === rollback0 && o.pinnedFrom === rollback1)) {
+          throw new Error('fixture must replace an existing applied tip with an older pin');
+        }
+        const rolledBack = await guardedRegister({
+          root: w.simCloneRoot, ref: 'lane/carried', pr: null, env: w.env, gate: {},
+          register: () => addOverlay(w.simCloneRoot, { ref: 'lane/carried' }, { env: w.env }),
+        });
+        if (rolledBack.registered || rolledBack.reason !== 'conflict'
+          || readOverlays(w.simCloneRoot, { env: w.env }).some(o => o.ref === 'lane/carried')) {
+          api.violation('existing-overlay-rolled-back', 'carried candidate was admitted by pinning an existing applied tip backwards');
+        }
       },
     });
   },
