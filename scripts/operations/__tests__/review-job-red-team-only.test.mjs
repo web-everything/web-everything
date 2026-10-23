@@ -22,7 +22,7 @@ describe('review-job CLI --red-team-only', () => {
     [['--red-team-only='], true, ''],
   ])('passes %j to the job without losing its recovery mode', (flags, redTeamOnly, redTeamMode) => {
     const source = `
-      import { runReviewJobCli } from ${JSON.stringify(new URL('../review-job.mjs', import.meta.url).href)};
+      import { runReviewJobCli } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-job.mjs')).href)};
       runReviewJobCli(process.argv.slice(1), { runJob: options => options });
     `;
     const output = execFileSync(process.execPath, ['--input-type=module', '-e', source,

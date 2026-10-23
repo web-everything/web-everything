@@ -3,7 +3,8 @@ import { runRedTeam, speculateRedTeam } from '../review-extra-seats.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 describe('red-team CLI --resume-only', () => {
   it.each([
@@ -18,7 +19,7 @@ describe('red-team CLI --resume-only', () => {
       // Execute the production CLI handler in a child. Only effect IO is replaced;
       // argv parsing, payload reading and the real runRedTeam guard all execute.
       const source = `
-        import { runExtraSeatsCli } from ${JSON.stringify(new URL('../review-extra-seats.mjs', import.meta.url).href)};
+        import { runExtraSeatsCli } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
         const calls = { provider: 0, reserve: 0, model: 0, recheck: 0 };
         const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
         await runExtraSeatsCli(process.argv.slice(1), { redTeamIo: {
