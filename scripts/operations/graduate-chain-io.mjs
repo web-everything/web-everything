@@ -4,7 +4,6 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
-import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { runGraduateChain } from './graduate-chain.mjs';
 
@@ -20,7 +19,7 @@ export function createGraduateChainRunner({ cwd = process.cwd(), env = process.e
   return input => {
     const temporary = [];
     const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'graduate-chain-')); temporary.push(dir); return dir; };
-    return runGraduateChain(input, { exec, cwd, env, cascadePolicy, resolveBuildPolicy, extractSubmitResult,
+    return runGraduateChain(input, { exec, cwd, env, cascadePolicy, extractSubmitResult,
       readTemplate: file => readFileSync(resolve(cwd, file), 'utf8'),
       writeBody: body => { const file = join(temp(), 'body.md'); writeFileSync(file, body); return file; },
       mergeEnvironment: (objects, directory) => ({ GIT_OBJECT_DIRECTORY: temp(),
