@@ -249,6 +249,11 @@ describe('real git: cleanup CLI', () => {
       mkdirSync(join(dir, '.git', path, '..'), { recursive: true });
       writeFileSync(join(dir, '.git', path), '');
     }, `git lock present (${path})`]),
+    // Unfinished operations: gc does not keep the commits these name.
+    ...['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'rebase-merge/head-name', 'sequencer/todo', 'worktrees/w/REBASE_HEAD'].map((path) => [`in-flight ${path}`, (dir) => {
+      mkdirSync(join(dir, '.git', path, '..'), { recursive: true });
+      writeFileSync(join(dir, '.git', path), `${git(dir, 'rev-parse', 'HEAD')}\n`);
+    }, `git lock present (${path.split('/').slice(0, path.startsWith('worktrees/') ? 3 : 1).join('/')})`]),
     ['gc.recentObjectsHook', (dir, other, ran) => hook(dir, ran), 'gc.recentObjectsHook configured (gc would run it)'],
     ['absolute commondir', (dir, other) => commondir(dir, join(other, '.git')), /^git common dir is redirected/],
     ['relative commondir', (dir, other) => commondir(dir, relative(join(dir, '.git'), join(other, '.git'))), /^git common dir is redirected/],

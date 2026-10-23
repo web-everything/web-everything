@@ -25,7 +25,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { LEASE_FILENAME } from './lib/lane-lease.mjs';
 import { laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
@@ -103,6 +103,8 @@ function borrowerMap() {
 const BORROWERS = borrowerMap();
 // Audit the whole Git directory: GC's write paths extend beyond config, refs, logs and objects, and any `*.lock`
 // anywhere (e.g. a prepared update-ref transaction's refs/heads/<name>.lock) or gc.pid means an op is mid-flight.
+// So does an unfinished merge/rebase/cherry-pick/bisect: gc does not keep the commits these pseudorefs name.
+const IN_FLIGHT = new Set(['gc.pid', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'REBASE_HEAD', 'AUTO_MERGE', 'BISECT_HEAD', 'BISECT_START', 'rebase-merge', 'rebase-apply', 'sequencer']);
 const auditGitDir = (dir) => {
   const links = [];
   const locks = [];
@@ -110,7 +112,7 @@ const auditGitDir = (dir) => {
     let entry;
     try { entry = lstatSync(join(dir, '.git', path)); } catch (err) { if (err.code === 'ENOENT') return; throw err; }
     if (entry.isSymbolicLink()) { links.push(path); return; } // Never traverse even a dangling link.
-    if (path.endsWith('.lock') || path === 'gc.pid') locks.push(path);
+    if (path.endsWith('.lock') || IN_FLIGHT.has(basename(path))) locks.push(path); // basename: linked worktrees too.
     if (!entry.isDirectory()) return;
     let names;
     // Git removes empty loose-ref and fan-out dirs as it works: a dir gone since its lstat is simply skipped.
