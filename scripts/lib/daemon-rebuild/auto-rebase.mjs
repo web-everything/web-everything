@@ -211,6 +211,13 @@ export function finishPendingSwaps({ root, env = process.env, run, removeOverlay
       if (!/^[a-f0-9]{40}$/.test(currentOld)) throw new Error('current origin tip unavailable');
       const containsCurrentTip = git(['merge-base', '--is-ancestor', currentOld, swap.newSha]);
       if (containsCurrentTip.status !== 0 || containsCurrentTip.error) throw new Error('replacement does not contain the current origin tip; both registrations retained');
+      requireOk(git(['fetch', 'origin', `+refs/heads/${swap.new}:refs/remotes/origin/${swap.new}`]));
+      const currentNew = requireOk(git(['rev-parse', '--verify', `refs/remotes/origin/${swap.new}`]));
+      if (!/^[a-f0-9]{40}$/.test(currentNew)) throw new Error('current replacement origin tip unavailable');
+      const containsReplacement = git(['merge-base', '--is-ancestor', swap.newSha, currentNew]);
+      if (containsReplacement.status !== 0 || containsReplacement.error) throw new Error('replacement origin tip no longer contains the pending SHA');
+      const state = overlays.readOverlayState(root, { env });
+      if (state.corrupt || !state.overlays.some(o => o?.ref === swap.new)) throw new Error('replacement registration unavailable');
       removeOverlay(root, swap.old, { env, why: `auto-rebase adopted ${swap.new}` });
       appendOverlayEvent(root, { kind: 'auto-rebase-swapped', ...swap }, { env });
       fs.unlinkSync(file);

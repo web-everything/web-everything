@@ -6,7 +6,10 @@ The detached worker in `scripts/lib/daemon-rebuild/auto-rebase.mjs` merges main 
 `<ref>-auto-<n>` branch so ancestry preserves the original tip. It retains the old registration
 until the verified adopted HEAD contains the replacement SHA and the replacement contains a freshly
 fetched origin tip of the old ref. An advanced or unreadable old tip retains both registrations and
-escalates through `auto-rebase-needs-you`. Per-ref JSON sidecars next to the overlay
+escalates through `auto-rebase-needs-you`. Cleanup also re-reads the overlay list and requires the
+replacement still registered and its freshly fetched origin tip to contain the pending SHA;
+missing or unreadable evidence retains the old registration and pending file and alerts in both sinks.
+Per-ref JSON sidecars next to the overlay
 list survive ticks; per-ref markers expire after 30 minutes without a heartbeat. Live detached
 workers touch their own token's marker every minute with an unrefed interval, cleared in `finally`.
 Long-running agents and tests use asynchronous child processes so they cannot starve that timer.

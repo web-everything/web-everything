@@ -254,6 +254,59 @@ describe('established overlay auto rebase', () => {
     expect(events).toContain('auto-rebase-needs-you'); expect(events).not.toContain('auto-rebase-swapped');
   });
 
+  it.each(['removed registration', 'corrupt list', 'deleted remote', 'rewound remote', 'rewritten remote', 'failed replacement fetch', 'unreadable replacement tip'])(
+    'retains the old registration and pending evidence and alerts in both sinks on %s after adoption', async failure => {
+      const f = fixture(); f.moveMain(); const replacement = await job(f);
+      ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+      const listFile = overlayFilePath(f.root, f.env);
+      if (failure === 'removed registration') removeOverlay(f.root, replacement.ref, { env: f.env });
+      if (failure === 'corrupt list') fs.appendFileSync(listFile, '\n{');
+      if (failure === 'deleted remote') ok(f.origin, ['update-ref', '-d', `refs/heads/${replacement.ref}`]);
+      if (failure === 'rewound remote' || failure === 'rewritten remote') {
+        const tip = failure === 'rewound remote' ? f.oldSha : ok(f.root, ['rev-parse', 'origin/main']);
+        ok(f.origin, ['update-ref', `refs/heads/${replacement.ref}`, tip]);
+      }
+      // Cached origin still passes: only a fresh remote read can detect deletion or rewriting.
+      expect(ok(f.root, ['rev-parse', `origin/${replacement.ref}`])).toBe(replacement.newSha);
+      const pendingFile = join(pendingDir(f), fs.readdirSync(pendingDir(f))[0]);
+      const pending = fs.readFileSync(pendingFile, 'utf8'), list = fs.readFileSync(listFile, 'utf8');
+      const remove = vi.fn(), probe = vi.fn((args, opts) => {
+        if (failure === 'failed replacement fetch' && args[0] === 'fetch' && args.includes(`+refs/heads/${replacement.ref}:refs/remotes/origin/${replacement.ref}`)) return { status: 1 };
+        if (failure === 'unreadable replacement tip' && args[0] === 'rev-parse' && args.includes(`refs/remotes/origin/${replacement.ref}`)) return { status: 0, stdout: '' };
+        return run(args, opts);
+      });
+      finishPendingSwaps({ root: f.root, env: f.env, run: probe, removeOverlay: remove });
+      expect(remove).not.toHaveBeenCalled();
+      expect(fs.readFileSync(listFile, 'utf8')).toBe(list);
+      expect(fs.readFileSync(pendingFile, 'utf8')).toBe(pending);
+      if (failure !== 'corrupt list') expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual(
+        failure === 'removed registration' ? [ref] : [ref, replacement.ref]);
+      const events = fs.readFileSync(listFile.replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+      expect(events.filter(e => e.kind === 'auto-rebase-needs-you')).toEqual([
+        expect.objectContaining({ ref, stage: 'swap', reason: expect.any(String) }),
+      ]);
+      expect(events.some(e => e.kind === 'auto-rebase-swapped')).toBe(false);
+      expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim())).toMatchObject({
+        kind: 'auto-rebase-needs-you', detail: { ref, stage: 'swap', reason: expect.any(String) },
+      });
+    },
+  );
+
+  it('finishes a pending swap when the registered remote replacement advances beyond newSha', async () => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    const author = join(f.base, 'author');
+    ok(f.base, ['clone', '-q', '--branch', replacement.ref, f.origin, author]);
+    write(author, 'followup.txt', 'replacement advanced\n'); ok(author, ['add', '.']);
+    ok(author, ['commit', '-qm', 'replacement followup']); ok(author, ['push', '-q', 'origin', replacement.ref]);
+    swaps(f);
+    expect(ok(f.root, ['rev-parse', `origin/${replacement.ref}`])).toBe(ok(author, ['rev-parse', 'HEAD']));
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([replacement.ref]);
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+    expect(f.calls.slice(-2)).toEqual(['remove', 'auto-rebase-swapped']);
+    expect(fs.existsSync(alertsFilePath(f.root, f.env))).toBe(false);
+  });
+
   describe.each(['codex', 'auditor'])('%s JSON report validation', agent => {
     it.each([
       ['nonzero exit', { exitCode: 1 }], ['timeout', { timedOut: true }],
@@ -376,12 +429,12 @@ describe('established overlay auto rebase', () => {
     'reports %s in both sinks, retains its evidence and registration, and still finishes another pending file', failure => {
       const f = fixture(), healthy = 'lane/healthy', replacement = `${healthy}-auto-1`;
       ok(f.root, ['reset', '--hard', f.oldSha]);
-      ok(f.root, ['push', '-q', 'origin', `${f.oldSha}:refs/heads/${healthy}`]);
+      ok(f.root, ['push', '-q', 'origin', `${f.oldSha}:refs/heads/${healthy}`, `${f.oldSha}:refs/heads/${replacement}`]);
       for (const r of [healthy, replacement]) addOverlay(f.root, { ref: r, pr: 456 }, { env: f.env });
       fs.mkdirSync(pendingDir(f), { recursive: true });
       const badFile = join(pendingDir(f), '00-bad.json'), goodFile = join(pendingDir(f), '99-good.json');
       const bad = failure === 'malformed JSON' ? '{' : failure === 'invalid swap' ? '{}' : failure === 'null swap' ? 'null'
-        : JSON.stringify({ old: ref, new: `${ref}-auto-1`, newSha: failure === 'invalid SHA type' ? [f.oldSha] : f.oldSha });
+        : JSON.stringify({ old: ref, new: replacement, newSha: failure === 'invalid SHA type' ? [f.oldSha] : f.oldSha });
       fs.writeFileSync(badFile, bad);
       fs.writeFileSync(goodFile, JSON.stringify({ old: healthy, new: replacement, newSha: f.oldSha }));
       const remove = vi.fn((root, r, opts) => {
