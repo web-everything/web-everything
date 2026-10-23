@@ -686,8 +686,9 @@ describe('daemon refresh lookahead and legacy fallback liveness', () => {
     const env = { PATH: '/usr/bin:/bin', GH_TOKEN: 'fixture-personal', ...extraEnv };
     const work = vi.fn(async () => ({ code: 0 }));
     const writeCallerStatus = vi.fn();
+    const writeStatus = vi.fn();
     const refresh = () => ensureFreshGithubAppEnv({
-      ...NOOP_STATUS, writeCallerStatus, env, daemon: true, caller: 'guard-config-test', ...opts,
+      writeStatus, writeCallerStatus, env, daemon: true, caller: 'guard-config-test', ...opts,
       installShim: async () => ({ ok: true }), log: { error() {} },
     });
     const attempt = loop === 'pass'
@@ -696,6 +697,42 @@ describe('daemon refresh lookahead and legacy fallback liveness', () => {
     await expect(attempt).rejects.toThrow('refusing to run daemon without the gh auth guard');
     expect(work).not.toHaveBeenCalled();
     expect(writeCallerStatus).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ applied: false, reason: 'guard-config-invalid' }));
+    // One caller's bad config never overwrites the fleet-wide installation status.
+    expect(writeStatus).not.toHaveBeenCalled();
+  });
+
+  // The whole pre-guard region, default parameters included, is inside the one fail-closed boundary.
+  it.each(['explicit daemon option', 'env daemon marker'])
+  ('stops the real loops when a default parameter throws before the guard (%s)', async (how) => {
+    const brokenEnv = () => ({
+      PATH: '/usr/bin:/bin', GH_TOKEN: 'fixture-personal',
+      ...(how === 'env daemon marker' ? { XPC_SERVICE_NAME: 'com.we.fixture-daemon' } : {}),
+      get WE_GITHUB_AUTH_CALLER() { throw TypeError('fixture unreadable caller'); },
+    });
+    for (const loop of ['pass', 'verify']) {
+      const work = vi.fn(async () => ({ code: 0 }));
+      const installShim = vi.fn(async () => ({ ok: true }));
+      let thrown;
+      const refresh = () => ensureFreshGithubAppEnv({
+        ...NOOP_STATUS, env: brokenEnv(), ...(how === 'explicit daemon option' ? { daemon: true } : {}),
+        identity: {}, policy: { auth: 'app' }, installShim, log: { error() {} },
+      }).catch((e) => { thrown = e; throw e; });
+      const attempt = loop === 'pass'
+        ? runPassDaemonLoop({ refreshAuth: refresh, runPass: work, sleep: async () => {}, intervalMs: 1, maxRuns: 1 })
+        : runLoopCycle({ ensureAuth: refresh, cycle: work });
+      await expect(attempt).rejects.toThrow('refusing to run daemon without the gh auth guard');
+      expect(work).not.toHaveBeenCalled();
+      expect(installShim).not.toHaveBeenCalled();
+      expect(thrown.cause?.message).toBe('fixture unreadable caller');
+    }
+  });
+
+  it('keeps a throw AFTER the guard is installed as a transient refresh error (the guard stays in effect)', async () => {
+    const err = TypeError('fixture cache unreadable');
+    await expect(ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env: { ...CONFIGURED_ENV }, daemon: true, caller: 'post-guard', identity: {}, policy: { auth: 'app' },
+      installShim: async () => ({ ok: true }), readCache: () => { throw err; }, log: { error() {} },
+    })).rejects.toBe(err);
   });
 
   it('a non-daemon caller still sees the original config error (no guard to protect)', async () => {

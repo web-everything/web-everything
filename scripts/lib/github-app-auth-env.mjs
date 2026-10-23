@@ -42,8 +42,8 @@ import { installationMap, ownerOfSlug, remapLegacyInstallationId, installationCa
 
 /** A missing refusal boundary is fatal even to callers that tolerate transient refresh errors. */
 export class GithubAppAuthGuardError extends Error {
-  constructor() {
-    super('github-app-auth-env: refusing to run daemon without the gh auth guard');
+  constructor(options) {
+    super('github-app-auth-env: refusing to run daemon without the gh auth guard', options);
     this.code = 'GITHUB_APP_AUTH_GUARD_UNAVAILABLE';
   }
 }
@@ -369,7 +369,23 @@ export function readGithubAppStatus(path = defaultStatusPath(), {
  *   statusPath?:string, writeStatus?:(path:string, status:object)=>void}} [o]
  * @returns {Promise<{applied:boolean, reason:string, missingPermissions?:string[], missingRepos?:string[]}>}
  */
-export async function ensureFreshGithubAppEnv({
+export async function ensureFreshGithubAppEnv(opts = {}) {
+  // ONE fail-closed boundary for a daemon: any throw before the refusal shim is in place (a default parameter,
+  // a config read, an env write) becomes GithubAppAuthGuardError — the only error the daemon loops stop on.
+  // Throws after the shim is installed, and every throw for an interactive caller, pass through unchanged.
+  const guard = { installed: false };
+  try {
+    return await ensureFreshGithubAppEnvUnguarded(opts, guard);
+  } catch (e) {
+    if (isGithubAppAuthGuardError(e) || guard.installed) throw e;
+    let daemon = true; // an env too broken to classify is treated as a daemon's
+    try { daemon = opts?.daemon ?? isDaemonCaller(opts?.env ?? process.env); } catch { /* fail closed */ }
+    if (!daemon) throw e;
+    throw new GithubAppAuthGuardError({ cause: e });
+  }
+}
+
+async function ensureFreshGithubAppEnvUnguarded({
   env = process.env,
   cachePath = defaultCachePath(),
   now = Date.now(),
@@ -401,7 +417,7 @@ export async function ensureFreshGithubAppEnv({
   identity: identityOpt,
   readKeyRef = readPrivateKeyRef,
   canReadKeyRef = mint === mintInstallationToken ? (ref) => canReadPrivateKeyRef(ref) : () => true,
-} = {}) {
+} = {}, guard = {}) {
   if (daemon) env.WE_GH_DAEMON_CALLER = caller;
   const bufferMs = daemon ? DAEMON_REFRESH_BUFFER_MS : REFRESH_BUFFER_MS;
   const recordCaller = (result, extra = {}) => {
@@ -450,8 +466,9 @@ export async function ensureFreshGithubAppEnv({
     let why = 'unreadable error';
     try { why = String((e && e.message) || e); } catch { /* keep the generic text */ }
     try { log.error?.(`github-app-auth-env: ${caller} could not read its GitHub auth config before installing the gh guard: ${why}`); } catch { /* logging never reopens the path */ }
-    try { record({ applied: false, reason: 'guard-config-invalid' }); } catch { /* the refusal must still throw */ }
-    throw new GithubAppAuthGuardError();
+    // A bad config read is a fact about THIS caller's env, not the fleet's installation: per-caller file only.
+    try { record({ applied: false, reason: 'guard-config-invalid' }, { shared: false }); } catch { /* the refusal must still throw */ }
+    throw new GithubAppAuthGuardError({ cause: e });
   }
   if (personal) {
     warnOnce(log, `policy-personal:${caller}`, `github-app-auth-env: github.auth=personal (${authPolicy.source?.auth ?? '?'}) — ${caller} uses the operator's personal gh login by policy.`);
@@ -466,6 +483,7 @@ export async function ensureFreshGithubAppEnv({
       try { record({ applied: false, reason: 'shim-failed' }); } catch { /* the refusal must still throw */ }
       throw new GithubAppAuthGuardError();
     }
+    guard.installed = true;
   }
   const fallbackFrom = [];
   const label = (role) => (role === LEGACY_ROLE ? "today's App" : `the ${role} App`);
