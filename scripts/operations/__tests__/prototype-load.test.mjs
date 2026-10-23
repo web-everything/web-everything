@@ -1,10 +1,13 @@
 /**
  * @file Hermetic prototype admission proofs.
  * WHY (incident 2026-10-22): pin main preservation, ready evidence, add-before-remove, stale
- * replacement, and adoption refusal without touching git, launchd, disk, network, or the real clock.
+ * replacement, and adoption refusal with injected doubles, plus real filesystem refusal persistence.
  */
 import { describe, it, expect } from 'vitest';
-import { createPrototypeLoader } from '../prototype-load-io.mjs';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { withRealRepo } from './helpers/real-repo.mjs';
+import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import { createRegistry } from '../registry.mjs';
 import { startRun, advance } from '../engine.mjs';
@@ -91,6 +94,21 @@ function fixture(options = {}) {
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('prototype-load', () => {
+  it('refuses missing readiness evidence and persists the refusal on a real filesystem', async () => {
+    await withRealRepo(async ({ root }) => {
+      const recordPath = join(root, 'audit', 'prototype-load.jsonl');
+      const load = createPrototypeLoader({ ...defaultDeps(),
+        env: { HOME: root },
+        settings: { ...settings, workspaceRoot: root, recordPath, readyRecordPath: join(root, 'missing-ready.jsonl') },
+      });
+      const result = await load(BASE);
+      expect(result).toMatchObject({ ok: false, stopReason: 'no-ready', registered: false, adopted: false });
+      const records = readFileSync(recordPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({ ...BASE, ok: false, stopReason: 'no-ready', registered: false, adopted: false });
+    });
+  });
+
   it.each([
     ['missing', ''], ['wrong sha', JSON.stringify({ ref: BASE.branch, sha: TREE, tests: 'green', audit: 'NOT WEAKENED' })],
     ['weakened', JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED' })],
