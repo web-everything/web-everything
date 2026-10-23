@@ -32,6 +32,7 @@ import { signalFixDispatch } from '../lib/fix-handoff.mjs';
  *     node scripts/operations/red-team-gate-apply.mjs --pr=<n> --repo=<owner/repo> [--dry-run]
  */
 import { readDrainQueueSafety, dequeueSentBack, sendBackReason } from '../lib/drain-queue-safety.mjs';
+import { readSavedRedTeamResult } from '../lib/drain-saved-red-team.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -40,6 +41,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
+  withholdUnpublishableFindings,
 } from '../lib/red-team-gate.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
@@ -94,8 +96,10 @@ export function buildRedTeamCardInput({ repo, pr, head, findings }) {
  * EXACT argv to the writer's own parser: `--to=changes` refuses `--expect-head`, and a sender that added it returned
  * `send-back-failed` for every real break (review of PR #4762).
  */
-export function buildSendBackArgv({ repo, pr, bodyPath }) {
-  return [String(pr), `--repo=${repo}`, '--to=changes', `--body-file=${bodyPath}`, `--actor=${RED_TEAM_GATE_ACTOR}`, `--channel=${RED_TEAM_GATE_CHANNEL}`];
+export function buildSendBackArgv({ repo, pr, bodyPath, head }) {
+  // #5492 rebuild slice 2 (W1): a holding row names the head the gate judged (the label still swaps if it moved).
+  const pin = /^[0-9a-f]{40}$/.test(head ?? '') ? [`--judged-head=${head}`] : [];
+  return [String(pr), `--repo=${repo}`, '--to=changes', `--body-file=${bodyPath}`, `--actor=${RED_TEAM_GATE_ACTOR}`, `--channel=${RED_TEAM_GATE_CHANNEL}`, ...pin];
 }
 
 /** The gate's own record for ONE action on the head. PURE. */
@@ -107,8 +111,9 @@ export function buildGateComment({ pr, head, outcome, plan, round, result = null
       : `- ${plan.sendBack.length} confirmed break(s) sent back to the fixer (${plan.sendBack.map((f) => `#${f.index}`).join(', ')})${sendBackResult?.already ? ' — the PR was already under review:changes' : ''}.`);
   }
   if (plan.card.length) {
-    lines.push(`- ${plan.card.length} finding(s) filed as a follow-up card (${plan.card.map((f) => `#${f.index}`).join(', ')})`
-      + `${cardResult?.ok ? ` — landing job ${sanitizeCardField(cardResult.session ?? cardResult.handle ?? '', 120)}` : ` — FILING FAILED: ${sanitizeCardField(cardResult?.error ?? 'unknown', 300)}`}.`);
+    const owed = cardResult?.step === 'paused' && cardResult?.skipped === true;
+    lines.push(`- ${plan.card.length} finding(s) ${owed ? 'recorded, owed as a follow-up card' : 'filed as a follow-up card'} (${plan.card.map((f) => `#${f.index}`).join(', ')})`
+      + `${owed ? ' — filing paused; will file on resume' : cardResult?.ok ? ` — landing job ${sanitizeCardField(cardResult.session ?? cardResult.handle ?? '', 120)}` : ` — FILING FAILED: ${sanitizeCardField(cardResult?.error ?? 'unknown', 300)}`}.`);
   }
   if (plan.advisory.length) lines.push(`- ${plan.advisory.length} finding(s) left advisory (${plan.advisory.map((f) => `#${f.index}`).join(', ')}).`);
   return lines.join('\n');
@@ -138,8 +143,19 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     try { standingRuling = io.readGrantScope?.({ repo, pr, head, comments: view?.comments }) ?? null; } catch { standingRuling = null; }
     // The live head's latest result, and only the records that decide THAT result (an earlier same-head result's
     // records never dedup a newer one, PR #5482).
-    const { result: parsed, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = liveResultGateState(view?.comments, pr, head, repo, standingRuling);
+    const posted = liveResultGateState(view?.comments, pr, head, repo, standingRuling);
+    const saved = posted.result ? null : (io.readSavedResult ?? readSavedRedTeamResult)({ repo, pr, head });
+    const { result, resultId, headReviewIndex, outcomes: recorded, sendBackOutcome, reopened } = saved ? liveResultGateState(view?.comments, pr, head, repo, standingRuling, saved) : posted;
+    let parsed = result;
     if (!parsed) return { status: 'no-red-team-on-head', head };
+    // Saved evidence may be precisely the result whose comment failed this scrub. Check raw fields
+    // before clipping, plus the composed comment/card (including scope) before any publication.
+    if (!posted.result) {
+      parsed = { ...parsed, findings: withholdUnpublishableFindings(parsed.findings, [
+        buildSendBackBody({ pr, head, findings: parsed.findings }),
+        ...Object.values(buildRedTeamCardInput({ repo, pr, head, findings: parsed.findings })),
+      ]) };
+    }
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
     if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
@@ -202,8 +218,8 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     let cardMarker = null;
     if (cardPending) {
       cardResult = io.fileCard(cardInput);
-      // A card that was not filed records nothing: a permanent per-head record here would make the failure unretryable.
-      if (!cardResult?.ok) return { status: 'card-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, error: cardResult?.error ?? 'unknown' };
+      // A durable owed filing is handled on resume; every other failure must remain retryable.
+      if (!cardResult?.ok && !(cardResult?.step === 'paused' && cardResult?.skipped === true)) return { status: 'card-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, error: cardResult?.error ?? 'unknown' };
       cardMarker = record(GATE_OUTCOMES.CARD_QUEUED, { sendBack: [], card: plan.card, advisory: sendPending ? [] : plan.advisory }, { cardResult });
       // The job is spawned but its record is not on the PR: the next run would queue a DUPLICATE card. Say so, loudly.
       if (cardMarker !== 'posted') return { status: 'card-record-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, error: cardMarker };
@@ -247,24 +263,27 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     // Fresh per run on the App identity: a closed or edited ruling stops crediting automatic grants at the next run.
     readGrantScope: ({ repo, pr, head, comments }) => standingRulingScope({ repo, pr: { number: Number(pr), headRefOid: head, comments } }),
     readSetting: () => readConfirmedBreaks({ env }),
+    readSavedResult: args => readSavedRedTeamResult({ ...args, env }),
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
     readRoundAsOf: ({ repo, pr, at, head }) => readReviewRoundAsOf({ repo, pr, at, head }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).
     readHead: ({ repo, pr }) => String(JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'])).headRefOid ?? ''),
-    sendBack: ({ repo, pr, body }) => {
+    sendBack: ({ repo, pr, head, body }) => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-gate-'));
       try {
         const path = join(dir, 'body.md');
         writeFileSync(path, body, 'utf8');
-        const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), ...buildSendBackArgv({ repo, pr, bodyPath: path })],
+        const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), ...buildSendBackArgv({ repo, pr, bodyPath: path, head })],
           { cwd: root, encoding: 'utf8', timeout: 180_000, env: { ...env, [ACTOR_ENV]: `red-team-gate-${randomUUID()}` } });
         if (r.status === 0) return { ok: true };
         return { ok: false, error: String(r.stderr || r.stdout || `exit ${r.status}`).trim().split('\n').pop() };
       } finally { rmSync(dir, { recursive: true, force: true }); }
     },
-    appendSendBackEvent: ({ repo, pr }) => appendLedgerEvents([buildLedgerEvent({
+    appendSendBackEvent: ({ repo, pr, head }) => appendLedgerEvents([buildLedgerEvent({
       type: EVENT_TYPES.SEND_BACK, repo, pr, at: new Date().toISOString(), source: 'red-team-gate',
       declaredActor: RED_TEAM_GATE_ACTOR, channel: RED_TEAM_GATE_CHANNEL, cause: 'changes',
+      // #5492 rebuild slice 2: the head sent back (re-read live just before the send-back), so the hold binds to it.
+      ...(/^[0-9a-f]{40}$/.test(head ?? '') ? { judgedHead: head } : {}),
     })]),
     fileCard: (input) => spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-card' }),
     postComment: ({ repo, pr, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),

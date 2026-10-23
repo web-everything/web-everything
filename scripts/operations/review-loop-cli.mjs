@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveRealFiles } from '../lib/pr-real-files.mjs';
 /**
  * @file scripts/operations/review-loop-cli.mjs
  * @description #3072's REMAINING SLICE, MADE CALLABLE — drives ONE `review-pr` run unattended, using
@@ -66,6 +67,7 @@ import {
 } from './cli-adapter.mjs';
 import { startRun, runStatus, rewindRunToStep } from './engine.mjs';
 import { createFileRunStore, newRunId } from './run-store.mjs';
+import { chosenRunIdRecord } from './run-record.mjs';
 import { REPO_ROOT as SCAFFOLD_ROOT } from './scaffold-io.mjs';
 import { resolveOperation, createCliJudgeFactory } from './run.mjs';
 import { appendEntry } from '../conveyor/learnings-drop.mjs';
@@ -73,9 +75,11 @@ import {
   acceptResumeCommand, buildAcceptQueueEntry, buildPreventionFilingInput, buildPreventionQueueEntry, preventionHeadMarker,
   cardCoversGuard, isPreventionOutstandingClear, isPreventionOutstandingParked, isQueuedAcceptStop, reviewLoopAutoConfirm,
   buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsFindingsFingerprint,
-  roundCardsFindingsMarker, roundCardsHeadMarker,
+  roundCardsFindingsMarker, roundCardsHeadMarker, unrulableBrokenSendBackReason,
 } from '../lib/review-loop-policy.mjs';
-import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
+import { BROKEN_UNRULED_HOLD, unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy,
+  unrulableBrokenFindings } from '../lib/unattended-review-accept.mjs';
+import { CONFIRM_ACTORS } from './review-pr-constants.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { findResumableParkedRun, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
@@ -85,7 +89,7 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_LENS, SECURITY_SEAT_STEP, seatSecurityForTouchSet, securitySeatFromRun } from './review-pr.mjs';
-import { parallelSeatsEnabled, seatsByTouchSetEnabled, resolveCardOnlyReviewSettings } from '../lib/review-seat-settings.mjs';
+import { parallelSeatsEnabled, seatsByTouchSetEnabled, resolveCardClassSettings, resolveCardOnlyReviewSettings } from '../lib/review-seat-settings.mjs';
 import { planReviewDispatch } from './review-dispatch.mjs';
 import { READ_SINK_ENV, withReadSink } from '../lib/review-speculative-red-team.mjs';
 // #4493 — this file's own mechanized prevention filing had the SAME orphaned-card bug `we:scripts/review-set-
@@ -193,6 +197,8 @@ export async function fileItemForPrevention(input, {
  */
 export async function fileItemForPreventionViaLandingJob(input, { spawnJob = spawnPreventionLandingJob } = {}) {
   const filed = spawnJob(input, { sessionPrefix: 'review-loop-prevention' });
+  if (filed.step === 'paused' && filed.skipped === true) return { code: 0, lines: [JSON.stringify({ skipped: true, owed: true, reason: filed.reason })] };
+  if (filed.skipped) return { code: 1, lines: [JSON.stringify({ skipped: true, reason: filed.reason })] };
   if (!filed.ok) {
     return { code: 1, lines: [filed.error ?? 'land-prevention-card: unknown spawn failure'] };
   }
@@ -431,7 +437,7 @@ export const TOUCH_SET_FILE_CAP = 100;
  * @param {{enabled?: boolean, store?: {read: Function}, readChangedFiles?: (o: {pr: number, repo: string}) => string[]}} [o]
  * @returns {{securitySeat: boolean, reason: string}}
  */
-export function chooseSecuritySeat(argv, { enabled = true, store = null, readChangedFiles = defaultReadChangedFiles, cardOnly = resolveCardOnlyReviewSettings().value } = {}) {
+export function chooseSecuritySeat(argv, { enabled = true, store = null, readChangedFiles = defaultReadChangedFiles, cardOnly = resolveCardOnlyReviewSettings().value, cardClass = resolveCardClassSettings().value } = {}) {
   const resumeId = argvFlag(argv, 'resume');
   if (resumeId) {
     try { const saved = store?.read(resumeId); return { securitySeat: securitySeatFromRun(saved), cardOnlyLight: saved?.findings?.read?.cardOnlyLight === true, reason: `--resume ${resumeId}: roster read off the saved run` }; } catch {
@@ -441,15 +447,21 @@ export function chooseSecuritySeat(argv, { enabled = true, store = null, readCha
   const pr = Number(argvFlag(argv, 'pr'));
   const repo = argvFlag(argv, 'repo');
   if (!Number.isInteger(pr) || pr <= 0) return { securitySeat: true, reason: 'no --pr — full roster' };
-  let files;
-  try { files = readChangedFiles({ pr, repo }); } catch (e) {
+  let files, verified = false;
+  try {
+    const result = readChangedFiles({ pr, repo });
+    files = Array.isArray(result) ? result : result?.files;
+    verified = result?.source === 'git';
+  } catch (e) {
     return { securitySeat: true, reason: `touch-set unreadable (${String(e?.message ?? e).slice(0, 200)}) — full roster` };
   }
-  if (!Array.isArray(files) || files.length >= TOUCH_SET_FILE_CAP) {
+  if (!Array.isArray(files) || (!verified && files.length >= TOUCH_SET_FILE_CAP)) {
     return { securitySeat: true, reason: `touch-set ${Array.isArray(files) ? `has ${files.length} file(s), may be truncated` : 'unreadable'} — full roster` };
   }
   if (cardOnly.lightLane && isCardOnlyDiff(files) && (argvFlag(argv, 'lens') || DEFAULT_LENS) === 'correctness') {
-    return { securitySeat: cardOnly.claudeSeat, cardOnlyLight: true, reason: 'card-only light lane: Codex correctness' };
+    // Card review class — `review.cardClass.lenses` may add the security seat (it can never remove correctness).
+    const security = cardOnly.claudeSeat || (cardClass?.enabled === true && Array.isArray(cardClass.lenses) && cardClass.lenses.includes('security'));
+    return { securitySeat: security, cardOnlyLight: true, reason: `card-only light lane: Codex correctness${security ? ' + security' : ''}` };
   }
   if (!enabled) return { securitySeat: true, reason: 'review.seatsByTouchSet is off — full roster' };
   const plan = seatSecurityForTouchSet({ changedFiles: files, lens: argvFlag(argv, 'lens') || DEFAULT_LENS });
@@ -471,15 +483,21 @@ export function pathsWithRenameSources(files) {
   return out;
 }
 
-function defaultReadChangedFiles({ pr, repo }) {
+export function defaultReadChangedFiles({ pr, repo, cwd = process.cwd(), exec = execFileSyncThrottled, run, enabled } = {}) {
   // No repo, no REST path: throw, which `chooseSecuritySeat` answers with the full roster. 100 entries is one page and
   // is the cap above, so a list that long is never trusted to buy prose.
   if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo ?? ''))) throw new Error('no valid --repo: the file list with rename sources needs <owner>/<name>');
   // `--jq` drops each file's `patch`, which would otherwise make a documentation-heavy PR overflow the read buffer.
-  const out = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`,
+  const out = JSON.parse(exec('gh', ['api', `repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`,
     '--jq', '[.[] | {filename, previous_filename}]'],
   { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }));
-  return pathsWithRenameSources(out);
+  // Head metadata is mutable: read it once per attempt, then let pr-real-files cache only
+  // immutable repo+head evidence. Caching by PR number could grant an old head's card exemption.
+  let info;
+  try { info = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefName,headRefOid,baseRefName'],
+    { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 })); } catch { info = null; }
+  return resolveRealFiles({ pr: info, repo, cwd, run, enabled,
+    ghFiles: !Array.isArray(out) || out.length >= TOUCH_SET_FILE_CAP ? null : pathsWithRenameSources(out) });
 }
 
 /**
@@ -577,6 +595,14 @@ export async function runReviewLoopOnce({
       return unattendedAcceptHold({ ...run.input, verdict: run.verdict, ...live, head: live.headRefOid,
         expectedHead: run.findings?.read?.netBasis?.rev, roundCards, cardReadable });
     } catch (error) { return `live referrals unavailable: ${error.message}`; }
+  };
+  // The broken findings no referral could ever rule, read against the LIVE thread (null on any doubt: then it parks).
+  const unrulableBrokenFor = (run) => {
+    try {
+      const live = readAcceptancePr(run.input);
+      return unrulableBrokenFindings({ ...run.input, verdict: run.verdict, ...live, head: live.headRefOid,
+        expectedHead: run.findings?.read?.netBasis?.rev, cardReadable });
+    } catch { return null; }
   };
   const drive = (o) => {
     const guardedConfirm = (pending, current) => {
@@ -696,6 +722,11 @@ export async function runReviewLoopOnce({
         input: applyUnattendedActorDefault(parsed.input, argv),
         registry,
       });
+      if (parsed.control.runId) {
+        const chosen = chosenRunIdRecord(run, store);
+        if (chosen.error) return { code: 2, lines: [`error: ${chosen.error}`], run: null, stopped: 'refused' };
+        run = chosen.run;
+      }
       store.write(run);
     }
   }
@@ -739,6 +770,25 @@ export async function runReviewLoopOnce({
 
   if (outcome.stopped === 'confirm') {
     const hold = acceptHold(outcome.run);
+    // A `broken` finding with NO referral that could rule it never lifts this hold by itself (live #5608: the same head
+    // parked 7 times with no verdict). On the agent-addressed tier, send it back with those findings instead of parking.
+    // Never an accept, and only when no referral record, operator ruling or verdict referral exists; otherwise unchanged.
+    const unrulable = hold === BROKEN_UNRULED_HOLD && outcome.run?.pending?.of === CONFIRM_ACTORS.AGENT
+      ? unrulableBrokenFor(outcome.run) : null;
+    if (unrulable) {
+      const sending = { ...outcome.run, input: { ...outcome.run.input, reason: unrulableBrokenSendBackReason(unrulable) } };
+      store.write(sending);
+      const sentBack = await drive({
+        run: sending, registry, store, sinks, judge: activeJudge, resume: { step: outcome.run.pending.step, value: 'changes' },
+        autoConfirm, attemptedBy: 'agent',
+      });
+      const rendered = renderOutcome({ outcome: sentBack, json: parsed.control.json, declaration });
+      const line = `Unattended accept held (${hold}) with no referral to rule it — sent back as \`changes\` with `
+        + `${unrulable.length} broken finding(s).`;
+      return { ...rendered, lines: parsed.control.json
+        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), unrulableBrokenSendBack: unrulable.length })]
+        : [...rendered.lines, '', line], run: sentBack.run, stopped: sentBack.stopped };
+    }
     if (hold) {
       const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
       return { ...rendered, lines: parsed.control.json ? rendered.lines
@@ -808,6 +858,12 @@ export async function runReviewLoopOnce({
       };
     }
 
+    if (filedPayload?.skipped) {
+      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      return { ...rendered, code: filedPayload.owed === true ? 0 : 1, lines: parsed.control.json
+        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason, ...(filedPayload.owed === true ? { preventionFilingOwed: true } : {}) })]
+        : [...rendered.lines, filedPayload.owed === true ? `Prevention filing recorded, owed — ${filedPayload.reason}` : filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
+    }
     const filedNum = alreadyFiled ? alreadyFiled.num : (filedPayload?.verdict?.num ?? null);
     const filedRel = alreadyFiled ? alreadyFiled.path : (filedPayload?.verdict?.rel ?? null);
     // #4493 — the production filer now spawns a detached landing job (see `fileItemForPreventionViaLandingJob`)
@@ -898,6 +954,12 @@ export async function runReviewLoopOnce({
         run: outcome.run,
         stopped: outcome.stopped,
       };
+    }
+    if (filedPayload?.skipped) {
+      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      return { ...rendered, code: filedPayload.owed === true ? 0 : 1, lines: parsed.control.json
+        ? [JSON.stringify({ ...JSON.parse(rendered.lines[0]), preventionFilingPaused: filedPayload.reason, ...(filedPayload.owed === true ? { preventionFilingOwed: true } : {}) })]
+        : [...rendered.lines, filedPayload.owed === true ? `Prevention filing recorded, owed — ${filedPayload.reason}` : filedPayload.reason], run: outcome.run, stopped: outcome.stopped };
     }
     const queued = alreadyFiled ? alreadyFiled.queued : filedPayload?.queued === true;
     const num = alreadyFiled ? alreadyFiled.num : (filedPayload?.verdict?.num ?? null);

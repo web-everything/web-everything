@@ -30,7 +30,7 @@ export const CARD_BATCH_ENV = Object.freeze({
 });
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const validValue = (key, value) => key === 'batchFiling'
+const validValue = (key, value) => key === 'batchFiling' || key === 'filingEnabled'
   ? typeof value === 'boolean'
   : Number.isSafeInteger(value) && value > 0;
 
@@ -41,7 +41,7 @@ function envLayer(env, keys = CARD_BATCH_SETTING_KEYS, names = CARD_BATCH_ENV) {
   for (const key of keys) {
     const raw = env[names[key]];
     if (raw === undefined || raw === '') continue;
-    if (key === 'batchFiling') layer[key] = raw === '1' || raw === 'true' ? true : raw === '0' || raw === 'false' ? false : raw;
+    if (key === 'batchFiling' || key === 'filingEnabled') layer[key] = raw === '1' || raw === 'true' ? true : raw === '0' || raw === 'false' ? false : raw;
     else layer[key] = /^\d+$/.test(String(raw)) ? Number(raw) : raw;
   }
   return layer;
@@ -95,19 +95,20 @@ export function loadCardBatchSettings({
  * lives in scripts/settings/prevention-batch.json. Lease waiting defaults to 15 minutes here, independently
  * of the policy overlay. Invalid optional values retain the lower layer.
  */
-const PREVENTION_BATCH_SETTING_KEYS = Object.freeze(['batchFiling', 'batchWindowMinutes', 'batchMaxCards', 'batchLeaseWaitMinutes']);
+const PREVENTION_BATCH_SETTING_KEYS = Object.freeze(['batchFiling', 'batchWindowMinutes', 'batchMaxCards', 'batchLeaseWaitMinutes', 'filingEnabled']);
 const PREVENTION_BATCH_ENV = Object.freeze({
   batchFiling: 'WE_PREVENTION_BATCH_FILING',
   batchWindowMinutes: 'WE_PREVENTION_BATCH_WINDOW_MINUTES',
   batchMaxCards: 'WE_PREVENTION_BATCH_MAX_CARDS',
   batchLeaseWaitMinutes: 'WE_PREVENTION_BATCH_LEASE_WAIT_MINUTES',
+  filingEnabled: 'WE_PREVENTION_FILING_ENABLED',
 });
 
 /** PURE: resolve boolean batchFiling and positive integer window/count/lease wait, retaining each source. */
 export function resolvePreventionBatchSettings({ standard, platform, repo, env } = {}) {
   if (!isObject(standard)) throw new TypeError('prevention batch settings: standard prevention policy is required');
   const out = { batchFiling: standard.enabled, batchWindowMinutes: standard.maxAgeMinutes,
-    batchMaxCards: standard.maxCards, batchLeaseWaitMinutes: 15 };
+    batchMaxCards: standard.maxCards, batchLeaseWaitMinutes: 15, filingEnabled: true };
   const sources = Object.fromEntries(PREVENTION_BATCH_SETTING_KEYS.map((k) => [k, 'standard']));
   const invalid = [];
   for (const [name, layer] of [['platform', platform], ['repo', repo],
@@ -160,6 +161,40 @@ export function resolveVerifyRetryMinutes({ platform, repo, env, now = Date.now(
 export function loadVerifyRetryMinutes({ env = process.env, read = readFileSync, platformPath = PLATFORM_PREFERENCES_PATH, now = Date.now(),
   repo = (() => { try { return readSettings()?.cards; } catch { return undefined; } })() } = {}) {
   return resolveVerifyRetryMinutes({ platform: readCards(platformPath, read), repo, env, now });
+}
+
+/**
+ * `prevention.alsoRaised.route` — where an "also raised" note (a raised-by sidecar for an EXISTING open card) goes:
+ *   `batch` (standard) — into the rolling prevention batch PR, or the pending spool when the batch cannot take it now;
+ *   `single` — the kill switch: the old one-PR-per-filing path (`lane/<id>-prevention-card`).
+ * Cascade: standard → platform `prevention.alsoRaised.route` → repo `prevention.alsoRaised.route` → env
+ * `WE_PREVENTION_ALSO_RAISED_ROUTE`. An unknown value is ignored (reported in `invalid`); the layer below answers.
+ */
+export const ALSO_RAISED_ROUTES = Object.freeze(['batch', 'single']);
+export function resolveAlsoRaisedRoute({ platform, repo, env } = {}) {
+  let route = 'batch';
+  let source = 'standard';
+  const invalid = [];
+  const raw = env?.WE_PREVENTION_ALSO_RAISED_ROUTE;
+  for (const [name, value] of [['platform', platform?.alsoRaised?.route], ['repo', repo?.alsoRaised?.route],
+    ['env', raw === '' ? undefined : raw]]) {
+    if (value === undefined) continue;
+    if (!ALSO_RAISED_ROUTES.includes(value)) { invalid.push(`${name}.alsoRaised.route`); continue; }
+    route = value;
+    source = name;
+  }
+  return { route, source, invalid };
+}
+export function formatAlsoRaisedRoute({ route, source, invalid = [] }) {
+  return `prevention.alsoRaised.route=${route} (${source})${invalid.length ? `, ignored invalid: ${invalid.join(', ')}` : ''}`;
+}
+export function loadAlsoRaisedRoute({
+  env = process.env, read = readFileSync, platformPath = PLATFORM_PREFERENCES_PATH,
+  repo = (() => { try { return readSettings()?.prevention; } catch { return undefined; } })(),
+} = {}) {
+  let platform;
+  try { platform = JSON.parse(read(platformPath, 'utf8'))?.prevention; } catch { /* no preference */ }
+  return resolveAlsoRaisedRoute({ platform, repo, env });
 }
 
 /** The full policy with independent filing and prevention settings overlays. */

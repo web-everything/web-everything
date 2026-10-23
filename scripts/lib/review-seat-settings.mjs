@@ -184,3 +184,100 @@ export function resolveCardOnlyReviewSettings({ env = process.env, platform,
   log(formatCascadeSourcesLine('review.cardOnly', result));
   return result;
 }
+
+export const EXTRA_SEATS_PAUSED_LENSES_ENV = 'WE_REVIEW_EXTRA_SEATS_PAUSED_LENSES';
+
+/**
+ * `review.extraSeats.pausedLenses` - advisory lenses whose extra (non-Claude) seat is NOT called. Standard `[]`;
+ * resolves standard -> platform -> tool (`extraSeats.pausedLenses` in `we:scripts/settings/review.json`) -> env
+ * (JSON array or comma list), through the policy cascade. Never touches mandatory seats or verdicts. Never throws.
+ * @returns {{value: string[], source: string}} source is the winning layer ('setting' for the tool file).
+ */
+export function resolveExtraSeatsPausedLenses({ env = process.env, file = REVIEW_SETTINGS_FILE,
+  readFile = (p) => readFileSync(p, 'utf8'), platform, log } = {}) {
+  const valid = (v) => Array.isArray(v) && v.every((x) => typeof x === 'string' && x.trim());
+  // Project the WHOLE array per layer before the cascade flattens objects into leaves: a malformed layer
+  // (an object, a non-string member) is dropped, never half-applied, and can never throw.
+  const project = (block) => (valid(block?.pausedLenses) ? { pausedLenses: block.pausedLenses } : undefined);
+  try {
+    let tool;
+    try { tool = project(JSON.parse(readFile(file))?.extraSeats); } catch { /* standard/platform still apply */ }
+    let plat = platform;
+    if (plat === undefined) { try { plat = platformPreference('review.extraSeats', { env }); } catch { plat = undefined; } }
+    let envValue;
+    const raw = env?.[EXTRA_SEATS_PAUSED_LENSES_ENV];
+    if (raw !== undefined && raw !== '') {
+      try { envValue = JSON.parse(raw); } catch { envValue = String(raw).split(',').map((x) => x.trim()).filter(Boolean); }
+    }
+    const r = cascadePolicy('review.extraSeats', tool, {
+      standard: { pausedLenses: [] }, platform: project(plat) ?? {}, env, ...(log ? { log } : {}),
+      envValues: { pausedLenses: envValue }, valid: { pausedLenses: valid },
+    });
+    const list = r.value?.pausedLenses;
+    if (!valid(list)) return { value: [], source: 'standard' };
+    const layer = r.sources?.pausedLenses ?? 'standard';
+    return { value: [...new Set(list.map((x) => x.trim()))], source: layer === 'tool' ? 'setting' : layer };
+  } catch { return { value: [], source: 'standard' }; }
+}
+
+/**
+ * Card review class (prototype, operator OK 2026-10-21): `review.cardClass` through the cascade
+ * standard → platform (`review.cardClass`) → tool (`cardClass` in scripts/settings/review.json) → env, logged with
+ * each value's source. The standard IS the proposed policy; `enabled: false` is the kill switch that restores the
+ * routing from before the class (every head `full`).
+ *   enabled          kill switch                                  env WE_REVIEW_CARD_CLASS (on/off)
+ *   cardPathPatterns which card paths may earn the class          env WE_REVIEW_CARD_CLASS_PATH_PATTERNS (JSON array)
+ *                    (can only NARROW `isCardPath`, never widen it)
+ *   kinds            card kinds the class may cover (allowlist)   env WE_REVIEW_CARD_CLASS_KINDS (comma list)
+ *   fullKeys         frontmatter keys that force full review      env WE_REVIEW_CARD_CLASS_FULL_KEYS (comma list)
+ *   fullMarker       regex over the diff that forces full review  env WE_REVIEW_CARD_CLASS_FULL_MARKER
+ *   lenses           mandatory lenses on a card PR                env WE_REVIEW_CARD_CLASS_LENSES (comma list;
+ *                    correctness required; security adds the Claude security seat)
+ *   redTeam          off | advisory | on for card-class heads     env WE_REVIEW_CARD_CLASS_RED_TEAM
+ *   coverageRoute    card-suggestion | referral for COVERAGE      env WE_REVIEW_CARD_CLASS_COVERAGE_ROUTE
+ */
+export const CARD_CLASS_STANDARD = Object.freeze({
+  enabled: true,
+  cardPathPatterns: Object.freeze(['^backlog/[^/\\\\\\s]+\\.md$', '^backlog/raised-by/(?:\\d{1,5}|x[a-z0-9]{6})/\\d+-[a-f0-9]{24}\\.md$']),
+  kinds: Object.freeze(['story', 'task', 'epic', 'investigation', 'feature']),
+  fullKeys: Object.freeze(['codifiedIn', 'ratified']),
+  fullMarker: 'codified|ratif|(?:kind|type)\\W{0,8}\\s*(?:!!\\w+\\s*)?[>|]?[-+]?\\s*["\']?\\s*decision',
+  lenses: Object.freeze(['correctness']),
+  redTeam: 'off',
+  coverageRoute: 'card-suggestion',
+});
+
+const strList = (v) => Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'string' && x.trim());
+const compiles = (s) => { try { new RegExp(s, 'i'); return true; } catch { return false; } };
+export const CARD_CLASS_VALID = Object.freeze({
+  enabled: (v) => typeof v === 'boolean',
+  cardPathPatterns: (v) => strList(v) && v.every(compiles),
+  kinds: (v) => strList(v) && !v.some((k) => k.trim().toLowerCase() === 'decision'),
+  fullKeys: (v) => Array.isArray(v) && v.every((x) => typeof x === 'string' && x.trim()),
+  fullMarker: (v) => typeof v === 'string' && v.trim().length > 0 && compiles(v),
+  lenses: (v) => strList(v) && v.includes('correctness') && v.every((l) => ['correctness', 'security'].includes(l)),
+  redTeam: (v) => ['off', 'advisory', 'on'].includes(v),
+  coverageRoute: (v) => ['card-suggestion', 'referral'].includes(v),
+});
+
+export function resolveCardClassSettings({ env = process.env, platform,
+  file = REVIEW_SETTINGS_FILE, readFile = p => readFileSync(p, 'utf8'), log } = {}) {
+  let tool = {};
+  try { tool = JSON.parse(readFile(file))?.cardClass ?? {}; } catch { /* absent layer */ }
+  const project = (o) => Object.fromEntries(Object.keys(CARD_CLASS_STANDARD).filter((k) => o?.[k] !== undefined).map((k) => [k, o[k]]));
+  const list = (raw) => (raw === undefined || raw === '' ? undefined : String(raw).split(',').map((x) => x.trim()).filter(Boolean));
+  const json = (raw) => { if (raw === undefined || raw === '') return undefined; try { return JSON.parse(raw); } catch { return raw; } };
+  const onOff = (raw) => (normOnOff(raw) === 'on' ? true : normOnOff(raw) === 'off' ? false : raw === undefined || raw === '' ? undefined : raw);
+  const str = (raw) => (raw === undefined || raw === '' ? undefined : String(raw).trim());
+  return cascadePolicy('review.cardClass', project(tool), {
+    standard: { ...CARD_CLASS_STANDARD },
+    platform: project(platform ?? platformPreference('review', { env })?.cardClass), env, ...(log ? { log } : {}),
+    envValues: {
+      enabled: onOff(env.WE_REVIEW_CARD_CLASS), cardPathPatterns: json(env.WE_REVIEW_CARD_CLASS_PATH_PATTERNS),
+      kinds: list(env.WE_REVIEW_CARD_CLASS_KINDS), fullKeys: list(env.WE_REVIEW_CARD_CLASS_FULL_KEYS),
+      fullMarker: str(env.WE_REVIEW_CARD_CLASS_FULL_MARKER), lenses: list(env.WE_REVIEW_CARD_CLASS_LENSES),
+      redTeam: str(env.WE_REVIEW_CARD_CLASS_RED_TEAM), coverageRoute: str(env.WE_REVIEW_CARD_CLASS_COVERAGE_ROUTE),
+    },
+    valid: CARD_CLASS_VALID,
+  });
+}

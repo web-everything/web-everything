@@ -34,7 +34,7 @@ describe('review seat timing', () => {
     try {
       const registry = createRegistry();
       registry.register(op('review-pr', { input: {}, read: compute({ reads: [], fn: () => ({}) }) }));
-      let record = startRun({ op: 'review-pr', id: 'review-1', input: {}, registry });
+      let record = startRun({ op: 'review-pr', id: 'review-pr-1', input: {}, registry });
       record = withSeatTiming(record, row('correctness', null));
       record = withSeatTiming(record, row('correctness', 100, 'changes'));
       record = withSeatTiming(record, { ...row('correctness', 200), startedAt: at(101) });
@@ -43,14 +43,14 @@ describe('review seat timing', () => {
       expect(grouped.seatTimings).toHaveLength(2);
       const store = createFileRunStore(dir);
       store.write(record);
-      const before = readFileSync(join(dir, 'review-1.json'), 'utf8');
+      const before = readFileSync(join(dir, 'review-pr-1.json'), 'utf8');
       const report = readSeatTimingReport({ env: { OPERATION_RUNS_DIR: dir } });
       expect(report.runs[0].seats).toEqual(record.seatTimings);
       const cli = JSON.parse(execFileSync(process.execPath, ['scripts/operations/review-seat-timing.mjs', '--json', '--since=2026-10-16T00:00:00Z'], { env: { ...process.env, OPERATION_RUNS_DIR: dir }, encoding: 'utf8' }));
       expect(cli.summary.completeRuns).toBe(1);
       expect(cli.runs[0].spreadMs).toBe(100000);
-      expect(readFileSync(join(dir, 'review-1.json'), 'utf8')).toBe(before);
-      expect(readdirSync(dir)).toEqual(['review-1.json']);
+      expect(readFileSync(join(dir, 'review-pr-1.json'), 'utf8')).toBe(before);
+      expect(readdirSync(dir)).toEqual(['review-pr-1.json']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

@@ -736,6 +736,16 @@ function roundCardLine(f, i) {
   return `${i + 1}. ${anchor} — ${lens}, ${sev}: ${summary}`;
 }
 
+/**
+ * PURE. The `--reason` an unattended review records when it sends a PR back because its `broken` findings have no
+ * referral that could ever rule them (see `unrulableBrokenFindings`). Names every such finding; never empty.
+ */
+export function unrulableBrokenSendBackReason(findings = []) {
+  const list = Array.isArray(findings) ? findings : [];
+  return [`Unattended review: ${list.length} broken finding(s) block acceptance and no referral exists to rule them `
+    + 'card or not-real, so this PR goes back to its author for a fix:', ...list.map(roundCardLine)].join('\n');
+}
+
 /** The text a round card carries to name the head it was filed for (the retry key, like {@link preventionHeadMarker}). */
 export function roundCardsHeadMarker(head) {
   return `reviewed head \`${head}\``;

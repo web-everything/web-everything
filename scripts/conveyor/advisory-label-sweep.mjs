@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { RED_TEAM_STATUS_LABELS, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
+import { liveResultGateState } from '../lib/red-team-gate.mjs';
 /**
  * @file scripts/conveyor/advisory-label-sweep.mjs
  * @description THE `advisory:*` STALENESS SWEEP — drops `advisory:accepted` / `advisory:changes` from any open PR
@@ -18,6 +19,9 @@ import { readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
  * read side: `we:scripts/operations/operator-queue.mjs` compares the advisory comment's head to the live head
  * itself and reports a label that outlived its head as a disagreement in NOT READY, so a stale label can never
  * put a PR in NEEDS YOU even before this sweep removes it.
+ *
+ * ONE EXCEPTION, the red-team re-gate: when a `round-cap` gate record is followed by an operator round grant on the
+ *   live head, it asks the gate (`red-team-gate-apply.mjs`) to look again; the gate posts its own record.
  *
  * WHAT IT NEVER DOES: touch `review:human` / `review:changes` / `review:accepted`, add anything but an
  * `advisory:*` label, or post a comment. The ONLY non-`advisory:*` labels it may remove are `review:pending` and
@@ -54,6 +58,7 @@ import {
   ADVISORY_LABELS, ADVISORY_LABEL_META, labelNames, latestAdvisory, planAdvisoryRepairLabels, planAdvisoryStaleLabels,
   trustedAdvisoryComments,
 } from '../lib/advisory-labels.mjs';
+import { runRedTeamGateForPr } from '../operations/extend-rounds-io.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from './pr-comments-complete.mjs';
@@ -64,6 +69,19 @@ export const PR_LIST_LIMIT = 200;
 /** True when the PR is human-gated: a covering advisory may be owed a label (see `planAdvisoryRepairLabels`). */
 export function isHumanGated(pr) {
   return labelNames(pr?.labels).includes('review:human');
+}
+
+/**
+ * True when the red-team gate owes a re-run on this PR's live head: it recorded `round-cap` for the live result and an
+ * operator round grant was posted AFTER that record (`reopened`). The gate itself decides whether the grant covers the
+ * round; a re-run records either `sent-back` or a fresh `round-cap` after the grant, which ends the reopen, so this
+ * fires at most once per grant. A grant posted by a caller that cannot re-run the gate (e.g. an older checkout) is
+ * otherwise never noticed (live PR #5485). PURE.
+ */
+export function redTeamRegateOwed(pr, repo) {
+  if (!repo || !pr?.headRefOid || !Array.isArray(pr?.comments)) return false;
+  try { return liveResultGateState(pr.comments, pr.number, String(pr.headRefOid).toLowerCase(), repo, null).reopened === true; }
+  catch { return false; }
 }
 
 /** True when the PR carries either advisory label — the only PRs this pass has any business with. */
@@ -138,7 +156,7 @@ export function planForPr(pr) {
  *   PR that needed (or would need) a change, or whose live re-read failed.
  */
 export function sweepAdvisoryLabels({
-  repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence,
+  repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence, regate = null,
   log = line => process.stderr.write(`${line}\n`),
 } = {}) {
   const prs = listPrs({ repo });
@@ -157,6 +175,15 @@ export function sweepAdvisoryLabels({
         evidence, live, comments: live.comments, provider, dryRun, log });
       if (plan.add || plan.remove.length) results.push({ num: pr.number, ...plan });
     } catch (e) { results.push({ num: pr.number, skipped: `red-team status: ${e.message}` }); }
+    // A round grant posted after a `round-cap` record re-opens the send-back: re-run the gate (it posts its own record).
+    // Independent of the label sync above, so a label failure never hides an owed re-gate.
+    try {
+      const live = dryRun || typeof regate !== 'function' ? null : readPr({ repo: resolvedRepo, number: pr.number });
+      if (live && (!live.state || live.state === 'OPEN') && redTeamRegateOwed({ ...live, number: pr.number }, resolvedRepo)) {
+        const gate = regate({ repo: resolvedRepo, pr: pr.number });
+        results.push({ num: pr.number, remove: [], regate: gate?.status ?? 'none', ...(gate?.outcome ? { outcome: gate.outcome } : {}) });
+      }
+    } catch (e) { results.push({ num: pr.number, remove: [], skipped: `red-team re-gate: ${e.message}` }); }
   }
   for (const pr of (Array.isArray(prs) ? prs : []).filter((p) => carriesAdvisoryLabel(p) || isHumanGated(p))) {
     const nominated = planForPr(pr);
@@ -203,9 +230,10 @@ if (IS_CLI) {
   } else {
     try {
       const results = sweepAdvisoryLabels({
-        repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
+        repo, dryRun, regate: runRedTeamGateForPr, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
       });
       for (const r of results) {
+        if (r.regate) { writeLineSync(2, `  ⚠ PR #${r.num}: round grant after round-cap, red-team gate re-run → ${r.regate}${r.outcome ? ` (${r.outcome})` : ''}`); continue; }
         if (r.skipped) { writeLineSync(2, `  ⚠ PR #${r.num}: no label change (${r.skipped})`); continue; }
         const did = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';
         const what = r.add ? `set ${r.add}${r.remove.length ? ` and remove ${r.remove.join(',')}` : ''} (advisory covers head, label missing)`

@@ -3943,6 +3943,19 @@ fs.writeFileSync('state.json', JSON.stringify(s));
   it('refuses when the head moves between the writer\'s first and second read', () => {
     refused(run({ race: 'head' }));
   });
+  // #5492 rebuild slice 2 (W1/W2) — the same boundary for a verdict pinned with --judged-head.
+  it('a --judged-head accept stamps the judged head, its boundary and run id (today\'s head field unchanged)', () => {
+    const result = run({ expectHead: null, expectFingerprint: null, extra: [`--judged-head=${head}`, '--seen=empty', '--run-id=run-7'] });
+    expect(result.r.status, result.r.stdout + result.r.stderr).toBe(0);
+    const row = JSON.parse(readFileSync(join(dir, 'ledger', 'web-everything-web-everything.jsonl'), 'utf8').trim().split('\n')[0]);
+    expect(row).toMatchObject({ verdict: 'accepted', judgedHead: head, seen: 'empty', runId: 'run-7', coverage: { headSha: head } });
+  });
+  it('a --judged-head accept refuses with nothing written when the head moves between the two reads', () => {
+    refused(run({ expectHead: null, expectFingerprint: null, race: 'head', extra: [`--judged-head=${head}`] }));
+  });
+  it('a --judged-head accept refuses with nothing written when the live head is not the judged one', () => {
+    refused(run({ livehead: pushedHead, expectHead: null, expectFingerprint: null, extra: [`--judged-head=${head}`] }));
+  });
   it('refuses when the pinned commit\'s net diff differs from the compared fingerprint', () => {
     refused(run({ expectFingerprint: normalizeDiffFingerprint(diff.replace('+export const value = 2', '+export const value = 9')) }));
   });
