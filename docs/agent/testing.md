@@ -102,17 +102,21 @@ prevents dispatch, except a finished `skipped` status with `skipCardOnly === tru
 stored card-only net read with non-empty trimmed `diffText` and `netBasis.rev` matching the status head: that historical gap dispatches fresh to settle the skip. A structured result with a present policy other than `card-only` refuses healing; legacy string `skipped` remains eligible.
 The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head; admission treats the validated historical card-only skip as fresh while retaining the seat-row and comment guards. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying.
 
-Settlement runs for every outcome except `ran` and `resumed`, before the finished status write and gate in both normal and red-team-only jobs.
+Settlement runs for skipped, error, disabled and unknown outcomes before the finished status write and gate in both normal and red-team-only jobs. Completed, not-owed and deferred outcomes (including `deferredByCap` and `deferredByGuard`) bypass settlement; a deferral is not a skip.
 Only structured `status: 'skipped', policy: 'card-only'` with a real 40-hex `readHead`
 (the loop read's `netBasis.rev`) matching the settlement head case-insensitively produces a trusted,
 head-bound zero-finding result comment. An absent, invalid or mismatched read head publishes
 needs-you with reason `policy skip head not bound to the reviewed read`. Reason strings never grant clearance. Other skips and failed policy comment posts
-publish needs-you with kind `red-team-skip-<first 26 hex of the SHA-256 identity key>`, so distinct reasons survive feed deduplication. Markers deduplicate by repo/PR/head/reason under `red-team-status/skip-published`;
+publish needs-you with kind `red-team-skip-<first 26 hex of the SHA-256 identity key>`, so distinct reasons survive feed deduplication. Embedded reasons are sanitized with `sanitizeForFeed` and capped at 80 characters before constructing both the item and deterministic identity key. Markers deduplicate by repo/PR/head/sanitized bounded reason under `red-team-status/skip-published`;
 Write the item atomically to `red-team-status/skip-pending/<key>.json` before publication, then write the published marker and remove the pending record after success. Every settlement first retries up to 25 unpublished pending records without a model call, even when settling another PR. Failures retain their records and do not abort the current settlement; overflow is logged and remains for the next settlement. Already-published pending records are removed without republication. Settlement uses the stored review head, then the prepared lane head, then the live PR head from the existing carry evidence reader. If no real head is available, publish with `head: 'unknown'` and include the run ID in the identity key (a fresh attempt ID if absent); fallback heads identify needs-you items but cannot authorize policy clearance.
-Regressions: `red-team-skip-outcome.test.mjs`, `review-job-red-team-skip.test.mjs`, and the
-historical card-only cases in `review-red-team-on-skip.test.mjs`.
+Regressions: `red-team-skip-outcome.test.mjs`, `red-team-skip-outcome-regressions.test.mjs`, `review-job-red-team-skip.test.mjs`, `review-red-team-on-skip.test.mjs`, `review-red-team-resume-only.test.mjs`.
 Regression mapping (one representative assertion per guarantee; names are in the files above unless noted):
 
+- Sanitized bounded identity and publication: **sanitizes and bounds %s reasons before publication and deterministic deduplication**.
+- Head fallback and failed live reads: **settlement head precedence and contained live read (%s, %s, %s)**.
+- Production comment and feed effects: **production settlement posts marker via gh argv/body and publishes real needs-you**.
+- Deferrals never escalate as skips: **deferral or not-owed outcome does not settle or publish needs-you: %j**.
+- Healing retains fresh guards: **healed card-only fresh admission still refuses a prior %s**.
 - Structured policy provenance: **policy predicate requires both structured fields: %s cannot clear**.
 - Read/head binding fails closed: **policy cannot clear an unbound reviewed read (%s)**.
 - Case-insensitive read/head binding: **policy read head binding is case-insensitive**.

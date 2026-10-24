@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
@@ -99,6 +100,7 @@ export function settleRedTeamSkip(input = {}) {
         reason = `policy-clear comment failed: ${error?.message ?? error}`;
       }
     }
+    reason = sanitizeForFeed(reason, 80);
     const identity = [repo, pr, head, reason];
     if (!realHead) identity.push(input.runId || randomUUID());
     const key = createHash('sha256').update(JSON.stringify(identity)).digest('hex');

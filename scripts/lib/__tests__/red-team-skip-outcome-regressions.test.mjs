@@ -47,6 +47,23 @@ describe('red-team skip pre-review regressions', () => {
     expect(planRedTeamStatusLabels({ ...f.input, labels: ['red-team:pending'] }).add).not.toBe('red-team:clear');
   });
 
+  it.each(['provider', 'comment failure'])('sanitizes and bounds %s reasons before publication and deterministic deduplication', source => {
+    const f = fixture();
+    const reason = '\n\x1b[31m\u202e\u2066' + 'x'.repeat(5000);
+    if (source === 'comment failure') f.io.postComment.mockImplementation(() => { throw Error(reason); });
+    const redTeam = source === 'provider' ? { status: 'error', reason } : { status: 'skipped', policy: 'card-only' };
+    f.settle(redTeam);
+    const item = f.io.publishNeedsYou.mock.calls[0][0];
+    expect(item.reason).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
+    expect(item.reason.length).toBeLessThanOrEqual('red team skipped (); not cleared'.length + 80);
+    const embedded = item.reason.slice('red team skipped ('.length, -'); not cleared'.length);
+    expect(embedded).toHaveLength(80);
+    const key = createHash('sha256').update(JSON.stringify([f.input.repo, f.input.pr, f.input.head, embedded])).digest('hex');
+    expect(item.kind).toBe(`red-team-skip-${key.slice(0, 26)}`);
+    f.settle(redTeam);
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
+  });
+
   it('failed publication leaves no marker; retry succeeds before deduplication begins', () => {
     const f = fixture(), redTeam = { status: 'skipped', reason: 'provider unavailable' };
     f.io.publishNeedsYou.mockImplementationOnce(() => { throw Error('feed unavailable'); });

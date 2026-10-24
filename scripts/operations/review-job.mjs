@@ -299,6 +299,17 @@ export function readRedTeamRecoveryStatus(input, {
 
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────
 
+/** PURE apart from the injected reader: prefer reviewed, then lane, then live head. */
+export function resolveSettlementHead({ readRev, laneHead, readLiveHead } = {}) {
+  const isHead = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
+  for (const head of [readRev, laneHead]) if (isHead(head)) return head;
+  try {
+    const live = readLiveHead?.();
+    if (isHead(live)) return live;
+  } catch { /* unavailable live evidence retains an unknown identity */ }
+  return 'unknown';
+}
+
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execRead, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence } = {}) {
   const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
@@ -805,18 +816,16 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     } catch { /* malformed diagnostics cannot prevent skip settlement */ }
     recordSeats(redTeam?.seat ? [redTeam.seat] : []);
     out.redTeam = summarizeRedTeam(redTeam);
-    if (!['ran', 'resumed'].includes(redTeam?.status) && typeof io.settleRedTeamSkip === 'function') {
+    if (!['ran', 'resumed', 'not-owed'].includes(redTeam?.status)
+      && !(typeof redTeam?.status === 'string' && redTeam.status.startsWith('deferred'))
+      && redTeam?.deferredByCap !== true && redTeam?.deferredByGuard !== true
+      && typeof io.settleRedTeamSkip === 'function') {
       try {
         const isHead = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
         const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
         const readHead = isHead(rev) ? rev : null;
-        let head = [readHead, seatsBox.laneHead].find(isHead);
-        if (!head) {
-          try {
-            const live = io.readCarryEvidence?.({ repo: out.repo, pr: out.pr })?.headSha;
-            if (isHead(live)) head = live;
-          } catch { /* unavailable head escalates under a per-run unknown identity */ }
-        }
+        const head = resolveSettlementHead({ readRev: rev, laneHead: seatsBox.laneHead,
+          readLiveHead: () => io.readCarryEvidence?.({ repo: out.repo, pr: out.pr })?.headSha });
         const settled = io.settleRedTeamSkip({ redTeam, repo: out.repo, pr: out.pr,
           head: head ?? 'unknown', readHead, runId: out.runId });
         out.redTeam = { ...out.redTeam, ...settled };

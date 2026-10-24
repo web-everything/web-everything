@@ -5,10 +5,11 @@ import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { publishAttention, replay } from '../needs-you-feed.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { runReviewJob, createReviewJobIo } from '../review-job.mjs';
+import { runReviewJob, createReviewJobIo, resolveSettlementHead } from '../review-job.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus } from '../../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../../lib/review-red-team-on-skip.mjs';
-import { speculateRedTeam } from '../review-extra-seats.mjs';
+import { redTeamMarker } from '../../lib/red-team-gate.mjs';
+import { speculateRedTeam, runRedTeam } from '../review-extra-seats.mjs';
 
 const repo = 'web-everything/web-everything', pr = 5872, head = 'a'.repeat(40);
 const skipped = { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
@@ -176,6 +177,74 @@ describe('review-job red-team skip settlement', () => {
     delete f.loopPayload.findings.read.netBasis.rev;
     runReviewJob({ repo, pr }, f.io);
     expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ head, runId: f.loopPayload.runId }));
+  });
+
+  it.each([
+    [head, 'b'.repeat(40), 'c'.repeat(40), head],
+    ['invalid', head, 'c'.repeat(40), head],
+    [undefined, 'invalid', head, head],
+    [undefined, undefined, undefined, 'unknown'],
+    [undefined, 'invalid', 'invalid', 'unknown'],
+    [undefined, 'invalid', 'throw', 'unknown'],
+  ])('settlement head precedence and contained live read (%s, %s, %s)', (readRev, laneHead, live, expected) => {
+    const readLiveHead = vi.fn(() => { if (live === 'throw') throw Error('offline'); return live; });
+    expect(resolveSettlementHead({ readRev, laneHead, readLiveHead })).toBe(expected);
+    expect(readLiveHead).toHaveBeenCalledTimes(expected === readRev || expected === laneHead ? 0 : 1);
+  });
+
+  it('settlement head without evidence or a live reader is unknown', () => {
+    expect(resolveSettlementHead({})).toBe('unknown');
+  });
+
+  it.each([
+    { status: 'deferred' }, { status: 'deferred-by-budget' },
+    { status: 'skipped', deferredByCap: true }, { status: 'skipped', deferredByGuard: true },
+    { status: 'not-owed' }, { status: 'not-owed', deferredByGuard: true },
+  ])('deferral or not-owed outcome does not settle or publish needs-you: %j', redTeam => {
+    const f = fixture(redTeam);
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.runRedTeam).toHaveBeenCalledOnce();
+    expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
+  });
+
+  it('production settlement posts marker via gh argv/body and publishes real needs-you', () => {
+    const root = mkdtempSync(join(tmpdir(), 'production-skip-'));
+    const path = join(root, 'feed.jsonl');
+    try {
+      vi.stubEnv('VITEST', '');
+      vi.stubEnv('WE_UNDER_TEST', '');
+      vi.stubEnv('WE_NEEDS_YOU_FEED', path);
+      const exec = vi.fn(() => '');
+      const production = createReviewJobIo({ env: { WE_SHARED_RUNS_DIR: join(root, 'runs') }, exec });
+      expect(production.settleRedTeamSkip({ repo, pr, head, readHead: head, redTeam: skipped, comments: [] }).outcome).toBe('policy-clear');
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec).toHaveBeenCalledWith('gh', ['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'],
+        expect.objectContaining({ input: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: card-only diff (policy redTeam.skipCardOnly)` }));
+      production.settleRedTeamSkip({ repo, pr, head, redTeam: { status: 'error', reason: 'offline' } });
+      expect(replay({ path })).toEqual([expect.objectContaining({ repo, pr, head, reason: 'red team skipped (offline); not cleared' })]);
+    } finally { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['seat row', 'trusted comment'])('healed card-only fresh admission still refuses a prior %s', async guard => {
+    const root = mkdtempSync(join(tmpdir(), 'healed-guard-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: '1', WE_RED_TEAM_STATUS_LABELS: '0', WE_REVIEW_RED_TEAM: '1', WE_REVIEW_EXTRA_SEATS: '1' };
+    try {
+      const production = createReviewJobIo({ env, readEvidence: () => ({ inFlight: false, queued: false }) });
+      const loopPayload = payload();
+      production.redTeamStatus({ repo, pr, loopPayload, status: 'finished', result: { status: 'skipped', policy: 'card-only' } });
+      const { redTeamAdmission } = production.redTeamStatus({ repo, pr, loopPayload, status: 'queued', redTeamMode: 'fresh' });
+      expect(redTeamAdmission.prior).toBeNull();
+      const io = {
+        readRecords: vi.fn(() => guard === 'seat row' ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'error' }] : []),
+        readRedTeamStatus: () => readRedTeamStatus({ repo, pr, head, env }),
+        readRecoveryComments: () => guard === 'trusted comment' ? [{ body: redTeamMarker(pr, head), author: { login: 'web-everything' } }] : [],
+        cliAvailable: vi.fn(() => { throw Error('must not reach provider'); }),
+      };
+      const result = await runRedTeam({ repo, pr, loopPayload, env, redTeamMode: 'fresh', redTeamAdmission }, io);
+      expect(result).toMatchObject({ status: 'not-owed', reason: expect.stringContaining(guard === 'seat row' ? 'prior red-team seat row' : 'red-team result already on head') });
+      expect(io.readRecords).toHaveBeenCalledWith({ strict: true });
+      expect(io.cliAvailable).not.toHaveBeenCalled();
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('createReviewJobIo exposes the settlement hook', () => {
