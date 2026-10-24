@@ -63,15 +63,23 @@ describe('sameGapSameHead', () => {
     ['authenticated', 'unauthenticated'], ['valid', 'invalid'], ['higher', 'lower'], ['and', 'or'],
   ])('refuses antonym %s versus %s despite high word overlap', (a, b) => {
     const summary = `Handler validates the payload ${a} the cache write on every request path in the worker`;
-    expect(sameGapSameHead({ ...base, summary },
-      { ...base, line: 24, summary: summary.replace(` ${a} `, ` ${b} `) })).toBe(false);
+    const first = { ...base, summary }, second = { ...base, line: 24, summary: summary.replace(` ${a} `, ` ${b} `) };
+    expect(sameGapSameHead(first, second)).toBe(false);
+    expect(sameGapSameHead(second, first)).toBe(false);
+    // Pin the persisted-carry path too: an operator's dismissal must not clear the opposite claim.
+    const { ruled, ctx } = world(first), target = referral('judgeSecurity', second);
+    expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
+    expect(referralRecordState(record([target], { carried: [carry(ruled, target)] }), ctx).pending).toEqual([target.key]);
   });
   it('enforces the word-overlap threshold independently of protected tokens', () => {
     const finding = { ...base, summary: 'Validation checks request payload before processing' };
-    expect(sameGapSameHead(finding, { ...finding, summary: `${finding.summary} malformed` })).toBe(true);
-    expect(sameGapSameHead(finding, { ...finding, summary: `${finding.summary} malformed input` })).toBe(false);
     const boundary = { ...base, summary: 'Validation checks request payload' };
-    expect(sameGapSameHead(boundary, { ...boundary, summary: `${boundary.summary} malformed` })).toBe(true);
+    for (const [source, suffix, matches] of [[finding, 'malformed', true], [finding, 'malformed input', false],
+      [boundary, 'malformed', true]]) {
+      const extended = { ...source, summary: `${source.summary} ${suffix}` };
+      expect(sameGapSameHead(source, extended)).toBe(matches);
+      expect(sameGapSameHead(extended, source)).toBe(matches);
+    }
   });
   it('requires identical content-word sets for long summaries while allowing reordering', () => {
     const finding = { ...base, summary: 'Validation checks request payload before processing cached records' };
@@ -158,7 +166,7 @@ describe('same-head operator matching and read-time validation', () => {
     ctx.operatorRulings.push({ ...ctx.operatorRulings[0], result: 'block' });
     expect(findSameHeadSiblingRuling(referral(), ctx)).toBeNull();
   });
-  it.each(['block', 'card', 'missing-referral', 'missing-record'])('withdraws a persisted carry after a newer matching sibling %s', result => {
+  it.each(['block', 'card', 'not-real', 'missing-referral', 'missing-record'])('withdraws a persisted carry after a newer matching sibling %s', result => {
     const { ruled, ctx } = world(), target = referral(), third = referral('judgeCorrectness', {
       summary: 'Request payload validation is missing before use',
     });
@@ -168,6 +176,10 @@ describe('same-head operator matching and read-time validation', () => {
     ctx.operatorRulings.push({ ...ctx.operatorRulings[0], runId: result === 'missing-record' ? 'missing' : 'run-3',
       key: result === 'missing-referral' ? 'missing' : third.key, result: result.startsWith('missing') ? 'not-real' : result,
       ...(result === 'card' ? { card } : {}) });
+    const latest = findSameHeadSiblingRuling(target, ctx);
+    if (result === 'card' || result === 'not-real') {
+      expect(latest).toMatchObject({ result, from: { head, runId: 'run-3', key: third.key } });
+    } else expect(latest).toBeNull();
     expect(referralRecordState(saved, { ...ctx, cardReadable: () => true }).pending).toEqual([target.key]);
   });
 });
