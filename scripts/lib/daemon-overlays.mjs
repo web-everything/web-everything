@@ -326,8 +326,9 @@ export function recordEdgeResolution(root, ref, {
  * @param {string} ref
  * `requireRef`, when supplied, must still be registered under the list mutex, else nothing is removed: a swap that
  * retires `ref` for its replacement never leaves the list without both. `expectedOverlay`, when supplied, must still
- * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed.
- * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object}} [o]
+ * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed; `null` expects no
+ * entry, so one registered since the caller's read is refused too.
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object|null}} [o]
  * @returns {{removed:boolean, list:Array<object>}}
  */
 export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay } = {}) {

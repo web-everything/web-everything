@@ -838,6 +838,19 @@ describe('established overlay auto rebase', () => {
     expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: 'registration changed; refusing removal' } });
   });
 
+  it('never removes an original re-registered after cleanup read it as absent', async () => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    removeOverlay(f.root, ref, { env: f.env });
+    const remove = (root, r, opts) => { addOverlay(root, { ref, pr: 999, reason: 'operator re-registration' }, { env: f.env }); return removeOverlay(root, r, opts); };
+    expect(() => finishPendingSwaps({ root: f.root, env: f.env, run, removeOverlay: remove })).not.toThrow();
+    expect(readOverlays(f.root, { env: f.env })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ref, pr: 999 }), expect.objectContaining({ ref: replacement.ref }),
+    ]));
+    expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
+    expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: 'registration changed; refusing removal' } });
+  });
+
   describe('mechanism-pinned original', () => {
     const mechanism = 'scripts/lib/daemon-rebuild/prepare.mjs';
     const pinnedFixture = async ({ forcePush = false } = {}) => {
