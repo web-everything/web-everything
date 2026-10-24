@@ -2,13 +2,15 @@
  * @file pr-sweep-unhealthy-owner-and-symlink-entry.mjs
  * @description PR #5323 red-team replay: unhealthy owners/refusals mask stalls, cross-repo logs misbind, symlink launches skip entry points.
  */
-import { mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 import { collectOwnerSignals, runPrSweep } from '../../pr-sweep.mjs';
+import { publishStalledDigest } from '../../pr-stall-digest.mjs';
+import { replay } from '../../../operations/needs-you-feed.mjs';
 
 const CONVEYOR = fileURLToPath(new URL('../../', import.meta.url));
 export default {
@@ -105,6 +107,43 @@ export default {
     }
     const root = mkdtempSync(join(tmpdir(), 'soak-pr-sweep-entry-'));
     try {
+      // PR #5856: health refusals use numeric clocks. Hidden sweep output must not suppress a detector event.
+      const prefs = join(root, 'preferences.json'); writeFileSync(prefs, '{}');
+      const head = 'abcdef0123'.repeat(4), label = 'red-team:pending';
+      const stalledPr = { ...pr, headRefOid: head, labels: [label] };
+      const clock = `${key}@${head}|${label}`;
+      const detectorEnv = { WE_PLATFORM_PREFERENCES_FILE: prefs, WE_PR_STALL_DETECTOR_ENABLED: 'true',
+        WE_PR_STALL_DETECTOR_SAME_LABEL_MINUTES: '60', WE_PR_STALL_DETECTOR_REPEATED_REASON_COUNT: '5' };
+      for (const [mode, digest] of [['off', false], ['off', true], ['shadow', false], ['on', false], ['shadow', true], ['on', true]]) {
+        const stateDir = join(root, `${mode}-${digest}`, 'digest'), feedPath = join(root, `${mode}-${digest}`, 'events.jsonl');
+        let previous = { stallDetector: { [clock]: now - 90 * 60000 } }, notifications = 0;
+        for (const offset of [0, 60000]) {
+          const tick = now + offset;
+          const report = await runPrSweep({ now: tick, env: detectorEnv, config: {}, settings: { value, sources: {} },
+            readPrevious: () => previous, readPrs: () => [stalledPr], readQueue: () => ({ ready: [], rulingNeeded: [] }),
+            readSignals: args => collector(args, { health: { daemons: { 'fix-dispatch-daemon': {
+              prRefusals: { 'we#12': { at: tick, reason: 'already-reviewed-head: referral hold auto-resolved' } },
+            } } } }),
+            flush: () => ({}), append: () => {}, persist: () => {}, notify: () => { notifications++; return { ok: true }; },
+            stallSweep: async () => ({ mode, digest, state: {}, dir: stateDir, items: [
+              { lane: 'operator', repo, pr: 12, head: head.toUpperCase(), state: 'needs-decision:note' },
+            ] }),
+            stallDigest: (pass, options) => {
+              if ((mode === 'off' || !digest) && (pass.items.length !== 1 || pass.items[0].action !== 'stalled-detector')) {
+                violations.push({ invariant: 'hidden-sweep-suppresses-detector', detail: `${mode}/${digest}` });
+              }
+              return publishStalledDigest(pass, { ...options, feedPath });
+            } });
+          previous = report.nextState;
+          if (report.errors.length || report.stallDetector?.stalled !== 1 || previous.stallDetector[clock] !== now - 90 * 60000) {
+            violations.push({ invariant: 'numeric-refusal-drops-stalled-pr', detail: JSON.stringify({ mode, digest, errors: report.errors }) });
+          }
+        }
+        const events = replay({ path: feedPath });
+        if (events.length !== 1 || events[0]?.kind !== 'stalled' || notifications !== 1) {
+          violations.push({ invariant: 'same-head-publication-count', detail: JSON.stringify({ mode, digest, events, notifications }) });
+        }
+      }
       const alias = join(root, 'conveyor-link'); symlinkSync(CONVEYOR, alias, 'dir');
       const env = { ...process.env, NODE_NO_WARNINGS: '1' };
       for (const key of ['DAEMON_JOB_ID', 'DAEMON_JOB_ATTEMPT', 'OPERATION_RUNS_DIR']) delete env[key];

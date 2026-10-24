@@ -1,9 +1,14 @@
 /** @file Regression contract for same-head stalls, settings provenance, and sweep publication. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   DETECTOR_DEFAULTS, REMEDIES, detectStalls, normalizeReason, resolveDetectorSettings, runDetector,
 } from '../pr-stall-detector.mjs';
 import { collectOwnerSignals, runPrSweep } from '../pr-sweep.mjs';
+import { publishStalledDigest } from '../pr-stall-digest.mjs';
+import { replay } from '../../operations/needs-you-feed.mjs';
 
 // runDetector has no settings-reader argument. Keep its real settings resolver while
 // replacing only its file inputs; integration passes inject every sweep write seam.
@@ -172,6 +177,15 @@ describe('detectStalls', () => {
     expect(out.items[0]).toMatchObject({ repeatCount: 6, repeatingReason: lines[0].reason });
   });
 
+  it.each(['refusal', 'diagnostic'])('accepts numeric epoch timestamps for %s signals without dropping a stalled PR', kind => {
+    const out = detect({ seen: { [key()]: NOW - 90 * MINUTE }, daemons: { [PR_KEY]: [
+      { name: 'fix-dispatch-daemon', at: NOW - MINUTE, kind, reason: REASON },
+    ] } });
+    expect(out.errors).toEqual([]);
+    expect(out.items).toHaveLength(1);
+    expect(out.nextSeen[key()]).toBe(NOW - 90 * MINUTE);
+  });
+
   it('seeds age from the earliest repeating daemon ISO timestamp on a first pass', () => {
     const out = detect({ daemons: { [PR_KEY]: skips(2, { start: NOW - 120 * MINUTE }) } });
     expect(out.items[0].stalledMinutes).toBe(120);
@@ -186,8 +200,8 @@ describe('detectStalls', () => {
     expect(out.nextSeen[key()]).toBe(NOW - 18 * MINUTE);
   });
 
-  it('newer progress clears the K rule even if daemon entries are out of order', () => {
-    const progress = { name: 'review-daemon', at: new Date(NOW).toISOString(), kind: 'progress' };
+  it.each(['ISO', 'epoch'])('newer %s progress clears the K rule even if daemon entries are out of order', format => {
+    const progress = { name: 'review-daemon', at: format === 'epoch' ? NOW : new Date(NOW).toISOString(), kind: 'progress' };
     expect(detect({ daemons: { [PR_KEY]: [progress, ...skips(6)] } }).items).toEqual([]);
   });
 
@@ -216,6 +230,26 @@ describe('detectStalls', () => {
     expect(out.items[0].repeatingReason).toBe(reason.slice(0, 200));
     expect(out.items[0].evidence.length).toBeLessThanOrEqual(3);
     expect(out.items[0].remedy).toContain('red-team-on-skip not live on review daemon');
+  });
+
+  it('sanitizes daemon reasons before every report and notification field', () => {
+    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz012345';
+    const reason = `${REASON}\x1b[31m\r\n\x00\u2028\u202e ${secret} --token="private value"`;
+    const out = detect({ daemons: { [PR_KEY]: skips(6, { reason }) } });
+    const item = out.items[0];
+    for (const value of [item.reason, item.repeatingReason, ...item.evidence]) {
+      expect(value).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+      expect(value).not.toContain(secret);
+      expect(value).not.toContain('private value');
+      expect(value).not.toContain('[31m');
+    }
+    expect(item.remedy).toContain('red-team-on-skip not live on review daemon');
+  });
+
+  it.each([null, undefined, {}, true, 'invalid', Infinity, NaN])('rejects unreadable daemon timestamp %j', at => {
+    const out = detect({ daemons: { [PR_KEY]: [{ at, kind: 'refusal', reason: REASON }] } });
+    expect(out.items).toEqual([]);
+    expect(out.errors.join(' ')).toContain('unreadable daemon timestamp');
   });
 
   it.each([undefined, null, '', 'not-a-head', 'a'.repeat(39), 'g'.repeat(40)])('malformed head %j is skipped with an error', headRefOid => {
@@ -254,6 +288,29 @@ describe('detectStalls', () => {
 });
 
 describe('runDetector', () => {
+  it.each(['health', 'log-T', 'log-space'])('accepts the collectOwnerSignals %s producer timestamp contract', async source => {
+    const errors = [];
+    const readSignals = args => collectOwnerSignals({ ...args, env: {}, errors,
+      readAgents: () => [], cloneRoots: () => ['fixture-clone'], listLogs: () => ['review-daemon.log'],
+      readHealth: () => source === 'health' ? { daemons: { 'fix-dispatch-daemon': {
+        prRefusals: { 'we#5759': { at: NOW - MINUTE, reason: REASON } },
+      } } } : {},
+      readTail: () => source === 'health' ? '' : `[${new Date(NOW - MINUTE).toISOString().replace('T', source === 'log-space' ? ' ' : 'T')}] review-daemon: we#5759 not dispatched — ${REASON}` });
+    const out = await runDetector({ prs: [pr(), pr({ number: 42 })], readSignals,
+      seen: { [key()]: NOW - 90 * MINUTE }, now: NOW, env: env(), log: () => {} });
+    expect(errors).toEqual([]);
+    expect(out.errors).toEqual([]);
+    expect(out.items).toMatchObject([{ pr: 5759, stalledMinutes: 90 }]);
+    expect(out.nextSeen[`${REPO}#42@${HEAD}|${LABEL}`]).toBe(NOW);
+  });
+
+  it('preserves all saved clocks when the signals reader rejects', async () => {
+    const seen = { [key()]: NOW - 90 * MINUTE };
+    const out = await runDetector({ prs: [pr()], readSignals: async () => { throw new Error('logs unreadable'); },
+      seen, now: NOW, env: env(), log: () => {} });
+    expect(out.nextSeen).toEqual(seen);
+    expect(out.errors.join(' ')).toContain('logs unreadable');
+  });
   it('disabled settings read no signals and preserve seen state', async () => {
     const readSignals = vi.fn();
     const seen = { [key()]: NOW - 90 * MINUTE };
@@ -331,6 +388,95 @@ describe('runPrSweep detector integration', () => {
     expect(persisted.nextState.stallDetector).toEqual(report.nextState.stallDetector);
   });
 
+  it('persists a brand-new detector clock in the second save and recovers its age', async () => {
+    const options = sweepOptions({ readPrevious: () => ({}),
+      readSignals: async () => ({ [PR_KEY]: { sessions: [], daemons: [] } }) });
+    const report = await runPrSweep(options);
+    expect(options.persist).toHaveBeenCalledTimes(2);
+    const saved = options.persist.mock.results.at(-1).value.nextState;
+    expect(saved.stallDetector).toEqual({ [key()]: NOW });
+    expect(report.nextState.stallDetector).toEqual(saved.stallDetector);
+    const recovery = sweepOptions({ now: NOW + 61 * MINUTE, readPrevious: () => saved, readSignals: options.readSignals });
+    expect((await runPrSweep(recovery)).stallDetector.stalled).toBe(1);
+  });
+
+  it('includes saved detector clocks in the first persistence call', async () => {
+    const options = sweepOptions({ readSignals: async () => ({ [PR_KEY]: { sessions: [], daemons: [] } }) });
+    await runPrSweep(options);
+    expect(options.persist.mock.results[0].value.nextState.stallDetector).toEqual({ [key()]: NOW - 90 * MINUTE });
+  });
+
+  it('preserves an unreadable PR clock through persistence and recovery without retaining another repo clock', async () => {
+    const otherKey = `another/repo#5759@${HEAD}|${LABEL}`;
+    const saved = { [key()]: NOW - 90 * MINUTE, [otherKey]: NOW - 120 * MINUTE };
+    const options = sweepOptions({ readPrevious: () => ({ stallDetector: saved }),
+      readPrs: () => [pr({ headRefOid: 'invalid', updatedAt: new Date(NOW).toISOString() })] });
+    const report = await runPrSweep(options);
+    expect(report.nextState.stallDetector).toEqual({ [key()]: saved[key()] });
+    expect(options.persist.mock.results.at(-1).value.nextState.stallDetector).toEqual({ [key()]: saved[key()] });
+    expect(options.stallDigest.mock.calls[0][0].incomplete).toBe(true);
+    const recovery = sweepOptions({ readPrevious: () => report.nextState });
+    expect((await runPrSweep(recovery)).stallDetector.stalled).toBe(1);
+  });
+
+  it.each(['reject', 'invalid'])('preserves previous detector state and marks the digest incomplete on a %s PR read', async failure => {
+    const saved = { [key()]: NOW - 90 * MINUTE };
+    const options = sweepOptions({ readPrevious: () => ({ stallDetector: saved }),
+      readPrs: () => { if (failure === 'reject') throw new Error('PR read failed'); return null; } });
+    const report = await runPrSweep(options);
+    expect(report.nextState.stallDetector).toEqual(saved);
+    for (const result of options.persist.mock.results) expect(result.value.nextState.stallDetector).toEqual(saved);
+    expect(options.stallDigest.mock.calls[0][0].incomplete).toBe(true);
+  });
+
+  it.each(['reject', 'partial'])('preserves clocks and marks the digest incomplete on a %s signal read', async failure => {
+    const saved = { [key()]: NOW - 90 * MINUTE };
+    const options = sweepOptions({ readSignals: async ({ errors }) => {
+      if (failure === 'reject') throw new Error('logs unreadable');
+      errors.push('log unreadable'); return { [PR_KEY]: { daemons: [] } };
+    } });
+    const report = await runPrSweep(options);
+    expect(report.nextState.stallDetector).toEqual(saved);
+    expect(options.persist.mock.results.at(-1).value.nextState.stallDetector).toEqual(saved);
+    expect(options.stallDigest.mock.calls[0][0].incomplete).toBe(true);
+    expect(options.stallDigest.mock.calls[0][0].items).toEqual([]);
+  });
+
+  it('preserves only the errored PR clock when daemon data is malformed', async () => {
+    const otherKey = `${REPO}#42@${HEAD}|${LABEL}`;
+    const options = sweepOptions({ readPrevious: () => ({ stallDetector: {
+      [key()]: NOW - 90 * MINUTE, [otherKey]: NOW - 120 * MINUTE,
+    } }), readSignals: async () => ({ [PR_KEY]: { daemons: [{ at: null, kind: 'refusal', reason: REASON }] } }) });
+    const report = await runPrSweep(options);
+    expect(report.nextState.stallDetector).toEqual({ [key()]: NOW - 90 * MINUTE });
+    expect(options.stallDigest.mock.calls[0][0].incomplete).toBe(true);
+  });
+
+  it('publishes one stalled event across repeated passes for the same PR and head', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'detector-digest-'));
+    try {
+      const feedPath = join(root, 'events.jsonl'), stateDir = join(root, 'digest');
+      const options = sweepOptions({ stallDigest: (pass, opts) => publishStalledDigest(pass, { ...opts, feedPath, stateDir }) });
+      let previous = {};
+      for (const tick of [NOW, NOW + MINUTE]) {
+        const report = await runPrSweep({ ...options, now: tick, readPrevious: () => previous });
+        expect(report.errors).toEqual([]);
+        previous = report.nextState;
+      }
+      expect(replay({ path: feedPath })).toMatchObject([{ kind: 'stalled', pr: 5759, head: HEAD }]);
+      expect(replay({ path: feedPath })).toHaveLength(1);
+      expect(options.notify).toHaveBeenCalledTimes(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['shadow', 'on'])('publishes a single operator item when the %s sweep and detector share a PR and uppercase head', async mode => {
+    const item = { lane: 'operator', repo: REPO, pr: 5759, head: HEAD.toUpperCase(), state: 'needs-decision:note' };
+    const options = sweepOptions({ stallSweep: async () => ({ mode, digest: true,
+      state: {}, dir: 'fixture/pr-stall-sweep', items: [item], act: [] }) });
+    await runPrSweep(options);
+    expect(options.stallDigest.mock.calls[0][0].items).toEqual([item]);
+  });
+
   it('publishes detector items even when the automatic stall sweep and its digest are off', async () => {
     const options = sweepOptions();
     await runPrSweep(options);
@@ -340,7 +486,7 @@ describe('runPrSweep detector integration', () => {
   });
 
   it.each(['shadow', 'on', 'off'])('digest:false excludes %s sweep items while the enabled detector still publishes', async mode => {
-    const sweepItem = { lane: 'operator', repo: REPO, pr: 42, head: 'b'.repeat(40), state: 'needs-decision:note' };
+    const sweepItem = { lane: 'operator', repo: REPO, pr: 5759, head: HEAD.toUpperCase(), state: 'needs-decision:note' };
     const options = sweepOptions({ stallSweep: async () => ({ mode, digest: false, state: {},
       dir: 'fixture/pr-stall-sweep', items: [sweepItem], act: [] }) });
     const report = await runPrSweep(options);

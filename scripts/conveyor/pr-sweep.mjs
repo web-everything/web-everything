@@ -166,12 +166,18 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   const report = { at: new Date(now).toISOString(), settings: value, sources: resolved.sources, ...planned.report, alerts: planned.alerts, diagnose: planned.diagnose, nextState: planned.nextState, errors };
   const detect = async () => {
     const out = await runDetector({ prs, seen: previous?.stallDetector ?? {}, now, env,
-      readSignals: ({ prs }) => readSignals({ prs, now, dir, env, errors: detectorErrors, sourceRoot }) });
+      readSignals: async ({ prs }) => {
+        const before = detectorErrors.length;
+        const signals = await readSignals({ prs, now, dir, env, errors: detectorErrors, sourceRoot });
+        if (detectorErrors.length > before) throw new Error('owner signals incomplete');
+        return signals;
+      } });
     detectorErrors.push(...out.errors);
     errors.push(...detectorErrors.map(e => `stall detector: ${e}`));
     report.stallDetector = { enabled: out.enabled, stalled: out.items.length, ...(dryRun ? { items: out.items } : {}) };
     // A PR the detector could not read keeps its saved clock, so recovery does not restart its age.
-    const keptOld = Object.fromEntries(Object.entries(previous?.stallDetector ?? {}).filter(([k]) => out.errors.some(e => k.includes(`#${String(e).split(':')[0]}@`))));
+    const keptOld = Object.fromEntries(Object.entries(previous?.stallDetector ?? {}).filter(([k]) =>
+      (out.failedPrKeys ?? []).some(key => k.startsWith(`${key}@`))));
     report.nextState.stallDetector = prsReadOk ? { ...keptOld, ...out.nextSeen } : previous?.stallDetector ?? {};
     return out;
   };
@@ -210,9 +216,10 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       errors.push(...(out.errors ?? []).map((e) => `stall sweep: ${e}`));
       // Operator items go to the needs-you feed (kind `stalled`) and one quiet-hours-gated alert per pass.
       const sweepDigestEnabled = out.mode !== 'off' && out.digest !== false;
+      const published = sweepDigestEnabled ? out.items ?? [] : [];
       // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
       if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
-        const d = stallDigest({ ...out, items: [...(sweepDigestEnabled ? out.items ?? [] : []), ...detector.items.filter(d => !(out.items ?? []).some(i => i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === d.head))],
+        const d = stallDigest({ ...out, items: [...published, ...detector.items.filter(d => !published.some(i => i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === d.head))],
           incomplete: out.incomplete || !prsReadOk || detectorErrors.length > 0 },
         { now, env, stateDir: out.dir, notify,
           enabled: sweepDigestEnabled || detector.items.length > 0 || detector.enabled });

@@ -2,12 +2,16 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripVTControlCharacters } from 'node:util';
 import { cascadePolicy, formatCascadeSourcesLine, readPlatformPreferences } from '../lib/policy-cascade.mjs';
+import { redactCommandLine } from '../operations/command-redact.mjs';
+import { scrubText } from './health-watch-core.mjs';
 
 export const DETECTOR_DEFAULTS = { enabled: true, sameLabelMinutes: 60, repeatedReasonCount: 5,
   blockingLabels: ['red-team:pending', 'review:pending', 'status:fixing'] };
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), '../settings/pr-stall-sweep.json');
-const message = e => String(e?.message ?? e).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200);
+const message = e => scrubText(redactCommandLine(stripVTControlCharacters(String(e?.message ?? e).slice(0, 4096))
+  .normalize('NFKC').replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' '))).slice(0, 200);
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const positive = v => Number.isSafeInteger(v) && v > 0;
 
@@ -79,10 +83,16 @@ function prError(pr, e) {
   try { n = pr?.number ?? n; } catch { /* unreadable identity */ }
   return `${n}: ${message(e)}`;
 }
+function failureKey(pr) {
+  try {
+    return typeof pr?.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(pr.repo) && positive(pr.number)
+      ? `${pr.repo}#${pr.number}` : null;
+  } catch { return null; }
+}
 
 /** PURE: retain only current PR/head/label clocks, and emit at most one item per PR/head. */
 export function detectStalls({ prs, daemons = {}, seen = {}, now = Date.now(), settings = DETECTOR_DEFAULTS }) {
-  const items = new Map(), nextSeen = {}, errors = [];
+  const items = new Map(), nextSeen = {}, errors = [], failedPrKeys = [];
   if (!Array.isArray(prs)) return { items: [], nextSeen, errors: ['PR listing is not an array'] };
   for (const pr of prs) {
     try {
@@ -93,12 +103,15 @@ export function detectStalls({ prs, daemons = {}, seen = {}, now = Date.now(), s
       if (!Array.isArray(entries)) throw new Error('daemon signals are not an array');
       const groups = new Map(); let progress = -Infinity;
       for (const entry of entries) {
-        const at = typeof entry?.at === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(entry.at) ? Date.parse(entry.at) : NaN;
+        // Health refusals carry epoch milliseconds; log entries carry ISO dates (T or space separator).
+        const at = typeof entry?.at === 'number' ? entry.at
+          : typeof entry?.at === 'string' && /^\d{4}-\d{2}-\d{2}[T ]/.test(entry.at) ? Date.parse(entry.at) : NaN;
         if (!Number.isFinite(at) || !['progress', 'refusal', 'diagnostic'].includes(entry?.kind)) throw new Error('unreadable daemon timestamp or kind');
         if (entry.kind === 'progress') { progress = Math.max(progress, at); continue; }
         if (typeof entry.reason !== 'string') throw new Error('unreadable daemon reason');
-        const normalized = normalizeReason(entry.reason);
-        const group = groups.get(normalized) ?? { count: 0, first: at, last: at, raw: entry.reason.slice(0, 200) };
+        const reason = message(entry.reason);
+        const normalized = normalizeReason(reason);
+        const group = groups.get(normalized) ?? { count: 0, first: at, last: at, raw: reason };
         group.count++; group.first = Math.min(group.first, at); group.last = Math.max(group.last, at);
         groups.set(normalized, group);
       }
@@ -128,9 +141,9 @@ export function detectStalls({ prs, daemons = {}, seen = {}, now = Date.now(), s
         if (!items.has(id) || items.get(id).stalledMinutes < item.stalledMinutes) items.set(id, item);
       }
       Object.assign(nextSeen, clocks);
-    } catch (e) { errors.push(prError(pr, e)); }
+    } catch (e) { errors.push(prError(pr, e)); const key = failureKey(pr); if (key) failedPrKeys.push(key); }
   }
-  return { items: [...items.values()], nextSeen, errors };
+  return { items: [...items.values()], nextSeen, errors, failedPrKeys };
 }
 
 /** IO shell: read the blocking PRs' signals once and adapt collectOwnerSignals' prKey map. */
@@ -139,11 +152,11 @@ export async function runDetector({ prs, readSignals, seen = {}, now = Date.now(
   const { enabled } = resolved.value;
   const errors = [...resolved.errors];
   if (!enabled) return { enabled, items: [], nextSeen: seen, errors };
-  const filtered = [];
+  const filtered = [], failedPrKeys = [];
   if (!Array.isArray(prs)) errors.push('PR listing is not an array');
   for (const pr of Array.isArray(prs) ? prs : []) {
     try { if (identity(pr, resolved.value.blockingLabels).labels.some(l => resolved.value.blockingLabels.includes(l))) filtered.push(pr); }
-    catch (e) { errors.push(prError(pr, e)); }
+    catch (e) { errors.push(prError(pr, e)); const key = failureKey(pr); if (key) failedPrKeys.push(key); }
   }
   const daemons = {};
   try {
@@ -159,5 +172,5 @@ export async function runDetector({ prs, readSignals, seen = {}, now = Date.now(
     return { enabled, items: [], nextSeen: seen, errors };
   }
   const out = detectStalls({ prs: filtered, daemons, seen, now, settings: resolved.value });
-  return { ...out, enabled, errors: [...errors, ...out.errors] };
+  return { ...out, enabled, errors: [...errors, ...out.errors], failedPrKeys: [...failedPrKeys, ...out.failedPrKeys] };
 }
