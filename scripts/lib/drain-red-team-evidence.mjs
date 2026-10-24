@@ -69,6 +69,8 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // For local records, a changed birth time proves pid reuse. An unavailable birth time is unknown,
     // so preserve the conservative liveness probe (also supports records written before this field).
     // A queued pass is a live queue entry only while the job that queued it is alive (the same probe).
+    // The result is the bare status string or the compact result object that carries it.
+    const resultStatus = typeof status.result === 'string' ? status.result : status.result?.status;
     let live = false;
     if (['queued', 'running'].includes(status.status)) {
       if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
@@ -77,8 +79,8 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         live = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    return { loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
-      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(status.result), recorded: recorded || status.result === 'ran' };
+    return { status, loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const loopPayload = latestRun().run;
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
