@@ -3242,8 +3242,9 @@ export function sameGapSameHead(a, b) {
 
 /** Security is the category lens; unreadable findings cannot authorize a not-real clearance. */
 export function isSecurityClassFinding(f) {
-  const category = typeof f?.category === 'string' ? f.category.trim().toLowerCase() : '';
-  return !category || category.split('/')[0] === 'security';
+  // Match normalizeFindingIdentity's lens normalization, including an empty lens before '/'.
+  const lens = typeof f?.category === 'string' ? f.category.split('/')[0].trim().toLowerCase() : '';
+  return !lens || lens === 'security';
 }
 
 /** Latest same-head operator clearance of a sibling gap; security-class not-real rulings never inherit. PURE. */

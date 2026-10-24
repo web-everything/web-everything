@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  normalizeFinding, referralFindingKey, sameGapSameHead, isSecurityClassFinding, findSameHeadSiblingRuling, findCarriedReviewerRuling,
+  normalizeFinding, normalizeFindingIdentity, referralFindingKey, sameGapSameHead, isSecurityClassFinding, findSameHeadSiblingRuling, findCarriedReviewerRuling,
   validateReferralRecord, referralRecordState, mandatoryReferralReviewer, REFERRAL_CARRY_REASON,
   buildOperatorRulingComment, renderReferralRecord, readReferralRecords, mandatoryReferralState,
 } from '../jury-core.mjs';
@@ -239,6 +239,22 @@ describe('same-head operator matching and read-time validation', () => {
       expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
       const r = record([target], { carried: [carry(ruled, target)] });
       expect(referralRecordState(r, ctx).pending).toEqual([target.key]);
+    }
+  });
+  it.each([
+    'security /authz', ' Security \t/ authz ', 'security\n/authz', 'security\r\n/authz',
+    'security\u2028/authz', 'security\u00a0/authz', 'security\ufeff/authz',
+    '/authz', ' \t/authz',
+  ])('keeps security/empty lenses pending through serialized not-real carries: %j', category => {
+    const lens = normalizeFindingIdentity({ ...base, category }).lens;
+    expect(['security', 'unknown']).toContain(lens);
+    expect.soft(isSecurityClassFinding({ category })).toBe(true);
+    for (const source of [true, false]) {
+      const { ruled, ctx } = world(source ? { category } : {});
+      const target = referral('judgeSecurity', source ? {} : { category });
+      expect.soft(findSameHeadSiblingRuling(target, ctx)).toBeNull();
+      const saved = record([target], { runId: 'dest', carried: [carry(ruled, target)] });
+      expect.soft(serializedGate(ctx, saved).pending).toEqual([target.key]);
     }
   });
   it('recognizes a present non-security category', () => expect(isSecurityClassFinding({ category: ' Correctness ' })).toBe(false));
