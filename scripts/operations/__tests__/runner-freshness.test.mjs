@@ -91,6 +91,7 @@ describe('runner freshness policy', () => {
         "open-pr",
         "operator-session-bootstrap",
         "perf-snapshot",
+        "pr-digest",
         "pr-ownership",
         "pr-reconcile",
         "pr-status",
@@ -124,7 +125,7 @@ describe('runner freshness policy', () => {
         "why",
       ]
     `);
-    for (const name of ['close-items', 'reopen-items', 'graduate-chain', 'prototype-load']) {
+    for (const name of ['close-items', 'reopen-items', 'graduate-chain', 'prototype-load', 'pr-digest']) {
       expect(isReadOnlyOperation(resolveOperation(name).declaration), name).toBe(false);
     }
     for (const name of names) {
@@ -195,4 +196,9 @@ describe('runner freshness policy', () => {
   it('independent dispatch refusal remains authoritative', () => {
     expect(() => cliPreflight('dispatch-lane', { arm: () => {}, assertFresh: () => { throw new Error('dispatch refusal'); } })).toThrow('dispatch refusal');
   });
+});
+
+it('refuses a stale pr-digest runner because digest generation writes files', () => {
+  const f = fixture({ name: 'pr-digest', count: '4' });
+  expect(() => f.run()).toThrow();
 });
