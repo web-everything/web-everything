@@ -85,7 +85,7 @@ const OTHER = 3002; // an unrelated PR that is otherwise fully mergeable
  * @param {{ freeze?: 'env'|'legacy'|'both'|null, priorityPrs?: number[]|null, publishedRed?: boolean, holdSetting?: 'on'|'off'|null,
  *           fixMergeable?: string, unfreezeFirst?: boolean, dryRun?: boolean, stranded?: boolean, lateFreeze?: boolean }} o
  */
-function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdSetting = null, fixMergeable = 'MERGEABLE', unfreezeFirst = false, dryRun = false, stranded = false, lateFreeze = false, shared = null, markerKind = null, manualFix = 'hold' } = {}) {
+function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdSetting = null, fixMergeable = 'MERGEABLE', unfreezeFirst = false, dryRun = false, stranded = false, lateFreeze = false, shared = null, markerKind = null, manualFix = 'hold', cardGroup = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-rmh-'));
   try {
     const bin = join(dir, 'bin');
@@ -113,6 +113,9 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     if (freeze === 'sibling') { mkdirSync(dirname(siblingMarker), { recursive: true }); writeFileSync(siblingMarker, JSON.stringify(marker)); }
     if (freeze === 'both') writeFileSync(newMarker, JSON.stringify({ ...marker, reason: 'raised at the new path' }));
     if (priorityPrs) writeFileSync(join(coord, 'main-red-priority.json'), JSON.stringify({ repo: 'we', pr: priorityPrs[0], prs: priorityPrs, firstRedSha: 'abc1234567', expiresAt: FUTURE }));
+    // xym8nt4 — an open card group (combined #4000, awaiting review) that RESERVES the fix PR's card file.
+    if (cardGroup) writeFileSync(join(coord, 'drain-card-groups.json'), JSON.stringify({ groups: [{ id: 'g', repo: 'fixture/drain-rmh', pr: 4000,
+      branch: 'lane/card-group-g', createdAt: NOW, files: [`backlog/leaf-${FIX}.md`], sources: [{ num: 4001, headSha: 'sha-4001' }] }], failed: {} }));
     if (publishedRed) writeFileSync(join(coord, 'main-ci-red-state.json'), JSON.stringify({ red: true, firstRedSha: 'abc1234567', since: NOW - 60_000, setAt: NOW, expiresAt: FUTURE }));
     // The merge-queue/freshness hook is a separate gate (its own wiring test); with VITEST cleared the live ON file would
     // be read and refuse these fixture PRs (facts-incomplete), so pin it OFF to isolate the red-main hold.
@@ -163,6 +166,20 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
       migratedFrom: existsSync(newMarker) ? JSON.parse(readFileSync(newMarker, 'utf8')).migratedFrom ?? null : null, legacyMarker };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
+
+describe('xym8nt4 — a card group never deadlocks the published main-red repair PR (real drain CLI)', () => {
+  it('control: on green main the group reservation holds the PR touching its card', () => {
+    const { attempts, stderr, result } = runCli({ cardGroup: true });
+    expect(attempts, stderr).toEqual([OTHER]);
+    expect(result.enqueueOutcomes).toContainEqual(expect.objectContaining({ num: FIX, outcome: 'not-enqueued', kind: 'card-grouped',
+      reason: expect.stringMatching(/reserved by open card group #4000/) }));
+  }, 30000);
+
+  it('main red: the published fix PR lands although the group reserves its card; the unrelated PR stays held', () => {
+    const { attempts, stderr } = runCli({ publishedRed: true, priorityPrs: [FIX], cardGroup: true });
+    expect(attempts, stderr).toEqual([FIX]);
+  }, 30000);
+});
 
 describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-red-main-freeze)', () => {
   it('control: main not red → both PRs merge', () => {

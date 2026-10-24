@@ -132,7 +132,10 @@ import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } fro
 // #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
 // beside `latestRequiredCheck`) for why `collapseRollupToLatestPerName`/`rollupRowKind` now live in their own
 // dependency-free `./lib/rollup-collapse.mjs` rather than here.
-import { collapseRollupToLatestPerName, rollupRowKind } from './lib/rollup-collapse.mjs';
+import {
+  collapseRollupToLatestPerName, latestCheckNamed, isFailedCheckRow,
+  requiredCheckReadNeeded, requiredCheckRunsEndpoint, mergeRequiredCheckRuns,
+} from './lib/rollup-collapse.mjs';
 import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
@@ -199,6 +202,9 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // x2e120n — per-step pass timing ("why so slow", the resident drain daemon's history.jsonl carried only a
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
+import { createCardGrouping, runCardGroupPass } from './lib/card-group.mjs';
+import { readQueueFacts } from './lib/merge-queue-adaptive-batching.mjs';
+import { readQueueEntryFiles } from './lib/queue-file-overlap.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from './lib/drain-concurrency.mjs';
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
@@ -447,9 +453,7 @@ export function syncPrimaryOnLand({ exec, primary, hinted = false, isCwd = () =>
  */
 export function latestRequiredCheck(pr, requiredCheck = 'test') {
   if (pr?.requiredCheckReadError) return null;
-  const roll = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
-  const collapsed = collapseRollupToLatestPerName(roll);
-  return collapsed.find((c) => (c?.name || c?.context) === requiredCheck) || null;
+  return latestCheckNamed(pr?.statusCheckRollup, requiredCheck);
 }
 
 /**
@@ -476,32 +480,15 @@ export function isCodeQLFailed(pr) {
  * Read failures are unknown, not CI failures, and must be retried next pass.
  */
 export async function resolveRequiredCheck(pr, { repo = null, requiredCheck = 'test', exec = execFileP, onDeferred = () => {} } = {}) {
-  const rollup = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
-  if (!pr?.requiredCheckReadError && rollup.length < 100 && latestRequiredCheck(pr, requiredCheck)) return pr;
+  if (!requiredCheckReadNeeded(pr, requiredCheck)) return pr;
   const resolved = { ...pr };
   delete resolved.requiredCheckReadError;
   try {
     if (!pr?.headRefOid) throw new Error('PR head SHA is missing');
-    const endpoint = `repos/${repo || '{owner}/{repo}'}/commits/${encodeURIComponent(pr.headRefOid)}/check-runs?check_name=${encodeURIComponent(requiredCheck)}&filter=latest&per_page=100`;
-    const { stdout } = await exec('gh', ['api', endpoint, '--paginate', '--slurp'], {
+    const { stdout } = await exec('gh', ['api', requiredCheckRunsEndpoint(repo, pr.headRefOid, requiredCheck), '--paginate', '--slurp'], {
       encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
     });
-    const pages = JSON.parse(stdout);
-    if (!Array.isArray(pages) || !pages.length || pages.some((page) => !Array.isArray(page?.check_runs))) {
-      throw new Error('invalid check-runs response');
-    }
-    const runs = pages.flatMap((page) => page.check_runs);
-    if (runs.some((run) => run?.name !== requiredCheck || run.head_sha !== pr.headRefOid
-      || !Number.isSafeInteger(run.id) || run.id <= 0 || typeof run.status !== 'string')) {
-      throw new Error('invalid check-run evidence for the requested head/name');
-    }
-    // The REST read replaces only CheckRun evidence. A legacy commit status of the same name is a different
-    // source the check-runs endpoint never returns, so dropping it would delete the only verdict when the head
-    // has no check-run; it stays listed and `latestRequiredCheck` ranks any CheckRun above it.
-    resolved.statusCheckRollup = [
-      ...rollup.filter((row) => (row?.name || row?.context) !== requiredCheck || rollupRowKind(row) === 'StatusContext'),
-      ...runs.map((run) => ({ ...run, __typename: 'CheckRun', conclusion: run.status === 'completed' ? run.conclusion : null })),
-    ];
+    resolved.statusCheckRollup = mergeRequiredCheckRuns(pr, requiredCheck, stdout);
   } catch (error) {
     resolved.requiredCheckReadError = `required check "${requiredCheck}" direct read failed; deferred this pass: ${String(error.message || error).split('\n')[0]}`;
     onDeferred(resolved.requiredCheckReadError);
@@ -538,10 +525,7 @@ export function isRequiredCheckGreen(pr, requiredCheck = 'test') {
  *  is NOT failed — it reads as in-flight (`checking`), never `ci:failed`; only a check GitHub has actually
  *  concluded red counts. */
 export function isRequiredCheckFailed(pr, requiredCheck = 'test') {
-  const check = latestRequiredCheck(pr, requiredCheck);
-  if (!check) return false;
-  const concl = String(check.conclusion || check.state || '').toUpperCase();
-  return ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(concl);
+  return isFailedCheckRow(latestRequiredCheck(pr, requiredCheck));
 }
 
 /**
@@ -4638,8 +4622,21 @@ async function runCli() {
     onDeferred: (reason) => process.stderr.write(`  ⚠ ${repoTag(repo)}${pr.number} ${reason}\n`),
   });
   const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
-  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
+  // xym8nt4 — this pass's published main-red repair PRs (local numbers), always from the LIVE red-main signal
+  // (fast path, pass start, then the red-main hold below), never from a cached candidate. A card group never holds
+  // one, never shields it from rebase/repair, and dissolves when it needs the group's card: red main holds the
+  // combined PR, so either hold would deadlock both.
+  let passMainFix = new Set();
+  const isMainFix = (c) => isLocalRepo(c?.repo) && passMainFix.has(Number(c?.num));
+  const mainFixFrom = (sig) => new Set(sig?.red ? (sig.fixPrs || []).map(Number).filter(Number.isInteger) : []);
+  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
+  // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
+  const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
+    queueOwnsFreshness: () => mergeStrategy.queueOwnsFreshness(null),
+    withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }),
+    readQueue: () => readQueueFacts({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }),
+    readQueueFiles: () => readQueueEntryFiles({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }) });
   // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
   // head, so they are written per candidate only once an enqueue entry point CONFIRMS its merge or enqueue: the
   // cascade below and the green-event pre-stage shortcut both call this one recorder. The pass-start `decision` is
@@ -5071,6 +5068,7 @@ async function runCli() {
     const freeze = redMainBypass ? null : await readDrainFreezePass();
     const hold = redMainBypass ? null : drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: resolveRedMainHoldSetting().value === 'on' });
     const blocked = hold?.red && decideRedMainHold({ num: onlyPr, isLocal: true, signal: hold, setting: 'on' }).hold;
+    passMainFix = mainFixFrom(hold);
     const fast = blocked ? { fallback: true } : await enqueuePrestage({ cache: prestageCache, repo: localSlug, num: Number(onlyPr), settings: prestageSetting,
       readPr: async () => {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
@@ -5097,6 +5095,11 @@ async function runCli() {
     }
     process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
   }
+  // xym8nt4 — the repair PRs as of pass start, BEFORE the heal/rebase steps consult card-group membership (the
+  // red-main hold below refreshes it with the freeze applied). Records only: a manual freeze is re-read there.
+  passMainFix = !redMainBypass && resolveRedMainHoldSetting().value === 'on'
+    ? mainFixFrom(drainFreezeSignal({ state: {}, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: true }))
+    : new Set();
   // Keep listing, bare-loop and review-escalation policy on one fresh snapshot per pass.
   const workflowEditSetting = resolveDrainWorkflowEditHuman();
   process.stderr.write(`policy · drainWorkflowEditHuman=${workflowEditSetting.value} (${workflowEditSetting.source})\n`);
@@ -5398,6 +5401,7 @@ async function runCli() {
       // rebuild below (one rebuilt tip drops the manifest AND renumbers), so skip it here to avoid a double
       // rebuild. The standalone rebuild then only covers a collision-RED PR that is not a rebase-drop candidate.
       if (REBASE_DROP && isRebaseDropCandidate(v)) continue;
+      if (cardGrouping.inGroup(v)) continue; // xym8nt4 — never move a card group member's head
       if (DRY_RUN) {
         // Cheap detect only (no push) so the dry-run plan can flag a collision without mutating anything.
         const probe = healNnnCollision({ laneRef: v.headRef, base: 'origin/main', run: (cmd, args, opts) => (args[0] === 'push' || args[0] === 'commit-tree' || args[0] === 'update-index' || args[0] === 'write-tree' || args[0] === 'read-tree' || args[0] === 'hash-object' || args[0] === 'cat-file' ? { status: 0, stdout: '' } : gitRunner(cmd, args, opts)) });
@@ -5482,6 +5486,11 @@ async function runCli() {
       // landable but still CARRIES the manifest on its head (#2183 first-lander leak — a clean merge would
       // otherwise commit the transient file to `main`). Both cases route through the same plumbing.
       if (v.prestagePendingCi || (!isRebaseDropCandidate(v) && !needsManifestStripBeforeMerge(v))) continue;
+      // xym8nt4 — keep reviewed group heads stable. The queue owns combined-PR freshness; under direct merging,
+      // whole-pass reconciliation closes a BEHIND/DIRTY combined PR and releases its sources for ordinary repair.
+      // Wiring coverage: 'stale group freshness has an owner' exercises both strategies, roles and stale states.
+      // The manifest strip is never skipped: a member that still carries the transient manifest is rebuilt as before.
+      if (isLocalRepo(v.repo) && !needsManifestStripBeforeMerge(v) && cardGrouping.inGroup(v)) { if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} rebase skipped: in an open card group (drain.group)\n`); continue; }
       if (approvedHeadHold(v)) {
         const pr = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
         if (pr && mergeStrategy.queueOwnsFreshness(v.repo) && v.reason?.startsWith('merge state ')
@@ -6198,8 +6207,10 @@ async function runCli() {
     const holdSetting = resolveRedMainHoldSetting();
     const holdOn = holdSetting.value === 'on';
     const freeze = redMainBypass ? null : await readDrainFreezePass();
+    passMainFix = new Set(); // xym8nt4 — refreshed from this hold's own signal (the freeze applied)
     if (!redMainBypass && (holdOn || freeze.frozen)) {
       const sig = drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn });
+      passMainFix = mainFixFrom(sig);
       if (sig.red) {
         redMainHeld = true;
         let held = 0;
@@ -6535,6 +6546,12 @@ async function runCli() {
     c.decision = 'skip'; c.reason = 'pre-staged while required CI is pending — no enqueue';
     if (!skipped.includes(c)) skipped.push(c);
   }
+  // xym8nt4 — post-approval card grouping, BEFORE the cascade enqueues anything: every whole pass re-reads active
+  // groups (under any delivery strategy, so a switch to direct merging never strands a hold), then, under the merge
+  // queue, forms at most one new group from the planner's overlap waits and the PRs they yield to. The cascade's
+  // hold below then keeps every source out of the queue this same pass. Never throws.
+  runCardGroupPass({ grouping: cardGrouping, onlyPr, enqueues: mergeStrategy.enqueues(null), enqueueOutcomes, deferred: preparedPass.plan.deferred, verdicts,
+    mainFixNums: [...passMainFix], isLocalRepo });
   let deferred = [];
   if (DRY_RUN) {
     // Report the planned first-pass order (blockedBy + #2393 stackParents-honoured) without merging. Nothing has
@@ -6560,6 +6577,13 @@ async function runCli() {
     // dependents next pass (mirrors the lane-drain cascade). A merge FAILURE (red/behind) marks the PR `skip`
     // so it keeps blocking its dependents — never land past a broken blocker.
     let remaining = verdicts.map((v) => ({ ...v }));
+    // xym8nt4 — a source PR of a card group lands only through the combined PR.
+    for (const c of remaining.filter(v => v.decision === 'merge')) {
+      const grouped = cardGrouping.holdFor(c);
+      if (!grouped) continue;
+      c.decision = 'skip'; c.reason = grouped.reason;
+      enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...grouped });
+    }
     // #2257 — an item is unique per (repo, PR#): match/remove candidates on both so a WE #10 and a FUI #10 never
     // collide in the cascade bookkeeping.
     const sameCand = (a, b) => a.num === b.num && a.repo === b.repo;

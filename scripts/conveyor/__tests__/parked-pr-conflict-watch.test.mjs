@@ -4,7 +4,9 @@
  * mirroring `we:scripts/conveyor/__tests__/review-status-tag.test.mjs`'s own shape.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   CONFLICT_LABEL,
@@ -119,6 +121,84 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
     expect(calls[0][3]).toContain('lane/2412c-engine-tier-redteam-gate');
     expect(calls[1]).toEqual(['ensureLabel', 'web-everything/web-everything', CONFLICT_LABEL]);
     expect(calls[2]).toEqual(['setLabels', 'web-everything/web-everything', 1920, { add: CONFLICT_LABEL, remove: [] }]);
+  });
+
+  it('xym8nt4: an open card-group member (source or combined PR) is left to the drain grouping — no label, comment or send-back', () => {
+    const calls = [];
+    const provider = { ensureLabel: (...a) => calls.push(a), setLabels: (...a) => calls.push(a), postComment: (...a) => calls.push(a) };
+    const seen = [];
+    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'web-everything/web-everything', listPrs: () => [REAL_1920_SNAPSHOT], provider, ...noopRouting(),
+      inCardGroupFn: q => { seen.push(q); return true; } });
+    expect(results).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(seen[0]).toMatchObject({ num: 1920, headRef: REAL_1920_SNAPSHOT.headRefName });
+  });
+
+  it.each(['source', 'combined'])('default sweep resolves an omitted repo before the real group reader exempts a %s', role => {
+    const dir = mkdtempSync(join(tmpdir(), 'conflict-watch-group-'));
+    const statePath = join(dir, 'groups.json');
+    const branch = role === 'combined' ? 'lane/card-group-fixture' : REAL_1920_SNAPSHOT.headRefName;
+    writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'fixture', repo: 'resolved/repo',
+      pr: 2000, branch: 'lane/card-group-fixture', sources: [{ num: 1920 }] }] }));
+    vi.stubEnv('WE_DRAIN_CARD_GROUP_STATE', statePath);
+    try {
+      const provider = { currentRepo: vi.fn(() => 'resolved/repo'),
+        ensureLabel: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
+      const postFinding = vi.fn(), postStandDown = vi.fn();
+      const results = watchParkedPrConflicts({ repo: null, sameLineConflict: 'stand-down', provider,
+        postFinding, postStandDown, listPrs: () => [{ ...REAL_1920_SNAPSHOT,
+          number: role === 'combined' ? 2000 : 1920, headRefName: branch }] });
+      expect(results).toEqual([]);
+      expect(provider.currentRepo).toHaveBeenCalledTimes(1);
+      for (const effect of [provider.ensureLabel, provider.setLabels, provider.postComment, postFinding, postStandDown])
+        expect(effect).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['returns an empty string', () => ''],
+    ['returns null', () => null],
+    ['throws', () => { throw new Error('gh repo view: not a git repository'); }],
+  ])('xym8nt4: when the default repo cannot be resolved (currentRepo %s), every PR is held — fail closed, no effect', (_, currentRepo) => {
+    const provider = { currentRepo: vi.fn(currentRepo), ensureLabel: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
+    const postFinding = vi.fn(), postStandDown = vi.fn();
+    const inCardGroupFn = vi.fn(() => false);
+    const results = watchParkedPrConflicts({ repo: null, sameLineConflict: 'stand-down', provider, postFinding, postStandDown, inCardGroupFn,
+      listPrs: () => [REAL_1920_SNAPSHOT, { ...REAL_1920_SNAPSHOT, number: 1921 }] });
+    expect(results).toEqual([]);
+    for (const effect of [provider.ensureLabel, provider.setLabels, provider.postComment, postFinding, postStandDown])
+      expect(effect).not.toHaveBeenCalled();
+    // Group membership is never judged with an empty repository (that read always answers "not a member").
+    expect(inCardGroupFn).not.toHaveBeenCalled();
+    // One resolution attempt per sweep, not one per PR.
+    expect(provider.currentRepo).toHaveBeenCalledTimes(1);
+  });
+
+  it('xym8nt4: an unreadable card-group state (membership unknown) holds every PR — fail closed, no effect', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'conflict-watch-group-'));
+    const statePath = join(dir, 'groups.json');
+    writeFileSync(statePath, '{broken');
+    vi.stubEnv('WE_DRAIN_CARD_GROUP_STATE', statePath);
+    try {
+      const provider = { currentRepo: vi.fn(() => 'resolved/repo'), ensureLabel: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
+      const postFinding = vi.fn(), postStandDown = vi.fn();
+      const results = watchParkedPrConflicts({ repo: 'web-everything/web-everything', sameLineConflict: 'stand-down', provider, postFinding, postStandDown,
+        listPrs: () => [REAL_1920_SNAPSHOT] });
+      expect(results).toEqual([]);
+      for (const effect of [provider.ensureLabel, provider.setLabels, provider.postComment, postFinding, postStandDown])
+        expect(effect).not.toHaveBeenCalled();
+      // A readable state with no group lets the same PR through (the hold is only for "unknown").
+      writeFileSync(statePath, JSON.stringify({ groups: [], failed: {} }));
+      watchParkedPrConflicts({ repo: 'web-everything/web-everything', sameLineConflict: 'stand-down', provider, postFinding, postStandDown, ...noopRouting(),
+        listPrs: () => [REAL_1920_SNAPSHOT] });
+      expect(provider.setLabels).toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('once the PR is rebased clean (as #1920 actually was, mid-investigation) the label self-clears', () => {
@@ -869,7 +949,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     expect(CONFLICT_LABEL_META.description.length).toBeLessThanOrEqual(100);
   });
 
-  it('never calls currentRepo() when repo was already supplied, or when nothing needs a write', () => {
+  it('resolves repo once for ownership reads, but never for an explicit repo or empty sweep', () => {
     let currentRepoCalls = 0;
     const provider = fakeProvider();
     provider.currentRepo = () => { currentRepoCalls += 1; return 'should-not-be-used'; };
@@ -877,10 +957,12 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
     const listPrsA = () => [{ number: 1920, mergeable: 'CONFLICTING', labels: [{ name: 'review:human' }] }];
     watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: 'o/n', listPrs: listPrsA, provider, ...noopRouting() });
     expect(currentRepoCalls).toBe(0);
-    // Case 2: repo omitted, but nothing to write (already labelled) — no gh repo view call either.
+    // Case 2: even already-labelled PRs need a repo for the ownership read before routing.
     const listPrsB = () => [{ number: 1920, mergeable: 'CONFLICTING', labels: [{ name: 'review:human' }, { name: CONFLICT_LABEL }] }];
     watchParkedPrConflicts({ sameLineConflict: 'stand-down', repo: null, listPrs: listPrsB, provider, ...noopRouting() });
-    expect(currentRepoCalls).toBe(0);
+    expect(currentRepoCalls).toBe(1);
+    watchParkedPrConflicts({ repo: null, listPrs: () => [], provider });
+    expect(currentRepoCalls).toBe(1);
   });
 });
 

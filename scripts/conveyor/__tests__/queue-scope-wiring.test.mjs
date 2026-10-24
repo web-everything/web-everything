@@ -66,7 +66,8 @@ describe('parked-pr-conflict-watch', () => {
   const conflicting = (pr) => ({ ...pr, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', labels: [{ name: 'review:pending' }], files: [{ path: 'scripts/x.mjs' }] });
   const OPEN = [conflicting(MINE[0]), conflicting(THEIRS[0])];
   const run = (queueScope) => watchParkedPrConflicts({
-    listPrs: () => OPEN, dryRun: true, provider: {}, queueScope,
+    listPrs: () => OPEN, dryRun: true,
+    provider: { currentRepo: () => 'web-everything/web-everything' }, queueScope,
   });
 
   it('UNSCOPED: labels the unrelated conflicted PR too', () => {

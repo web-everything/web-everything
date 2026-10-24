@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { unlandableStateReason } from '../../merge-ai-prs.mjs';
 import { buildSkipReasons, classifySkipReason, formatSkipSummary, formatSkipReasonsLine } from '../drain-skip-reasons.mjs';
+import { cardGroupHold } from '../card-group.mjs';
 
 describe('drain skip reasons (card 122 slice 1)', () => {
   it('a pass with 3 ready PRs, 1 landed and 2 skipped for different reasons, lists both reasons', () => {
@@ -20,6 +21,17 @@ describe('drain skip reasons (card 122 slice 1)', () => {
     expect(rows.map((r) => [r.num, r.kind])).toEqual([[102, 'unknown-mergeability'], [103, 'couple-held']]);
     expect(formatSkipSummary(rows)).toBe('skipped 2: #102 unknown-mergeability, #103 couple-held');
     expect(JSON.parse(formatSkipReasonsLine(rows).split('skip-reasons: ')[1])).toEqual(rows);
+  });
+  it('xym8nt4: every card-group hold reason cardGroupHold emits classifies as card-grouped (all four)', () => {
+    const state = { groups: [{ id: 'g', repo: 'o/r', pr: 9, files: ['backlog/1-a.md'], sources: [{ num: 5 }] }] };
+    const reasons = [
+      cardGroupHold(state, { num: 5, localSlug: 'o/r' }),                                   // a source
+      cardGroupHold(state, { num: 7, localSlug: 'o/r', files: ['backlog/1-a.md'] }),       // a reserved card
+      cardGroupHold({ unreadable: true }, { num: 7, localSlug: 'o/r' }),                    // unreadable state
+      cardGroupHold(state, { num: 5, repo: '', localSlug: '' }),                            // repository identity missing
+    ].map(h => h?.reason);
+    expect(reasons.every(Boolean)).toBe(true);
+    for (const r of reasons) expect(classifySkipReason(r), r).toBe('card-grouped');
   });
   it('classifies the common drain reasons', () => {
     expect(classifySkipReason('merge state BEHIND (BEHIND⇒needs rebase, DIRTY/BLOCKED/DRAFT⇒not landable) — left for its author')).toBe('behind');

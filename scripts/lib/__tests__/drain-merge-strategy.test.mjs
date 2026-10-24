@@ -11,6 +11,8 @@ import {
 } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
+// Load the renderer during collection: its cold import graph must not consume a gate assertion's timeout.
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { publishAttention } from '../../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../under-test.mjs';
 
@@ -25,7 +27,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline } = {}) {
+function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline, strategyExtra = {} } = {}) {
   const calls = [];
   const logs = [];
   let stored = initial;
@@ -68,6 +70,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const readFile = () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); };
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
+    ...strategyExtra,
     dryRun, env, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
@@ -96,6 +99,32 @@ describe('drain merge strategy — drain-direct (default) is unchanged', () => {
 });
 
 describe('drain merge strategy — github-merge-queue', () => {
+  it('xym8nt4: a card-group source is deferred as card-grouped and never reaches the enqueue mutation', () => {
+    const { s, calls } = harness({ strategy: 'github-merge-queue', strategyExtra: {
+      cardGroupHold: c => (c.num === 42 ? { kind: 'card-grouped', reason: 'grouped into #9 (lands with it; drain.group)' } : null) } });
+    const r = s.enqueue({ num: 42, repo: null }, HEAD, { comments: [] });
+    expect(r).toMatchObject({ enqueued: false, deferred: true, kind: 'card-grouped' });
+    expect(calls.some(c => c.join(' ').includes('enqueuePullRequest'))).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it('xym8nt4: the published main-red repair PR is never deferred by a card group (the real default hold)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dms-card-group-'));
+    try {
+      const statePath = join(dir, 'groups.json');
+      writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: LOCAL, pr: 77, files: ['backlog/5360-prevention-card.md'], sources: [{ num: 5, headSha: HEAD }] }], failed: {} }));
+      const env = { ...process.env, WE_DRAIN_CARD_GROUP_STATE: statePath };
+      const repair = { num: 99, repo: null, listedFilesComplete: true, listedFiles: ['backlog/5360-prevention-card.md'] };
+      // Main green: held. A cached candidate still carrying an old repair flag is held all the same.
+      const held = harness({ strategy: 'github-merge-queue', env });
+      expect(held.s.enqueue(repair, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true, kind: 'card-grouped' });
+      expect(held.s.enqueue({ ...repair, redMainFixPr: true }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deferred: true, kind: 'card-grouped' });
+      // Main red with #99 the published repair (the drain's live signal): never deferred by the group.
+      const fix = harness({ strategy: 'github-merge-queue', env, strategyExtra: { isMainFix: c => c.num === 99 && c.repo == null } });
+      expect(fix.s.enqueue(repair, HEAD, { comments: [] })).not.toMatchObject({ kind: 'card-grouped' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('enqueues only the local repo PRs (sibling-repo impl halves stay direct)', () => {
     const { s } = harness({ strategy: 'github-merge-queue' });
     expect(s.enqueues(null)).toBe(true);
@@ -612,8 +641,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [result] })).toMatchObject({ enqueued: true });
     expect(h.calls.some(c => c.includes('--add-label') && c.includes('red-team:clear'))).toBe(true);
   });
-  it.each([false, true])('holds a confirmed break before the gate acts (scheduled=%s)', async scheduled => {
-    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+  it.each([false, true])('holds a confirmed break before the gate acts (scheduled=%s)', scheduled => {
     const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
       pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
       findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
@@ -645,7 +673,6 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
   });
   it('a real round-cap record followed by the clear-human renderer releases admission before retry backoff', async () => {
     const { applyRedTeamGate } = await import('../../operations/red-team-gate-apply.mjs');
-    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
     const { buildVerdictComment } = await import('../../review-set-label.mjs');
     const { CONFIRMED_BREAKS_DEFAULTS } = await import('../red-team-gate.mjs');
     const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
@@ -673,7 +700,6 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     ['mixed #5460', ['degraded', 'broken'], 5, false],
   ])('follows the real gate disposition: %s', async (_name, impacts, round, enqueued) => {
     const { applyRedTeamGate } = await import('../../operations/red-team-gate-apply.mjs');
-    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
     const { CONFIRMED_BREAKS_DEFAULTS } = await import('../red-team-gate.mjs');
     const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
       pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
@@ -1216,7 +1242,6 @@ describe('drain pre-stage queue admission', () => {
     const prepared = s.prestage(c, HEAD);
     expect(prepared.allowed).toBe(true);
     if (variant === 'break') {
-      const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
       comments.push({ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
         pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
         findings: [{ summary: 'new break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }],

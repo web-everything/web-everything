@@ -1058,6 +1058,8 @@
   "scripts/conveyor/soak/breaks/builder-prepare-starved-phantom-scope.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/builder-round-bound.soak.test.mjs": 8.72,
   "scripts/conveyor/soak/breaks/capped-compare-scope-never-trusted.soak.test.mjs": 27.55,
+  "scripts/conveyor/soak/breaks/card-group-default-repo-conflict-watch.soak.test.mjs": 52.98,
+  "scripts/conveyor/soak/breaks/card-group-unresolved-repo-conflict-watch.soak.test.mjs": 53.01,
   "scripts/conveyor/soak/breaks/card-only-timeout-never-rerun-and-heal-budget-burned.soak.test.mjs": 2.76,
   "scripts/conveyor/soak/breaks/ci-heal-acquire-false-escalation.soak.test.mjs": 2.66,
   "scripts/conveyor/soak/breaks/ci-heal-empty-scope.soak.test.mjs": 72.92,
