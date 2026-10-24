@@ -53,6 +53,15 @@ describe('review-job red-team skip settlement', () => {
       .toEqual([result]);
   });
 
+  it.each(['deferredByGuard', 'deferredByCap'])('summary does not preserve contradictory policy provenance with %s', flag => {
+    const f = fixture({ status: 'skipped', policy: 'card-only', [flag]: true });
+    f.io.settleRedTeamSkip.mockReturnValue({ outcome: 'non-policy' });
+    const out = runReviewJob({ repo, pr }, f.io);
+    expect(out.redTeam).toMatchObject({ status: 'skipped', [flag]: true, outcome: 'non-policy' });
+    expect(out.redTeam).not.toHaveProperty('policy');
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
+  });
+
   it.each([true, false])('real persisted skip survives drain reads and recovery admission (policy=%s)', cardOnly => {
     const root = mkdtempSync(join(tmpdir(), 'skip-provenance-'));
     const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: '1', WE_RED_TEAM_STATUS_LABELS: '0' };
@@ -217,7 +226,7 @@ describe('review-job red-team skip settlement', () => {
   });
 
   it.each([
-    { status: 'not-owed' }, { status: 'not-owed', deferredByGuard: true },
+    { status: 'not-owed' },
   ])('not-owed outcome does not settle or publish needs-you: %j', redTeam => {
     const f = fixture(redTeam);
     runReviewJob({ repo, pr }, f.io);
@@ -226,6 +235,10 @@ describe('review-job red-team skip settlement', () => {
   });
 
   it.each([
+    { status: 'not-owed', deferredByGuard: true, reason: 'scorecard store unreadable' },
+    { status: 'not-owed', deferredByCap: true, reason: 'cap exhausted' },
+    { status: 'skipped', policy: 'card-only', deferredByGuard: true },
+    { status: 'skipped', policy: 'card-only', deferredByCap: true },
     { status: 'deferred', reason: 'budget unavailable' },
     { status: 'deferred-by-budget', reason: 'daily quota exhausted' },
     { status: 'skipped', deferredByCap: true, reason: 'cap exhausted' },
@@ -257,6 +270,52 @@ describe('review-job red-team skip settlement', () => {
       expect(publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
       expect(postComment).not.toHaveBeenCalled();
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { status: 'resumed', comment: { status: { toString: null } } },
+    { status: 'ran', findings: {} },
+    { status: 'ran', findings: [null] },
+  ])('malformed result settles once without a comment and preserves finished status and gate: %j', redTeam => {
+    for (const redTeamOnly of [false, true]) {
+      const root = mkdtempSync(join(tmpdir(), 'review-malformed-result-'));
+      const postComment = vi.fn(), publishNeedsYou = vi.fn();
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const f = fixture(redTeam);
+          f.io.settleRedTeamSkip.mockImplementation(input => {
+            f.events.push('settle');
+            return settleRedTeamSkip({ ...input, comments: [], io: {
+              env: { WE_SHARED_RUNS_DIR: join(root, 'runs') }, postComment, publishNeedsYou,
+            } });
+          });
+          let out;
+          expect(() => { out = runReviewJob({ repo, pr, redTeamOnly }, f.io); }).not.toThrow();
+          expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
+          expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({
+            redTeam: { status: 'unpublished', reason: `red team ${redTeam.status} but its result comment is unknown` },
+          }));
+          expect(out.redTeam.outcome).toBe('non-policy');
+          expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
+          expect(f.io.redTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ status: 'finished' }));
+          expect(out.redTeamGate.status).toBe('ok');
+        }
+        expect(postComment).not.toHaveBeenCalled();
+        expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    }
+  });
+
+  it('throwing red-team diagnostic logger still settles and writes finished status before the gate', () => {
+    const f = fixture();
+    f.io.log.mockImplementation(line => {
+      if (line.includes(': red team —')) throw Error('logger unavailable');
+    });
+    const out = runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
+    expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
+    expect(f.io.redTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ status: 'finished' }));
+    expect(out.redTeamGate.status).toBe('ok');
   });
 
   it('throwing settlement and logger still write finished status and run the gate', () => {

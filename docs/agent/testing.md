@@ -102,9 +102,14 @@ prevents dispatch, except a finished `skipped` status with `skipCardOnly === tru
 stored card-only net read with non-empty trimmed `diffText` and `netBasis.rev` matching the status head: that historical gap dispatches fresh to settle the skip. A structured result with an absent policy or any policy other than `card-only` never heals; legacy string `skipped` remains eligible.
 The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head; admission treats the validated historical card-only skip as fresh while retaining the seat-row and comment guards. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying.
 
-Settlement runs for skipped, error, disabled and unknown outcomes before the finished status write and gate in both normal and red-team-only jobs. Budget/guard deferrals (including `deferredByCap` and `deferredByGuard`) also reach non-policy settlement. Only not-owed and completed (`ran`/`resumed`) outcomes with a `posted` or `deduped` result comment bypass settlement. Completed outcomes with any other or missing comment status settle as `unpublished`, with reason `red team <status> but its result comment is <comment status or unknown>` through the same sanitized, bounded needs-you path; they never post a result comment or clear.
+Settlement runs for skipped, error, disabled and unknown outcomes before the finished status write and gate in both normal and red-team-only jobs. Budget/guard deferrals (including `deferredByCap` and `deferredByGuard`) also reach non-policy settlement. Only plain not-owed (without a truthy guard/cap deferral flag) and completed (`ran`/`resumed`) outcomes with a `posted` or `deduped` result comment bypass settlement. Completed outcomes with any other or missing comment status settle as `unpublished`, with reason `red team <status> but its result comment is <comment status or unknown>` through the same sanitized, bounded needs-you path; they never post a result comment or clear.
 The persisted `skipCardOnly` boolean records the writer's resolved setting; consumers must still classify the stored net read, so a `.mjs` code diff remains owed. Settlement exception diagnostics cannot abort the finished status write or gate even if the logger throws.
-Only structured `status: 'skipped', policy: 'card-only'` with a real 40-hex `readHead`
+Contain summary construction, seat diagnostics and unpublished-comment reason coercion too: malformed
+findings or an unstringifiable comment status must still reach settlement and preserve the finished
+status write and gate. Coerce diagnostic values with `String()` inside a catch boundary, using `unknown`
+for an unreadable comment status; retain the original completed status when summary rows fail.
+Only structured `status: 'skipped', policy: 'card-only'` without any truthy `deferredByGuard`
+or `deferredByCap` flag, with a real 40-hex `readHead`
 (the loop read's `netBasis.rev`) matching the settlement head case-insensitively produces a trusted,
 head-bound zero-finding result comment. An absent, invalid or mismatched read head publishes
 needs-you with reason `policy skip head not bound to the reviewed read`. Reason strings never grant clearance. Other skips and failed policy comment posts
@@ -124,7 +129,7 @@ Regression mapping (one representative assertion per guarantee; names are in the
 - Production comment and feed effects: **production settlement posts marker via gh argv/body and publishes real needs-you**.
 - Budget/guard deferrals escalate once per head/reason without posting a result: **unfinished publication or deferral publishes needs-you once without a result comment: %j**.
 - Finished but unpublished results escalate once without posting or clearing: **unfinished publication or deferral publishes needs-you once without a result comment: %j**.
-- Not-owed results bypass settlement: **not-owed outcome does not settle or publish needs-you: %j**.
+- Plain not-owed results bypass settlement: **not-owed outcome does not settle or publish needs-you: %j**.
 - Writer setting never classifies a code PR as card-only: **never exempts a code read from speculation, recovery guards or an owed pending label**.
 - A throwing settlement logger preserves finished status and gate: **throwing settlement and logger still write finished status and run the gate**.
 - Unreadable record metadata cannot block pending retries: **unreadable pending metadata is quarantined without blocking a valid pending record**.
@@ -152,6 +157,8 @@ Regression mapping (one representative assertion per guarantee; names are in the
 - Parse failures quarantine pending evidence: **unparseable pending evidence is quarantined and cannot prevent current settlement**.
 - Retry bound and overflow fallback: **flushes at most 25 pending records and leaves overflow for the next settlement**.
 - Crash cleanup avoids duplicates: **already-published pending records are removed without republication**.
+- Contradictory policy/deferral evidence fails closed and deduplicates escalation: **policy with contradictory %s=%j fails closed and notifies once**.
+- Malformed completed results retain settlement, finished status and gate: **malformed result settles once without a comment and preserves finished status and gate: %j**.
 - Malformed diagnostics cannot abort settlement: **malformed reason cannot prevent settlement or throw (redTeamOnly=%s)**.
 - Finished status preserves provenance: **persists skip provenance and keeps other outcomes as strings: %j**.
 - Persisted recovery honors policy: **real persisted skip survives drain reads and recovery admission (policy=%s)**.

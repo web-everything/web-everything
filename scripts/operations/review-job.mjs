@@ -88,7 +88,7 @@ import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, bu
 import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../lib/review-red-team-on-skip.mjs';
-import { isRealHead, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
+import { classifyRedTeamSkip, isRealHead, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
@@ -685,10 +685,10 @@ export function summarizeRedTeam(r) {
   if (!r || typeof r !== 'object') return null;
   return {
     status: r.status ?? null,
-    ...(r.deferredByCap === true ? { deferredByCap: true } : {}),
-    ...(r.deferredByGuard === true ? { deferredByGuard: true } : {}),
+    ...(r.deferredByCap ? { deferredByCap: true } : {}),
+    ...(r.deferredByGuard ? { deferredByGuard: true } : {}),
     ...(r.reason ? { reason: r.reason } : {}),
-    ...(r.status === 'skipped' && r.policy === 'card-only' ? { policy: 'card-only' } : {}),
+    ...(classifyRedTeamSkip(r).kind === 'policy' ? { policy: 'card-only' } : {}),
     ...(r.status === 'ran' ? {
       provider: r.provider, model: r.model, seatStatus: r.seat?.status ?? null, foldedVerdict: r.foldedVerdict ?? null,
       recheckStatus: r.recheckStatus ?? null, confirmedMissCount: r.confirmedMissCount ?? 0,
@@ -799,21 +799,35 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       }
     }
     if (out.redTeamSpeculative) delete out.redTeamSpeculative.result;
+    // Diagnostic formatting must never prevent settlement, the finished write or the gate.
+    // String coercion can itself throw for malformed JSON objects such as { toString: null }.
+    const diagnosticText = (value, fallback) => {
+      try { return String(value ?? fallback); } catch { return fallback; }
+    };
+    let settlementOutcome = { status: 'error', reason: 'malformed red-team outcome' };
+    let bypassSettlement = false;
+    out.redTeam = settlementOutcome;
     try {
-      io.log(`review-job ${out.sessionSlug}: red team — ${redTeam?.status ?? 'none'}${redTeam?.reason ? ` (${redTeam.reason})` : ''}`
-        + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
-    } catch { /* malformed diagnostics cannot prevent skip settlement */ }
-    recordSeats(redTeam?.seat ? [redTeam.seat] : []);
-    out.redTeam = summarizeRedTeam(redTeam);
-    const completed = ['ran', 'resumed'].includes(redTeam?.status);
-    const visibleResult = ['posted', 'deduped'].includes(redTeam?.comment?.status);
-    // Only not-owed or a completed pass with a visible result bypasses settlement.
-    // Budget/guard deferrals and finished-but-unpublished passes still need an operator.
-    const settlementOutcome = completed && !visibleResult
-      ? { status: 'unpublished', reason: `red team ${redTeam.status} but its result comment is ${redTeam.comment?.status ?? 'unknown'}` }
-      : redTeam;
-    if (redTeam?.status !== 'not-owed' && !(completed && visibleResult)
-      && typeof io.settleRedTeamSkip === 'function') {
+      const status = redTeam?.status;
+      const completed = ['ran', 'resumed'].includes(status);
+      const visibleResult = ['posted', 'deduped'].includes(redTeam?.comment?.status);
+      // Plain not-owed is exempt; contradictory guard/cap evidence requires an operator.
+      const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
+      bypassSettlement = (status === 'not-owed' && !deferred) || (completed && visibleResult);
+      settlementOutcome = completed && !visibleResult
+        ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}` }
+        : redTeam;
+      // Retain status/deferral evidence even when detailed summary rows are malformed.
+      out.redTeam = { status: typeof status === 'string' ? status : 'error',
+        ...(redTeam?.deferredByGuard ? { deferredByGuard: true } : {}),
+        ...(redTeam?.deferredByCap ? { deferredByCap: true } : {}) };
+      try { out.redTeam = summarizeRedTeam(redTeam); }
+      catch { /* malformed findings must not suppress settlement or erase retry evidence */ }
+      recordSeats(redTeam?.seat ? [redTeam.seat] : []);
+      io.log(`review-job ${out.sessionSlug}: red team — ${diagnosticText(status, 'none')}${redTeam?.reason ? ` (${diagnosticText(redTeam.reason, 'unknown')})` : ''}`
+        + `${status === 'ran' ? `: ${diagnosticText(redTeam.findings?.length, '0')} break(s), ${diagnosticText(redTeam.confirmedMissCount, '0')} confirmed, comment ${diagnosticText(redTeam.comment?.status, '-')}` : ''}`);
+    } catch { /* malformed diagnostics cannot prevent settlement */ }
+    if (!bypassSettlement && typeof io.settleRedTeamSkip === 'function') {
       try {
         const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
         const readHead = isRealHead(rev) ? rev : null;

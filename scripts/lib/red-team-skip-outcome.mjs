@@ -34,6 +34,7 @@ export function classifyRedTeamSkip(redTeam) {
   const reason = valid && typeof redTeam.reason === 'string' && redTeam.reason.trim()
     ? redTeam.reason : 'unknown red-team outcome';
   return { kind: valid && redTeam.status === 'skipped' && redTeam.policy === 'card-only'
+    && !redTeam.deferredByGuard && !redTeam.deferredByCap
     ? 'policy' : 'non-policy', reason };
 }
 

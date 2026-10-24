@@ -39,6 +39,17 @@ function pendingRecord(input, reason, attemptId) {
 }
 
 describe('red-team skip pre-review regressions', () => {
+  it.each(['deferredByGuard', 'deferredByCap'].flatMap(flag =>
+    [true, 1, 'yes', {}].map(value => [flag, value])))('policy with contradictory %s=%j fails closed and notifies once', (flag, value) => {
+    const f = fixture();
+    const redTeam = { status: 'skipped', policy: 'card-only', [flag]: value };
+    expect(classifyRedTeamSkip(redTeam).kind).toBe('non-policy');
+    expect(f.settle(redTeam).outcome).toBe('non-policy');
+    expect(f.settle(redTeam).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
+  });
+
   it('pending retry re-sanitizes and bounds reason and title before publication', () => {
     const f = fixture();
     const { name, item } = pendingRecord(f.input, 'x'.repeat(80));
