@@ -550,8 +550,6 @@ if (!resolvedGate && typeof flags.gate === 'string') {
 SELECTION = summarizeSelection({ gate: resolvedGate, explicitGate: typeof flags.gate === 'string' });
 if (DISPATCHED_RUN && MODE === 'verify') process.stderr.write(`${selectionNotice({ sha: headSha, summary: SELECTION })}\n`);
 
-// Only ordinary verify may substitute the remote gate. Custom commands retain their exact local meaning.
-// Read-only/request/run/remote modes never probe the queue or dispatch a workflow.
 if (MODE === 'verify') {
   let tool;
   try { tool = JSON.parse(readFileSync(new URL('./settings/remote-route.json', import.meta.url), 'utf8')); } catch { /* no tool override */ }
@@ -562,8 +560,7 @@ if (MODE === 'verify') {
   const remotePassed = await autoRouteVerify({ settings, eligible: flags.gate === undefined,
     mode: resolvedGate?.decision?.mode === 'full' ? 'full' : 'lane-check',
     readQueue: () => JSON.parse(execFileSync(process.execPath, ['scripts/readiness/heavy-admission.mjs', 'queue-status', '--json'], {
-        cwd: REPO, encoding: 'utf8', timeout: 15000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
-      })),
+      cwd: REPO, encoding: 'utf8', timeout: 15000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })),
     readLoad: () => loadavg()[0],
     readiness: () => {
       const ready = remoteIO(REPO).ready();

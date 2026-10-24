@@ -2,16 +2,10 @@
 
 ## Remote verification routing
 
-Plain `scripts/verify-lane.mjs verify` routes remotely when the projected wait (lane checks) or heavy wait (full checks) exceeds `thresholdMinutes`, or one-minute host load exceeds `loadCap`.
-Remote routing requires a clean tree and HEAD pushed to a GitHub origin branch; unknown queue/load/readiness evidence or any dispatch, polling or marker-import failure falls back to the local gate.
-Explicit `--gate` commands stay local; `request`, `run`, `check`, `reset`, dry-run and `remote` never auto-dispatch.
-`remoteRoute` resolves standard → platform preferences → `scripts/settings/remote-route.json` → environment; defaults: `thresholdMinutes: 10`, `loadCap: 36`, `enabled: true`.
-Override with `WE_REMOTE_ROUTE_THRESHOLD_MINUTES`, `WE_REMOTE_ROUTE_LOAD_CAP`; opt out with `WE_REMOTE_ROUTE=off`.
-Invalid numeric environment bounds visibly fall back to standard values; an unknown enable setting disables routing. `verify-lane route:` reports the reason, effective settings and provenance on stderr.
+Plain `scripts/verify-lane.mjs verify` routes remotely when the projected wait (lane checks) or heavy wait (full checks) exceeds `thresholdMinutes`, or one-minute host load exceeds `loadCap`. Remote routing requires a clean tree and HEAD pushed to a GitHub origin branch; unknown queue/load/readiness evidence or any dispatch, polling or marker-import failure falls back to the local gate.
+Explicit `--gate` commands stay local; `request`, `run`, `check`, `reset`, dry-run and `remote` never auto-dispatch. `remoteRoute` resolves standard → platform preferences → `scripts/settings/remote-route.json` → environment; defaults: `thresholdMinutes: 10`, `loadCap: 36`, `enabled: true`. Override with `WE_REMOTE_ROUTE_THRESHOLD_MINUTES`, `WE_REMOTE_ROUTE_LOAD_CAP`; opt out with `WE_REMOTE_ROUTE=off`. Invalid numeric environment bounds visibly fall back to standard values; an unknown enable setting disables routing. `verify-lane route:` reports the reason, effective settings and provenance on stderr.
 
-`scripts/remote-test.mjs --ref <branch-or-SHA> --mode <lane-check|full|targeted>` dispatches the workflow; targeted requires exactly one of `--tests=<files>` or `--operation <name>` and never records a marker.
-Only a new exact-HEAD dispatch matching the requested inputs may count; unavailable or incomplete evidence leaves local verification as the fallback.
-Green lane/full results import markers through `node scripts/verify-lane.mjs remote`, which rechecks the successful required job.
+`scripts/remote-test.mjs --ref <branch-or-SHA> --mode <lane-check|full|targeted>` dispatches the workflow; targeted requires exactly one of `--tests=<files>` or `--operation <name>` and never records a marker. Only a new exact-HEAD dispatch matching the requested inputs may count; unavailable or incomplete evidence leaves local verification as the fallback. Green lane/full results import markers through `node scripts/verify-lane.mjs remote`, which rechecks the successful required job.
 Test through heavy admission: `remote-route.test.mjs`, `remote-test-cli.test.mjs`, `remote-verify.test.mjs`, `lane-verify.test.mjs`.
 
 ## Daemon entry boot smoke

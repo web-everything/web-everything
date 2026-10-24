@@ -1,8 +1,6 @@
-/** Pure routing decisions: unknown evidence always retains the local gate. */
 export const ROUTE_DEFAULTS = Object.freeze({ thresholdMinutes: 10, loadCap: 36, enabled: true });
 const bound = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 export const cleanRouteText = value => String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ');
-
 export function decideRoute(options = {}) {
   const local = reason => ({ path: 'local', reason });
   if (!['lane-check', 'full', 'targeted'].includes(options.mode)) return local('unavailable mode or targeted ref');
@@ -17,7 +15,6 @@ export function decideRoute(options = {}) {
   if (wait > options.thresholdMinutes) return { path: 'remote', reason: 'queue wait exceeds threshold' };
   return local('tiny runs are faster locally');
 }
-
 export function resolveRouteSettings(env = {}, cascadeDefaults = {}) {
   const settings = { ...ROUTE_DEFAULTS, source: {} };
   for (const key of Object.keys(ROUTE_DEFAULTS)) {
@@ -34,13 +31,10 @@ export function resolveRouteSettings(env = {}, cascadeDefaults = {}) {
   }
   return settings;
 }
-
 export function formatRouteLog(decision, settings) {
   return cleanRouteText(`verify-lane route: ${decision.path} — ${decision.reason}; ` +
     Object.keys(ROUTE_DEFAULTS).map(key => `${key}=${settings[key]} (${settings.source[key]})`).join(', '));
 }
-
-/** IO boundary for verify only. False means the caller must still run its local gate. */
 export async function autoRouteVerify({ settings, mode, eligible = true, readQueue, readLoad, readiness, remote, log }) {
   let decision = { path: 'local', reason: settings.enabled ? 'explicit gate requires local verification' : 'remote routing disabled' };
   let ref;
@@ -50,7 +44,6 @@ export async function autoRouteVerify({ settings, mode, eligible = true, readQue
       const load1 = await readLoad();
       const evidence = { ...settings, projectedWaitMinutes: queue.projectedWaitMinutes,
         heavyWaitMinutes: queue.heavyWaitMinutes, load1, mode };
-      // Avoid network probes when the queue already says to stay local.
       decision = decideRoute({ ...evidence, remoteReady: true });
       if (decision.path === 'remote') {
         let remoteReady;
