@@ -572,7 +572,7 @@ export function dispatchReview({
   // referenced `settingsEnv` — so no review session ever got `--settings`, and (after the earlier follow-up)
   // no review session ever got `<root>/.claude/settings.local.json` either. Every review 401 traced back to
   // this: the shim was simply never on `PATH`, at all, for any review dispatch, since before this fix
-  // existed. NEVER throws — see `resolveGhShimSettingsEnv`'s own contract.
+  // existed. Throws only a daemon's gh-guard refusal — see `resolveGhShimSettingsEnv`'s own contract.
   resolveSettingsEnv = resolveGhShimSettingsEnv,
   // #4174 — same two seams `createDispatchSinks` takes: WHERE this session's cwd is (a scratch directory,
   // never `root` itself) and making that directory real.

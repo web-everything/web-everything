@@ -35,6 +35,7 @@ import { nodeRuntimeEnv } from './node-runtime-env.mjs';
 import { seedLaneDependencies } from './dependencies.mjs';
 import { writeFixtureNpm } from './npm-shim.mjs';
 import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
+import { createHash } from 'node:crypto';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
@@ -329,6 +330,9 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // reject-cache the same way.
     WE_DAEMON_STATE_DIR: join(root, 'daemon-self-sync-state'),
     GH_TOKEN: 'sim-token-1',
+    // The fake GitHub's synthetic credential represents an App token. Keep the daemon guard active;
+    // a different/revoked credential must still fail the fake server's auth checks.
+    WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update('sim-token-1').digest('hex'),
     // tuning knobs, pinned short so a real failure surfaces fast instead of the suite waiting out production
     // defaults (bounded-child.mjs#CHILD_TIMEOUT_ENV, lane-pool.mjs's own list-cache/scan-timeout env vars).
     WE_CHILD_TIMEOUT_MS: '20000',

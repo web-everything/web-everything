@@ -42,13 +42,16 @@ export function parseGitAlternates(text) {
  * (reachable objects could be removed or redirected outside the validated store), or a per-ref
  * `gc.<pattern>.reflogExpire[Unreachable]` (it overrides the generic keys the gc pins to `never`, so reflog-only work
  * could expire and be pruned).
- * @param {{dir: string, poolRoot: string, realDir?: string, realGitDir?: string, lease?: object|null, nowMs: number,
+ * Under a claim, pass `claimHolder`: the real `lease` must then be that holder's marker (absent, unreadable or another
+ * holder's → refused as a lost claim; ours but past its TTL → refused as expired), and only then is the marker read
+ * as ours rather than as a live lease.
+ * @param {{dir: string, poolRoot: string, realDir?: string, realGitDir?: string, lease?: object|null, claimHolder?: string, nowMs: number,
  *   realCommonDir?: string, realObjectsDir?: string, ttlMs?: number, locks?: string[], borrowers?: string[],
  *   gcHooks?: string[], gcRepackFilters?: string[], gcReflogPatterns?: string[], configHooks?: string[], refStorage?: string[], symlinkedGitPaths?: string[]}} o  `realCommonDir`/`realObjectsDir` = resolved `git rev-parse --git-common-dir` and
  *   `<git dir>/objects`: a `commondir` file or symlinked object store would redirect the cleanup into another repo.
  * @returns {{ok: true} | {ok: false, reason: string}}
  */
-export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCommonDir, realObjectsDir, symlinkedGitPaths = [], lease = null, nowMs, ttlMs, locks = [], borrowers = [], gcHooks = [], gcRepackFilters = [], gcReflogPatterns = [], configHooks = [], refStorage = [] }) {
+export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCommonDir, realObjectsDir, symlinkedGitPaths = [], lease = null, claimHolder, nowMs, ttlMs, locks = [], borrowers = [], gcHooks = [], gcRepackFilters = [], gcReflogPatterns = [], configHooks = [], refStorage = [] }) {
   const root = String(poolRoot || '').replace(/\/+$/, '');
   const rel = String(dir || '').startsWith(`${root}/`) ? String(dir).slice(root.length + 1) : null;
   const m = rel && /^([^/]+)\/lane-(\d+)\/?$/.exec(rel);
@@ -61,10 +64,14 @@ export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCom
   if (realObjectsDir !== undefined && realObjectsDir !== `${clean}/.git/objects`) return { ok: false, reason: `object store is redirected (${realObjectsDir})` };
   // git's config/ref writers follow symlinks, so a symlinked .git/config (or refs store) would write into another repo.
   if (symlinkedGitPaths.length) return { ok: false, reason: `symlinked git paths (${symlinkedGitPaths.join(', ')})` };
-  if (lease && !isLeaseStale(lease, nowMs, ttlMs)) {
+  if (claimHolder !== undefined) {
+    if (!claimHolder || lease?.holder !== claimHolder) return { ok: false, reason: 'claim lost (lease marker is no longer ours)' };
+    // Our marker past its TTL reads as free to lane-pool, so another acquirer may already be working the lane.
+    if (isLeaseStale(lease, nowMs, ttlMs)) return { ok: false, reason: 'claim expired (our lease marker is past its TTL)' };
+  } else if (lease && !isLeaseStale(lease, nowMs, ttlMs)) {
     return { ok: false, reason: lease.reserved ? 'reserved lease' : `live lease (${lease.purpose || lease.holder || lease.ownerSession || 'unknown holder'})` };
   }
-  if (lease) return { ok: false, reason: 'stale lease marker present (lane-pool reclaims it; the cleanup only claims an absent marker)' };
+  else if (lease) return { ok: false, reason: 'stale lease marker present (lane-pool reclaims it; the cleanup only claims an absent marker)' };
   if (locks.length) return { ok: false, reason: `git lock present (${locks.join(', ')})` };
   if (borrowers.length) return { ok: false, reason: `objects borrowed by ${borrowers.join(', ')}` };
   if (gcHooks.length) return { ok: false, reason: 'gc.recentObjectsHook configured (gc would run it)' };

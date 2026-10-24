@@ -18,10 +18,20 @@
  *     760299").
  *   - `main-push`: informational. `git push` to protected `main` uses the operator's SSH key, not a gh token.
  *
+ * `ghAuth.personalFallback` is a separate cascade: default (daemon refuse, interactive allow)
+ * → platform `ghAuth` → tool `ghAuth` → `WE_GH_AUTH_PERSONAL_FALLBACK`. It does not change github.*.
+ * The shim applies this guard only to daemon callers and reports the effective source.
+ *
  * Never throws: unreadable settings fall back to the default.
  */
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
+
+/** PURE, inlined into the standalone gh shim (`gh-app-shim.mjs`). The one test for "this process is a daemon". */
+export function isDaemonCaller(env = {}) {
+  return Boolean(env.WE_GH_DAEMON_CALLER)
+    || /^(com\.we\.|com\.plateau\.)/.test(String(env.XPC_SERVICE_NAME || ''));
+}
 
 export const GITHUB_AUTH_MODES = Object.freeze(['app', 'personal']);
 export const GITHUB_AUTH_DEFAULTS = Object.freeze({ auth: 'app', personalExceptions: Object.freeze({}) });
@@ -83,4 +93,27 @@ export function readGithubAuthPolicy({ env = process.env, read = readSettings } 
     cachedPlatform = platform;
   }
   return resolveAndLog({ platform: cachedPlatform, tool: cachedTool, env });
+}
+
+/** Personal-auth fallback is independent of github.auth. Only daemon callers are restricted. PURE. */
+export function resolveGhAuthPolicy({ daemon = false, platform = {}, tool = {}, env = {} } = {}) {
+  let personalFallback = daemon ? 'refuse' : 'allow';
+  let source = 'default';
+  for (const [name, layer] of [['platform', platform], ['tool', tool]]) {
+    if (['refuse', 'allow'].includes(layer?.personalFallback)) {
+      personalFallback = layer.personalFallback;
+      source = name;
+    }
+  }
+  const override = String(env.WE_GH_AUTH_PERSONAL_FALLBACK ?? '').trim().toLowerCase();
+  if (['refuse', 'allow'].includes(override)) { personalFallback = override; source = 'env'; }
+  return { personalFallback, source: { personalFallback: source } };
+}
+
+/** Resolve the separate ghAuth namespace; existing github.* policy remains unchanged. */
+export function readGhAuthPolicy({ daemon = false, env = process.env, read = readSettings, readFile } = {}) {
+  let tool = {};
+  try { tool = read()?.ghAuth ?? {}; } catch { /* default */ }
+  const platform = platformPreference('ghAuth', readFile ? { env, readFile } : { env }) ?? {};
+  return resolveGhAuthPolicy({ daemon, platform, tool, env });
 }

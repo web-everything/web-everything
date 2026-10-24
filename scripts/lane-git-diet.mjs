@@ -18,8 +18,9 @@
  *      acquirer sees a live lease and moves on, and we never act on a lane someone else just took; before any write
  *      the marker is re-read (still ours?) and every eligibility input is re-checked;
  *   1. apply the diet config (negative `^refs/heads/ops/*` refspec + unpackLimit=1);
- *   2. delete the stale `refs/remotes/origin/ops/*` tracking refs (readers re-fetch them explicitly by name);
- *   3. `git repack -A -d -l --unpack-unreachable=never` (no cruft pack), a re-check of the claim and
+ *   2. delete the stale `refs/remotes/origin/ops/*` tracking refs (readers re-fetch them explicitly by name), except
+ *      any a symbolic ref points at (the lane's HEAD, a linked worktree's HEAD or refs, any other symref): kept, reported;
+ *   3. a re-check of the claim and every input, then `git repack -A -d -l --unpack-unreachable=never` (no cruft pack), a re-check of the claim and
  *      every input, then `git prune --expire=<1.hour.ago>`: only objects unreachable from every ref, reflog, index
  *      and HEAD, and older than the grace window, are dropped (the old ledger blobs);
  *   4. drop the claim marker (only if it is still ours).
@@ -155,6 +156,19 @@ const auditGitDir = (dir) => {
   visit('');
   return { symlinkedGitPaths: links, locks };
 };
+// Every ref a symbolic ref points at, seen from the lane's own git dir and from each linked worktree's (its HEAD,
+// root refs and per-worktree refs). Each hop is read unresolved, so every ref along a chain (HEAD → ops/a → ops/b) is
+// kept. Ref names hold no whitespace, so one per line is exact. Any read failure throws: lane error row.
+const symrefTargets = (dir) => {
+  let ids = [];
+  try { ids = readdirSync(join(dir, '.git', 'worktrees')); } catch (err) { if (!['ENOENT', 'ENOTDIR'].includes(err.code)) throw err; }
+  const targets = new Set();
+  for (const gitDir of [join(dir, '.git'), ...ids.map((id) => join(dir, '.git', 'worktrees', id))]) {
+    try { targets.add(git(dir, [`--git-dir=${gitDir}`, 'symbolic-ref', '-q', '--no-recurse', 'HEAD']).trim()); } catch (e) { if (e.status !== 1) throw e; } // 1: detached
+    for (const t of git(dir, [`--git-dir=${gitDir}`, 'for-each-ref', '--include-root-refs', '--format=%(symref)']).split('\n')) if (t) targets.add(t);
+  }
+  return targets;
+};
 // Never trimmed: a common dir `<lane>/.git ` must not read as the lane's own `.git`. Unreadable → null → refused.
 const commonDir = (dir) => { try { return real(gitPath(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir'])); } catch { return null; } };
 
@@ -169,8 +183,8 @@ const eligible = (dir) => {
     refStorage: realGitDir ? refStorage(dir) : [],
   });
 };
-// Every eligibility input re-read while we hold the claim (our own marker is the lease, so `lease: null`).
-const recheckUnderClaim = (dir) => cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: null, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir), gcReflogPatterns: gcReflogPatterns(dir), configHooks: configHooks(dir), refStorage: refStorage(dir) });
+// Every eligibility input re-read while we hold the claim, ownership first: the real marker must still be ours.
+const recheckUnderClaim = (dir, holder) => cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: readLease(dir), claimHolder: holder, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir), gcReflogPatterns: gcReflogPatterns(dir), configHooks: configHooks(dir), refStorage: refStorage(dir) });
 
 // O_EXCL claim, same marker shape as `lane-pool` (so `acquire` reads it as a live lease and skips the lane).
 function claim(dir) {
@@ -223,14 +237,16 @@ for (const n of lanes) {
     if (!holder) { rows.push({ lane: n, skipped: 'lost the claim race (someone took the lane)' }); continue; }
     try {
       testPause('after-claim');
-      // Re-read ownership before any write: a marker rewritten or removed by another holder means the claim is lost.
-      if (readLease(dir)?.holder !== holder) { rows.push({ lane: n, skipped: 'claim lost (lease marker is no longer ours)' }); continue; }
-      const recheck = recheckUnderClaim(dir);
-      if (!recheck.ok) { rows.push({ lane: n, skipped: recheck.reason }); continue; }
+      // Measure and read first, so the ownership check sits right before the writes: a marker rewritten or removed by
+      // another holder means the claim is lost.
       const before = duBytes(join(dir, '.git'));
+      const pinned = symrefTargets(dir);
+      const recheck = recheckUnderClaim(dir, holder);
+      if (!recheck.ok) { rows.push({ lane: n, skipped: recheck.reason }); continue; }
       const applied = applyLaneDietConfig((args) => git(dir, args));
       const refsNow = opsRefs(dir);
-      for (const ref of refsNow) git(dir, ['update-ref', '--no-deref', '-d', ref]);
+      const kept = refsNow.filter((ref) => pinned.has(ref));
+      for (const ref of refsNow) if (!pinned.has(ref)) git(dir, ['update-ref', '--no-deref', '-d', ref]);
       // Re-scan borrowers right before pruning: a repo that started borrowing this lane's objects since startup
       // would lose them to gc. (Lane-pool clones `--reference` the primary, never a lane, so this is the anomaly path.)
       // TEST SEAM (honoured only under vitest): simulate a borrower appearing mid-run, after the startup scan.
@@ -245,7 +261,7 @@ for (const n of lanes) {
       // Re-audit right before pruning too: a ref transaction prepared since the recheck holds a `*.lock` naming
       // objects gc would otherwise drop.
       testPause('before-gc');
-      const late = recheckUnderClaim(dir);
+      const late = recheckUnderClaim(dir, holder);
       if (!late.ok) { rows.push({ lane: n, skipped: `${late.reason} (config + ref cleanup done, gc skipped)` }); continue; }
       // Two steps, so the walk that decides what to delete starts seconds after the last audit, not after a long
       // repack: unreachable objects stay or become loose (no cruft pack, which `git prune` cannot expire), then the
@@ -256,16 +272,16 @@ for (const n of lanes) {
       // index, destroying its HEAD-only reachability root. Repack expires neither worktree metadata nor reflogs.
       git(dir, ['repack', '-A', '-d', '-l', '--unpack-unreachable=never', '--quiet'], GC_TIMEOUT_MS);
       testPause('before-prune');
-      if (readLease(dir)?.holder !== holder) { rows.push({ lane: n, skipped: 'claim lost (lease marker is no longer ours) (repack done, prune skipped)' }); continue; }
-      const final = recheckUnderClaim(dir);
-      if (!final.ok) { rows.push({ lane: n, skipped: `${final.reason} (repack done, prune skipped)` }); continue; }
+      // The borrower scan walks every scan root, so it runs first and the claim recheck sits right before prune.
       const finalBorrowers = borrowerMap().get(real(join(dir, '.git', 'objects'))) || [];
       if (finalBorrowers.length) { rows.push({ lane: n, skipped: `objects borrowed by ${finalBorrowers.join(', ')} (repack done, prune skipped)` }); continue; }
+      const final = recheckUnderClaim(dir, holder);
+      if (!final.ok) { rows.push({ lane: n, skipped: `${final.reason} (repack done, prune skipped)` }); continue; }
       git(dir, ['prune', `--expire=${PRUNE_EXPIRE}`], GC_TIMEOUT_MS);
       const after = duBytes(join(dir, '.git'));
       const freed = before - after;
       total += Number.isFinite(freed) ? freed : 0;
-      rows.push({ lane: n, mode: 'apply', configOps: applied.length, opsRefsDeleted: refsNow.length, beforeBytes: before, afterBytes: after, freedBytes: freed });
+      rows.push({ lane: n, mode: 'apply', configOps: applied.length, opsRefsDeleted: refsNow.length - kept.length, opsRefsKept: kept, beforeBytes: before, afterBytes: after, freedBytes: freed });
     } finally {
       unclaim(dir, holder);
     }
@@ -282,7 +298,7 @@ if (flags.json) {
     if (r.skipped) process.stdout.write(`lane-${r.lane}: SKIP ${r.skipped}\n`);
     else if (r.error) process.stdout.write(`lane-${r.lane}: ERROR ${r.error}\n`);
     else if (r.mode === 'dry-run') process.stdout.write(`lane-${r.lane}: ~${formatBytes(r.projectedBytes)} potentially reclaimable (${r.loose} loose objects, ${r.packs} packs, ${r.opsRefs} ops refs)\n`);
-    else process.stdout.write(`lane-${r.lane}: ${formatBytes(r.beforeBytes)} -> ${formatBytes(r.afterBytes)} (freed ${formatBytes(r.freedBytes)}) [${r.configOps} config ops, ${r.opsRefsDeleted} ops refs deleted]\n`);
+    else process.stdout.write(`lane-${r.lane}: ${formatBytes(r.beforeBytes)} -> ${formatBytes(r.afterBytes)} (freed ${formatBytes(r.freedBytes)}) [${r.configOps} config ops, ${r.opsRefsDeleted} ops refs deleted${r.opsRefsKept.length ? `, kept as symbolic-ref targets: ${r.opsRefsKept.join(', ')}` : ''}]\n`);
   }
   const counted = rows.filter((r) => !r.skipped && !r.error).length;
   process.stdout.write(`${APPLY ? 'freed' : 'projected (estimate)'}: ${formatBytes(total)} across ${counted} lane(s); skipped ${rows.filter((r) => r.skipped).length}, errors ${rows.filter((r) => r.error).length}\n`);

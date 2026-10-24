@@ -8,6 +8,7 @@
  *   Drives the REAL CLI entrypoint (`runCli` is not exported — it only runs under the `IS_CLI` guard), with a
  *   fake `gh` on PATH so no network/real `gh` is touched, following the `review-set-label.test.mjs` shim pattern.
  */
+import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
@@ -59,7 +60,7 @@ describe('merge-ai-prs CLI — #3383 gh-error exit code split from the dup-id tr
   const runCli = (extraEnv = {}) => spawnSync('node', [script, '--this-repo', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
     cwd: repoDir,
     encoding: 'utf8',
-    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`,
+    env: { ...process.env, ...daemonAppEnv(repoDir), PATH: `${shimDir}:${process.env.PATH}`,
       WE_GH_THROTTLE_LOCK_ROOT: join(repoDir, `throttle-${randomUUID()}`),
       WE_GH_THROTTLE_GH_BIN: join(shimDir, 'gh'), WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1', ...extraEnv },
   });
