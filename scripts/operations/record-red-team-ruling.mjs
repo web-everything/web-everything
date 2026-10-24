@@ -17,11 +17,23 @@ import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
 import { GATE_OUTCOMES, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { sanitizeCardField } from '../lib/review-loop-policy.mjs';
+import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
 
 export const RECORD_RED_TEAM_RULING_OP = 'record-red-team-ruling';
 export const RED_TEAM_RULINGS = Object.freeze(['card']);
 export const RED_TEAM_RULING_CARD_EFFECT = 'github.red-team-ruling-card';
 export const OPERATOR_CARD_OUTCOME = 'operator-card';
+
+/** Refuse lossy landing bounds before posting a pending intent. Include escaping expansion in the budget. */
+export function assertRulingCardInputFits(input) {
+  for (const field of ['digest', 'scope']) {
+    const text = boundCardText(input[field], Number.MAX_SAFE_INTEGER,
+      { singleLine: field === 'scope', escapeWikiLinks: field !== 'scope' });
+    if (!text.trim() || text.length > CARD_TEXT_CAPS[field]) {
+      throw new Error(`automatic card landing ${field} exceeds its limit or is empty; select a smaller --break group or file the complete findings manually and cite --card`);
+    }
+  }
+}
 
 /** The bare intent marker written BEFORE the card job is spawned: it has no action line, so the break stays held. */
 export const CARD_PENDING_OUTCOME = 'card-pending';
@@ -154,6 +166,9 @@ export function planRedTeamRuling(read, input) {
   }
   const cardInput = buildRedTeamCardInput({ repo: input.repo, pr, head, findings: selected });
   cardInput.digest += `\n\nOperator ruling (${base.actor} via ${base.channel}): carded. Reason: ${sanitizeCardField(reason, 600)}`;
+  // No-file findings remain rulable with --card. An empty automatic filing scope
+  // must be refused here, before a pending intent can strand the ruling.
+  assertRulingCardInputFits(cardInput);
   const jobKey = cardJobKey(base);
   const pending = conflictingPendingCardJobs(comments, { pr, head, resultId: state.resultId, jobKey, indices: base.indices });
   if (pending.length) {

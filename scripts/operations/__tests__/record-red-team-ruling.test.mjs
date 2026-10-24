@@ -6,13 +6,15 @@ import { join } from 'node:path';
 import { createActionStore } from '../action-store.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
-import { planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
+import { assertRulingCardInputFits, planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { runCardLandingWithReceipt, createRecordRedTeamRulingSinks, spawnStableCardJob } from '../record-red-team-ruling-io.mjs';
 import { cardJobKey, conflictingPendingCardJobs, rulingCardResource } from '../record-red-team-ruling.mjs';
 import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
 import { parseAdvisories, trustedAdvisoryComments } from '../../lib/advisory-labels.mjs';
+import { parseLandPreventionCardArgv, runLandPreventionCardCli } from '../land-prevention-card.mjs';
+import { parseFilingItems, planDedupe } from '../../lib/card-dedupe.mjs';
 
 const repo = 'o/r';
 const PR = 5530;
@@ -313,6 +315,114 @@ describe('automatic card filing with shared durable claims', () => {
     expect(p.cardInput.digest).toContain('card it, ship the PR');
     expect(p.cardInput.scope).toContain('backlog/x.md');
   });
+  const landingArgv = p => {
+    let captured;
+    spawnStableCardJob(p.cardInput, p.session, {}, {
+      resolveSettingsEnv: () => null,
+      spawnDetached: argv => { captured = argv.slice(3); return { pid: 4242 }; },
+    });
+    return captured;
+  };
+  it('refuses twelve oversized findings before an intent or child can be created', () => {
+    const findings = Array.from({ length: 12 }, (_, i) => ({
+      summary: `UNIQUE_BREAK_${i + 1} ${'s'.repeat(580)}`, scenario: 'c'.repeat(600),
+      file: `scripts/break-${i + 1}.mjs`, line: 1, category: 'edge-case',
+      impactIfUnfixed: 'broken', confirmedByRecheck: true,
+    }));
+    expect(() => payloadFor({ break: findings.map((_, i) => i + 1).join(',') }, [redTeam(HEAD, findings), capped()]))
+      .toThrow(/landing.*digest.*limit.*smaller.*--card/i);
+  });
+  it('refuses automatic no-file findings before dispatch and permits the explicit --card recovery', () => {
+    const comments = [redTeam(HEAD, [{ summary: 'No-file confirmed break', scenario: 'repository-wide failure',
+      file: null, line: null, category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }]), capped()];
+    expect(() => payloadFor({}, comments)).toThrow(/landing scope.*empty.*--card/);
+    expect(planRedTeamRuling(read({ comments }), input({ repo }))).toMatchObject({ cardRef: CARD, indices: [1] });
+  });
+  it.each([
+    ['digest', 'x'.repeat(8001)], ['scope', 'we:a,'.repeat(401)],
+    ['digest', '[['.repeat(2700)], ['digest', '<!--'.repeat(1200)],
+  ])('refuses landing truncation of %s after sanitization', (field, text) => {
+    expect(() => assertRulingCardInputFits({ digest: 'one finding', scope: 'we:a.mjs', [field]: text }))
+      .toThrow(/landing.*limit.*smaller.*--card/i);
+  });
+  it('preserves a digest exactly at the landing limit through the spawn adapter and parser', () => {
+    const p = payloadFor();
+    p.cardInput.digest = 'x'.repeat(8000);
+    expect(parseLandPreventionCardArgv(landingArgv(p)).digest).toBe(p.cardInput.digest);
+  });
+  it.each(['done', 'held', 'batched', 'mentioned'].flatMap(step =>
+    ['present', 'removed during reason', 'landed on main'].map(evidence => ({ step, evidence }))))(
+    'dedupe rechecks every backing card for a $step receipt ($evidence), including retries', async ({ step, evidence }) => {
+    const initial = two(), p = payloadFor({ break: '1,2' }, initial), lane = root();
+    const existing = { id: 'xoldone', status: 'open', rel: 'backlog/xoldone-card.md', host: { pr: 111 },
+      items: parseFilingItems(p.cardInput.digest).slice(0, step === 'mentioned' ? 2 : 1) };
+    const dedupe = input => planDedupe({ input, cards: [existing], policy: { dedupe: true, similarity: 1 } });
+    expect(dedupe(p.cardInput).action).toBe(step === 'mentioned' ? 'mention' : 'partial');
+    let existingReadable = true;
+    const f = fake({ initial, changeAfterReason: () => { if (evidence === 'removed during reason') existingReadable = false; },
+      resolveCard: ref => ({ ref, readable: !ref.includes('xoldone')
+        || (existingReadable && !(evidence === 'landed on main' && ref.endsWith('@pr111'))) }) });
+    f.act(p);
+    const filedDigests = [];
+    const landed = await runCardLandingWithReceipt(f.cards[0], landingArgv(p), {
+      actions: f.actions, dedupe,
+      land: (args, deps = {}) => runLandPreventionCardCli(args, {
+        ...deps, dedupe: deps.dedupe ?? dedupe, write: () => {}, writeErr: () => {},
+        pendingDir: join(lane, 'pending'), mkTmp: () => lane, rmTmp: () => {}, writeFile: () => {},
+        readFile: () => '---\nstatus: open\n---\n# Card\n',
+        batch: async () => step === 'done' ? { disabled: true } : step === 'batched' ? { batched: true, batchRef: 'batch' } : { reason: 'paused' },
+        loadPreventionBatchSettings: () => ({ batchLeaseWaitMinutes: 0 }),
+        exec: (_cmd, args) => {
+          if (args.includes('acquire')) return JSON.stringify({ lane: 1, path: lane });
+          if (args.includes('file-item')) {
+            filedDigests.push(args.find(a => a.startsWith('--digest=')).slice(9));
+            return JSON.stringify({ verdict: { rel: result.rel } });
+          }
+          if (args.includes('open-pr')) return JSON.stringify({ findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 222 } }] } } });
+          if (args.includes('verify')) return JSON.stringify({ verdict: { ok: true } });
+          return '';
+        },
+      }),
+    });
+    expect(landed).toMatchObject({ code: 0, result: { step, rel: step === 'mentioned' ? null : result.rel } });
+    expect(filedDigests).toHaveLength(step === 'mentioned' ? 0 : 1);
+    if (step !== 'mentioned') {
+      expect(filedDigests[0]).not.toContain('we:a.mjs');
+      expect(filedDigests[0]).toContain('we:b.mjs');
+    }
+    if (evidence === 'removed during reason') {
+      for (let retry = 0; retry < 2; retry++) expect(() => f.act(p)).toThrow(/no release record written/);
+      expect(heldAfter(f.comments)).toHaveLength(2);
+    } else {
+      expect(f.act(p)).toMatchObject({ card: { reconciled: true } });
+      expect(heldAfter(f.comments)).toEqual([]);
+    }
+    expect(f.cards).toHaveLength(1);
+  });
+  it.each(['done', 'held', 'batched'])('legacy %s receipts with unknown dedupe coverage stay held without respawning', async step => {
+    const f = fake(), p = payloadFor(); f.act(p);
+    await f.complete({ code: 0, result: { ...result, step } });
+    const row = f.actions.read(rulingCardResource(p), 1);
+    delete row.evidence.backingCards;
+    delete row.evidence.dedupeMatches;
+    writeFileSync(f.actions.pathFor(row.resource, row.attempt), JSON.stringify(row));
+    expect(() => f.act(p)).toThrow(/no release record written.*recover the owed card/);
+    expect(f.cards).toHaveLength(1);
+    expect(heldAfter(f.comments)).toHaveLength(1);
+  });
+  it.each([
+    { backingCards: [], dedupeMatches: 1 },
+    { backingCards: [{ rel: 'backlog/xoldone-card.md', pr: '111' }], dedupeMatches: 1 },
+    { backingCards: [{ rel: '../bad.md', pr: 111 }], dedupeMatches: 1 },
+  ])('incomplete or malformed backing-card inventory cannot release: %j', async inventory => {
+    const f = fake(), p = payloadFor(); f.act(p); await f.complete();
+    const row = f.actions.read(rulingCardResource(p), 1);
+    Object.assign(row.evidence, inventory);
+    writeFileSync(f.actions.pathFor(row.resource, row.attempt), JSON.stringify(row));
+    expect(() => f.act(p)).toThrow(/no release record written/);
+    expect(heldAfter(f.comments)).toHaveLength(1);
+    expect(f.cards).toHaveLength(1);
+  });
   it('spawnStableCardJob passes the receipt binding and overrides the random session in detached argv', () => {
     const p = payloadFor(), calls = [];
     const binding = { resource: rulingCardResource(p), attempt: 1, ownerToken: 'owner',
@@ -535,7 +645,7 @@ describe('automatic card filing with shared durable claims', () => {
     f.actions.claim = request => {
       const r = f.actions.read(rulingCardResource(p), 1);
       expect(f.actions.transition(r.resource, r.attempt, { token: r.ownerToken, rev: r.rev, from: 'observed', to: 'terminal',
-        patch: { outcome: 'settled', evidence: { ...r.evidence, at: Date.now(), result,
+        patch: { outcome: 'settled', evidence: { ...r.evidence, at: Date.now(), result, backingCards: [], dedupeMatches: 0,
           card: { session: p.session, ref: `we:${result.rel}` } } } }).ok).toBe(true);
       return original(request);
     };
@@ -970,7 +1080,7 @@ describe('automatic card filing with shared durable claims', () => {
     f.actions.claim = request => {
       const r = f.actions.read(rulingCardResource(p), 1);
       expect(f.actions.transition(r.resource, r.attempt, { token: r.ownerToken, rev: r.rev, from: 'observed', to: 'terminal',
-        patch: { outcome: 'settled', evidence: { ...r.evidence, at: Date.now(), result: { ...result, step: 'done' },
+        patch: { outcome: 'settled', evidence: { ...r.evidence, at: Date.now(), result: { ...result, step: 'done' }, backingCards: [], dedupeMatches: 0,
           card: { session: p.session, ref: `we:${result.rel}` } } } }).ok).toBe(true);
       return claim(request);
     };

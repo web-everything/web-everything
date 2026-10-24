@@ -21,7 +21,8 @@ import { buildGateComment } from './red-team-gate-apply.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
-import { CARD_PENDING_OUTCOME, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, rulableBreaks } from './record-red-team-ruling.mjs';
+import { runCardDedupe, runLandPreventionCardCli } from './land-prevention-card.mjs';
+import { assertRulingCardInputFits, CARD_PENDING_OUTCOME, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, rulableBreaks } from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
@@ -127,6 +128,7 @@ const completion = (r, p) => bound(r, p) && r.state === 'terminal' && r.outcome 
 
 /** Spawn the landing job under a STABLE session, so the job (and its log) is identified by the ruling, not by a fresh random slug. */
 export const spawnStableCardJob = (input, session, binding, { spawnDetached = defaultSpawnDetached, resolveSettingsEnv } = {}) => {
+  assertRulingCardInputFits(input);
   const logPath = preventionCardLandingLogPath(session);
   const r = spawnPreventionLandingJob(input, { resolveSettingsEnv, sessionPrefix: 'red-team-ruling-card',
     spawnDetached: (argv, o) => spawnDetached([fileURLToPath(import.meta.url), '--land-card-receipt',
@@ -212,6 +214,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         proveReleased(p, 'the operator-card record', record);
         return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
       }
+      assertRulingCardInputFits(p.cardInput);
       const pending = conflictingPendingCardJobs(comments, p);
       if (pending.length) throw new Error(`a different card job (${pending.map((j) => j.jobKey).join(', ')}) is already pending for an overlapping break; nothing written — re-run with that exact selection`);
       const session = p.session, resource = rulingCardResource(p);
@@ -280,18 +283,22 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
       const result = r.evidence.result, ref = landingRef(result);
       let readable = false;
       try {
+        const readableRef = reference => {
+          try {
+            const current = resolveCard(reference, { repo: p.repo, pr: p.pr, head: p.head });
+            return current?.readable === true && current.ref === reference;
+          } catch { return false; }
+        };
+        const readableCard = card => {
+          const reference = landingRef(card);
+          if (!reference) return false;
+          const exact = Number.isInteger(card.pr) && card.pr > 0 ? `${reference}@pr${card.pr}` : reference;
+          return readableRef(exact) || (exact !== reference && readableRef(reference));
+        };
         if (ref) {
-          const exact = Number.isInteger(result.pr) && result.pr > 0 ? `${ref}@pr${result.pr}` : ref;
-          const readableRef = reference => {
-            try {
-              const current = resolveCard(reference, { repo: p.repo, pr: p.pr, head: p.head });
-              return current?.readable === true && current.ref === reference;
-            } catch { return false; }
-          };
-          readable = readableRef(exact);
           // JIT numbering can remove the receipt's provisional path from its PR head.
           // Main's fresh resolver validates that same card through its landed bornAs identity.
-          if (!readable && exact !== ref) readable = readableRef(ref);
+          readable = readableCard(result);
           if (!readable && result.step === 'held') {
             const id = /^backlog\/([^/-]+)-[^/]+\.md$/.exec(result.rel)?.[1];
             if (id) {
@@ -301,6 +308,16 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
             }
           }
         }
+        // The new card can contain only the unmatched findings. Receipts predating this
+        // inventory cannot prove coverage (held/batched results even omit the mention count).
+        // Keep the whole selection held if ANY backing card has disappeared.
+        const backing = r.evidence.backingCards;
+        const matched = r.evidence.dedupeMatches;
+        const inventoried = Array.isArray(backing) && Number.isInteger(matched) && matched >= 0
+          && backing.length === matched
+          && backing.every(card => card && (card.pr === null || (Number.isInteger(card.pr) && card.pr > 0)))
+          && (result.mentions == null || (Number.isInteger(result.mentions) && result.mentions >= 0 && result.mentions <= matched));
+        readable = inventoried && (ref ? readable : matched > 0) && backing.every(readableCard);
       } catch { readable = false; }
       if (!readable) throw new Error(`card completion evidence no longer resolves to a readable card or spool; no release record written — inspect the landing log for ${session}; recover the owed card and cite its readable --card reference`);
       post(p.repo, p.pr, record);
@@ -324,7 +341,8 @@ const cardLandingExists = (result) => result?.ok === true && (
 /** Child-side receipt: a successful spawn never calls this writer in the parent. */
 export async function runCardLandingWithReceipt(binding, argv, {
   actions = createActionStore({ root: binding.coordinationRoot ?? resolveCoordinationRoot() }),
-  land = async (args) => (await import('./land-prevention-card.mjs')).runLandPreventionCardCli(args) } = {}) {
+  dedupe = runCardDedupe,
+  land = runLandPreventionCardCli } = {}) {
   const readBound = () => {
     const r = actions.read(binding.resource, binding.attempt);
     if (!bound(r, binding) || r.ownerToken !== binding.ownerToken || !['dispatching', 'observed'].includes(r.state)) {
@@ -333,13 +351,24 @@ export async function runCardLandingWithReceipt(binding, argv, {
     return r;
   };
   readBound(); // Refuse an invalid receipt binding before filing anything.
-  const landed = await land(argv);
+  let backingCards = [], dedupeMatches = 0;
+  const landed = await land(argv, { dedupe: (input, options) => {
+    const plan = dedupe(input, options);
+    // Inventory ALL candidate matches, including ones later refiled after a mention
+    // failure. This conservative superset cannot omit a backing card on any landing branch.
+    const matches = ['mention', 'partial'].includes(plan?.action) ? plan.matches : [];
+    backingCards = matches.map(({ card }) => ({ rel: card.rel,
+      pr: card.host === 'main' ? null : card.host?.pr }));
+    dedupeMatches = matches.length;
+    return plan;
+  } });
   if (landed.code === 0 && cardLandingExists(landed.result)) {
     let r = readBound();
     if (r.state === 'dispatching') r = transition(actions, r, 'observed', { handle: binding.session });
     if (!completion(r, binding)) transition(actions, r, 'terminal', { outcome: 'settled',
       evidence: { ...r.evidence, card: { session: binding.session,
-        ...(landingRef(landed.result) ? { ref: landingRef(landed.result) } : {}) }, result: landed.result, at: Date.now() } });
+        ...(landingRef(landed.result) ? { ref: landingRef(landed.result) } : {}) },
+      backingCards, dedupeMatches, result: landed.result, at: Date.now() } });
   }
   return landed;
 }
