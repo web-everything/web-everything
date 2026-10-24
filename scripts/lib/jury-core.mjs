@@ -3183,12 +3183,10 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
 const sameGapOrder = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 function sameGapIdentity(f) {
   const id = normalizeFindingIdentity(f);
-  // The shared grouping identity folds case and quotes. Exact clearance must also retain
-  // case and delimiters: parseUser/parseuser and `admin`/'admin' may name different expressions.
-  // Such differences require a judge decision rather than identifier or expression heuristics.
-  const exactClaim = id && String(f.summary).normalize('NFKC')
-    .replace(/:\d+(?::\d+)?\b/g, ':N')
-    .replace(/\s+/g, ' ').trim().replace(/[\s.,;:!?]+$/, '');
+  // Grouping normalization is lossy: numbers, literal whitespace, Unicode, delimiters and
+  // punctuation can distinguish defects. Keep the claim verbatim after the outer trim used
+  // by normalizeFinding; all other differences require a judge decision before clearance.
+  const exactClaim = id && String(f.summary).trim();
   return id && [id.path, f.line, [id.normSummary, exactClaim], id.lens,
     String(f.category ?? '').trim().toLowerCase(), f.lens ?? null, f.class ?? null,
     ...CARRY_SEVERITY_FIELDS.map(k => f[k] ?? null)];

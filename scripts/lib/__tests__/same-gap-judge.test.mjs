@@ -7,14 +7,22 @@ const yes = (confidence = 0.95, sameGap = true) => vi.fn(async () => ({ pairs: [
 const pairsFrom = input => JSON.parse(input.split('\n').slice(1, -1).join('\n'));
 
 describe('R59 batched same-gap judge', () => {
-  it('deduplicates normalized exact claims without a call; reworded same-line claims need a decision', async () => {
-    const exact = { ...a, summary: '  Missing payload validation. ' }, judge = yes();
+  it('deduplicates exact claims without a call; reworded same-line claims need a decision', async () => {
+    const exact = { ...a, summary: '  Missing payload validation ' }, judge = yes();
     const result = await judgeSameGapPairs([a, exact], { judge });
     expect(judge).not.toHaveBeenCalled();
     expect(sameGapSameHead(a, exact)).toBe(true);
     expect(sameGapSameHead(a, { ...b, line: a.line })).toBe(false);
     expect(result.records).toMatchObject([{ source: 'exact', merged: true }]);
     expect(sameGapPairKey(a, b)).toBe(sameGapPairKey(b, a));
+  });
+  it('requires a judge decision for trailing punctuation even when grouping normalizes it away', async () => {
+    const punctuated = { ...a, summary: 'Missing payload validation.' }, judge = yes();
+    expect(sameGapSameHead(a, punctuated)).toBe(false);
+    const result = await judgeSameGapPairs([a, punctuated], { judge });
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(result.records).toMatchObject([{ source: 'judge', merged: true }]);
+    expect(sameGapSameHead(a, punctuated, result)).toBe(true);
   });
   it('requires a judge for case-only changes and binds its decision to the precise casing', async () => {
     const source = { ...a, summary: 'parseUser returns unchecked data' };

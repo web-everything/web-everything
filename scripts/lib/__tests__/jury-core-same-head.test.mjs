@@ -48,6 +48,36 @@ const serializedGate = (ctx, saved) => {
 };
 
 describe('sameGapSameHead', () => {
+  it.each([
+    ['ports', 'Request reaches 127.0.0.1:3000 before validation', 'Request reaches 127.0.0.1:5000 before validation'],
+    ['line references', 'Validation is missing at src/cache.mjs:20', 'Validation is missing at src/cache.mjs:30'],
+    ['column references', 'Validation is missing at src/cache.mjs:20:3', 'Validation is missing at src/cache.mjs:20:5'],
+    ['single-quoted spaces', "Handler accepts 'a  b' before validation", "Handler accepts 'a b' before validation"],
+    ['double-quoted spaces', 'Handler accepts "a  b" before validation', 'Handler accepts "a b" before validation'],
+    ['backtick spaces', 'Handler accepts `a  b` before validation', 'Handler accepts `a b` before validation'],
+    ['escaped quote spaces', String.raw`Handler accepts 'a\'  b' before validation`, String.raw`Handler accepts 'a\' b' before validation`],
+    ['literal tab', "Handler accepts 'a\tb' before validation", "Handler accepts 'a b' before validation"],
+    ['literal newline', "Handler accepts 'a\nb' before validation", "Handler accepts 'a b' before validation"],
+    ['literal nonbreaking space', "Handler accepts 'a\u00a0b' before validation", "Handler accepts 'a b' before validation"],
+    ['literal compatibility character', "Handler accepts 'Ａ' before validation", "Handler accepts 'A' before validation"],
+    ['trailing operator', 'Handler evaluates value!', 'Handler evaluates value'],
+  ])('keeps distinct %s pending without a judge decision', async (_label, source, dest) => {
+    const first = { ...base, file: 'src/cache.mjs', summary: source };
+    const second = { ...first, summary: dest };
+    expect.soft(sameGapSameHead(first, second)).toBe(false);
+    expect.soft(sameGapSameHead(second, first)).toBe(false);
+    expect.soft(sameGapPairKey(first, second)).not.toBe(sameGapPairKey(first, first));
+    const judge = vi.fn(async () => ({ pairs: [{ id: 0, sameGap: false, confidence: 0.99, reason: 'distinct claims' }] }));
+    const judged = await judgeSameGapPairs([first, second], { judge });
+    expect.soft(judge).toHaveBeenCalledTimes(1);
+    expect.soft(sameGapSameHead(first, second, judged)).toBe(false);
+    for (const result of ['not-real', 'card']) {
+      const { ruled, ctx } = world(first, result), target = referral('judgeCorrectness', second);
+      expect.soft(findSameHeadSiblingRuling(target, ctx)).toBeNull();
+      expect.soft(serializedGate(ctx, record([target], { runId: 'dest', carried: [carry(ruled, target, result)] })).pending)
+        .toEqual([target.key]);
+    }
+  });
   it.each(["'admin'", '"admin"', 'admin'])('keeps identifier-versus-string/expression delimiters distinct without a decision: %s', expression => {
     for (const category of ['correctness', 'security']) {
       const first = { ...base, category, summary: 'Handler compares `admin` before validation' };
