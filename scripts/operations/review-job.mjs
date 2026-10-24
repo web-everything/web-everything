@@ -987,7 +987,7 @@ export function dispatchReviewJob({
   }
 
   const policy = resolveTimingPolicy({ env }).review;
-  const ci = redTeamOnly ? { allowed: true } : ciGate({ repo: planned.repo, pr: planned.pr, policy });
+  const ci = ciGate({ repo: planned.repo, pr: planned.pr, policy });
   // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
   const waived = policy.startAfter === 'ci-green' && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()

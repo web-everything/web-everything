@@ -274,13 +274,23 @@ describe('red-team-only dispatch', () => {
     const dir = mkdtempSync(join(tmpdir(), 'review-red-team-only-'));
     const options = { pr, repo, redTeamOnly: true, root: '/daemon', dir,
       checkStaleness: () => ({ fresh: true, behind: 0 }), readCompletion: () => null,
-      resolveSettingsEnv: () => ({}), ciGate: vi.fn(() => ({ allowed: false })), spawnJob: vi.fn(() => 4242) };
+      resolveSettingsEnv: () => ({}), ciGate: vi.fn(() => ({ allowed: true })), spawnJob: vi.fn(() => 4242) };
     try { run(options); } finally { rmSync(dir, { recursive: true, force: true }); }
   }
-  it.each(['fresh', 'resume'])('passes --red-team-only=%s and preferred lane, skipping CI admission', redTeamMode => withDispatch(options => {
+  it.each(['fresh', 'resume'])('passes --red-team-only=%s and preferred lane after CI admission', redTeamMode => withDispatch(options => {
     const out = dispatchReviewJob({ ...options, redTeamMode, preferLane: 7 });
-    expect(out.jobPid).toBe(4242); expect(options.ciGate).not.toHaveBeenCalled();
+    expect(out.jobPid).toBe(4242); expect(options.ciGate).toHaveBeenCalledOnce();
     expect(options.spawnJob.mock.calls[0][0].argv).toEqual(expect.arrayContaining(['run', `--pr=${pr}`, `--repo=${repo}`, `--red-team-only=${redTeamMode}`, '--prefer-lane=7']));
+  }));
+  it.each(['fresh', 'resume'])('refuses a denying CI gate in %s mode without spawning', redTeamMode => withDispatch(options => {
+    const ci = { allowed: false, headSha: head, reason: 'required-checks-not-successful' };
+    options.ciGate.mockReturnValue(ci);
+    const out = dispatchReviewJob({ ...options, redTeamMode });
+    expect(options.ciGate).toHaveBeenCalledOnce();
+    expect(options.ciGate).toHaveBeenCalledWith({ repo, pr, policy: expect.any(Object) });
+    expect(out).toMatchObject({ pr, repo, headSha: head, ci });
+    expect(out.skipped).toContain('required-checks-not-successful');
+    expect(options.spawnJob).not.toHaveBeenCalled();
   }));
   it('still skips live-job with the same slug and record', () => withDispatch(options => {
     writeJobRecord({ slug: `review-${pr}`, pr, repo, pid: 99, cwd: '/daemon', startedAt: new Date().toISOString() }, options.dir);
