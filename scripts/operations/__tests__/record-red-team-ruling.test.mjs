@@ -243,7 +243,7 @@ describe('automatic card filing', () => {
   const read = (over = {}) => ({ identity: OP, head: HEAD, labels: [{ name: 'review:human' }], comments: thread(), setting: CONFIRMED_BREAKS_DEFAULTS, now: '2026-10-20T20:55:00-04:00', ...over });
   const input = (over = {}) => ({ repo, pr: PR, break: '1', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'card it, ship the PR', ...over });
   /** A fake PR whose thread grows as the sinks post (as the operator account), so the read-back proves the gate released the break. */
-  function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims, noPid = false, initial, sharedBreaks, attemptFails = false, receiptFails = false } = {}) {
+  function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims, noPid = false, initial, sharedBreaks, attemptFails = false, receiptFails = false, completed = true } = {}) {
     const comments = initial ? [...initial] : thread();
     const posted = [], cards = [], labelSyncs = [];
     const attempts = new Set();
@@ -252,6 +252,7 @@ describe('automatic card filing', () => {
     const memClaims = {
       claim: (k) => { if (!gens.has(k)) { gens.set(k, { gen: 0, at: clock }); return { created: true, gen: 0, at: clock }; } return { created: false, ...gens.get(k) }; },
       reclaim: (k, g) => { if (gens.get(k).gen !== g) return false; gens.set(k, { gen: g + 1, at: clock }); return true; },
+      completed: (k) => completed && receipts.has(k),
       spawned: (k) => receipts.has(k), markSpawned: (k) => { if (receiptFails) throw new Error('receipt write failed'); receipts.add(k); }, now: () => clock,
       attempted: (k) => attempts.has(k), markAttempt: (k) => { if (attemptFails) throw new Error('disk full'); if (attempts.has(k)) return false; attempts.add(k); return true; }, clearAttempt: (k) => attempts.delete(k),
       claimBreak: (k, job) => { if (!breakOwners.has(k)) breakOwners.set(k, job); return breakOwners.get(k); },
@@ -264,7 +265,7 @@ describe('automatic card filing', () => {
       post: (r, n, body) => { if (postFails?.(body)) throw new Error('gh down'); posted.push(body); comments.push({ author: { login: author }, createdAt: '2026-10-20T23:55:00Z', body }); },
       warn: () => {}, syncLabels: (a) => { labelSyncs.push(a); return { add: null, remove: [] }; },
     });
-    return { sinks, posted, cards, labelSyncs, comments, memClaims, advance: (ms) => { clock += ms; } };
+    return { sinks, posted, cards, labelSyncs, comments, memClaims, complete: () => { completed = true; }, advance: (ms) => { clock += ms; } };
   }
   const payloadFor = (over = {}, readOver = {}) => planRedTeamRuling(read(readOver), input(over));
   const heldAfter = (comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, repo }).held;
@@ -417,8 +418,8 @@ describe('automatic card filing', () => {
         expect(c.reclaim('k', 0)).toBe(false);
         expect(c.claim('k')).toMatchObject({ created: false, gen: 1 });
         expect(c.spawned('k')).toBe(false);
-        c.markSpawned('k', { session: 's', handle: 'pid:1' });
-        expect(c.spawned('k')).toBe(true);
+        c.markSpawned('k', { session: 'red-team-ruling-card-k', handle: 'pid:1', head: HEAD });
+        expect(c.spawned('k', { session: 'red-team-ruling-card-k', head: HEAD })).toBe(true);
         expect(c.spawned('other')).toBe(false);
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
@@ -494,6 +495,92 @@ describe('automatic card filing', () => {
         expect(c.claimBreak('b1', 'jobA')).toBe('jobA');
         expect(c.claimBreak('b1', 'jobB')).toBe('jobA');
         expect(c.claimBreak('b1', 'jobA')).toBe('jobA');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  });
+
+  describe('card existence evidence', () => {
+    it('a child failing before spool leaves the break pending on every retry without a second spawn', () => {
+      const f = fake({ completed: false });
+      const p = payloadFor();
+      for (let i = 0; i < 2; i++) {
+        expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](p)).toMatchObject({ pending: true, released: false });
+        f.advance(121_000);
+      }
+      expect(f.cards).toHaveLength(1);
+      expect(f.posted).toHaveLength(1);
+      expect(heldAfter(f.comments)).toHaveLength(1);
+      expect(f.labelSyncs).toEqual([]);
+      f.complete();
+      expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](p)).toMatchObject({ card: { reconciled: true } });
+      expect(f.cards).toHaveLength(1);
+      expect(heldAfter(f.comments)).toEqual([]);
+    });
+
+    it.each(['', '{', '{}', 'legacy', 'head', 'session', 'handle', 'at'])('invalid spawned receipt (%s) is not evidence and cannot duplicate an attempted job', async variant => {
+      const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createFileClaims } = await import('../record-red-team-ruling-io.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'invalid-ruling-receipt-'));
+      try {
+        let now = 1000;
+        const claims = createFileClaims({ dir, nowMs: () => now });
+        const p = payloadFor();
+        claims.claim(p.jobKey);
+        claims.markAttempt(p.jobKey);
+        const receipt = { session: p.session, head: p.head, handle: 'pid:1', at: now };
+        if (variant === 'legacy') delete receipt.head;
+        if (variant === 'head') receipt.head = OTHER;
+        if (variant === 'session') receipt.session = 'another-job';
+        if (variant === 'handle') receipt.handle = 'pid:0';
+        if (variant === 'at') receipt.at = null;
+        writeFileSync(join(dir, `${p.jobKey}.spawned`), ['legacy', 'head', 'session', 'handle', 'at'].includes(variant) ? JSON.stringify(receipt) : variant);
+        expect(claims.spawned(p.jobKey, p)).toBe(false);
+        now += 121_000;
+        const f = fake({ claims });
+        expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](p)).toThrow(/may have started its landing job/);
+        expect(f.cards).toEqual([]);
+        expect(heldAfter(f.comments)).toHaveLength(1);
+        expect(f.posted.some(b => b.includes('outcome=operator-card'))).toBe(false);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('an invalid receipt with no prior attempt permits a safe re-claim but never a release from the PID alone', async () => {
+      const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createFileClaims } = await import('../record-red-team-ruling-io.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'ruling-reclaim-'));
+      try {
+        let now = 1000;
+        const claims = createFileClaims({ dir, nowMs: () => now });
+        const p = payloadFor();
+        claims.claim(p.jobKey);
+        writeFileSync(join(dir, `${p.jobKey}.spawned`), '');
+        now += 121_000;
+        const f = fake({ claims });
+        expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](p)).toMatchObject({ pending: true, released: false });
+        expect(claims.claim(p.jobKey)).toMatchObject({ created: false, gen: 1 });
+        expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](p)).toMatchObject({ pending: true, released: false });
+        expect(f.cards).toHaveLength(1);
+        expect(heldAfter(f.comments)).toHaveLength(1);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it.each([false, true])('child writes completion evidence only after successful filing (ok=%s)', async ok => {
+      const { mkdtempSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createFileClaims, runCardLandingWithReceipt } = await import('../record-red-team-ruling-io.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'ruling-completion-'));
+      try {
+        const claims = createFileClaims({ dir });
+        const p = payloadFor();
+        await runCardLandingWithReceipt(p, [], { claims, land: async () => ({ code: ok ? 0 : 1,
+          result: ok ? { ok: true, step: 'held', rel: 'backlog/xabcdef-card.md' } : { ok: false, step: 'acquire' } }) });
+        expect(claims.completed(p.jobKey, p)).toBe(ok);
+        expect(claims.completed(p.jobKey, { ...p, head: OTHER })).toBe(false);
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
   });
