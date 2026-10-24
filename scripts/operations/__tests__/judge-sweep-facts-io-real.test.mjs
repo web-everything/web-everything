@@ -6,11 +6,6 @@ import { join } from 'node:path';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO } from '../judge-sweep-facts-io.mjs';
 
-vi.mock('node:fs', async original => {
-  const fs = await original();
-  return { ...fs, readFileSync: vi.fn(fs.readFileSync) };
-});
-
 it('runs the real shape child and reuses its head-and-base result from an owner-only disk cache in a fresh reader', async () => {
   await withRealRepo(async ctx => {
     const head = ctx.head(), cacheDir = join(ctx.tmp, 'conveyor');
@@ -44,11 +39,11 @@ it.each([128 * 1024, 128 * 1024 + 1])('checks the cache byte bound before readin
     const data = JSON.stringify({ rulesVersion: 1, entries: { [key]: false }, padding: '' });
     writeFileSync(file, data.replace('"padding":""', `"padding":"${'x'.repeat(size - Buffer.byteLength(data))}"`));
     expect(statSync(file).size).toBe(size);
-    // Clear startup/module-loader reads; only observe this cache read.
-    readFileSync.mockClear();
-    const cache = createShapeCache({ cacheDir });
+    // Observe only the byte-bounded read; keep real stat, JSON and disk writes.
+    const readFile = vi.fn(readFileSync);
+    const cache = createShapeCache({ cacheDir, readFile });
     expect(cache.get(key)).toBe(size > 128 * 1024 ? undefined : false);
-    expect(readFileSync).toHaveBeenCalledTimes(size > 128 * 1024 ? 0 : 1);
+    expect(readFile).toHaveBeenCalledTimes(size > 128 * 1024 ? 0 : 1);
     cache.set(key, true);
     expect(statSync(file).size).toBeLessThan(128 * 1024);
     expect(createShapeCache({ cacheDir }).get(key)).toBe(true);

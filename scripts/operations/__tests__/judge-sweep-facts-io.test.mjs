@@ -1,6 +1,5 @@
 /** Bounded observations must expose grants that need evidence beyond list + comments. */
 import { afterEach, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, operatorGh } from '../judge-sweep-facts-io.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
@@ -8,13 +7,13 @@ import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord,
   REFERRAL_DROP_REASON, REFERRAL_SUPERSEDE_REASON, validateReferralRecord } from '../../lib/jury-core.mjs';
 
-vi.mock('node:child_process', async original => ({ ...await original(), execFileSync: vi.fn() }));
 vi.mock('../../lib/gh-throttle.mjs', async original => ({ ...await original(), runGhSync: vi.fn() }));
 
 afterEach(() => { vi.resetAllMocks(); vi.unstubAllEnvs(); });
 
 const repo = 'o/r', head = 'a'.repeat(40), at = '2026-10-22T13:00:00Z';
 const baseCap = 12;
+const exec = vi.fn();
 
 it.each([
   ['automatic standing grant', 'web-everything[bot]', true, baseCap, true],
@@ -50,6 +49,7 @@ const pr = (extra = {}) => ({ number: 1, title: 'IO fixture', headRefOid: head,
   baseRefOid: 'b'.repeat(40), labels: [], assignees: [], updatedAt: at,
   body: '<!-- authored-by-actor: author -->', createdAt: at, ...extra });
 const options = (extra = {}) => ({
+  exec,
   gh: () => JSON.stringify([pr()]), now: () => Date.parse(at), baseCap,
   readLedgerRows: () => [], readFixRows: () => [], readJobs: () => [], readComments: () => [],
   cache: createShapeCache({ read: () => '{}', write: () => {} }), ...extra,
@@ -79,7 +79,8 @@ it.each([
   });
   expect(facts.fixerRunning).toBe(fixerRunning);
   expect(facts.inCi).toBe(inCi);
-  expect(readComments).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ repo, number: 1, exec: expect.any(Function) }));
+  expect(readComments).toHaveBeenCalledTimes(1);
+  expect(readComments).toHaveBeenCalledWith(expect.objectContaining({ repo, number: 1, exec: expect.any(Function) }));
   expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: false, superseded: false }]);
   expect(facts.evidenceErrors).toEqual([]);
 });
@@ -130,7 +131,7 @@ it('remote card verification refuses additional GitHub reads and leaves the refe
   const gh = vi.fn(() => JSON.stringify([pr()]));
   const facts = read({ gh, readComments: () => [comment(renderReferralRecord(record))] });
   expect(gh).toHaveBeenCalledTimes(1);
-  expect(execFileSync).not.toHaveBeenCalled();
+  expect(exec).not.toHaveBeenCalled();
   expect(runGhSync).not.toHaveBeenCalled();
   expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: true, superseded: false }]);
 });
@@ -146,7 +147,7 @@ it('default transport issues only repository-scoped reads and preserves a referr
   const facts = createJudgeSweepFactsReader(defaults)({ repo }).prs[0];
   expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: false, superseded: false }]);
   expect(facts.evidenceErrors).toEqual([]);
-  expect(execFileSync).not.toHaveBeenCalled();
+  expect(exec).not.toHaveBeenCalled();
   const calls = runGhSync.mock.calls;
   expect(calls).toHaveLength(3);
   expect(calls[0][0]).toEqual(expect.arrayContaining(['pr', 'list', '--repo', repo]));
@@ -254,7 +255,8 @@ it('ignores legacy head-only cache entries and recomputes a permissive result', 
   const shape = vi.fn(() => ({ humanRequired: true }));
   const facts = read({ cache, shape, gh: () => JSON.stringify([humanPr()]) });
   expect(facts.humanRequired).toBe(true);
-  expect(shape).toHaveBeenCalledExactlyOnceWith(['README.md']);
+  expect(shape).toHaveBeenCalledTimes(1);
+  expect(shape).toHaveBeenCalledWith(['README.md']);
 });
 
 it('a shape-rules version bump invalidates a cached non-human result in a fresh reader', () => {
@@ -268,7 +270,8 @@ it('a shape-rules version bump invalidates a cached non-human result in a fresh 
   const facts = read({ cache: createShapeCache({ ...io, rulesVersion: 2 }), shape,
     gh: () => JSON.stringify([humanPr()]) });
   expect(facts.humanRequired).toBe(true);
-  expect(shape).toHaveBeenCalledExactlyOnceWith(['README.md']);
+  expect(shape).toHaveBeenCalledTimes(1);
+  expect(shape).toHaveBeenCalledWith(['README.md']);
   expect(createShapeCache({ ...io, rulesVersion: 2 }).get(key)).toBe(true);
   expect(createShapeCache({ ...io, rulesVersion: 1 }).get(key)).toBeUndefined();
 });
@@ -321,11 +324,11 @@ it('shape child receives filenames unchanged as JSON stdin with bounded output a
   const files = ['with,comma.md', 'with space.md', 'with\ttab.md', 'with\nnewline.md', 'with\rreturn.md',
     'with\u2028separator.md', '`backtick`.md', "quote'\".md", '$(shell).md', '--leading.md',
     '../parent.md', 'invisible\u200b.md', 'ｆullwidth.md', 'back\\slash.md'];
-  execFileSync.mockReturnValue('{"humanRequired":true}');
+  exec.mockReturnValue('{"humanRequired":true}');
   const facts = read({ gh: () => JSON.stringify([humanPr({ files: files.map(path => ({ path })), changedFiles: files.length })]) });
   expect(facts.humanRequired).toBe(true);
-  expect(execFileSync).toHaveBeenCalledTimes(1);
-  const [bin, args, opts] = execFileSync.mock.calls[0];
+  expect(exec).toHaveBeenCalledTimes(1);
+  const [bin, args, opts] = exec.mock.calls[0];
   expect(bin).toBe(process.execPath);
   expect(args).toEqual([expect.stringMatching(/scripts\/review-core-cli\.mjs$/), 'shape', '--json']);
   expect(JSON.parse(opts.input)).toEqual(files);

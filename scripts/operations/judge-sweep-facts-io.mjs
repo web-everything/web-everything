@@ -49,9 +49,10 @@ export function operatorGh(args, options = {}) {
 /** A disposable, bounded head-and-base cache, scoped to a shape-rules version. Legacy entries are misses. */
 export function createShapeCache({ cacheDir = join(homedir(), '.claude', 'conveyor'),
   rulesVersion = SHAPE_RULES_VERSION,
+  readFile = readFileSync,
   read = path => {
     if (statSync(path).size > CACHE_BYTES) throw failure('shape cache oversized');
-    return readFileSync(path, 'utf8');
+    return readFile(path, 'utf8');
   }, write = (path, data) => {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const temp = `${path}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
@@ -107,11 +108,12 @@ function readRows(repo) {
 
 /** Injectable at every boundary; tests never need the host's credentials, process table, or ledgers. */
 export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.now(),
+  exec = execFileSync,
   readLedgerRows = readRows, readFixRows = readFixLoopRows,
-  readJobs = () => parseLiveJobs(execFileSync('ps', ['-axo', 'pid,etime,command'], {
+  readJobs = () => parseLiveJobs(exec('ps', ['-axo', 'pid,etime,command'], {
     encoding: 'utf8', timeout: 10_000, maxBuffer: 8 * 1024 * 1024 })),
   readComments = defaultListPrComments, cache = createShapeCache(),
-  shape = files => JSON.parse(execFileSync(process.execPath, [join(rootDir(), 'scripts/review-core-cli.mjs'), 'shape', '--json'], {
+  shape = files => JSON.parse(exec(process.execPath, [join(rootDir(), 'scripts/review-core-cli.mjs'), 'shape', '--json'], {
     // JSON stdin preserves commas, whitespace and shell syntax in filenames.
     input: JSON.stringify(files), cwd: rootDir(), encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
   })),
