@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, operatorGh } from '../judge-sweep-facts-io.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
+import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord,
   REFERRAL_DROP_REASON, REFERRAL_SUPERSEDE_REASON, validateReferralRecord } from '../../lib/jury-core.mjs';
@@ -56,6 +57,92 @@ const options = (extra = {}) => ({
 });
 const read = extra => createJudgeSweepFactsReader(options(extra))({ repo }).prs[0];
 const comment = body => ({ id: 'IC_referral', body, author: { login: 'web-everything' }, createdAt: at });
+
+// Every failed source must leave independently readable list and comment evidence intact.
+function unreadableSource(source) {
+  return read({
+    [source]: () => { throw new Error('source unavailable'); },
+    gh: () => JSON.stringify([pr({ labels: [{ name: 'review:pending' }] })]),
+    now: () => Date.parse(at) + 30 * 60_000,
+    readComments: () => [comment(renderRedTeamComment({ pr: 1, rev: head,
+      provider: 'codex', model: 'fixture', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }))],
+  });
+}
+function expectIndependentEvidence(facts) {
+  expect(facts.labels).toEqual(['review:pending']);
+  expect(facts.headSha).toBe(head);
+  expect(facts.minutesSinceUpdate).toBe(30);
+  expect(facts.redTeam).toEqual({ state: 'clear', latestResultId: expect.stringMatching(/^[a-f0-9]{16}$/), latestOutcome: null });
+}
+
+it('reports verdict ledger unreadable and preserves unrelated evidence', () => {
+  const facts = unreadableSource('readLedgerRows');
+  expect(facts.evidenceErrors).toEqual(['verdict ledger unreadable']);
+  expect(facts.round).toBeNull();
+  expectIndependentEvidence(facts);
+});
+
+it('reports fix-loop ledger unreadable and preserves unrelated evidence', () => {
+  const facts = unreadableSource('readFixRows');
+  expect(facts.evidenceErrors).toEqual(['fix-loop ledger unreadable']);
+  expect(facts.lastFixLoop).toBeNull();
+  expect(facts.minutesSinceFixLoop).toBeNull();
+  expectIndependentEvidence(facts);
+});
+
+it('reports live jobs unreadable and preserves unrelated evidence', () => {
+  const facts = unreadableSource('readJobs');
+  expect(facts.evidenceErrors).toEqual(['live jobs unreadable']);
+  expect(facts.fixerRunning).toBeNull();
+  expect(facts.owner).toBe('unknown');
+  expectIndependentEvidence(facts);
+});
+
+it('reports worker repository unknown for an unscoped worker with no assignee', () => {
+  const facts = read({ readJobs: () => [{ pr: 1, kind: 'fix-run' }] });
+  expect(facts.evidenceErrors).toEqual(['worker repository unknown']);
+  expect(facts.fixerRunning).toBeNull();
+  expect(facts.owner).toBe('unknown');
+});
+
+it.each(['red-team:clear', 'red-team:blocked'])('reports red-team label lacks live result evidence (%s)', label => {
+  const facts = read({ gh: () => JSON.stringify([pr({ labels: [{ name: label }] })]) });
+  expect(facts.evidenceErrors).toEqual(['red-team label lacks live result evidence']);
+  expect(facts.redTeam).toEqual({ state: 'unknown', latestResultId: null, latestOutcome: null });
+});
+
+it('reports round-limit label disagrees with round evidence below the cap', () => {
+  const facts = read({ gh: () => JSON.stringify([pr({ labels: [{ name: 'status:at-round-limit' }] })]) });
+  expect(facts.round).toBe(1);
+  expect(facts.cap).toBe(baseCap);
+  expect(facts.evidenceErrors).toEqual(['round-limit label disagrees with round evidence']);
+});
+
+it.each(['advisory:accepted', 'review:accepted'])('reports accepted label lacks live verdict evidence (%s)', label => {
+  const facts = read({ gh: () => JSON.stringify([pr({ labels: [{ name: label }] })]) });
+  expect(facts.evidenceErrors).toEqual(['accepted label lacks live verdict evidence']);
+  expect(facts.latestVerdict).toBeNull();
+});
+
+it('fails closed on verdict findings incomplete when the header count differs from parsed findings', () => {
+  const verdict = count => comment([
+    '**Verdict:** changes requested',
+    `Net basis: \`${'b'.repeat(40)}..${head}\``,
+    `### Findings (${count})`,
+    '**correctness** (1)',
+    '- `scripts/x.mjs:10` — Missing evidence _[CONFIRMED]_ [impact if unfixed: broken]',
+  ].join('\n'));
+  // The same trusted verdict parses normally when its declared count is complete.
+  const complete = read({ readComments: () => [verdict(1)] });
+  expect(complete.evidenceErrors).toEqual([]);
+  expect(complete.latestVerdict.findings).toHaveLength(1);
+  const incomplete = read({ readComments: () => [verdict(2)] });
+  // commentVerdict's internal 'verdict findings incomplete' error is surfaced by the comment boundary.
+  expect(incomplete.evidenceErrors).toEqual(['comment evidence unreadable or budget exhausted']);
+  expect(incomplete.latestVerdict).toBeNull();
+  expect(incomplete.verdictHistory).toEqual([]);
+});
+
 function referralRecord(summaries = ['active finding'], seat = 'judgeCorrectnessAdvisory') {
   const runId = 'review-pr-1';
   return { version: 1, repo, pr: 1, head, runId, reviewer: mandatoryReferralReviewer(runId),
