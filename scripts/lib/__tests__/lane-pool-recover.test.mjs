@@ -74,7 +74,7 @@ describe('recoverPool fail-closed lane recovery', () => {
   it('backs up preserved lanes before reclaiming without override', async () => {
     const h = harness();
     expect(await h.run({ lanes: [1] })).toEqual({
-      reclaimed: [1], keptUnpushed: [], keptLeased: [], skipped: [], backedUp: [1], budgetExhausted: false,
+      reclaimed: [1], keptUnpushed: [], keptLeased: [], skipped: [], backedUp: [1], salvaged: [], budgetExhausted: false,
     });
     expect(h.calls).toEqual([['proof', 1], ['backup', 1], ['reclaim', 1, { override: false }]]);
   });
@@ -276,5 +276,103 @@ describe('real recovery backup Git hardening', () => {
       vi.unstubAllEnvs();
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('recoverPool salvage push before recovery', () => {
+  const unpushed = (files = []) => ({ preserved: false, unpreservedFiles: files,
+    unpreservedCommitShas: ['a'.repeat(40)], reason: 'local commits never pushed' });
+  const ref = 'salvage/lane-1-20261024-1200';
+
+  it('always exposes an empty salvaged list when nothing needed pushing', async () => {
+    expect((await harness().run({ lanes: [1] })).salvaged).toEqual([]);
+  });
+
+  it.each(['pushed', 'matched'])('re-proofs after %s, then backs up and reclaims using the refreshed proof', async status => {
+    const h = harness();
+    h.io.proof = vi.fn().mockReturnValueOnce(unpushed()).mockReturnValueOnce(preserved());
+    h.io.salvage = vi.fn(() => ({ status, ...(status === 'pushed' ? { ref } : {}) }));
+    const result = await h.run({ lanes: [1] });
+    expect(h.io.salvage).toHaveBeenCalledExactlyOnceWith(1);
+    expect(h.io.proof).toHaveBeenCalledTimes(2);
+    expect(result.reclaimed).toEqual([1]);
+    expect(result.keptUnpushed).toEqual([]);
+    expect(result.salvaged).toEqual(status === 'pushed' ? [{ lane: 1, ref }] : []);
+    expect(h.calls).toEqual([['backup', 1], ['reclaim', 1, { override: false }]]);
+  });
+
+  it('orders initial proof, salvage, refreshed proof, backup, reclaim for commits plus qualifying cards', async () => {
+    const h = harness();
+    let proofs = 0;
+    h.io.proof = n => { h.calls.push(['proof', n]); return proofs++ === 0 ? unpushed(['backlog/42-card.md']) : cards(); };
+    h.io.salvage = n => { h.calls.push(['salvage', n]); return { status: 'pushed', ref }; };
+    const result = await h.run({ lanes: [1] });
+    expect(h.calls).toEqual([['proof', 1], ['salvage', 1], ['proof', 1], ['backup', 1], ['reclaim', 1, { override: true }]]);
+    expect(result.backedUp).toEqual([1]);
+    expect(result.reclaimed).toEqual([1]);
+    expect(result.salvaged).toEqual([{ lane: 1, ref }]);
+  });
+
+  it('keeps a failed salvage in keptUnpushed with a salvage reason and no backup or reclaim', async () => {
+    const h = harness({ proof: vi.fn(() => unpushed()), salvage: vi.fn(() => ({ status: 'failed', reason: 'origin unavailable' })) });
+    const result = await h.run({ lanes: [1] });
+    expect(h.io.salvage).toHaveBeenCalledExactlyOnceWith(1);
+    expect(h.io.proof).toHaveBeenCalledTimes(1);
+    expect(result.keptUnpushed).toEqual([{ lane: 1, reason: expect.stringMatching(/salvage/i) }]);
+    expect(result.reclaimed).toEqual([]);
+    expect(result.salvaged).toEqual([]);
+    expect(h.calls).toEqual([]);
+  });
+
+  it.each(['src/tracked.ts', 'backlog/nested/card.md', 'backlog/not-a-card.txt'])('never salvages or reclaims unpreserved non-card files: %s', async file => {
+    const h = harness({ proof: () => unpushed(['backlog/42-card.md', file]), salvage: vi.fn(() => ({ status: 'pushed', ref })) });
+    const result = await h.run({ lanes: [1] });
+    expect(h.io.salvage).not.toHaveBeenCalled();
+    expect(result.reclaimed).toEqual([]);
+    expect(result.keptUnpushed.map(row => row.lane)).toEqual([1]);
+    expect(result.salvaged).toEqual([]);
+    expect(h.calls).toEqual([]);
+  });
+
+  it('never salvages a leased lane', async () => {
+    const h = harness({ isLeased: () => true, proof: vi.fn(() => unpushed()), salvage: vi.fn() });
+    const result = await h.run({ lanes: [1] });
+    expect(h.io.proof).not.toHaveBeenCalled();
+    expect(h.io.salvage).not.toHaveBeenCalled();
+    expect(result.keptLeased).toEqual([1]);
+    expect(result.salvaged).toEqual([]);
+    expect(h.calls).toEqual([]);
+  });
+
+  it.each([
+    ['still unpushed', () => unpushed()],
+    ['new tracked edits', () => ({ ...unpushed(['src/new.ts']), unpreservedCommitShas: [] })],
+    ['unreadable', () => ({ error: 'cannot read refreshed refs' })],
+  ])('refuses backup and reclaim when refreshed proof is %s despite successful salvage', async (_label, refreshed) => {
+    const h = harness({ proof: vi.fn().mockReturnValueOnce(unpushed()).mockImplementationOnce(refreshed), salvage: vi.fn(() => ({ status: 'pushed', ref })) });
+    const result = await h.run({ lanes: [1] });
+    expect(h.io.salvage).toHaveBeenCalledExactlyOnceWith(1);
+    expect(h.io.proof).toHaveBeenCalledTimes(2);
+    expect(result.reclaimed).toEqual([]);
+    expect(result.keptUnpushed.map(row => row.lane)).toEqual([1]);
+    expect(h.calls).toEqual([]);
+  });
+});
+
+// A salvage transport exception must not abort recovery of independent lanes.
+describe('recoverPool salvage exception isolation', () => {
+  it('keeps the failed lane with a salvage reason and continues to the next lane', async () => {
+    const h = harness({
+      proof: n => n === 1
+        ? { preserved: false, unpreservedFiles: [], unpreservedCommitShas: ['a'.repeat(40)], reason: 'unpushed' }
+        : preserved(),
+      salvage: vi.fn(() => { throw new Error('origin unavailable'); }),
+    });
+    const result = await h.run();
+    expect(h.io.salvage).toHaveBeenCalledExactlyOnceWith(1);
+    expect(result.keptUnpushed).toEqual([{ lane: 1, reason: expect.stringMatching(/salvage/i) }]);
+    expect(result.reclaimed).toEqual([2]);
+    expect(result.salvaged).toEqual([]);
+    expect(h.calls).toEqual([['backup', 2], ['reclaim', 2, { override: false }]]);
   });
 });
