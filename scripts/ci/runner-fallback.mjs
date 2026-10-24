@@ -116,8 +116,7 @@ function restExec(cmd, args, { charge, maxAttemptsPerCall, ...options }) {
   const repo = flag('--repo');
   let request = args;
   if (args[0] === 'run' && args[1] === 'list') {
-    const created = args.includes('--created') ? `&created=${encodeURIComponent(flag('--created'))}` : '';
-    request = ['api', `repos/${repo}/actions/workflows/ci.yml/runs?status=${flag('--status')}&per_page=${flag('--limit')}${created}`];
+    request = ['api', `repos/${repo}/actions/workflows/ci.yml/runs?status=${flag('--status')}&per_page=${flag('--limit')}`];
   } else if (args[0] === 'variable' && args[1] === 'set') {
     request = ['api', '--method', 'PATCH', `repos/${repo}/actions/variables/WE_SHARD_RUNNER`, '-f', 'name=WE_SHARD_RUNNER', '-f', `value=${flag('--body')}`];
   } else if (args[0] === 'run' && ['cancel', 'rerun'].includes(args[1])) {
@@ -134,7 +133,7 @@ function restExec(cmd, args, { charge, maxAttemptsPerCall, ...options }) {
 /** IO: bounded discovery, then variable -> all cancels -> all reruns, with no reverse switch. */
 export async function runRunnerFallback(options = {}) {
   const { repo, exec = restExec, env = process.env, now = Date.now(), apply = false,
-    log = console.error, sleep = sleepDefault } = options;
+    log = console.error, sleep = sleepDefault, readFeed = readFileSync } = options;
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw new Error('A valid owner/repo is required');
   const settings = resolveRunnerFallbackSettings({ env, platform: options.platform, tool: options.settings, log });
   let feedPath = options.feedPath || env.WE_NEEDS_YOU_FEED
@@ -165,13 +164,23 @@ export async function runRunnerFallback(options = {}) {
     const line = formatFeedLine({ at: new Date(now).toISOString(), repo, pr: runIds[0] ?? 0,
       kind, reason, pick: 'inspect CI and runner group configuration', runIds, ...details });
     let old = '';
-    try { old = readFileSync(feedPath, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    try { old = readFeed(feedPath, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     const suffix = line.slice(line.indexOf(' {"at":'));
     // Ignore event time when deduplicating identical alerts, without a separate state write.
     const identity = suffix.slice(suffix.indexOf(',"repo":'));
     if (old.split('\n').some(previous => previous.endsWith(identity))) return;
     mkdirSync(dirname(feedPath), { recursive: true });
     appendFileSync(feedPath, `${old && !old.endsWith('\n') ? '\n' : ''}${line}\n`);
+  };
+  // Publication is best-effort reporting: never re-enter repair error handling
+  // or discard landed mutation outcomes because the feed is unavailable.
+  const publishNotice = (...args) => {
+    try { notice(...args); return {}; }
+    catch (error) {
+      const feedError = `Runner fallback feed publication failed: ${clean(error.message)}; inspect CI manually`;
+      log(clean(feedError));
+      return { feedError };
+    }
   };
   const emptyPlan = () => ({ setVariable: null, cancel: [], rerun: [] });
   let preflight, decision, discoveryComplete = false, planned = emptyPlan();
@@ -220,14 +229,33 @@ export async function runRunnerFallback(options = {}) {
     let jobs = options.jobs;
     if (!offline) {
       const runs = new Map();
-      // Keep active runs regardless of age; completed history uses a creation window.
-      // Completeness is required within that window; oversized evidence needs operator inspection.
+      // Active runs are age-independent. Completed reruns can have old creation
+      // dates: inspect the latest page, then select by activity on the client.
+      const limit = Math.min(settings.maxRuns, 100);
+      const cutoff = now - settings.completedLookbackMinutes * 60000;
       for (const status of ['queued', 'in_progress', 'completed']) {
         const response = await json(['run', 'list', '--repo', repo, '--workflow', 'ci.yml', '--status', status,
-          '--limit', String(Math.min(settings.maxRuns, 100)), '--json', 'databaseId,status',
-          ...(status === 'completed' ? ['--created', `>=${new Date(now - settings.completedLookbackMinutes * 60000).toISOString()}`] : [])]);
-        const list = response.workflow_runs;
-        if (!complete(response, list) || list.length >= Math.min(settings.maxRuns, 100)) {
+          '--limit', String(limit), '--json', status === 'completed' ? 'databaseId,status,updatedAt,startedAt' : 'databaseId,status']);
+        let list = response.workflow_runs;
+        if (status === 'completed') {
+          if (!Array.isArray(list) || !Number.isSafeInteger(response.total_count)
+            || response.total_count < 0 || list.length !== Math.min(response.total_count, limit)) {
+            throw new Error('Unreadable completed run page; inspect CI manually or raise maxRuns');
+          }
+          const activity = run => {
+            const times = [run?.updated_at ?? run?.updatedAt, run?.run_started_at ?? run?.startedAt]
+              .filter(value => value != null).map(epoch);
+            if (!times.length || times.some(time => !Number.isFinite(time) || time > now)) {
+              throw new Error('Unreadable completed run activity; inspect CI manually');
+            }
+            return Math.max(...times);
+          };
+          const recent = list.map(run => activity(run) >= cutoff);
+          if (list.length === limit && recent.at(-1)) {
+            throw new Error('Run read bound reached with recent completed activity; inspect CI manually or raise maxRuns');
+          }
+          list = list.filter((_, index) => recent[index]);
+        } else if (!complete(response, list) || list.length >= limit) {
           throw new Error('Run read bound reached or unreadable runs; inspect CI manually or raise maxRuns');
         }
         for (const run of list) {
@@ -250,8 +278,9 @@ export async function runRunnerFallback(options = {}) {
     if (decision.decision === 'fallback') planned = { setVariable: { name: 'WE_SHARD_RUNNER', value: decision.setVariableTo },
       cancel: decision.runIds, rerun: decision.runIds };
     if (!apply || decision.decision !== 'fallback') {
-      if (preflight.status !== 'ok') notice(preflight.reason, decision.runIds, 'runner-preflight');
-      return { preflight, ...decision, planned };
+      const publication = preflight.status !== 'ok'
+        ? publishNotice(preflight.reason, decision.runIds, 'runner-preflight') : {};
+      return { preflight, ...decision, planned, ...publication };
     }
     // Reserve every attempt of worst-case polling and mutations before the first write.
     const repairCalls = 1 + decision.runIds.length * (2 + settings.cancelPollAttempts);
@@ -303,14 +332,14 @@ export async function runRunnerFallback(options = {}) {
       skipped.length ? 'cancel-not-completed; inspect CI manually' : ''].filter(Boolean);
     const reason = [...failures, decision.reason, preflight.status !== 'ok' ? preflight.reason : '']
       .filter(Boolean).join('; ');
-    notice(reason, decision.runIds, 'runner-fallback', { rerunResults, preflight });
-    return { preflight, ...decision, reason, planned, applied: true, rerunResults };
+    const publication = publishNotice(reason, decision.runIds, 'runner-fallback', { rerunResults, preflight });
+    return { preflight, ...decision, reason, planned, applied: true, rerunResults, ...publication };
   } catch (error) {
     const reason = `Runner fallback incomplete: ${clean(error.message)}; inspect CI manually`;
     // Incomplete discovery authorizes no writes, including feed writes.
-    if (discoveryComplete) notice(reason, decision?.runIds);
-    else log(clean(reason));
-    return { preflight, decision: 'no-action', planned, error: reason, applied: false };
+    const publication = discoveryComplete ? publishNotice(reason, decision?.runIds) : {};
+    if (!discoveryComplete) log(clean(reason));
+    return { preflight, decision: 'no-action', planned, error: reason, applied: false, ...publication };
   }
 }
 
