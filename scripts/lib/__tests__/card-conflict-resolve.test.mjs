@@ -118,7 +118,7 @@ describe('trusted no-checkout rebase path with real local Git', () => {
     const f = fixture({ duplicateBornAs: 'xabc123' });
     const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
     expect(result).toMatchObject({ action: 'skip', precondition: true, reason: 'ambiguous JIT reference mapping' });
-    expect(shouldCountRebaseAttempt(result)).toBe(false);
+    expect(shouldCountRebaseAttempt(result)).toBe(true);
     expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
     expect(readFileSync(join(f.cwd, path), 'utf8')).toBe(f.before);
   });
@@ -136,14 +136,14 @@ describe('trusted no-checkout rebase path with real local Git', () => {
     const f = fixture({ code: true });
     const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run: f.run, fetch: false });
     expect(result).toMatchObject({ action: 'skip', precondition: true, reason: 'PR is not proven card-only' });
-    expect(shouldCountRebaseAttempt(result)).toBe(false);
+    expect(shouldCountRebaseAttempt(result)).toBe(true);
     expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
   });
   it.each([
     ['grep', 'cannot read JIT reference mapping'],
     ['show', 'conflicting card side is missing'],
     ['ls-tree', 'conflicting card is not a regular file'],
-  ])('does not count a resolver refusal from failed %s', (command, reason) => {
+  ])('counts a resolver refusal from failed %s', (command, reason) => {
     const f = fixture();
     const run = (cmd, args, opts) => {
       if (args[0] === command) return { status: 2, stdout: '', stderr: 'unavailable' };
@@ -151,7 +151,7 @@ describe('trusted no-checkout rebase path with real local Git', () => {
     };
     const result = rebaseDropManifest({ laneRef: 'lane/cards', cwd: f.cwd, run, fetch: false });
     expect(result).toMatchObject({ action: 'skip', precondition: true, reason });
-    expect(shouldCountRebaseAttempt(result)).toBe(false);
+    expect(shouldCountRebaseAttempt(result)).toBe(true);
     expect(f.git('ls-remote', 'origin', 'refs/heads/lane/cards')).toContain(f.head);
     expect(readFileSync(join(f.cwd, path), 'utf8')).toBe(f.before);
   });
