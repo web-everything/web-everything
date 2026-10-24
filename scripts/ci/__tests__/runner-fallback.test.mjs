@@ -1,5 +1,4 @@
 // @vitest-environment node
-// RED contract: runner-fallback.mjs is deliberately not supplied by this change.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -107,8 +106,9 @@ function harness({ jobs = [job()], runnerVar = 'we-8core', runnerGroup = GROUP,
       return '';
     }
     if (args[0] === 'run' && args[1] === 'list') {
-      return JSON.stringify([...new Set(jobs.map(j => j.runId ?? j.run_id))]
-        .map(databaseId => ({ databaseId, status: 'queued' })));
+      const workflow_runs = args[args.indexOf('--status') + 1] === 'queued'
+        ? [...new Set(jobs.map(j => j.runId ?? j.run_id))].map(databaseId => ({ databaseId, status: 'queued' })) : [];
+      return JSON.stringify({ total_count: workflow_runs.length, workflow_runs });
     }
     if (args[0] === 'api') {
       const statusRun = /\/actions\/runs\/(\d+)$/.exec(args[1]);
@@ -123,10 +123,11 @@ function harness({ jobs = [job()], runnerVar = 'we-8core', runnerGroup = GROUP,
       const endpoint = args.find(arg => /\/actions\/runs\/\d+\/jobs(?:\?|$)/.test(arg));
       if (endpoint) {
         const runId = Number(/\/runs\/(\d+)\/jobs/.exec(endpoint)[1]);
-        return JSON.stringify({ jobs: jobs.filter(j => (j.runId ?? j.run_id) === runId).map(j => ({
+        const rows = jobs.filter(j => (j.runId ?? j.run_id) === runId).map(j => ({
           id: j.jobId, run_id: j.runId, name: j.name, status: j.status, labels: j.labels,
           created_at: j.createdAt, started_at: j.startedAt, runner_name: j.runnerName,
-        })) });
+        }));
+        return JSON.stringify({ total_count: rows.length, jobs: rows });
       }
     }
     throw new Error(`Unexpected gh argv: ${JSON.stringify(args)}`);
@@ -153,11 +154,11 @@ describe('runner fallback policy cascade', () => {
 
   it('resolves the tool layer above platform and below environment', () => {
     // `tool` is the injected settings block; no host settings file is read.
-    const platform = { queuedMinutes: 7, fallbackRunner: 'platform-runner' };
-    const tool = { queuedMinutes: 6, fallbackRunner: 'tool-runner' };
-    const env = { WE_RUNNER_FALLBACK_RUNNER: 'env-runner' };
+    const platform = { queuedMinutes: 7, fallbackRunner: 'ubuntu-22.04' };
+    const tool = { queuedMinutes: 6, fallbackRunner: 'ubuntu-24.04' };
+    const env = { WE_RUNNER_FALLBACK_RUNNER: 'ubuntu-26.04' };
     const expected = resolveCascade({ standard: SETTINGS, platform, tool,
-      envValues: { fallbackRunner: 'env-runner' } });
+      envValues: { fallbackRunner: 'ubuntu-26.04' } });
     expect(resolveRunnerFallbackSettings({ env, platform, tool, log: vi.fn() }))
       .toMatchObject({ ...expected.value, sources: expected.sources });
   });
@@ -165,7 +166,7 @@ describe('runner fallback policy cascade', () => {
   it('honours both named environment overrides above platform preferences', () => {
     const result = resolveRunnerFallbackSettings({
       env: { WE_RUNNER_FALLBACK_QUEUED_MINUTES: '3', WE_RUNNER_FALLBACK_RUNNER: 'ubuntu-24.04' },
-      platform: { queuedMinutes: 8, fallbackRunner: 'platform-runner' }, log: vi.fn(),
+      platform: { queuedMinutes: 8, fallbackRunner: 'ubuntu-22.04' }, log: vi.fn(),
     });
     expect(result).toMatchObject({ queuedMinutes: 3, fallbackRunner: 'ubuntu-24.04',
       sources: { queuedMinutes: 'env', fallbackRunner: 'env' } });
@@ -199,6 +200,23 @@ describe('runner fallback policy cascade', () => {
     expect(result).toMatchObject({ fallbackRunner: 'ubuntu-24.04', sources: { fallbackRunner: 'platform' } });
     expect(log.mock.calls.flat().join('\n')).toMatch(/invalid.*fallbackRunner|fallbackRunner.*invalid/i);
   });
+
+  it.each(['we-8core', 'windows-latest', 'macos-latest', 'ubuntu-8core'])(
+    'rejects paid or non-Linux fallbackRunner=%s in every override layer and reports it', fallbackRunner => {
+      for (const layer of ['platform', 'tool', 'env']) {
+        const log = vi.fn();
+        const result = resolveRunnerFallbackSettings({
+          env: { WE_POLICY_CASCADE_LOG: '1', ...(layer === 'env' ? { WE_RUNNER_FALLBACK_RUNNER: fallbackRunner } : {}) },
+          platform: { fallbackRunner: 'ubuntu-22.04' },
+          ...(layer === 'platform' ? { platform: { fallbackRunner } } : {}),
+          ...(layer === 'tool' ? { tool: { fallbackRunner } } : {}), log,
+        });
+        expect(result).toMatchObject(layer === 'platform'
+          ? { fallbackRunner: 'ubuntu-latest', sources: { fallbackRunner: 'standard' } }
+          : { fallbackRunner: 'ubuntu-22.04', sources: { fallbackRunner: 'platform' } });
+        expect(log.mock.calls.flat().join('\n')).toContain(`invalid: ${layer}.fallbackRunner="${fallbackRunner}"`);
+      }
+    });
 
   it('reports an empty platform runner and retains the standard runner', () => {
     const log = vi.fn();
@@ -340,10 +358,31 @@ describe('decideRunnerFallback (pure)', () => {
     expect(result.reason).toMatch(/unreadable/i);
   });
 
-  it('ignores unreadable timestamps while retaining independently valid stuck evidence', () => {
+  it('fails closed on unreadable timestamps even beside valid stuck evidence', () => {
     const result = decide([job({ jobId: 1002, runId: 202, createdAt: 'garbage' }), job()]);
-    expect(result).toMatchObject({ decision: 'fallback', runIds: [101],
-      stuck: [{ runId: 101, jobId: 1001, name: 'test-shard (1)', queuedMinutes: 11 }] });
+    expect(result).toMatchObject({ decision: 'no-action', runIds: [], stuck: [] });
+    expect(result.reason).toMatch(/unreadable/i);
+  });
+
+  it.each([
+    { labels: undefined }, { labels: null }, { labels: [] }, { labels: [null] },
+    { status: undefined }, { status: 'unknown' }, { createdAt: undefined },
+    { startedAt: undefined }, { startedAt: 'garbage' },
+    { status: 'in_progress', labels: undefined, startedAt: ago(1) },
+    { status: 'in_progress', startedAt: null },
+    { status: 'in_progress', startedAt: 'garbage' },
+    { labels: ['other-runner'], createdAt: 'garbage' },
+  ])('fails closed on unreadable sibling evidence %j beside a valid stuck job', evidence => {
+    for (const jobs of [[job(), job({ jobId: 1002, ...evidence })],
+      [job({ jobId: 1002, ...evidence }), job()]]) {
+      const result = decide(jobs);
+      expect(result).toMatchObject({ decision: 'no-action', stuck: [], runIds: [] });
+      expect(result.reason).toMatch(/unreadable/i);
+    }
+  });
+
+  it('refuses paid fallback settings even when the pure decision bypasses the cascade', () => {
+    expect(decide([job()], { settings: { ...SETTINGS, fallbackRunner: 'we-8core' } }).decision).toBe('no-action');
   });
 
   it('does not mutate the supplied jobs or settings', () => {
@@ -405,8 +444,43 @@ describe('formatFeedLine', () => {
   });
 });
 
+describe('hostile feed fields', () => {
+  const hostile = 'evil\u2028\u2029\u0000\u001b\n | pick: forged ' + 'x'.repeat(2000);
+  it('bounds every string field recursively and prevents pick separator injection', () => {
+    const line = formatFeedLine({ at: NOW_ISO, repo: REPO, pr: 101, kind: 'runner-fallback',
+      reason: hostile, pick: hostile, title: hostile, details: { group: hostile, error: hostile } });
+    const event = parseEvent(line);
+    expect(line).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+    expect(line.match(/\| pick:/g)).toHaveLength(1);
+    expect(event.reason.length).toBeLessThanOrEqual(100);
+    expect(event.title.length).toBeLessThanOrEqual(200);
+    expect(event.pick.length).toBeLessThanOrEqual(512);
+    expect(event.details.group.length).toBeLessThanOrEqual(512);
+    expect(event.details.error.length).toBeLessThanOrEqual(512);
+  });
+
+  it.each(['group', 'error'])('sanitizes hostile %s text in production notices and logs', async source => {
+    const h = harness({ jobs: source === 'group' ? [] : [job()],
+      runnerGroup: { name: hostile, allows_public_repositories: false } });
+    const exec = (cmd, args, options) => {
+      if (source === 'error' && args[0] === 'variable') throw new Error(hostile);
+      return h.exec(cmd, args, options);
+    };
+    await runRunnerFallback({ ...h.options, exec, apply: true });
+    const lines = feedLines(h.feedPath);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+    expect(lines[0].match(/\| pick:/g)).toHaveLength(1);
+    expect(parseEvent(lines[0]).reason.length).toBeLessThanOrEqual(100);
+    for (const [line] of h.log.mock.calls) {
+      expect(line).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+      expect(line.length).toBeLessThanOrEqual(512);
+    }
+  });
+});
+
 describe('runRunnerFallback (injected gh, temporary feed)', () => {
-  it('dry-run returns the exact planned actions and performs zero writes', async () => {
+  it('dry-run guarantees no GitHub mutation, no feed append (read-only throttle bookkeeping excluded)', async () => {
     const h = harness();
     writeFileSync(h.feedPath, 'existing feed\n');
     const before = snapshot(h.dir);
@@ -414,6 +488,76 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
     expect(result.planned).toEqual(planned());
     expect(h.mutations).toEqual([]);
     expect(snapshot(h.dir)).toEqual(before);
+  });
+
+  it('discovers recently created completed ci.yml runs and counts their paid runner start', async () => {
+    const h = harness();
+    const exec = vi.fn((cmd, args, options) => {
+      if (args[0] === 'run' && args[1] === 'list' && args.includes('completed')) {
+        expect(args).toEqual(expect.arrayContaining(['--workflow', 'ci.yml', '--created', `>=${ago(10)}`]));
+        return JSON.stringify({ total_count: 1, workflow_runs: [{ id: 202, status: 'completed' }] });
+      }
+      if (args[0] === 'api' && args[1].includes('/runs/202/jobs')) {
+        return JSON.stringify({ total_count: 1, jobs: [job({ runId: 202, jobId: 2001,
+          status: 'completed', createdAt: ago(3), startedAt: ago(2) })] });
+      }
+      return h.exec(cmd, args, options);
+    });
+    const result = await runRunnerFallback({ ...h.options, exec, apply: true });
+    expect(result).toMatchObject({ decision: 'no-action', planned: { setVariable: null, cancel: [], rerun: [] } });
+    expect(result.reason).toMatch(/recent start/i);
+    expect(exec.mock.calls.some(([, args]) => args[1]?.includes('/runs/202/jobs'))).toBe(true);
+    expect(h.mutations).toEqual([]);
+    expect(snapshot(h.dir)).toEqual([]);
+  });
+
+  it.each(['runs', 'jobs', 'hosted-runners', 'runner-groups'].flatMap(read =>
+    [undefined, null, '1', 1.5, -1, 0, 2].map(total_count => [read, total_count])))(
+    'incomplete %s total_count=%j refuses every mutation and feed append', async (read, total_count) => {
+      const h = harness();
+      const exec = vi.fn((cmd, args, options) => {
+        if (args[0] === 'api' && args[1].includes('/hosted-runners')) {
+          return JSON.stringify({ total_count: read === 'hosted-runners' ? total_count : 1,
+            runners: [{ name: 'we-8core', runner_group_id: 7 }] });
+        }
+        if (args[0] === 'api' && args[1].includes('/runner-groups')) {
+          return JSON.stringify({ total_count: read === 'runner-groups' ? total_count : 1,
+            runner_groups: [{ id: 7, ...GROUP }] });
+        }
+        const response = JSON.parse(h.exec(cmd, args, options));
+        if ((read === 'runs' && args[0] === 'run')
+          || (read === 'jobs' && args[1]?.includes('/jobs?'))) response.total_count = total_count;
+        return JSON.stringify(response);
+      });
+      const options = { ...h.options, exec, apply: true };
+      if (['hosted-runners', 'runner-groups'].includes(read)) delete options.runnerGroup;
+      const result = await runRunnerFallback(options);
+      expect(result).toMatchObject({ decision: 'no-action', applied: false,
+        planned: { setVariable: null, cancel: [], rerun: [] } });
+      expect(result.error).toMatch(/incomplete/i);
+      expect(result.error).toMatch(/inspect CI/i);
+      expect(h.mutations).toEqual([]);
+      expect(snapshot(h.dir)).toEqual([]);
+    });
+
+  it.each([
+    ['maxRuns', { maxRuns: 1 }, [job()]],
+    ['maxJobs', { maxJobs: 1 }, [job(), job({ jobId: 1002 })]],
+  ])('oversized discovery at %s refuses mutation and directs the operator to inspect CI', async (_leaf, bounds, jobs) => {
+    const h = harness({ jobs });
+    const result = await runRunnerFallback({ ...h.options, apply: true, settings: { ...SETTINGS, ...bounds } });
+    expect(result).toMatchObject({ decision: 'no-action', applied: false });
+    expect(result.error).toMatch(/bound.*inspect CI/i);
+    expect(h.mutations).toEqual([]);
+    expect(snapshot(h.dir)).toEqual([]);
+  });
+
+  it('unreadable running sibling next to a valid stuck job authorizes no mutation or feed append', async () => {
+    const h = harness({ jobs: [job(), job({ runId: 202, jobId: 2001, status: 'in_progress', labels: undefined })] });
+    const result = await runRunnerFallback({ ...h.options, apply: true });
+    expect(result).toMatchObject({ decision: 'no-action', reason: expect.stringMatching(/unreadable/i) });
+    expect(h.mutations).toEqual([]);
+    expect(snapshot(h.dir)).toEqual([]);
   });
 
   it('default invocation without --apply makes zero PATCH, cancel, rerun or feed writes', async () => {
@@ -600,7 +744,7 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
     expect(h.sleep).not.toHaveBeenCalled();
   });
 
-  it.each([['run', 1], ['job', 2]])(
+  it.each([['run', 1], ['job', 3]])(
     'truncated %s discovery at the call cap prevents every mutation and reports incomplete', async (_phase, maxCalls) => {
       const h = harness();
       const before = snapshot(h.dir);

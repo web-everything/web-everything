@@ -2,6 +2,8 @@
 /**
  * @file scripts/ci/runner-fallback.mjs
  * @description Detect stalled paid CI shards and switch forward to the fallback runner.
+ * Dry-run guarantees no GitHub mutation, no feed append. Read-only throttle bookkeeping
+ * (local slots, budgets and call logs) is excluded: gh-throttle has no no-state option.
  * Pure decisions are separate from bounded, injected GitHub IO. Defaults to dry-run;
  * --apply sets the variable before cancelling and rerunning affected runs. Never restores
  * the paid runner. Incomplete discovery requires operator inspection, never a partial repair.
@@ -16,14 +18,19 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as sleepDefault } from 'node:timers/promises';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export const RUNNER_FALLBACK_POLICY = Object.freeze({ queuedMinutes: 10, fallbackRunner: 'ubuntu-latest' });
 const CANCEL_BOUNDS = Object.freeze({ cancelPollAttempts: 6, cancelPollIntervalMs: 1000 });
 const READ_BOUNDS = Object.freeze({ maxRuns: 40, maxJobs: 100, maxCalls: 160 });
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0;
-const runnerLabel = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(value);
-const clean = value => String(value ?? '').replace(/[\p{Cc}\p{Cf}]/gu, ' ');
+const runnerLabel = value => typeof value === 'string' && /^ubuntu-(?:latest|\d{2}\.04)(?:-arm)?$/.test(value);
+// Match needs-you-feed field bounds; sanitize every nested string before publication.
+const FEED_LIMITS = Object.freeze({ repo: 200, head: 128, kind: 40, was: 40, reason: 100, title: 200, pick: 512, command: 512 });
+const clean = (value, max = 512) => sanitizeForFeed(value ?? '', max).replace(/\|\s*pick:/gi, ' pick:');
+const complete = (body, rows) => Array.isArray(rows) && Number.isSafeInteger(body?.total_count)
+  && body.total_count >= 0 && body.total_count === rows.length;
 const epoch = value => typeof value === 'string' && value ? Date.parse(value) : NaN;
 
 /** Resolve every leaf independently; invalid overrides retain the lower valid layer. */
@@ -50,23 +57,31 @@ export function decideRunnerFallback({ jobs = [], runnerVar, settings = RUNNER_F
   if (!runnerVar || runnerVar === settings.fallbackRunner) return idle('Runner already uses the fallback or is unset');
   if (!Array.isArray(jobs) || !Number.isFinite(now) || !positiveInteger(settings.queuedMinutes)
     || !runnerLabel(settings.fallbackRunner)) return idle('Unreadable decision evidence');
+  // Validate the entire discovered run set before interpreting any positive evidence.
+  for (const j of jobs) {
+    const created = epoch(Object.hasOwn(j ?? {}, 'createdAt') ? j.createdAt : j?.created_at);
+    const started = Object.hasOwn(j ?? {}, 'startedAt') ? j.startedAt : j?.started_at;
+    if (!Array.isArray(j?.labels) || !j.labels.length || j.labels.some(label => typeof label !== 'string' || !label.trim())
+      || !['queued', 'in_progress', 'completed', 'waiting', 'pending', 'requested'].includes(j.status)
+      || !Number.isFinite(created) || created > now
+      || (started !== null && (!Number.isFinite(epoch(started)) || epoch(started) > now))
+      || (j.status === 'in_progress' && started === null)) return idle('Unreadable job evidence; inspect CI manually');
+  }
   const matching = jobs.filter(j => Array.isArray(j?.labels) && j.labels.includes(runnerVar));
   const window = settings.queuedMinutes * 60000;
   if (matching.some(j => j.status === 'in_progress'
     || epoch(j.startedAt ?? j.started_at) >= now - window)) return idle('Runner saturation or a recent start explains the queue');
   const stuck = [];
-  let unreadable = false;
   for (const j of matching) {
     if (j.status !== 'queued' || !/^test-shard \(\d+\)$/.test(j.name)) continue;
     const created = epoch(Object.hasOwn(j, 'createdAt') ? j.createdAt : j.created_at);
     const runId = Number(j.runId ?? j.run_id), jobId = Number(j.jobId ?? j.id);
     if (!Number.isFinite(created) || created > now || !positiveInteger(runId) || !positiveInteger(jobId)) {
-      unreadable = true;
-      continue;
+      return idle('Unreadable queued job evidence; inspect CI manually');
     }
     if (now - created >= window) stuck.push({ runId, jobId, name: j.name, queuedMinutes: (now - created) / 60000 });
   }
-  if (!stuck.length) return idle(unreadable ? 'Unreadable queued job evidence' : 'No stalled paid shards');
+  if (!stuck.length) return idle('No stalled paid shards');
   return { decision: 'fallback', reason: `Paid shards queued beyond ${settings.queuedMinutes} minutes; switch to ${settings.fallbackRunner}`,
     stuck, runIds: [...new Set(stuck.map(j => j.runId))].sort((a, b) => a - b), setVariableTo: settings.fallbackRunner };
 }
@@ -77,14 +92,15 @@ export function evaluatePreflight({ runnerVar, repoVisibility, runnerGroup, sett
   if (!['public', 'private', 'internal'].includes(repoVisibility) || !runnerGroup?.name
     || typeof runnerGroup.allows_public_repositories !== 'boolean') return { status: 'unreadable', reason: 'Unreadable repository or runner group evidence; inspect runner configuration' };
   if (repoVisibility === 'public' && !runnerGroup.allows_public_repositories) {
-    return { status: 'blocked', reason: `Runner group ${runnerGroup.name} prohibits public repositories` };
+    return { status: 'blocked', reason: `Runner group ${clean(runnerGroup.name, 200)} prohibits public repositories` };
   }
   return { status: 'ok', reason: 'Runner group permits repository visibility' };
 }
 
 /** Existing needs-you text envelope with an at-first JSON suffix; controls remain inert. */
 export function formatFeedLine(event) {
-  const safe = JSON.parse(JSON.stringify({ at: event.at, ...event }, (_key, value) => typeof value === 'string' ? clean(value) : value));
+  const safe = JSON.parse(JSON.stringify({ at: event.at, ...event }, (key, value) =>
+    typeof value === 'string' ? clean(value, FEED_LIMITS[key] ?? 512) : value));
   return `NEEDS-YOU ${safe.repo}#${safe.pr} ${safe.kind}: ${safe.reason} | pick: ${safe.pick} ${JSON.stringify(safe)}`;
 }
 
@@ -94,7 +110,7 @@ function restExec(cmd, args, { charge, ...options }) {
   const repo = flag('--repo');
   let request = args;
   if (args[0] === 'run' && args[1] === 'list') {
-    request = ['api', `repos/${repo}/actions/workflows/ci.yml/runs?status=${flag('--status')}&per_page=${flag('--limit')}`];
+    request = ['api', `repos/${repo}/actions/workflows/ci.yml/runs?status=${flag('--status')}&per_page=${flag('--limit')}${args.includes('--created') ? `&created=${encodeURIComponent(flag('--created'))}` : ''}`];
   } else if (args[0] === 'variable' && args[1] === 'set') {
     request = ['api', '--method', 'PATCH', `repos/${repo}/actions/variables/WE_SHARD_RUNNER`, '-f', 'name=WE_SHARD_RUNNER', '-f', `value=${flag('--body')}`];
   } else if (args[0] === 'run' && ['cancel', 'rerun'].includes(args[1])) {
@@ -155,24 +171,25 @@ export async function runRunnerFallback(options = {}) {
         try {
           const org = repo.split('/')[0];
           const hosted = await api(`orgs/${org}/actions/hosted-runners?per_page=100`);
-          if (!Array.isArray(hosted.runners) || hosted.total_count > hosted.runners.length) throw new Error('Incomplete hosted runner lookup');
+          if (!complete(hosted, hosted.runners)) throw new Error('Incomplete hosted runner lookup');
           const runner = hosted.runners.find(r => r.name === runnerVar);
           if (!positiveInteger(runner?.runner_group_id)) throw new Error('Runner group unresolved');
           const groups = await api(`orgs/${org}/actions/runner-groups?per_page=100`);
-          if (!Array.isArray(groups.runner_groups) || groups.total_count > groups.runner_groups.length) throw new Error('Incomplete runner group lookup');
+          if (!complete(groups, groups.runner_groups)) throw new Error('Incomplete runner group lookup');
           runnerGroup = groups.runner_groups.find(g => g.id === runner.runner_group_id) ?? 'unreadable';
-        } catch { runnerGroup = 'unreadable'; }
+        } catch (error) { throw new Error(`Unreadable runner group discovery: ${clean(error.message)}`); }
       }
     }
     preflight = evaluatePreflight({ runnerVar, repoVisibility, runnerGroup, settings });
     let jobs = options.jobs;
     if (!offline) {
       const runs = new Map();
-      for (const status of ['queued', 'in_progress']) {
+      for (const status of ['queued', 'in_progress', 'completed']) {
         const response = await json(['run', 'list', '--repo', repo, '--workflow', 'ci.yml', '--status', status,
+          ...(status === 'completed' ? ['--created', `>=${new Date(now - settings.queuedMinutes * 60000).toISOString()}`] : []),
           '--limit', String(Math.min(settings.maxRuns, 100)), '--json', 'databaseId,status']);
-        const list = Array.isArray(response) ? response : response.workflow_runs;
-        if (!Array.isArray(list) || response.total_count > list.length || list.length >= Math.min(settings.maxRuns, 100)) {
+        const list = response.workflow_runs;
+        if (!complete(response, list) || list.length >= Math.min(settings.maxRuns, 100)) {
           throw new Error('Run read bound reached or unreadable runs; inspect CI manually or raise maxRuns');
         }
         for (const run of list) {
@@ -185,7 +202,7 @@ export async function runRunnerFallback(options = {}) {
       jobs = [];
       for (const id of runs.keys()) {
         const body = await api(`repos/${repo}/actions/runs/${id}/jobs?per_page=${Math.min(settings.maxJobs, 100)}`);
-        if (!Array.isArray(body.jobs) || body.total_count > body.jobs.length || body.jobs.length >= 100
+        if (!complete(body, body.jobs) || body.jobs.length >= 100
           || jobs.length + body.jobs.length > settings.maxJobs) throw new Error('Job read bound reached; inspect CI manually or raise maxJobs');
         jobs.push(...body.jobs.map(j => ({ ...j, run_id: id })));
       }
@@ -238,11 +255,14 @@ export async function runRunnerFallback(options = {}) {
     const skipped = rerunResults.filter(run => run.rerunSkipped).map(run => run.runId);
     const pollFailures = rerunResults.filter(run => run.pollFailed).map(run => run.runId);
     const rerunFailures = rerunResults.filter(run => run.rerunFailed).map(run => run.runId);
-    const reason = [decision.reason, preflight.status !== 'ok' ? preflight.reason : '',
+    // Lead with actionable failures so the bounded feed reason retains the diagnosis.
+    // Full per-run outcomes remain in the structured rerunResults.
+    const failures = [
       cancelFailures.size ? `Cancellation requests rejected for runs ${[...cancelFailures].join(', ')}; inspect CI manually` : '',
       pollFailures.length ? `Polling failed for runs ${pollFailures.join(', ')}; inspect CI manually` : '',
       rerunFailures.length ? `Rerun requests failed for runs ${rerunFailures.join(', ')}; inspect CI manually` : '',
-      skipped.length ? `rerunSkipped: cancel-not-completed for runs ${skipped.join(', ')}; inspect CI manually` : '']
+      skipped.length ? 'cancel-not-completed; inspect CI manually' : ''].filter(Boolean);
+    const reason = [...failures, decision.reason, preflight.status !== 'ok' ? preflight.reason : '']
       .filter(Boolean).join('; ');
     notice(reason, decision.runIds, 'runner-fallback', { rerunResults });
     return { preflight, ...decision, reason, planned, applied: true, rerunResults };
