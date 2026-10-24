@@ -1,0 +1,21 @@
+{
+  "id": "collector-pr-per-stream-card-batching",
+  "title": "Collector PRs per stream - how merge tooling batches many small, same-shape changes into one reviewed PR",
+  "status": "open",
+  "summary": "Prep research for the decision on collector PRs that batch card-only filings per stream (count or age flush). Finding 1: the idea is mostly shipped already as the card-batch epic (rolling card-only PRs, count-or-age seal, per-card extraction on a review finding). Finding 2: prior art (Renovate grouping and schedule windows, Dependabot groups, bors and GitHub merge queue batching, Gerrit topics) agrees on the same three levers - a group key, a size cap, and a time window - which is exactly the shipped policy shape. Finding 3: every one of those systems pairs the batch with a bisect-or-eject path so one bad member does not sink the rest, and none of them re-queues the bad member into the next batch. Finding 4 (local, measured): the shipped prevention collector has refused every new card since 2026-10-14 because its last sealed state was never retired, so 327 cards sit in a spool - the gap to close first is self-healing of the collector, before adding streams.",
+  "dateOpened": "2026-10-18",
+  "lastReviewed": "2026-10-18",
+  "reviewHorizon": "P12M",
+  "tags": [
+    "pr-batching",
+    "card-batch",
+    "merge-queue",
+    "renovate",
+    "dependabot",
+    "bors",
+    "decision-prep"
+  ],
+  "relatedBlocks": [],
+  "relatedPlugs": [],
+  "relatedProject": ""
+}
