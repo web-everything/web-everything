@@ -11,6 +11,7 @@ import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 import { collectOwnerSignals, runPrSweep } from '../../pr-sweep.mjs';
 import { publishStalledDigest } from '../../pr-stall-digest.mjs';
 import { replay } from '../../../operations/needs-you-feed.mjs';
+import { installDaemonLog } from '../../../../skills-src/conveyor/daemon-log.mjs';
 
 const CONVEYOR = fileURLToPath(new URL('../../', import.meta.url));
 export default {
@@ -114,6 +115,26 @@ export default {
       const clock = `${key}@${head}|${label}`;
       const detectorEnv = { WE_PLATFORM_PREFERENCES_FILE: prefs, WE_PR_STALL_DETECTOR_ENABLED: 'true',
         WE_PR_STALL_DETECTOR_SAME_LABEL_MINUTES: '60', WE_PR_STALL_DETECTOR_REPEATED_REASON_COUNT: '5' };
+      // PR #5856 round 3: default production logging compresses seven refusals
+      // into two physical lines; detection must still count seven occurrences.
+      const compressed = [];
+      const target = { log: line => compressed.push(line) };
+      const restore = installDaemonLog({ target, env: {}, timers: false, logDirs: [], now: () => new Date(now - 60000) });
+      try {
+        for (let i = 0; i < 7; i++) target.log(`review-daemon: ${key} not dispatched — already-reviewed-head: referral hold auto-resolved`);
+      } finally { restore(); }
+      const compressedReport = await runPrSweep({ now, dryRun: true, env: detectorEnv, config: {}, settings: { value, sources: {} },
+        readPrevious: () => ({ stallDetector: { [clock]: now - 20 * 60000 } }),
+        readPrs: () => [stalledPr], readQueue: () => ({ ready: [], rulingNeeded: [] }),
+        readSignals: args => collector(args, { name: 'review-daemon.log', line: compressed.join('\n') }) });
+      const compressedItem = compressedReport.stallDetector?.items?.[0];
+      if (compressed.length !== 2 || !compressed[1]?.includes('(repeated 6 times since ')
+        || compressedReport.errors.length || compressedReport.stallDetector?.stalled !== 1
+        || compressedItem?.repeatCount !== 7 || compressedItem?.stalledMinutes !== 20) {
+        violations.push({ invariant: 'compressed-refusals-hide-stall', detail: JSON.stringify({
+          lines: compressed.length, detector: compressedReport.stallDetector, errors: compressedReport.errors,
+        }) });
+      }
       for (const [mode, digest] of [['off', false], ['off', true], ['shadow', false], ['on', false], ['shadow', true], ['on', true]]) {
         const stateDir = join(root, `${mode}-${digest}`, 'digest'), feedPath = join(root, `${mode}-${digest}`, 'events.jsonl');
         let previous = { stallDetector: { [clock]: now - 90 * 60000 } }, notifications = 0;

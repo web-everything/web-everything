@@ -20,6 +20,7 @@ import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession } fro
 import { runStallSweep } from './pr-stall-sweep.mjs';
 import { publishStalledDigest } from './pr-stall-digest.mjs';
 import { runDetector } from './pr-stall-detector.mjs';
+import { expandRepeatedLines } from '../lib/log-timestamp.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
@@ -114,7 +115,9 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
     let files;
     try { files = listLogs(d); } catch (e) { if (e.code !== 'ENOENT') recordError('logs', `logs ${d}: ${e.message}`); continue; }
     for (const name of files.filter((n) => /^(fix-dispatch-daemon|review-daemon)\.log$|drain.*\.log$|^pass-daemon\.merge-orphan-sweep\.log$/.test(n))) {
-      const text = await guarded(`log ${name}`, () => readTail(join(d, name)), '');
+      // Replay the logger's bounded compression format once per log, before PR
+      // binding and progress/refusal parsing, so each occurrence counts normally.
+      const text = await guarded(`log ${name}`, async () => expandRepeatedLines(await readTail(join(d, name))), '');
       logs.push({ name: basename(name, '.log'), text, repo: /plateau/.test(d) ? 'plateau-app' : 'we' });
     }
   }

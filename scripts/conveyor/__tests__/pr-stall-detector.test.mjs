@@ -9,6 +9,7 @@ import {
 import { collectOwnerSignals, runPrSweep } from '../pr-sweep.mjs';
 import { feedItem, publishStalledDigest } from '../pr-stall-digest.mjs';
 import { replay } from '../../operations/needs-you-feed.mjs';
+import { installDaemonLog } from '../../../skills-src/conveyor/daemon-log.mjs';
 
 // runDetector has no settings-reader argument. Keep its real settings resolver while
 // replacing only its file inputs; integration passes inject every sweep write seam.
@@ -343,6 +344,41 @@ describe('detectStalls', () => {
 });
 
 describe('runDetector', () => {
+  it.each([
+    ['review-daemon.log', 7, false],
+    ['fix-dispatch-daemon.log', 7, false],
+    ['drain.log', 7, false],
+    ['pass-daemon.merge-orphan-sweep.log', 7, false],
+    ['review-daemon.log', 7, true],
+    ['review-daemon.log', 5, false],
+  ])('counts compressed logger occurrences from %s (%i writes, marker-only=%s)', async (name, count, markerOnly) => {
+    const lines = [];
+    const target = { log: line => lines.push(line) };
+    const restore = installDaemonLog({ target, env: {}, timers: false, logDirs: [],
+      now: () => new Date(NOW - MINUTE) });
+    try {
+      for (let i = 0; i < count; i++) target.log(`review-daemon: ${PR_KEY} not dispatched — ${REASON}`);
+    } finally { restore(); }
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toContain(`(repeated ${count - 1} times since `);
+    const errors = [];
+    const signals = await collectOwnerSignals({ prs: [pr()], env: {}, errors,
+      readAgents: () => [], readHealth: () => ({}), cloneRoots: () => ['fixture-clone'],
+      listLogs: () => [name], readTail: () => lines.slice(markerOnly ? 1 : 0).join('\n') });
+    const daemons = { [PR_KEY]: signals[PR_KEY].daemons };
+    const out = detect({ daemons, seen: { [key()]: NOW - 20 * MINUTE } });
+    expect(errors).toEqual([]);
+    expect(out.errors).toEqual([]);
+    const occurrences = count - (markerOnly ? 1 : 0);
+    expect(out.items).toHaveLength(occurrences > 5 ? 1 : 0);
+    expect(daemons[PR_KEY]).toHaveLength(occurrences);
+    if (occurrences > 5) expect(out.items[0]).toMatchObject({ repeatCount: occurrences, stalledMinutes: 20 });
+    // Expanding a log must not bypass head-lifetime or subsequent-progress filtering.
+    expect(detect({ daemons, seen: { [key()]: NOW } }).items).toEqual([]);
+    daemons[PR_KEY].push({ name: 'review-daemon', at: NOW, kind: 'progress' });
+    expect(detect({ daemons, seen: { [key()]: NOW - 20 * MINUTE } }).items).toEqual([]);
+  });
+
   it.each(['head', 'headRefOid'])('preserves explicit health refusal %s attribution through detection', async field => {
     const signals = await collectOwnerSignals({ prs: [pr()], env: {}, errors: [],
       readAgents: () => [], cloneRoots: () => [],
