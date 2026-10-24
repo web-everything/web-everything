@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["scripts/operations/pr-digest*.mjs", "scripts/operations/__tests__/pr-digest*.test.mjs"]
+scope: ["we:scripts/operations/pr-digest*.mjs", "we:scripts/operations/__tests__/pr-digest*.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
