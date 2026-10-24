@@ -1,7 +1,10 @@
 /** Bounded observations must expose grants that need evidence beyond list + comments. */
 import { afterEach, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, operatorGh } from '../judge-sweep-facts-io.mjs';
+import { buildShapePlan } from '../../review-core-cli.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
@@ -15,6 +18,7 @@ afterEach(() => { vi.resetAllMocks(); vi.unstubAllEnvs(); });
 const repo = 'o/r', head = 'a'.repeat(40), at = '2026-10-22T13:00:00Z';
 const baseCap = 12;
 const exec = vi.fn();
+const policyHash = () => createHash('sha256').update(JSON.stringify(resolveHumanReviewSurfaces().categories)).digest('hex');
 
 it.each([
   ['automatic standing grant', 'web-everything[bot]', true, baseCap, true],
@@ -307,6 +311,36 @@ it.each([199, 200, 201])('refuses a potentially truncated listing at the 200-PR 
 });
 
 const humanPr = extra => pr({ labels: [{ name: 'review:human' }], files: [{ path: 'README.md' }], changedFiles: 1, ...extra });
+it.each([
+  ['narrow', 'broad', false, true],
+  ['broad', 'narrow', true, false],
+  ['workflow', 'workflow,statute', false, true],
+])('invalidates serialized and in-memory shape results when policy changes from %s to %s', (before, after, initial, expected) => {
+  let disk = '{}';
+  const io = { read: () => disk, write: (_path, data) => { disk = data; } };
+  const changedFiles = ['docs/agent/platform-decisions.md'];
+  const shape = vi.fn(files => buildShapePlan({ changedFiles: files }));
+  const readerOptions = options({ shape,
+    gh: () => JSON.stringify([humanPr({ files: changedFiles.map(path => ({ path })) })]),
+  });
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', before);
+  const reader = createJudgeSweepFactsReader({ ...readerOptions, cache: createShapeCache(io) });
+  expect(reader({ repo }).prs[0].humanRequired).toBe(initial);
+  expect(reader({ repo }).prs[0].humanRequired).toBe(initial);
+  expect(shape).toHaveBeenCalledTimes(1);
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', after);
+  expect(buildShapePlan({ changedFiles }).humanRequired).toBe(expected);
+  const fresh = createJudgeSweepFactsReader({ ...readerOptions, cache: createShapeCache(io) });
+  const facts = fresh({ repo }).prs[0];
+  expect(facts.evidenceErrors).toEqual([]);
+  expect(facts.humanRequired).toBe(expected);
+  expect(reader({ repo }).prs[0].humanRequired).toBe(expected);
+  expect(shape).toHaveBeenCalledTimes(3);
+  const reloaded = createJudgeSweepFactsReader({ ...readerOptions, cache: createShapeCache(io) });
+  expect(reloaded({ repo }).prs[0].humanRequired).toBe(expected);
+  expect(shape).toHaveBeenCalledTimes(3);
+});
+
 it.each(['base', 'head'])('recomputes shape when only the %s changes and reuses an identical identity', changed => {
   let current = humanPr();
   const shape = vi.fn().mockReturnValueOnce({ humanRequired: false }).mockReturnValueOnce({ humanRequired: true });
@@ -316,6 +350,36 @@ it.each(['base', 'head'])('recomputes shape when only the %s changes and reuses 
   current = { ...current, [changed === 'head' ? 'headRefOid' : 'baseRefOid']: 'c'.repeat(40) };
   expect(reader({ repo }).prs[0].humanRequired).toBe(true);
   expect(shape).toHaveBeenCalledTimes(2);
+});
+
+it('reuses equivalent effective policies across presets, reordered categories, and cascade sources', () => {
+  let disk = '{}';
+  const io = { read: () => disk, write: (_path, data) => { disk = data; } };
+  const shape = vi.fn(() => ({ humanRequired: false }));
+  const evaluate = () => read({ cache: createShapeCache(io), shape,
+    gh: () => JSON.stringify([humanPr()]) });
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'narrow');
+  expect(evaluate().humanRequired).toBe(false);
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', ' secrets, identity, permission, protection, workflow,workflow ');
+  expect(evaluate().humanRequired).toBe(false);
+  expect(shape).toHaveBeenCalledTimes(1);
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', undefined);
+  expect(evaluate().humanRequired).toBe(false);
+  const calls = shape.mock.calls.length;
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', resolveHumanReviewSurfaces().categories.join(','));
+  expect(evaluate().humanRequired).toBe(false);
+  expect(shape).toHaveBeenCalledTimes(calls);
+});
+
+it('rejects a policy-free head-and-base entry in a current rules envelope', () => {
+  const key = `${repo}:${head}:${'b'.repeat(40)}`;
+  const cache = createShapeCache({
+    read: () => JSON.stringify({ rulesVersion: 1, entries: { [key]: false } }), write: () => {},
+  });
+  expect(cache.get(key)).toBeUndefined();
+  const shape = vi.fn(() => ({ humanRequired: true }));
+  expect(read({ cache, shape, gh: () => JSON.stringify([humanPr()]) }).humanRequired).toBe(true);
+  expect(shape).toHaveBeenCalledTimes(1);
 });
 
 it('normalizes head and base SHA case consistently before cache lookup', () => {
@@ -343,14 +407,14 @@ it('ignores legacy head-only cache entries and recomputes a permissive result', 
   const facts = read({ cache, shape, gh: () => JSON.stringify([humanPr()]) });
   expect(facts.humanRequired).toBe(true);
   expect(shape).toHaveBeenCalledTimes(1);
-  expect(shape).toHaveBeenCalledWith(['README.md']);
+  expect(shape).toHaveBeenCalledWith(['README.md'], resolveHumanReviewSurfaces());
 });
 
 it('a shape-rules version bump invalidates a cached non-human result in a fresh reader', () => {
   let disk = '{}';
   const io = { read: () => disk, write: (_path, data) => { disk = data; } };
   const old = createShapeCache({ ...io, rulesVersion: 1 });
-  const key = `${repo}:${head}:${'b'.repeat(40)}`;
+  const key = `${repo}:${head}:${'b'.repeat(40)}:${policyHash()}`;
   old.set(key, false);
   expect(createShapeCache({ ...io, rulesVersion: 1 }).get(key)).toBe(false);
   const shape = vi.fn(() => ({ humanRequired: true }));
@@ -358,13 +422,13 @@ it('a shape-rules version bump invalidates a cached non-human result in a fresh 
     gh: () => JSON.stringify([humanPr()]) });
   expect(facts.humanRequired).toBe(true);
   expect(shape).toHaveBeenCalledTimes(1);
-  expect(shape).toHaveBeenCalledWith(['README.md']);
+  expect(shape).toHaveBeenCalledWith(['README.md'], resolveHumanReviewSurfaces());
   expect(createShapeCache({ ...io, rulesVersion: 2 }).get(key)).toBe(true);
   expect(createShapeCache({ ...io, rulesVersion: 1 }).get(key)).toBeUndefined();
 });
 
 it('cache retains at most 256 entries on both load and write, evicting the oldest entry', () => {
-  const keys = Array.from({ length: 257 }, (_, i) => `${repo}:${i.toString(16).padStart(40, '0')}:${head}`);
+  const keys = Array.from({ length: 257 }, (_, i) => `${repo}:${i.toString(16).padStart(40, '0')}:${head}:${policyHash()}`);
   let disk = JSON.stringify({ rulesVersion: 1, entries: Object.fromEntries(keys.map(key => [key, false])) });
   const io = { read: () => disk, write: (_path, data) => { disk = data; } };
   const cache = createShapeCache(io);
@@ -400,7 +464,7 @@ it('rejects a legacy head-only entry even inside the current version envelope', 
 it.each(['null', '[]', '{', '{"rulesVersion":1,"entries":null}', '{"rulesVersion":1,"entries":[]}'])
 ('treats an unreadable cache envelope as a miss and replaces it (%s)', contents => {
   let disk = contents;
-  const key = `${repo}:${head}:${'b'.repeat(40)}`;
+  const key = `${repo}:${head}:${'b'.repeat(40)}:${policyHash()}`;
   const cache = createShapeCache({ read: () => disk, write: (_path, data) => { disk = data; } });
   expect(cache.get(key)).toBeUndefined();
   cache.set(key, true);
@@ -420,4 +484,5 @@ it('shape child receives filenames unchanged as JSON stdin with bounded output a
   expect(args).toEqual([expect.stringMatching(/scripts\/review-core-cli\.mjs$/), 'shape', '--json']);
   expect(JSON.parse(opts.input)).toEqual(files);
   expect(opts).toMatchObject({ encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
+  expect(opts.env.WE_HUMAN_REVIEW_SURFACES).toBe(resolveHumanReviewSurfaces().categories.join(','));
 });

@@ -1,5 +1,6 @@
 /** GitHub/file observations for judge-sweep-facts. No GitHub mutations or agent dispatches. */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -26,6 +27,7 @@ import { ignoredRulings } from '../lib/ruling-ledger.mjs';
 import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { parseFindings } from '../review-corpus/mine-review-corpus.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY, repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { resolveHumanReviewSurfaces } from '../lib/human-review-surfaces.mjs';
 export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
 
 const rootDir = () => join(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -46,7 +48,7 @@ export function operatorGh(args, options = {}) {
     throttle: { bin: '/opt/homebrew/bin/gh', personalRoute: false, maxAttempts: 1 } });
 }
 
-/** A disposable, bounded head-and-base cache, scoped to a shape-rules version. Legacy entries are misses. */
+/** A bounded head/base/policy cache, scoped to a shape-rules version. Legacy entries are misses. */
 export function createShapeCache({ cacheDir = join(homedir(), '.claude', 'conveyor'),
   rulesVersion = SHAPE_RULES_VERSION,
   readFile = readFileSync,
@@ -69,7 +71,7 @@ export function createShapeCache({ cacheDir = join(homedir(), '.claude', 'convey
           if (parsed?.rulesVersion !== rulesVersion || !parsed.entries || typeof parsed.entries !== 'object'
             || Array.isArray(parsed.entries)) throw failure('shape cache version or entries unreadable');
           entries = new Map(Object.entries(parsed.entries).filter(([k, v]) =>
-            /^[\w.-]+\/[\w.-]+:[a-f0-9]{40}:[a-f0-9]{40}$/.test(k) && typeof v === 'boolean').slice(-CACHE_ENTRIES));
+            /^[\w.-]+\/[\w.-]+:[a-f0-9]{40}:[a-f0-9]{40}:[a-f0-9]{64}$/.test(k) && typeof v === 'boolean').slice(-CACHE_ENTRIES));
         } catch { entries = new Map(); }
       }
       return entries.get(key);
@@ -113,9 +115,11 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
   readJobs = () => parseLiveJobs(exec('ps', ['-axo', 'pid,etime,command'], {
     encoding: 'utf8', timeout: 10_000, maxBuffer: 8 * 1024 * 1024 })),
   readComments = defaultListPrComments, cache = createShapeCache(),
-  shape = files => JSON.parse(exec(process.execPath, [join(rootDir(), 'scripts/review-core-cli.mjs'), 'shape', '--json'], {
+  shape = (files, humanSurfaces) => JSON.parse(exec(process.execPath, [join(rootDir(), 'scripts/review-core-cli.mjs'), 'shape', '--json'], {
     // JSON stdin preserves commas, whitespace and shell syntax in filenames.
     input: JSON.stringify(files), cwd: rootDir(), encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    // Pin the child to the same resolved policy used for this cache lookup.
+    env: { ...process.env, WE_HUMAN_REVIEW_SURFACES: humanSurfaces.categories.join(',') },
   })),
   baseCap = resolveRoundCap(process.env),
   cardReadable = ref => referralCardReadable(ref, rootDir(), { readOnPr: () => {
@@ -231,13 +235,16 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
           // A retarget or base advance can change the net files without changing the head.
           // Unknown base identity cannot reuse a prior non-human result.
           if (typeof p.baseRefOid !== 'string' || !/^[a-f0-9]{40}$/i.test(p.baseRefOid)) throw failure('base identity unreadable');
-          const key = `${repo}:${headSha}:${p.baseRefOid.toLowerCase()}`;
+          // Resolve on each observation: both environment and lower cascade layers can change.
+          const humanSurfaces = resolveHumanReviewSurfaces();
+          const policyHash = createHash('sha256').update(JSON.stringify(humanSurfaces.categories)).digest('hex');
+          const key = `${repo}:${headSha}:${p.baseRefOid.toLowerCase()}:${policyHash}`;
           let human = cache.get(key);
           if (typeof human !== 'boolean') {
             if (!Array.isArray(p.files) || p.files.length !== p.changedFiles || !p.files.length
               || p.files.some(f => typeof f?.path !== 'string' || !f.path)
               || new Set(p.files.map(f => f.path)).size !== p.files.length) throw failure('net file list incomplete; inspect full diff');
-            const shaped = shape(p.files.map(f => f.path));
+            const shaped = shape(p.files.map(f => f.path), humanSurfaces);
             if (typeof shaped?.humanRequired !== 'boolean') throw failure('shape unreadable');
             human = shaped.humanRequired;
             cache.set(key, human);

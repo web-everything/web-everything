@@ -1,5 +1,7 @@
 /** Real subprocess + disk-cache fidelity; GitHub and host ledgers stay injected. */
 import { expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
 import { readFileSync, statSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,7 +23,8 @@ it('runs the real shape child and reuses its head-and-base result from an owner-
     expect(first.evidenceErrors).toEqual([]);
     const file = join(cacheDir, 'judge-sweep-shape-cache.json');
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ rulesVersion: 1,
-      entries: { [`${JUDGE_SWEEP_REPO}:${head}:${head}`]: false } });
+      entries: { [`${JUDGE_SWEEP_REPO}:${head}:${head}:${createHash('sha256')
+        .update(JSON.stringify(resolveHumanReviewSurfaces().categories)).digest('hex')}`]: false } });
     expect(statSync(file).mode & 0o077).toBe(0);
     expect(statSync(cacheDir).mode & 0o077).toBe(0);
     const second = createJudgeSweepFactsReader({ ...options, cache: createShapeCache({ cacheDir }),
@@ -34,7 +37,7 @@ it('runs the real shape child and reuses its head-and-base result from an owner-
 it.each([128 * 1024, 128 * 1024 + 1])('checks the cache byte bound before reading valid JSON (%i bytes)', size => {
   const cacheDir = mkdtempSync(join(tmpdir(), 'judge-sweep-cache-'));
   try {
-    const key = `${JUDGE_SWEEP_REPO}:${'a'.repeat(40)}:${'b'.repeat(40)}`;
+    const key = `${JUDGE_SWEEP_REPO}:${'a'.repeat(40)}:${'b'.repeat(40)}:${'c'.repeat(64)}`;
     const file = join(cacheDir, 'judge-sweep-shape-cache.json');
     const data = JSON.stringify({ rulesVersion: 1, entries: { [key]: false }, padding: '' });
     writeFileSync(file, data.replace('"padding":""', `"padding":"${'x'.repeat(size - Buffer.byteLength(data))}"`));
