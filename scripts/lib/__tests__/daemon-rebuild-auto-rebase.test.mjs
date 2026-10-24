@@ -173,6 +173,63 @@ describe('established overlay auto rebase', () => {
       assertUnregistered(f);
     });
 
+    it.each(['NOT WEAKENED', 'WEAKENED', 'Probably NOT WEAKENED', 'NOT WEAKENED\n', undefined])(
+      'requires an exact audit certification when the fixer deletes the only related test: %s', async lastMessage => {
+        const f = fixture(); f.moveMain();
+        const resolveConflicts = f.deps.codex;
+        f.deps.codex = async options => {
+          const result = await resolveConflicts(options);
+          expect(fs.existsSync(join(options.root, 'worker.test.mjs'))).toBe(true);
+          fs.unlinkSync(join(options.root, 'worker.test.mjs'));
+          return result;
+        };
+        f.deps.auditor = vi.fn(async ({ root, args, taskFile }) => {
+          expect(args).toContain('--review');
+          expect(ok(root, ['ls-files']).split('\n')).not.toContain('worker.test.mjs');
+          const task = fs.readFileSync(taskFile, 'utf8');
+          // \x3c matches the literal opening angle bracket of each material tag.
+          const fencedMaterial = task.match(/\x3cmaterial>\n([\s\S]*?)\n\x3c\/material>/);
+          expect(fencedMaterial).not.toBeNull();
+          const material = JSON.parse(fencedMaterial[1]);
+          expect(material).toMatchObject({
+            rule: 'codex-audit-required', noTestFiles: ['worker.mjs', 'worker.test.mjs'],
+          });
+          return agentResult({ lastMessage });
+        });
+        if (lastMessage === 'NOT WEAKENED') {
+          const result = await job(f);
+          assertRule(f, result, 'codex-audit-required');
+        } else {
+          await expect(job(f)).rejects.toThrow(/audit/i);
+          assertUnregistered(f);
+          expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'audit' } });
+        }
+        expect(f.deps.testRunner).not.toHaveBeenCalled();
+        expect(f.deps.auditor).toHaveBeenCalledOnce();
+      },
+    );
+
+    it.each(['evidence only', 'all alerts'])('fails closed at tests when appending %s fails', async failure => {
+      const f = fixture(); f.moveMain();
+      const alerts = alertsFilePath(f.root, f.env);
+      const error = new Error('injected evidence append failure');
+      f.deps.io.appendFileSync = vi.fn((file, data, ...args) => {
+        if (file === alerts && (failure === 'all alerts' || JSON.parse(data).kind === 'auto-rebase-evidence')) throw error;
+        return fs.appendFileSync(file, data, ...args);
+      });
+      await expect(job(f)).rejects.toBe(error);
+      expect(f.deps.io.appendFileSync).toHaveBeenCalledWith(alerts, expect.stringContaining('auto-rebase-evidence'));
+      expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(f.deps.auditor).not.toHaveBeenCalled();
+      expect(events(f).filter(e => e.kind === 'auto-rebase-needs-you')).toEqual([
+        expect.objectContaining({ ref, stage: 'tests', reason: error.message }),
+      ]);
+      if (failure === 'evidence only') expect(needsYouAlert(f)).toMatchObject({
+        detail: { ref, stage: 'tests', reason: error.message },
+      });
+      assertUnregistered(f);
+    });
+
     it.each(['success', 'audit failure'])('persists original conflict markers and noTestFiles before audit, surviving cleanup on %s', async outcome => {
       const f = fixture({ workerTest: false }); f.moveMain();
       let conflicted;

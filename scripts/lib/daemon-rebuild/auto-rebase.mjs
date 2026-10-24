@@ -177,12 +177,13 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     stage = 'tests';
     const changed = new Set([...conflicts, ...requireOk(git(['diff', '--name-only', oldSha, candidate], scratch)).split('\n').filter(Boolean)]);
     const files = requireOk(git(['ls-files'], scratch)).split('\n');
+    const candidateFiles = new Set(files);
     const contents = new Map(files.filter(isGraphSourceFile).map(f => [f, io.readFileSync(join(scratch, f), 'utf8')]));
     const reverse = buildReverseImportGraph({ files, readFile: f => contents.get(f) });
     const selected = new Set();
     const noTestFiles = [];
     for (const file of changed) {
-      const related = [...testDepths([file], reverse).keys()];
+      const related = [...testDepths([file], reverse).keys()].filter(f => candidateFiles.has(f));
       if (!related.length) noTestFiles.push(file);
       related.forEach(f => selected.add(f));
     }
@@ -191,18 +192,15 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
       const base = requireOk(git(['merge-base', 'origin/main', oldSha], scratch));
       if (!/^[a-f0-9]{40}$/.test(base)) throw new Error('overlay merge base unavailable; human review required');
       const branchFiles = requireOk(git(['diff', '--name-only', '--diff-filter=ACMRT', base, oldSha], scratch)).split('\n').filter(Boolean);
-      const candidateFiles = new Set(files);
       const fallback = new Set(branchFiles.filter(f => candidateFiles.has(f) && isVitestTestFile(f)));
       const sources = branchFiles.filter(f => isGraphSourceFile(f) && !isVitestTestFile(f));
       for (const test of testDepths(sources, reverse).keys()) fallback.add(test);
       fallback.forEach(f => selected.add(f));
       rule = fallback.size ? 'overlay-branch-tests+import-graph' : 'codex-audit-required';
     }
-    try {
-      const file = alertsFilePath(root, env);
-      io.mkdirSync(dirname(file), { recursive: true });
-      io.appendFileSync(file, `${JSON.stringify({ at: now(), kind: 'auto-rebase-evidence', detail: { ref, rule, noTestFiles, conflicts: conflictContents } })}\n`);
-    } catch { /* best-effort persistence only; never catch selection failures */ }
+    const file = alertsFilePath(root, env);
+    io.mkdirSync(dirname(file), { recursive: true });
+    io.appendFileSync(file, `${JSON.stringify({ at: now(), kind: 'auto-rebase-evidence', detail: { ref, rule, noTestFiles, conflicts: conflictContents } })}\n`);
     if (selected.size > 100) throw new Error('test selection over 100; human review required');
     if (!selected.size && rule !== 'codex-audit-required') throw new Error('test selection empty; human review required');
     if (selected.size) {
