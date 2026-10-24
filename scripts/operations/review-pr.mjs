@@ -2,6 +2,7 @@ import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { advisoryLabelOutcome } from '../lib/review-advisory-outcome.mjs';
 export { advisoryLabelOutcome, deriveAdvisoryOutcome } from '../lib/review-advisory-outcome.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock, operatorSendBackVerdict } from '../lib/operator-send-backs.mjs';
+import { isOperatorAuthored } from '../lib/marker-authorship.mjs';
 import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
   referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable, openReferralHeads, readOperatorRulings,
   seatNeedsToolVerification, knownVerifications, verificationCandidates, settleVerification, applyVerification, verificationsToPersist,
@@ -2035,14 +2036,21 @@ export function renderVerdictWriteUp({ read, verdict, answer, actor, reason = ''
   ].join('\n');
 }
 
-/** Pure fallback reason when an open operator send-back, rather than a juror finding, requires changes. */
+/** Pure fallback only for an authenticated operator send-back already recorded on the reviewed head. */
 export function openSendBackBounceReason(read) {
   const items = read?.openOperatorSendBacks;
+  const head = pinnedSha(read?.netBasis?.rev);
+  if (!head) return '';
   const plain = value => (typeof value === 'string' ? value : '')
     .replace(/`/g, "'").replace(/\s/g, ' ').replace(/[<>\p{Cc}\p{Cf}]/gu, '')
     .replace(/\s+/g, ' ').trim();
   const open = Array.isArray(items)
     ? items.filter(item => item && typeof item === 'object'
+      // shapeReadFinding's shared reader authenticates the ceremony; persisted legacy rows without
+      // its reviewer/head evidence must still refuse. Short heads are the ceremony's normal spelling.
+      && isOperatorAuthored({ author: { login: item.login } })
+      && typeof item.head === 'string' && /^[a-f0-9]{7,40}$/i.test(item.head)
+      && head.toLowerCase().startsWith(item.head.toLowerCase())
       && typeof item.id === 'string' && /^[A-Za-z0-9_.:=-]+$/.test(item.id)
       && typeof item.at === 'string' && Number.isFinite(Date.parse(item.at))
       && typeof item.body === 'string')
@@ -2115,7 +2123,7 @@ export function planRecordDecision(view) {
   // ships a comment that reads "✅ pass — no blocking findings" beside "Decision: `changes`". The author lane
   // is then bounced with nothing to act on and comes back for another round having changed whatever it
   // guessed at. Refuse it here, in the pure core, so no caller can post one: either the juror named findings,
-  // or the operator names a reason, or an open operator send-back supplies one.
+  // or the operator names a reason, or a verified operator already recorded a send-back on this same head.
   //
   // The check is deliberately narrow. A bounce that CARRIES juror findings needs no `--reason` — the findings
   // are the reason, and they are already rendered. This only binds the empty case.

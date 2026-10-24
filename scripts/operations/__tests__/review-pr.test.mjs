@@ -1292,22 +1292,23 @@ describe('#3540 the stageVerdict step stages the write-up alone, ahead of the la
 });
 
 describe('#3540 planRecordDecision and confirmAnswerFor — the shared pure core', () => {
+  const sendBackHead = 'e5ed9cb74' + 'a'.repeat(31);
   const openSendBacks = [
     { id: 'send-back-5809-a', at: '2026-10-22T12:00:00Z', body: 'Repair the evidence gap. ' + 'x'.repeat(200) + 'OMITTED_TAIL' },
     { id: 'send-back-5809-b', at: '2026-10-22T13:00:00Z', body: 'Explain the remaining failure.' },
-  ];
+  ].map(item => ({ ...item, login: 'chalbert', head: sendBackHead }));
   function bounceView(openOperatorSendBacks, reason) {
     return {
       input: { ...BASE_INPUT, actor: 'reviewer', reason },
       findings: {
         confirm: 'changes',
-        read: { ...shapeReadFinding(stubReader({})({ pr: 1234, repo: BASE_INPUT.repo }), BASE_INPUT), openOperatorSendBacks },
+        read: { ...shapeReadFinding(stubReader({ netRev: sendBackHead })({ pr: 1234, repo: BASE_INPUT.repo }), BASE_INPUT), openOperatorSendBacks },
       },
       verdict: { verdict: 'changes', findings: [], lenses: [DEFAULT_LENS] },
     };
   }
 
-  it('plans a zero-finding changes verdict with actionable evidence instructions for every open send-back', () => {
+  it('plans a zero-finding changes verdict for verified same-head send-backs with actionable evidence instructions', () => {
     const plan = planRecordDecision(bounceView(openSendBacks));
     expect(plan.to).toBe('changes');
     for (const item of openSendBacks) {
@@ -1322,6 +1323,23 @@ describe('#3540 planRecordDecision and confirmAnswerFor — the shared pure core
   });
 
   it.each([
+    ['missing reviewer', { login: undefined }],
+    ['untrusted reviewer', { login: 'outsider' }],
+    ['missing head', { head: undefined }],
+    ['malformed head', { head: 'e5ed9cb' + 'z'.repeat(33) }],
+    ['different head', { head: 'b'.repeat(40) }],
+  ])('retains the reasonless-bounce refusal for an open send-back with %s', (_name, fields) => {
+    const view = bounceView([{ ...openSendBacks[0], ...fields }]);
+    expect(() => planRecordDecision(view)).toThrow(/no stated reason/);
+  });
+
+  it('refuses a generated reason when the reviewed head is unpinned', () => {
+    const view = bounceView(openSendBacks);
+    view.findings.read.netBasis.rev = null;
+    expect(() => planRecordDecision(view)).toThrow(/no stated reason/);
+  });
+
+  it.each([
     undefined, [], {}, [{}], [null], [{ id: '' }], [{ id: '  ' }],
     [{ id: '<>' }], [{ id: 'only-id' }], [{ id: 'metadata', at: {}, body: {} }],
     [{ ...openSendBacks[0], id: 'bad`<img>\n[id](url)' }],
@@ -1332,13 +1350,13 @@ describe('#3540 planRecordDecision and confirmAnswerFor — the shared pure core
     ...['<>', '\u200b\u200b', '   ', '\u0000\u200c\u200d\u2060', '!!!', '!'.repeat(160) + 'Repair']
       .map(body => [{ ...openSendBacks[0], body }]),
   ].map(open => [open]))('still refuses a zero-finding changes verdict without a reason or open send-backs (%j)', open => {
-    expect(openSendBackBounceReason({ openOperatorSendBacks: open })).toBe('');
+    expect(openSendBackBounceReason(bounceView(open).findings.read)).toBe('');
     expect(() => planRecordDecision(bounceView(open))).toThrow(/no stated reason/);
   });
 
   it('refuses malformed send-backs with non-string metadata', () => {
     const open = [null, {}, { id: '' }, { id: 12 }, { id: 'metadata', at: {}, body: {} }];
-    expect(openSendBackBounceReason({ openOperatorSendBacks: open })).toBe('');
+    expect(openSendBackBounceReason(bounceView(open).findings.read)).toBe('');
     expect(() => planRecordDecision(bounceView(open))).toThrow(/no stated reason/);
   });
 
@@ -1346,8 +1364,8 @@ describe('#3540 planRecordDecision and confirmAnswerFor — the shared pure core
     const valid = { ...openSendBacks[0], id: 'IC_kwDORBt1-c8AAAABedLjDQ' };
     const open = [valid, { id: 'metadata', at: {}, body: {} },
       ...['<>', '\u200b\u200b', '   ', '!!!'].map(body => ({ ...openSendBacks[1], body }))];
-    const reason = openSendBackBounceReason({ openOperatorSendBacks: open });
-    expect(reason).toBe(openSendBackBounceReason({ openOperatorSendBacks: [valid] }));
+    const reason = openSendBackBounceReason(bounceView(open).findings.read);
+    expect(reason).toBe(openSendBackBounceReason(bounceView([valid]).findings.read));
     expect(reason).toContain(`\`<!-- addresses-operator-send-back: ${valid.id} -->\``);
   });
 
@@ -1367,7 +1385,7 @@ describe('#3540 planRecordDecision and confirmAnswerFor — the shared pure core
     expect(plan.body).toContain(`\`Send-back ${openSendBacks[0].id} at ${openSendBacks[0].at}: `);
     expect(plan.body).toContain("img src=x [click](https://example.com) 'escape' quote ");
     expect(plan.body).not.toContain('<img');
-    const reason = openSendBackBounceReason({ openOperatorSendBacks: [{ ...openSendBacks[0], body: 'x'.repeat(200) }] });
+    const reason = openSendBackBounceReason(bounceView([{ ...openSendBacks[0], body: 'x'.repeat(200) }]).findings.read);
     expect(reason).toContain(`: ${'x'.repeat(160)}\``);
     expect(reason).not.toContain('x'.repeat(161));
     const outsideCode = plan.body.replace(/`[^`\n]*`/g, '');
@@ -2141,6 +2159,29 @@ describe('an override must say why', () => {
     });
     expect(out.code).toBe(1);
     expect(out.lines.join('\n')).toMatch(/no stated reason/);
+  });
+
+  it.each([
+    ['same head', 'e5ed9cb74', 'chalbert', true],
+    ['different head', '245c40542', 'chalbert', false],
+    ['missing head', null, 'chalbert', false],
+    ['malformed head', 'not-a-sha', 'chalbert', false],
+    ['untrusted reviewer', 'e5ed9cb74', 'outsider', false],
+    ['missing reviewer', 'e5ed9cb74', undefined, false],
+  ])('only generates a send-back reason recorded by a verified reviewer on the same head: %s', async (_name, head, login, allowed) => {
+    const comments = [{ id: 'SB1', author: { login }, createdAt: '2026-10-14T20:07:00Z',
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via console.\n\n'
+        + (head ? `Operator send-back at head ${head}.\n` : '') + 'MUST FIX the original guard.' }];
+    const { out, calls } = await driveToAnswer({ answer: 'changes', id: `run-send-back-${_name.replaceAll(' ', '-')}`, comments,
+      netRev: 'e5ed9cb74' + 'a'.repeat(31) });
+    expect(out.code).toBe(allowed ? 0 : 1);
+    expect(out.stopped).toBe(allowed ? 'complete' : 'step-refused');
+    if (allowed) {
+      expect(calls.find(c => c.type === REVIEW_EFFECTS.WRITE_UP)?.payload.body).toContain('Send-back SB1');
+    } else {
+      expect(out.lines.join('\n')).toMatch(/no stated reason/);
+      expect(calls).toEqual([]);
+    }
   });
 
   // THE TEST THE OLD BLOCK COULD NOT HAVE FAILED. `--reason` here travels the whole real path: parsed by
