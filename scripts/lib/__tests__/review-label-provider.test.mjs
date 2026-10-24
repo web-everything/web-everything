@@ -282,7 +282,7 @@ describe('comment completeness proof through the provider exec seam', () => {
     .mockReturnValueOnce(comments.map(c => JSON.stringify(c)).join('\n')).mockReturnValueOnce(response);
 
   it.each([0, 1, 100, 201])('accepts %i unique comments only with an equal GraphQL count through the same exec', count => {
-    const comments = Array.from({ length: count }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
+    const comments = Array.from({ length: count }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'chalbert' } }));
     const exec = transport(comments);
     expect(createGhProvider({ exec }).readComments('o/n', 9)).toEqual(comments);
     expect(exec).toHaveBeenCalledTimes(2);
@@ -303,11 +303,31 @@ describe('comment completeness proof through the provider exec seam', () => {
   });
 
   it.each([
+    ['missing body', { body: undefined }], ['null body', { body: null }], ['non-string body', { body: 42 }],
+    ['missing author', { author: undefined }], ['null author', { author: null }],
+    ['missing login', { author: {} }], ['empty login', { author: { login: '' } }],
+    ['blank login', { author: { login: ' ' } }], ['non-string login', { author: { login: 42 } }],
+    ['empty user login', { author: undefined, user: { login: '' } }],
+  ])('rejects %s despite an equal count and unique ids', (_name, fields) => {
+    const comments = [
+      { id: 'IC_1', body: 'valid discussion', author: { login: 'chalbert' } },
+      { id: 'IC_2', body: 'discussion', author: { login: 'chalbert' }, ...fields },
+    ];
+    expect(() => createGhProvider({ exec: transport(comments) }).readComments('o/n', 9)).toThrow(/string body|author login/);
+  });
+
+  it.each([{ author: { login: 'chalbert' } }, { user: { login: 'chalbert' } }])('accepts an empty string body with a valid author: %j', author => {
+    const comments = [{ id: 'IC_1', body: '', ...author }];
+    expect(createGhProvider({ exec: transport(comments) }).readComments('o/n', 9)).toEqual(comments);
+  });
+
+  it.each([
     ['duplicate ids', [{ id: 'IC_1' }, { id: 'IC_1' }]], ['missing id', [{}]],
     ['null id', [{ id: null }]], ['empty id', [{ id: '' }]], ['blank id', [{ id: ' ' }]],
     ['numeric REST id without node id', [{ id: 123 }]], ['malformed comment', [null]],
   ])('rejects %s despite an equal count', (_name, comments) => {
-    expect(() => createGhProvider({ exec: transport(comments) }).readComments('o/n', 9)).toThrow();
+    const records = comments.map(c => c && ({ body: 'discussion', author: { login: 'chalbert' }, ...c }));
+    expect(() => createGhProvider({ exec: transport(records) }).readComments('o/n', 9)).toThrow(/comment node ids/);
   });
 
   it.each([

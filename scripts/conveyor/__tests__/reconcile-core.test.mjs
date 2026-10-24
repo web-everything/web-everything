@@ -2173,6 +2173,40 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
   // xuxcsw6 — live 2026-10-04, #3771: both direct review branches (a fix postdates the advisory; the newest
   // advisory does not cover the head) bypassed the referral hold and re-dispatched a full review each tick.
   const referralHold = { head: 'a'.repeat(40), episode: 'e', count: 2, why: 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back' };
+  describe.each(['stale-advisory', 'addressed-advisory'])('%s human clearance', branch => {
+    const clearedHead = REAL_2766_HEAD;
+    const commentsFor = () => [
+      { author: AUTOMATION, body: `${buildReviewedShaMarker(clearedHead)}\n${buildClearedHumanMarker('chalbert')}` },
+      ...(branch === 'stale-advisory' ? live2766Comments() : [
+        advisoryNote, { author: AUTOMATION, body: buildAdvisoryFixComment({}) },
+      ]),
+    ];
+
+    it('refuses already-reviewed-head without dispatch on a trusted human-cleared head', () => {
+      const comments = commentsFor();
+      expect(isLatestAdvisoryFindingAddressed(comments)).toBe(branch === 'addressed-advisory');
+      if (branch === 'stale-advisory') {
+        expect(countCompletedAdvisoryEpisodes(comments)).toBe(ADVISORY_FIX_ROUND_CAP);
+      }
+      const plan = planReconcile({
+        prs: [prNeedsHuman({ comments, headRefOid: ` ${clearedHead.toUpperCase()} ` })], agents: [], now: NOW,
+      });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({
+        kind: 'already-reviewed-head', prNumber: 2601, phase: 'needs-human', headSha: clearedHead,
+        why: 'this exact head already carries a human clearance — no further advisory review is owed',
+      })]);
+    });
+
+    it('still dispatches review on a different, uncleared head with the same thread', () => {
+      const plan = planReconcile({
+        prs: [prNeedsHuman({ comments: commentsFor(), headRefOid: 'f'.repeat(40) })], agents: [], now: NOW,
+      });
+      expect(plan.refusals).toEqual([]);
+      expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 2601 })]);
+    });
+  });
+
   it('xuxcsw6 — a held PR is refused review-referrals-pending on the stale-advisory branch, and not when the hold lifts', () => {
     const pr = prNeedsHuman({ comments: live2766Comments(), headRefOid: REAL_2766_HEAD });
     const held = planReconcile({ prs: [{ ...pr, referralHold }], agents: [], now: NOW });

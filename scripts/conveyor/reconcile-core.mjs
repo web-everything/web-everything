@@ -1372,9 +1372,20 @@ function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
   return true;
 }
 
+/** Every review path respects a trusted human clearance of the exact, normalized head. */
+function refuseHumanClearedHead({ pr, refuse, withPhase, extra = {} }) {
+  const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
+  if (!headSha || !headEverHumanCleared(pr.comments, headSha)) return false;
+  refuse('already-reviewed-head', {
+    ...withPhase, headSha, ...extra,
+    why: 'this exact head already carries a human clearance — no further advisory review is owed',
+  });
+  return true;
+}
+
 /**
  * The pre-review gates a review emission that does NOT go through {@link dispatchReviewRow} must still honour: a draft
- * PR and a scope-bloated diff are never reviewed (the same two refusals `dispatchReviewRow` makes). The direct
+ * PR, a scope-bloated diff and a human-cleared head are never reviewed. The direct
  * `kind: 'review'` branches (a past-cap grant, the advisory-fix cap's stale-advisory review, the addressed-advisory
  * review) call this next to {@link refuseReferralHold}, so none of them reviews what the main path would refuse.
  */
@@ -1388,7 +1399,7 @@ function refuseUnreviewable({ pr, refuse, withPhase, extra = {} }) {
       why: `scope-bloat: ${pr.scopeBloat.why} — a fixer rebases it first, no review reads this diff` });
     return true;
   }
-  return false;
+  return refuseHumanClearedHead({ pr, refuse, withPhase, extra });
 }
 
 /**
@@ -1525,13 +1536,7 @@ function dispatchReviewRow({
   // whose verdict run re-applies the label — carrying `relabelOwed: true` so the report names why.
   const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
   const reviewedSha = headSha ? parseReviewedSha(pr?.comments) : null;
-  if (headSha && headEverHumanCleared(pr.comments, headSha)) {
-    refuse('already-reviewed-head', {
-      ...withPhase, headSha, reviewedSha, ...extra,
-      why: `this exact head (\`${headSha}\`) already carries a human clearance — no further advisory review is owed`,
-    });
-    return;
-  }
+  if (refuseHumanClearedHead({ pr, refuse, withPhase, extra: { reviewedSha, ...extra } })) return;
   const relabelOwed = !!(headSha && reviewedSha && reviewedSha === headSha)
     && acceptLabelDropped({ labels: withPhase?.labels, comments: pr?.comments, headSha, now });
   if (relabelOwed) extra = { ...extra, relabelOwed: true };
@@ -3394,10 +3399,8 @@ export function planReconcile({
           // actually runs, `review-pr.mjs`'s `advise` step posts a FRESH advisory note against the CURRENT head
           // unconditionally — which flips `advisoryCoversHead` back to `true` for the next tick, so this path
           // fires AT MOST ONCE per head movement. #2588's own one-review-per-head guard sits ahead of the
-          // ordinary `OWED`-table review dispatch, never this one (this branch dispatches directly, exactly like
-          // the `addressed` branch below it already does) — but it needs no restating here: the SAME evidence
-          // that gates it (a reviewed-sha/advisory naming the current head) is exactly what `advisoryCoversHead`
-          // just proved absent, so the two can never contradict each other on the same PR.
+          // ordinary `OWED`-table review dispatch. This direct path still checks the shared human-clearance
+          // guard through `refuseUnreviewable`: a stale advisory cannot reopen an already human-cleared head.
           const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
           // #3383 / PR #2806 review: only a TRUSTED author's advisory counts — `latestAdvisory` itself does no
           // author check, and WE's PRs are public, so an unfiltered read would let any commenter forge a

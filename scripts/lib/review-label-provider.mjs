@@ -164,7 +164,7 @@ export function parseJsonLines(out) {
   return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean).map((l) => JSON.parse(l));
 }
 
-/** Shared proof for the provider and conveyor readers. Missing counts or node ids never prove completeness. */
+/** Shared proof for both readers: count, unique node ids, string bodies and author logins must all be present. */
 export function assertCompletePrComments(comments, response) {
   const totalCount = response?.data?.repository?.pullRequest?.comments?.totalCount;
   if ((response?.errors !== undefined && (!Array.isArray(response.errors) || response.errors.length > 0))
@@ -176,6 +176,13 @@ export function assertCompletePrComments(comments, response) {
   for (const comment of comments) {
     if (typeof comment?.id !== 'string' || !comment.id.trim() || ids.has(comment.id)) {
       throw new Error('complete comments read requires present and unique comment node ids');
+    }
+    if (typeof comment.body !== 'string') {
+      throw new Error('complete comments read requires a string body on every comment');
+    }
+    const login = comment.author?.login ?? comment.user?.login;
+    if (typeof login !== 'string' || !login.trim()) {
+      throw new Error('complete comments read requires a non-empty author login on every comment');
     }
     ids.add(comment.id);
   }

@@ -239,8 +239,8 @@ describe('operator queue read safety', () => {
     });
     const comments = [
       advisory('3956cb512', 'changes', '2026-10-11T09:00:00Z'),
-      { body: '🔁 review — changes requested', createdAt: '2026-10-11T09:01:00Z' },
-      ...Array.from({ length: 98 }, () => ({ body: 'discussion' })),
+      { body: '🔁 review — changes requested', author: { login: 'chalbert' }, createdAt: '2026-10-11T09:01:00Z' },
+      ...Array.from({ length: 98 }, () => ({ body: 'discussion', author: { login: 'web-everything' } })),
     ];
     const listed = { ...pr(4631, comments), headRefOid: '572049b31',
       labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }],

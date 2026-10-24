@@ -5,6 +5,7 @@ import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
 import { standDownOf } from '../health-smells/stood-down-prs.mjs';
 import { planNoteComment } from '../reconcile-note-comment.mjs';
 import { buildClearedHumanMarker, buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
+import * as prCommentsList from '../pr-comments-list.mjs';
 
 const repo = 'web-everything/web-everything';
 const filler = (n) => Array.from({ length: n }, (_, i) => ({ author: { login: 'web-everything' }, body: `drain park-reason spam ${i} ${'x'.repeat(10_000)}` }));
@@ -35,6 +36,31 @@ describe('complete PR comment count proof', () => {
     const exec = transport(Array.from({ length: 200 }, (_, i) => `IC_${i}`), countResponse(300));
     expect(() => readCompletePrComments(7, { repo, exec })).toThrow();
     expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['missing body', { body: undefined }], ['null body', { body: null }], ['non-string body', { body: 42 }],
+    ['missing author', { author: undefined }], ['null author', { author: null }],
+    ['missing login', { author: {} }], ['empty login', { author: { login: '' } }],
+    ['blank login', { author: { login: ' ' } }], ['non-string login', { author: { login: 42 } }],
+    ['empty user login', { author: undefined, user: { login: '' } }],
+  ])('rejects a parsed comment with %s despite an equal count and unique ids', (_name, fields) => {
+    // TSV cannot distinguish a missing body from an empty string; exercise verification after parsing.
+    const read = vi.spyOn(prCommentsList, 'defaultListPrComments').mockReturnValueOnce([
+      { id: 'IC_1', body: 'valid discussion', author: { login: 'chalbert' } },
+      { id: 'IC_2', body: 'discussion', author: { login: 'chalbert' }, ...fields },
+    ]);
+    try {
+      expect(() => readCompletePrComments(7, { repo, exec: () => countResponse(2) })).toThrow(/string body|author login/);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it('rejects a paginated TSV comment with a missing author despite an equal count and unique id', () => {
+    const exec = vi.fn().mockReturnValueOnce('discussion\t2026-01-01T00:00:00Z\t\tIC_1\n')
+      .mockReturnValueOnce(countResponse(1));
+    expect(() => readCompletePrComments(7, { repo, exec })).toThrow(/author login/);
   });
 
   it.each([['duplicate ids', ['IC_1', 'IC_1']], ['missing id', [null]], ['blank id', [' ']]])('rejects %s despite an equal count', (_name, ids) => {

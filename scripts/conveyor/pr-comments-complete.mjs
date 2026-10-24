@@ -20,7 +20,7 @@ import { GH_ARGV, assertCompletePrComments } from '../lib/review-label-provider.
 /** `gh pr list --json comments` page size; a listed thread this long may be truncated. */
 export const LIST_COMMENTS_PAGE_SIZE = 100;
 
-/** Complete, paginated read, proved by GraphQL totalCount and unique node ids; throws on missing proof. */
+/** Complete, paginated read, proved by count, unique node ids, string bodies and author logins; throws on missing proof. */
 export function readCompletePrComments(number, { repo = null, exec = execRead } = {}) {
   const countArgv = GH_ARGV.readCommentsTotalCount(repo, number);
   const comments = defaultListPrComments({ number, repo, exec: (file, args, opts) => exec(file, args, opts) });
