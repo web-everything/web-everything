@@ -13,6 +13,7 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync, chmodSync, utimesSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 
 const POOL_SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
@@ -326,6 +327,41 @@ describe('lane-pool reclaim — liveness gate (#xl5xhmj)', () => {
     expect(report.reclaimed).toBe(true);
     expect(existsSync(join(dir, 'work.txt'))).toBe(false);
   });
+});
+
+describe('automatic card override keeps liveness protection', () => {
+  it.each(['owner', 'process', 'quiet', 'under-hold'])(
+    'keeps backed-up card content when blocked by %s', kind => {
+      const dir = lanePath(1), file = 'backlog/card.md', content = 'card awaiting review\n';
+      mkdirSync(join(dir, 'backlog'));
+      writeFileSync(join(dir, file), content);
+      const manifestPath = join(base, 'backup-manifest.json');
+      writeFileSync(manifestPath, JSON.stringify({ version: 1, files: {
+        [file]: createHash('sha256').update(content).digest('hex'),
+      } }));
+      const agents = JSON.stringify([{ sessionId: 'worker', state: 'working', cwd: dir }]);
+      if (kind === 'owner') writeFileSync(join(binDir, 'claude'), `#!/bin/sh\necho '${agents}'\n`);
+      if (kind === 'process') writeFileSync(join(binDir, 'lsof'), `#!/bin/sh\nprintf 'p999999\\nfcwd\\nn${dir}\\n'\n`);
+      const counter = join(base, 'agent-reads');
+      if (kind === 'under-hold') {
+        writeFileSync(counter, '0');
+        writeFileSync(join(binDir, 'claude'), `#!/bin/sh\nn=$(cat "${counter}")\nn=$((n+1))\necho "$n" > "${counter}"\nif [ "$n" -ge 2 ]; then echo '${agents}'; else echo '[]'; fi\n`);
+      }
+      const r = runPoolWithEnv(['reclaim', '--lane=1', '--override', '--json', ...poolArgs()], {
+        ...env, WE_LANE_RECOVERY_BACKUP: manifestPath,
+        WE_LANE_SALVAGE_QUIET_MIN: kind === 'quiet' ? '30' : '0',
+      });
+      expect(r.code, r.err).toBe(0);
+      const reason = kind === 'process' ? /live process.*pid/ : kind === 'quiet' ? /quiet period/ : /owning session is still live/;
+      expect(JSON.parse(r.out)).toMatchObject({ reclaimed: false, kept: true, keptReason: expect.stringMatching(reason) });
+      expect(readFileSync(join(dir, file), 'utf8')).toBe(content);
+      expect(existsSync(leaseMarker(1))).toBe(false);
+      if (kind === 'under-hold') {
+        expect(r.err).toContain('re-checked under the hold');
+        expect(Number(readFileSync(counter, 'utf8').trim())).toBeGreaterThanOrEqual(2);
+      }
+    },
+  );
 });
 
 // #xl5xhmj — `cmdReclaim` re-checks liveness a SECOND time ("under the hold", right before `git reset --hard`)

@@ -1,9 +1,12 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   classifyLaneNames, nextLaneNumbers, capState, qualifiesForCardBackup,
-  recoverPool, diagnosePool, buildNeedsYouItem, backupLaneContent,
+  recoverPool, diagnosePool, buildNeedsYouItem, backupLaneContent, realRecoverIo,
 } from '../lane-pool-recover.mjs';
+import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv, scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 import { diffFeed, REPORT_KINDS, sanitizeForFeed } from '../../operations/needs-you-feed.mjs';
 
 const preserved = () => ({ preserved: true, unpreservedFiles: [], unpreservedCommitShas: [], reason: 'safe' });
@@ -241,4 +244,37 @@ describe('backupLaneContent verified preservation', () => {
       expect((await f.run()).ok).toBe(false);
     },
   );
+});
+
+describe('real recovery backup Git hardening', () => {
+  it('passes a scrubbed, hardened read-only env to status, stash list and stash show', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'recover-env-'));
+    try {
+      vi.stubEnv('GIT_DIR', '/untrusted/repo');
+      vi.stubEnv('GIT_CONFIG_COUNT', '1');
+      vi.stubEnv('GIT_CONFIG_KEY_0', 'remote.origin.url');
+      vi.stubEnv('GIT_CONFIG_VALUE_0', 'untrusted-origin');
+      vi.stubEnv('GIT_EXTERNAL_DIFF', 'untrusted-command');
+      const runGit = vi.fn((_git, args) => args[0] === 'status' ? '' : args[1] === 'list' ? 'stash@{0}\n' : 'patch\n');
+      const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
+      const io = realRecoverIo({ repo, backupRoot: root, isLeased: () => false, runGit });
+      expect(await io.backup(1)).toMatchObject({ ok: true, stashes: 1 });
+      expect(runGit.mock.calls.map(([, args]) => args)).toEqual([
+        ['status', '--porcelain', '--untracked-files=all', '-z'],
+        ['stash', 'list', '--format=%gd'], ['stash', 'show', '-p', 'stash@{0}'],
+      ]);
+      const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
+      for (const [command, , options] of runGit.mock.calls) {
+        expect(command).toBe('git');
+        expect(options.cwd).toBe(join(repo.poolDir, 'lane-1'));
+        expect(options.env).toEqual(env);
+        expect(options.env.GIT_DIR).toBeUndefined();
+        expect(options.env.GIT_EXTERNAL_DIFF).toBeUndefined();
+        expect(options.env.GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

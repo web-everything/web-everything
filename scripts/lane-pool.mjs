@@ -356,7 +356,9 @@ function resolveRepo() {
   const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, gitOptions) || referencePath;
   const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
     || (cmd === 'list' && flags.acquirable);
-  if (!flags.origin && needsOrigin) {
+  // GC can maintain a pool without a trusted origin, but its recovery must never forward a lane remote.
+  let canonicalOrigin = true;
+  if (!flags.origin && (needsOrigin || cmd === 'gc')) {
     const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
     // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
     // (the git dir and the common dir) is checked too: a worktree of a lane is refused wherever it sits on
@@ -379,7 +381,8 @@ function resolveRepo() {
     // ambiguous lane-shaped checkouts must supply --origin or a primary --reference.
     if (unreadableOwner || originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
       || path.split(sep).some(part => /^lane-\d+$/.test(part)))) {
-      fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
+      canonicalOrigin = false;
+      if (needsOrigin) fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
     }
   }
   const originUrl = flags.origin || tryGit(['remote', 'get-url', 'origin'], topLevel, gitOptions);
@@ -400,7 +403,7 @@ function resolveRepo() {
   // Only discover a default when --branch is absent; explicit-branch acquire must not pay for an unused probe.
   const head = flags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
   const branch = flags.branch || (head ? head.replace(/^origin\//, '') : 'main');
-  return { name, originUrl: originUrl || null, referencePath: topLevel, branch, poolDir: join(POOL_ROOT, name) };
+  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, branch, poolDir: join(POOL_ROOT, name) };
 }
 
 const laneDir = (repo, n) => join(repo.poolDir, `lane-${n}`);
@@ -4244,6 +4247,7 @@ function cmdReclaim(repo) {
   }
   const dryRun = !!flags['dry-run'];
   const override = !!flags.override;
+  const requireLiveness = !override || process.env.WE_LANE_RECOVERY_BACKUP !== undefined;
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) fail(`lane-${n} does not exist under ${repo.poolDir}`);
 
@@ -4281,9 +4285,8 @@ function cmdReclaim(repo) {
   // worker can be mid-verify or mid-PR, having just pushed, with its own lease already gone (see #xbk2is9). The
   // ONLY guard this direct-reset path ran before was the live-LEASE check above — this is the SAME liveness
   // gate `cmdReclaimSalvage` always ran (live owner session / live process cwd / quiet period), now run here
-  // too, for EVERY non-override reclaim, preserved or not (one gate, one place). Skipped only under
-  // `--override`: that flag is the operator's own explicit, logged "I looked at this lane myself" call, and it
-  // already reuses every OTHER guard unchanged — never re-litigated per guard.
+  // too, for every normal or automated reclaim, preserved or not. Only a human `--override` may skip it;
+  // WE_LANE_RECOVERY_BACKUP marks an automatic content override, which must still prove the owner is gone.
   // Shared by BOTH liveness-gate call sites below (the initial read here, and the "under the hold" re-check
   // after the claim), so the two KEPT reports (identical log/JSON shape, differing only in the
   // `(re-checked under the hold)` suffix and whether a just-claimed marker needs releasing) can never quietly
@@ -4298,7 +4301,7 @@ function cmdReclaim(repo) {
     }
     return true;
   };
-  if (!override) {
+  if (requireLiveness) {
     const liveness = laneLivenessGate({ dir });
     if (reportKept(liveness, proof)) return;
   }
@@ -4358,9 +4361,9 @@ function cmdReclaim(repo) {
   }
   // #xl5xhmj — re-check liveness UNDER the hold too, closing the same tiny race the preservation reproof above
   // already closes: a live session could start (or resume) in the window between the initial gate read and
-  // this claim. Skipped only under `--override`, matching the initial gate above.
+  // this claim. Only human overrides skip this, matching the initial gate above.
   let relive = null;
-  if (!override) {
+  if (requireLiveness) {
     relive = laneLivenessGate({ dir, ignoreLeaseSession: session }); // ignore only our temporary hold
     if (reportKept(relive, reproof, { underHold: true, ownSession: session })) return;
   }
@@ -4662,19 +4665,23 @@ async function cmdGc(repo) {
   const pass = () => scheduledLaneGc(existingLanes(repo).map((n) => laneDir(repo, n)), { log, interactive: !flags.watch && !!process.stdin.isTTY });
   const recover = async () => {
     if (!recoveryEnabled()) return;
+    if (!repo.originUrl) {
+      log('gc recovery skipped: canonical origin unresolved — pass --origin=<url> or --reference=<primary-checkout>');
+      return;
+    }
     try { await recoverRepoPool(repo); } catch (e) { log(`gc recovery skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
   };
-  if (!flags.watch) { const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); await recover(); return; }
+  if (!flags.watch) { const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); if (result.ran) await recover(); return; }
   const tick = async () => {
     let interval = 60000; // unreadable policy refuses the pass, then retries policy later
     try {
       interval = loadHostOverloadSettings({ log }).settings.lanes.gc.schedule;
-      pass();
-      await recover();
+      const result = pass();
+      if (result.ran) await recover();
     } catch (e) { log(`gc skipped: ${e.message}`); }
     setTimeout(tick, Math.min(interval, 2147483647));
   };
-  tick();
+  await tick();
 }
 
 // ── dispatch ──────────────────────────────────────────────────────────────────────────────────────

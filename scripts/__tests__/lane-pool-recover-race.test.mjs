@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -33,7 +33,14 @@ beforeEach(() => {
   git(['clone', '--quiet', origin, laneDir]);
   repo = { poolDir, name: 'racepool', originUrl: origin, referencePath: reference, branch: 'main' };
   vi.stubEnv('LANE_POOL_ROOT', poolRoot);
-  vi.stubEnv('PATH', withGhStub(process.env).PATH);
+  const binDir = join(base, 'bin');
+  mkdirSync(binDir);
+  for (const [name, body] of [['claude', 'echo "[]"'], ['lsof', 'exit 0']]) {
+    writeFileSync(join(binDir, name), `#!/bin/sh\n${body}\n`);
+    chmodSync(join(binDir, name), 0o755);
+  }
+  vi.stubEnv('PATH', `${binDir}:${withGhStub(process.env).PATH}`);
+  vi.stubEnv('WE_LANE_SALVAGE_QUIET_MIN', '0');
 });
 afterEach(() => { vi.unstubAllEnvs(); rmSync(base, { recursive: true, force: true }); });
 

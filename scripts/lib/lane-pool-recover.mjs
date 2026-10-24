@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { isUnderTest } from './under-test.mjs';
+import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 
 const clean = (value, max = 2000) => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, max);
 const message = e => clean(e?.message || e);
@@ -162,12 +163,13 @@ export async function collectVerdicts({ lanePoolDir, runWhois = execFileSync }) 
   } catch { return {}; }
 }
 
-export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), isLeased }) {
+export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), isLeased, runGit = execFileSync }) {
   const proofs = new Map(), backups = new Map();
   const run = (args, env = {}) => spawnSync(process.execPath, [lanePoolPath, 'reclaim', ...args, `--repo=${repo.referencePath}`,
     ...Object.entries({ origin: repo.originUrl, reference: repo.referencePath, name: repo.name, branch: repo.branch })
       .filter(([, value]) => value != null).map(([key, value]) => `--${key}=${value}`)], { ...processOptions, env: { ...process.env, ...env } });
-  const git = (dir, args) => execFileSync('git', args, { ...processOptions, cwd: dir });
+  const gitEnv = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
+  const git = (dir, args) => runGit('git', args, { ...processOptions, cwd: dir, env: gitEnv });
   const backupIo = {
     untracked: dir => {
       // -z keeps spaces, newlines, and quoted paths literal; ?? entries are the only copied paths.
