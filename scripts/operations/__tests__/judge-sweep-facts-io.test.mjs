@@ -1,0 +1,488 @@
+/** Bounded observations must expose grants that need evidence beyond list + comments. */
+import { afterEach, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
+import { runGhSync } from '../../lib/gh-throttle.mjs';
+import { createJudgeSweepFactsReader, createShapeCache, operatorGh } from '../judge-sweep-facts-io.mjs';
+import { buildShapePlan } from '../../review-core-cli.mjs';
+import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
+import { renderRedTeamComment } from '../review-extra-seats.mjs';
+import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
+import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord,
+  REFERRAL_DROP_REASON, REFERRAL_SUPERSEDE_REASON, validateReferralRecord } from '../../lib/jury-core.mjs';
+
+vi.mock('../../lib/gh-throttle.mjs', async original => ({ ...await original(), runGhSync: vi.fn() }));
+
+afterEach(() => { vi.resetAllMocks(); vi.unstubAllEnvs(); });
+
+const repo = 'o/r', head = 'a'.repeat(40), at = '2026-10-22T13:00:00Z';
+const baseCap = 12;
+const exec = vi.fn();
+const policyHash = () => createHash('sha256').update(JSON.stringify(resolveHumanReviewSurfaces().categories)).digest('hex');
+
+it.each([
+  ['automatic standing grant', 'web-everything[bot]', true, baseCap, true],
+  ['operator grant', OPERATOR_LOGINS[0], false, baseCap + 1, false],
+  ['untrusted grant', 'untrusted-contributor', true, baseCap, false],
+])('keeps %s scope explicit within the list-and-comments budget', (_name, login, standing, cap, incomplete) => {
+  const comments = [{ id: 'IC_grant', author: { login }, createdAt: at,
+    body: buildRoundExtensionComment({ repo, pr: 1, by: 1, actor: OPERATOR_LOGINS[0],
+      channel: 'test', reason: 'one more round', at,
+      ...(standing ? { standingRuling: `${repo}#6000`, head, episode: `${repo}#1@${head}:review:12/12` } : {}),
+    }) }];
+  const calls = [];
+  const reader = createJudgeSweepFactsReader({
+    gh: args => {
+      calls.push(args);
+      if (args[0] !== 'pr' || args[1] !== 'list') throw new Error('unexpected extra GitHub read');
+      return JSON.stringify([{ number: 1, title: 'scope fixture', headRefOid: head,
+        labels: [], assignees: [], updatedAt: at }]);
+    },
+    now: () => Date.parse(at), baseCap,
+    readLedgerRows: () => [], readFixRows: () => [], readJobs: () => [],
+    readComments: () => comments,
+  });
+  const facts = reader({ repo }).prs[0];
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual(expect.arrayContaining(['--repo', repo]));
+  expect(facts.cap).toBe(cap);
+  expect(facts.evidenceErrors).toEqual(incomplete
+    ? ['standing ruling unverified; inspect ruling and grant scope before judging'] : []);
+});
+
+const pr = (extra = {}) => ({ number: 1, title: 'IO fixture', headRefOid: head,
+  baseRefOid: 'b'.repeat(40), labels: [], assignees: [], updatedAt: at,
+  body: '<!-- authored-by-actor: author -->', createdAt: at, ...extra });
+const options = (extra = {}) => ({
+  exec,
+  gh: () => JSON.stringify([pr()]), now: () => Date.parse(at), baseCap,
+  readLedgerRows: () => [], readFixRows: () => [], readJobs: () => [], readComments: () => [],
+  cache: createShapeCache({ read: () => '{}', write: () => {} }), ...extra,
+});
+const read = extra => createJudgeSweepFactsReader(options(extra))({ repo }).prs[0];
+const comment = body => ({ id: 'IC_referral', body, author: { login: 'web-everything' }, createdAt: at });
+
+// Every failed source must leave independently readable list and comment evidence intact.
+function unreadableSource(source) {
+  return read({
+    [source]: () => { throw new Error('source unavailable'); },
+    gh: () => JSON.stringify([pr({ labels: [{ name: 'review:pending' }] })]),
+    now: () => Date.parse(at) + 30 * 60_000,
+    readComments: () => [comment(renderRedTeamComment({ pr: 1, rev: head,
+      provider: 'codex', model: 'fixture', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }))],
+  });
+}
+function expectIndependentEvidence(facts) {
+  expect(facts.labels).toEqual(['review:pending']);
+  expect(facts.headSha).toBe(head);
+  expect(facts.minutesSinceUpdate).toBe(30);
+  expect(facts.redTeam).toEqual({ state: 'clear', latestResultId: expect.stringMatching(/^[a-f0-9]{16}$/), latestOutcome: null });
+}
+
+it('reports verdict ledger unreadable and preserves unrelated evidence', () => {
+  const facts = unreadableSource('readLedgerRows');
+  expect(facts.evidenceErrors).toEqual(['verdict ledger unreadable']);
+  expect(facts.round).toBeNull();
+  expectIndependentEvidence(facts);
+});
+
+it('reports fix-loop ledger unreadable and preserves unrelated evidence', () => {
+  const facts = unreadableSource('readFixRows');
+  expect(facts.evidenceErrors).toEqual(['fix-loop ledger unreadable']);
+  expect(facts.lastFixLoop).toBeNull();
+  expect(facts.minutesSinceFixLoop).toBeNull();
+  expectIndependentEvidence(facts);
+});
+
+it('reports live jobs unreadable and preserves unrelated evidence', () => {
+  const facts = unreadableSource('readJobs');
+  expect(facts.evidenceErrors).toEqual(['live jobs unreadable']);
+  expect(facts.fixerRunning).toBeNull();
+  expect(facts.owner).toBe('unknown');
+  expectIndependentEvidence(facts);
+});
+
+it('reports worker repository unknown for an unscoped worker with no assignee', () => {
+  const facts = read({ readJobs: () => [{ pr: 1, kind: 'fix-run' }] });
+  expect(facts.evidenceErrors).toEqual(['worker repository unknown']);
+  expect(facts.fixerRunning).toBeNull();
+  expect(facts.owner).toBe('unknown');
+});
+
+it.each(['red-team:clear', 'red-team:blocked'])('reports red-team label lacks live result evidence (%s)', label => {
+  const facts = read({ gh: () => JSON.stringify([pr({ labels: [{ name: label }] })]) });
+  expect(facts.evidenceErrors).toEqual(['red-team label lacks live result evidence']);
+  expect(facts.redTeam).toEqual({ state: 'unknown', latestResultId: null, latestOutcome: null });
+});
+
+it('reports round-limit label disagrees with round evidence below the cap', () => {
+  const facts = read({ gh: () => JSON.stringify([pr({ labels: [{ name: 'status:at-round-limit' }] })]) });
+  expect(facts.round).toBe(1);
+  expect(facts.cap).toBe(baseCap);
+  expect(facts.evidenceErrors).toEqual(['round-limit label disagrees with round evidence']);
+});
+
+it.each(['advisory:accepted', 'review:accepted'])('reports accepted label lacks live verdict evidence (%s)', label => {
+  const facts = read({ gh: () => JSON.stringify([pr({ labels: [{ name: label }] })]) });
+  expect(facts.evidenceErrors).toEqual(['accepted label lacks live verdict evidence']);
+  expect(facts.latestVerdict).toBeNull();
+});
+
+it('fails closed on verdict findings incomplete when the header count differs from parsed findings', () => {
+  const verdict = count => comment([
+    '**Verdict:** changes requested',
+    `Net basis: \`${'b'.repeat(40)}..${head}\``,
+    `### Findings (${count})`,
+    '**correctness** (1)',
+    '- `scripts/x.mjs:10` — Missing evidence _[CONFIRMED]_ [impact if unfixed: broken]',
+  ].join('\n'));
+  // The same trusted verdict parses normally when its declared count is complete.
+  const complete = read({ readComments: () => [verdict(1)] });
+  expect(complete.evidenceErrors).toEqual([]);
+  expect(complete.latestVerdict.findings).toHaveLength(1);
+  const incomplete = read({ readComments: () => [verdict(2)] });
+  // commentVerdict's internal 'verdict findings incomplete' error is surfaced by the comment boundary.
+  expect(incomplete.evidenceErrors).toEqual(['comment evidence unreadable or budget exhausted']);
+  expect(incomplete.latestVerdict).toBeNull();
+  expect(incomplete.verdictHistory).toEqual([]);
+});
+
+function referralRecord(summaries = ['active finding'], seat = 'judgeCorrectnessAdvisory') {
+  const runId = 'review-pr-1';
+  return { version: 1, repo, pr: 1, head, runId, reviewer: mandatoryReferralReviewer(runId),
+    authorBody: pr().body, attempted: true, rulings: [],
+    referrals: summaries.map(summary => {
+      const original = { summary, file: 'scripts/x.mjs', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+      return { key: referralFindingKey(seat, original), seat, original, finding: normalizeFinding(original) };
+    }) };
+}
+
+it.each([
+  ['fixer', true, false], ['CI', false, true], ['fixer and CI', true, true],
+])('reads mandatory referrals while %s runs', (_name, fixerRunning, inCi) => {
+  const record = referralRecord();
+  expect(validateReferralRecord(record)).toBe(true);
+  const readComments = vi.fn(() => [comment(renderReferralRecord(record))]);
+  const facts = read({ readComments,
+    readJobs: () => fixerRunning ? [{ repo, pr: 1, kind: 'fix-run' }] : [],
+    gh: () => JSON.stringify([pr({ statusCheckRollup: inCi
+      ? [{ name: 'test', status: 'IN_PROGRESS', conclusion: null }] : [] })]),
+  });
+  expect(facts.fixerRunning).toBe(fixerRunning);
+  expect(facts.inCi).toBe(inCi);
+  expect(readComments).toHaveBeenCalledTimes(1);
+  expect(readComments).toHaveBeenCalledWith(expect.objectContaining({ repo, number: 1, exec: expect.any(Function) }));
+  expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: false, superseded: false }]);
+  expect(facts.evidenceErrors).toEqual([]);
+});
+
+it('excludes superseded and dropped findings while retaining an active referral', () => {
+  const record = referralRecord(['active', 'retired finding', 'dropped'], 'judgeAntigravityReview');
+  const owner = referralRecord(['retired finding']);
+  owner.runId = 'owner-review';
+  owner.reviewer = mandatoryReferralReviewer(owner.runId);
+  owner.rulings = [{ id: 'owner-ruling', key: owner.referrals[0].key, reviewerId: owner.reviewer.id,
+    lens: owner.reviewer.lens, result: 'not-real', rationale: 'checked', evidence: ['diff'] }];
+  record.superseded = [{ key: record.referrals[1].key, reason: REFERRAL_SUPERSEDE_REASON,
+    by: { runId: owner.runId, key: owner.referrals[0].key, rulingId: 'owner-ruling' } }];
+  record.dropped = [{ key: record.referrals[2].key, reason: REFERRAL_DROP_REASON }];
+  expect(validateReferralRecord(record)).toBe(true);
+  expect(validateReferralRecord(owner)).toBe(true);
+  const facts = read({ readComments: () => [comment(renderReferralRecord(record)),
+    { ...comment(renderReferralRecord(owner)), id: 'IC_owner' }] });
+  expect(facts.evidenceErrors).toEqual([]);
+  expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: false, superseded: false }]);
+});
+
+it('keeps an unbacked supersession open instead of silently retiring it', () => {
+  const record = referralRecord();
+  record.superseded = [{ key: record.referrals[0].key, reason: REFERRAL_SUPERSEDE_REASON,
+    by: { runId: 'missing-run', key: 'missing-key', rulingId: 'missing-ruling' } }];
+  expect(validateReferralRecord(record)).toBe(true);
+  const facts = read({ readComments: () => [comment(renderReferralRecord(record))] });
+  expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: false, superseded: false }]);
+});
+
+it('keeps a dropped finding with an existing block open', () => {
+  const record = referralRecord(['blocked optional finding'], 'judgeAntigravityReview');
+  record.dropped = [{ key: record.referrals[0].key, reason: REFERRAL_DROP_REASON }];
+  record.rulings = [{ id: 'ruling-1', key: record.referrals[0].key, reviewerId: record.reviewer.id,
+    lens: record.reviewer.lens, result: 'block', rationale: 'must repair', evidence: ['diff'] }];
+  expect(validateReferralRecord(record)).toBe(true);
+  const facts = read({ readComments: () => [comment(renderReferralRecord(record))] });
+  expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: true, superseded: false }]);
+});
+
+it('remote card verification refuses additional GitHub reads and leaves the referral open', () => {
+  const record = referralRecord();
+  record.rulings = [{ id: 'ruling-1', key: record.referrals[0].key, reviewerId: record.reviewer.id,
+    lens: record.reviewer.lens, result: 'card', rationale: 'filed', evidence: ['diff'],
+    card: 'we:backlog/123-fixture.md@pr55' }];
+  expect(validateReferralRecord(record)).toBe(true);
+  const gh = vi.fn(() => JSON.stringify([pr()]));
+  const facts = read({ gh, readComments: () => [comment(renderReferralRecord(record))] });
+  expect(gh).toHaveBeenCalledTimes(1);
+  expect(exec).not.toHaveBeenCalled();
+  expect(runGhSync).not.toHaveBeenCalled();
+  expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: true, superseded: false }]);
+});
+
+// Exercise the shared, real TSV comment reader, including the adapter's page loop.
+const tsv = (body = 'ordinary comment') => `${body}\t${at}\tweb-everything\tIC_fixture\n`;
+it('default transport issues only repository-scoped reads and preserves a referral on page two', () => {
+  const record = referralRecord();
+  const escaped = renderReferralRecord(record).replaceAll('\\', '\\\\').replaceAll('\t', '\\t').replaceAll('\n', '\\n').replaceAll('\r', '\\r');
+  runGhSync.mockImplementation(args => args[0] === 'pr' ? JSON.stringify([pr()])
+    : args.includes('page=1') ? tsv().repeat(100) : tsv(escaped));
+  const { gh: _gh, readComments: _comments, ...defaults } = options();
+  const facts = createJudgeSweepFactsReader(defaults)({ repo }).prs[0];
+  expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: false, superseded: false }]);
+  expect(facts.evidenceErrors).toEqual([]);
+  expect(exec).not.toHaveBeenCalled();
+  const calls = runGhSync.mock.calls;
+  expect(calls).toHaveLength(3);
+  expect(calls[0][0]).toEqual(expect.arrayContaining(['pr', 'list', '--repo', repo]));
+  expect(calls[0][0][calls[0][0].indexOf('--repo') + 1]).toBe(repo);
+  for (const [args, opts] of calls) {
+    expect(opts).toMatchObject({ timeout: 60_000, maxBuffer: 32 * 1024 * 1024,
+      throttle: { maxAttempts: 1, personalRoute: false } });
+    if (args[0] === 'api') {
+      // gh api takes an explicit repository endpoint; it has no --repo flag.
+      expect(args).toEqual(expect.arrayContaining(['--method', 'GET', `repos/${repo}/issues/1/comments`]));
+      expect(args).not.toContain('--paginate');
+    } else expect(args.slice(0, 2)).toEqual(['pr', 'list']);
+  }
+  expect(calls[1][0]).toContain('page=1');
+  expect(calls[2][0]).toContain('page=2');
+});
+
+it('operatorGh strips both token variables and disables retries without modifying the parent environment', () => {
+  vi.stubEnv('GH_TOKEN', 'fixture-gh-token');
+  vi.stubEnv('GITHUB_TOKEN', 'fixture-github-token');
+  runGhSync.mockReturnValue('output');
+  const args = ['pr', 'list', '--repo', repo];
+  expect(operatorGh(args, { timeout: 123, env: { GH_TOKEN: 'override-token' }, throttle: { maxAttempts: 9 } })).toBe('output');
+  const [actualArgs, opts] = runGhSync.mock.calls[0];
+  expect(actualArgs).toEqual(args);
+  expect(opts.env).not.toHaveProperty('GH_TOKEN');
+  expect(opts.env).not.toHaveProperty('GITHUB_TOKEN');
+  expect(opts.throttle).toEqual({ bin: '/opt/homebrew/bin/gh', personalRoute: false, maxAttempts: 1 });
+  expect(opts.timeout).toBe(123);
+  expect(process.env.GH_TOKEN).toBe('fixture-gh-token');
+  expect(process.env.GITHUB_TOKEN).toBe('fixture-github-token');
+});
+
+it.each([126, 127])('each comment page consumes the 128-call budget (%i full pages)', fullPages => {
+  let page = 0;
+  const gh = vi.fn(args => {
+    if (args[0] === 'pr') return JSON.stringify([pr()]);
+    page++;
+    return page <= fullPages ? tsv().repeat(100) : '';
+  });
+  const { readComments: _comments, ...defaults } = options({ gh });
+  const facts = createJudgeSweepFactsReader(defaults)({ repo }).prs[0];
+  expect(gh).toHaveBeenCalledTimes(128);
+  expect(page).toBe(127);
+  expect(facts.openReferrals).toEqual(fullPages === 126 ? [] : null);
+  expect(facts.evidenceErrors).toEqual(fullPages === 126 ? [] : ['comment evidence unreadable or budget exhausted']);
+});
+
+it('shares the call budget across PRs and withholds unread comments after exhaustion', () => {
+  const listing = Array.from({ length: 129 }, (_, i) => pr({ number: i + 1 }));
+  const gh = vi.fn(args => args[0] === 'pr' ? JSON.stringify(listing) : '');
+  const { readComments: _comments, ...defaults } = options({ gh });
+  const facts = createJudgeSweepFactsReader(defaults)({ repo }).prs;
+  expect(gh).toHaveBeenCalledTimes(128);
+  expect(facts[126].openReferrals).toEqual([]);
+  expect(facts.slice(127).map(p => p.openReferrals)).toEqual([null, null]);
+  expect(facts[128].evidenceErrors).toContain('comment evidence unreadable or budget exhausted');
+});
+
+it.each([199, 200, 201])('refuses a potentially truncated listing at the 200-PR limit (received %i)', count => {
+  const readComments = vi.fn(() => []);
+  const reader = createJudgeSweepFactsReader(options({ readComments,
+    gh: () => JSON.stringify(Array.from({ length: count }, (_, i) => pr({ number: i + 1 }))),
+  }));
+  if (count < 200) expect(reader({ repo }).prs).toHaveLength(count);
+  else {
+    expect(() => reader({ repo })).toThrow(/listing incomplete.*exhaustive operator listing/);
+    expect(readComments).not.toHaveBeenCalled();
+  }
+});
+
+const humanPr = extra => pr({ labels: [{ name: 'review:human' }], files: [{ path: 'README.md' }], changedFiles: 1, ...extra });
+it.each([
+  ['narrow', 'broad', false, true],
+  ['broad', 'narrow', true, false],
+  ['workflow', 'workflow,statute', false, true],
+])('invalidates serialized and in-memory shape results when policy changes from %s to %s', (before, after, initial, expected) => {
+  let disk = '{}';
+  const io = { read: () => disk, write: (_path, data) => { disk = data; } };
+  const changedFiles = ['docs/agent/platform-decisions.md'];
+  const shape = vi.fn(files => buildShapePlan({ changedFiles: files }));
+  const readerOptions = options({ shape,
+    gh: () => JSON.stringify([humanPr({ files: changedFiles.map(path => ({ path })) })]),
+  });
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', before);
+  const reader = createJudgeSweepFactsReader({ ...readerOptions, cache: createShapeCache(io) });
+  expect(reader({ repo }).prs[0].humanRequired).toBe(initial);
+  expect(reader({ repo }).prs[0].humanRequired).toBe(initial);
+  expect(shape).toHaveBeenCalledTimes(1);
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', after);
+  expect(buildShapePlan({ changedFiles }).humanRequired).toBe(expected);
+  const fresh = createJudgeSweepFactsReader({ ...readerOptions, cache: createShapeCache(io) });
+  const facts = fresh({ repo }).prs[0];
+  expect(facts.evidenceErrors).toEqual([]);
+  expect(facts.humanRequired).toBe(expected);
+  expect(reader({ repo }).prs[0].humanRequired).toBe(expected);
+  expect(shape).toHaveBeenCalledTimes(3);
+  const reloaded = createJudgeSweepFactsReader({ ...readerOptions, cache: createShapeCache(io) });
+  expect(reloaded({ repo }).prs[0].humanRequired).toBe(expected);
+  expect(shape).toHaveBeenCalledTimes(3);
+});
+
+it.each(['base', 'head'])('recomputes shape when only the %s changes and reuses an identical identity', changed => {
+  let current = humanPr();
+  const shape = vi.fn().mockReturnValueOnce({ humanRequired: false }).mockReturnValueOnce({ humanRequired: true });
+  const reader = createJudgeSweepFactsReader(options({ gh: () => JSON.stringify([current]), shape }));
+  expect(reader({ repo }).prs[0].humanRequired).toBe(false);
+  expect(reader({ repo }).prs[0].humanRequired).toBe(false);
+  current = { ...current, [changed === 'head' ? 'headRefOid' : 'baseRefOid']: 'c'.repeat(40) };
+  expect(reader({ repo }).prs[0].humanRequired).toBe(true);
+  expect(shape).toHaveBeenCalledTimes(2);
+});
+
+it('reuses equivalent effective policies across presets, reordered categories, and cascade sources', () => {
+  let disk = '{}';
+  const io = { read: () => disk, write: (_path, data) => { disk = data; } };
+  const shape = vi.fn(() => ({ humanRequired: false }));
+  const evaluate = () => read({ cache: createShapeCache(io), shape,
+    gh: () => JSON.stringify([humanPr()]) });
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'narrow');
+  expect(evaluate().humanRequired).toBe(false);
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', ' secrets, identity, permission, protection, workflow,workflow ');
+  expect(evaluate().humanRequired).toBe(false);
+  expect(shape).toHaveBeenCalledTimes(1);
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', undefined);
+  expect(evaluate().humanRequired).toBe(false);
+  const calls = shape.mock.calls.length;
+  vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', resolveHumanReviewSurfaces().categories.join(','));
+  expect(evaluate().humanRequired).toBe(false);
+  expect(shape).toHaveBeenCalledTimes(calls);
+});
+
+it('rejects a policy-free head-and-base entry in a current rules envelope', () => {
+  const key = `${repo}:${head}:${'b'.repeat(40)}`;
+  const cache = createShapeCache({
+    read: () => JSON.stringify({ rulesVersion: 1, entries: { [key]: false } }), write: () => {},
+  });
+  expect(cache.get(key)).toBeUndefined();
+  const shape = vi.fn(() => ({ humanRequired: true }));
+  expect(read({ cache, shape, gh: () => JSON.stringify([humanPr()]) }).humanRequired).toBe(true);
+  expect(shape).toHaveBeenCalledTimes(1);
+});
+
+it('normalizes head and base SHA case consistently before cache lookup', () => {
+  let current = humanPr();
+  const shape = vi.fn(() => ({ humanRequired: false }));
+  const reader = createJudgeSweepFactsReader(options({ gh: () => JSON.stringify([current]), shape }));
+  expect(reader({ repo }).prs[0].humanRequired).toBe(false);
+  current = { ...current, headRefOid: head.toUpperCase(), baseRefOid: current.baseRefOid.toUpperCase() };
+  expect(reader({ repo }).prs[0].humanRequired).toBe(false);
+  expect(shape).toHaveBeenCalledTimes(1);
+});
+
+it.each([undefined, '', 'unknown', 'b'.repeat(39)])('withholds shape when base identity is missing or unreadable (%s)', baseRefOid => {
+  const cache = { get: vi.fn(() => false), set: vi.fn() }, shape = vi.fn(() => ({ humanRequired: false }));
+  const facts = read({ cache, shape, gh: () => JSON.stringify([humanPr({ baseRefOid })]) });
+  expect(facts.humanRequired).toBeNull();
+  expect(facts.evidenceErrors).toContain('shape unavailable; inspect full diff before delegating');
+  expect(cache.get).not.toHaveBeenCalled();
+  expect(shape).not.toHaveBeenCalled();
+});
+
+it('ignores legacy head-only cache entries and recomputes a permissive result', () => {
+  const cache = createShapeCache({ read: () => JSON.stringify({ [`${repo}:${head}`]: false }), write: () => {} });
+  const shape = vi.fn(() => ({ humanRequired: true }));
+  const facts = read({ cache, shape, gh: () => JSON.stringify([humanPr()]) });
+  expect(facts.humanRequired).toBe(true);
+  expect(shape).toHaveBeenCalledTimes(1);
+  expect(shape).toHaveBeenCalledWith(['README.md'], resolveHumanReviewSurfaces());
+});
+
+it('a shape-rules version bump invalidates a cached non-human result in a fresh reader', () => {
+  let disk = '{}';
+  const io = { read: () => disk, write: (_path, data) => { disk = data; } };
+  const old = createShapeCache({ ...io, rulesVersion: 1 });
+  const key = `${repo}:${head}:${'b'.repeat(40)}:${policyHash()}`;
+  old.set(key, false);
+  expect(createShapeCache({ ...io, rulesVersion: 1 }).get(key)).toBe(false);
+  const shape = vi.fn(() => ({ humanRequired: true }));
+  const facts = read({ cache: createShapeCache({ ...io, rulesVersion: 2 }), shape,
+    gh: () => JSON.stringify([humanPr()]) });
+  expect(facts.humanRequired).toBe(true);
+  expect(shape).toHaveBeenCalledTimes(1);
+  expect(shape).toHaveBeenCalledWith(['README.md'], resolveHumanReviewSurfaces());
+  expect(createShapeCache({ ...io, rulesVersion: 2 }).get(key)).toBe(true);
+  expect(createShapeCache({ ...io, rulesVersion: 1 }).get(key)).toBeUndefined();
+});
+
+it('cache retains at most 256 entries on both load and write, evicting the oldest entry', () => {
+  const keys = Array.from({ length: 257 }, (_, i) => `${repo}:${i.toString(16).padStart(40, '0')}:${head}:${policyHash()}`);
+  let disk = JSON.stringify({ rulesVersion: 1, entries: Object.fromEntries(keys.map(key => [key, false])) });
+  const io = { read: () => disk, write: (_path, data) => { disk = data; } };
+  const cache = createShapeCache(io);
+  expect(cache.get(keys[0])).toBeUndefined();
+  expect(cache.get(keys[1])).toBe(false);
+  cache.set(keys[1], true); // Rewriting refreshes insertion order.
+  cache.set(keys[0], true);
+  expect(cache.get(keys[2])).toBeUndefined();
+  const saved = JSON.parse(disk).entries;
+  expect(Object.keys(saved)).toHaveLength(256);
+  expect(saved[keys[0]]).toBe(true);
+  expect(saved[keys[1]]).toBe(true);
+  const fresh = createShapeCache(io);
+  expect(fresh.get(keys[2])).toBeUndefined();
+  expect(fresh.get(keys[0])).toBe(true);
+});
+
+it('ignores unversioned head-and-base cache entries after upgrading the cache format', () => {
+  const key = `${repo}:${head}:${'b'.repeat(40)}`;
+  const cache = createShapeCache({ read: () => JSON.stringify({ [key]: false }), write: () => {} });
+  const shape = vi.fn(() => ({ humanRequired: true }));
+  expect(read({ cache, shape, gh: () => JSON.stringify([humanPr()]) }).humanRequired).toBe(true);
+  expect(shape).toHaveBeenCalledTimes(1);
+});
+
+it('rejects a legacy head-only entry even inside the current version envelope', () => {
+  const cache = createShapeCache({
+    read: () => JSON.stringify({ rulesVersion: 1, entries: { [`${repo}:${head}`]: false } }), write: () => {},
+  });
+  expect(cache.get(`${repo}:${head}`)).toBeUndefined();
+});
+
+it.each(['null', '[]', '{', '{"rulesVersion":1,"entries":null}', '{"rulesVersion":1,"entries":[]}'])
+('treats an unreadable cache envelope as a miss and replaces it (%s)', contents => {
+  let disk = contents;
+  const key = `${repo}:${head}:${'b'.repeat(40)}:${policyHash()}`;
+  const cache = createShapeCache({ read: () => disk, write: (_path, data) => { disk = data; } });
+  expect(cache.get(key)).toBeUndefined();
+  cache.set(key, true);
+  expect(JSON.parse(disk)).toEqual({ rulesVersion: 1, entries: { [key]: true } });
+});
+
+it('shape child receives filenames unchanged as JSON stdin with bounded output and runtime', () => {
+  const files = ['with,comma.md', 'with space.md', 'with\ttab.md', 'with\nnewline.md', 'with\rreturn.md',
+    'with\u2028separator.md', '`backtick`.md', "quote'\".md", '$(shell).md', '--leading.md',
+    '../parent.md', 'invisible\u200b.md', 'ｆullwidth.md', 'back\\slash.md'];
+  exec.mockReturnValue('{"humanRequired":true}');
+  const facts = read({ gh: () => JSON.stringify([humanPr({ files: files.map(path => ({ path })), changedFiles: files.length })]) });
+  expect(facts.humanRequired).toBe(true);
+  expect(exec).toHaveBeenCalledTimes(1);
+  const [bin, args, opts] = exec.mock.calls[0];
+  expect(bin).toBe(process.execPath);
+  expect(args).toEqual([expect.stringMatching(/scripts\/review-core-cli\.mjs$/), 'shape', '--json']);
+  expect(JSON.parse(opts.input)).toEqual(files);
+  expect(opts).toMatchObject({ encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
+  expect(opts.env.WE_HUMAN_REVIEW_SURFACES).toBe(resolveHumanReviewSurfaces().categories.join(','));
+});

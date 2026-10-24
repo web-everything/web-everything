@@ -46,6 +46,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { OPERATOR_LOGINS } from './marker-authorship.mjs';
 
 /** Env var that pins the overlay state root outside any git tree (ruling clause 3(iii)). */
 export const WE_DAEMON_OVERLAY_DIR_ENV = 'WE_DAEMON_OVERLAY_DIR';
@@ -212,8 +213,41 @@ export function writeOverlays(root, list, { env = process.env } = {}) {
  * Detached repairs use this snapshot to avoid undoing a concurrent unload or update.
  * @returns {Array<object>} the new list
  */
+/**
+ * allow-conflict gate (live 2026-10-21: two agents registered with `--allow-conflict` on the review clone in one
+ * afternoon, which the operator forbids). A conflict override is the OPERATOR's call only, proven by CREDENTIAL, not by
+ * a typed flag: `viewerLogin` must be the login the caller's GitHub credential authenticates as (read by the caller with
+ * `extend-rounds-io.mjs#readViewerLogin`, the same check extend-rounds uses) and must be one of
+ * `marker-authorship.mjs#OPERATOR_LOGINS`. An App/bot/other credential, or one that cannot be read, is refused, whatever
+ * `--actor` says. The operator's own words (`--operator-instruction="<quote>"`, 3+ words) are recorded with the login.
+ * Shared by `daemon-overlay add` and `daemon-load-overlay`. Pure: the caller does the credential read.
+ * @returns {{ok:true, override:null|{instruction:string, actor:string, at:string}}|{ok:false, error:string}}
+ */
+export function allowConflictGate({
+  allowConflict, operatorInstruction, viewerLogin, operatorLogins = OPERATOR_LOGINS, now,
+} = {}) {
+  if (!allowConflict) return { ok: true, override: null };
+  const quote = typeof operatorInstruction === 'string' ? operatorInstruction.trim() : '';
+  if (quote.split(/\s+/).filter(Boolean).length < 3 || quote.length > 1000) {
+    return { ok: false, error: '--allow-conflict is the operator\'s call only: pass --operator-instruction="<the operator\'s own words authorising this override>" (3+ words), run under the operator\'s own GitHub credential' };
+  }
+  const viewer = typeof viewerLogin === 'string' ? viewerLogin.trim().toLowerCase() : '';
+  if (!viewer || !operatorLogins.includes(viewer)) {
+    return { ok: false, error: `--allow-conflict must run under the operator's own GitHub credential; this one is "${viewer || 'unknown'}" (a typed --actor does not count)` };
+  }
+  return { ok: true, override: { instruction: quote, actor: viewer, at: now || new Date().toISOString() } };
+}
+
+/** The caller's GitHub login for {@link allowConflictGate}, or null when it cannot be read (fails closed). */
+export async function readOverrideViewerLogin() {
+  try {
+    const { readViewerLogin } = await import('../operations/extend-rounds-io.mjs');
+    return String(readViewerLogin() ?? '').trim() || null;
+  } catch { return null; }
+}
+
 export function addOverlay(root, {
-  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases,
+  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
 } = {}, { env = process.env, expectedOverlay } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
@@ -232,12 +266,14 @@ export function addOverlay(root, {
         ref, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
+        ...(conflictOverride ? { conflictOverride } : {}),
       });
     } else {
       const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
+      if (conflictOverride) next.conflictOverride = conflictOverride;
       list[idx] = next;
     }
     return writeOverlays(root, list, { env });
