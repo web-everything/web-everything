@@ -2205,6 +2205,26 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
       expect(plan.refusals).toEqual([]);
       expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 2601 })]);
     });
+
+    it('refuses a human-cleared head on the advisory path past the shared round cap', () => {
+      const rounds = Array.from({ length: NEGOTIATION_ROUND_CAP + 1 }, () => ({
+        author: AUTOMATION, body: REARM_COMMENT_MARKER,
+      }));
+      const history = commentsFor();
+      const comments = [...rounds, ...history];
+      const plan = thread => planReconcile({
+        prs: [prNeedsHuman({ comments: thread, headRefOid: clearedHead })], agents: [], now: NOW,
+      });
+      // Without the clearance, this branch really would dispatch beyond the shared cap.
+      expect(plan([...rounds, ...history.slice(1)]).dispatch)
+        .toEqual([expect.objectContaining({ kind: 'review', prNumber: 2601 })]);
+      const refused = plan(comments);
+      expect(refused.dispatch).toEqual([]);
+      expect(refused.refusals).toEqual([expect.objectContaining({
+        kind: 'already-reviewed-head', prNumber: 2601, headSha: clearedHead,
+        why: expect.stringContaining('human clearance'),
+      })]);
+    });
   });
 
   it('xuxcsw6 — a held PR is refused review-referrals-pending on the stale-advisory branch, and not when the hold lifts', () => {
@@ -4213,6 +4233,34 @@ describe('human clearance and complete evidence before review dispatch (live #55
   const run = pr => planReconcile({ prs: [pr], agents: [], now: NOW });
   const expected = branch => branch === 'convert-advisory'
     ? { kind: 'convert-advisory' } : { kind: 'review', [branch]: true };
+
+  it('refuses a human-cleared head past the round cap before dispatching a mechanical review', () => {
+    const at = hour => new Date(NOW - (12 - hour) * HOUR).toISOString();
+    const rounds = Array.from({ length: NEGOTIATION_ROUND_CAP + 1 }, (_, i) => ({
+      author: AUTOMATION, body: REARM_COMMENT_MARKER, createdAt: at(i),
+    }));
+    const comments = [
+      ...rounds,
+      { author: AUTOMATION, createdAt: at(7), body: `✅ review — accepted\n\n${buildReviewedShaMarker(OLD)}` },
+      { author: AUTOMATION, createdAt: at(8), body: CONFLICT_FIX_COMMENT_MARKER },
+    ];
+    const pr = pr1563({ number: 5530, headRefOid: HEAD, labels: lbl('review:pending'), comments,
+      mechanicalRound: { head: HEAD, priorHead: OLD, proven: true, netDiffIdentical: false, changedFiles: ['src/a.mjs'] },
+    });
+    const plan = thread => planReconcile({ prs: [{ ...pr, comments: thread }], agents: [], now: NOW,
+      mechanicalRoundsCountTowardCap: false });
+    expect(plan(comments).dispatch).toEqual([expect.objectContaining({
+      kind: 'review', attempts: NEGOTIATION_ROUND_CAP + 1, cap: NEGOTIATION_ROUND_CAP,
+      mechanicalRound: expect.objectContaining({ ok: true, action: 'review' }),
+    })]);
+    const refused = plan([{ author: AUTOMATION,
+      body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` }, ...comments]);
+    expect(refused.dispatch).toEqual([]);
+    expect(refused.refusals).toEqual([expect.objectContaining({
+      kind: 'already-reviewed-head', prNumber: 5530, headSha: HEAD,
+      why: expect.stringContaining('human clearance'),
+    })]);
+  });
 
   describe.each(['advisoryOwed', 'convert-advisory'])('%s', branch => {
     it('refuses an already-reviewed, human-cleared head without dispatching another advisory review', () => {

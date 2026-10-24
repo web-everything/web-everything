@@ -3209,6 +3209,28 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
         { readComments, freshState: { comments, headRefOid: freshHead } })
       : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
 
+    it.each([
+      ['Web-Everything', 'web-everything[bot]'],
+      ['Web-Everything[bot]', 'web-everything'],
+    ])('rearms a complete 201-comment bot thread with GraphQL %s and REST %s', (listedLogin, fullLogin) => {
+      const full = Array.from({ length: 201 }, (_, i) => ({
+        node_id: `IC_bot_${i}`, body: `bot discussion ${i}`, user: { login: fullLogin },
+      }));
+      const comments = full.slice(0, PR_COMMENTS_PAGE_SIZE).map(c => ({
+        id: c.node_id, body: c.body, author: { login: listedLogin },
+      }));
+      const readComments = vi.fn(() => full);
+      const result = fresh
+        ? run(['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`], [], {
+          readComments, freshState: { comments }, postSwapState: { labels: [{ name: REVIEW_LABELS.pending }] },
+        })
+        : attempt(comments, readComments);
+      expect(readComments).toHaveBeenCalledTimes(fresh ? 3 : 2);
+      expect(result.exitCode).toBe(0);
+      expect(result.calls).toEqual(['postComment', 'setLabels']);
+      expect(result.ledgerWrites).toHaveLength(1);
+    });
+
     it('refuses matching ids with a stale body lacking an embedded older-head clearance', () => {
       const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
         id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'web-everything' },
@@ -3250,6 +3272,8 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       });
 
       if (!fresh) it.each([
+        ['normalized author / user', { author: { login: 'Web-Everything' } }, { user: { login: 'web-everything[bot]' } }],
+        ['normalized user / author', { user: { login: 'Web-Everything[bot]' } }, { author: { login: 'web-everything' } }],
         ['author / author', { author: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
         ['author / user', { author: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
         ['user / author', { user: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],

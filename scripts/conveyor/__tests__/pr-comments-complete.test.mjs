@@ -117,6 +117,23 @@ describe('complete PR comments', () => {
   const full = [...firstPage, ...filler(120), grant(1), grant(2)];
   const read = () => full;
 
+  it.each([
+    ['Web-Everything', 'web-everything[bot]'],
+    ['Web-Everything[bot]', 'web-everything'],
+  ])('accepts a complete 201-comment bot thread with GraphQL %s and REST %s', (listedLogin, fullLogin) => {
+    const comments = Array.from({ length: 201 }, (_, i) => ({
+      id: `IC_bot_${i}`, body: `bot discussion ${i}`, user: { login: fullLogin },
+    }));
+    const listed = comments.slice(0, LIST_COMMENTS_PAGE_SIZE).map(({ id, body }) => ({
+      id, body, author: { login: listedLogin },
+    }));
+    const onError = vi.fn();
+    const pr = { number: 4017, comments: listed };
+    expect(enrichPrsWithCompleteComments([pr], { repo, readComments: () => comments, onError, annotate: p => p }))
+      .toEqual([{ ...pr, comments, commentsComplete: true }]);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it('counts grants placed past the first page (>100 comments, >1 MiB)', () => {
     expect(JSON.stringify(full).length).toBeGreaterThan(1024 * 1024);
     expect(countGrantedRoundExtensions(firstPage, { repo, pr: 4017 })).toBe(0);
@@ -196,6 +213,8 @@ describe('complete PR comments', () => {
     });
 
     it.each([
+      ['normalized author / user', { author: { login: 'Web-Everything' } }, { user: { login: 'web-everything[bot]' } }],
+      ['normalized user / author', { user: { login: 'Web-Everything[bot]' } }, { author: { login: 'web-everything' } }],
       ['author / author', { author: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
       ['author / user', { author: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
       ['user / author', { user: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
