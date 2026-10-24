@@ -3164,9 +3164,33 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
 export function sameGapSameHead(a, b) {
   const negations = s => [...new Set(String(s ?? '').toLowerCase()
     .match(/\b(?:not|no|never|without|missing|cannot|lacks)\b/g) ?? [])].sort().join(',');
-  return Boolean(a && b && typeof a === 'object' && typeof b === 'object'
+  if (!(a && b && typeof a === 'object' && typeof b === 'object'
     && Number.isInteger(a.line) && Number.isInteger(b.line) && sameFindingForClearing(a, b)
-    && wordJaccard(a.summary, b.summary) >= 0.8 && negations(a.summary) === negations(b.summary));
+    && negations(a.summary) === negations(b.summary))) return false;
+  const verbs = new Set(('read reads write writes get put post patch delete deletes create creates update updates '
+    + 'remove removes add adds allow allows deny denies enable disables disable enables grant grants revoke revokes '
+    + 'load save send receive open close').split(' '));
+  const functionWords = new Set('a an the of is are was be to in on at by as it its or and for with this that if so do'.split(' '));
+  const tokenize = summary => {
+    const text = String(summary ?? ''), identifiers = new Set(), words = new Set();
+    for (const [context] of text.matchAll(/`[^`]*(?:`|$)|[a-z0-9_-]*(?:[./\\][a-z0-9_-]+)+/gi)) {
+      for (const [token] of context.matchAll(/[a-z0-9_]{2,}/gi)) identifiers.add(token.toLowerCase());
+    }
+    for (const [token] of text.matchAll(/[a-z0-9_]{2,}/gi)) {
+      const word = token.toLowerCase();
+      if (functionWords.has(word)) continue; // grammar words carry no claim; every other 2+ char token counts
+      words.add(word);
+      if (/^[A-Z]{2,}$|[0-9_]|[a-z][A-Z]/.test(token)) identifiers.add(word);
+    }
+    return { words, identifiers };
+  };
+  const A = tokenize(a.summary), B = tokenize(b.summary);
+  let hit = 0;
+  for (const word of new Set([...A.words, ...B.words])) {
+    if (A.words.has(word) && B.words.has(word)) hit += 1;
+    else if (verbs.has(word) || A.identifiers.has(word) || B.identifiers.has(word)) return false;
+  }
+  return hit > 0 && hit / (A.words.size + B.words.size - hit) >= 0.8;
 }
 
 /** Security is the category lens; unreadable findings cannot authorize a not-real clearance. */
