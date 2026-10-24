@@ -24,6 +24,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
@@ -38,7 +39,7 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -66,6 +67,19 @@ export async function prepareRebuild({
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
+
+  const finishVerifiedSwaps = async () => {
+    try {
+      if (!state.inProgress && !state.unverified && !state.quarantine && state.adopted?.head
+        && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled) {
+        await autoRebase.finishPendingSwaps({ root, env, run, removeOverlay, appendOverlayEvent });
+      }
+    } catch (error) {
+      const detail = realAutoRebase.reportNeedsYou({ root, env: stEnv, ref: 'pending-swaps', stage: 'swap', error, now: nowIso });
+      alertsList.push({ kind: 'auto-rebase-needs-you', detail });
+      log?.error?.(`daemon-rebuild: auto-rebase-needs-you ${JSON.stringify(detail)}`);
+    }
+  };
 
   // ── Step 0: recovery ──────────────────────────────────────────────────────────────────────────────────
   const indexLockPath = join(root, '.git', 'index.lock');
@@ -121,6 +135,7 @@ export async function prepareRebuild({
           state.held = null;
           writeState();
           alert('rebuild-interrupted-recovered', { target: ip.target, headNow, promoted: true });
+          await finishVerifiedSwaps();
           // Short-circuit here (unlike the non-promoted branch below, which falls through to a fresh plan this
           // same tick): this build is now FULLY adopted, so there is nothing else for this tick to decide.
           return terminal({
@@ -169,6 +184,8 @@ export async function prepareRebuild({
       return terminal({ moved: false, reason: 'quarantined' });
     }
   }
+
+  await finishVerifiedSwaps();
 
   // ── Step 1: must be on main, and the local tree must be safe to move ────────────────────────────────────
   let headRef = git(['symbolic-ref', '--short', 'HEAD']);
@@ -319,6 +336,12 @@ export async function prepareRebuild({
       refs: lost.map((l) => l.ref), lost,
       message: `${lost.length} overlay(s) in the running build would be lost (${lost.map((l) => l.ref).join(', ')}) — holding on the last-good build; rebase them onto main (or merge main into the stack top) and re-register`,
     };
+    let setting;
+    try { setting = autoRebase.resolveAutoRebaseSwitch(env); } catch { setting = { enabled: false, source: 'unavailable' }; detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
+    if (setting.enabled) {
+      try { detail.autoRebase = { ...await autoRebase.kickAutoRebase({ root, env, lost }), source: setting.source }; }
+      catch { detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
+    }
     alert('established-overlay-hold', detail);
     if (state.adopted?.head && state.adopted.head === prevHead) {
       state.held = {
