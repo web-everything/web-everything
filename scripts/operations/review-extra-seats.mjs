@@ -1403,7 +1403,8 @@ export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = proces
 
 /** Recovery alone requires complete evidence. Normal full reviews retain their existing policy. */
 function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission }, io) {
-  const refuse = reason => ({ status: 'not-owed', reason: `${reason}; inspect stored evidence before retrying — no call launched` });
+  const refuse = (reason, terminal = false) => ({ status: 'not-owed', ...(!terminal ? { deferredByGuard: true } : {}),
+    reason: `${reason}; inspect stored evidence before retrying — no call launched` });
   if (!['fresh', 'resume'].includes(redTeamMode) || typeof repo !== 'string' || !repo.trim()
     || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || !isPinnedRev(head)) return refuse('invalid red-team recovery identity or mode');
   let records, status, comments;
@@ -1431,7 +1432,7 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
     comments = io.readRecoveryComments({ pr, repo });
     if (!Array.isArray(comments)) throw Error('invalid comments');
   } catch { return refuse('PR comments unreadable'); }
-  if (redTeamForHead(comments, pr, head)) return refuse('red-team result already on head');
+  if (redTeamForHead(comments, pr, head)) return refuse('red-team result already on head', true);
   if (redTeamMode === 'fresh') {
     if (status != null) return refuse('prior red-team status; not re-run');
     if (seatRows(records).some(row => row.seat === RED_TEAM_SEAT.seat && row.repo === repo

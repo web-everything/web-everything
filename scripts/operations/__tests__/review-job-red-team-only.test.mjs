@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
-import { redTeamForHead } from '../../lib/red-team-gate.mjs';
+import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, readDrainRedTeamEvidence, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
 import { createReviewJobIo, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
 
@@ -72,7 +72,137 @@ function fakeIo(over = {}) {
     runRedTeamGate: vi.fn(() => ({ status: 'ok', outcome: 'advisory' })), redTeamStatus: vi.fn(), ...over };
 }
 
+// Exercise the async shared seat through the same synchronous child boundary as the job.
+function runSharedRecovery(input, { status, records = [], commentsUnreadable = false, comments = [] } = {}) {
+  const source = `
+    import { readFileSync } from 'node:fs';
+    import { runRedTeam } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
+    const { input, status, records, commentsUnreadable, comments } = JSON.parse(readFileSync(0, 'utf8'));
+    const calls = { provider: 0, reserve: 0, model: 0, recheck: 0 };
+    const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
+    const result = await runRedTeam({ ...input, env: {} }, {
+      now: () => 1000, log: () => {}, readRecords: () => records,
+      readRedTeamStatus: () => status,
+      readRecoveryComments: () => { if (commentsUnreadable) throw Error('transient EIO'); return comments; },
+      cliAvailable: forbid('provider'), reserveCalls: forbid('reserve'),
+      runSeat: forbid('model'), runRecheck: forbid('recheck'),
+      listComments: () => comments, postComment: ({ body }) => comments.push({ body, author: { login: 'web-everything' } }),
+      append: () => { throw Error('resume must reuse stored row'); },
+    });
+    process.stdout.write(JSON.stringify({ result, calls, comments }));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
+    input: JSON.stringify({ input, status, records, commentsUnreadable, comments }), encoding: 'utf8',
+    timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
+  }));
+}
+
 describe('red-team-only review job', () => {
+  it('a transient comments-unreadable guard refusal leaves status absent and fresh recovery eligible', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-guard-retry-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const production = createReviewJobIo({ env });
+    let observed;
+    const io = fakeIo({ redTeamStatus: vi.fn(production.redTeamStatus),
+      clearRedTeamQueued: vi.fn(production.clearRedTeamQueued),
+      runRedTeam: input => {
+        observed = runSharedRecovery(input, { status: read(), commentsUnreadable: true });
+        return observed.result;
+      },
+    });
+    try {
+      const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io);
+      expect(out.redTeam).toMatchObject({ status: 'not-owed', reason: expect.stringContaining('PR comments unreadable') });
+      expect(observed.calls).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0 });
+      expect(observed.comments).toEqual([]);
+      expect(read()).toBeNull();
+      expect(io.clearRedTeamQueued).toHaveBeenCalledWith({ repo, pr, head });
+      expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(['queued']);
+      expect(io.runRedTeamGate).not.toHaveBeenCalled();
+      const retry = runRedTeamOnSkip({ repo,
+        plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+        rawPrs: [{ number: pr, headRefOid: head, comments: [] }],
+        readEvidence: () => ({ loopPayload: payload(), recorded: false, inFlight: false }), readStatus: read,
+        setting: { enabled: true, retryCooldownMin: 30 }, now: () => 1_801_000,
+        lastDispatch: new Map([[`${repo}#${pr}@${head}`, 1_000]]), capacity: { lanes: 1 },
+        dispatch: () => ({ jobPid: 42 }),
+      });
+      expect(retry.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('a confirmed-dead queued/ran prior admits and reaches the shared resume path without a model call', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-crashed-resume-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const loopPayload = payload();
+    loopPayload.findings.read.diffText = '+export const value = true;';
+    const records = [{ dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', repo, pr, rev: head,
+      callId: 'stored-call', provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' }];
+    const evidence = () => ({ inFlight: false, recorded: true, loopPayload });
+    let observed;
+    const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }),
+      redTeamStatus: createReviewJobIo({ env, readEvidence: evidence }).redTeamStatus,
+      runRedTeam: input => {
+        expect(read()).toMatchObject({ status: 'queued', pid: process.pid, result: 'ran' });
+        observed = runSharedRecovery(input, { status: read(), records });
+        return observed.result;
+      },
+    });
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'queued', result: 'ran' }, { env });
+      writeFileSync(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`),
+        JSON.stringify({ ...read(), pid: 4242 }));
+      expect(readRedTeamRecoveryStatus({ repo, pr, head, env }, { readEvidence: evidence }))
+        .toMatchObject({ status: 'finished', result: 'ran' });
+      const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'resume' }, io);
+      expect(out.redTeam).toMatchObject({ status: 'resumed' });
+      expect(observed.result).toMatchObject({ status: 'resumed', callId: 'stored-call', comment: { status: 'posted' } });
+      expect(observed.calls).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0 });
+      expect(redTeamForHead(observed.comments, pr, head)).toMatchObject({ pr, rev: head });
+      expect(read()).toMatchObject({ status: 'finished', result: 'resumed' });
+      expect(io.runRedTeamGate).toHaveBeenCalledOnce();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([
+    ['finished', 'ran'], ['finished', { status: 'resumed', comment: 'error' }], ['error', 'error'],
+  ])('restores prior %s/%j evidence after a shared guard refusal', (status, result) => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-guard-rollback-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const production = createReviewJobIo({ env });
+    const io = fakeIo({ redTeamStatus: production.redTeamStatus,
+      clearRedTeamQueued: vi.fn(production.clearRedTeamQueued),
+      runRedTeam: input => runSharedRecovery(input, { status: read(), commentsUnreadable: true }).result,
+    });
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status, result }, { env });
+      expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'resume' }, io).redTeam)
+        .toMatchObject({ status: 'not-owed', deferredByGuard: true });
+      expect(read()).toMatchObject({ status, result });
+      expect(io.clearRedTeamQueued).not.toHaveBeenCalled();
+      expect(io.runRedTeamGate).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('keeps a shared result-already-on-head refusal terminal', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-guard-terminal-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const production = createReviewJobIo({ env });
+    const io = fakeIo({ redTeamStatus: production.redTeamStatus,
+      clearRedTeamQueued: vi.fn(production.clearRedTeamQueued),
+      runRedTeam: input => runSharedRecovery(input, { status: read(), comments: [{
+        author: { login: 'web-everything' }, body: redTeamMarker(pr, head),
+      }] }).result,
+    });
+    try {
+      const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io);
+      expect(out.redTeam).toMatchObject({ status: 'not-owed', reason: expect.stringContaining('red-team result already on head') });
+      expect(out.redTeam).not.toHaveProperty('deferredByGuard');
+      expect(read()).toMatchObject({ status: 'finished', result: 'not-owed' });
+      expect(io.clearRedTeamQueued).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it.each(['owned', 'foreign-host'])('normal review admits only its own local speculative writer (%s)', writer => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-spec-owner-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };

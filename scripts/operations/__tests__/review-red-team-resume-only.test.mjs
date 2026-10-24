@@ -78,6 +78,7 @@ describe('shared red-team recovery entry guards', () => {
   }
   async function refused(mode, io, reason, extra) {
     expect(await run(mode, io, extra)).toEqual({ status: 'not-owed',
+      ...(reason === 'red-team result already on head' ? {} : { deferredByGuard: true }),
       reason: `${reason}; inspect stored evidence before retrying — no call launched` });
     noLaunch(io);
     for (const key of ['postComment', 'append']) expect(io[key], key).not.toHaveBeenCalled();
@@ -258,6 +259,7 @@ describe('red-team CLI recovery mode plumbing', () => {
       expect(results).toEqual(['red-team result already on head', 'PR comments unreadable', 'scorecard store unreadable',
         mode === 'resume' ? 'prior red-team result is not resumable' : 'prior red-team seat row; not re-run',
         'red-team result already on head'].map(reason => ({ status: 'not-owed',
+        ...(reason === 'red-team result already on head' ? {} : { deferredByGuard: true }),
         reason: reason + '; inspect stored evidence before retrying — no call launched' })));
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

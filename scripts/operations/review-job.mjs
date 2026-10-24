@@ -314,7 +314,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const head = input.loopPayload?.findings?.read?.netBasis?.rev;
       const key = { repo: input.repo, pr: input.pr, head, env };
       const queued = input.status === 'queued';
-      let prior, attempted = false, priorResult = null;
+      let prior, admissionPrior, attempted = false, priorResult = null;
       try {
         if (queued) {
           prior = readStatus(key);
@@ -328,6 +328,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
               if (evidence?.inFlight !== false || ![undefined, false].includes(evidence.queued)) throw Error('red-team writer is live or unknown');
             }
           }
+          // Carry the daemon's confirmed-dead queued/resumable normalization into
+          // the guard before replacing that evidence with our own queued writer.
+          admissionPrior = input.redTeamMode
+            ? readRedTeamRecoveryStatus(key, { readStatus: () => prior, readEvidence }) : prior;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(prior?.result).priorResult)) priorResult = prior.result;
           input = { ...input, result: priorResult };
         }
@@ -357,7 +361,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           evidence: readEvidence(key), env, log: line => process.stderr.write(`${line}\n`) });
       } catch (e) { process.stderr.write(`review-job: red-team status label sync failed: ${e.message}\n`); }
       return { priorResult, ...(queued && input.redTeamMode ? { redTeamAdmission: { pid: process.pid,
-        prior: prior == null ? null : { repo: prior.repo, pr: prior.pr, head: prior.head, status: prior.status, result: prior.result } } } : {}) };
+        prior: admissionPrior == null ? null : { repo: admissionPrior.repo, pr: admissionPrior.pr, head: admissionPrior.head,
+          status: admissionPrior.status, result: admissionPrior.result } } } : {}) };
     },
     root,
     prepareLane: ({ pr, repo, lanePath }) => {
@@ -653,6 +658,7 @@ export function summarizeRedTeam(r) {
   return {
     status: r.status ?? null,
     ...(r.deferredByCap === true ? { deferredByCap: true } : {}),
+    ...(r.deferredByGuard === true ? { deferredByGuard: true } : {}),
     ...(r.reason ? { reason: r.reason } : {}),
     ...(r.status === 'ran' ? {
       provider: r.provider, model: r.model, seatStatus: r.seat?.status ?? null, foldedVerdict: r.foldedVerdict ?? null,
@@ -770,27 +776,31 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     out.redTeam = summarizeRedTeam(redTeam);
   }
   if (accepted) {
-    // Cap, quota-hold and reservation-error deferrals launch no model call or seat
-    // row. Remove our queued admission so the next tick can retry after cooldown.
-    if (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true && seatsBox.priorRedTeamResult == null) {
+    // Deferrals launch no model call or seat row. Roll back admission so the next
+    // tick can retry after cooldown, retaining any pre-admission evidence.
+    const guardDeferred = out.redTeam?.deferredByGuard === true;
+    const prior = seatsBox.input?.redTeamAdmission?.prior;
+    if ((guardDeferred || (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true))
+      && seatsBox.priorRedTeamResult == null && prior == null) {
       try {
         io.clearRedTeamQueued({ repo: out.repo, pr: out.pr,
           head: seatsBox.input.loopPayload.findings.read.netBasis.rev });
       } catch (e) {
-        io.log(`review-job ${out.sessionSlug}: cap deferral status cleanup failed (${tail(e?.message ?? e, 300)})`);
+        io.log(`review-job ${out.sessionSlug}: red-team deferral status cleanup failed (${tail(e?.message ?? e, 300)})`);
       }
       return out;
     }
     // An unsuccessful effects retry must keep the durable clean pass eligible for recovery.
-    const result = seatsBox.priorRedTeamResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
+    const result = guardDeferred && prior ? prior.result
+      : seatsBox.priorRedTeamResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
       ? seatsBox.priorRedTeamResult : out.redTeam?.status ?? null;
-    io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result });
+    io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
   }
   else if (spec && seatsBox.input) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
   // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
   // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
   // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
-  if (out.redTeam && !out.redTeam.deferredByCap && typeof io.runRedTeamGate === 'function') {
+  if (out.redTeam && !out.redTeam.deferredByCap && !out.redTeam.deferredByGuard && typeof io.runRedTeamGate === 'function') {
     let gate;
     try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
     io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);
