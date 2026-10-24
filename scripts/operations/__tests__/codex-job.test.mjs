@@ -8,7 +8,7 @@ import { chmodSync, lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, resetLane, commitAndPush, captureAuditExport, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
+import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, checkAuditedFiles, resetLane, commitAndPush, captureAuditExport, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
 import { registerScope, releaseScope, assessFreeScope } from '../free-scope.mjs';
 
 const flags = ['--brief=brief.md', '--purpose=example', '--scope=we:scripts/a.mjs,we:scripts/lib/', '--tests=scripts/a.test.mjs', '--repo=/repo'];
@@ -18,14 +18,15 @@ const report = (extra = {}) => ok(`progress\n${JSON.stringify({ exitCode: 0, tim
 const loaderHelp = '--branch= --sha= --daemon= --why= --tests-run= --audit= --json\n';
 const originUrl = 'https://github.com/example/trusted.git';
 const laneConfig = `local\0remote.origin.url\n${originUrl}\0local\0remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0local\0remote.origin.fetch\n^refs/heads/ops/*\0`;
-// Model a faithful `git add`: staged blobs and modes equal the exported bytes and modes.
-async function stagedEntries(io, reads, stats, files) {
-  const keep = [reads.length, stats.length], out = [];
+// Stage what the publisher wrote, independently of the source lane's bytes/modes.
+function stagedEntries(writes, dir, files) {
+  const out = [];
   for (const file of files) {
-    const bytes = await io.readFile(`/lane/${file}`, null), stat = await io.lstat(`/lane/${file}`);
-    out.push(`${stat.mode & 0o100 ? '100755' : '100644'} ${createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')} 0\t${file}\0`);
+    const written = writes.findLast(w => w.file === path.join(dir, file));
+    if (!written) continue;
+    const bytes = written.data, mode = written.options?.mode ?? 0o644;
+    out.push(`${mode & 0o100 ? '100755' : '100644'} ${createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')} 0\t${file}\0`);
   }
-  reads.length = keep[0]; stats.length = keep[1];
   return out.join('');
 }
 function fixture(rules = [], { ready = true } = {}) {
@@ -60,7 +61,8 @@ function fixture(rules = [], { ready = true } = {}) {
         if (args.includes('--binary')) return ok('audited binary diff');
         if (args.includes('hash-object')) return ok(args.slice(args.indexOf('--') + 1).map(() => 'a'.repeat(40) + '\n').join(''));
         if (args.includes('diff')) return ok('scripts/a.mjs\0');
-        if (args.includes('--stage') && args.includes('ls-files')) return ok(await stagedEntries(io, reads, stats, args.slice(args.indexOf('--') + 1)));
+        if (args.includes('merge-base')) return ok();
+        if (args.includes('--stage') && args.includes('ls-files')) return ok(stagedEntries(writes, options.cwd, args.slice(args.indexOf('--') + 1)));
         if (['reset', 'checkout', 'switch', 'ls-files', 'add', 'commit', 'ls-remote', 'push'].some(x => args.includes(x))) return ok();
       }
       throw new Error(`Unscripted command: ${call.text}`);
@@ -79,7 +81,7 @@ function fixture(rules = [], { ready = true } = {}) {
       if (file.startsWith('/lane/scripts/')) return Buffer.from([0x00, 0xff, 0x61, 0x0a]);
       throw new Error(`Unexpected read ${file}`);
     },
-    writeFile: async (file, data) => { writes.push({ file, data }); },
+    writeFile: async (file, data, options) => { writes.push({ file, data, options }); },
     now: () => 1234,
     log: line => logs.push(line),
     stdout: { write: line => output.push(line) },
@@ -102,7 +104,7 @@ const codexCalls = f => f.calls.filter(c => c.text.includes('codex-direct-task.m
 // input is a declared path list, never the lane's index, refs or Git configuration.
 // These contracts replace checkStagedScope and the old lane-ancestry/index tests.
 const remoteBase = 'e'.repeat(40), publishedSha = 'f'.repeat(40);
-async function publicationFixture({ config = '', laneTip = 'abc123', files = ['scripts/a.mjs'], base = 'origin/main', laneRefs = {} } = {}) {
+async function publicationFixture({ config = '', laneTip = 'abc123', files = ['scripts/a.mjs'], base = 'origin/main', laneRefs = {}, remoteTip = remoteBase, ancestor = true } = {}) {
   const f = fixture();
   const s = { opts: { ...parseArgs(flags), base }, lane: { path: '/lane', holder: 'session' },
     io: f.io, originUrl, startSha: 'abc123', baseSha: 'abc123',
@@ -118,6 +120,8 @@ async function publicationFixture({ config = '', laneTip = 'abc123', files = ['s
   let freshHead = 'd'.repeat(40);
   const commits = [];
   const isFresh = c => f.temps.some(dir => c.cwd === dir || c.args.includes(dir));
+  const pathStats = new Map(), lstat = f.io.lstat;
+  f.io.lstat = file => pathStats.has(file) ? pathStats.get(file) : lstat(file);
   f.io.exec = async (cmd, args, options) => {
     const call = { cmd, args, ...options };
     if (cmd === 'git' && isFresh(call) && !args.includes('clone')) {
@@ -125,15 +129,16 @@ async function publicationFixture({ config = '', laneTip = 'abc123', files = ['s
       await exec(cmd, args, options);
       if (args.includes('rev-parse')) {
         const ref = args.at(-1);
-        if (ref.includes('origin/')) return ok(`${remoteBase}\n`);
+        if (ref.includes('origin/')) return ok(`${remoteTip}\n`);
         if (ref.endsWith('^')) return ok(`${commits.at(-1)?.parent ?? remoteBase}\n`);
         if (ref.endsWith('^{tree}')) return ok('a'.repeat(40) + '\n');
         return ok(`${freshHead}\n`);
       }
       if (['reset', 'checkout', 'switch'].some(v => args.includes(v))) {
-        if (args.some(a => a === remoteBase || a.includes('origin/'))) freshHead = remoteBase;
+        freshHead = args.at(-1).includes('origin/') ? remoteTip : args.at(-1);
       }
-      if (args.includes('ls-files')) return ok(await stagedEntries(f.io, f.reads, f.stats, s.files));
+      if (args.includes('merge-base')) return ancestor && args.at(-2) === remoteBase ? ok() : red('not an ancestor');
+      if (args.includes('ls-files')) return ok(stagedEntries(f.writes, options.cwd, s.files));
       if (args.includes('commit')) {
         commits.push({ sha: publishedSha, parent: freshHead });
         freshHead = publishedSha;
@@ -155,8 +160,16 @@ async function publicationFixture({ config = '', laneTip = 'abc123', files = ['s
   const publish = async () => {
     try { await commitAndPush(s); return { ok: true, ...s.result }; }
     catch (error) { return { ok: false, stopReason: error.stopReason ?? 'internal-error', detail: error.detail ?? error.message }; }
+    finally { expectScrubbedPublicationEnv(f); }
   };
-  return { ...f, s, commits, isFresh, publish };
+  return { ...f, s, commits, pathStats, isFresh, publish };
+}
+const publicationEnvKeys = ['GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_NO_REPLACE_OBJECTS',
+  'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'].sort();
+function expectScrubbedPublicationEnv(f) {
+  for (const call of f.calls.filter(c => c.cmd === 'git' && f.temps.includes(c.cwd))) {
+    expect(Object.keys(call.env).filter(key => key.startsWith('GIT_')).sort()).toEqual(publicationEnvKeys);
+  }
 }
 const pushes = f => f.calls.filter(c => c.cmd === 'git' && c.args.includes('push'));
 const publicationGit = f => f.calls.filter(c => c.cmd === 'git');
@@ -1207,7 +1220,148 @@ it('malformed lane acquisition fails closed without destructive commands', async
   }
 });
 
-it('refuses to publish when the trusted remote base moved since the audited starting commit', async () => {
+it('publication review: publishes on the audited start when the trusted remote tip is a descendant', async () => {
+  const remoteTip = 'b'.repeat(40);
+  const f = await publicationFixture({ remoteTip });
+  expect(await f.publish()).toMatchObject({ ok: true });
+  expect(f.commits).toEqual([{ sha: publishedSha, parent: remoteBase }]);
+  expect(f.calls.find(c => c.args.includes('merge-base')).args.slice(-4))
+    .toEqual(['merge-base', '--is-ancestor', remoteBase, remoteTip]);
+  expectFreshPush(f);
+});
+
+it('publication review: refuses a rewritten remote base with no audited ancestor', async () => {
+  const f = await publicationFixture({ remoteTip: 'b'.repeat(40), ancestor: false });
+  expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'changed-after-audit' });
+  expect(f.commits).toEqual([]);
+  expect(pushes(f)).toEqual([]);
+  expect(f.removals).toContainEqual({ file: f.temps[0], options: { recursive: true, force: true } });
+});
+
+it.each(['deleted tracked file', 'rename source'])('publication review: reports the unsupported %s before audit', async kind => {
+  const f = fixture([['diff --name-only', ok(kind === 'rename source' ? 'scripts/a.mjs\0scripts/lib/new.mjs\0' : 'scripts/a.mjs\0')]]);
+  const lstat = f.io.lstat;
+  f.io.lstat = file => {
+    if (file === '/lane/scripts/a.mjs') throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+    return lstat(file);
+  };
+  expect((await f.run()).result).toMatchObject({ ok: false, stopReason: 'audit-failed',
+    detail: expect.stringContaining('Deleted or renamed files are not supported') });
+  expect(f.calls.some(c => c.args.includes('--review') || c.args.includes('clone') || c.args.includes('commit'))).toBe(false);
+  expect(pushes(f)).toEqual([]);
+  released(f); scopeReleased(f);
+});
+
+it.each(['scripts', 'scripts/lib'])('publication review: rejects a lane symlink ancestor %s before reading a regular leaf', async ancestor => {
+  const f = await publicationFixture({ files: ['scripts/lib/a.mjs'] });
+  f.pathStats.set(`/lane/${ancestor}`, { isSymbolicLink: () => true });
+  expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope' });
+  expect(f.reads).toEqual([]);
+  expect(f.temps).toEqual([]);
+  expect(f.commits).toEqual([]);
+  expect(pushes(f)).toEqual([]);
+});
+
+it.each(['scripts', 'scripts/lib'])('publication review: rejects a fresh-clone symlink directory %s before writing through it', async ancestor => {
+  const f = await publicationFixture({ files: ['scripts/lib/a.mjs'] });
+  const mkdtemp = f.io.mkdtemp;
+  f.io.mkdtemp = async prefix => {
+    const dir = await mkdtemp(prefix);
+    f.pathStats.set(path.join(dir, ancestor), { isSymbolicLink: () => true });
+    return dir;
+  };
+  expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope' });
+  expect(f.writes).toEqual([]);
+  expect(f.commits).toEqual([]);
+  expect(pushes(f)).toEqual([]);
+  expect(f.removals).toEqual([{ file: f.temps[0], options: { recursive: true, force: true } }]);
+});
+
+it.each(['scripts/.git/x', 'scripts/.GiT/x', 'scripts//x', 'scripts/x\\y', 'scripts/x\0y',
+  'scripts/./x', 'scripts/../x'])('publication review: rejects unsafe in-scope export path %j before filesystem access', async file => {
+  const f = await publicationFixture();
+  f.s.opts.scope = ['we:scripts/'];
+  f.s.files = [file];
+  expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope' });
+  expect(f.reads).toEqual([]);
+  expect(f.stats).toEqual([]);
+  expect(f.temps).toEqual([]);
+});
+
+it('publication review: scrubs inherited Git overrides from clone, commit and push', async () => {
+  const injected = { GIT_DIR: '/untrusted/git', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fsmonitor',
+    GIT_CONFIG_VALUE_0: 'untrusted-helper', GIT_SSH_COMMAND: 'untrusted-ssh', GIT_EXEC_PATH: '/untrusted/bin',
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: '/untrusted/objects' };
+  const saved = Object.fromEntries(Object.keys(injected).map(key => [key, process.env[key]]));
+  try {
+    Object.assign(process.env, injected);
+    const f = await publicationFixture();
+    expect(await f.publish()).toMatchObject({ ok: true });
+    for (const verb of ['clone', 'commit', 'push']) expect(f.calls.some(c => c.args.includes(verb))).toBe(true);
+    for (const call of publicationGit(f)) {
+      for (const key of Object.keys(injected)) expect(call.env).not.toHaveProperty(key);
+    }
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
+
+it.each(['bytes', 'executable mode'])('publication review: rejects export bytes or modes changed after the post-audit check (%s)', async change => {
+  const f = await publicationFixture();
+  await checkAuditedFiles(f.s);
+  // The change occurs only AFTER the final worktree check has succeeded.
+  if (change === 'bytes') f.io.readFile = async () => Buffer.from('unaudited bytes');
+  else f.pathStats.set('/lane/scripts/a.mjs', { mode: 0o100755, isFile: () => true, isSymbolicLink: () => false });
+  expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'changed-after-audit',
+    detail: expect.stringContaining('Exported bytes or modes differ') });
+  expect(f.temps).toEqual([]);
+  expect(f.commits).toEqual([]);
+  expect(pushes(f)).toEqual([]);
+});
+
+it.each([0o755, 0o644])('publishes executable exports with mode 100755 and non-executable exports with mode 100644 (real Git; mode=%s)', async mode => {
+  const f = await publicationFixture();
+  const dir = mkdtempSync(path.join(tmpdir(), 'codex-job-mode-publication-'));
+  try {
+    f.pathStats.set('/lane/scripts/a.mjs', { mode: 0o100000 | mode, isFile: () => true, isSymbolicLink: () => false });
+    f.s.auditExportFingerprint = await captureAuditExport(f.s);
+    f.io.mkdtemp = async () => { f.temps.push(dir); return dir; };
+    f.io.mkdir = (target, options) => mkdirSync(target, options);
+    f.io.rm = (target, options) => rmSync(target, options);
+    f.io.writeFile = (target, bytes, options) => writeFileSync(target, bytes, options);
+    const exec = f.io.exec;
+    f.io.exec = async (cmd, args, options) => {
+      if (args.includes('clone')) {
+        execFileSync('git', ['-C', dir, 'init', '--quiet', '--template='], { env: options.env });
+        execFileSync('git', ['-C', dir, 'config', 'core.fileMode', 'true'], { env: options.env });
+        // Exercise replacement too: writeFile's mode option alone cannot chmod
+        // a pre-existing file with the opposite execute bit.
+        mkdirSync(path.join(dir, 'scripts'));
+        writeFileSync(path.join(dir, 'scripts/a.mjs'), 'base bytes', { mode: mode === 0o755 ? 0o644 : 0o755 });
+      }
+      if (args.includes('add')) {
+        const staged = spawnSync(cmd, args, { ...options, encoding: 'utf8' });
+        expect(staged.status).toBe(0);
+      }
+      if (args.includes('ls-files')) {
+        const target = path.join(dir, 'scripts/a.mjs');
+        const actualMode = lstatSync(target).mode & 0o777;
+        expect(actualMode & 0o100).toBe(mode & 0o100);
+        const staged = spawnSync(cmd, args, { ...options, encoding: 'utf8' });
+        expect(staged.status).toBe(0);
+        expect(staged.stdout).toMatch(new RegExp(`^${mode === 0o755 ? '100755' : '100644'} `));
+        return staged;
+      }
+      return exec(cmd, args, options);
+    };
+    expect(await f.publish()).toMatchObject({ ok: true });
+    expectFreshPush(f);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('refuses to publish when the audited starting commit is absent from trusted remote history', async () => {
   const f = await publicationFixture();
   f.s.startSha = 'c'.repeat(40);
   expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'changed-after-audit' });

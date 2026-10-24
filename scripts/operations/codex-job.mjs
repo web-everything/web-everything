@@ -3,6 +3,8 @@
  * @file scripts/operations/codex-job.mjs
  * @description Run one foreground Codex job with scope, lane, test and audit gates.
  * All process and filesystem effects are injectable; main accepts an optional stdout sink.
+ * Deletions and renames are not supported: missing audit entries stop with audit-failed.
+ * Use the normal reviewed lane workflow for jobs that remove or move tracked files.
  */
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -258,7 +260,10 @@ export async function captureAuditExport(s) {
       if (!Buffer.isBuffer(bytes)) throw new Error('Unreadable audit bytes');
       entries.push(exportEntry(file, bytes, mode));
     }
-  } catch {
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      fail('audit-failed', 'Deleted or renamed files are not supported; use the normal reviewed lane workflow for removals or moves');
+    }
     fail('audit-failed', 'Cannot capture audit bytes and modes; inspect the lane diff and rerun tests and audit before retrying');
   }
   return exportFingerprint(entries);
@@ -324,11 +329,12 @@ export async function commitAndPush(s) {
     const baseRef = `refs/remotes/origin/${s.opts.base.replace(/^origin\//, '')}`;
     const base = await trustedGit(['rev-parse', '--verify', `${baseRef}^{commit}`]);
     if (!good(base) || typeof base.stdout !== 'string' || !base.stdout.trim()) fail('lane-reset-failed', 'Cannot resolve base from trusted remote; inspect the remote branch before retrying');
-    // Never publish audited files onto a base that was not the one tested and audited.
-    if (!s.startSha || base.stdout.trim() !== s.startSha) {
-      fail('changed-after-audit', 'Trusted remote base differs from the audited starting commit; restart the job against the new base');
+    // A busy remote may advance while tests/audit run. Trust only a start commit
+    // still reachable from that remote, and publish on exactly the audited tree.
+    if (!s.startSha || !good(await trustedGit(['merge-base', '--is-ancestor', s.startSha, base.stdout.trim()]))) {
+      fail('changed-after-audit', 'Audited starting commit is absent from trusted remote history; restart the job against the new base');
     }
-    if (!good(await trustedGit(['checkout', '--detach', base.stdout.trim()]))) fail('commit-failed');
+    if (!good(await trustedGit(['checkout', '--detach', s.startSha]))) fail('commit-failed');
     for (const { file, bytes, mode } of exported) {
       const parts = file.split('/');
       for (let n = 1; n < parts.length; n++) {
@@ -418,8 +424,9 @@ function plan(s) {
     show('node', codexArgs(s, '<audit-task-file>', true)),
     'Check changed and untracked file list and content fingerprint are unchanged since audit started',
     'Export scoped regular file bytes with lstat/readFile; reject symlinks, gitlinks and unreadable entries',
+    'Deleted or renamed files stop with audit-failed; use the normal reviewed lane workflow for removals or moves',
     'Create a fresh clone of the trusted primary origin with system/global Git config disabled and hooks pinned to /dev/null',
-    'Require the trusted remote base to equal the audited starting commit; otherwise restart the job',
+    'Require the audited starting commit to be an ancestor of the trusted remote base; check out that exact audited commit',
     'Apply saved scoped bytes and execute modes to the clean checkout',
     'Stage only the allowed paths and commit once with the fixed Codex Job identity',
     `${show('git', ['ls-remote', '--heads', s.originUrl])} <branch> (try suffixes -2 through -9 if occupied)`,
