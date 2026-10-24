@@ -605,8 +605,33 @@ describe('remote-verify workflow — source contract', () => {
     }
   });
 
-  it('references no secrets except secrets.GITHUB_TOKEN', () => {
-    expect(source().replace(/\bsecrets\.GITHUB_TOKEN\b/g, '')).not.toMatch(/secrets\./i);
+  it('authenticates the sibling checkout with a read-scoped App token and the CI fallback', () => {
+    const workflow = yaml.safeLoad(source());
+    const steps = workflow.jobs.verify.steps;
+    const mint = steps.find(step => step.id === 'fui-app-token');
+    const checkout = steps.find(step => step.name === 'Checkout FUI (sibling)');
+    expect(mint).toMatchObject({
+      uses: 'actions/create-github-app-token@v2',
+      if: "vars.WE_APP_ID != ''",
+      with: {
+        'app-id': '${{ vars.WE_APP_ID }}',
+        'private-key': '${{ secrets.WE_APP_PRIVATE_KEY }}',
+        owner: 'frontier-ui',
+        repositories: 'frontierui',
+        'permission-contents': 'read',
+      },
+    });
+    expect(checkout.with).toMatchObject({
+      repository: 'frontier-ui/frontierui',
+      token: '${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}',
+      path: 'frontierui',
+    });
+    expect(steps.indexOf(mint)).toBeLessThan(steps.indexOf(checkout));
+  });
+
+  it('references only the CI sibling-read credentials', () => {
+    const references = source().match(/\bsecrets\.[A-Za-z_][A-Za-z0-9_]*/g) || [];
+    expect([...new Set(references)].sort()).toEqual(['secrets.FUI_READ_TOKEN', 'secrets.WE_APP_PRIVATE_KEY']);
   });
 
   it('contains no model-provider or agent references, case-insensitively', () => {
