@@ -167,13 +167,16 @@ const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.arg
 describe('default combined-tree test proof', () => {
   const limits = { waitMs: 1234, timeoutMs: 5678, maxBuffer: 4096 };
   const report = { success: true, numFailedTests: 0, numFailedTestSuites: 0,
-    numPassedTests: 3, numPendingTests: 2, testResults: [{}, {}] };
-  async function runReport(value, { missing = false } = {}) {
+    numPassedTests: 3, numPendingTests: 2, testResults: [
+      { name: 'one.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }, { status: 'skipped' }, { status: 'todo' }] },
+      { name: 'two.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }, { status: 'passed' }] },
+    ] };
+  async function runReport(value, { missing = false, failure, cleanupRemains = false } = {}) {
     const worktree = '/tmp/prototype-combined-proof';
     const sources = new Map([['one.test.mjs', ''], ['two.test.mjs', '']]);
     let reportPath;
     const fs = {
-      mkdtempSync: () => worktree, existsSync: () => false, rmSync: vi.fn(),
+      mkdtempSync: () => worktree, existsSync: vi.fn((path) => path === worktree && cleanupRemains), rmSync: vi.fn(),
       readFileSync: vi.fn((path) => {
         if (path === reportPath) {
           if (missing) throw new Error('missing report');
@@ -187,6 +190,7 @@ describe('default combined-tree test proof', () => {
     const exec = vi.fn((command, args) => {
       if (command === 'node') {
         reportPath = args.find(arg => arg.startsWith('--outputFile='))?.slice('--outputFile='.length);
+        if (failure) throw failure;
         return ''; // Exit zero alone proves nothing.
       }
       if (args[0] === '-C' || args[0] === 'rev-parse') return SHA;
@@ -205,12 +209,61 @@ describe('default combined-tree test proof', () => {
     expect(result).toMatchObject({ ok: true, testCount: 2, result: '3 passed, 2 skipped' });
     const [, args, options] = exec.mock.calls.find(([command]) => command === 'node');
     expect(args.slice(args.indexOf('vitest'))).toEqual(['vitest', 'run', '--reporter=json',
-      `--outputFile=${reportPath}`, 'one.test.mjs', 'two.test.mjs']);
+      `--outputFile=${reportPath}`, '--testTimeout=30000', '--hookTimeout=60000', '--teardownTimeout=10000',
+      'one.test.mjs', 'two.test.mjs']);
     expect(reportPath.startsWith(worktree + '/')).toBe(true);
     expect(fs.readFileSync).toHaveBeenCalledWith(reportPath, 'utf8');
     expect(args.slice(0, args.indexOf('--'))).toContain(`--ceiling-ms=${limits.timeoutMs}`);
-    expect(options).toMatchObject({ cwd: worktree, timeout: limits.timeoutMs, maxBuffer: limits.maxBuffer, shell: false });
+    expect(options).toMatchObject({ cwd: worktree, timeout: limits.timeoutMs, maxBuffer: limits.maxBuffer, shell: false,
+      killSignal: 'SIGTERM' });
     expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
+  });
+  it('accepts absolute worktree file names and reordered results', async () => {
+    const value = { ...report, testResults: [...report.testResults].reverse().map(file => ({
+      ...file, name: `/tmp/prototype-combined-proof/${file.name}`,
+    })) };
+    expect((await runReport(value)).result.ok).toBe(true);
+  });
+  it.each([
+    ['wrong file', files => { files[1].name = 'other.test.mjs'; }],
+    ['duplicate file', files => { files[1].name = files[0].name; }],
+    ['outside worktree', files => { files[1].name = '../two.test.mjs'; }],
+    ['missing name', files => { delete files[1].name; }],
+    ['missing file status', files => { delete files[1].status; }],
+    ['failed file status', files => { files[1].status = 'failed'; }],
+    ['skipped file status', files => { files[1].status = 'skipped'; }],
+    ['missing assertions', files => { delete files[1].assertionResults; }],
+    ['empty assertions', files => { files[1].assertionResults = []; }],
+    ['failed assertion with green counts', files => { files[1].assertionResults.push({ status: 'failed' }); }],
+    ['unknown assertion status', files => { files[1].assertionResults.push({ status: 'unknown' }); }],
+    ['null assertion', files => { files[1].assertionResults.push(null); }],
+    ['skipped-only file despite overall passes', files => { files[1].assertionResults = [{ status: 'skipped' }, { status: 'todo' }]; }],
+    ['null file', files => { files[1] = null; }],
+  ])('rejects %s in fake JSON despite green aggregate counts', async (_name, mutate) => {
+    const value = structuredClone(report);
+    mutate(value.testResults);
+    const { result, fs, worktree } = await runReport(value);
+    expect(result).toMatchObject({ ok: false, reason: 'tests-unproven' });
+    expect(fs.existsSync).toHaveBeenCalledWith(worktree);
+    expect(result.result).toContain('temp worktree removed');
+  });
+  it.each([
+    ['timeout', { code: 'ETIMEDOUT', status: null, signal: 'SIGTERM' }],
+    ['nonzero exit', { status: 1, stderr: 'failed' }],
+    ['output overflow', { code: 'ENOBUFS', status: null }],
+    ['spawn failure', { code: 'ENOENT' }],
+  ])('verifies cleanup after %s and reports descendant ownership only as information', async (_name, failure) => {
+    const { result, fs, exec, worktree } = await runReport(report, { failure: Object.assign(new Error('runner failed'), failure) });
+    expect(result).toMatchObject({ ok: false, reason: 'tests-failed' });
+    expect(exec.mock.calls.some(([cmd, args]) => cmd === 'git' && args.join(' ') === `worktree remove --force ${worktree}`)).toBe(true);
+    expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
+    expect(fs.existsSync).toHaveBeenCalledWith(worktree);
+    expect(result.result).toContain('temp worktree removed');
+    expect(result.result).toContain('child processes may outlive the timeout; heavy-admission owns them');
+  });
+  it('refuses unverifiable cleanup with an operator recovery instruction', async () => {
+    await expect(runReport(report, { failure: Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }), cleanupRemains: true }))
+      .rejects.toThrow('cleanup unproven; remove the temporary worktree and retry');
   });
   it.each([
     ['missing JSON', report, { missing: true }], ['unparseable JSON', '{bad'],

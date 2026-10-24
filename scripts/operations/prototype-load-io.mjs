@@ -7,20 +7,24 @@
 import { execFileSync } from 'node:child_process';
 import nodeFs from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { basename, dirname, resolve, join } from 'node:path';
+import { basename, dirname, resolve, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
+import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { cloneKey } from '../lib/daemon-overlays.mjs';
 import { buildReverseImportGraph, selectRelatedTests, testDepths, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
+// Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
+const VITEST_BOUNDS = Object.freeze({ testTimeout: 30000, hookTimeout: 60000, teardownTimeout: 10000 });
+const CHILD_PROCESS_NOTE = 'child processes may outlive the timeout; heavy-admission owns them';
 // prototypeLoad.combinedTest settings, resolved and recorded through the usual cascade.
-// Defaults: ten minutes for admission, twenty minutes total, 16 MiB child output.
+// Defaults: ten minutes for admission, twenty minutes before SIGTERM, 16 MiB child output.
 const COMBINED_TEST_DEFAULTS = Object.freeze({ waitMs: 600000, timeoutMs: 1200000, maxBuffer: 16 * 1024 * 1024 });
 
 /** Real combined-tree proof, rebound by the loader to its resolved settings and injected IO. */
-async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, { exec, fs, env, settings }) {
+async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, { exec, fs, env, settings, queuedExec = exec === execFileSync ? spawnToCompletion : exec }) {
   const limits = settings.combinedTest;
   for (const key of Object.keys(COMBINED_TEST_DEFAULTS)) {
     if (!Number.isSafeInteger(limits?.[key]) || limits[key] <= 0) throw new Error(`invalid combinedTest.${key}; configure a positive bounded value and retry`);
@@ -55,6 +59,7 @@ async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, 
   const commit = git('commit-tree', tree, '-p', head, '-p', candidateSha, '-m', 'Prototype combined-tree test');
   if (!validSha(commit)) throw new Error('invalid combined-tree commit');
   const worktree = fs.mkdtempSync(join(env.TMPDIR || tmpdir(), 'prototype-combined-'));
+  let outcome;
   try {
     git('worktree', 'add', '--detach', worktree, commit);
     if (fs.existsSync(join(repo, 'node_modules'))) fs.symlinkSync(join(repo, 'node_modules'), join(worktree, 'node_modules'), 'dir');
@@ -70,38 +75,53 @@ async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, 
     const { MAX_RELATED_TARGETS } = await import('../lib/verify-lane-gate.mjs');
     const selection = selectRelatedTests({ changedFiles, reverse, maxTests: MAX_RELATED_TARGETS, maxDepth: 2 });
     // A local gate's bounded subset is insufficient to waive an admission blocker.
-    if (selection.status === 'selection-truncated') return {
+    if (selection.status === 'selection-truncated') return outcome = {
       ok: false, reason: 'related-tests-truncated', testCount: 0,
       result: `Incomplete evidence: selection omits ${selection.droppedCount} of ${selection.fullTestCount} related tests. Narrow the candidate or rebase and retest the overlapping refs before retrying.`,
     };
     const tests = [...testDepths(changedFiles, reverse).keys()].filter(isVitestTestFile).sort();
-    if (!tests.length) return { ok: false, reason: 'no-related-tests', testCount: 0 };
+    if (!tests.length) return outcome = { ok: false, reason: 'no-related-tests', testCount: 0 };
     const reportPath = join(worktree, '.prototype-vitest-results.json');
-    // Admission is shell-backed: execFileSync's timeout may leave descendants alive.
-    // Give admission its own hard ceiling; retain the outer timeout as a backstop.
+    // Admission is shell-backed: terminating its direct wrapper may leave descendants alive.
+    // Keep the admission-wait ceiling and bound the direct wrapper separately.
     const args = [join(repo, 'scripts/readiness/heavy-admission.mjs'), 'run', `--wait-ms=${limits.waitMs}`,
-      `--ceiling-ms=${limits.timeoutMs}`, '--', 'npx', 'vitest', 'run', '--reporter=json', `--outputFile=${reportPath}`, ...tests];
+      `--ceiling-ms=${limits.timeoutMs}`, '--', 'npx', 'vitest', 'run', '--reporter=json', `--outputFile=${reportPath}`,
+      ...Object.entries(VITEST_BOUNDS).map(([key, value]) => `--${key}=${value}`), ...tests];
     const command = ['node', 'scripts/readiness/heavy-admission.mjs', ...args.slice(1)].map((arg) => JSON.stringify(arg.replaceAll(worktree, '<worktree>'))).join(' ');
     try {
-      run('node', args, worktree, limits.timeoutMs);
+      await queuedExec('node', args, { cwd: worktree, env, encoding: 'utf8', timeout: limits.timeoutMs,
+        maxBuffer: limits.maxBuffer, shell: false, stdio: ['ignore', 'pipe', 'pipe'], killSignal: 'SIGTERM' });
       let report;
       try { report = JSON.parse(fs.readFileSync(reportPath, 'utf8')); }
-      catch { return { ok: false, reason: 'tests-unproven', command, testCount: tests.length,
+      catch { return outcome = { ok: false, reason: 'tests-unproven', command, testCount: tests.length,
         result: 'unknown passed, unknown skipped; JSON report missing, unreadable or unparseable' }; }
       const passed = Number.isSafeInteger(report?.numPassedTests) && report.numPassedTests >= 0 ? report.numPassedTests : 'unknown';
       const skipped = Number.isSafeInteger(report?.numPendingTests) && report.numPendingTests >= 0 ? report.numPendingTests : 'unknown';
+      const selected = new Set(tests);
+      const filesProven = Array.isArray(report?.testResults) && report.testResults.length === tests.length
+        && report.testResults.every((file) => {
+          if (typeof file?.name !== 'string') return false;
+          const path = relative(worktree, resolve(worktree, file.name));
+          if (!selected.delete(path) || file.status !== 'passed' || !Array.isArray(file.assertionResults)
+            || !file.assertionResults.length) return false;
+          return file.assertionResults.every((assertion) => ['passed', 'skipped', 'todo'].includes(assertion?.status))
+            && file.assertionResults.some((assertion) => assertion.status === 'passed');
+        }) && selected.size === 0;
       const proven = report?.success === true && report.numFailedTests === 0 && report.numFailedTestSuites === 0
-        && passed !== 'unknown' && passed > 0 && Array.isArray(report.testResults) && report.testResults.length === tests.length;
-      return { ok: proven, command, result: `${passed} passed, ${skipped} skipped${proven ? '' : '; JSON evidence incomplete or counts mismatch'}`,
+        && passed !== 'unknown' && passed > 0 && filesProven;
+      return outcome = { ok: proven, command, result: `${passed} passed, ${skipped} skipped${proven ? '' : '; JSON evidence incomplete or counts mismatch'}`,
         testCount: tests.length, ...(proven ? {} : { reason: 'tests-unproven' }) };
     } catch (e) {
-      if (!Number.isInteger(e.status)) throw e;
       const output = `${e.stdout || ''}${e.stderr || ''}`.replaceAll(worktree, '<worktree>').replaceAll(repo, '<repo>').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
-      return { ok: false, command, result: `exit ${e.status}: ${output.slice(-400)}`, testCount: tests.length, reason: 'tests-failed' };
+      return outcome = { ok: false, command, result: `exit ${Number.isInteger(e.status) ? e.status : 'unknown'}: ${output.slice(-400)}`, testCount: tests.length, reason: 'tests-failed' };
     }
   } finally {
     try { git('worktree', 'remove', '--force', worktree); }
-    finally { fs.rmSync(worktree, { recursive: true, force: true }); }
+    finally {
+      fs.rmSync(worktree, { recursive: true, force: true });
+      if (fs.existsSync(worktree)) throw new Error('combined-test worktree cleanup unproven; remove the temporary worktree and retry');
+      if (outcome && !outcome.ok) outcome.result = `${outcome.result || outcome.reason}; temp worktree removed; ${CHILD_PROCESS_NOTE}`;
+    }
   }
 }
 
