@@ -8,12 +8,14 @@
  * FIX: `review-referral-hold.mjs#decideReferralHoldAutoResolve` (+ `enrichPrsWithReferralHoldAutoResolve`, wired in
  * `reconcile-pass.mjs` after the ledger step) reads each live-head finding as the gate does; `reconcile-core.mjs`
  * turns an all-ruled `resume` into the next step: the human /review (`already-reviewed-head`, `review:human` kept)
- * when the head's advisory is current, or ONE advisory re-run when the head's only review left no advisory.
+ * when the head's advisory is current, or ONE advisory re-run when the head's only review left no advisory and
+ * the head has not already been human-cleared.
  *
  * SCENARIO: the production enrich chain (today's hold, then the auto-resolve step when the tree has it) and the
  * production planner, on the three live threads captured 2026-10-21 (the unit test's fixtures). No IO.
  * RED  = pre-fix: all three plans refuse `review-referrals-pending` with nothing to resume them.
- * GREEN = #5775 and #5800 move to the human gate, #5773 gets its one advisory review; the kill switch
+ * GREEN = all three leave the referral pause without another panel; #5773's carried human clearance is final.
+ *         Without that clearance #5773 still gets its one advisory review; the kill switch
  *         (WE_REFERRAL_HOLD_AUTO_RESOLVE=0) still pauses all three.
  */
 import { existsSync, readFileSync } from 'node:fs';
@@ -75,10 +77,20 @@ export default {
         check(kinds(p).includes('already-reviewed-head') && (p.dispatch ?? []).length === 0,
           `#${n}: an all-ruled review:human pause must move to the human /review (already-reviewed-head), no new panel`);
       }
-      const p5773 = planFor(fx(5773), {});
+      const f5773 = fx(5773);
+      const p5773 = planFor(f5773, {});
       check(!kinds(p5773).includes(PAUSED), `#5773: every live-head finding is ruled, yet the plan still refuses ${PAUSED}`);
-      check((p5773.dispatch ?? []).map(d => d.kind).join(',') === 'review',
-        '#5773: its one finished review left no advisory, so exactly one advisory review is owed');
+      check((p5773.dispatch ?? []).length === 0 && (p5773.refusals ?? []).some(r =>
+        r.kind === 'already-reviewed-head' && r.why.includes('human clearance')),
+        '#5773: its live head carries a trusted human clearance, so no further advisory review is owed');
+      // Preserve the missing-advisory guarantee without clearance of the live head. Keep the older-head clearance,
+      // reviewed-sha and referral records intact, removing only the live head's clearance marker.
+      const uncleared = { ...f5773, comments: f5773.comments.map(c => ({ ...c,
+        body: c.body.includes(`<!-- reviewed-sha: ${f5773.headRefOid} -->`)
+          ? c.body.replace(/<!-- cleared-human: [^\r\n]*? -->/g, '') : c.body })) };
+      const pUncleared = planFor(uncleared, {});
+      check((pUncleared.dispatch ?? []).map(d => d.kind).join(',') === 'review',
+        '#5773 without human clearance: its one finished review left no advisory, so exactly one advisory review is owed');
       for (const n of [5773, 5775, 5800]) {
         const off = planFor(fx(n), { WE_REFERRAL_HOLD_AUTO_RESOLVE: '0' });
         check(kinds(off).includes(PAUSED) && (off.dispatch ?? []).length === 0, `#${n}: the kill switch must keep today's pause`);
