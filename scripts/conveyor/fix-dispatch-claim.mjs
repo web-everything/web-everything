@@ -343,9 +343,14 @@ export function refreshLiveFixDispatchClaims({
       }
       continue;
     }
-    // A stale working row may point at a recycled spare. Unknown identities or missing pids retain the claim.
+    // A stale working row may point at a recycled spare, but reusable names alone cannot associate it with
+    // this claim during listing lag. Every non-terminal row must belong to this claim; only claims without
+    // a sessionId can fall back to start time. Ambiguous rows, unknown identities or missing pids retain it.
     const nonTerminal = agentsAll.filter((a) => !['done', 'stopped', 'failed'].includes(a.state));
-    if (!isAwaiting && nonTerminal.length && nonTerminal.every((a) => Number.isInteger(a.pid))) {
+    if (!isAwaiting && nonTerminal.length && nonTerminal.every((a) =>
+      ((entry.meta.sessionId && a.sessionId === entry.meta.sessionId)
+        || (!entry.meta.sessionId && Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs))
+      && Number.isInteger(a.pid))) {
       const identities = nonTerminal.map((a) => {
         try { return identity(a.pid); } catch { return null; }
       });

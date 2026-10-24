@@ -120,6 +120,57 @@ describe('PID snapshot safety boundaries', () => {
 
 describe('session-bound fixing claim identity safety', () => {
   it.each([
+    ['an older dead-pid working row with a different sessionId keeps a newer claim', 'bound-fix',
+      [{ sessionId: 'old-fix', startedAt: NOW - 1000 }], false],
+    ['an older dead-pid working row keeps a newer claim without a sessionId', null,
+      [{ sessionId: 'old-fix', startedAt: NOW - 1000 }], false],
+    ['a different sessionId cannot use a newer start time to release a bound claim', 'bound-fix',
+      [{ sessionId: 'other-fix', startedAt: NOW + 1 }], false],
+    ['a row missing sessionId cannot release a bound claim', 'bound-fix',
+      [{ startedAt: NOW + 1 }], false],
+    ['a matching sessionId row with a recycled pid releases even when it started before the claim', 'bound-fix',
+      [{ sessionId: 'bound-fix', startedAt: NOW - 1000 }], true],
+    ['a row starting at the claim releases a legacy claim with a recycled pid', null,
+      [{ sessionId: 'legacy-fix', startedAt: NOW }], true],
+    ['a row with no start time keeps a legacy claim', null,
+      [{ sessionId: 'legacy-fix' }], false],
+    ['a row with an unreadable start time keeps a legacy claim', null,
+      [{ sessionId: 'legacy-fix', startedAt: 'unreadable' }], false],
+    ['a non-associated live sibling keeps the claim despite a matching dead row', 'bound-fix',
+      [{ sessionId: 'bound-fix' }, { sessionId: 'other-fix', startedAt: NOW + 1, live: true }], false],
+    ['a non-associated unknown sibling keeps the claim despite a matching dead row', 'bound-fix',
+      [{ sessionId: 'bound-fix' }, { sessionId: 'other-fix', startedAt: NOW + 1 }], false],
+  ])('%s', (_name, sessionId, rows, released) => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'session-identity-association-'));
+    const claim = { repo: 'we', pr: 42, kind: 'fixing', lockRoot };
+    const agents = rows.map((row, index) => ({ name: 'fix-42', state: 'working', pid: PID + index, ...row }));
+    const identity = vi.fn(pid => pid === PID
+      ? { alive: false, reason: 'recycled-spare' }
+      : { alive: agents.find(row => row.pid === pid)?.live ? true : null });
+    try {
+      expect(acquireFixClaim({ ...claim, who: 'fix-42', sessionId, nowMs: NOW }).ok).toBe(true);
+      const result = refreshLiveFixDispatchClaims({
+        lockRoot, identity, listAgentsAll: () => agents,
+        hungInfoFor: () => null, awaitingVerifyFor: null,
+        nowMs: NOW + 1000, nowIso: () => new Date(NOW + 1000).toISOString(),
+      });
+      if (released) {
+        expect(result.released).toEqual([{ repo: 'we', pr: 42, kind: 'fixing', owner: 'fixer:fix-42',
+          reason: 'session-identity-dead (recycled-spare)' }]);
+        expect(result.refreshed).toEqual([]);
+        expect(readFixDispatchClaim(claim)).toBeNull();
+        expect(identity).toHaveBeenCalledWith(PID);
+      } else {
+        expect(result.released ?? []).toEqual([]);
+        expect(result.refreshed).toHaveLength(1);
+        expect(readFixDispatchClaim(claim).heartbeatAt).toBe(new Date(NOW + 1000).toISOString());
+      }
+    } finally {
+      rmSync(lockRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
     ['releases a working row with a recycled-spare pid and logs the reason', [], true],
     ['releases when all working rows have dead identities', [{ pid: PID + 1 }], true],
     ['unknown identity keeps the claim', [{ pid: PID, unknown: true }], false],
@@ -179,7 +230,7 @@ describe('session-bound fixing claim identity safety', () => {
       acquireFixClaim({ ...claim, who: 'fix-42', sessionId: 'bound-fix', nowMs: NOW });
       const result = refreshLiveFixDispatchClaims({
         lockRoot, identity,
-        listAgentsAll: () => [{ name: 'fix-42', state: 'working', pid: PID }],
+        listAgentsAll: () => [{ name: 'fix-42', sessionId: 'bound-fix', state: 'working', pid: PID }],
         hungInfoFor: () => null, awaitingVerifyFor: null,
         nowMs: NOW + 1000, nowIso: () => new Date(NOW + 1000).toISOString(),
       });
