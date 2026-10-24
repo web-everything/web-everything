@@ -18,6 +18,7 @@ const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
 const VITEST_BOUNDS = Object.freeze({ testTimeout: 30000, hookTimeout: 60000, teardownTimeout: 10000 });
+const ABSOLUTE_POSIX_PATH = /(?<![\w.<])\/[^/\s"'()]+(?:\/[^/\s"'()]+)+/g;
 const CHILD_PROCESS_NOTE = 'child processes may outlive the timeout; heavy-admission owns them';
 // prototypeLoad.combinedTest settings, resolved and recorded through the usual cascade.
 // Defaults: ten minutes for admission, twenty minutes before SIGTERM, 16 MiB child output.
@@ -94,9 +95,10 @@ async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, 
       let report;
       try { report = JSON.parse(fs.readFileSync(reportPath, 'utf8')); }
       catch { return outcome = { ok: false, reason: 'tests-unproven', command, testCount: tests.length,
-        result: 'unknown passed, unknown skipped; JSON report missing, unreadable or unparseable' }; }
-      const passed = Number.isSafeInteger(report?.numPassedTests) && report.numPassedTests >= 0 ? report.numPassedTests : 'unknown';
-      const skipped = Number.isSafeInteger(report?.numPendingTests) && report.numPendingTests >= 0 ? report.numPendingTests : 'unknown';
+        result: 'Unproven passed/skipped counts; JSON report missing, unreadable or unparseable' }; }
+      const countsValid = ['numPassedTests', 'numFailedTests', 'numPendingTests', 'numTodoTests', 'numTotalTests']
+        .every((key) => Number.isSafeInteger(report?.[key]) && report[key] >= 0);
+      const assertions = { passed: 0, failed: 0, skipped: 0, todo: 0 };
       const selected = new Set(tests);
       const filesProven = Array.isArray(report?.testResults) && report.testResults.length === tests.length
         && report.testResults.every((file) => {
@@ -104,15 +106,28 @@ async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, 
           const path = relative(worktree, resolve(worktree, file.name));
           if (!selected.delete(path) || file.status !== 'passed' || !Array.isArray(file.assertionResults)
             || !file.assertionResults.length) return false;
+          for (const assertion of file.assertionResults) {
+            if (Object.hasOwn(assertions, assertion?.status)) assertions[assertion.status]++;
+          }
           return file.assertionResults.every((assertion) => ['passed', 'skipped', 'todo'].includes(assertion?.status))
             && file.assertionResults.some((assertion) => assertion.status === 'passed');
         }) && selected.size === 0;
+      // Vitest can count todos as pending and serialize them as skipped assertions.
+      // Do not add overlapping aggregate counters or infer a missing todo count.
+      const skippedAssertions = assertions.skipped + assertions.todo;
+      const countsMatch = countsValid && report.numPassedTests === assertions.passed
+        && report.numFailedTests === assertions.failed
+        && (report.numPendingTests === assertions.skipped || report.numPendingTests === skippedAssertions)
+        && (assertions.todo > 0 ? report.numTodoTests === assertions.todo : report.numTodoTests <= assertions.skipped)
+        && report.numTotalTests === Object.values(assertions).reduce((sum, count) => sum + count, 0);
       const proven = report?.success === true && report.numFailedTests === 0 && report.numFailedTestSuites === 0
-        && passed !== 'unknown' && passed > 0 && filesProven;
-      return outcome = { ok: proven, command, result: `${passed} passed, ${skipped} skipped${proven ? '' : '; JSON evidence incomplete or counts mismatch'}`,
+        && assertions.passed > 0 && filesProven && countsMatch;
+      const summary = countsValid ? `${report.numPassedTests} passed, ${skippedAssertions} skipped`
+        : 'Unproven passed/skipped counts';
+      return outcome = { ok: proven, command, result: `${summary}${proven ? '' : '; JSON evidence incomplete or counts mismatch'}`,
         testCount: tests.length, ...(proven ? {} : { reason: 'tests-unproven' }) };
     } catch (e) {
-      const output = `${e.stdout || ''}${e.stderr || ''}`.replaceAll(worktree, '<worktree>').replaceAll(repo, '<repo>').replaceAll(env.HOME || homedir(), '<home>').replace(/(?<![\w.<])\/(?:Users|home|private|var|tmp|opt|Volumes)\/[^\s'"):]+/g, '<path>').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+      const output = `${e.stdout || ''}${e.stderr || ''}`.replaceAll(worktree, '<worktree>').replaceAll(repo, '<repo>').replaceAll(env.HOME || homedir(), '<home>').replace(ABSOLUTE_POSIX_PATH, '<path>').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
       return outcome = { ok: false, command, result: `exit ${Number.isInteger(e.status) ? e.status : 'unknown'}: ${output.slice(-400)}`, testCount: tests.length, reason: 'tests-failed' };
     }
   } finally {
@@ -299,7 +314,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             .map(([root, placeholder]) => [root.replace(/\/+$/, ''), placeholder])
             .sort(([a], [b]) => b.length - a.length);
           for (const [root, placeholder] of roots) message = message.replaceAll(root, placeholder);
-          message = message.slice(0, 300);
+          message = message.replace(ABSOLUTE_POSIX_PATH, '<path>').slice(0, 300);
           out.combinedTests = { result: message };
           failure = `combined-tests-unrunnable: ${message}`;
         }

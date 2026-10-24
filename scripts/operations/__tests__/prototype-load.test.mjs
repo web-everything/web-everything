@@ -167,7 +167,7 @@ const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.arg
 describe('default combined-tree test proof', () => {
   const limits = { waitMs: 1234, timeoutMs: 5678, maxBuffer: 4096 };
   const report = { success: true, numFailedTests: 0, numFailedTestSuites: 0,
-    numPassedTests: 3, numPendingTests: 2, testResults: [
+    numPassedTests: 3, numPendingTests: 2, numTodoTests: 1, numTotalTests: 5, testResults: [
       { name: 'one.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }, { status: 'skipped' }, { status: 'todo' }] },
       { name: 'two.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }, { status: 'passed' }] },
     ] };
@@ -218,6 +218,39 @@ describe('default combined-tree test proof', () => {
       killSignal: 'SIGTERM' });
     expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
   });
+  it('accepts actual Vitest JSON containing skipped and todo tests', async () => {
+    // Serialized by Vitest 3.2.4 JsonReporter.onFinished with pass/skip/todo task
+    // records (the todo has result.state=skip). No test runner is spawned here.
+    // Source: https://github.com/vitest-dev/vitest/blob/v3.2.4/packages/vitest/src/node/reporters/json.ts
+    const json = `{
+      "numTotalTestSuites": 2, "numPassedTestSuites": 2, "numFailedTestSuites": 0, "numPendingTestSuites": 0,
+      "numTotalTests": 5, "numPassedTests": 3, "numFailedTests": 0, "numPendingTests": 2, "numTodoTests": 1,
+      "snapshot": {}, "startTime": 0, "success": true,
+      "testResults": [
+        {"assertionResults": [
+          {"ancestorTitles": [],"fullName": "case 0","status": "passed","title": "case 0","duration": 0,"failureMessages": [],"meta": {}},
+          {"ancestorTitles": [],"fullName": "case 1","status": "skipped","title": "case 1","duration": 0,"failureMessages": [],"meta": {}},
+          {"ancestorTitles": [],"fullName": "case 2","status": "skipped","title": "case 2","duration": 0,"failureMessages": [],"meta": {}}
+        ], "startTime": 0, "endTime": 0, "status": "passed", "message": "", "name": "one.test.mjs"},
+        {"assertionResults": [
+          {"ancestorTitles": [],"fullName": "case 0","status": "passed","title": "case 0","duration": 0,"failureMessages": [],"meta": {}},
+          {"ancestorTitles": [],"fullName": "case 1","status": "passed","title": "case 1","duration": 0,"failureMessages": [],"meta": {}}
+        ], "startTime": 0, "endTime": 0, "status": "passed", "message": "", "name": "two.test.mjs"}
+      ]
+    }`;
+    expect(JSON.parse(json)).toMatchObject({ numPendingTests: 2, numTodoTests: 1, numTotalTests: 5 });
+    expect((await runReport(json)).result).toMatchObject({ ok: true, testCount: 2, result: '3 passed, 2 skipped' });
+  });
+  it('accepts separately reported todo assertions without double-counting the summary', async () => {
+    expect((await runReport({ ...report, numPendingTests: 1 })).result)
+      .toMatchObject({ ok: true, testCount: 2, result: '3 passed, 2 skipped' });
+  });
+  it('rejects a todo count larger than all skipped assertions in reporter output', async () => {
+    const value = structuredClone(report);
+    value.testResults[0].assertionResults[2].status = 'skipped';
+    value.numTodoTests = 3;
+    expect((await runReport(value)).result).toMatchObject({ ok: false, reason: 'tests-unproven' });
+  });
   it('accepts absolute worktree file names and reordered results', async () => {
     const value = { ...report, testResults: [...report.testResults].reverse().map(file => ({
       ...file, name: `/tmp/prototype-combined-proof/${file.name}`,
@@ -247,6 +280,55 @@ describe('default combined-tree test proof', () => {
     expect(fs.existsSync).toHaveBeenCalledWith(worktree);
     expect(result.result).toContain('temp worktree removed');
   });
+  it.each(['numPassedTests', 'numFailedTests', 'numPendingTests', 'numTodoTests', 'numTotalTests'])(
+    'fails closed on missing or invalid %s without unknown counts', async (key) => {
+      for (const invalid of [undefined, null, '0', -1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        const value = { ...report, [key]: invalid };
+        const { result } = await runReport(value);
+        expect(result).toMatchObject({ ok: false, reason: 'tests-unproven' });
+        expect(result.result).not.toContain('unknown');
+      }
+    },
+  );
+  it.each([
+    ['passed', { numPassedTests: 4, numTotalTests: 6 }],
+    ['pending', { numPendingTests: 3, numTotalTests: 6 }],
+    ['todo', { numTodoTests: 2, numTotalTests: 6 }],
+    ['total', { numTotalTests: 6 }],
+    ['balanced pending/todo', { numPendingTests: 0, numTodoTests: 2 }],
+  ])('rejects %s counts inconsistent with individual assertions', async (_name, counts) => {
+    const { result } = await runReport({ ...report, ...counts });
+    expect(result).toMatchObject({ ok: false, reason: 'tests-unproven' });
+    expect(result.result).toContain('counts mismatch');
+  });
+  it.each(['', ' ', '\n', '"', "'", '(', ')', ':', '='])(
+    'redacts arbitrary absolute paths from failed-run output after %j', async (prefix) => {
+      const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), {
+        status: 1, stderr: `${prefix}/srv/x/y ${prefix}/mnt/a/b`,
+      }) });
+      expect(result).toMatchObject({ ok: false, reason: 'tests-failed' });
+      expect(result.result).not.toMatch(/\/srv\/x\/y|\/mnt\/a\/b/);
+      expect(result.result).toContain(`${prefix}<path> ${prefix}<path>`);
+    },
+  );
+  it.each(['[', ']', ',', '{', '}', ';', '!', '?', '+', '-', '@', '#', '$', '%', '&', '*', '/', '\\', '|', '~', '`'])(
+    'preserves legacy delimiter %j redaction in persisted failed-run output', async (prefix) => {
+      const raw = `${prefix}/home/alice/secret.txt] ${prefix}/srv/x/y ${prefix}/mnt/a/b`;
+      const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), {
+        status: 1, stderr: raw,
+      }) });
+      expect(result).toMatchObject({ ok: false, reason: 'tests-failed' });
+      expect(result.result.match(/<path>/g)).toHaveLength(3);
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], combinedTest: result });
+      const loaded = await f.run();
+      expect(loaded).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
+      for (const output of [result, loaded, ...f.records]) {
+        expect(JSON.stringify(output)).not.toMatch(/\/home\/alice\/secret\.txt|\/srv\/x\/y|\/mnt\/a\/b/);
+      }
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    },
+  );
   it('redacts home and other absolute paths from failed-run output', async () => {
     const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), { status: 1, stderr: 'at /Users/someone/secret/dir/file.mjs:3 and /private/var/x/y' }) });
     expect(result.result).not.toMatch(/\/Users\/someone|\/private\/var/);
@@ -282,6 +364,7 @@ describe('default combined-tree test proof', () => {
     const { result, fs, worktree } = await runReport(value, options);
     expect(result).toMatchObject({ ok: false, reason: 'tests-unproven', testCount: 2 });
     expect(result.result).toMatch(/passed.*skipped/);
+    expect(result.result).not.toContain('unknown');
     expect(result.result.length).toBeLessThanOrEqual(300);
     expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
   });
@@ -514,8 +597,37 @@ describe('prototype-load', () => {
     expect(f.records).toHaveLength(1);
     expect(f.records[0]).toMatchObject({ stopReason: 'stale-registration', combinedTests: r.combinedTests, staleTolerated: [] });
   });
+  it.each(['', ' ', '\n', '"', "'", '(', ')', ':', '='])(
+    'redacts arbitrary absolute paths from thrown errors after %j in every persisted field', async (prefix) => {
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+        combinedTest: () => { throw new Error(`${prefix}/srv/x/y ${prefix}/mnt/a/b`); } });
+      const result = await f.run();
+      expect(result).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
+      expect(result.combinedTests.result.match(/<path>/g)).toHaveLength(2);
+      for (const output of [result, ...f.records]) {
+        expect(JSON.stringify(output)).not.toMatch(/\/srv\/x\/y|\/mnt\/a\/b/);
+      }
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    },
+  );
+  it.each(['[', ']', ',', '{', '}', ';', '!', '?', '+', '-', '@', '#', '$', '%', '&', '*', '/', '\\', '|', '~', '`'])(
+    'preserves legacy delimiter %j redaction in persisted thrown-error output', async (prefix) => {
+      const raw = `${prefix}/home/alice/secret.txt] ${prefix}/srv/x/y ${prefix}/mnt/a/b`;
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+        combinedTest: () => { throw new Error(raw); } });
+      const result = await f.run();
+      expect(result).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
+      expect(result.combinedTests.result.match(/<path>/g)).toHaveLength(3);
+      for (const output of [result, ...f.records]) {
+        expect(JSON.stringify(output)).not.toMatch(/\/home\/alice\/secret\.txt|\/srv\/x\/y|\/mnt\/a\/b/);
+      }
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    },
+  );
   it('sanitizes and bounds thrown combined-test errors in every persisted refusal field', async () => {
-    const repoPath = new URL('../../../', import.meta.url).pathname.replace(/\/$/, '');
+    const repoPath = process.cwd().replace(/\/$/, '');
     const raw = `unavailable \u0000${repoPath}/private.mjs /home/test/secret /tmp/private-log \n` + 'x'.repeat(400);
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
       combinedTest: () => { throw new Error(raw); } });
