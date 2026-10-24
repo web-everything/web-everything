@@ -13,7 +13,7 @@ import { REPO_ROOT } from '../../operations/dispatch-lane-io.mjs';
 import {
   buildCandidates, sweepCiRedRecovery, refreshOntoMain, formatReport, defaultPostRebaseComment,
   HUNG_CI_COMMENT_MARKER, buildHungCiComment, countHungCiComments, countHungCiCommentsByJob, bodyHasExactLine,
-  cancelAndRerunHungRun, cancelHungRun, describeExecError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
+  cancelAndRerunHungRun, cancelHungRun, describeExecError, isRunNotFoundError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
   defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
   sweepMissingRunRecovery as sweepMissingRunRecoveryWithIo, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels,
 } from '../ci-red-recovery-watch.mjs';
@@ -569,13 +569,15 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
   // forever, and this pass would have retried the identical doomed call every 2 minutes indefinitely. Fixed:
   // the marker (and therefore the count) is posted on EVERY attempt, success or failure.
   it('POSTS the marker comment even when the cancel+rerun itself FAILED — a failed attempt still counts toward the cap', () => {
-    const cancelAndRerun = vi.fn(() => ({ ok: false, action: 'rerun-failed', error: 'boom' }));
+    const cancelAndRerun = vi.fn(() => ({ ok: false, action: 'cancel-failed', error: 'boom' }));
     const postComment = vi.fn();
+    const trigger = vi.fn();
     const result = sweepHungCiRecovery({
-      readOpenPrs: () => [PR_2636_HUNG], readComments: () => [], cancelAndRerun, postComment, now: NOW, apply: true,
+      readOpenPrs: () => [PR_2636_HUNG], readComments: () => [], cancelAndRerun, trigger, postComment, now: NOW, apply: true,
     });
-    expect(postComment).toHaveBeenCalledWith(2636, expect.objectContaining({ ok: false, action: 'rerun-failed', error: 'boom' }));
-    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, ok: false, action: 'rerun-failed', error: 'boom' })]);
+    expect(trigger).not.toHaveBeenCalled();
+    expect(postComment).toHaveBeenCalledWith(2636, expect.objectContaining({ ok: false, action: 'cancel-failed', error: 'boom' }));
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, ok: false, action: 'cancel-failed', error: 'boom' })]);
   });
 
   // 2026-09-25 18:55 ET correction (#4075/#3383): once the GitHub App token got `actions:write`, a cap-hit run
@@ -656,6 +658,20 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
   const missingRun = { ok: false, action: 'cancel-failed', error: 'Could not find any workflow run with ID 36161558017' };
   const triggered = { ok: true, action: 'pull-request-push' };
 
+  it.each([
+    ['Could not find any workflow run with ID 123', true],
+    ['gh: run NOT FOUND', true],
+    ['HTTP 404: missing', true],
+    ['permission denied', false],
+    ['HTTP 503: service unavailable', false],
+    ['boom', false],
+    [undefined, false],
+    [null, false],
+    ['', false],
+  ])('isRunNotFoundError(%s) returns %s', (error, expected) => {
+    expect(isRunNotFoundError(error)).toBe(expected);
+  });
+
   function fixture(kind, outcome = triggered, repo = null) {
     const comments = [];
     if (kind === 'repeat-hang' || kind === 'hung-cap-escalate') {
@@ -700,6 +716,7 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(bodyHasExactLine(body, `sha: ${PR_2636_HUNG.headRefOid}`)).toBe(true);
     expect(bodyHasExactLine(body, `reason: ${reason}`)).toBe(true);
     expect(body).toContain(triggered.action);
+    expect(body).toContain(missingRun.error);
     expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, ...triggered })]);
 
     const again = sweepHungCiRecovery(f.options);
@@ -732,6 +749,7 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
       headSha: PR_2636_HUNG.headRefOid, reason, ...failure,
     }));
     expect(f.comments.at(-1).body).toContain(failure.error);
+    expect(f.comments.at(-1).body).toContain(missingRun.error);
     expect(bodyHasExactLine(f.comments.at(-1).body, `reason: ${reason}`)).toBe(true);
     expect(result.applied).toEqual([expect.objectContaining(failure)]);
     expect(sweepHungCiRecovery(f.options).applied).toEqual([]);
@@ -741,16 +759,45 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(f.postComment).toHaveBeenCalledTimes(1);
   });
 
-  it('a deferred trigger records no comment and can retry on the next tick', () => {
+  it('a deferred trigger records the cancel failure, can retry next tick, and reaches the normal cap', () => {
     const f = fixture('hung-cancel-rerun', { ok: false, deferred: true, action: 'pull-request-push' });
-    sweepHungCiRecovery(f.options);
+    expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining(missingRun)]);
     expect(f.trigger).toHaveBeenCalledTimes(1);
-    expect(f.postComment).not.toHaveBeenCalled();
-    expect(f.comments).toEqual([]);
-    f.trigger.mockReturnValue(triggered);
-    expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining(triggered)]);
-    expect(f.trigger).toHaveBeenCalledTimes(2);
     expect(f.postComment).toHaveBeenCalledTimes(1);
+    expect(f.postComment).toHaveBeenCalledWith(2636, expect.objectContaining(missingRun));
+    expect(f.comments[0].body).toContain(missingRun.error);
+    expect(bodyHasExactLine(f.comments[0].body, `reason: ${reason}`)).toBe(false);
+    expect(countHungCiComments(f.comments, PR_2636_HUNG.headRefOid)).toBe(1);
+    expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining(missingRun)]);
+    expect(f.trigger).toHaveBeenCalledTimes(2);
+    expect(f.postComment).toHaveBeenCalledTimes(2);
+    expect(countHungCiComments(f.comments, PR_2636_HUNG.headRefOid)).toBe(2);
+    const capped = sweepHungCiRecovery({ ...f.options, apply: false });
+    expect(capped.dispatch).toEqual([expect.objectContaining({ kind: 'hung-cap-escalate', attempts: 2 })]);
+    expect(f.cancelAndRerun).toHaveBeenCalledTimes(2);
+    expect(f.comments.some(({ body }) => bodyHasExactLine(body, `reason: ${reason}`))).toBe(false);
+  });
+
+  it('permission-denied cancel failure never triggers, posts the normal marker, and counts toward the cap', () => {
+    const f = fixture('hung-cancel-rerun');
+    const failure = { ok: false, action: 'cancel-failed', error: 'permission denied' };
+    f.cancelAndRerun.mockReturnValue(failure);
+    for (let i = 0; i < 2; i++) {
+      expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining(failure)]);
+    }
+    expect(f.trigger).not.toHaveBeenCalled();
+    expect(f.postComment).toHaveBeenCalledTimes(2);
+    expect(f.postComment).toHaveBeenCalledWith(2636, expect.objectContaining(failure));
+    expect(countHungCiComments(f.comments, PR_2636_HUNG.headRefOid)).toBe(2);
+    for (const { body } of f.comments) {
+      expect(body).toContain(failure.error);
+      expect(bodyHasExactLine(body, `reason: ${reason}`)).toBe(false);
+    }
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+    expect(sweepHungCiRecovery(f.options).dispatch).toEqual([expect.objectContaining({ kind: 'hung-cap-escalate', attempts: 2 })]);
+    expect(f.cancelAndRerun).toHaveBeenCalledTimes(2);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(f.trigger).not.toHaveBeenCalled();
   });
 });
 

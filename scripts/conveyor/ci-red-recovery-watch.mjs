@@ -597,12 +597,12 @@ export const HUNG_CI_COMMENT_MARKER = '⏱️ conveyor CI-hung-recovery';
  * captured, so a permission gap (a GitHub App token missing `actions:write`, the concrete cause found live) or
  * a "run already completing" race is VISIBLE on the PR itself, not just swallowed. PURE.
  * @param {{actor?:string, runId?:(number|string|null), headSha?:(string|null), jobName?:(string|null),
- *   kind?:string, reason?:string|null, ok?:boolean, action?:string, error?:(string|null)}} o
+ *   kind?:string, reason?:string|null, ok?:boolean, action?:string, error?:(string|null), cancelError?:(string|null)}} o
  * @returns {string}
  */
 export function buildHungCiComment({
   actor = 'conveyor CI-hung-recovery', runId = null, headSha = null, jobName = null,
-  kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null,
+  kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null, cancelError = null,
 } = {}) {
   const outcome = ok
     ? (reason === 'run-not-found-retrigger'
@@ -619,6 +619,7 @@ export function buildHungCiComment({
     `sha: ${headSha ?? '(unknown)'}`,
     `job: ${jobName ?? '(unknown)'}`,
     ...(reason ? [`reason: ${markerFreeText(reason)}`] : []),
+    ...(cancelError != null ? [`Original cancel error: ${markerFreeText(cancelError)}`] : []),
     `${actor} ${outcome}`,
   ].join('\n');
 }
@@ -762,14 +763,14 @@ export function reconcileAcceptanceAfterRebase({
  * caller).
  * @param {number} prNumber
  * @param {{exec?:Function, repo?:string|null, runId?:(number|null), headSha?:(string|null),
- *   jobName?:(string|null), kind?:string, reason?:string|null, ok?:boolean, action?:string, error?:(string|null)}} [o]
+ *   jobName?:(string|null), kind?:string, reason?:string|null, ok?:boolean, action?:string, error?:(string|null), cancelError?:(string|null)}} [o]
  */
 export function defaultPostHungCiComment(prNumber, {
   exec = execFileSyncThrottled, repo = null, runId = null, headSha = null, jobName = null,
-  kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null,
+  kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null, cancelError = null,
 } = {}) {
   const argv = ['pr', 'comment', String(prNumber), '--body', buildHungCiComment({
-    runId, headSha, jobName, kind, reason, ok, action, error,
+    runId, headSha, jobName, kind, reason, ok, action, error, cancelError,
   })];
   if (repo) argv.push('--repo', repo);
   exec('gh', argv, {
@@ -820,6 +821,10 @@ export function describeExecError(e) {
   const stderr = typeof e?.stderr === 'string' ? e.stderr.trim() : (Buffer.isBuffer(e?.stderr) ? e.stderr.toString('utf8').trim() : '');
   const raw = redactTokenShapes(stderr || String((e && e.message) || e));
   return raw.length > 500 ? `${raw.slice(0, 500)}…` : raw;
+}
+
+export function isRunNotFoundError(error) {
+  return typeof error === 'string' && /could not find any workflow run|not found|HTTP 404/i.test(error);
 }
 
 /**
@@ -934,19 +939,21 @@ export function sweepHungCiRecovery({
         // `repeat-hang`: both hand the PR to the existing ci-red -> ci-heal path rather than retrying.
         : ((d.kind === 'repeat-hang' || d.kind === 'hung-cap-escalate') ? cancelOnly(d.runId, { repo }) : cancelAndRerun(d.runId, { repo }));
       let reason = null;
-      // The fallback covers every cancel-failed dispatch, including escalation kinds;
-      // eligibility uses the action rather than matching GitHub's error text.
-      if (!result.ok && result.action === 'cancel-failed') {
-        result = trigger(d, { repo: repoSlug(repo), defaultBranch });
-        // No durable attempt for a transient refusal; the next tick may try again.
-        if (result.deferred) continue;
-        reason = 'run-not-found-retrigger';
+      let cancelError = null;
+      if (!result.ok && result.action === 'cancel-failed' && isRunNotFoundError(result.error)) {
+        const triggered = trigger(d, { repo: repoSlug(repo), defaultBranch });
+        // A deferred trigger still records the cancel failure against the normal cap.
+        if (!triggered.deferred) {
+          cancelError = result.error;
+          result = triggered;
+          reason = 'run-not-found-retrigger';
+        }
       }
       // Posted on EVERY attempt, success or failure — see this function's own docblock above for why.
       if (d.runId != null) {
         postComment(d.prNumber, {
           repo, runId: d.runId, headSha: d.headSha, jobName: d.jobName, kind: d.kind, ok: result.ok, action: result.action, error: result.error ?? null,
-          ...(reason ? { reason } : {}),
+          ...(reason ? { reason, cancelError } : {}),
         });
       }
       // xd1sfms (#4075/#3383) — `why` carries forward from the PLAN (never re-derived here) so every applied
