@@ -597,15 +597,17 @@ export const HUNG_CI_COMMENT_MARKER = '⏱️ conveyor CI-hung-recovery';
  * captured, so a permission gap (a GitHub App token missing `actions:write`, the concrete cause found live) or
  * a "run already completing" race is VISIBLE on the PR itself, not just swallowed. PURE.
  * @param {{actor?:string, runId?:(number|string|null), headSha?:(string|null), jobName?:(string|null),
- *   kind?:string, ok?:boolean, action?:string, error?:(string|null)}} o
+ *   kind?:string, reason?:string|null, ok?:boolean, action?:string, error?:(string|null)}} o
  * @returns {string}
  */
 export function buildHungCiComment({
   actor = 'conveyor CI-hung-recovery', runId = null, headSha = null, jobName = null,
-  kind = 'hung-cancel-rerun', ok = true, action = 'cancelled-and-rerun', error = null,
+  kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null,
 } = {}) {
   const outcome = ok
-    ? (kind === 'repeat-hang'
+    ? (reason === 'run-not-found-retrigger'
+      ? `could not cancel run ${runId ?? '?'}; triggered CI for the current PR head via "${markerFreeText(action)}".`
+      : kind === 'repeat-hang'
       ? `cancelled run ${runId ?? '?'} (job "${jobName ?? '?'}") and did NOT re-run it — this job has hung before on a different head, so this is handed to ci-heal for a real diagnosis instead of retried again.`
       : kind === 'hung-cap-escalate'
         ? `cancelled run ${runId ?? '?'} (job "${jobName ?? '?'}") and did NOT re-run it — this head sha's own hung-recovery retries are exhausted, so this is handed to ci-heal instead of left for GitHub's own job timeout-minutes, which this PR's branch predates.`
@@ -616,6 +618,7 @@ export function buildHungCiComment({
     '',
     `sha: ${headSha ?? '(unknown)'}`,
     `job: ${jobName ?? '(unknown)'}`,
+    ...(reason ? [`reason: ${markerFreeText(reason)}`] : []),
     `${actor} ${outcome}`,
   ].join('\n');
 }
@@ -759,14 +762,14 @@ export function reconcileAcceptanceAfterRebase({
  * caller).
  * @param {number} prNumber
  * @param {{exec?:Function, repo?:string|null, runId?:(number|null), headSha?:(string|null),
- *   jobName?:(string|null), kind?:string, ok?:boolean, action?:string, error?:(string|null)}} [o]
+ *   jobName?:(string|null), kind?:string, reason?:string|null, ok?:boolean, action?:string, error?:(string|null)}} [o]
  */
 export function defaultPostHungCiComment(prNumber, {
   exec = execFileSyncThrottled, repo = null, runId = null, headSha = null, jobName = null,
-  kind = 'hung-cancel-rerun', ok = true, action = 'cancelled-and-rerun', error = null,
+  kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null,
 } = {}) {
   const argv = ['pr', 'comment', String(prNumber), '--body', buildHungCiComment({
-    runId, headSha, jobName, kind, ok, action, error,
+    runId, headSha, jobName, kind, reason, ok, action, error,
   })];
   if (repo) argv.push('--repo', repo);
   exec('gh', argv, {
@@ -830,10 +833,10 @@ export function describeExecError(e) {
  * @returns {{ok:boolean, action:string, error?:string}}
  */
 export function cancelHungRun(runId, { repo = null, exec = execFileSyncThrottled } = {}) {
-  const repoArgs = repo ? ['--repo', repo] : [];
+  const slug = repoSlug(repo);
   const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
   try {
-    exec('gh', ['run', 'cancel', String(runId), ...repoArgs], opts);
+    exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/cancel`], opts);
   } catch (e) {
     return { ok: false, action: 'cancel-failed', error: describeExecError(e) };
   }
@@ -842,8 +845,8 @@ export function cancelHungRun(runId, { repo = null, exec = execFileSyncThrottled
 
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#cancelAndRerunHungRun — the ONE real write the ordinary
- * (non-repeat-hang) hung-run dispatch performs: `gh run cancel <runId>`, a short bounded pause, then
- * `gh run rerun <runId>` (the WHOLE run — never `--failed`, which matches a `failure` conclusion, not the
+ * (non-repeat-hang) hung-run dispatch performs: REST run cancellation, a short bounded pause, then
+ * REST run rerun (the WHOLE run — never `--failed`, which matches a `failure` conclusion, not the
  * `cancelled` one this pass's own cancel just produced, and would silently rerun nothing). Never a raw retry
  * of the still-hung attempt in place.
  * @param {number|string} runId
@@ -851,16 +854,16 @@ export function cancelHungRun(runId, { repo = null, exec = execFileSyncThrottled
  * @returns {{ok:boolean, action:string, error?:string}}
  */
 export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncThrottled, sleepSync = defaultSleepSync, waitMs = 5000 } = {}) {
-  const repoArgs = repo ? ['--repo', repo] : [];
+  const slug = repoSlug(repo);
   const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
   try {
-    exec('gh', ['run', 'cancel', String(runId), ...repoArgs], opts);
+    exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/cancel`], opts);
   } catch (e) {
     return { ok: false, action: 'cancel-failed', error: describeExecError(e) };
   }
   sleepSync(waitMs);
   try {
-    exec('gh', ['run', 'rerun', String(runId), ...repoArgs], opts);
+    exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/rerun`], opts);
   } catch (e) {
     return { ok: false, action: 'rerun-failed', error: describeExecError(e) };
   }
@@ -882,7 +885,7 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
  * GitHub's own job `timeout-minutes` exactly as a successful-but-still-hung run would.
  * @param {{repo?:string|null, apply?:boolean, requiredCheck?:string, workflowName?:string, thresholdMs?:number,
  *   maxRetriesPerSha?:number, readOpenPrs?:Function, readComments?:Function, cancelAndRerun?:Function,
- *   cancelOnly?:Function, postComment?:Function, now?:number}} [o]
+ *   cancelOnly?:Function, trigger?:Function, defaultBranch?:string, postComment?:Function, now?:number}} [o]
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
 export function sweepHungCiRecovery({
@@ -890,6 +893,7 @@ export function sweepHungCiRecovery({
   thresholdMs = DEFAULT_HUNG_THRESHOLD_MS, maxRetriesPerSha = DEFAULT_MAX_HUNG_RETRIES_PER_SHA,
   readOpenPrs = defaultReadOpenPrs, readComments = defaultReadPrComments,
   cancelAndRerun = cancelAndRerunHungRun, cancelOnly = cancelHungRun, postComment = defaultPostHungCiComment, now = Date.now(),
+  trigger = triggerCiForPr, defaultBranch = 'main',
 } = {}) {
   const prs = readOpenPrs({ repo });
   const rawCandidates = buildHungCandidates(prs, { requiredCheck, workflowName });
@@ -902,6 +906,9 @@ export function sweepHungCiRecovery({
     const hungNow = (now - Date.parse(c.startedAt)) >= thresholdMs;
     if (!hungNow) return c;
     const comments = readComments(c.prNumber, { repo });
+    // Any non-deferred retrigger attempt consumes this head's one attempt, success or failure.
+    const retriggerComments = comments.filter((cm) => bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, 'reason: run-not-found-retrigger'));
+    if (countHungCiComments(retriggerComments, c.headSha) > 0) return null;
     // `hungAttemptsForJob` must answer "has this job hung on a DIFFERENT head sha before" — the repeat-hang
     // signal (main-red-recovery.mjs#planHungCiRecoveries) is about the shard surviving a rebase/refresh, not
     // about how many times THIS sha's own retries have already failed (that is `hungAttemptsForSha`'s job).
@@ -913,7 +920,7 @@ export function sweepHungCiRecovery({
       hungAttemptsForSha: countHungCiComments(comments, c.headSha),
       hungAttemptsForJob: countHungCiCommentsByJob(otherShaComments, c.jobName),
     };
-  });
+  }).filter(Boolean);
   const plan = planHungCiRecoveries({
     candidates, now, thresholdMs, maxRetriesPerSha,
   });
@@ -921,15 +928,25 @@ export function sweepHungCiRecovery({
   const applied = [];
   if (apply) {
     for (const d of plan.dispatch) {
-      const result = d.runId == null
+      let result = d.runId == null
         ? { ok: false, action: 'no-run-id', error: `PR #${d.prNumber}'s hung check has no resolvable run id (detailsUrl missing/unparseable)` }
         // #4075/#3383, 2026-09-25 18:55 ET correction — `hung-cap-escalate` cancels only, exactly like
         // `repeat-hang`: both hand the PR to the existing ci-red -> ci-heal path rather than retrying.
         : ((d.kind === 'repeat-hang' || d.kind === 'hung-cap-escalate') ? cancelOnly(d.runId, { repo }) : cancelAndRerun(d.runId, { repo }));
+      let reason = null;
+      // The fallback covers every cancel-failed dispatch, including escalation kinds;
+      // eligibility uses the action rather than matching GitHub's error text.
+      if (!result.ok && result.action === 'cancel-failed') {
+        result = trigger(d, { repo: repoSlug(repo), defaultBranch });
+        // No durable attempt for a transient refusal; the next tick may try again.
+        if (result.deferred) continue;
+        reason = 'run-not-found-retrigger';
+      }
       // Posted on EVERY attempt, success or failure — see this function's own docblock above for why.
       if (d.runId != null) {
         postComment(d.prNumber, {
           repo, runId: d.runId, headSha: d.headSha, jobName: d.jobName, kind: d.kind, ok: result.ok, action: result.action, error: result.error ?? null,
+          ...(reason ? { reason } : {}),
         });
       }
       // xd1sfms (#4075/#3383) — `why` carries forward from the PLAN (never re-derived here) so every applied

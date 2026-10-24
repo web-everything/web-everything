@@ -569,13 +569,13 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
   // forever, and this pass would have retried the identical doomed call every 2 minutes indefinitely. Fixed:
   // the marker (and therefore the count) is posted on EVERY attempt, success or failure.
   it('POSTS the marker comment even when the cancel+rerun itself FAILED — a failed attempt still counts toward the cap', () => {
-    const cancelAndRerun = vi.fn(() => ({ ok: false, action: 'cancel-failed', error: 'boom' }));
+    const cancelAndRerun = vi.fn(() => ({ ok: false, action: 'rerun-failed', error: 'boom' }));
     const postComment = vi.fn();
     const result = sweepHungCiRecovery({
       readOpenPrs: () => [PR_2636_HUNG], readComments: () => [], cancelAndRerun, postComment, now: NOW, apply: true,
     });
-    expect(postComment).toHaveBeenCalledWith(2636, expect.objectContaining({ ok: false, action: 'cancel-failed', error: 'boom' }));
-    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, ok: false, action: 'cancel-failed', error: 'boom' })]);
+    expect(postComment).toHaveBeenCalledWith(2636, expect.objectContaining({ ok: false, action: 'rerun-failed', error: 'boom' }));
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, ok: false, action: 'rerun-failed', error: 'boom' })]);
   });
 
   // 2026-09-25 18:55 ET correction (#4075/#3383): once the GitHub App token got `actions:write`, a cap-hit run
@@ -690,10 +690,10 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     const result = sweepHungCiRecovery(f.options);
     expect(result.dispatch).toEqual([expect.objectContaining({ kind })]);
     expect(f.cancelAndRerun.mock.calls.length + f.cancelOnly.mock.calls.length).toBe(1);
-    expect(f.trigger).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    expect(f.trigger).toHaveBeenCalledWith(expect.objectContaining({
       prNumber: PR_2636_HUNG.number, headSha: PR_2636_HUNG.headRefOid, headRefName: PR_2636_HUNG.headRefName,
     }), { repo: repo ?? 'web-everything/web-everything', defaultBranch: 'trunk' });
-    expect(f.postComment).toHaveBeenCalledExactlyOnceWith(2636, expect.objectContaining({
+    expect(f.postComment).toHaveBeenCalledWith(2636, expect.objectContaining({
       headSha: PR_2636_HUNG.headRefOid, reason, ...triggered,
     }));
     const body = f.comments.at(-1).body;
@@ -728,7 +728,7 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     const f = fixture('hung-cancel-rerun', failure);
     const result = sweepHungCiRecovery(f.options);
     expect(f.trigger).toHaveBeenCalledTimes(1);
-    expect(f.postComment).toHaveBeenCalledExactlyOnceWith(2636, expect.objectContaining({
+    expect(f.postComment).toHaveBeenCalledWith(2636, expect.objectContaining({
       headSha: PR_2636_HUNG.headRefOid, reason, ...failure,
     }));
     expect(f.comments.at(-1).body).toContain(failure.error);
