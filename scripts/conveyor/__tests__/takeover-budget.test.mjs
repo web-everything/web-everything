@@ -594,12 +594,42 @@ describe('duplicate findings from two seats count once', () => {
     expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeUndefined();
   });
 
-  it('keeps the later broken member when the first seat reports lower impact', () => {
+  it('upgrades impact while keeping the first claim when a later seat reports broken', () => {
     // Same line isolates weight selection from the expanded line window.
     const thread = [review(T1, 9, [['src/j.mjs', 20, 'degraded', claim]]),
       review(T1, 10, [['src/j.mjs', 20, 'broken', similar]])];
     expect(openDefects(thread, T1)).toMatchObject({ count: 1, weight: findingWeight({ impact: 'broken' }) });
-    expect(reviewRounds(thread).at(-1).findings).toMatchObject([{ impact: 'broken', claim: similar }]);
+    expect(reviewRounds(thread).at(-1).findings).toMatchObject([{ impact: 'broken', claim }]);
+  });
+
+  it('keeps the first grouping anchor when heavier duplicates arrive in either order', () => {
+    const findings = [[20, 'cosmetic'], [28, 'degraded'], [36, 'broken']];
+    const results = [findings, [...findings].reverse()].map((order) => {
+      const thread = order.map(([line, impact], i) => review(T1, 9 + i, [['src/j.mjs', line, impact, claim]]));
+      const result = openDefects(thread, T1);
+      expect(result.findings[0]).toMatchObject({ file: 'src/j.mjs', line: order[0][0], claim });
+      return result;
+    });
+    expect(results[0].count).toBe(2);
+    expect(results[1].count).toBe(results[0].count);
+    // The middle finding joins the first anchor, so each order has different group maxima.
+    expect(results[0].weight).toBe(findingWeight({ impact: 'degraded' }) + findingWeight({ impact: 'broken' }));
+    expect(results[1].weight).toBe(findingWeight({ impact: 'broken' }) + findingWeight({ impact: 'cosmetic' }));
+  });
+
+  it.each([false, true])('merges matching file citations with and without a line (line-less first: %s)', (lineLessFirst) => {
+    const findings = [
+      `- \`src/j.mjs\` — ${claim} — _[CONFIRMED]_ impact if unfixed: degraded`,
+      `- \`src/j.mjs:20\` — ${claim} — _[CONFIRMED]_ impact if unfixed: degraded`,
+    ];
+    if (!lineLessFirst) findings.reverse();
+    const thread = findings.map((finding, i) => {
+      const comment = review(T1, 9 + i, []);
+      return { ...comment, body: comment.body + finding };
+    });
+    expect(openDefects(thread, T1)).toMatchObject({ count: 1, weight: findingWeight({ impact: 'degraded' }),
+      findings: [{ file: 'src/j.mjs', line: lineLessFirst ? null : 20, claim }] });
+    expect(reviewRounds(thread).at(-1).findings).toHaveLength(1);
   });
 
   it.each([

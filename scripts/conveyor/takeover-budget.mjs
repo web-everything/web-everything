@@ -184,12 +184,13 @@ const FIXER_TURN = /^🔧 conveyor fix —/;
 
 /**
  * Fold findings using the shared clearing identity without severity, or identical file-less claims.
- * Keep the heavier member's ruling, impact, claim and line; equal weights keep existing impact and later ruling.
+ * Keep the first member's file, line and claim as the anchor; heavier members upgrade ruling and impact.
+ * Equal weights keep existing impact and later ruling. A missing line on either member permits file-level matching.
  */
 function mergeFinding(into, f) {
   const same = into.find((g) => (f.file && sameFindingForClearing(
-    { file: g.file, line: g.line, summary: g.claim },
-    { file: f.file, line: f.line, summary: f.claim },
+    { file: g.file, line: f.line == null ? null : g.line, summary: g.claim },
+    { file: f.file, line: g.line == null ? null : f.line, summary: f.claim },
   ))
     || (!f.file && !g.file && g.claim === f.claim));
   if (same) {
@@ -197,8 +198,6 @@ function mergeFinding(into, f) {
     if (incomingWeight > existingWeight) {
       same.ruling = f.ruling ?? null;
       same.impact = f.impact ?? null;
-      same.claim = f.claim ?? '';
-      same.line = f.line ?? null;
     } else if (f.ruling) same.ruling = f.ruling; // a later ruling (even a closing one) always lands, as before
     return;
   }
