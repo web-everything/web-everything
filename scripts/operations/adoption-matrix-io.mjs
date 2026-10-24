@@ -42,7 +42,7 @@ export function createAdoptionMatrixReader({
     probes++;
     const gitEnv = { ...env, GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' };
     for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES']) {
+      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES', 'GIT_GRAFT_FILE']) {
       delete gitEnv[key];
     }
     try { return run('git', argv, { cwd, env: gitEnv, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 }); }
