@@ -1377,13 +1377,13 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
  * This sequential entry runs both back to back, exactly as before the split.
  * @param {ReturnType<typeof createRedTeamIo>} io
  */
-export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true } = {}, io = createRedTeamIo({ env })) {
+export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true, resumeOnly = false } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
     if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     const read = loopPayload?.findings?.read;
     const recording = record !== false && loopPayload?.replay !== true;
-    const pass = await speculateRedTeam({ pr, repo, lanePath, read, claudeFindings: claudeFindingsFromLoop(loopPayload), env, post, record: recording }, io);
+    const pass = await speculateRedTeam({ pr, repo, lanePath, read, claudeFindings: claudeFindingsFromLoop(loopPayload), env, post, record: recording, resumeOnly }, io);
     if (pass.status !== 'speculated') return pass;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);
   } catch (e) {
@@ -1409,9 +1409,10 @@ export function redTeamReadFingerprint(read) {
  * taken, so a speculative pass that is killed mid-call can still have its spend recorded.
  * `claudeFindings` is null for a speculative pass (the jurors have not answered yet), and `resume: false` makes a
  * prior clean row a `prior-row` status instead of finishing that row's effects (no effect before the verdict).
+ * `resumeOnly` refuses an unreadable store or missing clean prior row before provider selection or reservation.
  */
 export async function speculateRedTeam({
-  pr, repo, lanePath, read, claudeFindings = null, env = process.env, post = true, record = true, onReserved = null, onTiming = () => {}, resume = true,
+  pr, repo, lanePath, read, claudeFindings = null, env = process.env, post = true, record = true, onReserved = null, onTiming = () => {}, resume = true, resumeOnly = false,
 } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
@@ -1419,6 +1420,19 @@ export async function speculateRedTeam({
     const rev = read.netBasis?.rev;
     if (!isPinnedRev(rev)) return { status: 'skipped', reason: 'the review printed no pinned head commit (netBasis.rev)' };
     const settings = readRedTeamProbes({ env, log: io.log });
+    const now = io.now();
+    let records = [];
+    try { records = io.readRecords(); } catch (e) {
+      if (resumeOnly) return { status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' };
+      io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
+    }
+    const prior = priorRedTeamRow(records, pr, rev);
+    if (resumeOnly && !prior) return { status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' };
+    // A speculative pass (`resume: false`) must not finish a prior pass's effects before the verdict is known: it
+    // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
+    if (prior && !resume) return { status: 'prior-row', reason: `a clean red-team row already exists for #${pr} at ${rev.slice(0, 12)}` };
+    if (prior) return await resumeRedTeam({ pr, repo, rev, title: read.title, prior, records, post, record }, io);
+    // Launch policy applies only to new calls: a recorded pass must finish its effects even if policy changed.
     // The net path list names only rename/copy destinations. Include sources so
     // moving executable code into backlog/ cannot turn the probe off. Unknown
     // or empty destination lists and malformed source lists must still probe.
@@ -1426,14 +1440,6 @@ export async function speculateRedTeam({
       io.log('red team skipped: card-only');
       return { status: 'skipped', reason: 'red team skipped: card-only' };
     }
-    const now = io.now();
-    let records = [];
-    try { records = io.readRecords(); } catch (e) { io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`); }
-    const prior = priorRedTeamRow(records, pr, rev);
-    // A speculative pass (`resume: false`) must not finish a prior pass's effects before the verdict is known: it
-    // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
-    if (prior && !resume) return { status: 'prior-row', reason: `a clean red-team row already exists for #${pr} at ${rev.slice(0, 12)}` };
-    if (prior) return await resumeRedTeam({ pr, repo, rev, title: read.title, prior, records, post, record }, io);
     // Card xn2wf9t — each provider's OWN cap, same treatment as `runExtraSeats`: a provider already at its cap is
     // excluded from `available` up front, so `selectReviewSeatProvider` picks whichever else has budget rather
     // than the pass giving up outright. The reservation loop below still guards the rare RACE (a concurrent pass
@@ -1441,13 +1447,18 @@ export async function speculateRedTeam({
     // available provider — bounded to the provider count.
     let available = [];
     const unavailable = [];
+    let deferredByCap = false;
     const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, resolveProviderCap(p, env)]));
     const usedByProvider = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     for (const p of REVIEW_SEAT_PROVIDERS) {
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
       const hold = quotaHoldOrProbe(records, p, now, env);
       if (hold) { unavailable.push(`${p}: ${hold}`); continue; }
-      if (usedByProvider[p] >= caps[p]) { unavailable.push(`${p}: daily-cap: ${usedByProvider[p]}/${caps[p]} non-Claude seat calls already used today`); continue; }
+      if (usedByProvider[p] >= caps[p]) {
+        deferredByCap = true;
+        unavailable.push(`${p}: daily-cap: ${usedByProvider[p]}/${caps[p]} non-Claude seat calls already used today`);
+        continue;
+      }
       available.push(p);
     }
     let provider = null;
@@ -1467,9 +1478,14 @@ export async function speculateRedTeam({
       }
       usedByProvider[pick.provider] = reservation.used;
       if (reservation.callIds.length) { provider = pick.provider; callId = reservation.callIds[0]; }
-      else { lastReason = `daily-cap: ${reservation.used}/${caps[pick.provider]} non-Claude seat calls used today for ${pick.provider}`; available = available.filter((x) => x !== pick.provider); }
+      else {
+        deferredByCap = true;
+        lastReason = `daily-cap: ${reservation.used}/${caps[pick.provider]} non-Claude seat calls used today for ${pick.provider}`;
+        available = available.filter((x) => x !== pick.provider);
+      }
     }
-    if (!callId) return { status: 'skipped', reason: `${lastReason ?? 'no provider available'}${unavailable.length ? ` (${unavailable.join('; ')})` : ''}` };
+    if (!callId) return { status: 'skipped', ...(deferredByCap ? { deferredByCap: true } : {}),
+      reason: `${lastReason ?? 'no provider available'}${unavailable.length ? ` (${unavailable.join('; ')})` : ''}` };
     const { model: defaultModel, effort: defaultEffort } = RED_TEAM_MODELS[provider];
     const effort = configuredRoute?.effort ?? resolveOperationEffort("review-seat", provider, RED_TEAM_SEAT.key);
     const model = configuredRoute?.model ?? defaultModel;
@@ -1779,9 +1795,9 @@ export function replayPayload({ view, diffText }) {
 
 // ── CLI ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
-if (IS_CLI) {
-  const [sub, ...rest] = process.argv.slice(2);
+/** CLI boundary; injected red-team effects keep recovery tests free of paid calls. */
+export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {}) {
+  const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
@@ -1797,7 +1813,7 @@ if (IS_CLI) {
     runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() })
       .then((result) => emit(result, renderSeatSummary));
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
-    runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post') })
+    return runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only') }, redTeamIo)
       .then((result) => emit(result, renderRedTeamSummary));
   } else if (sub === 'red-team-speculate' && flag('pr') && flag('repo') && flag('lane') && flag('read-sink') && flag('out')) {
     // Card xbizuci — THE SPECULATIVE RED TEAM, started by the review job beside the review loop. It waits for the
@@ -1864,3 +1880,6 @@ if (IS_CLI) {
     process.exitCode = 2;
   }
 }
+
+const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
+if (IS_CLI) runExtraSeatsCli();

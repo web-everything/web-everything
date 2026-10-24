@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { recordRedTeamStatus, readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
+import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
@@ -83,7 +84,10 @@ import { spawn, spawnSync } from 'node:child_process';
 import { execRead } from '../lib/proc-read.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
-import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
+
+import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
+import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -106,7 +110,7 @@ import { ACTOR_ENV } from '../lib/review-independence.mjs';
 import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import {
-  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs,
+  createRedTeamIo, priorRedTeamRow, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs,
 } from './review-extra-seats.mjs';
 import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
@@ -266,6 +270,29 @@ export function laneCooloffActive(record, nowMs, cooloffMs = INFRA_RETRY_COOLOFF
   return Number.isFinite(at) && nowMs - at < cooloffMs;
 }
 
+/** PURE — argv for the red-team child; only resume mode forbids a fresh model call. */
+export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode }) {
+  return [
+    'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`, `--loop-json=${loopFile}`,
+    ...(redTeamMode === 'resume' ? ['--resume-only'] : []),
+  ];
+}
+
+/** A crashed resume keeps its clean prior result in the queued record. Only a confirmed dead
+ * writer can expose that result as finished again; live/unknown liveness still blocks recovery.
+ * Both daemon planning and job admission use this reader, followed by their existing row guards.
+ */
+export function readRedTeamRecoveryStatus(input, {
+  readStatus = readRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+} = {}) {
+  const status = readStatus(input);
+  const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
+  if (status?.status !== 'queued' || !Number.isInteger(status.pid) || status.pid <= 0
+    || !['ran', 'resumed'].includes(priorResult) || priorComment === 'posted') return status;
+  const evidence = readEvidence(input);
+  return evidence?.inFlight === false && !evidence.queued ? { ...status, status: 'finished' } : status;
+}
+
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
@@ -278,6 +305,22 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
   return {
+    restoreRedTeamStatus: ({ repo, pr, head, status }) => {
+      const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
+      if (status == null) rmSync(path, { force: true });
+      else writeJsonAtomic(path, status);
+    },
+    recordRedTeamQueued: input => {
+      recordRedTeamStatus(input, { env });
+      const head = input.loopPayload?.findings?.read?.netBasis?.rev;
+      const stored = readRedTeamStatus({ repo: input.repo, pr: input.pr, head, env });
+      if (stored?.status !== 'queued' || stored.pid !== process.pid) throw Error('queued red-team status could not be persisted');
+      try {
+        syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head,
+          evidence: readDrainRedTeamEvidence({ repo: input.repo, pr: input.pr, head, env }), env,
+          log: line => process.stderr.write(`${line}\n`) });
+      } catch (e) { process.stderr.write(`review-job: red-team status label sync failed: ${e.message}\n`); }
+    },
     redTeamStatus: input => {
       try {
         recordRedTeamStatus(input, { env });
@@ -288,6 +331,14 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       catch (e) { process.stderr.write(`review-job: red-team status write failed: ${e.message}\n`); }
     },
     root,
+    readRedTeamRecords: () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records,
+    readRedTeamStatus: input => readRedTeamRecoveryStatus({ ...input, env }),
+    readRedTeamComments: ({ pr, repo }) => readCompletePrComments(pr, { repo,
+      exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) }),
+    readRedTeamOnlyPayload: ({ pr, repo }) => {
+      const { headRefOid: head } = JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env }));
+      return { head, loopPayload: readDrainRedTeamEvidence({ repo, pr, head, env }).loopPayload };
+    },
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
     readCarryEvidence: ({ pr, repo }) => {
@@ -369,15 +420,14 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // x00g3tt — the POST-ACCEPT RED TEAM, its own process and wall, run only after the added seats. Advisory: it
     // posts one deduped comment and writes evidence; nothing it returns reaches a label, merge or verdict.
-    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug }) => {
+    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, redTeamMode }) => {
       if (!redTeamEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
       const loopFile = join(dir, `${slug}.red-team.loop.json`);
       try {
         mkdirSync(dir, { recursive: true });
         writeFileSync(loopFile, JSON.stringify(loopPayload));
-        const r = node([
-          'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`, `--loop-json=${loopFile}`,
-        ], { timeoutMs: resolveSeatTimeoutMs(env) + 20 * 60 * 1000 });
+        const r = node(redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode }),
+          { timeoutMs: resolveSeatTimeoutMs(env) + 20 * 60 * 1000 });
         for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
           writeLineSync(2, `  ${line}`);
         }
@@ -570,6 +620,7 @@ export function summarizeRedTeam(r) {
   if (!r || typeof r !== 'object') return null;
   return {
     status: r.status ?? null,
+    ...(r.deferredByCap === true ? { deferredByCap: true } : {}),
     ...(r.reason ? { reason: r.reason } : {}),
     ...(r.status === 'ran' ? {
       provider: r.provider, model: r.model, seatStatus: r.seat?.status ?? null, foldedVerdict: r.foldedVerdict ?? null,
@@ -627,7 +678,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   const seatsBox = {};
   // Card xbizuci — `review.speculativeRedTeam` (policy cascade; the layer that set it is logged). Off, or an io
   // without the hook, is the sequential order: the red team starts only after the review accepts.
-  if (typeof io.speculativeRedTeamSetting === 'function') {
+  if (!opts.redTeamOnly && typeof io.speculativeRedTeamSetting === 'function') {
     let setting;
     try { setting = io.speculativeRedTeamSetting(); } catch { setting = null; }
     seatsBox.speculativeEnabled = setting?.enabled === true;
@@ -645,12 +696,12 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
   // The accept is already labelled, and the added seats below can take minutes: record the pass as queued now, so
   // the drain holds the head until the pass records its result. The `finished` write at the end supersedes it.
-  if (accepted && (spec || typeof io.runRedTeam === 'function')) io.redTeamStatus?.({ ...seatsBox.input, status: 'queued' });
+  if (!seatsBox.redTeamQueued && accepted && (spec || typeof io.runRedTeam === 'function')) io.redTeamStatus?.({ ...seatsBox.input, status: 'queued' });
   // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
   // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
   // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
   // outcome above. A missing hook, a crash, a timeout, a thrown kill switch: each is only a status in `extraSeats`.
-  if (seatsBox.input && typeof io.runExtraSeats === 'function') {
+  if (!opts.redTeamOnly && seatsBox.input && typeof io.runExtraSeats === 'function') {
     let extraSeats;
     try {
       extraSeats = io.runExtraSeats(seatsBox.input);
@@ -691,7 +742,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
     // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
     // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
-    if (typeof io.runRedTeamGate === 'function') {
+    if (!redTeam?.deferredByCap && typeof io.runRedTeamGate === 'function') {
       let gate;
       try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
       io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);
@@ -699,13 +750,32 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         ...(gate?.plan ? { sendBack: gate.plan.sendBack.length, card: gate.plan.card.length, advisory: gate.plan.advisory.length } : {}) };
     }
   }
-  if (accepted) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam?.status ?? null });
+  if (accepted) {
+    // No model call or seat row exists after a cap deferral. Remove our queued
+    // admission so the next tick can retry fresh after cooldown/budget reset.
+    // A recorded resume keeps its prior clean result through the branch below.
+    if (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true
+      && seatsBox.redTeamResumeResult == null) {
+      try {
+        io.restoreRedTeamStatus({ repo: out.repo, pr: out.pr,
+          head: seatsBox.input.loopPayload.findings.read.netBasis.rev, status: null });
+      } catch (e) {
+        io.log(`review-job ${out.sessionSlug}: cap deferral status cleanup failed (${tail(e?.message ?? e, 300)})`);
+      }
+      return out;
+    }
+    // A resume only retries effects of an already-clean pass. A transient child/store failure
+    // must not replace that admission evidence with skipped/error and strand the next retry.
+    const result = seatsBox.redTeamResumeResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
+      ? seatsBox.redTeamResumeResult : out.redTeam?.status ?? null;
+    io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result });
+  }
   else if (spec && seatsBox.input) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
   return out;
 }
 
 function runReviewArc({
-  pr, repo, preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
+  pr, repo, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
@@ -736,8 +806,8 @@ function runReviewArc({
   let lanePath = null;
   try {
     const prev = io.readPrevCompletion(slug);
-    io.report({ session: slug, kind: 'review', pr: String(planned.pr), repo: planned.repo, status: 'started', timeoutMs: loopTimeoutMs });
-    if (typeof io.carryAcrossRebaseSetting === 'function') {
+    if (!redTeamOnly) io.report({ session: slug, kind: 'review', pr: String(planned.pr), repo: planned.repo, status: 'started', timeoutMs: loopTimeoutMs });
+    if (!redTeamOnly && typeof io.carryAcrossRebaseSetting === 'function') {
       try {
         const setting = io.carryAcrossRebaseSetting();
         io.log(`review-job: carryAcrossRebase=${setting.value} (${setting.source})`);
@@ -797,6 +867,68 @@ function runReviewArc({
     lanePath = acq.lanePath;
     io.updateRecord({ ...record, cwd: lanePath, actorId });
 
+    if (redTeamOnly) {
+      const { head, loopPayload } = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo });
+      const pinned = /^[a-f0-9]{40}$/i.test(head ?? '') && loopPayload?.findings?.read?.netBasis?.rev === head;
+      if (!pinned || !redTeamOwedFor(loopPayload)) {
+        classified = { outcome: 'red-team-not-owed', reason: pinned ? 'stored review does not owe a red team' : 'stored review does not match live head' };
+        return result({ ...classified, lanePath });
+      }
+      const status = io.readRedTeamStatus({ pr: planned.pr, repo: planned.repo, head });
+      const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
+      const refuse = reason => {
+        classified = { outcome: 'red-team-not-owed', reason };
+        return result({ ...classified, lanePath });
+      };
+      if (!['resume', 'fresh'].includes(redTeamMode)) return refuse('unknown red-team mode; inspect stored evidence before retrying');
+      let records;
+      try {
+        records = io.readRedTeamRecords();
+        if (!Array.isArray(records)) throw Error('invalid records');
+      } catch {
+        return refuse('scorecard store unreadable; inspect stored evidence before retrying');
+      }
+      if (redTeamMode === 'resume') {
+        if (status?.status !== 'finished' || !['ran', 'resumed'].includes(priorResult) || priorComment === 'posted') {
+          return refuse(`prior result ${typeof priorResult === 'string' ? priorResult : 'unknown'}; not re-run`);
+        }
+        if (!priorRedTeamRow(records.filter(row => row?.repo === planned.repo), planned.pr, head)) {
+          return refuse('no clean prior red-team row; inspect stored evidence before retrying');
+        }
+      } else {
+        if (status != null) return refuse(`prior result ${typeof priorResult === 'string' ? priorResult : 'unknown'}; not re-run`);
+        if (records.some(row => row?.dispatchKind === 'review-seat' && row.seat === 'red-team'
+          && row.repo === planned.repo && Number(row.pr) === planned.pr && row.rev === head)) {
+          return refuse('prior red-team seat row; not re-run');
+        }
+      }
+      let comments;
+      try {
+        comments = io.readRedTeamComments({ pr: planned.pr, repo: planned.repo });
+        if (!Array.isArray(comments)) throw Error('invalid comments');
+      } catch {
+        return refuse('PR comments unreadable');
+      }
+      if (redTeamForHead(comments, planned.pr, head)) return refuse('red-team result already on head');
+      const input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode };
+      // Publish admission before finally drops the job slot, so another recovery cannot enter the gap.
+      try {
+        io.recordRedTeamQueued({ ...input, status: 'queued', ...(redTeamMode === 'resume' ? { result: status.result } : {}) });
+      } catch {
+        // A queued write can succeed before its read-back fails. Roll it back while
+        // we still hold the job claim; no child has started, so the prior evidence
+        // (including absence for a fresh pass) must remain eligible for retry.
+        try { io.restoreRedTeamStatus({ pr: planned.pr, repo: planned.repo, head, status }); }
+        catch (e) { io.log(`review-job ${slug}: red-team status rollback failed (${tail(e?.message ?? e, 300)})`); }
+        return refuse('queued red-team status could not be persisted');
+      }
+      seatsBox.input = input;
+      seatsBox.redTeamQueued = true;
+      if (redTeamMode === 'resume') seatsBox.redTeamResumeResult = status.result;
+      classified = { outcome: 'red-team-only' };
+      return result({ ...classified, lanePath });
+    }
+
     // Card xbizuci — `review.speculativeRedTeam`: start the red team NOW, beside the loop. It waits for the loop's
     // `read` (the sink below) and runs on exactly that head and diff while the jurors judge; `runReviewJob` keeps it
     // only if the review accepts. Starting it can never fail the review: a failed start is the sequential order.
@@ -848,7 +980,7 @@ function runReviewArc({
   } finally {
     const done = classified ?? { outcome: BLOCKED_ON_INFRA, label: 'review-job exited without an outcome' };
     try {
-      io.report({
+      if (!redTeamOnly) io.report({
         session: slug, pr: String(planned.pr), repo: planned.repo, status: 'done', outcome: done.outcome,
         ...(done.loopOutcome ? { verdict: done.loopOutcome } : {}),
         ...(done.runId ? { runId: done.runId } : {}),
@@ -874,7 +1006,7 @@ function runReviewArc({
  *   logPath:string, skipped?:string}}
  */
 export function dispatchReviewJob({
-  ciGate = readReviewCiGate, advisoryCiWaiver = null,
+  ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh',
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
@@ -902,7 +1034,7 @@ export function dispatchReviewJob({
   }
 
   const policy = resolveTimingPolicy({ env }).review;
-  const ci = ciGate({ repo: planned.repo, pr: planned.pr, policy });
+  const ci = redTeamOnly ? { allowed: true } : ciGate({ repo: planned.repo, pr: planned.pr, policy });
   // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
   const waived = policy.startAfter === 'ci-green' && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
@@ -917,6 +1049,7 @@ export function dispatchReviewJob({
   mkdirSync(dir, { recursive: true });
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
+      ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
   });
   // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
@@ -1045,9 +1178,9 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
 
 // ── CLI ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
-if (IS_CLI) {
-  const [sub, ...rest] = process.argv.slice(2);
+/** CLI boundary; injected job and rating effects keep recovery guard tests hermetic. */
+export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob } = {}) {
+  const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
@@ -1061,7 +1194,10 @@ if (IS_CLI) {
     // its slug, which the lane pool's ghost-lease reaper reclaims (#2748).
     try {
       const lane = Number(flag('prefer-lane'));
-      const out = runReviewJob({ pr: flag('pr'), repo: flag('repo'),
+      // Bare legacy flag is fresh-guarded; explicit modes survive detached dispatch.
+      const redTeamMode = flag('red-team-only') ?? 'fresh';
+      const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
+      const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode,
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       writeAllSync(1, `${JSON.stringify(out)}\n`);
       // #4075/run-rating slice 1 — mechanical grading for this now-finished job-mode review, read back from
@@ -1069,7 +1205,7 @@ if (IS_CLI) {
       // that function's own `openSync(logPath, 'a')`). Best-effort: `rateAndRecordReviewJob` never throws, and
       // a rating failure must never affect this CLI's own exit code. A refused job ran no review — nothing to
       // rate (`rateReviewJobLog` also skips any summary with no loop timing, the same guard at the pure layer).
-      if (out.sessionSlug && !out.refused) { try { rateAndRecordReviewJob(jobLogPath(out.sessionSlug)); } catch { /* best-effort */ } }
+      if (!redTeamOnly && out.sessionSlug && !out.refused) { try { rate(jobLogPath(out.sessionSlug)); } catch { /* best-effort */ } }
       process.exitCode = out.refused ? 75 : 0;
     } catch (e) {
       writeLineSync(2, `review-job: error: ${String(e?.message ?? e)}`);
@@ -1077,3 +1213,6 @@ if (IS_CLI) {
     }
   }
 }
+
+const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
+if (IS_CLI) runReviewJobCli();
