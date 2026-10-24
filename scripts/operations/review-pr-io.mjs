@@ -1240,31 +1240,31 @@ export function createReviewPrSinks({
                   && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
               // #76c — else the mandatory reviewer's own counted not-real/card on the same deterministic finding
               // identity (never a block, never a declared link); the same unchanged-lines proof applies below.
-              const match = findCarriedOperatorRuling(f, { records, operatorRulings,
-                head: record.head, repo: record.repo, pr: record.pr })
-                ?? findCarriedReviewerRuling(f, { records, operatorRulings, head: record.head, repo: record.repo,
-                  pr: record.pr, body: state.body ?? '', createdAt: state.createdAt ?? '', cardReadable })
-                ?? findSameHeadSiblingRuling(f, { records, operatorRulings,
-                  head: record.head, repo: record.repo, pr: record.pr });
-              if (!match) continue;
+              const candidates = [findCarriedOperatorRuling(f, { records, operatorRulings,
+                head: record.head, repo: record.repo, pr: record.pr }),
+                findCarriedReviewerRuling(f, { records, operatorRulings, head: record.head, repo: record.repo,
+                  pr: record.pr, body: state.body ?? '', createdAt: state.createdAt ?? '', cardReadable }),
+                findSameHeadSiblingRuling(f, { records, operatorRulings,
+                  head: record.head, repo: record.repo, pr: record.pr })];
               // `referralRecordState` keeps a carried `card` pending while its card is unreadable, yet `liveReferrals`
               // drops a carried finding from dispatch: that pairing would hold the gate with no reviewer to clear it.
-              if (match.result === 'card' && !cardReadable(match.card)) continue;
-              if (match.from.head !== record.head) {
-                let changed;
-                try {
-                  // The exact cited path: an `a/` or `b/` prefix may be a real directory, so it is never stripped for a lookup.
-                  const file = exactCitedPath(f.finding.file);
-                  changed = await changedLines(record.repo, match.from.head, record.head, file);
-                } catch { changed = null; }
-                if (!(changed instanceof Set)) continue;
-                // Each citation is checked in its own revision's coordinates: this finding's line against the new side,
-                // the earlier ruled finding's line against the old side (a plain injected Set serves for both).
-                if (changesTouchCitedLines(changed, [f.finding.line])
-                  || changesTouchCitedLines(changed.old ?? changed, [match.finding.line])) continue;
+              for (const match of candidates) {
+                if (!match || (match.result === 'card' && !cardReadable(match.card))) continue;
+                if (match.from.head !== record.head) {
+                  let changed;
+                  try {
+                    // Preserve the exact cited path, including real a/ or b/ directories.
+                    changed = await changedLines(record.repo, match.from.head, record.head, exactCitedPath(f.finding.file));
+                  } catch { changed = null; }
+                  if (!(changed instanceof Set)) continue;
+                  // Check each citation in its own revision's coordinates.
+                  if (changesTouchCitedLines(changed, [f.finding.line])
+                    || changesTouchCitedLines(changed.old ?? changed, [match.finding.line])) continue;
+                }
+                carried.push({ key: f.key, reason: REFERRAL_CARRY_REASON, from: match.from,
+                  result: match.result, ...(match.card ? { card: match.card } : {}) });
+                break;
               }
-              carried.push({ key: f.key, reason: REFERRAL_CARRY_REASON, from: match.from,
-                result: match.result, ...(match.card ? { card: match.card } : {}) });
             }
             if (!carried.length) continue;
             const updated = { ...record, carried: [...(record.carried ?? []), ...carried] };

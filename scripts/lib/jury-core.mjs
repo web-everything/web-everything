@@ -3126,14 +3126,18 @@ export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] })
  * The gate's read-time check of an operator `carried` entry: the backing ruling still holds ({@link carriedBackingHolds})
  * AND, when the source record is readable, the destination is the same finding the sink matched on
  * ({@link sameFindingForClearing}) — a carry entry cannot name an unrelated finding. Without the source record there
- * is nothing to compare, so only the backing is checked (the sink proved the match when it wrote the entry).
+ * is nothing to compare, so only the backing is checked for cross-head carries. Same-head siblings require
+ * readable source evidence, the stricter gap match, and the security-class not-real exclusion on every read.
  */
-function operatorCarryBacking(carried, target, { repo, pr, operatorRulings, records }) {
+function operatorCarryBacking(carried, target, { head, repo, pr, operatorRulings, records }) {
   const backing = carriedBackingHolds(carried, { repo, pr, operatorRulings });
   if (!backing) return null;
   const source = (Array.isArray(records) ? records : []).find(r => r.head === carried.from.head
     && r.runId === carried.from.runId && r.repo === repo && r.pr === pr);
   const from = source?.referrals.find(x => x.key === carried.from.key);
+  if (carried.from.head === head && (!sameGapSameHead(from?.finding, target.finding)
+    || (carried.result === 'not-real' && (isSecurityClassFinding(from?.original ?? from?.finding)
+      || isSecurityClassFinding(target.original ?? target.finding))))) return null;
   return source && (!from || !sameFindingForClearing(from.finding, target.finding)) ? null : backing;
 }
 
@@ -3156,15 +3160,19 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
   return null;
 }
 
-/** Same-head siblings need a concrete line on both sides of the shared clearing predicate. PURE. */
+/** Same-head siblings require concrete lines, >=0.8 word overlap and identical negation tokens. PURE. */
 export function sameGapSameHead(a, b) {
+  const negations = s => [...new Set(String(s ?? '').toLowerCase()
+    .match(/\b(?:not|no|never|without|missing|cannot|lacks)\b/g) ?? [])].sort().join(',');
   return Boolean(a && b && typeof a === 'object' && typeof b === 'object'
-    && Number.isInteger(a.line) && Number.isInteger(b.line) && sameFindingForClearing(a, b));
+    && Number.isInteger(a.line) && Number.isInteger(b.line) && sameFindingForClearing(a, b)
+    && wordJaccard(a.summary, b.summary) >= 0.8 && negations(a.summary) === negations(b.summary));
 }
 
 /** Security is the category lens; unreadable findings cannot authorize a not-real clearance. */
 export function isSecurityClassFinding(f) {
-  return !f || typeof f !== 'object' || String(f.category ?? '').split('/')[0].toLowerCase() === 'security';
+  const category = typeof f?.category === 'string' ? f.category.trim().toLowerCase() : '';
+  return !category || category.split('/')[0] === 'security';
 }
 
 /** Latest same-head operator clearance of a sibling gap; security-class not-real rulings never inherit. PURE. */
@@ -3180,6 +3188,7 @@ export function findSameHeadSiblingRuling(referral, { records = [], operatorRuli
     const record = records.find(r => r?.runId === o.runId && r.head === head && r.repo === repo && r.pr === pr);
     const ruled = record?.referrals?.find(f => f.key === o.key);
     const finding = ruled?.finding;
+    if (!finding) return null; // Unknown newer evidence must not expose an older clearance.
     if (!sameGapSameHead(finding, referral.finding)) continue;
     if (o.result !== 'not-real' && o.result !== 'card') return null;
     if (o.result === 'not-real' && (isSecurityClassFinding(referral.original ?? referral.finding)
@@ -3339,7 +3348,8 @@ export function validateReferralRecord(r) {
     if (r.carried !== undefined && (!Array.isArray(r.carried)
       || new Set(r.carried.map(c => c.key)).size !== r.carried.length
       || r.carried.some(c => !keys.has(c.key) || c.reason !== REFERRAL_CARRY_REASON
-        || !c.from || !/^[a-f0-9]{40}$/.test(c.from.head) || c.from.head === r.head
+        || !c.from || !/^[a-f0-9]{40}$/.test(c.from.head)
+        || (c.from.head === r.head && (c.from.rulingId !== undefined || c.from.key === c.key || c.result === 'block'))
         || typeof c.from.runId !== 'string' || !c.from.runId.trim()
         || typeof c.from.key !== 'string' || !c.from.key.trim()
         // #76c — a reviewer-backed carry names the ruling it stands on, and is never a block.
@@ -3438,7 +3448,7 @@ export function referralRecordState(record, options = {}) {
       const backing = carried.from.rulingId !== undefined
         ? reviewerCarryBacking(carried, { repo: record.repo, pr: record.pr, operatorRulings, records, identityTable,
           target: f, body, createdAt, cardReadable, stampPolicy, seatDisabled })
-        : operatorCarryBacking(carried, f, { repo: record.repo, pr: record.pr, operatorRulings, records });
+        : operatorCarryBacking(carried, f, { head: record.head, repo: record.repo, pr: record.pr, operatorRulings, records });
       if (head !== record.head || !backing
         || (carried.result === 'card' && !cardReadable(carried.card))) pending.push(f.key);
       else { rulings.push(backing); if (carried.result === 'block') blocked.push(f.key); }
