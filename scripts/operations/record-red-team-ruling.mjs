@@ -25,6 +25,7 @@ export const OPERATOR_CARD_OUTCOME = 'operator-card';
 
 /** The bare intent marker written BEFORE the card job is spawned: it has no action line, so the break stays held. */
 export const CARD_PENDING_OUTCOME = 'card-pending';
+const CARD_PENDING_INTENT_RE = /Operator card ruling pending \(job ([0-9a-f]{12}), break\(s\) (#\d+(?:, #\d+)*)\)/;
 
 /** The stable key one card ruling spawns under: same PR, head, result and breaks always map to the same job. PURE. */
 export function cardJobKey({ repo, pr, head, resultId, indices }) {
@@ -105,7 +106,7 @@ export function conflictingPendingCardJobs(comments, { pr, head, resultId, jobKe
   for (const c of Array.isArray(comments) ? comments : []) {
     const body = String(c?.body ?? '').trimStart();
     if (!body.startsWith(marker) || !isHumanOperatorComment(c)) continue;
-    const m = /Operator card ruling pending \(job ([0-9a-f]{12}), break\(s\) (#\d+(?:, #\d+)*)\)/.exec(body);
+    const m = CARD_PENDING_INTENT_RE.exec(body);
     if (!m || m[1] === jobKey) continue;
     const theirs = m[2].split(', ').map((x) => Number(x.slice(1)));
     const overlap = indices.filter((i) => theirs.includes(i));
@@ -120,7 +121,7 @@ export function hasPendingCardIntent(comments, { pr, head, resultId, jobKey }) {
   return (Array.isArray(comments) ? comments : []).some((c) => {
     const body = String(c?.body ?? '').trimStart();
     return body.startsWith(marker) && isHumanOperatorComment(c)
-      && /Operator card ruling pending \(job ([0-9a-f]{12}), break\(s\) (#\d+(?:, #\d+)*)\)/.exec(body)?.[1] === jobKey;
+      && CARD_PENDING_INTENT_RE.exec(body)?.[1] === jobKey;
   });
 }
 

@@ -126,10 +126,10 @@ const completion = (r, p) => bound(r, p) && r.state === 'terminal' && r.outcome 
   && Number.isFinite(r.evidence?.at) && r.evidence.at >= 0 && cardLandingExists(r.evidence.result);
 
 /** Spawn the landing job under a STABLE session, so the job (and its log) is identified by the ruling, not by a fresh random slug. */
-const spawnStableCardJob = (input, session, binding) => {
+export const spawnStableCardJob = (input, session, binding, { spawnDetached = defaultSpawnDetached, resolveSettingsEnv } = {}) => {
   const logPath = preventionCardLandingLogPath(session);
-  const r = spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-ruling-card',
-    spawnDetached: (argv, o) => defaultSpawnDetached([fileURLToPath(import.meta.url), '--land-card-receipt',
+  const r = spawnPreventionLandingJob(input, { resolveSettingsEnv, sessionPrefix: 'red-team-ruling-card',
+    spawnDetached: (argv, o) => spawnDetached([fileURLToPath(import.meta.url), '--land-card-receipt',
       JSON.stringify(binding),
       ...argv.slice(1).map((a) => (a.startsWith('--session=') ? `--session=${session}` : a))], { ...o, logPath }) });
   return r.ok ? { ...r, session } : r;
@@ -195,10 +195,6 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
   return {
     [RED_TEAM_RULING_CARD_EFFECT]: (p) => {
       const { comments } = recheck(p);
-      if (!p.cardRef) {
-        const pending = conflictingPendingCardJobs(comments, p);
-        if (pending.length) throw new Error(`a different card job (${pending.map((j) => j.jobKey).join(', ')}) is already pending for an overlapping break; nothing written — re-run with that exact selection`);
-      }
       if (p.cardRef) {
         // Persist the reason before release: either failed POST leaves the break held and retryable.
         if (!/^we:backlog\/[A-Za-z0-9][A-Za-z0-9._-]*\.md(?:@pr[1-9]\d{0,8})?$/.test(p.cardRef)) throw new Error(`--card resolved to an unsafe reference ${JSON.stringify(p.cardRef)}; nothing written`);
@@ -216,6 +212,8 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         proveReleased(p, 'the operator-card record', record);
         return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
       }
+      const pending = conflictingPendingCardJobs(comments, p);
+      if (pending.length) throw new Error(`a different card job (${pending.map((j) => j.jobKey).join(', ')}) is already pending for an overlapping break; nothing written — re-run with that exact selection`);
       const session = p.session, resource = rulingCardResource(p);
       const hasIntent = hasPendingCardIntent(comments, p);
       const rows = actions.attempts(resource), prior = rows.at(-1);
@@ -234,8 +232,9 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
       }
       let r = claim.record;
       if (!r || !bound(r, p)) throw new Error('card claim binding is unreadable; inspect the shared coordination record before retrying');
-      const spawned = !claim.ok;
-      if (claim.ok) {
+      const reconciled = !claim.ok;
+      // A bound intent has not crossed the dispatch fence; retry reservations and its owner-token CAS.
+      if (claim.ok || r.state === 'intent') {
         // Durable per-break reservations also exclude different, overlapping selections.
         const reserved = [];
         for (const index of [...p.indices].sort((a, b) => a - b)) {
@@ -268,11 +267,11 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         if (r.state === 'dispatching') r = transition(actions, r, 'observed', { handle: session,
           evidence: { ...r.evidence, card: { session, handle: card.handle } } });
       } else r = actions.read(resource, r.attempt);
-      const card = { ok: true, session, reconciled: spawned,
+      const card = { ok: true, session, reconciled,
         ...(completion(r, p) && r.evidence.card.ref ? { ref: r.evidence.card.ref } : {}) };
       if (!completion(r, p)) return { ruling: 'card', head: p.head, indices: p.indices, pending: true, released: false, card,
         message: `No validated card completion yet; retry later. If it persists, inspect the landing log for ${session}; recover the owed card and cite its readable --card reference. Do not remove the shared claim.` };
-      // 4. Release only with positive child evidence that the card exists or is durably spooled.
+      // Release only with positive child evidence that the card exists or is durably spooled.
       const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
         plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card });
       post(p.repo, p.pr, reasonBody(p, `Follow-up card queued through the prevention landing job (${session}); filing may be paused, in which case it is owed in the spool.`));

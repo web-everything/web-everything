@@ -9,7 +9,7 @@ import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, l
 import { planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
-import { runCardLandingWithReceipt, createRecordRedTeamRulingSinks } from '../record-red-team-ruling-io.mjs';
+import { runCardLandingWithReceipt, createRecordRedTeamRulingSinks, spawnStableCardJob } from '../record-red-team-ruling-io.mjs';
 import { cardJobKey, conflictingPendingCardJobs, rulingCardResource } from '../record-red-team-ruling.mjs';
 import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
 import { parseAdvisories, trustedAdvisoryComments } from '../../lib/advisory-labels.mjs';
@@ -312,6 +312,22 @@ describe('automatic card filing with shared durable claims', () => {
     expect(p).toMatchObject({ effect: RED_TEAM_RULING_CARD_EFFECT, head: HEAD, indices: [1], actor: 'chalbert' });
     expect(p.cardInput.digest).toContain('card it, ship the PR');
     expect(p.cardInput.scope).toContain('backlog/x.md');
+  });
+  it('spawnStableCardJob passes the receipt binding and overrides the random session in detached argv', () => {
+    const p = payloadFor(), calls = [];
+    const binding = { resource: rulingCardResource(p), attempt: 1, ownerToken: 'owner',
+      jobKey: p.jobKey, head: p.head, session: p.session, coordinationRoot: root() };
+    expect(spawnStableCardJob(p.cardInput, p.session, binding, {
+      resolveSettingsEnv: () => null,
+      spawnDetached: (argv, options) => { calls.push({ argv, options }); return { pid: 4242 }; },
+    })).toMatchObject({ ok: true, session: p.session, handle: 'pid:4242' });
+    expect(calls).toHaveLength(1);
+    const { argv, options } = calls[0];
+    expect(argv[0]).toMatch(/record-red-team-ruling-io\.mjs$/);
+    expect(argv.slice(1, 3)).toEqual(['--land-card-receipt', JSON.stringify(binding)]);
+    expect(argv.filter(arg => arg.startsWith('--session='))).toEqual([`--session=${p.session}`]);
+    expect(argv).toContain(`--digest=${p.cardInput.digest}`);
+    expect(options.logPath).toContain(p.session);
   });
   it('card: the job key is stable for the same ruling and differs per break/result', () => {
     const p = payloadFor();
@@ -636,6 +652,26 @@ describe('automatic card filing with shared durable claims', () => {
     const f = fake({ transitionFails: () => ({ ok: false, reason: 'busy' }) });
     expect(() => f.act(payloadFor())).toThrow(/transition refused/);
     expect(f.cards).toEqual([]); expect(f.posted).toEqual([]);
+  });
+  it.each(['busy', 'stale-rev'])('an exact retry recovers an intent after a %s dispatch fence failure and spawns once', async reason => {
+    let fail = true;
+    const f = fake({ transitionFails: (_r, _a, opts) => fail && opts.to === 'dispatching' && { ok: false, reason } });
+    const p = payloadFor();
+    expect(() => f.act(p)).toThrow(/transition refused/);
+    const before = f.actions.read(rulingCardResource(p), 1);
+    expect(before).toMatchObject({ state: 'intent' });
+    expect(f.actions.attempts(rulingCardResource(p, 'break'))).toHaveLength(1);
+    expect(f.cards).toEqual([]); expect(f.posted).toEqual([]);
+    fail = false;
+    expect(f.act(p)).toMatchObject({ pending: true, released: false });
+    expect(f.actions.read(rulingCardResource(p), 1)).toMatchObject({ state: 'observed', ownerToken: before.ownerToken });
+    expect(f.act(p)).toMatchObject({ pending: true, released: false });
+    expect(f.cards).toHaveLength(1);
+    expect(heldAfter(f.comments)).toHaveLength(1);
+    await f.complete();
+    expect(f.act(p)).toMatchObject({ card: { ref: `we:${result.rel}`, reconciled: true } });
+    expect(f.cards).toHaveLength(1);
+    expect(heldAfter(f.comments)).toEqual([]);
   });
   it('spawn ok, observed receipt write fails, exact retry after the lease expires refuses to respawn', () => {
     const f = fake({ transitionFails: (_r, _a, o) => o.to === 'observed' && { ok: false, reason: 'busy' } }), p = payloadFor();
