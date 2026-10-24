@@ -13,6 +13,9 @@ const fixtures = {
   },
 };
 const readdir = () => [...Object.keys(fixtures).map(label => `${label}.plist`), 'unrelated.plist', 'notes.txt'];
+const readPrototypeSettings = () => ({
+  workspaceRoot: '~/workspace', daemons: { drain: { clone: '.lanes/we-drain-daemon/code' } },
+});
 const exec = (bin, argv) => {
   expect(bin).toBe('plutil');
   expect(argv.slice(0, 4)).toEqual(['-convert', 'json', '-o', '-']);
@@ -22,7 +25,7 @@ const exec = (bin, argv) => {
 
 describe('daemon clone resolver', () => {
   it('discovers WorkingDirectory and the configured drain code clone, deduping paths and retaining every daemon label', () => {
-    const clones = resolveDaemonClones({ env: {}, home: '/home', readdir, exec });
+    const clones = resolveDaemonClones({ env: {}, home: '/home', readdir, exec, readPrototypeSettings });
     expect(clones).toEqual([
       { path: '/clones/we', name: 'we', labels: ['com.we.fix', 'com.we.review'] },
       { path: '/home/workspace/.lanes/we-drain-daemon/code', name: 'code', labels: ['com.plateau.drain-daemon'] },
@@ -33,7 +36,7 @@ describe('daemon clone resolver', () => {
   it('honors the LaunchAgents env dir, configured extra paths, home expansion and exclusions', () => {
     const seen = [];
     const clones = resolveDaemonClones({ env: { WE_LAUNCH_AGENTS_DIR: '/agents' }, home: '/home',
-      readdir: dir => { seen.push(dir); return readdir(); }, exec,
+      readdir: dir => { seen.push(dir); return readdir(); }, exec, readPrototypeSettings,
       clones: ['~/extra', '/clones/we'], excludeClones: ['~/workspace/.lanes/we-drain-daemon/code', '/other/we/'],
     });
     expect(seen).toEqual(['/agents']);
@@ -43,7 +46,7 @@ describe('daemon clone resolver', () => {
 
   it('retains an empty result for unreadable discovery evidence', () => {
     expect(resolveDaemonClones({ env: {}, readdir: () => { throw new Error('missing'); }, exec })).toEqual([]);
-    expect(resolveDaemonClones({ env: {}, readdir, exec: () => { throw new Error('bad plist'); } })).toEqual([]);
+    expect(resolveDaemonClones({ env: {}, readdir, readPrototypeSettings, exec: () => { throw new Error('bad plist'); } })).toEqual([]);
     expect(resolveDaemonClones({ env: {}, readdir: () => ['com.we.review.plist'], exec: () => '{}' })).toEqual([]);
   });
 });
@@ -83,6 +86,30 @@ it('reports unreadable clone discovery evidence without discarding readable clon
   expect(incomplete).toEqual(['daemon plist unreadable']);
 });
 
+it('rejects relative extra clone paths without resolving against cwd, retaining absolute clones', () => {
+  const incomplete = [];
+  expect(resolveDaemonClones({ env: {}, readdir: () => [],
+    clones: ['.', 'relative/clone', '/extra'], onIncomplete: reason => incomplete.push(reason),
+  })).toEqual([{ path: '/extra', name: 'extra', labels: [] }]);
+  expect(incomplete).toEqual(Array(2).fill('daemon plist clone field missing or invalid'));
+});
+
+it('accepts plist clone paths after absolute home expansion', () => {
+  const incomplete = [];
+  expect(resolveDaemonClones({ env: {}, home: '/home', readdir: () => ['com.we.review.plist'],
+    exec: () => JSON.stringify({ WorkingDirectory: '~/clone' }), onIncomplete: reason => incomplete.push(reason),
+  })).toEqual([{ path: '/home/clone', name: 'clone', labels: ['com.we.review'] }]);
+  expect(incomplete).toEqual([]);
+});
+
+it('rejects home-expanded clone paths when home is relative', () => {
+  const incomplete = [];
+  expect(resolveDaemonClones({ env: {}, home: '.', readdir: () => ['com.we.review.plist'],
+    exec: () => JSON.stringify({ WorkingDirectory: '~/clone' }), onIncomplete: reason => incomplete.push(reason),
+  })).toEqual([]);
+  expect(incomplete).toEqual(['daemon plist clone field missing or invalid']);
+});
+
 it('bounds plist conversion calls and clone count and reports both truncations', () => {
   const incomplete = new Set();
   let calls = 0;
@@ -108,6 +135,8 @@ it.each([
   ['com.we.review', {}],
   ['com.we.review', { WorkingDirectory: ' ' }],
   ['com.we.review', { WorkingDirectory: 42 }],
+  ['com.we.review', { WorkingDirectory: '.' }],
+  ['com.we.review', { WorkingDirectory: 'relative/clone' }],
 ])('reports a readable %s plist missing a valid expected clone field (%j)', (label, plist) => {
   const incomplete = [];
   expect(resolveDaemonClones({ env: {}, readdir: () => [`${label}.plist`],
@@ -141,6 +170,7 @@ it.each([
   () => ({}),
   () => ({ workspaceRoot: '/workspace', daemons: { drain: { clone: ' ' } } }),
   () => ({ workspaceRoot: 42, daemons: { drain: { clone: 'code' } } }),
+  () => ({ workspaceRoot: '.', daemons: { drain: { clone: 'code' } } }),
 ])('reports incomplete when the drain code target cannot be determined', readPrototypeSettings => {
   const incomplete = [];
   expect(resolveDaemonClones({ env: {}, readdir: () => ['com.plateau.drain-daemon.plist'], exec,

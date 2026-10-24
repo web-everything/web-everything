@@ -2134,6 +2134,10 @@ must never fetch missing objects. Negative ancestry is definitive only after a s
 `rev-parse --is-shallow-repository` returns `false`; shallow or unreadable history stays unknown.
 The drain adoption target comes from prototype-load settings (`workspaceRoot` + `daemons.drain.clone`),
 not the plist's `DRAIN_DAEMON_WE_CLONE` data clone. Missing code-target settings mark discovery incomplete.
+Clone paths must start with `/` after home expansion; relative evidence is incomplete and must never
+resolve against the caller's cwd. The drain's relative code target resolves only against an absolute
+workspace root. Tests reaching the drain label inject `readPrototypeSettings` fixtures so the
+prototype-load settings file cannot become an implicit, unkeyed test-cache dependency.
 
 Every nonblank corrupt JSON line or missing/invalid timestamp or ref marks the adoption snapshot
 incomplete, even when an older valid revision remains available. Missing clone fields in

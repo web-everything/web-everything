@@ -17,12 +17,16 @@ export function resolveDaemonClones({
 } = {}) {
   const explicitDiscoveryDir = launchAgentsDir !== undefined || Boolean(env.WE_LAUNCH_AGENTS_DIR);
   launchAgentsDir ??= env.WE_LAUNCH_AGENTS_DIR || join(home, 'Library', 'LaunchAgents');
-  const expand = path => resolve(path === '~' ? home : path.startsWith('~/') ? join(home, path.slice(2)) : path);
+  const expand = path => {
+    if (typeof path !== 'string' || !path.trim()) return null;
+    const expanded = path === '~' ? home : path.startsWith('~/') ? join(home, path.slice(2)) : path;
+    return expanded.startsWith('/') ? resolve(expanded) : null;
+  };
   const excluded = new Set(excludeClones.map(expand));
   const byPath = new Map();
   const add = (path, label) => {
-    if (typeof path !== 'string' || !path.trim()) return;
     path = expand(path);
+    if (!path) { onIncomplete('daemon plist clone field missing or invalid'); return; }
     if (excluded.has(path)) return;
     if (!byPath.has(path) && byPath.size >= MAX_DAEMON_CLONES) {
       onIncomplete('clone discovery truncated');
@@ -50,8 +54,9 @@ export function resolveDaemonClones({
         const target = settings?.daemons?.drain?.clone;
         if (typeof target !== 'string' || !target.trim()
           || typeof settings?.workspaceRoot !== 'string' || !settings.workspaceRoot.trim()) throw new Error('invalid code target');
-        const expandHome = path => path.startsWith('~/') ? join(home, path.slice(2)) : path;
-        clone = resolve(expandHome(settings.workspaceRoot), expandHome(target));
+        const root = expand(settings.workspaceRoot);
+        if (!root) throw new Error('invalid workspace root');
+        clone = target === '~' || target.startsWith('~/') ? expand(target) : resolve(root, target);
       } catch {
         onIncomplete('drain code clone settings unreadable or invalid');
         continue;
