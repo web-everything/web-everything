@@ -42,6 +42,7 @@ import {
   restPullToPrStateShape,
   detachedWrapperPidsBySession,
   claimRunnerPidsBySession,
+  staleTerminalNamesForClaims,
   readDetachedWrapperPids,
   laneBranchItemNum,
   laneQuietSincePr,
@@ -613,6 +614,145 @@ describe('claimRunnerPidsBySession — borrowed fixer runner pids (PR #5806 regr
 
   it.each([null, undefined, {}, 'corrupt', 123])('non-array claims %s → empty Map', (claims) => {
     expect(claimRunnerPidsBySession(claims)).toEqual(new Map());
+  });
+});
+
+describe('staleTerminalNamesForClaims — earlier fix rounds cannot condemn the current lease (PR #5848)', () => {
+  const claimedAt = '2026-10-24T21:15:47Z';
+  const claim = (over = {}) => ({ meta: { repo: 'we', pr: 5848, kind: 'fix', claimedAt, ...over } });
+  const row = (over = {}) => ({ kind: 'background', name: 'fix-5848', state: 'stopped', startedAt: '2026-10-24T21:00:00Z', sessionId: 'previous-round', ...over });
+
+  it('returns a Set when ALL same-name terminal rows predate the claim, regardless of listing order', () => {
+    const agents = [row(), row({ state: 'failed', startedAt: '2026-10-24T21:10:00Z', sessionId: 'another-round' })];
+    expect(staleTerminalNamesForClaims(agents, [claim()])).toEqual(new Set(['fix-5848']));
+    expect(staleTerminalNamesForClaims([...agents].reverse(), [claim()])).toEqual(new Set(['fix-5848']));
+  });
+
+  it.each(['done', 'failed', 'stopped'])('recognizes an earlier %s round as stale', (state) => {
+    expect(staleTerminalNamesForClaims([row({ state })], [claim()])).toEqual(new Set(['fix-5848']));
+  });
+
+  it('uses shared repo/kind session names, including ci-heal, without mutating inputs', () => {
+    const claims = [claim(), claim({ kind: 'ci-heal' }), claim({ repo: 'frontierui' })];
+    const agents = claims.map(({ meta }) => Object.freeze(row({ name: fixDispatchSessionName(meta) })));
+    claims.forEach((entry) => { Object.freeze(entry.meta); Object.freeze(entry); });
+    expect(staleTerminalNamesForClaims(Object.freeze(agents), Object.freeze(claims)))
+      .toEqual(new Set(claims.map(({ meta }) => fixDispatchSessionName(meta))));
+  });
+
+  it.each([claimedAt, '2026-10-24T21:15:48Z'])('a terminal sibling started at/after the claim (%s) prevents stale classification', (startedAt) => {
+    expect(staleTerminalNamesForClaims([row(), row({ startedAt })], [claim()])).toEqual(new Set());
+  });
+
+  it('an exact claim sessionId match prevents stale classification even when the row started earlier', () => {
+    expect(staleTerminalNamesForClaims([row(), row({ sessionId: 'current-round' })], [claim({ sessionId: 'current-round' })])).toEqual(new Set());
+  });
+
+  it('no matching claim leaves terminal rows actionable', () => {
+    expect(staleTerminalNamesForClaims([row()], [])).toEqual(new Set());
+    expect(staleTerminalNamesForClaims([row()], [claim({ pr: 5849 })])).toEqual(new Set());
+  });
+
+  it.each(['working', 'blocked'])('a %s sibling prevents stale classification in either listing order', (state) => {
+    const agents = [row(), row({ state })];
+    expect(staleTerminalNamesForClaims(agents, [claim()])).toEqual(new Set());
+    expect(staleTerminalNamesForClaims([...agents].reverse(), [claim()])).toEqual(new Set());
+  });
+
+  it.each([undefined, null, '', 'not-a-date'])('does not infer an earlier round from unreadable startedAt %s', (startedAt) => {
+    expect(staleTerminalNamesForClaims([row(), row({ startedAt })], [claim()])).toEqual(new Set());
+  });
+
+  it.each([undefined, null, '', 'not-a-date'])('does not infer an earlier round from unreadable claimedAt %s', (claimedAt) => {
+    expect(staleTerminalNamesForClaims([row()], [claim({ claimedAt })])).toEqual(new Set());
+  });
+
+  it('a claim without any listed rows does not create a stale name', () => {
+    expect(staleTerminalNamesForClaims([], [claim()])).toEqual(new Set());
+  });
+});
+
+describe('sessionGoneForLease — stale terminal rows give no verdict (PR #5848)', () => {
+  it.each(['fix-5848', 'ci-heal-5848'])('%s ignores both terminal state and dead listing PID from an earlier round', (session) => {
+    const lease = fresh({ session });
+    const states = new Map([[session, 'stopped']]);
+    expect(sessionGoneForLease(lease, states, { nowMs: NOW, staleTerminalRows: true })).toBe(null);
+    expect(sessionGoneForLease(lease, states, { nowMs: NOW, staleTerminalRows: true, pidAlive: false })).toBe(null);
+  });
+
+  it('a live claim runner still returns not-gone before the stale-row no-verdict guard', () => {
+    expect(sessionGoneForLease(fresh({ session: 'fix-5848' }), new Map([['fix-5848', 'stopped']]), {
+      nowMs: NOW, staleTerminalRows: true, pidAlive: false, claimRunnerAlive: true,
+    })).toBe(false);
+  });
+});
+
+describe('buildLeaseSignalsFor + reapPlan — lane-8 old stopped rounds (PR #5848)', () => {
+  const claimedAt = '2026-10-24T21:15:47Z';
+  const nowMs = Date.parse(claimedAt) + 93_000;
+  const lease = { session: 'fix-5848', acquiredAt: claimedAt, ttlMinutes: DEFAULT_LEASE_TTL_MINUTES };
+  const cand = { pool: 'web-everything', lane: 8, dir: join(tmpdir(), 'lease-reaper-5848-no-such-lane'), repoKey: 'we', lease };
+  const claims = [{ meta: { repo: 'we', pr: 5848, kind: 'fix', claimedAt, sessionId: 'current-round' } }];
+  const agents = [
+    { kind: 'background', name: 'fix-5848', state: 'stopped', startedAt: '2026-10-24T20:55:00Z', sessionId: 'old-round-1' },
+    { kind: 'background', name: 'fix-5848', state: 'stopped', startedAt: '2026-10-24T21:10:00Z', sessionId: 'old-round-2' },
+  ];
+  const signalsWith = (rows = agents, staleTerminalNames = new Set(['fix-5848'])) => buildLeaseSignalsFor({
+    prStatesByRepo: new Map(), sessionStates: sessionStateByName(rows),
+    sessionPidAlive: new Map([['fix-5848', false]]), sessionAgents: rows,
+    wrapperPids: new Map(), staleTerminalNames, nowMs,
+  });
+
+  it('does not release the live fixer 93 seconds after acquire when both stopped rows belong to earlier rounds', () => {
+    // Pin the wiring separately from the new helper so a missing helper cannot hide a dropped option.
+    const signalsFor = signalsWith();
+    expect(signalsFor(cand).sessionGone).toBe(null);
+    const { reap, keep } = reapPlan([cand], { nowMs, ttlMs: TTL_MS, signalsFor });
+    expect(reap).toEqual([]);
+    expect(keep).toHaveLength(1);
+    expect(keep[0].lease).toEqual(lease);
+  });
+
+  it('threads stale names derived from the two stopped rows and the current fix-dispatch claim', () => {
+    const staleTerminalNames = staleTerminalNamesForClaims(agents, claims);
+    expect(staleTerminalNames).toEqual(new Set(['fix-5848']));
+    expect(signalsWith(agents, staleTerminalNames)(cand).sessionGone).toBe(null);
+  });
+
+  it.each([
+    ['started exactly at claimedAt', { startedAt: claimedAt }],
+    ['started after claimedAt', { startedAt: '2026-10-24T21:15:48Z' }],
+    ['matching claim sessionId despite earlier start', { sessionId: 'current-round' }],
+  ])('still reaps a current terminal round: %s', (_label, over) => {
+    const rows = [agents[0], { ...agents[1], ...over }];
+    const names = staleTerminalNamesForClaims(rows, claims);
+    expect(names).toEqual(new Set());
+    const signalsFor = signalsWith(rows, names);
+    expect(signalsFor(cand).sessionGone).toBe(true);
+    expect(reapPlan([cand], { nowMs, ttlMs: TTL_MS, signalsFor }).reap.map((r) => r.reason)).toEqual(['session-gone']);
+  });
+
+  it('without a claim the same stopped rows still condemn the lease', () => {
+    const names = staleTerminalNamesForClaims(agents, []);
+    expect(names).toEqual(new Set());
+    expect(signalsWith(agents, names)(cand).sessionGone).toBe(true);
+  });
+
+  it('omitting the optional staleTerminalNames preserves terminal-row reaping', () => {
+    const signalsFor = buildLeaseSignalsFor({
+      prStatesByRepo: new Map(), sessionStates: sessionStateByName(agents),
+      sessionPidAlive: new Map([['fix-5848', false]]), sessionAgents: agents,
+      wrapperPids: new Map(), nowMs,
+    });
+    expect(signalsFor(cand).sessionGone).toBe(true);
+  });
+
+  it('stale listing rows leave TTL expiry and PR-terminal reclamation active', () => {
+    const sig = signalsWith()(cand);
+    expect(sig.sessionGone).toBe(null);
+    const expiredLease = { ...lease, acquiredAt: new Date(nowMs - TTL_MS - 1).toISOString() };
+    expect(classifyReap(expiredLease, { nowMs, ttlMs: TTL_MS, ...sig })).toEqual({ reap: true, reason: 'ttl-stale' });
+    expect(classifyReap(lease, { nowMs, ttlMs: TTL_MS, ...sig, prState: 'merged' })).toEqual({ reap: true, reason: 'pr-merged' });
   });
 });
 
