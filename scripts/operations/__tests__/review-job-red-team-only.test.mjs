@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, readDrainRedTeamEvidence } from '../../lib/drain-red-team-evidence.mjs';
-import { runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
+import { createReviewJobIo, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
@@ -43,6 +43,7 @@ function fakeIo(over = {}) {
     readRedTeamOnlyPayload: vi.fn(() => ({ head, loopPayload: payload() })),
     readRedTeamComments: vi.fn(() => []),
     readRedTeamStatus: vi.fn(() => null), readRedTeamRecords: vi.fn(() => []), recordRedTeamQueued: vi.fn(),
+    restoreRedTeamStatus: vi.fn(),
     runRedTeam: vi.fn(() => ({ status: 'ran', findings: [], comment: { status: 'posted' } })),
     runRedTeamGate: vi.fn(() => ({ status: 'ok', outcome: 'advisory' })), redTeamStatus: vi.fn(), ...over };
 }
@@ -114,6 +115,68 @@ describe('red-team-only review job', () => {
       outcome: 'red-team-not-owed', reason: 'queued red-team status could not be persisted',
     });
     expect(io.recordRedTeamQueued).toHaveBeenCalledOnce();
+    for (const hook of ['runRedTeam', 'runRedTeamGate', 'redTeamStatus']) expect(io[hook]).not.toHaveBeenCalled();
+    expect(io.releaseLane).toHaveBeenCalledOnce(); expect(io.unclaim).toHaveBeenCalledOnce();
+  });
+  it.each(['fresh', 'resume'].flatMap(redTeamMode => ['write', 'readback'].map(failure => ({ redTeamMode, failure }))))(
+    'restores admission evidence after queued $failure EIO in $redTeamMode mode and retries after cooldown', ({ redTeamMode, failure }) => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-queued-rollback-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      const write = input => recordRedTeamStatus(input, { env });
+      const read = () => readRedTeamStatus({ repo, pr, head, env });
+      const recorded = redTeamMode === 'resume';
+      try {
+        if (recorded) write({ repo, pr, loopPayload: payload(), status: 'finished', result: { status: 'ran', comment: 'error' } });
+        const prior = read();
+        const restore = createReviewJobIo({ env }).restoreRedTeamStatus;
+        const io = fakeIo({ readRedTeamStatus: read,
+          readRedTeamRecords: () => recorded ? [{ dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', repo, pr, rev: head }] : [],
+          recordRedTeamQueued: vi.fn(input => {
+            if (failure === 'readback') {
+              write(input);
+              expect(read()).toMatchObject({ status: 'queued', result: prior?.result ?? null });
+            }
+            throw Object.assign(Error('transient queued status EIO'), { code: 'EIO' });
+          }),
+          restoreRedTeamStatus: vi.fn(input => {
+            expect(io.unclaim).not.toHaveBeenCalled();
+            expect(io.releaseLane).not.toHaveBeenCalled();
+            restore(input);
+          }),
+          redTeamStatus: vi.fn(write),
+        });
+        const history = new Map();
+        const recover = at => runRedTeamOnSkip({ repo,
+          plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+          rawPrs: [{ number: pr, headRefOid: head, comments: [] }],
+          readEvidence: () => ({ loopPayload: payload(), recorded }), readStatus: read,
+          setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: history, now: () => at,
+          capacity: { lanes: 1 }, dispatch: options => {
+            expect(runReviewJob(options, io)).toMatchObject({
+              outcome: 'red-team-not-owed', reason: 'queued red-team status could not be persisted',
+            });
+            return { jobPid: 42 };
+          },
+        });
+        expect(recover(1_000).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: redTeamMode }]);
+        expect(read()).toEqual(prior);
+        expect(io.restoreRedTeamStatus).toHaveBeenCalledOnce();
+        for (const hook of ['runRedTeam', 'runRedTeamGate', 'redTeamStatus']) expect(io[hook]).not.toHaveBeenCalled();
+        expect(recover(1_001).rows[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+        io.unclaim.mockClear(); io.releaseLane.mockClear();
+        expect(recover(1_801_000).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: redTeamMode }]);
+        expect(read()).toEqual(prior);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  it('keeps the admission refusal and releases the claim when status rollback also fails', () => {
+    const io = fakeIo({ recordRedTeamQueued: () => { throw Error('readback EIO'); },
+      restoreRedTeamStatus: vi.fn(() => { throw Error('rollback EIO'); }),
+    });
+    expect(runReviewJob({ pr, repo, redTeamOnly: true }, io)).toMatchObject({
+      outcome: 'red-team-not-owed', reason: 'queued red-team status could not be persisted',
+    });
+    expect(io.restoreRedTeamStatus).toHaveBeenCalledOnce();
+    expect(io.log).toHaveBeenCalledWith(expect.stringContaining('rollback EIO'));
     for (const hook of ['runRedTeam', 'runRedTeamGate', 'redTeamStatus']) expect(io[hook]).not.toHaveBeenCalled();
     expect(io.releaseLane).toHaveBeenCalledOnce(); expect(io.unclaim).toHaveBeenCalledOnce();
   });
@@ -268,6 +331,8 @@ describe('red-team-only review job', () => {
             write(input);
             if (failure === 'queued-readback') throw Error('transient readback failure');
           },
+          // Keep the crash-recovery case: even the best-effort rollback cannot write.
+          restoreRedTeamStatus: () => { throw Error('transient rollback failure'); },
           redTeamStatus: vi.fn(),
           runRedTeam: () => ({ status: 'skipped' }),
         });

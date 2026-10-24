@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
+import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
@@ -304,6 +305,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
   return {
+    restoreRedTeamStatus: ({ repo, pr, head, status }) => {
+      const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
+      if (status == null) rmSync(path, { force: true });
+      else writeJsonAtomic(path, status);
+    },
     recordRedTeamQueued: input => {
       recordRedTeamStatus(input, { env });
       const head = input.loopPayload?.findings?.read?.netBasis?.rev;
@@ -895,6 +901,11 @@ function runReviewArc({
       try {
         io.recordRedTeamQueued({ ...input, status: 'queued', ...(redTeamMode === 'resume' ? { result: status.result } : {}) });
       } catch {
+        // A queued write can succeed before its read-back fails. Roll it back while
+        // we still hold the job claim; no child has started, so the prior evidence
+        // (including absence for a fresh pass) must remain eligible for retry.
+        try { io.restoreRedTeamStatus({ pr: planned.pr, repo: planned.repo, head, status }); }
+        catch (e) { io.log(`review-job ${slug}: red-team status rollback failed (${tail(e?.message ?? e, 300)})`); }
         return refuse('queued red-team status could not be persisted');
       }
       seatsBox.input = input;
