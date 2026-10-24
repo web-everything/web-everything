@@ -70,9 +70,9 @@ const EXTRA_SCAN_ROOTS = extraParts.map((p) => {
   return r;
 });
 const poolDir = join(POOL_ROOT, POOL);
-let poolIsDir = false;
-try { poolIsDir = statSync(poolDir).isDirectory(); } catch { /* absent or unreadable: refused below */ }
-if (!poolIsDir) { process.stderr.write(`pool directory ${poolDir} does not exist or is not a readable directory\n`); process.exit(2); }
+let poolEntries = null;
+try { poolEntries = readdirSync(poolDir); } catch { /* absent, not a directory or unlistable: refused below */ }
+if (!poolEntries) { process.stderr.write(`pool directory ${poolDir} does not exist or is not a readable directory\n`); process.exit(2); }
 const GC_TIMEOUT_MS = Number(flags['gc-timeout-ms']) || 900_000;
 const PRUNE_EXPIRE = typeof flags['prune-expire'] === 'string' ? flags['prune-expire'] : '1.hour.ago';
 const ONLY = typeof flags.lanes === 'string' ? new Set(flags.lanes.split(',').map((s) => Number(s.trim())).filter(Number.isInteger)) : null;
@@ -196,7 +196,7 @@ const testPause = (stage) => {
   }
 };
 
-const lanes = readdirSync(poolDir)
+const lanes = poolEntries
   .map((name) => /^lane-(\d+)$/.exec(name)).filter(Boolean).map((m) => Number(m[1]))
   .filter((n) => !ONLY || ONLY.has(n)).sort((a, b) => a - b);
 
