@@ -100,6 +100,7 @@ function unsafePublicationConfig(output, originUrl) {
   for (let i = 0; i + 1 < parts.length; i += 2) {
     const entry = parts[i + 1], newline = entry.indexOf('\n');
     const key = newline < 0 ? entry : entry.slice(0, newline);
+    if (/^diff\.ignoresubmodules$/i.test(key) || /^submodule\..+\.ignore$/i.test(key)) return true;
     // Clone fetch refspecs map incoming refs; they cannot redirect publication.
     if (/^remote\..+\.fetch$/i.test(key)) continue;
     // Inspect every effective scope: even a URL passed literally can be rewritten.
@@ -133,10 +134,13 @@ export async function resetLane(s) {
   const origin = await exec(s, 'git', ['-C', s.opts.repo, 'remote', 'get-url', 'origin']);
   if (!good(origin) || typeof origin.stdout !== 'string' || !origin.stdout.trim()) fail('push-failed', 'Cannot read trusted origin URL');
   s.originUrl = origin.stdout.trim();
-  if (!good(await git(s, ['reset', '--hard', s.opts.base], true))) fail('lane-reset-failed');
+  let base = await git(s, ['rev-parse', '--verify', '--end-of-options', `${s.opts.base}^{commit}`]);
+  if (!good(base)) base = await git(s, ['rev-parse', '--verify', '--end-of-options', `origin/${s.opts.base}^{commit}`]);
+  if (!good(base) || typeof base.stdout !== 'string' || !base.stdout.trim()) fail('lane-reset-failed');
+  s.baseSha = base.stdout.trim();
+  if (!good(await git(s, ['reset', '--hard', s.baseSha], true))) fail('lane-reset-failed');
   const head = await git(s, ['rev-parse', 'HEAD']);
-  const base = await git(s, ['rev-parse', s.opts.base]);
-  if (!good(head) || !good(base) || !head.stdout?.trim() || head.stdout.trim() !== base.stdout?.trim()) fail('lane-reset-failed');
+  if (!good(head) || head.stdout?.trim() !== s.baseSha) fail('lane-reset-failed');
   s.startSha = head.stdout.trim();
 }
 const codexArgs = (s, file, review = false) => ['scripts/codex-direct-task.mjs', ...(review ? ['--review'] : []), `--task-file=${file}`, `--dir=${s.lane.path}`, '--gate=none', '--no-stream', '--json'];
@@ -150,7 +154,7 @@ async function codex(s, file, review = false) {
 }
 export async function runCodex(s, file = s.opts.brief) { return codex(s, file); }
 async function changedFiles(s, reason = 'diff-out-of-scope') {
-  const diff = await git(s, ['diff', '--name-only', s.startSha, '--no-renames', '-z']);
+  const diff = await git(s, ['diff', '--name-only', s.startSha, '--no-renames', '--ignore-submodules=none', '-z']);
   const untracked = await git(s, ['ls-files', '--others', '--exclude-standard', '-z']);
   if ([diff, untracked].some(r => !good(r) || typeof r.stdout !== 'string' || (r.stdout && !r.stdout.endsWith('\0')))) {
     fail(reason, 'Cannot read complete changed file list; inspect the lane diff before retrying');
@@ -162,7 +166,7 @@ async function changedFiles(s, reason = 'diff-out-of-scope') {
 }
 async function worktreeFingerprint(s, untracked, reason) {
   // Keep originally untracked files separate even after git add moves them into the index.
-  const diff = await git(s, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-renames', s.startSha, '--',
+  const diff = await git(s, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', s.startSha, '--',
     '.', ...untracked.map(file => `:(top,literal,exclude)${file}`)]);
   if (!good(diff) || typeof diff.stdout !== 'string') {
     fail(reason, 'Cannot read worktree fingerprint; inspect the lane diff before retrying');
@@ -258,7 +262,20 @@ export async function checkAuditedFiles(s) {
   }
 }
 export async function checkStagedScope(s) {
-  const staged = await git(s, ['diff', '--cached', '--name-only', '--no-renames', '-z']);
+  const head = await git(s, ['rev-parse', 'HEAD']);
+  if (!good(head) || !s.startSha || head.stdout?.trim() !== s.startSha) {
+    fail('changed-after-audit', 'Lane HEAD differs from the starting commit; inspect local history before retrying');
+  }
+  // Gitlinks are never in scope, even when unchanged or beneath an allowed directory.
+  const index = await git(s, ['ls-files', '--stage', '-z']);
+  if (!good(index) || typeof index.stdout !== 'string' || (index.stdout && !index.stdout.endsWith('\0'))) {
+    fail('diff-out-of-scope', 'Cannot read complete index modes; inspect the lane index before retrying');
+  }
+  for (const entry of index.stdout.split('\0').filter(Boolean)) {
+    const match = /^([0-7]{6}) (?:[a-f0-9]{40}|[a-f0-9]{64}) [0-3]\t([\s\S]+)$/.exec(entry);
+    if (!match || match[1] === '160000') fail('diff-out-of-scope', 'Invalid index entry or gitlink; inspect the lane index before retrying');
+  }
+  const staged = await git(s, ['diff', '--cached', '--name-only', '--no-renames', '--ignore-submodules=none', '-z']);
   if (!good(staged) || typeof staged.stdout !== 'string' || (staged.stdout && !staged.stdout.endsWith('\0'))) {
     fail('diff-out-of-scope', 'Cannot read complete staged file list; inspect the lane index before retrying');
   }
@@ -269,7 +286,7 @@ export async function checkStagedScope(s) {
     fail('diff-out-of-scope', 'Staged file list differs from the audited worktree; inspect the lane index before retrying');
   }
   // Compare the entire index with the worktree, including paths absent from s.files.
-  const match = await git(s, ['diff', '--quiet', '--exit-code', '--no-ext-diff', '--no-textconv', '--']);
+  const match = await git(s, ['diff', '--quiet', '--exit-code', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--']);
   if (!good(match)) {
     fail('diff-out-of-scope', 'Cannot verify staged contents match the audited worktree; inspect the lane index before retrying');
   }
@@ -286,6 +303,17 @@ export async function commitAndPush(s) {
   const sha = await git(s, ['rev-parse', 'HEAD']);
   if (!good(sha) || !sha.stdout?.trim()) fail('commit-failed');
   s.result.sha = sha.stdout.trim();
+  const parent = await git(s, ['rev-parse', 'HEAD^']);
+  const count = await git(s, ['rev-list', '--count', `${s.startSha}..HEAD`]);
+  if (!good(parent) || parent.stdout?.trim() !== s.startSha || !good(count) || count.stdout?.trim() !== '1') {
+    fail('changed-after-audit', 'Committed history is not exactly one child of the starting commit; inspect local history before retrying');
+  }
+  // HEAD is mutable; publication must also validate the immutable SHA it will push.
+  const pinnedParent = await git(s, ['rev-parse', `${s.result.sha}^`]);
+  const pinnedCount = await git(s, ['rev-list', '--count', `${s.startSha}..${s.result.sha}`]);
+  if (!good(pinnedParent) || pinnedParent.stdout?.trim() !== s.startSha || !good(pinnedCount) || pinnedCount.stdout?.trim() !== '1') {
+    fail('changed-after-audit', 'Publication commit has unaudited ancestry; inspect local history before retrying');
+  }
   // Hooks or another writer may have replaced the index during commit. Check the
   // immutable committed tree, including added paths, modes, deletions and link blobs.
   const committedTree = await git(s, ['rev-parse', `${s.result.sha}^{tree}`]);
@@ -350,10 +378,12 @@ function plan(s) {
     show('node', codexArgs(s, '<audit-task-file>', true)),
     'Check changed and untracked file list and content fingerprint are unchanged since audit started',
     'git add -- <scope-checked changed files>',
-    'git diff --cached --name-only --no-renames -z (require scoped paths to match the audited file list)',
-    'git diff --quiet --exit-code --no-ext-diff --no-textconv -- (require the complete index to match the worktree)',
+    'Require HEAD to equal the starting commit and reject gitlinks in git ls-files --stage -z',
+    'git diff --cached --name-only --no-renames --ignore-submodules=none -z (require scoped paths to match the audited file list)',
+    'git diff --quiet --exit-code --no-ext-diff --no-textconv --ignore-submodules=none -- (require the complete index to match the worktree)',
     'Recheck audited file list and content fingerprint immediately before commit',
     'git commit -m <brief title> -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"',
+    'Verify committed history is exactly one child of the starting commit',
     'Verify committed tree equals the audited index snapshot before publishing its pinned SHA',
     `${show('git', ['ls-remote', '--heads', s.originUrl])} <branch> (try suffixes -2 through -9 if occupied)`,
     show('git', ['push', s.originUrl, `<checked-sha>:refs/heads/${s.result.branch}`]),
