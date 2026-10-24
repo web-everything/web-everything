@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import {
-  startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart,
+  startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
   PID_START_TIMEOUT_MS, JOB_RECORD_INIT_DEADLINE_MS,
   CODEX_CLI,
   DEFAULT_TIMEOUT_MS,
@@ -1631,9 +1631,63 @@ describe('detached jobs', () => {
       throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
     });
     try {
-      expect(jobIsAlive({ pid: 123, pidStart: 'x' }, { readStart })).toBe(false);
+      expect(jobIsAlive({ pid: 123, pidStart: 'x' }, { readStart, readState: readStart })).toBe(false);
       expect(readStart).not.toHaveBeenCalled();
     } finally { kill.mockRestore(); }
+  });
+
+  // An exited child its parent never reaped still answers kill(pid, 0) and keeps its start time.
+  it.each([
+    ['a zombie with an unchanged start time', 'Fri Oct 23 20:10:13 2026', 'Z', false],
+    ['a foreground zombie with an unchanged start time', 'Fri Oct 23 20:10:13 2026', 'Z+', false],
+    ['a legacy record (no start time) whose PID is a zombie', undefined, 'Z', false],
+    ['a null start time whose PID is a zombie', null, 'Zs', false],
+    ['a sleeping process with a matching start time', 'Fri Oct 23 20:10:13 2026', 'S', true],
+    ['a legacy record whose PID is running', undefined, 'R+', true],
+    ['a PID that vanished before the state probe', 'Fri Oct 23 20:10:13 2026', null, false],
+  ])('jobIsAlive with %s', (_label, pidStart, state, expected) => {
+    const readStart = vi.fn(() => 'Fri Oct 23 20:10:13 2026');
+    expect(jobIsAlive({ pid: process.pid, pidStart }, { readStart, readState: () => state })).toBe(expected);
+    if (state === null || state.startsWith('Z')) expect(readStart).not.toHaveBeenCalled();
+  });
+
+  it('jobIsAlive fails closed when the state probe does not answer, on both record shapes', () => {
+    const readState = () => { throw Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }); };
+    for (const pidStart of ['Fri Oct 23 20:10:13 2026', undefined]) {
+      expect(() => jobIsAlive({ pid: process.pid, pidStart }, { readStart: () => pidStart, readState })).toThrow('timed out');
+    }
+  });
+
+  it('a zombie job with an unchanged start time is recovered as failed (code 1), not left running', async () => {
+    const pidStart = 'Fri Oct 23 20:10:13 2026';
+    const record = { id: 'zombie', pid: process.pid, pidStart, status: 'running', exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    const isAlive = rec => jobIsAlive(rec, { readStart: () => pidStart, readState: () => 'Z+' });
+    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 }))
+      .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
+    expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
+  });
+
+  it('a state probe that does not answer fails the wait closed (exit 2) without marking the job failed', async () => {
+    const record = { id: 'ps-state-hung', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    const isAlive = rec => jobIsAlive(rec, { readState: () => { throw new Error('ps timed out'); } });
+    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 })).toMatchObject({ code: 2 });
+    expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'running', exitCode: null });
+  });
+
+  it('readPidState reads a bounded, locale- and zone-pinned ps state; null for no such pid, throws when ps does not answer', () => {
+    const execFn = vi.fn(() => ' Z+ \n');
+    expect(readPidState(42, { execFn })).toBe('Z+');
+    expect(execFn).toHaveBeenCalledWith('ps', ['-o', 'stat=', '-p', '42'], expect.objectContaining({
+      timeout: PID_START_TIMEOUT_MS, env: expect.objectContaining({ LC_ALL: 'C', TZ: 'UTC' }),
+    }));
+    expect(readPidState(42, { execFn: () => { throw Object.assign(new Error('ps exited 1'), { status: 1 }); } })).toBeNull();
+    expect(readPidState(42, { execFn: () => '\n' })).toBeNull();
+    expect(readPidState(0, { execFn })).toBeNull();
+    expect(() => readPidState(42, { execFn: () => { throw Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }); } }))
+      .toThrow('timed out');
+    expect(readPidState(process.pid)).toMatch(/^[^Z\s]/);
   });
 
   it('readPidStart reads a bounded, locale- and zone-pinned ps start time; null for no such pid, throws when ps does not answer', () => {

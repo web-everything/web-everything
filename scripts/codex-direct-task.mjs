@@ -1220,14 +1220,37 @@ export function readPidStart(pid, { execFn = execFileSync, timeoutMs = PID_START
     execFn: (bin, args, opts) => execFn(bin, args, { ...opts, timeout: timeoutMs, env: { ...opts.env, TZ: 'UTC' } }),
   });
 }
+/**
+ * The process state (`ps -o stat=`, e.g. `S`, `R+`, `Z`) under the same bounded, locale- and zone-pinned ps
+ * as readPidStart: null when the pid does not exist; throws when ps does not answer.
+ */
+export function readPidState(pid, { execFn = execFileSync, timeoutMs = PID_START_TIMEOUT_MS } = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const out = execFn('ps', ['-o', 'stat=', '-p', String(pid)], {
+      env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' }, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return String(out ?? '').trim() || null;
+  } catch (error) {
+    if (error && error.status === 1) return null; // ps: no such process
+    throw error;
+  }
+}
 const pidStartOrNull = (readStart, pid) => { try { return readStart(pid); } catch { return null; } };
-/** Whether the job's own process is alive: the PID exists AND, when recorded, still has the same start time. */
-export function jobIsAlive({ pid, pidStart }, { readStart = readPidStart } = {}) {
+/**
+ * Whether the job's own process is alive: the PID exists, is not an unreaped zombie, AND, when recorded, still
+ * has the same start time.
+ */
+export function jobIsAlive({ pid, pidStart }, { readStart = readPidStart, readState = readPidState } = {}) {
   try { process.kill(pid, 0); } catch (error) {
     if (error.code === 'ESRCH') return false;
     if (error.code !== 'EPERM') throw error;
   }
-  // Legacy records (or a ps failure at spawn) carry no start time: the PID probe alone decides.
+  // An exited job its parent never reaped still answers kill(pid, 0) with an unchanged start time. A state
+  // probe that does not answer throws, so `wait` fails closed; a pid gone by now (null) is dead.
+  const state = readState(pid);
+  if (!state || state.startsWith('Z')) return false;
+  // Legacy records (or a ps failure at spawn) carry no start time: the PID and state probes alone decide.
   if (typeof pidStart !== 'string' || !pidStart) return true;
   // A different (or no) start time means the PID now names another process. A probe that does not
   // answer throws, so `wait` fails closed (exit 2) instead of marking a possibly-live job failed.
