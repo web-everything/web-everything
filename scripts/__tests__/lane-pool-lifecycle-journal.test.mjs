@@ -12,7 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -38,8 +38,16 @@ function runPool(args, extraEnv = {}) {
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
-/** The reaper's real `releaseLane`, pointed at this fixture pool. */
-const reaperRelease = (lane, reason) => releaseLane(POOL, lane, { reason, env, cli: POOL_SCRIPT });
+/** The reaper's real `releaseLane`, pointed at this fixture's pool AND canonical origin. */
+const reaperRelease = (lane, reason) => releaseLane(POOL, lane, {
+  reason, env, cli: POOL_SCRIPT,
+  exec: (cmd, argv, opts) => execFileSync(cmd, [...argv, ...poolArgs()], { ...opts, cwd: referenceDir }),
+});
+
+/** Keep work unpushed through release, which now tries to salvage before dropping the lease. */
+function rejectSalvagePush() {
+  writeFileSync(join(originDir, 'hooks', 'pre-receive'), '#!/bin/sh\necho rejected > "$LANE_POOL_ROOT/salvage-rejected"\nexit 1\n', { mode: 0o755 });
+}
 
 /** The health watch's real `defaultReclaimLane`; the exec wrapper only adds this fixture's pool args + env
  *  (keeping the actor env the watch itself set). */
@@ -76,7 +84,9 @@ beforeEach(() => {
   chmodSync(join(binDir, 'claude'), 0o755);
   writeFileSync(join(binDir, 'lsof'), '#!/bin/sh\nexit 0\n');
   chmodSync(join(binDir, 'lsof'), 0o755);
-  env = { ...process.env, LANE_POOL_ROOT: poolRoot, HOME: base, PATH: `${binDir}:${process.env.PATH}`, WE_LANE_SALVAGE_QUIET_MIN: '0' };
+  env = { ...process.env, LANE_POOL_ROOT: poolRoot, HOME: base, PATH: `${binDir}:${process.env.PATH}`, WE_LANE_SALVAGE_QUIET_MIN: '0', WE_LANE_BACKUP_ROOT: join(base, 'backups') };
+  delete env.LANE_POOL_AUTO_RECOVER;
+  delete env.LANE_POOL_NO_RECOVER;
   delete env.LANE_JOURNAL_ACTOR;
 
   expect(runPool(['provision', '--count=2', ...poolArgs()]).code).toBe(0);
@@ -155,12 +165,36 @@ describe('lane lifecycle journal — acquire → reaper release → health-watch
     expect(out.indexOf('acquire')).toBeLessThan(out.indexOf('reclaim-reset'));
   });
 
+  it('salvages unpushed work on reaper release so a later reclaim is safe and quiet', () => {
+    const mainSha = git(['rev-parse', 'HEAD'], referenceDir);
+    expect(runPool(['acquire', '--lane=1', '--session=s', ...poolArgs()]).code).toBe(0);
+    writeFileSync(join(lanePath(1), 'file.txt'), 'salvage me\n');
+    commit(lanePath(1), 'local only');
+    const localSha = git(['rev-parse', 'HEAD'], lanePath(1));
+
+    reaperRelease(1, 'ttl-stale');
+    expect(git(['ls-remote', '--heads', originDir, 'refs/heads/salvage/lane-1-*'], referenceDir))
+      .toMatch(new RegExp(`^${localSha}\\s+refs/heads/salvage/lane-1-`));
+    expect(watchReclaim(1)?.reclaimed).toBe(true);
+    const entries = readLaneJournal(join(poolRoot, POOL), { lane: 1 });
+    expect(entries.find(e => e.action === 'release')).toMatchObject({
+      actor: { name: LEASE_REAPER_ACTOR }, headBefore: localSha, aheadBefore: 1, unpushed: true,
+    });
+    const reset = entries.find(e => e.action === 'reclaim-reset');
+    expect(reset).toMatchObject({ headBefore: localSha, headAfter: mainSha, unpushed: false });
+    expect(isUnsalvagedDestructiveUnpushed(reset)).toBe(false);
+  });
+
   it('a reclaim over UNPUSHED work is refused, journalled loud once (not every tick), and the tree survives', () => {
     expect(runPool(['acquire', '--lane=1', '--session=s', ...poolArgs()]).code).toBe(0);
     writeFileSync(join(lanePath(1), 'file.txt'), 'never pushed\n');
     commit(lanePath(1), 'local only');
     const localSha = git(['rev-parse', 'HEAD'], lanePath(1));
+    rejectSalvagePush();
     reaperRelease(1, 'ttl-stale');
+    expect(existsSync(join(poolRoot, 'salvage-rejected'))).toBe(true);
+    expect(git(['rev-list', 'origin/main..HEAD'], lanePath(1))).toBe(localSha);
+    expect(git(['ls-remote', '--heads', originDir, 'refs/heads/salvage/*'], referenceDir)).toBe('');
 
     const first = runPool(['reclaim', '--lane=1', '--json', '--reason=test', ...poolArgs()]);
     expect(first.code).toBe(0);
@@ -177,7 +211,12 @@ describe('lane lifecycle journal — acquire → reaper release → health-watch
     expect(runPool(['acquire', '--lane=2', '--session=s', ...poolArgs()]).code).toBe(0);
     writeFileSync(join(lanePath(2), 'file.txt'), 'never pushed\n');
     commit(lanePath(2), 'local only');
+    const localSha = git(['rev-parse', 'HEAD'], lanePath(2));
+    rejectSalvagePush();
     reaperRelease(2, 'ttl-stale');
+    expect(existsSync(join(poolRoot, 'salvage-rejected'))).toBe(true);
+    expect(git(['rev-list', 'origin/main..HEAD'], lanePath(2))).toBe(localSha);
+    expect(git(['ls-remote', '--heads', originDir, 'refs/heads/salvage/*'], referenceDir)).toBe('');
 
     const r = runPool(['reclaim', '--lane=2', '--override', '--json', ...poolArgs()]);
     expect(JSON.parse(r.out).reclaimed).toBe(true);
