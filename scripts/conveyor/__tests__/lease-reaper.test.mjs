@@ -621,7 +621,7 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
   // is replaced, so a stale clock passed by main cannot hide behind a unit fixture.
   const source = readFileSync(join(process.cwd(), 'scripts/conveyor/lease-reaper.mjs'), 'utf8');
   const shell = source.slice(source.indexOf('function parseFlags('), source.indexOf('// Run the IO shell only'));
-  const dryRun = ({ delayAt, heartbeatOffset = 0 }) => {
+  const dryRun = ({ delayAt, heartbeatOffset = 0, retainedRound = false }) => {
     let clock = NOW;
     let stdout = '';
     const logs = [];
@@ -636,7 +636,9 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
       process: { env: {}, stdout: { write: (s) => { stdout += s; } }, exit: (code) => expect(code).toBe(0) },
       fetchSessionSignals: () => {
         advance('listing');
-        return { states: new Map([['conveyor-1', 'working']]), pidAlive: new Map(), agents: [] };
+        return retainedRound
+          ? { states: new Map([['fix-5806', 'done']]), pidAlive: new Map([['fix-5806', false]]), agents: [] }
+          : { states: new Map([['conveyor-1', 'working']]), pidAlive: new Map(), agents: [] };
       },
       readWrapperPidsForPass: () => { advance('run-store'); return new Map(); },
       listFixDispatchClaims: () => {
@@ -658,6 +660,12 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
 
   it.each(['listing', 'run-store', 'claims'])('keeps a live borrowed fixer after a 61-second %s delay', (delayAt) => {
     const { report, logs } = dryRun({ delayAt });
+    expect(logs).toContain('lease-reaper: added 1 claim runner pid(s)');
+    expect(report).toMatchObject({ scanned: 1, kept: 1, wouldReap: [], sessionAxis: 'on' });
+  });
+
+  it.each(['listing', 'run-store', 'claims'])('keeps the borrowed round despite a retained terminal Claude row after a slow %s read', (delayAt) => {
+    const { report, logs } = dryRun({ delayAt, retainedRound: true });
     expect(logs).toContain('lease-reaper: added 1 claim runner pid(s)');
     expect(report).toMatchObject({ scanned: 1, kept: 1, wouldReap: [], sessionAxis: 'on' });
   });
@@ -693,6 +701,50 @@ describe('buildLeaseSignalsFor + reapPlan — borrowed Codex fixer absent from c
     ...overrides,
   });
   const claimsWith = (runnerPid) => [{ owner: 'borrowed-fixer', pid: 456, heartbeatAt: new Date(NOW).toISOString(), meta: { repo: 'we', pr: 5806, kind: 'fix', runnerPid } }];
+
+  it.each(['done', 'failed', 'stopped', 'working', 'blocked'])('a fresh live borrowed runner survives a previous Claude round listed as %s with a dead PID', (state) => {
+    const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
+      sessionStates: new Map([['fix-5806', state]]),
+      sessionPidAlive: new Map([['fix-5806', false]]),
+    });
+    expect(signalsFor(cand).sessionGone).toBe(false);
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap).toEqual([]);
+    expect(keep).toHaveLength(1);
+  });
+
+  it.each([
+    ['expired', -24 * 60 * 60_000, process.pid, 'node fix-run.mjs --session=fix-5806'],
+    ['future-dated', 60_001, process.pid, 'node fix-run.mjs --session=fix-5806'],
+    ['missing heartbeat', null, process.pid, 'node fix-run.mjs --session=fix-5806'],
+    ['dead runner', 0, 2147483647, 'node fix-run.mjs --session=fix-5806'],
+    ['reused PID', 0, process.pid, 'node unrelated.mjs'],
+    ['session prefix collision', 0, process.pid, 'node fix-run.mjs --session=fix-58061'],
+    ['unknown command', 0, process.pid, null],
+  ])('retained terminal rows still reap with an invalid claim: %s', (_label, offset, runnerPid, command) => {
+    const claims = claimsWith(runnerPid).map((claim) => ({
+      ...claim, heartbeatAt: offset === null ? undefined : new Date(NOW + offset).toISOString(),
+    }));
+    const signalsFor = signalsWith(claimRunnerPidsBySession(claims, { nowMs: NOW }), {
+      sessionStates: new Map([['fix-5806', 'done']]),
+      sessionPidAlive: new Map([['fix-5806', false]]),
+      pidCommand: () => command,
+    });
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap.map((r) => r.reason)).toEqual(['session-gone']);
+    expect(keep).toEqual([]);
+  });
+
+  it('a live claim runner does not override lease expiry or a terminal PR', () => {
+    const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
+      sessionStates: new Map([['fix-5806', 'done']]),
+      sessionPidAlive: new Map([['fix-5806', false]]),
+    });
+    const sig = signalsFor(cand);
+    const expiredLease = { ...lease, acquiredAt: new Date(NOW - TTL_MS - 1).toISOString() };
+    expect(classifyReap(expiredLease, { nowMs: NOW, ttlMs: TTL_MS, ...sig })).toEqual({ reap: true, reason: 'ttl-stale' });
+    expect(classifyReap(lease, { nowMs: NOW, ttlMs: TTL_MS, ...sig, prState: 'merged' })).toEqual({ reap: true, reason: 'pr-merged' });
+  });
 
   it('reaps a twenty-minute-old fixer as session-gone despite a stale claim with a LIVE runner pid', () => {
     const claims = claimsWith(process.pid).map((claim) => ({
@@ -765,27 +817,28 @@ describe('buildLeaseSignalsFor + reapPlan — borrowed Codex fixer absent from c
     expect(keep).toEqual([]);
   });
 
-  it('a live claim runner pid cannot override a direct session PID death signal', () => {
+  it('a live claim runner pid overrides a previous round\'s session PID death signal', () => {
     const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
       sessionPidAlive: new Map([['fix-5806', false]]),
     });
-    expect(signalsFor(cand).sessionGone).toBe(true);
+    expect(signalsFor(cand).sessionGone).toBe(false);
     const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
-    expect(reap.map((r) => r.reason)).toEqual(['session-gone']);
-    expect(keep).toEqual([]);
+    expect(reap).toEqual([]);
+    expect(keep).toHaveLength(1);
   });
 
-  it('a live claim runner pid cannot override a listed done session', () => {
+  it.each([true, null])('a live claim runner pid overrides a retained done row with listed PID liveness %s', (pidAlive) => {
     const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
       sessionStates: new Map([['fix-5806', 'done']]),
+      sessionPidAlive: new Map([['fix-5806', pidAlive]]),
     });
-    expect(signalsFor(cand).sessionGone).toBe(true);
+    expect(signalsFor(cand).sessionGone).toBe(false);
     const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
-    expect(reap.map((r) => r.reason)).toEqual(['session-gone']);
-    expect(keep).toEqual([]);
+    expect(reap).toEqual([]);
+    expect(keep).toHaveLength(1);
   });
 
-  it('run-store PID evidence still decides a session also present in claims', () => {
+  it('either live wrapper keeps a session, while two dead wrappers leave session death checks active', () => {
     const deadPid = 2147483647;
     expect(() => process.kill(deadPid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
     const wrapperPids = new Map([['fix-5806', process.pid]]);
@@ -809,7 +862,13 @@ describe('buildLeaseSignalsFor + reapPlan — borrowed Codex fixer absent from c
       wrapperPids: new Map([['fix-5806', deadPid]]),
       sessionPidAlive: new Map([['fix-5806', false]]),
     });
-    expect(deadWrapperSignals(cand).sessionGone).toBe(true);
+    expect(deadWrapperSignals(cand).sessionGone).toBe(false);
+
+    const bothDeadSignals = signalsWith(claimRunnerPidsBySession(claimsWith(deadPid), { nowMs: NOW }), {
+      wrapperPids: new Map([['fix-5806', deadPid]]),
+      sessionPidAlive: new Map([['fix-5806', false]]),
+    });
+    expect(bothDeadSignals(cand).sessionGone).toBe(true);
   });
 
   it('old behaviour: without the claim pid, the same unlisted fixer is reaped mid-run', () => {

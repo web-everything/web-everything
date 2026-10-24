@@ -7,6 +7,7 @@
  * isolated pool. No daemon ticks or real lane releases are needed to observe the break.
  * PR #5846: advance a virtual clock by 61 seconds during session listing, so a
  * heartbeat refreshed during slow I/O must be validated against the read-time clock.
+ * A retained terminal Claude row from the previous round must not defeat the new runner.
  */
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -25,9 +26,9 @@ function fakeClaudeBin(root) {
   const bin = join(root, 'fakebin');
   mkdirSync(bin, { recursive: true });
   const claude = join(bin, 'claude');
-  // One unrelated background row keeps the session-gone axis ON; an empty listing
-  // would disable it and make the scenario pass without exercising the incident.
-  const listing = [{ kind: 'background', name: 'conveyor-1', sessionId: 'unrelated-bg-session', state: 'working', startedAt: Date.now() - 60 * MIN }];
+  // --all retains the previous Claude round under the same deterministic name.
+  // The borrowed round has its own live claim runner, absent from this listing.
+  const listing = [{ kind: 'background', name: SESSION, sessionId: 'previous-claude-round', pid: 2147483647, state: 'done', startedAt: Date.now() - 60 * MIN }];
   writeFileSync(claude, `#!/bin/sh\ncat <<'JSON'\n${JSON.stringify(listing)}\nJSON\n`);
   chmodSync(claude, 0o755);
   return bin;
@@ -35,7 +36,7 @@ function fakeClaudeBin(root) {
 
 export default {
   id: 'lease-reaper-borrowed-fixer-pid-invisible',
-  title: 'a borrowed fixer absent from claude agents and the run store keeps its lease after a slow listing while its fresh claim runner PID is live and bound to its session',
+  title: 'a borrowed fixer keeps its lease despite a retained terminal Claude round and slow listing while its fresh claim runner PID is live and bound to its session',
   card: 'PR #5806 incident',
   fixedBy: { sha: 'd5b71e11a6ae', where: 'lane/reaper-borrowed-fixer-pid' },
   fixPresent(root) {

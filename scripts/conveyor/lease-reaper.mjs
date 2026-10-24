@@ -1071,9 +1071,10 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  *   `ownerAlive` is a proxy (`workerSession`) that can legitimately outlive the one delivery agent a lease was
  *   minted for — see {@link ownerSessionAliveForLease}'s own "known, accepted trade-offs" note
  *   for what this narrowing does and does not close. `claimRunnerAlive` requires a live claim-derived PID
- *   whose command contains the exact session token (`null` when no claim pid). This only bridges the listing gap for an
- *   unlisted borrowed fixer; it never overrides `pidAlive === false` or a listed terminal state. Run-store
- *   wrapper evidence retains its separate early return above those checks.
+ *   whose command contains the exact session token (`null` when no claim pid). This identifies the current
+ *   borrowed runner even when a previous Claude round remains listed under the same deterministic name,
+ *   with a terminal state or dead PID. Like live run-store wrapper evidence, it takes precedence over that
+ *   name-keyed listing evidence. Without a validated live runner, the ordinary death checks still apply.
  * @returns {boolean|null}
  */
 export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DISPATCH_GUARD_LISTING_GRACE_MINUTES * 60_000, pidAlive = null, wrapperAlive = null, ownerAlive = null, claimRunnerAlive = null } = {}) {
@@ -1092,7 +1093,10 @@ export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DIS
   // gate this check actually means; it matches every kind `parseSessionSlug` accepts, item or PR alike.
   if (!session || !isDispatcherMintedSession(session)) return null; // not a dispatcher-minted name — don't guess
   if (!(sessionStates instanceof Map)) return null; // listing unavailable/all-empty this pass — axis off
-  // #3383 — a REAL, direct death signal wins outright: no grace window (it is not an inference from silence),
+  // A fresh claim's live, session-bound runner is the current borrowed round. `--all` can retain an older
+  // Claude round's terminal row and dead PID under this same name; neither describes the borrowed process.
+  if (claimRunnerAlive === true) return false;
+  // #3383 — without a validated current wrapper, a REAL death signal wins: no grace window (it is not an inference from silence),
   // and it fires even when the row is LISTED with a non-terminal state (the phantom shape neither branch below
   // can see — see the docblock above). Deliberately checked BEFORE `ownerAlive` — see the `ownerAlive` @param
   // doc above for why.
@@ -1103,7 +1107,6 @@ export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DIS
     // matches the dispatcher grammar — see {@link ownerSessionAliveForLease}'s own doc for the incident and the
     // id set checked. This is the ONLY branch `ownerAlive` applies in (see the `ownerAlive` @param doc above).
     if (ownerAlive === true) return false;
-    if (claimRunnerAlive === true) return false;
     // Absence alone is ambiguous until the lease has outlived the listing's own visibility lag.
     if (typeof nowMs !== 'number') return null; // can't judge age — never guess
     const acquiredAtMs = Date.parse(lease?.acquiredAt);
@@ -1111,8 +1114,8 @@ export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DIS
     if (nowMs - acquiredAtMs < graceMs) return null; // too young — not yet listed is not the same as gone
     return true; // aged past the grace window and still never listed — gone
   }
-  // A listed row — terminal or not — is a DIRECT, positive observation about THIS session's own process,
-  // never overridden by `ownerAlive` or `claimRunnerAlive` (same reasoning as the `pidAlive` ordering above).
+  // Without a validated current wrapper, a listed terminal row is positive evidence of death,
+  // never overridden by `ownerAlive`. Validated claim runners were handled above because names span rounds.
   return AGENT_GONE_STATES.has(sessionStates.get(session));
 }
 
