@@ -112,7 +112,7 @@ async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, 
       return outcome = { ok: proven, command, result: `${passed} passed, ${skipped} skipped${proven ? '' : '; JSON evidence incomplete or counts mismatch'}`,
         testCount: tests.length, ...(proven ? {} : { reason: 'tests-unproven' }) };
     } catch (e) {
-      const output = `${e.stdout || ''}${e.stderr || ''}`.replaceAll(worktree, '<worktree>').replaceAll(repo, '<repo>').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+      const output = `${e.stdout || ''}${e.stderr || ''}`.replaceAll(worktree, '<worktree>').replaceAll(repo, '<repo>').replaceAll(env.HOME || homedir(), '<home>').replace(/(?<![\w.<])\/(?:Users|home|private|var|tmp|opt|Volumes)\/[^\s'"):]+/g, '<path>').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
       return outcome = { ok: false, command, result: `exit ${Number.isInteger(e.status) ? e.status : 'unknown'}: ${output.slice(-400)}`, testCount: tests.length, reason: 'tests-failed' };
     }
   } finally {

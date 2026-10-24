@@ -247,6 +247,11 @@ describe('default combined-tree test proof', () => {
     expect(fs.existsSync).toHaveBeenCalledWith(worktree);
     expect(result.result).toContain('temp worktree removed');
   });
+  it('redacts home and other absolute paths from failed-run output', async () => {
+    const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), { status: 1, stderr: 'at /Users/someone/secret/dir/file.mjs:3 and /private/var/x/y' }) });
+    expect(result.result).not.toMatch(/\/Users\/someone|\/private\/var/);
+    expect(result.result).toContain('<path>');
+  });
   it.each([
     ['timeout', { code: 'ETIMEDOUT', status: null, signal: 'SIGTERM' }],
     ['nonzero exit', { status: 1, stderr: 'failed' }],
