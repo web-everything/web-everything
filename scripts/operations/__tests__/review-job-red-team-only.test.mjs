@@ -354,7 +354,6 @@ describe('red-team-only review job', () => {
     'retries after the $cap deferral clears (initial red-team-only=$redTeamOnly)', ({ cap, redTeamOnly }) => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-cap-retry-'));
       const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
-      const write = input => recordRedTeamStatus(input, { env });
       const read = () => readRedTeamStatus({ repo, pr, head, env });
       const loopPayload = payload();
       Object.assign(loopPayload, { stopped: 'complete', runId: 'review-pr-cap' });
@@ -368,7 +367,7 @@ describe('red-team-only review job', () => {
       const source = `
         import { readFileSync } from 'node:fs';
         import { runRedTeam, reserveSeatCalls } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
-        const { input, at, cap, saved } = JSON.parse(readFileSync(0, 'utf8'));
+        const { input, at, cap, saved, status } = JSON.parse(readFileSync(0, 'utf8'));
         const spent = { dispatchKind: 'review-seat', seat: 'juror', provider: 'codex', status: 'ok',
           callId: 'spent', scoredAt: '2026-10-23T15:00:00Z' };
         const held = { ...spent, status: 'quota-exhausted', quotaResetsAt: '2026-10-23T16:00:00Z' };
@@ -376,6 +375,8 @@ describe('red-team-only review job', () => {
         const ledger = { version: 1, reservations: [{ callId: 'spent', provider: 'codex', at: spent.scoredAt }] };
         const result = await runRedTeam({ ...input, env: { WE_REVIEW_SEAT_CAP_CODEX: cap === 'quota-hold' ? '100' : '1' } }, {
           now: () => at, log: () => {}, readRecords: () => records,
+          readRedTeamStatus: () => status,
+          readRecoveryComments: () => saved.comments,
           cliAvailable: provider => provider === 'codex',
           reserveCalls: options => {
             if (cap === 'reservation-error' && at < Date.parse('2026-10-24T15:00:00Z')) throw Error('reservation EIO');
@@ -393,13 +394,13 @@ describe('red-team-only review job', () => {
       `;
       const io = fakeIo({
         readRedTeamOnlyPayload: () => ({ head, loopPayload }),
-        redTeamStatus: vi.fn(write),
+        redTeamStatus: vi.fn(createReviewJobIo({ env, readEvidence: evidence }).redTeamStatus),
         clearRedTeamQueued: vi.fn(createReviewJobIo({ env }).clearRedTeamQueued),
         runLoop: () => ({ status: 0, stdout: JSON.stringify(loopPayload), stderr: '' }),
         runRedTeam: input => {
           expect(read()).toMatchObject({ status: 'queued', result: null });
           observed = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
-            input: JSON.stringify({ input, at, cap, saved: observed }), encoding: 'utf8',
+            input: JSON.stringify({ input, at, cap, saved: observed, status: read() }), encoding: 'utf8',
             timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
           }));
           return observed.result;
@@ -579,14 +580,37 @@ describe('red-team-only dispatch', () => {
 
 describe('red-team child resume enforcement', () => {
   it.each([
-    ['fresh', []],
-    ['resume', ['--resume-only']],
+    [undefined, []],
+    ['fresh', ['--red-team-mode=fresh']],
+    ['resume', ['--resume-only', '--red-team-mode=resume']],
   ])('builds exact child argv for %s mode', (redTeamMode, modeArgs) => {
     const loopFile = `review-${pr}.red-team.loop.json`;
     expect(redTeamRunnerArgs({ pr, repo, lanePath: '/lanes/lane-7', loopFile, redTeamMode })).toEqual([
       'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`,
       '--lane=/lanes/lane-7', `--loop-json=${loopFile}`, ...modeArgs,
     ]);
+  });
+  it.each(['fresh', 'resume'])('carries the exact pre-queue %s evidence to the shared child argv', redTeamMode => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-mode-plumbing-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const result = { status: 'ran', comment: { status: 'error' } };
+    try {
+      if (redTeamMode === 'resume') recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'finished', result }, { env });
+      const prior = readRedTeamStatus({ repo, pr, head, env });
+      const real = createReviewJobIo({ env, readEvidence: () => ({ inFlight: false }) });
+      const io = fakeIo({ redTeamStatus: real.redTeamStatus });
+      expect(runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode }, io).redTeam.status).toBe('ran');
+      expect(io.runRedTeam).toHaveBeenCalledOnce();
+      const input = io.runRedTeam.mock.calls[0][0];
+      const admission = { pid: process.pid, prior: prior == null ? null : { repo, pr, head, status: 'finished', result } };
+      expect(input).toEqual({ pr, repo, lanePath: '/lanes/lane-7', loopPayload: payload(), slug: `review-${pr}`,
+        redTeamMode, redTeamAdmission: admission });
+      expect(redTeamRunnerArgs({ ...input, loopFile: 'loop.json' })).toEqual([
+        'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`,
+        '--lane=/lanes/lane-7', '--loop-json=loop.json', ...(redTeamMode === 'resume' ? ['--resume-only'] : []),
+        `--red-team-mode=${redTeamMode}`, `--red-team-admission=${JSON.stringify(admission)}`,
+      ]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it.each(['fresh', 'resume'])('forwards %s mode to the red-team-only job hook', redTeamMode => {
     const io = fakeIo({

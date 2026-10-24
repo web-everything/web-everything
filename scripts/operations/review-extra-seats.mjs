@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
 import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
@@ -79,7 +82,7 @@ import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { RED_TEAM_UNVERIFIABLE_TAG, readRedTeamProbes, RED_TEAM_COMMENT_MARKER, RED_TEAM_CONFIRMED_TAG, RED_TEAM_UNCONFIRMED_TAG, redTeamMarker } from '../lib/red-team-gate.mjs';
+import { RED_TEAM_UNVERIFIABLE_TAG, readRedTeamProbes, RED_TEAM_COMMENT_MARKER, RED_TEAM_CONFIRMED_TAG, RED_TEAM_UNCONFIRMED_TAG, redTeamMarker, redTeamForHead } from '../lib/red-team-gate.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(THIS_FILE), '..', '..');
@@ -1378,18 +1381,67 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
  * This sequential entry runs both back to back, exactly as before the split.
  * @param {ReturnType<typeof createRedTeamIo>} io
  */
-export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true, resumeOnly = false } = {}, io = createRedTeamIo({ env })) {
+export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true, resumeOnly = false, redTeamMode, redTeamAdmission } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
     if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     const read = loopPayload?.findings?.read;
+    let recovery;
+    if (redTeamMode !== undefined) {
+      recovery = redTeamRecoveryGuard({ pr, repo, head: read?.netBasis?.rev, redTeamMode, redTeamAdmission }, io);
+      if (recovery.status) return recovery;
+    }
     const recording = record !== false && loopPayload?.replay !== true;
-    const pass = await speculateRedTeam({ pr, repo, lanePath, read, claudeFindings: claudeFindingsFromLoop(loopPayload), env, post, record: recording, resumeOnly }, io);
+    const pass = await speculateRedTeam({ pr, repo, lanePath, read, claudeFindings: claudeFindingsFromLoop(loopPayload), env, post, record: recording, resumeOnly: resumeOnly || redTeamMode === 'resume' },
+      recovery ? { ...io, readRecords: () => recovery.records } : io);
     if (pass.status !== 'speculated') return pass;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);
   } catch (e) {
     return { status: 'error', reason: String(e?.message ?? e).slice(0, MAX_TEXT) };
   }
+}
+
+/** Recovery alone requires complete evidence. Normal full reviews retain their existing policy. */
+function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission }, io) {
+  const refuse = reason => ({ status: 'not-owed', reason: `${reason}; inspect stored evidence before retrying — no call launched` });
+  if (!['fresh', 'resume'].includes(redTeamMode) || typeof repo !== 'string' || !repo.trim()
+    || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || !isPinnedRev(head)) return refuse('invalid red-team recovery identity or mode');
+  let records, status, comments;
+  try {
+    records = io.readRecords({ strict: true });
+    if (!Array.isArray(records)) throw Error('invalid scorecards');
+  } catch { return refuse('scorecard store unreadable'); }
+  try {
+    status = io.readRedTeamStatus({ pr, repo, head });
+    if (status === undefined) throw Error('missing status evidence');
+    // Admission replaced the status while the job still held its claim. Only that
+    // exact queued writer may carry its prior evidence through to this shared seat.
+    if (redTeamAdmission !== undefined) {
+      if (!redTeamAdmission || !Object.hasOwn(redTeamAdmission, 'prior')
+        || !Number.isInteger(redTeamAdmission.pid) || redTeamAdmission.pid <= 0
+        || status?.status !== 'queued' || status.pid !== redTeamAdmission.pid) return refuse('red-team admission changed');
+      const prior = redTeamAdmission.prior;
+      if (prior !== null && (!prior || prior.repo !== repo || Number(prior.pr) !== Number(pr) || prior.head !== head)) return refuse('prior red-team status identity mismatch');
+      const result = ['ran', 'resumed'].includes(normalizeRedTeamResult(prior?.result).priorResult) ? prior.result : null;
+      if (JSON.stringify(status.result) !== JSON.stringify(result)) return refuse('red-team admission result changed');
+      status = prior;
+    }
+  } catch { return refuse('red-team status unreadable'); }
+  try {
+    comments = io.readRecoveryComments({ pr, repo });
+    if (!Array.isArray(comments)) throw Error('invalid comments');
+  } catch { return refuse('PR comments unreadable'); }
+  if (redTeamForHead(comments, pr, head)) return refuse('red-team result already on head');
+  if (redTeamMode === 'fresh') {
+    if (status != null) return refuse('prior red-team status; not re-run');
+    if (seatRows(records).some(row => row.seat === RED_TEAM_SEAT.seat && row.repo === repo
+      && Number(row.pr) === Number(pr) && row.rev === head)) return refuse('prior red-team seat row; not re-run');
+  } else {
+    const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
+    if (status?.status !== 'finished' || !['ran', 'resumed'].includes(priorResult) || priorComment === 'posted') return refuse('prior red-team result is not resumable');
+    if (!priorRedTeamRow(records, pr, head, repo)) return refuse('no clean prior red-team row');
+  }
+  return { records };
 }
 
 /**
@@ -1719,6 +1771,11 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
   };
   return {
     ...base,
+    readRecords: ({ strict = false } = {}) => strict
+      ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),
+    readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
+    readRecoveryComments: ({ pr, repo }) => readCompletePrComments(pr, { repo,
+      exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }),
     redTeamStatus: input => {
       recordRedTeamStatus(input, { env });
       try { syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev,
@@ -1818,7 +1875,8 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {
     runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() })
       .then((result) => emit(result, renderSeatSummary));
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
-    return runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only') }, redTeamIo)
+    return runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only'),
+      redTeamMode: flag('red-team-mode'), redTeamAdmission: flag('red-team-admission') === undefined ? undefined : JSON.parse(flag('red-team-admission')) }, redTeamIo)
       .then((result) => emit(result, renderRedTeamSummary));
   } else if (sub === 'red-team-speculate' && flag('pr') && flag('repo') && flag('lane') && flag('read-sink') && flag('out')) {
     // Card xbizuci — THE SPECULATIVE RED TEAM, started by the review job beside the review loop. It waits for the

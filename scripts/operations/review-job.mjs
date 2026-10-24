@@ -270,11 +270,13 @@ export function laneCooloffActive(record, nowMs, cooloffMs = INFRA_RETRY_COOLOFF
   return Number.isFinite(at) && nowMs - at < cooloffMs;
 }
 
-/** PURE — argv for the red-team child; only resume mode forbids a fresh model call. */
-export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode }) {
+/** PURE — carry recovery mode and pre-admission evidence to the shared red-team entry. */
+export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission }) {
   return [
     'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`, `--loop-json=${loopFile}`,
     ...(redTeamMode === 'resume' ? ['--resume-only'] : []),
+    ...(redTeamMode === undefined ? [] : [`--red-team-mode=${redTeamMode}`]),
+    ...(redTeamAdmission === undefined ? [] : [`--red-team-admission=${JSON.stringify(redTeamAdmission)}`]),
   ];
 }
 
@@ -354,7 +356,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head,
           evidence: readEvidence(key), env, log: line => process.stderr.write(`${line}\n`) });
       } catch (e) { process.stderr.write(`review-job: red-team status label sync failed: ${e.message}\n`); }
-      return { priorResult };
+      return { priorResult, ...(queued && input.redTeamMode ? { redTeamAdmission: { pid: process.pid,
+        prior: prior == null ? null : { repo: prior.repo, pr: prior.pr, head: prior.head, status: prior.status, result: prior.result } } } : {}) };
     },
     root,
     prepareLane: ({ pr, repo, lanePath }) => {
@@ -449,13 +452,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // x00g3tt — the POST-ACCEPT RED TEAM, its own process and wall, run only after the added seats. Advisory: it
     // posts one deduped comment and writes evidence; nothing it returns reaches a label, merge or verdict.
-    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, redTeamMode }) => {
+    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, redTeamMode, redTeamAdmission }) => {
       if (!redTeamEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
       const loopFile = join(dir, `${slug}.red-team.loop.json`);
       try {
         mkdirSync(dir, { recursive: true });
         writeFileSync(loopFile, JSON.stringify(loopPayload));
-        const r = node(redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode }),
+        const r = node(redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission }),
           { timeoutMs: resolveSeatTimeoutMs(env) + 20 * 60 * 1000 });
         for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
           writeLineSync(2, `  ${line}`);
@@ -905,8 +908,10 @@ function runReviewArc({
     const finishArc = input => {
       // Both modes persist and verify admission while the job claim still excludes another writer.
       if (input && redTeamOwedFor(input.loopPayload) && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
-        seatsBox.priorRedTeamResult = io.redTeamStatus({ ...input, status: 'queued',
-          ...(seatsBox.speculative ? { speculativePid: seatsBox.speculative.pid } : {}) })?.priorResult;
+        const queued = io.redTeamStatus({ ...input, status: 'queued',
+          ...(seatsBox.speculative ? { speculativePid: seatsBox.speculative.pid } : {}) });
+        seatsBox.priorRedTeamResult = queued?.priorResult;
+        if (input.redTeamMode && queued?.redTeamAdmission) input = { ...input, redTeamAdmission: queued.redTeamAdmission };
       }
       seatsBox.input = input;
       return result({ ...classified, lanePath });
