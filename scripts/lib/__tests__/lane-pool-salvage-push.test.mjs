@@ -71,7 +71,7 @@ describe('salvage push contract', () => {
     expect(h.io.remoteSha.mock.invocationCallOrder[0]).toBeLessThan(h.io.push.mock.invocationCallOrder[0]);
     expect(h.io.push.mock.invocationCallOrder[0]).toBeLessThan(h.io.remoteSha.mock.invocationCallOrder[1]);
     expect(h.io.remoteSha.mock.invocationCallOrder[1]).toBeLessThan(h.io.record.mock.invocationCallOrder[0]);
-    expect(h.io.record).toHaveBeenCalledExactlyOnceWith(7, expect.stringContaining(ref));
+    expect(h.io.record).toHaveBeenCalledTimes(1); expect(h.io.record).toHaveBeenCalledWith(7, expect.stringContaining(ref));
     expect(h.io.record.mock.calls[0][1]).toContain(head);
   });
 
@@ -98,6 +98,37 @@ describe('salvage push contract', () => {
     const result = await h.run();
     expect(result.status).toBe('failed');
     expect(result.reason).toEqual(expect.stringMatching(/\S/));
+  });
+
+  it('returns failed without recording when asynchronous verification resolves to a mismatched SHA', async () => {
+    const h = harness({ remoteSha: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(other) });
+    expectFailed(await h.run(), h.io);
+    expect(h.io.push).toHaveBeenCalledTimes(1); expect(h.io.push).toHaveBeenCalledWith(laneDir, ref, head);
+    expect(h.io.remoteSha).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns failed when the record write rejects despite a verified remote SHA', async () => {
+    const h = harness({ record: vi.fn().mockRejectedValue(new Error('record write rejected')) });
+    expect(await h.run()).toMatchObject({ status: 'failed', reason: expect.stringContaining('record write rejected') });
+    expect(h.io.remoteSha).toHaveReturnedWith(head);
+    expect(h.io.record).toHaveBeenCalledTimes(1); expect(h.io.record).toHaveBeenCalledWith(7, `${ref} ${head}\n`);
+  });
+
+  it('reports pushed only after remote verification and the pending record write both succeed', async () => {
+    let finishRecord, recordStarted;
+    const written = new Promise(resolve => { finishRecord = resolve; });
+    const started = new Promise(resolve => { recordStarted = resolve; });
+    const h = harness({ record: vi.fn(() => { recordStarted(); return written; }) });
+    let settled = false;
+    const pending = h.run().then(result => { settled = true; return result; });
+    await started;
+    await Promise.resolve();
+    expect(h.io.remoteSha).toHaveReturnedWith(head);
+    expect(h.io.record).toHaveBeenCalledTimes(1); expect(h.io.record).toHaveBeenCalledWith(7, `${ref} ${head}\n`);
+    expect(settled).toBe(false);
+    finishRecord();
+    expect(await pending).toMatchObject({ status: 'pushed', ref, unmatched: [older] });
+    expect(settled).toBe(true);
   });
 
   it('fails closed if the remote verification throws after a successful push', async () => {

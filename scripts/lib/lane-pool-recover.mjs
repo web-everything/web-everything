@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { isUnderTest } from './under-test.mjs';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
+import { realSalvageIo, salvagePushLane } from './lane-pool-salvage-push.mjs';
 
 const clean = (value, max = 2000) => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, max);
 const message = e => clean(e?.message || e);
@@ -101,7 +102,7 @@ function recoveryBudget() {
 }
 
 export async function recoverPool({ lanes, io, budgetMs = recoveryBudget(), now = Date.now }) {
-  const result = { reclaimed: [], keptUnpushed: [], keptLeased: [], skipped: [], backedUp: [], budgetExhausted: false };
+  const result = { reclaimed: [], keptUnpushed: [], keptLeased: [], skipped: [], backedUp: [], salvaged: [], budgetExhausted: false };
   const start = now();
   for (let i = 0; i < lanes.length; i++) {
     if (now() - start >= budgetMs) {
@@ -112,8 +113,19 @@ export async function recoverPool({ lanes, io, budgetMs = recoveryBudget(), now 
     const n = lanes[i];
     try {
       if (await io.isLeased(n)) { result.keptLeased.push(n); continue; }
-      const proof = await io.proof(n);
+      let proof = await io.proof(n);
       if (proof?.error) throw new Error(proof.error);
+      if (io.salvage && proof?.preserved === false && Array.isArray(proof.unpreservedCommitShas)
+        && proof.unpreservedCommitShas.length > 0 && Array.isArray(proof.unpreservedFiles)
+        && (proof.unpreservedFiles.length === 0 || qualifiesForCardBackup({ ...proof, unpreservedCommitShas: [] }))) {
+        let salvage;
+        try { salvage = await io.salvage(n); }
+        catch (e) { throw new Error(`salvage failed: ${message(e)}`); }
+        if (!['pushed', 'matched'].includes(salvage?.status)) throw new Error(`salvage failed: ${salvage?.reason || 'preservation incomplete'}`);
+        if (salvage.status === 'pushed') result.salvaged.push({ lane: n, ref: salvage.ref });
+        proof = await io.proof(n);
+        if (proof?.error) throw new Error(proof.error);
+      }
       const override = qualifiesForCardBackup(proof);
       const preserved = proof?.preserved === true && Array.isArray(proof.unpreservedFiles)
         && proof.unpreservedFiles.length === 0 && Array.isArray(proof.unpreservedCommitShas) && proof.unpreservedCommitShas.length === 0;
@@ -192,6 +204,7 @@ export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_
   };
   return {
     isLeased,
+    salvage: n => salvagePushLane({ lane: n, laneDir: join(repo.poolDir, `lane-${n}`), io: realSalvageIo({ repo, backupRoot }) }),
     proof: n => {
       backups.delete(n);
       const result = run([`--lane=${n}`, '--dry-run', '--json']);
