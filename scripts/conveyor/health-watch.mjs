@@ -658,8 +658,8 @@ export function probeLaneJournal({ poolRoot, now = Date.now(), windowMs = 24 * 6
   return out;
 }
 
-function run(cmd, args, { timeoutMs = CHILD_TIMEOUT_MS, cwd = REPO_ROOT } = {}) {
-  return execFileSync(cmd, args, { cwd, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+function run(cmd, args, { timeoutMs = CHILD_TIMEOUT_MS, cwd = REPO_ROOT, env = process.env, stderr = 'pipe' } = {}) {
+  return execFileSync(cmd, args, { cwd, env, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', stderr] });
 }
 
 /** `machine-overload`'s own process snapshot: every live process, BSD/macOS `ps` column order
@@ -989,8 +989,13 @@ export function probeBgIsolationStalls(agents, { readInfo = readBgIsolationStall
  * other child call in this file.
  * @returns {{observedAt:string, records:Array<object>, gaps:string[]}}
  */
-export function probeStaleState({ exec = run, timeoutMs = 90_000, repoRoot = REPO_ROOT } = {}) {
-  const out = exec(process.execPath, [join(repoRoot, 'scripts/operations/run.mjs'), 'stale-state', '--json'], { timeoutMs, cwd: repoRoot });
+export function probeStaleState({ exec = run, timeoutMs = 90_000, repoRoot = REPO_ROOT, laneScanDir = healthDir(), laneScanWrite = true } = {}) {
+  const out = exec(process.execPath, [join(repoRoot, 'scripts/operations/run.mjs'), 'stale-state', '--json'], {
+    timeoutMs, cwd: repoRoot, stderr: 'inherit', env: { ...process.env,
+      WE_HEALTH_WATCH_LANE_SCAN: '1', WE_HEALTH_WATCH_LANE_SCAN_DIR: laneScanDir || '',
+      WE_HEALTH_WATCH_LANE_SCAN_WRITE: laneScanWrite ? '1' : '0',
+    },
+  });
   return JSON.parse(out).verdict;
 }
 
@@ -1020,7 +1025,7 @@ export { GH_GROUP_PROBE_NAMES };
  * checkout itself (backlog, review jobs, the stale-state CLI) must name the real clone, never the snapshot.
  * @returns {{probes: object, errors: Record<string, string>}}
  */
-export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false } = {}) {
+export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false, laneScanDir = healthDir(), laneScanWrite = true } = {}) {
   const probes = {};
   const errors = {};
   const attempt = (name, fn) => {
@@ -1051,7 +1056,7 @@ export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skip
   if (agents && !skipBuildSessions) probes.buildSessions = attempt('buildSessions', () => probeBuildSessions(agents, { nowMs: now, prs: prs || [] }));
   // stale-claim's two probes ride the same 'gh' cadence (both are gh/git-heavy reads); independent of the
   // prs/agents pairing above — one failing never blocks the other.
-  const staleState = attempt('staleState', () => probeStaleState({ repoRoot: sourceRoot }));
+  const staleState = attempt('staleState', () => probeStaleState({ repoRoot: sourceRoot, laneScanDir, laneScanWrite }));
   if (staleState) probes.staleState = staleState;
   const mergedPrs = attempt('mergedPrs', () => probeMergedPrs({ repoRoot: sourceRoot }));
   if (mergedPrs) probes.mergedPrs = mergedPrs;
@@ -1082,6 +1087,13 @@ function archiveOptions(config, flags, now) {
   return { jobsRoot: flags['claude-jobs-root'], archiveRoot: flags['claude-jobs-archive-root'],
     dryRun: !!flags['dry-run'], now, olderThanMs: config.claudeJobsArchiveOlderThanMs,
     maxMoves: config.claudeJobsArchiveMaxMovesPerRun, timeBudgetMs: config.claudeJobsArchiveTimeBudgetMs };
+}
+
+/** Fixtures and bare dry runs cannot read or write the host lane-scan cache. */
+export function resolveLaneScanTarget(flags, dir, fixtureTick) {
+  const laneScanDir = flags['state-root'] ? dir
+    : (fixtureTick || flags['dry-run'] || Object.keys(flags).some(key => key.endsWith('-fixture'))) ? null : dir;
+  return { laneScanDir, laneScanWrite: !!laneScanDir };
 }
 
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
@@ -1295,6 +1307,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // `ghProbes` job switch on, it runs as a detached durable job (we:scripts/conveyor/health-watch-job.mjs) and
   // this tick only consumes a finished job's result; otherwise it runs inline, exactly as before. A dry run or a
   // fixture tick never touches the host job store (a test supplies its own store through `deps.ghJobs`).
+  // Fixtures without a state root and bare dry runs must never write the host cache.
+  const { laneScanDir, laneScanWrite } = resolveLaneScanTarget(flags, dir, fixtureTick);
   const jobsAllowed = (!fixtureTick || !!deps.ghJobs) && !flags['dry-run'] && !flags['no-gh'];
   const ghJobsOn = jobsAllowed && resolveHealthJobSwitches(config).ghProbes;
   // Switched off with job state left behind (a rollback): still reconcile — reattach, consume, never queue — so an
@@ -1304,7 +1318,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   if (ghJobsOn || reconcileOnly) {
     const out = await attempt('ghJob', () => runGhProbeJobs({
       ...(deps.ghJobs || {}), now, due: ghJobsOn && ghDue, state: prev.jobs, drain: reconcileOnly,
-      input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'] },
+      input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite },
     }));
     if (out) {
       jobsState = reconcileOnly && !out.summary.remaining ? undefined : out.state;
@@ -1319,7 +1333,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     }
   }
   if (!ghJobsOn && ghDue && !ghFromJob) {
-    const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'] });
+    const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite });
     Object.assign(probes, got.probes);
     Object.assign(probeErrors, got.errors);
     if (got.probes.prs && got.probes.agents) ghCache.at = now;

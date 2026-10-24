@@ -14,6 +14,7 @@ import {
   probeDaemonStatus, daemonNameForLabel, runTickWithWatchdog, probeAuthExpiredSessions, probeAgents,
   probePrs, probeStaleState, probeMergedPrs, probeProcesses, probeMachineLoad, probeGhShimLanes,
   probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend, breakthroughEmergency, isRepeatAlert,
+  resolveLaneScanTarget,
 } from '../health-watch.mjs';
 import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mjs';
 import { replay, unacknowledged } from '../../operations/needs-you-feed.mjs';
@@ -50,6 +51,45 @@ vi.mock('../../operations/card-batch-seal-io.mjs', () => ({ sealDueBatches: card
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'health-watch-test-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+describe('lane scan cache target isolation', () => {
+  it.each([
+    { flags: {}, fixtureTick: false, allowed: true },
+    { flags: { 'dry-run': true }, fixtureTick: false, allowed: false },
+    { flags: {}, fixtureTick: true, allowed: false },
+    { flags: { 'ps-fixture': '/fixture/ps' }, fixtureTick: false, allowed: false },
+    { flags: { 'machine-load-fixture': '/fixture/load' }, fixtureTick: false, allowed: false },
+    { flags: { 'future-fixture': '/fixture/new' }, fixtureTick: false, allowed: false },
+    { flags: { 'state-root': '/fixture/state' }, fixtureTick: true, allowed: true },
+    { flags: { 'state-root': '/fixture/state', 'dry-run': true }, fixtureTick: true, allowed: true },
+    { flags: { 'state-root': '/fixture/state', 'ps-fixture': '/fixture/ps' }, fixtureTick: true, allowed: true },
+  ])('resolves flags=$flags fixtureTick=$fixtureTick to cache allowed=$allowed', ({ flags, fixtureTick, allowed }) => {
+    expect(resolveLaneScanTarget(flags, '/resolved/health', fixtureTick)).toEqual({
+      laneScanDir: allowed ? '/resolved/health' : null, laneScanWrite: allowed,
+    });
+  });
+
+  it.each([false, true])('tick forwards the isolated cache target to collectGh (state root: %s)', async explicitRoot => {
+    sealTestRoot.path = dir; // A stand-in for the host health dir, never the real host store.
+    const collectGh = vi.fn(() => ({ probes: {}, errors: {} }));
+    const budget = join(dir, 'budget.json');
+    writeFileSync(budget, '{}');
+    const flags = {
+      'dry-run': true, 'force-gh': true, 'no-diagnose': true, 'no-investigate': true,
+      'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+      'graphql-budget-fixture': budget, 'rest-budget-fixture': budget,
+      ...(explicitRoot ? { 'state-root': join(dir, 'explicit-state') } : {}),
+    };
+    try {
+      await tick(flags, { collectGh, collectInventory: () => ({}), smells: [] });
+      expect(collectGh).toHaveBeenCalledTimes(1);
+      expect(collectGh.mock.calls[0][0]).toMatchObject({
+        laneScanDir: explicitRoot ? healthDir(flags['state-root']) : null,
+        laneScanWrite: explicitRoot,
+      });
+    } finally { sealTestRoot.path = null; }
+  }, 30_000);
+});
 
 // ── probeDaemonLogs ──────────────────────────────────────────────────────────────────────────────────────────
 
@@ -623,6 +663,18 @@ describe('probePrs — carries headRefName (stale-claim\'s open-PR exclusion nee
 });
 
 describe('probeStaleState', () => {
+  it('passes the tick cache root and write control to the CLI and exposes scan decisions on stderr', () => {
+    const calls = [];
+    const exec = (...args) => { calls.push(args); return JSON.stringify({ verdict: { records: [], gaps: [] } }); };
+    probeStaleState({ exec, laneScanDir: '/fixture/health', laneScanWrite: true });
+    expect(calls[0][2]).toMatchObject({ stderr: 'inherit', env: {
+      WE_HEALTH_WATCH_LANE_SCAN: '1', WE_HEALTH_WATCH_LANE_SCAN_DIR: '/fixture/health',
+      WE_HEALTH_WATCH_LANE_SCAN_WRITE: '1',
+    } });
+    probeStaleState({ exec, laneScanDir: null, laneScanWrite: false });
+    expect(calls[1][2].env).toMatchObject({ WE_HEALTH_WATCH_LANE_SCAN_DIR: '', WE_HEALTH_WATCH_LANE_SCAN_WRITE: '0' });
+  });
+
   it('shells the declared stale-state read and returns its verdict (records/gaps), not the whole run envelope', () => {
     const exec = () => JSON.stringify({ runId: 'x', verdict: { observedAt: 'now', records: [{ kind: 'claim', id: '4169' }], gaps: ['g'] } });
     const out = probeStaleState({ exec });
