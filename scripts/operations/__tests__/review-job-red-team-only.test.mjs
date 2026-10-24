@@ -9,6 +9,7 @@ import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, readDrainRedTeamEvidence, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
 import { createReviewJobIo, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
+import { createExtraSeatsIo } from '../review-extra-seats.mjs';
 
 vi.mock('../../lib/red-team-status-labels.mjs', () => ({ syncRedTeamStatusLabels: vi.fn() }));
 vi.mock('../../lib/atomic-json-file.mjs', async importOriginal => {
@@ -73,6 +74,7 @@ function fakeIo(over = {}) {
     speculativeRedTeamSetting: vi.fn(() => ({ enabled: true })), startSpeculativeRedTeam: vi.fn(),
     readRedTeamOnlyPayload: vi.fn(() => ({ head, loopPayload: payload() })),
     prepareLane: vi.fn(() => ({ head })), clearRedTeamQueued: vi.fn(),
+    fetchRedTeamHead: vi.fn(() => ({ head })),
     runRedTeam: vi.fn(() => ({ status: 'ran', findings: [], comment: { status: 'posted' } })),
     runRedTeamGate: vi.fn(() => ({ status: 'ok', outcome: 'advisory' })), redTeamStatus: vi.fn(), ...over };
 }
@@ -138,6 +140,142 @@ function runStoredRecovery(input, { status, prior, saved, failComment = false, f
 }
 
 describe('red-team-only review job', () => {
+  it('recovery fetch: lane without H fetches before queued and runRedTeam sees H', () => {
+    let available = false;
+    const events = [];
+    const io = fakeIo({
+      fetchRedTeamHead: vi.fn(input => {
+        expect(input).toEqual({ lanePath: '/lanes/lane-7', repo, pr, head });
+        events.push('fetch');
+        available = true;
+        return { head };
+      }),
+      redTeamStatus: input => events.push(input.status),
+      runRedTeam: vi.fn(() => {
+        expect(available).toBe(true);
+        events.push('started');
+        return { status: 'ran' };
+      }),
+    });
+    expect(runReviewJob({ repo, pr, redTeamOnly: true }, io).redTeam.status).toBe('ran');
+    expect(events).toEqual(['fetch', 'queued', 'started', 'finished']);
+  });
+
+  it.each(['fresh', 'resume'])('recovery fetch: %s failure preserves status and next tick starts', redTeamMode => {
+    const prior = redTeamMode === 'resume' ? { status: 'finished', result: 'ran' } : null;
+    let status = prior;
+    const io = fakeIo({
+      fetchRedTeamHead: vi.fn().mockImplementationOnce(() => { throw Error('fetch failed'); })
+        .mockReturnValue({ head }),
+      redTeamStatus: vi.fn(input => { status = { status: input.status, result: input.result }; }),
+    });
+    const options = { repo, pr, redTeamOnly: true, redTeamMode };
+    expect(runReviewJob(options, io)).toMatchObject({ refused: true,
+      reason: 'reviewed head could not be fetched into the lane; retry next tick' });
+    expect(status).toBe(prior);
+    expect(io.redTeamStatus).not.toHaveBeenCalled();
+    expect(io.clearRedTeamQueued).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+    expect(io.runRedTeamGate).not.toHaveBeenCalled();
+    expect(io.report).not.toHaveBeenCalled();
+    expect(io.releaseLane).toHaveBeenCalledOnce();
+    expect(io.unclaim).toHaveBeenCalledOnce();
+    expect(runReviewJob(options, io).redTeam.status).toBe('ran');
+    expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(['queued', 'finished']);
+  });
+
+  it.each([undefined, {}, { head: 'b'.repeat(40) }])('recovery fetch: missing or mismatched pinned SHA refuses (%j)', fetched => {
+    const io = fakeIo({ fetchRedTeamHead: () => fetched });
+    expect(runReviewJob({ repo, pr, redTeamOnly: true }, io)).toMatchObject({ refused: true,
+      reason: 'reviewed head could not be fetched into the lane; retry next tick' });
+    expect(io.redTeamStatus).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+  });
+
+  it('recovery fetch: absent IO refuses without persisting admission', () => {
+    const io = fakeIo({ fetchRedTeamHead: undefined });
+    expect(runReviewJob({ repo, pr, redTeamOnly: true }, io).refused).toBe(true);
+    expect(io.redTeamStatus).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+  });
+
+  it('real ops head missing from lane: scratch reports not our ref before fetch and red team starts after', () => {
+    // Local-only fixture for the launcher gate; this writes temporary Git repositories.
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-missing-head-'));
+    const origin = join(dir, 'origin'), lanePath = join(dir, 'lane');
+    const git = args => execFileSync('git', args, { encoding: 'utf8', timeout: 30_000,
+      maxBuffer: 1024 * 1024, env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } }).trim();
+    const seats = createExtraSeatsIo();
+    let scratch;
+    try {
+      git(['init', '--quiet', '--initial-branch=main', origin]);
+      const commit = message => git(['-C', origin, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+        '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', message]);
+      commit('base');
+      git(['clone', '--quiet', '--no-local', '--single-branch', '--branch', 'main', origin, lanePath]);
+      git(['-C', origin, 'checkout', '--quiet', '-b', 'ops/recovery-fixture']);
+      commit('reviewed ops head');
+      const pinned = git(['-C', origin, 'rev-parse', 'HEAD']);
+      git(['-C', origin, 'update-ref', `refs/pull/${pr}/head`, pinned]);
+      expect(() => git(['-C', lanePath, 'cat-file', '-e', `${pinned}^{commit}`])).toThrow();
+      expect(() => seats.makeScratch({ lanePath, rev: pinned })).toThrow(/not our ref/);
+
+      const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: pinned } } } };
+      const events = [];
+      const io = fakeIo({
+        acquireLane: () => ({ lanePath }),
+        // Isolate the recovery boundary with H absent even if shared setup changes.
+        prepareLane: () => ({ head: pinned }),
+        readRedTeamOnlyPayload: () => ({ head: pinned, loopPayload }),
+        fetchRedTeamHead: createReviewJobIo().fetchRedTeamHead,
+        redTeamStatus: input => events.push(input.status),
+        runRedTeam: vi.fn(input => {
+          scratch = seats.makeScratch({ lanePath: input.lanePath, rev: input.loopPayload.findings.read.netBasis.rev });
+          expect(git(['-C', scratch, 'rev-parse', 'HEAD'])).toBe(pinned);
+          events.push('started');
+          return { status: 'ran' };
+        }),
+      });
+      expect(runReviewJob({ repo, pr, redTeamOnly: true }, io).redTeam.status).toBe('ran');
+      expect(events).toEqual(['queued', 'started', 'finished']);
+      expect(io.runRedTeam).toHaveBeenCalledOnce();
+    } finally {
+      if (scratch) seats.removeScratch(scratch);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['ok', 'fetch-error', 'missing-commit', 'moved-head', 'wrong-commit'])(
+    'recovery fetch: production IO checks origin PR ref and pinned commit (%s)', kind => {
+      const calls = [];
+      const exec = vi.fn((file, args, options) => {
+        calls.push([file, args]);
+        expect(options).toMatchObject({ timeout: 180_000, maxBuffer: 1024 * 1024 });
+        expect(args.slice(0, 2)).toEqual(['-C', '/lanes/lane-7']);
+        if (args[2] === 'fetch') {
+          if (kind === 'fetch-error') throw Error('fetch failed');
+          return '';
+        }
+        if (args[4] === 'FETCH_HEAD^{commit}') return kind === 'moved-head' ? 'b'.repeat(40) : `${head}\n`;
+        if (kind === 'missing-commit') throw Error('unknown commit');
+        return kind === 'wrong-commit' ? 'b'.repeat(40) : `${head}\n`;
+      });
+      const io = fakeIo({ fetchRedTeamHead: createReviewJobIo({ env: {}, exec }).fetchRedTeamHead });
+      const out = runReviewJob({ repo, pr, redTeamOnly: true }, io);
+      expect(calls[0]).toEqual(['git', ['-C', '/lanes/lane-7', 'fetch', '--quiet', '--no-tags', 'origin', `pull/${pr}/head`]]);
+      if (kind === 'ok') {
+        expect(calls.slice(1)).toEqual([
+          ['git', ['-C', '/lanes/lane-7', 'rev-parse', '--verify', 'FETCH_HEAD^{commit}']],
+          ['git', ['-C', '/lanes/lane-7', 'rev-parse', '--verify', `${head}^{commit}`]],
+        ]);
+        expect(out.redTeam.status).toBe('ran');
+      } else {
+        expect(out.refused).toBe(true);
+        expect(io.redTeamStatus).not.toHaveBeenCalled();
+        expect(io.runRedTeam).not.toHaveBeenCalled();
+      }
+    });
+
   it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])(
     '%s disabled plus transient scorecard EIO leaves fresh recovery eligible after restoration', switchName => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-disabled-retry-'));
@@ -763,6 +901,7 @@ describe('red-team-only review job', () => {
       const io = fakeIo({ prepareLane, runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify(payload()) })) });
       runReviewJob({ pr, repo, redTeamOnly }, io);
       expect(io.prepareLane).toBe(prepareLane);
+      expect(io.fetchRedTeamHead).toHaveBeenCalledTimes(redTeamOnly ? 1 : 0);
     }
     expect(prepareLane.mock.calls).toEqual([[args], [args], [args]]);
   });
@@ -1017,7 +1156,7 @@ describe('red-team-only review job', () => {
       loopPayload: kind === 'missing' ? null : loopPayload }) });
     const out = runReviewJob({ pr, repo, redTeamOnly: true }, io);
     expect(out.outcome).toBe('red-team-not-owed'); expect(out.reason).toBeTruthy();
-    for (const hook of ['runLoop', 'runExtraSeats', 'runRedTeam', 'runRedTeamGate', 'redTeamStatus', 'report']) expect(io[hook]).not.toHaveBeenCalled();
+    for (const hook of ['fetchRedTeamHead', 'runLoop', 'runExtraSeats', 'runRedTeam', 'runRedTeamGate', 'redTeamStatus', 'report']) expect(io[hook]).not.toHaveBeenCalled();
     expect(io.releaseLane).toHaveBeenCalledOnce(); expect(io.unclaim).toHaveBeenCalledOnce();
   });
   it('fails closed on unreadable stored evidence and releases its lane', () => {

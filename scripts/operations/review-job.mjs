@@ -365,6 +365,16 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           status: admissionPrior.status, result: admissionPrior.result } } } : {}) };
     },
     root,
+    fetchRedTeamHead: ({ lanePath, pr, head }) => {
+      if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing pinned red-team head');
+      const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
+      exec('git', ['-C', lanePath, 'fetch', '--quiet', '--no-tags', 'origin', `pull/${pr}/head`], options);
+      const fetched = exec('git', ['-C', lanePath, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}'], options).trim();
+      if (fetched !== head) throw Error('red-team head changed during fetch');
+      const resolved = exec('git', ['-C', lanePath, 'rev-parse', '--verify', `${head}^{commit}`], options).trim();
+      if (resolved !== head) throw Error('pinned red-team commit unavailable');
+      return { head: resolved };
+    },
     prepareLane: ({ pr, repo, lanePath }) => {
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
@@ -943,6 +953,18 @@ function runReviewArc({
       if (!pinned || !redTeamOwedFor(loopPayload)) {
         classified = { outcome: 'red-team-not-owed', reason: pinned ? 'stored review does not owe a red team' : 'stored review does not match live head' };
         return result({ ...classified, lanePath });
+      }
+      // Refuse before finishArc can persist admission; a missing commit must leave recovery retryable.
+      const refuse = reason => {
+        classified = { outcome: 'red-team-fetch-refused', refused: true, reason };
+        io.log(`review-job ${slug}: refused — ${reason}`);
+        return result({ ...classified, lanePath });
+      };
+      try {
+        const fetched = io.fetchRedTeamHead({ lanePath, repo: planned.repo, pr: planned.pr, head });
+        if (fetched?.head !== head) throw Error('pinned red-team head mismatch');
+      } catch {
+        return refuse('reviewed head could not be fetched into the lane; retry next tick');
       }
       classified = { outcome: 'red-team-only' };
       return finishArc({ pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode });

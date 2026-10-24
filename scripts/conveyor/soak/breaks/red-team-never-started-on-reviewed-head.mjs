@@ -170,7 +170,7 @@ export default {
         reserveCalls: () => { throw Error('cap check must precede reservation'); },
       });
       check(capped.status === 'skipped' && capped.reason.includes('daily-cap:'), '#5838: cap fixture did not hit the daily cap');
-      let status = null, calls = 0, capReset = false, job;
+      let status = null, calls = 0, capReset = false, fetchReady = false, headAvailable = false, job;
       const capHistory = new Map();
       const io = {
         root: sourceRoot, now: () => at, newActorId: () => 'soak-cap',
@@ -178,9 +178,18 @@ export default {
         unclaim: () => {}, acquireLane: () => ({ lanePath: sourceRoot }), releaseLane: () => {}, log: () => {},
         readRedTeamOnlyPayload: () => ({ head, loopPayload: cappedPayload }),
         prepareLane: () => ({ head }),
+        fetchRedTeamHead: () => {
+          if (!fetchReady) throw Error('temporary PR fetch failure');
+          headAvailable = true;
+          return { head };
+        },
         redTeamStatus: input => { status = { status: input.status, result: input.result }; },
         clearRedTeamQueued: () => { status = null; },
-        runRedTeam: () => { calls++; return capReset ? { status: 'ran', findings: [], comment: { status: 'posted' } } : capped; },
+        runRedTeam: () => {
+          check(headAvailable, '#5838: red team started without its pinned commit in the lane');
+          calls++;
+          return capReset ? { status: 'ran', findings: [], comment: { status: 'posted' } } : capped;
+        },
         runRedTeamGate: () => { check(capReset, '#5838: cap deferral ran the gate'); return { status: 'ok' }; },
         report: () => { throw Error('recovery must not write review completion'); },
         runLoop: () => { throw Error('recovery must not run a new review'); },
@@ -192,6 +201,11 @@ export default {
         setting, lastDispatch: capHistory, now: () => at, capacity: { lanes: 1 },
         dispatch: options => { job = runReviewJob(options, io); return { jobPid: 42 }; },
       });
+      retryCap();
+      check(job?.refused === true && calls === 0 && status == null,
+        '#5838: failed head fetch persisted status or started a red team');
+      at += 31 * 60_000;
+      fetchReady = true;
       retryCap();
       check(calls === 1 && status == null, '#5838: capped recovery persisted terminal evidence');
       check(retryCap()?.rows[0]?.why === 'retry cooldown active', '#5838: cap retry ignored cooldown');
