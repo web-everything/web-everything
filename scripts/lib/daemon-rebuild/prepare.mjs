@@ -348,8 +348,12 @@ export async function prepareRebuild({
   // adopted, silently dropping live hotfixes. Instead HOLD on the last-good build (dispatch continues from it via
   // x5wbsbc; `daemon-held-on-last-good` raises needs-you after 15 min) and leave the overlay list untouched, until the
   // lost overlays are rebased onto main (or retired). Nothing is applied from this plan.
-  if (!mainOnly && plan.establishedLost?.length > 0) {
-    const lost = plan.establishedLost;
+  // A lost overlay whose current tip this build still contains is live through its carrier — e.g. a mechanism-pinned
+  // original (never set aside as stack-contained) beside its registered auto-rebase repair. Holding on it would keep
+  // the repair from ever being adopted. Ancestry git cannot confirm keeps the overlay lost (fail closed).
+  const lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha && plan.finalSha
+    && git(['merge-base', '--is-ancestor', l.sha, plan.finalSha]).status === 0));
+  if (!mainOnly && lost.length > 0) {
     const detail = {
       refs: lost.map((l) => l.ref), lost,
       message: `${lost.length} overlay(s) in the running build would be lost (${lost.map((l) => l.ref).join(', ')}) — holding on the last-good build; rebase them onto main (or merge main into the stack top) and re-register`,

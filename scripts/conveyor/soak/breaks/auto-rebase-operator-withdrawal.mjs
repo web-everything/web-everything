@@ -4,8 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runAutoRebase } from '../../../lib/daemon-rebuild/auto-rebase.mjs';
-import { addOverlay, readOverlays, overlayFilePath } from '../../../lib/daemon-overlays.mjs';
+import { runAutoRebase, finishPendingSwaps } from '../../../lib/daemon-rebuild/auto-rebase.mjs';
+import { addOverlay, removeOverlay, readOverlays, overlayFilePath } from '../../../lib/daemon-overlays.mjs';
 
 const REPO = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const WORKER = 'scripts/lib/daemon-rebuild/auto-rebase.mjs';
@@ -16,13 +16,19 @@ const agent = lastMessage => success(JSON.stringify({ exitCode: 0, events: { ter
 export default {
   id: 'auto-rebase-operator-withdrawal',
   title: 'a detached repair never re-registers an overlay removed by the operator',
-  card: 'PR #5848 send-back x1b8hlo item 1',
+  card: 'PR #5848 send-back x1b8hlo items 1 and 2 (detached repair, then adoption cleanup)',
   fixedBy: { sha: 'launcher-pending', where: 'lane/loader-auto-rebase-r2', paths: [WORKER, 'scripts/lib/daemon-overlays.mjs'] },
   fixPresent(root) {
-    return fs.readFileSync(join(root, WORKER), 'utf8').includes('expectedOverlay: old');
+    const worker = fs.readFileSync(join(root, WORKER), 'utf8');
+    return worker.includes('expectedOverlay: old') && worker.includes('requireRef: swap.new');
   },
   async run({ log } = {}) {
     const violations = [];
+    const operatorRemove = (root, env, ref) => {
+      const result = spawnSync(process.execPath, [join(REPO, 'scripts/daemon-overlay.mjs'), 'remove', `--clone=${root}`, `--ref=${ref}`, '--json'], { env, encoding: 'utf8', timeout: 20_000 });
+      if (result.status !== 0) throw new Error(`operator remove failed: ${result.stderr}`);
+      if (readOverlays(root, { env }).some(o => o.ref === ref)) throw new Error('operator removal did not reach overlay state');
+    };
     // Real worker + real list mutex + real operator CLI. Git and agents are injected:
     // no network, repository mutation, Codex or heavy test process is needed for this race.
     for (const phase of ['fixer', 'tests', 'audit', 'push', 'register']) {
@@ -32,11 +38,7 @@ export default {
       const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(dir, 'overlays'), WE_DAEMON_STATE_DIR: join(dir, 'state') };
       addOverlay(root, { ref: REF, pr: 123 }, { env });
       let resolved = false, pushed = false, registered = false, failure;
-      const withdraw = () => {
-        const result = spawnSync(process.execPath, [join(REPO, 'scripts/daemon-overlay.mjs'), 'remove', `--clone=${root}`, `--ref=${REF}`, '--json'], { env, encoding: 'utf8', timeout: 20_000 });
-        if (result.status !== 0) throw new Error(`operator remove failed: ${result.stderr}`);
-        if (readOverlays(root, { env }).length) throw new Error('operator removal did not reach overlay state');
-      };
+      const withdraw = () => operatorRemove(root, env, REF);
       const deps = {
         io: {
           ...fs,
@@ -76,6 +78,29 @@ export default {
         log?.(`${phase}: ${failure?.message ?? 'replacement registered'}`);
       } finally { fs.rmSync(dir, { recursive: true, force: true }); }
     }
+    // Adoption cleanup: the operator withdraws the adopted replacement after cleanup read the list, just before the
+    // removal of the original takes the list mutex. The original and the pending evidence must both survive.
+    const dir = fs.mkdtempSync(join(tmpdir(), 'soak-auto-withdraw-'));
+    try {
+      const root = join(dir, 'clone'), next = `${REF}-auto-1`;
+      fs.mkdirSync(root);
+      const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(dir, 'overlays'), WE_DAEMON_STATE_DIR: join(dir, 'state') };
+      addOverlay(root, { ref: REF, pr: 123 }, { env });
+      addOverlay(root, { ref: next, pr: 123, stackBases: [REF] }, { env });
+      const pending = `${overlayFilePath(root, env)}.auto-rebase`;
+      fs.mkdirSync(pending, { recursive: true });
+      fs.writeFileSync(join(pending, `${encodeURIComponent(REF)}.json`), JSON.stringify({ old: REF, new: next, newSha: 'a'.repeat(40) }));
+      finishPendingSwaps({
+        root, env,
+        run: args => success(args[0] === 'rev-parse' ? 'a'.repeat(40) : ''),
+        removeOverlay(r, ref, opts) { operatorRemove(r, env, next); return removeOverlay(r, ref, opts); },
+      });
+      const kept = readOverlays(root, { env }).map(o => o.ref), swaps = fs.readdirSync(pending).filter(n => n.endsWith('.json'));
+      if (!kept.includes(REF) || swaps.length !== 1) {
+        violations.push({ invariant: 'cleanup-withdrawal', detail: `registered=[${kept.join(',')}], pending=${swaps.length}` });
+      }
+      log?.(`cleanup: registered=[${kept.join(',')}], pending=${swaps.length}`);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
     return { violations };
   },
   judge: report => report.violations.map(v => `[${v.invariant}] ${v.detail}`),

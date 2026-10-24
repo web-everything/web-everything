@@ -805,6 +805,55 @@ describe('established overlay auto rebase', () => {
     expect(needsYouAlerts(f)).toEqual([]);
   });
 
+  it('keeps the original and pending evidence when the replacement is withdrawn before cleanup takes the list mutex', async () => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    // The operator unloads the replacement after cleanup's registration read, just before the removal locks the list.
+    const remove = (root, r, opts) => { removeOverlay(root, replacement.ref, { env: f.env }); return removeOverlay(root, r, opts); };
+    expect(() => finishPendingSwaps({ root: f.root, env: f.env, run, removeOverlay: remove })).not.toThrow();
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref]);
+    expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
+    expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: 'replacement registration unavailable' } });
+  });
+
+  describe('mechanism-pinned original', () => {
+    const mechanism = 'scripts/lib/daemon-rebuild/prepare.mjs';
+    const pinnedFixture = async () => {
+      const f = fixture({
+        baseFiles: { 'scripts/lib/daemon-rebuild.mjs': 'core\n', 'scripts/lib/daemon-overlays.mjs': 'core\n', [mechanism]: 'base\n' },
+        branchFiles: { [mechanism]: 'overlay\n' }, mainFiles: { [mechanism]: 'main\n' }, resolvedFiles: { [mechanism]: 'overlay + main\n' },
+      });
+      f.deps.testRunner = vi.fn(async () => ({ status: 0 }));
+      const live = await planRebuild({ git: (a, o) => run(a, { cwd: f.root, ...o }), headSha: f.baseSha, mainRef: 'origin/main', overlays: [overlay] });
+      f.moveMain(); ok(f.root, ['reset', '--hard', live.finalSha]);
+      writeRebuildState(f.root, { adopted: { head: live.finalSha } }, f.env);
+      return { f, replacement: await job(f) };
+    };
+    const prepare = (f, runFn = run) => prepareRebuild({ root: f.root, env: f.env, run: runFn, log: {}, now: Date.now, prState: async () => 'OPEN', prBaseChain: async () => null });
+
+    it('builds with its registered repair, then cleanup retires the original', async () => {
+      const { f, replacement } = await pinnedFixture();
+      const built = await prepare(f);
+      expect(built.result?.reason).not.toBe('established-overlay-conflict');
+      expect(built.terminal).toBe(false);
+      expect(built.plan.decisions).toContainEqual(expect.objectContaining({ ref, reason: 'pinned-overlay-conflict-skipped' }));
+      expect(run(['merge-base', '--is-ancestor', replacement.newSha, built.plan.finalSha], { cwd: f.root }).status).toBe(0);
+      ok(f.root, ['reset', '--hard', built.plan.finalSha]); swaps(f);
+      expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([replacement.ref]);
+      expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+    });
+
+    it('still holds when the build cannot prove it carries the original tip', async () => {
+      const { f } = await pinnedFixture();
+      const blind = (args, opts) => (args[0] === 'merge-base' && args[1] === '--is-ancestor' && args[2] === f.oldSha
+        ? { status: 128, stdout: '', stderr: 'unreadable' } : run(args, opts));
+      const held = await prepare(f, blind);
+      expect(held.result.reason).toBe('established-overlay-conflict');
+      expect(held.result.detail.refs).toEqual([ref]);
+      expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toContain(ref);
+    });
+  });
+
   describe.each(['codex', 'auditor'])('%s JSON report validation', agent => {
     it.each([
       ['nonzero exit', { exitCode: 1 }], ['timeout', { timedOut: true }],

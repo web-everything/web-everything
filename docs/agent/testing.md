@@ -14,9 +14,13 @@ The detached worker in `scripts/lib/daemon-rebuild/auto-rebase.mjs` merges main 
 `<ref>-auto-<n>` branch so ancestry preserves the original tip. It retains the old registration
 until the verified adopted HEAD contains the replacement SHA and the replacement contains a freshly
 fetched origin tip of the old ref. An advanced or unreadable old tip retains both registrations and
-escalates through `auto-rebase-needs-you`. Cleanup also re-reads the overlay list and requires the
-replacement still registered and its freshly fetched origin tip to contain the pending SHA;
+escalates through `auto-rebase-needs-you`. Cleanup requires the replacement's freshly fetched origin
+tip to contain the pending SHA, and `removeOverlay`'s `requireRef` checks the replacement is still
+registered under the same list mutex that removes the original, so a withdrawal up to that write wins;
 missing or unreadable evidence retains the old registration and pending file and alerts in both sinks.
+A mechanism-pinned original is never set aside as stack-contained, so the plan still lists it as lost
+beside its applied repair. `prepareRebuild` does not hold for a lost overlay whose current tip the
+build contains (git ancestry; an unreadable answer still holds), so the repair can be adopted and cleaned up.
 Per-ref JSON sidecars next to the overlay
 list survive ticks; per-ref markers expire after 30 minutes without a heartbeat. Live detached
 workers touch their own token's marker every minute with an unrefed interval, cleared in `finally`.

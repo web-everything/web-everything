@@ -324,14 +324,19 @@ export function recordEdgeResolution(root, ref, {
  * {@link appendOverlayEvent} when the removal should be recorded.
  * @param {string} root
  * @param {string} ref
- * @param {{env?:NodeJS.ProcessEnv, why?:string}} [o]
+ * `requireRef`, when supplied, must still be registered under the list mutex, else nothing is removed: a swap that
+ * retires `ref` for its replacement never leaves the list without both.
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string}} [o]
  * @returns {{removed:boolean, list:Array<object>}}
  */
-export function removeOverlay(root, ref, { env = process.env, why } = {}) {
+export function removeOverlay(root, ref, { env = process.env, why, requireRef } = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
     pause();
+    if (requireRef !== undefined && !list.some((o) => o && o.ref === requireRef)) {
+      throw new Error('replacement registration unavailable');
+    }
     const idx = list.findIndex((o) => o && o.ref === ref);
     if (idx === -1) return { removed: false, list };
     const next = list.slice(0, idx).concat(list.slice(idx + 1));
