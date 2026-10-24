@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync, cpSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync, cpSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -717,7 +717,11 @@ describe('real git: cleanup CLI', () => {
   });
 
   it('--apply without an explicit --lanes list is refused', () => {
-    expect(() => execFileSync('node', [CLI, `--pool-root=${poolRoot}`, '--apply'], { env, stdio: 'pipe' })).toThrow();
+    // Both roots exist, so only the explicit-lanes guard can refuse (a missing default scan root must not pass this).
+    const out = spawnSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--apply'], { env, encoding: 'utf8' });
+    expect(out.status).toBe(2);
+    expect(out.stderr).toMatch(/--apply needs an explicit --lanes=N,M list/);
+    expect(out.stdout).toBe('');
   });
 
   it('apply cleans the idle lane, keeps its working tree, and never touches the leased one', () => {
@@ -965,6 +969,56 @@ describe('CLI pools and per-lane failure isolation', () => {
     }
     expect(cli(poolRoot).rows).toEqual([expect.objectContaining({ lane: CLEANUP_POOLS.indexOf('web-everything') + 1, mode: 'dry-run' })]);
     expect(spawnSync('node', [CLI, `--pool-root=${poolRoot}`, '--pool=we-drain-daemon'], { env, encoding: 'utf8' }).status).toBe(2);
+  }, 60_000);
+
+  it('an allow-listed pool with no directory on this host exits 2 with a message, not a stack trace', () => {
+    const poolRoot = join(root, 'no-frontierui');
+    mkdirSync(join(poolRoot, 'web-everything'), { recursive: true });
+    const out = spawnSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--pool=frontierui'], { env, encoding: 'utf8' });
+    expect(out.status).toBe(2);
+    expect(out.stderr).toMatch(/^pool directory .*frontierui does not exist\n$/);
+  });
+
+  it('a borrower outside the default roots is protected once its root is passed in --extra-scan-roots, and the roots are reported', () => {
+    const poolRoot = join(root, 'extra-roots');
+    const dir = join(poolRoot, 'web-everything', 'lane-1');
+    const scanRoot = join(root, 'extra-scan');
+    const elsewhere = join(root, 'elsewhere');
+    git(root, 'clone', '-q', up, dir);
+    mkdirSync(scanRoot);
+    mkdirSync(join(elsewhere, 'borrower', 'objects', 'info'), { recursive: true });
+    writeFileSync(join(elsewhere, 'borrower', 'objects', 'info', 'alternates'), `${join(dir, '.git', 'objects')}\n`);
+    const run = (...args) => JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${scanRoot}`, '--json', ...args], { env, encoding: 'utf8' }));
+    // The default roots cannot see it: the report names exactly what was scanned, so the operator can tell.
+    const plain = run();
+    expect(plain.rows).toEqual([expect.objectContaining({ lane: 1, mode: 'dry-run' })]);
+    expect(plain.scannedRoots).not.toContain(realpathSync(elsewhere));
+    expect(plain.scannedRoots).toContain(realpathSync(scanRoot));
+    const before = git(dir, 'count-objects', '-v');
+    const extra = run(`--extra-scan-roots=${elsewhere}`, '--prune-expire=now', '--apply', '--lanes=1');
+    expect(extra.scannedRoots).toContain(realpathSync(elsewhere));
+    expect(extra.rows).toEqual([{ lane: 1, skipped: expect.stringMatching(/borrowed by .*elsewhere\/borrower/) }]);
+    expect(git(dir, 'count-objects', '-v')).toBe(before);
+    const missing = spawnSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${scanRoot}`, `--extra-scan-roots=${join(root, 'nope')}`], { env, encoding: 'utf8' });
+    expect(missing.status).toBe(2);
+    expect(missing.stderr).toMatch(/extra scan root .*nope does not exist/);
+  }, 60_000);
+
+  // The seams are honoured only under vitest: a stray seam variable in an operator's shell must change nothing.
+  it('the test seams are inert without VITEST: no alternates written, no pause, and gc runs normally', () => {
+    const poolRoot = join(root, 'seams');
+    const dir = join(poolRoot, 'web-everything', 'lane-1');
+    const decoy = join(root, 'seam-decoy', 'objects');
+    const signals = join(root, 'seam-signals');
+    git(root, 'clone', '-q', up, dir);
+    mkdirSync(signals);
+    const seamEnv = { ...env, LANE_GIT_DIET_TEST_LATE_BORROWER: decoy, LANE_GIT_DIET_TEST_PAUSE_AT: 'before-gc', LANE_GIT_DIET_TEST_PAUSE_DIR: signals };
+    delete seamEnv.VITEST;
+    const out = spawnSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=1', '--json'], { env: seamEnv, encoding: 'utf8', timeout: 20_000 });
+    expect(out.status).toBe(0);
+    expect(JSON.parse(out.stdout).rows).toEqual([expect.objectContaining({ lane: 1, mode: 'apply' })]);
+    expect(existsSync(join(root, 'seam-decoy'))).toBe(false);
+    expect(existsSync(join(signals, 'ready'))).toBe(false);
   }, 60_000);
 
   it('a lane whose git config cannot be read gets an error row, and the lanes around it are still cleaned', () => {

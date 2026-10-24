@@ -223,6 +223,12 @@ describe('findDuplicateKeysPerScope — the #2149 Fork 1 dup-key merge gate for 
     expect(findDuplicateKeysPerScope(String.raw`{"soak":{"a/b":1,"a\/b":2}}`)).toEqual(['a/b']);
     expect(findDuplicateKeysPerScope(String.raw`{"soak":{"a\\b":1,"a\u005cb":2}}`)).toEqual(['a\\b']);
   });
+  it('stays tolerant of malformed strings: an unterminated string or raw control character never throws', () => {
+    expect(findDuplicateKeysPerScope('{"a":1,"a":2,"b":"unterminated')).toEqual(['a']);
+    expect(findDuplicateKeysPerScope(`{"a":1,"a":2,"b${String.fromCharCode(1)}":3}`)).toEqual(['a']);
+    expect(findDuplicateKeysPerScope('{"x\ty":1,"x\ty":2}')).toEqual(['x\ty']);
+    expect(validateNoDuplicateManifestKeys('{"x":1,"x":2,"bad\tkey":3', 'p.json')).toEqual([{ message: expect.stringMatching(/^p\.json: duplicate key "x"/) }]);
+  });
   it('flags two same-name keys in one object scope (the clean-but-wrong merge class)', () => {
     // Two lanes both add a "wrangler" dep at different offsets → git line-merges CLEAN into this:
     const raw = '{ "dependencies": { "wrangler": "^3.1.0", "vite": "^5.0.0", "wrangler": "^3.2.0" } }';

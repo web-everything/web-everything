@@ -6,11 +6,11 @@
  *   node scripts/lane-git-diet.mjs                      # DRY RUN over every lane in the web-everything pool
  *   node scripts/lane-git-diet.mjs --apply --lanes=5,7  # act on those lanes only (an explicit list is required)
  *   flags: --pool=<web-everything|frontierui|plateau-app>  --pool-root=<dir>  --scan-root=<dir>  --json
- *          --gc-timeout-ms=N  --prune-expire=<git date, default 1.hour.ago>
+ *          --extra-scan-roots=<dir>[:<dir>...]  --gc-timeout-ms=N  --prune-expire=<git date, default 1.hour.ago>
  *
  * Eligibility (`cleanupEligibility`): a real, non-symlinked `<pool>/lane-N` with its own `.git` dir, NO lease
- * marker, no git lock file anywhere under `.git` (`*.lock`, gc.pid), no other repository borrowing its objects (alternates under --scan-root/* and the pool
- * root, following alternate chains), no `gc.recentObjectsHook` or config-defined `hook.*` (neither obeys the
+ * marker, no git lock file anywhere under `.git` (`*.lock`, gc.pid), no other repository borrowing its objects (alternates under --scan-root/*,
+ * each --extra-scan-roots/*, the temp dir and the pool root, following alternate chains; the report lists the roots scanned), no `gc.recentObjectsHook` or config-defined `hook.*` (neither obeys the
  * core.hooksPath pin), a common dir that is exactly the lane's own `.git`, a plain ref store (no `<format>://<path>`
  * `extensions.refStorage`; inherited GIT_REFERENCE_BACKEND is scrubbed), no GC repack filtering, and no per-ref
  * `gc.<pattern>.reflogExpire[Unreachable]`. Per eligible lane, on --apply:
@@ -30,7 +30,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
-import { basename, isAbsolute, join, resolve } from 'node:path';
+import { basename, delimiter, isAbsolute, join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { LEASE_FILENAME } from './lib/lane-lease.mjs';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
@@ -44,7 +44,7 @@ const flags = Object.fromEntries(process.argv.slice(2).map((a) => {
   if (!m) { process.stderr.write(`unexpected argument: ${a}\n`); process.exit(2); }
   return [m[1], m[2] ?? true];
 }));
-const KNOWN = new Set(['apply', 'lanes', 'pool', 'pool-root', 'scan-root', 'json', 'gc-timeout-ms', 'prune-expire']);
+const KNOWN = new Set(['apply', 'lanes', 'pool', 'pool-root', 'scan-root', 'extra-scan-roots', 'json', 'gc-timeout-ms', 'prune-expire']);
 const unknown = Object.keys(flags).filter((f) => !KNOWN.has(f));
 if (unknown.length) { process.stderr.write(`unknown flag(s): ${unknown.map((f) => `--${f}`).join(', ')}\n`); process.exit(2); }
 
@@ -55,6 +55,15 @@ const real = (p) => { try { return realpathSync(p); } catch (err) { if (['ENOENT
 const POOL_ROOT = real(typeof flags['pool-root'] === 'string' ? flags['pool-root'] : join(homedir(), 'workspace', '.lanes'));
 const SCAN_ROOT = real(typeof flags['scan-root'] === 'string' ? flags['scan-root'] : join(homedir(), 'workspace'));
 if (!POOL_ROOT || !SCAN_ROOT) { process.stderr.write('pool root / scan root does not exist\n'); process.exit(2); }
+// Git records no back-pointer from a store to the repos borrowing it, so a borrower outside every scanned root is
+// invisible: the operator names any other place such clones live (`:`-separated), and the report lists every root.
+const EXTRA_SCAN_ROOTS = (typeof flags['extra-scan-roots'] === 'string' ? flags['extra-scan-roots'].split(delimiter).filter(Boolean) : []).map((p) => {
+  const r = real(p);
+  if (!r) { process.stderr.write(`extra scan root ${p} does not exist\n`); process.exit(2); }
+  return r;
+});
+const poolDir = join(POOL_ROOT, POOL);
+if (!real(poolDir) || !statSync(poolDir).isDirectory()) { process.stderr.write(`pool directory ${poolDir} does not exist\n`); process.exit(2); }
 const GC_TIMEOUT_MS = Number(flags['gc-timeout-ms']) || 900_000;
 const PRUNE_EXPIRE = typeof flags['prune-expire'] === 'string' ? flags['prune-expire'] : '1.hour.ago';
 const ONLY = typeof flags.lanes === 'string' ? new Set(flags.lanes.split(',').map((s) => Number(s.trim())).filter(Number.isInteger)) : null;
@@ -78,12 +87,14 @@ const refStorage = (dir) => { try { return git(dir, ['config', '--get-all', 'ext
 // A path git prints, byte-exact: whitespace is a legal path byte, so only the one trailing newline is git's.
 const gitPath = (dir, args) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(git(dir, args, 120_000, null)).replace(/\n$/, '');
 
-// Who borrows whose objects: repos under <scan-root>/* and <pool-root>/*/*, including Gitfile/common-dir stores.
+// Who borrows whose objects: repos under <scan-root>/*, each --extra-scan-roots/*, <tmpdir>/* and <pool-root>/*/*,
+// including Gitfile/common-dir stores.
+const SCANNED_ROOTS = [...new Set([SCAN_ROOT, ...EXTRA_SCAN_ROOTS, real(tmpdir()) || tmpdir()])];
 function borrowerMap() {
   const map = new Map();
   const candidates = [];
   const kids = (d) => { try { return readdirSync(d).map((n) => join(d, n)); } catch (err) { if (['ENOENT', 'ENOTDIR'].includes(err.code)) return []; throw err; } };
-  candidates.push(...kids(SCAN_ROOT), ...kids(real(tmpdir()) || tmpdir()));
+  for (const r of SCANNED_ROOTS) candidates.push(...kids(r));
   for (const pool of kids(POOL_ROOT)) candidates.push(...kids(pool));
   for (const repo of candidates) {
     const stores = [join(repo, '.git', 'objects'), join(repo, 'objects')];
@@ -175,7 +186,6 @@ const testPause = (stage) => {
   }
 };
 
-const poolDir = join(POOL_ROOT, POOL);
 const lanes = readdirSync(poolDir)
   .map((name) => /^lane-(\d+)$/.exec(name)).filter(Boolean).map((m) => Number(m[1]))
   .filter((n) => !ONLY || ONLY.has(n)).sort((a, b) => a - b);
@@ -255,8 +265,9 @@ for (const n of lanes) {
 }
 
 if (flags.json) {
-  process.stdout.write(JSON.stringify({ mode: APPLY ? 'apply' : 'dry-run', pool: POOL, totalBytes: total, rows }, null, 2) + '\n');
+  process.stdout.write(JSON.stringify({ mode: APPLY ? 'apply' : 'dry-run', pool: POOL, scannedRoots: [...SCANNED_ROOTS, `${POOL_ROOT}/*`], totalBytes: total, rows }, null, 2) + '\n');
 } else {
+  process.stdout.write(`borrower scan roots: ${[...SCANNED_ROOTS, `${POOL_ROOT}/*`].join(', ')} (a borrower elsewhere is not seen: add --extra-scan-roots)\n`);
   for (const r of rows) {
     if (r.skipped) process.stdout.write(`lane-${r.lane}: SKIP ${r.skipped}\n`);
     else if (r.error) process.stdout.write(`lane-${r.lane}: ERROR ${r.error}\n`);

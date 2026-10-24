@@ -1085,7 +1085,9 @@ export function findDuplicateKeysPerScope(raw) {
         if (raw[j] === '"') break;
         j++;
       }
-      const s = JSON.parse(raw.slice(i, j + 1));
+      // A malformed string (unterminated, raw control character) keeps the scanner tolerant: compare its raw text.
+      let s;
+      try { s = JSON.parse(raw.slice(i, j + 1)); } catch { s = raw.slice(i + 1, j); }
       i = j + 1;
       const top = frames[frames.length - 1];
       if (top && top.isObject && top.expectKey) {
