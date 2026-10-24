@@ -82,7 +82,7 @@ let templateCache = null;
  *  daemons against progressively wider copies; nothing outside these needed adding). `git ls-files -co
  *  --exclude-standard` (not a blind full-tree copy) so gitignored junk (`node_modules`, `_site/`, …) never
  *  rides along and so an uncommitted fix in THIS lane is what the simulator actually runs.
- *  Tests, fixtures and corpora are excluded: per-scenario checkout/clone/teardown cost scales with this
+ *  Tests, fixtures and corpus data are excluded: per-scenario checkout/clone/teardown cost scales with this
  *  tree, and that cost under CI load caused A3 to time out. Fake gh/claude helpers and their shims resolve
  *  from INVOKING_ROOT, not the sim clone, so they do not need to ride along. */
 function buildWeTemplate() {
@@ -119,7 +119,8 @@ function buildWeTemplate() {
     { cwd: INVOKING_ROOT, encoding: 'utf8' },
   ).split('\n').filter(Boolean).filter((path) =>
     !/(^|\/)__tests__\/|\.(?:test|spec)\.[^/]+$/.test(path)
-    && !/^scripts\/(?:golden-corpus|review-corpus)\//.test(path)
+    // The registry imports this parser through judge-sweep-facts-io; retain the runtime module, not its corpus.
+    && (path === 'scripts/review-corpus/mine-review-corpus.mjs' || !/^scripts\/(?:golden-corpus|review-corpus)\//.test(path))
     && !/^scripts\/(?:.*\/)?fixtures\//.test(path));
 
   const work = mkdtempSync(join(tmpdir(), 'sim-template-we-'));
