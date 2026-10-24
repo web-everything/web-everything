@@ -292,7 +292,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           if (!included) {
             let staleChanged = [];
             try {
-              staleChanged = changedPaths(requireGit('diff', '--name-status', '-z', `origin/main...origin/${ref}`));
+              const raw = requireGit('diff', '--name-status', '-z', `origin/main...origin/${ref}`);
+              // Unterminated NUL output is partial evidence: leave staleChanged empty so the ref stays blocking.
+              if (raw.endsWith('\0')) staleChanged = changedPaths(raw);
             } catch { /* Unreadable changed-file evidence keeps this registration blocking. */ }
             const staleFiles = new Set([...staleChanged, ...(Array.isArray(evidence.files) ? evidence.files : [])]);
             const overlap = effectivePaths.filter((file) => staleFiles.has(file));

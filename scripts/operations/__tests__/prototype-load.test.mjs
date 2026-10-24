@@ -791,6 +791,12 @@ describe('prototype-load', () => {
       expect(f.records[0]).toMatchObject({ ok, combinedTests, staleTolerated: r.staleTolerated });
     }
   });
+  it('fails closed when the stale ref changed-file diff is unterminated (partial evidence)', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only' } });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blockingReasons: { 'lane/old': expect.stringContaining('stale-files-unknown') } });
+    expect(mutations(f, 'add')).toEqual([]);
+  });
   it('fails closed when the stale ref changed-file diff is unreadable', async () => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleDiffFails: 'lane/old' });
     const r = await f.run();
