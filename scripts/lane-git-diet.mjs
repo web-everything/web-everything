@@ -39,11 +39,14 @@ import {
   cleanupEligibility, CLEANUP_POOLS, formatBytes, parseCountObjects, parseGitAlternates, projectedFreedBytes,
 } from './lib/lane-git-diet-cleanup.mjs';
 
-const flags = Object.fromEntries(process.argv.slice(2).map((a) => {
+const flags = {};
+for (const a of process.argv.slice(2)) {
   const m = /^--([^=]+)(?:=(.*))?$/.exec(a);
   if (!m) { process.stderr.write(`unexpected argument: ${a}\n`); process.exit(2); }
-  return [m[1], m[2] ?? true];
-}));
+  // A repeated flag would silently drop all but its last value (e.g. one of two --extra-scan-roots): refuse it.
+  if (Object.hasOwn(flags, m[1])) { process.stderr.write(`--${m[1]} given more than once\n`); process.exit(2); }
+  flags[m[1]] = m[2] ?? true;
+}
 const KNOWN = new Set(['apply', 'lanes', 'pool', 'pool-root', 'scan-root', 'extra-scan-roots', 'json', 'gc-timeout-ms', 'prune-expire']);
 const unknown = Object.keys(flags).filter((f) => !KNOWN.has(f));
 if (unknown.length) { process.stderr.write(`unknown flag(s): ${unknown.map((f) => `--${f}`).join(', ')}\n`); process.exit(2); }
@@ -56,14 +59,20 @@ const POOL_ROOT = real(typeof flags['pool-root'] === 'string' ? flags['pool-root
 const SCAN_ROOT = real(typeof flags['scan-root'] === 'string' ? flags['scan-root'] : join(homedir(), 'workspace'));
 if (!POOL_ROOT || !SCAN_ROOT) { process.stderr.write('pool root / scan root does not exist\n'); process.exit(2); }
 // Git records no back-pointer from a store to the repos borrowing it, so a borrower outside every scanned root is
-// invisible: the operator names any other place such clones live (`:`-separated), and the report lists every root.
-const EXTRA_SCAN_ROOTS = (typeof flags['extra-scan-roots'] === 'string' ? flags['extra-scan-roots'].split(delimiter).filter(Boolean) : []).map((p) => {
+// invisible: the operator names any other place such clones live (`:`-separated; each root AND its children are
+// scanned), and the report lists every root. A bare or empty value is refused, never read as "no extra roots".
+const extraFlag = flags['extra-scan-roots'];
+const extraParts = extraFlag === undefined ? [] : typeof extraFlag === 'string' ? extraFlag.split(delimiter) : [''];
+if (extraParts.some((p) => !p)) { process.stderr.write('--extra-scan-roots needs non-empty directory paths\n'); process.exit(2); }
+const EXTRA_SCAN_ROOTS = extraParts.map((p) => {
   const r = real(p);
   if (!r) { process.stderr.write(`extra scan root ${p} does not exist\n`); process.exit(2); }
   return r;
 });
 const poolDir = join(POOL_ROOT, POOL);
-if (!real(poolDir) || !statSync(poolDir).isDirectory()) { process.stderr.write(`pool directory ${poolDir} does not exist\n`); process.exit(2); }
+let poolIsDir = false;
+try { poolIsDir = statSync(poolDir).isDirectory(); } catch { /* absent or unreadable: refused below */ }
+if (!poolIsDir) { process.stderr.write(`pool directory ${poolDir} does not exist or is not a readable directory\n`); process.exit(2); }
 const GC_TIMEOUT_MS = Number(flags['gc-timeout-ms']) || 900_000;
 const PRUNE_EXPIRE = typeof flags['prune-expire'] === 'string' ? flags['prune-expire'] : '1.hour.ago';
 const ONLY = typeof flags.lanes === 'string' ? new Set(flags.lanes.split(',').map((s) => Number(s.trim())).filter(Number.isInteger)) : null;
@@ -87,14 +96,15 @@ const refStorage = (dir) => { try { return git(dir, ['config', '--get-all', 'ext
 // A path git prints, byte-exact: whitespace is a legal path byte, so only the one trailing newline is git's.
 const gitPath = (dir, args) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(git(dir, args, 120_000, null)).replace(/\n$/, '');
 
-// Who borrows whose objects: repos under <scan-root>/*, each --extra-scan-roots/*, <tmpdir>/* and <pool-root>/*/*,
-// including Gitfile/common-dir stores.
-const SCANNED_ROOTS = [...new Set([SCAN_ROOT, ...EXTRA_SCAN_ROOTS, real(tmpdir()) || tmpdir()])];
+// Who borrows whose objects: repos under <scan-root>/*, each extra root and its children, <tmpdir>/* and
+// <pool-root>/*/*, including Gitfile/common-dir stores.
+const CHILD_ROOTS = [...new Set([SCAN_ROOT, ...EXTRA_SCAN_ROOTS, real(tmpdir()) || tmpdir()])];
+const SCANNED = [...EXTRA_SCAN_ROOTS, ...CHILD_ROOTS.map((r) => join(r, '*')), join(POOL_ROOT, '*', '*')];
 function borrowerMap() {
   const map = new Map();
-  const candidates = [];
+  const candidates = [...EXTRA_SCAN_ROOTS];
   const kids = (d) => { try { return readdirSync(d).map((n) => join(d, n)); } catch (err) { if (['ENOENT', 'ENOTDIR'].includes(err.code)) return []; throw err; } };
-  for (const r of SCANNED_ROOTS) candidates.push(...kids(r));
+  for (const r of CHILD_ROOTS) candidates.push(...kids(r));
   for (const pool of kids(POOL_ROOT)) candidates.push(...kids(pool));
   for (const repo of candidates) {
     const stores = [join(repo, '.git', 'objects'), join(repo, 'objects')];
@@ -265,9 +275,9 @@ for (const n of lanes) {
 }
 
 if (flags.json) {
-  process.stdout.write(JSON.stringify({ mode: APPLY ? 'apply' : 'dry-run', pool: POOL, scannedRoots: [...SCANNED_ROOTS, `${POOL_ROOT}/*`], totalBytes: total, rows }, null, 2) + '\n');
+  process.stdout.write(JSON.stringify({ mode: APPLY ? 'apply' : 'dry-run', pool: POOL, scannedRoots: SCANNED, totalBytes: total, rows }, null, 2) + '\n');
 } else {
-  process.stdout.write(`borrower scan roots: ${[...SCANNED_ROOTS, `${POOL_ROOT}/*`].join(', ')} (a borrower elsewhere is not seen: add --extra-scan-roots)\n`);
+  process.stdout.write(`borrower scan: ${SCANNED.join(', ')} (a borrower elsewhere is not seen: add --extra-scan-roots)\n`);
   for (const r of rows) {
     if (r.skipped) process.stdout.write(`lane-${r.lane}: SKIP ${r.skipped}\n`);
     else if (r.error) process.stdout.write(`lane-${r.lane}: ERROR ${r.error}\n`);

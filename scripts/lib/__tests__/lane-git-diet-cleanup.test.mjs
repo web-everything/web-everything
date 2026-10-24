@@ -7,7 +7,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync, cpSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { delimiter, join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH } from '../lane-git-diet.mjs';
 import { cleanupEligibility, CLEANUP_POOLS, parseCountObjects, projectedFreedBytes } from '../lane-git-diet-cleanup.mjs';
@@ -16,6 +16,8 @@ const REPO = join(import.meta.dirname, '..', '..', '..');
 const CLI = join(REPO, 'scripts', 'lane-git-diet.mjs');
 const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
 delete env.GIT_DIR; delete env.GIT_WORK_TREE; delete env.LANE_SESSION;
+// Tests run under VITEST, so a stray seam variable in the shell would pause or skew every CLI run: each test opts in.
+for (const key of Object.keys(env)) if (key.startsWith('LANE_GIT_DIET_TEST_')) delete env[key];
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const refs = (cwd, prefix = 'refs/remotes/origin/') => git(cwd, 'for-each-ref', '--format=%(refname)', prefix).split('\n').filter(Boolean);
 // Planted by the CLI startup-refusal test below. The guard holds them to the CLI's own IN_FLIGHT set, so every
@@ -976,7 +978,7 @@ describe('CLI pools and per-lane failure isolation', () => {
     mkdirSync(join(poolRoot, 'web-everything'), { recursive: true });
     const out = spawnSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--pool=frontierui'], { env, encoding: 'utf8' });
     expect(out.status).toBe(2);
-    expect(out.stderr).toMatch(/^pool directory .*frontierui does not exist\n$/);
+    expect(out.stderr).toMatch(/^pool directory .*frontierui does not exist or is not a readable directory\n$/);
   });
 
   it('a borrower outside the default roots is protected once its root is passed in --extra-scan-roots, and the roots are reported', () => {
@@ -992,16 +994,31 @@ describe('CLI pools and per-lane failure isolation', () => {
     // The default roots cannot see it: the report names exactly what was scanned, so the operator can tell.
     const plain = run();
     expect(plain.rows).toEqual([expect.objectContaining({ lane: 1, mode: 'dry-run' })]);
-    expect(plain.scannedRoots).not.toContain(realpathSync(elsewhere));
-    expect(plain.scannedRoots).toContain(realpathSync(scanRoot));
+    expect(plain.scannedRoots.some((r) => r.startsWith(realpathSync(elsewhere)))).toBe(false);
+    expect(plain.scannedRoots).toContain(join(realpathSync(scanRoot), '*'));
+    expect(plain.scannedRoots).toContain(join(realpathSync(poolRoot), '*', '*'));
     const before = git(dir, 'count-objects', '-v');
     const extra = run(`--extra-scan-roots=${elsewhere}`, '--prune-expire=now', '--apply', '--lanes=1');
-    expect(extra.scannedRoots).toContain(realpathSync(elsewhere));
+    expect(extra.scannedRoots).toEqual(expect.arrayContaining([realpathSync(elsewhere), join(realpathSync(elsewhere), '*')]));
     expect(extra.rows).toEqual([{ lane: 1, skipped: expect.stringMatching(/borrowed by .*elsewhere\/borrower/) }]);
+    // The named root is itself a candidate: a bare borrower passed directly is seen too, alongside a second root.
+    const direct = run(`--extra-scan-roots=${join(elsewhere, 'borrower')}${delimiter}${scanRoot}`, '--prune-expire=now', '--apply', '--lanes=1');
+    expect(direct.rows).toEqual([{ lane: 1, skipped: expect.stringMatching(/borrowed by .*elsewhere\/borrower/) }]);
     expect(git(dir, 'count-objects', '-v')).toBe(before);
-    const missing = spawnSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${scanRoot}`, `--extra-scan-roots=${join(root, 'nope')}`], { env, encoding: 'utf8' });
-    expect(missing.status).toBe(2);
-    expect(missing.stderr).toMatch(/extra scan root .*nope does not exist/);
+    // Never silently fewer roots than asked for: a missing, bare, empty or repeated value is refused.
+    const refused = (...args) => spawnSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${scanRoot}`, ...args], { env, encoding: 'utf8' });
+    for (const [args, message] of [
+      [[`--extra-scan-roots=${join(root, 'nope')}`], /extra scan root .*nope does not exist/],
+      [['--extra-scan-roots'], /--extra-scan-roots needs non-empty directory paths/],
+      [['--extra-scan-roots='], /--extra-scan-roots needs non-empty directory paths/],
+      [[`--extra-scan-roots=${elsewhere}${delimiter}`], /--extra-scan-roots needs non-empty directory paths/],
+      [[`--extra-scan-roots=${elsewhere}`, `--extra-scan-roots=${scanRoot}`], /--extra-scan-roots given more than once/],
+    ]) {
+      const out = refused(...args);
+      expect(out.status).toBe(2);
+      expect(out.stderr).toMatch(message);
+      expect(out.stdout).toBe('');
+    }
   }, 60_000);
 
   // The seams are honoured only under vitest: a stray seam variable in an operator's shell must change nothing.
