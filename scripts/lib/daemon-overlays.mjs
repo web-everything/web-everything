@@ -325,11 +325,12 @@ export function recordEdgeResolution(root, ref, {
  * @param {string} root
  * @param {string} ref
  * `requireRef`, when supplied, must still be registered under the list mutex, else nothing is removed: a swap that
- * retires `ref` for its replacement never leaves the list without both.
- * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string}} [o]
+ * retires `ref` for its replacement never leaves the list without both. `expectedOverlay`, when supplied, must still
+ * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed.
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object}} [o]
  * @returns {{removed:boolean, list:Array<object>}}
  */
-export function removeOverlay(root, ref, { env = process.env, why, requireRef } = {}) {
+export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay } = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
@@ -338,6 +339,9 @@ export function removeOverlay(root, ref, { env = process.env, why, requireRef } 
       throw new Error('replacement registration unavailable');
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
+    if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(list[idx], expectedOverlay)) {
+      throw new Error('registration changed; refusing removal');
+    }
     if (idx === -1) return { removed: false, list };
     const next = list.slice(0, idx).concat(list.slice(idx + 1));
     writeOverlays(root, next, { env });

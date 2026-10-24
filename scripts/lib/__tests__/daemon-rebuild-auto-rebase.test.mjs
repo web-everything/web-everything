@@ -816,9 +816,21 @@ describe('established overlay auto rebase', () => {
     expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: 'replacement registration unavailable' } });
   });
 
+  it('never removes an original the operator re-registers before cleanup takes the list mutex', async () => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    const remove = (root, r, opts) => { addOverlay(root, { ref, pr: 999, reason: 'operator re-registration' }, { env: f.env }); return removeOverlay(root, r, opts); };
+    expect(() => finishPendingSwaps({ root: f.root, env: f.env, run, removeOverlay: remove })).not.toThrow();
+    expect(readOverlays(f.root, { env: f.env })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ref, pr: 999 }), expect.objectContaining({ ref: replacement.ref }),
+    ]));
+    expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
+    expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: 'registration changed; refusing removal' } });
+  });
+
   describe('mechanism-pinned original', () => {
     const mechanism = 'scripts/lib/daemon-rebuild/prepare.mjs';
-    const pinnedFixture = async () => {
+    const pinnedFixture = async ({ forcePush = false } = {}) => {
       const f = fixture({
         baseFiles: { 'scripts/lib/daemon-rebuild.mjs': 'core\n', 'scripts/lib/daemon-overlays.mjs': 'core\n', [mechanism]: 'base\n' },
         branchFiles: { [mechanism]: 'overlay\n' }, mainFiles: { [mechanism]: 'main\n' }, resolvedFiles: { [mechanism]: 'overlay + main\n' },
@@ -827,6 +839,13 @@ describe('established overlay auto rebase', () => {
       const live = await planRebuild({ git: (a, o) => run(a, { cwd: f.root, ...o }), headSha: f.baseSha, mainRef: 'origin/main', overlays: [overlay] });
       f.moveMain(); ok(f.root, ['reset', '--hard', live.finalSha]);
       writeRebuildState(f.root, { adopted: { head: live.finalSha } }, f.env);
+      if (forcePush) {
+        // The author rewrites the live overlay: the repair then carries the new tip, never the head the build runs.
+        ok(f.root, ['checkout', '-qb', 'rewrite', f.baseSha]);
+        write(f.root, 'worker.mjs', 'rewritten\n'); write(f.root, mechanism, 'rewritten\n');
+        ok(f.root, ['commit', '-qam', 'rewritten hotfix']); ok(f.root, ['push', '-qf', 'origin', `HEAD:${ref}`]);
+        ok(f.root, ['checkout', '-q', 'main']);
+      }
       return { f, replacement: await job(f) };
     };
     const prepare = (f, runFn = run) => prepareRebuild({ root: f.root, env: f.env, run: runFn, log: {}, now: Date.now, prState: async () => 'OPEN', prBaseChain: async () => null });
@@ -851,6 +870,14 @@ describe('established overlay auto rebase', () => {
       expect(held.result.reason).toBe('established-overlay-conflict');
       expect(held.result.detail.refs).toEqual([ref]);
       expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toContain(ref);
+    });
+
+    it('still holds when the repair carries a force-pushed tip but not the head the running build carries', async () => {
+      const { f, replacement } = await pinnedFixture({ forcePush: true });
+      expect(run(['merge-base', '--is-ancestor', f.oldSha, replacement.newSha], { cwd: f.root }).status).toBe(1);
+      const held = await prepare(f);
+      expect(held.result.reason).toBe('established-overlay-conflict');
+      expect(held.result.detail.refs).toEqual([ref]);
     });
   });
 

@@ -350,9 +350,11 @@ export async function prepareRebuild({
   // lost overlays are rebased onto main (or retired). Nothing is applied from this plan.
   // A lost overlay whose current tip this build still contains is live through its carrier — e.g. a mechanism-pinned
   // original (never set aside as stack-contained) beside its registered auto-rebase repair. Holding on it would keep
-  // the repair from ever being adopted. Ancestry git cannot confirm keeps the overlay lost (fail closed).
-  const lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha && plan.finalSha
-    && git(['merge-base', '--is-ancestor', l.sha, plan.finalSha]).status === 0));
+  // the repair from ever being adopted. Only a tip the running build already carries qualifies: a changed tip says
+  // nothing about the older live heads it replaced. Ancestry git cannot confirm keeps the overlay lost (fail closed).
+  const contains = (sha, build) => !!build && git(['merge-base', '--is-ancestor', sha, build]).status === 0;
+  const lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha
+    && contains(l.sha, prevHead) && contains(l.sha, plan.finalSha)));
   if (!mainOnly && lost.length > 0) {
     const detail = {
       refs: lost.map((l) => l.ref), lost,
