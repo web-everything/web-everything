@@ -455,3 +455,88 @@ function withContainmentLane(check) {
     check({ base, origin, reference, lane, git, run });
   } finally { rmSync(base, { recursive: true, force: true }); }
 }
+
+// lane-pool.mjs LANE_GIT_ENV + dropGitLocationEnv: an inherited GIT_DIR / GIT_WORK_TREE / GIT_REFERENCE_BACKEND must
+// never redirect a lane git call — gitQuiet (refresh), the mutating git() helper (acquire's checkout/clean),
+// reclaim's and salvage-reclaim's direct `reset --hard` / `clean -fd`, or a library's git (status proof, history
+// snapshot, salvage refs) — into another repository. A PATH stub records each call's env; the decoy the inherited
+// env points at must come through untouched.
+function withRedirectingEnv({ base, git }, check) {
+  git(['init', '--quiet', '--initial-branch=decoy', decoy]);
+  git(['config', 'user.email', 'test@example.com'], decoy);
+  git(['config', 'user.name', 'Test'], decoy);
+  writeFileSync(join(decoy, 'decoy.txt'), 'committed\n');
+  git(['add', 'decoy.txt'], decoy);
+  git(['commit', '--quiet', '-m', 'decoy'], decoy);
+  writeFileSync(join(decoy, 'decoy.txt'), 'uncommitted decoy edit\n');
+  writeFileSync(join(decoy, 'untracked.txt'), 'untracked decoy file\n');
+  const decoyHead = git(['rev-parse', 'HEAD'], decoy);
+
+  const bin = join(base, 'bin'), trace = join(base, 'git-env-trace.jsonl');
+  mkdirSync(bin);
+  writeFileSync(trace, '');
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const { appendFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const commandArgs = args.slice();
+while (commandArgs[0] === '-c') commandArgs.splice(0, 2);
+const leaked = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_REFERENCE_BACKEND'].filter((k) => k in process.env);
+appendFileSync(${JSON.stringify(trace)}, JSON.stringify({ args: commandArgs, cwd: process.cwd(), leaked, paranoia: process.env.GIT_REF_PARANOIA ?? null }) + '\\n');
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
+process.exit(result.status ?? 1);
+`);
+  for (const [name, source] of [['claude', '#!/bin/sh\necho "[]"\n'], ['lsof', '#!/bin/sh\nexit 0\n']]) writeFileSync(join(bin, name), source);
+  for (const name of ['git', 'claude', 'lsof']) chmodSync(join(bin, name), 0o755);
+  const hostile = {
+    PATH: `${bin}:${process.env.PATH}`, WE_LANE_SALVAGE_QUIET_MIN: '0', WE_LANE_SALVAGE_DIR: join(base, 'salvage'),
+    GIT_DIR: join(decoy, '.git'), GIT_WORK_TREE: decoy, GIT_INDEX_FILE: join(decoy, '.git', 'index'),
+    GIT_REFERENCE_BACKEND: 'files', GIT_REF_PARANOIA: '0',
+  };
+  const calls = () => readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const ran = (pred) => calls().some(({ args }) => pred(args));
+  check({ hostile, ran });
+
+  expect(ran((a) => a[0] === 'reset' && a.includes('--hard'))).toBe(true);
+  expect(ran((a) => a[0] === 'clean' && a.includes('-fd'))).toBe(true);
+  expect(calls().filter((c) => c.leaked.length)).toEqual([]);
+  expect(calls().filter((c) => c.paranoia === '0')).toEqual([]);
+  expect(git(['rev-parse', 'HEAD'], decoy)).toBe(decoyHead);
+  expect(readFileSync(join(decoy, 'decoy.txt'), 'utf8')).toBe('uncommitted decoy edit\n');
+  expect(readFileSync(join(decoy, 'untracked.txt'), 'utf8')).toBe('untracked decoy file\n');
+  expect(git(['for-each-ref', '--format=%(refname)'], decoy)).toBe('refs/heads/decoy');
+}
+
+it('refresh, reclaim and acquire never let an inherited GIT_DIR redirect a lane git call', () => {
+  withContainmentLane(({ base, origin, lane, git, run }) => {
+    git(['push', '--quiet', origin, 'HEAD:refs/heads/lane/landed'], lane);
+    git(['fetch', '--quiet', 'origin'], lane);
+    withRedirectingEnv({ base, git }, ({ hostile, ran }) => {
+      const refresh = run(['refresh', '--count=1'], hostile);
+      expect(refresh.status, refresh.stderr).toBe(0);
+      const reclaim = run(['reclaim', '--lane=1', '--json'], hostile);
+      expect(reclaim.status, reclaim.stderr).toBe(0);
+      expect(JSON.parse(reclaim.stdout).reclaimed, reclaim.stdout).toBe(true);
+      expect(git(['rev-parse', 'HEAD'], lane)).toBe(git(['rev-parse', 'refs/heads/trunk'], origin));
+      const acquire = run(['acquire', '--lane=1', '--session=location-scrub', '--hard-max=1'], hostile);
+      expect(acquire.status, acquire.stderr).toBe(0);
+      expect(acquire.stdout.trim()).toBe(lane);
+      run(['release', '--lane=1', '--session=location-scrub'], hostile);
+      expect(ran((a) => a[0] === 'config' && a.includes('gc.auto'))).toBe(true);
+      expect(ran((a) => a[0] === 'checkout' && a.includes('-B'))).toBe(true);
+    });
+  });
+}, 60000);
+
+it('salvage-reclaim never lets an inherited GIT_DIR redirect its salvage refs or reset', () => {
+  withContainmentLane(({ base, origin, lane, git, run }) => {
+    withRedirectingEnv({ base, git }, ({ hostile }) => {
+      const reclaim = run(['reclaim', '--lane=1', '--salvage', '--json'], hostile);
+      expect(reclaim.status, reclaim.stderr).toBe(0);
+      expect(JSON.parse(reclaim.stdout).reclaimed, reclaim.stdout).toBe(true);
+      expect(git(['rev-parse', 'HEAD'], lane)).toBe(git(['rev-parse', 'refs/heads/trunk'], origin));
+      expect(git(['for-each-ref', '--format=%(refname)', 'refs/salvage/'], lane)).not.toBe('');
+    });
+  });
+}, 60000);

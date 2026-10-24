@@ -71,6 +71,18 @@ export function scrubGitLocationEnv(env) {
 }
 
 /**
+ * Deletes {@link GIT_REPO_LOCATION_ENV_KEYS} from `env` IN PLACE — for `process.env` of a lane CLI, so the git a
+ * library spawns from `process.env` (status proofs, history snapshots, salvage refs) is not redirected either. An
+ * inherited `GIT_REF_PARANOIA=0` is dropped back to git's default; callers that want `1` use {@link scrubGitLocationEnv}.
+ * @param {Record<string,string|undefined>} env
+ * @returns {Record<string,string|undefined>} the same `env`
+ */
+export function dropGitLocationEnv(env) {
+  for (const key of GIT_REPO_LOCATION_ENV_KEYS) delete env[key];
+  return env;
+}
+
+/**
  * {@link scrubGitLocationEnv}, and also without any env config source (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` /
  * `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`, `GIT_CONFIG_GLOBAL` / `SYSTEM`): for a check that reads the lane's config
  * and must see exactly what git will use. Run it BEFORE {@link laneGitHardeningEnv}: the pins are appended after any
