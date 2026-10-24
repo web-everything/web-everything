@@ -277,6 +277,105 @@ describe('prototype-load', () => {
       expect(f.records[0]).toMatchObject({ stopReason: 'stale-registration', combinedTests: r.combinedTests, staleTolerated: [] });
     }
   });
+  it('blocks admission for truncated combined evidence when selected tests pass but an omitted related test fails', async () => {
+    const { MAX_RELATED_TARGETS } = await import('../../lib/verify-lane-gate.mjs');
+    const { buildReverseImportGraph, selectRelatedTests } = await import('../../lib/related-test-selection.mjs');
+    const sources = new Map([
+      ['x', ''], ['bridge.mjs', "import './x';"], ['deep.mjs', "import './bridge.mjs';"],
+      ['omitted.test.mjs', "import './deep.mjs';"],
+      ...Array.from({ length: MAX_RELATED_TARGETS }, (_, i) => [`passing-${i}.test.mjs`, "import './x';"]),
+    ]);
+    const reverse = buildReverseImportGraph({ files: [...sources.keys()], readFile: (file) => sources.get(file) });
+    const selection = selectRelatedTests({ changedFiles: ['x'], reverse, maxTests: MAX_RELATED_TARGETS, maxDepth: 2 });
+    expect(selection.status).toBe('selection-truncated');
+    expect(selection.tests).toHaveLength(MAX_RELATED_TARGETS);
+    expect(selection.tests).not.toContain('omitted.test.mjs');
+    // Model the regression: the bounded subset passes, but complete evidence would fail.
+    const testRunner = (tests) => {
+      if (tests.includes('omitted.test.mjs')) throw Object.assign(new Error('omitted related regression'), { status: 1, stderr: 'omitted related regression' });
+      return '';
+    };
+    expect(testRunner(selection.tests)).toBe('');
+    expect(() => testRunner([...selection.tests, 'omitted.test.mjs'])).toThrow('omitted related regression');
+    const queuedRun = vi.fn((args) => testRunner(args));
+    const commands = [];
+    const worktree = '/tmp/prototype-combined-fixture';
+    const fs = {
+      mkdtempSync: vi.fn(() => worktree), existsSync: () => false,
+      readFileSync: (path) => {
+        const file = path.slice(worktree.length + 1);
+        if (!sources.has(file)) throw new Error(`unexpected read: ${file}`);
+        return sources.get(file);
+      },
+      rmSync: vi.fn(),
+    };
+    const exec = (command, args) => {
+      commands.push({ command, args });
+      if (command === 'node') return queuedRun(args);
+      if (args[0] === '-C') return SHA;
+      if (args[0] === 'rev-parse') return SHA;
+      if (args[0] === 'merge-base') return '';
+      if (args[0] === 'fetch' || args[0] === 'worktree') return '';
+      if (args[0] === 'merge-tree') return TREE;
+      if (args[0] === 'commit-tree') return MERGE;
+      if (args[0] === 'ls-files') return [...sources.keys()].join('\0') + '\0';
+      throw new Error(`unexpected command: ${command} ${args}`);
+    };
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      combinedTest: (input) => defaultDeps().combinedTest(input, { exec, fs, env: {},
+        settings: { combinedTest: { waitMs: 600000, timeoutMs: 1200000, maxBuffer: 16 * 1024 * 1024 } } }) });
+    const result = await f.run();
+    expect(result).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'stale-registration',
+      blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: related-tests-truncated' },
+      combinedTests: { testCount: 0, result: expect.stringContaining('Narrow the candidate or rebase and retest') }, staleTolerated: [] });
+    expect(queuedRun).not.toHaveBeenCalled();
+    expect(commands).toContainEqual({ command: 'git', args: ['worktree', 'remove', '--force', worktree] });
+    expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(f.records[0]).toMatchObject({ ok: false, combinedTests: result.combinedTests });
+  });
+  it('blocks an overlapping ref absent from HEAD and candidate when its inclusion cannot be proved', async () => {
+    const head = 'd'.repeat(40), staleTip = 'e'.repeat(40);
+    const commands = [];
+    // Even a passing runner cannot rescue a tree that excludes the registered work.
+    const queuedRun = vi.fn(() => 'passed');
+    const mkdtempSync = vi.fn();
+    const exec = (command, args) => {
+      commands.push({ command, args });
+      if (command === 'node') return queuedRun(args);
+      if (args[0] === '-C') return head;
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'rev-parse') return staleTip;
+      if (args[0] === 'merge-base') throw Object.assign(new Error('registered work absent'), { status: 1 });
+      // Without the containment guard, a conflicting inclusion would never be attempted.
+      if (args[0] === 'merge-tree' && args.includes(staleTip)) throw Object.assign(new Error('registered changes conflict'), { status: 1 });
+      if (args[0] === 'merge-tree') return TREE;
+      throw new Error(`unexpected command: ${command} ${args}`);
+    };
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      combinedTest: (input) => defaultDeps().combinedTest(input, { exec, fs: { mkdtempSync }, env: {},
+        settings: { combinedTest: { waitMs: 600000, timeoutMs: 1200000, maxBuffer: 16 * 1024 * 1024 } } }) });
+    const result = await f.run();
+    expect(result).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'stale-registration',
+      blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: combined-ref-not-contained' },
+      combinedTests: { testCount: 0, result: expect.stringContaining('Include its current tip in a tested replacement') }, staleTolerated: [] });
+    expect(commands).toContainEqual({ command: 'git', args: ['fetch', 'origin', 'refs/heads/lane/old'] });
+    expect(commands).toContainEqual({ command: 'git', args: ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'] });
+    expect(commands.filter(({ args }) => args[0] === 'merge-base').map(({ args }) => args)).toEqual([
+      ['merge-base', '--is-ancestor', staleTip, head], ['merge-base', '--is-ancestor', staleTip, SHA],
+    ]);
+    expect(commands.filter(({ args }) => args[0] === '-C')).toEqual([
+      { command: 'git', args: ['-C', '/home/test/workspace/wev-control', 'rev-parse', 'HEAD'] },
+    ]);
+    expect(mkdtempSync).not.toHaveBeenCalled();
+    expect(queuedRun).not.toHaveBeenCalled();
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(f.records[0]).toMatchObject({ ok: false, combinedTests: result.combinedTests });
+  });
   it('refuses an overlapping stale ref when combined-tree tests are unrunnable (throws)', async () => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
       combinedTest: () => { throw new Error('test runner unavailable'); } });

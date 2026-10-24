@@ -6,25 +6,103 @@
  */
 import { execFileSync } from 'node:child_process';
 import nodeFs from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { cloneKey } from '../lib/daemon-overlays.mjs';
+import { buildReverseImportGraph, selectRelatedTests, testDepths, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+
+// prototypeLoad.combinedTest settings, resolved and recorded through the usual cascade.
+// Defaults: ten minutes for admission, twenty minutes total, 16 MiB child output.
+const COMBINED_TEST_DEFAULTS = Object.freeze({ waitMs: 600000, timeoutMs: 1200000, maxBuffer: 16 * 1024 * 1024 });
+
+/** Real combined-tree proof, rebound by the loader to its resolved settings and injected IO. */
+async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, { exec, fs, env, settings }) {
+  const limits = settings.combinedTest;
+  for (const key of Object.keys(COMBINED_TEST_DEFAULTS)) {
+    if (!Number.isSafeInteger(limits?.[key]) || limits[key] <= 0) throw new Error(`invalid combinedTest.${key}; configure a positive bounded value and retry`);
+  }
+  const run = (command, args, cwd = repo, timeout = 120000) => String(exec(command, args, {
+    cwd, env, encoding: 'utf8', timeout, maxBuffer: limits.maxBuffer, shell: false, stdio: ['ignore', 'pipe', 'pipe'],
+  }) || '');
+  const git = (...args) => run('git', args).trim();
+  const head = git('-C', clone, 'rev-parse', 'HEAD');
+  if (!validSha(head) || !validSha(candidateSha)) throw new Error('invalid combined-tree parent');
+  git('fetch', clone, head);
+  if (!Array.isArray(refs) || !refs.length || !refs.every(safeRegistrationRef)) throw new Error('invalid combined-tree refs');
+  const containedIn = (tip, parent) => {
+    try { git('merge-base', '--is-ancestor', tip, parent); return true; }
+    catch (e) { if (e.status === 1) return false; throw e; }
+  };
+  // Only waive refs whose fetched tips are included in the immutable proof parents.
+  // Fetch into this lane, never into the daemon clone; do not trust a cached origin ref.
+  for (const ref of new Set(refs)) {
+    git('fetch', 'origin', `refs/heads/${ref}`);
+    const tip = git('rev-parse', '--verify', 'FETCH_HEAD^{commit}');
+    if (!validSha(tip)) throw new Error(`invalid combined-tree ref tip: ${ref}`);
+    if (!containedIn(tip, head) && !containedIn(tip, candidateSha)) return {
+      ok: false, reason: 'combined-ref-not-contained', testCount: 0,
+      result: `Registered ref ${ref} is absent from the combined-tree parents. Include its current tip in a tested replacement or wait for daemon adoption, then retry.`,
+    };
+  }
+  let tree;
+  try { tree = git('merge-tree', '--write-tree', head, candidateSha).split(/\r?\n/)[0]; }
+  catch (e) { if (e.status === 1) return { ok: false, reason: 'combined-merge-conflict' }; throw e; }
+  if (!validSha(tree)) throw new Error('invalid combined tree');
+  const commit = git('commit-tree', tree, '-p', head, '-p', candidateSha, '-m', 'Prototype combined-tree test');
+  if (!validSha(commit)) throw new Error('invalid combined-tree commit');
+  const worktree = fs.mkdtempSync(join(env.TMPDIR || tmpdir(), 'prototype-combined-'));
+  try {
+    git('worktree', 'add', '--detach', worktree, commit);
+    if (fs.existsSync(join(repo, 'node_modules'))) fs.symlinkSync(join(repo, 'node_modules'), join(worktree, 'node_modules'), 'dir');
+    const files = run('git', ['ls-files', '-z'], worktree).split('\0').filter(Boolean);
+    // The shared graph skips unreadable sources; refuse incomplete reads here instead.
+    const readErrors = [];
+    const reverse = buildReverseImportGraph({ files, readFile: (file) => {
+      try { return fs.readFileSync(join(worktree, file), 'utf8'); }
+      catch (e) { readErrors.push(file); throw e; }
+    } });
+    if (readErrors.length) throw new Error('combined-tree graph incomplete; inspect unreadable tracked sources and retry');
+    // This module loads its own settings: keep it out of injected-only loader construction.
+    const { MAX_RELATED_TARGETS } = await import('../lib/verify-lane-gate.mjs');
+    const selection = selectRelatedTests({ changedFiles, reverse, maxTests: MAX_RELATED_TARGETS, maxDepth: 2 });
+    // A local gate's bounded subset is insufficient to waive an admission blocker.
+    if (selection.status === 'selection-truncated') return {
+      ok: false, reason: 'related-tests-truncated', testCount: 0,
+      result: `Incomplete evidence: selection omits ${selection.droppedCount} of ${selection.fullTestCount} related tests. Narrow the candidate or rebase and retest the overlapping refs before retrying.`,
+    };
+    const tests = [...testDepths(changedFiles, reverse).keys()].filter(isVitestTestFile).sort();
+    if (!tests.length) return { ok: false, reason: 'no-related-tests', testCount: 0 };
+    const args = [join(repo, 'scripts/readiness/heavy-admission.mjs'), 'run', `--wait-ms=${limits.waitMs}`, '--', 'npx', 'vitest', 'run', ...tests];
+    const command = ['node', 'scripts/readiness/heavy-admission.mjs', ...args.slice(1)].map((arg) => JSON.stringify(arg)).join(' ');
+    try {
+      run('node', args, worktree, limits.timeoutMs);
+      return { ok: true, command, result: `passed ${tests.length} tests`, testCount: tests.length };
+    } catch (e) {
+      if (!Number.isInteger(e.status)) throw e;
+      const output = `${e.stdout || ''}${e.stderr || ''}`.replaceAll(worktree, '<worktree>').replaceAll(repo, '<repo>').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+      return { ok: false, command, result: `exit ${e.status}: ${output.slice(-400)}`, testCount: tests.length, reason: 'tests-failed' };
+    }
+  } finally {
+    try { git('worktree', 'remove', '--force', worktree); }
+    finally { fs.rmSync(worktree, { recursive: true, force: true }); }
+  }
+}
 
 /** The sole real IO binding; constructing an injected loader performs no ambient reads. */
 export function defaultDeps() {
   return { exec: execFileSync, fs: nodeFs, now: () => Date.now(), sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
-    env: { ...process.env, HOME: homedir() }, settings: undefined, cloneKey };
+    env: { ...process.env, HOME: homedir() }, settings: undefined, cloneKey, combinedTest: defaultCombinedTest };
 }
-export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, cloneKey: keyForClone = cloneKey }) {
+export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
-  const policy = resolveCascade({ standard: {}, platform: platform.prefs.prototypeLoad, tool });
+  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS }, platform: platform.prefs.prototypeLoad, tool });
   const config = policy.value;
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
@@ -32,6 +110,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
   if (env.WE_OVERLAY_NO_PR?.trim() === 'refuse') childEnv.WE_OVERLAY_NO_PR = 'refuse';
   // A state location is safe configuration, unlike credential or admission-bypass variables.
   if (env.WE_DAEMON_OVERLAY_DIR) childEnv.WE_DAEMON_OVERLAY_DIR = expand(env.WE_DAEMON_OVERLAY_DIR);
+  const runCombinedTest = combinedTest && combinedTest !== defaultCombinedTest ? combinedTest
+    : (input) => defaultCombinedTest(input, { exec, fs, env: childEnv, settings: config });
   const execute = (command, args) => {
     try { return { code: 0, stdout: String(exec(command, args, { cwd: repo, env: childEnv, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) || '') }; }
     catch (e) { return { code: Number.isInteger(e.status) ? e.status : -1, stdout: String(e.stdout || ''), error: String(e.stderr || e.message || e) }; }
@@ -126,6 +206,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       if (listing.code !== 0 || !Array.isArray(rows) || rows.some((r) => !safeRegistrationRef(r?.ref))) return stop('check-unverifiable', { listing });
       const established = [...new Set(rows.map((r) => r.ref))];
       const contained = [], blocking = [];
+      const overlapping = [], combinedChanged = new Set(effectivePaths);
       const blockingReasons = Object.create(null);
       out.staleChecks = {};
       for (const ref of established.filter((ref) => ref !== out.effectiveRef)) {
@@ -147,7 +228,13 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
             const reason = !staleChanged.length ? 'stale-files-unknown'
               : out.check.ok !== true || out.check.clean !== true ? 'candidate-not-clean'
               : overlap.length ? `overlap-with-candidate: ${overlap.join(', ')}` : null;
-            if (reason) { blocking.push(ref); blockingReasons[ref] = reason; }
+            if (reason) {
+              blocking.push(ref); blockingReasons[ref] = reason;
+              if (reason.startsWith('overlap-with-candidate:')) {
+                overlapping.push(ref);
+                for (const file of staleFiles) combinedChanged.add(file);
+              }
+            }
             else {
               const cherry = git('cherry', 'origin/main', `origin/${ref}`);
               const lines = cherry.stdout.trimEnd().split(/\r?\n/);
@@ -160,7 +247,36 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         }
       }
       out.contained = contained;
-      if (blocking.length) return stop('stale-registration', { message: blocking.map((ref) => `stale-registration: ${ref} (${blockingReasons[ref]})`).join('; '), blocking, blockingReasons });
+      if (overlapping.length && blocking.every((ref) => overlapping.includes(ref))) {
+        let passed = false;
+        let failure;
+        try {
+          const evidence = await runCombinedTest({ clone: out.clone, candidateSha: out.effectiveSha,
+            changedFiles: [...combinedChanged].sort(), refs: overlapping });
+          if (!evidence || typeof evidence.ok !== 'boolean') throw new Error('incomplete combined-test evidence');
+          const { ok, reason, ...summary } = evidence;
+          out.combinedTests = summary;
+          passed = ok === true;
+          failure = `combined-tests-failed: ${reason || 'tests-failed'}`;
+        } catch (e) {
+          const message = String(e.message || e);
+          out.combinedTests = { result: message };
+          failure = `combined-tests-unrunnable: ${message}`;
+        }
+        for (const ref of overlapping) {
+          if (!passed) { blockingReasons[ref] += `; ${failure}`; continue; }
+          blocking.splice(blocking.indexOf(ref), 1);
+          delete blockingReasons[ref];
+          const cherry = git('cherry', 'origin/main', `origin/${ref}`);
+          const landedByContent = cherry.code === 0 && cherry.stdout.trimEnd().split(/\r?\n/).every((line) => line.startsWith('-'));
+          out.staleTolerated.push({ ref, landedByContent, why: 'pre-existing stale registration; combined-tree tests passed', combinedTests: out.combinedTests });
+        }
+        out.staleTolerated.sort((a, b) => established.indexOf(a.ref) - established.indexOf(b.ref));
+      }
+      if (blocking.length) return stop('stale-registration', {
+        message: blocking.map((ref) => `stale-registration: ${ref} (${blockingReasons[ref]})`).join('; '), blocking, blockingReasons,
+        fallback: 'Retain the registrations; rebase and retest the overlapping refs, or resolve the combined-test evidence failure and retry.',
+      });
       if (!out.check.ok) return stop('check-unverifiable');
       if (!out.check.clean) return stop('check-conflict');
       out.swap = { contained };
