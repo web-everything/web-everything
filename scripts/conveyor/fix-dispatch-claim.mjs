@@ -343,6 +343,22 @@ export function refreshLiveFixDispatchClaims({
       }
       continue;
     }
+    // A stale working row may point at a recycled spare. Unknown identities or missing pids retain the claim.
+    const nonTerminal = agentsAll.filter((a) => !['done', 'stopped', 'failed'].includes(a.state));
+    if (!isAwaiting && nonTerminal.length && nonTerminal.every((a) => Number.isInteger(a.pid))) {
+      const identities = nonTerminal.map((a) => {
+        try { return identity(a.pid); } catch { return null; }
+      });
+      if (identities.every((verdict) => verdict?.alive === false)) {
+        const current = readLockEntry(lockRoot, fixDispatchResource({ repo, pr, kind }));
+        if (current?.owner === entry.owner && current.meta?.claimedAt === claimedAt) {
+          const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
+          if (result.released) released.push({ repo, pr, kind, owner: entry.owner,
+            reason: `session-identity-dead (${identities[0].reason})` });
+        }
+        continue;
+      }
+    }
     const resource = fixDispatchResource({ repo, pr, kind });
     const current = readLockEntry(lockRoot, resource);
     if (!current || current.owner !== entry.owner) continue;

@@ -8,9 +8,10 @@ import { isClaimRunnerDead } from '../dispatch-throttle.mjs';
 import { enrichAgents, probePid } from '../../conveyor/reconcile-pass.mjs';
 import { assessLiveness } from '../../conveyor/reconcile-core.mjs';
 import { defaultIsPidAlive } from '../../conveyor/driver-watchdog.mjs';
+import { acquireFixClaim } from '../../conveyor/fix-procedure.mjs';
 import {
   acquireFixDispatchClaim, readFixDispatchClaim, stampBorrowedRunnerPid,
-  refreshLiveFixDispatchClaims,
+  refreshLiveFixDispatchClaims, releaseFixDispatchClaim,
 } from '../../conveyor/fix-dispatch-claim.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
@@ -114,6 +115,83 @@ describe('PID snapshot safety boundaries', () => {
     expect(assessLiveness([{ agent }])).toMatchObject({ kind: 'liveness-unknown' });
     vi.spyOn(process, 'kill').mockReturnValue(true);
     expect(defaultIsPidAlive(PID, identity)).toBeNull();
+  });
+});
+
+describe('session-bound fixing claim identity safety', () => {
+  it.each([
+    ['releases a working row with a recycled-spare pid and logs the reason', [], true],
+    ['releases when all working rows have dead identities', [{ pid: PID + 1 }], true],
+    ['unknown identity keeps the claim', [{ pid: PID, unknown: true }], false],
+    ['a second live row keeps the claim', [{ pid: PID + 1, live: true }], false],
+    ['a second unknown row keeps the claim', [{ pid: PID + 1, unknown: true }], false],
+    ['a throwing identity probe keeps the claim', [{ pid: PID, throws: true }], false],
+    ['a row without pid keeps the claim', [{}], false],
+    ['a non-integer pid keeps the claim', [{ pid: String(PID) }], false],
+    ['terminal rows do not veto dead identity release', [{ state: 'done' }], true],
+  ])('%s', (_name, extra, released) => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'session-identity-release-'));
+    const claim = { repo: 'we', pr: 42, kind: 'fixing', lockRoot };
+    const rows = (extra.some(row => row.pid === PID) ? extra : [{ pid: PID }, ...extra])
+      .map(row => ({ name: 'fix-42', state: 'working', sessionId: 'bound-fix', ...row }));
+    const exec = vi.fn((_cmd, args) => {
+      const row = rows.find(row => row.pid === Number(args[1]));
+      if (row?.unknown) throw new Error('unreadable ps');
+      return `S ${START} ${row?.live ? ARGV : 'claude bg-spare --bg-spare /tmp/x.sock'}\n`;
+    });
+    const identity = vi.fn(pid => {
+      if (rows.find(row => row.pid === pid)?.throws) throw new Error('identity probe failed');
+      return pidIdentity(pid, { exec });
+    });
+    try {
+      expect(acquireFixClaim({ ...claim, who: 'fix-42', sessionId: 'bound-fix', nowMs: NOW }).ok).toBe(true);
+      expect(readFixDispatchClaim(claim).meta).not.toHaveProperty('runnerPid');
+      const result = refreshLiveFixDispatchClaims({
+        lockRoot, identity, listAgentsAll: () => rows,
+        hungInfoFor: () => null, awaitingVerifyFor: null,
+        nowMs: NOW + 1000, nowIso: () => new Date(NOW + 1000).toISOString(),
+      });
+      if (released) {
+        expect(result.refreshed).toEqual([]);
+        expect(result.released).toEqual([{ repo: 'we', pr: 42, kind: 'fixing', owner: 'fixer:fix-42',
+          reason: 'session-identity-dead (recycled-spare)' }]);
+        expect(readFixDispatchClaim(claim)).toBeNull();
+      } else {
+        expect(result.released ?? []).toEqual([]);
+        expect(result.refreshed).toHaveLength(1);
+        expect(readFixDispatchClaim(claim).heartbeatAt).toBe(new Date(NOW + 1000).toISOString());
+      }
+    } finally {
+      rmSync(lockRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['owner', 'claimedAt'])('does not release a fixing claim whose %s changes during the identity probe', changed => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'session-identity-race-'));
+    const claim = { repo: 'we', pr: 42, kind: 'fixing', lockRoot };
+    const identity = vi.fn(() => {
+      releaseFixDispatchClaim({ ...claim, owner: 'fixer:fix-42' });
+      acquireFixClaim({ ...claim, who: changed === 'owner' ? 'new-fixer' : 'fix-42',
+        sessionId: 'new-session', nowMs: NOW + 500 });
+      return { alive: false, reason: 'recycled-spare' };
+    });
+    try {
+      acquireFixClaim({ ...claim, who: 'fix-42', sessionId: 'bound-fix', nowMs: NOW });
+      const result = refreshLiveFixDispatchClaims({
+        lockRoot, identity,
+        listAgentsAll: () => [{ name: 'fix-42', state: 'working', pid: PID }],
+        hungInfoFor: () => null, awaitingVerifyFor: null,
+        nowMs: NOW + 1000, nowIso: () => new Date(NOW + 1000).toISOString(),
+      });
+      expect(identity).toHaveBeenCalledWith(PID);
+      expect(result.refreshed).toEqual([]);
+      expect(result.released ?? []).toEqual([]);
+      expect(readFixDispatchClaim(claim).meta).toMatchObject({
+        sessionId: 'new-session', claimedAt: new Date(NOW + 500).toISOString(),
+      });
+    } finally {
+      rmSync(lockRoot, { recursive: true, force: true });
+    }
   });
 });
 

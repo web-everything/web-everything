@@ -12,9 +12,8 @@
  * and an observed dispatch decision. The bounded failure names the stuck PR/session for operator investigation.
  */
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { scenario, runScenario } from '../../__tests__/sim/scenario.mjs';
 import { sessionMatches } from '../invariants.mjs';
 import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../../../lib/required-status-checks.mjs';
@@ -40,19 +39,13 @@ export default {
   },
   fixPresent(root) {
     try {
-      // Probe behavior in a fresh module process, so a forced-alive mutation is
-      // absent even though the function's declaration still exists. ps is injected
-      // only for fix detection; the scenario below always probes a REAL process.
-      const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
-        const { pidIdentity } = await import(process.argv[1]);
-        const verdict = pidIdentity(1, { exec: () =>
-          'S Sat Oct 24 12:00:00 2026 claude bg-spare --bg-spare /tmp/x.sock' });
-        process.stdout.write(JSON.stringify(verdict));
-      `, pathToFileURL(join(root, 'scripts/lib/pid-alive.mjs')).href], {
-        encoding: 'utf8', timeout: 5000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      const verdict = JSON.parse(output);
-      return verdict.alive === false && verdict.reason === 'recycled-spare';
+      // Fix detection must not run the behavior under test: a regression must
+      // remain a required GREEN test, never turn itself into an expected failure.
+      return /export function pidIdentity\(/.test(readFileSync(join(root, 'scripts/lib/pid-alive.mjs'), 'utf8'))
+        && /export function probePid\([^\n]*identity = pidIdentity\)/.test(
+          readFileSync(join(root, 'scripts/conveyor/reconcile-pass.mjs'), 'utf8'))
+        && /export function defaultIsPidAlive\([^\n]*identity = pidIdentity\)/.test(
+          readFileSync(join(root, 'scripts/conveyor/driver-watchdog.mjs'), 'utf8'));
     } catch { return false; }
   },
   async run({ log } = {}) {
@@ -108,11 +101,16 @@ export default {
               || row?.authExpired || row?.idleFinished || typeof row?.pidAlive !== 'boolean') {
             fail(`r${round}: stale listing row lost its live PID or was bypassed by another finished signal`);
           }
-          if (round === 0 && (evidence.before?.meta?.runnerPid !== sleeper.pid
-              || evidence.before?.meta?.sessionId !== ctx.sessionId)) fail('initial fixing claim missing or unbound');
+          if (round === 0 && (evidence.before?.meta?.kind !== 'fixing'
+              || evidence.before?.meta?.who !== `fix-${ctx.pr}`
+              || evidence.before?.meta?.sessionId !== ctx.sessionId
+              || Object.hasOwn(evidence.before?.meta ?? {}, 'runnerPid'))) {
+            fail('initial fixing claim must be session-bound without a runnerPid, as acquired in production');
+          }
           if (round > 0 && row?.pidAlive !== ctx.pidAlive) fail('PID verdict changed during scenario');
           ctx.pidAlive = row?.pidAlive;
-          if (!!evidence.after !== row?.pidAlive) fail(`r${round}: fixing claim did not follow runner identity`);
+          ctx.claimReleased ||= !evidence.after;
+          if (evidence.after) fail(`r${round}: production refresh retained the dead fixer's session-bound fixing claim (pidAlive=${row?.pidAlive})`);
           ctx.evidenceChecks += 1;
         });
         play.push('tick fix-dispatch');
@@ -134,7 +132,7 @@ export default {
             fail(`r${round}: no dispatch or PID/claim refusal for PR #${ctx.pr}; inspect daemon refusals: ${reasons.join(', ') || 'none'}`);
           }
           ctx.checked += 1;
-          say(`r${round}: PR #${ctx.pr}, pidAlive=${ctx.pidAlive}, new fix dispatched=${ctx.dispatched}, refusal=${!!decision}`);
+          say(`r${round}: PR #${ctx.pr}, pidAlive=${ctx.pidAlive}, fixing claim released=${ctx.claimReleased}, new fix dispatched=${ctx.dispatched}, refusal=${!!decision}`);
           w.clock.advance('3m');
         });
       }
@@ -176,15 +174,12 @@ export default {
             const sessionId = w.claude.sessions().find(s => s.id === id).sessionId;
             const claim = JSON.parse(inClone(w, `
               import { acquireFixClaim } from './scripts/conveyor/fix-procedure.mjs';
-              import { stampBorrowedRunnerPid } from './scripts/conveyor/fix-dispatch-claim.mjs';
-              const [pr, sessionId, pid] = process.argv.slice(1);
+              const [pr, sessionId] = process.argv.slice(1);
               const claim = acquireFixClaim({ repo: 'we', pr: Number(pr), who: 'fix-' + pr, sessionId });
-              if (!claim.ok || !stampBorrowedRunnerPid({ repo: 'we', pr: Number(pr), kind: 'fixing',
-                  owner: claim.entry.owner, pid: Number(pid) })) throw new Error('fixing claim setup failed');
               process.stdout.write(JSON.stringify(claim));
-            `, [String(pr), sessionId, String(sleeper.pid)]));
+            `, [String(pr), sessionId]));
             if (!claim.ok) throw new Error('fixing claim was refused');
-            report.ctx = { pr, staleId: id, sessionId, psChecks: 0, evidenceChecks: 0, hostGateChecks: 0, dispatched: false, checked: 0 };
+            report.ctx = { pr, staleId: id, sessionId, psChecks: 0, evidenceChecks: 0, hostGateChecks: 0, claimReleased: false, dispatched: false, checked: 0 };
             return report.ctx;
           },
         }), { timeoutMs: 60_000, budgetMs: 240_000 });
