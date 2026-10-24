@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -54,7 +54,7 @@ describe('operator send-back regressions', () => {
       GIT_CONFIG_PARAMETERS: "'core.fsmonitor=marker'", GIT_DIR: '/foreign/.git', GIT_COMMON_DIR: '/foreign/common',
       GIT_WORK_TREE: '/foreign', GIT_INDEX_FILE: '/foreign/index', GIT_OBJECT_DIRECTORY: '/foreign/objects',
       GIT_ALTERNATE_OBJECT_DIRECTORIES: '/foreign/alt', GIT_NAMESPACE: 'foreign',
-      GIT_REPLACE_REF_BASE: 'refs/foreign/', GIT_ATTR_SOURCE: 'foreign' };
+      GIT_REPLACE_REF_BASE: 'refs/foreign/', GIT_ATTR_SOURCE: 'foreign', GIT_GRAFT_FILE: '/foreign/grafts' };
     for (const [key, value] of Object.entries(inherited)) vi.stubEnv(key, value);
     try {
       const env = laneProbeEnv('/fixture/lane');
@@ -277,6 +277,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
     ['git', ['ls-files', '-v']],
     ['git', ['stash', 'list', '--no-show-signature']],
+    ['git', ['rev-parse', '--git-path', 'info/grafts']],
     ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']],
   ];
   const gitMocks = [];
@@ -288,7 +289,8 @@ describe('fresh per-lane safety check before any destructive action', () => {
   });
   const git = outputs => {
     const replies = new Map(commands.map((command, i) => [JSON.stringify(command),
-      [outputs.config ?? '', outputs.stage ?? '', outputs.status, outputs['ls-files'] ?? 'H tracked.txt\n', outputs.stash, outputs['rev-list']][i]]));
+      [outputs.config ?? '', outputs.stage ?? '', outputs.status, outputs['ls-files'] ?? 'H tracked.txt\n', outputs.stash,
+        outputs.grafts ?? '.git/info/grafts\n', outputs['rev-list']][i]]));
     const exec = vi.fn((bin, argv) => {
       const out = replies.get(JSON.stringify([bin, argv]));
       if (out instanceof Error) throw out;
@@ -330,6 +332,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
       ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
       ['git', ['ls-files', '-v']],
       ['git', ['stash', 'list', '--no-show-signature']],
+      ['git', ['rev-parse', '--git-path', 'info/grafts']],
       ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']],
     ]);
     for (const [, , options] of exec.mock.calls) {
@@ -405,6 +408,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
       if (argv[0] === 'status') return argv.includes('--ignore-submodules=none') ? ' M child\n' : '';
       if (argv[0] === 'ls-files') return 'H child\n';
       if (argv[0] === 'stash') return '';
+      if (argv[0] === 'rev-parse') return '.git/info/grafts\n';
       if (argv[0] === 'rev-list') return '0\n';
       throw new Error(`unexpected command: ${bin} ${argv.join(' ')}`);
     });
@@ -591,6 +595,32 @@ describe('lane action guard with real Git', () => {
       expect(guardLaneAction({ path, action, log: vi.fn() }))
         .toMatchObject({ act: false, fresh: { hasUnsafeWork: true } });
     }
+  });
+
+  it('refuses a lane with a legacy info/grafts file that would hide an unpushed commit; unchanged without it', () => {
+    const { path, git } = fixture();
+    const pushed = git(['rev-parse', 'HEAD']).trim();
+    git(['-c', 'user.name=Guard Fixture', '-c', 'user.email=guard@example.invalid', '-c', 'commit.gpgSign=false',
+      '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '--allow-empty', '-m', 'unpushed']);
+    const unpushed = git(['rev-parse', 'HEAD']).trim();
+    // The probe's unpushed-commit count must not be trusted once the lane can rewrite history with grafts.
+    const grafts = join(path, '.git', 'info', 'grafts');
+    mkdirSync(join(path, '.git', 'info'), { recursive: true });
+    writeFileSync(grafts, `${unpushed} ${pushed}\n`);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { hasUnsafeWork: true, reason: 'lane has legacy grafts file' } });
+    }
+    // An empty grafts file still counts: presence is the signal, not content.
+    writeFileSync(grafts, '');
+    expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'lane has legacy grafts file' });
+    rmSync(grafts);
+    expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: '1 unpushed commit(s)' });
+  });
+
+  it('refuses a lane whose grafts path cannot be resolved (fail closed)', () => {
+    const exec = vi.fn((bin, argv) => argv[0] === 'rev-parse' ? '' : argv[0] === 'status' ? '' : '0\n');
+    expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({ hasUnsafeWork: true, reason: 'lane grafts path unreadable' });
   });
 
   it('stays unsafe when a lane-local replace ref makes an unpushed commit look already pushed', () => {

@@ -7,9 +7,9 @@
  * release-on-behalf) the actor must call {@link guardLaneAction}, which runs {@link freshLaneSafety} on that one lane
  * now and permits the action only on a fresh, positively-safe result; any error is unsafe.
  */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { platformPreference, resolveCascade } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { DIRTY_PROBE_ARGS, hasHiddenIndexFlags, laneGitEnv } from './git-transport-branch.mjs';
@@ -88,6 +88,11 @@ export function laneProbeEnv(path) {
     GIT_NO_REPLACE_OBJECTS: '1' };
 }
 
+/** True when anything (file, symlink, directory) exists at `file`; any error other than "absent" counts as present. */
+function graftsFilePresent(file) {
+  try { lstatSync(file); return true; } catch (error) { return error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR'; }
+}
+
 /**
  * FRESH safety read of ONE lane, right now (never the cache). Unsafe when the worktree has any change (tracked or
  * untracked or ignored), index flags that may hide edits, any stash, or any commit absent from local origin refs. Any git error,
@@ -117,6 +122,11 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
     // `stash list` is `git log -g`: a lane-set log.showSignature + gpg.program must not run a verifier.
     const stash = git(['stash', 'list', '--no-show-signature']);
     if (stash.trim()) return unsafe('stash entries present');
+    // A legacy grafts file rewrites parentage (`GIT_NO_REPLACE_OBJECTS` does not switch it off), so it can make unpushed
+    // commits read as already pushed. Presence of the file, of any size, is enough: the count below cannot be trusted.
+    const grafts = git(['rev-parse', '--git-path', 'info/grafts']).trim();
+    if (!grafts) return unsafe('lane grafts path unreadable');
+    if (graftsFilePresent(resolve(path, grafts))) return unsafe('lane has legacy grafts file');
     // Protect work held by other branches, tags or custom refs, plus a detached HEAD.
     const ahead = git(['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']).trim();
     if (!/^\d+$/.test(ahead)) return unsafe('ahead count unreadable');
