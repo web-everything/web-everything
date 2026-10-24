@@ -143,6 +143,15 @@ export function acquireFixDispatchClaim({
   return { ...result, resource, lockRoot };
 }
 
+// Identity probes can block while another dispatcher replaces the claim or stamps a runner. Re-read only
+// after probing and require the same dispatch and runner before using this fresh entry in a write/release.
+function readUnchangedClaim(lockRoot, resource, expected) {
+  const current = readLockEntry(lockRoot, resource);
+  return current && current.owner === expected.owner
+    && current.meta?.claimedAt === expected.meta?.claimedAt
+    && current.meta?.runnerPid === expected.meta?.runnerPid ? current : null;
+}
+
 /**
  * Stamp the borrowed runner's pid onto the claim it was launched under, so the cap and the claim sweep can tell a live
  * borrowed fix from a dead one. Owner-checked (never rewrites a claim someone else now holds). Best effort.
@@ -154,14 +163,16 @@ export function stampBorrowedRunnerPid({
 } = {}) {
   if (!owner || !Number.isInteger(pid) || pid <= 0) return false;
   const resource = fixDispatchResource({ repo, pr, kind });
-  const current = readLockEntry(lockRoot, resource);
-  if (!current || current.owner !== owner) return false;
+  const entry = readLockEntry(lockRoot, resource);
+  if (!entry || entry.owner !== owner) return false;
   if (runnerStart == null || runnerArgv == null) {
     let stamp;
     try { stamp = identityOf(pid); } catch { stamp = null; }
     runnerStart ??= stamp?.runnerStart ?? null;
     runnerArgv ??= stamp?.runnerArgv ?? null;
   }
+  const current = readUnchangedClaim(lockRoot, resource, entry);
+  if (!current) return false;
   return heartbeat(lockRoot, resource, owner, nowIso, current.pid ?? null, {
     ...(current.meta ?? {}), runnerPid: pid, runnerStart, runnerArgv,
   });
@@ -249,10 +260,10 @@ export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
  *    `hungInfoFor`) — the SAME detector `reconcile-pass.mjs` feeds `markHungSessions` — so a session stuck at
  *    `state: 'working'` with a stale transcript is not "live" here either.
  *  - CEILING: past {@link MAX_FIX_DISPATCH_CLAIM_REFRESH_MS} since `meta.claimedAt`, a claim is never refreshed.
- *  - OWNERSHIP: the entry is RE-READ immediately before the heartbeat write and skipped unless the on-disk owner
- *    still matches the listed one — the same owner check `releaseFixDispatchClaim` makes — so a claim released
- *    and re-acquired by a different owner during the sweep is skipped, not overwritten. (Read-then-write, not
- *    atomic: the residual window is the microseconds between that re-read and the write.)
+ *  - OWNERSHIP: after all identity probes, the entry is RE-READ immediately before each heartbeat/release and
+ *    skipped unless owner, claimedAt and runnerPid still match the probed entry. A replaced dispatch or newly
+ *    stamped runner is skipped, not overwritten/released. (Read-then-write, not atomic: the residual window is
+ *    the microseconds between that re-read and the write.)
  *  - A session judged hung, or older than the ceiling, deliberately LOSES its claim to the plain TTL — so a
  *    genuinely slow-but-alive run past those bounds can be re-dispatched. That matches the reaper's own view.
  *  - SYNC ONLY: `listAgentsAll` must return an array; a Promise throws, rather than reading as "no agents".
@@ -294,24 +305,28 @@ export function refreshLiveFixDispatchClaims({
     if (kind === 'fixing') name = entry.meta.who ? String(entry.meta.who) : null;
     else { try { name = fixDispatchSessionName({ repo, pr, kind }); } catch { name = null; } }
     if (!name) continue;
+    const resource = fixDispatchResource({ repo, pr, kind });
     // A BORROWED (non-Claude) fix, or (117 S3b) a Claude fix / ci-heal run through the detached worker wrapper, has no
     // `claude agents` row: its liveness is its runner pid. Dead -> release now, with a reason; alive -> heartbeat.
     // (No pid stamped yet -> falls through to the plain TTL like any new claim.)
     if (Number.isInteger(entry.meta.runnerPid)) {
-      const cur = readLockEntry(lockRoot, fixDispatchResource({ repo, pr, kind }));
-      if (!cur || cur.owner !== entry.owner) continue;
       let identityReason = null;
       const probeIdentity = (pid, expectations) => {
         const verdict = identity(pid, expectations);
         if (verdict.alive === false) identityReason = verdict.reason;
         return verdict;
       };
-      if (isClaimRunnerDead(cur, alive, probeIdentity)) {
+      const runnerDead = isClaimRunnerDead(entry, alive, probeIdentity);
+      const heartbeatAt = runnerDead ? null : nowIso();
+      const cur = readUnchangedClaim(lockRoot, resource, entry);
+      if (!cur) continue;
+      if (runnerDead) {
         const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
         if (result.released) released.push({ repo, pr, kind, owner: entry.owner, reason: identityReason ? `runner-identity-dead (${identityReason})` : `${entry.meta.borrowed ? 'borrowed' : 'wrapped'}-runner-dead (pid ${entry.meta.runnerPid} is gone)` });
       } else {
-        heartbeat(lockRoot, fixDispatchResource({ repo, pr, kind }), cur.owner, nowIso(), cur.pid ?? null, cur.meta);
-        refreshed.push({ repo, pr, kind, headSha, owner: entry.owner });
+        if (heartbeat(lockRoot, resource, cur.owner, heartbeatAt, cur.pid ?? null, cur.meta)) {
+          refreshed.push({ repo, pr, kind, headSha, owner: entry.owner });
+        }
       }
       continue;
     }
@@ -335,8 +350,7 @@ export function refreshLiveFixDispatchClaims({
         && ((entry.meta.sessionId && a.sessionId === entry.meta.sessionId)
           || (Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs)));
       if (settled) {
-        const current = readLockEntry(lockRoot, fixDispatchResource({ repo, pr, kind }));
-        if (current?.owner === entry.owner && current.meta?.claimedAt === claimedAt) {
+        if (readUnchangedClaim(lockRoot, resource, entry)) {
           const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
           if (result.released) released.push({ repo, pr, kind, owner: entry.owner });
         }
@@ -355,8 +369,7 @@ export function refreshLiveFixDispatchClaims({
         try { return identity(a.pid); } catch { return null; }
       });
       if (identities.every((verdict) => verdict?.alive === false)) {
-        const current = readLockEntry(lockRoot, fixDispatchResource({ repo, pr, kind }));
-        if (current?.owner === entry.owner && current.meta?.claimedAt === claimedAt) {
+        if (readUnchangedClaim(lockRoot, resource, entry)) {
           const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
           if (result.released) released.push({ repo, pr, kind, owner: entry.owner,
             reason: `session-identity-dead (${identities[0].reason})` });
@@ -364,13 +377,13 @@ export function refreshLiveFixDispatchClaims({
         continue;
       }
     }
-    const resource = fixDispatchResource({ repo, pr, kind });
-    const current = readLockEntry(lockRoot, resource);
-    if (!current || current.owner !== entry.owner) continue;
+    const heartbeatAt = nowIso();
+    const current = readUnchangedClaim(lockRoot, resource, entry);
+    if (!current) continue;
     // Write back the FRESHLY re-read entry (not the listing snapshot); a pre-`claimedAt` claim is stamped now so
     // the ceiling applies to it from here on.
-    const meta = current.meta?.claimedAt ? current.meta : { ...(current.meta ?? entry.meta), claimedAt: nowIso() };
-    heartbeat(lockRoot, resource, current.owner, nowIso(), current.pid ?? null, meta);
+    const meta = current.meta?.claimedAt ? current.meta : { ...(current.meta ?? entry.meta), claimedAt: heartbeatAt };
+    if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) continue;
     if (isAwaiting) awaiting.push({ repo, pr, kind, owner: entry.owner });
     refreshed.push({
       repo, pr, kind, headSha, owner: entry.owner,

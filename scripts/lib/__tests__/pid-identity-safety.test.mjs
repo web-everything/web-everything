@@ -240,6 +240,87 @@ describe('session-bound fixing claim identity safety', () => {
   });
 });
 
+describe.each(['runnerPid', 'session-identity'])('%s claim probe fencing', path => {
+  it.each(['owner', 'claimedAt', 'runnerPid', 'absent'].flatMap(changed =>
+    [true, false, null].map(alive => ({ changed, alive }))))(
+    'a claim replaced during the identity probe is not overwritten ($changed, alive=$alive)', ({ changed, alive }) => {
+      const lockRoot = mkdtempSync(join(tmpdir(), 'claim-probe-fence-'));
+      const claim = { repo: 'we', pr: 42, kind: 'fix', owner: 'original-owner', lockRoot };
+      const stamp = { runnerStart: START, runnerArgv: ARGV, nowIso: new Date(NOW).toISOString() };
+      let replacement;
+      const identity = vi.fn(() => {
+        if (changed === 'runnerPid') {
+          expect(stampBorrowedRunnerPid({ ...claim, ...stamp, pid: PID + 1 })).toBe(true);
+        } else {
+          expect(releaseFixDispatchClaim(claim).released).toBe(true);
+          if (changed !== 'absent') {
+            const next = { ...claim, owner: changed === 'owner' ? 'replacement-owner' : claim.owner };
+            expect(acquireFixDispatchClaim({ ...next, headSha: 'replacement-head', sessionId: 'replacement-session',
+              nowMs: changed === 'claimedAt' ? NOW + 500 : NOW }).ok).toBe(true);
+            if (path === 'runnerPid') {
+              expect(stampBorrowedRunnerPid({ ...next, ...stamp, pid: PID })).toBe(true);
+            }
+          }
+        }
+        replacement = readFixDispatchClaim(claim);
+        return { alive, reason: alive === false ? 'recycled-spare' : 'match' };
+      });
+      try {
+        expect(acquireFixDispatchClaim({ ...claim, sessionId: 'bound-fix', nowMs: NOW }).ok).toBe(true);
+        if (path === 'runnerPid') {
+          expect(stampBorrowedRunnerPid({ ...claim, ...stamp, pid: PID })).toBe(true);
+        }
+        const result = refreshLiveFixDispatchClaims({
+          lockRoot, alive: () => true, identity,
+          listAgentsAll: () => [{ name: 'fix-42', sessionId: 'bound-fix', state: 'working', pid: PID }],
+          hungInfoFor: () => null, awaitingVerifyFor: null,
+          nowMs: NOW + 1000, nowIso: () => new Date(NOW + 1000).toISOString(),
+        });
+        expect(identity).toHaveBeenCalledTimes(1);
+        expect(result.refreshed).toEqual([]);
+        expect(result.released ?? []).toEqual([]);
+        expect(readFixDispatchClaim(claim)).toEqual(replacement);
+      } finally {
+        rmSync(lockRoot, { recursive: true, force: true });
+      }
+    });
+});
+
+describe('borrowed runner stamp probe fencing', () => {
+  it.each(['owner', 'claimedAt', 'runnerPid', 'absent'])(
+    'a claim replaced during the identity probe is not overwritten (%s)', changed => {
+      const lockRoot = mkdtempSync(join(tmpdir(), 'stamp-probe-fence-'));
+      const claim = { repo: 'we', pr: 42, owner: 'original-owner', lockRoot };
+      const stamp = { runnerStart: START, runnerArgv: ARGV, nowIso: new Date(NOW).toISOString() };
+      let replacement;
+      const identityOf = vi.fn(() => {
+        if (changed === 'runnerPid') {
+          expect(stampBorrowedRunnerPid({ ...claim, ...stamp, pid: PID + 1 })).toBe(true);
+        } else {
+          expect(releaseFixDispatchClaim(claim).released).toBe(true);
+          if (changed !== 'absent') {
+            const next = { ...claim, owner: changed === 'owner' ? 'replacement-owner' : claim.owner };
+            expect(acquireFixDispatchClaim({ ...next, headSha: 'replacement-head',
+              nowMs: changed === 'claimedAt' ? NOW + 500 : NOW }).ok).toBe(true);
+            expect(stampBorrowedRunnerPid({ ...next, ...stamp, pid: PID })).toBe(true);
+          }
+        }
+        replacement = readFixDispatchClaim(claim);
+        return { runnerStart: START, runnerArgv: ARGV };
+      });
+      try {
+        expect(acquireFixDispatchClaim({ ...claim, nowMs: NOW }).ok).toBe(true);
+        expect(stampBorrowedRunnerPid({ ...claim, ...stamp, pid: PID })).toBe(true);
+        expect(stampBorrowedRunnerPid({ ...claim, pid: PID + 2, identityOf,
+          nowIso: new Date(NOW + 1000).toISOString() })).toBe(false);
+        expect(identityOf).toHaveBeenCalledWith(PID + 2);
+        expect(readFixDispatchClaim(claim)).toEqual(replacement);
+      } finally {
+        rmSync(lockRoot, { recursive: true, force: true });
+      }
+    });
+});
+
 describe('positive identity evidence controls claim release', () => {
   it.each([
     ['zombie releases claim', 'Z+', START, ARGV, 'zombie'],
