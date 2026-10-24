@@ -1,18 +1,19 @@
 ---
+bornAs: xggu1ne
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/judge-sweep-facts.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/preview.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5857 (head e4619f996)
+# Red-team follow-ups from web-everything/web-everything#5809 (head fb017f506)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5857 (reviewed head `e4619f996c426a750342de3964f33fbf3042d02d`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5809 (reviewed head `fb017f506957427e713896165831dda443f7d737`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/judge-sweep-facts.mjs:20` — (edge-case, degraded) A terminally parked fix loop suppresses judgment for an idle, at-cap PR
-   - Scenario: Reproduced through createJudgeSweepFactsReader and buildJudgeSweepBundle: a PR has round=5, cap=5, status:at-round-limit, no running jobs or CI, no referrals, and a valid kind:'park' fix-loop row from five minutes ago. Include the producer's canonical fix-loop-exhausted stand-down comment. With evidenceErrors=[], the bundle returns needsJudgment:false and reason:'fix-loop active (&lt;60 min)'. The park producer explicitly stands down to the operator queue and stops dispatching repairs, so this PR should return needsJudgment:true, reason:'at-cap'. The timestamp-only shortcut mistakes terminal acti
+1. `we:scripts/lib/daemon-rebuild/preview.mjs:284` — (edge-case, degraded) Repair admission rejects an existing overlay preserved through its stack top.
+   - Scenario: With edge resolution disabled and default stack-tops planning: M0 contains a.txt=base and shared.txt=base. Register and adopt B0 (adds b.txt=B) and A0 (changes a.txt=OLD-A), in B,A order. Advance main to M1, changing shared.txt=main. Advance A to A1 with parents A0 and B0, setting a.txt=NEW-A and shared.txt=NEW-A. Now register repair R, branched from M1, which restores shared.txt=base, sets a.txt=NEW-A, and adds repair.txt. Existing-only planning pins A0 and restores B0 through stack fallback. Planning with R succeeds: R applies, A1 retries successfully, and A1 carries B0 by ancestry, so B nee
    - Claude's re-check: demonstrated break
 
 ## Acceptance
