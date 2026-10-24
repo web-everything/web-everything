@@ -57,9 +57,10 @@ import { fixDispatchSessionName } from '../fix-claim-store.mjs';
 import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
 import { DISPATCH_GUARD_LISTING_GRACE_MINUTES } from '../../operations/dispatch-lane.mjs';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { runInNewContext } from 'node:vm';
 
 const NOW = Date.parse('2026-07-26T12:00:00Z');
 const TTL_MS = DEFAULT_LEASE_TTL_MINUTES * 60_000;
@@ -612,6 +613,62 @@ describe('claimRunnerPidsBySession — borrowed fixer runner pids (PR #5806 regr
 
   it.each([null, undefined, {}, 'corrupt', 123])('non-array claims %s → empty Map', (claims) => {
     expect(claimRunnerPidsBySession(claims)).toEqual(new Map());
+  });
+});
+
+describe('main — claim freshness after slow I/O (PR #5846)', () => {
+  // Execute the checked-in CLI shell with real claim/signal/reap helpers. Only I/O
+  // is replaced, so a stale clock passed by main cannot hide behind a unit fixture.
+  const source = readFileSync(join(process.cwd(), 'scripts/conveyor/lease-reaper.mjs'), 'utf8');
+  const shell = source.slice(source.indexOf('function parseFlags('), source.indexOf('// Run the IO shell only'));
+  const dryRun = ({ delayAt, heartbeatOffset = 0 }) => {
+    let clock = NOW;
+    let stdout = '';
+    const logs = [];
+    const advance = (stage) => { if (stage === delayAt) clock += 61_000; };
+    const lease = { session: 'fix-5806', acquiredAt: new Date(NOW - 20 * 60_000).toISOString(), ttlMinutes: 240 };
+    runInNewContext(`${shell}\nmain(['--dry-run', '--json']);`, {
+      Date: class extends Date { static now() { return clock; } },
+      Map, Set, Number, JSON,
+      DEFAULT_LEASE_TTL_MINUTES,
+      POOL_ROOT: '/unused-lease-reaper-fixture', join,
+      log: (line) => logs.push(line),
+      process: { env: {}, stdout: { write: (s) => { stdout += s; } }, exit: (code) => expect(code).toBe(0) },
+      fetchSessionSignals: () => {
+        advance('listing');
+        return { states: new Map([['conveyor-1', 'working']]), pidAlive: new Map(), agents: [] };
+      },
+      readWrapperPidsForPass: () => { advance('run-store'); return new Map(); },
+      listFixDispatchClaims: () => {
+        advance('claims');
+        return [{ heartbeatAt: new Date(clock + heartbeatOffset).toISOString(),
+          meta: { repo: 'we', pr: 5806, kind: 'fix', runnerPid: process.pid } }];
+      },
+      claimRunnerPidsBySession,
+      poolsToScan: () => ['fixture'], repoKeyForPool: () => null,
+      laneIndicesIn: () => [53], readLease: () => lease,
+      fetchPrStatesForRepo: () => { throw new Error('no PR lookup expected'); },
+      buildLeaseSignalsFor: (opts) => buildLeaseSignalsFor({ ...opts,
+        pidCommand: () => 'node fix-run.mjs --session=fix-5806' }),
+      reapPlan, applyLaneHold: (plan) => plan,
+      releaseLane: () => { throw new Error('dry-run must never release'); },
+    }, { timeout: 1000 });
+    return { report: JSON.parse(stdout), logs };
+  };
+
+  it.each(['listing', 'run-store', 'claims'])('keeps a live borrowed fixer after a 61-second %s delay', (delayAt) => {
+    const { report, logs } = dryRun({ delayAt });
+    expect(logs).toContain('lease-reaper: added 1 claim runner pid(s)');
+    expect(report).toMatchObject({ scanned: 1, kept: 1, wouldReap: [], sessionAxis: 'on' });
+  });
+
+  it.each([
+    ['expired', -24 * 60 * 60_000],
+    ['future-dated', 60_001],
+  ])('still rejects a truly %s heartbeat after a slow scan', (_label, heartbeatOffset) => {
+    const { report, logs } = dryRun({ delayAt: 'run-store', heartbeatOffset });
+    expect(logs).toContain('lease-reaper: added 0 claim runner pid(s)');
+    expect(report.wouldReap).toEqual([{ pool: 'fixture', lane: 53, reason: 'session-gone', session: 'fix-5806' }]);
   });
 });
 

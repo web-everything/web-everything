@@ -5,6 +5,8 @@
  * Before the fix, the resident reaper ignores that evidence and plans a session-gone reap.
  * Like the hand-briefed-owner break, exercise the real CLI in dry-run mode against an
  * isolated pool. No daemon ticks or real lane releases are needed to observe the break.
+ * PR #5846: advance a virtual clock by 61 seconds during session listing, so a
+ * heartbeat refreshed during slow I/O must be validated against the read-time clock.
  */
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -33,7 +35,7 @@ function fakeClaudeBin(root) {
 
 export default {
   id: 'lease-reaper-borrowed-fixer-pid-invisible',
-  title: 'a borrowed fixer absent from claude agents and the run store keeps its lease while its fresh claim runner PID is live and bound to its session',
+  title: 'a borrowed fixer absent from claude agents and the run store keeps its lease after a slow listing while its fresh claim runner PID is live and bound to its session',
   card: 'PR #5806 incident',
   fixedBy: { sha: 'd5b71e11a6ae', where: 'lane/reaper-borrowed-fixer-pid' },
   fixPresent(root) {
@@ -76,11 +78,12 @@ export default {
           await once(child, 'spawn');
           const coordinationRoot = join(ctx.base, 'coordination');
           const resource = fixDispatchResource({ repo: 'we', kind: 'fix', pr: 5806 });
+          const heartbeatMs = Date.now();
           const claimed = acquireLockDir(fixDispatchClaimRoot(coordinationRoot), resource, {
             owner: SESSION,
             path: resource,
             pid: child.pid,
-            heartbeatAt: new Date().toISOString(),
+            heartbeatAt: new Date(heartbeatMs).toISOString(),
             meta: { repo: 'we', kind: 'fix', pr: 5806, borrowed: true, runnerPid: child.pid },
           });
           if (!claimed) {
@@ -92,10 +95,27 @@ export default {
             LANE_POOL_ROOT: ctx.poolRoot,
             WE_COORDINATION_ROOT: coordinationRoot,
             OPERATION_RUNS_DIR: ctx.runsDir, // deliberately empty: no pid:<n> run record
+            WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0', // always exercise the delayed listing
             PATH: `${ctx.binDir}:${process.env.PATH}`,
           };
           const script = join(w.simCloneRoot, 'scripts/conveyor/lease-reaper.mjs');
-          const r = spawnSync(process.execPath, [script, '--dry-run', '--json', '--no-check-prs'], {
+          const clockPreload = join(ctx.base, 'slow-listing-clock.cjs');
+          // Start one minute behind the claim, then catch up when listing returns.
+          // This simulates a slow scan without sleeping or changing the reaper source.
+          writeFileSync(clockPreload, `
+const cp = require('node:child_process');
+const { syncBuiltinESMExports } = require('node:module');
+const realExec = cp.execFileSync;
+let clock = ${heartbeatMs} - 61000;
+Date.now = () => clock;
+cp.execFileSync = function(file, args, options) {
+  const result = realExec.call(this, file, args, options);
+  if (file === 'claude') clock += 61000;
+  return result;
+};
+syncBuiltinESMExports();
+`);
+          const r = spawnSync(process.execPath, ['--require', clockPreload, script, '--dry-run', '--json', '--no-check-prs'], {
             encoding: 'utf8', env, timeout: 20_000, maxBuffer: 1024 * 1024,
           });
           ctx.checked = true;

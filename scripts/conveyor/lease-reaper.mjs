@@ -1529,7 +1529,9 @@ function main(argv) {
   let claimRunnerPids = new Map();
   try {
     const claims = listFixDispatchClaims(undefined, { liveOnly: true });
-    claimRunnerPids = claimRunnerPidsBySession(claims, { nowMs });
+    // Listing/run-store I/O can outlast the future-skew allowance. Validate the
+    // heartbeat against a clock sampled AFTER the claim read, not pass start.
+    claimRunnerPids = claimRunnerPidsBySession(claims, { nowMs: Date.now() });
     log(`lease-reaper: added ${claimRunnerPids.size} claim runner pid(s)`);
   } catch {
     log('lease-reaper: fix-dispatch claim read failed — old behaviour applies (run-store pids only)');
