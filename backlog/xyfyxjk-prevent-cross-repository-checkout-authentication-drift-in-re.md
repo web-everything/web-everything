@@ -1,7 +1,7 @@
 ---
 kind: task
 status: open
-scope: ["we:.github/workflows/", "we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/remote-verify.test.mjs"]
+scope: ["we:.github/workflows/", "we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/remote-verify.test.mjs", "we:scripts/__tests__/check-standards-external-checkout.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
@@ -13,7 +13,7 @@ PR #5878 review requires CI-matching external-checkout authentication and one re
 ## Acceptance
 
 - [A1] Add a `check:standards` rule over every `actions/checkout` step with an external `repository:`. Resolve that repository's canonical token expression from `we:.github/workflows/ci.yml` and require the same expression. Refuse unknown repositories, missing tokens, unreadable YAML, and mismatched token expressions with the workflow and step named. Own-repository checkouts retain their existing token policy.
-- [A2] Planned cases in `we:scripts/__tests__/check-standards-external-checkout.test.mjs`: **external checkout requires CI token expression** rejects the old `secrets.GITHUB_TOKEN` FUI checkout, accepts the App-output/fallback expression, checks multiple workflows/jobs/steps, and rejects missing or malformed evidence. **own repository checkout retains its token policy** accepts an explicit own-repository checkout without the FUI token expression. Run with `npm run test:unit -- scripts/__tests__/check-standards-external-checkout.test.mjs`.
+- [A2] Planned cases in `we:scripts/__tests__/check-standards-external-checkout.test.mjs`: **external checkout requires CI token expression** rejects the old `secrets.GITHUB_TOKEN` FUI checkout, accepts the App-output/fallback expression, checks multiple workflows/jobs/steps, and rejects missing or malformed evidence. **own repository checkout retains its token policy** accepts an explicit own-repository checkout without the FUI token expression. Pass that test file to `npm run test:unit --`.
 - [A3] Before merging PR #5878, dispatch `we:.github/workflows/remote-verify.yml` on the repaired SHA in lane-check mode; require one completed successful run, successful sibling checkout and required lane gate, and successful exact-SHA marker import. Record the run URL and SHA on the PR. No such live run was possible in the offline repair sandbox; this release check remains owed.
 - [A4] Record timings for the first two live runs. Confirm setup-node's npm download cache restores without a node_modules cache that `npm ci` would delete. This is measurement evidence, not a promised speedup.
 
