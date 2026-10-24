@@ -851,7 +851,12 @@ export function prStatesByPrNumber(prs) {
  */
 export const AGENT_GONE_STATES = new Set(['done', 'failed', 'stopped']);
 
-/** Names whose listed background rows are terminal and all started before the live claim. */
+/**
+ * Names whose listed background rows are terminal and all started before the live claim.
+ * @param {Array<{kind?:string, name?:string, state?:string, startedAt?:string|number, sessionId?:string}>} agents
+ * @param {Array<{meta?:{repo:string, pr:number, kind?:string, claimedAt?:string, sessionId?:string}}>} claims
+ * @returns {Set<string>} Names with only earlier terminal background rows; non-array inputs yield an empty Set.
+ */
 export function staleTerminalNamesForClaims(agents, claims) {
   const stale = new Set();
   if (!Array.isArray(agents) || !Array.isArray(claims)) return stale;
@@ -1078,7 +1083,7 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  *
  * @param {object|null} lease
  * @param {Map<string,string|null>|null} sessionStates  from {@link sessionStatesForReap}; null = axis off.
- * @param {{nowMs?:number, graceMs?:number, pidAlive?:boolean|null, wrapperAlive?:boolean|null, ownerAlive?:boolean|null, claimRunnerAlive?:boolean|null}} [o]  `nowMs` = the clock reading to age the
+ * @param {{nowMs?:number, graceMs?:number, pidAlive?:boolean|null, wrapperAlive?:boolean|null, ownerAlive?:boolean|null, claimRunnerAlive?:boolean|null, staleTerminalRows?:boolean}} [o]  `nowMs` = the clock reading to age the
  *   lease against (no default — omitting it makes the absence branch always `null`, never guessing at an
  *   unknown age); `graceMs` defaults to {@link DISPATCH_GUARD_LISTING_GRACE_MINUTES}; `pidAlive` (#3383) = this
  *   session's REAL process-liveness read from {@link sessionPidAliveByName} (`null` when not supplied/unknown —
@@ -1096,6 +1101,9 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  *   borrowed runner even when a previous Claude round remains listed under the same deterministic name,
  *   with a terminal state or dead PID. Like live run-store wrapper evidence, it takes precedence over that
  *   name-keyed listing evidence. Without a validated live runner, the ordinary death checks still apply.
+ *   `staleTerminalRows` defaults to false; true means the listed terminal rows predate the live claim
+ *   (see {@link staleTerminalNamesForClaims}) and gives no verdict (`null`) after the live-wrapper and
+ *   live-claim-runner checks.
  * @returns {boolean|null}
  */
 export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DISPATCH_GUARD_LISTING_GRACE_MINUTES * 60_000, pidAlive = null, wrapperAlive = null, ownerAlive = null, claimRunnerAlive = null, staleTerminalRows = false } = {}) {

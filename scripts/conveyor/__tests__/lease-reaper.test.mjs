@@ -632,6 +632,41 @@ describe('staleTerminalNamesForClaims — earlier fix rounds cannot condemn the 
     expect(staleTerminalNamesForClaims([row({ state })], [claim()])).toEqual(new Set(['fix-5848']));
   });
 
+  it('recognizes numeric epoch-ms startedAt before claimedAt as stale', () => {
+    const startedAt = 1792630008356;
+    expect(staleTerminalNamesForClaims([row({ startedAt })], [claim({
+      claimedAt: new Date(startedAt + 1).toISOString(),
+    })])).toEqual(new Set(['fix-5848']));
+  });
+
+  it.each([0, 1])('numeric epoch-ms startedAt at/after claimedAt (+%s ms) prevents stale classification', (offset) => {
+    const startedAt = Date.parse(claimedAt) + offset;
+    expect(staleTerminalNamesForClaims([row(), row({ startedAt })], [claim()])).toEqual(new Set());
+  });
+
+  it('ignores a non-background same-name row: it neither counts nor vetoes stale background rows', () => {
+    expect(staleTerminalNamesForClaims([row({ kind: 'interactive' })], [claim()])).toEqual(new Set());
+    const agents = [row(), row({ kind: 'interactive', state: 'working', startedAt: claimedAt })];
+    expect(staleTerminalNamesForClaims(agents, [claim()])).toEqual(new Set(['fix-5848']));
+    expect(staleTerminalNamesForClaims([...agents].reverse(), [claim()])).toEqual(new Set(['fix-5848']));
+  });
+
+  it('skips bad claim meta when fixDispatchSessionName throws, without throwing or skipping valid claims', () => {
+    const badClaim = claim({ kind: 'unknown-kind' });
+    expect(() => fixDispatchSessionName(badClaim.meta)).toThrow();
+    expect(() => staleTerminalNamesForClaims([row()], [badClaim])).not.toThrow();
+    expect(staleTerminalNamesForClaims([row()], [badClaim])).toEqual(new Set());
+    expect(staleTerminalNamesForClaims([row()], [badClaim, claim()])).toEqual(new Set(['fix-5848']));
+  });
+
+  it.each([null, undefined, {}, 'corrupt', 123])('non-array agents %s return an empty Set', (agents) => {
+    expect(staleTerminalNamesForClaims(agents, [claim()])).toEqual(new Set());
+  });
+
+  it.each([null, undefined, {}, 'corrupt', 123])('non-array claims %s return an empty Set', (claims) => {
+    expect(staleTerminalNamesForClaims([row()], claims)).toEqual(new Set());
+  });
+
   it('uses shared repo/kind session names, including ci-heal, without mutating inputs', () => {
     const claims = [claim(), claim({ kind: 'ci-heal' }), claim({ repo: 'frontierui' })];
     const agents = claims.map(({ meta }) => Object.freeze(row({ name: fixDispatchSessionName(meta) })));
