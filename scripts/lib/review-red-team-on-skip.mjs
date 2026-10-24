@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus } from './drain-red-team-evidence.mjs';
 import { redTeamForHead } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
+import { isRealHead } from './red-team-skip-outcome.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 
 /** Normalize both persisted production result shapes at the recovery boundary. */
@@ -25,7 +26,7 @@ export function redTeamSkipNeedsSettlement(status) {
   // branch runs before every other applicable skip reason, so this combination
   // can only be a card-only skip. Never infer that provenance for object results.
   return typeof read?.diffText === 'string' && read.diffText.trim().length > 0
-    && /^[a-f0-9]{40}$/i.test(status?.head ?? '') && read.netBasis?.rev === status.head
+    && isRealHead(status?.head) && read.netBasis?.rev === status.head
     && status?.status === 'finished' && normalizeRedTeamResult(status.result).priorResult === 'skipped'
     && status.skipCardOnly === true && redTeamCardOnly(status.loopPayload?.findings?.read);
 }
@@ -55,7 +56,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const skip = why => ({ ...row, why });
     try {
       if (!setting.enabled) return skip('reviewRedTeamOnSkip.enabled=false');
-      if (!/^[a-f0-9]{40}$/i.test(head ?? '') || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
+      if (!isRealHead(head) || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
       // Unknown comments cannot establish that no result was published.
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
       if (redTeamForHead(rawPr.comments, pr, head)) return skip('red-team result already on head');

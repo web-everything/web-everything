@@ -5,7 +5,7 @@ import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { publishAttention, replay } from '../needs-you-feed.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { runReviewJob, createReviewJobIo, resolveSettlementHead } from '../review-job.mjs';
+import { runReviewJob, createReviewJobIo } from '../review-job.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus } from '../../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
@@ -179,21 +179,37 @@ describe('review-job red-team skip settlement', () => {
     expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ head, runId: f.loopPayload.runId }));
   });
 
-  it.each([
-    [head, 'b'.repeat(40), 'c'.repeat(40), head],
-    ['invalid', head, 'c'.repeat(40), head],
-    [undefined, 'invalid', head, head],
-    [undefined, undefined, undefined, 'unknown'],
-    [undefined, 'invalid', 'invalid', 'unknown'],
-    [undefined, 'invalid', 'throw', 'unknown'],
-  ])('settlement head precedence and contained live read (%s, %s, %s)', (readRev, laneHead, live, expected) => {
-    const readLiveHead = vi.fn(() => { if (live === 'throw') throw Error('offline'); return live; });
-    expect(resolveSettlementHead({ readRev, laneHead, readLiveHead })).toBe(expected);
-    expect(readLiveHead).toHaveBeenCalledTimes(expected === readRev || expected === laneHead ? 0 : 1);
+  it.each([undefined, 'invalid'])('invalid prepared lane head stops the job before settlement (%s)', laneHead => {
+    const f = fixture();
+    delete f.loopPayload.findings.read.netBasis.rev;
+    f.io.prepareLane = () => ({ head: laneHead });
+    f.io.readCarryEvidence = vi.fn(() => ({ headSha: head }));
+    expect(runReviewJob({ repo, pr }, f.io)).toMatchObject({
+      outcome: 'blocked-on-infra', label: expect.stringContaining('missing pinned review head'),
+    });
+    expect(f.io.runLoop).not.toHaveBeenCalled();
+    expect(f.io.runRedTeam).not.toHaveBeenCalled();
+    expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
+    expect(f.io.readCarryEvidence).not.toHaveBeenCalled();
   });
 
-  it('settlement head without evidence or a live reader is unknown', () => {
-    expect(resolveSettlementHead({})).toBe('unknown');
+  it('missing read revision uses the valid lane head without reading live carry evidence', () => {
+    const f = fixture();
+    delete f.loopPayload.findings.read.netBasis.rev;
+    f.io.readCarryEvidence = vi.fn(() => { throw Error('must not read live head'); });
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ head, readHead: null }));
+    expect(f.io.readCarryEvidence).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('throwing settlement still writes finished status and runs gate (redTeamOnly=%s)', redTeamOnly => {
+    const f = fixture();
+    f.io.settleRedTeamSkip.mockImplementation(() => { f.events.push('settle'); throw Error('settlement unavailable'); });
+    const out = runReviewJob({ repo, pr, redTeamOnly }, f.io);
+    expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
+    expect(f.io.redTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ status: 'finished' }));
+    expect(out.redTeamGate.status).toBe('ok');
+    expect(f.io.log).toHaveBeenCalledWith(expect.stringContaining('settlement unavailable'));
   });
 
   it.each([

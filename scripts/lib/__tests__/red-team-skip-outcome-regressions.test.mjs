@@ -29,7 +29,68 @@ function fixture() {
   return { input, io, markers, settle, pending, pendingDir };
 }
 
+function pendingRecord(input, reason, attemptId) {
+  const identity = [input.repo, input.pr, input.head, reason];
+  if (attemptId) identity.push(attemptId);
+  const key = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+  return { name: `${key}.json`, item: { repo: input.repo, pr: input.pr, head: input.head,
+    kind: `red-team-skip-${key.slice(0, 26)}`, reason: `red team skipped (${reason}); not cleared`, title: '',
+    ...(attemptId ? { attemptId } : {}) } };
+}
+
 describe('red-team skip pre-review regressions', () => {
+  it('pending retry re-sanitizes and bounds reason and title before publication', () => {
+    const f = fixture();
+    const { name, item } = pendingRecord(f.input, 'x'.repeat(80));
+    item.reason = `red team skipped (${'x'.repeat(5000)}\x1b\u202e); not cleared`;
+    item.title = '\x1b\u202e' + 't'.repeat(5000);
+    mkdirSync(f.pendingDir, { recursive: true });
+    writeJsonAtomic(join(f.pendingDir, name), item);
+    f.settle({ status: 'skipped', policy: 'card-only' });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+    const published = f.io.publishNeedsYou.mock.calls[0][0];
+    expect(published.reason).toBe(`red team skipped (${'x'.repeat(80)}); not cleared`);
+    expect(published.title.length).toBeLessThanOrEqual(200);
+    expect(published.title).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
+    expect(JSON.parse(readFileSync(join(f.pendingDir, '..', 'skip-published', name), 'utf8'))).toEqual(published);
+  });
+
+  it('pending record with a valid-shaped kind but mismatched content key is quarantined', () => {
+    const f = fixture();
+    const { name, item } = pendingRecord(f.input, 'original');
+    item.reason = 'red team skipped (changed); not cleared';
+    mkdirSync(f.pendingDir, { recursive: true });
+    writeJsonAtomic(join(f.pendingDir, name), item);
+    expect(f.settle({ status: 'skipped', policy: 'card-only' }).outcome).toBe('policy-clear');
+    expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+    expect(f.pending()).toEqual([`${name}.bad`]);
+    expect(f.markers()).toEqual([]);
+    expect(f.io.log).toHaveBeenCalledWith(expect.stringContaining('quarantined'));
+  });
+
+  it('legacy unknown-head pending records without attempt identity are quarantined', () => {
+    const f = fixture();
+    const { name, item } = pendingRecord({ ...f.input, head: 'unknown' }, 'missing head', 'old-run');
+    delete item.attemptId;
+    mkdirSync(f.pendingDir, { recursive: true });
+    writeJsonAtomic(join(f.pendingDir, name), item);
+    f.settle({ status: 'skipped', policy: 'card-only' });
+    expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+    expect(f.pending()).toEqual([`${name}.bad`]);
+    expect(f.io.log).toHaveBeenCalledWith(expect.stringContaining('missing pending attempt identity'));
+  });
+
+  it('unknown-head pending records retain their attempt identity across retries', () => {
+    const f = fixture();
+    f.io.publishNeedsYou.mockImplementationOnce(() => { throw Error('offline'); });
+    f.settle({ status: 'skipped', reason: 'missing head' }, { head: 'unknown', runId: 'attempt-1' });
+    const name = f.pending()[0];
+    f.settle({ status: 'skipped', policy: 'card-only' });
+    expect(f.pending()).toEqual([]);
+    expect(f.markers()).toEqual([name]);
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     ['missing policy', { status: 'skipped', reason: 'red team skipped: card-only' }],
     ['missing status', { policy: 'card-only', reason: 'red team skipped: card-only' }],
@@ -170,8 +231,7 @@ describe('red-team skip pre-review regressions', () => {
       if (n % 2 === 0) writeFileSync(path, '{broken');
       utimesSync(path, 1, 1);
     }
-    const name = `${'f'.repeat(64)}.json`;
-    const item = { ...f.input, kind: `red-team-skip-${'f'.repeat(26)}`, reason: 'pending valid', title: '' };
+    const { name, item } = pendingRecord(f.input, 'pending valid');
     writeJsonAtomic(join(f.pendingDir, name), item);
     expect(f.settle({ status: 'skipped', policy: 'card-only' }).outcome).toBe('policy-clear');
     expect(f.io.publishNeedsYou.mock.calls).toEqual([[item]]);
@@ -188,8 +248,7 @@ describe('red-team skip pre-review regressions', () => {
     const f = fixture(), items = [];
     mkdirSync(f.pendingDir, { recursive: true });
     for (let n = 0; n < 30; n++) {
-      const name = `${n.toString(16).padStart(64, '0')}.json`;
-      const item = { ...f.input, kind: `red-team-skip-${name.slice(0, 26)}`, reason: `valid ${n}`, title: '' };
+      const { name, item } = pendingRecord(f.input, `valid ${n}`);
       items.push(item);
       const path = join(f.pendingDir, name);
       writeJsonAtomic(path, item);

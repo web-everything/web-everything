@@ -7,6 +7,27 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 
+/** A pinned Git head must be a full SHA, never a coercible value or sentinel. */
+export function isRealHead(value) {
+  return typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
+}
+
+const reasonPrefix = 'red team skipped (', reasonSuffix = '); not cleared';
+const embeddedReason = item => item.reason.slice(reasonPrefix.length, -reasonSuffix.length);
+const boundReason = reason => sanitizeForFeed(reason, 80);
+const normalizeItem = item => ({ ...item,
+  reason: `${reasonPrefix}${boundReason(embeddedReason(item))}${reasonSuffix}`,
+  title: sanitizeForFeed(item.title, 200),
+});
+function itemKey(item) {
+  const identity = [item.repo, item.pr, item.head, embeddedReason(item)];
+  if (!isRealHead(item.head)) {
+    if (typeof item.attemptId !== 'string' || !item.attemptId) throw Error('missing pending attempt identity');
+    identity.push(item.attemptId);
+  }
+  return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+}
+
 /** PURE. A reason string is never evidence of a policy exemption. */
 export function classifyRedTeamSkip(redTeam) {
   const valid = redTeam != null && typeof redTeam === 'object' && !Array.isArray(redTeam);
@@ -30,23 +51,26 @@ function flushPending(io, note) {
     for (const { name } of records) {
       const pending = join(pendingDir, name), published = join(base, 'skip-published', name);
       try {
-        if (existsSync(published)) { unlinkSync(pending); continue; }
         let item;
         try {
           item = JSON.parse(readFileSync(pending, 'utf8'));
           if (!item || typeof item.repo !== 'string' || !item.repo
             || !Number.isSafeInteger(Number(item.pr)) || Number(item.pr) <= 0
-            || !/^(?:[a-f0-9]{40}|unknown)$/i.test(item.head ?? '')
+            || !(isRealHead(item.head) || item.head === 'unknown')
             || item.kind !== `red-team-skip-${name.slice(0, 26)}`
-            || typeof item.reason !== 'string' || !item.reason || typeof item.title !== 'string') {
+            || typeof item.reason !== 'string' || !item.reason.startsWith(reasonPrefix)
+            || !item.reason.endsWith(reasonSuffix) || typeof item.title !== 'string') {
             throw Error(`invalid pending red-team skip record ${name}`);
           }
+          item = normalizeItem(item);
+          if (`${itemKey(item)}.json` !== name) throw Error('pending content key mismatch');
         } catch (error) {
           // Poison evidence must never consume publication slots or be scanned again.
           renameSync(pending, `${pending}.bad`);
           note(`quarantined ${name}.bad: ${error.message}`);
           continue;
         }
+        if (existsSync(published)) { unlinkSync(pending); continue; }
         if (attempted >= 25) { overflow = true; continue; }
         attempted++;
         try {
@@ -79,18 +103,18 @@ export function settleRedTeamSkip(input = {}) {
     io = input.io;
     flushPending(io, note);
     const { redTeam, pr, repo, comments } = input;
-    const realHead = /^[a-f0-9]{40}$/i.test(input.head ?? '');
+    const realHead = isRealHead(input.head);
     const head = realHead ? input.head : 'unknown';
     const classified = classifyRedTeamSkip(redTeam);
     let { reason } = classified;
-    const boundRead = typeof input.readHead === 'string' && /^[a-f0-9]{40}$/i.test(input.readHead)
+    const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
     if (classified.kind === 'policy' && !boundRead) {
       reason = 'policy skip head not bound to the reviewed read';
     } else if (classified.kind === 'policy') {
       try {
         if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || typeof repo !== 'string' || !repo
-          || !/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing or invalid PR/head');
+          || !isRealHead(head)) throw Error('missing or invalid PR/head');
         const thread = comments ?? io.readComments({ repo, pr });
         if (!Array.isArray(thread)) throw Error('PR comments unreadable');
         if (redTeamForHead(thread, pr, head)) return { outcome: 'already' };
@@ -100,14 +124,14 @@ export function settleRedTeamSkip(input = {}) {
         reason = `policy-clear comment failed: ${error?.message ?? error}`;
       }
     }
-    reason = sanitizeForFeed(reason, 80);
-    const identity = [repo, pr, head, reason];
-    if (!realHead) identity.push(input.runId || randomUUID());
-    const key = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+    reason = boundReason(reason);
+    const item = normalizeItem({ repo, pr, head, reason: `${reasonPrefix}${reason}${reasonSuffix}`, title: '',
+      ...(!realHead ? { attemptId: input.runId || randomUUID() } : {}) });
+    const key = itemKey(item);
+    item.kind = `red-team-skip-${key.slice(0, 26)}`;
     const path = join(redTeamStatusDir(io?.env ?? process.env), 'skip-published', `${key}.json`);
     if (existsSync(path)) return { outcome: 'non-policy', reason };
     const pending = join(redTeamStatusDir(io?.env ?? process.env), 'skip-pending', `${key}.json`);
-    const item = { repo, pr, head, kind: `red-team-skip-${key.slice(0, 26)}`, reason: `red team skipped (${reason}); not cleared`, title: '' };
     mkdirSync(dirname(pending), { recursive: true });
     writeJsonAtomic(pending, item);
     io.publishNeedsYou(item);

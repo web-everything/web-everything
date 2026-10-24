@@ -88,7 +88,7 @@ import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, bu
 import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../lib/review-red-team-on-skip.mjs';
-import { settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
+import { isRealHead, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
@@ -299,17 +299,6 @@ export function readRedTeamRecoveryStatus(input, {
 
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────
 
-/** PURE apart from the injected reader: prefer reviewed, then lane, then live head. */
-export function resolveSettlementHead({ readRev, laneHead, readLiveHead } = {}) {
-  const isHead = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
-  for (const head of [readRev, laneHead]) if (isHead(head)) return head;
-  try {
-    const live = readLiveHead?.();
-    if (isHead(live)) return live;
-  } catch { /* unavailable live evidence retains an unknown identity */ }
-  return 'unknown';
-}
-
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execRead, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence } = {}) {
   const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
@@ -395,7 +384,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     root,
     fetchRedTeamHead: ({ lanePath, pr, head }) => {
-      if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing pinned red-team head');
+      if (!isRealHead(head)) throw Error('missing pinned red-team head');
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       exec('git', ['-C', lanePath, 'fetch', '--quiet', '--no-tags', 'origin', `pull/${pr}/head`], options);
       const fetched = exec('git', ['-C', lanePath, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}'], options).trim();
@@ -407,7 +396,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     prepareLane: ({ pr, repo, lanePath }) => {
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
-      if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
+      if (!isRealHead(head)) throw Error('review head missing; inspect PR evidence before retrying');
       exec('git', ['fetch', '--no-tags', `https://github.com/${repo}.git`, `refs/pull/${pr}/head`], options);
       const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], options).trim();
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
@@ -821,13 +810,11 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       && redTeam?.deferredByCap !== true && redTeam?.deferredByGuard !== true
       && typeof io.settleRedTeamSkip === 'function') {
       try {
-        const isHead = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
         const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
-        const readHead = isHead(rev) ? rev : null;
-        const head = resolveSettlementHead({ readRev: rev, laneHead: seatsBox.laneHead,
-          readLiveHead: () => io.readCarryEvidence?.({ repo: out.repo, pr: out.pr })?.headSha });
+        const readHead = isRealHead(rev) ? rev : null;
+        const head = readHead ?? seatsBox.laneHead;
         const settled = io.settleRedTeamSkip({ redTeam, repo: out.repo, pr: out.pr,
-          head: head ?? 'unknown', readHead, runId: out.runId });
+          head, readHead, runId: out.runId });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
         io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`);
@@ -878,7 +865,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
 export function prepareReviewArc(input, io) {
   try {
     const { head } = io.prepareLane(input);
-    if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing pinned review head');
+    if (!isRealHead(head)) throw Error('missing pinned review head');
     return { head };
   } catch (e) {
     throw Error(`review lane setup failed: ${tail(e?.message ?? e, 300)}; inspect the PR head and retry`);
@@ -924,7 +911,7 @@ function runReviewArc({
         io.log(`review-job: carryAcrossRebase=${setting.value} (${setting.source})`);
         if (setting.value === 'on') {
           const evidence = io.readCarryEvidence({ pr: planned.pr, repo: planned.repo });
-          if (!/^[0-9a-f]{40}$/.test(evidence?.headSha ?? '') || !Array.isArray(evidence?.comments)) throw Error('carry evidence unreadable');
+          if (!isRealHead(evidence?.headSha) || !Array.isArray(evidence?.comments)) throw Error('carry evidence unreadable');
           const prior = findCarriableVerdict({ ...evidence, pr: planned.pr });
           if (prior) {
             const priorPatchId = io.contributionPatchId({ sha: prior.sha, repo: planned.repo });
@@ -1187,7 +1174,6 @@ export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stack
   return named(dispatchReviewJob(opts));
 }
 
-const STACK_CARRY_HEAD = /^[0-9a-f]{40}$/;
 const STACK_CARRY_FINGERPRINT = /^[0-9a-f]{64}$/;
 
 /**
@@ -1213,7 +1199,7 @@ export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = proce
   let stackFingerprint = null;
   let mainFingerprint = null;
   if (base) { try { stackFingerprint = fingerprintOf(stackText(base)); } catch { stackFingerprint = null; } }
-  else if (thread?.headRefName && STACK_CARRY_HEAD.test(String(thread.headRefOid ?? ''))) {
+  else if (thread?.headRefName && isRealHead(thread.headRefOid)) {
     // The fingerprint is of THIS commit (`headRefOid`), not of whatever the branch name points at by now; the carry
     // below is bound to that same commit and fingerprint.
     try { const net = mainText({ headRefName: thread.headRefName, headRefOid: thread.headRefOid }); mainFingerprint = net?.scored ? fingerprintOf(net.text) : null; } catch { mainFingerprint = null; }
@@ -1251,7 +1237,7 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
   try {
     const head = String(decision?.head ?? '');
     const fingerprint = String(decision?.fingerprint ?? '');
-    if (!STACK_CARRY_HEAD.test(head) || !STACK_CARRY_FINGERPRINT.test(fingerprint)) {
+    if (!isRealHead(head) || !STACK_CARRY_FINGERPRINT.test(fingerprint)) {
       return { ok: false, error: 'carry refused: the compared head and fingerprint are not both known' };
     }
     const bodyPath = join('/tmp', `review-stack-carry-${String(repo).replace(/[^\w.-]+/g, '-')}-${pr}-${randomUUID()}.md`);
