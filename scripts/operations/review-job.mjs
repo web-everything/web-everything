@@ -1164,8 +1164,8 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
 
 // ── CLI ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-/** CLI boundary; runJob injection observes the options passed to the real job. */
-export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob } = {}) {
+/** CLI boundary; injected job and rating effects keep recovery guard tests hermetic. */
+export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob } = {}) {
   const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
@@ -1191,7 +1191,7 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       // that function's own `openSync(logPath, 'a')`). Best-effort: `rateAndRecordReviewJob` never throws, and
       // a rating failure must never affect this CLI's own exit code. A refused job ran no review — nothing to
       // rate (`rateReviewJobLog` also skips any summary with no loop timing, the same guard at the pure layer).
-      if (!redTeamOnly && out.sessionSlug && !out.refused) { try { rateAndRecordReviewJob(jobLogPath(out.sessionSlug)); } catch { /* best-effort */ } }
+      if (!redTeamOnly && out.sessionSlug && !out.refused) { try { rate(jobLogPath(out.sessionSlug)); } catch { /* best-effort */ } }
       process.exitCode = out.refused ? 75 : 0;
     } catch (e) {
       writeLineSync(2, `review-job: error: ${String(e?.message ?? e)}`);

@@ -1,8 +1,40 @@
 import { it, expect, vi } from 'vitest';
 import { runRedTeamOnSkip } from '../../../scripts/lib/review-red-team-on-skip.mjs';
-import { runReviewTick, sharedHostBudget } from '../review-daemon.mjs';
+import { cliReviewTickOpts, runReviewTick, sharedHostBudget } from '../review-daemon.mjs';
+import * as reviewJob from '../../../scripts/operations/review-job.mjs';
+import * as redTeamEvidence from '../../../scripts/lib/drain-red-team-evidence.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
+
+it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head in %s mode', mode => {
+  const repo = 'web-everything/web-everything', head = (mode === 'fresh' ? 'c' : 'd').repeat(40), pr = 5762;
+  const readEvidence = vi.spyOn(redTeamEvidence, 'readDrainRedTeamEvidence').mockReturnValue({
+    recorded: mode === 'resume', loopPayload: {
+      verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } },
+    },
+  });
+  const readStatus = vi.spyOn(reviewJob, 'readRedTeamRecoveryStatus')
+    .mockReturnValue(mode === 'resume' ? { status: 'finished', result: 'ran' } : null);
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const take = vi.fn();
+    const out = runReviewTick({ ...production, repo,
+      readPrs: () => [{ number: pr, headRefOid: head, labels: [], comments: [] }],
+      readAgents: () => [], holdReconcile: () => [], acquirableLanes: () => 1,
+      liveReviewBudget: { left: 1 }, hostAdmission: () => ({ admitted: true, maxPerTick: 1, take }),
+      reconcile: () => ({ dispatch: [], refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] }),
+      tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
+    });
+    expect(out.redTeamOnSkip?.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode }]);
+    expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head });
+    expect(readStatus).toHaveBeenCalledWith({ repo, pr, head });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: mode });
+    expect(take).toHaveBeenCalledOnce();
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
 
 it.each(['fresh', 'resume'])('real reconcile recovers a queued accepted head in %s mode', mode => {
   const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;

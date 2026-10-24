@@ -14,6 +14,30 @@ const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { net
 
 describe('review-job CLI --red-team-only', () => {
   it.each([
+    [[], 1],
+    [['--red-team-only'], 0],
+    [['--red-team-only=fresh'], 0],
+    [['--red-team-only=resume'], 0],
+  ])('rates only ordinary completed reviews (%j)', (flags, expectedRatings) => {
+    const source = `
+      import { runReviewJobCli } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-job.mjs')).href)};
+      const ratings = [];
+      runReviewJobCli(process.argv.slice(1), {
+        runJob: () => ({ sessionSlug: 'review-5762', refused: false }),
+        rate: path => ratings.push(path),
+      });
+      process.stdout.write(JSON.stringify({ ratings }) + '\\n');
+    `;
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', source,
+      'run', '--pr=5762', `--repo=${repo}`, ...flags], {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
+    });
+    const [result, { ratings }] = output.trim().split('\n').map(line => JSON.parse(line));
+    expect(result).toEqual({ sessionSlug: 'review-5762', refused: false });
+    expect(ratings).toHaveLength(expectedRatings);
+    if (expectedRatings) expect(ratings[0]).toMatch(/review-5762\.log$/);
+  });
+  it.each([
     [[], false, 'fresh'],
     [['--red-team-only'], true, 'fresh'],
     [['--red-team-only=fresh'], true, 'fresh'],
@@ -49,6 +73,83 @@ function fakeIo(over = {}) {
 }
 
 describe('red-team-only review job', () => {
+  it.each(['fresh', 'resume'].flatMap(redTeamMode => ['clean', 'degraded', 'read-error'].map(gateCase => ({ redTeamMode, gateCase }))))(
+    '$redTeamMode recovery preserves acceptance, review:human and completion through the real gate ($gateCase)', ({ redTeamMode, gateCase }) => {
+      // The job invokes the asynchronous gate in a synchronous child in production.
+      // Keep that boundary, replacing only the gate's external IO and label provider.
+      const operationsUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../')).href;
+      const source = `
+        import { applyRedTeamGate } from ${JSON.stringify(`${operationsUrl}red-team-gate-apply.mjs`)};
+        import { renderRedTeamComment } from ${JSON.stringify(`${operationsUrl}review-extra-seats.mjs`)};
+        import { syncRedTeamStatusLabels } from ${JSON.stringify(new URL('../lib/red-team-status-labels.mjs', operationsUrl).href)};
+        const { repo, pr, head, gateCase } = JSON.parse(process.argv[1]);
+        const labels = new Set(['review:accepted', 'review:human', 'red-team:pending']);
+        const mutations = [], effects = [];
+        const comments = [{ author: { login: 'web-everything' }, body: renderRedTeamComment({
+          pr, rev: head, provider: 'codex', model: 'fixture', foldedVerdict: 'accept', recheckStatus: 'ok',
+          findings: gateCase === 'degraded' ? [{ summary: 'follow-up', category: 'edge-case',
+            impactIfUnfixed: 'degraded', confirmedByRecheck: true, file: 'scripts/example.mjs', line: 1 }] : [],
+        }) }];
+        const live = () => ({ headRefOid: head, labels: [...labels], comments });
+        const provider = {
+          readPrState: live, readComments: () => comments, ensureLabel: () => {},
+          setLabels: (_repo, _pr, change) => {
+            mutations.push(change);
+            for (const name of change.remove) labels.delete(name);
+            if (change.add) labels.add(change.add);
+          },
+        };
+        const result = await applyRedTeamGate({ repo, pr }, {
+          readPr: () => { if (gateCase === 'read-error') throw Error('fixture read error'); return live(); },
+          readGrantScope: () => null,
+          readSetting: () => ({ value: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' } }),
+          readHead: () => head, readRound: () => 1,
+          sendBack: () => { effects.push('sendBack'); return { ok: true }; },
+          appendSendBackEvent: () => effects.push('verdict'),
+          dequeueSentBack: () => effects.push('dequeue'),
+          fileCard: () => { effects.push('card'); return { ok: true, session: 'fixture-card' }; },
+          postComment: ({ body }) => comments.push({ author: { login: 'web-everything' }, body }),
+          log: () => {},
+          syncStatusLabels: input => syncRedTeamStatusLabels({ ...input, provider,
+            env: { WE_RED_TEAM_STATUS_LABELS: '1' }, standingRuling: null }),
+        });
+        process.stdout.write(JSON.stringify({ result, labels: [...labels], mutations, effects }));
+      `;
+      const completion = { status: 'done', outcome: 'parked', verdict: 'accept' };
+      const before = { ...completion };
+      let gate;
+      const io = fakeIo({
+        readPrevCompletion: () => completion,
+        report: vi.fn(flags => Object.assign(completion, flags)),
+        ...(redTeamMode === 'resume' ? {
+          readRedTeamStatus: () => ({ status: 'finished', result: 'ran' }),
+          readRedTeamRecords: () => [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' }],
+        } : {}),
+        runRedTeamGate: vi.fn(() => {
+          gate = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source,
+            JSON.stringify({ repo, pr, head, gateCase })], {
+            encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
+          }));
+          return gate.result;
+        }),
+      });
+      const out = runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode }, io);
+      expect(out.outcome).toBe('red-team-only');
+      expect(io.runRedTeamGate).toHaveBeenCalledOnce();
+      expect(io.runRedTeamGate).toHaveBeenCalledWith({ pr, repo });
+      expect(out.redTeamGate.status).toBe(gateCase === 'clean' ? 'advisory-only' : gateCase === 'degraded' ? 'applied' : 'error');
+      expect(gate.labels).toEqual(expect.arrayContaining(['review:accepted', 'review:human']));
+      expect(gate.mutations.flatMap(({ add, remove }) => [add, ...remove]).filter(name => name?.startsWith('review:'))).toEqual([]);
+      expect(gate.effects).toEqual(gateCase === 'degraded' ? ['card'] : []);
+      if (gateCase !== 'read-error') expect(gate.mutations).toEqual([{ add: 'red-team:clear', remove: ['red-team:pending'] }]);
+      expect(completion).toEqual(before);
+      for (const hook of ['report', 'runLoop', 'runExtraSeats', 'restampVerdict']) expect(io[hook]).not.toHaveBeenCalled();
+      // These are live-job lease operations, not review completion writes.
+      expect(io.updateRecord).toHaveBeenCalledOnce();
+      expect(io.updateRecord.mock.calls[0][0]).not.toHaveProperty('outcome');
+      expect(io.unclaim).toHaveBeenCalledOnce();
+      expect(io.unclaim).toHaveBeenCalledWith(`review-${pr}`, process.pid);
+    });
   it.each(['fresh', 'resume'])('refuses a result posted after the daemon snapshot in %s mode with zero red-team calls', redTeamMode => {
     const io = fakeIo({
       ...(redTeamMode === 'resume' ? {
