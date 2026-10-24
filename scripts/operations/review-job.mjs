@@ -92,7 +92,7 @@ import { contributionPatchId, attemptVerdictCarry, resolveCarryAcrossRebase, git
 import { proveIdenticalNetPatch } from '../lib/identical-net-patch.mjs';
 import { readRedTeamTiming, readRedTeamProbes, readConfirmedBreaks, planRedTeamActions, redTeamForHead } from '../lib/red-team-gate.mjs';
 import { savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
-import { normalizeRedTeamResult, redTeamRecoveryRows, resolveReviewRedTeamOnSkip } from '../lib/review-red-team-on-skip.mjs';
+import { freshRedTeamRecoveryAllowed, normalizeRedTeamResult, redTeamRecoveryRows, resolveReviewRedTeamOnSkip } from '../lib/review-red-team-on-skip.mjs';
 import { readStore } from '../conveyor/run-scorecard-store.mjs';
 
 import { randomUUID } from 'node:crypto';
@@ -937,6 +937,7 @@ function runReviewArc({
         if (redTeamMode === 'fresh') {
           if (recovery.verifiedRow) return refuse('verified prior red-team row; use resume mode');
           if (recovery.freshAttempts >= setting.maxFreshPerHead) return refuse('fresh attempts exhausted for head');
+          if (!freshRedTeamRecoveryAllowed({ status, recovery })) return refuse('prior red-team evidence; inspect stored evidence before retrying');
         }
         let comments;
         try {

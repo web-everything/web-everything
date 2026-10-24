@@ -4931,7 +4931,7 @@ async function runCli() {
     // Dry runs skip provisioning entirely.
     if (!DRY_RUN) {
       for (const [name, meta] of Object.entries(CI_LIFECYCLE_LABEL_META)) {
-        try { ensureLabelCached(['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { exec: args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }); } catch { /* already exists — fine */ }
+        try { ensureLabelCached(['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { exec: args => execFileSyncThrottled('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, throttle: { op: 'drain label provisioning' } }) }); } catch { /* already exists — fine */ }
       }
     }
     const reconciled = [];
@@ -5683,7 +5683,7 @@ async function runCli() {
       const escalationRepos = new Set(verdicts.filter((v) => !v.prestagePendingCi && (v.decision === 'merge' || v.reviewHeld)).map((v) => v.repo || null));
       for (const repo of escalationRepos) {
         for (const [name, meta] of Object.entries(REVIEW_LABEL_META)) {
-          try { ensureLabelCached(['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { exec: args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }); } catch { /* already exists — fine */ }
+          try { ensureLabelCached(['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { exec: args => execFileSyncThrottled('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, throttle: { op: 'drain label provisioning' } }) }); } catch { /* already exists — fine */ }
         }
       }
     }

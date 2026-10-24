@@ -620,6 +620,9 @@ describe('red-team-only review job', () => {
   });
   it('permits one failed seat row below the fresh cap', () => {
     const io = fakeIo({ readRedTeamRecords: () => [{ ...cleanRow, status: 'error' }] });
+    // This is a retry of the overlay's durably admitted fresh recovery. Historical
+    // error rows without that reservation retain the prior-pass refusal below.
+    io.reserveFreshRedTeamAttempt({ repo, pr, head, at: 1, pid: 42, maxFreshPerHead: 2 });
     expect(runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' }, io).outcome).toBe('red-team-only');
     expect(io.runRedTeam).toHaveBeenCalledOnce();
   });

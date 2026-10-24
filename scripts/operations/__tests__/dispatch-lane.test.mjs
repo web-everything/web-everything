@@ -2838,7 +2838,9 @@ describe('#3960: the fix/ci-heal briefs fill repo-aware, and reproduce WE\'s pre
     // Landing-freeze fix (lane-leftover-reclaim) — `--repo=` is now `{{LANE_REPO}}`, an absolute path equal to
     // `{{WE_ROOT}}` for `we` (was the literal `.`, broken from a dispatched session's scratch cwd — #4174).
     expect(prompt).toContain(`node "${tokens.WE_ROOT}/scripts/lane-pool.mjs" acquire --repo=${tokens.LANE_REPO} --lane=5`);
-    expect(prompt).toContain('gh pr view 701 --json title,body,comments --repo web-everything/web-everything');
+    // The overlay's shared context port replaces this informational gh read with
+    // a paginated, TTL-bounded read pinned to the examined checkout head.
+    expect(prompt).toContain(`node "${tokens.WE_ROOT}/scripts/pr-context.mjs" 701 --repo=web-everything/web-everything --head="$(git rev-parse HEAD)"`);
   });
 
   it('for WE, the ci-heal brief\'s {{ATTRIBUTION}} reproduces the pre-#3960 hardcoded literal exactly', () => {

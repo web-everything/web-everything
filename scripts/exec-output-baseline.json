@@ -53,7 +53,7 @@
   "scripts/operations/dispatch-lane-io.mjs": 2,
   "scripts/operations/handoff-home.mjs": 2,
   "scripts/operations/record-verdict-io.mjs": 2,
-  "scripts/operations/review-extra-seats.mjs": 3,
+  "scripts/operations/review-extra-seats.mjs": 2,
   "scripts/operations/runner-freshness.mjs": 1,
   "scripts/pr-body-edit.mjs": 1,
   "scripts/pr-land.mjs": 4,

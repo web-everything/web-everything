@@ -430,6 +430,8 @@ export function fillReviewBrief(template, values = {}) {
 const REVIEW_CODE_PATH_RE = /^scripts\/(operations|lib|conveyor)\/[^/]*(review|judge|jury)[^/]*$/;
 const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/operations/cli-adapter.mjs', 'scripts/lib/main-staleness.mjs',
+  // The dispatcher computes the sandbox closure; the job proves carried patches through this helper.
+  'scripts/lib/import-closure.mjs', 'scripts/lib/identical-net-patch.mjs',
   // the dispatcher's own imports: sandbox, session isolation, routing, repo resolution
   'scripts/operations/dispatch-lane-io.mjs', 'scripts/lib/dispatch-bg-isolation.mjs',
   'scripts/lib/provider-routing.mjs', 'scripts/lib/codex-model-routing.mjs', 'scripts/lib/constellation-repos.mjs',

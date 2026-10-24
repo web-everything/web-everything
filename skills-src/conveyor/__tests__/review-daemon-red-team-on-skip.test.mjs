@@ -77,7 +77,8 @@ it('a throwing recovery dispatch spends the only shared host seat and leaves zer
     readPrs: () => [{ number: pr, headRefOid: head, comments: [], labels: [] }],
     redTeamOnSkip: options => runRedTeamOnSkip({ ...options, dispatch,
       setting: { enabled: true, retryCooldownMin: 30, maxFreshPerHead: 2 },
-      readEvidence: () => ({ loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } } }),
+      // Main's fresh-pass guard requires an explicit absence of recorded work, even in this spawn-failure fixture.
+      readEvidence: () => ({ recorded: false, loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } } }),
       readStatus: () => null, readRecoveryRows: () => ({ verifiedRow: null, freshAttempts: 0 }),
       now: () => 2_000_000, lastDispatch: new Map(),
     }),

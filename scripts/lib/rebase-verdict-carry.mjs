@@ -121,6 +121,11 @@ function findCarriableVerdictFor({ comments, trusted, sha, headSha, pr }) {
     return !informationalProvenance(c?.body, sha, number);
   });
   const record = latestAcceptRecord(verdictComments);
+  // The shared reader recognizes red-team markers as machine records without this path's
+  // head/outcome/whole-body proof. Anything that survived the strict filter above is
+  // still a hold here, including a valid marker with unknown prose appended to it.
+  if (record && verdictComments.slice(record.index + 1).some(c =>
+    parseRedTeamGateMarker(c?.body) || parseRedTeamComment(c?.body))) return null;
   // A body-derived hold anywhere after the accept counts on the UNFILTERED thread: neutral shapes are never a way to
   // hide one (Codex re-audit #3, finding 1).
   if (latestAcceptRecord(comments)?.laterBodyDerivedHold) return null;

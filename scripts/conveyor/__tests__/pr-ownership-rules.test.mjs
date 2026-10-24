@@ -16,6 +16,9 @@ const unlabeled = 'pr-5172-unlabeled-red';
 function replay(name, settings = {}, mutate = () => {}) {
   const fx = fixture(name); mutate(fx.pr);
   return planReconcile({ repo: 'we', prs: [fx.pr], now: Date.parse(fx.observedAt), requiredChecks: checks,
+    // Isolate the incident's opt-in ownership rules. The overlay's default `stuck`
+    // healer now also restores settled green orphans, covered separately below.
+    reviewLabelHeal: 'green',
     advisoryReviewOnHumanHandoff: 'off', unlabeledRedAgentPr: 'off', ...settings });
 }
 const on = { advisoryReviewOnHumanHandoff: 'on' };
@@ -112,6 +115,15 @@ describe('cards 273 and 278 incident replays', () => {
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated',
       reviewRefusal: expect.objectContaining({ kind: 'draft' }) }));
   });
+});
+
+it('the default stuck healer restores the settled green orphan even with ownership overrides off', () => {
+  // The incident snapshot is still inside the ten-minute grace after its newest
+  // completed check. The newer stuck healer must restore it once that grace ends.
+  const result = replay(unlabeled, { reviewLabelHeal: 'stuck', now: healing.now });
+  expect(result.dispatch).toEqual([expect.objectContaining({
+    kind: 'restore-review-label', variant: 'stuck', label: 'review:pending',
+  })]);
 });
 
 describe('ownership reports', () => {

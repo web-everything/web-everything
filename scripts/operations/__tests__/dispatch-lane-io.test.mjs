@@ -229,6 +229,8 @@ describe('PR #5729 — daemon dispatch fails closed without the gh refusal shim'
     const spawnDetached = vi.fn(() => ({ pid: 4242 }));
     const r = spawnPreventionLandingJob({ title: 't', kind: 'story', size: 1, digest: 'd', scope: 'we:x', queue: true }, {
       spawnDetached, logPathFor: () => '/dev/null',
+      // The overlay pauses filing by default; this fixture exercises the downstream auth boundary.
+      loadFilingSettings: () => ({ filingEnabled: true }),
       resolveSettingsEnv: () => { throw new Error('gh-shim: refusing daemon dispatch without the gh auth guard'); },
     });
     expect(r).toMatchObject({ ok: false, error: expect.stringMatching(/refusing to spawn without the gh auth guard/) });
@@ -240,6 +242,8 @@ describe('PR #5729 — daemon dispatch fails closed without the gh refusal shim'
     vi.stubEnv('XPC_SERVICE_NAME', '');
     const spawnDetached = vi.fn(() => ({ pid: 4242 }));
     const r = spawnPreventionLandingJob({ title: 't', kind: 'story', size: 1, digest: 'd', scope: 'we:x', queue: true }, {
+      // Explicitly enable filing to reach the interactive settings fallback under test.
+      loadFilingSettings: () => ({ filingEnabled: true }),
       spawnDetached, logPathFor: () => '/dev/null', resolveSettingsEnv: () => { throw new Error('boom'); },
     });
     expect(r.ok).toBe(true);

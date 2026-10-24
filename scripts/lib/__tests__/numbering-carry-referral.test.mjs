@@ -225,7 +225,12 @@ describe('numbering carry referral evidence', () => {
       const warm = readReviewRunHeads({ dir, memo: new Map(), readRun: () => { throw Error('cache miss'); } });
       expect(cold).toEqual([{ id: LIVE_RUN, repo, pr, head: TO }]);
       expect(warm).toEqual(cold);
-      expect(evidence).toEqual([]);
+      // Main now retains incomplete attempts for retry accounting. They must stay
+      // explicitly uncompleted and pending, so they still prove no clean review.
+      expect(evidence).toEqual([{ id: LIVE_RUN, repo, pr, head: TO,
+        startedAt: Date.parse('2026-10-17T12:00:00Z'), completedAt: null,
+        incomplete: true, parked: false, attempted: false, persistenceFailed: false,
+        count: 0, pending: ['review-incomplete'], rulings: [] }]);
       expect(readdirSync(dir).filter(n => n.endsWith('.cache')).sort())
         .toEqual(['.review-run-evidence.cache', '.review-run-heads.cache']);
     });
@@ -337,7 +342,10 @@ describe('numbering carry referral evidence', () => {
       expect(byId(readReviewRunHeads({ dir, memo: new Map(), persist: false }))).toEqual({
         [LIVE_RUN]: undefined, 'review-pr-custom-live': true, [PRIOR_RUN]: undefined, 'review-pr-custom-prior': true });
       expect(byId(readReviewRunEvidence({ dir, memo: new Map(), persist: false })))
-        .toEqual({ [PRIOR_RUN]: undefined, 'review-pr-custom-prior': true });
+        // Incomplete attempts are retained too; their custom identity must survive
+        // alongside the completed evidence rather than disappearing from this check.
+        .toEqual({ [LIVE_RUN]: undefined, 'review-pr-custom-live': true,
+          [PRIOR_RUN]: undefined, 'review-pr-custom-prior': true });
       expect(isMintedReviewRunId(newRunId('review-pr'))).toBe(true);
     });
     it('still carries numbering evidence when no run reviewed the live head', () => {

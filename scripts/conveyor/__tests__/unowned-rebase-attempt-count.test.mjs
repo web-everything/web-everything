@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { rebaseDropManifest } from '../../lib/rebase-drop-manifest.mjs';
 import { UNOWNED_REBASE_INFRA_MARKER, UNOWNED_REBASE_INFRA_RETRY_CAP_DEFAULT, formatUnownedRebaseInfraMarker, shouldCountRebaseInfra, countUnownedRebaseInfraFailures, countUnownedRebaseAttempts, UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, shouldCountRebaseAttempt, formatUnownedRebaseAttemptMarker, loadUnownedRebaseSettings, grantedRebaseCap } from '../unowned-rebase-attempt-count.mjs';
 import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
+import { countUnownedRebaseAggregateAttempts } from '../unowned-rebase-attempt-count.mjs';
 
 const AUTOMATION = { login: 'web-everything' };
 
@@ -49,6 +50,19 @@ describe('countUnownedRebaseAttempts — the durable unowned-population rebase-d
 
 
 describe('content-conflict attempt policy', () => {
+  it.each([
+    'ambiguous JIT reference mapping', 'cannot read JIT reference mapping', 'PR is not proven card-only',
+    'non-backlog conflict', 'conflicting card side is missing', 'conflicting card is not a regular file',
+  ])('keeps resolver precondition %s bounded by the infra and aggregate counters', reason => {
+    const result = { action: 'skip', precondition: true, reason };
+    expect(shouldCountRebaseAttempt(result)).toBe(false);
+    expect(shouldCountRebaseInfra(result)).toBe(true);
+    const comment = { body: formatUnownedRebaseInfraMarker(result, 'abc'), author: AUTOMATION };
+    expect(countUnownedRebaseInfraFailures([comment], { headSha: 'abc' })).toBe(1);
+    expect(countUnownedRebaseAggregateAttempts([comment])).toBe(1);
+    // A reason alone cannot opt an arbitrary skip out of the content budget.
+    expect(shouldCountRebaseAttempt({ action: 'skip', reason })).toBe(true);
+  });
   it.each([
     ['cannot pin card conflict inputs', false],
     ['cannot prove pinned card conflict', false],

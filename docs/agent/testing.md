@@ -277,7 +277,7 @@ mode (`--red-team-only=resume|fresh`; the bare flag retains fresh guards). A rec
 resumes its missing comment/effects without another model call; a failed recovery persists `resumed` and remains eligible after cooldown, subject to the same clean-row guards;
 only a head with neither status nor row starts fresh. A trusted result comment, live pass,
 non-accept, unreadable evidence, recorded row without a status, or any prior result other than `ran` or `resumed`
-prevents dispatch. The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying. Recovery
+prevents dispatch. The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses historical status or red-team seat evidence except for the bounded recovery cases below. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying. Recovery
 shares the tick's lane/live-review capacity and host admission (including recovery-only ticks).
 Ordinary and recovery starts share the remaining host per-tick allowance; confirmed starts and
 unknown outcomes consume the cross-repo host budget, while confirmed non-starts do not.
@@ -288,7 +288,14 @@ Recovery defaults to a 30-minute retry cooldown through
 live in `review-red-team-on-skip.test.mjs` and `review-job-red-team-only.test.mjs`.
 Resume additionally requires `verifiedPriorRedTeamRow` provenance from a strict scorecard read.
 The fresh-attempt cap defaults to `maxFreshPerHead: 2`; it bounds otherwise eligible fresh
-admissions and does not override the status/recorded-row guards above. Status mtime also
+admissions. The planner and job share `freshRedTeamRecoveryAllowed`: an exact finished
+`resume-only: no clean prior red-team row — no call launched` skip with only unattested
+`ok` rows can recover fresh. An existing fresh reservation can retry only `ok`/`error`
+rows with missing status or a finished `ran`/`resumed` result whose comment failed.
+Historical error rows without a reservation, arbitrary skipped results, queued/running
+statuses, verified rows and unknown row statuses stay held. Every allowed retry reserves
+another slot before publishing queued status; no case bypasses the two-attempt ceiling.
+Status mtime also
 supplies a persisted cooldown across dispatcher restarts. A finished `ran` result whose
 comment is `withheld` instead uses the saved-result gate reader for the exact PR/head;
 missing, mismatched or unreadable saved evidence refuses. Gate application starts no model
@@ -1815,8 +1822,13 @@ or pruned run evidence remains the explicit label-only boundary, rather than an 
 A confirmed send-back finding still holds during the result-comment → gate-label race. Queue
 admission must also read the exact combined comment emitted by verdict carry: gate markers,
 the carried marker and producer prose, then the re-keyed advisory. Test the real review job's
-carry path, CRLF, stale/foreign/untrusted markers and malformed or quoted layouts. An operator's
-later `clear-human` ceremony on the same head releases findings handed over at the round cap;
+carry path, CRLF, stale/foreign/untrusted markers and malformed or quoted layouts.
+The rebase carry's whole-body provenance filter is stricter than the shared accept reader's
+machine-marker recognition. A red-team record retained by that filter must remain a hold,
+including stale/foreign heads, broken findings and unknown appended prose; the shared reader
+must not reclassify it as neutral. `rebase-verdict-carry.test.mjs` and
+`accept-carry-identical-net-patch.test.mjs` pin both producer output and rejected surrounding text.
+An operator's later `clear-human` ceremony on the same head releases findings handed over at the round cap;
 an ordinary accept, restamp alone, superseded clearance or ruling before the finding does not.
 Preserve a proven ruling through chains of identical-contribution carries. Both paginated comment
 reads (admission and clearance dedupe) allow 256 MiB with a timeout; exercise a thread above
@@ -2359,7 +2371,10 @@ flag. Only the explicit `CARD_CONFLICT_PRECONDITION_REASONS` allowlist in
 `scripts/lib/card-conflict-resolve.mjs` exempts resolver refusals: ambiguous or unreadable
 JIT reference mapping, an unproven card-only PR, non-backlog conflicts, missing card
 sides, or non-regular card files. Those carry
-`precondition: true`; errors and throws do not spend the cap either.
+`precondition: true`; they spend the infrastructure budget instead of the content
+budget, as do errors and throws. The existing whole-history aggregate ceiling counts
+both markers, so resolver preconditions cannot create unbounded retries. Generic
+precondition/deferred skips still spend the content budget.
 Disabled auto-resolution skips retain their existing behavior without a `precondition` flag.
 Card attempt outcomes remain in conflict-watch results
 even when normal routing exits early. Nightly failure scans retain failed records

@@ -1,5 +1,5 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
-import { readSavedRedTeamGateResult } from './drain-saved-red-team.mjs';
+import { readSavedRedTeamGateResult, sameRepo } from './drain-saved-red-team.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,10 +15,29 @@ export function redTeamRecoveryRows(records, { repo, pr, head, env = process.env
   if (!Array.isArray(records)) throw Error('invalid scorecard records');
   const attempts = readAttempts({ repo, pr, head, env });
   if (!Array.isArray(attempts)) throw Error('invalid fresh red-team attempts');
+  const rows = records.filter(row => row?.dispatchKind === 'review-seat' && row.seat === 'red-team'
+    && sameRepo(row.repo, repo) && Number(row.pr) === Number(pr) && String(row.rev ?? '').toLowerCase() === head.toLowerCase());
   return {
     verifiedRow: verifiedPriorRedTeamRow(records, { repo, pr, rev: head, env }),
     freshAttempts: attempts.length,
+    recordedRow: rows.length > 0,
+    onlyOkRows: rows.length > 0 && rows.every(row => row.status === 'ok'),
+    onlyRetryableRows: rows.length > 0 && rows.every(row => ['ok', 'error'].includes(row.status)),
   };
+}
+
+/** Recovery is narrower than a general re-run: legacy errors/statuses remain held. A skipped
+ * resume with unattested clean rows launched no call; an already admitted bounded recovery may
+ * retry its failed publication. Neither case can mint resume provenance or bypass the fresh cap. */
+export function freshRedTeamRecoveryAllowed({ status, recovery, recorded }) {
+  if (recovery.verifiedRow) return false;
+  if (status == null && recorded !== true && recovery.recordedRow !== true
+    && (recovery.recordedRow === false || recorded === false)) return true;
+  const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
+  if (recovery.onlyOkRows && status?.status === 'finished' && priorResult === 'skipped'
+    && status.result?.reason === 'resume-only: no clean prior red-team row — no call launched') return true;
+  return recovery.freshAttempts > 0 && recovery.onlyRetryableRows === true
+    && (status == null || (status.status === 'finished' && ['ran', 'resumed'].includes(priorResult) && priorComment === 'error'));
 }
 export function readRedTeamRecoveryRows({ env = process.env, ...input }) {
   return redTeamRecoveryRows(readStore({ path: resolveScorecardStorePath(env), strict: true }).records, { ...input, env });
@@ -79,11 +98,13 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const recovery = readRecoveryRows({ repo, pr, head });
       if (!recovery || !Number.isSafeInteger(recovery.freshAttempts) || recovery.freshAttempts < 0) throw Error('invalid recovery evidence');
       let mode;
-      // Any seat row (including an error) counts as recorded. Only a finished, clean
-      // pass can resume effects without risking another model call.
-      if (status?.status === 'finished' && ['ran', 'resumed'].includes(priorResult) && evidence.recorded === true) {
+      // Verified finished passes resume effects; narrowly proven recovery cases use
+      // a durable fresh reservation. All other prior rows/statuses retain their hold.
+      if (status?.status === 'finished' && ['ran', 'resumed'].includes(priorResult) && evidence.recorded === true && recovery.verifiedRow) {
         mode = 'resume';
-      } else if (status == null && evidence.recorded === false) mode = 'fresh';
+      } else if (freshRedTeamRecoveryAllowed({ status, recovery, recorded: evidence.recorded })) mode = 'fresh';
+      else if (status?.status === 'finished' && ['ran', 'resumed'].includes(priorResult) && evidence.recorded === true)
+        return skip('recorded pass lacks verified provenance; inspect stored evidence before retrying');
       else return skip(`prior result ${typeof priorResult === 'string' ? priorResult : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
       if (mode === 'resume' && !recovery.verifiedRow) return skip('recorded pass lacks verified provenance; inspect stored evidence before retrying');
       if (mode === 'fresh' && recovery.freshAttempts >= (setting.maxFreshPerHead ?? 2)) return skip('fresh attempts exhausted for head');

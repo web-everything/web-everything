@@ -6,7 +6,7 @@ import { landPreventionCard, parseLandPreventionCardArgv } from '../../operation
 import { fileItemForPreventionViaLandingJob } from '../../operations/review-loop-cli.mjs';
 import { runApprovalPreventionFiling } from '../../review-set-label.mjs';
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { reconcileCardBatches } from '../../operations/card-batch-reconcile.mjs';
@@ -113,6 +113,10 @@ it('a subsequent landing call resumes the obligation once and failures retain it
   expect((await landPreventionCard(input, options)).ok).toBe(false);
   expect(JSON.parse(readFileSync(path)).status).toBe('owed');
   exec.mockReset();
+  // The overlay verifies file-item wrote into the acquired lane. Model that durable
+  // output too; a successful JSON response alone must never satisfy the guard.
+  mkdirSync(join(stateDir, 'backlog'));
+  writeFileSync(join(stateDir, 'backlog/9-guard.md'), '# Guard\n');
   exec.mockReturnValueOnce(JSON.stringify({ lane: 7, path: stateDir }))
     .mockReturnValueOnce(JSON.stringify({ verdict: { num: 9, rel: 'backlog/9-guard.md' } }))
     .mockReturnValueOnce('').mockReturnValueOnce('')

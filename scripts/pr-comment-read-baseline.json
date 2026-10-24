@@ -19,6 +19,5 @@
   "scripts/operations/review-extra-seats.mjs": 1,
   "scripts/operator/dispatch.mjs": 2,
   "scripts/prune-landed-lanes.mjs": 1,
-  "scripts/readiness/conveyor-state.mjs": 1,
-  "scripts/review-detail.mjs": 1
+  "scripts/readiness/conveyor-state.mjs": 1
 }

@@ -333,11 +333,14 @@ describe('fresh attempt accounting', () => {
       const row = { repo, pr, rev: head, dispatchKind: 'review-seat', seat: 'red-team', status: 'error' };
       const records = [row, { ...row, status: 'skipped' }, { ...row, status: 'ok' },
         { ...row, dispatchKind: RED_TEAM_DISCARD_DISPATCH_KIND }];
-      expect(redTeamRecoveryRows(records, { repo, pr, head, env })).toEqual({ verifiedRow: null, freshAttempts: 0 });
+      // Recovery now reports the strict row classification too: mixed historical
+      // statuses neither establish provenance nor authorize a bounded retry.
+      const classification = { recordedRow: true, onlyOkRows: false, onlyRetryableRows: false };
+      expect(redTeamRecoveryRows(records, { repo, pr, head, env })).toEqual({ verifiedRow: null, freshAttempts: 0, ...classification });
       reserveFreshRedTeamAttempt({ repo, pr, head, at: 1, pid: 42, maxFreshPerHead: 2 }, { env });
       reserveFreshRedTeamAttempt({ repo: repo.toUpperCase(), pr, head: head.toUpperCase(), at: 2, pid: 43, maxFreshPerHead: 2 }, { env });
       expect(readFreshRedTeamAttempts({ repo, pr, head, env })).toHaveLength(2);
-      expect(redTeamRecoveryRows(records, { repo, pr, head, env })).toEqual({ verifiedRow: null, freshAttempts: 2 });
+      expect(redTeamRecoveryRows(records, { repo, pr, head, env })).toEqual({ verifiedRow: null, freshAttempts: 2, ...classification });
       for (const identity of [{ repo: 'other/repo', pr, head }, { repo, pr: pr + 1, head }, { repo, pr, head: 'b'.repeat(40) }]) {
         expect(readFreshRedTeamAttempts({ ...identity, env })).toEqual([]);
       }

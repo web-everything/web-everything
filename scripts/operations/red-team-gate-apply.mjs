@@ -129,8 +129,9 @@ export function buildRedTeamCardInput({ repo, pr, head, findings }) {
  * EXACT argv to the writer's own parser: `--to=changes` refuses `--expect-head`, and a sender that added it returned
  * `send-back-failed` for every real break (review of PR #4762).
  */
-export function buildSendBackArgv({ repo, pr, bodyPath }) {
-  return [String(pr), `--repo=${repo}`, '--to=changes', `--body-file=${bodyPath}`, `--actor=${RED_TEAM_GATE_ACTOR}`, `--channel=${RED_TEAM_GATE_CHANNEL}`];
+export function buildSendBackArgv({ repo, pr, bodyPath, head }) {
+  return [String(pr), `--repo=${repo}`, '--to=changes', `--body-file=${bodyPath}`, `--actor=${RED_TEAM_GATE_ACTOR}`, `--channel=${RED_TEAM_GATE_CHANNEL}`,
+    ...(head ? [`--judged-head=${head}`] : [])];
 }
 
 /** The gate's own record for ONE action on the head. PURE. */
@@ -346,12 +347,12 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT, readC
     readRoundAsOf: ({ repo, pr, at, head }) => readReviewRoundAsOf({ repo, pr, at, head }),
     // The live head, read fresh and alone (the PR view above can be minutes old by the time a slow step finishes).
     readHead: ({ repo, pr }) => String(JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'])).headRefOid ?? ''),
-    sendBack: ({ repo, pr, body }) => {
+    sendBack: ({ repo, pr, head, body }) => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-gate-'));
       try {
         const path = join(dir, 'body.md');
         writeFileSync(path, body, 'utf8');
-        const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), ...buildSendBackArgv({ repo, pr, bodyPath: path })],
+        const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), ...buildSendBackArgv({ repo, pr, head, bodyPath: path })],
           { cwd: root, encoding: 'utf8', timeout: 180_000, env: { ...env, [ACTOR_ENV]: `red-team-gate-${randomUUID()}` } });
         if (r.status === 0) return { ok: true };
         return { ok: false, error: String(r.stderr || r.stdout || `exit ${r.status}`).trim().split('\n').pop() };

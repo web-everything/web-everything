@@ -29,6 +29,7 @@ import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { roundExtensionGrants } from './round-extension-mark.mjs';
+import { CARD_CONFLICT_PRECONDITION_REASONS } from '../lib/card-conflict-resolve.mjs';
 
 /**
  * we:scripts/conveyor/unowned-rebase-attempt-count.mjs#UNOWNED_REBASE_ATTEMPT_MARKER — the stable first-line PREFIX of
@@ -65,10 +66,13 @@ export function loadUnownedRebaseSettings({ env = process.env, platform = platfo
       && Number.isFinite(Date.parse(v)) } });
 }
 
-/** Every unsuccessful `skip` spends the attempt cap, precondition and deferred skips included (main's rule, kept by the
- *  1020c unfreeze: an excluded skip could retry forever). Errors and throws are counted by the infra markers below. */
+const cardResolverPrecondition = result => result?.action === 'skip' && result.precondition === true
+  && CARD_CONFLICT_PRECONDITION_REASONS.includes(result.reason);
+
+/** Generic skips still spend the content cap. Explicit card-resolver preconditions spend the infra
+ *  budget instead, and therefore retain main's aggregate ceiling; they cannot retry without a bound. */
 export function shouldCountRebaseAttempt(result) {
-  return result?.action === 'skip';
+  return result?.action === 'skip' && !cardResolverPrecondition(result);
 }
 
 /** Stable prefix plus a single-line, bounded outcome for operator inspection. */
@@ -105,7 +109,7 @@ export function countUnownedRebaseAttempts(comments, { countSince } = {}) {
 
 /** An error result or caught exception spends only the infrastructure budget. */
 export function shouldCountRebaseInfra(result) {
-  return result instanceof Error || result?.thrown === true || result?.action === 'error';
+  return result instanceof Error || result?.thrown === true || result?.action === 'error' || cardResolverPrecondition(result);
 }
 
 /** Put head before the free-text reason so reason tokens cannot impersonate a head. */

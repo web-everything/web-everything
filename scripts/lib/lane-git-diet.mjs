@@ -40,6 +40,7 @@ export const OPS_REF_READERS = Object.freeze([
   { file: 'scripts/operations/record-verdict-io.mjs', refs: 'ops/review-requests (+ board genesis source)', how: 'trackingRefspec(sourceBranch) / stageOnTransportBranch' },
   { file: 'scripts/operations/handoff-home.mjs', refs: 'ops/handoff', how: 'trackingRefspec(HANDOFF_BRANCH); runs in its own ~/.claude checkout, not a lane' },
   { file: 'scripts/ci/quarantine-skip.mjs', refs: 'ops/quarantine', how: '+refs/heads/${base}:refs/remotes/origin/${base} (CI job)' },
+  { file: 'scripts/lib/verdict-ledger-outbox.mjs', refs: 'ops/review-requests', how: 'trackingRefspec(branch) before plumbing flush and push reconciliation' },
   // Delegators: they never name a tracking ref themselves; every read goes through readFromTransportBranch.
   { file: 'scripts/lib/verdict-ledger-io.mjs', refs: 'ops/review-requests', how: 'readFromTransportBranch' },
   { file: 'scripts/lib/review-precedents-io.mjs', refs: 'ops/review-requests', how: 'readFromTransportBranch' },

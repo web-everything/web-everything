@@ -231,8 +231,10 @@ describe('projectAvoidedRounds', () => {
 
 describe('resolveReviewSettings', () => {
   it('preserves the built-in defaults and allows file shadow mode', () => {
+    // The overlay adds both referral safeguards with default-on behavior; retain their
+    // explicit values here so this exact defaults assertion covers the newer policy too.
     expect(resolveReviewSettings({ fileConfig: null, env: {} }))
-      .toEqual({ recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, scopedRereview: 'off', referralDefault: 'operator', roundBudget: 'off', takeoverReviewAttempts: 1,
+      .toEqual({ recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, autoBlockYieldsToReviewerNotReal: true, noFixerOnClearedRuled: true, scopedRereview: 'off', referralDefault: 'operator', roundBudget: 'off', takeoverReviewAttempts: 1,
         rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you' });
     expect(resolveReviewSettings({ fileConfig: { scopedRereview: 'shadow' }, env: {} }).scopedRereview).toBe('shadow');
   });
