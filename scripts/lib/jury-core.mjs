@@ -3126,11 +3126,17 @@ export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] })
  * The gate's read-time check of an operator `carried` entry: the backing ruling still holds ({@link carriedBackingHolds})
  * AND, when the source record is readable, the destination is the same finding the sink matched on
  * ({@link sameFindingForClearing}) — a carry entry cannot name an unrelated finding. Without the source record there
- * is nothing to compare, so only the backing is checked (the sink proved the match when it wrote the entry).
+ * is nothing to compare, so only the backing is checked for cross-head carries. Same-head siblings require
+ * readable source evidence and the latest sibling selection to agree with the persisted provenance on every read.
  */
-function operatorCarryBacking(carried, target, { repo, pr, operatorRulings, records }) {
+function operatorCarryBacking(carried, target, { head, repo, pr, operatorRulings, records }) {
   const backing = carriedBackingHolds(carried, { repo, pr, operatorRulings });
   if (!backing) return null;
+  if (carried.from.head === head) {
+    const latest = findSameHeadSiblingRuling(target, { head, repo, pr, operatorRulings, records });
+    return latest && latest.from.runId === carried.from.runId && latest.from.key === carried.from.key
+      && latest.result === carried.result && latest.card === carried.card ? backing : null;
+  }
   const source = (Array.isArray(records) ? records : []).find(r => r.head === carried.from.head
     && r.runId === carried.from.runId && r.repo === repo && r.pr === pr);
   const from = source?.referrals.find(x => x.key === carried.from.key);
@@ -3151,6 +3157,108 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
     // surrounding dependency leaves them identical). The latest ruling still decides, so a block also ends the search:
     // the finding stays live for the current-head reviewer, who rules it afresh (the earlier block is not passed on as evidence).
     if (o.result === 'block') return null;
+    return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
+  }
+  return null;
+}
+
+/** Same-head siblings require concrete lines, >=0.8 overlap and preserved claim/identifier order. PURE. */
+export function sameGapSameHead(a, b) {
+  const negations = s => [...new Set(String(s ?? '').toLowerCase()
+    .replace(/[‘’ʼ＇]/g, "'")
+    .match(/\b(?:not|no|never|without|missing|cannot|lacks)\b|n't\b/g) ?? [])].sort().join(',');
+  if (!(a && b && typeof a === 'object' && typeof b === 'object'
+    && Number.isInteger(a.line) && Number.isInteger(b.line) && sameFindingForClearing(a, b)
+    && negations(a.summary) === negations(b.summary))) return false;
+  const verbs = new Set(('read reads write writes get put post patch delete deletes create creates update updates '
+    + 'remove removes add adds allow allows deny denies enable disables disable enables grant grants revoke revokes '
+    + 'load save send receive open close').split(' '));
+  const functionWords = new Set('a an the of is are was be'.split(' '));
+  const tokenize = summary => {
+    const text = String(summary ?? ''), identifiers = new Set(), words = new Set(), forms = new Map();
+    let order = [];
+    const tokens = s => s.match(/[\p{L}\p{M}\p{N}_$\u200c\u200d]+/gu) ?? [];
+    for (const [context] of text.matchAll(/`[^`]*(?:`|$)|(?<![\p{L}\p{N}_$])["'][^"'\r\n]*(?:["']|$)|[a-z0-9_-]*(?:[./\\][a-z0-9_-]+)+/giu)) {
+      for (const token of tokens(context)) identifiers.add(token.toLowerCase());
+    }
+    for (const token of tokens(text)) {
+      const word = token.toLowerCase();
+      if (!forms.has(word)) forms.set(word, new Set());
+      forms.get(word).add(token);
+      // Uppercase prose negation (MISSING) is still prose; explicit quoted/path identifiers retain their case.
+      if ((/^\p{Lu}{2,}$|[0-9_$\u200c\u200d]|\p{Ll}\p{Lu}/u.test(token) && !negations(token))
+        || ([...token].length === 1 && !functionWords.has(word)) || identifiers.has(word)) {
+        identifiers.add(word);
+      }
+      if (functionWords.has(word) && !identifiers.has(word)) continue;
+      words.add(word);
+      order.push(token); // retain repetitions, case and argument order, which a word set erases
+    }
+    // One supported nominal paraphrase: "missing validation of X before Y" / "X validation missing before Y".
+    // Keep X and Y in order; do not infer arbitrary subject/object or clause permutations from overlap.
+    const before = order.findIndex(token => token.toLowerCase() === 'before');
+    if (/^\s*missing\s+validation\s+of\s+/i.test(text) && before > 2
+      && !order.slice(2, before).some(token => identifiers.has(token.toLowerCase()) || verbs.has(token.toLowerCase()))) {
+      order = [...order.slice(2, before), 'validation', 'missing', ...order.slice(before)];
+    }
+    return { words, identifiers, forms, order };
+  };
+  const A = tokenize(a.summary), B = tokenize(b.summary);
+  for (const word of new Set([...A.identifiers, ...B.identifiers])) {
+    const left = A.forms.get(word), right = B.forms.get(word);
+    if (!left || !right || left.size !== right.size || [...left].some(token => !right.has(token))) return false;
+  }
+  let hit = 0;
+  for (const word of new Set([...A.words, ...B.words])) {
+    if (A.words.has(word) && B.words.has(word)) hit += 1;
+    else if (verbs.has(word) || A.identifiers.has(word) || B.identifiers.has(word)) return false;
+  }
+  // A similarity score cannot distinguish arbitrary antonyms. Never substitute content words, even once in a
+  // long claim; only short claims (at most six content words) may gain/lose words under the overlap floor.
+  // Prose case and function-word changes still match for claims of any length.
+  if (hit < Math.min(A.words.size, B.words.size)
+    || (A.words.size !== B.words.size && Math.min(A.words.size, B.words.size) > 6)) return false;
+  if (!hit || hit / (A.words.size + B.words.size - hit) < 0.8) return false;
+  const identifiers = new Set([...A.identifiers, ...B.identifiers]);
+  const ordered = (from, to) => from.order.filter(token => to.words.has(token.toLowerCase()))
+    .map(token => identifiers.has(token.toLowerCase()) ? token : token.toLowerCase());
+  const left = ordered(A, B), right = ordered(B, A);
+  const equal = (x, y) => x.length === y.length && x.every((word, i) => word === y[i]);
+  if (equal(left, right)) return true;
+  // Moving an intact trailing "before ..." adjunct to the front preserves both clauses' internal order.
+  const frontedBefore = (x, y) => {
+    const at = x.indexOf('before');
+    return at > 0 && y[0] === 'before' && x.lastIndexOf('before') === at
+      && equal([...x.slice(at), ...x.slice(0, at)], y);
+  };
+  return frontedBefore(left, right) || frontedBefore(right, left);
+}
+
+/** Security is the category lens; unreadable findings cannot authorize a not-real clearance. */
+export function isSecurityClassFinding(f) {
+  const category = typeof f?.category === 'string' ? f.category.trim().toLowerCase() : '';
+  return !category || category.split('/')[0] === 'security';
+}
+
+/** Latest same-head operator clearance of a sibling gap; security-class not-real rulings never inherit. PURE. */
+export function findSameHeadSiblingRuling(referral, { records = [], operatorRulings = [], head, repo, pr } = {}) {
+  if (!referral?.key || !referral.finding || !head || !repo || !pr
+    || !Array.isArray(records) || !Array.isArray(operatorRulings)) return null;
+  const seen = new Set();
+  for (const o of [...operatorRulings].reverse()) {
+    if (!o || o.head !== head || o.repo !== repo || o.pr !== pr || !o.runId || !o.key) continue;
+    const identity = JSON.stringify([o.head, o.runId, o.key]);
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    const record = records.find(r => r?.runId === o.runId && r.head === head && r.repo === repo && r.pr === pr);
+    const ruled = record?.referrals?.find(f => f.key === o.key);
+    const finding = ruled?.finding;
+    if (!finding) return null; // Unknown newer evidence must not expose an older clearance.
+    if (o.key === referral.key) return null; // An own-key decision cannot authorize a sibling carry over itself.
+    if (!sameGapSameHead(finding, referral.finding)) continue;
+    if (o.result !== 'not-real' && o.result !== 'card') return null;
+    if (o.result === 'not-real' && (isSecurityClassFinding(referral.original ?? referral.finding)
+      || isSecurityClassFinding(ruled.original ?? finding))) return null;
     return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
   }
   return null;
@@ -3306,7 +3414,8 @@ export function validateReferralRecord(r) {
     if (r.carried !== undefined && (!Array.isArray(r.carried)
       || new Set(r.carried.map(c => c.key)).size !== r.carried.length
       || r.carried.some(c => !keys.has(c.key) || c.reason !== REFERRAL_CARRY_REASON
-        || !c.from || !/^[a-f0-9]{40}$/.test(c.from.head) || c.from.head === r.head
+        || !c.from || !/^[a-f0-9]{40}$/.test(c.from.head)
+        || (c.from.head === r.head && (c.from.rulingId !== undefined || c.from.key === c.key || c.result === 'block'))
         || typeof c.from.runId !== 'string' || !c.from.runId.trim()
         || typeof c.from.key !== 'string' || !c.from.key.trim()
         // #76c — a reviewer-backed carry names the ruling it stands on, and is never a block.
@@ -3405,7 +3514,7 @@ export function referralRecordState(record, options = {}) {
       const backing = carried.from.rulingId !== undefined
         ? reviewerCarryBacking(carried, { repo: record.repo, pr: record.pr, operatorRulings, records, identityTable,
           target: f, body, createdAt, cardReadable, stampPolicy, seatDisabled })
-        : operatorCarryBacking(carried, f, { repo: record.repo, pr: record.pr, operatorRulings, records });
+        : operatorCarryBacking(carried, f, { head: record.head, repo: record.repo, pr: record.pr, operatorRulings, records });
       if (head !== record.head || !backing
         || (carried.result === 'card' && !cardReadable(carried.card))) pending.push(f.key);
       else { rulings.push(backing); if (carried.result === 'block') blocked.push(f.key); }
