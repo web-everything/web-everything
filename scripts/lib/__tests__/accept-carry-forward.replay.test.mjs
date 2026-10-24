@@ -1178,7 +1178,8 @@ describe('red-team machine-body boundary (#5828)', () => {
     ['gate record', gate()],
     ['advisory', advisory()],
   ];
-  const laterRecord = (body, metadata = {}) => latestAcceptRecord([fx.comments[0], { body, ...metadata }]);
+  // The later clearance matches NEW's net diff; the first accept predates that contribution.
+  const laterRecord = (body, metadata = {}) => latestAcceptRecord([...fx.comments, { body, ...metadata }]);
 
   it.each(bodies)('trusted %s after an accept does not supersede it', (_kind, body) => {
     expect(laterRecord(body, { author: { login: 'web-everything[bot]' } }).laterVerdict).toBe(false);
