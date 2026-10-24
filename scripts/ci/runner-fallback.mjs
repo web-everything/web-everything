@@ -19,12 +19,12 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as sleepDefault } from 'node:timers/promises';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
+import { checkedFeedPath, sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export const RUNNER_FALLBACK_POLICY = Object.freeze({ queuedMinutes: 10, fallbackRunner: 'ubuntu-latest' });
 const CANCEL_BOUNDS = Object.freeze({ cancelPollAttempts: 6, cancelPollIntervalMs: 1000 });
-const READ_BOUNDS = Object.freeze({ maxRuns: 40, maxJobs: 100, maxCalls: 160, maxAttemptsPerCall: 5 });
+const READ_BOUNDS = Object.freeze({ completedLookbackMinutes: 120, maxRuns: 40, maxJobs: 100, maxCalls: 160, maxAttemptsPerCall: 5 });
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0;
 const runnerLabel = value => typeof value === 'string' && /^ubuntu-(?:latest|\d{2}\.04)(?:-arm)?$/.test(value);
 // Match needs-you-feed field bounds; sanitize every nested string before publication.
@@ -38,7 +38,7 @@ const epoch = value => typeof value === 'string' && value ? Date.parse(value) : 
 export function resolveRunnerFallbackSettings({ env = process.env, platform, tool, log } = {}) {
   const envValues = {};
   for (const [key, name] of Object.entries({ queuedMinutes: 'QUEUED_MINUTES', fallbackRunner: 'RUNNER',
-    maxRuns: 'MAX_RUNS', maxJobs: 'MAX_JOBS', maxCalls: 'MAX_CALLS', maxAttemptsPerCall: 'MAX_ATTEMPTS_PER_CALL',
+    completedLookbackMinutes: 'COMPLETED_LOOKBACK_MINUTES', maxRuns: 'MAX_RUNS', maxJobs: 'MAX_JOBS', maxCalls: 'MAX_CALLS', maxAttemptsPerCall: 'MAX_ATTEMPTS_PER_CALL',
     cancelPollAttempts: 'CANCEL_POLL_ATTEMPTS', cancelPollIntervalMs: 'CANCEL_POLL_INTERVAL_MS' })) {
     const raw = env[`WE_RUNNER_FALLBACK_${name}`];
     if (raw !== undefined) envValues[key] = key === 'fallbackRunner' ? raw : /^\d+$/.test(raw) ? Number(raw) : NaN;
@@ -46,7 +46,7 @@ export function resolveRunnerFallbackSettings({ env = process.env, platform, too
   const result = cascadePolicy('runnerFallback', tool, {
     standard: { ...RUNNER_FALLBACK_POLICY, ...READ_BOUNDS, ...CANCEL_BOUNDS }, platform, env, envValues, log,
     valid: { queuedMinutes: positiveInteger, fallbackRunner: runnerLabel,
-      maxRuns: positiveInteger, maxJobs: positiveInteger, maxCalls: positiveInteger, maxAttemptsPerCall: positiveInteger,
+      completedLookbackMinutes: positiveInteger, maxRuns: positiveInteger, maxJobs: positiveInteger, maxCalls: positiveInteger, maxAttemptsPerCall: positiveInteger,
       cancelPollAttempts: positiveInteger, cancelPollIntervalMs: positiveInteger },
   });
   return { ...result.value, sources: result.sources };
@@ -116,7 +116,8 @@ function restExec(cmd, args, { charge, maxAttemptsPerCall, ...options }) {
   const repo = flag('--repo');
   let request = args;
   if (args[0] === 'run' && args[1] === 'list') {
-    request = ['api', `repos/${repo}/actions/workflows/ci.yml/runs?status=${flag('--status')}&per_page=${flag('--limit')}`];
+    const created = args.includes('--created') ? `&created=${encodeURIComponent(flag('--created'))}` : '';
+    request = ['api', `repos/${repo}/actions/workflows/ci.yml/runs?status=${flag('--status')}&per_page=${flag('--limit')}${created}`];
   } else if (args[0] === 'variable' && args[1] === 'set') {
     request = ['api', '--method', 'PATCH', `repos/${repo}/actions/variables/WE_SHARD_RUNNER`, '-f', 'name=WE_SHARD_RUNNER', '-f', `value=${flag('--body')}`];
   } else if (args[0] === 'run' && ['cancel', 'rerun'].includes(args[1])) {
@@ -136,7 +137,7 @@ export async function runRunnerFallback(options = {}) {
     log = console.error, sleep = sleepDefault } = options;
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw new Error('A valid owner/repo is required');
   const settings = resolveRunnerFallbackSettings({ env, platform: options.platform, tool: options.settings, log });
-  const feedPath = options.feedPath || env.WE_NEEDS_YOU_FEED
+  let feedPath = options.feedPath || env.WE_NEEDS_YOU_FEED
     || join(env.HOME || homedir(), 'workspace', '.operations', 'handoff', 'needs-you-events.jsonl');
   let calls = 0;
   const charge = () => {
@@ -175,6 +176,7 @@ export async function runRunnerFallback(options = {}) {
   const emptyPlan = () => ({ setVariable: null, cancel: [], rerun: [] });
   let preflight, decision, discoveryComplete = false, planned = emptyPlan();
   try {
+    feedPath = checkedFeedPath(feedPath);
     const offline = Object.hasOwn(options, 'jobs');
     const runnerVar = Object.hasOwn(options, 'runnerVar') ? options.runnerVar
       : options.readRunnerVar ? await options.readRunnerVar()
@@ -182,7 +184,12 @@ export async function runRunnerFallback(options = {}) {
     if (typeof runnerVar !== 'string' && runnerVar != null) throw new Error('Unreadable runner variable');
     let repoVisibility = options.repoVisibility, runnerGroup = options.runnerGroup;
     if (!offline && runnerVar && runnerVar !== settings.fallbackRunner && !runnerLabel(runnerVar)) {
-      if (!Object.hasOwn(options, 'repoVisibility')) repoVisibility = (await api(`repos/${repo}`)).visibility;
+      if (!Object.hasOwn(options, 'repoVisibility')) {
+        try { repoVisibility = (await api(`repos/${repo}`)).visibility; }
+        catch (error) {
+          preflight = { status: 'unreadable', reason: `Unreadable repository visibility: ${clean(error.message)}; inspect runner configuration` };
+        }
+      }
       if (!Object.hasOwn(options, 'runnerGroup')) {
         let incompleteLookup = false;
         try {
@@ -213,12 +220,12 @@ export async function runRunnerFallback(options = {}) {
     let jobs = options.jobs;
     if (!offline) {
       const runs = new Map();
-      // REST has no activity-time filter. Read a bounded complete set, then let
-      // job started_at bound recent activity; creation time cannot exclude work.
-      // Oversized evidence requires operator inspection rather than a partial repair.
+      // Keep active runs regardless of age; completed history uses a creation window.
+      // Completeness is required within that window; oversized evidence needs operator inspection.
       for (const status of ['queued', 'in_progress', 'completed']) {
         const response = await json(['run', 'list', '--repo', repo, '--workflow', 'ci.yml', '--status', status,
-          '--limit', String(Math.min(settings.maxRuns, 100)), '--json', 'databaseId,status']);
+          '--limit', String(Math.min(settings.maxRuns, 100)), '--json', 'databaseId,status',
+          ...(status === 'completed' ? ['--created', `>=${new Date(now - settings.completedLookbackMinutes * 60000).toISOString()}`] : [])]);
         const list = response.workflow_runs;
         if (!complete(response, list) || list.length >= Math.min(settings.maxRuns, 100)) {
           throw new Error('Run read bound reached or unreadable runs; inspect CI manually or raise maxRuns');
