@@ -271,12 +271,12 @@ describe('automatic card filing with shared durable claims', () => {
   const result = { ok: true, step: 'held', rel: 'backlog/xabcdef-card.md' };
   function fake({ coordinationRoot = root(), initial = thread(), fileCard, postFails, changeAfterReason,
     cardOk = true, noPid = false, transitionFails, liveHead = () => HEAD,
-    env = {}, resolveCard = ref => ({ ref, readable: true }) } = {}) {
+    env = {}, runGit, readOnPr, resolveCard = runGit ? undefined : ref => ({ ref, readable: true }) } = {}) {
     const comments = [...initial], posted = [], cards = [], labelSyncs = [];
     const actions = createActionStore({ root: coordinationRoot });
     const realTransition = actions.transition;
     if (transitionFails) actions.transition = (...args) => transitionFails(...args) || realTransition(...args);
-    const sinks = createRecordRedTeamRulingSinks({ coordinationRoot, actions, env, resolveCard,
+    const sinks = createRecordRedTeamRulingSinks({ coordinationRoot, actions, env, runGit, readOnPr, resolveCard,
       readThread: () => ({ headRefOid: liveHead(), labels: [], comments: [...comments] }),
       resolveIdentity: () => OP, readStandingRulingScope: () => null,
       fileCard: (input, session, binding) => {
@@ -836,7 +836,76 @@ describe('automatic card filing with shared durable claims', () => {
       expect(heldAfter(f.comments)).toHaveLength(1);
       expect(f.posted.some(body => body.includes('outcome=operator-card'))).toBe(false);
     }
-    expect(refs).toEqual([`we:${result.rel}@pr123`, `we:${result.rel}@pr123`]);
+    expect(refs).toEqual([`we:${result.rel}@pr123`, `we:${result.rel}@pr123`, ...(!readable ? [`we:${result.rel}`] : [])]);
+    expect(f.cards).toHaveLength(1);
+  });
+  it.each([
+    ['renumbered', true], ['quoted bornAs', true], ['CRLF', true], ['PR read throws', true],
+    ['original on main', true], ['missing', false], ['wrong bornAs', false],
+    ['bornAs only in body', false], ['malformed', false], ['fetch fails', false],
+    ['vanished after failed POST', false, true], ['refresh fails after failed POST', false, true],
+  ])('persisted landing receipt follows published card identity after JIT numbering (%s)', async (variant, released, initiallyReadable = released) => {
+    const calls = [], prReads = [];
+    let failRecord = true, retrying = false;
+    const original = 'xabcdef-card.md', numbered = '6000-card.md';
+    const content = variant === 'malformed' ? '# Not a card\nbornAs: xabcdef\n'
+      : variant === 'bornAs only in body' ? '---\nstatus: open\n---\nbornAs: xabcdef\n'
+      : `---\nbornAs: ${variant === 'wrong bornAs' ? 'xbcdefg' : variant === 'quoted bornAs' ? '"xabcdef"' : 'xabcdef'}\nstatus: open\n---\n# Follow-up\n`;
+    const f = fake({ runGit: args => {
+      calls.push(args);
+      if (variant === 'fetch fails' || (retrying && variant === 'refresh fails after failed POST')) throw new Error('main unavailable');
+      if (args[0] === 'fetch') return '';
+      if (retrying && variant === 'vanished after failed POST') {
+        if (args[0] === 'ls-tree') return '';
+        throw new Error('card removed from main');
+      }
+      if (args[0] === 'ls-tree') return variant === 'missing' ? '' : numbered;
+      if (args[0] === 'show') {
+        const file = args[1].slice('origin/main:backlog/'.length);
+        if ((file === original && variant === 'original on main') || (file === numbered && variant !== 'missing')) {
+          return variant === 'CRLF' ? content.replace(/\n/g, '\r\n') : content;
+        }
+        throw new Error('card absent');
+      }
+      throw new Error(`unexpected git arguments: ${JSON.stringify(args)}`);
+    }, readOnPr: (file, pr) => {
+      prReads.push([file, pr]);
+      if (variant === 'PR read throws') throw new Error('old path absent on numbered PR head');
+      return null;
+    }, postFails: body => failRecord && body.includes('outcome=operator-card') });
+    const p = payloadFor(); f.act(p);
+    await f.complete({ code: 0, result: { ...result, step: 'done', pr: 123 } });
+    const completed = f.actions.read(rulingCardResource(p), 1);
+    if (initiallyReadable) expect(() => f.act(p)).toThrow(/gh down/);
+    failRecord = false; retrying = true;
+    const retry = () => f.act(payloadFor({}, f.comments));
+    if (released) {
+      expect(retry()).toMatchObject({ card: { reconciled: true, ref: `we:${result.rel}` } });
+      expect(heldAfter(f.comments)).toEqual([]);
+      expect(f.labelSyncs).toHaveLength(1);
+    } else {
+      expect(retry).toThrow(/evidence no longer resolves.*no release record written/);
+      expect(heldAfter(f.comments)).toHaveLength(1);
+      expect(f.posted.some(body => body.includes('outcome=operator-card'))).toBe(false);
+      expect(f.labelSyncs).toEqual([]);
+    }
+    expect(prReads).toEqual(Array(initiallyReadable ? 2 : 1).fill([original, '123']));
+    expect(calls.filter(args => args[0] === 'fetch')).toHaveLength(initiallyReadable ? 2 : 1);
+    expect(f.cards).toHaveLength(1);
+    expect(f.actions.attempts(rulingCardResource(p))).toEqual([completed]);
+  });
+  it('a throwing exact receipt resolver still validates main before release', async () => {
+    const refs = [];
+    const f = fake({ resolveCard: ref => {
+      refs.push(ref);
+      if (ref.endsWith('@pr123')) throw new Error('PR source unavailable');
+      return { ref, readable: true };
+    } });
+    const p = payloadFor(); f.act(p);
+    await f.complete({ code: 0, result: { ...result, step: 'done', pr: 123 } });
+    expect(f.act(p)).toMatchObject({ card: { reconciled: true } });
+    expect(refs).toEqual([`we:${result.rel}@pr123`, `we:${result.rel}`]);
+    expect(heldAfter(f.comments)).toEqual([]);
     expect(f.cards).toHaveLength(1);
   });
   it('refuses evidence removed during the reason POST immediately before release', async () => {

@@ -282,8 +282,16 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
       try {
         if (ref) {
           const exact = Number.isInteger(result.pr) && result.pr > 0 ? `${ref}@pr${result.pr}` : ref;
-          const current = resolveCard(exact, { repo: p.repo, pr: p.pr, head: p.head });
-          readable = current?.readable === true && current.ref === exact;
+          const readableRef = reference => {
+            try {
+              const current = resolveCard(reference, { repo: p.repo, pr: p.pr, head: p.head });
+              return current?.readable === true && current.ref === reference;
+            } catch { return false; }
+          };
+          readable = readableRef(exact);
+          // JIT numbering can remove the receipt's provisional path from its PR head.
+          // Main's fresh resolver validates that same card through its landed bornAs identity.
+          if (!readable && exact !== ref) readable = readableRef(ref);
           if (!readable && result.step === 'held') {
             const id = /^backlog\/([^/-]+)-[^/]+\.md$/.exec(result.rel)?.[1];
             if (id) {
