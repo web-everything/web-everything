@@ -3127,17 +3127,19 @@ export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] })
  * AND, when the source record is readable, the destination is the same finding the sink matched on
  * ({@link sameFindingForClearing}) — a carry entry cannot name an unrelated finding. Without the source record there
  * is nothing to compare, so only the backing is checked for cross-head carries. Same-head siblings require
- * readable source evidence, the stricter gap match, and the security-class not-real exclusion on every read.
+ * readable source evidence and the latest sibling selection to agree with the persisted provenance on every read.
  */
 function operatorCarryBacking(carried, target, { head, repo, pr, operatorRulings, records }) {
   const backing = carriedBackingHolds(carried, { repo, pr, operatorRulings });
   if (!backing) return null;
+  if (carried.from.head === head) {
+    const latest = findSameHeadSiblingRuling(target, { head, repo, pr, operatorRulings, records });
+    return latest && latest.from.runId === carried.from.runId && latest.from.key === carried.from.key
+      && latest.result === carried.result && latest.card === carried.card ? backing : null;
+  }
   const source = (Array.isArray(records) ? records : []).find(r => r.head === carried.from.head
     && r.runId === carried.from.runId && r.repo === repo && r.pr === pr);
   const from = source?.referrals.find(x => x.key === carried.from.key);
-  if (carried.from.head === head && (!sameGapSameHead(from?.finding, target.finding)
-    || (carried.result === 'not-real' && (isSecurityClassFinding(from?.original ?? from?.finding)
-      || isSecurityClassFinding(target.original ?? target.finding))))) return null;
   return source && (!from || !sameFindingForClearing(from.finding, target.finding)) ? null : backing;
 }
 
@@ -3160,17 +3162,18 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
   return null;
 }
 
-/** Same-head siblings require concrete lines, >=0.8 word overlap and identical negation tokens. PURE. */
+/** Same-head siblings require concrete lines, >=0.8 word overlap and no content-word substitutions. PURE. */
 export function sameGapSameHead(a, b) {
   const negations = s => [...new Set(String(s ?? '').toLowerCase()
-    .match(/\b(?:not|no|never|without|missing|cannot|lacks)\b/g) ?? [])].sort().join(',');
+    .replace(/[‘’ʼ＇]/g, "'")
+    .match(/\b(?:not|no|never|without|missing|cannot|lacks)\b|n't\b/g) ?? [])].sort().join(',');
   if (!(a && b && typeof a === 'object' && typeof b === 'object'
     && Number.isInteger(a.line) && Number.isInteger(b.line) && sameFindingForClearing(a, b)
     && negations(a.summary) === negations(b.summary))) return false;
   const verbs = new Set(('read reads write writes get put post patch delete deletes create creates update updates '
     + 'remove removes add adds allow allows deny denies enable disables disable enables grant grants revoke revokes '
     + 'load save send receive open close').split(' '));
-  const functionWords = new Set('a an the of is are was be to in on at by as it its or and for with this that if so do'.split(' '));
+  const functionWords = new Set('a an the of is are was be'.split(' '));
   const tokenize = summary => {
     const text = String(summary ?? ''), identifiers = new Set(), words = new Set();
     for (const [context] of text.matchAll(/`[^`]*(?:`|$)|[a-z0-9_-]*(?:[./\\][a-z0-9_-]+)+/gi)) {
@@ -3178,7 +3181,7 @@ export function sameGapSameHead(a, b) {
     }
     for (const [token] of text.matchAll(/[a-z0-9_]{2,}/gi)) {
       const word = token.toLowerCase();
-      if (functionWords.has(word)) continue; // grammar words carry no claim; every other 2+ char token counts
+      if (functionWords.has(word)) continue; // keep conditions, conjunctions and relationship words in the claim
       words.add(word);
       if (/^[A-Z]{2,}$|[0-9_]|[a-z][A-Z]/.test(token)) identifiers.add(word);
     }
@@ -3190,6 +3193,11 @@ export function sameGapSameHead(a, b) {
     if (A.words.has(word) && B.words.has(word)) hit += 1;
     else if (verbs.has(word) || A.identifiers.has(word) || B.identifiers.has(word)) return false;
   }
+  // A similarity score cannot distinguish arbitrary antonyms. Never substitute content words, even once in a
+  // long claim; only short claims (at most six content words) may gain/lose words under the overlap floor.
+  // Reordering, case and function-word changes still match for claims of any length.
+  if (hit < Math.min(A.words.size, B.words.size)
+    || (A.words.size !== B.words.size && Math.min(A.words.size, B.words.size) > 6)) return false;
   return hit > 0 && hit / (A.words.size + B.words.size - hit) >= 0.8;
 }
 

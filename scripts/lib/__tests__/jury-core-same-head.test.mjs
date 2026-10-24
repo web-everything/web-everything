@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  normalizeFinding, referralFindingKey, sameGapSameHead, isSecurityClassFinding, findSameHeadSiblingRuling,
+  normalizeFinding, referralFindingKey, sameGapSameHead, isSecurityClassFinding, findSameHeadSiblingRuling, findCarriedReviewerRuling,
   validateReferralRecord, referralRecordState, mandatoryReferralReviewer, REFERRAL_CARRY_REASON,
   buildOperatorRulingComment, renderReferralRecord, readReferralRecords,
 } from '../jury-core.mjs';
@@ -57,6 +57,36 @@ describe('sameGapSameHead', () => {
   it('accepts the existing positive claim with a harmless article change', () => {
     expect(sameGapSameHead(base,
       { ...base, line: 24, summary: base.summary.replace('the request', 'a request') })).toBe(true);
+  });
+  it.each([
+    ['before', 'after'], ['all', 'any'], ['first', 'last'], ['always', 'sometimes'],
+    ['authenticated', 'unauthenticated'], ['valid', 'invalid'], ['higher', 'lower'], ['and', 'or'],
+  ])('refuses antonym %s versus %s despite high word overlap', (a, b) => {
+    const summary = `Handler validates the payload ${a} the cache write on every request path in the worker`;
+    expect(sameGapSameHead({ ...base, summary },
+      { ...base, line: 24, summary: summary.replace(` ${a} `, ` ${b} `) })).toBe(false);
+  });
+  it('enforces the word-overlap threshold independently of protected tokens', () => {
+    const finding = { ...base, summary: 'Validation checks request payload before processing' };
+    expect(sameGapSameHead(finding, { ...finding, summary: `${finding.summary} malformed` })).toBe(true);
+    expect(sameGapSameHead(finding, { ...finding, summary: `${finding.summary} malformed input` })).toBe(false);
+    const boundary = { ...base, summary: 'Validation checks request payload' };
+    expect(sameGapSameHead(boundary, { ...boundary, summary: `${boundary.summary} malformed` })).toBe(true);
+  });
+  it('requires identical content-word sets for long summaries while allowing reordering', () => {
+    const finding = { ...base, summary: 'Validation checks request payload before processing cached records' };
+    expect(sameGapSameHead(finding, { ...finding, summary: `Malformed ${finding.summary}` })).toBe(false);
+    expect(sameGapSameHead(finding, { ...finding,
+      summary: 'Before processing cached records validation checks request payload' })).toBe(true);
+  });
+  it('refuses a substitution even in a short summary', () => {
+    const finding = { ...base, summary: 'Validation checks request payload before processing' };
+    expect(sameGapSameHead(finding, { ...finding, summary: finding.summary.replace('before', 'after') })).toBe(false);
+  });
+  it.each(["'", '’', '‘', 'ʼ', '＇'])('refuses contracted negation with apostrophe %s despite identical content words', apostrophe => {
+    const summary = 'Handler can validate the payload before the cache write on every request path in the worker';
+    expect(sameGapSameHead({ ...base, summary },
+      { ...base, summary: summary.replace('can', `can${apostrophe}t`) })).toBe(false);
   });
   it.each([
     ['another file', { file: 'other.md' }], ['distant line', { line: 60 }], ['missing line', { line: undefined }],
@@ -128,11 +158,23 @@ describe('same-head operator matching and read-time validation', () => {
     ctx.operatorRulings.push({ ...ctx.operatorRulings[0], result: 'block' });
     expect(findSameHeadSiblingRuling(referral(), ctx)).toBeNull();
   });
+  it.each(['block', 'card', 'missing-referral', 'missing-record'])('withdraws a persisted carry after a newer matching sibling %s', result => {
+    const { ruled, ctx } = world(), target = referral(), third = referral('judgeCorrectness', {
+      summary: 'Request payload validation is missing before use',
+    });
+    const saved = record([target], { carried: [carry(ruled, target)] });
+    expect(referralRecordState(saved, ctx).pending).toEqual([]);
+    ctx.records.push(record([third], { runId: 'run-3' }));
+    ctx.operatorRulings.push({ ...ctx.operatorRulings[0], runId: result === 'missing-record' ? 'missing' : 'run-3',
+      key: result === 'missing-referral' ? 'missing' : third.key, result: result.startsWith('missing') ? 'not-real' : result,
+      ...(result === 'card' ? { card } : {}) });
+    expect(referralRecordState(saved, { ...ctx, cardReadable: () => true }).pending).toEqual([target.key]);
+  });
 });
 
 // Sink coverage stays here to respect the explicit three-file edit boundary.
 describe('mandatory-referral sink same-head persistence', () => {
-  it.each(['none', 'unreadable-card', 'unknown-lines', 'changed-lines', 'old-lines'])('persists without a same-head comparison, falling through failed cross-head proof: %s', async mode => {
+  const persistScenario = async mode => {
     const root = mkdtempSync(join(tmpdir(), 'same-head-carry-'));
     try {
       const { ruled, ctx } = world(), target = referral(), current = record([ruled, target]);
@@ -143,11 +185,23 @@ describe('mandatory-referral sink same-head persistence', () => {
         at: '2026-10-04T12:00:00Z', clearerId: '', rulings: [{ runId: r.runId, key: ruled.key, result,
           ...(result === 'card' ? { card } : {}) }] }), 'chalbert');
       state.comments.push(operatorPost(current));
-      if (mode !== 'none') {
+      let reviewerCarry;
+      if (mode === 'reviewer-first') {
+        const old = record([target], { head: otherHead, runId: 'old', attempted: true });
+        old.rulings.push({ id: 'old:0', key: target.key, reviewerId: old.reviewer.id, lens: old.reviewer.lens,
+          result: 'card', card, rationale: 'Checked the cited claim', evidence: ['diff:20'] });
+        state.comments.unshift(post(renderReferralRecord(old)));
+        const candidates = { ...ctx, records: [old, current], body: state.body, cardReadable: () => true };
+        expect(findCarriedReviewerRuling(target, candidates)).toMatchObject({ result: 'card', card });
+        expect(findSameHeadSiblingRuling(target, candidates)).toMatchObject({ result: 'not-real' });
+        reviewerCarry = { ...carry(ruled, target, 'card'),
+          from: { head: otherHead, runId: 'old', key: target.key, rulingId: 'old:0' } };
+      } else if (mode !== 'none') {
         const old = record([ruled], { head: otherHead, runId: 'old' });
         state.comments.push(post(renderReferralRecord(old)), operatorPost(old, mode === 'unreadable-card' ? 'card' : 'not-real'));
       }
-      const changedLines = vi.fn(() => mode === 'old-lines' ? Object.assign(new Set(), { old: new Set([20]) })
+      const changedLines = vi.fn(() => mode === 'reviewer-first' ? new Set()
+        : mode === 'old-lines' ? Object.assign(new Set(), { old: new Set([20]) })
         : mode === 'changed-lines' ? new Set([20]) : null), judge = vi.fn(() => { throw new Error('unexpected judge'); });
       const provider = {
         readPrState: () => { state.comments.forEach((c, i) => { c.id ??= String(i); }); return structuredClone(state); },
@@ -155,16 +209,19 @@ describe('mandatory-referral sink same-head persistence', () => {
         postComment: (_repo, _pr, body) => state.comments.push(post(body)), setLabels: () => {},
       };
       const sinks = createReviewPrSinks({ root, env: {}, labelProvider: provider, readChangedLines: changedLines,
-        referralJudge: judge, cardReadable: () => false, mirrorReferral: () => {}, appendLedgerRow: () => ({ ok: true }), out: () => {} });
+        referralJudge: judge, cardReadable: () => mode === 'reviewer-first', mirrorReferral: () => {}, appendLedgerRow: () => ({ ok: true }), out: () => {} });
       const result = await sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS]({ referrals: [], read: {
         repo: ctx.repo, pr: ctx.pr, netBasis: { rev: head }, body: state.body } }, { runId: 'sink-run' });
       const saved = readReferralRecords(state.comments).records.find(r => r.runId === current.runId);
       expect(validateReferralRecord(saved)).toBe(true);
-      expect(saved.carried).toEqual([carry(ruled, target)]);
+      expect(saved.carried).toEqual([reviewerCarry ?? carry(ruled, target)]);
       expect(result.pending).toEqual([]);
       expect(judge).not.toHaveBeenCalled();
       expect(changedLines).toHaveBeenCalledTimes(['none', 'unreadable-card'].includes(mode) ? 0 : 1);
       for (const [, baseHead, targetHead] of changedLines.mock.calls) expect([baseHead, targetHead]).toEqual([otherHead, head]);
     } finally { rmSync(root, { recursive: true, force: true }); }
-  });
+  };
+  it.each(['none', 'unreadable-card', 'unknown-lines', 'changed-lines', 'old-lines'])(
+    'persists without a same-head comparison, falling through failed cross-head proof: %s', persistScenario);
+  it('persists the reviewer card candidate before a competing same-head not-real candidate', () => persistScenario('reviewer-first'));
 });
