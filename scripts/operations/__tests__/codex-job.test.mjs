@@ -97,6 +97,7 @@ async function publicationFixture({ config = '', laneTip = 'abc123', files = ['s
     brief: '# Task: Build the example\nDetailed brief.', result: { branch: 'lane/example', sha: null } };
   await checkDiffScope(s);
   s.files = files;
+  s.startSha = remoteBase;
   // Out-of-scope paths are never audited; publication must reject them before any read.
   try { s.auditExportFingerprint = await captureAuditExport(s); } catch { /* rejected at publish */ }
   f.reads.length = 0; f.stats.length = 0;
@@ -1191,4 +1192,12 @@ it('malformed lane acquisition fails closed without destructive commands', async
     expect((await f.run()).result.stopReason).toBe('lane-acquire-failed');
     expect(f.calls.some(c => c.args.includes('reset'))).toBe(false); scopeReleased(f);
   }
+});
+
+it('refuses to publish when the trusted remote base moved since the audited starting commit', async () => {
+  const f = await publicationFixture();
+  f.s.startSha = 'c'.repeat(40);
+  expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'changed-after-audit' });
+  expect(pushes(f)).toHaveLength(0);
+  expect(f.calls.some(c => c.args.includes('commit'))).toBe(false);
 });

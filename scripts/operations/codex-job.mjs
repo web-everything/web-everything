@@ -324,6 +324,10 @@ export async function commitAndPush(s) {
     const baseRef = `refs/remotes/origin/${s.opts.base.replace(/^origin\//, '')}`;
     const base = await trustedGit(['rev-parse', '--verify', `${baseRef}^{commit}`]);
     if (!good(base) || typeof base.stdout !== 'string' || !base.stdout.trim()) fail('lane-reset-failed', 'Cannot resolve base from trusted remote; inspect the remote branch before retrying');
+    // Never publish audited files onto a base that was not the one tested and audited.
+    if (!s.startSha || base.stdout.trim() !== s.startSha) {
+      fail('changed-after-audit', 'Trusted remote base differs from the audited starting commit; restart the job against the new base');
+    }
     if (!good(await trustedGit(['checkout', '--detach', base.stdout.trim()]))) fail('commit-failed');
     for (const { file, bytes, mode } of exported) {
       const parts = file.split('/');
