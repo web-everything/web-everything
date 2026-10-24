@@ -377,7 +377,31 @@ it('bounds the real log read to a recent byte window and marks omitted evidence 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-it('strips inherited GIT_DIR and repository overrides from every child while retaining read-only settings', () => {
+it.each(['FIFO', 'directory'])('marks a %s log unreadable without blocking', (kind, context) => {
+  const dir = mkdtempSync(join(tmpdir(), 'adoption-nonregular-log-'));
+  try {
+    const log = kind === 'directory' ? dir : join(dir, 'fix-ready.fifo');
+    if (kind === 'FIFO') {
+      const made = spawnSync('mkfifo', [log], { encoding: 'utf8', timeout: 5000 });
+      if (made.error?.code === 'ENOENT') { context.skip(); return; }
+      expect(made.error).toBeUndefined();
+      expect(made.status, made.stderr).toBe(0);
+    }
+    // A blocking open must time out in a child rather than hang the test worker.
+    const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import { createAdoptionMatrixReader } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../adoption-matrix-io.mjs')).href)};
+      const result = createAdoptionMatrixReader({
+        env: { WE_FIX_READY_PATH: process.argv[1] }, settings: {}, readdir: () => [],
+      })();
+      process.stdout.write(JSON.stringify(result));
+    `, log], { encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 }));
+    expect(result.rows).toEqual([]);
+    expect(result.incomplete).toEqual(['fix-ready log unreadable']);
+    expect(renderAdoptionMatrix(result)).toMatch(/INCOMPLETE: fix-ready log unreadable.*inspect.*retry/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('strips repository overrides and disables lazy fetch and replacement objects in every Git child', () => {
   const dir = mkdtempSync(join(tmpdir(), 'adoption-git-env-'));
   try {
     const log = join(dir, 'calls.jsonl');
@@ -386,13 +410,13 @@ const { appendFileSync } = require('node:fs');
 const argv = process.argv.slice(2);
 const overrides = Object.fromEntries(Object.entries(process.env).filter(([key]) => ${JSON.stringify(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES'])}.includes(key)));
 appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv, overrides, env: { PATH: process.env.PATH,
-  GIT_NO_LAZY_FETCH: process.env.GIT_NO_LAZY_FETCH, GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT } }) + '\\n');
+  GIT_NO_LAZY_FETCH: process.env.GIT_NO_LAZY_FETCH, GIT_NO_REPLACE_OBJECTS: process.env.GIT_NO_REPLACE_OBJECTS, GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT } }) + '\\n');
 if (argv.includes('--is-shallow-repository')) process.stdout.write('false');
 else if (argv[0] === 'rev-parse') process.stdout.write('abcdef0000000000000000000000000000000000');
 else if (argv.includes('merge-base')) process.exitCode = 1;
 `, { mode: 0o755 });
     const env = { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH}`,
-      GIT_NO_LAZY_FETCH: '0', GIT_TERMINAL_PROMPT: '1',
+      GIT_NO_LAZY_FETCH: '0', GIT_NO_REPLACE_OBJECTS: '0', GIT_TERMINAL_PROMPT: '1',
       ...Object.fromEntries(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
         'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES']
         .map(key => [key, '/unrelated-repository'])) };
@@ -405,7 +429,7 @@ else if (argv.includes('merge-base')) process.exitCode = 1;
       .toEqual(['rev-parse', 'cat-file', 'merge-base', 'rev-parse']);
     for (const call of calls) {
       expect(call.overrides).toEqual({});
-      expect(call.env).toMatchObject({ PATH: env.PATH, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' });
+      expect(call.env).toMatchObject({ PATH: env.PATH, GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' });
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

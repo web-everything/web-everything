@@ -2116,6 +2116,9 @@ stay unknown rather than resolving a mutable branch. Probe commit presence befor
 `cat-file -e <sha>^{commit}` returns 128 with `Not a valid object name` on this Git, while
 other 128 failures (including an invalid repository) remain unknown. Keep a real-Git fixture
 alongside injected exit-code cases so the distinction stays observed.
+The reader opens logs nonblocking and checks the open descriptor is a regular file before reading;
+FIFOs, devices and directories are unreadable evidence. Test FIFO reads in a child with a timeout
+so a blocking-open regression cannot hang the test worker (skip if `mkfifo` is unavailable).
 The reader reads at most a 1 MiB log tail, retains 50 recent refs, discovers at most 20 clones through at most 100 plist reads,
 and shares a 500-call Git budget across resolution, presence, ancestry and shallow-history checks. Omitted evidence
 is explicitly truncated; log/discovery read failures are incomplete. Operators must inspect
@@ -2129,7 +2132,8 @@ a visible display-truncation notice directs operators to `--json` for full text.
 Every Git probe removes inherited `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
 `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`,
 `GIT_NAMESPACE` and `GIT_CEILING_DIRECTORIES` so probes observe the selected clone.
-Every Git probe passes `GIT_NO_LAZY_FETCH=1` and `GIT_TERMINAL_PROMPT=0`; presence checks
+Every Git probe passes `GIT_NO_LAZY_FETCH=1`, `GIT_NO_REPLACE_OBJECTS=1` and `GIT_TERMINAL_PROMPT=0`;
+replacement objects must not rewrite evidence, and presence checks
 must never fetch missing objects. Negative ancestry is definitive only after a successful
 `rev-parse --is-shallow-repository` returns `false`; shallow or unreadable history stays unknown.
 The drain adoption target comes from prototype-load settings (`workspaceRoot` + `daemons.drain.clone`),

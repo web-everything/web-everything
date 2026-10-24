@@ -1,6 +1,6 @@
 /** Injected, read-only IO. Object presence and ancestry failures remain distinct. */
 import { spawnSync, execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
+import { constants, readFileSync, readdirSync, statSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveDaemonClones } from '../lib/daemon-clones.mjs';
@@ -11,9 +11,11 @@ export const MAX_ADOPTION_PROBES = 500;
 const MAX_LOG_BYTES = 1024 * 1024;
 
 function readLogTail(path) {
-  const fd = openSync(path, 'r');
+  const fd = openSync(path, constants.O_NONBLOCK | constants.O_RDONLY);
   try {
-    const size = fstatSync(fd).size;
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error('log is not a regular file');
+    const size = stat.size;
     const start = Math.max(0, size - MAX_LOG_BYTES);
     const bytes = Buffer.alloc(Math.min(size, MAX_LOG_BYTES));
     const count = readSync(fd, bytes, 0, bytes.length, start);
@@ -37,7 +39,7 @@ export function createAdoptionMatrixReader({
   const git = argv => {
     if (probes >= MAX_ADOPTION_PROBES) { truncated = true; return null; }
     probes++;
-    const gitEnv = { ...env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
+    const gitEnv = { ...env, GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' };
     for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
       'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES']) {
       delete gitEnv[key];
