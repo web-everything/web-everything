@@ -56,7 +56,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
   return async function load(input) {
     const out = { ok: false, daemon: input.daemon, clone: null, cloneSource: null, registered: false, adopted: false,
       stopReason: null, branch: input.branch, sha: input.sha, effectiveRef: input.branch, effectiveSha: input.sha,
-      dryRun: !!input.dryRun, stale: [], removed: [], removedTips: {}, why: input.why || '',
+      dryRun: !!input.dryRun, stale: [], staleTolerated: [], removed: [], removedTips: {}, why: input.why || '',
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
@@ -126,6 +126,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       if (listing.code !== 0 || !Array.isArray(rows) || rows.some((r) => !safeRegistrationRef(r?.ref))) return stop('check-unverifiable', { listing });
       const established = [...new Set(rows.map((r) => r.ref))];
       const contained = [], blocking = [];
+      const blockingReasons = Object.create(null);
       out.staleChecks = {};
       for (const ref of established.filter((ref) => ref !== out.effectiveRef)) {
         const evidence = check(out.clone, ref);
@@ -134,10 +135,28 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         if (git('fetch', 'origin', ref).code !== 0) return stop('check-unverifiable', { detail: `could not fetch registered ref ${ref}` });
         const included = ancestor(`origin/${ref}`, out.effectiveSha);
         if (included) contained.push(ref);
-        if (!evidence.clean) { out.stale.push(ref); if (!included) blocking.push(ref); }
+        if (!evidence.clean) {
+          out.stale.push(ref);
+          if (!included) {
+            const staleFiles = Array.isArray(evidence.files) ? evidence.files : [];
+            const overlap = effectivePaths.filter((file) => staleFiles.includes(file));
+            const reason = out.check.ok !== true || out.check.clean !== true ? 'candidate-not-clean'
+              : !staleFiles.length ? 'stale-files-unknown'
+              : overlap.length ? `overlap-with-candidate: ${overlap.join(', ')}` : null;
+            if (reason) { blocking.push(ref); blockingReasons[ref] = reason; }
+            else {
+              const cherry = git('cherry', 'origin/main', `origin/${ref}`);
+              const lines = cherry.stdout.trimEnd().split(/\r?\n/);
+              const landedByContent = cherry.code === 0 && lines.every((line) => line.startsWith('-'));
+              out.staleTolerated.push({ ref, landedByContent,
+                why: 'pre-existing stale registration; candidate clean and file-disjoint'
+                  + (landedByContent ? ', commits already on main by patch-id' : '') });
+            }
+          }
+        }
       }
       out.contained = contained;
-      if (blocking.length) return stop('stale-registration', { message: blocking.map((ref) => `stale-registration: ${ref}`).join('; '), blocking });
+      if (blocking.length) return stop('stale-registration', { message: blocking.map((ref) => `stale-registration: ${ref} (${blockingReasons[ref]})`).join('; '), blocking, blockingReasons });
       if (!out.check.ok) return stop('check-unverifiable');
       if (!out.check.clean) return stop('check-conflict');
       out.swap = { contained };
