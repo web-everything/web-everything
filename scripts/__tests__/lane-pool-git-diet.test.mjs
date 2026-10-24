@@ -462,6 +462,7 @@ function withContainmentLane(check) {
 // snapshot, salvage refs) — into another repository. A PATH stub records each call's env; the decoy the inherited
 // env points at must come through untouched.
 function withRedirectingEnv({ base, git }, check) {
+  const decoy = join(base, 'decoy');
   git(['init', '--quiet', '--initial-branch=decoy', decoy]);
   git(['config', 'user.email', 'test@example.com'], decoy);
   git(['config', 'user.name', 'Test'], decoy);
@@ -496,10 +497,17 @@ process.exit(result.status ?? 1);
   };
   const calls = () => readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const ran = (pred) => calls().some(({ args }) => pred(args));
-  check({ hostile, ran });
+  // lane-pool's own calls carry LANE_GIT_ENV's GIT_REF_PARANOIA=1 (the process-level drop alone leaves it unset), so
+  // reverting any per-site scrub — gitQuiet, the git() helper, the reclaim reset/clean — reddens this.
+  const laneOwn = (pred) => {
+    const matched = calls().filter(({ args }) => pred(args));
+    expect(matched.length).toBeGreaterThan(0);
+    expect(matched.filter((c) => c.paranoia !== '1')).toEqual([]);
+  };
+  check({ hostile, laneOwn });
 
-  expect(ran((a) => a[0] === 'reset' && a.includes('--hard'))).toBe(true);
-  expect(ran((a) => a[0] === 'clean' && a.includes('-fd'))).toBe(true);
+  laneOwn((a) => a[0] === 'reset' && a[1] === '--hard' && a[2] === 'origin/trunk');
+  laneOwn((a) => a[0] === 'clean' && a[1] === '-fd');
   expect(calls().filter((c) => c.leaked.length)).toEqual([]);
   expect(calls().filter((c) => c.paranoia === '0')).toEqual([]);
   expect(git(['rev-parse', 'HEAD'], decoy)).toBe(decoyHead);
@@ -512,7 +520,7 @@ it('refresh, reclaim and acquire never let an inherited GIT_DIR redirect a lane 
   withContainmentLane(({ base, origin, lane, git, run }) => {
     git(['push', '--quiet', origin, 'HEAD:refs/heads/lane/landed'], lane);
     git(['fetch', '--quiet', 'origin'], lane);
-    withRedirectingEnv({ base, git }, ({ hostile, ran }) => {
+    withRedirectingEnv({ base, git }, ({ hostile, laneOwn }) => {
       const refresh = run(['refresh', '--count=1'], hostile);
       expect(refresh.status, refresh.stderr).toBe(0);
       const reclaim = run(['reclaim', '--lane=1', '--json'], hostile);
@@ -523,8 +531,8 @@ it('refresh, reclaim and acquire never let an inherited GIT_DIR redirect a lane 
       expect(acquire.status, acquire.stderr).toBe(0);
       expect(acquire.stdout.trim()).toBe(lane);
       run(['release', '--lane=1', '--session=location-scrub'], hostile);
-      expect(ran((a) => a[0] === 'config' && a.includes('gc.auto'))).toBe(true);
-      expect(ran((a) => a[0] === 'checkout' && a.includes('-B'))).toBe(true);
+      laneOwn((a) => a[0] === 'config' && a[1] === '--local' && a[2] === 'gc.auto');
+      laneOwn((a) => a[0] === 'checkout' && a.includes('-B'));
     });
   });
 }, 60000);
