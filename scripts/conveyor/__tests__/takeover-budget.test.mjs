@@ -573,3 +573,52 @@ describe('a thread cut at the list cap grants no takeover and no takeover review
     expect(plan(read).dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'fix', mode: 'takeover', takeover: { n: 1 } });
   });
 });
+
+describe('duplicate findings from two seats count once', () => {
+  const claim = 'Retry budget resets before pending requests finish';
+  const similar = 'Retry budget resets before pending requests complete';
+  const plain = (head, comments) => planTakeover({ pr: pr(head, comments), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER });
+
+  it('counts a repeated gap once at its heavier weight and permits a converging takeover', () => {
+    const thread = [...rounds5.slice(0, -1), review(R5, 6, [['src/j.mjs', 20, FIVE[0][2], claim]]),
+      marker(R5, 7), rearm(8), review(T1, 9, [['src/j.mjs', 20, 'degraded', claim]]),
+      review(T1, 10, [['src/j.mjs', 24, 'cosmetic', similar]])];
+    const weight = findingWeight({ impact: 'degraded' });
+    expect(openDefects(thread, R5)).toMatchObject({ count: 1, weight: findingWeight({ impact: 'broken' }) });
+    expect(openDefects(thread, T1)).toMatchObject({ count: 1, weight });
+    expect(reviewRounds(thread).at(-1).findings).toHaveLength(1);
+    expect(plain(T1, thread)).toMatchObject({ ok: true, n: 2, previous: { after: { count: 1, weight } } });
+    const p = plan(pr(T1, thread));
+    expect(p.dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'fix', mode: 'takeover', takeover: { n: 2 } });
+    expect(p.refusals.find((r) => r.prNumber === 7 && r.takeover === 'takeover-not-converging')).toBeUndefined();
+    expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeUndefined();
+  });
+
+  it('keeps the later broken member when the first seat reports lower impact', () => {
+    // Same line isolates weight selection from the expanded line window.
+    const thread = [review(T1, 9, [['src/j.mjs', 20, 'degraded', claim]]),
+      review(T1, 10, [['src/j.mjs', 20, 'broken', similar]])];
+    expect(openDefects(thread, T1)).toMatchObject({ count: 1, weight: findingWeight({ impact: 'broken' }) });
+    expect(reviewRounds(thread).at(-1).findings).toMatchObject([{ impact: 'broken', claim: similar }]);
+  });
+
+  it.each([
+    ['different files', 'src/k.mjs', 20, claim],
+    ['lines 30 apart', 'src/j.mjs', 50, claim],
+    ['nearby lines with dissimilar claims', 'src/j.mjs', 21, 'Credentials leak through diagnostic logging during authentication'],
+  ])('keeps separate findings for %s', (_name, file, line, otherClaim) => {
+    const thread = [review(T1, 9, [['src/j.mjs', 20, 'degraded', claim]]),
+      review(T1, 10, [[file, line, 'degraded', otherClaim]])];
+    expect(openDefects(thread, T1)).toMatchObject({ count: 2, weight: 2 * findingWeight({ impact: 'degraded' }) });
+    expect(reviewRounds(thread).at(-1).findings).toHaveLength(2);
+  });
+
+  it('still merges identical file-less claims from two seats', () => {
+    const ruling = (h) => ({ ...review(T1, h, []),
+      body: `## Automatic policy ruling on mandatory referrals\n\nRecorded by policy, for head \`${T1}\`.\n\n1. **block** — ${claim} (run \`review-pr-x\`)` });
+    const thread = [ruling(9), ruling(10)];
+    expect(openDefects(thread, T1)).toMatchObject({ count: 1, weight: findingWeight({ ruling: 'block' }),
+      findings: [{ file: null, line: null, claim }] });
+    expect(reviewRounds(thread).at(-1).findings).toHaveLength(1);
+  });
+});
