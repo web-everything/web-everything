@@ -788,19 +788,21 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       } catch (e) {
         io.log(`review-job ${out.sessionSlug}: red-team deferral status cleanup failed (${tail(e?.message ?? e, 300)})`);
       }
-      return out;
+      // A cap deferral ends here; a guard refusal still runs the independent gate below.
+      if (!guardDeferred) return out;
+    } else {
+      // An unsuccessful effects retry must keep the durable clean pass eligible for recovery.
+      const result = guardDeferred && prior ? prior.result
+        : seatsBox.priorRedTeamResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
+          ? seatsBox.priorRedTeamResult : out.redTeam?.status ?? null;
+      io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
     }
-    // An unsuccessful effects retry must keep the durable clean pass eligible for recovery.
-    const result = guardDeferred && prior ? prior.result
-      : seatsBox.priorRedTeamResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
-      ? seatsBox.priorRedTeamResult : out.redTeam?.status ?? null;
-    io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
   }
   else if (spec && seatsBox.input) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
   // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
   // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
   // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
-  if (out.redTeam && !out.redTeam.deferredByCap && !out.redTeam.deferredByGuard && typeof io.runRedTeamGate === 'function') {
+  if (out.redTeam && !out.redTeam.deferredByCap && typeof io.runRedTeamGate === 'function') {
     let gate;
     try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
     io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);
