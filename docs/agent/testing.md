@@ -2108,3 +2108,15 @@ On an App-token rejection, keep gh's original stderr before the daemon refusal d
 so callers that read the first error line still report GitHub's actual cause.
 The simulator binds its synthetic `sim-token-1` to matching App-token provenance; its fake
 GitHub still owns revocation checks. Never enable personal fallback globally in test setup.
+
+### Adoption evidence and compact terminal output
+
+The adoption matrix is read-only evidence and fails closed. Logged revisions must be full object IDs; probes
+use a sanitized Git environment (no inherited `GIT_DIR`-style variables, `GIT_NO_LAZY_FETCH`,
+`GIT_NO_REPLACE_OBJECTS`, no prompts), run only at a verified repository root, and treat a shallow or unreadable history as
+unknown, never as a definitive "no". Corrupt log lines, bad timestamps or refs, unreadable logs or settings, and gaps in
+clone discovery mark the snapshot incomplete. Reads are bounded (1 MiB log tail, 50 refs, 20 clones, 500 Git calls) and
+omissions are reported as truncation. Clone paths must be absolute. The drain target is the code clone from the
+prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
+Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
+

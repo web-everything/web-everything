@@ -294,12 +294,15 @@ export function shapeReadFinding(raw) {
       number,
       headSha,
       title: String(p?.title ?? ''),
+      updatedAt: String(p?.updatedAt ?? ''),
       labels: (Array.isArray(p?.labels) ? p.labels : []).map((l) => String(l)),
       mergeable: String(p?.mergeable ?? 'unknown'),
       checks: Array.isArray(p?.checks) ? p.checks : [],
     };
   });
-  return { repo: String(raw.repo ?? ''), prs, truncated: raw.truncated === true };
+  return { repo: String(raw.repo ?? ''), prs, truncated: raw.truncated === true,
+    ...(Number.isFinite(raw.nowMs) ? { nowMs: raw.nowMs } : {}),
+  };
 }
 
 /**
@@ -309,7 +312,7 @@ export function shapeReadFinding(raw) {
  * outranks one whose checks failed, because the failure is at least known and someone can act on it. A
  * silently unchecked PR is the one that costs twelve hours.
  */
-export function assessPrs(finding) {
+export function assessPrs(finding, { table = false } = {}) {
   const prs = finding.prs.map((pr) => {
     const check = reduceCheckState(pr.checks);
     return {
@@ -334,6 +337,18 @@ export function assessPrs(finding) {
     red: red.length,
     unchecked: unchecked.length,
     prs,
+    ...(table ? { table: prs.map((pr) => {
+      const updated = Date.parse(pr.updatedAt);
+      return {
+        pr: pr.number,
+        minutesSinceUpdate: Number.isFinite(finding.nowMs) && Number.isFinite(updated)
+          ? Math.max(0, Math.floor((finding.nowMs - updated) / 60000)) : '-',
+        title: pr.title.slice(0, 40),
+        state: pr.state,
+        redTeam: pr.labels.find(label => label.startsWith('red-team:'))?.slice(9) || '-',
+        round: pr.labels.map(label => /^review-round:(\d+)$/.exec(label)).find(Boolean)?.[1] ?? '-',
+      };
+    }) } : {}),
     blocking: [
       ...unchecked.map((p) => ({ pr: p.number, why: 'unchecked', detail: `${p.headSha.slice(0, 8)} — ${p.why}` })),
       ...red.map((p) => ({ pr: p.number, why: 'red', detail: `${p.headSha.slice(0, 8)} — ${p.why}` })),
@@ -365,6 +380,7 @@ export function prStatusOperation({ readPrs } = {}) {
       // One PR, or every open one. REQUIRED to be explicit about which: defaulting to "all" would make a
       // caller asking about #1518 quietly pay for a repo-wide sweep.
       pr: { type: 'number', required: false, default: 0 },
+      table: { type: 'boolean', required: false, default: false },
     },
     verdictFrom: 'assess',
 
@@ -374,8 +390,25 @@ export function prStatusOperation({ readPrs } = {}) {
     }),
 
     assess: compute({
-      reads: ['findings.read'],
-      fn: (view) => assessPrs(view.findings.read),
+      reads: ['findings.read', 'input.table'],
+      fn: (view) => assessPrs(view.findings.read, { table: view.input.table === true }),
     }),
   });
+}
+
+/** Fixed-width, single-line cells; the clock belongs to the injected reader. */
+export function renderPrTable(rows) {
+  const widths = [6, 6, 40, 9, 8, 3];
+  const line = cells => cells.map((cell, i) => String(cell).replace(/[\p{Cc}\p{Cf}]/gu, '')
+    .slice(0, widths[i]).padEnd(widths[i])).join('  ').trimEnd();
+  return [line(['PR', 'MIN', 'TITLE', 'STATE', 'RT', 'RND']),
+    ...rows.map(row => line([row.pr, row.minutesSinceUpdate, row.title, row.state, row.redTeam, row.round])),
+  ].join('\n');
+}
+
+export function finishPrStatus({ run, code, lines, json = false }) {
+  if (json) return { code, lines };
+  const output = Array.isArray(run?.verdict?.table) ? [renderPrTable(run.verdict.table)] : lines;
+  return { code, lines: run?.verdict?.truncated
+    ? [...output, 'WARNING: PR listing truncated — incomplete evidence; inspect the full listing before acting.'] : output };
 }

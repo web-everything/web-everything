@@ -55,10 +55,12 @@ import { graduationProgressReportOperation, GRADUATION_PROGRESS_REPORT_OP } from
 import { createScorecardReader, createPromotionsReader, createProbationReader } from './graduation-progress-report-io.mjs';
 import { selectSupervisionLevel, DEFAULT_BACKDOWN_THRESHOLDS } from '../lib/provider-routing.mjs';
 import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
-import { prStatusOperation, PR_STATUS_OP } from './pr-status.mjs';
+import { prStatusOperation, PR_STATUS_OP, finishPrStatus } from './pr-status.mjs';
 import { createPrReader } from './pr-status-io.mjs';
 import { judgeSweepFactsOperation, JUDGE_SWEEP_FACTS_OP, finishJudgeSweep } from './judge-sweep-facts.mjs';
 import { createJudgeSweepFactsReader } from './judge-sweep-facts-io.mjs';
+import { adoptionMatrixOperation, ADOPTION_MATRIX_OP, finishAdoptionMatrix } from './adoption-matrix.mjs';
+import { createAdoptionMatrixReader } from './adoption-matrix-io.mjs';
 import { staleStateOperation, STALE_STATE_OP } from './stale-state.mjs';
 import { createStaleStateReader } from './stale-state-io.mjs';
 import { prReconcileOperation, PR_RECONCILE_OP } from './pr-reconcile.mjs';
@@ -344,9 +346,11 @@ export const OPERATIONS = Object.freeze({
     declaration: staleStateOperation({ readState: createStaleStateReader() }),
     sinks: {},
   }),
+  [ADOPTION_MATRIX_OP]: () => ({ declaration: adoptionMatrixOperation({ collect: createAdoptionMatrixReader() }), sinks: {}, finish: finishAdoptionMatrix }),
   [PR_STATUS_OP]: () => ({
     declaration: prStatusOperation({ readPrs: createPrReader() }),
     sinks: {},
+    finish: finishPrStatus,
   }),
   // #3856 — plan only, no sinks. Every effect the plan can call for (dispatching a delivery agent, a
   // CI-heal repair, a review, queueing an item) lives behind `land-advance-io.mjs`'s sinks, which this
@@ -745,7 +749,7 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: controlPolicy.zeroWrites || [JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
@@ -755,7 +759,7 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    : [ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

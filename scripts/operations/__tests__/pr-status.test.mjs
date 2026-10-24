@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   prStatusOperation, reduceCheckState, labelDisagreements, shapeReadFinding, assessPrs,
-  PR_STATUS_OP, CHECK_STATES, LABEL_CLAIMS, FAILING_CONCLUSIONS,
+  PR_STATUS_OP, CHECK_STATES, LABEL_CLAIMS, FAILING_CONCLUSIONS, renderPrTable, finishPrStatus,
 } from '../pr-status.mjs';
 import { collapseRollupToLatestPerName } from '../../lib/rollup-collapse.mjs';
 import { listArgv, checksArgv, parseJsonLines, labelNames, createPrReader, LIST_LIMIT } from '../pr-status-io.mjs';
@@ -253,7 +253,7 @@ describe('the io shell', () => {
   it('asks for headRefOid — without it every PR is unassessable', () => {
     expect(listArgv({ repo: 'o/r' }).join(' ')).toContain('headRefOid');
     expect(listArgv({ repo: 'o/r', pr: 7 })).toEqual(
-      ['pr', 'view', '7', '--repo', 'o/r', '--json', 'number,title,labels,mergeable,headRefOid'],
+      ['pr', 'view', '7', '--repo', 'o/r', '--json', 'number,title,labels,mergeable,headRefOid,updatedAt'],
     );
   });
 
@@ -367,7 +367,7 @@ describe('the declaration', () => {
     expect(() => prStatusOperation({})).toThrow(/needs a `readPrs\(\)` reader/);
     const decl = prStatusOperation({ readPrs: () => ({ repo: 'o/r', prs: [] }) });
     expect(decl.name).toBe(PR_STATUS_OP);
-    expect(Object.keys(decl.input)).toEqual(['repo', 'pr']);
+    expect(Object.keys(decl.input)).toEqual(['repo', 'pr', 'table']);
     expect(decl.input.repo.required).toBe(true);
   });
 
@@ -474,4 +474,81 @@ it('xxh4zw8 complete required evidence and latest numeric reruns restore green i
   for (const ordered of [runs, [...runs].reverse()]) {
     expect(reduceCheckState(ordered, ['test', 'smoke'])).toMatchObject({ state: 'green', counts: { total: 2, failed: 0 } });
   }
+});
+
+describe('PR status compact table', () => {
+  const nowMs = Date.parse('2026-10-22T12:00:00Z');
+  const row = overrides => ({ number: 42, headSha: 'abc', title: 'A'.repeat(50),
+    updatedAt: '2026-10-22T11:57:30Z', labels: ['red-team:clear', 'review-round:3'],
+    checks: [done('success')], ...overrides });
+
+  it('requests updatedAt for list and single PR reads and threads an injected clock through the reader', () => {
+    for (const pr of [0, 42]) {
+      const argv = listArgv({ repo: 'o/r', pr });
+      expect(argv[argv.indexOf('--json') + 1].split(',')).toContain('updatedAt');
+    }
+    const read = createPrReader({ now: () => nowMs, run: (_bin, argv) => argv[0] === 'pr'
+      ? JSON.stringify([{ number: 42, headRefOid: 'abc', updatedAt: '2026-10-22T11:57:30Z' }]) : '' });
+    const raw = read({ repo: 'o/r' });
+    expect(raw.nowMs).toBe(nowMs);
+    const finding = shapeReadFinding(raw);
+    expect(finding.nowMs).toBe(nowMs);
+    expect(finding.prs[0].updatedAt).toBe('2026-10-22T11:57:30Z');
+  });
+
+  it('reports elapsed whole minutes, a 40-character title, existing state and label suffixes', () => {
+    const finding = shapeReadFinding({ repo: 'o/r', nowMs, prs: [row({})] });
+    const verdict = assessPrs(finding, { table: true });
+    expect(verdict.table).toEqual([{ pr: 42, minutesSinceUpdate: 2, title: 'A'.repeat(40),
+      state: 'green', redTeam: 'clear', round: '3' }]);
+    expect(verdict.prs[0].title).toHaveLength(50);
+    expect(verdict.prs[0].updatedAt).toBe('2026-10-22T11:57:30Z');
+  });
+
+  it('handles missing timestamps, clock and labels without consulting a clock in the core', () => {
+    for (const updatedAt of ['', 'invalid', undefined]) {
+      const verdict = assessPrs(shapeReadFinding({ nowMs, prs: [row({ updatedAt, labels: [], checks: [] })] }), { table: true });
+      expect(verdict.table[0]).toMatchObject({ minutesSinceUpdate: '-', state: 'unchecked', redTeam: '-', round: '-' });
+    }
+    expect(assessPrs(shapeReadFinding({ prs: [row({})] }), { table: true }).table[0].minutesSinceUpdate).toBe('-');
+    expect(assessPrs(shapeReadFinding({ nowMs, prs: [row({ updatedAt: '2026-10-22T13:00:00Z' })] }), { table: true }).table[0].minutesSinceUpdate).toBe(0);
+    expect(assessPrs(shapeReadFinding({ nowMs, prs: [row({ labels: ['review-round:bad'] })] }), { table: true }).table[0].round).toBe('-');
+  });
+
+  it('renders aligned headers and rows without prose, and finishes text or full JSON', () => {
+    const table = assessPrs(shapeReadFinding({ nowMs, prs: [row({ title: 'fix' })] }), { table: true }).table;
+    const rendered = renderPrTable(table);
+    expect(rendered).toBe([
+      'PR      MIN     TITLE                                     STATE      RT        RND',
+      '42      2       fix                                       green      clear     3',
+    ].join('\n'));
+    expect(renderPrTable([])).toBe(rendered.split('\n')[0]);
+    const outcome = { run: { verdict: { table } }, code: 0, lines: ['full json'] };
+    expect(finishPrStatus(outcome)).toEqual({ code: 0, lines: [rendered] });
+    expect(finishPrStatus({ ...outcome, json: true })).toEqual({ code: 0, lines: ['full json'] });
+    expect(assessPrs(shapeReadFinding({ nowMs, prs: [row({})] }))).not.toHaveProperty('table');
+    expect(finishPrStatus({ ...outcome, run: { verdict: {} } })).toEqual({ code: 0, lines: ['full json'] });
+    expect(finishPrStatus({ ...outcome, run: null })).toEqual({ code: 0, lines: ['full json'] });
+  });
+});
+
+
+describe('PR table evidence and terminal safety', () => {
+  it('preserves the same truncated-listing warning and exit semantics in normal and table modes', () => {
+    for (const code of [0, 1]) {
+      const normal = finishPrStatus({ run: { verdict: { truncated: true } }, code, lines: ['normal'] });
+      const compact = finishPrStatus({ run: { verdict: { truncated: true, table: [] } }, code, lines: ['normal'] });
+      expect(normal.lines.at(-1)).toMatch(/WARNING.*truncated.*incomplete/i);
+      expect(compact.lines.at(-1)).toBe(normal.lines.at(-1));
+      expect(compact.code).toBe(code);
+      expect(finishPrStatus({ run: { verdict: { truncated: true, table: [] } }, code, lines: ['json'], json: true }))
+        .toEqual({ code, lines: ['json'] });
+    }
+  });
+  it('strips C0, DEL, C1 and bidi/format controls from titles and label cells', () => {
+    const unsafe = 'x\x1b[31m\x00\x7f\x85\u202e\u2066\r\n\t';
+    const rendered = renderPrTable([{ pr: 1, minutesSinceUpdate: 0, title: unsafe, state: unsafe, redTeam: unsafe, round: unsafe }]);
+    expect(rendered.replaceAll('\n', '')).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+    expect(rendered).toContain('x[31m');
+  });
 });

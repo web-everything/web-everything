@@ -61,6 +61,7 @@ describe('runner freshness policy', () => {
     const names = Object.keys(OPERATIONS).sort();
     expect(names).toMatchInlineSnapshot(`
       [
+        "adoption-matrix",
         "agent-activity",
         "claim",
         "clear-claim",
