@@ -759,6 +759,13 @@ export function createCardGrouping({
         files: c?.listedFilesComplete === true ? c.listedFiles : null, mainFix: isMainFix(c) === true });
     },
     /**
+     * Could a group hold a PR right now or claim one mid-pass (grouping on, or a state file present)? A land whose
+     * hold re-check must be serialized against a group claim then refuses to run unlocked on mutex contention.
+     */
+    mayHold() {
+      return setting.enabled === true || (!!statePath && existsSync(statePath));
+    },
+    /**
      * A source or combined PR of a recorded group: the drain's own rebase/repair must not move its head. The
      * published main-red repair PR is not exempted from rebase/repair: it must become landable (its group dissolves).
      */

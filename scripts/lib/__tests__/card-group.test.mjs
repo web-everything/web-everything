@@ -344,6 +344,16 @@ describe('resolveCardGroupStatePath (one resolver for grouping and enqueue)', ()
     const g = createCardGrouping({ localSlug: 'o/r', env: { VITEST: '1' }, settings: { enabled: true, maxSize: 8, eligibility: 'card-only', reconcileSec: 120, retryMin: 30, sources: {} }, log: { write() {} } });
     expect(g.form({ outcomes: [] }).reason).toBe('disabled');
     expect(g.holdFor({ num: 1 })).toBeNull();
+    expect(g.mayHold()).toBe(false);
+  });
+  it('mayHold: grouping on, or a leftover state file while off, makes a direct merge refuse an unlocked fallback (xym8nt4)', () => {
+    const statePath = join(tmp(), 's.json');
+    const base = { enabled: true, maxSize: 8, eligibility: 'card-only', reconcileSec: 120, retryMin: 30, sources: {} };
+    const mk = enabled => createCardGrouping({ localSlug: 'o/r', statePath, settings: { ...base, enabled }, log: { write() {} } });
+    expect(mk(true).mayHold()).toBe(true);
+    expect(mk(false).mayHold()).toBe(false);
+    writeFileSync(statePath, JSON.stringify({ groups: [], failed: {} }));
+    expect(mk(false).mayHold()).toBe(true);
   });
 });
 
