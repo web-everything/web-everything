@@ -1,4 +1,6 @@
 /** Pure command planning for the remote workflow; existence checks are injected. */
+// Keep identical to operationNamePattern in scripts/remote-test.mjs.
+const operationNamePattern = /^[a-z][a-z0-9-]*$/;
 export function remoteVerifyCommands({ mode, tests = '', operation = '' }, exists) {
   switch (mode) {
     case 'lane-check':
@@ -14,7 +16,7 @@ export function remoteVerifyCommands({ mode, tests = '', operation = '' }, exist
         return [['npm', ['run', 'test:unit', '--', ...files]]];
       }
       const name = operation.trim();
-      if (!/^[a-z][a-z0-9-]*$/.test(name)) {
+      if (!operationNamePattern.test(name)) {
         throw new Error('Targeted mode requires tests or an operation name');
       }
       const declaration = `scripts/operations/${name}.mjs`;

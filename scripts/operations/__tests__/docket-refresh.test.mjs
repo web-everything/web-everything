@@ -34,6 +34,9 @@ import {
 import { createRegistry } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
+// Load the full CLI registry during collection rather than charging its cold import
+// to the registration assertion's unit-test timeout on a busy CI shard.
+import { resolveOperation } from '../run.mjs';
 import { importGraph } from './import-graph.mjs';
 import { git as realGit, withBareOrigin } from './helpers/real-repo.mjs';
 
@@ -386,8 +389,7 @@ describe('docket-refresh (real git, real reader and sink)', () => {
     expect(clean(ws.primary)).toBe('');
   }));
 
-  it('is registered on the command line under its name', async () => {
-    const { resolveOperation } = await import('../run.mjs');
+  it('is registered on the command line under its name', () => {
     expect(resolveOperation(DOCKET_REFRESH_OP).declaration.name).toBe(DOCKET_REFRESH_OP);
   });
 });

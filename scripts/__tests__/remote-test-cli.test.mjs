@@ -1,7 +1,7 @@
 // Live IO uses injected children; the argument-error script probe performs no git/network IO.
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, buildDispatchArgs, runRemoteTest, runRemoteCLI, remoteIO } from '../remote-test.mjs';
@@ -10,6 +10,7 @@ const REF = 'lane/remote-tests';
 const SHA = 'a'.repeat(40);
 const CREATED_AFTER = '2026-10-24T12:00:00.000Z';
 const tests = ['scripts/__tests__/remote-route.test.mjs', 'blocks/example.test.ts'];
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '../..');
 
 describe('live IO construction with injected children', () => {
   function readinessFixture({ dirty = '', pushed = `${SHA}\trefs/heads/${REF}`, authenticated = true } = {}) {
@@ -69,7 +70,7 @@ describe('live IO construction with injected children', () => {
 });
 
 it('remote-test script rejects invalid arguments with usage and exit 3', () => {
-  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../remote-test.mjs', import.meta.url)), '--mode=invalid'],
+  const result = spawnSync(process.execPath, [join(REPO, 'scripts/remote-test.mjs'), '--mode=invalid'],
     { encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024 });
   expect(result.status).toBe(3);
   expect(result.stderr).toContain('Usage: remote-test');
@@ -233,16 +234,20 @@ describe('parseArgs', () => {
       .toMatchObject({ ref: REF, mode: 'targeted', operation: 'check-standards' });
   });
 
-  it('pins CLI and workflow operation regex equality', () => {
+  it('pins CLI and workflow dispatcher operation regex equality', () => {
     const pattern = source => {
       const match = /const operationNamePattern = (\/[^\n]+\/);/.exec(source);
       expect(match).not.toBeNull();
       return match[1];
     };
-    const cli = readFileSync(join(process.cwd(), 'scripts/remote-test.mjs'), 'utf8');
-    const workflow = readFileSync(join(process.cwd(), '.github/workflows/remote-verify.yml'), 'utf8');
-    expect(pattern(cli)).toBe(pattern(workflow));
-    expect(pattern(workflow)).toBe('/^[a-z][a-z0-9-]*$/');
+    const cli = readFileSync(join(REPO, 'scripts/remote-test.mjs'), 'utf8');
+    const dispatcher = readFileSync(join(REPO, 'scripts/lib/remote-verify-dispatch.mjs'), 'utf8');
+    const workflow = readFileSync(join(REPO, '.github/workflows/remote-verify.yml'), 'utf8');
+    expect(workflow).toContain("import { remoteVerifyCommands } from '../remote-verify-source/scripts/lib/remote-verify-dispatch.mjs'");
+    expect(workflow).toContain('const commands = remoteVerifyCommands(');
+    expect(pattern(cli)).toBe(pattern(dispatcher));
+    expect(pattern(dispatcher)).toBe('/^[a-z][a-z0-9-]*$/');
+    expect(dispatcher).toContain('operationNamePattern.test(name)');
   });
 
   it.each(['check:standards', 'Check', '1check', 'check_unit', 'check/unit', 'check.unit',

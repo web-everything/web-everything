@@ -9,7 +9,7 @@ import { cleanRouteText } from './lib/remote-route.mjs';
 const usage = () => new Error('Usage: remote-test --ref <branch|SHA> --mode <lane-check|full|targeted> [--tests=<files> | --operation <name>]');
 const safe = value => typeof value === 'string' && value.length > 0 && value.length <= 4096
   && /^[A-Za-z0-9_./:@+-]+$/.test(value) && !value.startsWith('-');
-// Keep identical to operationNamePattern in .github/workflows/remote-verify.yml.
+// Keep identical to operationNamePattern in scripts/lib/remote-verify-dispatch.mjs.
 const operationNamePattern = /^[a-z][a-z0-9-]*$/;
 function validate(options) {
   if (!safe(options.ref) || !['lane-check', 'full', 'targeted'].includes(options.mode)) throw usage();

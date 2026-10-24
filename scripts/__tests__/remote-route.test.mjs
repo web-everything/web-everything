@@ -1,18 +1,20 @@
 // Test-first contract: static imports intentionally fail until the module exists.
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { autoRouteVerify, decideRoute, resolveRouteSettings, formatRouteLog, ROUTE_DEFAULTS } from '../lib/remote-route.mjs';
 import { resolveCascade } from '../lib/policy-cascade.mjs';
 
 // Execute the actual entrypoint's orchestration, from selection through admission,
 // with in-memory marker/child IO. No git repository, network or heavy gate is needed.
 // Keep the whole contiguous region so moving routing ahead of a short-circuit fails.
-const entry = readFileSync(new URL('../verify-lane.mjs', import.meta.url), 'utf8');
+const entryPath = join(dirname(fileURLToPath(import.meta.url)), '../verify-lane.mjs');
+const entry = readFileSync(entryPath, 'utf8');
 const modeDeclaration = entry.slice(entry.indexOf('const MODE ='), entry.indexOf('\n\n', entry.indexOf('const MODE =')));
 const dispatchDeclaration = entry.slice(entry.indexOf('const DISPATCHED_RUN ='), entry.indexOf('\n', entry.indexOf('const DISPATCHED_RUN =')));
 const orchestration = entry.slice(entry.indexOf('SELECTION = summarizeSelection'), entry.indexOf('// 2. Admission:'))
-  .replaceAll('import.meta.url', JSON.stringify(new URL('../verify-lane.mjs', import.meta.url).href));
+  .replaceAll('import.meta.url', JSON.stringify(pathToFileURL(entryPath).href));
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 async function entryFixture({ command, flags = {}, selected = 'related', cached = false, remoteCode = 0, readySha } = {}) {
   const sha = 'a'.repeat(40);
