@@ -700,9 +700,12 @@ export function pushFailedDetail(message, { SRC, REF, REMOTE }) {
 
 // Allow importing the pure helpers without running the CLI (the test file imports this module).
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-if (IS_CLI) runCli();
+let emit;
+if (IS_CLI) runCli().catch((error) => emit({ repo: REPO, merged: false, reason: 'internal-error', detail: String(error?.message || error).split('\n')[0] }, 3));
 
 async function runCli() {
+  // Install the closure before setup so the entry-point catch can use the normal failure output.
+  emit = emitResult;
   const gitC = (args) => execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   // #2217 — pr-land is a SANCTIONED main-writer (fallback-git merge, post-land heal/regen). Those pushes go to
   // `main`, so they must carry the MAIN_PUSH_OK=1 override the new pre-push hook (guard-git-push.mjs) checks —
@@ -730,7 +733,7 @@ async function runCli() {
     }
   };
 
-  function emit(result, exitCode) {
+  function emitResult(result, exitCode) {
     // LIVE INCIDENT 2026-10-03/04, PR #3830: a `--label-on-green` run that ends red/timeout/behind left the PR with
     // NO label of any kind; once the fix daemon healed the red the PR sat green and label-less forever.
     let handOff = null;
@@ -998,12 +1001,21 @@ async function runCli() {
   let prNum = null;
   try { prNum = forge.listOpenByHead(REF)?.[0]?.number ?? null; } catch { /* gh may be absent */ }
   let sizeBody = CREATE_BODY;
+  let sizeBodyRead = false;
   if (prNum != null) {
-    try { sizeBody = composePrBody(forge.viewPr(prNum, 'body').body || ''); } catch { /* local lookup still prevents duplicate cards */ }
+    try {
+      sizeBody = composePrBody(forge.viewPr(prNum, 'body').body || '');
+      sizeBodyRead = true;
+    } catch { /* local lookup still prevents duplicate cards; never replace an unread live body */ }
   }
-  const sizeAdmission = await admitPrSize({ ref: REF, pr: prNum, base: `${REMOTE}/${BASE}`, sha: refSha, body: sizeBody }, { cwd: REPO });
+  let sizeAdmission;
+  try {
+    sizeAdmission = await admitPrSize({ ref: REF, pr: prNum, base: `${REMOTE}/${BASE}`, sha: refSha, body: sizeBody }, { cwd: REPO });
+  } catch {
+    sizeAdmission = { status: 'unknown', body: sizeBody, reviewLabel: REVIEW_LABELS.pending };
+  }
   createParams.body = sizeAdmission.body;
-  if (prNum != null && sizeAdmission.body !== sizeBody) {
+  if (prNum != null && sizeBodyRead && sizeAdmission.body !== sizeBody) {
     try { forge.editBody(prNum, sizeAdmission.body); } catch { /* retry will reuse the local split card */ }
   }
 

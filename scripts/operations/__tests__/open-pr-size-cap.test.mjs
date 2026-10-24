@@ -214,11 +214,64 @@ describe('direct pr-land uses the same admission and existing review-label path'
     // Complements the effect tests: a new exported helper alone cannot fix direct callers.
     const source = readFileSync(join(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
     const cli = source.slice(source.indexOf('function runCli('));
-    const call = /(?:const|let)\s+(\w+)\s*=\s*(?:await\s+)?admitPrSize\s*\(/.exec(cli);
+    const call = /\b(\w+)\s*=\s*(?:await\s+)?admitPrSize\s*\(/.exec(cli);
     expect(call, 'runCli must actually invoke shared size admission').not.toBeNull();
     expect(call.index).toBeLessThan(cli.indexOf('forge.create(createParams)'));
     expect(cli).toMatch(new RegExp('body\\s*:\\s*' + call[1] + '\\.body|createParams\\.body\\s*=\\s*' + call[1] + '\\.body'));
     expect(cli).toMatch(new RegExp('sizeAdmission\\s*:\\s*' + call[1] + '\\b'));
     expect(source).toContain('#size-adds-reviewers-never-refuses');
+  });
+});
+
+describe('pr-land CLI size failure boundaries', () => {
+  const source = readFileSync(join(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
+  // Execute the production block with injected IO without running publication or Git commands.
+  const block = source.slice(source.indexOf('  let sizeBody = CREATE_BODY;'), source.indexOf('\n  if (prNum == null) {', source.indexOf('  let sizeBody = CREATE_BODY;')));
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const runBlock = new AsyncFunction('forge', 'admitPrSize', 'prNum', 'REVIEW_LABELS', `
+    const CREATE_BODY = 'create body', REF = 'lane/test', REMOTE = 'origin', BASE = 'main', refSha = 'sha', REPO = '.';
+    const composePrBody = (body) => body;
+    const createParams = {};
+    ${block}
+    return { sizeAdmission, createParams };
+  `);
+
+  it.each([false, true])('only edits an existing PR after a successful live body read (read succeeds: %s)', async (readSucceeds) => {
+    const forge = {
+      viewPr: vi.fn(() => {
+        if (!readSucceeds) throw new Error('body unavailable');
+        return { body: 'live body' };
+      }),
+      editBody: vi.fn(),
+    };
+    const admit = vi.fn(async ({ body }) => ({ status: 'over', body: `${body}\nSize note`, reviewLabel: REVIEW_LABELS.pending }));
+    await runBlock(forge, admit, 5854, REVIEW_LABELS);
+    expect(admit).toHaveBeenCalledTimes(1);
+    if (readSucceeds) expect(forge.editBody).toHaveBeenCalledWith(5854, 'live body\nSize note');
+    else expect(forge.editBody).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['synchronous throw', () => { throw new Error('admission failed'); }],
+    ['async rejection', async () => { throw new Error('admission failed'); }],
+  ])('%s preserves new and existing bodies and forces unknown-size review', async (_name, admit) => {
+    for (const prNum of [null, 5854]) {
+      const forge = { viewPr: vi.fn(() => ({ body: 'live body' })), editBody: vi.fn() };
+      const body = prNum == null ? 'create body' : 'live body';
+      const result = await runBlock(forge, admit, prNum, REVIEW_LABELS);
+      expect(result).toEqual({ sizeAdmission: { status: 'unknown', body, reviewLabel: REVIEW_LABELS.pending }, createParams: { body } });
+      expect(forge.editBody).not.toHaveBeenCalled();
+      expect(prLand.resolveProducerReviewLabel({ sizeAdmission: result.sizeAdmission }))
+        .toMatchObject({ label: REVIEW_LABELS.pending, apply: true });
+    }
+  });
+
+  it('entry-point rejection emits internal-error with a nonzero exit code', async () => {
+    const entry = source.slice(source.indexOf('if (IS_CLI) runCli()'), source.indexOf('\nasync function runCli()'));
+    const emit = vi.fn();
+    const run = new Function('runCli', 'emit', 'REPO', entry.replace('if (IS_CLI) ', 'return '));
+    await run(async () => { throw new Error('unexpected failure'); }, emit, '.');
+    expect(emit).toHaveBeenCalledWith({ repo: '.', merged: false, reason: 'internal-error', detail: 'unexpected failure' }, 3);
+    expect(source).toMatch(/async function runCli\(\)\s*\{\s*\/\/[^\n]*\n\s*emit = emitResult;/);
   });
 });
