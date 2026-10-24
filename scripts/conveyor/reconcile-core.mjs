@@ -1348,7 +1348,7 @@ function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
     // All card / not-real: no ruling is owed, so the pause is over and the PR moves to its next step. On a
     // `review:human` PR whose live head already has its advisory, that step is the human /review, never another panel
     // (the same-head guard still stands) and never an accept: refuse as the nothing-owed `already-reviewed-head`, which
-    // is not an operator referral hold and posts no "waiting on your ruling" notice.
+    // is not an operator referral hold and posts no "waiting on your ruling" notice. Anything else stays paused.
     // "Complete" = the live head carries its advisory: the human has what the /review reads. (A head whose one
     // finished review left no advisory was already resumed above, in planReconcile; a second such run stays paused.)
     const human = withPhase?.phase === 'needs-human' || (withPhase?.labels ?? []).includes(REVIEW_LABELS.human);
@@ -1361,9 +1361,7 @@ function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
       });
       return true;
     }
-    // Non-human resumes are cleared in planReconcile's pre-pass. Failed safety bounds arrive here as `stay`,
-    // carrying that pre-pass's reason; never replace it with a blanket refusal to re-review non-human PRs.
-    if (human) auto = { ...auto, outcome: 'stay', why: 'no advisory covers the live head' };
+    auto = { ...auto, outcome: 'stay', why: human ? 'no advisory covers the live head' : 'not a review:human PR, so a re-review of this head would be a second verdict' };
   }
   // A `stay` keeps the pause's own words (the daemon logs why it stayed, once per reason).
   const note = auto?.outcome === 'send-back' ? ` (auto-resolve: ${auto.why}; sending back to the fixer)` : '';
@@ -2036,16 +2034,29 @@ export function planReconcile({
   const dispatch = [];
   const refusals = [];
   const notes = [];
-  // A same-head pause whose live-head findings are all ruled resumes the ordinary review once (#5806).
-  // `review:human` keeps its existing advisory-only path: a current advisory leaves the next step to the human;
-  // without one (#5773), resume once to publish it. Every path requires exactly one finished review and one attempt.
+  // Resume a review:human head once to publish its missing advisory (#5773). A non-human head needs a recorded
+  // live-head referral ruling as well (#5806); a current advisory never permits a second review of either kind.
+  // Every path requires exactly one finished review and one attempt.
   prs = prs.map(pr => {
     const auto = pr?.referralHoldAutoResolve;
     const hold = pr?.referralHold;
     if (auto?.outcome !== 'resume' || !hold || auto.head !== pr.headRefOid || hold.kind !== 'same-head'
       || hold.head !== pr.headRefOid || hold.noVerdict) return pr;
     const human = labelNames(pr.labels).includes(REVIEW_LABELS.human);
-    if (human && advisoryHeadState(pr).advisoryIsCurrent) return pr;
+    if (advisoryHeadState(pr).advisoryIsCurrent) return pr;
+    if (!human) {
+      // The enriched `resume` answer alone is not a grant: require readable thread evidence for this exact head,
+      // run and finding. Older-head carries and missing/malformed records leave the ordinary refusal in place.
+      const records = readReferralRecords(pr.comments, { head: pr.headRefOid });
+      const operator = readOperatorRulings(pr.comments, { head: pr.headRefOid });
+      const findings = Array.isArray(auto.findings) ? auto.findings : [];
+      const recorded = !records.malformed && !operator.malformed && records.records.some(r => r.head === pr.headRefOid
+        && r.pr === Number(pr.number) && findings.some(f => f?.runId === r.runId
+          && ['card', 'not-real'].includes(f.result) && (r.rulings.some(x => x.key === f.key && x.result === f.result)
+            || operator.rulings.some(x => x.repo === r.repo && x.pr === r.pr && x.head === r.head
+              && x.runId === r.runId && x.key === f.key && x.result === f.result))));
+      if (!recorded) return pr;
+    }
     // Every attempt since the wake counts, finished or not (a review that dies before `advise` is an attempt too). A
     // hold that cannot say (a ledger-derived hold carries only finished runs) is never resumed: fail closed.
     const attempts = Number.isInteger(hold.attemptsSinceWake) ? hold.attemptsSinceWake : null;

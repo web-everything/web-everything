@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { AUTO_POLICY_ACTOR, buildOperatorRulingComment, readReferralRecords, REFERRAL_SUPERSEDE_REASON } from '../../lib/jury-core.mjs';
 import { liveReferralState } from '../../lib/referral-live-context.mjs';
+import { advisoryCoversHead, latestAdvisory } from '../../lib/advisory-labels.mjs';
 import { openReferralFindings } from '../../operations/record-referral-ruling.mjs';
 import {
   decideReferralHoldAutoResolve, enrichPrsWithReferralHoldAutoResolve, enrichPrsWithReferralHolds, resolveReferralHoldAutoResolve,
@@ -329,23 +330,23 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
   it('the kill switch turns it off', () => {
     expect(decide(pr, hold, { env: { WE_REFERRAL_HOLD_AUTO_RESOLVE: '0' } })).toBeNull();
   });
-  it('a resume on a PR that is not review:human clears the hold and dispatches review even with a current advisory', () => {
+  it('a resume on a PR that is not review:human stays paused (no second verdict on an unchanged head)', () => {
     const p0 = enrich(fx);
-    const pr = { ...p0, labels: [{ name: 'review:pending' }] };
-    const p = plan(pr);
-    expect(p.dispatch.map(d => d.kind)).toEqual(['review']);
-    expect(p.refusals.some(r => r.kind === 'review-referrals-pending')).toBe(false);
-    expect(p.notes.filter(n => n.kind === 'referral-hold-auto-resolved')).toEqual([expect.objectContaining({
-      outcome: 'resume', next: 'review', head: fx.headRefOid,
-    })]);
-    expect(pr.labels).toEqual([{ name: 'review:pending' }]);
+    const p = plan({ ...p0, labels: [{ name: 'review:pending' }] });
+    expect(p.dispatch.filter(d => d.kind === 'review')).toEqual([]);
+    const row = p.refusals.find(r => r.kind === 'review-referrals-pending');
+    expect(row?.referralHoldAutoResolve).toMatchObject({ outcome: 'stay' });
   });
 });
 
 describe('ruled parked heads: #5806-shaped pending and #5762-shaped human replays', () => {
   const fx = FX[5775];
   const rec = liveRecord(fx);
-  const pending = options => ({ ...enrich(fx, options), labels: [{ name: 'review:pending' }] });
+  const pending = (options = {}) => {
+    // Model the failed write-back: rulings landed on the thread, but the live head's advisory did not.
+    const comments = (options.comments ?? fx.comments).filter(c => !advisoryCoversHead(latestAdvisory([c]), fx.headRefOid));
+    return { ...enrich(fx, { ...options, comments }), labels: [{ name: 'review:pending' }] };
+  };
   const expectLabelsKept = (pr, p) => {
     const labels = pr.labels.map(l => l.name);
     for (const row of [...p.dispatch, ...p.refusals]) expect(row.labels).toEqual(labels);
@@ -353,7 +354,26 @@ describe('ruled parked heads: #5806-shaped pending and #5762-shaped human replay
     expect(p.notes.some(n => /label/.test(n.kind))).toBe(false);
   };
 
-  it('#5806-shaped: all not-real/card on the live head, one review and one attempt, re-arms review with no accept or label change', () => {
+  it.each([
+    ['missing records', () => []],
+    ['only older-head rulings', comments => comments.filter(c => !c.body.startsWith('## Operator ruling')
+      && !readReferralRecords([c]).records.some(r => r.head === fx.headRefOid))],
+    ['untrusted records', comments => comments.map(c => ({ ...c, author: { login: 'outsider' } }))],
+    ['malformed evidence', comments => [...comments, { author: { login: 'web-everything' },
+      body: '<!-- mandatory-referrals-v1: % -->' }]],
+  ])('#5806-shaped: %s cannot authorize a non-human resume, even with an enriched resume answer', (_name, change) => {
+    const pr = pending();
+    expect(pr.referralHoldAutoResolve.outcome).toBe('resume');
+    pr.comments = change(pr.comments);
+    const p = plan(pr);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals).toContainEqual(expect.objectContaining({ kind: 'review-referrals-pending',
+      referralHoldAutoResolve: expect.objectContaining({ outcome: 'stay', why: expect.stringMatching(/second verdict/) }) }));
+    expect(p.notes.some(n => n.kind === 'referral-hold-auto-resolved')).toBe(false);
+    expectLabelsKept(pr, p);
+  });
+
+  it('#5806-shaped: recorded live-head not-real/card rulings and no current advisory re-arm review once without accept or label change', () => {
     const card = 'we:backlog/referral-follow-up.md';
     const cardReadable = ref => ref === card;
     const comments = fx.comments.map(c => {
@@ -443,7 +463,15 @@ describe('ruled parked heads: #5806-shaped pending and #5762-shaped human replay
     const subject = { key: rec.referrals[0].key, runId: rec.runId };
     const policy = operatorRuling(fx, { ...subject, result: 'block', actor: AUTO_POLICY_ACTOR, at: '2026-10-21T10:57:30.000Z' });
     const operator = operatorRuling(fx, { ...subject, result: 'not-real', at: '2026-10-21T10:58:00.000Z' });
-    const pr = pending({ comments: [...fx.comments, policy, operator] });
+    // No reviewer ruling backs this resume: only the recorded live-head operator ruling can authorize it.
+    const comments = fx.comments.map(c => {
+      const m = /<!-- mandatory-referrals-v1: (\S+) -->/.exec(c.body);
+      if (!m) return c;
+      const record = JSON.parse(decodeURIComponent(m[1]));
+      return record.head !== fx.headRefOid ? c
+        : { ...c, body: c.body.replace(m[1], encodeURIComponent(JSON.stringify({ ...record, rulings: [] }))) };
+    });
+    const pr = pending({ comments: [...comments, policy, operator] });
     expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', counts: { 'not-real': 1 } });
     const p = plan(pr);
     expect(p.dispatch.map(d => d.kind)).toEqual(['review']);
