@@ -88,6 +88,12 @@ unresolved policy supersedes the stale accept; the fallback is a fresh review. R
 in `accept-carry-forward.replay.test.mjs` cover `degraded=send-back`, cosmetic classification,
 non-blocking overrides, and throwing, missing, incomplete or unknown policy resolution.
 
+Gate exemption tests must isolate each predicate with an otherwise valid envelope. The replay
+cases **rejects complete gate envelopes with forbidden outcomes** retain a successful card action;
+**rejects card-queued without a successful card line** covers absent, advisory-only, failed and
+malformed card actions. A successful card beside a failed or unrecognized action must also refuse
+carry, independently defending validation of every action line.
+
 The drain owes a live-head red team only after a speculative or sequential pass is scheduled
 (recorded queued/running status or seat evidence). The review job records the pass as queued as
 soon as the loop returns an owed accept, before the added seats. Before that status exists, the

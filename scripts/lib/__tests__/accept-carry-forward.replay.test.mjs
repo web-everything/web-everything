@@ -1174,9 +1174,9 @@ describe('red-team machine-body boundary (#5828)', () => {
   const advisory = (findings = []) => renderRedTeamComment({ pr: 5828, rev: NEW, provider: 'codex', model: 'm',
     findings, recheckStatus: 'ok', foldedVerdict: 'accept' });
   const finding = { category: 'edge-case', impactIfUnfixed: 'degraded', summary: 'Follow-up finding.', confirmedByRecheck: true };
-  const gate = (outcome = 'no-send-back') => buildGateComment({ pr: 5828, head: NEW, outcome,
+  const gate = (outcome = 'no-send-back', overrides = {}) => buildGateComment({ pr: 5828, head: NEW, outcome,
     plan: { sendBack: [], card: outcome === 'card-queued' ? [{ index: 1 }] : [], advisory: [] },
-    cardResult: { ok: true, session: 'prevention-card-123' } });
+    cardResult: { ok: true, session: 'prevention-card-123' }, ...overrides });
   const bodies = [
     ['gate record', gate()],
     ['advisory', advisory()],
@@ -1241,6 +1241,45 @@ describe('red-team machine-body boundary (#5828)', () => {
       expect(record.laterVerdict).toBe(true);
       expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
     });
+
+  it.each(['sent-back', 'round-cap', 'error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed', 'unknown'])
+    ('rejects complete gate envelopes with forbidden outcomes: %s', (outcome) => {
+      // Keep a successful card action so only the outcome distinguishes this from an allowed envelope.
+      const body = gate('card-queued', { outcome });
+      const metadata = { author: { login: 'web-everything[bot]' } };
+      expect(isKnownMachineBody(gate('card-queued'), metadata)).toBe(true);
+      expect(isKnownMachineBody(body, metadata)).toBe(false);
+      const record = laterRecord(body, metadata);
+      expect(record.laterVerdict).toBe(true);
+      expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+    });
+
+  it.each([
+    ['no action lines', gate('card-queued', { plan: { sendBack: [], card: [], advisory: [] } })],
+    ['advisory-only actions', gate('card-queued', { plan: { sendBack: [], card: [], advisory: [{ index: 1 }] } })],
+    ['failed card filing', gate('card-queued', { cardResult: { ok: false, error: 'filing unavailable' } })],
+    ['a malformed card line', gate('card-queued').replace('landing job prevention-card-123', 'landing job')],
+  ])('rejects card-queued without a successful card line: %s', (_kind, body) => {
+    const metadata = { author: { login: 'web-everything[bot]' } };
+    expect(isKnownMachineBody(gate('card-queued'), metadata)).toBe(true);
+    expect(isKnownMachineBody(body, metadata)).toBe(false);
+    const record = laterRecord(body, metadata);
+    expect(record.laterVerdict).toBe(true);
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+  });
+
+  it.each([
+    ['failed card filing', gate('card-queued', { cardResult: { ok: false, error: 'filing unavailable' } }).split('\n').at(-1)],
+    ['an unrecognized action', '- 1 finding(s) queued for later.'],
+  ])('rejects a successful card gate with %s beside its valid card line', (_kind, action) => {
+    const body = gate('card-queued') + '\n' + action;
+    const metadata = { author: { login: 'web-everything[bot]' } };
+    expect(isKnownMachineBody(gate('card-queued'), metadata)).toBe(true);
+    expect(isKnownMachineBody(body, metadata)).toBe(false);
+    const record = laterRecord(body, metadata);
+    expect(record.laterVerdict).toBe(true);
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+  });
 
   it.each([
     gate('card-queued'),
