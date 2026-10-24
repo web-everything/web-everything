@@ -4181,6 +4181,20 @@ describe('human clearance and complete evidence before review dispatch (live #55
     ? { kind: 'convert-advisory' } : { kind: 'review', [branch]: true };
 
   describe.each(['advisoryOwed', 'convert-advisory'])('%s', branch => {
+    it('refuses an already-reviewed, human-cleared head without dispatching another advisory review', () => {
+      const pr = prFor(branch);
+      expect(run(pr).dispatch).toEqual([expect.objectContaining(expected(branch))]);
+      // A later plain accept must not erase the earlier human clearance of this head.
+      pr.comments.unshift({ author: AUTOMATION,
+        body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` });
+      const plan = run(pr);
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({
+        kind: 'already-reviewed-head', prNumber: 5530, headSha: HEAD, reviewedSha: HEAD,
+        why: expect.stringContaining('human clearance'),
+      })]);
+    });
+
     it.each([
       ['current-head latest', HEAD, AUTOMATION, true],
       ['current-head followed by plain accept', HEAD, AUTOMATION, true],

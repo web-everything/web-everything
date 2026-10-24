@@ -1458,6 +1458,8 @@ export function runReviewLabelCli({
         if (headEverHumanCleared(page, threadHead.trim())) refuseRearm('head carries a human clearance — a rearm never undoes it');
         refuseRearm('comments unreadable — cannot prove no human clearance');
       }
+      // Matching ids prove coverage, but stale bodies must never erase an embedded clearance.
+      return [...page, ...comments];
     }
     return comments;
   };

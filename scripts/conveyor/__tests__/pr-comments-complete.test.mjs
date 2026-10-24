@@ -79,6 +79,46 @@ describe('complete PR comments', () => {
     expect(enrichPrsWithCompleteComments(prs, { readComments: () => { throw new Error('no'); } })).toEqual(prs);
   });
 
+  it.each([
+    ['different ids despite matching body and timestamp', { id: 'IC_listed' }, { node_id: 'IC_other' }],
+    ['different bodies without ids', {}, { body: 'other discussion' }],
+    ['different timestamps without ids', {}, { created_at: '2026-10-07T00:00:00Z' }],
+  ])('rejects an equal-length read omitting an embedded comment: %s', (_name, listedFields, fullFields) => {
+    const listed = { body: 'listed discussion', createdAt: '2026-10-06T00:00:00Z', ...listedFields };
+    const replacement = { body: listed.body, created_at: listed.createdAt, ...fullFields };
+    const pr = { number: 4017, comments: [listed, ...firstPage.slice(1)] };
+    const onError = vi.fn();
+    const annotate = vi.fn(p => p);
+    const out = enrichPrsWithCompleteComments([pr], {
+      repo, readComments: () => [...firstPage.slice(1), replacement], onError, annotate,
+    });
+    expect(out).toEqual([]);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(pr, expect.any(Error));
+    expect(annotate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['node_id matches id', { id: 'IC_listed' }, { node_id: 'IC_listed', body: 'edited discussion' }],
+    ['id matches id', { id: 'IC_listed' }, { id: 'IC_listed', body: 'edited discussion' }],
+    ['url matches html_url', { url: 'https://github.com/o/n/issues/4017#issuecomment-1' },
+      { html_url: 'https://github.com/o/n/issues/4017#issuecomment-1', body: 'edited discussion' }],
+    ['body and timestamp without ids', {}, {}],
+    ['body and timestamp when only listed has an id', { id: 'IC_listed' }, {}],
+    ['body and timestamp when only complete has an id', {}, { id: 'IC_listed' }],
+  ])('marks an equal-length covering read complete: %s', (_name, listedFields, fullFields) => {
+    const listed = { body: 'listed discussion', createdAt: '2026-10-06T00:00:00Z', ...listedFields };
+    const pr = { number: 4017, comments: [listed, ...firstPage.slice(1)] };
+    const complete = [...firstPage.slice(1), { body: listed.body, created_at: listed.createdAt, ...fullFields }];
+    const onError = vi.fn();
+    const readComments = vi.fn(() => complete);
+    expect(enrichPrsWithCompleteComments([pr], { repo, readComments, onError, annotate: p => p }))
+      .toEqual([{ ...pr, comments: complete, commentsComplete: true }]);
+    expect(readComments).toHaveBeenCalledTimes(1);
+    expect(readComments).toHaveBeenCalledWith(pr.number, { repo });
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it('reads through the safe reader with a large buffer and surfaces failures', () => {
     const seen = [];
     const exec = (f, a, o) => { seen.push(o.maxBuffer); return 'hi\t2026-01-01T00:00:00Z\tchalbert\tIC_1\n'; };

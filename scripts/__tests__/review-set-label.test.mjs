@@ -3265,6 +3265,25 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
   });
 
   describe.each(['initial read', 'fresh changed-head reread'])('embedded-page human clearance on %s', read => {
+    it('refuses rearm when matching paginated ids have stale bodies without the embedded clearance', () => {
+      const fresh = read === 'fresh changed-head reread';
+      const head = (fresh ? 'b' : 'a').repeat(40);
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
+        id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'web-everything' },
+      }));
+      comments[0].body = buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: head });
+      const readComments = vi.fn(() => comments.map(c => ({ ...c, body: 'stale discussion' })));
+      const result = fresh
+        ? run(missingArgs, [], { readComments, freshState: { comments, headRefOid: head } })
+        : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+      expect(readComments).toHaveBeenCalledTimes(1);
+      expect(readComments).toHaveBeenCalledWith('o/n', '9');
+      expect(result.exitCode).toBe(1);
+      expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+      expect(result.calls).toEqual([]);
+      expect(result.ledgerWrites).toEqual([]);
+    });
+
     it.each(['empty', 'shorter', 'same-size non-covering', 'longer non-covering'])(
       'refuses rearm without label, comment or ledger writes when pagination is %s', shape => {
         const fresh = read === 'fresh changed-head reread';
