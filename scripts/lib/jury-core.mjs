@@ -3530,7 +3530,7 @@ export function referralRecordState(record, options = {}) {
     cardReadable = () => false, seatDisabled = () => false, operatorRulings = [], records = [],
     stampPolicy = resolveReferralStampPolicy(), identityTable = null, linkedBlocked, sameGapDecisions } = options;
   if (!validateReferralRecord(record)) return { pending: ['malformed-referral-record'], blocked: [], blockedFindings: [], rulings: [] };
-  const pending = [], blocked = [], rulings = [];
+  const pending = [], blocked = [], rulings = [], withdrawnSiblingCarries = new Set();
   const decision = decideClearerIndependence({ authorId: parseAuthorActorId(body),
     clearerId: record.reviewer.id, prCreatedAt: createdAt });
   // `validateReferralRecord` already pinned reviewer.id to the run-derived seat, so no separate id check here.
@@ -3574,6 +3574,7 @@ export function referralRecordState(record, options = {}) {
         ? reviewerCarryBacking(carried, { repo: record.repo, pr: record.pr, operatorRulings, records, identityTable,
           target: f, body, createdAt, cardReadable, stampPolicy, seatDisabled })
         : operatorCarryBacking(carried, f, { head: record.head, repo: record.repo, pr: record.pr, operatorRulings, records, sameGapDecisions });
+      if (!backing && carried.from.head === record.head && carried.from.rulingId === undefined) withdrawnSiblingCarries.add(f.key);
       if (head !== record.head || !backing
         || (carried.result === 'card' && !cardReadable(carried.card))) pending.push(f.key);
       else { rulings.push(backing); if (carried.result === 'block') blocked.push(f.key); }
@@ -3610,6 +3611,9 @@ export function referralRecordState(record, options = {}) {
       const findingId = findingIdOf(table, { head: record.head, runId: record.runId, key: f.key });
       const from = findingId ? linked.get(findingId) : undefined;
       if (!from) continue;
+      // A sibling block withdraws a same-head carry for fresh review; projecting it back as a linked block
+      // would hide that pending obligation from the withdrawn-carry re-ask. An own-key block still holds.
+      if (withdrawnSiblingCarries.has(f.key) && from.key !== f.key) continue;
       for (let i = pending.indexOf(f.key); i !== -1; i = pending.indexOf(f.key)) pending.splice(i, 1);
       blocked.push(f.key);
       rulings.push({ key: f.key, result: 'block', linked: { findingId, ...from },
