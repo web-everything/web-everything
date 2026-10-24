@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { classifyLaneNames, nextLaneNumbers, capState, recoverPool, realRecoverIo, verifyRecoveryBackup, collectVerdicts, diagnosePool, emitFullPoolNeedsYou } from './lib/lane-pool-recover.mjs';
 import { scheduledLaneGc } from './lib/host-load.mjs';
 import { loadHostOverloadSettings } from './lib/host-overload-settings.mjs';
 import { isTerminalStatus } from './lib/backlog-status.cjs';
@@ -23,6 +24,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * Repo-parameterized: the pool is keyed by repo NAME, so cross-repo slice 4 (lanes of
  * frontierui / plateau-app — the constellation) reuses this unchanged via `--repo=<checkout-path>`.
  *
+ * gc/acquire auto-recover backed-up lanes; LANE_POOL_AUTO_RECOVER=0 or LANE_POOL_NO_RECOVER=1 disables recovery.
  * Usage:
  *   node scripts/lane-pool.mjs provision --count=N [--acquirable] [--no-install] [--force]   # ensure N lanes exist (clone missing) + refresh all + ensure deps + ensure the WE pool's FUI render-sibling (#2166); --acquirable grows PAST foreign-leased lanes so N ACQUIRABLE ones result (#2426)
  *   node scripts/lane-pool.mjs refresh           [--no-install] [--force]     # fetch + hard-reset existing lanes to origin/main (no creation)
@@ -32,7 +34,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) OPT-IN bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure, instead of failing on the very first full-pool reading (omitted ⇒ today's instant-fail, unchanged); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
  *   node scripts/lane-pool.mjs adopt   --lane=N [--force] [--json]   # #2997 r2 the dispatcher → worker OCCUPANCY hand-off: declare the CALLING session the agent working in lane-N (stamps `workerSession`), which is what arms guard-lane.mjs's Edit/Write refusal against every OTHER session. `ownerSession` cannot do this job — it records whoever RAN `acquire`, which for a dispatched lane is the dispatcher, not the worker. Idempotent; a lane already declared-occupied by a different LIVE session needs --force (a deliberate takeover, which names who is displaced).
  *   node scripts/lane-pool.mjs release (--lane=N | --all | --all-pools (--session=<slug> | --item=<num>)) [--session=<slug>] [--pool=<name>] [--force] [--release-reserved]   # #2275 hand a leased lane back to the pool (own lease, or --force); #2350 --release-reserved is the deliberate un-reserve for a PERMANENT reserved lane (--force alone never drops one); #2667 --all-pools --session sweeps EVERY pool under POOL_ROOT and releases that session's leases (cross-locus couple cleanup in one call), and --pool=<name> selects a pool by dir-name (no checkout path needed); #2748 --all-pools --item=<num> is the by-ITEM sweep the drain's release-on-land uses (matches every lease whose session encodes that item number — needs no exact slug); #2997 a CONTESTED lease (another live lease — in ANY pool under POOL_ROOT, per r2 — shares its ownerSession, i.e. a sibling agent of yours holds a lane) is never released on the ownerSession match alone — pass `--session=<the holder slug acquire printed>` or `--force`. A STALE lease is never contested (r2): a dead holder has nothing to prove, so an expired lease releases without --force exactly as on main.
- *   node scripts/lane-pool.mjs remove  (--lane=N | --all)           # tear down lane(s); #2350 REFUSES a reserved lane (even --all/--force) — deliberate teardown is `remove --lane=N --release-reserved`
+ *   node scripts/lane-pool.mjs remove  (--lane=N | --all) [--dry-run] # tear down lane(s); #2350 REFUSES a reserved lane (even --all/--force) — deliberate teardown is `remove --lane=N --release-reserved`
  *   node scripts/lane-pool.mjs trim    [--max=N] [--dry-run] [--json]  # #4025 shrink the pool toward a cap (default per-repo, `LANE_POOL_TRIM_MAX` overridable): deletes HIGHEST-numbered lane dirs first among those with no live (or provably dead) lease, never reserved, nothing uncommitted beyond the scratch allowlist, and every ahead commit provably pushed — a lane with real unpushed/uncommitted work is reported, never removed. Crash-safe (rename to `.trash-<n>` then delete). Wired into `scripts/conveyor/lane-pool-health-watch.mjs`'s periodic pass.
  *   node scripts/lane-pool.mjs map     --lane=N --item=NNN[,NNN…]   # register item(s) → lane page-port (#2139 proxy)
  *   node scripts/lane-pool.mjs unmap   (--item=NNN[,…] | --lane=N | --all)   # drop lane-ports registry entries
@@ -166,6 +168,7 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
 import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
+import { realSalvageIo, salvagePushLane } from './lib/lane-pool-salvage-push.mjs';
 import {
   salvageLane, removeLitterWorktrees, listLitterWorktrees, laneLivenessGate,
 } from './lib/lane-salvage.mjs';
@@ -341,9 +344,9 @@ try {
 }
 
 // ── repo descriptor resolution ──────────────────────────────────────────────────────────────────────
-function resolveRepo() {
-  const repoPath = resolve(expandHome(flags.repo) || (CWD_TOP_LEVEL ? process.cwd() : CHECKOUT_ROOT));
-  const referencePath = resolve(expandHome(flags.reference) || repoPath);
+function resolveRepo(repoFlags = flags) {
+  const repoPath = resolve(expandHome(repoFlags.repo) || (CWD_TOP_LEVEL ? process.cwd() : CHECKOUT_ROOT));
+  const referencePath = resolve(expandHome(repoFlags.reference) || repoPath);
   // An inherited lane Git context must not override an explicitly selected primary.
   // Scrub BEFORE hardening: the hardening appends its pins after any inherited GIT_CONFIG_COUNT entries, so an
   // inherited GIT_CONFIG_KEY_n=remote.origin.url would otherwise survive as the "canonical" origin.
@@ -358,8 +361,10 @@ function resolveRepo() {
   const gitOptions = { timeout: LOCAL_GIT_TIMEOUT_MS, env };
   const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, gitOptions) || referencePath;
   const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
-    || (cmd === 'list' && flags.acquirable);
-  if (!flags.origin && needsOrigin) {
+    || (cmd === 'list' && repoFlags.acquirable);
+  // GC and release can maintain leases without a trusted origin, but recovery must never forward a lane remote.
+  let canonicalOrigin = true;
+  if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
     const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
     // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
     // (the git dir and the common dir) is checked too: a worktree of a lane is refused wherever it sits on
@@ -382,28 +387,32 @@ function resolveRepo() {
     // ambiguous lane-shaped checkouts must supply --origin or a primary --reference.
     if (unreadableOwner || originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
       || path.split(sep).some(part => /^lane-\d+$/.test(part)))) {
-      fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
+      canonicalOrigin = false;
+      if (needsOrigin) fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
     }
   }
-  const originUrl = flags.origin || tryGit(['remote', 'get-url', 'origin'], topLevel, gitOptions);
+  const rawOrigin = repoFlags.origin || tryGit(['remote', 'get-url', 'origin'], topLevel, gitOptions);
+  // A configured local path belongs to the primary checkout. Explicit --origin paths belong to the caller.
+  const originUrl = !repoFlags.origin && rawOrigin && !/^[^/]*:/.test(rawOrigin)
+    ? resolve(topLevel, rawOrigin) : rawOrigin;
   // #2667 — `--pool=<name>` selects a pool DIRECTLY by its directory name under POOL_ROOT, bypassing origin-URL
   // derivation. It is the pool selector for the READ / RELEASE ops (status / list / path / release) that need
   // only `poolDir` — e.g. the main session releasing a cross-locus couple's lingering lease in the `plateau-app`
   // pool from the WE checkout, without needing a plateau-app checkout path. When `--pool` names the pool an
   // undeterminable origin URL is NOT fatal for metadata-only operations. Operations that clone, fetch,
   // or prove preservation need a canonical origin at startup; a lane-controlled remote is no fallback.
-  const explicitPool = typeof flags.pool === 'string' && flags.pool ? flags.pool : null;
+  const explicitPool = typeof repoFlags.pool === 'string' && repoFlags.pool ? repoFlags.pool : null;
   if (!originUrl && !explicitPool) {
     fail(`could not determine an origin URL — pass --origin=<url> (looked in ${topLevel})`);
   }
   if (!originUrl && needsOrigin) {
     fail(`${cmd} requires a canonical origin for pool ${explicitPool} — pass --origin=<url> (looked in ${topLevel})`);
   }
-  const name = explicitPool || flags.name || basename(originUrl).replace(/\.git$/, '');
+  const name = explicitPool || repoFlags.name || basename(originUrl).replace(/\.git$/, '');
   // Only discover a default when --branch is absent; explicit-branch acquire must not pay for an unused probe.
-  const head = flags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
-  const branch = flags.branch || (head ? head.replace(/^origin\//, '') : 'main');
-  return { name, originUrl: originUrl || null, referencePath: topLevel, branch, poolDir: join(POOL_ROOT, name) };
+  const head = repoFlags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
+  const branch = repoFlags.branch || (head ? head.replace(/^origin\//, '') : 'main');
+  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, branch, poolDir: join(POOL_ROOT, name) };
 }
 
 const laneDir = (repo, n) => join(repo.poolDir, `lane-${n}`);
@@ -2129,7 +2138,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
   return dir;
 }
 
-function cmdAcquire(repo) {
+async function cmdAcquire(repo) {
   // #2386 — `--base` and `--no-reset` are mutually exclusive: `--base=<ref>` means "reset this clone to <ref>",
   // and `--no-reset` skips the reset entirely. Honoring both would skip the reset yet still report the base as
   // applied (log line + JSON `base`), so an orchestrator stacking a serial batch would believe the lane sits on
@@ -2303,6 +2312,7 @@ function cmdAcquire(repo) {
     // (ours or a competitor's) changes the pool's lease fingerprint, which invalidates the cache on the very
     // next read, so a lane just taken is never handed out twice from a stale hit.
     let grownOnce = false;
+    let recoveredOnce = false;
     // #3383 (coordinator follow-up, live-caught 2026-09-24 16:25 ET) — did the MOST RECENT round's scan fail
     // to finish at all (`scanTimeout`), as opposed to finishing and genuinely finding zero candidates? These
     // read identically as "no pickable candidate this round" below, but they are NOT the same fact: 7
@@ -2485,6 +2495,22 @@ function cmdAcquire(repo) {
           continue;
         }
       }
+      if (!recoveredOnce && recoveryEnabled() && !sawScanTimeout && !sawLockContention && !sawProvisionFailure) {
+        recoveredOnce = true;
+        try {
+          const names = classifyLaneNames(readdirSync(repo.poolDir), acquireHardMaxFor(repo));
+          const result = await recoverRepoPool(repo, names.valid);
+          if (result.reclaimed.length) {
+            invalidateListCache(repo);
+            excluded.clear();
+            continue; // one fresh scan even past deadline; recoveredOnce bounds this retry
+          }
+          const verdictByLane = await collectVerdicts({ lanePoolDir: repo.poolDir });
+          const diagnosis = diagnosePool({ ...result, verdictByLane, rejected: names.rejected });
+          log(diagnosis.summary);
+          await emitFullPoolNeedsYou({ repoName: repo.name, diagnosis });
+        } catch (e) { log(`auto-recover failed: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
+      }
       // #3383 bug 3b / #xj2k2pp — say WHICH happened: a scan that never finished (never proven "all held/dirty"
       // at all), THIS call giving up on a DIFFERENT caller's lock at its own deadline, and a completed scan
       // that genuinely found nothing acquirable are three distinct facts, each with its own message — never
@@ -2665,7 +2691,7 @@ function assertReleaseReservedScoped() {
 // by-session sweep needs no separate `(pool, lane)` ledger — the markers ARE that record. A blanket cross-pool
 // `--all` would nuke every session's leases everywhere, so `--all-pools` REQUIRES `--session` and refuses
 // `--all`. Reserved (permanent memory) leases are always skipped — a sweep never un-reserves.
-function cmdReleaseAllPools(repo) {
+async function cmdReleaseAllPools(repo) {
   const session = flags.session || process.env.LANE_SESSION || null;
   // #x2psfwz — an OPTIONAL co-selector alongside `--session`, never alone: a PR_KIND session name (`review-`/
   // `fix-`/`ci-heal-`/`inspect-<PR>`) carries no attempt suffix, so it is REUSED VERBATIM by a round-2 dispatch
@@ -2724,6 +2750,7 @@ function cmdReleaseAllPools(repo) {
   for (const name of pools) {
     const poolDir = join(POOL_ROOT, name);
     const lanes = [];
+    let salvageRepo;
     for (const n of laneIndicesIn(poolDir)) {
       const dir = join(poolDir, `lane-${n}`);
       const lease = readLease(dir);
@@ -2735,7 +2762,18 @@ function cmdReleaseAllPools(repo) {
         log(`  ${name}/lane-${n}: ${describeLease(lease)} — reserved; skipped (un-reserve is single-lane --release-reserved)`);
         continue;
       }
-      rmSync(LEASE_MARKER(dir), { force: true });
+      if (recoveryEnabled()) {
+        // Other pools must resolve their own primary's origin; never reuse this pool's URL or a lane remote.
+        salvageRepo ??= name === repo.name ? repo
+          : resolveRepo({ reference: primarySiblingPath(repo, name), pool: name });
+        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo: salvageRepo }) });
+        if (salvage.status === 'failed') log(`  WARNING ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+        else if (salvage.status === 'pushed') log(`  ${name}/lane-${n}: salvaged to ${salvage.ref}`);
+      }
+      if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
+        log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
+        continue;
+      }
       journalLaneEvent(dir, {
         action: 'release', reason: typeof flags.reason === 'string' ? flags.reason : `release --all-pools (${selectorLabel})`,
         before: laneStateSnapshot(dir, 'origin/HEAD'), leaseSession: lease.session, leaseOwnerSession: lease.ownerSession || undefined,
@@ -2787,7 +2825,7 @@ function deliveredLeaseForLane(dir, lease) {
   });
 }
 
-function cmdRelease(repo) {
+async function cmdRelease(repo) {
   assertReleaseReservedScoped();
   if (flags['all-pools']) return cmdReleaseAllPools(repo); // #2667 — cross-pool release-by-session
   const session = defaultSession();
@@ -2896,6 +2934,11 @@ function cmdRelease(repo) {
     // have released and a brand-new acquirer could already be sitting on this exact lane. An unconditional
     // `rmSync` here would destroy that NEW holder's live lease, not the one this call actually decided to drop
     // — the same check-then-act TOCTOU `cmdTrim` already closed for its own reap path with this exact primitive.
+    if (recoveryEnabled()) {
+      const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo }) });
+      if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+      else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
+    }
     releaseTestBarrier();
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
@@ -3656,6 +3699,10 @@ function cmdRemove(repo) {
     }
     return true;
   });
+  if (flags['dry-run']) {
+    for (const n of removable) log(`would remove lane-${n} (${laneDir(repo, n)})`);
+    return;
+  }
   unmapLanes(repo, removable); // a torn-down lane must stop receiving proxied page requests (#2139); a skipped reserved lane still serves
   for (const n of removable) {
     const dir = laneDir(repo, n);
@@ -3783,11 +3830,8 @@ function acquireGrowthMaxNew() {
  * #3383 — called ONLY from `cmdAcquire`'s auto-pick path, ONLY once the wait/poll window (if any) is exhausted
  * with genuinely no free lane. Clones a bounded number of brand-new lanes (never past `acquireHardMaxFor`,
  * never more than `acquireGrowthMaxNew()` in this one call) and appends their numbers to `lanes` IN PLACE so
- * the caller's very next `chooseFreeLane` pass sees them. Numbers from `highest(lanes) + 1` up — trim always
- * removes the HIGHEST-numbered lanes first (see this file's `trim` section), so a live pool's numbering stays
- * contiguous from 1 in practice; basing growth on the highest existing number (not `lanes.length`) still fails
- * safe if a gap ever exists, since it can only make growth start a little higher than strictly necessary,
- * never collide with an existing lane directory.
+ * the caller's very next `chooseFreeLane` pass sees them. Canonical lane names count toward the cap;
+ * new lanes fill numbering gaps first. Stray and out-of-range entries are ignored and reported.
  * Returns the number of lanes actually added (0 ⇒ the caller's existing "no free lane" failure stands).
  */
 function growPoolOnEmpty(repo, lanes, remoteProbeFailed) {
@@ -3800,16 +3844,19 @@ function growPoolOnEmpty(repo, lanes, remoteProbeFailed) {
     return 0;
   }
   const hardMax = acquireHardMaxFor(repo);
-  const highest = lanes.length ? Math.max(...lanes) : 0;
-  if (highest >= hardMax) {
+  const { valid, rejected } = classifyLaneNames(existsSync(repo.poolDir) ? readdirSync(repo.poolDir) : [], hardMax);
+  for (const entry of rejected) log(`  ignored pool entry ${JSON.stringify(entry.name)} (${entry.why})`);
+  const state = capState(valid, hardMax);
+  if (state.atCap) {
     log(
-      `  ⚠ pool "${repo.name}" is already at its hard cap (lane-${highest} ≥ ${hardMax}; override with ` +
+      `  ⚠ pool "${repo.name}" is already at its hard cap (${state.count} lanes ≥ ${hardMax}; override with ` +
         `--hard-max=N or LANE_POOL_HARD_MAX) — acquire cannot grow it further; release a lane or raise the cap.`,
     );
     return 0;
   }
   const maxNew = acquireGrowthMaxNew();
-  const toAdd = Math.min(maxNew, hardMax - highest);
+  const numbers = nextLaneNumbers(valid, hardMax, maxNew);
+  const toAdd = numbers.length;
   if (toAdd <= 0) {
     log(`  ⚠ acquire's per-call growth cap is 0 (--growth-max-new=0 or LANE_POOL_ACQUIRE_GROWTH_MAX_NEW=0) — not growing.`);
     return 0;
@@ -3821,7 +3868,7 @@ function growPoolOnEmpty(repo, lanes, remoteProbeFailed) {
   );
   let added = 0;
   for (let i = 0; i < toAdd; i++) {
-    const n = highest + i + 1;
+    const n = numbers[i];
     try {
       provisionLane(repo, n, false);
       lanes.push(n);
@@ -3834,7 +3881,7 @@ function growPoolOnEmpty(repo, lanes, remoteProbeFailed) {
   if (added > 0) {
     lanes.sort((a, b) => a - b);
     invalidateListCache(repo); // #xn432dz — the pool's composition just changed
-    log(`  grew pool "${repo.name}" by ${added} lane(s) (through lane-${highest + added})`);
+    log(`  grew pool "${repo.name}" by ${added} lane(s) (through lane-${numbers[added - 1]})`);
   }
   return added;
 }
@@ -4228,6 +4275,7 @@ function cmdReclaim(repo) {
   }
   const dryRun = !!flags['dry-run'];
   const override = !!flags.override;
+  const requireLiveness = !override || process.env.WE_LANE_RECOVERY_BACKUP !== undefined;
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) fail(`lane-${n} does not exist under ${repo.poolDir}`);
 
@@ -4265,9 +4313,8 @@ function cmdReclaim(repo) {
   // worker can be mid-verify or mid-PR, having just pushed, with its own lease already gone (see #xbk2is9). The
   // ONLY guard this direct-reset path ran before was the live-LEASE check above — this is the SAME liveness
   // gate `cmdReclaimSalvage` always ran (live owner session / live process cwd / quiet period), now run here
-  // too, for EVERY non-override reclaim, preserved or not (one gate, one place). Skipped only under
-  // `--override`: that flag is the operator's own explicit, logged "I looked at this lane myself" call, and it
-  // already reuses every OTHER guard unchanged — never re-litigated per guard.
+  // too, for every normal or automated reclaim, preserved or not. Only a human `--override` may skip it;
+  // WE_LANE_RECOVERY_BACKUP marks an automatic content override, which must still prove the owner is gone.
   // Shared by BOTH liveness-gate call sites below (the initial read here, and the "under the hold" re-check
   // after the claim), so the two KEPT reports (identical log/JSON shape, differing only in the
   // `(re-checked under the hold)` suffix and whether a just-claimed marker needs releasing) can never quietly
@@ -4282,7 +4329,7 @@ function cmdReclaim(repo) {
     }
     return true;
   };
-  if (!override) {
+  if (requireLiveness) {
     const liveness = laneLivenessGate({ dir });
     if (reportKept(liveness, proof)) return;
   }
@@ -4342,9 +4389,9 @@ function cmdReclaim(repo) {
   }
   // #xl5xhmj — re-check liveness UNDER the hold too, closing the same tiny race the preservation reproof above
   // already closes: a live session could start (or resume) in the window between the initial gate read and
-  // this claim. Skipped only under `--override`, matching the initial gate above.
+  // this claim. Only human overrides skip this, matching the initial gate above.
   let relive = null;
-  if (!override) {
+  if (requireLiveness) {
     relive = laneLivenessGate({ dir, ignoreLeaseSession: session }); // ignore only our temporary hold
     if (reportKept(relive, reproof, { underHold: true, ownSession: session })) return;
   }
@@ -4361,6 +4408,14 @@ function cmdReclaim(repo) {
     journalReclaimRefusal(dir, repo, `not reclaimed — ${verdict.reason}`, { unpushed: true, before });
     if (flags.json) process.stdout.write(`${JSON.stringify({ lane: n, path: dir, dryRun, reclaimed: false, ...reproof }, null, 2)}\n`);
     return;
+  }
+  if (process.env.WE_LANE_RECOVERY_BACKUP !== undefined) {
+    const backup = verifyRecoveryBackup({ laneDir: dir, proof: () => laneReclaimPreservationProof(dir, repo.branch, repo), manifestPath: process.env.WE_LANE_RECOVERY_BACKUP });
+    if (!backup.ok) {
+      takeMarkerIf(dir, (moved) => moved?.session === session, n);
+      log(`  lane-${n}: NOT reclaimed — ${backup.error}`);
+      return;
+    }
   }
   scrubClaimedLaneConfig(dir, 'before reclaim reset');
   execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
@@ -4626,18 +4681,35 @@ const KNOWN_FLAGS = new Set([
 
 // Maintenance may run under an external scheduler (`gc`) or as one recurring process (`gc --watch`).
 // Every pass re-resolves policy, checks host load, and takes the same host lock across all lane pools.
-function cmdGc(repo) {
+const recoveryEnabled = () => process.env.LANE_POOL_AUTO_RECOVER !== '0' && process.env.LANE_POOL_NO_RECOVER !== '1';
+async function recoverRepoPool(repo, lanes = classifyLaneNames(readdirSync(repo.poolDir), acquireHardMaxFor(repo)).valid) {
+  const io = realRecoverIo({ repo, lanePoolPath: fileURLToPath(import.meta.url),
+    isLeased: n => !!liveLease(laneDir(repo, n), Date.now(), ttlMsFromFlags()) });
+  const result = await recoverPool({ lanes, io });
+  log(`auto-recover: reclaimed ${result.reclaimed.length}, kept-unpushed ${result.keptUnpushed.length}, leased ${result.keptLeased.length}, skipped ${result.skipped.length}, salvaged ${result.salvaged.map(({ lane, ref }) => `lane-${lane}: ${ref}`).join(', ') || 'none'}`);
+  return result;
+}
+async function cmdGc(repo) {
   const pass = () => scheduledLaneGc(existingLanes(repo).map((n) => laneDir(repo, n)), { log, interactive: !flags.watch && !!process.stdin.isTTY });
-  if (!flags.watch) { const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); return; }
-  const tick = () => {
+  const recover = async () => {
+    if (!recoveryEnabled()) return;
+    if (!repo.originUrl) {
+      log('gc recovery skipped: canonical origin unresolved — pass --origin=<url> or --reference=<primary-checkout>');
+      return;
+    }
+    try { await recoverRepoPool(repo); } catch (e) { log(`gc recovery skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
+  };
+  if (!flags.watch) { const result = pass(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); if (result.ran) await recover(); return; }
+  const tick = async () => {
     let interval = 60000; // unreadable policy refuses the pass, then retries policy later
     try {
       interval = loadHostOverloadSettings({ log }).settings.lanes.gc.schedule;
-      pass();
+      const result = pass();
+      if (result.ran) await recover();
     } catch (e) { log(`gc skipped: ${e.message}`); }
     setTimeout(tick, Math.min(interval, 2147483647));
   };
-  tick();
+  await tick();
 }
 
 // ── dispatch ──────────────────────────────────────────────────────────────────────────────────────
@@ -4668,6 +4740,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
       '  # gc [--watch]: serialized maintenance; --watch repeats at lanes.gc.schedule (default 24h), host load may defer a pass\n' +
+      '  # gc/acquire auto-recover backed-up lanes; disable with LANE_POOL_AUTO_RECOVER=0 or LANE_POOL_NO_RECOVER=1\n' +
       '  # status --leased-only (#4345): skip git for every unleased lane, keep the full probe only for leased ones\n' +
       '  # acquire (auto-pick, no --lane): on a full pool, grows it by up to --growth-max-new=N new lanes (default 4, env ' +
       'LANE_POOL_ACQUIRE_GROWTH_MAX_NEW) up to a --hard-max=N ceiling (default 90 for web-everything/30 for siblings, env LANE_POOL_HARD_MAX) ' +
@@ -4696,4 +4769,4 @@ if (unknownFlags.length) {
   );
 }
 
-COMMANDS[cmd](resolveRepo());
+await COMMANDS[cmd](resolveRepo());

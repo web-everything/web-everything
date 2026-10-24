@@ -23,7 +23,8 @@ function git(args, cwd) {
 }
 
 function runPool(args, extraEnv = {}) {
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, ...extraEnv } });
+  // Exercise the picker/refusal path; automatic recovery has its own CLI coverage in lane-pool-recover-race.
+  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, LANE_POOL_NO_RECOVER: '1', ...extraEnv } });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 

@@ -27,7 +27,8 @@ function git(args, cwd) {
 function runPool(args) {
   // LANE_POOL_ROOT MUST be this test's private tmp dir — without it every command falls back to the
   // real default pool root (~/workspace/.lanes), colliding with any other lane pool of the same --name.
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: poolRoot } });
+  // Pin containment semantics before recovery: salvage may now publish genuinely unpushed work.
+  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: poolRoot, LANE_POOL_NO_RECOVER: '1' } });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 

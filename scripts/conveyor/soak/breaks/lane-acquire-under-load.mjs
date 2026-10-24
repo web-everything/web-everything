@@ -122,7 +122,9 @@ async function perRound(w, round, ctx, api) {
   const shimPath = join(shimDir, 'git');
   writeFileSync(shimPath, `#!/bin/sh\nsleep "$GIT_SHIM_SLEEP"\nexec "${REAL_GIT}" "$@"\n`);
   chmodSync(shimPath, 0o755);
-  const slowEnv = { ...w.env, PATH: `${shimDir}:${w.env.PATH}`, GIT_SHIM_SLEEP: String(SLOW_GIT_S) };
+  // This break measures scan/wait contention. Recovery's preservation probes are a separate workload,
+  // just as growth's clone cost is excluded below; the recovery CLI has its own real-Git coverage.
+  const slowEnv = { ...w.env, LANE_POOL_NO_RECOVER: '1', PATH: `${shimDir}:${w.env.PATH}`, GIT_SHIM_SLEEP: String(SLOW_GIT_S) };
 
   // 4. Fire CALLERS concurrent real acquire callers, free lane-1 partway through, measure wall time.
   // soak-main-red — lane-1 is freed (its tracked edit written back — no git command, so `.git` never changes,

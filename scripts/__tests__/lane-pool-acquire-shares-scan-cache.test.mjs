@@ -37,7 +37,8 @@ let base, originDir, referenceDir, poolRoot, shimDir, traceLog;
 const REPO = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=acqcache', '--branch=main', '--no-install', '--no-reap'];
 const pool = () => join(poolRoot, 'acqcache');
 const lanePath = (n) => join(pool(), `lane-${n}`);
-const env = (extra = {}) => ({ ...process.env, LANE_POOL_ROOT: poolRoot, PATH: `${shimDir}:${process.env.PATH}`, GIT_TRACE_LOG: traceLog, ...extra });
+// Measure the shared scan alone; recovery intentionally performs additional preservation probes.
+const env = (extra = {}) => ({ ...process.env, LANE_POOL_ROOT: poolRoot, LANE_POOL_NO_RECOVER: '1', PATH: `${shimDir}:${process.env.PATH}`, GIT_TRACE_LOG: traceLog, ...extra });
 
 function runPool(args, extraEnv = {}) {
   const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: env(extraEnv) });
