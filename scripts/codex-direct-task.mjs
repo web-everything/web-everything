@@ -1407,9 +1407,14 @@ export async function waitForJob({
       }
     }
     if (record.status !== 'running') return terminalResult();
-    const remaining = deadline - now();
-    if (remaining <= 0) return { ...result(), code: 75 };
-    if (await withinBudget(() => sleep(Math.min(Math.max(1, pollMs), remaining))) === expired) return { ...result(), code: 75 };
+    const pollAt = Math.min(deadline, now() + Math.max(1, pollMs));
+    // Timers can wake before the clock reaches their target. Finish this wait
+    // before polling again, especially when the next poll is the deadline itself.
+    for (;;) {
+      const remaining = pollAt - now();
+      if (remaining <= 0) break;
+      if (await withinBudget(() => sleep(remaining)) === expired) return { ...result(), code: 75 };
+    }
   }
 }
 
