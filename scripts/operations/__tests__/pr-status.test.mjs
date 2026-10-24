@@ -532,3 +532,23 @@ describe('PR status compact table', () => {
   });
 });
 
+
+describe('PR table evidence and terminal safety', () => {
+  it('preserves the same truncated-listing warning and exit semantics in normal and table modes', () => {
+    for (const code of [0, 1]) {
+      const normal = finishPrStatus({ run: { verdict: { truncated: true } }, code, lines: ['normal'] });
+      const compact = finishPrStatus({ run: { verdict: { truncated: true, table: [] } }, code, lines: ['normal'] });
+      expect(normal.lines.at(-1)).toMatch(/WARNING.*truncated.*incomplete/i);
+      expect(compact.lines.at(-1)).toBe(normal.lines.at(-1));
+      expect(compact.code).toBe(code);
+      expect(finishPrStatus({ run: { verdict: { truncated: true, table: [] } }, code, lines: ['json'], json: true }))
+        .toEqual({ code, lines: ['json'] });
+    }
+  });
+  it('strips C0, DEL, C1 and bidi/format controls from titles and label cells', () => {
+    const unsafe = 'x\x1b[31m\x00\x7f\x85\u202e\u2066\r\n\t';
+    const rendered = renderPrTable([{ pr: 1, minutesSinceUpdate: 0, title: unsafe, state: unsafe, redTeam: unsafe, round: unsafe }]);
+    expect(rendered.replaceAll('\n', '')).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+    expect(rendered).toContain('x[31m');
+  });
+});

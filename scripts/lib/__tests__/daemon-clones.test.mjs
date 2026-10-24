@@ -75,3 +75,32 @@ describe('adoption matrix settings', () => {
     }
   });
 });
+
+it('reports unreadable clone discovery evidence without discarding readable clones', () => {
+  const incomplete = [];
+  const clones = resolveDaemonClones({ env: {}, readdir: () => ['com.we.bad.plist'],
+    exec: () => { throw new Error('denied'); }, clones: ['/extra'], onIncomplete: reason => incomplete.push(reason) });
+  expect(clones).toEqual([{ path: '/extra', name: 'extra', labels: [] }]);
+  expect(incomplete).toEqual(['daemon plist unreadable']);
+});
+
+it('bounds plist conversion calls and clone count and reports both truncations', () => {
+  const incomplete = new Set();
+  let calls = 0;
+  const clones = resolveDaemonClones({ env: {},
+    readdir: () => Array.from({ length: 1000 }, (_, i) => `com.we.${i}.plist`),
+    exec: () => JSON.stringify({ WorkingDirectory: `/clone/${calls++}` }),
+    onIncomplete: reason => incomplete.add(reason),
+  });
+  expect(calls).toBe(100);
+  expect(clones).toHaveLength(20);
+  expect([...incomplete].sort()).toEqual(['clone discovery truncated', 'daemon plist discovery truncated']);
+});
+
+it.each(['ENOENT', 'EACCES'])('reports discovery directory failures except missing directories (%s)', code => {
+  const incomplete = [];
+  expect(resolveDaemonClones({ env: {}, readdir: () => { throw Object.assign(new Error('failed'), { code }); },
+    onIncomplete: reason => incomplete.push(reason),
+  })).toEqual([]);
+  expect(incomplete).toEqual(code === 'ENOENT' ? [] : ['daemon discovery directory unreadable']);
+});

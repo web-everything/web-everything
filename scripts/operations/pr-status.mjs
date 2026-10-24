@@ -399,7 +399,7 @@ export function prStatusOperation({ readPrs } = {}) {
 /** Fixed-width, single-line cells; the clock belongs to the injected reader. */
 export function renderPrTable(rows) {
   const widths = [6, 6, 40, 9, 8, 3];
-  const line = cells => cells.map((cell, i) => String(cell).replace(/[\r\n\t]/g, ' ')
+  const line = cells => cells.map((cell, i) => String(cell).replace(/[\p{Cc}\p{Cf}]/gu, '')
     .slice(0, widths[i]).padEnd(widths[i])).join('  ').trimEnd();
   return [line(['PR', 'MIN', 'TITLE', 'STATE', 'RT', 'RND']),
     ...rows.map(row => line([row.pr, row.minutesSinceUpdate, row.title, row.state, row.redTeam, row.round])),
@@ -407,5 +407,8 @@ export function renderPrTable(rows) {
 }
 
 export function finishPrStatus({ run, code, lines, json = false }) {
-  return json || !Array.isArray(run?.verdict?.table) ? { code, lines } : { code, lines: [renderPrTable(run.verdict.table)] };
+  if (json) return { code, lines };
+  const output = Array.isArray(run?.verdict?.table) ? [renderPrTable(run.verdict.table)] : lines;
+  return { code, lines: run?.verdict?.truncated
+    ? [...output, 'WARNING: PR listing truncated — incomplete evidence; inspect the full listing before acting.'] : output };
 }

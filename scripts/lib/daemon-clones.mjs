@@ -5,10 +5,13 @@ import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { listDaemonPlistFiles, readPlistAsJson } from '../operations/daemon-status-io.mjs';
 
+export const MAX_DAEMON_CLONES = 20;
+const MAX_DISCOVERY_PLISTS = 100;
+
 export function resolveDaemonClones({
   env = process.env, home = homedir(),
   launchAgentsDir = env.WE_LAUNCH_AGENTS_DIR || join(home, 'Library', 'LaunchAgents'),
-  readdir = readdirSync, exec = execFileSync, clones = [], excludeClones = [],
+  readdir = readdirSync, exec = execFileSync, clones = [], excludeClones = [], onIncomplete = () => {},
 } = {}) {
   const expand = path => resolve(path === '~' ? home : path.startsWith('~/') ? join(home, path.slice(2)) : path);
   const excluded = new Set(excludeClones.map(expand));
@@ -17,13 +20,24 @@ export function resolveDaemonClones({
     if (typeof path !== 'string' || !path.trim()) return;
     path = expand(path);
     if (excluded.has(path)) return;
+    if (!byPath.has(path) && byPath.size >= MAX_DAEMON_CLONES) {
+      onIncomplete('clone discovery truncated');
+      return;
+    }
     if (!byPath.has(path)) byPath.set(path, { path, name: basename(path), labels: [] });
     const labels = byPath.get(path).labels;
     if (label && !labels.includes(label)) labels.push(label);
   };
-  for (const label of listDaemonPlistFiles(launchAgentsDir, { readdir })) {
+  const labels = listDaemonPlistFiles(launchAgentsDir, { readdir: dir => {
+    try { return readdir(dir); } catch (error) {
+      if (error?.code !== 'ENOENT') onIncomplete('daemon discovery directory unreadable');
+      return [];
+    }
+  } });
+  if (labels.length > MAX_DISCOVERY_PLISTS) onIncomplete('daemon plist discovery truncated');
+  for (const label of labels.slice(0, MAX_DISCOVERY_PLISTS)) {
     const plist = readPlistAsJson(join(launchAgentsDir, `${label}.plist`), { exec });
-    if (!plist) continue;
+    if (!plist) { onIncomplete('daemon plist unreadable'); continue; }
     if (label.startsWith('com.we.')) add(plist.WorkingDirectory, label);
     if (label === 'com.plateau.drain-daemon') add(plist.EnvironmentVariables?.DRAIN_DAEMON_WE_CLONE, label);
   }

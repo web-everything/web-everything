@@ -2108,3 +2108,17 @@ On an App-token rejection, keep gh's original stderr before the daemon refusal d
 so callers that read the first error line still report GitHub's actual cause.
 The simulator binds its synthetic `sim-token-1` to matching App-token provenance; its fake
 GitHub still owns revocation checks. Never enable personal fallback globally in test setup.
+
+### Adoption evidence and compact terminal output
+
+Adoption-matrix log revisions must be literal 7–40 digit hex SHAs; missing or symbolic revisions
+stay unknown rather than resolving a mutable branch. Probe commit presence before ancestry:
+`cat-file -e <sha>^{commit}` returns 128 with `Not a valid object name` on this Git, while
+other 128 failures (including an invalid repository) remain unknown. Keep a real-Git fixture
+alongside injected exit-code cases so the distinction stays observed.
+The reader reads at most a 1 MiB log tail, retains 50 recent refs, discovers at most 20 clones through at most 100 plist reads,
+and shares a 500-call Git budget across resolution, presence and ancestry. Omitted evidence
+is explicitly truncated; log/discovery read failures are incomplete. Operators must inspect
+source evidence and retry smaller explicit batches. Only ENOENT on the default log is empty
+complete evidence. Both matrix and PR table cells strip Unicode Cc/Cf controls; PR table mode
+must retain the same truncated-listing warning and exit code as normal output.
