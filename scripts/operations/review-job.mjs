@@ -892,7 +892,7 @@ function runReviewArc({
         if (status?.status !== 'finished' || !['ran', 'resumed'].includes(priorResult) || priorComment === 'posted') {
           return refuse(`prior result ${typeof priorResult === 'string' ? priorResult : 'unknown'}; not re-run`);
         }
-        if (!priorRedTeamRow(records.filter(row => row?.repo === planned.repo), planned.pr, head)) {
+        if (!priorRedTeamRow(records, planned.pr, head, planned.repo)) {
           return refuse('no clean prior red-team row; inspect stored evidence before retrying');
         }
       } else {

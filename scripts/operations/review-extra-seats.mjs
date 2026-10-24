@@ -1012,18 +1012,19 @@ export function redTeamCommentPosted(comments, pr, rev) {
   });
 }
 
-/** The latest red-team seat row that ran cleanly for this `(pr, head)`, or null. PURE. */
-export function priorRedTeamRow(records, pr, rev) {
-  return seatRows(records).filter((r) => r.seat === RED_TEAM_SEAT.seat && r.pr === Number(pr) && r.rev === rev && r.status === 'ok').at(-1) ?? null;
+/** The latest red-team seat row that ran cleanly for this `(repo, pr, head)`, or null. PURE. */
+export function priorRedTeamRow(records, pr, rev, repo) {
+  if (typeof repo !== 'string' || !repo.trim()) return null;
+  return seatRows(records).filter((r) => r.seat === RED_TEAM_SEAT.seat && r.repo === repo && r.pr === Number(pr) && r.rev === rev && r.status === 'ok').at(-1) ?? null;
 }
 
 /**
- * Has this `(pr, head)` already had a red-team pass that ran cleanly? PURE. A clean row only stops the MODEL from
+ * Has this `(repo, pr, head)` already had a red-team pass that ran cleanly? PURE. A clean row only stops the MODEL from
  * running again — the effects after it (miss rows, delegation trial, comment) are re-checked and finished by
  * {@link runRedTeam} on the next run, so a failure between the row and those effects never strands them.
  */
-export function redTeamAlreadyRan(records, pr, rev) {
-  return priorRedTeamRow(records, pr, rev) !== null;
+export function redTeamAlreadyRan(records, pr, rev, repo) {
+  return priorRedTeamRow(records, pr, rev, repo) !== null;
 }
 
 /** Is this exact miss row (same pass, same role, same seat) already in the store? PURE. */
@@ -1426,7 +1427,7 @@ export async function speculateRedTeam({
       if (resumeOnly) return { status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' };
       io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
     }
-    const prior = priorRedTeamRow(records, pr, rev);
+    const prior = priorRedTeamRow(records, pr, rev, repo);
     if (resumeOnly && !prior) return { status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' };
     // A speculative pass (`resume: false`) must not finish a prior pass's effects before the verdict is known: it
     // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
@@ -1657,7 +1658,7 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     }
     let records = [];
     try { records = io.readRecords(); } catch { records = []; }
-    if (priorRedTeamRow(records, pr, pass.rev)) return { status: 'superseded', reason: `a clean red-team row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
+    if (priorRedTeamRow(records, pr, pass.rev, repo)) return { status: 'superseded', reason: `a clean red-team row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
     const recording = loopPayload?.replay !== true;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);
   } catch (e) {

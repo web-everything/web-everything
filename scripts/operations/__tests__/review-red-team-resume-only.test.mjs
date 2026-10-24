@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { runRedTeam, speculateRedTeam } from '../review-extra-seats.mjs';
+import { priorRedTeamRow, redTeamAlreadyRan, runRedTeam, speculateRedTeam } from '../review-extra-seats.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -54,8 +54,26 @@ describe('red-team CLI --resume-only', () => {
 const pr = 5762, repo = 'web-everything/web-everything', rev = 'a'.repeat(40);
 const read = { netBasis: { rev }, netChangedFiles: ['scripts/example.mjs'], diffText: '+export const example = true;' };
 const loopPayload = { verdict: { verdict: 'accept' }, findings: { read } };
-const prior = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', pr, rev,
+const prior = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', pr, repo, rev,
   callId: 'stored-call', provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' };
+
+describe('red-team scorecard repository identity', () => {
+  const foreign = { ...prior, repo: 'other/repo', callId: 'foreign-call', findings: [{
+    summary: 'Foreign confirmed broken finding', confirmedByRecheck: true, impactIfUnfixed: 'broken',
+  }] };
+  it('selects the target repository even when a foreign clean row is last', () => {
+    expect(priorRedTeamRow([prior, foreign], pr, rev, repo)).toBe(prior);
+    expect(redTeamAlreadyRan([prior, foreign], pr, rev, repo)).toBe(true);
+  });
+  it.each([foreign, { ...prior, repo: undefined }])('rejects foreign and legacy rows: %j', row => {
+    expect(priorRedTeamRow([row], pr, rev, repo)).toBeNull();
+    expect(redTeamAlreadyRan([row], pr, rev, repo)).toBe(false);
+  });
+  it.each([undefined, null, '', '   ', 42])('requires a non-empty repository: %j', invalidRepo => {
+    expect(priorRedTeamRow([{ ...prior, repo: invalidRepo }], pr, rev, invalidRepo)).toBeNull();
+    expect(redTeamAlreadyRan([{ ...prior, repo: invalidRepo }], pr, rev, invalidRepo)).toBe(false);
+  });
+});
 
 describe('runRedTeam pre-launch deferrals', () => {
   it.each(['quota-hold', 'reservation-error'])('marks %s retryable without a model call or seat row', async failure => {
@@ -94,9 +112,26 @@ for (const entry of [runRedTeam, speculateRedTeam]) {
       expect(await run(io)).toEqual({ status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' });
       noCalls(io);
     });
-    it.each([[], [{ ...prior, status: 'error' }], [{ ...prior, rev: 'b'.repeat(40) }]])('refuses scorecards with no clean prior row: %j', async records => {
+    it.each([[], [{ ...prior, status: 'error' }], [{ ...prior, rev: 'b'.repeat(40) }],
+      [{ ...prior, repo: 'other/repo' }], [{ ...prior, repo: undefined }]])('refuses scorecards with no clean prior row: %j', async records => {
       const io = fakeIo(() => records);
       expect(await run(io)).toEqual({ status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' });
+      expect(io.postComment).not.toHaveBeenCalled();
+      noCalls(io);
+    });
+    it('publishes only the target findings when a foreign confirmed break is the last clean row', async () => {
+      const target = { ...prior, findings: [{ summary: 'Target repository finding', filesRead: ['scripts/example.mjs'] }] };
+      const foreign = { ...prior, repo: 'other/repo', callId: 'foreign-call', foldedVerdict: 'changes', findings: [{
+        summary: 'Foreign confirmed broken finding', confirmedByRecheck: true,
+        filesRead: ['scripts/example.mjs'], recheckReason: 'demonstrated break',
+      }] };
+      const io = fakeIo(() => [target, foreign]);
+      expect(await run(io)).toMatchObject({ status: 'resumed', callId: target.callId, comment: { status: 'posted' } });
+      expect(io.postComment).toHaveBeenCalledOnce();
+      expect(io.postComment).toHaveBeenCalledWith({ pr, repo,
+        body: expect.stringContaining('Target repository finding') });
+      for (const [comment] of io.postComment.mock.calls) expect(comment.body).not.toContain('Foreign confirmed broken finding');
+      expect(io.append).not.toHaveBeenCalled();
       noCalls(io);
     });
     it('resumes a clean prior row and finishes its comment without new reservation or model calls', async () => {
