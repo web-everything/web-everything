@@ -170,10 +170,13 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     detectorErrors.push(...out.errors);
     errors.push(...detectorErrors.map(e => `stall detector: ${e}`));
     report.stallDetector = { enabled: out.enabled, stalled: out.items.length, ...(dryRun ? { items: out.items } : {}) };
-    report.nextState.stallDetector = prsReadOk ? out.nextSeen : previous?.stallDetector ?? {};
+    // A PR the detector could not read keeps its saved clock, so recovery does not restart its age.
+    const keptOld = Object.fromEntries(Object.entries(previous?.stallDetector ?? {}).filter(([k]) => out.errors.some(e => k.includes(`#${String(e).split(':')[0]}@`))));
+    report.nextState.stallDetector = prsReadOk ? { ...keptOld, ...out.nextSeen } : previous?.stallDetector ?? {};
     return out;
   };
   const detectorErrors = [];
+  report.nextState.stallDetector = previous?.stallDetector ?? {}; // the first save must not drop saved clocks
   if (!dryRun) {
     await safe('quiet digest', () => flush({ send: (n) => notify(n, { quietGate: null }) }));
     let needsYouSendFailed = false;
@@ -209,7 +212,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       const sweepDigestEnabled = out.mode !== 'off' && out.digest !== false;
       // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
       if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
-        const d = stallDigest({ ...out, items: [...(sweepDigestEnabled ? out.items ?? [] : []), ...detector.items],
+        const d = stallDigest({ ...out, items: [...(sweepDigestEnabled ? out.items ?? [] : []), ...detector.items.filter(d => !(out.items ?? []).some(i => i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === d.head))],
           incomplete: out.incomplete || !prsReadOk || detectorErrors.length > 0 },
         { now, env, stateDir: out.dir, notify,
           enabled: sweepDigestEnabled || detector.items.length > 0 || detector.enabled });
