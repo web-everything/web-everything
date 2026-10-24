@@ -559,7 +559,8 @@ describe('red-team-only review job', () => {
         expect(out.redTeam.status).toBe('ran');
         expect(io.finishSpeculativeRedTeam).toHaveBeenCalledOnce();
       } else {
-        expect(out).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringMatching(/writer.*(live|unknown)/) });
+        // An ordinary review keeps its completed outcome; admission is refused, so no red team runs.
+        expect(out.outcome).not.toBe('blocked-on-infra');
         expect(io.finishSpeculativeRedTeam).not.toHaveBeenCalled();
         expect(read()).toMatchObject({ status: 'running', pid: 4242, host: 'another-host' });
       }
@@ -660,8 +661,29 @@ describe('red-team-only review job', () => {
       expect(calls).toEqual(['queued', 'readback', 'unclaim', 'red-team', 'finished']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it('preserves the accepted ordinary review outcome and done report when the queued status hook throws', () => {
+    const loopPayload = { ...payload(), runId: 'review-pr-5762', stopped: 'complete',
+      verdict: { verdict: 'accept', loop: { outcome: 'converged' } } };
+    const io = fakeIo({
+      runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify(loopPayload) })),
+      redTeamStatus: vi.fn(({ status }) => {
+        if (status === 'queued') throw Error('queued status persistence failed');
+      }),
+    });
+
+    expect(runReviewJob({ pr, repo }, io)).toMatchObject({
+      outcome: 'auto-cleared', verdict: 'accept', loopOutcome: 'converged', runId: loopPayload.runId,
+    });
+    expect(io.report.mock.calls.map(([report]) => report)).toEqual([
+      expect.objectContaining({ status: 'started' }),
+      expect.objectContaining({ status: 'done', outcome: 'auto-cleared', verdict: 'converged', runId: loopPayload.runId }),
+    ]);
+    expect(io.redTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ status: 'queued' }));
+    expect(io.log).toHaveBeenCalledWith(expect.stringContaining('queued status persistence failed'));
+  });
   it.each(['fresh', 'resume'])('refuses a throwing strict queued hook in %s mode with zero red-team calls', redTeamMode => {
-    const io = fakeIo({ redTeamStatus: vi.fn(() => {
+    const io = fakeIo({ redTeamStatus: vi.fn(({ status }) => {
+      if (status !== 'queued') return;
       expect(io.unclaim).not.toHaveBeenCalled();
       expect(io.releaseLane).not.toHaveBeenCalled();
       throw Error('queued status persistence failed; inspect evidence before retrying');

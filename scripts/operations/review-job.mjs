@@ -731,7 +731,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   const spec = seatsBox.speculative ?? null;
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
-  const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
+  const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && redTeamOwedFor(seatsBox.input.loopPayload);
   // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
   // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
   // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
@@ -799,7 +799,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
     }
   }
-  else if (spec && seatsBox.input) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
+  else if (spec && seatsBox.input && !seatsBox.admissionFailed) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
   // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
   // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
   // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
@@ -921,10 +921,16 @@ function runReviewArc({
     const finishArc = input => {
       // Both modes persist and verify admission while the job claim still excludes another writer.
       if (input && redTeamOwedFor(input.loopPayload) && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
-        const queued = io.redTeamStatus({ ...input, status: 'queued',
-          ...(seatsBox.speculative ? { speculativePid: seatsBox.speculative.pid } : {}) });
-        seatsBox.priorRedTeamResult = queued?.priorResult;
-        if (input.redTeamMode && queued?.redTeamAdmission) input = { ...input, redTeamAdmission: queued.redTeamAdmission };
+        try {
+          const queued = io.redTeamStatus({ ...input, status: 'queued',
+            ...(seatsBox.speculative ? { speculativePid: seatsBox.speculative.pid } : {}) });
+          seatsBox.priorRedTeamResult = queued?.priorResult;
+          if (input.redTeamMode && queued?.redTeamAdmission) input = { ...input, redTeamAdmission: queued.redTeamAdmission };
+        } catch (e) {
+          if (redTeamOnly) throw e;
+          seatsBox.admissionFailed = true;
+          io.log(`review-job ${slug}: queued red-team status write failed (${tail(e?.message ?? e, 300)})`);
+        }
       }
       seatsBox.input = input;
       return result({ ...classified, lanePath });
