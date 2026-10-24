@@ -318,7 +318,7 @@ export function scrubPublish(value) {
     // The leading lookahead rejects any line repeating a key, so each key's hex is unambiguous.
     return line.replace(/( rev=)[0-9a-f]{40}(?= )/, '$1')
       .replace(/( result=)[0-9a-f]{16}(?= )/, '$1')
-      .replace(/( grants=)[0-9a-f]+(?:,[0-9a-f]+)*(?= )/, '$1');
+      .replace(/( grants=)[0-9a-f]{16}(?:,[0-9a-f]{16})*(?= )/, '$1');
   }).join('\n');
   for (const tok of publishSegments(segmentValue)) {
     if (isOpaquePublishToken(tok)) { reasons.push('opaque token (unpronounceable ≥20-char key/secret)'); break; }
