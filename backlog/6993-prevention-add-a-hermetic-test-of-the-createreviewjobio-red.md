@@ -1,22 +1,21 @@
 ---
+bornAs: xysx5z9
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/__tests__/pr-stall-detector.test.mjs", "we:scripts/conveyor/pr-sweep.mjs", "we:scripts/conveyor/__tests__/pr-sweep.test.mjs"]
+scope: ["we:scripts/operations/review-job.mjs", "we:scripts/operations/__tests__/review-job.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Add a test that iterates every key of DETECTOR_DEFAULTS with one invalid value per layer, so a ne… (from web-everything/web-everything#5856 review)
+# Prevention — Add a hermetic test of the createReviewJobIo red-team hooks against a temp WE_SHARED_RUNS_DIR and… (from web-everything/web-everything#5838 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/__tests__/pr-stall-detector.test.mjs:75` — Add a test that iterates every key of DETECTOR_DEFAULTS with one invalid value per layer, so a new setting leaf cannot ship without a fallback test.
-2. `we:scripts/conveyor/pr-sweep.mjs:237` — Split settings errors from observation errors in `runDetector`'s return value, and add a test that a bad platform-preferences file still lets resolved stalls clear.
-3. `we:scripts/conveyor/__tests__/pr-stall-detector.test.mjs` — Add a parameterized invalid-value test matrix covering every key in DETECTOR_DEFAULTS, with an assertion that the matrix's keys equal the defaults' keys.
+1. `we:scripts/operations/review-job.mjs:308` — Add a hermetic test of the `createReviewJobIo` red-team hooks against a temp `WE_SHARED_RUNS_DIR` and scorecard path. A lint or standards check that every new `io.*` hook added to `createReviewJobIo` is referenced from a test using the real factory would catch the whole class.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5856@797927fd6c20d5acd1a3e89a6cffa8ebc3041ecc
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5838@8ef8437cab7d09e0a4b61429a02f15a7f846e8ee
 
 ## Acceptance
 

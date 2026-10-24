@@ -1,19 +1,22 @@
 ---
+bornAs: xui65fw
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/operations/review-pr.mjs"]
+scope: ["we:scripts/operations/review-pr.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5863 (head 93c2e91cf)
+# Prevention — Have planRecordDecision pass a reason-source flag to renderVerdictWriteUp, and add a test for the… (from web-everything/web-everything#5863 review)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5863 (reviewed head `93c2e91cfc760453c1a278f996ad372a75f8d1a6`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/review-pr.mjs:2042` — (failing-input, degraded) Sanitization deletes comparison operators and corrupts the repair instruction.
-   - Scenario: A recognized operator send-back says: In validateCount, replace 'count &lt; 0' with 'count &gt; 0'. With zero juror findings and no explicit reason, the fallback produces: In validateCount, replace 'count 0' with 'count 0'. A read-only Node probe executing the exact helper extracted from this checkout confirmed this output using an item returned by openOperatorSendBacks. The resulting bounce loses the distinction that specifies the required repair. Preserve comparison operators when safely rendering the excerpt.
-   - Claude's re-check: demonstrated break
+1. `we:scripts/operations/review-pr.mjs:2118` — Have `planRecordDecision` pass a reason-source flag to `renderVerdictWriteUp`, and add a test for the heading wording when the reason is derived. A lens note would be enough.
+2. `we:scripts/operations/__tests__/review-pr.test.mjs:1293` — Add a round-trip test that feeds `planRecordDecision(...).body` into `openOperatorSendBacks` and asserts the send-backs stay open. Better, add a shared check that any rendered text containing a machine marker is not recognised by that marker's reader.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5863@93c2e91cfc760453c1a278f996ad372a75f8d1a6
 
 ## Acceptance
 

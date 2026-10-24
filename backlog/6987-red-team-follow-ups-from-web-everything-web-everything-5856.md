@@ -1,20 +1,20 @@
 ---
+bornAs: x9h26kv
 kind: story
-size: 3
-parent: "4075"
+size: 2
 status: open
-scope: ["we:scripts/operations/review-job.mjs", "we:scripts/operations/__tests__/review-job.test.mjs"]
+scope: ["we:scripts/conveyor/pr-sweep.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Add a hermetic test of the createReviewJobIo red-team hooks against a temp WE_SHARED_RUNS_DIR and… (from web-everything/web-everything#5838 review)
+# Red-team follow-ups from web-everything/web-everything#5856 (head 27fe24550)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5856 (reviewed head `27fe2455019eb09ded71a5292368040b06373416`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/review-job.mjs:308` — Add a hermetic test of the `createReviewJobIo` red-team hooks against a temp `WE_SHARED_RUNS_DIR` and scorecard path. A lint or standards check that every new `io.*` hook added to `createReviewJobIo` is referenced from a test using the real factory would catch the whole class.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5838@8ef8437cab7d09e0a4b61429a02f15a7f846e8ee
+1. `we:scripts/conveyor/pr-sweep.mjs:229` — (failing-input, degraded) Published stalled events lose the mapped remedy.
+   - Scenario: Pass a red-team:pending PR with a 90-minute clock and no daemon entries. Detection correctly supplies remedy='red team never ran: check red-team gate'. The publication path passes it through feedItem(), which drops remedy and does not include it in reason, evidence, or command. Executing the adapter confirms the remedy is absent from its entire output. Normal non-dry-run reports also retain only the detector count. The promised mapped remedy should survive into the operator's stalled event.
+   - Claude's re-check: demonstrated break
 
 ## Acceptance
 

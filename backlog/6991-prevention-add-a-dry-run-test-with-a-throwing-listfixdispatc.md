@@ -1,19 +1,22 @@
 ---
+bornAs: xng4511
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/pr-sweep.mjs"]
+scope: ["we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5856 (head 27fe24550)
+# Prevention — Add a dry-run test with a throwing listFixDispatchClaims and an argument-asserting fixture. A bro… (from web-everything/web-everything#5846 review)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5856 (reviewed head `27fe2455019eb09ded71a5292368040b06373416`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/pr-sweep.mjs:229` — (failing-input, degraded) Published stalled events lose the mapped remedy.
-   - Scenario: Pass a red-team:pending PR with a 90-minute clock and no daemon entries. Detection correctly supplies remedy='red team never ran: check red-team gate'. The publication path passes it through feedItem(), which drops remedy and does not include it in reason, evidence, or command. Executing the adapter confirms the remedy is absent from its entire output. Normal non-dry-run reports also retain only the detector count. The promised mapped remedy should survive into the operator's stalled event.
-   - Claude's re-check: demonstrated break
+1. `we:scripts/conveyor/lease-reaper.mjs:1531` — Add a dry-run test with a throwing listFixDispatchClaims and an argument-asserting fixture. A broader guard would be a lint requiring a test reference for each new degraded-mode catch.
+2. `we:scripts/conveyor/lease-reaper.mjs:1529` — Add a dry-run test with a throwing claim reader, plus a test asserting liveOnly:true. Longer term, a lint or standards check requiring a test reference for each new catch that logs a degraded-mode message.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5846@756a771bbdee9c937a8f46d1137286cd5d229ace
 
 ## Acceptance
 

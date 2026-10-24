@@ -1,21 +1,23 @@
 ---
+bornAs: x3vjaag
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs"]
+scope: ["we:scripts/conveyor/__tests__/pr-stall-detector.test.mjs", "we:scripts/conveyor/pr-sweep.mjs", "we:scripts/conveyor/__tests__/pr-sweep.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Add a dry-run test with a throwing listFixDispatchClaims and an argument-asserting fixture. A bro… (from web-everything/web-everything#5846 review)
+# Prevention — Add a test that iterates every key of DETECTOR_DEFAULTS with one invalid value per layer, so a ne… (from web-everything/web-everything#5856 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/lease-reaper.mjs:1531` — Add a dry-run test with a throwing listFixDispatchClaims and an argument-asserting fixture. A broader guard would be a lint requiring a test reference for each new degraded-mode catch.
-2. `we:scripts/conveyor/lease-reaper.mjs:1529` — Add a dry-run test with a throwing claim reader, plus a test asserting liveOnly:true. Longer term, a lint or standards check requiring a test reference for each new catch that logs a degraded-mode message.
+1. `we:scripts/conveyor/__tests__/pr-stall-detector.test.mjs:75` — Add a test that iterates every key of DETECTOR_DEFAULTS with one invalid value per layer, so a new setting leaf cannot ship without a fallback test.
+2. `we:scripts/conveyor/pr-sweep.mjs:237` — Split settings errors from observation errors in `runDetector`'s return value, and add a test that a bad platform-preferences file still lets resolved stalls clear.
+3. `we:scripts/conveyor/__tests__/pr-stall-detector.test.mjs` — Add a parameterized invalid-value test matrix covering every key in DETECTOR_DEFAULTS, with an assertion that the matrix's keys equal the defaults' keys.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5846@756a771bbdee9c937a8f46d1137286cd5d229ace
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5856@797927fd6c20d5acd1a3e89a6cffa8ebc3041ecc
 
 ## Acceptance
 
