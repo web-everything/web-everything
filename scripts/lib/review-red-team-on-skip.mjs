@@ -17,7 +17,10 @@ export function normalizeRedTeamResult(result) {
 
 /** Historical card-only skips need a result comment, not a resumed model pass. PURE. */
 export function redTeamSkipNeedsSettlement(status) {
-  return status?.status === 'finished' && normalizeRedTeamResult(status.result).priorResult === 'skipped'
+  const read = status?.loopPayload?.findings?.read;
+  return typeof read?.diffText === 'string' && read.diffText.trim().length > 0
+    && /^[a-f0-9]{40}$/i.test(status?.head ?? '') && read.netBasis?.rev === status.head
+    && status?.status === 'finished' && normalizeRedTeamResult(status.result).priorResult === 'skipped'
     && status.skipCardOnly === true && redTeamCardOnly(status.loopPayload?.findings?.read);
 }
 

@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readdirSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -105,7 +106,7 @@ describe('settleRedTeamSkip', () => {
     await f.settle(redTeam);
     expect(f.io.postComment).not.toHaveBeenCalled();
     expect(redTeamForHead(f.comments, pr, head)).toBeNull();
-    expect(f.io.publishNeedsYou.mock.calls).toEqual([[{ repo, pr, head, kind: 'needs-you',
+    expect(f.io.publishNeedsYou.mock.calls).toEqual([[{ repo, pr, head, kind: `red-team-skip-${createHash('sha256').update(JSON.stringify([repo, pr, head, reason])).digest('hex').slice(0, 8)}`,
       reason: `red team skipped (${reason}); not cleared`, title: '' }]]);
     expect(f.markers()).toHaveLength(1);
     expect(f.markers()[0]).toMatch(/^[a-f0-9]{64}\.json$/);
@@ -155,7 +156,7 @@ describe('settleRedTeamSkip', () => {
     const result = await f.settle();
     expect(result.outcome).not.toBe('policy-clear');
     expect(redTeamForHead(f.comments, pr, head)).toBeNull();
-    expect(f.io.publishNeedsYou.mock.calls).toEqual([[{ repo, pr, head, kind: 'needs-you',
+    expect(f.io.publishNeedsYou.mock.calls).toEqual([[{ repo, pr, head, kind: `red-team-skip-${createHash('sha256').update(JSON.stringify([repo, pr, head, 'policy-clear comment failed: GitHub unavailable'])).digest('hex').slice(0, 8)}`,
       reason: 'red team skipped (policy-clear comment failed: GitHub unavailable); not cleared', title: '' }]]);
     await f.settle();
     expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);

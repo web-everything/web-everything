@@ -1,5 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
+import { publishAttention, replay } from '../needs-you-feed.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runReviewJob, createReviewJobIo } from '../review-job.mjs';
@@ -60,6 +63,56 @@ describe('review-job red-team skip settlement', () => {
     expect(f.io.settleRedTeamSkip.mock.calls[0][0]).toMatchObject({ redTeam, repo, pr, head });
     expect(f.events.indexOf('settle')).toBeLessThan(f.events.indexOf('gate'));
     expect(out.redTeam).toMatchObject({ status: 'skipped', outcome: 'non-policy' });
+  });
+
+  it.each([{ status: 'error' }, { status: 'disabled' }, { unexpected: true }, null, undefined])(
+    'production dispatch settles every incomplete outcome %j', redTeam => {
+      const f = fixture();
+      f.io.runRedTeam.mockReturnValue(redTeam);
+      f.io.settleRedTeamSkip.mockReturnValue({ outcome: 'non-policy' });
+      const out = runReviewJob({ repo, pr }, f.io);
+      expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
+      expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ redTeam, repo, pr, head }));
+      expect(out.redTeam.outcome).toBe('non-policy');
+    });
+
+  it.each(['ran', 'resumed'])('completed %s does not settle', status => {
+    const f = fixture({ status });
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
+  });
+
+  it('stored review head takes precedence over the prepared lane head', () => {
+    const f = fixture();
+    f.io.prepareLane = () => ({ head: 'b'.repeat(40) });
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ head }));
+  });
+
+  it('two real lane heads without netBasis.rev publish twice', () => {
+    const root = mkdtempSync(join(tmpdir(), 'review-skip-heads-'));
+    const path = join(root, 'feed.jsonl');
+    try {
+      for (const realHead of [head, 'b'.repeat(40)]) {
+        const f = fixture({ status: 'skipped', reason: 'missing rev' });
+        delete f.loopPayload.findings.read.netBasis.rev;
+        f.io.prepareLane = () => ({ head: realHead });
+        f.io.settleRedTeamSkip.mockImplementation(input => settleRedTeamSkip({ ...input, io: {
+          env: { WE_SHARED_RUNS_DIR: join(root, 'runs') },
+          publishNeedsYou: item => publishAttention(item, { path }),
+        } }));
+        runReviewJob({ repo, pr }, f.io);
+        expect(f.io.settleRedTeamSkip.mock.calls[0][0].head).toBe(realHead);
+      }
+      expect(replay({ path }).map(item => item.head)).toEqual([head, 'b'.repeat(40)]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a missing pinned rev falls back to the prepared lane head, never a null identity', () => {
+    const f = fixture({ status: 'skipped', reason: 'missing rev' });
+    delete f.loopPayload.findings.read.netBasis.rev;
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ head, runId: f.loopPayload.runId }));
   });
 
   it('createReviewJobIo exposes the settlement hook', () => {

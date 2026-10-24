@@ -801,10 +801,18 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
     recordSeats(redTeam?.seat ? [redTeam.seat] : []);
     out.redTeam = summarizeRedTeam(redTeam);
-    if (redTeam?.status === 'skipped' && typeof io.settleRedTeamSkip === 'function') {
+    if (!['ran', 'resumed'].includes(redTeam?.status) && typeof io.settleRedTeamSkip === 'function') {
       try {
+        const isHead = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
+        let head = [seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev, seatsBox.laneHead].find(isHead);
+        if (!head) {
+          try {
+            const live = io.readCarryEvidence?.({ repo: out.repo, pr: out.pr })?.headSha;
+            if (isHead(live)) head = live;
+          } catch { /* unavailable head escalates under a per-run unknown identity */ }
+        }
         const settled = io.settleRedTeamSkip({ redTeam, repo: out.repo, pr: out.pr,
-          head: seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev });
+          head: head ?? 'unknown', runId: out.runId });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
         io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`);
@@ -955,6 +963,7 @@ function runReviewArc({
 
     const { head } = prepareReviewArc({ pr: planned.pr, repo: planned.repo, lanePath }, io);
     const finishArc = input => {
+      seatsBox.laneHead = head;
       // Both modes persist and verify admission while the job claim still excludes another writer.
       if (input && redTeamOwedFor(input.loopPayload) && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
         try {
