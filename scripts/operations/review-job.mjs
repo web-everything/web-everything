@@ -907,7 +907,7 @@ function runReviewArc({
       const input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode };
       try {
         const status = io.readRedTeamStatus({ pr: planned.pr, repo: planned.repo, head });
-        const { priorComment } = normalizeRedTeamResult(status?.result);
+        const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
         if (!['resume', 'fresh'].includes(redTeamMode)) return refuse('unknown red-team mode; inspect stored evidence before retrying');
         let records;
         try {
@@ -928,6 +928,9 @@ function runReviewArc({
         }
         if (redTeamMode === 'resume' && !recovery.verifiedRow) {
           return refuse('no verified prior red-team row; inspect stored evidence before retrying');
+        }
+        if (redTeamMode === 'resume' && (status?.status !== 'finished' || !['ran', 'resumed'].includes(priorResult))) {
+          return refuse(`prior result ${typeof priorResult === 'string' ? priorResult : 'unknown'}; not re-run`);
         }
         const setting = resolveReviewRedTeamOnSkip({ env: io.env, log: io.log }).value;
         if (status?.updatedAtMs != null && io.now() - status.updatedAtMs < setting.retryCooldownMin * 60_000) return refuse('retry cooldown active');
@@ -1126,7 +1129,7 @@ export function dispatchReviewJob({
   }
 
   const policy = resolveTimingPolicy({ env }).review;
-  const ci = redTeamOnly ? { allowed: true } : ciGate({ repo: planned.repo, pr: planned.pr, policy });
+  const ci = ciGate({ repo: planned.repo, pr: planned.pr, policy });
   // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
   const waived = policy.startAfter === 'ci-green' && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()

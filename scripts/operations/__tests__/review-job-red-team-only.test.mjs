@@ -215,6 +215,7 @@ describe('red-team-only review job', () => {
   });
   it.each(['fresh', 'resume'])('refuses lost admission immediately before queued in %s mode', redTeamMode => {
     const io = fakeIo(redTeamMode === 'resume' ? {
+      readRedTeamStatus: () => ({ status: 'finished', result: 'ran' }),
       readRedTeamRecords: () => [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' }],
     } : {});
     const replaceOwner = () => {
@@ -553,13 +554,32 @@ describe('red-team-only review job', () => {
     expect(io.releaseLane).toHaveBeenCalledOnce(); expect(io.unclaim).toHaveBeenCalledOnce();
   });
   const cleanRow = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', pr, repo, rev: head };
+  it.each(['error', 'skipped', 'disabled', 'not-owed', null])('refuses a finished non-recoverable result %s without running any seats', prior => {
+    const io = fakeIo({ readRedTeamStatus: vi.fn(() => ({ status: 'finished',
+      result: { status: prior } })), readRedTeamRecords: () => [cleanRow] });
+    const out = runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode: 'resume' }, io);
+    expect(out).toMatchObject({ outcome: 'red-team-not-owed', reason: `prior result ${prior ?? 'unknown'}; not re-run` });
+    expect(io.readRedTeamStatus).toHaveBeenCalledWith({ pr, repo, head });
+    for (const hook of ['runLoop', 'runExtraSeats', 'runRedTeam', 'runRedTeamGate', 'redTeamStatus', 'report']) expect(io[hook]).not.toHaveBeenCalled();
+    expect(io.releaseLane).toHaveBeenCalledOnce(); expect(io.unclaim).toHaveBeenCalledOnce();
+  });
+  it.each([null, { status: 'queued', result: 'ran' }, { status: 'running', result: 'resumed' },
+    { status: 'unknown', result: 'ran' }, { status: 'finished', result: 'unknown' }])(
+    'refuses unfinished or unknown resume status %j despite verified evidence', status => {
+      const io = fakeIo({ readRedTeamStatus: () => status, readRedTeamRecords: () => [cleanRow] });
+      expect(runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode: 'resume' }, io).outcome).toBe('red-team-not-owed');
+      for (const hook of ['recordRedTeamQueued', 'reserveFreshRedTeamAttempt', 'runRedTeam', 'runRedTeamGate', 'redTeamStatus']) {
+        expect(io[hook]).not.toHaveBeenCalled();
+      }
+      expect(io.releaseLane).toHaveBeenCalledOnce(); expect(io.unclaim).toHaveBeenCalledOnce();
+    });
   it.each(['ran', { status: 'ran', comment: 'error' }, 'resumed', { status: 'resumed', comment: 'error' }])('resumes both production result shapes %j with a clean stored row', result => {
     const io = fakeIo({ readRedTeamStatus: () => ({ status: 'finished', result }), readRedTeamRecords: () => [cleanRow] });
     expect(runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode: 'resume' }, io).outcome).toBe('red-team-only');
     expect(io.runRedTeam).toHaveBeenCalledOnce();
     expect(io.runRedTeam).toHaveBeenCalledWith({ pr, repo, lanePath: '/lanes/lane-7', loopPayload: payload(), slug: `review-${pr}`, redTeamMode: 'resume' });
   });
-  it.each([{ status: 'ran', comment: 'posted' }, { status: 'ran', comment: { status: 'posted' } },
+  it.each(['error', { status: 'error' }, { status: 'ran', comment: 'posted' }, { status: 'ran', comment: { status: 'posted' } },
     { status: 'resumed', comment: 'posted' }, { status: 'resumed', comment: { status: 'posted' } }])('refuses resume result %j with zero red-team calls', result => {
     const io = fakeIo({ readRedTeamStatus: () => ({ status: 'finished', result }), readRedTeamRecords: () => [cleanRow] });
     expect(runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode: 'resume' }, io).outcome).toBe('red-team-not-owed');
@@ -664,7 +684,8 @@ describe('red-team-only review job', () => {
     expect(redTeamRecoveryRows([], { repo, pr, head, env: io.env }).freshAttempts).toBe(1);
   });
   it('resume admission never writes the fresh attempt files', () => {
-    const io = fakeIo({ readRedTeamRecords: () => [cleanRow] });
+    const io = fakeIo({ readRedTeamStatus: () => ({ status: 'finished', result: 'ran' }),
+      readRedTeamRecords: () => [cleanRow] });
     expect(runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode: 'resume' }, io).outcome).toBe('red-team-only');
     expect(io.reserveFreshRedTeamAttempt).not.toHaveBeenCalled();
     expect(readFreshRedTeamAttempts({ repo, pr, head, env: io.env })).toEqual([]);
@@ -691,6 +712,15 @@ describe('red-team-only review job', () => {
     expect(io.reserveFreshRedTeamAttempt).toHaveBeenCalledOnce();
     expect(readFreshRedTeamAttempts({ repo, pr, head, env: io.env })).toHaveLength(1);
     expect(redTeamRunnerArgs({ pr, repo, lanePath: '/lane', loopFile: '/loop', redTeamMode: decision.mode })).not.toContain('--resume-only');
+  });
+  it.each(['row', 'error-row', 'status', 'queued', 'unreadable'])('retains prior-pass fresh refusal on %s evidence with zero red-team calls', kind => {
+    const io = fakeIo({ readRedTeamRecords: vi.fn(() => {
+      if (kind === 'unreadable') throw Error('unreadable');
+      return kind.endsWith('row') ? [{ ...cleanRow, status: kind === 'error-row' ? 'error' : 'ok' }] : [];
+    }), readRedTeamStatus: vi.fn(() => ['status', 'queued'].includes(kind) ? { status: kind === 'queued' ? 'queued' : 'finished', result: 'ran' } : null) });
+    expect(runReviewJob({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' }, io).outcome).toBe('red-team-not-owed');
+    expect(io.readRedTeamRecords).toHaveBeenCalledOnce(); expect(io.readRedTeamStatus).toHaveBeenCalledWith({ pr, repo, head });
+    expect(io.runRedTeam).not.toHaveBeenCalled(); expect(io.redTeamStatus).not.toHaveBeenCalled();
   });
   it('fails closed on an unreadable head status without running the red team', () => {
     const io = fakeIo({ readRedTeamStatus: () => { throw Error('unreadable'); } });
@@ -726,13 +756,23 @@ describe('red-team-only dispatch', () => {
     const dir = mkdtempSync(join(tmpdir(), 'review-red-team-only-'));
     const options = { pr, repo, redTeamOnly: true, root: '/daemon', dir,
       checkStaleness: () => ({ fresh: true, behind: 0 }), readCompletion: () => null,
-      resolveSettingsEnv: () => ({}), ciGate: vi.fn(() => ({ allowed: false })), spawnJob: vi.fn(() => 4242) };
+      resolveSettingsEnv: () => ({}), ciGate: vi.fn(() => ({ allowed: true })), spawnJob: vi.fn(() => 4242) };
     try { run(options); } finally { rmSync(dir, { recursive: true, force: true }); }
   }
-  it.each(['fresh', 'resume'])('passes --red-team-only=%s and preferred lane, skipping CI admission', redTeamMode => withDispatch(options => {
+  it.each(['fresh', 'resume'])('passes --red-team-only=%s and preferred lane after CI admission', redTeamMode => withDispatch(options => {
     const out = dispatchReviewJob({ ...options, redTeamMode, preferLane: 7 });
-    expect(out.jobPid).toBe(4242); expect(options.ciGate).not.toHaveBeenCalled();
+    expect(out.jobPid).toBe(4242); expect(options.ciGate).toHaveBeenCalledOnce();
     expect(options.spawnJob.mock.calls[0][0].argv).toEqual(expect.arrayContaining(['run', `--pr=${pr}`, `--repo=${repo}`, `--red-team-only=${redTeamMode}`, '--prefer-lane=7']));
+  }));
+  it.each(['fresh', 'resume'])('refuses a denying CI gate in %s mode without spawning', redTeamMode => withDispatch(options => {
+    const ci = { allowed: false, headSha: head, reason: 'required-checks-not-successful' };
+    options.ciGate.mockReturnValue(ci);
+    const out = dispatchReviewJob({ ...options, redTeamMode });
+    expect(options.ciGate).toHaveBeenCalledOnce();
+    expect(options.ciGate).toHaveBeenCalledWith({ repo, pr, policy: expect.any(Object) });
+    expect(out).toMatchObject({ pr, repo, headSha: head, ci });
+    expect(out.skipped).toContain('required-checks-not-successful');
+    expect(options.spawnJob).not.toHaveBeenCalled();
   }));
   it('still skips live-job with the same slug and record', () => withDispatch(options => {
     writeJobRecord({ slug: `review-${pr}`, pr, repo, pid: 99, cwd: '/daemon', startedAt: new Date().toISOString() }, options.dir);

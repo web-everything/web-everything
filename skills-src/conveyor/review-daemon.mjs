@@ -980,13 +980,25 @@ export function runReviewTick({
   let redTeamOnSkipResult;
   if (!paused && host.admitted && typeof redTeamOnSkip === 'function') {
     try {
+      let hostStartsTaken = 0;
       redTeamOnSkipResult = redTeamOnSkip({ repo, plan, rawPrs,
-        capacity: { lanes: Math.max(0, Math.min(acquirable - occupiedLanes, hostLimit - occupiedLanes)), budget: liveReviewBudget }, paused });
-      // Uncertain starts retain a host seat just like throwing ordinary review dispatches.
-      for (const _ of [...(redTeamOnSkipResult?.dispatched ?? []), ...(redTeamOnSkipResult?.uncertain ?? [])]) {
-        if (typeof host.take === 'function') host.take(1);
-      }
+        capacity: { lanes: Math.max(0, Math.min(acquirable - occupiedLanes, hostLimit - occupiedLanes)), budget: liveReviewBudget,
+          ...(Number.isFinite(hostLimit) ? { remainingStarts: Math.max(0, hostLimit - occupiedLanes) } : {}),
+          ...(typeof host.take === 'function' ? { take: () => { host.take(1); hostStartsTaken++; } } : {}),
+        }, paused });
+      // Production recovery consumes the shared allowance at dispatch time. Hooks returning
+      // starts without using take still owe those seats, including uncertain spawns.
+      const starts = (redTeamOnSkipResult?.dispatched?.length ?? 0) + (redTeamOnSkipResult?.uncertain?.length ?? 0);
+      for (let i = hostStartsTaken; i < starts; i++) host.take?.(1);
     } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
+  }
+  if (!paused && !host.admitted && typeof redTeamOnSkip === 'function') {
+    const rows = (plan.refusals ?? []).filter(row => row?.kind === 'already-reviewed-head')
+      .map(row => ({ prNumber: row.prNumber,
+        head: rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid ?? null,
+        action: 'skip', why: 'no review capacity left' }));
+    if (rows.length) redTeamOnSkipResult = { rows, dispatched: [], uncertain: [],
+      notStarted: rows.map(row => ({ prNumber: row.prNumber, reason: row.why })), applied: [] };
   }
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.

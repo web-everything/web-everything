@@ -11,6 +11,7 @@ import { writeRun } from '../../operations/run-store.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 import { readSavedRedTeamGateResult } from '../drain-saved-red-team.mjs';
 import { tmpdir } from 'node:os';
+import { cliReviewTickOpts, runReviewTick, runReviewTickAllRepos } from '../../../skills-src/conveyor/review-daemon.mjs';
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
@@ -453,5 +454,73 @@ describe('withheld saved red-team result (live #5759 shape)', () => {
     run(2_000_000); run(2_000_000 + 60_000);
     expect(applyGate).toHaveBeenCalledTimes(1);
     expect(dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('daemon recovery shares host admission', () => {
+  function tickFixture(over = {}) {
+    const f = runFixture();
+    return { repo, reconcile: () => ({ dispatch: [], ...f.plan }),
+      readPrs: () => f.rawPrs, readAgents: () => [], holdReconcile: () => [],
+      tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [], acquirableLanes: () => 5,
+      liveReviewBudget: { left: 5 },
+      redTeamOnSkip: input => runRedTeamOnSkip({ ...f, ...input }), ...over };
+  }
+  it.each(['denied', 'unreadable'])('a recovery-only tick checks host admission and refuses %s capacity', kind => {
+    const dispatch = vi.fn(() => ({ jobPid: 42 }));
+    const hostAdmission = vi.fn(() => {
+      if (kind === 'unreadable') throw Error('host reading failed');
+      return { admitted: false, reason: 'host memory low' };
+    });
+    const f = runFixture({ dispatch });
+    const options = tickFixture({ hostAdmission, redTeamOnSkip: input => runRedTeamOnSkip({ ...f, ...input }) });
+    const out = runReviewTick(options);
+    expect(hostAdmission).toHaveBeenCalledOnce();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.redTeamOnSkip.rows[0]).toMatchObject({ action: 'skip', why: 'no review capacity left' });
+    expect(options.liveReviewBudget.left).toBe(5);
+    expect(f.lastDispatch.size).toBe(0);
+  });
+  it.each(['started', 'unknown', 'skipped'])('a %s recovery shares the host cap with ordinary reviews in later repos', kind => {
+    const recoveryDispatch = vi.fn(() => {
+      if (kind === 'unknown') throw Error('spawn may have occurred');
+      return kind === 'skipped' ? { skipped: 'lane-cooloff' } : { jobPid: 42 };
+    });
+    const f = runFixture({ dispatch: recoveryDispatch });
+    const dispatch = vi.fn(() => ({ jobPid: 43 }));
+    const hostAdmission = vi.fn(() => ({ admitted: true, maxPerTick: 1 }));
+    const options = tickFixture({ dispatch, hostAdmission,
+      reconcile: ({ repo: target }) => target === repo ? { dispatch: [], ...f.plan }
+        : { dispatch: [{ kind: 'review', prNumber: 99 }], refusals: [] },
+      redTeamOnSkip: input => runRedTeamOnSkip({ ...f, ...input }),
+    });
+    runReviewTickAllRepos({ ...options, repos: [repo, 'other/repo'],
+      authGateOverride: () => ({ paused: false, reason: null }) });
+    expect(hostAdmission).toHaveBeenCalledOnce();
+    expect(recoveryDispatch).toHaveBeenCalledOnce();
+    expect(dispatch).toHaveBeenCalledTimes(kind === 'skipped' ? 1 : 0);
+    expect(options.liveReviewBudget.left).toBe(4);
+  });
+  it('ordinary reviews spend the per-tick host allowance before recovery', () => {
+    const f = runFixture();
+    const dispatch = vi.fn(() => ({ jobPid: 43 }));
+    const out = runReviewTick(tickFixture({ dispatch,
+      reconcile: () => ({ ...f.plan, dispatch: [{ kind: 'review', prNumber: 99 }] }),
+      hostAdmission: () => ({ admitted: true, maxPerTick: 1 }),
+      redTeamOnSkip: input => runRedTeamOnSkip({ ...f, ...input }),
+    }));
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(out.redTeamOnSkip.rows[0]).toMatchObject({ action: 'skip', why: 'no review capacity left' });
+  });
+  it('the current CLI effects factory wires recovery through runRedTeamOnSkip', () => {
+    const log = { error: vi.fn() };
+    const effects = cliReviewTickOpts({ log });
+    const f = runFixture({ dryRun: true });
+    const out = effects.redTeamOnSkip(f);
+    expect(out.rows[0]).toMatchObject({ action: 'skip', why: 'dry run (fresh)' });
+    expect(out.dispatched).toEqual([]);
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('red team not dispatched'));
   });
 });
