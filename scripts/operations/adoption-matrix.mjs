@@ -4,6 +4,7 @@ import { compute } from './step-kinds.mjs';
 
 export const ADOPTION_MATRIX_OP = 'adoption-matrix';
 export const MAX_ADOPTION_REFS = 50;
+const MAX_DISPLAY_WIDTH = 80;
 
 /** Latest timestamp per ref, retaining at most the 50 most recent refs; later lines break ties. */
 export function parseFixReadyLines(text, { onTruncated = () => {}, onIncomplete = () => {} } = {}) {
@@ -34,13 +35,20 @@ export function parseFixReadyLines(text, { onTruncated = () => {}, onIncomplete 
 export function renderAdoptionMatrix({ clones, rows, incomplete = [], truncated = false }) {
   const cells = [['BRANCH', ...clones.map(clone => clone.name)],
     ...rows.map(row => [row.ref, ...row.cells])];
-  const clean = cells.map(row => row.map(cell => String(cell).replace(/[\p{Cc}\p{Cf}]/gu, '')));
+  let displayTruncated = false;
+  const clean = cells.map(row => row.map(cell => {
+    const text = String(cell).replace(/[\p{Cc}\p{Cf}]/gu, '');
+    if (text.length <= MAX_DISPLAY_WIDTH) return text;
+    displayTruncated = true;
+    return text.slice(0, MAX_DISPLAY_WIDTH - 1) + '…';
+  }));
   const widths = clean[0].map(() => 0);
   for (const row of clean) row.forEach((cell, i) => { widths[i] = Math.max(widths[i], cell.length); });
   const warning = incomplete.length || truncated
     ? '\nINCOMPLETE: ' + [...incomplete, ...(truncated ? ['truncated'] : [])].join('; ')
       + ' — inspect source evidence and retry with explicit branches/clones in smaller batches.' : '';
-  return clean.map(row => row.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd()).join('\n') + warning;
+  const displayWarning = displayTruncated ? '\nNOTE: display text truncated — use --json for full text.' : '';
+  return clean.map(row => row.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd()).join('\n') + warning + displayWarning;
 }
 
 export function adoptionMatrixOperation({ collect } = {}) {

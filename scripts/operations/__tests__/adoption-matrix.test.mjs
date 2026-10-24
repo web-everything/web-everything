@@ -10,10 +10,10 @@ import { createAdoptionMatrixReader } from '../adoption-matrix-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 
 const lines = [
-  { at: '2026-10-20T00:00:00Z', ref: 'fix/a', sha: 'aaaaaaa' },
-  { at: '2026-10-22T00:00:00Z', ref: 'fix/a', sha: 'bbbbbbb' },
-  { at: '2026-10-21T00:00:00Z', ref: 'fix/a', sha: 'ccccccc' },
-  { at: '2026-10-22T00:00:00Z', ref: 'fix/b', sha: 'ddddddd' },
+  { at: '2026-10-20T00:00:00Z', ref: 'fix/a', sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+  { at: '2026-10-22T00:00:00Z', ref: 'fix/a', sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' },
+  { at: '2026-10-21T00:00:00Z', ref: 'fix/a', sha: 'cccccccccccccccccccccccccccccccccccccccc' },
+  { at: '2026-10-22T00:00:00Z', ref: 'fix/b', sha: 'dddddddddddddddddddddddddddddddddddddddd' },
 ].map(JSON.stringify).join('\n');
 const settings = { clones: ['/clones/yes', '/clones/no', '/clones/error', '/clones/missing'] };
 const defaults = { env: {}, home: '/home', cwd: '/repo', settings, readdir: () => [],
@@ -25,16 +25,16 @@ describe('adoption matrix', () => {
   it('takes the latest timestamp per ref, flags corrupt records and keeps its SHA', () => {
     const incomplete = [];
     expect(parseFixReadyLines(`${lines}\ninvalid\nnull\n{}\n`, { onIncomplete: reason => incomplete.push(reason) })).toEqual([
-      { at: '2026-10-22T00:00:00Z', ref: 'fix/a', sha: 'bbbbbbb' },
-      { at: '2026-10-22T00:00:00Z', ref: 'fix/b', sha: 'ddddddd' },
+      { at: '2026-10-22T00:00:00Z', ref: 'fix/a', sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' },
+      { at: '2026-10-22T00:00:00Z', ref: 'fix/b', sha: 'dddddddddddddddddddddddddddddddddddddddd' },
     ]);
     expect(incomplete).toEqual(Array(3).fill('fix-ready log malformed'));
   });
 
   it.each([
-    ['invalid timestamp', JSON.stringify({ ref: 'fix/a', at: 'invalid', sha: 'eeeeeee' })],
-    ['missing timestamp', JSON.stringify({ ref: 'fix/a', sha: 'eeeeeee' })],
-    ['non-string timestamp', JSON.stringify({ ref: 'fix/a', at: 123, sha: 'eeeeeee' })],
+    ['invalid timestamp', JSON.stringify({ ref: 'fix/a', at: 'invalid', sha: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' })],
+    ['missing timestamp', JSON.stringify({ ref: 'fix/a', sha: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' })],
+    ['non-string timestamp', JSON.stringify({ ref: 'fix/a', at: 123, sha: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' })],
     ['missing ref', JSON.stringify({ at: '2026-10-23T00:00:00Z' })],
     ['blank ref', JSON.stringify({ ref: '  ', at: '2026-10-23T00:00:00Z' })],
     ['non-string ref', JSON.stringify({ ref: 42, at: '2026-10-23T00:00:00Z' })],
@@ -43,7 +43,7 @@ describe('adoption matrix', () => {
     const result = createAdoptionMatrixReader({ ...defaults,
       readText: () => `${lines}\n${record}\n`, run: () => ({ status: 0 }),
     })();
-    expect(result.rows.find(row => row.ref === 'fix/a').tipSha).toBe('bbbbbbb');
+    expect(result.rows.find(row => row.ref === 'fix/a').tipSha).toBe('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
     expect(result.incomplete).toEqual(['fix-ready log malformed']);
     expect(renderAdoptionMatrix(result)).toMatch(/INCOMPLETE: fix-ready log malformed.*inspect.*retry/);
   });
@@ -58,29 +58,29 @@ describe('adoption matrix', () => {
       calls.push(argv);
       expect(bin).toBe('git');
       expect(options.cwd).toBe('/repo');
-      if (argv[0] === 'rev-parse') return { status: 0, stdout: 'ddddddd\n' };
+      if (argv[0] === 'rev-parse') return { status: 0, stdout: 'dddddddddddddddddddddddddddddddddddddddd\n' };
       expect(argv[0]).toBe('-C');
       if (argv[2] === 'cat-file') {
-        expect(argv.slice(2)).toEqual(['cat-file', '-e', expect.stringMatching(/^(bbbbbbb|ddddddd)\^\{commit\}$/)]);
+        expect(argv.slice(2)).toEqual(['cat-file', '-e', expect.stringMatching(/^(bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|dddddddddddddddddddddddddddddddddddddddd)\^\{commit\}$/)]);
         return { status: 0 };
       }
       if (argv[2] === 'rev-parse') {
         expect(argv.slice(2)).toEqual(['rev-parse', '--is-shallow-repository']);
         return { status: 0, stdout: 'false\n' };
       }
-      expect(argv.slice(2)).toEqual(['merge-base', '--is-ancestor', expect.stringMatching(/^(bbbbbbb|ddddddd)$/), 'HEAD']);
+      expect(argv.slice(2)).toEqual(['merge-base', '--is-ancestor', expect.stringMatching(/^(bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|dddddddddddddddddddddddddddddddddddddddd)$/), 'HEAD']);
       return { status: argv[1].endsWith('/yes') ? 0 : argv[1].endsWith('/no') ? 1 : 128 };
     } });
     const result = read();
     const byName = row => Object.fromEntries(result.clones.map((clone, i) => [clone.name, row.cells[i]]));
-    expect(result.rows.map(row => row.tipSha)).toEqual(['bbbbbbb', 'ddddddd']);
+    expect(result.rows.map(row => row.tipSha)).toEqual(['bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'dddddddddddddddddddddddddddddddddddddddd']);
     for (const row of result.rows) {
       expect(byName(row)).toEqual({ yes: 'yes', no: 'no', error: '?', missing: '?' });
     }
     expect(calls.some(argv => argv.includes('/clones/missing'))).toBe(false);
   });
 
-  it.each([undefined, '', 'HEAD', ' abcdef0 ', 'main', 'abc123', 'a'.repeat(41), 'g'.repeat(40)])('rejects invalid logged SHA %s without resolving a replacement', sha => {
+  it.each([undefined, '', 'HEAD', ' abcdef0000000000000000000000000000000000 ', 'main', 'abc123', 'abcdef0', 'a'.repeat(39), 'a'.repeat(41), 'a'.repeat(63), 'a'.repeat(65), 'g'.repeat(40), 'a'.repeat(40) + '\n'])('rejects invalid logged SHA %s without resolving a replacement', sha => {
     const calls = [];
     const result = createAdoptionMatrixReader({ ...defaults,
       readText: () => JSON.stringify({ ref: 'fix/a', at: '2026-10-22T00:00:00Z', sha }),
@@ -88,6 +88,29 @@ describe('adoption matrix', () => {
     })();
     expect(result.rows[0].cells).toEqual(['?', '?', '?', '?']);
     expect(calls).toEqual([]);
+  });
+
+  it('keeps a 7-character logged SHA unknown without resolving it in any clone', () => {
+    const calls = [];
+    const result = createAdoptionMatrixReader({ ...defaults,
+      readText: () => JSON.stringify({ ref: 'fix/a', at: '2026-10-22T00:00:00Z', sha: 'abcdef0' }),
+      run: (...args) => { calls.push(args); return { status: 0 }; },
+    })();
+    expect(result.rows[0]).toEqual({ ref: 'fix/a', tipSha: null, cells: ['?', '?', '?', '?'] });
+    expect(calls).toEqual([]);
+  });
+
+  it('caps oversized refs, column names and cells with visible truncation and a full-data fallback', () => {
+    const verdict = { clones: [{ name: 'c'.repeat(10000) }],
+      rows: [{ ref: 'r'.repeat(10000), cells: ['v'.repeat(10000)] }, { ref: 'short', cells: ['?'] }] };
+    const rendered = renderAdoptionMatrix(verdict);
+    const table = rendered.split('\n').slice(0, 3);
+    expect(table.every(line => line.length <= 162)).toBe(true);
+    expect(table[0]).toContain('c'.repeat(79) + '…');
+    expect(table[1]).toBe('r'.repeat(79) + '…  ' + 'v'.repeat(79) + '…');
+    expect(rendered).toMatch(/display text truncated.*--json/);
+    expect(verdict.rows[0].ref).toHaveLength(10000);
+    expect(finishAdoptionMatrix({ run: { verdict }, code: 0, lines: ['full JSON'], json: true }).lines).toEqual(['full JSON']);
   });
 
   it.each([1, 128])('recognizes only proven absent objects (cat-file exit %s)', status => {
@@ -126,7 +149,7 @@ describe('adoption matrix', () => {
     const result = createAdoptionMatrixReader({ ...defaults,
       settings: { clones: Array.from({ length: 80 }, (_, i) => `/clones/${i}`) },
       readText: () => Array.from({ length: 1000 }, (_, i) => JSON.stringify({
-        ref: `fix/${i}`, at: new Date(i * 1000).toISOString(), sha: 'abcdef0',
+        ref: `fix/${i}`, at: new Date(i * 1000).toISOString(), sha: 'abcdef0000000000000000000000000000000000',
       })).join('\n'),
       run: () => { probes++; return { status: 0 }; },
     })();
@@ -159,7 +182,7 @@ describe('adoption matrix', () => {
       readText: () => { throw new Error('must not read log'); }, run: (_bin, argv) => {
         calls.push(argv);
         if (argv[0] !== 'rev-parse') return { status: 0 };
-        return argv.at(-1) === 'local^{commit}' ? { status: 0, stdout: 'eeeeeee\n' } : { status: 128 };
+        return argv.at(-1) === 'local^{commit}' ? { status: 0, stdout: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n' } : { status: 128 };
       },
     });
     const result = read({ branches: ' local,missing,local ' });
@@ -206,7 +229,7 @@ describe('adoption matrix', () => {
       },
       exec: (_bin, argv) => JSON.stringify({ WorkingDirectory: argv.at(-1).includes('excluded') ? '/excluded' : '/shared' }),
       isDirectory: () => true,
-      run: (_bin, argv) => argv[0] === 'rev-parse' ? { status: 0, stdout: 'ddddddd' } : { status: 0 },
+      run: (_bin, argv) => argv[0] === 'rev-parse' ? { status: 0, stdout: 'dddddddddddddddddddddddddddddddddddddddd' } : { status: 0 },
     })();
     expect(seen).toEqual(['/settings', '/fixes']);
     expect(result.clones).toEqual([
@@ -240,12 +263,12 @@ describe('adoption matrix', () => {
 });
 
 it('real git distinguishes a missing commit from an invalid repository', () => withRealRepo(({ root: dir }) => {
-  const absent = spawnSync('git', ['-C', dir, 'cat-file', '-e', 'deadbee^{commit}'], { encoding: 'utf8' });
+  const absent = spawnSync('git', ['-C', dir, 'cat-file', '-e', 'deadbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee^{commit}'], { encoding: 'utf8' });
   expect(absent.status).toBe(128);
   expect(absent.stderr).toContain('Not a valid object name');
   const result = createAdoptionMatrixReader({ ...defaults, cwd: dir,
     settings: { clones: [dir, join(dir, 'not-a-repo')] }, isDirectory: () => true,
-    readText: () => JSON.stringify({ at: '2026-10-22T00:00:00Z', ref: 'fix/a', sha: 'deadbee' }), run: spawnSync,
+    readText: () => JSON.stringify({ at: '2026-10-22T00:00:00Z', ref: 'fix/a', sha: 'deadbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' }), run: spawnSync,
   })();
   expect(result.rows[0].cells).toEqual(['no (not in clone)', '?']);
 }));
@@ -268,7 +291,7 @@ it('computes widths without argument spreads for large rendered matrices', () =>
   expect(rendered.split('\n')).toHaveLength(150001);
 });
 
-it.each(['abcdef0', 'A'.repeat(40)])('accepts only immutable logged hex SHA %s', sha => {
+it.each(['a'.repeat(40), 'A'.repeat(40), 'b'.repeat(64)])('accepts only immutable logged hex SHA %s', sha => {
   const calls = [];
   const result = createAdoptionMatrixReader({ ...defaults, settings: { clones: ['/clone'] },
     readText: () => JSON.stringify({ ref: 'fix/a', at: '2026-10-22T00:00:00Z', sha }),
@@ -292,7 +315,7 @@ it('shares the probe cap with explicit tip resolution', () => {
   const calls = [];
   const result = createAdoptionMatrixReader({ ...defaults,
     settings: { clones: Array.from({ length: 20 }, (_, i) => `/clone/${i}`) },
-    run: (_bin, argv) => { calls.push(argv); return { status: 0, stdout: 'abcdef0' }; },
+    run: (_bin, argv) => { calls.push(argv); return { status: 0, stdout: 'abcdef0000000000000000000000000000000000' }; },
   })({ branches: Array.from({ length: 50 }, (_, i) => `branch/${i}`).join(',') });
   expect(calls).toHaveLength(500);
   expect(calls.some(argv => argv[0] === 'rev-parse')).toBe(true);
@@ -306,7 +329,7 @@ it('bounds the real log read to a recent byte window and marks omitted evidence 
   const dir = mkdtempSync(join(tmpdir(), 'adoption-log-'));
   try {
     const log = join(dir, 'fix-ready.jsonl');
-    writeFileSync(log, `${'x'.repeat(2 * 1024 * 1024)}\n${JSON.stringify({ ref: 'recent', at: '2026-10-22T00:00:00Z', sha: 'abcdef0' })}\n`);
+    writeFileSync(log, `${'x'.repeat(2 * 1024 * 1024)}\n${JSON.stringify({ ref: 'recent', at: '2026-10-22T00:00:00Z', sha: 'abcdef0000000000000000000000000000000000' })}\n`);
     const cap = 1024 * 1024;
     const size = statSync(log).size;
     // Native ESM instrumentation observes the production reader's named fs imports.
@@ -348,27 +371,31 @@ it('bounds the real log read to a recent byte window and marks omitted evidence 
       expect(read.position).toBeGreaterThanOrEqual(size - cap);
       expect(read.position + read.length).toBeLessThanOrEqual(size);
     }
-    expect(result.rows).toEqual([{ ref: 'recent', tipSha: 'abcdef0', cells: [] }]);
+    expect(result.rows).toEqual([{ ref: 'recent', tipSha: 'abcdef0000000000000000000000000000000000', cells: [] }]);
     expect(result.truncated).toBe(true);
     expect(renderAdoptionMatrix(result)).toMatch(/INCOMPLETE.*truncated.*inspect.*retry/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-it('passes read-only and noninteractive environment to every spawned git probe', () => {
+it('strips inherited GIT_DIR and repository overrides from every child while retaining read-only settings', () => {
   const dir = mkdtempSync(join(tmpdir(), 'adoption-git-env-'));
   try {
     const log = join(dir, 'calls.jsonl');
     writeFileSync(join(dir, 'git'), `#!${process.execPath}
 const { appendFileSync } = require('node:fs');
 const argv = process.argv.slice(2);
-appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv, env: { PATH: process.env.PATH,
+const overrides = Object.fromEntries(Object.entries(process.env).filter(([key]) => ${JSON.stringify(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES'])}.includes(key)));
+appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv, overrides, env: { PATH: process.env.PATH,
   GIT_NO_LAZY_FETCH: process.env.GIT_NO_LAZY_FETCH, GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT } }) + '\\n');
 if (argv.includes('--is-shallow-repository')) process.stdout.write('false');
-else if (argv[0] === 'rev-parse') process.stdout.write('abcdef0');
+else if (argv[0] === 'rev-parse') process.stdout.write('abcdef0000000000000000000000000000000000');
 else if (argv.includes('merge-base')) process.exitCode = 1;
 `, { mode: 0o755 });
     const env = { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH}`,
-      GIT_NO_LAZY_FETCH: '0', GIT_TERMINAL_PROMPT: '1' };
+      GIT_NO_LAZY_FETCH: '0', GIT_TERMINAL_PROMPT: '1',
+      ...Object.fromEntries(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+        'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES']
+        .map(key => [key, '/unrelated-repository'])) };
     const result = createAdoptionMatrixReader({ ...defaults, cwd: dir, settings: { clones: ['/clone'] }, env,
       run: spawnSync,
     })({ branches: 'fix/a' });
@@ -377,6 +404,7 @@ else if (argv.includes('merge-base')) process.exitCode = 1;
     expect(calls.map(call => call.argv[0] === '-C' ? call.argv[2] : call.argv[0]))
       .toEqual(['rev-parse', 'cat-file', 'merge-base', 'rev-parse']);
     for (const call of calls) {
+      expect(call.overrides).toEqual({});
       expect(call.env).toMatchObject({ PATH: env.PATH, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' });
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }

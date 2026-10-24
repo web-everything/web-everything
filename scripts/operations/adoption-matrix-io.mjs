@@ -23,7 +23,7 @@ function readLogTail(path) {
   } finally { closeSync(fd); }
 }
 
-const SHA = /^[a-f0-9]{7,40}$/i;
+const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
 
 export function createAdoptionMatrixReader({
   env = process.env, home = homedir(), cwd = process.cwd(), run = spawnSync, exec = execFileSync,
@@ -37,7 +37,12 @@ export function createAdoptionMatrixReader({
   const git = argv => {
     if (probes >= MAX_ADOPTION_PROBES) { truncated = true; return null; }
     probes++;
-    try { return run('git', argv, { cwd, env: { ...env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' }, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 }); }
+    const gitEnv = { ...env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
+    for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES']) {
+      delete gitEnv[key];
+    }
+    try { return run('git', argv, { cwd, env: gitEnv, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 }); }
     catch { return null; }
   };
   const tipFor = ref => {

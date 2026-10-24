@@ -2111,7 +2111,7 @@ GitHub still owns revocation checks. Never enable personal fallback globally in 
 
 ### Adoption evidence and compact terminal output
 
-Adoption-matrix log revisions must be literal 7–40 digit hex SHAs; missing or symbolic revisions
+Adoption-matrix log revisions must be full object IDs (40 hex digits for SHA-1 or 64 for SHA-256); abbreviated, missing or symbolic revisions
 stay unknown rather than resolving a mutable branch. Probe commit presence before ancestry:
 `cat-file -e <sha>^{commit}` returns 128 with `Not a valid object name` on this Git, while
 other 128 failures (including an invalid repository) remain unknown. Keep a real-Git fixture
@@ -2123,6 +2123,12 @@ source evidence and retry smaller explicit batches. Only ENOENT on the default l
 complete evidence. Both matrix and PR table cells strip Unicode Cc/Cf controls; PR table mode
 must retain the same truncated-listing warning and exit code as normal output.
 
+Matrix display cells (including refs and clone headers) are capped at 80 characters with an ellipsis;
+a visible display-truncation notice directs operators to `--json` for full text. JSON evidence stays intact.
+
+Every Git probe removes inherited `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`,
+`GIT_NAMESPACE` and `GIT_CEILING_DIRECTORIES` so probes observe the selected clone.
 Every Git probe passes `GIT_NO_LAZY_FETCH=1` and `GIT_TERMINAL_PROMPT=0`; presence checks
 must never fetch missing objects. Negative ancestry is definitive only after a successful
 `rev-parse --is-shallow-repository` returns `false`; shallow or unreadable history stays unknown.
