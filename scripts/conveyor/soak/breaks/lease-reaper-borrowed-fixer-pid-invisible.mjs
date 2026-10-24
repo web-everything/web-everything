@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { acquireLockDir } from '../../../readiness/file-locks.mjs';
 import { fixDispatchClaimRoot, fixDispatchResource } from '../../fix-claim-store.mjs';
+import { keepAliveScript } from '../../../lib/test-keepalive.mjs';
 import { runSoak } from '../soak.mjs';
 
 const MIN = 60_000;
@@ -71,7 +72,7 @@ export default {
         let child;
         try {
           // argv keeps the session token literal; only this child's own PID is stopped below.
-          child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)', '--', `--session=${SESSION}`], { stdio: 'ignore' });
+          child = spawn(process.execPath, ['-e', keepAliveScript(), '--', `--session=${SESSION}`], { stdio: 'ignore' });
           await once(child, 'spawn');
           const coordinationRoot = join(ctx.base, 'coordination');
           const resource = fixDispatchResource({ repo: 'we', kind: 'fix', pr: 5806 });
