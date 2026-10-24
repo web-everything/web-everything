@@ -784,6 +784,54 @@ describe('automatic card filing with shared durable claims', () => {
     expect(heldAfter(f.comments)).toEqual([]);
     expect(f.labelSyncs).toHaveLength(1);
   });
+  // Every step accepted by cardLandingExists needs an explicit release/hold contract.
+  // Batched cards have no PR reference yet: keep the break held until main resolves them.
+  it.each([
+    { step: 'held' }, { step: 'batched' }, { step: 'done' },
+    { step: 'mentioned', mentions: 1 }, { step: 'done', mentions: 1 },
+  ].flatMap(landing => ['present', 'missing', 'removed during reason', 'spooled'].map(evidence => ({ ...landing, evidence }))))(
+    'landing step $step (mentions: $mentions) revalidates $evidence card evidence before release', async ({ step, mentions, evidence }) => {
+      const stateDir = root();
+      if (evidence === 'spooled') {
+        mkdirSync(join(stateDir, 'pending-prevention'));
+        writeFileSync(join(stateDir, 'pending-prevention', 'xabcdef.json'), JSON.stringify({
+          cardId: 'xabcdef', rel: result.rel, content: '---\nstatus: open\n---\n# Follow-up\n',
+        }));
+      }
+      let readable = evidence !== 'missing';
+      if (evidence === 'spooled') readable = false;
+      const f = fake({ env: { WE_CARD_BATCH_STATE_DIR: stateDir }, resolveCard: ref => ({ ref, readable }),
+        changeAfterReason: () => { if (evidence === 'removed during reason') readable = false; } });
+      const p = payloadFor();
+      expect(f.act(p)).toMatchObject({ pending: true, released: false });
+      const receipt = mentions
+        ? { ok: true, step, mentions, rel: null }
+        : { ...result, step, pr: null };
+      await f.complete({ code: 0, result: receipt });
+      const completed = f.actions.read(rulingCardResource(p), 1);
+      expect(completed).toMatchObject({ state: 'terminal', outcome: 'settled', evidence: { result: receipt } });
+
+      if (!mentions && (evidence === 'present' || (step === 'held' && evidence === 'spooled'))) {
+        expect(f.act(p)).toMatchObject({ card: { reconciled: true, ref: `we:${result.rel}` } });
+        expect(heldAfter(f.comments)).toEqual([]);
+        expect(f.labelSyncs).toHaveLength(1);
+      } else {
+        for (let retry = 0; retry < 2; retry++) expect(() => f.act(p)).toThrow(/no release record written.*recover the owed card/);
+        expect(f.posted.some(body => body.includes('outcome=operator-card'))).toBe(false);
+        expect(heldAfter(f.comments)).toHaveLength(1);
+        expect(f.labelSyncs).toEqual([]);
+        if (step === 'batched' && evidence === 'missing') {
+          // The batch has since landed. Reuse the receipt rather than filing another card.
+          readable = true;
+          expect(f.act(p)).toMatchObject({ card: { reconciled: true, ref: `we:${result.rel}` } });
+          expect(heldAfter(f.comments)).toEqual([]);
+          expect(f.labelSyncs).toHaveLength(1);
+        }
+      }
+      expect(f.cards).toHaveLength(1);
+      expect(f.actions.attempts(rulingCardResource(p))).toEqual([completed]);
+    });
+
   it.each(['present', 'missing', 'malformed', 'wrong card'])('persisted completion retry rereads %s spool evidence before release', async evidence => {
     const stateDir = root(), pending = join(stateDir, 'pending-prevention');
     mkdirSync(pending);
