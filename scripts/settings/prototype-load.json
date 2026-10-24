@@ -1,0 +1,22 @@
+{
+  "daemons": {
+    "review": { "label": "com.we.review-daemon" },
+    "fix": { "label": "com.we.fix-dispatch-daemon" },
+    "build": { "label": "com.we.build-dispatch-daemon" },
+    "verify": { "label": "com.we.verify-daemon" },
+    "health-watch": { "label": "com.we.health-watch" },
+    "lease-reaper": { "label": "com.we.lease-reaper" },
+    "control": { "label": "com.we.control", "clone": "wev-control" },
+    "drain": {
+      "label": "com.plateau.drain-daemon",
+      "clone": ".lanes/we-drain-daemon/code",
+      "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs."
+    }
+  },
+  "launchAgentsDir": "~/Library/LaunchAgents",
+  "workspaceRoot": "~/workspace",
+  "adoption": { "timeoutMs": 600000, "pollMs": 15000 },
+  "recordPath": "~/workspace/.operations/coordination/prototype-loads.jsonl",
+  "readyRecordPath": "~/workspace/.operations/coordination/fix-ready.jsonl",
+  "loaderCli": "scripts/daemon-overlay.mjs"
+}

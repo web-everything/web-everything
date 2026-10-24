@@ -15,6 +15,7 @@ import { spawnSync } from 'node:child_process';
 import { rebuildClone } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
+import { gitRun } from '../main-staleness.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -80,6 +81,69 @@ function fixture() {
 }
 
 describe('overlay-pin — a moving overlay whose new tip conflicts stays at its adopted head', () => {
+  it('holds without a pin alert or persisted notice when the pin commit-tree fails', async () => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+    expect(await f.tick()).toMatchObject({ adopted: true });
+    const head = f.head();
+    f.push('lane/moving', f.mOld, { [DAEMON]: lines({ 2: 'moving conflict' }) });
+    let failedPins = 0;
+    f.smoke.mockClear();
+    const result = await rebuildClone({
+      root: f.clone, env: f.env, prState: async () => 'OPEN', runSmoke: f.smoke,
+      log: { error: m => f.logs.push(m) },
+      run: (args, options) => {
+        if (args[0] === 'commit-tree' && args.some(a => a.includes('(pinned at adopted head;'))) {
+          failedPins++;
+          return { status: 1, stdout: '', stderr: 'injected pin mint failure' };
+        }
+        return gitRun(args, options);
+      },
+    });
+    expect(failedPins).toBeGreaterThan(0);
+    expect(result).toMatchObject({ moved: false, reason: 'established-overlay-conflict' });
+    expect(result.alerts.some(a => a.kind === 'established-overlay-hold')).toBe(true);
+    expect(result.alerts.some(a => a.kind === 'overlay-pinned')).toBe(false);
+    expect(f.pinnedLogs()).toEqual([]);
+    expect(readRebuildState(f.clone, f.env).pinnedNotified?.['lane/moving']).toBeUndefined();
+    expect(f.head()).toBe(head);
+    expect(f.smoke).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it('persists pin notices before a later overlay refuses the plan and deduplicates repeated refused ticks', async () => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+    expect(await f.tick()).toMatchObject({ adopted: true });
+    const live = f.head();
+    const tip = f.push('lane/moving', f.mOld, { [DAEMON]: lines({ 2: 'moving conflict' }) });
+    f.push('lane/refusal', f.init, { [DAEMON]: lines({ 8: 'refusal conflict' }) });
+    addOverlay(f.clone, { ref: 'lane/refusal', pinned: true }, { env: f.env });
+    const registered = readOverlays(f.clone, { env: f.env });
+    f.smoke.mockClear();
+
+    for (let i = 0; i < 3; i++) {
+      expect(await f.tick()).toMatchObject({ moved: false, reason: 'pinned-overlay-conflict' });
+      expect(readRebuildState(f.clone, f.env).pinnedNotified).toEqual({ 'lane/moving': tip });
+    }
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(registered);
+    // An earlier refusal has an incomplete alert list: it cannot prove the previous pin cleared.
+    removeOverlay(f.clone, 'lane/moving', { env: f.env });
+    addOverlay(f.clone, { ref: 'lane/moving', pr: 5793 }, { env: f.env });
+    const early = await f.tick();
+    expect(early).toMatchObject({ moved: false, reason: 'pinned-overlay-conflict' });
+    expect(early.alerts.some(a => a.kind === 'overlay-pinned')).toBe(false);
+    expect(readRebuildState(f.clone, f.env).pinnedNotified).toEqual({ 'lane/moving': tip });
+    expect(f.head()).toBe(live);
+    expect(f.smoke).not.toHaveBeenCalled();
+    removeOverlay(f.clone, 'lane/refusal', { env: f.env });
+    const recovered = await f.tick();
+    expect(recovered.adopted || recovered.reason === 'up-to-date').toBe(true);
+    expect(f.pinnedLogs()).toHaveLength(1);
+    expect(isAncestor(f.clone, f.mOld, f.head())).toBe(true);
+    expect(readOverlays(f.clone, { env: f.env }).map(o => o.ref).sort())
+      .toEqual(registered.filter(o => o.ref !== 'lane/refusal').map(o => o.ref).sort());
+  }, 60_000);
+
   it('refuses to pin when the adopted head also conflicts', async () => {
     const f = fixture();
     f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';

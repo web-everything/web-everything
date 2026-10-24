@@ -3,7 +3,7 @@
  */
 
 import { gitRun } from '../main-staleness.mjs';
-import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
+import { makeGit, verifyRev, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { findUnsafeLocalState, knownInputsOf } from './local-state.mjs';
 import { overlayFilePath, readOverlayState } from '../daemon-overlays.mjs';
 import { readRebuildState } from './state.mjs';
@@ -186,6 +186,9 @@ export async function previewOverlayConflict({
   root, ref, pr = null, existingOverlays, env = process.env, originUrl, run = gitRun,
 } = {}) {
   if (!isSafeBranchName(ref)) return { ok: false, reason: 'unsafe-ref' };
+  // Re-registration must compare the candidate against the other overlays. Including it here can
+  // let its established priority drop a peer before even reaching the candidate conflict check.
+  existingOverlays = existingOverlays.filter((o) => o.ref !== ref);
   const rootGit = makeGit({ run, cwd: root, env, extraEnv: { GIT_OPTIONAL_LOCKS: '0' } });
   const head = verifyRev(rootGit, 'HEAD');
   if (!head) return { ok: false, reason: 'head-unresolved' };
@@ -272,7 +275,15 @@ export async function previewOverlayConflict({
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
       });
-      if (planCandidate.ok && planCandidate.applied.some((o) => o.ref === ref && !o.pinnedFrom)
+      const candidate = planCandidate.ok && planCandidate.applied.find((o) => o.ref === ref);
+      // establishedLost covers adopted content; admission must also retain overlays that the
+      // existing-only plan applies, including registrations not yet adopted by the running clone.
+      // Ref identity alone permits rolling an existing tip back to its adopted pin. Require the
+      // same commit or a descendant; an unreadable ancestry check cannot authorize admission.
+      if (candidate && !candidate.pinnedFrom
+        && planExisting.applied.every((o) => planCandidate.applied.some((a) => a.ref === o.ref
+          && FULL_SHA_RE.test(o.sha ?? '') && FULL_SHA_RE.test(a.sha ?? '')
+          && (a.sha === o.sha || scratchGit(['merge-base', '--is-ancestor', o.sha, a.sha]).status === 0)))
         && planCandidate.establishedLost.length === 0) {
         return { ok: true, clean: true, mainSha, cur, candSha, setAside };
       }

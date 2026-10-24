@@ -14,6 +14,7 @@ import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs'
 import { rebuildClone, dryRunRebuild, previewOverlayConflict } from '../daemon-rebuild.mjs';
 import { stackAwareOverlayCheck } from '../../daemon-overlay.mjs';
 import * as planner from '../daemon-rebuild/plan.mjs';
+import * as strategies from '../daemon-rebuild/overlay-strategies.mjs';
 
 const temps = [];
 afterEach(() => {
@@ -68,10 +69,111 @@ function fixture() {
 }
 
 describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before registering', () => {
+  it.each(['0', '1'])('admits a full-plan replay-resolved candidate only with edge resolution on: %s', async (edgeResolve) => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = edgeResolve;
+    const first = f.push('lane/replay', { 'shared.mjs': 'export const X = 2;\n' });
+    const tip = f.push('lane/replay', { 'shared.mjs': 'export const X = 3;\n' }, first);
+    // Force the direct resolver to fall through so the real planner's resolver is the admission evidence.
+    const resolver = vi.spyOn(strategies, 'resolveOverlayConflict');
+    if (edgeResolve === '1') resolver.mockReturnValueOnce({ ok: false, files: ['shared.mjs'], tried: [] });
+    const plan = vi.spyOn(planner, 'planRebuild');
+    const result = await f.load({ ref: 'lane/replay', pr: null });
+    expect(plan).toHaveBeenCalledTimes(2);
+    const fullPlan = await plan.mock.results[1].value;
+    if (edgeResolve === '1') {
+      expect(resolver).toHaveBeenCalledTimes(2);
+      expect(fullPlan.applied).toContainEqual(expect.objectContaining({ ref: 'lane/replay', sha: tip, resolvedVia: 'replay' }));
+      expect(result.refused).toBeFalsy();
+      expect(readOverlays(f.clone, { env: f.env }).find(o => o.ref === 'lane/replay').conflictOverride).toBeUndefined();
+      expect(f.rebuild).toHaveBeenCalledOnce();
+    } else {
+      expect(resolver).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ refused: true, registered: false, reason: 'conflict' });
+      expect(readOverlays(f.clone, { env: f.env }).some(o => o.ref === 'lane/replay')).toBe(false);
+      expect(f.rebuild).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(['0', '1'])('refuses admission that replaces an existing applied tip with an older pin; edge resolve=%s', async (edgeResolve) => {
+    const f = fixture();
+    Object.assign(f.env, {
+      WE_DAEMON_STATE_DIR: mktemp('we-rollback-state-'),
+      WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-rollback-lock-'),
+      WE_DAEMON_OVERLAY_EDGE_RESOLVE: edgeResolve,
+      WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
+    });
+    const a0 = f.push('lane/a', { 'a.txt': 'A\n' });
+    addOverlay(f.clone, { ref: 'lane/a' }, { env: f.env });
+    expect(await rebuildClone({
+      root: f.clone, env: f.env, prState: async () => 'OPEN',
+      runSmoke: async () => ({ verdict: 'pass', smoke: { results: [] } }),
+    })).toMatchObject({ adopted: true });
+    removeOverlay(f.clone, 'lane/fix-procedure', { env: f.env });
+    const a1 = f.push('lane/a', { 'shared.mjs': 'export const X = 1;\n' }, a0);
+    const existing = await dryRunRebuild({ root: f.clone, env: f.env, prState: async () => 'OPEN' });
+    expect(existing.plan.applied).toContainEqual(expect.objectContaining({ ref: 'lane/a', sha: a1 }));
+    const candidate = await dryRunRebuild({
+      root: f.clone, env: f.env, prState: async () => 'OPEN', extraOverlays: [{ ref: 'lane/fix-procedure' }],
+    });
+    expect(candidate.plan).toMatchObject({ ok: true, establishedLost: [] });
+    expect(candidate.plan.applied).toContainEqual(expect.objectContaining({ ref: 'lane/a', sha: a0, pinnedFrom: a1 }));
+    expect(candidate.plan.applied.find(o => o.ref === 'lane/fix-procedure').pinnedFrom).toBeUndefined();
+    const registered = readOverlays(f.clone, { env: f.env });
+    expect(await stackAwareOverlayCheck({
+      root: f.clone, ref: 'lane/fix-procedure', existingOverlays: registered, env: f.env,
+    })).toMatchObject({ ok: true, clean: false, files: ['shared.mjs'] });
+    expect(await f.load({ ref: 'lane/fix-procedure', pr: null }))
+      .toMatchObject({ registered: false, refused: true, reason: 'conflict' });
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(registered);
+    expect(f.rebuild).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it.each([false, true])('refuses a carried conflicting tip when the full plan drops an existing overlay; still registered=%s', async (stillRegistered) => {
+    const f = fixture();
+    Object.assign(f.env, {
+      WE_DAEMON_STATE_DIR: mktemp('we-drop-state-'),
+      WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-drop-lock-'),
+      WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0',
+      WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
+    });
+    removeOverlay(f.clone, 'lane/fix-procedure', { env: f.env });
+    const a0 = f.push('lane/a', { 'a.txt': 'A\n', 'shared.mjs': 'export const X = 1;\n' });
+    addOverlay(f.clone, { ref: 'lane/a' }, { env: f.env });
+    expect(await rebuildClone({
+      root: f.clone, env: f.env, prState: async () => 'OPEN',
+      runSmoke: async () => ({ verdict: 'pass', smoke: { results: [] } }),
+    })).toMatchObject({ adopted: true });
+    if (!stillRegistered) removeOverlay(f.clone, 'lane/a', { env: f.env });
+    addOverlay(f.clone, { ref: 'lane/fix-procedure' }, { env: f.env });
+    const registered = readOverlays(f.clone, { env: f.env });
+    const live = await dryRunRebuild({
+      root: f.clone, env: f.env, prState: async () => 'OPEN', extraOverlays: [{ ref: 'lane/a' }],
+    });
+    expect(live.plan).toMatchObject({ ok: true, establishedLost: [] });
+    expect(live.plan.applied).toContainEqual(expect.objectContaining({ ref: 'lane/a', sha: a0 }));
+    expect(live.plan.decisions).toContainEqual(expect.objectContaining({ ref: 'lane/fix-procedure', action: 'drop', reason: 'conflict' }));
+
+    // The CLI passes the whole registry; load-overlay already filters the candidate out.
+    const check = await stackAwareOverlayCheck({
+      root: f.clone, ref: 'lane/a', existingOverlays: registered, env: f.env,
+    });
+    expect(check).toMatchObject({ ok: true, clean: false, files: ['shared.mjs'] });
+    const result = await f.load({ ref: 'lane/a', pr: null });
+    expect(result).toMatchObject({ registered: false, refused: true, reason: 'conflict' });
+    expect(result.conflictCheck).toMatchObject({ ok: true, clean: false, files: ['shared.mjs'] });
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(registered);
+    expect(f.rebuild).not.toHaveBeenCalled();
+  }, 60_000);
+
   it.each([
     { name: 'planner is not ok', ok: false, establishedLost: [] },
     { name: 'establishedLost is non-empty', ok: true, establishedLost: [{ ref: 'lane/fix-procedure', reason: 'conflict' }] },
-  ])('refuses full-plan admission when $name even with the candidate applied unpinned', async ({ ok, establishedLost }) => {
+    { name: 'an existing applied overlay is missing', ok: true, establishedLost: [], omitExisting: true },
+    { name: 'an existing applied tip is replaced with an older pin', ok: true, establishedLost: [], pinExisting: true },
+    { name: 'retained ancestry is unreadable', ok: true, establishedLost: [], retainedSha: 'f'.repeat(40) },
+    { name: 'a retained SHA is missing', ok: true, establishedLost: [], retainedSha: '' },
+  ])('refuses full-plan admission when $name even with the candidate applied unpinned', async ({ ok, establishedLost, omitExisting, pinExisting, retainedSha }) => {
     const f = fixture();
     f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
     const ref = 'lane/promote-stale-green';
@@ -85,9 +187,13 @@ describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before r
       if (!options.overlays.some(o => o.ref === ref)) return realPlan(options);
       fullPlanCalls++;
       expect(options.overlays.map(o => o.ref)).toEqual(['lane/fix-procedure', ref]);
+      const existingSha = gitOk(f.clone, ['rev-parse', 'origin/lane/fix-procedure']).trim();
+      const existing = pinExisting
+        ? { ref: 'lane/fix-procedure', sha: gitOk(f.clone, ['rev-parse', 'origin/main']).trim(), pinnedFrom: existingSha }
+        : { ref: 'lane/fix-procedure', sha: retainedSha ?? existingSha };
       return {
         ok, reason: ok ? undefined : 'pinned-overlay-conflict',
-        applied: [{ ref, sha }], establishedLost,
+        applied: [...(omitExisting ? [] : [existing]), { ref, sha }], establishedLost,
       };
     });
 
@@ -282,6 +388,24 @@ describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before r
       expect(r).toMatchObject({ registered: false, refused: true });
       expect(entry).toBeUndefined();
       expect(f.rebuild).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(['yes load', 'yes load anyway'])('operator-instruction word boundary before load registration: %s', async (instruction) => {
+    const f = fixture();
+    const r = await f.load({
+      ref: 'lane/promote-stale-green', allowConflict: true, operatorInstruction: instruction,
+      readViewer: async () => 'chalbert',
+    });
+    const entry = readOverlays(f.clone, { env: f.env }).find(o => o.ref === 'lane/promote-stale-green');
+    if (instruction === 'yes load') {
+      expect(r).toMatchObject({ registered: false, refused: true });
+      expect(entry).toBeUndefined();
+      expect(f.rebuild).not.toHaveBeenCalled();
+    } else {
+      expect(r.refused).toBeFalsy();
+      expect(entry.conflictOverride).toMatchObject({ instruction, actor: 'chalbert' });
+      expect(f.rebuild).toHaveBeenCalledOnce();
     }
   });
 

@@ -1,8 +1,13 @@
 /** Live existing-card reader, sink and CLI subset; all IO injected. */
+import { readFileSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
+import { buildStandingRulingBody, pickStandingRuling } from '../../conveyor/standing-ruling-mark.mjs';
+import { standingRulingScope } from '../../conveyor/standing-ruling-io.mjs';
 import { planRedTeamRuling, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
 import { operatorBoundComments } from '../../lib/operator-identity.mjs';
 
@@ -24,18 +29,144 @@ const card = { requested: CARD, ref: CARD, readable: true, reason: 'readable' };
 const read = (over = {}) => ({ identity: OP, card, head: HEAD, labels: [{ name: 'review:human' }], comments: thread(), setting: CONFIRMED_BREAKS_DEFAULTS, now: '2026-10-20T20:55:00-04:00', ...over });
 const input = (over = {}) => ({ repo, pr: PR, card: CARD, break: '1', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'card it, ship the PR', ...over });
 
-function fake({ liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', initial = thread() } = {}) {
+function fake({ liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', initial = thread(), failPost = 0,
+  readStandingRulingScope = () => null } = {}) {
   const comments = [...initial], posted = [], labelSyncs = [];
+  let attempts = 0;
   const sinks = createRecordRedTeamRulingSinks({
     readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
     resolveIdentity: () => identity,
-    post: (r, n, body) => { posted.push(body); comments.push({ author: { login: author }, createdAt: '2026-10-20T23:55:00Z', body }); },
+    resolveCard: () => card,
+    readStandingRulingScope,
+    post: (r, n, body) => {
+      if (++attempts === failPost) throw new Error('transient post failure');
+      posted.push(body); comments.push({ author: { login: author }, createdAt: '2026-10-20T23:55:00Z', body });
+    },
     warn: () => {}, syncLabels: a => { labelSyncs.push(a); return { add: null, remove: [] }; },
   });
   return { sinks, comments, posted, labelSyncs };
 }
 const payloadFor = (over = {}, readOver = {}) => planRedTeamRuling(read(readOver), input(over));
 const heldAfter = comments => readRedTeamDisposition({ comments, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).held;
+
+describe('published backing cards at the production reader and release boundary', () => {
+  const file = '6935-prevention-require-named-refusal-and-post-failure-coverage-f.md';
+  const ref = `we:backlog/${file}`;
+  const text = '---\nbornAs: xabc123\nstatus: open\n---\n# Published card\n';
+  const root = join(dirname(fileURLToPath(import.meta.url)), '../../..');
+  const main = (files = {}, fail = '') => {
+    const calls = [];
+    const runGit = args => {
+      calls.push(args);
+      if (args[0] === fail) throw new Error('main unavailable');
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'ls-tree') return Object.keys(files).join('\n');
+      if (args[0] === 'show' && args[1].startsWith('origin/main:backlog/')) {
+        const name = args[1].slice('origin/main:backlog/'.length);
+        if (Object.hasOwn(files, name)) return files[name];
+        throw new Error('absent from origin/main');
+      }
+      throw new Error(`unexpected git arguments: ${JSON.stringify(args)}`);
+    };
+    return { runGit, calls };
+  };
+  const reader = options => createRecordRedTeamRulingReader({ assertFresh: () => {},
+    readThread: () => ({ headRefOid: HEAD, labels: [], comments: thread() }),
+    readStandingRulingScope: () => null, readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }),
+    resolveIdentity: () => OP, ...options });
+
+  it.each([ref, '6935'])('refuses checkout-only card %s as unpublished on main', ask => {
+    expect(readFileSync(join(root, 'backlog', file), 'utf8')).toMatch(/^---/);
+    const io = main();
+    const context = reader(io)(input({ card: ask }));
+    expect(context.card.readable).toBe(false);
+    expect(context.card.reason).toMatch(/has it landed on main.*cite it as we:backlog\/<file>\.md@pr<N>/);
+    expect(() => planRedTeamRuling(context, input({ card: ask }))).toThrow(/does not resolve to a readable backlog card/);
+    expect(io.calls[0]).toEqual(['fetch', '--no-tags', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+  });
+
+  it('refuses a checkout-only card in the sink recheck without posting an operator-card release', () => {
+    const io = main();
+    const comments = thread(), posted = [];
+    const sinks = createRecordRedTeamRulingSinks({ ...io,
+      readThread: () => ({ headRefOid: HEAD, comments: [...comments] }),
+      readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      post: (_repo, _pr, body) => { posted.push(body); comments.push({ author: OP, body }); },
+      syncLabels: () => { throw new Error('must remain held'); },
+    });
+    const plan = payloadFor({ card: ref }, { card: { ...card, ref } });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](plan)).toThrow(/no release record written/);
+    expect(posted).toHaveLength(1);
+    expect(posted.some(body => body.includes(redTeamGateMarker(PR, HEAD, 'operator-card', plan.resultId)))).toBe(false);
+    expect(heldAfter(comments)).toHaveLength(1);
+    expect(io.calls[0]).toEqual(['fetch', '--no-tags', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+  });
+
+  it.each([ref, '6935', 'xabc123'])('resolves %s using main content and enumeration', ask => {
+    const io = main({ [file]: text });
+    expect(reader(io)(input({ card: ask })).card).toMatchObject({ ref, foundIn: 'main', readable: true });
+    expect(io.calls.filter(args => args[0] === 'fetch')).toHaveLength(1);
+    expect(io.calls).toContainEqual(['show', `origin/main:backlog/${file}`]);
+  });
+
+  it('keeps renumbered provisional full references backed by main frontmatter', () => {
+    const oldRef = 'we:backlog/xabc123-follow-up.md';
+    expect(reader(main({ [file]: text }))(input({ card: oldRef })).card)
+      .toMatchObject({ ref: oldRef, readable: true, foundIn: 'main' });
+    expect(reader(main())(input({ card: oldRef })).card.readable).toBe(false);
+  });
+
+  it.each(['fetch', 'show', 'ls-tree'])('fails closed when main %s fails', fail => {
+    const context = reader(main({ [file]: text }, fail))(input({ card: fail === 'ls-tree' ? '6935' : ref }));
+    expect(context.card.readable).toBe(false);
+  });
+
+  it('rejects malformed main content even when the checkout has valid frontmatter', () => {
+    expect(reader(main({ [file]: '# No frontmatter' }))(input({ card: ref })).card.readable).toBe(false);
+  });
+
+  it('keeps explicit open-PR references on the PR readability path', () => {
+    const reads = [];
+    const io = main();
+    const context = reader({ ...io, readOnPr: (name, pr) => { reads.push([name, pr]); return text; } })(input({ card: `${ref}@pr5829` }));
+    expect(context.card).toMatchObject({ ref: `${ref}@pr5829`, foundIn: 'pr-head', readable: true });
+    expect(reads).toEqual([[file, '5829']]);
+    expect(io.calls).toEqual([]);
+  });
+
+  it('does not fall back to main when an explicitly cited PR card is unreadable', () => {
+    const io = main({ [file]: text });
+    expect(reader({ ...io, readOnPr: () => null })(input({ card: `${ref}@pr5829` })).card.readable).toBe(false);
+    expect(io.calls).toEqual([]);
+  });
+});
+
+// Exercise production issue verification and scope construction; only GitHub reads are offline.
+const rulingIssue = { number: 6000, state: 'OPEN', author: OP, lastEditedAt: null,
+  body: buildStandingRulingBody({ repos: [repo], ruledAt: '2026-10-19', confirmedAt: '2026-10-20', words: 'one more round' }) };
+const verifiedScope = ({ repo: slug, pr }) => standingRulingScope({ repo: slug, pr }, {
+  readRuling: () => pickStandingRuling([rulingIssue], { repo: slug }),
+  cardOnly: () => true, unedited: () => ['IC_auto'],
+});
+
+// `consumed`: the gate re-recorded the cap with the grant listed, so the grant no longer reopens the gate.
+function standingThread(lateCap = false, sent = true, consumed = false) {
+  const comments = thread();
+  const { resultId } = liveResultGateState(comments, PR, HEAD);
+  const cap = bot(`${redTeamGateMarker(PR, HEAD, 'round-cap', resultId, [])}\n- 1 confirmed break(s) NOT sent back: round cap (#1).`,
+    lateCap ? '2026-10-20T23:51:00Z' : '2026-10-20T23:41:12Z');
+  comments[1] = cap;
+  comments.push({ id: 'IC_auto', author: { login: 'web-everything[bot]' }, createdAt: '2026-10-20T23:45:00Z',
+    body: buildRoundExtensionComment({ repo, pr: PR, by: 1, actor: OP.login, channel: 'test', reason: 'one more round',
+      at: '2026-10-20T23:45:00Z', standingRuling: `${repo}#6000`, head: HEAD, episode: `${repo}#${PR}@${HEAD}:review:12/12` }) });
+  const scope = verifiedScope({ repo, pr: { number: PR, headRefOid: HEAD, comments } });
+  const ids = gateRoundGrants(operatorBoundComments(comments), PR, repo, scope).map(g => g.id);
+  expect(ids).toHaveLength(1);
+  if (consumed) comments[1] = bot(`${redTeamGateMarker(PR, HEAD, 'round-cap', resultId, ids)}\n- 1 confirmed break(s) NOT sent back: round cap (#1).`, '2026-10-20T23:46:00Z');
+  if (sent) comments.push(bot(`${redTeamGateMarker(PR, HEAD, 'sent-back', resultId, ids)}\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-10-20T23:46:00Z'));
+  if (lateCap) { comments.splice(1, 1); comments.push(cap); }
+  return comments;
+}
 
 function extendedThread({ grantRepo = repo, grantPr = PR, author = OP, sent = true, lateCap = false } = {}) {
   const comments = thread();
@@ -58,15 +189,183 @@ function extendedThread({ grantRepo = repo, grantPr = PR, author = OP, sent = tr
 }
 
 describe('existing-card IO', () => {
+  it.each(['missing', 'unknown', 'read error', 'different reference'])('keeps the break held when the backing card becomes %s while posting the reason', failure => {
+    const comments = thread(), posted = [], resolutions = [], labelSyncs = [];
+    const plan = payloadFor();
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, comments: [...comments] }),
+      readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      resolveCard: (ref, context) => {
+        resolutions.push([ref, context, posted.length]);
+        if (!posted.length) return card;
+        if (failure === 'read error') throw new Error('card read failed');
+        if (failure === 'unknown') return null;
+        return failure === 'missing' ? { ...card, readable: false } : { ...card, ref: 'we:backlog/other.md' };
+      },
+      post: (_repo, _pr, body) => {
+        posted.push(body);
+        comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body });
+      },
+      syncLabels: args => labelSyncs.push(args), warn: () => {},
+    });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](plan)).toThrow(/card.*no release record written/);
+    expect(resolutions.at(-1)).toEqual([CARD, { repo, pr: PR, head: HEAD }, 1]);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).not.toContain('outcome=operator-card');
+    expect(heldAfter(comments)).toHaveLength(1);
+    expect(labelSyncs).toEqual([]);
+  });
+  it('a throwing syncLabels is warned, not fatal', () => {
+    const comments = thread(), posted = [], warnings = [], labelSyncs = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, comments: [...comments] }),
+      resolveIdentity: () => OP,
+      resolveCard: () => card,
+      readStandingRulingScope: () => null,
+      post: (_repo, _pr, body) => {
+        posted.push(body);
+        comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body });
+      },
+      syncLabels: args => { labelSyncs.push(args); throw new Error('label service unavailable'); },
+      warn: message => warnings.push(message),
+    });
+
+    expect(heldAfter(comments)).toHaveLength(1);
+    const result = sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor());
+
+    expect(result).toEqual({ ruling: 'card', head: HEAD, indices: [1], card: { ref: CARD }, labels: null });
+    expect(posted).toHaveLength(2);
+    expect(heldAfter(comments)).toEqual([]);
+    expect(readRedTeamDisposition({ comments, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).sendBack).toEqual([]);
+    expect(labelSyncs).toEqual([{ repo, pr: PR, head: HEAD }]);
+    expect(warnings).toEqual([`red-team-status-label-miss: ${repo}#${PR}: label service unavailable`]);
+  });
+  it('operation IO rulableBreaks and liveResultGateState call sites pass standing-ruling scope explicitly', async () => {
+    const { default: ts } = await import('typescript');
+    const dir = dirname(dirname(fileURLToPath(import.meta.url)));
+    const calls = [], missingScope = [];
+    for (const file of readdirSync(dir).filter(name => name.endsWith('-io.mjs'))) {
+      const source = ts.createSourceFile(file, readFileSync(join(dir, file), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      const visit = node => {
+        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+          const name = node.expression.text;
+          if (name === 'rulableBreaks' || name === 'liveResultGateState') {
+            const at = `${file}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`;
+            calls.push(at);
+            const arg = name === 'liveResultGateState' ? node.arguments[4] : node.arguments[0];
+            const scoped = name === 'liveResultGateState'
+              ? arg && ts.isIdentifier(arg) && arg.text === 'standingRuling'
+              : arg && ts.isObjectLiteralExpression(arg) && arg.properties.some(p =>
+                ts.isShorthandPropertyAssignment(p) && p.name.text === 'standingRuling'
+                || ts.isPropertyAssignment(p) && p.name.getText(source) === 'standingRuling'
+                  && ts.isIdentifier(p.initializer) && p.initializer.text === 'standingRuling');
+            if (!scoped) missingScope.push(at);
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(source);
+    }
+    expect(calls.length).toBeGreaterThan(0);
+    expect(missingScope).toEqual([]);
+  });
+  it('pre-write refuses every selected break when only part of the selection is still held', () => {
+    const findings = [1, 2].map(n => ({ summary: `confirmed break ${n}`, category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }));
+    const initial = [redTeam(HEAD, findings), capped()];
+    const plan = payloadFor({ break: '1,2' }, { comments: initial });
+    expect(plan.indices).toEqual([1, 2]);
+    const alreadyCarded = { author: OP, createdAt: '2026-10-20T23:50:00Z',
+      body: `${redTeamGateMarker(PR, HEAD, 'operator-card', plan.resultId)}\n- 1 finding(s) carded by the operator to \`${CARD}\` (#1).` };
+    const f = fake({ initial: [...initial, alreadyCarded] });
+    expect(heldAfter(f.comments).map(finding => finding.index)).toEqual([2]);
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](plan)).toThrow(/#1.*no longer held.*nothing written/);
+    expect(f.posted).toEqual([]);
+    expect(f.labelSyncs).toEqual([]);
+  });
+  it.each([false, true])('pre-write re-verifies a standing grant added after planning (late cap: %s)', lateCap => {
+    const plan = payloadFor();
+    const calls = [];
+    const f = fake({ initial: standingThread(lateCap), readStandingRulingScope: args => { calls.push(args); return verifiedScope(args); } });
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](plan)).toThrow(/no red-team break is held.*nothing written/);
+    expect(calls[0]).toMatchObject({ repo, pr: { number: PR, headRefOid: HEAD, comments: f.comments } });
+    expect(f.posted).toEqual([]);
+    expect(f.labelSyncs).toEqual([]);
+  });
+  it('read-back uses a fresh standing scope for result and disposition proof', () => {
+    const calls = [];
+    const f = fake({ initial: standingThread(false, false, true), readStandingRulingScope: args => { calls.push(args); return verifiedScope(args); } });
+    expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toMatchObject({ indices: [1] });
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(calls.at(-1).pr.comments.some(c => c.body.includes('outcome=operator-card'))).toBe(true);
+    expect(f.labelSyncs).toHaveLength(1);
+  });
+  it('reader and sink default to the production standing-ruling scope verifier', async () => {
+    const comments = standingThread();
+    const scope = verifiedScope({ repo, pr: { number: PR, headRefOid: HEAD, comments } });
+    const { vi } = await import('vitest');
+    const spy = vi.spyOn(await import('../../conveyor/standing-ruling-io.mjs'), 'standingRulingScope').mockReturnValue(scope);
+    try {
+      const readThread = () => ({ headRefOid: HEAD, comments });
+      const context = createRecordRedTeamRulingReader({ assertFresh: () => {}, readThread,
+        resolveIdentity: () => OP, resolveCard: () => card, readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }) })(input());
+      expect(context.standingRuling).toBe(scope);
+      expect(() => planRedTeamRuling(context, input())).toThrow(/no red-team break is held/);
+      const posted = [];
+      const sinks = createRecordRedTeamRulingSinks({ readThread, resolveIdentity: () => OP, post: (...args) => posted.push(args) });
+      expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no red-team break is held.*nothing written/);
+      expect(posted).toEqual([]);
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(spy).toHaveBeenLastCalledWith({ repo, pr: { number: PR, headRefOid: HEAD, comments } });
+    } finally { spy.mockRestore(); }
+  });
+  it.each(['head', 'standing grant'])('refuses release if the %s changes during the reason POST', variant => {
+    let postedReason = false;
+    const posted = [], synced = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: postedReason && variant === 'head' ? OTHER : HEAD,
+        comments: postedReason && variant === 'standing grant' ? standingThread() : thread() }),
+      readStandingRulingScope: verifiedScope, resolveIdentity: () => OP,
+      post: (_r, _n, body) => { posted.push(body); postedReason = true; }, syncLabels: args => synced.push(args),
+    });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/reason posted; no release record written/);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toContain('> card it, ship the PR');
+    expect(synced).toEqual([]);
+  });
+  it.each([
+    'we:backlog/x.md`\n- evil', 'we:backlog/x.md\n', 'we:backlog/x.md\r',
+    'we:backlog/x.md\u2028', 'we:backlog/x`y.md', 'we:backlog/x"y.md',
+    '--we:backlog/x.md', 'we:backlog/../x.md', 'we:backlog/x/../y.md',
+    'we:other/x.md', 'we:backlog/ｘ.md', 'we:backlog/x\u200b.md',
+    'we:backlog/x.mdwe:backlog/y.md', 'we:backlog/x.md@pr0',
+  ])('unsafe card reference %j throws before posting anything', cardRef => {
+    const f = fake();
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT]({ ...payloadFor(), cardRef })).toThrow(/unsafe reference.*nothing written/s);
+    expect(f.posted).toEqual([]);
+    expect(f.labelSyncs).toEqual([]);
+  });
+  it.each([1, 2])('post %i failure leaves the break held and a retry can record the reason and release', failPost => {
+    const f = fake({ failPost });
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/transient post failure/);
+    expect(heldAfter(f.comments).map(finding => finding.index)).toEqual([1]);
+    expect(f.labelSyncs).toEqual([]);
+    if (failPost === 2) expect(f.posted[0]).toContain('> card it, ship the PR');
+    const retry = payloadFor({}, { comments: f.comments });
+    expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](retry)).toMatchObject({ indices: [1] });
+    expect(f.posted.at(-2)).toContain('> card it, ship the PR');
+    expect(f.posted.at(-1)).toContain('outcome=operator-card');
+    expect(heldAfter(f.comments)).toEqual([]);
+    expect(f.labelSyncs).toHaveLength(1);
+  });
   for (const phase of ['planning', 'pre-write']) {
     it.each([
       ['authenticated grant and send-back', {}, true],
       ['cap POST arriving after send-back', { lateCap: true }, true],
-      ['grant awaiting send-back', { sent: false }, false],
+      ['grant awaiting send-back', { sent: false }, false, true],
       ['grant for another repo', { grantRepo: 'other/repo' }, false],
       ['grant for another PR', { grantPr: PR + 1 }, false],
       ['automation-posted grant without a verified standing ruling', { author: { login: 'web-everything', type: 'Bot' } }, false],
-    ])(`${phase}: %s preserves the current owner`, (_name, options, fixerOwns) => {
+    ])(`${phase}: %s preserves the current owner`, (_name, options, fixerOwns, pendingGrant = false) => {
       const plan = payloadFor(); // Plan while the break is still cap-held.
       const comments = extendedThread(options);
       const d = readRedTeamDisposition({ comments: operatorBoundComments(comments), repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS });
@@ -75,7 +374,12 @@ describe('existing-card IO', () => {
       expect(d.sendBack.map(f => f.index)).toEqual(fixerOwns ? [1] : []);
       const f = fake({ initial: comments });
       const act = phase === 'planning' ? () => payloadFor({}, { comments }) : () => f.sinks[RED_TEAM_RULING_CARD_EFFECT](plan);
-      if (fixerOwns) {
+      if (pendingGrant) {
+        // The reader still holds the break, but the gate has not consumed the grant: a ruling now would race the send-back.
+        expect(act).toThrow(phase === 'planning' ? /pending round extension/ : /pending round extension.*nothing written/);
+        expect(f.posted).toEqual([]);
+        expect(f.labelSyncs).toEqual([]);
+      } else if (fixerOwns) {
         expect(act).toThrow(phase === 'planning' ? /no red-team break is held/ : /no red-team break is held.*nothing written/);
         expect(f.posted).toEqual([]);
         expect(f.labelSyncs).toEqual([]);
@@ -96,9 +400,9 @@ describe('existing-card IO', () => {
     const out = f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor());
     expect(out).toMatchObject({ ruling: 'card', indices: [1], card: { ref: CARD } });
     expect(f.posted).toHaveLength(2);
-    expect(f.posted[0]).toContain(`outcome=operator-card result=${liveResultGateState(thread(), PR, HEAD).resultId}`);
-    expect(f.posted[0]).toContain(`- 1 finding(s) carded by the operator to \`${CARD}\` (#1).`);
-    expect(f.posted[1]).toContain('> card it, ship the PR');
+    expect(f.posted[0]).toContain('> card it, ship the PR');
+    expect(f.posted[1]).toContain(`outcome=operator-card result=${liveResultGateState(thread(), PR, HEAD).resultId}`);
+    expect(f.posted[1]).toContain(`- 1 finding(s) carded by the operator to \`${CARD}\` (#1).`);
     expect(heldAfter(f.comments)).toEqual([]);
     expect(f.labelSyncs).toEqual([{ repo, pr: PR, head: HEAD }]);
     expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no red-team break is held/);
@@ -133,7 +437,8 @@ describe('existing-card IO', () => {
       { headRefOid: HEAD, comments: [...thread(), next] },
     ]) {
       let n = 0;
-      const sinks = createRecordRedTeamRulingSinks({ readThread: () => n++ === 0 ? { headRefOid: HEAD, comments: thread() } : after,
+      const sinks = createRecordRedTeamRulingSinks({ readThread: () => n++ < 2 ? { headRefOid: HEAD, comments: thread() } : after,
+        resolveCard: () => card,
         resolveIdentity: () => OP, post: () => {}, warn: () => {}, syncLabels: () => null });
       expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/head moved|not in the read-back|result changed/);
     }
@@ -151,6 +456,52 @@ describe('existing-card IO', () => {
 });
 
 describe('standalone CLI', () => {
+  it.each([
+    [['--preview'], true], [['--preview=true'], true], [['--preview=1'], true],
+    [['--preview=false'], false], [['--preview=0'], false],
+    [['--preview', '--preview=false'], false], [['--preview=false', '--preview=1'], true],
+  ])('selects stores using the parsed preview value for %j', async (flags, preview) => {
+    const { main } = await import('../record-red-team-ruling-cli.mjs');
+    const runStores = await import('../run-store.mjs');
+    const callLogs = await import('../call-log-store.mjs');
+    const { vi } = await import('vitest');
+    const f = fake();
+    const entry = () => ({ declaration: recordRedTeamRulingOperation({ readRulingContext: () => read() }), sinks: f.sinks });
+    // Observe the actual default-store branch without writing persistent run data.
+    const fileStore = vi.spyOn(runStores, 'createFileRunStore').mockImplementation(() => runStores.createMemoryRunStore());
+    const fileLog = vi.spyOn(callLogs, 'createFileCallLogStore').mockImplementation(() => callLogs.createMemoryCallLogStore());
+    const output = vi.spyOn(await import('../../lib/write-all-sync.mjs'), 'writeAllSync').mockImplementation(() => {});
+    try {
+      expect(await main(['--pr=5530', '--repo=o/r', '--break=1', '--ruling=card', `--card=${CARD}`,
+        '--actor=chalbert', '--channel=chat', '--reason=ok', ...flags], { entry })).toBe(0);
+      expect(fileStore).toHaveBeenCalledTimes(preview ? 0 : 1);
+      expect(fileLog).toHaveBeenCalledTimes(preview ? 0 : 1);
+      expect(f.posted).toHaveLength(preview ? 0 : 2);
+      expect(heldAfter(f.comments)).toHaveLength(preview ? 1 : 0);
+    } finally { fileStore.mockRestore(); fileLog.mockRestore(); output.mockRestore(); }
+  });
+  it.each([false, true])('live CLI refuses a break sent back under a verified standing ruling (late cap: %s)', async lateCap => {
+    const { main } = await import('../record-red-team-ruling-cli.mjs');
+    const { createMemoryRunStore } = await import('../run-store.mjs');
+    const { createMemoryCallLogStore } = await import('../call-log-store.mjs');
+    const f = fake({ initial: standingThread(lateCap) });
+    const entry = () => ({ declaration: recordRedTeamRulingOperation({ readRulingContext: createRecordRedTeamRulingReader({
+      assertFresh: () => {}, readThread: () => ({ headRefOid: HEAD, comments: f.comments }),
+      readStandingRulingScope: verifiedScope,
+      readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), resolveIdentity: () => OP, resolveCard: () => card,
+    }) }), sinks: f.sinks });
+    const chunks = [];
+    const { vi } = await import('vitest');
+    const spy = vi.spyOn(await import('../../lib/write-all-sync.mjs'), 'writeAllSync').mockImplementation((_fd, t) => chunks.push(String(t)));
+    try {
+      const code = await main(['--pr=5530', '--repo=o/r', '--break=1', '--ruling=card', `--card=${CARD}`, '--actor=chalbert', '--channel=chat', '--reason=ok'],
+        { entry, stores: { store: createMemoryRunStore(), callLog: createMemoryCallLogStore() } });
+      expect(code).not.toBe(0);
+      expect(chunks.join('')).toMatch(/no red-team break is held/);
+    } finally { spy.mockRestore(); }
+    expect(f.posted).toEqual([]);
+    expect(f.labelSyncs).toEqual([]);
+  });
   it.each([true, false])('runs the real CLI with preview=%s and the existing-card sink', async preview => {
     const { main } = await import('../record-red-team-ruling-cli.mjs');
     const { createMemoryRunStore } = await import('../run-store.mjs');

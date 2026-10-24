@@ -13,6 +13,8 @@ import { resolveReviewSettings, validateReviewSettings, resolveReferralSafetySet
 import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 import { classifyEvent, normalizeComment } from '../../operations/coroner-rounds.mjs';
 import { H1, H2, H3, H4, repo, record, recordComment, iso } from './ruling-fixtures.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
+import { parseLatestHumanClearedSha } from '../../lib/review-escalation.mjs';
 
 const AUTO = { referralDefault: 'auto-block' };
 const OPERATOR = { referralDefault: 'operator' };
@@ -46,6 +48,44 @@ describe('auto-block plan', () => {
     const plan = planAutoBlock(parked(), { mode: 'auto-block', cardReadable });
     expect(plan.block).toHaveLength(1);
     expect(plan.operator).toHaveLength(0);
+  });
+  it('a trusted human clearance is final for its head; an older clearance leaves the new head reviewable', () => {
+    const withClearance = (headSha) => parked({ headRefOid: H2, comments: [
+      recordComment(record({ head: H2, runId: 'run-2' }), 5),
+      { body: buildVerdictComment({ to: 'clear-human', actor: 'Nicolas Gilbert', headSha }),
+        createdAt: iso(10), author: { login: 'web-everything' } },
+    ] });
+    const opts = { mode: 'auto-block', cardReadable, isJudgment: () => false };
+    const older = withClearance(H1);
+    expect(parseLatestHumanClearedSha(older.comments)).toBe(H1);
+    expect(planAutoBlock(older, opts)).toMatchObject({ head: H2, block: [expect.any(Object)], operator: [] });
+
+    const cleared = withClearance(H2);
+    expect(parseLatestHumanClearedSha(cleared.comments)).toBe(cleared.headRefOid);
+    expect(planAutoBlock(cleared, opts)).toBeNull();
+  });
+  it('clear-human then a same-head plain accept remains protected from auto-block', () => {
+    const pr = parked();
+    pr.comments.push(
+      { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: H1 }), author: { login: 'web-everything' } },
+      { body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: H1 }), author: { login: 'web-everything' } },
+    );
+    expect(parseLatestHumanClearedSha(pr.comments)).toBeNull();
+    expect(planAutoBlock(pr, { mode: 'auto-block', cardReadable, isJudgment: () => false })).toBeNull();
+  });
+  it.each([
+    ['trusted current-head clearance', H2, { login: 'web-everything' }, true],
+    ['trusted stale-head clearance', H1, { login: 'web-everything' }, false],
+    ['untrusted current-head marker', H2, { login: 'drive-by' }, false],
+    ['current-head marker with no author', H2, undefined, false],
+  ])('auto-block respects %s with a mixed-case live head', (_name, headSha, author, final) => {
+    const pr = parked({ headRefOid: H2.toUpperCase(), comments: [
+      recordComment(record({ head: H2, runId: 'run-2' }), 5),
+      { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), createdAt: iso(10), author },
+    ] });
+    const plan = planAutoBlock(pr, { mode: 'auto-block', cardReadable, isJudgment: () => false });
+    if (final) expect(plan).toBeNull();
+    else expect(plan).toMatchObject({ head: H2, block: [expect.any(Object)], operator: [] });
   });
   it('a finding the reviewer marked a judgment call stays with the operator', () => {
     const plan = planAutoBlock(parked(), { mode: 'auto-block', cardReadable, isJudgment: () => true });

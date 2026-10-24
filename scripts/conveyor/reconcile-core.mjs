@@ -518,6 +518,17 @@ export function splitFailingChecks(rollup, requiredChecks) {
   return out;
 }
 
+/**
+ * PURE: a review bounce still owes CI repair when a real required check is red (#5729).
+ * Conflict-labelled bounces retain their repair owner; review-gate/merge-gate are intentional holds.
+ */
+export function isBouncedRealRed({ pr, phase, check, requiredChecks }) {
+  return phase === 'bounced' && !labelNames(pr?.labels).includes(CONFLICT_LABEL)
+    && check?.state === 'red'
+    && splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required
+      .some(name => name !== 'review-gate' && name !== 'merge-gate');
+}
+
 /** PURE: settled head CI missing a required job introduced after this PR's base. */
 export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length
@@ -2835,8 +2846,16 @@ export function planReconcile({
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
     };
-    const ciRepairOwed = ['ci-red', 'needs-human'].includes(phase)
-      && ciHealOwed({ state: pr.state, labels: pr.labels, ci: check.state, phase });
+    const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
+    // Only a proven real required failure on a bounced PR transfers review:changes ownership to CI repair.
+    // Keep the shared open-state, definitive-red and CI-heal cap guards for that exception too.
+    const ciHealInput = { state: pr.state, ci: check.state, phase,
+      labels: bouncedRealRed ? labelNames(pr.labels).filter(name => name !== 'review:changes') : pr.labels };
+    // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
+    // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
+    const ciRepairOwed = (['ci-red', 'needs-human'].includes(phase)
+      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap)))
+      && ciHealOwed(ciHealInput);
     if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
@@ -3266,7 +3285,7 @@ export function planReconcile({
       // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
       // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
       // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
-      if (fixTiming.joinCiAndReview && readiness.ciFailed && readiness.reviewFindings && roundAttempts() >= effectiveRoundCap) {
+      if ((bouncedRealRed || (fixTiming.joinCiAndReview && readiness.ciFailed && readiness.reviewFindings)) && roundAttempts() >= effectiveRoundCap) {
         refuseCapExhausted({ ...withPhase, attempts: roundAttempts(), cap: effectiveRoundCap, capKind: 'fix',
           why: 'joined CI/review repair cannot bypass the review-fix round cap' });
         continue;
@@ -3277,7 +3296,7 @@ export function planReconcile({
       const refunded = healBudget.windowRefunded;
       const healFacts = { failingRequiredChecks: failing.required, nonRequiredRed: failing.nonRequired, ciHealBudget: healBudget.log };
       const refund = refunded > 0 ? { refunded } : {};
-      if (!ciHealOwed({ state: pr.state, labels: pr.labels, ci: check.state, phase, attempts: ciHealAttempts, cap: ciHealCap })) {
+      if (!ciHealOwed({ ...ciHealInput, attempts: ciHealAttempts, cap: ciHealCap })) {
         refuse('cap-exhausted', {
           ...withPhase, ...refund, ...healFacts, attempts: ciHealAttempts, cap: ciHealCap,
           why: `the PR's own durable CI-heal count is ${ciHealAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,

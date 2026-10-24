@@ -44,9 +44,10 @@ function fixture({ pinnedA = false } = {}) {
   gitOk(clone, ['push', '-q', '-u', 'origin', 'main']);
   const author = join(base, 'author');
   gitOk(base, ['clone', '-q', origin, author]);
-  const push = (ref, from, files) => {
+  const push = (ref, from, files, mergeParent = null) => {
     gitOk(author, ['fetch', '-q', 'origin']);
     gitOk(author, ['checkout', '-q', '-B', ref, from]);
+    if (mergeParent) gitOk(author, ['merge', '--no-ff', '--no-commit', mergeParent]);
     for (const [n, c] of Object.entries(files)) write(author, n, c);
     gitOk(author, ['add', '-A']);
     gitOk(author, ['commit', '-q', '-m', ref]);
@@ -69,6 +70,101 @@ function fixture({ pinnedA = false } = {}) {
 }
 
 describe('planRebuild retry pass', () => {
+  it.each([
+    { repair: true, explicitA: false, label: 'retries a pin-induced refusal and keeps explicit P (A,P,R)' },
+    { repair: false, explicitA: false, label: 'returns the original pin-induced refusal when retries lose carried A' },
+    { repair: true, explicitA: true, label: 'never disables an explicit pin to escape a refusal' },
+  ])('$label', async ({ repair, explicitA }) => {
+    const f = fixture();
+    const base = f.push('main', f.mainSha, { 'a.txt': 'BASE\n', 'p.txt': 'BASE\n', 'shared.txt': 'BASE\n' });
+    const a0 = f.push('lane/a', base, { 'a.txt': 'OLD-A\n' });
+    const p0 = f.push('lane/p', base, { 'p.txt': 'OLD-P\n' });
+    const overlays = [{ ref: 'lane/a', pinned: explicitA }, { ref: 'lane/p', pinned: true }];
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const args = { git: f.runGit, mainRef: 'origin/main', overlays, edgeResolve: false, stackMode: 'independent' };
+    const live = await planRebuild({ ...args, headSha: base });
+    expect(live.applied.map(a => a.sha)).toEqual([a0, p0]);
+    const main = f.push('main', base, { 'p.txt': 'MAIN\n', 'shared.txt': 'MAIN\n' });
+    const a1 = f.push('lane/a', a0, { 'a.txt': 'NEW-A\n', 'shared.txt': 'NEW-A\n' });
+    const p1 = f.push('lane/p', p0, { 'p.txt': 'MAIN\n', 'a.txt': 'NEW-A\n' });
+    if (repair) {
+      f.push('lane/repair', main, { 'shared.txt': 'BASE\n' });
+      overlays.push({ ref: 'lane/repair' });
+    }
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+
+    const plan = await planRebuild({ ...args, headSha: live.finalSha });
+    if (!repair || explicitA) {
+      expect(plan).toMatchObject({ ok: false, reason: 'pinned-overlay-conflict',
+        detail: { ref: 'lane/p', sha: p1, dropReason: 'conflict', pinnedBy: 'flag' } });
+      expect(plan.alerts).toEqual([expect.objectContaining({ kind: 'overlay-pinned',
+        detail: expect.objectContaining({ ref: 'lane/a', adopted: a0, newTip: a1 }) })]);
+      return;
+    }
+    expect(plan.ok).toBe(true);
+    expect(plan.establishedLost).toEqual([]);
+    expect(plan.applied.find(a => a.ref === 'lane/a')).toMatchObject({ sha: a1 });
+    expect(plan.applied.find(a => a.ref === 'lane/a').pinnedFrom).toBeUndefined();
+    expect(plan.applied.find(a => a.ref === 'lane/p')).toMatchObject({ sha: p1 });
+    expect(plan.applied.find(a => a.ref === 'lane/p').pinnedFrom).toBeUndefined();
+    expect(plan.applied.map(a => a.ref)).toContain('lane/repair');
+    for (const sha of [a0, p0, a1, p1]) {
+      expect(f.runGit(['merge-base', '--is-ancestor', sha, plan.finalSha]).status).toBe(0);
+    }
+  }, 60_000);
+
+  it.each([
+    { movedBase: false, label: 'accepts a pin retry whose stack top carries the originally applied base (B,A,C,R)' },
+    { movedBase: true, label: 'rejects a pin retry that genuinely drops the originally applied base tip' },
+  ])('$label', async ({ movedBase }) => {
+    const f = fixture();
+    const base = f.push('main', f.mainSha, { 'shared.txt': 'base\n', 'c.txt': 'base\n' });
+    const b0 = f.push('lane/b', base, { 'b.txt': 'B\n' });
+    const a0 = f.push('lane/a', base, { 'a.txt': 'old-A\n' });
+    const c0 = f.push('lane/c', base, { 'c.txt': 'old-C\n' });
+    const overlays = ['b', 'a', 'c'].map(name => ({ ref: `lane/${name}` }));
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+    const args = { git: f.runGit, mainRef: 'origin/main', overlays, edgeResolve: false, stackMode: 'tops' };
+    const live = await planRebuild({ ...args, headSha: base });
+    expect(live.applied.map(a => a.sha)).toEqual([b0, a0, c0]);
+    const main = f.push('main', base, { 'shared.txt': 'main\n', 'c.txt': 'main-C\n' });
+    const a1 = f.push('lane/a', a0, {
+      'a.txt': 'new-A\n', 'shared.txt': 'new-A\n', ...(movedBase ? { 'b.txt': 'top-B\n' } : {}),
+    }, b0);
+    const b1 = movedBase ? f.push('lane/b', b0, { 'b.txt': 'new-B\n' }) : b0;
+    // A declares B as its base even when B advances beyond the head carried by A.
+    overlays[1].stackBases = ['lane/b'];
+    const c1 = f.push('lane/c', c0, { 'c.txt': 'main-C\n', 'a.txt': 'new-A\n' });
+    const repair = f.push('lane/repair', main, { 'shared.txt': 'base\n', 'repair.txt': 'R\n' });
+    overlays.push({ ref: 'lane/repair' });
+    gitOk(f.clone, ['fetch', '-q', 'origin']);
+
+    const retry = await planRebuild({ ...args, headSha: live.finalSha, noPin: new Set(['lane/a']) });
+    expect(retry.ok).toBe(true);
+    expect(retry.establishedLost).toEqual([]);
+    expect(retry.applied.some(a => a.ref === 'lane/b')).toBe(false);
+    expect(f.runGit(['merge-base', '--is-ancestor', b1, retry.finalSha]).status).toBe(movedBase ? 1 : 0);
+    const plan = await planRebuild({ ...args, headSha: live.finalSha });
+    if (movedBase) {
+      // B0 survives through A1, so establishedLost is empty in the retry, but B1 would really be lost.
+      expect(plan.applied).toContainEqual(expect.objectContaining({ ref: 'lane/b', sha: b1 }));
+      expect(plan.applied.find(a => a.ref === 'lane/a')).toMatchObject({ sha: a0, pinnedFrom: a1 });
+      expect(plan.establishedLost.map(a => a.ref)).toContain('lane/c');
+      expect(plan.finalSha).not.toBe(retry.finalSha);
+      return;
+    }
+    expect(plan.ok).toBe(true);
+    expect(plan.establishedLost).toEqual([]);
+    expect(plan.alerts.map(a => a.kind)).not.toContain('established-overlay-hold');
+    expect(plan.applied).toContainEqual(expect.objectContaining({ ref: 'lane/repair', sha: repair }));
+    expect(plan.applied.find(a => a.ref === 'lane/a')).toMatchObject({ sha: a1 });
+    expect(plan.applied.find(a => a.ref === 'lane/a').pinnedFrom).toBeUndefined();
+    expect(plan.applied.some(a => a.ref === 'lane/b')).toBe(false);
+    for (const sha of [b0, a1, c1, repair]) {
+      expect(f.runGit(['merge-base', '--is-ancestor', sha, plan.finalSha]).status).toBe(0);
+    }
+  }, 60_000);
+
   it.each([
     { count: 6, label: 'tries every subset for six pins', jointRetries: 56 },
     { count: 7, label: 'caps extra joint retries at 64', jointRetries: 64 },

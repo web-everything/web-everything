@@ -77,6 +77,8 @@ import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
 import { createMaintenanceSinks } from './maintenance-io.mjs';
 import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
+import { prototypeLoadOperation, PROTOTYPE_LOAD_OP, PROTOTYPE_LOAD_EFFECT } from './prototype-load.mjs';
+import { createPrototypeLoader, defaultDeps as prototypeLoadDeps } from './prototype-load-io.mjs';
 import { collectFreeScope } from './free-scope-io.mjs';
 import { reviewSeatCapsOperation, REVIEW_SEAT_CAPS_OP } from './review-seat-caps.mjs';
 import { readSeatCapUsage } from './review-extra-seats.mjs';
@@ -413,6 +415,13 @@ export const OPERATIONS = Object.freeze({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
   }),
+  [PROTOTYPE_LOAD_OP]: () => ({ declaration: prototypeLoadOperation(),
+    sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => createPrototypeLoader(prototypeLoadDeps())(input) },
+    finish: ({ run, code, lines, json }) => run?.verdict ? {
+      code: run.verdict.ok ? 0 : 1,
+      lines: [JSON.stringify(json ? run.verdict : Object.fromEntries(
+        ['ok', 'daemon', 'clone', 'registered', 'adopted', 'stopReason', ...(run.verdict.stale?.length ? ['stale'] : [])].map((key) => [key, run.verdict[key]])))],
+    } : { code, lines } }),
   // Card xn2wf9t (#3383 follow-up) — the operator's "how close is each non-Claude review seat provider to its
   // own daily call cap" one-liner, `heavy-queue`-style. Read-only, same no-sinks reasoning: every step is
   // `compute`. The real scorecard-store + reservation-ledger read (`readSeatCapUsage`) is bound here, and ONLY here.

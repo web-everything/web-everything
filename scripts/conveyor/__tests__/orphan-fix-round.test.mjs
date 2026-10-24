@@ -11,6 +11,8 @@ import {
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../fixer-stuck-reclaim.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
+import { parseLatestHumanClearedSha } from '../../lib/review-escalation.mjs';
 
 const BOT = { login: 'web-everything' };
 const c = (createdAt, body, author = BOT) => ({ createdAt, body, author });
@@ -28,6 +30,43 @@ describe('planOrphanFixRound — the #4715 shapes', () => {
     const p = planOrphanFixRound({ pr: pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END]), nowMs: NOW });
     expect(p.decision).toBe('rearm');
     expect(p.roundAt).toBe('2026-10-10T15:21:33.000Z');
+  });
+
+  it('a trusted human clearance prevents rearm only when it names the current head', () => {
+    const withClearance = (headSha) => pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END,
+      c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'Nicolas Gilbert', headSha })),
+    ]);
+    const olderHead = 'd9829f557f3f264ac885722cb9afef18bd91ca7f';
+    const older = withClearance(olderHead);
+    expect(parseLatestHumanClearedSha(older.comments)).toBe(olderHead);
+    expect(planOrphanFixRound({ pr: older, nowMs: NOW }).decision).toBe('rearm');
+
+    const cleared = withClearance(HEAD);
+    expect(parseLatestHumanClearedSha(cleared.comments)).toBe(cleared.headRefOid);
+    expect(planOrphanFixRound({ pr: cleared, nowMs: NOW }).decision).toBe('none');
+  });
+
+  it('clear-human then a same-head plain accept remains protected from orphan rearm', () => {
+    const pr = pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END,
+      c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: HEAD })),
+      c('2026-10-10T15:23:00Z', buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: HEAD })),
+    ]);
+    expect(parseLatestHumanClearedSha(pr.comments)).toBeNull();
+    expect(planOrphanFixRound({ pr, nowMs: NOW })).toEqual({ decision: 'none', reason: 'human-cleared head — final' });
+  });
+
+  it.each([
+    ['trusted current-head clearance', HEAD, BOT, 'none'],
+    ['trusted stale-head clearance', 'd9829f557f3f264ac885722cb9afef18bd91ca7f', BOT, 'rearm'],
+    ['untrusted current-head marker', HEAD, { login: 'drive-by' }, 'rearm'],
+    ['current-head marker with no author', HEAD, null, 'rearm'],
+  ])('orphan guard respects %s with a mixed-case live head', (_name, headSha, author, decision) => {
+    const pr = pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END,
+      c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), author),
+    ], { headRefOid: HEAD.toUpperCase() });
+    const plan = planOrphanFixRound({ pr, nowMs: NOW });
+    expect(plan.decision).toBe(decision);
+    if (decision === 'none') expect(plan).toEqual({ decision: 'none', reason: 'human-cleared head — final' });
   });
 
   it('re-dispatches a restack-only round that never addressed the review', () => {

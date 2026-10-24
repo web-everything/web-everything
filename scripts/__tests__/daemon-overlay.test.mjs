@@ -96,6 +96,40 @@ function overlayStateFile(overlayDir, cloneDir) {
   return names.length ? JSON.parse(readFileSync(join(overlayDir, names[0]), 'utf8')) : null;
 }
 
+describe('daemon-overlay.mjs add — expected SHA admission', () => {
+  it.each([false, true])('refuses an advanced branch before registration (check: %s)', (check) => {
+    const f = makeFixture();
+    const ref = 'lane/sha-bound';
+    pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'first.txt', 'approved\n'));
+    const approved = gitOk(f.originDir, ['rev-parse', `refs/heads/${ref}`]).trim();
+    pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'second.txt', 'unapproved\n'), { base: `origin/${ref}` });
+    const advanced = gitOk(f.originDir, ['rev-parse', `refs/heads/${ref}`]).trim();
+    const r = runCli(['add', `--clone=${f.cloneDir}`, `--ref=${ref}`, `--expected-sha=${approved}`, '--json', ...(check ? ['--check'] : [])], { ...f.env, WE_OVERLAY_NO_PR: 'warn' });
+    expect(r.status).toBe(3);
+    expect(JSON.parse(r.stdout)[check ? 'check' : 'conflictCheck']).toMatchObject({ ok: false, reason: 'sha-moved', candSha: advanced, expectedSha: approved });
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+    expect(readdirSync(f.overlayDir).filter((name) => name.endsWith('.events.jsonl'))).toEqual([]);
+  });
+
+  it('accepts the exact approved SHA and returns its admission evidence', () => {
+    const f = makeFixture();
+    pushBranch(f.originDir, 'lane/approved', (dir) => writeFile(dir, 'approved.txt', 'approved\n'));
+    const sha = gitOk(f.originDir, ['rev-parse', 'refs/heads/lane/approved']).trim();
+    const r = runCli(['add', `--clone=${f.cloneDir}`, '--ref=lane/approved', `--expected-sha=${sha}`, '--json'], { ...f.env, WE_OVERLAY_NO_PR: 'warn' });
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout).conflictCheck).toMatchObject({ ok: true, clean: true, candSha: sha });
+    expect(overlayStateFile(f.overlayDir, f.cloneDir).overlays.map((row) => row.ref)).toEqual(['lane/approved']);
+  });
+
+  it.each(['short', '', 'A'.repeat(40)])('rejects malformed expected SHA without registration: %s', (sha) => {
+    const f = makeFixture();
+    const r = runCli(['add', `--clone=${f.cloneDir}`, '--ref=lane/missing', `--expected-sha=${sha}`, '--json'], f.env);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('--expected-sha');
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+  });
+});
+
 describe('daemon-overlay.mjs add — the no-PR warning (xkhtg2a)', () => {
   function fixture(mode) {
     const f = makeFixture();
@@ -191,7 +225,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     expect(state.overlays.map((o) => o.ref)).toEqual(['lane/fix-procedure']); // #2826 never registered
   });
 
-  it('--allow-conflict --reason=... registers anyway, and PRINTS which overlay/file conflicts', () => {
+  function expectAuthorizedConflict(instruction) {
     const { originDir, cloneDir, overlayDir, env } = makeFixture();
     advanceMain(originDir, (dir) => writeFile(dir, 'shared.mjs', 'export const X = 1;\n'));
     pushBranch(originDir, 'lane/fix-procedure', (dir) => writeFile(dir, 'shared.mjs', 'export const X = 2;\n'));
@@ -200,7 +234,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
 
     const r = runCli([
       'add', `--clone=${cloneDir}`, '--ref=lane/promote-stale-green', '--pr=2826',
-      '--allow-conflict', '--reason=operator-approved override', '--operator-instruction=yes register 2826 despite the conflict',
+      '--allow-conflict', '--reason=operator-approved override', `--operator-instruction=${instruction}`,
     ], asGhLogin(env, 'chalbert'));
     expect(r.status).toBe(0);
     expect(r.stderr).toMatch(/registering DESPITE a known conflict/);
@@ -210,8 +244,16 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     expect(state.overlays.map((o) => o.ref).sort()).toEqual(['lane/fix-procedure', 'lane/promote-stale-green']);
     // the operator's own words are stored on the registration
     expect(state.overlays.find((o) => o.ref === 'lane/promote-stale-green').conflictOverride).toMatchObject({
-      instruction: 'yes register 2826 despite the conflict', actor: 'chalbert', files: ['shared.mjs'],
+      instruction, actor: 'chalbert', files: ['shared.mjs'],
     });
+  }
+
+  it('--allow-conflict --reason=... registers anyway, and PRINTS which overlay/file conflicts', () => {
+    expectAuthorizedConflict('yes register 2826 despite the conflict');
+  });
+
+  it('--allow-conflict accepts an operator instruction at the three-word minimum', () => {
+    expectAuthorizedConflict('yes register 2826');
   });
 
   it.each([
@@ -220,6 +262,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     ['an agent-typed --actor=operator under another human credential', ['--operator-instruction=yes register 2826 despite the conflict', '--actor=operator', '--by=chalbert'], 'someone-else'],
     ['an agent-typed --actor=operator when no credential can be read', ['--operator-instruction=yes register 2826 despite the conflict', '--actor=operator'], null],
     ['a one-word instruction', ['--operator-instruction=ok'], 'chalbert'],
+    ['a two-word instruction', ['--operator-instruction=yes register'], 'chalbert'],
     ['an operator instruction over the 1000-character cap', [`--operator-instruction=yes register ${'x'.repeat(988)}`], 'chalbert'],
   ])('--allow-conflict with %s is refused (exit 2) and registers nothing', (_label, extra, login) => {
     const { originDir, cloneDir, overlayDir, env } = makeFixture();
