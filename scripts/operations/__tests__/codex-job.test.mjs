@@ -476,6 +476,33 @@ it('fails closed on unreadable or incomplete post-audit file lists', async () =>
     }
   }
 });
+it('changes the fingerprint when only an originally untracked file owner execute bit flips', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-mode-'));
+  try {
+    mkdirSync(path.join(repo, 'scripts'));
+    const file = path.join(repo, 'scripts/a.mjs');
+    writeFileSync(file, 'unchanged contents\n');
+    const f = fixture([['ls-files', ok('scripts/a.mjs\0')]]);
+    f.io.lstat = file => lstatSync(file);
+    const state = { opts: { repo, scope: ['we:scripts/'] }, lane: { path: repo }, startSha: 'abc123', io: f.io };
+    chmodSync(file, 0o644);
+    await checkDiffScope(state);
+    const before = state.auditFingerprint;
+    expect(state.auditUntracked).toEqual(['scripts/a.mjs']);
+    await checkDiffScope(state);
+    expect(state.auditFingerprint).toBe(before);
+    // Git diff and blob hashes stay fixed in the fixture; only real file mode changes.
+    chmodSync(file, 0o755);
+    await checkDiffScope(state);
+    expect(state.auditFingerprint).not.toBe(before);
+    chmodSync(file, 0o644);
+    await checkDiffScope(state);
+    expect(state.auditFingerprint).toBe(before);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 it.each([
   { untracked: false, change: true },
   { untracked: true, change: true },

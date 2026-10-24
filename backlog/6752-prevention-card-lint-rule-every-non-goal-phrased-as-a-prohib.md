@@ -12,9 +12,9 @@ tags: []
 # Prevention — Card-lint rule: every non-goal phrased as a prohibition ('no model call', 'never X') must map to… (from web-everything/web-everything#5773 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/6687-held-daemon-clone-builds-its-own-stack-top-main-merge-candid.md:43` — Card-lint rule: every non-goal phrased as a prohibition ('no model call', 'never X') must map to a named Acceptance case or carry an explicit 'untested by design' note.
-2. `we:backlog/6686-daemon-rebuild-planner-replays-a-pinned-base-overlay-an-appl.md:18` — Card-lint: any 'live rebuild' or 'live proof' claim in the Fix or Why prose must have an Acceptance item tagged **Live proof**.
-3. `we:backlog/6687-held-daemon-clone-builds-its-own-stack-top-main-merge-candid.md:24` — Require a machine-checked Acceptance-to-test manifest at card admission, including positive and live-proof guarantees alongside refusal cases.
+1. `we:backlog/xqz26k1-held-daemon-clone-builds-its-own-stack-top-main-merge-candid.md:43` — Card-lint rule: every non-goal phrased as a prohibition ('no model call', 'never X') must map to a named Acceptance case or carry an explicit 'untested by design' note.
+2. `we:backlog/xn5h9sy-daemon-rebuild-planner-replays-a-pinned-base-overlay-an-appl.md:18` — Card-lint: any 'live rebuild' or 'live proof' claim in the Fix or Why prose must have an Acceptance item tagged **Live proof**.
+3. `we:backlog/xqz26k1-held-daemon-clone-builds-its-own-stack-top-main-merge-candid.md:24` — Require a machine-checked Acceptance-to-test manifest at card admission, including positive and live-proof guarantees alongside refusal cases.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 3 → #5473, finding 5 → #5473.
 
