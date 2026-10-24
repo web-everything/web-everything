@@ -174,7 +174,7 @@ describe('established overlay auto rebase', () => {
     });
 
     it.each(['NOT WEAKENED', 'WEAKENED', 'Probably NOT WEAKENED', 'NOT WEAKENED\n', undefined])(
-      'requires an exact audit certification when the fixer deletes the only related test: %s', async lastMessage => {
+      'rejects a fixer-deleted existing test before audit even with verdict %s', async lastMessage => {
         const f = fixture(); f.moveMain();
         const resolveConflicts = f.deps.codex;
         f.deps.codex = async options => {
@@ -183,31 +183,44 @@ describe('established overlay auto rebase', () => {
           fs.unlinkSync(join(options.root, 'worker.test.mjs'));
           return result;
         };
-        f.deps.auditor = vi.fn(async ({ root, args, taskFile }) => {
-          expect(args).toContain('--review');
-          expect(ok(root, ['ls-files']).split('\n')).not.toContain('worker.test.mjs');
-          const task = fs.readFileSync(taskFile, 'utf8');
-          // \x3c matches the literal opening angle bracket of each material tag.
-          const fencedMaterial = task.match(/\x3cmaterial>\n([\s\S]*?)\n\x3c\/material>/);
-          expect(fencedMaterial).not.toBeNull();
-          const material = JSON.parse(fencedMaterial[1]);
-          expect(material).toMatchObject({
-            rule: 'codex-audit-required', noTestFiles: ['worker.mjs', 'worker.test.mjs'],
-          });
-          return agentResult({ lastMessage });
-        });
-        if (lastMessage === 'NOT WEAKENED') {
-          const result = await job(f);
-          assertRule(f, result, 'codex-audit-required');
-        } else {
-          await expect(job(f)).rejects.toThrow(/audit/i);
-          assertUnregistered(f);
-          expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'audit' } });
-        }
+        f.deps.auditor = vi.fn(async () => agentResult({ lastMessage }));
+        await expect(job(f)).rejects.toThrow('existing test removed by resolution; human review required');
+        assertUnregistered(f);
+        expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'tests' } });
         expect(f.deps.testRunner).not.toHaveBeenCalled();
-        expect(f.deps.auditor).toHaveBeenCalledOnce();
+        expect(f.deps.auditor).not.toHaveBeenCalled();
       },
     );
+
+    it.each(['overlay', 'main'])('rejects deletion of an unrelated test present only in %s even when related tests remain', async parent => {
+      const file = 'unrelated-\u00e9.test.ts';
+      const f = fixture({ [parent === 'overlay' ? 'branchFiles' : 'mainFiles']: { [file]: '// existing test\n' } });
+      f.moveMain();
+      const resolveConflicts = f.deps.codex;
+      f.deps.codex = async options => {
+        const result = await resolveConflicts(options);
+        expect(fs.existsSync(join(options.root, 'worker.test.mjs'))).toBe(true);
+        fs.unlinkSync(join(options.root, file));
+        return result;
+      };
+      await expect(job(f)).rejects.toThrow('existing test removed by resolution; human review required');
+      assertUnregistered(f);
+      expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'tests' } });
+      expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(f.deps.auditor).not.toHaveBeenCalled();
+    });
+
+    it.each(['overlay', 'main'])('fails closed before audit when the %s deleted-test diff cannot be read', async parent => {
+      const f = fixture({ workerTest: false }); f.moveMain();
+      const parentSha = parent === 'overlay' ? f.oldSha : ok(f.root, ['rev-parse', 'HEAD']);
+      f.deps.git = (args, opts) => args.includes('--diff-filter=D') && args.includes(parentSha)
+        ? { status: 1, stdout: '' } : run(args, opts);
+      await expect(job(f)).rejects.toThrow('command failed or incomplete');
+      assertUnregistered(f);
+      expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'tests' } });
+      expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(f.deps.auditor).not.toHaveBeenCalled();
+    });
 
     it.each(['evidence only', 'all alerts'])('fails closed at tests when appending %s fails', async failure => {
       const f = fixture(); f.moveMain();

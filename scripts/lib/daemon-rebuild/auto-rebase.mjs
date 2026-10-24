@@ -175,6 +175,11 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     for (const sha of [oldSha, mainSha]) requireOk(git(['merge-base', '--is-ancestor', sha, 'HEAD'], scratch));
     const candidate = requireOk(git(['rev-parse', 'HEAD'], scratch));
     stage = 'tests';
+    // An audit can cover missing test coverage, never removal of either parent's tests.
+    for (const parent of [oldSha, mainSha]) {
+      const deleted = requireOk(git(['diff', '--name-only', '--diff-filter=D', '-z', parent, candidate], scratch)).split('\0');
+      if (deleted.some(isVitestTestFile)) throw new Error('existing test removed by resolution; human review required');
+    }
     const changed = new Set([...conflicts, ...requireOk(git(['diff', '--name-only', oldSha, candidate], scratch)).split('\n').filter(Boolean)]);
     const files = requireOk(git(['ls-files'], scratch)).split('\n');
     const candidateFiles = new Set(files);
