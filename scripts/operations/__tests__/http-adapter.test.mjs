@@ -24,7 +24,7 @@
  */
 
 import { types } from 'node:util';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer } from 'node:http';
 import { get as httpGet, request as httpRequest } from 'node:http';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -81,6 +81,7 @@ import { LIVE_STATE_OP } from '../live-state.mjs';
 import { LIVE_WORK_OP } from '../live-work.mjs';
 import { SESSIONS_OP } from '../sessions.mjs';
 import { ROUTE_PR_OUTCOME_OP } from '../route-pr-outcome.mjs';
+import { PR_DIGEST_OP } from '../pr-digest.mjs';
 import { STALE_STATE_OP } from '../stale-state.mjs';
 import { AGENT_ACTIVITY_OP } from '../agent-activity.mjs';
 import { ITEM_ACTIVITY_OP } from '../item-activity.mjs';
@@ -433,6 +434,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     [ROUTE_PR_OUTCOME_OP]: 'route-pr-outcome.mjs',
     // READ-ONLY and genuinely so: both steps are `compute`; the declaring module imports only `registry.mjs`/`step-kinds.mjs`, and all pid/lease/claim/run-store reads live in `stale-state-io.mjs` behind the injected `readState` reader.
     [STALE_STATE_OP]: 'stale-state.mjs',
+    // Local digest files are written by an effect sink; execution requires POST.
+    [PR_DIGEST_OP]: 'pr-digest.mjs',
     [MUTATION_CHECK_OP]: 'mutation-check.mjs',
     // #5466 — NOT read-only: its `probe` is an effect that reverts source files (same reason as `mutation-check`).
     [REVERT_RED_CHECK_OP]: 'mutation-check.mjs',
@@ -1016,5 +1019,21 @@ describe('effects applied over HTTP are attributed to an unidentifiable caller',
     expect(entry.lastAttemptBy).toBe('unknown');
     expect(entry.humanAttempts).toBe(0);
     expect(entry.unknownAttempts).toBe(1);
+  });
+});
+
+describe('pr-digest writing boundary', () => {
+  it('never exposes digest execution through GET with a caller-controlled out-dir', async () => {
+    const declaration = resolveOperation(PR_DIGEST_OP).declaration;
+    expect(isReadOnlyOperation(declaration)).toBe(false);
+    const executing = planRoutes(declaration).filter(r => r.kind === 'start' || r.kind === 'advance');
+    expect(executing.map(r => r.method)).toEqual(['POST', 'POST']);
+    const production = resolveOperation(PR_DIGEST_OP);
+    const sink = vi.fn(() => { throw new Error('GET must never write'); });
+    const deps = { resolve: () => ({ ...production, sinks: { 'pr-digest.write': sink } }), names: () => [PR_DIGEST_OP],
+      store: refusingStore(), newRunId: () => { throw new Error('GET must never mint a run'); } };
+    const response = await handleOperationRequest({ method: 'GET', url: '/operations/pr-digest/run?pr=42&out-dir=anything' }, deps);
+    expect(response.status).toBe(404);
+    expect(sink).not.toHaveBeenCalled();
   });
 });

@@ -62,6 +62,8 @@ import { createStaleStateReader } from './stale-state-io.mjs';
 import { prReconcileOperation, PR_RECONCILE_OP } from './pr-reconcile.mjs';
 import { createPrReconcileReader } from './pr-status-io.mjs';
 import { runnerActivityOperation, RUNNER_ACTIVITY_OP } from './runner-activity.mjs';
+import { prDigestOperation, PR_DIGEST_OP, finishPrDigest } from './pr-digest.mjs';
+import { createPrDigestSinks } from './pr-digest-io.mjs';
 import { prOwnershipOperation, PR_OWNERSHIP_OP } from './pr-ownership.mjs';
 import { createPrOwnershipReader } from './pr-ownership-io.mjs';
 import { createRunnerActivityReader, createRunnerActivityCliStores } from './runner-activity-io.mjs';
@@ -351,6 +353,11 @@ export const OPERATIONS = Object.freeze({
   [PR_RECONCILE_OP]: () => ({
     declaration: prReconcileOperation({ readPrs: createPrReconcileReader() }),
     sinks: {},
+  }),
+  [PR_DIGEST_OP]: () => ({
+    declaration: prDigestOperation(),
+    sinks: createPrDigestSinks(),
+    finish: finishPrDigest,
   }),
   [RUNNER_ACTIVITY_OP]: () => ({
     declaration: runnerActivityOperation({ readActivity: createRunnerActivityReader() }),

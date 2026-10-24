@@ -386,6 +386,46 @@ Probe identical-content commits, changed trees, expiry, disabled reuse, failure 
 results through the real rebuild fixture, plus actual check selection through `runLiveSmoke`.
 Run these suites through the host heavy-admission queue.
 
+## Read-only operation import boundaries
+
+`scripts/operations/__tests__/http-adapter.test.mjs` checks the full import graph of each read-only
+declaration. Shared validators can transitively reach filesystem/process helpers even when their
+own functions are pure; inject those validators from the operation's IO module.
+File-writing operations such as pr-digest declare an effect and run IO through a sink; they require
+runner freshness and POST execution, even when they never mutate GitHub. They must not appear
+in the pinned read-only list or runner zeroWrites exceptions. Register new operations in the
+module map and runner-freshness snapshot; add only compute-only readers to the read-only list.
+The digest regressions pin informational visible rulings, validated structured records bound to
+repo/PR/head/run/finding, and different-head send-back evidence. Fold validated rulings in
+comment order by head/run/finding: a later valid correction replaces an earlier block, while
+untrusted, unbound or incomplete corrections never clear it. At the 1000-PR --all ceiling,
+refuse before writing, report incomplete coverage, and direct the operator to enumerate the
+full list and run --pr for each. Below that list ceiling, a constant default budget of 100
+full-thread PR reads bounds each --all invocation (cached digests also consume a read because
+comments can be edited). Exhaustion fails the writing effect with incomplete coverage, the
+remaining PR count, and a --pr fallback; it never prints a successful aggregate count.
+The renderer checks the shared marker-authorship helper as well as the IO trust flag; a forged
+flag cannot authorize an outsider. A real-repo fixture exercises default filesystem history reads,
+atomic digest/cache writes and incomplete-evidence refusal with only GitHub doubled.
+Structured records require unindented final-line trailers; four-space/tab-indented reviewer
+clearance examples and trailers inside unterminated backtick/tilde fences must retain an existing
+block. Cover fence character, run length, closing-line syntax and CRLF; a closed example before
+a real trailer must still allow that trailer. Bump the digest cache schema when changing
+ruling interpretation so unchanged inputs cannot preserve an obsolete clearance.
+The fingerprint also binds the resolved `OPERATOR_LOGINS` and `AUTOMATION_LOGINS` used by the
+validators, so removing a ruling actor regenerates even when its bot poster remains trusted.
+Read the complete paginated thread once per PR and derive the last comment ID from its final
+comment; unchanged threads cache, edited comments regenerate, and missing/invalid IDs refuse.
+Missing default local histories retain the empty-evidence behavior. Explicit `--ledger` or
+`--daemon-log` paths must exist: ENOENT refuses even with a matching cache. Restore the file or
+correct the supplied path before retrying; never convert a missing explicit history into clearance.
+Operator comments must equal the shared
+canonical rendering after CRLF normalization and trailing-whitespace removal. Quoted and
+hand-edited records never clear a block. Complete ledger outcomes use the writer's supported
+pushed/no-change/failed enum and required row fields; unknown or partial evidence fails at the
+reader. Evidence comments may address multiple send-backs in their opening marker group.
+Run these suites through host heavy admission.
+
 ## Daemon entry import regression
 
 `daemon-entries-import.test.mjs` cold-imports every `DAEMON_ENTRY_MODULES` entry from the
