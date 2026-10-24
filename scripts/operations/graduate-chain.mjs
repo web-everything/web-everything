@@ -1,6 +1,7 @@
 /** Graduate a source slice through the existing import, verify and open-pr homes. */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
+import { laneGitHardeningEnv, hardenLaneGitArgs } from '../lib/lane-git-hardening.mjs';
 
 export const GRADUATE_CHAIN_OP = 'graduate-chain';
 const testPath = p => /(?:^|\/)__(?:tests|fixtures)__\//.test(p) || /\.test\.[^/]+$/.test(p);
@@ -56,8 +57,11 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
     stopReason: null, steps: [], size: { nonTest: 0, test: 0, files: 0 } };
   let lane;
   const command = (step, cmd, args, dir = cwd, extra = {}, allowFailure = false) => {
+    const commandEnv = { ...env, ...extra };
+    if (cmd === 'git') args = hardenLaneGitArgs(args);
     out.steps.push({ step, cmd, args });
-    const r = exec(cmd, args, { cwd: dir, env: { ...env, ...extra } });
+    const r = exec(cmd, args, { cwd: dir,
+      env: cmd === 'git' ? laneGitHardeningEnv(commandEnv) : commandEnv });
     if (!allowFailure && r.status !== 0) stop(step, { detail: String(r.stderr || 'command failed').slice(-1000) });
     return r;
   };

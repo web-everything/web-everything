@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createGraduateChainRunner, createGraduateChainSinks } from '../graduate-chain-io.mjs';
 import { cascadePolicy } from '../../lib/policy-cascade.mjs';
+import { LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import { describe, it, expect } from 'vitest';
 import { runGraduateChain, graduateChainOperation, measureSize, suggestedSplit, finishGraduateChain } from '../graduate-chain.mjs';
 import { driveRun, parseOperationArgv } from '../cli-adapter.mjs';
@@ -47,7 +48,7 @@ function fixture({ change = () => undefined, over = {}, options = {} } = {}) {
       if (args[0] === 'merge-base') return value(base);
       if (args[0] === 'rev-parse') return value(args.at(-1).startsWith('origin/') ? base : sha);
       if (args[0] === 'rev-list') return value(args.includes('--merges') ? '' : sha);
-      if (args[0] === 'diff') return value(args[1] === '--numstat' ? '12\t3\tscripts/file.mjs\n4\t1\tscripts/__tests__/file.test.mjs' : '2 files changed');
+      if (args[0] === 'diff') return value(args.includes('--numstat') ? '12\t3\tscripts/file.mjs\n4\t1\tscripts/__tests__/file.test.mjs' : '2 files changed');
       if (args[0] === 'log') return value('abc A commit');
       return value('');
     }
@@ -68,6 +69,49 @@ const released = calls => calls.some(c => c.args[1] === 'release');
 const prs = n => Array.from({ length: n }, (_, i) => ({ number: i + 1, author: { login: 'me' }, headRefName: `lane/${i}` }));
 
 describe('graduate-chain', () => {
+  for (const dryRun of [false, true]) {
+    it(`hardens every Git subprocess after composing its environment (dryRun=${dryRun})`, () => {
+      const inherited = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fsmonitor',
+        GIT_CONFIG_VALUE_0: 'untrusted-monitor', GIT_EXTERNAL_DIFF: 'untrusted-diff', KEEP_ME: 'present' };
+      const objects = { GIT_OBJECT_DIRECTORY: '/temporary/objects',
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: '/source/objects' };
+      const { result, calls } = fixture({ over: { dryRun }, options: {
+        env: inherited, mergeEnvironment: () => objects,
+      } });
+      expect(result.ok).toBe(true);
+      const gitCalls = calls.filter(c => c.cmd === 'git');
+      expect(gitCalls.length).toBeGreaterThan(0);
+      for (const call of gitCalls) {
+        const config = Object.fromEntries(Array.from({ length: Number(call.env.GIT_CONFIG_COUNT) },
+          (_, i) => [call.env[`GIT_CONFIG_KEY_${i}`], call.env[`GIT_CONFIG_VALUE_${i}`]]));
+        expect(config, call.args.join(' ')).toMatchObject(Object.fromEntries(LANE_GIT_CONFIG_PINS));
+        expect(call.env.GIT_EXTERNAL_DIFF).toBeUndefined();
+        expect(call.env.GIT_NO_LAZY_FETCH).toBe('1');
+        expect(call.env.KEEP_ME).toBe('present');
+        if (call.args[0] === 'diff') expect(call.args).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv']));
+      }
+      expect(gitCalls.find(c => c.args[0] === 'merge-tree').env).toMatchObject(objects);
+      if (dryRun) expect(gitCalls.find(c => c.args.includes('--numstat')).env).toMatchObject(objects);
+      else for (const name of ['reset', 'cherry-pick']) {
+        expect(gitCalls.find(c => c.args[0] === name).env.LANE_SESSION).toBe('held');
+      }
+      expect(inherited.GIT_CONFIG_COUNT).toBe('1');
+      expect(inherited.GIT_EXTERNAL_DIFF).toBe('untrusted-diff');
+    });
+  }
+  it('Git resolves fsmonitor as disabled in the actual replay subprocess environment', () => {
+    let resolved;
+    const { result } = fixture({ options: { env: { GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.fsmonitor', GIT_CONFIG_VALUE_0: 'untrusted-monitor' } },
+    change: (cmd, args, opts) => {
+      if (cmd === 'git' && args[0] === 'reset') resolved = spawnSync('git', ['config', '--get', 'core.fsmonitor'], {
+        encoding: 'utf8', env: { ...process.env, ...opts.env }, timeout: 5000,
+      });
+    } });
+    expect(result.ok).toBe(true);
+    expect(resolved.status).toBe(0);
+    expect(resolved.stdout.trim()).toBe('false');
+  });
   for (const dryRun of [false, true]) {
     for (const login of ['slice-worker[bot]', 'app/slice-worker', 'app/Slice-Worker']) {
       it(`installation credentials count the posting bot (${login}, dryRun=${dryRun})`, () => {
@@ -215,10 +259,10 @@ describe('graduate-chain', () => {
       options: { mergeEnvironment: () => mergeEnv }, change: (cmd, args) => {
         if (cmd === 'git' && args[0] === 'merge-base') return reply(ancestor);
         if (cmd === 'git' && args[0] === 'merge-tree') return reply(tree);
-        if (cmd === 'git' && args[1] === '--numstat') return reply(args.at(-1) === `${base}..${tree}` ? '1\t0\tslice.mjs' : '301\t0\tparent.mjs');
+        if (cmd === 'git' && args.includes('--numstat')) return reply(args.at(-1) === `${base}..${tree}` ? '1\t0\tslice.mjs' : '301\t0\tparent.mjs');
       } });
     expect(result).toMatchObject({ ok: true, size: { nonTest: 1, test: 0, files: 1 } });
-    expect(calls.find(c => c.args[1] === '--numstat').env).toMatchObject(mergeEnv);
+    expect(calls.find(c => c.args.includes('--numstat')).env).toMatchObject(mergeEnv);
   });
   it('refuses a source wholly reachable from the stack base and releases the lane', () => {
     const { result, calls } = fixture({ over: { stackOn: '7' }, change: (cmd, args) =>
@@ -342,8 +386,8 @@ describe('graduate-chain', () => {
     ['merge-tree', (c, a) => a[0] === 'merge-tree' && reply('', 128), true],
     ['empty-source', (c, a) => a[0] === 'rev-list' && reply(''), true],
     ['source', (c, a) => a[0] === 'rev-list' && reply('', 128), true],
-    ['too-large', (c, a) => a[1] === '--numstat' && reply('301\t0\tscripts/big.mjs'), true],
-    ['size-unreadable', (c, a) => a[1] === '--numstat' && reply('-\t-\timage.png'), true],
+    ['too-large', (c, a) => a.includes('--numstat') && reply('301\t0\tscripts/big.mjs'), true],
+    ['size-unreadable', (c, a) => a.includes('--numstat') && reply('-\t-\timage.png'), true],
     ['import-check', (c, a) => a[0].endsWith('graduation-import-check.mjs') && reply({ findings: [{}] }), true],
     ['verify-red', (c, a) => a[1] === 'verify' && reply({ verdict: { ok: false, checks: [{ outcome: 'fail' }] } }, 1), true],
     ['verify-unrun', (c, a) => a[1] === 'verify' && reply({ verdict: { ok: false, checks: [{ outcome: 'unrun' }] } }), true],
