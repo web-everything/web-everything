@@ -50,27 +50,31 @@ describe('measureNonTestLines — pure numstat accounting', () => {
       .toEqual({ lines: 250, exempt: false });
   });
 
-  it('counts pure renames by their numstat counts and classifies the destination path', () => {
+  it('counts renames by their numstat counts and classifies both paths', () => {
     expect(openPr.measureNonTestLines('0\t0\t\0scripts/old.mjs\0scripts/new.mjs\0'))
       .toEqual({ lines: 0, exempt: false });
     expect(openPr.measureNonTestLines('1\t1\t\0scripts/old.test.mjs\0scripts/new.mjs\0'))
       .toEqual({ lines: 2, exempt: false });
     expect(openPr.measureNonTestLines('400\t0\t\0scripts/old.mjs\0scripts/new.test.mjs\0'))
-      .toEqual({ lines: 0, exempt: false });
+      .toEqual({ lines: 400, exempt: false });
     expect(openPr.measureNonTestLines('400\t0\t\0docs/old.md\0backlog/new.md\0'))
-      .toEqual({ lines: 400, exempt: true });
+      .toEqual({ lines: 400, exempt: false });
     expect(openPr.measureNonTestLines('400\t0\t\0backlog/old.md\0docs/new.md\0'))
       .toEqual({ lines: 400, exempt: false });
+    expect(openPr.measureNonTestLines('400\t0\t\0scripts/old.test.mjs\0scripts/__tests__/new.mjs\0'))
+      .toEqual({ lines: 0, exempt: false });
+    expect(openPr.measureNonTestLines('400\t0\t\0backlog/old.md\0backlog/new.md\0'))
+      .toEqual({ lines: 400, exempt: true });
   });
 
   it.each([
-    ['assets/image.png', false],
-    ['scripts/a.test.mjs', false],
-    ['backlog/a.md', true],
-  ])('counts binary %s as zero lines', (path, exempt) => {
+    'assets/image.png',
+    'scripts/a.mjs',
+    'scripts/a.test.mjs',
+    'backlog/a.md',
+  ])('throws for unmeasurable binary counts on %s', (path) => {
     for (const terminator of ['\n', '\0']) {
-      expect(openPr.measureNonTestLines(`-\t-\t${path}${terminator}`))
-        .toEqual({ lines: 0, exempt });
+      expect(() => openPr.measureNonTestLines(`-\t-\t${path}${terminator}`)).toThrow(/unmeasurable/);
     }
   });
 
@@ -118,7 +122,7 @@ describe('measureNonTestLines — pure numstat accounting', () => {
     ['truncated rename', '1\t1\t\0scripts/old.mjs\0'],
     ['empty rename source', '1\t1\t\0\0scripts/new.mjs\0'],
     ['empty rename destination', '1\t1\t\0scripts/old.mjs\0\0'],
-    ['malformed NUL row after binary evidence', '-\t-\tbacklog/a.md\0malformed\0'],
+    ['malformed NUL row after valid evidence', '1\t0\tbacklog/a.md\0malformed\0'],
     ['unsafe count', '9007199254740992\t0\tscripts/a.mjs\0'],
     ['unsafe total', '9007199254740991\t0\tscripts/a.mjs\0' + '1\t0\tscripts/b.mjs\0'],
   ])('throws rather than silently undercounting %s', (_name, text) => {
@@ -128,6 +132,35 @@ describe('measureNonTestLines — pure numstat accounting', () => {
 });
 
 describe('real git numstat evidence', () => {
+  it.each(['worktree -diff', 'worktree binary', 'info -diff', 'global -diff', 'NUL bytes'])(
+    'the production reader counts oversized production content despite %s', (kind) => {
+      const dir = mkdtempSync(join(tmpdir(), 'open-pr-size-reader-'));
+      const git = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+      try {
+        git(['init', '--quiet', '--initial-branch=main']);
+        git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '--allow-empty', '-m', 'base']);
+        git(['update-ref', 'refs/remotes/origin/main', 'main']);
+        git(['checkout', '--quiet', '-b', 'lane/size-cap']);
+        if (kind.startsWith('worktree')) writeFileSync(join(dir, '.gitattributes'), `production.mjs ${kind === 'worktree binary' ? 'binary' : '-diff'}\n`);
+        if (kind === 'info -diff') writeFileSync(join(dir, '.git/info/attributes'), 'production.mjs -diff\n');
+        if (kind === 'global -diff') {
+          writeFileSync(join(dir, 'global-attributes'), 'production.mjs -diff\n');
+          git(['config', 'core.attributesFile', join(dir, 'global-attributes')]);
+        }
+        writeFileSync(join(dir, 'production.mjs'), `${kind === 'NUL bytes' ? '\0' : ''}${'code\n'.repeat(301)}`);
+        git(['add', '.']);
+        git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'oversized']);
+        // Prove the fixture really hides the production count without the hardened reader.
+        expect(git(['diff', '--numstat', '-z', 'main...HEAD'])).toContain('-\t-\tproduction.mjs\0');
+        const run = createPrLandRunner({ cwd: dir, prePrReview: () => ({ action: 'pass' }), env: {} });
+        expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-too-large' });
+        expect(spawnSync).not.toHaveBeenCalled();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('exempts a non-ASCII backlog path and counts a renamed 400-line production file with two changed lines as two', () => {
     const dir = mkdtempSync(join(tmpdir(), 'open-pr-numstat-'));
     const git = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
@@ -201,37 +234,57 @@ describe('createPrLandRunner — non-test size admission', () => {
   });
 
   it.each([
-    ['a throwing reader', () => { throw new Error('diff unavailable'); }],
-    ['malformed numstat', () => 'not numstat\n'],
-    ['partially readable numstat', () => '1\t0\tscripts/a.mjs\nmalformed\n'],
-  ])('fails closed with pr-size-unreadable for %s and never spawns', (_name, read) => {
-    const diffStat = vi.fn(read);
-    const { run, spawn } = fixture('', { diffStat });
-    expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+    ['backlog', 'backlog/new.md'],
+    ['a test filename', 'scripts/new.test.mjs'],
+  ])('counts and refuses an oversized production rename into %s', (_name, destination) => {
+    const { run, diffStat, spawn } = fixture(`301\t0\t\0scripts/old.mjs\0${destination}\0`);
+    expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-too-large', detail: expect.stringMatching(/301/) });
     expect(diffStat).toHaveBeenCalledTimes(1);
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it('admits binary evidence without hiding an oversized text diff', () => {
+  it.each([
+    ['a throwing reader', () => { throw new Error('diff unavailable'); }],
+    ['malformed numstat', () => 'not numstat\n'],
+    ['partially readable numstat', () => '1\t0\tscripts/a.mjs\nmalformed\n'],
+    ['unmeasurable production counts', () => '-\t-\tscripts/a.mjs\0'],
+  ])('fails closed with pr-size-unreadable for %s and never spawns', (_name, read) => {
+    const diffStat = vi.fn(read);
+    const { run, spawn } = fixture('', { diffStat });
+    expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable', detail: expect.stringMatching(/Restore readable git numstat evidence/) });
+    expect(diffStat).toHaveBeenCalledTimes(1);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('refuses binary evidence even alongside an oversized text diff', () => {
     const binary = '-\t-\tassets/image.png\0-\t-\tscripts/a.test.mjs\0-\t-\tbacklog/a.md\0';
-    const admitted = fixture(binary);
-    expect(admitted.run({ argv })).toMatchObject(opened);
-    expect(admitted.spawn).toHaveBeenCalledTimes(1);
+    const unmeasurable = fixture(binary);
+    expect(unmeasurable.run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+    expect(unmeasurable.spawn).not.toHaveBeenCalled();
     const refused = fixture(binary + '301\t0\tscripts/a.mjs\0');
-    expect(refused.run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-too-large' });
+    expect(refused.run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
     expect(refused.spawn).not.toHaveBeenCalled();
   });
 
-  it('the default reader requests NUL output and rename detection for the requested base and sha', () => {
-    const git = vi.fn((args) => args[0] === 'diff' ? '301\t0\tscripts/a.mjs\0' : 'base-sha\n');
+  it('the default reader pins the commit, clears attributes, disables external diff/textconv and forces text numstat', () => {
+    const git = vi.fn((args) => args.includes('diff') ? '301\t0\tscripts/a.mjs\0' : 'resolved-sha\n');
     // Use the default spawn identity to select the production reader; the spawn is mocked above.
     const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env: {}, git });
     expect(run({ argv: [...argv, '--base=release', '--sha=abc123'] }))
       .toMatchObject({ outcome: 'refused', reason: 'pr-too-large' });
     expect(git.mock.calls).toEqual([
+      [['rev-parse', '--verify', 'abc123^{commit}']],
       [['rev-parse', '--verify', '--quiet', 'origin/release']],
-      [['diff', '--numstat', '-z', '--find-renames', 'origin/release...abc123']],
+      [['-c', 'core.attributesFile=', 'diff', '--text', '--numstat', '-z', '--find-renames', '--no-ext-diff', '--no-textconv', 'origin/release...resolved-sha']],
     ]);
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it('the default reader refuses an unresolved commit before attempting a diff', () => {
+    const git = vi.fn(() => { throw new Error('not a commit'); });
+    const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env: {}, git });
+    expect(run({ argv: [...argv, '--sha=missing'] })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+    expect(git.mock.calls).toEqual([[['rev-parse', '--verify', 'missing^{commit}']]]);
     expect(spawnSync).not.toHaveBeenCalled();
   });
 
@@ -292,21 +345,14 @@ describe('createPrLandRunner — non-test size admission', () => {
     }
   });
 
-  it('admits an oversized diff with an authorised skip even when the gate returns no bypass', () => {
-    const { run, diffStat, spawn } = fixture('1000\t0\tscripts/a.mjs\0', { env: {} });
-    expect(run({ argv, skipPrePrReview: 'operator approved', actor: 'operator', operatorInstruction: 'Ship this change' }))
-      .toMatchObject(opened);
-    expect(diffStat).not.toHaveBeenCalled();
-    expect(spawn).toHaveBeenCalledTimes(1);
-  });
-
   it.each([
+    ['operator-authorised skip arguments', {}, 'operator approved', 'operator', 'Ship this change'],
     ['worker', { WE_CONVEYOR_WORKER: '1' }, 'reason', 'operator', 'Ship this change'],
     ['unknown role', { WE_CONVEYOR_WORKER: 'unknown' }, 'reason', 'operator', 'Ship this change'],
     ['missing actor', {}, 'reason', '', 'Ship this change'],
     ['missing instruction', {}, 'reason', 'operator', ''],
     ['empty skip', {}, '  ', 'operator', 'Ship this change'],
-  ])('still refuses an oversized diff for an unauthorised skip: %s', (_name, env, skipPrePrReview, actor, operatorInstruction) => {
+  ])('refuses an oversized diff without a recorded gate bypass despite %s', (_name, env, skipPrePrReview, actor, operatorInstruction) => {
     const { run, diffStat, spawn } = fixture('1000\t0\tscripts/a.mjs\0', { env });
     expect(run({ argv, skipPrePrReview, actor, operatorInstruction }))
       .toMatchObject({ outcome: 'refused', reason: 'pr-too-large' });

@@ -266,7 +266,7 @@ export function renderBypassNote({ actor = '', reason = '', operatorInstruction 
  * interactive session only with an explicit `--actor` plus a quoted operator instruction (the same honesty tax
  * as review-set-label's clear-human). @returns {{ok:boolean, refusal:string}}
  */
-export function authoriseBypass({ role, actor = '', operatorInstruction = '' }) {
+function authoriseBypass({ role, actor = '', operatorInstruction = '' }) {
   if (role === 'worker') return { ok: false, refusal: 'a dispatched worker (WE_CONVEYOR_WORKER=1) is refused a bypass of the pre-PR review — run /converge and stamp the receipt instead' };
   if (role !== 'orchestrator') return { ok: false, refusal: 'the session role is unknown (unrecognised WE_CONVEYOR_WORKER marker), so the bypass is refused' };
   if (!String(actor).trim() || !String(operatorInstruction).trim()) {

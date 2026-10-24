@@ -50,7 +50,7 @@ export const OPEN_PR_OP = 'open-pr';
 export const OPEN_PR_MAX_NON_TEST_LINES = 300;
 
 /** Pure git --numstat -z accounting (also accepts legacy unquoted newline rows).
- * Binary rows have no line count; malformed or incomplete evidence must never become a zero-sized diff.
+ * Binary rows are unmeasurable; malformed or incomplete evidence must never become a zero-sized diff.
  */
 export function measureNonTestLines(numstatText) {
   if (typeof numstatText !== 'string') throw new Error('numstat must be text');
@@ -64,19 +64,21 @@ export function measureNonTestLines(numstatText) {
     const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(rows[i]);
     if (!match) throw new Error('unreadable numstat line');
     const [, additions, deletions] = match;
-    let path = match[3];
+    let paths = [match[3]];
     // -z represents a rename as counts + empty path, then the old and new paths.
-    if (nulDelimited && !path) {
+    if (nulDelimited && !paths[0]) {
       const source = rows[++i];
-      path = rows[++i];
-      if (!source || !path) throw new Error('incomplete numstat rename');
+      const destination = rows[++i];
+      if (!source || !destination) throw new Error('incomplete numstat rename');
+      paths = [source, destination];
     }
-    if (!path || (!nulDelimited && /[\t\r\n]|^"/.test(path))) throw new Error('unreadable numstat path');
+    if (paths.some((path) => !path || (!nulDelimited && /[\t\r\n]|^"/.test(path)))) throw new Error('unreadable numstat path');
     if ((additions === '-') !== (deletions === '-')) throw new Error('unreadable numstat counts');
-    const changed = additions === '-' ? 0 : Number(additions) + Number(deletions);
+    if (additions === '-') throw new Error('unmeasurable numstat counts');
+    const changed = Number(additions) + Number(deletions);
     if (!Number.isSafeInteger(changed)) throw new Error('numstat count exceeds safe integer range');
-    exempt = exempt && path.startsWith('backlog/');
-    if (!/(^|\/)__tests__\//.test(path) && !/(^|\/)[^/]*\.(test|spec)\.[^/]+$/.test(path)) {
+    exempt = exempt && paths.every((path) => path.startsWith('backlog/'));
+    if (!paths.every((path) => /(^|\/)__tests__\//.test(path) || /(^|\/)[^/]*\.(test|spec)\.[^/]+$/.test(path))) {
       lines += changed;
       if (!Number.isSafeInteger(lines)) throw new Error('numstat total exceeds safe integer range');
     }
