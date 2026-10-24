@@ -1542,7 +1542,8 @@ it('re-probes a bound PID on each pass, discarding an earlier live result even w
   const { assessLiveness } = await import('../reconcile-core.mjs');
   const row = { sessionId: 'bound-fix', pid: 123, pidAlive: true, state: 'working' };
   let exists = true;
-  const probe = pid => probePid(pid, () => { if (!exists) throw Object.assign(Error('exited'), { code: 'ESRCH' }); });
+  const probe = pid => probePid(pid, () => { if (!exists) throw Object.assign(Error('exited'), { code: 'ESRCH' }); },
+    () => ({ alive: true, reason: 'match' }));
   const live = enrichAgents([row], { probe })[0];
   expect(assessLiveness([{ agent: live }]).kind).toBe('live-process');
   exists = false;
