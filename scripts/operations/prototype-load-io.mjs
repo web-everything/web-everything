@@ -25,6 +25,24 @@ const CHILD_PROCESS_NOTE = 'child processes may outlive the timeout; heavy-admis
 // Defaults: ten minutes for admission, twenty minutes before SIGTERM, 16 MiB child output.
 const COMBINED_TEST_DEFAULTS = Object.freeze({ waitMs: 600000, timeoutMs: 1200000, maxBuffer: 16 * 1024 * 1024 });
 
+/** Keep runner diagnostics safe for both terminal output and persisted evidence. */
+function sanitizeCombinedOutput(value, env, worktree, preserveLines = false) {
+  let message = String(value).replace(ANSI_SEQUENCE, '').replace(/[\p{Cc}\p{Cf}]/gu, (char) => preserveLines && /[\t\n]/.test(char) ? char : '');
+  const roots = [[worktree, '<worktree>'], [repo, '<repo>'], [env.HOME, '<home>'], [homedir(), '<home>'],
+    [env.TMPDIR, '<tmp>'], [tmpdir(), '<tmp>'], ['/private/tmp', '<tmp>'], ['/tmp', '<tmp>']]
+    .filter(([root]) => typeof root === 'string' && root.length > 1)
+    .map(([root, placeholder]) => [root.replace(/\/+$/, ''), placeholder])
+    .sort(([a], [b]) => b.length - a.length);
+  for (const [root, placeholder] of roots) message = message.replaceAll(root, placeholder);
+  return message.replace(ABSOLUTE_POSIX_PATH, '<path>');
+}
+
+// Candidate and stale-ref tests are untrusted code; git retains its authentication env.
+function combinedTestEnv(env) {
+  const credentials = /^(?:SSH_AUTH_SOCK|GIT_ASKPASS|GIT_SSH_COMMAND|GH_TOKEN|GITHUB_TOKEN)$|_(?:TOKEN|SECRET|KEY)$/i;
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !credentials.test(key)));
+}
+
 /** Real combined-tree proof, rebound by the loader to its resolved settings and injected IO. */
 async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, { exec, fs, env, settings, queuedExec = exec === execFileSync ? spawnToCompletion : exec }) {
   const limits = settings.combinedTest;
@@ -91,7 +109,7 @@ async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, 
       ...Object.entries(VITEST_BOUNDS).map(([key, value]) => `--${key}=${value}`), ...tests];
     const command = ['node', 'scripts/readiness/heavy-admission.mjs', ...args.slice(1)].map((arg) => JSON.stringify(arg.replaceAll(worktree, '<worktree>'))).join(' ');
     try {
-      await queuedExec('node', args, { cwd: worktree, env, encoding: 'utf8', timeout: limits.timeoutMs,
+      await queuedExec('node', args, { cwd: worktree, env: combinedTestEnv(env), encoding: 'utf8', timeout: limits.timeoutMs,
         maxBuffer: limits.maxBuffer, shell: false, stdio: ['ignore', 'pipe', 'pipe'], killSignal: 'SIGTERM' });
       let report;
       try { report = JSON.parse(fs.readFileSync(reportPath, 'utf8')); }
@@ -128,7 +146,7 @@ async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, 
       return outcome = { ok: proven, command, result: `${summary}${proven ? '' : '; JSON evidence incomplete or counts mismatch'}`,
         testCount: tests.length, ...(proven ? {} : { reason: 'tests-unproven' }) };
     } catch (e) {
-      const output = `${e.stdout || ''}${e.stderr || ''}`.replace(ANSI_SEQUENCE, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').replaceAll(worktree, '<worktree>').replaceAll(repo, '<repo>').replaceAll(env.HOME || homedir(), '<home>').replace(ABSOLUTE_POSIX_PATH, '<path>').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+      const output = sanitizeCombinedOutput(`${e.stdout || ''}${e.stderr || ''}`, env, worktree, true);
       return outcome = { ok: false, command, result: `exit ${Number.isInteger(e.status) ? e.status : 'unknown'}: ${output.slice(-400)}`, testCount: tests.length, reason: 'tests-failed' };
     }
   } finally {
@@ -168,6 +186,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const git = (...args) => execute('git', args);
   const requireGit = (...args) => { const r = git(...args); if (r.code !== 0) throw new Error(r.error || `git ${args[0]} failed (${r.code})`); return r.stdout.trim(); };
   const ancestor = (tip, sha) => { const r = git('merge-base', '--is-ancestor', tip, sha); if (![0, 1].includes(r.code)) throw new Error(r.error || 'ancestry unverifiable'); return r.code === 0; };
+  const landedByContent = (ref) => {
+    const cherry = git('cherry', 'origin/main', `origin/${ref}`);
+    return cherry.code === 0 && cherry.stdout.trimEnd().split(/\r?\n/).every((line) => line.startsWith('-'));
+  };
   const loader = (action, clone, ref, extra = []) => execute('node', [resolve(repo, config.loaderCli), action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])]);
   const lastJson = (r) => { try { return JSON.parse(r.stdout.trim().split(/\r?\n/).at(-1)); } catch { return null; } };
   const check = (clone, ref, expectedSha) => {
@@ -285,12 +307,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
               }
             }
             else {
-              const cherry = git('cherry', 'origin/main', `origin/${ref}`);
-              const lines = cherry.stdout.trimEnd().split(/\r?\n/);
-              const landedByContent = cherry.code === 0 && lines.every((line) => line.startsWith('-'));
-              out.staleTolerated.push({ ref, landedByContent,
+              const landed = landedByContent(ref);
+              out.staleTolerated.push({ ref, landedByContent: landed,
                 why: 'pre-existing stale registration; candidate clean and file-disjoint'
-                  + (landedByContent ? ', commits already on main by patch-id' : '') });
+                  + (landed ? ', commits already on main by patch-id' : '') });
             }
           }
         }
@@ -308,14 +328,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           passed = ok === true;
           failure = `combined-tests-failed: ${reason || 'tests-failed'}`;
         } catch (e) {
-          let message = String(e.message || e).replace(ANSI_SEQUENCE, '').replace(/[\p{Cc}\p{Cf}]/gu, '');
-          const roots = [[repo, '<repo>'], [env.HOME, '<home>'], [homedir(), '<home>'],
-            [env.TMPDIR, '<tmp>'], [tmpdir(), '<tmp>'], ['/private/tmp', '<tmp>'], ['/tmp', '<tmp>']]
-            .filter(([root]) => typeof root === 'string' && root.length > 1)
-            .map(([root, placeholder]) => [root.replace(/\/+$/, ''), placeholder])
-            .sort(([a], [b]) => b.length - a.length);
-          for (const [root, placeholder] of roots) message = message.replaceAll(root, placeholder);
-          message = message.replace(ABSOLUTE_POSIX_PATH, '<path>').slice(0, 300);
+          const message = sanitizeCombinedOutput(e.message || e, env).slice(0, 300);
           out.combinedTests = { result: message };
           failure = `combined-tests-unrunnable: ${message}`;
         }
@@ -323,9 +336,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           if (!passed) { blockingReasons[ref] += `; ${failure}`; continue; }
           blocking.splice(blocking.indexOf(ref), 1);
           delete blockingReasons[ref];
-          const cherry = git('cherry', 'origin/main', `origin/${ref}`);
-          const landedByContent = cherry.code === 0 && cherry.stdout.trimEnd().split(/\r?\n/).every((line) => line.startsWith('-'));
-          out.staleTolerated.push({ ref, landedByContent, why: 'pre-existing stale registration; combined-tree tests passed', combinedTests: out.combinedTests });
+          out.staleTolerated.push({ ref, landedByContent: landedByContent(ref), why: 'pre-existing stale registration; combined-tree tests passed', combinedTests: out.combinedTests });
         }
         out.staleTolerated.sort((a, b) => established.indexOf(a.ref) - established.indexOf(b.ref));
       }

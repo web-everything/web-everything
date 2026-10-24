@@ -53,8 +53,10 @@ function fixture(options = {}) {
   const fail = (status, stdout = '', stderr = 'failed') => { throw Object.assign(new Error(stderr), { status, stdout, stderr }); };
   const exec = (cmd, args, config) => {
     calls.push({ cmd, args, config });
+    if (options.combinedIO?.handles(cmd, args)) return options.combinedIO.exec(cmd, args, config);
     expect(args.join(' ')).not.toMatch(/--allow-conflict|--force|--allow-no-pr/);
-    expect(Object.keys(config.env).sort()).toEqual(['HOME', 'PATH', 'USER', ...(env.WE_DAEMON_OVERLAY_DIR ? ['WE_DAEMON_OVERLAY_DIR'] : []), ...(env.WE_OVERLAY_NO_PR?.trim() === 'refuse' ? ['WE_OVERLAY_NO_PR'] : [])]);
+    expect(Object.keys(config.env).sort()).toEqual(['HOME', 'PATH', 'USER', ...Object.keys(options.gitEnv || {}), ...(env.WE_DAEMON_OVERLAY_DIR ? ['WE_DAEMON_OVERLAY_DIR'] : []), ...(env.WE_OVERLAY_NO_PR?.trim() === 'refuse' ? ['WE_OVERLAY_NO_PR'] : [])].sort());
+    if (options.gitEnv) expect(config.env).toMatchObject(options.gitEnv);
     if (options.execFailure === args[0]) throw Object.assign(new Error('maxBuffer exceeded; inspect full output separately'), { code: 'ENOBUFS' });
     if (cmd === 'plutil') return JSON.stringify({ WorkingDirectory: '/home/test/workspace/review' });
     if (cmd === 'node') {
@@ -158,7 +160,8 @@ function fixture(options = {}) {
   const combinedTest = vi.fn(async (input) => typeof options.combinedTest === 'function'
     ? options.combinedTest(input)
     : options.combinedTest ?? { ok: false, command: 'fixture-related-tests', result: 'failed', reason: 'tests-failed' });
-  const load = createPrototypeLoader({ exec, fs, env, combinedTest, settings: structuredClone(settings), now: () => clock,
+  if (options.combinedIO) Object.assign(fs, options.combinedIO.fs);
+  const load = createPrototypeLoader({ exec, fs, env, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone(settings), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
   return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
@@ -171,9 +174,9 @@ describe('default combined-tree test proof', () => {
       { name: 'one.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }, { status: 'skipped' }, { status: 'todo' }] },
       { name: 'two.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }, { status: 'passed' }] },
     ] };
-  async function runReport(value, { missing = false, failure, cleanupRemains = false } = {}) {
+  async function runReport(value, { missing = false, failure, cleanupRemains = false, env = {}, sourceFiles, mergeConflict = false, unreadable = false } = {}) {
     const worktree = '/tmp/prototype-combined-proof';
-    const sources = new Map([['one.test.mjs', ''], ['two.test.mjs', '']]);
+    const sources = new Map(sourceFiles || [['one.test.mjs', ''], ['two.test.mjs', '']]);
     let reportPath;
     const fs = {
       mkdtempSync: () => worktree, existsSync: vi.fn((path) => path === worktree && cleanupRemains), rmSync: vi.fn(),
@@ -182,6 +185,7 @@ describe('default combined-tree test proof', () => {
           if (missing) throw new Error('missing report');
           return typeof value === 'string' ? value : JSON.stringify(value);
         }
+        if (unreadable) throw new Error('permission denied');
         const source = sources.get(path.slice(worktree.length + 1));
         if (source === undefined) throw new Error('unexpected read');
         return source;
@@ -195,15 +199,47 @@ describe('default combined-tree test proof', () => {
       }
       if (args[0] === '-C' || args[0] === 'rev-parse') return SHA;
       if (['fetch', 'merge-base', 'worktree'].includes(args[0])) return '';
-      if (args[0] === 'merge-tree') return TREE;
+      if (args[0] === 'merge-tree') {
+        if (mergeConflict) throw Object.assign(new Error('merge conflict'), { status: 1 });
+        return TREE;
+      }
       if (args[0] === 'commit-tree') return MERGE;
       if (args[0] === 'ls-files') return [...sources.keys()].join('\0') + '\0';
       throw new Error('unexpected command');
     });
     const result = await defaultDeps().combinedTest({ clone: '/fixture/clone', candidateSha: SHA,
-      changedFiles: [...sources.keys()], refs: ['lane/old'] }, { exec, fs, env: {}, settings: { combinedTest: limits } });
+      changedFiles: [...sources.keys()], refs: ['lane/old'] }, { exec, fs, env, settings: { combinedTest: limits } });
     return { result, exec, fs, worktree, reportPath };
   }
+  it.each(Object.keys(limits).flatMap(key => [0, -1, 1.5].map(value => [key, value])))(
+    'rejects invalid %s=%s before spawning anything', async (key, value) => {
+      const exec = vi.fn();
+      await expect(defaultDeps().combinedTest({}, { exec, fs: {}, env: {},
+        settings: { combinedTest: { ...limits, [key]: value } } })).rejects.toThrow(`invalid combinedTest.${key}`);
+      expect(exec).not.toHaveBeenCalled();
+    });
+  it('refuses a real combined-tree merge conflict without spawning tests', async () => {
+    const { result, exec } = await runReport(report, { mergeConflict: true });
+    expect(result).toEqual({ ok: false, reason: 'combined-merge-conflict' });
+    expect(exec.mock.calls.some(([command]) => command === 'node')).toBe(false);
+  });
+  it('refuses zero related tests without spawning tests', async () => {
+    const { result, exec } = await runReport(report, { sourceFiles: [['source.mjs', '']] });
+    expect(result).toMatchObject({ ok: false, reason: 'no-related-tests', testCount: 0 });
+    expect(exec.mock.calls.some(([command]) => command === 'node')).toBe(false);
+  });
+  it('throws graph incomplete for unreadable tracked sources before spawning tests', async () => {
+    await expect(runReport(report, { unreadable: true })).rejects.toThrow('graph incomplete');
+  });
+  it('drops credentials only from the tests child and preserves ordinary and NODE_* variables', async () => {
+    const safe = { PATH: '/bin', HOME: '/home/test', TMPDIR: '/tmp', USER: 'tester', NODE_OPTIONS: '--no-warnings', NODE_ENV: 'test' };
+    const secrets = { SSH_AUTH_SOCK: '/agent', GIT_ASKPASS: '/askpass', GIT_SSH_COMMAND: 'ssh', GH_TOKEN: 'gh',
+      GITHUB_TOKEN: 'github', SERVICE_TOKEN: 'token', SERVICE_SECRET: 'secret', SERVICE_KEY: 'key', NODE_API_KEY: 'key' };
+    const env = { ...safe, ...secrets };
+    const { exec } = await runReport(report, { env });
+    expect(exec.mock.calls.find(([command]) => command === 'node')[2].env).toEqual(safe);
+    for (const [command, , options] of exec.mock.calls) if (command === 'git') expect(options.env).toEqual(env);
+  });
   it('requires positive JSON proof and reports passed and skipped test counts', async () => {
     const { result, exec, fs, worktree, reportPath } = await runReport(report);
     expect(result).toMatchObject({ ok: true, testCount: 2, result: '3 passed, 2 skipped' });
@@ -651,6 +687,52 @@ describe('prototype-load', () => {
     }
     expect(mutations(f, 'add')).toEqual([]);
     expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it.each([false, true])('does not run combined tests for overlapping paths plus another blocker (dirty candidate: %s)', async (dirty) => {
+    const f = fixture({ list: ['lane/old', 'lane/also'],
+      conflicts: ['lane/old', 'lane/also', ...(dirty ? [BASE.branch] : [])],
+      ...(dirty ? {} : { staleChanged: { 'lane/also': '' } }), combinedTest: { ok: true } });
+    const result = await f.run();
+    expect(result).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old', 'lane/also'],
+      blockingReasons: dirty ? { 'lane/old': 'candidate-not-clean', 'lane/also': 'candidate-not-clean' }
+        : { 'lane/old': 'overlap-with-candidate: x', 'lane/also': 'stale-files-unknown' } });
+    expect(f.combinedTest).not.toHaveBeenCalled();
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it('wires the default runner with cascade defaults and a credential-free tests environment', async () => {
+    const worktree = '/tmp/prototype-default-wiring';
+    const gitEnv = { SSH_AUTH_SOCK: '/agent', GIT_ASKPASS: '/askpass', GIT_SSH_COMMAND: 'ssh' };
+    const combinedExec = vi.fn((cmd, args) => {
+      if (cmd === 'node') throw Object.assign(new Error('fixture stops runner'), { status: 1 });
+      if (args[0] === '-C' || args[0] === 'rev-parse') return SHA;
+      if (args[0] === 'merge-tree') return TREE;
+      if (args[0] === 'commit-tree') return MERGE;
+      if (args[0] === 'ls-files') return 'one.test.mjs\0';
+      return '';
+    });
+    const f = fixture({ defaultCombined: true, env: gitEnv, gitEnv,
+      list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['one.test.mjs'] },
+      combinedIO: { exec: combinedExec,
+        handles: (cmd, args) => cmd === 'node' && args[1] === 'run' || cmd === 'git' &&
+          (args[0] === '-C' || ['worktree', 'ls-files'].includes(args[0]) || args.includes('FETCH_HEAD^{commit}') ||
+            args[0] === 'fetch' && args[1] !== 'origin' || args[0] === 'fetch' && args[2]?.startsWith('refs/heads/') ||
+            args[0] === 'merge-base' && args[2] === SHA || args[0] === 'merge-tree' || args[0] === 'commit-tree'),
+        fs: { mkdtempSync: () => worktree, existsSync: () => false, rmSync: vi.fn(),
+          readFileSync: (path) => {
+            if (path === worktree + '/one.test.mjs') return '';
+            if (path === '/home/test/ready') return JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' });
+            throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+          } } } });
+    const result = await f.run();
+    expect(result).toMatchObject({ stopReason: 'stale-registration', combinedTests: { testCount: 1 } });
+    const [, args, config] = combinedExec.mock.calls.find(([cmd]) => cmd === 'node');
+    expect(args).toContain('--wait-ms=600000');
+    expect(args).toContain('--ceiling-ms=1200000');
+    expect(config).toMatchObject({ timeout: 1200000, maxBuffer: 16 * 1024 * 1024,
+      env: { HOME: '/home/test', PATH: '/bin', USER: 'tester' } });
+    expect(config.env).toEqual({ HOME: '/home/test', PATH: '/bin', USER: 'tester' });
+    for (const [cmd, , options] of combinedExec.mock.calls) if (cmd === 'git') expect(options.env).toMatchObject(gitEnv);
+    expect(f.combinedTest).not.toHaveBeenCalled();
   });
   it('does not run combined tests when the candidate is not clean or the stale files are unknown', async () => {
     for (const options of [
