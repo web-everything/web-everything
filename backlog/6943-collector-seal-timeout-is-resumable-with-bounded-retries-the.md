@@ -43,5 +43,5 @@ One line per class: either the handling, or `n/a: <why>`.
 3. **Shared state files** — the retry count and last completed step live in the state file, written under the per-kind lease.
 4. **Fail closed** — retry exhaustion holds with a named reason and never marks the PR ready, and the seal scan never relaunches the exhausted batch (cases `retry exhaustion holds with a named reason`, `seal scan does not relaunch a batch whose retries are exhausted`).
 5. **Identity scoping** — the retry count belongs to one batch (repo, kind, seq) and starts at zero for a fresh batch (case `retry count is per batch and starts at zero for a fresh batch`).
-6. **State over time** — resume from the last completed step; a resumed `number-members` numbers each member exactly once (case `timeout during number-members then resume leaves each member numbered exactly once`).
+6. **State over time** — resume from the last completed step, after 6942's journal check (a member without `numberedPath` restarts the seal at `number-members`); a resumed `number-members` numbers each member exactly once (case `timeout during number-members then resume leaves each member numbered exactly once`).
 7. **Who wrote it** — n/a: only the seal job writes seal progress.
