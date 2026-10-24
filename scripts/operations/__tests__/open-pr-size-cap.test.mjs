@@ -136,6 +136,80 @@ describe('measureNonTestLines — pure numstat accounting', () => {
   });
 });
 
+describe('default git reader — filename encoding', () => {
+  const encodedFixture = ({ numstat, topLevel = Buffer.from('/repo\n'), entry, blob = Buffer.from('code\n') }) => {
+    const exec = vi.fn((_command, args, options) => {
+      let output;
+      if (args.includes('--show-toplevel')) output = topLevel;
+      else if (args.includes('rev-parse')) output = Buffer.from('resolved-sha\n');
+      else if (args.includes('diff')) output = numstat;
+      else if (args.includes('merge-base')) output = Buffer.from('base-sha\n');
+      else if (args.includes('ls-tree')) output = entry ?? Buffer.alloc(0);
+      else if (args.includes('cat-file')) output = blob;
+      else throw new Error(`unexpected git call: ${args}`);
+      return options.encoding ? output.toString(options.encoding) : output;
+    });
+    return { exec, ...fixture(undefined, { diffStat: createPrDiffStatReader({ cwd: '/repo', exec }) }) };
+  };
+
+  it.each([
+    ['ordinary path', Buffer.from('production-'), Buffer.from('.mjs')],
+    ['rename source', Buffer.from('\0production-'), Buffer.from('.mjs\0replacement.mjs')],
+    ['rename destination', Buffer.from('\0original.mjs\0production-'), Buffer.from('.mjs')],
+  ])('refuses lossy UTF-8 decoding in a binary %s before submission', (_kind, prefix, suffix) => {
+    const numstat = Buffer.concat([Buffer.from('-\t-\t'), prefix, Buffer.from([0xff]), suffix, Buffer.from('\0')]);
+    const { exec, run, spawn } = encodedFixture({ numstat });
+    expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([, args]) => args.includes('ls-tree'))).toBe(false);
+  });
+
+  it('refuses an invalid UTF-8 repository root before using it as cwd', () => {
+    const { exec, run, spawn } = encodedFixture({
+      numstat: Buffer.from('1\t0\tproduction.mjs\0'),
+      topLevel: Buffer.concat([Buffer.from('/repo-'), Buffer.from([0xff]), Buffer.from('\n')]),
+    });
+    expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([, args]) => args.includes('diff'))).toBe(false);
+  });
+
+  it.each([' ', '\t', '\r', '\n'])('preserves trailing repository whitespace %j when selecting the diff cwd', (suffix) => {
+    const root = `/repo${suffix}`;
+    const { exec, run, spawn } = encodedFixture({
+      numstat: Buffer.from('301\t0\tproduction.mjs\0'),
+      topLevel: Buffer.from(`${root}\n`),
+    });
+    expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-too-large' });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(exec.mock.calls.find(([, args]) => args.includes('diff'))[1].slice(0, 2))
+      .toEqual(['-C', root]);
+  });
+
+  it('refuses invalid UTF-8 tree metadata instead of accepting a substituted filename', () => {
+    const { run, spawn } = encodedFixture({
+      numstat: Buffer.from('-\t-\tproduction-\ufffd.mjs\0'),
+      entry: Buffer.concat([Buffer.from(`100644 blob ${'a'.repeat(40)}\tproduction-`), Buffer.from([0xff]), Buffer.from('.mjs\0')]),
+    });
+    expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it.each(['production-\ufffd.mjs', '\ufeffproduction-é.mjs'])(
+    'preserves the valid UTF-8 path %j and counts arbitrary binary blob bytes', (path) => {
+      const { exec, run, spawn } = encodedFixture({
+        numstat: Buffer.from(`-\t-\t${path}\0`),
+        entry: Buffer.from(`100644 blob ${'a'.repeat(40)}\t${path}\0`),
+        blob: Buffer.concat([Buffer.from([0xff]), Buffer.from('\n'.repeat(301))]),
+      });
+      expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-too-large' });
+      expect(spawn).not.toHaveBeenCalled();
+      expect(exec.mock.calls.filter(([, args]) => args.includes('ls-tree')).map(([, args]) => args.at(-1)))
+        .toEqual([path, path]);
+    },
+  );
+});
+
 describe('real git numstat evidence', () => {
   it('counts production outside a subdirectory and keeps backlog paths rooted with diff.relative enabled', () => {
     const dir = mkdtempSync(join(tmpdir(), 'open-pr-relative-'));

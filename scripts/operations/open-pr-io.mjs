@@ -123,8 +123,13 @@ function failedGate(e, loadSettings) {
 }
 
 function createGitReader(cwd, exec = execFileSync) {
-  const opts = (options) => ({ cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options });
-  return (args, options = {}) => (exec === execFileSync ? execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options }) : exec('git', args, opts(options)));
+  // A replacement character changes filename identity: an empty lookup for the
+  // substituted path could otherwise be mistaken for proof that a blob is absent.
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+  return (args, options = {}) => {
+    const output = exec('git', args, { cwd, encoding: null, maxBuffer: 64 * 1024 * 1024, ...options });
+    return typeof output === 'string' ? output : decoder.decode(output);
+  };
 }
 
 /** Attributes can override --text. Recover binary rows from immutable blobs, counting the
@@ -137,17 +142,19 @@ function countBinaryDiffRows(text, { git, topLevel, base, sha }) {
   let mergeBase;
   // Bound the entire fallback, including every tree/blob read, rather than each file alone.
   const deadline = performance.now() + 60_000;
-  const read = (args) => {
+  const read = (args, options = {}) => {
     const timeout = Math.ceil(deadline - performance.now());
     if (timeout <= 0) throw new Error('binary size read timed out');
-    return git(['-C', topLevel, ...args], { timeout });
+    return git(['-C', topLevel, ...args], { ...options, timeout });
   };
   const lines = (revision, path) => {
     const entry = read(['ls-tree', '-z', '--full-tree', revision, '--', path]);
     if (entry === '') return 0;
     const match = /^\d+ blob ([a-f0-9]+)\t([\s\S]*)\0$/.exec(entry);
     if (!match || match[2] !== path) throw new Error('unreadable diff blob');
-    const blob = read(['cat-file', 'blob', match[1]]);
+    // Blob contents are arbitrary bytes, not filename metadata. Latin-1 preserves
+    // one character per byte so newline counting never needs lossy UTF-8 decoding.
+    const blob = read(['cat-file', 'blob', match[1]], { encoding: 'latin1' });
     let count = blob.length && !blob.endsWith('\n') ? 1 : 0;
     for (let i = 0; i < blob.length; i++) if (blob[i] === '\n') count++;
     return count;
@@ -176,7 +183,9 @@ export function createPrDiffStatReader({ cwd = process.cwd(), exec = execFileSyn
     const resolvedSha = git(['rev-parse', '--verify', `${sha}^{commit}`]).trim();
     let ref = base;
     try { git(['rev-parse', '--verify', '--quiet', `origin/${base}`]); ref = `origin/${base}`; } catch { /* use local base */ }
-    const topLevel = git(['rev-parse', '--show-toplevel']).trim();
+    // Remove Git's record terminator only; trailing whitespace can belong to the
+    // directory name, and trimming it could select a different repository.
+    const topLevel = git(['rev-parse', '--show-toplevel']).replace(/\n$/, '');
     const text = git(['-C', topLevel, '-c', 'core.attributesFile=', 'diff', '--no-relative', '--text', '--numstat', '-z', '--find-renames', '--no-ext-diff', '--no-textconv', `${ref}...${resolvedSha}`], { timeout: 60_000 });
     return {
       text: countBinaryDiffRows(text, { git, topLevel, base: ref, sha: resolvedSha }),
