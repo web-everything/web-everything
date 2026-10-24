@@ -79,10 +79,13 @@ function snapshot(dir) {
 // IO fixtures inject the var reader and preflight evidence. Only job discovery
 // uses gh reads. Mutations use the repo's exec(cmd, argv, options) convention.
 function harness({ jobs = [job()], runnerVar = 'we-8core', runnerGroup = GROUP,
-  repoVisibility = 'public', failVariableSet = false } = {}) {
+  repoVisibility = 'public', failVariableSet = false, cancelStatuses = ['completed'], failCancelRunIds = [] } = {}) {
   const dir = temp();
   const feedPath = join(dir, 'events.jsonl');
   const mutations = [];
+  const pollCounts = new Map();
+  const completed = new Set();
+  const sleep = vi.fn(async () => {});
   const exec = vi.fn((cmd, args, options = {}) => {
     expect(cmd).toBe('gh');
     expect(Array.isArray(args)).toBe(true);
@@ -94,7 +97,13 @@ function harness({ jobs = [job()], runnerVar = 'we-8core', runnerGroup = GROUP,
       return '';
     }
     if (args[0] === 'run' && ['cancel', 'rerun'].includes(args[1])) {
+      if (args[1] === 'rerun' && !completed.has(Number(args[2]))) {
+        throw new Error('Fixture rejects rerun before cancellation completed');
+      }
       mutations.push([...args]);
+      if (args[1] === 'cancel' && failCancelRunIds.includes(Number(args[2]))) {
+        throw new Error('Fixture rejects cancellation');
+      }
       return '';
     }
     if (args[0] === 'run' && args[1] === 'list') {
@@ -102,6 +111,15 @@ function harness({ jobs = [job()], runnerVar = 'we-8core', runnerGroup = GROUP,
         .map(databaseId => ({ databaseId, status: 'queued' })));
     }
     if (args[0] === 'api') {
+      const statusRun = /\/actions\/runs\/(\d+)$/.exec(args[1]);
+      if (statusRun) {
+        const id = Number(statusRun[1]);
+        const count = pollCounts.get(id) ?? 0;
+        pollCounts.set(id, count + 1);
+        const status = cancelStatuses[Math.min(count, cancelStatuses.length - 1)];
+        if (status === 'completed') completed.add(id);
+        return JSON.stringify({ status });
+      }
       const endpoint = args.find(arg => /\/actions\/runs\/\d+\/jobs(?:\?|$)/.test(arg));
       if (endpoint) {
         const runId = Number(/\/runs\/(\d+)\/jobs/.exec(endpoint)[1]);
@@ -114,10 +132,10 @@ function harness({ jobs = [job()], runnerVar = 'we-8core', runnerGroup = GROUP,
     throw new Error(`Unexpected gh argv: ${JSON.stringify(args)}`);
   });
   const log = vi.fn();
-  const options = { repo: REPO, exec, now: NOW, feedPath, settings: SETTINGS,
+  const options = { repo: REPO, exec, sleep, now: NOW, feedPath, settings: SETTINGS,
     readRunnerVar: vi.fn(() => runnerVar), repoVisibility, runnerGroup, log,
     env: {}, platform: null };
-  return { dir, feedPath, exec, mutations, log, options };
+  return { dir, feedPath, exec, sleep, mutations, pollCounts, log, options };
 }
 
 describe('runner fallback policy cascade', () => {
@@ -199,6 +217,31 @@ describe('runner fallback policy cascade', () => {
     expect(log.mock.calls[0][0]).toMatch(/queuedMinutes=4 \(platform\)/);
     expect(log.mock.calls[0][0]).toMatch(/fallbackRunner="ubuntu-latest" \(standard\)/);
   });
+
+  it('resolves cancellation polling leaves through every policy layer and logs provenance', () => {
+    const log = vi.fn();
+    const result = resolveRunnerFallbackSettings({
+      env: { WE_POLICY_CASCADE_LOG: '1', WE_RUNNER_FALLBACK_CANCEL_POLL_ATTEMPTS: '3' },
+      platform: { cancelPollAttempts: 8, cancelPollIntervalMs: 50 },
+      tool: { cancelPollAttempts: 5, cancelPollIntervalMs: 25 }, log,
+    });
+    expect(result).toMatchObject({ cancelPollAttempts: 3, cancelPollIntervalMs: 25,
+      sources: { cancelPollAttempts: 'env', cancelPollIntervalMs: 'tool' } });
+    expect(log.mock.calls.flat().join('\n')).toMatch(/cancelPollAttempts=3 \(env\)/);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/cancelPollIntervalMs=25 \(tool\)/);
+    expect(resolveRunnerFallbackSettings({ env: {}, platform: null, log: vi.fn() }))
+      .toMatchObject({ cancelPollAttempts: 6, cancelPollIntervalMs: 1000,
+        sources: { cancelPollAttempts: 'standard', cancelPollIntervalMs: 'standard' } });
+  });
+
+  it.each(['0', '-1', '1.5', 'garbage', 'Infinity', '9007199254740992'])(
+    'invalid cancellation polling bounds %s retain lower valid policy leaves', raw => {
+      expect(resolveRunnerFallbackSettings({
+        env: { WE_RUNNER_FALLBACK_CANCEL_POLL_ATTEMPTS: raw, WE_RUNNER_FALLBACK_CANCEL_POLL_INTERVAL_MS: raw },
+        platform: { cancelPollAttempts: 4, cancelPollIntervalMs: 20 }, log: vi.fn(),
+      })).toMatchObject({ cancelPollAttempts: 4, cancelPollIntervalMs: 20,
+        sources: { cancelPollAttempts: 'platform', cancelPollIntervalMs: 'platform' } });
+    });
 
   it('keeps the only literal threshold and default runner inside the policy defaults object', () => {
     const source = readFileSync(new URL('../runner-fallback.mjs', import.meta.url), 'utf8');
@@ -372,6 +415,202 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
     expect(h.mutations).toEqual([]);
     expect(snapshot(h.dir)).toEqual(before);
   });
+
+  it('default invocation without --apply makes zero PATCH, cancel, rerun or feed writes', async () => {
+    const h = harness();
+    writeFileSync(h.feedPath, 'existing feed\n');
+    const before = snapshot(h.dir);
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    expect(await main([`--repo=${REPO}`, '--json'], h.options)).toBe(0);
+    expect(JSON.parse(stdout.mock.calls.map(([s]) => s).join('')).planned).toEqual(planned());
+    expect(h.mutations).toEqual([]);
+    expect(h.exec.mock.calls.some(([, args]) => args.includes('PATCH'))).toBe(false);
+    expect(h.sleep).not.toHaveBeenCalled();
+    expect(snapshot(h.dir)).toEqual(before);
+  });
+
+  it('delayed cancellation polls through injected exec and sleep before rerun is accepted', async () => {
+    const h = harness({ cancelStatuses: ['queued', 'in_progress', 'completed'] });
+    const result = await runRunnerFallback({ ...h.options, apply: true,
+      settings: { ...SETTINGS, cancelPollAttempts: 4, cancelPollIntervalMs: 7 } });
+    expect(result).toMatchObject({ applied: true, rerunResults: [{ runId: 101, rerun: true }] });
+    expect(h.pollCounts.get(101)).toBe(3);
+    expect(h.sleep.mock.calls).toEqual([[7], [7]]);
+    expect(h.mutations.map(args => args.slice(0, 3))).toEqual([
+      ['variable', 'set', 'WE_SHARD_RUNNER'], ['run', 'cancel', '101'], ['run', 'rerun', '101'],
+    ]);
+    expect(feedLines(h.feedPath)).toHaveLength(1);
+  });
+
+  it('never-completes cancellation stops at the bound and reports cancel-not-completed in one feed line', async () => {
+    const h = harness({ cancelStatuses: ['in_progress'] });
+    const result = await runRunnerFallback({ ...h.options, apply: true,
+      settings: { ...SETTINGS, cancelPollAttempts: 3, cancelPollIntervalMs: 7 } });
+    const rerunResults = [{ runId: 101, rerunSkipped: 'cancel-not-completed' }];
+    expect(result).toMatchObject({ applied: true, rerunResults });
+    expect(h.pollCounts.get(101)).toBe(3);
+    expect(h.sleep.mock.calls).toEqual([[7], [7]]);
+    expect(h.mutations.map(args => args.slice(0, 3))).toEqual([
+      ['variable', 'set', 'WE_SHARD_RUNNER'], ['run', 'cancel', '101'],
+    ]);
+    expect(feedLines(h.feedPath)).toHaveLength(1);
+    const event = parseEvent(feedLines(h.feedPath)[0]);
+    expect(event.rerunResults).toEqual(rerunResults);
+    expect(event.reason).toMatch(/cancel-not-completed.*inspect CI/i);
+  });
+
+  it('a timed-out cancellation skips only that run and still reruns a completed sibling', async () => {
+    const h = harness({ jobs: [job(), job({ runId: 202, jobId: 2001 })] });
+    const exec = vi.fn((cmd, args, options) => args[0] === 'api'
+      && args[1] === `repos/${REPO}/actions/runs/101`
+      ? JSON.stringify({ status: 'in_progress' }) : h.exec(cmd, args, options));
+    const result = await runRunnerFallback({ ...h.options, exec, apply: true,
+      settings: { ...SETTINGS, cancelPollAttempts: 2, cancelPollIntervalMs: 7 } });
+    const rerunResults = [
+      { runId: 101, rerunSkipped: 'cancel-not-completed' }, { runId: 202, rerun: true },
+    ];
+    expect(result).toMatchObject({ applied: true, rerunResults });
+    expect(h.mutations.map(args => args.slice(0, 3))).toEqual([
+      ['variable', 'set', 'WE_SHARD_RUNNER'], ['run', 'cancel', '101'], ['run', 'cancel', '202'],
+      ['run', 'rerun', '202'],
+    ]);
+    expect(feedLines(h.feedPath)).toHaveLength(1);
+    expect(parseEvent(feedLines(h.feedPath)[0]).rerunResults).toEqual(rerunResults);
+  });
+
+  it.each([101, 202, 303])(
+    'rejected sibling cancellation at run %s still reruns previously cancelled runs and completed siblings', async failedId => {
+      const runIds = [101, 202, 303];
+      const h = harness({ jobs: runIds.map((runId, index) => job({ runId, jobId: 1001 + index })),
+        failCancelRunIds: [failedId], cancelStatuses: ['in_progress', 'completed'] });
+      const result = await runRunnerFallback({ ...h.options, apply: true,
+        settings: { ...SETTINGS, cancelPollAttempts: 2, cancelPollIntervalMs: 7 } });
+      const rerunResults = runIds.map(runId => ({ runId,
+        ...(runId === failedId ? { cancelFailed: true } : {}), rerun: true }));
+      expect(result).toMatchObject({ applied: true, rerunResults });
+      expect(h.mutations.map(args => args.slice(0, 3))).toEqual([
+        ['variable', 'set', 'WE_SHARD_RUNNER'],
+        ...runIds.map(id => ['run', 'cancel', String(id)]),
+        ...runIds.map(id => ['run', 'rerun', String(id)]),
+      ]);
+      for (const id of runIds) expect(h.pollCounts.get(id)).toBe(2);
+      expect(h.sleep.mock.calls).toEqual([[7], [7], [7]]);
+      expect(feedLines(h.feedPath)).toHaveLength(1);
+      expect(parseEvent(feedLines(h.feedPath)[0]).rerunResults).toEqual(rerunResults);
+    });
+
+  it('rejected cancellation that never completes skips only that run and recovers cancelled siblings', async () => {
+    const h = harness({ jobs: [job(), job({ runId: 202, jobId: 2001 }), job({ runId: 303, jobId: 3001 })],
+      failCancelRunIds: [202] });
+    const exec = vi.fn((cmd, args, options) => args[0] === 'api'
+      && args[1] === `repos/${REPO}/actions/runs/202`
+      ? JSON.stringify({ status: 'in_progress' }) : h.exec(cmd, args, options));
+    const result = await runRunnerFallback({ ...h.options, exec, apply: true,
+      settings: { ...SETTINGS, cancelPollAttempts: 2, cancelPollIntervalMs: 7 } });
+    const rerunResults = [
+      { runId: 101, rerun: true },
+      { runId: 202, cancelFailed: true, rerunSkipped: 'cancel-not-completed' },
+      { runId: 303, rerun: true },
+    ];
+    expect(result).toMatchObject({ applied: true, rerunResults });
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'api'
+      && args[1] === `repos/${REPO}/actions/runs/202`)).toHaveLength(2);
+    expect(h.sleep.mock.calls).toEqual([[7]]);
+    expect(h.mutations.filter(args => args[1] === 'rerun').map(args => args[2])).toEqual(['101', '303']);
+    expect(feedLines(h.feedPath)).toHaveLength(1);
+    const event = parseEvent(feedLines(h.feedPath)[0]);
+    expect(event.rerunResults).toEqual(rerunResults);
+    expect(event.reason).toMatch(/Cancellation requests rejected for runs 202.*inspect CI/i);
+    expect(event.reason).toContain('cancel-not-completed');
+  });
+
+  it.each([101, 202, 303])(
+    'polling failure at run %s skips its rerun and still permits completed siblings to rerun', async failedId => {
+      const runIds = [101, 202, 303];
+      const h = harness({ jobs: runIds.map((runId, index) => job({ runId, jobId: 1001 + index })) });
+      const exec = vi.fn((cmd, args, options) => {
+        if (args[0] === 'api' && args[1] === `repos/${REPO}/actions/runs/${failedId}`) {
+          throw new Error('Injected polling failure');
+        }
+        return h.exec(cmd, args, options);
+      });
+      const result = await runRunnerFallback({ ...h.options, exec, apply: true });
+      const rerunResults = runIds.map(runId => runId === failedId
+        ? { runId, pollFailed: true, rerunSkipped: 'cancel-not-completed' } : { runId, rerun: true });
+      expect(result).toMatchObject({ applied: true, rerunResults });
+      expect(h.mutations.filter(args => args[1] === 'cancel').map(args => args[2]))
+        .toEqual(runIds.map(String));
+      expect(h.mutations.filter(args => args[1] === 'rerun').map(args => args[2]))
+        .toEqual(runIds.filter(id => id !== failedId).map(String));
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'api'
+        && args[1] === `repos/${REPO}/actions/runs/${failedId}`)).toHaveLength(1);
+      expect(h.sleep).not.toHaveBeenCalled();
+      expect(feedLines(h.feedPath)).toHaveLength(1);
+      const event = parseEvent(feedLines(h.feedPath)[0]);
+      expect(event.rerunResults).toEqual(rerunResults);
+      expect(event.reason).toContain(`Polling failed for runs ${failedId}; inspect CI manually`);
+    });
+
+  it.each([101, 202, 303])(
+    'rerun rejection at run %s is recorded once and still permits completed siblings to rerun', async failedId => {
+      const runIds = [101, 202, 303];
+      const h = harness({ jobs: runIds.map((runId, index) => job({ runId, jobId: 1001 + index })) });
+      const exec = vi.fn((cmd, args, options) => {
+        if (args[0] === 'run' && args[1] === 'rerun' && args[2] === String(failedId)) {
+          throw new Error('Injected rerun rejection');
+        }
+        return h.exec(cmd, args, options);
+      });
+      const result = await runRunnerFallback({ ...h.options, exec, apply: true });
+      const rerunResults = runIds.map(runId => runId === failedId
+        ? { runId, rerunFailed: true } : { runId, rerun: true });
+      expect(result).toMatchObject({ applied: true, rerunResults });
+      expect(h.mutations.filter(args => args[1] === 'cancel').map(args => args[2]))
+        .toEqual(runIds.map(String));
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'run' && args[1] === 'rerun')
+        .map(([, args]) => args[2])).toEqual(runIds.map(String));
+      expect(h.mutations.filter(args => args[1] === 'rerun').map(args => args[2]))
+        .toEqual(runIds.filter(id => id !== failedId).map(String));
+      for (const id of runIds) expect(h.pollCounts.get(id)).toBe(1);
+      expect(h.sleep).not.toHaveBeenCalled();
+      expect(feedLines(h.feedPath)).toHaveLength(1);
+      const event = parseEvent(feedLines(h.feedPath)[0]);
+      expect(event.rerunResults).toEqual(rerunResults);
+      expect(event.reason).toContain(`Rerun requests failed for runs ${failedId}; inspect CI manually`);
+    });
+
+  it('unknown cancellation status fails closed at the polling bound', async () => {
+    const h = harness({ cancelStatuses: [undefined] });
+    const result = await runRunnerFallback({ ...h.options, apply: true,
+      settings: { ...SETTINGS, cancelPollAttempts: 2, cancelPollIntervalMs: 1 } });
+    expect(result.rerunResults).toEqual([{ runId: 101, rerunSkipped: 'cancel-not-completed' }]);
+    expect(h.pollCounts.get(101)).toBe(2);
+    expect(h.sleep.mock.calls).toEqual([[1]]);
+    expect(h.mutations.some(args => args[1] === 'rerun')).toBe(false);
+  });
+
+  it('polling reservation refuses repair before any mutation when the call budget is too small', async () => {
+    const h = harness();
+    const result = await runRunnerFallback({ ...h.options, apply: true,
+      settings: { ...SETTINGS, maxCalls: 8, cancelPollAttempts: 4 } });
+    expect(result).toMatchObject({ applied: false });
+    expect(result.error).toMatch(/Repair exceeds call bound.*inspect CI/i);
+    expect(h.mutations).toEqual([]);
+    expect(h.pollCounts.size).toBe(0);
+    expect(h.sleep).not.toHaveBeenCalled();
+  });
+
+  it.each([['run', 1], ['job', 2]])(
+    'truncated %s discovery at the call cap prevents every mutation and reports incomplete', async (_phase, maxCalls) => {
+      const h = harness();
+      const before = snapshot(h.dir);
+      const result = await runRunnerFallback({ ...h.options, apply: true, settings: { ...SETTINGS, maxCalls } });
+      expect(result).toMatchObject({ applied: false, decision: 'no-action' });
+      expect(result.error).toMatch(/incomplete.*call bound.*inspect CI/i);
+      expect(h.exec).toHaveBeenCalledTimes(maxCalls);
+      expect(h.mutations).toEqual([]);
+      expect(snapshot(h.dir)).toEqual(before);
+    });
 
   it('apply sets the variable before cancelling all stuck runs and then rerunning all of them', async () => {
     const h = harness({ jobs: [job({ runId: 202 }), job(), job({ jobId: 1002 })] });
