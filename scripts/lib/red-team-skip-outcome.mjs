@@ -7,6 +7,12 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 
+/** Thrown values can have unreadable messages or unstringifiable JSON shapes. */
+export function safeErrorText(error) {
+  try { return String(error?.message ?? error); }
+  catch { return 'unprintable error'; }
+}
+
 /** A pinned Git head must be a full SHA, never a coercible value or sentinel. */
 export function isRealHead(value) {
   return typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
@@ -108,7 +114,7 @@ function flushPending(io, note) {
 export function settleRedTeamSkip(input = {}) {
   let io;
   const note = error => {
-    try { io?.log?.(`red-team skip settlement: ${String(error?.message ?? error).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600)}`); }
+    try { io?.log?.(`red-team skip settlement: ${safeErrorText(error).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600)}`); }
     catch { /* diagnostics cannot abort settlement */ }
   };
   try {
@@ -133,7 +139,7 @@ export function settleRedTeamSkip(input = {}) {
         io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: card-only diff (policy redTeam.skipCardOnly)` });
         return { outcome: 'policy-clear' };
       } catch (error) {
-        reason = `policy-clear comment failed: ${error?.message ?? error}`;
+        reason = `policy-clear comment failed: ${safeErrorText(error)}`;
       }
     }
     reason = boundReason(reason);

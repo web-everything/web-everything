@@ -180,7 +180,15 @@ describe('review-job red-team skip settlement', () => {
         expect(publishNeedsYou).toHaveBeenCalledTimes(1);
         expect(publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
         expect(postComment).not.toHaveBeenCalled();
-        expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
+        // Guard deferrals clear admission for retry; cap deferrals suppress the gate.
+        // Neither is a completed pass, so the unconditional five-event expectation was wrong.
+        expect(f.events).toEqual(redTeam.deferredByGuard
+          ? ['queued', 'red-team', 'settle', 'gate']
+          : redTeam.deferredByCap ? ['queued', 'red-team', 'settle', 'finished']
+            : ['queued', 'red-team', 'settle', 'finished', 'gate']);
+        expect(f.io.clearRedTeamQueued.mock.calls).toEqual(redTeam.deferredByGuard ? [[{ repo, pr, head }]] : []);
+        expect(f.io.redTeamStatus.mock.calls.filter(([row]) => row.status === 'finished')).toHaveLength(redTeam.deferredByGuard ? 0 : 1);
+        expect(f.io.runRedTeamGate).toHaveBeenCalledTimes(redTeam.deferredByCap ? 0 : 1);
       } finally { rmSync(root, { recursive: true, force: true }); }
     }
   });
@@ -281,13 +289,47 @@ describe('review-job red-team skip settlement', () => {
     expect(f.io.log).toHaveBeenCalledWith(expect.stringContaining('settlement unavailable'));
   });
 
-  it.each([
-    { status: 'not-owed' },
-  ])('not-owed outcome does not settle or publish needs-you: %j', redTeam => {
-    const f = fixture(redTeam);
-    runReviewJob({ repo, pr }, f.io);
-    expect(f.io.runRedTeam).toHaveBeenCalledOnce();
-    expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
+  it.each([false, true])('not-owed on an accepted head publishes needs-you (redTeamOnly=%s)', redTeamOnly => {
+    // Acceptance already established that a pass was owed; plain not-owed cannot exempt it.
+    const root = mkdtempSync(join(tmpdir(), 'review-not-owed-'));
+    const postComment = vi.fn(), publishNeedsYou = vi.fn();
+    try {
+      const f = fixture({ status: 'not-owed' });
+      f.io.settleRedTeamSkip.mockImplementation(input => {
+        f.events.push('settle');
+        return settleRedTeamSkip({ ...input, comments: [], io: {
+          env: { WE_SHARED_RUNS_DIR: join(root, 'runs') }, postComment, publishNeedsYou,
+        } });
+      });
+      const out = runReviewJob({ repo, pr, redTeamOnly }, f.io);
+      expect(f.io.runRedTeam).toHaveBeenCalledOnce();
+      expect(f.io.settleRedTeamSkip).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        redTeam: { status: 'not-owed', reason: 'red team reported not-owed on an accepted head' }, repo, pr, head,
+      }));
+      expect(publishNeedsYou).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        repo, pr, head, reason: 'red team skipped (red team reported not-owed on an accepted head); not cleared',
+      }));
+      expect(postComment).not.toHaveBeenCalled();
+      expect(out.redTeam.outcome).toBe('non-policy');
+      expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([false, true])('unprintable runner exception still settles, finishes and gates (redTeamOnly=%s)', redTeamOnly => {
+    const f = fixture();
+    f.io.runRedTeam.mockImplementation(() => {
+      f.events.push('red-team');
+      throw { message: { toString: null } };
+    });
+    f.io.settleRedTeamSkip.mockImplementation(() => { f.events.push('settle'); return { outcome: 'non-policy' }; });
+    const out = runReviewJob({ repo, pr, redTeamOnly }, f.io);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      redTeam: { status: 'error', reason: 'unprintable error' }, repo, pr, head,
+    }));
+    expect(out.redTeam).toMatchObject({ status: 'error', reason: 'unprintable error', outcome: 'non-policy' });
+    expect(f.io.redTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ status: 'finished', result: 'error' }));
+    expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
+    expect(out.redTeamGate.status).toBe('ok');
   });
 
   it.each([

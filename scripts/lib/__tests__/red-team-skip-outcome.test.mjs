@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readdirSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyRedTeamSkip, settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
@@ -164,6 +164,32 @@ describe('settleRedTeamSkip', () => {
     await f.settle();
     expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
     expect(planRedTeamStatusLabels({ repo, pr, head, comments: f.comments }).add).not.toBe('red-team:clear');
+  });
+
+  it('unprintable policy post error persists pending notification before publishing and retrying', () => {
+    const f = fixture();
+    const reason = 'policy-clear comment failed: unprintable error';
+    const pendingDir = join(redTeamStatusDir(f.io.env), 'skip-pending');
+    let pendingAtPublication;
+    f.io.postComment.mockImplementation(() => { throw { message: { toString: null } }; });
+    f.io.publishNeedsYou.mockImplementationOnce(() => {
+      pendingAtPublication = readdirSync(pendingDir).map(name =>
+        JSON.parse(readFileSync(join(pendingDir, name), 'utf8')));
+      throw Error('feed unavailable');
+    });
+    expect(f.settle()).toEqual({ outcome: 'non-policy' });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      repo, pr, head, reason: `red team skipped (${reason}); not cleared`,
+    }));
+    // Assert outside the IO callback: settlement intentionally catches publication failures.
+    expect(pendingAtPublication).toEqual([f.io.publishNeedsYou.mock.calls[0][0]]);
+    expect(readdirSync(pendingDir)).toHaveLength(1);
+    expect(f.markers()).toEqual([]);
+    expect(f.settle()).toEqual({ outcome: 'non-policy', reason });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(2);
+    expect(readdirSync(pendingDir)).toEqual([]);
+    expect(f.markers()).toHaveLength(1);
+    expect(redTeamForHead(f.comments, pr, head)).toBeNull();
   });
 
   it('never throws when policy comment, needs-you publication, and diagnostic logging all fail', async () => {

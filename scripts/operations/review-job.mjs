@@ -88,7 +88,7 @@ import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, bu
 import { liveResultGateState, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../lib/review-red-team-on-skip.mjs';
-import { classifyRedTeamSkip, isRealHead, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
+import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
@@ -797,7 +797,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       try {
         redTeam = io.runRedTeam(seatsBox.input);
       } catch (e) {
-        redTeam = { status: 'error', reason: tail(e?.message ?? e, 300) };
+        redTeam = { status: 'error', reason: tail(safeErrorText(e), 300) };
       }
     }
     if (out.redTeamSpeculative) delete out.redTeamSpeculative.result;
@@ -813,12 +813,13 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       const status = redTeam?.status;
       const completed = ['ran', 'resumed'].includes(status);
       const published = ['posted', 'deduped'].includes(redTeam?.comment?.status);
-      // Plain not-owed is exempt; contradictory guard/cap evidence requires an operator.
+      // Acceptance already established that a pass was owed; not-owed cannot exempt it.
       const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
       // A completion claim remains unpublished until all derivations and live evidence succeed.
       settlementOutcome = completed
         ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}` }
-        : redTeam;
+        : status === 'not-owed' && !deferred
+          ? { status, reason: 'red team reported not-owed on an accepted head' } : redTeam;
       // Retain status/deferral evidence even when detailed summary rows are malformed.
       out.redTeam = { status: typeof status === 'string' ? status : 'error',
         ...(redTeam?.deferredByGuard ? { deferredByGuard: true } : {}),
@@ -834,8 +835,6 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         const head = isRealHead(rev) ? rev : seatsBox.laneHead;
         // Missing readers, unreadable threads and stale/untrusted markers cannot authorize bypass.
         bypassSettlement = io.redTeamResultVisible?.({ repo: out.repo, pr: out.pr, head }) === true;
-      } else {
-        bypassSettlement = status === 'not-owed' && !deferred && wellFormed;
       }
     } catch { /* malformed diagnostics cannot prevent settlement */ }
     if (!bypassSettlement && typeof io.settleRedTeamSkip === 'function') {
