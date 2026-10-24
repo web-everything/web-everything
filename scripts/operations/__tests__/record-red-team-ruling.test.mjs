@@ -466,6 +466,23 @@ describe('automatic card filing', () => {
       expect(a.cards.length + b.cards.length).toBe(1);
       expect(b.posted).toEqual([]);
     });
+    it('file claims: rejecting job B selecting [A,B] leaves A available to independent job C', async () => {
+      const { mkdtempSync, readdirSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createFileClaims } = await import('../record-red-team-ruling-io.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'claims-selection-'));
+      try {
+        expect(createFileClaims({ dir }).claimBreak('B', 'jobA')).toBe('jobA');
+        const before = readdirSync(dir).sort();
+        const rejected = createFileClaims({ dir });
+        expect(rejected.claimBreak('A', 'jobB', ['A', 'B'])).toBe('jobA');
+        expect(rejected.claimBreak('B', 'jobB', ['A', 'B'])).toBe('jobA');
+        expect(readdirSync(dir).sort()).toEqual(before);
+        expect(createFileClaims({ dir }).claimBreak('A', 'jobC')).toBe('jobC');
+        expect(createFileClaims({ dir }).claimBreak('B', 'jobC')).toBe('jobA');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
     it('file claims: a break is owned by the first job, atomically', async () => {
       const { mkdtempSync, rmSync } = await import('node:fs');
       const { tmpdir } = await import('node:os');
