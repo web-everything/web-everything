@@ -38,6 +38,7 @@ import {
   isPolicyDerivationPath,
   parseOperatorClearance,
   parseLatestHumanClearedSha,
+  headEverHumanCleared,
   shouldReparkForTestTampering,
   buildClearedHumanMarker,
   buildClearanceRevocationComment,
@@ -2261,6 +2262,35 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
       .toEqual({ actor: 'Grace' });
     expect(parseOperatorClearance([{ body: 'an ordinary review comment' }])).toBe(null);
     expect(parseOperatorClearance(null)).toBe(null);
+  });
+
+  describe('headEverHumanCleared', () => {
+    const head = 'abcdef1';
+    const clear = (sha, author = { login: 'web-everything' }) => ({
+      body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('Ada')}`, author,
+    });
+    const accept = { body: buildReviewedShaMarker(head), author: { login: 'web-everything' } };
+
+    it('preserves clearance after a plain accept on the same SHA, case-insensitively', () => {
+      const comments = [clear(head), accept];
+      expect(parseLatestHumanClearedSha(comments)).toBeNull();
+      expect(headEverHumanCleared(comments, head.toUpperCase())).toBe(true);
+    });
+
+    it('does not inherit clearance of another SHA through a plain accept', () => {
+      expect(headEverHumanCleared([clear('1234567'), accept], head)).toBe(false);
+    });
+
+    it('ignores an untrusted or missing author', () => {
+      for (const author of [{ login: 'drive-by' }, null]) {
+        expect(headEverHumanCleared([clear(head, author), accept], head)).toBe(false);
+      }
+    });
+
+    it('returns false for non-array or empty comments and a blank head', () => {
+      for (const comments of [undefined, null, {}, []]) expect(headEverHumanCleared(comments, head)).toBe(false);
+      for (const sha of [undefined, null, '', '   ']) expect(headEverHumanCleared([clear(head)], sha)).toBe(false);
+    });
   });
 
   it('#xuboo0q — parseLatestHumanClearedSha binds the SHA and the clear-human marker to the SAME comment', () => {

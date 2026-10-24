@@ -1950,6 +1950,21 @@ export function parseLatestHumanClearedSha(comments) {
 }
 
 /**
+ * Whether any trusted-comment prefix human-cleared this head, even if a later plain accept hides it.
+ * Each new clearance comes from one comment's paired markers, so checking comments individually preserves
+ * prefix semantics without repeatedly scanning the growing thread.
+ * @param {Array<object>} comments comments in thread order
+ * @param {string} headSha head to protect (case-insensitive)
+ * @returns {boolean} false for non-array/empty comments or a blank head
+ * @example headEverHumanCleared(comments, 'abcdef1')
+ */
+export function headEverHumanCleared(comments, headSha) {
+  if (!Array.isArray(comments) || typeof headSha !== 'string' || !headSha.trim()) return false;
+  const head = headSha.toLowerCase();
+  return comments.some((c) => isTrustedMarkerAuthor(c) && parseLatestHumanClearedSha([c]) === head);
+}
+
+/**
  * #xuboo0q — should the anti-test-gaming gate re-park `review:human` on THIS pass? Pure. Extracted from the
  * inline call site in `we:scripts/merge-ai-prs.mjs` (an `execFileSync`-heavy loop with no independently
  * testable seam) so the actual decision — not just the marker parsing `parseLatestHumanClearedSha` does — has

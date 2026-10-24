@@ -1004,6 +1004,100 @@ describe('case 5j — requiredChecks makes a NEW advisory check\'s red never rea
   });
 });
 
+describe('bounced PR CI repair — real required failures on the fixer head (#5729)', () => {
+  const HEAD = '5729'.repeat(10);
+  const requiredChecks = ['test', 'test-shard (2)', 'review-gate', 'merge-gate'];
+  const failed = name => ({ name, status: 'completed', conclusion: 'failure' });
+  const bounced = (over = {}) => pr1563({
+    number: 5729, headRefOid: HEAD,
+    statusCheckRollup: [failed('test-shard (2)'), failed('review-gate'), failed('merge-gate')],
+    ...over,
+  });
+  const planFor = pr => planReconcile({ prs: [pr], agents: [], requiredChecks, now: NOW });
+  const escalation = headSha => ({
+    body: buildCiHealEscalationComment({ headSha, outcome: 'needs-human', reason: 'requires human judgment' }),
+    author: AUTOMATION,
+  });
+
+  it.each(['test-shard (2)', 'test'])('dispatches ci-heal for bounced + required red %s with no escalation', name => {
+    const plan = planFor(bounced({ statusCheckRollup: [failed(name), failed('review-gate'), failed('merge-gate')] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', phase: 'bounced', prNumber: 5729 })]);
+  });
+
+  it('bounced real-red ci-heal still honours the review-fix round cap', () => {
+    const plan = planReconcile({ prs: [bounced()], agents: [], requiredChecks, now: NOW, roundCap: 0 });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', prNumber: 5729 }));
+  });
+
+  it.each([false, true])('keeps an unused operator repair round ahead of bounced CI healing (joined=%s)', joinCiAndReview => {
+    const round = () => ({ author: AUTOMATION, body: REARM_COMMENT_MARKER });
+    const sendBack = { id: 'operator', author: { login: 'chalbert' }, createdAt: '2026-08-26T16:00:00Z',
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via chat.\n\nRepair at head aaaaaaa.' };
+    const comments = [finding(), ...Array.from({ length: 8 }, round), sendBack, round(), round()];
+    const pr = bounced({ headRefOid: 'a'.repeat(40), comments, statusCheckRollup: [failed('gate')] });
+    const options = { prs: [pr], agents: [], requiredChecks: ['gate'], now: NOW, roundCap: 6,
+      fixTiming: { joinCiAndReview } };
+    const plan = planReconcile(options);
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced', findings: 2, attempts: 10,
+      operatorSendBackRound: { sendBackId: 'operator', used: 0, allowance: 1,
+        setting: 'fix.operatorRulingExtraRounds', source: 'standard' } })]);
+    expect(plan.refusals).not.toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+
+    const invalidGrants = [
+      { comments: [...comments, { author: AUTOMATION, body: FIX_END_MARKER }] },
+      { comments: comments.map(c => c === sendBack ? { ...c, author: AUTOMATION } : c) },
+    ];
+    for (const over of invalidGrants) {
+      const denied = planReconcile({ ...options, prs: [{ ...pr, ...over }] });
+      expect(denied.dispatch).toEqual([]);
+      expect(denied.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+    }
+    // At the list-reader page boundary, completeness must be proved before any cap decision.
+    const page = [...comments, ...Array.from({ length: 100 - comments.length },
+      (_, i) => finding(`Additional review finding ${i + 1}`))];
+    expect(page).toHaveLength(100);
+    const truncated = planReconcile({ ...options, prs: [{ ...pr, comments: page }] });
+    expect(truncated.dispatch).toEqual([]);
+    expect(truncated.refusals).toEqual([expect.objectContaining({ kind: 'thread-truncated', prNumber: 5729 })]);
+    const complete = planReconcile({ ...options, prs: [{ ...pr, comments: page, commentsComplete: true }] });
+    // Ten re-arm markers are bookkeeping; the other 90 comments are findings.
+    // Completing the page preserves the repair grant while carrying every added finding.
+    expect(complete.dispatch).toEqual(plan.dispatch.map(row => ({ ...row, findings: 90 })));
+    expect(complete.refusals).toEqual(plan.refusals);
+    const disabled = planReconcile({ ...options, operatorRulingExtraRounds: { value: 0, source: 'repo' } });
+    expect(disabled.dispatch).toEqual([]);
+    expect(disabled.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+  });
+
+  it('refuses ci-heal-escalated for an escalation on THIS bounced head', () => {
+    const plan = planFor(bounced({ comments: [finding(), escalation(HEAD)] }));
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated', headSha: HEAD }));
+  });
+
+  it('an escalation for an OLDER head does not suppress bounced real-red ci-heal', () => {
+    const plan = planFor(bounced({ comments: [finding(), escalation('abcd'.repeat(10))] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', phase: 'bounced' })]);
+    expect(plan.refusals.map(row => row.kind)).not.toContain('ci-heal-escalated');
+  });
+
+  it('bounced with only review-gate/merge-gate red keeps its review-findings fix', () => {
+    const plan = planFor(bounced({ statusCheckRollup: [failed('review-gate'), failed('merge-gate')] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced' })]);
+  });
+
+  it('bounced + conflict label keeps its conflict fix despite real red CI', () => {
+    const plan = planFor(bounced({ labels: lbl('review:changes', 'merge-status:conflicting') }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced', isConflict: true })]);
+  });
+
+  it('bounced with only a non-required real failure keeps its review-findings fix', () => {
+    const plan = planFor(bounced({ statusCheckRollup: [failed('optional-test'), failed('review-gate')] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced' })]);
+  });
+});
+
 // we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — LIVE INCIDENT, web-everything/web-everything: of
 // ~10 ci-heal sessions dispatched inside one hour, 7 (PRs #2782/#2778/#2772/#2779/…) ended "no change needed".
 // Real measured shape (`gh api repos/web-everything/web-everything/branches/main/protection`, `gh run list --branch

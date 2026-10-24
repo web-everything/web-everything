@@ -104,18 +104,17 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
     expect(isAncestor(f.clone, f.h, head)).toBe(true);
     expect(isAncestor(f.clone, cNew, head)).toBe(false);
     const kinds = second.alerts.map((a) => a.kind);
-    expect(kinds).toContain('established-overlay-dropped');
-    // c's old tip is also live: parking its new tip must not erase its already-adopted other.txt change.
-    expect(second).toMatchObject({ moved: false, reason: 'established-overlay-conflict' });
-    expect(head).toBe(liveHead);
+    // overlay-pin (2026-10-21): c's new head conflicts, so c is PINNED at the head this clone adopted it at (its
+    // already-live other.txt change is kept) and the build still advances — no established-overlay-hold.
+    expect(kinds).not.toContain('established-overlay-dropped');
+    expect(kinds).not.toContain('established-overlay-hold');
+    expect(second.alerts.find((a) => a.kind === 'overlay-pinned')?.detail).toMatchObject({
+      ref: 'lane/c', pr: 4643, adopted: f.cOld, newTip: cNew, files: [DAEMON],
+    });
+    expect(isAncestor(f.clone, f.cOld, head)).toBe(true);
     expect(readFileSync(join(f.clone, 'other.txt'), 'utf8')).toBe('c\n');
-    expect(smoke).not.toHaveBeenCalled();
-    const parked = second.alerts.find((a) => a.kind === 'overlay-newcomer-parked');
-    expect(parked?.detail).toMatchObject({ ref: 'lane/c', pr: 4643, sha: cNew, files: [DAEMON] });
-    expect(parked.detail.collidesWith.map((c) => c.ref)).toEqual(['lane/prepare-launch-stall', 'lane/ruled-hold-release']);
     // the newcomer's PR is woken so its author resolves the conflict (merge the established branches in)
     expect(readOverlayConflictWakes(f.env, { maxAgeMs: Infinity }).get(4643)).toMatchObject({ ref: 'lane/c', files: [DAEMON] });
-    expect(logs.some((m) => m.includes('established-overlay-hold'))).toBe(true);
     // The first build still smoked: per-step timings are logged on every smoke, fast or slow.
     expect(logs.some((m) => m.includes('smoke-timings') && m.includes('reconcile-dry-run:148000ms'))).toBe(true);
   });
@@ -128,9 +127,10 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
     gitOk(f.clone, ['fetch', '-q', 'origin']);
     const plan = await planRebuild({ git: f.runGit, headSha: established.finalSha, mainRef: 'origin/main', overlays: f.overlays });
     expect(plan.ok).toBe(true);
-    expect(plan.applied.map((a) => a.ref)).toEqual(['lane/prepare-launch-stall', 'lane/ruled-hold-release']);
-    expect(plan.decisions.find((d) => d.ref === 'lane/c')).toMatchObject({ action: 'drop', reason: 'conflict' });
-    expect(plan.alerts.find((a) => a.kind === 'overlay-newcomer-parked')?.detail).toMatchObject({ ref: 'lane/c', files: [DAEMON] });
+    // the changed lane/c goes last and, its new head conflicting, is pinned at the head the running build adopted
+    expect(plan.applied.map((a) => [a.ref, a.sha])).toEqual([['lane/prepare-launch-stall', f.p], ['lane/ruled-hold-release', f.h], ['lane/c', f.cOld]]);
+    expect(plan.decisions.find((d) => d.ref === 'lane/c')).toMatchObject({ action: 'apply', reason: 'applied-pinned', sha: f.cOld });
+    expect(plan.establishedLost).toEqual([]);
   });
 
   it('dropping an ESTABLISHED overlay is never silent: it raises established-overlay-dropped', async () => {

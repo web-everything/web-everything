@@ -110,6 +110,7 @@ describe('ops-ref reader inventory', () => {
   const NON_READERS = {
     'scripts/collect-review-requests.mjs': 'request DIRECTORY name inside the branch tree (CI job)',
     'scripts/operations/record-verdict.mjs': 'request file path inside the branch tree',
+    'scripts/operations/coroner-pr-postmortem.mjs': 'reads the verdict ledger through the GitHub contents API, not a local tracking ref',
     'scripts/lib/red-main-quarantine.mjs': 'branch-name constant only (pure rules)',
     'scripts/lib/merge-delivery-policy.mjs': 'default branch-name policy value',
     'scripts/lib/daemon-rebuild/wrong-branch-heal.mjs': 'daemon clone CURRENT-branch name check, not a tracking ref',
