@@ -617,6 +617,7 @@ export function buildHungCiComment({
     HUNG_CI_COMMENT_MARKER,
     '',
     `sha: ${headSha ?? '(unknown)'}`,
+    `run: ${runId ?? '(unknown)'}`,
     `job: ${jobName ?? '(unknown)'}`,
     ...(reason ? [`reason: ${markerFreeText(reason)}`] : []),
     ...(cancelError != null ? [`Original cancel error: ${markerFreeText(cancelError)}`] : []),
@@ -913,7 +914,10 @@ export function sweepHungCiRecovery({
     if (!hungNow) return c;
     const comments = readComments(c.prNumber, { repo });
     // Existing builder prose distinguishes successful retriggers from FAILED attempts, including old markers.
-    const retriggerComments = comments.filter((cm) => bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, 'reason: run-not-found-retrigger'));
+    const retriggerComments = comments.filter((cm) => {
+      const body = typeof cm === 'string' ? cm : cm?.body;
+      return bodyHasExactLine(body, 'reason: run-not-found-retrigger') && bodyHasExactLine(body, `run: ${c.runId}`);
+    });
     const successfulRetriggers = retriggerComments.filter((cm) => {
       const outcome = (typeof cm === 'string' ? cm : cm.body).split('\n').at(-1);
       return !outcome.includes(' and it FAILED:') && outcome.includes('; triggered CI for the current PR head via "');
@@ -921,7 +925,7 @@ export function sweepHungCiRecovery({
     const successfulRetriggerCount = countHungCiComments(successfulRetriggers, c.headSha);
     if (successfulRetriggerCount > 0) {
       retriggerRefusals.push({ ...c, kind: 'run-not-found-retriggered',
-        why: 'This head already has a recorded retrigger outcome that succeeded; see its run-not-found-retrigger comment. No further attempt owed.' });
+        why: 'This head and run already have a recorded retrigger outcome that succeeded; see its run-not-found-retrigger comment. No further attempt owed.' });
       return null;
     }
     // `hungAttemptsForJob` must answer "has this job hung on a DIFFERENT head sha before" — the repeat-hang

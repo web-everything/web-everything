@@ -462,7 +462,7 @@ describe('ci-red-recovery-watch — buildHungCiComment / countHungCiComments', (
     const body = buildHungCiComment({ runId: 36161558017, headSha: 'deadbeef2636' });
     expect(body.startsWith(HUNG_CI_COMMENT_MARKER)).toBe(true);
     expect(body).toContain('sha: deadbeef2636');
-    expect(body).toContain('36161558017');
+    expect(bodyHasExactLine(body, 'run: 36161558017')).toBe(true);
   });
 
   it('counts only a trusted marker comment naming THIS head sha', () => {
@@ -715,6 +715,7 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     }));
     const body = f.comments.at(-1).body;
     expect(bodyHasExactLine(body, `sha: ${PR_2636_HUNG.headRefOid}`)).toBe(true);
+    expect(bodyHasExactLine(body, 'run: 36161558017')).toBe(true);
     expect(bodyHasExactLine(body, `reason: ${reason}`)).toBe(true);
     expect(body).toContain(triggered.action);
     expect(body).toContain(missingRun.error);
@@ -733,12 +734,15 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
   });
 
   it.each([
-    ['old-head', reason],
-    [PR_2636_HUNG.headRefOid, 'another-reason'],
-  ])('dedupe requires BOTH the current head and retrigger reason (sha %s, reason %s)', (headSha, markerReason) => {
+    ['old-head', reason, 36161558017],
+    [PR_2636_HUNG.headRefOid, 'another-reason', 36161558017],
+    [PR_2636_HUNG.headRefOid, reason, 36161558018],
+    [PR_2636_HUNG.headRefOid, reason, '361615580170'],
+    [PR_2636_HUNG.headRefOid, reason, null],
+  ])('dedupe requires the current head, reason and exact run id (sha %s, reason %s, run %s)', (headSha, markerReason, runId) => {
     const f = fixture('hung-cancel-rerun');
     f.comments.push({
-      body: buildHungCiComment({ headSha, reason: markerReason, jobName: 'another-job', ...triggered }),
+      body: buildHungCiComment({ headSha, reason: markerReason, runId, jobName: 'another-job', ...triggered }),
       author: { login: 'web-everything' },
     });
     expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining(triggered)]);
