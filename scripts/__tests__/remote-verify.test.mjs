@@ -525,6 +525,11 @@ describe('remote lane marker import — required gate evidence', () => {
 describe('remote-verify workflow — source contract', () => {
   const source = () => readFileSync(join(process.cwd(), '.github/workflows/remote-verify.yml'), 'utf8');
 
+  it('publishes evaluated dispatch inputs in run metadata for concurrent request correlation', () => {
+    const workflow = yaml.safeLoad(source());
+    expect(workflow['run-name']).toBe('remote-verify ${{ toJSON(inputs) }}');
+  });
+
   it('gives targeted tests a distinct step name from the required lane gate', () => {
     const workflow = yaml.safeLoad(source());
     const step = workflow.jobs.verify.steps.find((step) => step.env?.VERIFY_MODE);

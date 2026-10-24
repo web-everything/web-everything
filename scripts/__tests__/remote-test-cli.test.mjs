@@ -1,11 +1,156 @@
 // Test-first contract: no subprocesses, network, live git state, or implementation mocks.
 import { describe, expect, it, vi } from 'vitest';
-import { parseArgs, buildDispatchArgs, runRemoteTest } from '../remote-test.mjs';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { parseArgs, buildDispatchArgs, runRemoteTest, runRemoteCLI, remoteIO } from '../remote-test.mjs';
 
 const REF = 'lane/remote-tests';
 const SHA = 'a'.repeat(40);
 const CREATED_AFTER = '2026-10-24T12:00:00.000Z';
 const tests = ['scripts/__tests__/remote-route.test.mjs', 'blocks/example.test.ts'];
+
+describe('live IO construction with injected children', () => {
+  it('pins GitHub host, bypasses both caches, and bounds argv-only children', () => {
+    const execFile = vi.fn().mockReturnValue('https://github.com/example/repo.git\n');
+    const execGh = vi.fn().mockReturnValue('{}');
+    const live = remoteIO('.', { env: { GH_HOST: 'foreign.example', WE_GH_READ_MEMO_DIR: '/unused', WE_FINISHED_CI_CACHE: '1' }, execFile, execGh });
+    live.api('actions/runs/123');
+    expect(execGh).toHaveBeenCalledTimes(1);
+    expect(execGh).toHaveBeenCalledWith('gh', ['api', '--hostname', 'github.com', 'repos/example/repo/actions/runs/123'],
+      expect.objectContaining({ timeout: 15000, maxBuffer: 2 * 1024 * 1024 }));
+    const options = execGh.mock.calls[0][2];
+    for (const env of [options.env, options.throttle.env]) {
+      expect(env.GH_HOST).toBe('github.com');
+      expect(env.WE_FINISHED_CI_CACHE).toBe('0');
+      expect(env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+    }
+    expect(execFile.mock.calls[0][1]).toEqual(expect.any(Array));
+    expect(execFile.mock.calls[0][2]).toMatchObject({ timeout: 15000, maxBuffer: 2 * 1024 * 1024 });
+    expect(options.shell).toBeUndefined();
+  });
+});
+
+describe('CLI marker delegation', () => {
+  const title = (options = {}) => `remote-verify ${JSON.stringify({ ref: '', mode: 'lane-check', tests: '', operation: '', ...options })}`;
+  function fixture({ preExisting = [], postDispatch, mode = 'lane-check', inputs = {} } = {}) {
+    const run = { id: 123, event: 'workflow_dispatch', head_sha: SHA,
+      created_at: CREATED_AFTER, status: 'completed', conclusion: 'success', display_title: title({ mode, ...inputs }) };
+    let dispatched = false;
+    let clock = Date.parse('2026-10-24T12:00:00.750Z');
+    return { live: { ready: vi.fn().mockReturnValue({ sha: SHA }), gh: vi.fn(() => { dispatched = true; }),
+      api: vi.fn(path => path.startsWith('commits/') ? { sha: SHA }
+        : path.includes('workflows/') ? (() => {
+          const runs = dispatched ? postDispatch ?? [...preExisting, run] : preExisting;
+          return { total_count: runs.length, workflow_runs: runs };
+        })() : run) }, execFile: vi.fn(), now: () => clock,
+      pause: vi.fn(async ms => { clock += ms; }) };
+  }
+  it.each(['lane-check', 'full'])('imports green %s through verify-lane remote with argv', async mode => {
+    const io = fixture({ mode });
+    expect(await runRemoteCLI({ ref: REF, mode }, io)).toBe(0);
+    expect(io.live.gh).toHaveBeenCalledTimes(1);
+    expect(io.live.gh).toHaveBeenCalledWith(buildDispatchArgs({ ref: REF, mode }));
+    expect(io.execFile).toHaveBeenCalledTimes(1);
+    expect(io.execFile).toHaveBeenCalledWith(process.execPath, ['scripts/verify-lane.mjs', 'remote'],
+      expect.objectContaining({ timeout: 60000, maxBuffer: 2 * 1024 * 1024 }));
+  });
+  it('returns failure when the marker importer refuses, allowing auto-route local fallback', async () => {
+    const io = fixture();
+    io.execFile.mockImplementation(() => { throw new Error('import refused'); });
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, io)).toBe(2);
+  });
+  it('refuses a moved ref before dispatch or marker import', async () => {
+    const io = fixture();
+    io.live.api.mockReturnValue({ sha: 'b'.repeat(40) });
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, { ...io, quietFailure: true })).toBe(2);
+    expect(io.live.gh).not.toHaveBeenCalled();
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
+
+  it('accepts a newly dispatched same-second run while rejecting pre-existing same-second runs', async () => {
+    const preExisting = [{ id: 999, event: 'workflow_dispatch', head_sha: SHA,
+      created_at: CREATED_AFTER, status: 'completed', conclusion: 'success' }];
+    const io = fixture({ preExisting });
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, io)).toBe(0);
+    expect(io.live.api).toHaveBeenCalledWith('actions/runs/123');
+    expect(io.live.api).not.toHaveBeenCalledWith('actions/runs/999');
+    expect(io.execFile).toHaveBeenCalledOnce();
+    expect(io.pause).not.toHaveBeenCalled();
+    // Baseline evidence must be read before dispatch, not inferred from a later listing.
+    expect(io.live.api.mock.invocationCallOrder[1]).toBeLessThan(io.live.gh.mock.invocationCallOrder[0]);
+  });
+
+  it('times out and falls back when only pre-existing same-second runs are available', async () => {
+    const preExisting = [{ id: 123, event: 'workflow_dispatch', head_sha: SHA,
+      created_at: CREATED_AFTER, status: 'completed', conclusion: 'success' }];
+    const io = fixture({ preExisting, postDispatch: preExisting });
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, { ...io, quietFailure: true })).toBe(2);
+    expect(io.live.api).not.toHaveBeenCalledWith('actions/runs/123');
+    expect(io.execFile).not.toHaveBeenCalled();
+    expect(io.pause).toHaveBeenCalledTimes(12);
+  });
+
+  it.each(['incomplete', 'oversized'])('refuses an %s pre-dispatch snapshot before dispatch', async kind => {
+    const io = fixture();
+    const runs = Array.from({ length: kind === 'oversized' ? 101 : 1 }, (_, index) => ({
+      id: index + 1, event: 'workflow_dispatch', head_sha: SHA, created_at: CREATED_AFTER,
+    }));
+    io.live.api.mockImplementation(path => path.startsWith('commits/') ? { sha: SHA }
+      : { total_count: kind === 'incomplete' ? 2 : runs.length, workflow_runs: runs });
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, { ...io, quietFailure: true })).toBe(2);
+    expect(io.live.gh).not.toHaveBeenCalled();
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ tests: ['blocks/failing.test.ts'] }, { mode: 'full' }],
+    [{ tests: ['blocks/failing.test.ts'] }, { mode: 'targeted', tests: 'blocks/other.test.ts' }],
+    [{ operation: 'check-standards' }, { mode: 'targeted', operation: 'test-unit' }],
+    [{ operation: 'check-standards' }, { mode: 'targeted', operation: 'check-standards', ref: 'other/ref' }],
+  ])('rejects successful concurrent same-SHA dispatches with different inputs and preserves the requested failure: %j', async (request, unrelated) => {
+    const options = { ref: REF, mode: 'targeted', ...request };
+    const requested = { id: 123, event: 'workflow_dispatch', head_sha: SHA, created_at: CREATED_AFTER,
+      status: 'completed', conclusion: 'failure', display_title: title({ mode: 'targeted',
+        tests: (request.tests ?? []).join(' '), operation: request.operation ?? '' }) };
+    const foreign = { ...requested, id: 999, conclusion: 'success', display_title: title(unrelated) };
+    const io = fixture({ postDispatch: [requested, foreign] });
+    const api = io.live.api.getMockImplementation();
+    io.live.api.mockImplementation(path => path === 'actions/runs/123' ? requested
+      : path === 'actions/runs/999' ? foreign : api(path));
+    expect(await runRemoteCLI(options, { ...io, quietFailure: true })).toBe(2);
+    expect(io.live.api).toHaveBeenCalledWith('actions/runs/123');
+    expect(io.live.api).not.toHaveBeenCalledWith('actions/runs/999');
+    expect(io.execFile).not.toHaveBeenCalled();
+    expect(io.pause).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'Remote verify', 'remote-verify {bad', title({ tests: 'unexpected.test.ts' })])
+    ('fails closed when fresh run input evidence is missing, malformed or mismatched: %j', async display_title => {
+      const run = { id: 123, event: 'workflow_dispatch', head_sha: SHA, created_at: CREATED_AFTER,
+        status: 'completed', conclusion: 'success', display_title };
+      const io = fixture({ postDispatch: [run] });
+      expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, { ...io, quietFailure: true })).toBe(2);
+      expect(io.live.api).not.toHaveBeenCalledWith('actions/runs/123');
+      expect(io.execFile).not.toHaveBeenCalled();
+    });
+
+  it('rechecks dispatch inputs when waiting instead of accepting changed run evidence', async () => {
+    const io = fixture();
+    const api = io.live.api.getMockImplementation();
+    io.live.api.mockImplementation(path => path === 'actions/runs/123'
+      ? { ...api(path), display_title: title({ mode: 'targeted', tests: 'other.test.ts' }) } : api(path));
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, { ...io, quietFailure: true })).toBe(2);
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
+
+  it.each([{ tests }, { operation: 'check-standards' }])
+    ('accepts green targeted verification only with the matching normalized inputs: %j', async request => {
+      const io = fixture({ mode: 'targeted', inputs: { tests: (request.tests ?? []).join(' '), operation: request.operation ?? '' } });
+      expect(await runRemoteCLI({ ref: REF, mode: 'targeted', ...request }, io)).toBe(0);
+      expect(io.live.api).toHaveBeenCalledWith('actions/runs/123');
+      expect(io.execFile).not.toHaveBeenCalled();
+    });
+});
 
 function usage(argv) {
   expect(() => parseArgs(argv)).toThrow(/usage/i);
@@ -22,10 +167,32 @@ describe('parseArgs', () => {
         .toMatchObject({ ref: REF, mode: 'targeted', tests });
     });
 
-  it('accepts an operation instead of tests in targeted mode', () => {
-    expect(parseArgs(['--ref', REF, '--mode', 'targeted', '--operation', 'check:standards']))
-      .toMatchObject({ ref: REF, mode: 'targeted', operation: 'check:standards' });
+  it('accepts a hyphenated operation instead of tests in targeted mode (formerly accepted check:standards)', () => {
+    expect(parseArgs(['--ref', REF, '--mode', 'targeted', '--operation', 'check-standards']))
+      .toMatchObject({ ref: REF, mode: 'targeted', operation: 'check-standards' });
   });
+
+  it('pins CLI and workflow operation regex equality', () => {
+    const pattern = source => {
+      const match = /const operationNamePattern = (\/[^\n]+\/);/.exec(source);
+      expect(match).not.toBeNull();
+      return match[1];
+    };
+    const cli = readFileSync(join(process.cwd(), 'scripts/remote-test.mjs'), 'utf8');
+    const workflow = readFileSync(join(process.cwd(), '.github/workflows/remote-verify.yml'), 'utf8');
+    expect(pattern(cli)).toBe(pattern(workflow));
+    expect(pattern(workflow)).toBe('/^[a-z][a-z0-9-]*$/');
+  });
+
+  it.each(['check:standards', 'Check', '1check', 'check_unit', 'check/unit', 'check.unit',
+    'check@unit', 'check+unit', 'check unit'])
+    ('rejects operation %j outside the workflow character set before dispatch', async operation => {
+      usage(['--ref', REF, '--mode', 'targeted', '--operation', operation]);
+      expect(() => buildDispatchArgs({ ref: REF, mode: 'targeted', operation })).toThrow(/usage/i);
+      const { io } = fixture({ mode: 'targeted', operation });
+      expect(await runRemoteTest(io)).toBe(3);
+      expect(io.dispatch).not.toHaveBeenCalled();
+    });
 
   it('accepts a commit SHA as a ref', () => {
     expect(parseArgs(['--ref', SHA, '--mode', 'full']).ref).toBe(SHA);
@@ -33,11 +200,11 @@ describe('parseArgs', () => {
 
   it.each([
     ['--mode', 'targeted', '--ref', REF],
-    ['--mode', 'targeted', '--ref', REF, '--tests=a.test.ts', '--operation', 'test:unit'],
+    ['--mode', 'targeted', '--ref', REF, '--tests=a.test.ts', '--operation', 'test-unit'],
     ['--mode', 'targeted', '--ref', REF, '--tests= ,  '],
     ['--mode', 'targeted', '--ref', REF, '--operation', ''],
     ['--mode', 'unknown'], ['--mode'], ['--ref'], ['--operation'], ['--unknown'],
-  ])('rejects invalid or incomplete usage %j', usage);
+  ].map(argv => [argv]))('rejects invalid or incomplete usage %j', usage);
 
   // Strings remain inert fixture data; none are sent to a shell.
   for (const field of ['ref', 'tests', 'operation']) {
@@ -69,9 +236,9 @@ describe('buildDispatchArgs', () => {
   });
 
   it('builds a targeted operation dispatch', () => {
-    expect(buildDispatchArgs({ ref: REF, mode: 'targeted', operation: 'check:standards' })).toEqual([
+    expect(buildDispatchArgs({ ref: REF, mode: 'targeted', operation: 'check-standards' })).toEqual([
       'workflow', 'run', 'remote-verify.yml', '--ref', REF,
-      '-f', 'mode=targeted', '-f', 'tests=', '-f', 'operation=check:standards',
+      '-f', 'mode=targeted', '-f', 'tests=', '-f', 'operation=check-standards',
     ]);
   });
 });
@@ -79,6 +246,8 @@ describe('buildDispatchArgs', () => {
 // IO contract: dispatch receives gh argv and returns a receipt containing the
 // pushed head_sha and a createdAfter timestamp captured before dispatch. findRun
 // receives { createdAfter, headSha }; wait receives { runId, timeoutMs }.
+// A live receipt also carries a complete existingRunIds snapshot, forwarded to
+// findRun and checked again before wait to admit fresh second-precision timestamps.
 // print receives a result object including exitCode and recordMarker, allowing
 // the CLI to delegate eligible green results to verify-lane.mjs remote.
 function fixture(overrides = {}) {
@@ -97,11 +266,14 @@ describe('runRemoteTest with injected IO', () => {
   it('dispatches, finds only the new matching HEAD, waits at most nine minutes, then prints', async () => {
     const { io, run } = fixture();
     expect(await runRemoteTest(io)).toBe(0);
-    expect(io.dispatch).toHaveBeenCalledExactlyOnceWith(buildDispatchArgs({ ref: REF, mode: 'lane-check' }));
-    expect(io.findRun).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    expect(io.dispatch).toHaveBeenCalledTimes(1);
+    expect(io.dispatch).toHaveBeenCalledWith(buildDispatchArgs({ ref: REF, mode: 'lane-check' }));
+    expect(io.findRun).toHaveBeenCalledTimes(1);
+    expect(io.findRun).toHaveBeenCalledWith(expect.objectContaining({
       createdAfter: CREATED_AFTER, headSha: SHA,
     }));
-    expect(io.wait).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: run.id, timeoutMs: 540000 }));
+    expect(io.wait).toHaveBeenCalledTimes(1);
+    expect(io.wait).toHaveBeenCalledWith(expect.objectContaining({ runId: run.id, timeoutMs: 540000 }));
     expect(io.print).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 0, recordMarker: true }));
     const order = [io.dispatch, io.findRun, io.wait, io.print].map((fn) => fn.mock.invocationCallOrder[0]);
     expect(order).toEqual([...order].sort((a, b) => a - b));
@@ -175,10 +347,19 @@ describe('runRemoteTest with injected IO', () => {
     expect(io.print).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 2, recordMarker: false }));
   });
 
+  it.each([NaN, Infinity, -1, '123', null])('refuses invalid timeout %s before dispatch', async timeoutMs => {
+    const { io } = fixture({ timeoutMs });
+    expect(await runRemoteTest(io)).toBe(2);
+    expect(io.dispatch).not.toHaveBeenCalled();
+    expect(io.print).toHaveBeenCalledWith(expect.objectContaining({ recordMarker: false, reason: expect.stringContaining('local verify') }));
+  });
+
   it.each([
     { mode: 'unknown' }, { mode: 'targeted' },
-    { mode: 'targeted', tests, operation: 'test:unit' },
+    { mode: 'targeted', tests, operation: 'test-unit' },
     { mode: 'targeted', tests: ['a;echo bad'] }, { ref: '$(id)' },
+    { mode: 'targeted', tests: Array(201).fill('a.test.ts') },
+    { ref: 'x'.repeat(4097) },
   ])('returns usage code 3 before IO for invalid options %j', async (options) => {
     const { io } = fixture(options);
     expect(await runRemoteTest(io)).toBe(3);

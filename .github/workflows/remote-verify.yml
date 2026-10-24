@@ -1,4 +1,7 @@
 name: Remote verify
+# GitHub's run metadata carries the evaluated inputs; clients must match these
+# before accepting a concurrent workflow_dispatch at the same commit.
+run-name: remote-verify ${{ toJSON(inputs) }}
 
 on:
   workflow_dispatch:
@@ -102,7 +105,9 @@ jobs:
                 if (tests.some((file) => file.startsWith('-') || !existsSync(file))) throw new Error('Expected existing test file paths');
                 run('npm', ['run', 'test:unit', '--', ...tests]);
               } else {
-                if (!/^[a-z][a-z0-9-]*$/.test(operation)) throw new Error('Targeted mode requires tests or an operation name');
+                // Keep identical to operationNamePattern in scripts/remote-test.mjs.
+                const operationNamePattern = /^[a-z][a-z0-9-]*$/;
+                if (!operationNamePattern.test(operation)) throw new Error('Targeted mode requires tests or an operation name');
                 // Operation declarations and their IO bindings live beside each other.
                 const declaration = `scripts/operations/${operation}.mjs`;
                 if (!existsSync(declaration)) throw new Error('Unknown operation');

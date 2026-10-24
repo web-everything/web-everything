@@ -70,7 +70,10 @@ import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlin
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
 import { recordRemoteVerification, waitForRemoteVerify, MAX_REMOTE_WAIT_MS } from './lib/remote-verify.mjs';
-import { homedir, tmpdir } from 'node:os';
+import { autoRouteVerify, resolveRouteSettings, ROUTE_DEFAULTS } from './lib/remote-route.mjs';
+import { remoteIO, runRemoteCLI } from './remote-test.mjs';
+import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs';
+import { homedir, tmpdir, loadavg } from 'node:os';
 import { join, resolve } from 'node:path';
 import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
 import { isAllowlistedLitterPath } from './lib/lane-litter.mjs';
@@ -546,6 +549,32 @@ if (!resolvedGate && typeof flags.gate === 'string') {
 
 SELECTION = summarizeSelection({ gate: resolvedGate, explicitGate: typeof flags.gate === 'string' });
 if (DISPATCHED_RUN && MODE === 'verify') process.stderr.write(`${selectionNotice({ sha: headSha, summary: SELECTION })}\n`);
+
+// Only ordinary verify may substitute the remote gate. Custom commands retain their exact local meaning.
+// Read-only/request/run/remote modes never probe the queue or dispatch a workflow.
+if (MODE === 'verify') {
+  let tool;
+  try { tool = JSON.parse(readFileSync(new URL('./settings/remote-route.json', import.meta.url), 'utf8')); } catch { /* no tool override */ }
+  const cascade = resolveCascade({ standard: ROUTE_DEFAULTS, platform: platformPreference('remoteRoute'), tool,
+    valid: { enabled: v => typeof v === 'boolean', thresholdMinutes: v => typeof v === 'number' && Number.isFinite(v) && v >= 0,
+      loadCap: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 } });
+  const settings = resolveRouteSettings(process.env, { ...cascade.value, source: cascade.sources });
+  const remotePassed = await autoRouteVerify({ settings, eligible: flags.gate === undefined,
+    mode: resolvedGate?.decision?.mode === 'full' ? 'full' : 'lane-check',
+    readQueue: () => JSON.parse(execFileSync(process.execPath, ['scripts/readiness/heavy-admission.mjs', 'queue-status', '--json'], {
+        cwd: REPO, encoding: 'utf8', timeout: 15000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+      })),
+    readLoad: () => loadavg()[0],
+    readiness: () => {
+      const ready = remoteIO(REPO).ready();
+      if (ready.sha !== headSha) throw new Error('HEAD changed before routing');
+      return ready;
+    },
+    remote: options => runRemoteCLI(options, { repo: REPO, json: AS_JSON, quietFailure: true }),
+    log: line => process.stderr.write(`${line}\n`),
+  });
+  if (remotePassed) process.exit(0);
+}
 
 // 1. Stamp the `running` marker BEFORE the suites start, so a kill mid-run leaves a stranded (detectably
 //    unfinished) marker rather than nothing.

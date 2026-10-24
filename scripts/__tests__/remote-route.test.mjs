@@ -1,11 +1,58 @@
 // Test-first contract: static imports intentionally fail until the module exists.
-import { describe, expect, it } from 'vitest';
-import { decideRoute, resolveRouteSettings, formatRouteLog } from '../lib/remote-route.mjs';
+import { describe, expect, it, vi } from 'vitest';
+import { autoRouteVerify, decideRoute, resolveRouteSettings, formatRouteLog } from '../lib/remote-route.mjs';
 
 const local = {
   projectedWaitMinutes: 1, heavyWaitMinutes: 1, load1: 2, loadCap: 36,
   thresholdMinutes: 10, remoteReady: true, mode: 'lane-check',
 };
+
+describe('autoRouteVerify local fallback', () => {
+  function fixture(changes = {}) {
+    return { settings: resolveRouteSettings({}, {}), mode: 'lane-check',
+      readQueue: vi.fn().mockResolvedValue({ projectedWaitMinutes: 20, heavyWaitMinutes: 20 }),
+      readLoad: vi.fn().mockReturnValue(2), readiness: vi.fn().mockResolvedValue({ ref: 'lane/pushed-head' }),
+      remote: vi.fn().mockResolvedValue(0), log: vi.fn(), ...changes };
+  }
+  it('dispatches the pushed ref and skips the local gate only on remote success', async () => {
+    const io = fixture();
+    expect(await autoRouteVerify(io)).toBe(true);
+    expect(io.remote).toHaveBeenCalledTimes(1);
+    expect(io.remote).toHaveBeenCalledWith({ ref: 'lane/pushed-head', mode: 'lane-check' });
+    expect(io.log.mock.calls.filter(([line]) => line.startsWith('verify-lane route:'))).toHaveLength(1);
+  });
+  it.each([2, 3, undefined])('retains the local gate on remote exit %s', async code => {
+    const io = fixture({ remote: vi.fn().mockResolvedValue(code) });
+    expect(await autoRouteVerify(io)).toBe(false);
+    expect(io.log).toHaveBeenCalledWith(expect.stringMatching(/falling back to the local gate/));
+    expect(io.log.mock.calls.filter(([line]) => line.startsWith('verify-lane route:'))).toHaveLength(1);
+  });
+  it('retains the local gate if remote execution throws', async () => {
+    const io = fixture({ remote: vi.fn().mockRejectedValue(new Error('unavailable')) });
+    expect(await autoRouteVerify(io)).toBe(false);
+    expect(io.log).toHaveBeenCalledWith(expect.stringMatching(/falling back/));
+  });
+  it.each(['readQueue', 'readLoad', 'readiness'])('retains the local gate if %s is unavailable', async stage => {
+    const io = fixture({ [stage]: vi.fn().mockRejectedValue(new Error('unavailable')) });
+    expect(await autoRouteVerify(io)).toBe(false);
+    expect(io.remote).not.toHaveBeenCalled();
+    expect(io.log).toHaveBeenCalledTimes(1);
+    expect(io.log).toHaveBeenCalledWith(expect.stringMatching(/^verify-lane route: local —/));
+  });
+  it('does not dispatch on incomplete queue evidence despite high load', async () => {
+    const io = fixture({ readQueue: vi.fn().mockResolvedValue({}), readLoad: vi.fn().mockReturnValue(99) });
+    expect(await autoRouteVerify(io)).toBe(false);
+    expect(io.remote).not.toHaveBeenCalled();
+  });
+  it.each([{ eligible: false }, { settings: resolveRouteSettings({ WE_REMOTE_ROUTE: 'off' }) }])
+    ('does not probe or dispatch when routing is disabled or a custom gate is requested', async changes => {
+      const io = fixture(changes);
+      expect(await autoRouteVerify(io)).toBe(false);
+      for (const key of ['readQueue', 'readLoad', 'readiness', 'remote']) expect(io[key]).not.toHaveBeenCalled();
+      expect(io.log).toHaveBeenCalledTimes(1);
+      expect(io.log).toHaveBeenCalledWith(expect.stringMatching(/^verify-lane route: local —/));
+    });
+});
 
 describe('decideRoute', () => {
   it('keeps tiny runs local and explains why', () => {
@@ -122,6 +169,12 @@ describe('resolveRouteSettings', () => {
   it('treats empty environment values as unset', () => {
     expect(resolveRouteSettings({ WE_REMOTE_ROUTE_THRESHOLD_MINUTES: '', WE_REMOTE_ROUTE_LOAD_CAP: '',
       WE_REMOTE_ROUTE: '' }, {})).toEqual(resolveRouteSettings({}, {}));
+  });
+
+  it('disables remote routing for an unknown enable setting', () => {
+    const settings = resolveRouteSettings({ WE_REMOTE_ROUTE: 'mystery' });
+    expect(settings.enabled).toBe(false);
+    expect(settings.source.enabled).toContain('invalid environment fallback');
   });
 });
 
