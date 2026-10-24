@@ -3156,6 +3156,39 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
   return null;
 }
 
+/** Same-head siblings need a concrete line on both sides of the shared clearing predicate. PURE. */
+export function sameGapSameHead(a, b) {
+  return Boolean(a && b && typeof a === 'object' && typeof b === 'object'
+    && Number.isInteger(a.line) && Number.isInteger(b.line) && sameFindingForClearing(a, b));
+}
+
+/** Security is the category lens; unreadable findings cannot authorize a not-real clearance. */
+export function isSecurityClassFinding(f) {
+  return !f || typeof f !== 'object' || String(f.category ?? '').split('/')[0].toLowerCase() === 'security';
+}
+
+/** Latest same-head operator clearance of a sibling gap; security-class not-real rulings never inherit. PURE. */
+export function findSameHeadSiblingRuling(referral, { records = [], operatorRulings = [], head, repo, pr } = {}) {
+  if (!referral?.key || !referral.finding || !head || !repo || !pr
+    || !Array.isArray(records) || !Array.isArray(operatorRulings)) return null;
+  const seen = new Set();
+  for (const o of [...operatorRulings].reverse()) {
+    if (!o || o.head !== head || o.repo !== repo || o.pr !== pr || !o.runId || !o.key || o.key === referral.key) continue;
+    const identity = JSON.stringify([o.head, o.runId, o.key]);
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    const record = records.find(r => r?.runId === o.runId && r.head === head && r.repo === repo && r.pr === pr);
+    const ruled = record?.referrals?.find(f => f.key === o.key);
+    const finding = ruled?.finding;
+    if (!sameGapSameHead(finding, referral.finding)) continue;
+    if (o.result !== 'not-real' && o.result !== 'card') return null;
+    if (o.result === 'not-real' && (isSecurityClassFinding(referral.original ?? referral.finding)
+      || isSecurityClassFinding(ruled.original ?? finding))) return null;
+    return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
+  }
+  return null;
+}
+
 // ── #76c — THE REVIEWER'S OWN not-real / card RULING STANDS ACROSS HEADS ────────────────────────────────────────
 // #4017 was re-ruled ~60 times: every push re-raised the same finding (new line, new wording) and a fresh reviewer
 // pass ruled it again, sometimes the other way a minute later. Operator rulings already carried (above); the

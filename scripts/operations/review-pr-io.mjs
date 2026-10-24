@@ -6,7 +6,7 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, referralRecheck, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
+  findCarriedOperatorRuling, findCarriedReviewerRuling, findSameHeadSiblingRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, referralRecheck, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
   requiresMandatoryReferral, REFERRAL_VERIFY_OUTCOMES, foldVerifyReason, verifierEvidenceCitesClaim } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
@@ -1243,22 +1243,26 @@ export function createReviewPrSinks({
               const match = findCarriedOperatorRuling(f, { records, operatorRulings,
                 head: record.head, repo: record.repo, pr: record.pr })
                 ?? findCarriedReviewerRuling(f, { records, operatorRulings, head: record.head, repo: record.repo,
-                  pr: record.pr, body: state.body ?? '', createdAt: state.createdAt ?? '', cardReadable });
+                  pr: record.pr, body: state.body ?? '', createdAt: state.createdAt ?? '', cardReadable })
+                ?? findSameHeadSiblingRuling(f, { records, operatorRulings,
+                  head: record.head, repo: record.repo, pr: record.pr });
               if (!match) continue;
               // `referralRecordState` keeps a carried `card` pending while its card is unreadable, yet `liveReferrals`
               // drops a carried finding from dispatch: that pairing would hold the gate with no reviewer to clear it.
               if (match.result === 'card' && !cardReadable(match.card)) continue;
-              let changed;
-              try {
-                // The exact cited path: an `a/` or `b/` prefix may be a real directory, so it is never stripped for a lookup.
-                const file = exactCitedPath(f.finding.file);
-                changed = await changedLines(record.repo, match.from.head, record.head, file);
-              } catch { changed = null; }
-              if (!(changed instanceof Set)) continue;
-              // Each citation is checked in its own revision's coordinates: this finding's line against the new side,
-              // the earlier ruled finding's line against the old side (a plain injected Set serves for both).
-              if (changesTouchCitedLines(changed, [f.finding.line])
-                || changesTouchCitedLines(changed.old ?? changed, [match.finding.line])) continue;
+              if (match.from.head !== record.head) {
+                let changed;
+                try {
+                  // The exact cited path: an `a/` or `b/` prefix may be a real directory, so it is never stripped for a lookup.
+                  const file = exactCitedPath(f.finding.file);
+                  changed = await changedLines(record.repo, match.from.head, record.head, file);
+                } catch { changed = null; }
+                if (!(changed instanceof Set)) continue;
+                // Each citation is checked in its own revision's coordinates: this finding's line against the new side,
+                // the earlier ruled finding's line against the old side (a plain injected Set serves for both).
+                if (changesTouchCitedLines(changed, [f.finding.line])
+                  || changesTouchCitedLines(changed.old ?? changed, [match.finding.line])) continue;
+              }
               carried.push({ key: f.key, reason: REFERRAL_CARRY_REASON, from: match.from,
                 result: match.result, ...(match.card ? { card: match.card } : {}) });
             }
