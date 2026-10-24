@@ -57,7 +57,7 @@ import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
 import { DISPATCH_GUARD_LISTING_GRACE_MINUTES } from '../../operations/dispatch-lane.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 
 const NOW = Date.parse('2026-07-26T12:00:00Z');
@@ -888,9 +888,9 @@ describe('sessionPidAliveByName — #3383 real process-liveness per session, reu
 
 describe('live dispatcher wrappers without run-store effects', () => {
   const nowMs = Date.parse('2026-10-23T15:48:26Z');
-  const psLine = (script, session) => `user 12345 0.0 0.1 123456 1234 ?? S 11:46AM 0:01.00 node /repo/scripts/operations/${script} --pr=5502 --session=${session}`;
+  const psLine = (script, session, repo = 'web-everything/web-everything') => `user 12345 0.0 0.1 123456 1234 ?? S 11:46AM 0:01.00 node /repo/scripts/operations/${script} --pr=5502 --session=${session} --repo=${repo}`;
   const staleRows = (session, state = 'done') => [{ kind: 'background', name: session, state, sessionId: 'dead-earlier-session-id' }];
-  const signals = (session, rows, psOutput, extra = {}) => {
+  const signals = (session, rows, psOutput, extra = {}, candidateExtra = {}) => {
     const exec = vi.fn((cmd) => {
       if (cmd === 'claude') return JSON.stringify(rows);
       if (cmd === 'ps') {
@@ -900,11 +900,13 @@ describe('live dispatcher wrappers without run-store effects', () => {
       throw new Error(`unexpected command: ${cmd}`);
     });
     const fetched = fetchSessionSignals({}, { exec });
-    const lease = fresh({ session, acquiredAt: '2026-10-23T15:46:37Z' });
-    const candidate = { lease, dir: '/unused', lane: 27, pool: 'web-everything' };
+    const lease = fresh({ session, acquiredAt: '2026-10-23T15:46:37Z', holder: 'current-holder', host: hostname() });
+    const candidate = { lease, dir: '/pools/web-everything/lane-27', lane: 27, pool: 'web-everything', repoKey: 'we', ...candidateExtra };
     const signalsFor = buildLeaseSignalsFor({
       prStatesByRepo: new Map(), sessionStates: fetched.states, sessionPidAlive: fetched.pidAlive,
       sessionAgents: fetched.agents, wrapperPids: new Map(), liveWrapperSessions: fetched.liveWrapperSessions,
+      readJournal: () => [{ action: 'acquire', lane: 27, session, holder: lease.holder,
+        actor: { pid: lease.pid, ppid: 12345, host: lease.host } }],
       nowMs, ...extra,
     });
     return { fetched, exec, signal: signalsFor(candidate), plan: reapPlan([candidate], { nowMs, signalsFor }) };
@@ -919,7 +921,9 @@ describe('live dispatcher wrappers without run-store effects', () => {
       psLine('fix-run.mjs', 'fix-996').replace('--session=', '--other-session='),
       'node /repo/scripts/operations/fix-run.mjs --pr=5502',
     ].join('\n');
-    expect([...liveWrapperSessionsFromPs(output)]).toEqual(['fix-5502', 'conveyor-123', 'ci-heal-5829']);
+    const wrappers = liveWrapperSessionsFromPs(output);
+    expect([...wrappers.keys()]).toEqual(['fix-5502', 'conveyor-123', 'ci-heal-5829']);
+    expect([...wrappers.get('fix-5502')]).toEqual([[12345, 'we']]);
     expect([...liveWrapperSessionsFromPs(null)]).toEqual([]);
     expect([...liveWrapperSessionsFromPs('')]).toEqual([]);
   });
@@ -935,6 +939,17 @@ describe('live dispatcher wrappers without run-store effects', () => {
     'nodejs fix-run.mjs --session=fix-5502',
     'node fix-run.mjs --session=fix-5502 --session=fix-9999',
   ])('ignores non-wrapper command: %s', command => {
+    expect([...liveWrapperSessionsFromPs(`user 12345 0.0 0.1 123456 1234 ?? S 11:46AM 0:01.00 ${command} --repo=we`)]).toEqual([]);
+  });
+
+  it.each([
+    'node fix-run.mjs --session=fix-5502', // repository ownership is unknown
+    'node fix-run.mjs --session=fix-5502 --repo=unknown/repo',
+    'node fix-run.mjs --session=fix-5502 --repo=',
+    'node fix-run.mjs --session=fix-5502 --repo=we --repo=frontierui',
+    'node fix-run.mjs --session=fix-5502 --repo=we --repo frontierui',
+    'node fix-run.mjs --session=fix-5502 --session --repo=we',
+  ])('refuses missing or ambiguous wrapper ownership: %s', command => {
     expect([...liveWrapperSessionsFromPs(`user 12345 0.0 0.1 123456 1234 ?? S 11:46AM 0:01.00 ${command}`)]).toEqual([]);
   });
 
@@ -944,7 +959,7 @@ describe('live dispatcher wrappers without run-store effects', () => {
     'node deliver-item-run.mjs',
     '/usr/bin/node ci-heal-run.mjs',
   ])('accepts a Node wrapper command: %s', command => {
-    expect([...liveWrapperSessionsFromPs(`  user 12345 0.0 0.1 123456 1234 ?? S 11:46AM 0:01.00   ${command} --pr=5502 --session=fix-5502`)]).toEqual(['fix-5502']);
+    expect([...liveWrapperSessionsFromPs(`  user 12345 0.0 0.1 123456 1234 ?? S 11:46AM 0:01.00   ${command} --pr=5502 --session=fix-5502 --repo=web-everything/web-everything`).keys()]).toEqual(['fix-5502']);
   });
 
   it.each([
@@ -966,6 +981,72 @@ describe('live dispatcher wrappers without run-store effects', () => {
     const { signal, plan } = signals('fix-5502', staleRows('fix-5502'), psLine('fix-run.mjs', 'fix-5608'));
     expect(signal.sessionGone).toBe(true);
     expect(plan.reap[0].reason).toBe('session-gone');
+  });
+
+  it('a same-slug wrapper from another repository does not protect a confirmed dead lease', () => {
+    const { fetched, signal, plan } = signals('fix-5502', staleRows('fix-5502'), psLine('fix-run.mjs', 'fix-5502', 'frontier-ui/frontierui'));
+    expect(fetched.pidAlive.get('fix-5502')).toBe(false);
+    expect(signal.sessionGone).toBe(true);
+    expect(plan.reap[0].reason).toBe('session-gone');
+    expect(plan.keep).toHaveLength(0);
+  });
+
+  it.each([
+    ['another lane', { lane: 28 }],
+    ['another session', { session: 'fix-5608' }],
+    ['a previous holder', { holder: 'previous-holder' }],
+    ['no holder', { holder: undefined }],
+    ['a release', { action: 'release' }],
+    ['another acquiring process', { actor: { pid: 222, ppid: 12345, host: hostname() } }],
+    ['another wrapper parent', { actor: { pid: 111, ppid: 12346, host: hostname() } }],
+    ['another host', { actor: { pid: 111, ppid: 12345, host: 'other-host' } }],
+    ['no actor', { actor: undefined }],
+  ])('a same-slug wrapper with journal evidence for %s does not protect the lease', (_label, change) => {
+    const { signal, plan } = signals('fix-5502', staleRows('fix-5502'), psLine('fix-run.mjs', 'fix-5502'), {
+      readJournal: () => [{ action: 'acquire', lane: 27, session: 'fix-5502', holder: 'current-holder',
+        actor: { pid: 111, ppid: 12345, host: hostname() }, ...change }],
+    });
+    expect(signal.sessionGone).toBe(true);
+    expect(plan.reap[0].reason).toBe('session-gone');
+  });
+
+  it('a same-repository wrapper without readable lane ownership evidence retains confirmed death', () => {
+    const { signal, plan } = signals('fix-5502', staleRows('fix-5502'), psLine('fix-run.mjs', 'fix-5502'), {
+      readJournal: () => [],
+    });
+    expect(signal.sessionGone).toBe(true);
+    expect(plan.reap[0].reason).toBe('session-gone');
+  });
+
+  it('reads ownership from the candidate pool and retains death for missing, corrupt or oversized journal evidence', () => {
+    const poolDir = mkdtempSync(join(tmpdir(), 'reaper-wrapper-journal-'));
+    const journal = join(poolDir, '.lane-journal.jsonl');
+    const check = () => signals('fix-5502', staleRows('fix-5502'), psLine('fix-run.mjs', 'fix-5502'),
+      { readJournal: undefined }, { dir: join(poolDir, 'lane-27') });
+    try {
+      expect(check().signal.sessionGone).toBe(true); // unreadable/missing journal
+      writeFileSync(journal, '{torn journal\n');
+      expect(check().signal.sessionGone).toBe(true);
+      const evidence = JSON.stringify({ action: 'acquire', lane: 27, session: 'fix-5502', holder: 'current-holder',
+        actor: { pid: 111, ppid: 12345, host: hostname() } });
+      writeFileSync(journal, evidence + '\n');
+      expect(check().signal.sessionGone).toBe(false);
+      // Evidence outside the shared reader's bounded tail is unknown, never a positive match.
+      writeFileSync(journal, evidence + '\n' + ' '.repeat(1024 * 1024 + 1));
+      const { signal, plan } = check();
+      expect(signal.sessionGone).toBe(true);
+      expect(plan.reap[0].reason).toBe('session-gone');
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a proven live wrapper does not suppress the existing PR-terminal reap axis', () => {
+    const { signal, plan } = signals('fix-5502', staleRows('fix-5502'), psLine('fix-run.mjs', 'fix-5502'), {
+      prStatesByRepo: new Map([['we', { byItem: new Map(), byPr: new Map([['5502', 'merged']]) }]]),
+    });
+    expect(signal.sessionGone).toBe(false);
+    expect(plan.reap[0].reason).toBe('pr-merged');
   });
 
   it('no matching ps line leaves stale done rows session-gone', () => {
