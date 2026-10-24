@@ -1126,6 +1126,7 @@
   "scripts/conveyor/soak/breaks/promote-draft-cross-repo.soak.test.mjs": 0.41,
   "scripts/conveyor/soak/breaks/queue-cleared-hash-never-resolves-after-jit-number.soak.test.mjs": 0.62,
   "scripts/conveyor/soak/breaks/queue-split-across-checkouts.soak.test.mjs": 0.13,
+  "scripts/conveyor/soak/breaks/ready-red-team-blocked-pr-enqueued.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/ready-to-merge-red-pr-never-reviewed.soak.test.mjs": 0.63,
   "scripts/conveyor/soak/breaks/reaper-backstop-clobbers-live-fixer.soak.test.mjs": 38.43,
   "scripts/conveyor/soak/breaks/reaper-restops-finished-sessions.soak.test.mjs": 28.62,
