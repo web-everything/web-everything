@@ -9,6 +9,7 @@ import {
   createDrainMergeStrategy, resolveDrainMergePolicy, readEnqueueClearance, buildClearanceComment, hasClearanceFor, DRY_RUN_STRATEGY_ENV,
   readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
 } from '../drain-merge-strategy.mjs';
+import { readEjectionHistory } from '../merge-queue-eject-loop.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 // Load the renderer during collection: its cold import graph must not consume a gate assertion's timeout.
@@ -1253,5 +1254,207 @@ describe('drain pre-stage queue admission', () => {
     if (variant === 'unreadable') expect(() => s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toThrow('evidence unreadable');
     else expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+});
+
+describe('merge queue failed-check ejection guard', () => {
+  const event = { __typename: 'RemovedFromMergeQueueEvent', onHead: true, reason: 'failed_checks', createdAt: '2026-10-24T00:00:00Z', beforeCommit: { oid: 'a'.repeat(40) } };
+  const history = n => ({ ok: true, events: Array(n).fill(event) });
+  const failing = { check: 'unit', job: 'unit', runId: 7, excerpt: 'FAIL test' };
+  function loopHarness({ n = 2, route = vi.fn(), read = () => history(n), ...opts } = {}) {
+    const publish = vi.fn(); const log = vi.fn(() => failing);
+    const h = harness({ strategy: 'github-merge-queue', now: () => Date.parse('2026-10-24T03:00:00Z'), publishNeedsYou: publish, ...opts,
+      strategyExtra: { readEjections: read, readEjectLog: log, routeToCiHeal: route, ...opts.strategyExtra } });
+    return { ...h, route, publish, log };
+  }
+  const enqueue = h => h.s.enqueue({ num: 42 }, HEAD, { comments: [] });
+  it('defers after two ejections, routes with the log, and publishes once across passes', () => {
+    const h = loopHarness();
+    expect(enqueue(h)).toMatchObject({ enqueued: false, deferred: true, kind: 'eject-loop' });
+    expect(h.calls.some(c => c.join(' ').includes('enqueuePullRequest'))).toBe(false);
+    expect(h.route).toHaveBeenCalledTimes(1);
+    expect(h.route).toHaveBeenCalledWith(expect.objectContaining({ failing, headSha: HEAD, count: 2 }));
+    expect(h.publish).toHaveBeenCalledTimes(1);
+    expect(h.publish).toHaveBeenCalledWith(expect.objectContaining({ kind: 'merge-queue-eject-loop', head: HEAD, pr: 42 }));
+    const next = loopHarness({ initial: h.state(), route: h.route });
+    expect(enqueue(next)).toMatchObject({ kind: 'eject-loop' });
+    expect(h.route).toHaveBeenCalledTimes(1); expect(next.publish).not.toHaveBeenCalled(); expect(next.log).not.toHaveBeenCalled();
+  });
+  it('routes at threshold two when an older parent lookup fails after two proven events', () => {
+    const events = ['oldest', 'older', 'newest'].map(oid => ({ ...event, beforeCommit: { oid } }));
+    const parents = vi.fn(({ oid }) => {
+      if (oid === 'oldest') throw Error('offline');
+      return [HEAD];
+    });
+    const read = () => readEjectionHistory({ repo: LOCAL, num: 42, headSha: HEAD,
+      exec: () => JSON.stringify({ data: { repository: { pullRequest: {
+        commits: { nodes: [{ commit: { oid: HEAD } }] }, timelineItems: { nodes: events },
+      } } } }), readParents: parents });
+    const h = loopHarness({ read, env: { WE_MERGE_QUEUE_EJECT_LOOP_THRESHOLD: '2' } });
+    expect(enqueue(h)).toMatchObject({ enqueued: false, deferred: true, kind: 'eject-loop' });
+    expect(parents).toHaveBeenCalledTimes(3);
+    expect(h.route).toHaveBeenCalledWith(expect.objectContaining({ count: 2 }));
+    expect(h.log).toHaveBeenCalledWith(expect.objectContaining({ oids: ['older', 'newest'] }));
+    expect(h.logs.join('')).not.toContain('ejection history unreadable');
+    expect(h.calls.some(c => c.join(' ').includes('enqueuePullRequest'))).toBe(false);
+  });
+  it('one ejection enqueues normally', () => { expect(enqueue(loopHarness({ n: 1 }))).toMatchObject({ enqueued: true }); });
+  it('a new head after a loop enqueues normally', () => {
+    const h = loopHarness(); enqueue(h);
+    const initial = h.state(); initial.ejectLoops['cwd#42'].headSha = 'old';
+    expect(enqueue(loopHarness({ initial, n: 0 }))).toMatchObject({ enqueued: true });
+  });
+  it('a newly pushed head with an old commit date does not inherit old ejections', () => {
+    const oldHead = 'a'.repeat(40);
+    const staleEvents = [
+      { ...event, beforeCommit: { oid: oldHead }, createdAt: '2026-10-24T01:00:00Z' },
+      { ...event, beforeCommit: { oid: oldHead }, createdAt: '2026-10-24T02:00:00Z' },
+    ];
+    const read = () => readEjectionHistory({ repo: LOCAL, num: 42, headSha: HEAD, exec: () => JSON.stringify({ data: { repository: { pullRequest: {
+      commits: { nodes: [{ commit: { oid: HEAD, committedDate: '2026-10-23T00:00:00Z' } }] },
+      timelineItems: { nodes: staleEvents },
+    } } } }), readParents: () => [oldHead] });
+    const h = loopHarness({ read, initial: { pending: [], followedUp: [], ejectLoops: {
+      'cwd#42': { headSha: oldHead, count: 2, routedAt: 1, notifiedAt: 1 },
+    } } });
+    expect(enqueue(h)).toMatchObject({ enqueued: true });
+    expect(h.route).not.toHaveBeenCalled(); expect(h.publish).not.toHaveBeenCalled();
+    expect(h.calls.some(c => c.join(' ').includes('enqueuePullRequest'))).toBe(true);
+  });
+  it('unreadable or throwing history fails open with an operator log', () => {
+    for (const read of [() => ({ ok: false }), () => { throw Error('offline'); }]) {
+      const h = loopHarness({ read }); expect(enqueue(h)).toMatchObject({ enqueued: true }); expect(h.logs.join('')).toContain('ejection history unreadable');
+    }
+  });
+  it('keeps a persisted same-head hold when history is unreadable, throws or exceeds its buffer', () => {
+    for (const read of [() => ({ ok: false }), () => { throw Error('offline'); },
+      () => { throw Object.assign(Error('maxBuffer exceeded'), { code: 'ENOBUFS' }); }]) {
+      const initial = { pending: [], followedUp: [], ejectLoops: { 'cwd#42': { headSha: HEAD, count: 2, routedAt: 1, notifiedAt: 1 } } };
+      const h = loopHarness({ read, initial });
+      expect(enqueue(h)).toMatchObject({ enqueued: false, deferred: true, kind: 'eject-loop',
+        reason: expect.stringMatching(/history unreadable; hold kept from persisted evidence/) });
+      expect(h.calls.some(c => c.join(' ').includes('enqueuePullRequest'))).toBe(false);
+      expect(h.state()).toEqual(initial);
+      expect(h.route).not.toHaveBeenCalled(); expect(h.publish).not.toHaveBeenCalled();
+    }
+  });
+  it.each(['unreadable', 'unattributable'])('retries missing handoffs with persisted count during %s history', variant => {
+    const read = () => variant === 'unreadable' ? { ok: false } : { ...history(0), unattributable: true };
+    const initial = { pending: [], followedUp: [], ejectLoops: { 'cwd#42': { headSha: HEAD, count: 3 } } };
+    const h = loopHarness({ read, initial, strategyExtra: { readEjectLog: () => { throw Error('offline'); } } });
+    expect(enqueue(h)).toMatchObject({ enqueued: false, deferred: true, kind: 'eject-loop' });
+    expect(h.route).toHaveBeenCalledWith(expect.objectContaining({ count: 3, failing: { unreadable: true } }));
+    expect(h.publish).toHaveBeenCalledTimes(1);
+    expect(h.state().ejectLoops['cwd#42']).toMatchObject({ count: 3, routedAt: expect.any(Number), notifiedAt: expect.any(Number) });
+    expect(h.calls.some(c => c.join(' ').includes('enqueuePullRequest'))).toBe(false);
+    const next = loopHarness({ read, initial: h.state() });
+    expect(enqueue(next)).toMatchObject({ deferred: true });
+    expect(next.route).not.toHaveBeenCalled(); expect(next.publish).not.toHaveBeenCalled();
+  });
+  it.each([undefined, 'old', HEAD])('parent lookup failure fails open except for persisted same-head hold %j', persistedHead => {
+    const read = () => readEjectionHistory({ repo: LOCAL, num: 42, headSha: HEAD,
+      exec: () => JSON.stringify({ data: { repository: { pullRequest: {
+        commits: { nodes: [{ commit: { oid: HEAD } }] }, timelineItems: { nodes: [event, event] },
+      } } } }), readParents: () => { throw Error('offline'); } });
+    const initial = { pending: [], followedUp: [], ...(persistedHead ? { ejectLoops: {
+      'cwd#42': { headSha: persistedHead, count: 2, routedAt: 1, notifiedAt: 1 },
+    } } : {}) };
+    const h = loopHarness({ read, initial });
+    if (persistedHead === HEAD) {
+      expect(enqueue(h)).toMatchObject({ deferred: true, kind: 'eject-loop' });
+      expect(h.state()).toEqual(initial);
+    } else {
+      expect(enqueue(h)).toMatchObject({ enqueued: true });
+      expect(h.logs.join('')).toContain('ejection history unreadable');
+    }
+    expect(h.route).not.toHaveBeenCalled(); expect(h.publish).not.toHaveBeenCalled();
+  });
+  it('retries only missing publication while history is unreadable', () => {
+    const h = loopHarness({ read: () => ({ ok: false }), initial: { pending: [], followedUp: [], ejectLoops: {
+      'cwd#42': { headSha: HEAD, count: 2, routedAt: 1 },
+    } } });
+    expect(enqueue(h)).toMatchObject({ deferred: true });
+    expect(h.route).not.toHaveBeenCalled(); expect(h.publish).toHaveBeenCalledTimes(1);
+    expect(h.state().ejectLoops['cwd#42'].notifiedAt).toEqual(expect.any(Number));
+  });
+  it('failed outage handoffs remain missing and retry while retaining the hold', () => {
+    const route = vi.fn(() => { throw Error('offline'); });
+    const publish = vi.fn(() => { throw Error('offline'); });
+    const initial = { pending: [], followedUp: [], ejectLoops: { 'cwd#42': { headSha: HEAD, count: 3 } } };
+    const h = loopHarness({ read: () => ({ ok: false }), route, initial, publishNeedsYou: publish });
+    expect(enqueue(h)).toMatchObject({ deferred: true });
+    expect(h.state()).toEqual({ ...initial, exists: true, unreadable: false });
+    expect(enqueue(h)).toMatchObject({ deferred: true });
+    expect(route).toHaveBeenCalledTimes(2); expect(publish).toHaveBeenCalledTimes(2);
+  });
+  it.each([null, [], 'bad', 42])('refuses malformed ejectLoops %j without enqueue or overwrite', ejectLoops => {
+    const h = loopHarness({ initial: { pending: [], followedUp: [], ejectLoops } });
+    expect(readQueueState('/ignored', () => JSON.stringify(h.state())).unreadable).toBe(true);
+    expect(() => enqueue(h)).toThrow('state');
+    expect(h.state().ejectLoops).toEqual(ejectLoops);
+    expect(h.calls.some(c => c.join(' ').includes('enqueuePullRequest'))).toBe(false);
+    expect(h.route).not.toHaveBeenCalled(); expect(h.publish).not.toHaveBeenCalled();
+  });
+  it('unreadable history fails open for a different persisted head', () => {
+    const initial = { pending: [], followedUp: [], ejectLoops: { 'cwd#42': { headSha: 'old', count: 2, routedAt: 1 } } };
+    const h = loopHarness({ read: () => ({ ok: false }), initial });
+    expect(enqueue(h)).toMatchObject({ enqueued: true });
+    expect(h.calls.some(c => c.join(' ').includes('enqueuePullRequest'))).toBe(true);
+  });
+  it('threads the earliest counted ejection to the log lookup, excluding previous runs', () => {
+    const read = () => ({ ok: true, events: [
+      { ...event, createdAt: '2026-10-23T00:00:00Z' },
+      { ...event, reason: 'merge conflict' },
+      { ...event, createdAt: '2026-10-24T01:00:00Z' },
+      { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-10-24T01:30:00Z' },
+      { ...event, createdAt: '2026-10-24T02:00:00Z' },
+    ] });
+    const h = loopHarness({ read });
+    expect(enqueue(h)).toMatchObject({ kind: 'eject-loop' });
+    expect(h.log).toHaveBeenCalledWith(expect.objectContaining({ since: '2026-10-24T01:00:00.000Z', oids: ['a'.repeat(40), 'a'.repeat(40)] }));
+    expect(h.route).toHaveBeenCalledWith(expect.objectContaining({ count: 2 }));
+  });
+  it('routing failure still defers and retries next pass without publishing twice', () => {
+    const route = vi.fn(() => { throw Error('offline'); }); const h = loopHarness({ route });
+    expect(enqueue(h)).toMatchObject({ kind: 'eject-loop' });
+    expect(h.state().ejectLoops['cwd#42'].routedAt).toBeUndefined();
+    const next = loopHarness({ route, initial: h.state() }); expect(enqueue(next)).toMatchObject({ kind: 'eject-loop' });
+    expect(route).toHaveBeenCalledTimes(2); expect(h.publish).toHaveBeenCalledTimes(1); expect(next.publish).not.toHaveBeenCalled();
+  });
+  it('unreadable logs still route and defer', () => {
+    const h = loopHarness({ strategyExtra: { readEjectLog: () => { throw Error('offline'); } } });
+    expect(enqueue(h)).toMatchObject({ kind: 'eject-loop' }); expect(h.route).toHaveBeenCalledWith(expect.objectContaining({ failing: { unreadable: true } }));
+  });
+  it('dry run writes, routes and publishes nothing', () => {
+    const h = loopHarness({ dryRun: true }); expect(() => enqueue(h)).toThrow('dry run');
+    expect(h.state()).toBeNull(); expect(h.route).not.toHaveBeenCalled(); expect(h.publish).not.toHaveBeenCalled();
+  });
+  it.each(['0', 'off'])('threshold %s disables the history read', value => {
+    const read = vi.fn(() => history(2));
+    const h = loopHarness({ read, env: { ...process.env, WE_MERGE_QUEUE_EJECT_LOOP_THRESHOLD: value } });
+    expect(enqueue(h)).toMatchObject({ enqueued: true }); expect(read).not.toHaveBeenCalled();
+    expect(h.logs.join('')).toContain('ejectLoopThreshold=0 (env)');
+  });
+});
+
+describe('ejection-loop state persistence', () => {
+  it('preserves routed heads through unrelated follow-up writes under the mutex', () => {
+    const ejectLoops = { 'cwd#42': { headSha: HEAD, count: 2, routedAt: 1, notifiedAt: 1 } };
+    const h = harness({ strategy: 'github-merge-queue', initial: {
+      pending: [{ repo: null, num: 1, headSha: HEAD }], followedUp: [], ejectLoops,
+    }, ghView: { 1: { state: 'CLOSED' } } });
+    h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+    expect(h.state().pending).toEqual([]); expect(h.state().ejectLoops).toEqual(ejectLoops);
+    expect(readQueueState('/ignored', () => JSON.stringify(h.state())).ejectLoops).toEqual(ejectLoops);
+  });
+  it('reads the mergeQueue tool setting from the existing delivery settings override and logs its source', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'eject-settings-'));
+    try {
+      const path = join(dir, 'settings.json'); writeFileSync(path, JSON.stringify({ mergeQueue: { ejectLoopThreshold: 'off' } }));
+      const readEjections = vi.fn();
+      const h = harness({ strategy: 'github-merge-queue', env: { ...process.env, [MERGE_DELIVERY_SETTINGS_FILE_ENV]: path }, strategyExtra: { readEjections } });
+      expect(h.s.enqueue({ num: 42 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
+      expect(readEjections).not.toHaveBeenCalled(); expect(h.logs.join('')).toContain('ejectLoopThreshold=0 (tool)');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

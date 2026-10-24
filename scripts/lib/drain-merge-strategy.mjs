@@ -32,6 +32,8 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
  *   operator can preview which PRs `github-merge-queue` would enqueue without flipping the live policy. A live
  *   (non-dry-run) pass ignores the variable and says so.
  */
+import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { countConsecutiveFailedChecksEjections, planEjectLoop, readEjectionHistory, readFailingMergeGroupLog, routeEjectLoopToCiHeal } from './merge-queue-eject-loop.mjs';
 import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
@@ -189,14 +191,17 @@ const isEntry = (p) => !!p && typeof p === 'object' && p.num != null;
 export function readQueueState(path, readFile = readFileSync) {
   try {
     const s = JSON.parse(readFile(path, 'utf8'));
-    return { pending: Array.isArray(s?.pending) ? s.pending.filter(isEntry) : [], ...(s?.enqueueFailures ? { enqueueFailures: s.enqueueFailures } : {}), ...(s?.redTeamPending ? { redTeamPending: s.redTeamPending } : {}), followedUp: Array.isArray(s?.followedUp) ? s.followedUp.filter((k) => typeof k === 'string') : [], exists: true, unreadable: false };
+    if (s != null && Object.hasOwn(s, 'ejectLoops')
+      && (s.ejectLoops === null || typeof s.ejectLoops !== 'object' || Array.isArray(s.ejectLoops)
+        || Object.getPrototypeOf(s.ejectLoops) !== Object.prototype)) throw new Error('malformed ejectLoops');
+    return { pending: Array.isArray(s?.pending) ? s.pending.filter(isEntry) : [], ...(s?.ejectLoops ? { ejectLoops: s.ejectLoops } : {}), ...(s?.enqueueFailures ? { enqueueFailures: s.enqueueFailures } : {}), ...(s?.redTeamPending ? { redTeamPending: s.redTeamPending } : {}), followedUp: Array.isArray(s?.followedUp) ? s.followedUp.filter((k) => typeof k === 'string') : [], exists: true, unreadable: false };
   } catch (e) { return { pending: [], followedUp: [], exists: false, unreadable: e?.code !== 'ENOENT' }; }
 }
 
 function writeQueueState(path, state) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify({ ...(state.enqueueFailures ? { enqueueFailures: state.enqueueFailures } : {}), ...(state.redTeamPending ? { redTeamPending: state.redTeamPending } : {}), pending: state.pending, followedUp: state.followedUp.slice(-FOLLOWED_UP_CAP) }, null, 2)}\n`);
+  writeFileSync(tmp, `${JSON.stringify({ ...(state.ejectLoops ? { ejectLoops: state.ejectLoops } : {}), ...(state.enqueueFailures ? { enqueueFailures: state.enqueueFailures } : {}), ...(state.redTeamPending ? { redTeamPending: state.redTeamPending } : {}), pending: state.pending, followedUp: state.followedUp.slice(-FOLLOWED_UP_CAP) }, null, 2)}\n`);
   renameSync(tmp, path);
 }
 
@@ -232,6 +237,7 @@ export function createDrainMergeStrategy({
   },
   readGrantScope = standingRulingScope, // PR #5758: the verified standing-ruling scope the red-team gate also reads
   redTeamDeadline, // resolved redTeam.deadlineAction (test seam); read from the cascade when absent
+  readEjections, readEjectLog, routeToCiHeal, // injectable IO; skipped by default under test
   publishNeedsYou, // operator note publisher; the real needs-you feed outside a test run
 } = {}) {
   const { policy, note } = resolved;
@@ -251,7 +257,7 @@ export function createDrainMergeStrategy({
     const lock = withLock(() => {
       const st = readQueueState(statePath, readFile);
       if (st.unreadable) { unreadable = true; return false; }
-      fn(st); writeState(statePath, { pending: st.pending, followedUp: st.followedUp, ...(st.enqueueFailures ? { enqueueFailures: st.enqueueFailures } : {}), ...(st.redTeamPending ? { redTeamPending: st.redTeamPending } : {}) }); return true;
+      fn(st); writeState(statePath, { pending: st.pending, followedUp: st.followedUp, ...(st.ejectLoops ? { ejectLoops: st.ejectLoops } : {}), ...(st.enqueueFailures ? { enqueueFailures: st.enqueueFailures } : {}), ...(st.redTeamPending ? { redTeamPending: st.redTeamPending } : {}) }); return true;
     });
     if (lock?.ran === false) { say(`  ⚠ merge-queue follow-up state lock not acquired — ${what} not recorded this pass; retried next pass`); return false; }
     if (unreadable) { say(`  ⚠ merge-queue follow-up state ${statePath} is unreadable — ${what} not recorded (file left untouched); fix or remove it`); return false; }
@@ -271,6 +277,18 @@ export function createDrainMergeStrategy({
   const deadlineAction = deadline.value?.deadlineAction ?? 'requeue-then-hold';
   // The real operator feed is never written from a test run unless the test injects its own publisher.
   const publishNote = publishNeedsYou ?? (isUnderTest(env) || isUnderTest(process.env) ? null : item => publishAttention(item));
+  const underTest = isUnderTest(env) || isUnderTest(process.env);
+  const historyReader = readEjections === undefined ? (underTest ? null : readEjectionHistory) : readEjections;
+  const logReader = readEjectLog === undefined ? (underTest ? null : readFailingMergeGroupLog) : readEjectLog;
+  const routeHeal = routeToCiHeal === undefined ? (underTest ? null : routeEjectLoopToCiHeal) : routeToCiHeal;
+  const rawThreshold = env.WE_MERGE_QUEUE_EJECT_LOOP_THRESHOLD;
+  const thresholdPolicy = cascadePolicy('mergeQueue', readMergeDeliveryToolSettings(env).mergeQueue, {
+    env, standard: { ejectLoopThreshold: 2 },
+    valid: { ejectLoopThreshold: v => v === 'off' || (Number.isInteger(v) && v >= 0) },
+    envValues: { ejectLoopThreshold: rawThreshold === undefined ? undefined : /^off$/i.test(rawThreshold) ? 'off' : Number(rawThreshold) },
+  });
+  const ejectThreshold = thresholdPolicy.value.ejectLoopThreshold === 'off' ? 0 : thresholdPolicy.value.ejectLoopThreshold;
+  log.write(`  ${formatCascadeSourcesLine('mergeQueue', { ...thresholdPolicy, leafValues: { ejectLoopThreshold: ejectThreshold } })}\n`);
   const pendingOutcome = (c, pending, quiet = false) => {
     const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
     const healthSmell = now() - pending.firstPendingAt >= maxMin * 60_000;
@@ -377,6 +395,50 @@ export function createDrainMergeStrategy({
       if (held) {
         removeSentBack(c.repo, c.num, live.labels);
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
+      }
+      if (ejectThreshold > 0 && historyReader) {
+        let history;
+        try { history = historyReader({ repo: slugOf(c.repo), num: c.num, headSha, exec }); } catch { history = { ok: false }; }
+        const evidence = history?.ok ? countConsecutiveFailedChecksEjections(history) : { unattributable: true };
+        const prior = before.ejectLoops?.[key];
+        const unusable = evidence.unattributable;
+        const persistedHold = prior?.headSha === headSha;
+        if (unusable && !persistedHold) {
+          say(`  ⚠ merge-queue: #${c.num} ejection history unreadable — continuing enqueue`);
+        } else {
+          const count = unusable ? prior.count : evidence.count;
+          const plan = planEjectLoop({ count, threshold: ejectThreshold, state: prior, headSha });
+          if ((unusable && persistedHold) || plan.loop) {
+            const reason = unusable
+              ? 'ejection history unreadable; hold kept from persisted evidence for this head — inspect history before resuming admission'
+              : `${count} consecutive failed-check merge-queue ejections on head ${headSha}; enqueue paused for CI-heal`;
+            const entry = { ...(persistedHold ? prior : {}), headSha, count,
+              ...(!unusable ? { oids: evidence.oids, since: evidence.since } : {}) };
+            if (!plan.alreadyRouted) {
+              let failing = { unreadable: true };
+              try { failing = logReader?.({ repo: slugOf(c.repo), num: c.num, oids: entry.oids, since: entry.since, exec }) ?? failing; } catch { /* diagnostics are best effort */ }
+              try {
+                if (!routeHeal) throw new Error('CI-heal router unavailable');
+                const routed = routeHeal({ repo: slugOf(c.repo), num: c.num, headSha, failing, count, exec });
+                if (routed === false || routed?.ok === false) throw new Error('CI-heal routing refused');
+                entry.routedAt = now();
+              } catch { say(`  ⚠ merge-queue: #${c.num} ejection-loop CI-heal routing failed — held; retrying next pass`); }
+            }
+            if (entry.notifiedAt == null && publishNote) {
+              try {
+                publishNote({ repo: slugOf(c.repo), pr: Number(c.num), head: headSha, kind: 'merge-queue-eject-loop', reason,
+                  pick: 'Inspect the failed merge-group check; CI-heal must repair this head before queue admission resumes.' });
+                entry.notifiedAt = now();
+              } catch { say(`  ⚠ merge-queue: #${c.num} ejection-loop needs-you publication failed — retrying next pass`); }
+            }
+            // enqueue already owns the land lock; never recursively acquire it here.
+            before.ejectLoops ??= {};
+            before.ejectLoops[key] = entry;
+            if (!unusable || prior.routedAt == null || prior.notifiedAt == null) writeState(statePath, before);
+            say(`  merge-queue: defer #${c.num}: ${reason}`);
+            return { enqueued: false, deferred: true, kind: 'eject-loop', reason };
+          }
+        }
       }
       // Head-bound file preparation is reusable; authorization evidence is always live.
       if (safety.value.waitForRedTeamBeforeEnqueue) {
