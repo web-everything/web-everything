@@ -1,9 +1,15 @@
 /** @file The `advisory:*` staleness sweep — labels come off a PR whose head moved, and only those. No `gh`. */
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { publishStoredRedTeamResult } from '../../lib/red-team-withheld-publish.mjs';
 import { describe, expect, it } from 'vitest';
 
 import {
-  LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultReadPr, sweepAdvisoryLabels as rawSweep,
+  defaultListUnpublishedStatuses, LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultReadPr, sweepAdvisoryLabels as realSweep,
 } from '../advisory-label-sweep.mjs';
+
+const rawSweep = (options = {}) => realSweep({ listUnpublishedStatuses: () => [], ...options });
 
 const HEAD = 'fd37ce270'.padEnd(40, 'a');
 const NEW_HEAD = 'b'.repeat(40);
@@ -299,3 +305,98 @@ describe('PR #4708 — a cut-off comment list never removes a label, and the liv
     expect(out).toEqual([{ num: 42, add: null, remove: ['red-team:clear'] }]);
     expect(writes).toEqual([['o/n', 42, { add: null, remove: ['red-team:clear'] }]]);
   });
+
+describe('finished red-team publication during sweep', () => {
+  const status = { repo: 'o/n', pr: 42, head: HEAD, status: 'finished', result: { status: 'ran', comment: 'withheld', foldedVerdict: 'changes', confirmedMissCount: 1 } };
+  function setup(extra = {}) {
+    const p = provider();
+    p.ensureLabel = () => {};
+    const live = pr(42, ['red-team:pending'], HEAD, []);
+    return { repo: 'o/n', provider: p, listPrs: () => [live], readPr: () => live,
+      readStatusEvidence: () => ({ status, scheduled: true }), log: () => {}, ...extra };
+  }
+  it('publishes before labeling and reads fresh comments after posting', () => {
+    const events = [];
+    const o = setup({ publishStored: ({ status: raw }) => {
+      expect(raw).toEqual(status); events.push('publish'); return { status: 'posted' };
+    } });
+    o.provider.readComments = () => { events.push('comments'); return [{ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${HEAD} -->` }]; };
+    const out = rawSweep(o);
+    expect(events).toEqual(['publish', 'comments']);
+    expect(out).toContainEqual(expect.objectContaining({ num: 42, add: 'red-team:clear' }));
+  });
+  it('a throwing publisher is logged and recorded but labels and the remaining sweep still run', () => {
+    const logs = [];
+    const o = setup({ publishStored: () => { throw Error('publisher failed'); }, log: s => logs.push(s) });
+    const second = pr(43, ['advisory:accepted'], NEW_HEAD);
+    o.listPrs = () => [pr(42, ['red-team:pending'], HEAD, []), second];
+    o.readPr = ({ number }) => o.listPrs().find(p => p.number === number);
+    const out = rawSweep(o);
+    expect(out).toContainEqual(expect.objectContaining({ num: 42, publishError: 'publisher failed', add: 'red-team:blocked' }));
+    expect(out).toContainEqual({ num: 43, remove: ['advisory:accepted'] });
+    expect(logs.some(s => s.includes('publisher failed'))).toBe(true);
+  });
+  it('dry-run never invokes the publisher', () => {
+    let calls = 0;
+    rawSweep(setup({ dryRun: true, publishStored: () => { calls++; } }));
+    expect(calls).toBe(0);
+  });
+});
+
+describe('unlabeled unpublished red-team discovery', () => {
+  const status = { repo: 'o/n', pr: 42, head: HEAD, status: 'finished',
+    result: { status: 'ran', comment: 'withheld', foldedVerdict: 'changes', findings: [] } };
+  it('lists only finished unpublished status files and ignores unreadable files', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-discovery-'));
+    try {
+      writeFileSync(join(dir, 'pending.json'), JSON.stringify(status));
+      writeFileSync(join(dir, 'posted.json'), JSON.stringify({ ...status, result: { ...status.result, comment: 'posted' } }));
+      writeFileSync(join(dir, 'bad.json'), '{');
+      expect(defaultListUnpublishedStatuses({ dir })).toEqual([status]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('publishes for an open PR without a red-team label', () => {
+    const calls = [];
+    const live = pr(42, [], HEAD, []);
+    rawSweep({ repo: 'o/n', listPrs: () => [live], readPr: () => live,
+      listUnpublishedStatuses: () => [status], readStatusEvidence: () => ({ status }),
+      publishStored: input => { calls.push(input.status); return { status: 'retry' }; },
+      provider: { ensureLabel: () => {}, setLabels: () => {} }, log: () => {} });
+    expect(calls).toEqual([status]);
+  });
+  it.each([{ repo: 'other/repo' }, { head: NEW_HEAD }, { pr: 43 }])('does not nominate mismatched status %j', mismatch => {
+    let calls = 0;
+    rawSweep({ repo: 'o/n', listPrs: () => [pr(42, [], HEAD, [])],
+      listUnpublishedStatuses: () => [{ ...status, ...mismatch }],
+      readPr: () => { calls++; }, log: () => {} });
+    expect(calls).toBe(0);
+  });
+  it('rechecks comments inside publication rather than reusing the pre-lock live snapshot', () => {
+    const live = pr(42, [], HEAD, []);
+    const marker = { author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${HEAD} -->` };
+    let posts = 0;
+    rawSweep({ repo: 'o/n', listPrs: () => [live], readPr: () => live,
+      listUnpublishedStatuses: () => [status], readStatusEvidence: () => ({ status }),
+      provider: { readComments: () => [marker], postComment: () => { posts++; },
+        ensureLabel: () => {}, setLabels: () => {} }, log: () => {},
+      publishStored: input => publishStoredRedTeamResult({ ...input,
+        withLock: (_path, fn) => fn(), readStatus: () => status,
+        writeStatus: () => { throw Error('must not write'); } }) });
+    expect(posts).toBe(0);
+  });
+  it('failed live comment reads count attempts and escalate once after two', () => {
+    let fresh = structuredClone(status);
+    let posts = 0, escalations = 0;
+    const options = { repo: 'o/n', listPrs: () => [pr(42, [], HEAD, [])],
+      listUnpublishedStatuses: () => [status], readStatusEvidence: () => ({ status }),
+      readPr: () => { throw Error('comments unavailable'); }, log: () => {},
+      publishStored: input => publishStoredRedTeamResult({ ...input,
+        withLock: (_path, fn) => fn(), readStatus: () => fresh,
+        writeStatus: next => { fresh = next; }, postComment: () => { posts++; },
+        publishNeedsYou: () => { escalations++; } }) };
+    for (let i = 0; i < 3; i++) rawSweep(options);
+    expect(fresh).toMatchObject({ publishAttempts: 2, needsYouPublished: true });
+    expect(escalations).toBe(1);
+    expect(posts).toBe(0);
+  });
+});

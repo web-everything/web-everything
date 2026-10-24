@@ -25,6 +25,7 @@
  * guard against this file (or `health-smells/index.mjs`) regressing back to a hand-maintained import list.
  * `codex-unproductive-jumps-to-claude.mjs` is registered through this discovery path as well.
  * `codex-prepare-pr-redispatched-as-unstamped.mjs` uses the same automatic registration.
+ * `red-team-finished-result-never-published.mjs` uses the same automatic registration.
  *
  * This file itself stays a thin, EAGER entry point (a top-level `await` builds `BREAKS` once, at import time) —
  * the discovery/validation logic lives in `../registry-discovery.mjs` (generic, no eager directory scan) and
