@@ -1,21 +1,20 @@
 ---
+bornAs: xn0221i
 kind: story
-size: 3
-parent: "4075"
+size: 2
 status: open
-scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool.test.mjs"]
+scope: ["we:scripts/operations/graduate-chain.mjs"]
 dateOpened: "2026-10-23"
 tags: []
 ---
 
-# Prevention — Add an inventory scan test, like the ops-reader one, that lists every script spawning lane-pool w… (from web-everything/web-everything#5805 review)
+# Red-team follow-ups from web-everything/web-everything#5840 (head 75d36e1b1)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5840 (reviewed head `75d36e1b1759e5f40cfa7833cbeae04ef9254303`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lane-pool.mjs:368` — Add an inventory scan test, like the ops-reader one, that lists every script spawning lane-pool with a needsOrigin command and asserts it passes --origin or runs from a non-lane root.
-2. `we:scripts/lane-pool.mjs:1260` — Extract one shared `isolatedGitEnv()` helper that strips every repo-context and config-injection variable, and use it from both call sites. Add a unit test asserting that inherited GIT_CONFIG_* entries other than the pins are absent from the probe env.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5805@cc0cb2b4f710ded32e5a54bf66bcd02520ab54d8
+1. `we:scripts/operations/graduate-chain.mjs:78` — (edge-case, degraded) Concurrent graduations exceed the caller cap
+   - Scenario: Start with three open PRs by one caller and callerMax=4. Start two graduations with distinct purposes; let both read the count before either publishes. Both pass admission and subsequently open PRs, leaving five. A deterministic interleaving probe of runGraduateChain produced read(3), read(3), open(4), open(5), with both results reporting ok:true. There is no reservation or caller-cap recheck at publication. Admission must reserve capacity or serialize the count-and-publication sequence.
+   - Claude's re-check: demonstrated break
 
 ## Acceptance
 

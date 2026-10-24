@@ -1,23 +1,22 @@
 ---
+bornAs: xzpxvo8
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lane-git-diet.mjs", "we:scripts/lib/__tests__/lane-git-diet-cleanup.test.mjs", "we:scripts/__tests__/lane-git-diet.test.mjs"]
+scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool.test.mjs"]
 dateOpened: "2026-10-23"
 tags: []
 ---
 
-# Prevention — For every guard in the claim/recheck sequence, require a pause-stage test that plants exactly tha… (from web-everything/web-everything#5806 review)
+# Prevention — Add an inventory scan test, like the ops-reader one, that lists every script spawning lane-pool w… (from web-everything/web-everything#5805 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lane-git-diet.mjs:225` — For every guard in the claim/recheck sequence, require a pause-stage test that plants exactly that guard's trigger. A table-driven `runPaused` matrix over (stage x trigger) would make a missing cell visible.
-2. `we:scripts/lane-git-diet.mjs:205` — Add a real-git test that back-dates a reflog-only unreachable commit with GIT_COMMITTER_DATE and asserts it survives an apply with `--prune-expire=now`. A cheaper gate is a lint that every `-c gc.*Expire*` pin in we:scripts/lane-git-diet.mjs is named in a test.
-3. `we:scripts/lane-git-diet.mjs:78` — Add a CLI-level test with a hostile hook and fsmonitor config that asserts no marker is written. Alternatively add a standards rule that any new script spawning git in a lane must route through a helper whose test plants a hook.
-4. `we:scripts/lib/__tests__/lane-git-diet-cleanup.test.mjs` — Require refusal tests to provide valid preceding inputs and assert the specific refusal diagnostic; add this corrected test to the required suite.
+1. `we:scripts/lane-pool.mjs:368` — Add an inventory scan test, like the ops-reader one, that lists every script spawning lane-pool with a needsOrigin command and asserts it passes --origin or runs from a non-lane root.
+2. `we:scripts/lane-pool.mjs:1260` — Extract one shared `isolatedGitEnv()` helper that strips every repo-context and config-injection variable, and use it from both call sites. Add a unit test asserting that inherited GIT_CONFIG_* entries other than the pins are absent from the probe env.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5806@3407639c4a07008eb1eaddfd65212745aaddfad7
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5805@cc0cb2b4f710ded32e5a54bf66bcd02520ab54d8
 
 ## Acceptance
 

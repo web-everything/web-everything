@@ -1,23 +1,21 @@
 ---
+bornAs: xjpmpcu
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/review-job.mjs", "we:scripts/operations/__tests__/review-job-red-team-only.test.mjs", "we:scripts/operations/__tests__/review-job.test.mjs"]
+scope: ["we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md"]
 dateOpened: "2026-10-23"
 tags: []
 ---
 
-# Prevention — A planner/job test that a fresh pass ending 'disabled' or 'skipped' with zero seat rows leaves th… (from web-everything/web-everything#5838 review)
+# Prevention — Require each acceptance sub-guarantee to map to a named planned test and observable assertion, in… (from web-everything/web-everything#5843 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/review-job.mjs:748` — A planner/job test that a fresh pass ending 'disabled' or 'skipped' with zero seat rows leaves the head retryable. Or have the finish write drop the status when no row was recorded.
-2. `we:scripts/operations/review-job.mjs:1183` — Add a CLI-level test that runJob returning {outcome:'red-team-only'} triggers no rateAndRecordReviewJob call. Optionally add a job-level assertion that no label hook is invoked.
-3. `we:scripts/operations/__tests__/review-job-red-team-only.test.mjs:119` — Add a recovery-path test that injects a label-write spy and asserts only `red-team:*` labels are ever written. A check:standards rule requiring every 'never X' claim in a PR body or comment to cite a test would catch this class.
-4. `we:scripts/operations/__tests__/review-job-red-team-only.test.mjs` — Add a deterministic integration test using the production gate with injected label IO, asserting that fresh and resumed recovery neither add acceptance labels nor remove review:human.
+1. `we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md:28` — Require each acceptance sub-guarantee to map to a named planned test and observable assertion, including configuration-absent controls for default guarantees; enforce completeness with a structured acceptance-to-test mapping gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5838@5d675c3215f4eeca61f2c912d13237925c27ec5d
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5843@f533a36c1c1bd7ca618c17b64fc2329397b4a7d4
 
 ## Acceptance
 

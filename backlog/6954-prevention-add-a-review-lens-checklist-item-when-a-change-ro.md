@@ -1,20 +1,21 @@
 ---
+bornAs: xetdj84
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md"]
+scope: ["we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
 dateOpened: "2026-10-23"
 tags: []
 ---
 
-# Prevention — Require each acceptance sub-guarantee to map to a named planned test and observable assertion, in… (from web-everything/web-everything#5843 review)
+# Prevention — Add a review-lens checklist item: when a change routes a new phase into an existing branch, enume… (from web-everything/web-everything#5836 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md:28` — Require each acceptance sub-guarantee to map to a named planned test and observable assertion, including configuration-absent controls for default guarantees; enforce completeness with a structured acceptance-to-test mapping gate.
+1. `we:scripts/conveyor/__tests__/reconcile-core.test.mjs:1007` — Add a review-lens checklist item: when a change routes a new phase into an existing branch, enumerate that branch's terminal outcomes (dispatch, escalation, round-cap refusal, heal-cap refusal) and require one test each for the new phase.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5843@f533a36c1c1bd7ca618c17b64fc2329397b4a7d4
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5836@336f6dbed5641a44f1f20966f10ef0aabafcb08d
 
 ## Acceptance
 

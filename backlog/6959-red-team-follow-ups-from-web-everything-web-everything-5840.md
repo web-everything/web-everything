@@ -1,18 +1,19 @@
 ---
+bornAs: xu36zj7
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/review-set-label.mjs"]
+scope: ["we:scripts/operations/graduate-chain.mjs"]
 dateOpened: "2026-10-23"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5841 (head 408199eb7)
+# Red-team follow-ups from web-everything/web-everything#5840 (head 926dd76f3)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5841 (reviewed head `408199eb7988916066aa0a10e2beed9dd9c8defc`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5840 (reviewed head `926dd76f3b5aff3f4d9927ab8ec654e8f521cb63`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/review-set-label.mjs:1824` — (edge-case, degraded) A rearm refused for human clearance can already have superseded that clearance in the ledger
-   - Scenario: An ordinary rearm initially reads H with review:human and review:changes and no clearance. Before its ledger append, the operator completes clear-human on H, recording the clearing verdict and trusted comment and restoring review:accepted. Rearm then appends pending at lines 1851–1854. Its new pre-swap clearance check detects the operator comment and exits 1, but does not retract the pending verdict. A probe using an in-memory append sink and the real foldVerdictLedger produced rows [clear-human, pending] and current verdict pending with clears:false, despite the explicit human-clearance refus
+1. `we:scripts/operations/graduate-chain.mjs:105` — (edge-case, degraded) Merge preflight can reject commits that cherry-pick cleanly
+   - Scenario: Construct main O, source O→A→B, and stack parent O→A→C. Let O contain we:f.mjs with value=0, A change it to value=1, C change it to value=2, and B only add we:g.mjs. Run --source=lane/source --stack-on=&lt;parent&gt;. Commit selection correctly excludes A and selects only B, which applies cleanly over C. However, preflight merges C and B using O as the forced merge base, producing a conflict on we:f.mjs and stopping before cherry-pick. Real Git merge-file probes confirmed the forced-base conflict and the clean result when applying B's unchanged we:f.mjs over C. Preflight must simulate the selected commits rathe
    - Claude's re-check: demonstrated break
 
 ## Acceptance
