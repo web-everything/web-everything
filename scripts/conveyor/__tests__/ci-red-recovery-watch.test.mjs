@@ -702,8 +702,6 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
 
   it.each([
     ['hung-cancel-rerun', null],
-    ['repeat-hang', 'frontier-ui/frontierui'],
-    ['hung-cap-escalate', null],
   ])('%s: failed cancel retriggers the CURRENT PR head once, records one outcome, and the next tick is a no-op', (kind, repo) => {
     const f = fixture(kind, triggered, repo);
     const result = sweepHungCiRecovery(f.options);
@@ -748,7 +746,25 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(f.postComment).toHaveBeenCalledTimes(1);
   });
 
-  it('a failed trigger records one durable error comment and never triggers again for that head and reason', () => {
+  it.each(['repeat-hang', 'hung-cap-escalate'])('%s: run-not-found cancel failure stays cancel-only even with a persisted deferred marker, never triggers, and posts the normal failure marker', (kind) => {
+    const f = fixture(kind);
+    f.comments.push({
+      body: buildHungCiComment({ headSha: PR_2636_HUNG.headRefOid, reason: `${reason}-deferred`, ok: false }),
+      author: { login: 'web-everything' },
+    });
+    expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining({ kind, ...missingRun })]);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(f.cancelAndRerun).not.toHaveBeenCalled();
+    expect(f.trigger).not.toHaveBeenCalled();
+    expect(f.postComment).toHaveBeenCalledTimes(1);
+    expect(f.postComment).toHaveBeenCalledWith(2636, expect.objectContaining({ kind, ...missingRun }));
+    expect(f.postComment.mock.calls[0][1]).not.toHaveProperty('reason');
+    expect(f.comments.at(-1).body).toContain('and it FAILED:');
+    expect(f.comments.at(-1).body).toContain(missingRun.error);
+    expect(bodyHasExactLine(f.comments.at(-1).body, `reason: ${reason}`)).toBe(false);
+  });
+
+  it('one failed trigger records a durable error and the next tick cancels first, then retries successfully', () => {
     const failure = { ok: false, action: 'pull-request-push', error: 'push refused' };
     const f = fixture('hung-cancel-rerun', failure);
     const result = sweepHungCiRecovery(f.options);
@@ -760,14 +776,50 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(f.comments.at(-1).body).toContain(missingRun.error);
     expect(bodyHasExactLine(f.comments.at(-1).body, `reason: ${reason}`)).toBe(true);
     expect(result.applied).toEqual([expect.objectContaining(failure)]);
-    expect(sweepHungCiRecovery(f.options).applied).toEqual([]);
-    expect(f.cancelAndRerun).toHaveBeenCalledTimes(1);
+    f.trigger.mockReturnValue(triggered);
+    expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining(triggered)]);
+    expect(f.cancelAndRerun).toHaveBeenCalledTimes(2);
     expect(f.cancelOnly).not.toHaveBeenCalled();
-    expect(f.trigger).toHaveBeenCalledTimes(1);
-    expect(f.postComment).toHaveBeenCalledTimes(1);
+    expect(f.trigger).toHaveBeenCalledTimes(2);
+    expect(f.cancelAndRerun.mock.invocationCallOrder[1]).toBeLessThan(f.trigger.mock.invocationCallOrder[1]);
+    expect(f.postComment).toHaveBeenCalledTimes(2);
+    expect(sweepHungCiRecovery(f.options).applied).toEqual([]);
+    expect(f.trigger).toHaveBeenCalledTimes(2);
   });
 
-  it.each(['hung-cancel-rerun', 'repeat-hang', 'hung-cap-escalate'])(
+  it('maxRetriesPerSha failed retriggers stop all further triggers and surface an exhausted refusal', () => {
+    const failure = { ok: false, action: 'pull-request-push', error: 'push refused' };
+    const f = fixture('hung-cancel-rerun', failure);
+    for (let i = 0; i < f.options.maxRetriesPerSha; i++) {
+      expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining(failure)]);
+    }
+    for (let i = 0; i < 2; i++) {
+      const result = sweepHungCiRecovery(f.options);
+      expect(result.dispatch).toEqual([]);
+      expect(result.applied).toEqual([]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'run-not-found-retrigger-exhausted' })]);
+      expect(formatHungReport(result)).toContain('run-not-found-retrigger-exhausted PR #2636');
+      expect(formatHungReport(result)).toContain('human/ci-heal diagnosis required');
+    }
+    expect(f.trigger).toHaveBeenCalledTimes(f.options.maxRetriesPerSha);
+    expect(f.cancelAndRerun).toHaveBeenCalledTimes(f.options.maxRetriesPerSha);
+    expect(f.cancelOnly).not.toHaveBeenCalled();
+    expect(f.postComment).toHaveBeenCalledTimes(f.options.maxRetriesPerSha);
+  });
+
+  it('a failed trigger after deferral retries cancellation first instead of reusing the stale deferred marker', () => {
+    const f = fixture('hung-cancel-rerun', { ok: false, deferred: true, action: 'pull-request-push' });
+    sweepHungCiRecovery(f.options);
+    f.trigger.mockReturnValue({ ok: false, action: 'pull-request-push', error: 'push refused' });
+    sweepHungCiRecovery(f.options);
+    expect(f.cancelAndRerun).toHaveBeenCalledTimes(1);
+    f.trigger.mockReturnValue(triggered);
+    expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining(triggered)]);
+    expect(f.cancelAndRerun).toHaveBeenCalledTimes(2);
+    expect(f.cancelAndRerun.mock.invocationCallOrder[1]).toBeLessThan(f.trigger.mock.invocationCallOrder[2]);
+  });
+
+  it.each(['hung-cancel-rerun'])(
     '%s: deferred retrigger posts once, retries only preflight, then records the final outcome', (kind) => {
       const deferred = { ok: false, deferred: true, action: 'pull-request-push' };
       const f = fixture(kind, deferred);

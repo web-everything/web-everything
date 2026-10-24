@@ -915,14 +915,26 @@ export function sweepHungCiRecovery({
     const hungNow = (now - Date.parse(c.startedAt)) >= thresholdMs;
     if (!hungNow) return c;
     const comments = readComments(c.prNumber, { repo });
-    // Any non-deferred retrigger attempt consumes this head's one attempt, success or failure.
+    // Existing builder prose distinguishes successful retriggers from FAILED attempts, including old markers.
     const retriggerComments = comments.filter((cm) => bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, 'reason: run-not-found-retrigger'));
-    if (countHungCiComments(retriggerComments, c.headSha) > 0) {
+    const successfulRetriggers = retriggerComments.filter((cm) => {
+      const outcome = (typeof cm === 'string' ? cm : cm.body).split('\n').at(-1);
+      return !outcome.includes(' and it FAILED:') && outcome.includes('; triggered CI for the current PR head via "');
+    });
+    const successfulRetriggerCount = countHungCiComments(successfulRetriggers, c.headSha);
+    // Unknown outcomes also consume the failure budget, rather than allowing unbounded attempts.
+    const failedRetriggers = countHungCiComments(retriggerComments, c.headSha) - successfulRetriggerCount;
+    if (successfulRetriggerCount > 0) {
       retriggerRefusals.push({ ...c, kind: 'run-not-found-retriggered',
-        why: 'This head already has a recorded retrigger outcome (success or failure); see its run-not-found-retrigger comment. No further attempt owed.' });
+        why: 'This head already has a recorded retrigger outcome that succeeded; see its run-not-found-retrigger comment. No further attempt owed.' });
       return null;
     }
-    const deferred = comments.find((cm) => bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, 'reason: run-not-found-retrigger-deferred')
+    if (failedRetriggers >= maxRetriesPerSha) {
+      retriggerRefusals.push({ ...c, kind: 'run-not-found-retrigger-exhausted',
+        why: `This head has ${failedRetriggers} failed retriggers (cap ${maxRetriesPerSha}); human/ci-heal diagnosis required.` });
+      return null;
+    }
+    const deferred = countHungCiComments(retriggerComments, c.headSha) === 0 && comments.find((cm) => bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, 'reason: run-not-found-retrigger-deferred')
       && countHungCiComments([cm], c.headSha) > 0);
     if (deferred) {
       const body = typeof deferred === 'string' ? deferred : deferred.body;
@@ -936,7 +948,9 @@ export function sweepHungCiRecovery({
     const otherShaComments = comments.filter((cm) => !bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, `sha: ${c.headSha}`));
     return {
       ...c,
-      hungAttemptsForSha: countHungCiComments(comments, c.headSha),
+      // Retriggers have their own failure cap; do not prematurely turn their retries into cancel-only escalation.
+      hungAttemptsForSha: countHungCiComments(comments.filter((cm) => !bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, 'reason: run-not-found-retrigger')
+        && !bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, 'reason: run-not-found-retrigger-deferred')), c.headSha),
       hungAttemptsForJob: countHungCiCommentsByJob(otherShaComments, c.jobName),
     };
   }).filter(Boolean);
@@ -948,7 +962,7 @@ export function sweepHungCiRecovery({
   const applied = [];
   if (apply) {
     for (const d of plan.dispatch) {
-      const wasDeferred = deferredRetriggers.has(d.prNumber);
+      const wasDeferred = d.kind === 'hung-cancel-rerun' && deferredRetriggers.has(d.prNumber);
       let result = wasDeferred
         ? { ok: false, action: 'cancel-failed', error: deferredRetriggers.get(d.prNumber) }
         : d.runId == null
@@ -958,7 +972,7 @@ export function sweepHungCiRecovery({
         : ((d.kind === 'repeat-hang' || d.kind === 'hung-cap-escalate') ? cancelOnly(d.runId, { repo }) : cancelAndRerun(d.runId, { repo }));
       let reason = null;
       let cancelError = null;
-      if (wasDeferred || (!result.ok && result.action === 'cancel-failed' && isRunNotFoundError(result.error))) {
+      if (d.kind === 'hung-cancel-rerun' && (wasDeferred || (!result.ok && result.action === 'cancel-failed' && isRunNotFoundError(result.error)))) {
         const triggered = trigger(d, { repo: repoSlug(repo), defaultBranch });
         cancelError = result.error;
         result = triggered;
