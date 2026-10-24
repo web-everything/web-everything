@@ -154,9 +154,9 @@ async function changedFiles(s, reason = 'diff-out-of-scope') {
     untracked: untracked.stdout.split('\0').filter(Boolean).sort(),
   };
 }
-async function worktreeFingerprint(s, untracked, reason, runGit = args => git(s, args)) {
-  // Keep originally untracked files separate even after git add moves them into the index.
-  const diff = await runGit(['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', s.startSha, '--',
+async function worktreeFingerprint(s, untracked, reason) {
+  // Audit lane contents without staging files or changing its index.
+  const diff = await git(s, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', s.startSha, '--',
     '.', ...untracked.map(file => `:(top,literal,exclude)${file}`)]);
   if (!good(diff) || typeof diff.stdout !== 'string') {
     fail(reason, 'Cannot read worktree fingerprint; inspect the lane diff before retrying');
@@ -184,7 +184,7 @@ async function worktreeFingerprint(s, untracked, reason, runGit = args => git(s,
   }
   let hashes = '';
   if (regular.length) {
-    const r = await runGit(['hash-object', '--no-filters', '--', ...regular]);
+    const r = await git(s, ['hash-object', '--no-filters', '--', ...regular]);
     if (!good(r) || typeof r.stdout !== 'string' || !r.stdout.endsWith('\n') ||
         r.stdout.trimEnd().split('\n').length !== regular.length ||
         r.stdout.trimEnd().split('\n').some(hash => !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(hash))) {
@@ -234,7 +234,37 @@ export async function runTests(s) {
   s.result.tests.status = good(r) ? 'green' : 'red';
   if (!good(r)) fail('tests-red', output(r).slice(-400));
 }
+// Bind publication to bytes and Git modes, independently of either checkout's
+// HEAD, index, diff formatting or untracked-file classification.
+const exportEntry = (file, bytes, mode) => [file, mode, createHash('sha256').update(bytes).digest('hex')];
+const exportFingerprint = entries => createHash('sha256').update(JSON.stringify(
+  [...entries].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0),
+)).digest('hex');
+export async function captureAuditExport(s) {
+  const entries = [];
+  try {
+    if (!Array.isArray(s.files) || !s.files.length) throw new Error('Missing audit paths');
+    for (const file of s.files) {
+      const target = path.join(s.lane.path, file);
+      const stat = await s.io.lstat(target);
+      let bytes, mode;
+      if (stat.isSymbolicLink()) {
+        bytes = await s.io.readlink(target);
+        mode = 0o120000;
+      } else if (stat.isFile() && Number.isInteger(stat.mode) && stat.mode >= 0) {
+        bytes = await s.io.readFile(target, null);
+        mode = stat.mode & 0o100 ? 0o755 : 0o644;
+      } else throw new Error('Unsupported audit entry');
+      if (!Buffer.isBuffer(bytes)) throw new Error('Unreadable audit bytes');
+      entries.push(exportEntry(file, bytes, mode));
+    }
+  } catch {
+    fail('audit-failed', 'Cannot capture audit bytes and modes; inspect the lane diff and rerun tests and audit before retrying');
+  }
+  return exportFingerprint(entries);
+}
 export async function runAudit(s) {
+  s.auditExportFingerprint = await captureAuditExport(s);
   const file = taskPath(s, 'audit');
   await s.io.writeFile(file, `Review the working-tree diff of this lane against ${s.startSha} for the brief below. Line 1 of your answer MUST be exactly \`NOT WEAKENED\` if no test/assertion/guard was weakened or removed and the change matches the brief, else \`WEAKENED: <why>\`.\n\n${s.brief}`);
   const report = await codex(s, file, true);
@@ -275,6 +305,10 @@ export async function commitAndPush(s) {
   } catch {
     fail('diff-out-of-scope', 'Cannot export regular file bytes; inspect the lane diff before retrying');
   }
+  if (!s.auditExportFingerprint || exportFingerprint(exported.map(({ file, bytes, mode }) =>
+    exportEntry(file, bytes, mode))) !== s.auditExportFingerprint) {
+    fail('changed-after-audit', 'Exported bytes or modes differ from the audit input; rerun tests and audit before retrying');
+  }
   // Drop inherited Git overrides as well as user/system configuration. The clean
   // checkout must never inherit a lane's object store, helpers or identity.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
@@ -290,9 +324,6 @@ export async function commitAndPush(s) {
     const baseRef = `refs/remotes/origin/${s.opts.base.replace(/^origin\//, '')}`;
     const base = await trustedGit(['rev-parse', '--verify', `${baseRef}^{commit}`]);
     if (!good(base) || typeof base.stdout !== 'string' || !base.stdout.trim()) fail('lane-reset-failed', 'Cannot resolve base from trusted remote; inspect the remote branch before retrying');
-    if (!s.startSha || base.stdout.trim() !== s.startSha) {
-      fail('changed-after-audit', 'Trusted remote base differs from the audited starting commit; restart the job against the new base');
-    }
     if (!good(await trustedGit(['checkout', '--detach', base.stdout.trim()]))) fail('commit-failed');
     for (const { file, bytes, mode } of exported) {
       const parts = file.split('/');
@@ -308,13 +339,7 @@ export async function commitAndPush(s) {
       await s.io.rm(target, { force: true });
       await s.io.writeFile(target, bytes, { mode });
     }
-    // Verify the frozen export itself, including execute bits, against the audit.
-    // Rechecking the mutable lane after readFile would not bind these saved bytes.
-    const snapshot = { ...s, lane: { path: dir } };
-    if (!s.auditFingerprint || !Array.isArray(s.auditUntracked) ||
-        await worktreeFingerprint(snapshot, s.auditUntracked, 'changed-after-audit', trustedGit) !== s.auditFingerprint) {
-      fail('changed-after-audit', 'Exported bytes or modes differ from the audit input; rerun tests and audit before retrying');
-    }
+    // Only the frozen bytes and modes verified above are staged here.
     if (!good(await trustedGit(['add', '--', ...s.files]))) fail('commit-failed');
     const title = (s.brief.split('\n')[0] ?? '').replace(/^\s*#+\s*/, '').replace(/^Task:\s*/i, '').trim().slice(0, 72);
     if (!good(await trustedGit(['commit', '-m', title]))) fail('commit-failed');
@@ -377,12 +402,13 @@ function plan(s) {
   return [show('node', codexArgs(s, s.opts.brief)), show('node', testArgs(s)),
     'On test failure: write repair brief, run Codex, check diff scope, run tests once more',
     'Recheck changed and untracked file scope after tests',
+    'Capture scoped byte and Git-mode fingerprints before the audit',
     show('node', codexArgs(s, '<audit-task-file>', true)),
     'Check changed and untracked file list and content fingerprint are unchanged since audit started',
     'Export scoped regular file bytes with lstat/readFile; reject symlinks, gitlinks and unreadable entries',
     'Create a fresh clone of the trusted primary origin with system/global Git config disabled and hooks pinned to /dev/null',
     'Require the trusted remote base to equal the audited starting commit; otherwise restart the job',
-    'Apply exported bytes and require their content and execute-mode fingerprint to equal the audit snapshot',
+    'Apply saved scoped bytes and execute modes to the clean checkout',
     'Stage only the allowed paths and commit once with the fixed Codex Job identity',
     `${show('git', ['ls-remote', '--heads', s.originUrl])} <branch> (try suffixes -2 through -9 if occupied)`,
     show('git', ['push', '--no-tags', '--no-follow-tags', s.originUrl, `<checked-sha>:refs/heads/${s.result.branch}`]),

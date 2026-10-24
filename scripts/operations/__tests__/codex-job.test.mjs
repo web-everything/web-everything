@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, resetLane, commitAndPush, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
+import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, resetLane, commitAndPush, captureAuditExport, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
 import { registerScope, releaseScope, assessFreeScope } from '../free-scope.mjs';
 
 const flags = ['--brief=brief.md', '--purpose=example', '--scope=we:scripts/a.mjs,we:scripts/lib/', '--tests=scripts/a.test.mjs', '--repo=/repo'];
@@ -97,6 +97,9 @@ async function publicationFixture({ config = '', laneTip = 'abc123', files = ['s
     brief: '# Task: Build the example\nDetailed brief.', result: { branch: 'lane/example', sha: null } };
   await checkDiffScope(s);
   s.files = files;
+  // Out-of-scope paths are never audited; publication must reject them before any read.
+  try { s.auditExportFingerprint = await captureAuditExport(s); } catch { /* rejected at publish */ }
+  f.reads.length = 0; f.stats.length = 0;
   f.calls.length = 0;
   const exec = f.io.exec;
   let freshHead = 'd'.repeat(40);
@@ -947,7 +950,7 @@ it.each([
     f.io.readlink = file => readlinkSync(path.join(repo, path.relative('/lane', file)), { encoding: 'buffer' });
     const exec = f.io.exec;
     f.io.exec = async (cmd, args, options) => {
-      if (cmd === 'git' && ['diff', 'ls-files', 'hash-object', 'add'].some(v => args.includes(v))) {
+      if (cmd === 'git' && !f.temps.some(dir => args.includes(dir)) && ['diff', 'ls-files', 'hash-object', 'add'].some(v => args.includes(v))) {
         await exec(cmd, args, options);
         const realArgs = args.slice(2).map(v => v === 'abc123' ? (untracked ? emptyTree : baseline) : v);
         if (realArgs.includes('--cached')) realArgs.push(untracked ? emptyTree : baseline);
