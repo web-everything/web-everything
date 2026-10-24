@@ -42,9 +42,9 @@ export default {
       // Fix detection must not run the behavior under test: a regression must
       // remain a required GREEN test, never turn itself into an expected failure.
       return /export function pidIdentity\(/.test(readFileSync(join(root, 'scripts/lib/pid-alive.mjs'), 'utf8'))
-        && /export function probePid\([^\n]*identity = pidIdentity\)/.test(
+        && /export function probePid\([^\n]*identity = pidIdentity\b/.test(
           readFileSync(join(root, 'scripts/conveyor/reconcile-pass.mjs'), 'utf8'))
-        && /export function defaultIsPidAlive\([^\n]*identity = pidIdentity\)/.test(
+        && /export function defaultIsPidAlive\([^\n]*identity = pidIdentity\b/.test(
           readFileSync(join(root, 'scripts/conveyor/driver-watchdog.mjs'), 'utf8'));
     } catch { return false; }
   },
