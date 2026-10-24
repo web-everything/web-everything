@@ -168,6 +168,9 @@ Keep the host queue; do not switch to a private pool or run tests directly.
 ## Open-PR size evidence
 
 An injected runner `spawn` keeps the default size reader and duplicate-card scan hermetic.
+An injected `git` also keeps the default size reader hermetic, so prepare guards' Git stubs
+need only cover their own observations. Prepare names never waive size admission: card and
+batch prepares qualify for the exemption only through their backlog-only diff paths.
 To exercise production size evidence, inject `diffStat: createPrDiffStatReader({ cwd })`
 with a temporary Git repo (or inject its `git`/`exec`); keep submission injected. Do not
 select production IO through a module-wide child-process mock's function identity.

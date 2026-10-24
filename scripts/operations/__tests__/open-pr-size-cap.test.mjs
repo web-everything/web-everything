@@ -321,6 +321,33 @@ describe('createPrLandRunner — non-test size admission', () => {
     expect(submit).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ['--ref=lane/4368-prepare-item-x'],
+    ['--ref=lane/prepare-batch', '--title=prepare: 4368, 4341'],
+  ])('keeps the default size reader hermetic with only git injected for %j', (...requested) => {
+    const git = vi.fn(() => { throw new Error('prepare evidence unavailable'); });
+    const run = createPrLandRunner({
+      prePrReview: () => ({ action: 'pass' }), env: {}, dupBornAs: () => [], git,
+    });
+    expect(run({ argv: requested })).toEqual({ outcome: 'refused', reason: 'prepare evidence unavailable' });
+    expect(git).toHaveBeenCalledTimes(1);
+    expect(git).toHaveBeenCalledWith(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+  });
+
+  it.each([
+    ['--ref=lane/4368-prepare-item-x'],
+    ['--ref=lane/prepare-batch', '--title=prepare: 4368, 4341'],
+    ['--ref=lane/4400-prepare-decision-x'],
+  ])('enforces explicit size evidence for prepare argv %j', (...requested) => {
+    const git = vi.fn(() => { throw new Error('prepare guard must not run'); });
+    const { run, diffStat, spawn } = fixture('301\t0\tscripts/a.mjs\0', { git });
+    expect(run({ argv: requested })).toMatchObject({ outcome: 'refused', reason: 'pr-too-large' });
+    expect(diffStat).toHaveBeenCalledTimes(1);
+    expect(diffStat).toHaveBeenCalledWith({ base: 'main', sha: 'HEAD' });
+    expect(git).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it.each([300, 301])('enforces the inclusive 300-line boundary at %i lines', (lines) => {
     const { run, diffStat, spawn } = fixture(`${lines - 100}\t100\tscripts/a.mjs\n`);
     const result = run({ argv });

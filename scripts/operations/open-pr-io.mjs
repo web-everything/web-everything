@@ -123,7 +123,8 @@ function failedGate(e, loadSettings) {
 }
 
 function createGitReader(cwd, exec = execFileSync) {
-  return (args, options = {}) => exec('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options });
+  const opts = (options) => ({ cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options });
+  return (args, options = {}) => (exec === execFileSync ? execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options }) : exec('git', args, opts(options)));
 }
 
 /** Attributes can override --text. Recover binary rows from immutable blobs, counting the
@@ -193,11 +194,13 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
   // outcome before any gh call (never a crash where run.mjs builds the sinks). An explicit `env` skips resolution;
   // a caller that injected `spawn` is a rehearsal/test and writes no shim.
   env: envOpt, resolveEnv = spawn !== spawnSync ? () => process.env : resolveGhCredentialEnv,
-  git = createGitReader(cwd),
-  diffStat = spawn !== spawnSync ? () => '' : createPrDiffStatReader({ git }),
+  git: gitOpt,
+  // Injected git or spawn keeps size evidence hermetic; opt in with an explicit diffStat reader.
+  diffStat = spawn !== spawnSync || gitOpt !== undefined ? () => '' : createPrDiffStatReader({ cwd }),
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
   dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
 } = {}) {
+  const git = gitOpt === undefined ? createGitReader(cwd) : gitOpt;
   return ({ argv, skipPrePrReview = '', actor = '', operatorInstruction = '' }) => {
     let env;
     try { env = envOpt ?? resolveEnv(); }
