@@ -43,9 +43,21 @@ function flushPending(io, note) {
     const base = redTeamStatusDir(io?.env ?? process.env);
     const pendingDir = join(base, 'skip-pending');
     if (!existsSync(pendingDir)) return;
-    const records = readdirSync(pendingDir).filter(name => /^[a-f0-9]{64}\.json$/.test(name))
-      .map(name => ({ name, mtime: statSync(join(pendingDir, name)).mtimeMs }))
-      .sort((a, b) => a.mtime - b.mtime || a.name.localeCompare(b.name));
+    const quarantine = (pending, name, error) => {
+      try { renameSync(pending, `${pending}.bad`); }
+      catch { unlinkSync(pending); }
+      note(`quarantined ${name}.bad (or removed): ${error.message}`);
+    };
+    const records = [];
+    for (const name of readdirSync(pendingDir).filter(name => /^[a-f0-9]{64}\.json$/.test(name))) {
+      const pending = join(pendingDir, name);
+      try {
+        // Metadata reads can fail too (for example a dangling symlink); isolate each record.
+        try { records.push({ name, mtime: statSync(pending).mtimeMs }); }
+        catch (error) { quarantine(pending, name, error); }
+      } catch (error) { note(error); }
+    }
+    records.sort((a, b) => a.mtime - b.mtime || a.name.localeCompare(b.name));
     let newestMtime = records.reduce((latest, record) => Math.max(latest, record.mtime), Date.now());
     let attempted = 0, overflow = false;
     for (const { name } of records) {
@@ -66,8 +78,7 @@ function flushPending(io, note) {
           if (`${itemKey(item)}.json` !== name) throw Error('pending content key mismatch');
         } catch (error) {
           // Poison evidence must never consume publication slots or be scanned again.
-          renameSync(pending, `${pending}.bad`);
-          note(`quarantined ${name}.bad: ${error.message}`);
+          quarantine(pending, name, error);
           continue;
         }
         if (existsSync(published)) { unlinkSync(pending); continue; }

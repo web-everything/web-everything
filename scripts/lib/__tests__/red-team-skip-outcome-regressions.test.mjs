@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyRedTeamSkip, settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
@@ -66,6 +66,24 @@ describe('red-team skip pre-review regressions', () => {
     expect(f.pending()).toEqual([`${name}.bad`]);
     expect(f.markers()).toEqual([]);
     expect(f.io.log).toHaveBeenCalledWith(expect.stringContaining('quarantined'));
+  });
+
+  it('unreadable pending metadata is quarantined without blocking a valid pending record', () => {
+    const f = fixture();
+    mkdirSync(f.pendingDir, { recursive: true });
+    const broken = `${'0'.repeat(64)}.json`;
+    symlinkSync(join(f.pendingDir, 'missing-target'), join(f.pendingDir, broken));
+    const { name, item } = pendingRecord(f.input, 'valid after dangling symlink');
+    writeJsonAtomic(join(f.pendingDir, name), item);
+    expect(f.settle({ status: 'skipped', policy: 'card-only' }).outcome).toBe('policy-clear');
+    expect(f.io.publishNeedsYou.mock.calls).toEqual([[item]]);
+    expect(f.markers()).toEqual([name]);
+    expect(f.pending()).toEqual([`${broken}.bad`]);
+    expect(f.io.log).toHaveBeenCalledWith(expect.stringContaining('quarantined'));
+    const logCount = f.io.log.mock.calls.length;
+    f.settle({ status: 'skipped', policy: 'card-only' });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(f.io.log).toHaveBeenCalledTimes(logCount);
   });
 
   it('legacy unknown-head pending records without attempt identity are quarantined', () => {

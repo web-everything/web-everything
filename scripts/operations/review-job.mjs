@@ -805,19 +805,25 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     } catch { /* malformed diagnostics cannot prevent skip settlement */ }
     recordSeats(redTeam?.seat ? [redTeam.seat] : []);
     out.redTeam = summarizeRedTeam(redTeam);
-    if (!['ran', 'resumed', 'not-owed'].includes(redTeam?.status)
-      && !(typeof redTeam?.status === 'string' && redTeam.status.startsWith('deferred'))
-      && redTeam?.deferredByCap !== true && redTeam?.deferredByGuard !== true
+    const completed = ['ran', 'resumed'].includes(redTeam?.status);
+    const visibleResult = ['posted', 'deduped'].includes(redTeam?.comment?.status);
+    // Only not-owed or a completed pass with a visible result bypasses settlement.
+    // Budget/guard deferrals and finished-but-unpublished passes still need an operator.
+    const settlementOutcome = completed && !visibleResult
+      ? { status: 'unpublished', reason: `red team ${redTeam.status} but its result comment is ${redTeam.comment?.status ?? 'unknown'}` }
+      : redTeam;
+    if (redTeam?.status !== 'not-owed' && !(completed && visibleResult)
       && typeof io.settleRedTeamSkip === 'function') {
       try {
         const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
         const readHead = isRealHead(rev) ? rev : null;
         const head = readHead ?? seatsBox.laneHead;
-        const settled = io.settleRedTeamSkip({ redTeam, repo: out.repo, pr: out.pr,
+        const settled = io.settleRedTeamSkip({ redTeam: settlementOutcome, repo: out.repo, pr: out.pr,
           head, readHead, runId: out.runId });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
-        io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`);
+        try { io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`); }
+        catch { /* diagnostics cannot abort the finished status write or gate */ }
       }
     }
   }
