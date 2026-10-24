@@ -7,7 +7,6 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
 import { registerScope, releaseScope, assessFreeScope } from '../free-scope.mjs';
 
@@ -108,34 +107,49 @@ it('pins executable Git configuration on every lane Git command', async () => {
   }
 });
 
-it('neutralizes inherited fsmonitor commands on a real read-only Git diff', async () => {
+it.each([false, true])('neutralizes inherited fsmonitor commands on a real read-only Git diff (changed=%s)', async changed => {
   const names = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
   const saved = names.map(name => process.env[name]);
-  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+  // The CI checkout has a local authentication header, which the lane guard must
+  // reject. Exercise fsmonitor in an isolated repository with known configuration.
+  const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-fsmonitor-'));
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+  const git = args => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', env });
   const results = [];
   try {
+    git(['init', '--quiet', '--template=']);
+    mkdirSync(path.join(repo, 'scripts'));
+    writeFileSync(path.join(repo, 'scripts/a.mjs'), 'original\n');
+    git(['add', '--', 'scripts/a.mjs']);
+    const startSha = git(['write-tree']).trim();
+    if (changed) writeFileSync(path.join(repo, 'scripts/a.mjs'), 'changed\n');
     process.env.GIT_CONFIG_COUNT = '1';
     process.env.GIT_CONFIG_KEY_0 = 'core.fsmonitor';
     process.env.GIT_CONFIG_VALUE_0 = 'echo CODEX_JOB_HOST_EXECUTION >&2; :';
-    const state = { opts: { repo, scope: ['we:scripts/operations/'] }, lane: { path: repo }, startSha: 'HEAD', io: {
+    const state = { opts: { repo, scope: ['we:scripts/'] }, lane: { path: repo }, startSha, io: {
       exec: async (cmd, args, options) => {
-        const r = spawnSync(cmd, args, { ...options, encoding: 'utf8' });
+        const r = spawnSync(cmd, args, { ...options, encoding: 'utf8',
+          env: { ...options.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
         results.push(r);
         return r;
       },
     } };
-    // The diff can be empty on a committed verify checkout; it must never run the helper.
-    try { await checkDiffScope(state); } catch (error) { expect(error.stopReason).toBe('no-changes'); }
+    if (changed) {
+      await expect(checkDiffScope(state)).resolves.toBeUndefined();
+      expect(state.files).toEqual(['scripts/a.mjs']);
+      expect(state.auditFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    } else await expect(checkDiffScope(state)).rejects.toMatchObject({ stopReason: 'no-changes' });
     expect(results.length).toBeGreaterThan(0);
     expect(results.every(r => r.status === 0 && !r.stderr.includes('CODEX_JOB_HOST_EXECUTION'))).toBe(true);
   } finally {
     names.forEach((name, i) => { if (saved[i] === undefined) delete process.env[name]; else process.env[name] = saved[i]; });
+    rmSync(repo, { recursive: true, force: true });
   }
 });
 
 it('refuses risky config introduced by a worker, tests or audit before another Git command', async () => {
   for (const boundary of ['codex-direct-task.mjs --task-file', 'heavy-admission', 'codex-direct-task.mjs --review']) {
-    for (const key of ['filter.host.clean', 'filter.host.process', 'credential.helper', 'remote.origin.receivepack', 'url.host.insteadof']) {
+    for (const key of ['filter.host.clean', 'filter.host.process', 'credential.helper', 'remote.origin.receivepack', 'url.host.insteadof', 'http.https://github.com/.extraheader']) {
       let poisoned = false;
       const f = fixture([
         [boundary, () => { poisoned = true; return boundary.includes('codex') ? report() : ok(); }],
