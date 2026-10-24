@@ -349,7 +349,7 @@ describe('default combined-tree test proof', () => {
   );
   it.each(['[', ']', ',', '{', '}', ';', '!', '?', '+', '-', '@', '#', '$', '%', '&', '*', '/', '\\', '|', '~', '`'])(
     'preserves legacy delimiter %j redaction in persisted failed-run output', async (prefix) => {
-      const raw = `${prefix}/home/alice/secret.txt] ${prefix}/srv/x/y ${prefix}/mnt/a/b`;
+      const raw = `${prefix}/home/fixture/secret.txt] ${prefix}/srv/x/y ${prefix}/mnt/a/b`;
       const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), {
         status: 1, stderr: raw,
       }) });
@@ -359,7 +359,7 @@ describe('default combined-tree test proof', () => {
       const loaded = await f.run();
       expect(loaded).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
       for (const output of [result, loaded, ...f.records]) {
-        expect(JSON.stringify(output)).not.toMatch(/\/home\/alice\/secret\.txt|\/srv\/x\/y|\/mnt\/a\/b/);
+        expect(JSON.stringify(output)).not.toMatch(/\/home\/fixture\/secret\.txt|\/srv\/x\/y|\/mnt\/a\/b/);
       }
       expect(mutations(f, 'add')).toEqual([]);
       expect(mutations(f, 'remove')).toEqual([]);
@@ -371,8 +371,8 @@ describe('default combined-tree test proof', () => {
     expect(result.result).not.toMatch(/\u001b/);
   });
   it('redacts home and other absolute paths from failed-run output', async () => {
-    const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), { status: 1, stderr: 'at /Users/someone/secret/dir/file.mjs:3 and /private/var/x/y' }) });
-    expect(result.result).not.toMatch(/\/Users\/someone|\/private\/var/);
+    const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), { status: 1, stderr: 'at /Users/fixture/secret/dir/file.mjs:3 and /private/var/x/y' }) });
+    expect(result.result).not.toMatch(/\/Users\/fixture|\/private\/var/);
     expect(result.result).toContain('<path>');
   });
   it.each([
@@ -654,14 +654,14 @@ describe('prototype-load', () => {
   );
   it.each(['[', ']', ',', '{', '}', ';', '!', '?', '+', '-', '@', '#', '$', '%', '&', '*', '/', '\\', '|', '~', '`'])(
     'preserves legacy delimiter %j redaction in persisted thrown-error output', async (prefix) => {
-      const raw = `${prefix}/home/alice/secret.txt] ${prefix}/srv/x/y ${prefix}/mnt/a/b`;
+      const raw = `${prefix}/home/fixture/secret.txt] ${prefix}/srv/x/y ${prefix}/mnt/a/b`;
       const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
         combinedTest: () => { throw new Error(raw); } });
       const result = await f.run();
       expect(result).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
       expect(result.combinedTests.result.match(/<path>/g)).toHaveLength(3);
       for (const output of [result, ...f.records]) {
-        expect(JSON.stringify(output)).not.toMatch(/\/home\/alice\/secret\.txt|\/srv\/x\/y|\/mnt\/a\/b/);
+        expect(JSON.stringify(output)).not.toMatch(/\/home\/fixture\/secret\.txt|\/srv\/x\/y|\/mnt\/a\/b/);
       }
       expect(mutations(f, 'add')).toEqual([]);
       expect(mutations(f, 'remove')).toEqual([]);
