@@ -85,10 +85,11 @@ it('answers the latest live hold rather than a newer lapsed hold', () => {
 });
 
 // Match gh api's @tsv output, including multiline bodies and the GraphQL comment id.
-const commentTsv = (comments) => comments.map((comment) => [
-  comment.body, comment.createdAt, comment.author?.login, comment.id,
+const commentTsv = (comments) => comments.map((comment, i) => [
+  comment.body, comment.createdAt, comment.author?.login, comment.id ?? `IC_${i}`,
 ].map((field) => String(field ?? '').replaceAll('\\', '\\\\').replaceAll('\t', '\\t')
   .replaceAll('\n', '\\n').replaceAll('\r', '\\r')).join('\t')).join('\n');
+const commentCount = (comments) => JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } });
 
 describe('operator queue read safety', () => {
   it.each([
@@ -192,6 +193,7 @@ describe('operator queue read safety', () => {
     execFileSync.mockImplementation((_cmd, args) => {
       if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');
       if (args[1] === 'list') return JSON.stringify([pr(1)]);
+      if (args[1] === 'graphql') return commentCount([standDown]);
       return commentTsv([standDown]);
     });
     run(['--json']);
@@ -199,8 +201,8 @@ describe('operator queue read safety', () => {
     expect(report.incomplete).not.toBe(true);
     expect(report.errors).toEqual([]);
     expect(report.stoodDown[0].number).toBe(1);
-    expect(execFileSync).toHaveBeenCalledTimes(4);
-    expect(execFileSync).toHaveBeenLastCalledWith('gh', [
+    expect(execFileSync).toHaveBeenCalledTimes(5);
+    expect(execFileSync).toHaveBeenNthCalledWith(4, 'gh', [
       'api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/1/comments',
       '--jq', '.[] | [.body, .created_at, .user.login, .node_id, .html_url] | @tsv',
     ], expect.objectContaining({ encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
@@ -215,6 +217,7 @@ describe('operator queue read safety', () => {
     execFileSync.mockImplementation((_cmd, args) => {
       if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');
       if (args[1] === 'list') return JSON.stringify([pr(1)]);
+      if (args[1] === 'graphql') return commentCount(comments);
       commentAttempts += 1;
       if (commentAttempts === 1) throw Object.assign(new Error('HTTP 502'), { stdout: commentTsv([standDown]) });
       return commentTsv(comments);
@@ -244,16 +247,18 @@ describe('operator queue read safety', () => {
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
     };
     expect(queue.evaluatePr(listed)).toMatchObject({ ready: false, reasons: expect.arrayContaining(['changes requested']) });
-    execFileSync.mockReturnValueOnce(JSON.stringify([listed])).mockReturnValueOnce(commentTsv([
+    const fullComments = [
       ...comments, advisory('572049b31', 'accept', '2026-10-11T10:00:00Z'),
-    ]));
+    ];
+    execFileSync.mockReturnValueOnce(JSON.stringify([listed])).mockReturnValueOnce(commentTsv(fullComments))
+      .mockReturnValueOnce(commentCount(fullComments));
     run(['--json']);
     const report = JSON.parse(stdout());
     expect(report.ready).toEqual([expect.objectContaining({ number: 4631 })]);
     expect(report.notReady).toEqual([]);
     expect(report.errors).toEqual([]);
-    expect(execFileSync).toHaveBeenCalledTimes(2);
-    expect(execFileSync).toHaveBeenLastCalledWith('gh', expect.arrayContaining([
+    expect(execFileSync).toHaveBeenCalledTimes(3);
+    expect(execFileSync).toHaveBeenNthCalledWith(2, 'gh', expect.arrayContaining([
       'api', '--paginate', 'repos/o/n/issues/4631/comments',
     ]), expect.any(Object));
     expect(process.exitCode).toBeUndefined();
@@ -290,6 +295,7 @@ describe('operator queue read safety', () => {
       if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');
       if (args[1] === 'list') return JSON.stringify([pr(1), pr(2)]);
       if (args.includes('repos/o/n/issues/1/comments')) throw new Error('HTTP 404: Not Found');
+      if (args[1] === 'graphql') return commentCount([standDown]);
       return commentTsv([standDown]);
     });
     run(['--json']);
@@ -307,6 +313,7 @@ describe('operator queue read safety', () => {
       if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');
       if (args[1] === 'list') return JSON.stringify([pr(1), pr(2)]);
       if (args.includes('repos/o/n/issues/1/comments')) throw new Error('HTTP 502: later page failed');
+      if (args[1] === 'graphql') return commentCount([standDown]);
       return commentTsv([standDown]);
     });
     run();

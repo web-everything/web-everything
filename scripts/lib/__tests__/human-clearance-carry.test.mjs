@@ -263,8 +263,11 @@ const graphExec = ({ parents, main, onComment = () => {}, view = null, tip = vie
   } // the sha the branch tip (the net diff's rev) resolves to
   if (cmd === 'gh' && args[1] === 'comment') { onComment(args[args.indexOf('--body') + 1]); return ''; }
   // PR #4631 round 11: a moved head's coverage reads the PR's formal reviews (`gh api …/reviews`); none stand here.
+  if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+    return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: view.comments.length } } } } });
+  }
   if (cmd === 'gh' && args[0] === 'api') return args.some(a => a.includes('/comments'))
-    ? view.comments.map(c => [c.body.replaceAll('\n', '\\n'), c.createdAt || '', c.author?.login || 'chalbert'].join('\t')).join('\n') : '';
+    ? view.comments.map((c, i) => [c.body.replaceAll('\n', '\\n'), c.createdAt || '', c.author?.login || 'chalbert', c.id ?? `IC_${i}`].join('\t')).join('\n') : '';
   if (cmd !== 'git') throw new Error(`unexpected ${cmd}`);
   const ancestors = (sha) => { const seen = new Set(); const st = [sha]; while (st.length) { const s = st.pop(); if (seen.has(s)) continue; seen.add(s); st.push(...(parents[s] || [])); } return seen; };
   const mainSet = new Set([...main].flatMap((m) => [...ancestors(m)]));
@@ -684,13 +687,17 @@ it('#5414 recorded heads: carries chalbert and updates acceptance as well as cle
   const before = 'fc7b05325a715a0f5f5dd07bed6223044fd92f2f39475906c5f7c4f4c303cd0a';
   const after = 'dc5d53c7d39b4f24465cf98f24122e860e479d5b6513b9e2e41471c0c410ad56';
   const comment = clearHumanComment(old, before);
+  comment.id = 'IC_clearance';
   comment.createdAt = '2026-10-15T23:41:24Z';
   comment.body += '\n<!-- reviewed-contribution: 39a4211c1e0740f32e484ba867419a7ae9eb137b670c574790ce23e1de14ba40 -->';
   const posted = []; const logs = []; const proofs = [];
   const exec = (cmd, args) => {
     if (cmd === 'gh' && args[1] === 'view') return JSON.stringify({ headRefOid: head, headRefName: 'lane/5414', comments: [comment] });
+    if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+      return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } });
+    }
     if (cmd === 'gh' && args[0] === 'api') return args.some(a => a.includes('/comments'))
-      ? [comment.body.replaceAll('\n', '\\n'), comment.createdAt, 'chalbert'].join('\t') : '';
+      ? [comment.body.replaceAll('\n', '\\n'), comment.createdAt, 'chalbert', comment.id].join('\t') : '';
     if (cmd === 'gh' && args[1] === 'comment') { posted.push(args[args.indexOf('--body') + 1]); return ''; }
     throw Error('unexpected command');
   };
