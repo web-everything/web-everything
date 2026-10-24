@@ -10,7 +10,7 @@ import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
@@ -812,6 +812,35 @@ describe('runGate — none/standards/full, never commits', () => {
     expect(['SIGINT', 'SIGTERM'].map(signal => process.listenerCount(signal))).toEqual(counts);
   });
 
+  // A descendant in its own process group survives the group kill and keeps the gate's pipes open, so
+  // `close` never arrives: the wrapper must settle on its own within timeout + close grace.
+  it.each([
+    { label: 'timeout', parent: keepAliveScript({ maxLifetimeMs: 10000 }), options: { timeout: 1000 }, rejects: /timed out/ },
+    { label: 'nonzero exit', parent: 'process.exit(7)', rejects: /gate exited 7/ },
+    { label: 'zero exit', parent: 'console.log("gate output"); process.exit(0)' },
+    { label: 'output limit', parent: `console.log("x".repeat(4096)); ${keepAliveScript({ maxLifetimeMs: 10000 })}`,
+      options: { maxBuffer: 1024 }, rejects: /maxBuffer/ },
+  ])('settles after $label while a detached descendant holds stdio', async ({ parent, options, rejects }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-gate-holder-'));
+    const pidFile = join(dir, 'holder.pid');
+    const holder = keepAliveScript({ maxLifetimeMs: 8000 });
+    const script = `const g = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(holder)}],
+      { detached: true, stdio: 'inherit' });
+      require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid)); g.unref(); ${parent}`;
+    const counts = ['SIGINT', 'SIGTERM'].map(signal => process.listenerCount(signal));
+    const started = Date.now();
+    try {
+      const pending = detachedGateExecFn(process.execPath, ['-e', script], { ...options, closeGraceMs: 300 });
+      if (rejects) await expect(pending).rejects.toThrow(rejects);
+      else expect(await pending).toContain('gate output');
+      expect(Date.now() - started).toBeLessThan((options?.timeout ?? 0) + 300 + 2000);
+      expect(['SIGINT', 'SIGTERM'].map(signal => process.listenerCount(signal))).toEqual(counts);
+    } finally {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
+
   it('mode "none" runs nothing and passes', () => {
     const execFn = vi.fn();
     const r = runGate({ dir: '/d', mode: 'none', execFn });
@@ -1039,6 +1068,27 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('settles a timed-out run while a detached descendant still holds the worker pipes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-holder-test-'));
+    const pidFile = join(dir, 'holder.pid');
+    const holder = keepAliveScript({ maxLifetimeMs: 8000 });
+    const script = `const g = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(holder)}],
+      { detached: true, stdio: 'inherit' });
+      require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid)); g.unref();
+      ${keepAliveScript({ maxLifetimeMs: 10000 })}`;
+    const spawnFn = (_cli, _argv, opts) => spawn(process.execPath, ['-e', script], opts);
+    const started = Date.now();
+    try {
+      const r = await runCodexDirectExec({ dir, gitDir: dir, task: 't', logFile: join(dir, 'events.jsonl'),
+        stream: false, timeoutMs: 1000, closeGraceMs: 300, spawnFn });
+      expect(r.timedOut).toBe(true);
+      expect(Date.now() - started).toBeLessThan(1000 + 300 + 2000);
+    } finally {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
 
   it('#4665 isolates each edit run, honors the pool override, and leaves review permissions alone', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-permissions-test-'));

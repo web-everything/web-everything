@@ -519,23 +519,53 @@ export function collectAndClearRolloutQuota({
 export const defaultExecFn = (bin, args, opts = {}) =>
   execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 50 * 1024 * 1024, ...opts });
 
+/** How long a gate may hold its pipes after it exited or failed before the wrapper settles without `close`. */
+export const GATE_CLOSE_GRACE_MS = 2000;
+
 /** Detached gates must yield to signal handlers, including while npm's descendants run. */
 export function detachedGateExecFn(bin, args, opts = {}) {
   return new Promise((resolveExec, reject) => {
-    const { timeout = DEFAULT_TIMEOUT_MS, maxBuffer = 50 * 1024 * 1024, ...spawnOpts } = opts;
+    const { timeout = DEFAULT_TIMEOUT_MS, maxBuffer = 50 * 1024 * 1024, closeGraceMs = GATE_CLOSE_GRACE_MS,
+      ...spawnOpts } = opts;
     const child = nodeSpawn(bin, args, { ...spawnOpts, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const output = { stdout: [], stderr: [] };
     const sizes = { stdout: 0, stderr: 0 };
     let failure;
     let timer;
+    let graceTimer;
+    let exitStatus = { code: null, signal: null };
+    let settled = false;
     const killGroup = () => {
       try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
     };
     const removeListeners = () => {
       clearTimeout(timer);
+      clearTimeout(graceTimer);
       process.removeListener('SIGINT', onSigint);
       process.removeListener('SIGTERM', onSigterm);
+    };
+    const settle = (code, signal) => {
+      if (settled) return;
+      settled = true;
+      removeListeners();
+      const stdout = Buffer.concat(output.stdout).toString('utf8');
+      const stderr = Buffer.concat(output.stderr).toString('utf8');
+      if (failure || code !== 0 || signal) {
+        const error = failure ?? new Error(`gate exited ${signal ?? code}`);
+        reject(Object.assign(error, { stdout, stderr: stderr || error.message }));
+      } else resolveExec(stdout);
+    };
+    // A descendant that left the process group (its own `detached`/setsid) survives the group kill and can
+    // hold the inherited pipes forever, so `close` may never come: stop reading and settle on our own.
+    const startGrace = () => {
+      if (settled || graceTimer) return;
+      graceTimer = setTimeout(() => {
+        killGroup(); // same-group stragglers of a gate that already exited
+        child.stdout.destroy();
+        child.stderr.destroy();
+        settle(exitStatus.code, exitStatus.signal);
+      }, closeGraceMs);
     };
     const cancel = signal => {
       killGroup();
@@ -544,7 +574,7 @@ export function detachedGateExecFn(bin, args, opts = {}) {
     };
     const onSigint = () => cancel('SIGINT');
     const onSigterm = () => cancel('SIGTERM');
-    const fail = error => { failure ??= error; killGroup(); };
+    const fail = error => { failure ??= error; killGroup(); startGrace(); };
     for (const stream of ['stdout', 'stderr']) {
       child[stream].on('data', chunk => {
         if (failure) return;
@@ -556,21 +586,20 @@ export function detachedGateExecFn(bin, args, opts = {}) {
       });
     }
     child.once('error', error => {
+      failure ??= error;
+      killGroup();
+      if (settled) return;
+      settled = true;
       removeListeners();
-      fail(error);
       reject(error);
     });
-    child.once('close', (code, signal) => {
-      removeListeners();
-      const stdout = Buffer.concat(output.stdout).toString('utf8');
-      const stderr = Buffer.concat(output.stderr).toString('utf8');
-      if (failure || code !== 0 || signal) {
-        const error = failure ?? new Error(`gate exited ${signal ?? code}`);
-        reject(Object.assign(error, { stdout, stderr: stderr || error.message }));
-      } else resolveExec(stdout);
-    });
+    child.once('close', (code, signal) => settle(code, signal));
     // A failed parent can exit before descendants close their inherited pipes.
-    child.once('exit', (code, signal) => { if (code !== 0 || signal) killGroup(); });
+    child.once('exit', (code, signal) => {
+      exitStatus = { code, signal };
+      if (code !== 0 || signal) killGroup();
+      startGrace();
+    });
     if (timeout > 0) {
       timer = setTimeout(() => fail(new Error(`gate timed out after ${timeout}ms`)), timeout);
       timer.unref();
@@ -827,6 +856,7 @@ export async function runCodexDirectExec({
   env = process.env,
   review = false,
   policy, resumeThreadId,
+  closeGraceMs = GATE_CLOSE_GRACE_MS,
 } = {}) {
   // Inside `.git/` — NEVER inside the working tree. A real live run against this very script found the bug
   // this avoids: a last-message/log file written into `dir` shows up as an untracked `??` file and pollutes
@@ -853,6 +883,8 @@ export async function runCodexDirectExec({
     let out = '';
     let err = '';
     let timer = null;
+    let graceTimer = null;
+    let exitCode = null;
     let killed = false;
     let settled = false;
     const removeSignalListeners = () => {
@@ -873,8 +905,20 @@ export async function runCodexDirectExec({
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       removeSignalListeners();
       resolvePromise(r);
+    };
+    // A descendant outside the worker's process group can hold its pipes after it exited or was killed,
+    // so `close` may never come: stop reading after a short grace and settle on our own.
+    const startGrace = () => {
+      if (settled || graceTimer) return;
+      graceTimer = setTimeout(() => {
+        child.stdout?.destroy?.();
+        child.stderr?.destroy?.();
+        recordStdout(stdoutDecoder.decode());
+        settle({ stdout: out, stderr: err, code: exitCode, timedOut: killed, argv, outputLastMessageFile });
+      }, closeGraceMs);
     };
     // Job bookkeeping installs an exit handler before execution starts. Kill the worker group
     // first, before that handler can exit the wrapper and leave its detached worker running.
@@ -887,6 +931,7 @@ export async function runCodexDirectExec({
           if (Number.isInteger(child.pid) && child.pid > 0) process.kill(-child.pid, 'SIGKILL');
         } catch { /* already gone, or process-group kill is unavailable */ }
         try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        startGrace();
       }, timeoutMs);
       if (typeof timer.unref === 'function') timer.unref();
     }
@@ -901,6 +946,7 @@ export async function runCodexDirectExec({
     child.stderr?.on('data', (d) => { err += d.toString(); });
     child.on('error', (e) => {
       if (timer) clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       removeSignalListeners();
       reject(new Error(`codex-direct-task: \`${cli}\` failed to run: ${e.message}`));
     });
@@ -908,6 +954,7 @@ export async function runCodexDirectExec({
       recordStdout(stdoutDecoder.decode());
       settle({ stdout: out, stderr: err, code, timedOut: killed, argv, outputLastMessageFile });
     });
+    child.on('exit', (code) => { exitCode = code; startGrace(); });
     // NO POSITIONAL PROMPT — the task rides stdin, and `.end()` closes it (the stdin-trap avoidance).
     child.stdin?.on('error', () => { /* the child may exit before we finish writing; `close` reports it */ });
     child.stdin?.end(prompt);
