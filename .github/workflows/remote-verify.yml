@@ -1,7 +1,5 @@
 name: Remote verify
-# GitHub's run metadata carries the evaluated inputs; clients must match these
-# before accepting a concurrent workflow_dispatch at the same commit.
-run-name: remote-verify ${{ toJSON(inputs) }}
+run-name: remote-verify (${{ inputs.mode || 'lane-check' }})
 
 on:
   workflow_dispatch:
@@ -30,7 +28,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: remote-verify-${{ inputs.mode == 'targeted' && (inputs.ref || github.ref) || github.ref }}
+  group: remote-verify-${{ github.event_name }}-${{ inputs.mode || 'lane-check' }}-${{ inputs.mode == 'targeted' && (inputs.ref || github.ref) || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -41,6 +39,15 @@ jobs:
       run:
         working-directory: web-everything
     steps:
+      # Targeted refs may predate the dispatcher; keep orchestration with the workflow.
+      - name: Checkout verification dispatcher
+        uses: actions/checkout@v4
+        with:
+          path: remote-verify-source
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/lib/remote-verify-dispatch.mjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Checkout WE
         uses: actions/checkout@v4
         with:
@@ -76,12 +83,6 @@ jobs:
           cache-dependency-path: |
             web-everything/package-lock.json
             frontierui/package-lock.json
-      - uses: actions/cache@v4
-        with:
-          path: |
-            web-everything/node_modules
-            frontierui/node_modules
-          key: remote-verify-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json', 'web-everything/package-lock.json', 'frontierui/package-lock.json') }}
       - name: Install + build FUI tools
         working-directory: frontierui
         run: |
@@ -99,33 +100,10 @@ jobs:
           node --input-type=module <<'NODE'
           import { execFileSync } from 'node:child_process';
           import { existsSync } from 'node:fs';
-          const run = (file, args) => execFileSync(file, args, { stdio: 'inherit' });
-          switch (process.env.VERIFY_MODE) {
-            case 'lane-check':
-              run('node', ['scripts/verify-lane.mjs', 'run']);
-              break;
-            case 'full':
-              run('npm', ['run', 'check:standards']);
-              run('npm', ['run', 'test:unit']);
-              break;
-            case 'targeted': {
-              const tests = (process.env.VERIFY_TESTS || '').trim().split(/\s+/).filter(Boolean);
-              const operation = (process.env.VERIFY_OPERATION || '').trim();
-              if (tests.length) {
-                if (tests.some((file) => file.startsWith('-') || !existsSync(file))) throw new Error('Expected existing test file paths');
-                run('npm', ['run', 'test:unit', '--', ...tests]);
-              } else {
-                // Keep identical to operationNamePattern in scripts/remote-test.mjs.
-                const operationNamePattern = /^[a-z][a-z0-9-]*$/;
-                if (!operationNamePattern.test(operation)) throw new Error('Targeted mode requires tests or an operation name');
-                // Operation declarations and their IO bindings live beside each other.
-                const declaration = `scripts/operations/${operation}.mjs`;
-                if (!existsSync(declaration)) throw new Error('Unknown operation');
-                const files = [declaration, `scripts/operations/${operation}-io.mjs`].filter(existsSync);
-                run('node', ['scripts/readiness/heavy-admission.mjs', 'run', '--', 'npx', 'vitest', 'related', '--run', ...files]);
-              }
-              break;
-            }
-            default: throw new Error('Unknown verification mode');
+          import { remoteVerifyCommands } from '../remote-verify-source/scripts/lib/remote-verify-dispatch.mjs';
+          const commands = remoteVerifyCommands({ mode: process.env.VERIFY_MODE,
+            tests: process.env.VERIFY_TESTS, operation: process.env.VERIFY_OPERATION }, existsSync);
+          for (const [file, args] of commands) {
+            execFileSync(file, args, { stdio: 'inherit' });
           }
           NODE
