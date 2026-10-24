@@ -122,7 +122,7 @@ function failedGate(e, loadSettings) {
     : { action: 'refuse', why: 'check-error', reason: 'pre-pr-review-error', message: `${message} — refusing (fail closed). Fix the cause and open the PR again.` };
 }
 
-export { createPrDiffStatReader } from '../lib/pr-size-admission.mjs';
+export { createPrDiffStatReader, OPEN_PR_MAX_NON_TEST_LINES, measureNonTestLines } from '../lib/pr-size-admission.mjs';
 import { createGitReader } from '../lib/pr-size-admission.mjs';
 
 /**

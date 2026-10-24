@@ -49,4 +49,6 @@ export const HOME_REASONS = Object.freeze({
   // the environment could not complete — the request is not what is wrong
   'gh-error': 'unrun', 'push-failed': 'unrun', 'fallback-failed': 'unrun', 'check-timeout': 'unrun',
   'blocked-on-infra': 'unrun',
+  // an unexpected internal fault in pr-land itself (async CLI catch) — the request is not what is wrong
+  'internal-error': 'unrun',
 });

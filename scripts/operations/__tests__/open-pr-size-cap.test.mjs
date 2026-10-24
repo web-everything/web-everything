@@ -3,7 +3,6 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import * as openPr from '../open-pr.mjs';
 import * as openPrIo from '../open-pr-io.mjs';
 import * as sizeAdmission from '../../lib/pr-size-admission.mjs';
 import * as prLand from '../../pr-land.mjs';
@@ -37,10 +36,10 @@ function direct(overrides = {}) {
 }
 
 describe('legacy size imports remain compatible with the shared home', () => {
-  it('open-pr re-exports the shared 300-line constant and measurement function', () => {
+  it('open-pr-io re-exports the shared 300-line constant and measurement function (the declaration stays import-free)', () => {
     expect(sizeAdmission.OPEN_PR_MAX_NON_TEST_LINES).toBe(300);
-    expect(openPr.OPEN_PR_MAX_NON_TEST_LINES).toBe(sizeAdmission.OPEN_PR_MAX_NON_TEST_LINES);
-    expect(openPr.measureNonTestLines).toBe(sizeAdmission.measureNonTestLines);
+    expect(openPrIo.OPEN_PR_MAX_NON_TEST_LINES).toBe(sizeAdmission.OPEN_PR_MAX_NON_TEST_LINES);
+    expect(openPrIo.measureNonTestLines).toBe(sizeAdmission.measureNonTestLines);
   });
   it('open-pr-io re-exports the shared diff-stat reader', () => {
     expect(openPrIo.createPrDiffStatReader).toBe(sizeAdmission.createPrDiffStatReader);

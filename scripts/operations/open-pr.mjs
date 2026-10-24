@@ -47,7 +47,6 @@ export const SUPERSEDES_LINE_GUIDANCE = 'A PR that folds in another open PR\'s f
 
 export const OPEN_PR_OP = 'open-pr';
 
-export { OPEN_PR_MAX_NON_TEST_LINES, measureNonTestLines } from '../lib/pr-size-admission.mjs';
 
 /** The one effect: hand the planned argv to the home. */
 export const SUBMIT_PR_EFFECT = 'open-pr.submit';
