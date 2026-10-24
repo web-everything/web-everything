@@ -82,6 +82,12 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Accept carry-forward's advisory exemption must use `readConfirmedBreaks` and `planRedTeamActions`,
+including settings and `WE_RED_TEAM_CONFIRMED_BREAKS` overrides. A send-back finding or an
+unresolved policy supersedes the stale accept; the fallback is a fresh review. Regression cases
+in `accept-carry-forward.replay.test.mjs` cover `degraded=send-back`, cosmetic classification,
+non-blocking overrides, and throwing, missing, incomplete or unknown policy resolution.
+
 The drain owes a live-head red team only after a speculative or sequential pass is scheduled
 (recorded queued/running status or seat evidence). The review job records the pass as queued as
 soon as the loop returns an owed accept, before the added seats. Before that status exists, the

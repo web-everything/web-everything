@@ -2,7 +2,7 @@
  * Card xu7kxtt (#5472, ruling P4) — replay fixtures for the accept carry-forward rule and its two consumers:
  * the restamp decision (review-set-label) and the review daemon's carry sweep. Live case: PR #4535, 2026-10-09.
  */
-import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -15,6 +15,7 @@ import {
 } from '../accept-carry-forward.mjs';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../review-set-label.mjs';
 import { redTeamGateMarker } from '../red-team-gate.mjs';
+import * as redTeamGate from '../red-team-gate.mjs';
 import { buildGateComment } from '../../operations/red-team-gate-apply.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import {
@@ -1168,6 +1169,8 @@ describe('plateau-app #217 replay — clearance stamped with reviewed-sha only (
 });
 
 describe('red-team machine-body boundary (#5828)', () => {
+  beforeEach(() => vi.stubEnv('WE_RED_TEAM_CONFIRMED_BREAKS', ''));
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
   const advisory = (findings = []) => renderRedTeamComment({ pr: 5828, rev: NEW, provider: 'codex', model: 'm',
     findings, recheckStatus: 'ok', foldedVerdict: 'accept' });
   const finding = { category: 'edge-case', impactIfUnfixed: 'degraded', summary: 'Follow-up finding.', confirmedByRecheck: true };
@@ -1180,6 +1183,46 @@ describe('red-team machine-body boundary (#5828)', () => {
   ];
   // The later clearance matches NEW's net diff; the first accept predates that contribution.
   const laterRecord = (body, metadata = {}) => latestAcceptRecord([...fx.comments, { body, ...metadata }]);
+
+  it.each(['degraded', 'cosmetic'])('configured degraded send-back supersedes a confirmed %s advisory', (impact) => {
+    vi.stubEnv('WE_RED_TEAM_CONFIRMED_BREAKS', 'degraded=send-back');
+    const body = advisory([{ ...finding, impactIfUnfixed: impact }]);
+    const parsed = redTeamGate.parseRedTeamComment(body);
+    expect(redTeamGate.planRedTeamActions(parsed, redTeamGate.readConfirmedBreaks().value).sendBack).toHaveLength(1);
+    const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
+    expect(record.laterVerdict).toBe(true);
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+  });
+
+  it('uses the shared settings policy when a confirmed degraded advisory is configured for send-back', () => {
+    const setting = redTeamGate.resolveConfirmedBreaks({ file: { redTeam: { confirmedBreaks: { degraded: 'send-back' } } } });
+    vi.spyOn(redTeamGate, 'readConfirmedBreaks').mockReturnValue(setting);
+    const body = advisory([finding]);
+    const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
+    expect(record.laterVerdict).toBe(true);
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+  });
+
+  it.each([
+    ['throws', () => { throw new Error('policy unavailable'); }],
+    ['missing', () => undefined],
+    ['incomplete', () => ({ value: {} })],
+    ['unknown action', () => ({ value: { degraded: 'unknown' } })],
+  ])('refuses carry when the advisory policy resolver is %s; a fresh review is owed', (_kind, resolve) => {
+    vi.spyOn(redTeamGate, 'readConfirmedBreaks').mockImplementation(resolve);
+    const body = advisory([finding]);
+    const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
+    expect(record.laterVerdict).toBe(true);
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+  });
+
+  it('permits a confirmed broken advisory when the configured action is card', () => {
+    vi.stubEnv('WE_RED_TEAM_CONFIRMED_BREAKS', 'broken=card');
+    const body = advisory([{ ...finding, impactIfUnfixed: 'broken' }]);
+    const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
+    expect(record.laterVerdict).toBe(false);
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('carry');
+  });
 
   it.each(bodies)('trusted %s after an accept does not supersede it', (_kind, body) => {
     expect(laterRecord(body, { author: { login: 'web-everything[bot]' } }).laterVerdict).toBe(false);

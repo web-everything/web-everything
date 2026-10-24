@@ -27,7 +27,7 @@
  *   today: a moved head loses a SHA-bound accept) → platform preference (`we:scripts/settings/accept-carry-forward.json`)
  *   → tool override (env `WE_ACCEPT_CARRY_FORWARD`).
  *
- *   Pure except {@link resolveAcceptCarryForward} (reads the settings file).
+ *   {@link resolveAcceptCarryForward} reads its settings file; red-team advisory classification reads the live gate policy.
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -36,7 +36,7 @@ import { fileURLToPath } from 'node:url';
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { MARKER_RE, JOB_RE } from './approval-prevention-notice.mjs';
-import { breakClass, GATE_OUTCOMES, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
+import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
 
 export const ACCEPT_CARRY_FORWARD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'accept-carry-forward.json');
 
@@ -178,18 +178,25 @@ function isNonBlockingRedTeamAdvisory(text) {
     || lines[4] !== '') return false;
   if (!findings.length) return lines.length === 6 && lines[5] === 'The red team tried to break this change and reported nothing.';
   if (lines.at(-2) !== '' || lines.at(-1) !== "A confirmed break is recorded as a miss for the accepting review and for the builder's model.") return false;
+  // Resolve exactly the gate's live policy: degraded (or any other class) can be configured for send-back.
+  // Unknown policy refuses the exemption; the existing later-verdict path requires a fresh review.
+  try {
+    const setting = readConfirmedBreaks()?.value;
+    if (findings.some(f => !Object.values(CONFIRMED_BREAK_ACTIONS).includes(setting?.[breakClass(f)]))) return false;
+    if (planRedTeamActions(parsed, setting).sendBack.length) return false;
+  } catch { return false; }
   let count = 0;
   for (const line of lines.slice(5, -2)) {
     const finding = parseRedTeamComment(`${lines[0]}\n${line}`).findings[0];
     if (finding) {
-      if (finding.index !== ++count || !finding.category || !finding.summary || breakClass(finding) === 'broken') return false;
+      if (finding.index !== ++count || !finding.category || !finding.summary) return false;
     } else if (!count || !/^ {3}- (?:Scenario|Re-check|Files read): [^\r\n]*$/.test(line)) return false;
   }
   return count === findings.length;
 }
 
 /**
- * Pure: is this comment body a recognised machine shape that cannot be a hold?
+ * Is this comment body a recognised machine shape that cannot be a hold? Red-team advisories read the live gate policy.
  * Approval-prevention notices require a trusted author when the caller supplies comment metadata. An empty body says nothing.
  * Red-team gate records and advisories require trusted author metadata, the complete machine shape, and no blocking result.
  * Verdicts, re-arms, stand-downs and non-mechanical drain parks are NOT machine shapes (they supersede the accept).
@@ -198,7 +205,7 @@ export function isKnownMachineBody(body, comment = undefined) {
   const text = typeof body === 'string' ? body : '';
   if (!text.trim()) return true;
   if (isLaterVerdictBody(text)) return false;
-  // Only non-blocking results are machine notes: a confirmed break or a failed/unknown gate still supersedes the accept.
+  // Only non-blocking results are machine notes: a policy send-back or a failed/unknown gate supersedes the accept.
   if (isTrustedMarkerAuthor(comment)) {
     if (text.startsWith(RED_TEAM_GATE_MARKER)) {
       return isNonBlockingRedTeamGate(text);
@@ -258,7 +265,7 @@ export function laterReviewHold(reviews, acceptAt = null) {
 const lastMatch = (re, body) => { re.lastIndex = 0; let m; let out = null; while ((m = re.exec(body)) !== null) out = m[1].toLowerCase(); return out; };
 
 /**
- * The latest trusted accept record on a PR thread, and what was posted after it. Pure.
+ * The latest trusted accept record on a PR thread, and what was posted after it, under the live red-team policy.
  * @param {Array<{body?:string, author?:object, createdAt?:string}>} comments
  * @param {Array|null|undefined} reviews — the PR's formal reviews (`pulls/{n}/reviews`): an array = read; `null` =
  *   UNREADABLE (the record is marked `reviewsUnreadable`, which {@link decideAcceptCarryForward} refuses as a retryable
