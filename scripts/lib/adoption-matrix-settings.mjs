@@ -1,5 +1,6 @@
 /** Read-only adoption matrix overrides; invalid fields retain built-in defaults. */
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const BUILT_IN_ADOPTION_MATRIX_SETTINGS = Object.freeze({
@@ -20,7 +21,7 @@ export function validateAdoptionMatrixSettings(raw) {
 }
 
 export function loadAdoptionMatrixSettingsFile(
-  path = fileURLToPath(new URL('./adoption-matrix-settings.json', import.meta.url)),
+  path = join(dirname(fileURLToPath(import.meta.url)), 'adoption-matrix-settings.json'),
   { readText = file => readFileSync(file, 'utf8') } = {},
 ) {
   try { return validateAdoptionMatrixSettings(JSON.parse(readText(path))); }

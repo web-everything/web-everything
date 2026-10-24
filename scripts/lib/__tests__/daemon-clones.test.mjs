@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { resolveDaemonClones } from '../daemon-clones.mjs';
 import { validateAdoptionMatrixSettings, loadAdoptionMatrixSettingsFile } from '../adoption-matrix-settings.mjs';
 
@@ -47,6 +49,16 @@ describe('daemon clone resolver', () => {
 });
 
 describe('adoption matrix settings', () => {
+  it('loads the default settings path as a filesystem path', () => {
+    const paths = [];
+    const settings = loadAdoptionMatrixSettingsFile(undefined, { readText: path => {
+      paths.push(path);
+      return '{"fixReadyPath":"/fixes"}';
+    } });
+    expect(paths).toEqual([join(dirname(fileURLToPath(import.meta.url)), '..', 'adoption-matrix-settings.json')]);
+    expect(settings.fixReadyPath).toBe('/fixes');
+  });
+
   it('validates fields independently and retains defaults for invalid values', () => {
     expect(validateAdoptionMatrixSettings({ clones: ['/clone'], excludeClones: 'bad', fixReadyPath: 42 }))
       .toEqual({ clones: ['/clone'], excludeClones: [], fixReadyPath: null });
