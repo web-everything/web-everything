@@ -314,8 +314,11 @@ export function scrubPublish(value) {
   }
   // Narrow exemption: only hex metadata on an exact red-team marker line.
   const segmentValue = value.split('\n').map((line) => {
-    if (!/^(?!.* ([a-z]+)=.* \1=)<!-- we:red-team-(gate|advisory) pr=\d+ rev=[0-9a-f]{40}( [a-z]+=[0-9a-z,_-]+)* -->$/.test(line)) return line;
-    // The leading lookahead rejects any line repeating a key, so each key's hex is unambiguous.
+    // Mirror red-team-gate.mjs's writers: advisory has no metadata; gate requires a recorded outcome.
+    // Require the full 40-hex head and strict end-of-input, with no trailing characters.
+    const advisory = /^<!-- we:red-team-advisory pr=\d+ rev=[0-9a-f]{40} -->(?![\s\S])/.test(line);
+    const gate = /^<!-- we:red-team-gate pr=\d+ rev=[0-9a-f]{40} outcome=(?:sent-back|round-cap|card-queued)(?: result=[0-9a-f]{16})?(?: grants=(?:none|[0-9a-f]{16}(?:,[0-9a-f]{16})*))? -->(?![\s\S])/.test(line);
+    if (!advisory && !gate) return line;
     return line.replace(/( rev=)[0-9a-f]{40}(?= )/, '$1')
       .replace(/( result=)[0-9a-f]{16}(?= )/, '$1')
       .replace(/( grants=)[0-9a-f]{16}(?:,[0-9a-f]{16})*(?= )/, '$1');

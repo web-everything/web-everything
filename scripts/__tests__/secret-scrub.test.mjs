@@ -93,13 +93,16 @@ describe('scrubPublish — PASSES ordinary, correct backlog/memory prose', () =>
 describe('scrubPublish — narrow red-team marker hex exemption', () => {
   const rev = '9f3c07b5d1c84b62f0937d5bc18f43b6d2c05f19'; // vowel-poor: 'rev=<sha>' trips the opaque rule outside the marker
   const opaque = 'qzxkvbnmtrplqzxkvbnmtrplqz';
-  const marker = `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=pass result=0123456789abcdef -->`;
+  const marker = `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=sent-back result=0123456789abcdef -->`;
 
   it.each([
     ['the real gate marker', marker],
-    ['an advisory marker with a hex grant', `<!-- we:red-team-advisory pr=5759 rev=${rev} grants=bcdf0123bcdf4567 -->`],
-    ['comma-separated hex grants', `<!-- we:red-team-advisory pr=5759 rev=${rev} grants=0123456789abcdef,bcdf0123bcdf4567 -->`],
-    ['an opaque-looking 16-hex result', `<!-- we:red-team-gate pr=5759 rev=${rev} result=bcdf0123bcdf4567 -->`],
+    ['the real advisory marker', `<!-- we:red-team-advisory pr=5759 rev=${rev} -->`],
+    ['a legacy gate without result or grants', `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=card-queued -->`],
+    ['a gate with a hex grant', `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=round-cap grants=bcdf0123bcdf4567 -->`],
+    ['comma-separated hex grants', marker.replace(' -->', ' grants=0123456789abcdef,bcdf0123bcdf4567 -->')],
+    ['an empty grant snapshot', marker.replace(' -->', ' grants=none -->')],
+    ['an opaque-looking 16-hex result', marker.replace('0123456789abcdef', 'bcdf0123bcdf4567')],
     ['a marker amid prose lines', `Review follows.\n${marker}\nReview ends.`],
   ])('passes %s', (_label, value) => {
     expect(scrubPublish(value)).toEqual([]);
@@ -108,15 +111,36 @@ describe('scrubPublish — narrow red-team marker hex exemption', () => {
   it.each([
     ['rev in prose', `Review rev=${rev} is ready.`],
     ['a trailing word', `${marker} extra`],
+    ['leading prose', `Review ${marker}`],
+    ['a trailing carriage return', `${marker}\r`],
+    ['embedded extra content', marker.replace(' -->', ' extra -->')],
+    ['a missing closing delimiter', marker.replace(' -->', '')],
     ['a different prefix', marker.replace('we:red-team-gate', 'we:other-gate')],
+    ['a gate missing its outcome', `<!-- we:red-team-gate pr=5759 rev=${rev} -->`],
+    ['a gate with an unknown outcome', marker.replace('outcome=sent-back', 'outcome=pass')],
+    ['an unknown harmless-looking field', marker.replace(' -->', ' note=ok -->')],
+    ['a reordered field', `<!-- we:red-team-gate pr=5759 outcome=sent-back rev=${rev} -->`],
+    ['advisory result metadata', `<!-- we:red-team-advisory pr=5759 rev=${rev} result=bcdf0123bcdf4567 -->`],
+    ['advisory grant metadata', `<!-- we:red-team-advisory pr=5759 rev=${rev} grants=bcdf0123bcdf4567 -->`],
+    ['a 39-hex revision', marker.replace(rev, rev.slice(0, 39))],
+    ['a 41-hex revision', marker.replace(rev, `${rev}0`)],
+    ['a 64-hex revision', marker.replace(rev, `${rev}${rev.slice(0, 24)}`)],
+    ['a revision with an embedded suffix', marker.replace(rev, `${rev}_extra`)],
+    ['a 15-hex result', marker.replace('0123456789abcdef', 'bcdf0123bcdf456')],
+    ['a 17-hex result on a complete gate', marker.replace('0123456789abcdef', 'bcdf0123bcdf45678')],
+    ['a gate with a 15-hex grant', marker.replace(' -->', ' grants=bcdf0123bcdf456 -->')],
+    ['a gate with a 17-hex grant', marker.replace(' -->', ' grants=bcdf0123bcdf45678 -->')],
+    ['an incomplete grant list', marker.replace(' -->', ' grants=bcdf0123bcdf4567, -->')],
+    ['an oversized id after a valid grant', marker.replace(' -->', ` grants=bcdf0123bcdf4567,${rev} -->`)],
+    ['a duplicated grants field', marker.replace(' -->', ' grants=none grants=bcdf0123bcdf4567 -->')],
     ['an extra opaque field', `<!-- we:red-team-gate pr=5759 rev=${rev} note=${opaque} -->`],
     ['an opaque outcome', `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=${opaque} -->`],
     ['a non-hex result', `<!-- we:red-team-gate pr=5759 rev=${rev} result=${opaque} -->`],
     ['a result longer than 16 hex', `<!-- we:red-team-gate pr=5759 rev=${rev} result=bcdf0123bcdf45678 -->`],
     ['a non-hex grant', `<!-- we:red-team-advisory pr=5759 rev=${rev} grants=${opaque} -->`],
-    ['a 40-hex grant in a gate marker', `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=pass grants=${rev} -->`],
+    ['a 40-hex grant in a gate marker', `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=sent-back grants=${rev} -->`],
     ['a 40-hex grant in an advisory marker', `<!-- we:red-team-advisory pr=5759 rev=${rev} grants=${rev} -->`],
-    ['a duplicated rev field', `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=pass rev=${rev} -->`],
+    ['a duplicated rev field', `<!-- we:red-team-gate pr=5759 rev=${rev} outcome=sent-back rev=${rev} -->`],
     ['a duplicated result field', `<!-- we:red-team-gate pr=5759 rev=${rev} result=none result=bcdf0123bcdf4567 -->`],
     ['an opaque token on another line', `${marker}\n${opaque}`],
   ])('rejects %s with only the opaque-token rule', (_label, value) => {
