@@ -118,10 +118,11 @@ describe('red-team-only review job', () => {
         readRedTeamOnlyPayload: () => ({ head, loopPayload }),
         readRedTeamStatus: read, readRedTeamRecords: () => observed.rows,
         readRedTeamComments: () => observed.comments,
-        recordRedTeamQueued: write, redTeamStatus: vi.fn(write),
+        recordRedTeamQueued: vi.fn(write), redTeamStatus: vi.fn(write),
         restoreRedTeamStatus: vi.fn(createReviewJobIo({ env }).restoreRedTeamStatus),
         runLoop: () => ({ status: 0, stdout: JSON.stringify(loopPayload), stderr: '' }),
         runRedTeam: input => {
+          expect(read()).toMatchObject({ status: 'queued', result: null });
           observed = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
             input: JSON.stringify({ input, at, cap, saved: observed }), encoding: 'utf8',
             timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
@@ -149,7 +150,10 @@ describe('red-team-only review job', () => {
         expect(read()).toBeNull();
         expect(io.restoreRedTeamStatus).toHaveBeenCalledOnce();
         expect(io.restoreRedTeamStatus).toHaveBeenCalledWith({ repo, pr, head, status: null });
-        expect(io.redTeamStatus).not.toHaveBeenCalled();
+        // Ordinary reviews queue through redTeamStatus; recovery uses the strict
+        // recordRedTeamQueued hook. Neither may write a finished deferral.
+        expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(redTeamOnly ? [] : ['queued']);
+        expect(io.recordRedTeamQueued.mock.calls.map(([input]) => input.status)).toEqual(redTeamOnly ? ['queued'] : []);
         expect(evidence()).toMatchObject({ scheduled: true, recorded: false, inFlight: false });
         expect(io.runRedTeamGate).not.toHaveBeenCalled();
         if (redTeamOnly) expect(recover().rows[0].why).toBe('retry cooldown active');
@@ -158,6 +162,8 @@ describe('red-team-only review job', () => {
         expect(job.redTeam).toMatchObject({ status: 'ran', comment: 'posted' });
         expect(observed.modelCalls).toBe(1);
         expect(read()).toMatchObject({ status: 'finished', result: 'ran' });
+        expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(redTeamOnly ? ['finished'] : ['queued', 'finished']);
+        expect(io.recordRedTeamQueued.mock.calls.map(([input]) => input.status)).toEqual(redTeamOnly ? ['queued', 'queued'] : ['queued']);
         expect(redTeamForHead(observed.comments, pr, head)).toMatchObject({ pr, rev: head });
         expect(io.runRedTeamGate).toHaveBeenCalledOnce();
         expect(recover().dispatched).toEqual([]);
