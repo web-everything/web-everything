@@ -25,7 +25,10 @@ export default {
         w.git.createBranch('we', head, { from: 'main', files: { 'soak/answer.txt': 'scope correction\n' } });
         const pr = w.gh.openPr({ repo: 'we', head, title: 'soak: scope correction ruling', labels: ['review:changes'], body: 'No backlog item.' });
         w.gh.comment('we', pr, '1. Correct the scope guard.', { author: 'review-bot' });
-        const stop = w.gh.comment('we', pr, buildStandDownComment({ reason: 'needs-judgment' }), { author: 'web-everything' });
+        w.gh.comment('we', pr, buildStandDownComment({ reason: 'needs-judgment' }), { author: 'web-everything' });
+        // The ceremony names the id from the PR reader, as stand-down-answer.mjs does. The fake store's numeric
+        // insertion id is a REST database id; it is not the GraphQL node id returned by the comment readers.
+        const stop = w.gh.pr('we', pr).comments.at(-1);
         const body = buildOperatorAnswer({ standDownId: String(stop.id), actor: 'chalbert', channel: 'Codex chat',
           reason: 'Scope correction is fine but must be careful to going against goal and decision and escalate if needed' });
         w.gh.comment('we', pr, body, { author: 'outsider' });

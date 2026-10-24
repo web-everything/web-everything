@@ -20,6 +20,8 @@ import { git, writeLocalIdentity, DEFAULT_BRANCH } from '../../operations/__test
 import { buildOpenPrPageQuery, listOpenPrsPagedHydrated, listOpenPrsLightPaged } from '../../lib/pr-list-paged.mjs';
 import { createGhProvider, GH_ARGV } from '../../lib/review-label-provider.mjs';
 import { readCompletePrComments } from '../pr-comments-complete.mjs';
+import { buildStandDownComment } from '../stand-down.mjs';
+import { buildOperatorAnswer, isOperatorAnswerStandDownSuperseded } from '../stand-down-answer-core.mjs';
 
 const execFileAsync = promisify(execFile);
 const cleanups = [];
@@ -365,6 +367,36 @@ describe('fake-gh generation 2 — stateful fake GitHub (#3383)', () => {
       }
       return out;
     } })).toThrow(/totalCount/);
+  });
+
+  it('an operator answer names the same stand-down node id through the embedded and complete readers', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-answer-id-');
+    const gh = makeGithub(originPath);
+    seedBranchAt(originPath, 'lane/answer-id');
+    const number = gh.openPr({ repo: SLUG, head: 'lane/answer-id', title: 'operator answer identity' });
+    const inserted = gh.comment(SLUG, number, buildStandDownComment({ reason: 'needs-judgment' }), { author: 'web-everything' });
+    const stop = gh.pr(SLUG, number).comments[0];
+    expect(stop.id).not.toBe(String(inserted.id));
+    const body = buildOperatorAnswer({ standDownId: stop.id, actor: 'chalbert', channel: 'chat', reason: 'Proceed with the repair' });
+    const provider = createGhProvider({ exec: (args) => ghExec(gh, args, clonePath) });
+    const readers = [
+      () => provider.readPrState(SLUG, number).comments,
+      () => provider.readComments(SLUG, number),
+      () => readCompletePrComments(number, { repo: SLUG,
+        exec: (_command, args) => ghExec(gh, args, clonePath) }),
+    ];
+    gh.comment(SLUG, number, body, { author: 'outsider' });
+    for (const read of readers) {
+      const comments = read();
+      expect(comments[0].id).toBe(stop.id);
+      expect(isOperatorAnswerStandDownSuperseded(comments, 0)).toBe(false);
+    }
+    gh.comment(SLUG, number, body, { author: 'web-everything' });
+    for (const read of readers) {
+      const comments = read();
+      expect(comments[0].id).toBe(stop.id);
+      expect(isOperatorAnswerStandDownSuperseded(comments, 0)).toBe(true);
+    }
   });
 
   it('rejects unsupported GraphQL queries and invalid pagination cursors', () => {
