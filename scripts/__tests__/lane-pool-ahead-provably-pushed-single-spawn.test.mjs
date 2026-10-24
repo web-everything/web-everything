@@ -26,7 +26,8 @@ function git(args, cwd) {
 function runPool(args, extraEnv = {}) {
   // LANE_POOL_ROOT MUST be this test's private tmp dir — without it every command falls back to the real
   // default pool root (~/workspace/.lanes), colliding with the LIVE pool this very task is running under.
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv } });
+  // Pin the acquisition proof without the separate salvage/recovery pass or its Git spawns.
+  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: poolRoot, LANE_POOL_NO_RECOVER: '1', ...extraEnv } });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 

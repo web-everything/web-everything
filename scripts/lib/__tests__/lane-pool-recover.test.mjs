@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   classifyLaneNames, nextLaneNumbers, capState, qualifiesForCardBackup,
   recoverPool, diagnosePool, buildNeedsYouItem, backupLaneContent, realRecoverIo,
+  collectVerdicts,
 } from '../lane-pool-recover.mjs';
 import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv, scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 import { diffFeed, REPORT_KINDS, sanitizeForFeed } from '../../operations/needs-you-feed.mjs';
@@ -139,6 +140,24 @@ describe('recoverPool fail-closed lane recovery', () => {
 });
 
 describe('operator diagnosis and feed item', () => {
+  it('does not launch a live whois diagnostic under test without an injected runner', async () => {
+    const result = await collectVerdicts({ lanePoolDir: '/fixture/pool' });
+    expect(result).toEqual({});
+  });
+  it('collects verdicts through an injected hermetic whois runner', async () => {
+    const runWhois = vi.fn(() => JSON.stringify({ lanes: [
+      { lane: 1, verdict: 'leased' }, { lane: 2, verdict: 'unknown-work' },
+    ] }));
+    expect(await collectVerdicts({ lanePoolDir: '/fixture/pool', runWhois })).toEqual({ 1: 'leased', 2: 'unknown-work' });
+    expect(runWhois).toHaveBeenCalledWith(process.execPath,
+      [expect.stringMatching(/lane-whois\.mjs$/), '--json', '--pool-root=/fixture', '--name=pool'],
+      expect.objectContaining({ timeout: 480_000 }));
+  });
+  it.each([() => { throw new Error('whois unavailable'); }, () => '{invalid', () => '{}'])(
+    'keeps failed or incomplete diagnostic reads advisory (%#)', async runWhois => {
+      expect(await collectVerdicts({ lanePoolDir: '/fixture/pool', runWhois })).toEqual({});
+    },
+  );
   it('counts verdicts, sorts unpushed lanes, and strips controls from the one-line summary', () => {
     const result = diagnosePool({
       verdictByLane: { 1: 'leased', 2: 'dirty', 9: 'dirty' },

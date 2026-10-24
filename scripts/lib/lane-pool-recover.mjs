@@ -171,6 +171,8 @@ export async function emitFullPoolNeedsYou({ repoName, diagnosis, publish }) {
 
 export async function collectVerdicts({ lanePoolDir, runWhois = execFileSync }) {
   try {
+    // Whois also reads live PRs. Tests must supply their own runner, even for this optional diagnosis.
+    if (isUnderTest() && runWhois === execFileSync) throw new Error('test verdict collection requires an injected whois runner');
     const script = fileURLToPath(new URL('../lane-whois.mjs', import.meta.url));
     const raw = await runWhois(process.execPath, [script, '--json', `--pool-root=${dirname(lanePoolDir)}`, `--name=${basename(lanePoolDir)}`], { ...processOptions, timeout: 480_000 });
     const report = JSON.parse(String(raw));

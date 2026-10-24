@@ -37,7 +37,8 @@ function gitc(args, cwd) {
 let base, originDir, referenceDir, poolRoot;
 
 function runPool(args, extraEnv = {}) {
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv } });
+  // Exercise the scan/provision guards without a subsequent automatic salvage/recovery attempt.
+  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: poolRoot, LANE_POOL_NO_RECOVER: '1', ...extraEnv } });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 

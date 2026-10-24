@@ -7,7 +7,8 @@ import { laneGitHardeningEnv, scrubGitRepoEnv } from '../lib/lane-git-hardening.
 
 // Exercise the actual resolver without running the pool CLI or mutating git state.
 const source = readFileSync(resolve(process.cwd(), 'scripts/lane-pool.mjs'), 'utf8');
-const start = source.indexOf('function resolveRepo()');
+const start = source.indexOf('function resolveRepo(');
+if (start === -1) throw new Error('lane-pool repository resolver not found');
 const resolver = source.slice(start, source.indexOf('\n}', start) + 2);
 
 function resolveWith(branch, remoteHead) {
