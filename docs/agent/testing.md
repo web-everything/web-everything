@@ -98,8 +98,14 @@ mode (`--red-team-only=resume|fresh`; the bare flag retains fresh guards). A rec
 resumes its missing comment/effects without another model call; a failed recovery persists `resumed` and remains eligible after cooldown, subject to the same clean-row guards;
 only a head with neither status nor row starts fresh. A trusted result comment, live pass,
 non-accept, unreadable evidence, recorded row without a status, or any prior result other than `ran` or `resumed`
-prevents dispatch. The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying. Recovery
-shares the tick's lane/live-review capacity and host admission (including recovery-only ticks).
+prevents dispatch. The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying.
+Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a confirmed-dead queued
+`ran`/`resumed` prior into the shared guard before writing its own queued status. A guard
+refusal that launches no call rolls back admission (removes queued status when no prior exists, or restores the
+prior status/result); only a trusted result already on the head is terminal. Regression:
+**a transient comments-unreadable guard refusal leaves status absent and fresh recovery eligible**
+and **a confirmed-dead queued/ran prior admits and reaches the shared resume path without a model call**.
+Recovery shares the tick's lane/live-review capacity and host admission (including recovery-only ticks).
 Ordinary and recovery starts share the remaining host per-tick allowance; confirmed starts and
 unknown outcomes consume the cross-repo host budget, while confirmed non-starts do not.
 Recovery defaults to a 30-minute retry cooldown through
