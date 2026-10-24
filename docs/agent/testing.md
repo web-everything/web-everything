@@ -31,7 +31,11 @@ The existing [test-selection fallback and durable evidence](../../scripts/lib/__
 Missing related tests fall back to overlay-branch tests plus import reach; fenced `noTestFiles` reaches the required audit, which must certify exactly `NOT WEAKENED`.
 Selection rules and original conflict markers persist as JSONL evidence before tests; each conflict read and capture is capped at 65,536 bytes, with its descriptor closed in `finally`.
 Evidence append failures stop at stage `tests` before tests, audit, push or registration; the needs-you event remains the fallback when the alerts file is unwritable.
-Deleted tests cannot be selected from the candidate: if the fixer deletes the only related test, require the fenced `codex-audit-required` review with `noTestFiles` and an exact `NOT WEAKENED` verdict.
+Before test selection, list the candidate and both parent trees and require every parent's
+`.test.*` or `.spec.*` JS/TS test path to remain at the same path in the candidate, including renames.
+Any existing test removed by resolution requires human review at stage `tests`, even if other tests
+remain or an auditor would certify the result. Unreadable tree listings also fail closed.
+The `codex-audit-required` fallback covers genuinely uncovered files only; it cannot rescue deleted tests.
 Capture skips non-regular files and platforms without `O_NOFOLLOW`; inspection, open and read failures remain best-effort omissions from evidence.
 
 ## Daemon entry boot smoke
