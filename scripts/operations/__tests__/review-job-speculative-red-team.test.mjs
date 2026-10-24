@@ -57,6 +57,8 @@ function jobIo({ verdict = 'accept', setting = { value: 'on', enabled: true, sou
     claim: () => ({ ok: true }),
     updateRecord: () => {},
     unclaim: () => {},
+    redTeamStatus: () => {},
+    prepareLane: () => ({ head: 'a'.repeat(40) }),
     acquireLane: () => ({ lanePath: '/lanes/lane-7' }),
     runLoop: (o) => { calls.push(['loop', o.readSink ?? null]); return { status: 0, stdout: JSON.stringify(payload(verdict)), stderr: '' }; },
     releaseLane: () => {},
