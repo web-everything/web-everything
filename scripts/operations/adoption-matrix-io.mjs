@@ -1,6 +1,6 @@
 /** Injected, read-only IO. Object presence and ancestry failures remain distinct. */
 import { spawnSync, execFileSync } from 'node:child_process';
-import { constants, readFileSync, readdirSync, statSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
+import { constants, readFileSync, readdirSync, realpathSync, statSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveDaemonClones } from '../lib/daemon-clones.mjs';
@@ -31,6 +31,7 @@ export function createAdoptionMatrixReader({
   env = process.env, home = homedir(), cwd = process.cwd(), run = spawnSync, exec = execFileSync,
   readText, readdir = readdirSync,
   isDirectory = path => { try { return statSync(path).isDirectory(); } catch { return false; } },
+  realpath = realpathSync,
   settings, settingsPath,
 } = {}) {
   const config = settings === undefined ? loadAdoptionMatrixSettingsFile(settingsPath, { readText: readText ?? (path => readFileSync(path, 'utf8')) })
@@ -86,11 +87,24 @@ export function createAdoptionMatrixReader({
     }
     const clones = resolveDaemonClones({ env, home, readdir, exec, clones: config.clones, excludeClones: config.excludeClones, onIncomplete: note });
     const present = clones.map(clone => isDirectory(clone.path));
+    const roots = new Map();
+    const isRoot = clone => {
+      if (!roots.has(clone.path)) {
+        let valid = false;
+        try {
+          const expected = realpath(clone.path);
+          const result = git(['-C', clone.path, 'rev-parse', '--show-toplevel']);
+          valid = result?.status === 0 && result.stdout?.trim() === expected;
+        } catch { /* Unreadable paths are unknown evidence. */ }
+        roots.set(clone.path, valid);
+      }
+      return roots.get(clone.path);
+    };
     const rows = fixes.map(fix => {
       // Logged revisions must be immutable SHAs; never reinterpret invalid/missing log data as a ref.
       const tipSha = Object.hasOwn(fix, 'sha') ? (SHA.test(fix.sha) ? fix.sha : null) : tipFor(fix.ref);
       const cells = clones.map((clone, i) => {
-        if (!tipSha || !present[i]) return '?';
+        if (!tipSha || !present[i] || !isRoot(clone)) return '?';
         const object = git(['-C', clone.path, 'cat-file', '-e', `${tipSha}^{commit}`]);
         if (object?.status === 1) return 'no (not in clone)';
         if (object?.status === 128 && String(object.stderr ?? '').trim()

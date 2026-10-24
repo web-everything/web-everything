@@ -178,3 +178,15 @@ it.each([
   })).toEqual([]);
   expect(incomplete).toEqual(['drain code clone settings unreadable or invalid']);
 });
+
+
+it.each(['relative/clone', '.', '', ' ', null, undefined, 42, {}])(
+  'reports an invalid exclusion %j while retaining clones and honoring valid exclusions', entry => {
+    const incomplete = [];
+    const clones = resolveDaemonClones({ env: {}, home: '/home', readdir: () => [],
+      clones: ['/home/keep', '/home/excluded'], excludeClones: [entry, '~/excluded'],
+      onIncomplete: reason => incomplete.push(reason),
+    });
+    expect(clones).toEqual([{ path: '/home/keep', name: 'keep', labels: [] }]);
+    expect(incomplete).toEqual(['excluded clone path missing or invalid']);
+  });

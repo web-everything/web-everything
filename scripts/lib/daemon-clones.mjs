@@ -22,7 +22,12 @@ export function resolveDaemonClones({
     const expanded = path === '~' ? home : path.startsWith('~/') ? join(home, path.slice(2)) : path;
     return expanded.startsWith('/') ? resolve(expanded) : null;
   };
-  const excluded = new Set(excludeClones.map(expand));
+  const excluded = new Set();
+  for (const entry of excludeClones) {
+    const path = expand(entry);
+    if (!path) { onIncomplete('excluded clone path missing or invalid'); continue; }
+    excluded.add(path);
+  }
   const byPath = new Map();
   const add = (path, label) => {
     path = expand(path);

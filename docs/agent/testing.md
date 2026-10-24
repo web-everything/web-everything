@@ -2149,3 +2149,9 @@ readable daemon plists are incomplete too. Only the built-in LaunchAgents direct
 be absent silently; ENOENT on an explicit discovery directory is incomplete. Unreadable,
 invalid JSON or malformed adoption settings throw instead of selecting defaults; repair
 the settings before retrying. Omitted settings fields still use their built-in defaults.
+
+Before probing adoption, verify `rev-parse --show-toplevel` equals the configured clone's
+realpath using the same sanitized Git environment. A repository subdirectory, failed root
+probe or unreadable realpath stays unknown. Keep a real-Git root/subdirectory regression;
+symlinks to roots remain valid. Invalid clone exclusions must report incomplete discovery
+and be ignored for matching, while valid exclusions still apply.
