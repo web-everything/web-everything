@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  normalizeFinding, normalizeFindingIdentity, referralFindingKey, sameGapSameHead, isSecurityClassFinding, findSameHeadSiblingRuling, findCarriedReviewerRuling,
+  normalizeFinding, normalizeFindingIdentity, referralFindingKey, sameGapSameHead, sameGapPairKey, judgeSameGapPairs, isSecurityClassFinding, findSameHeadSiblingRuling, findCarriedReviewerRuling,
   validateReferralRecord, referralRecordState, mandatoryReferralReviewer, REFERRAL_CARRY_REASON,
   buildOperatorRulingComment, renderReferralRecord, readReferralRecords, mandatoryReferralState,
 } from '../jury-core.mjs';
@@ -48,6 +48,21 @@ const serializedGate = (ctx, saved) => {
 };
 
 describe('sameGapSameHead', () => {
+  it.each(["'admin'", '"admin"', 'admin'])('keeps identifier-versus-string/expression delimiters distinct without a decision: %s', expression => {
+    for (const category of ['correctness', 'security']) {
+      const first = { ...base, category, summary: 'Handler compares `admin` before validation' };
+      const second = { ...first, summary: `Handler compares ${expression} before validation` };
+      expect(sameGapSameHead(first, second)).toBe(false);
+      expect(sameGapSameHead(second, first)).toBe(false);
+      expect(sameGapPairKey(first, second)).not.toBe(sameGapPairKey(first, first));
+      for (const result of ['not-real', 'card']) {
+        const { ruled, ctx } = world(first, result), target = referral('judgeCorrectness', second);
+        expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
+        expect(serializedGate(ctx, record([target], { runId: 'dest', carried: [carry(ruled, target, result)] })).pending)
+          .toEqual([target.key]);
+      }
+    }
+  });
   it.each([
     ['arithmetic', '`a + b`', '`a - b`'],
     ['comparison', '`a < b`', '`a > b`'],
@@ -82,7 +97,7 @@ describe('sameGapSameHead', () => {
   });
   it.each(['not-real', 'card'])('keeps an identical expression eligible for a serialized %s carry', result => {
     const first = { ...base, file: 'src/cache.mjs', summary: 'Handler evaluates `a + b` before validation' };
-    const second = { ...first, line: 24 };
+    const second = { ...first };
     expect(sameGapSameHead(first, second)).toBe(true);
     const { ruled, ctx } = world(first, result), target = referral('judgeCorrectness', second);
     expect(findSameHeadSiblingRuling(target, ctx)).toMatchObject({ result });
@@ -136,8 +151,8 @@ describe('sameGapSameHead', () => {
         .toEqual([target.key]);
     }
   });
-  it('accepts reordered wording and case-insensitive negation tokens', () => {
-    expect(sameGapSameHead(base, { ...base, line: 24, summary: 'Request payload validation is MISSING before use' })).toBe(true);
+  it('requires a decision for reordered wording and negation tokens', () => {
+    expect(sameGapSameHead(base, { ...base, line: 24, summary: 'Request payload validation is MISSING before use' })).toBe(false);
   });
   it('refuses GET versus PUT despite otherwise identical authorization claims', () => {
     const summary = 'GET handler skips the authorization check when the cached credential expires';
@@ -156,9 +171,9 @@ describe('sameGapSameHead', () => {
     expect(sameGapSameHead({ ...base, summary },
       { ...base, line: 24, summary: summary.replace(a, b) })).toBe(false);
   });
-  it('accepts the existing positive claim with a harmless article change', () => {
+  it('requires a decision for an article change', () => {
     expect(sameGapSameHead(base,
-      { ...base, line: 24, summary: base.summary.replace('the request', 'a request') })).toBe(true);
+      { ...base, line: 24, summary: base.summary.replace('the request', 'a request') })).toBe(false);
   });
   it.each([
     ['before', 'after'], ['all', 'any'], ['first', 'last'], ['always', 'sometimes'],
@@ -173,21 +188,21 @@ describe('sameGapSameHead', () => {
     expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
     expect(referralRecordState(record([target], { carried: [carry(ruled, target)] }), ctx).pending).toEqual([target.key]);
   });
-  it('enforces the word-overlap threshold independently of protected tokens', () => {
+  it('requires a decision for added claim words regardless of overlap', () => {
     const finding = { ...base, summary: 'Validation checks request payload before processing' };
     const boundary = { ...base, summary: 'Validation checks request payload' };
-    for (const [source, suffix, matches] of [[finding, 'malformed', true], [finding, 'malformed input', false],
-      [boundary, 'malformed', true]]) {
+    for (const [source, suffix, matches] of [[finding, 'malformed', false], [finding, 'malformed input', false],
+      [boundary, 'malformed', false]]) {
       const extended = { ...source, summary: `${source.summary} ${suffix}` };
       expect(sameGapSameHead(source, extended)).toBe(matches);
       expect(sameGapSameHead(extended, source)).toBe(matches);
     }
   });
-  it('requires identical content-word sets for long summaries while allowing reordering', () => {
+  it('requires a decision for reordered long summaries', () => {
     const finding = { ...base, summary: 'Validation checks request payload before processing cached records' };
     expect(sameGapSameHead(finding, { ...finding, summary: `Malformed ${finding.summary}` })).toBe(false);
     expect(sameGapSameHead(finding, { ...finding,
-      summary: 'Before processing cached records validation checks request payload' })).toBe(true);
+      summary: 'Before processing cached records validation checks request payload' })).toBe(false);
   });
   it('refuses a substitution even in a short summary', () => {
     const finding = { ...base, summary: 'Validation checks request payload before processing' };
@@ -224,12 +239,30 @@ describe('same-head operator matching and read-time validation', () => {
     expect(referralRecordState(r, { ...ctx, cardReadable: () => true }).pending).toEqual([]);
     expect(referralRecordState(r, { ...ctx, records: [] }).pending).toEqual([target.key]);
   });
-  it('settles the supported validation paraphrase through serialized trusted comments', () => {
+  it('settles a judged paraphrase through serialized trusted comments and refuses missing or altered evidence', async () => {
     const { ruled, ctx } = world(), target = referral('judgeCorrectness', {
       summary: 'Request payload validation is MISSING before use',
     });
-    expect(findSameHeadSiblingRuling(target, ctx)).toMatchObject({ result: 'not-real' });
-    expect(serializedGate(ctx, record([target], { runId: 'dest', carried: [carry(ruled, target)] })).pending).toEqual([]);
+    expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
+    const judged = await judgeSameGapPairs([ruled.finding, target.finding], { judge: async () => ({ pairs: [{ id: 0, sameGap: true, confidence: 0.95, reason: 'same validation gap' }] }) });
+    ctx.sameGapDecisions = judged.decisions;
+    const match = findSameHeadSiblingRuling(target, ctx);
+    expect(match).toMatchObject({ result: 'not-real' });
+    const saved = record([target], { runId: 'dest', carried: [carry(ruled, target, 'not-real', { sameGap: match.sameGap })] });
+    expect(serializedGate(ctx, saved).pending).toEqual([]);
+    const legacy = structuredClone(match.sameGap);
+    for (const field of ['keyA', 'keyB']) {
+      const identity = JSON.parse(legacy.record[field]);
+      identity[2] = identity[2][0]; // Older records retained only the case-folded claim.
+      legacy.record[field] = JSON.stringify(identity);
+    }
+    legacy.pairKey = JSON.stringify([legacy.record.keyA, legacy.record.keyB].sort());
+    saved.carried[0].sameGap = legacy;
+    expect(serializedGate(ctx, saved).pending).toEqual([target.key]);
+    delete saved.carried[0].sameGap;
+    expect(serializedGate(ctx, saved).pending).toEqual([target.key]);
+    saved.carried[0].sameGap = { ...match.sameGap, pairKey: sameGapPairKey(base, { ...base, line: 99 }) };
+    expect(serializedGate(ctx, saved).pending).toEqual([target.key]);
   });
   it.each([undefined, null, '', '   ', 42, {}, 'security', '  security/authz  ', 'SECURITY/INJECTION'])('refuses not-real with security/unknown category %j on either side', category => {
     expect(isSecurityClassFinding({ category })).toBe(true);
@@ -258,10 +291,11 @@ describe('same-head operator matching and read-time validation', () => {
     }
   });
   it('recognizes a present non-security category', () => expect(isSecurityClassFinding({ category: ' Correctness ' })).toBe(false));
-  it('refuses unreadable security classification but permits a security card carry', () => {
+  it('refuses unreadable security classification and permits an exact security card carry', () => {
     expect(isSecurityClassFinding(null)).toBe(true);
     const { ctx } = world({ category: 'SECURITY' }, 'card');
-    expect(findSameHeadSiblingRuling(referral('judgeSecurity', { category: undefined }), ctx)).toMatchObject({ result: 'card', card });
+    expect(findSameHeadSiblingRuling(referral('judgeSecurity', { category: undefined }), ctx)).toBeNull();
+    expect(findSameHeadSiblingRuling(referral('judgeSecurity', { category: 'SECURITY' }), ctx)).toMatchObject({ result: 'card', card });
   });
   it.each(['opposite', 'create/delete', 'line'])('withdraws a forged same-head carry at read time: %s', mode => {
     const { ruled, ctx } = world(mode === 'create/delete' ? { summary: `${base.summary} create` } : {});
@@ -284,7 +318,7 @@ describe('same-head operator matching and read-time validation', () => {
   });
   it.each(['block', 'not-real', 'card'])('does not skip an unreadable newer %s ruling with the destination key', result => {
     const { ruled, ctx } = world(), target = referral('judgeCorrectness', {
-      summary: 'Request payload validation is missing before use',
+      summary: base.summary,
     });
     const saved = record([target], { runId: 'dest', carried: [carry(ruled, target)] });
     ctx.operatorRulings.push({ ...ctx.operatorRulings[0], runId: 'unreadable-newer-run', key: target.key, result,
@@ -326,7 +360,7 @@ describe('same-head operator matching and read-time validation', () => {
   });
   it.each(['block', 'card', 'not-real', 'missing-referral', 'missing-record'])('withdraws a persisted carry after a newer matching sibling %s', result => {
     const { ruled, ctx } = world(), target = referral(), third = referral('judgeCorrectness', {
-      summary: 'Request payload validation is missing before use',
+      summary: base.summary,
     });
     const saved = record([target], { carried: [carry(ruled, target)] });
     expect(referralRecordState(saved, ctx).pending).toEqual([]);
@@ -342,12 +376,13 @@ describe('same-head operator matching and read-time validation', () => {
   });
 });
 
-// Sink coverage stays here to respect the explicit three-file edit boundary.
+// Sink coverage includes durable R59 provenance and the read-time gate.
 describe('mandatory-referral sink same-head persistence', () => {
   const persistScenario = async mode => {
     const root = mkdtempSync(join(tmpdir(), 'same-head-carry-'));
     try {
-      const { ruled, ctx } = world(), target = referral(), current = record([ruled, target]);
+      const { ruled, ctx } = world(), target = referral('judgeSecurity', mode === 'judged'
+        ? { summary: 'Payload is consumed without validation' } : {}), current = record([ruled, target]);
       const post = (body, login = 'web-everything') => ({ body, author: { login } });
       const state = { headRefOid: head, body: current.authorBody, labels: [], comments: [post(renderReferralRecord(current))] };
       const operatorPost = (r, result = 'not-real') => post(buildOperatorRulingComment({ version: 1,
@@ -366,7 +401,7 @@ describe('mandatory-referral sink same-head persistence', () => {
         expect(findSameHeadSiblingRuling(target, candidates)).toMatchObject({ result: 'not-real' });
         reviewerCarry = { ...carry(ruled, target, 'card'),
           from: { head: otherHead, runId: 'old', key: target.key, rulingId: 'old:0' } };
-      } else if (mode !== 'none') {
+      } else if (!['none', 'judged'].includes(mode)) {
         const old = record([ruled], { head: otherHead, runId: 'old' });
         state.comments.push(post(renderReferralRecord(old)), operatorPost(old, mode === 'unreadable-card' ? 'card' : 'not-real'));
       }
@@ -378,20 +413,33 @@ describe('mandatory-referral sink same-head persistence', () => {
         editComment: (id, body) => { state.comments.find(c => c.id === id).body = body; },
         postComment: (_repo, _pr, body) => state.comments.push(post(body)), setLabels: () => {},
       };
-      const sinks = createReviewPrSinks({ root, env: {}, labelProvider: provider, readChangedLines: changedLines,
+      const sameGapJudge = vi.fn(async () => ({ pairs: [{ id: 0, sameGap: true, confidence: 0.95, reason: 'same validation gap' }] }));
+      const sinks = createReviewPrSinks({ root, env: {}, sameGapJudge, labelProvider: provider, readChangedLines: changedLines,
         referralJudge: judge, cardReadable: () => mode === 'reviewer-first', mirrorReferral: () => {}, appendLedgerRow: () => ({ ok: true }), out: () => {} });
       const result = await sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS]({ referrals: [], read: {
         repo: ctx.repo, pr: ctx.pr, netBasis: { rev: head }, body: state.body } }, { runId: 'sink-run' });
       const saved = readReferralRecords(state.comments).records.find(r => r.runId === current.runId);
       expect(validateReferralRecord(saved)).toBe(true);
-      expect(saved.carried).toEqual([reviewerCarry ?? carry(ruled, target)]);
+      if (mode === 'judged') {
+        expect(sameGapJudge).toHaveBeenCalledTimes(1);
+        expect(saved.carried).toMatchObject([{ ...carry(ruled, target), sameGap: {
+          pairKey: sameGapPairKey(ruled.finding, target.finding), record: { source: 'judge', merged: true, confidence: 0.95 },
+        } }]);
+        expect(serializedGate(ctx, saved).pending).toEqual([]);
+        saved.carried[0].sameGap.record.confidence = 0.89;
+        expect(serializedGate(ctx, saved).pending).toEqual([target.key]);
+      } else {
+        expect(sameGapJudge).not.toHaveBeenCalled();
+        expect(saved.carried).toEqual([reviewerCarry ?? carry(ruled, target)]);
+      }
       expect(result.pending).toEqual([]);
       expect(judge).not.toHaveBeenCalled();
-      expect(changedLines).toHaveBeenCalledTimes(['none', 'unreadable-card'].includes(mode) ? 0 : 1);
+      expect(changedLines).toHaveBeenCalledTimes(['none', 'unreadable-card', 'judged'].includes(mode) ? 0 : 1);
       for (const [, baseHead, targetHead] of changedLines.mock.calls) expect([baseHead, targetHead]).toEqual([otherHead, head]);
     } finally { rmSync(root, { recursive: true, force: true }); }
   };
   it.each(['none', 'unreadable-card', 'unknown-lines', 'changed-lines', 'old-lines'])(
     'persists without a same-head comparison, falling through failed cross-head proof: %s', persistScenario);
+  it('persists one batched judge decision for the pure serialized gate', () => persistScenario('judged'));
   it('persists the reviewer card candidate before a competing same-head not-real candidate', () => persistScenario('reviewer-first'));
 });

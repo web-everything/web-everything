@@ -3129,11 +3129,28 @@ export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] })
  * is nothing to compare, so only the backing is checked for cross-head carries. Same-head siblings require
  * readable source evidence and the latest sibling selection to agree with the persisted provenance on every read.
  */
-function operatorCarryBacking(carried, target, { head, repo, pr, operatorRulings, records }) {
+function operatorCarryBacking(carried, target, { head, repo, pr, operatorRulings, records, sameGapDecisions }) {
   const backing = carriedBackingHolds(carried, { repo, pr, operatorRulings });
   if (!backing) return null;
   if (carried.from.head === head) {
-    const latest = findSameHeadSiblingRuling(target, { head, repo, pr, operatorRulings, records });
+    const evidence = carried.sameGap;
+    const decisions = new Map(sameGapDecisions);
+    if (evidence) {
+      const source = records?.find(r => r.runId === carried.from.runId && r.head === head && r.repo === repo && r.pr === pr)
+        ?.referrals?.find(f => f.key === carried.from.key);
+      const row = evidence.record;
+      const pairKey = source && sameGapPairKey(source.finding, target.finding);
+      if (!pairKey || evidence.pairKey !== pairKey || row?.source !== 'judge' || row.merged !== true
+        || row.sameGap !== true || !Number.isFinite(row.confidence) || row.confidence < 0.9 || row.confidence > 1
+        || typeof row.reason !== 'string'
+        || JSON.stringify([row.keyA, row.keyB].sort()) !== pairKey) return null;
+      decisions.set(pairKey, row);
+    }
+    // A non-exact carry must supply its durable decision even if this process has a transient map.
+    const source = records?.find(r => r.runId === carried.from.runId && r.head === head && r.repo === repo && r.pr === pr)
+      ?.referrals?.find(f => f.key === carried.from.key);
+    if (!source || (!sameGapSameHead(source.finding, target.finding) && !evidence)) return null;
+    const latest = findSameHeadSiblingRuling(target, { head, repo, pr, operatorRulings, records, sameGapDecisions: decisions });
     return latest && latest.from.runId === carried.from.runId && latest.from.key === carried.from.key
       && latest.result === carried.result && latest.card === carried.card ? backing : null;
   }
@@ -3162,82 +3179,112 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
   return null;
 }
 
-/** Same-head siblings require concrete lines, >=0.8 overlap and preserved claim/identifier order. PURE. */
-export function sameGapSameHead(a, b) {
-  const negations = s => [...new Set(String(s ?? '').toLowerCase()
-    .replace(/[‘’ʼ＇]/g, "'")
-    .match(/\b(?:not|no|never|without|missing|cannot|lacks)\b|n't\b/g) ?? [])].sort().join(',');
-  if (!(a && b && typeof a === 'object' && typeof b === 'object'
-    && Number.isInteger(a.line) && Number.isInteger(b.line) && sameFindingForClearing(a, b)
-    && negations(a.summary) === negations(b.summary))) return false;
-  // Word overlap cannot prove equivalence of expressions: punctuation, its placement, and even whitespace
-  // can change a computation. Without a language parser, require identical summaries when either contains
-  // punctuation, symbols or control/format characters. Keep the prose paraphrases below for plain text only.
-  // This also protects bare operators, escaped/unterminated quotes, paths and Unicode symbols on gate reads.
-  const symbolic = s => /[\p{P}\p{S}\p{C}]/u.test(String(s ?? ''));
-  if ((symbolic(a.summary) || symbolic(b.summary)) && a.summary !== b.summary) return false;
-  const verbs = new Set(('read reads write writes get put post patch delete deletes create creates update updates '
-    + 'remove removes add adds allow allows deny denies enable disables disable enables grant grants revoke revokes '
-    + 'load save send receive open close').split(' '));
-  const functionWords = new Set('a an the of is are was be'.split(' '));
-  const tokenize = summary => {
-    const text = String(summary ?? ''), identifiers = new Set(), words = new Set(), forms = new Map();
-    let order = [];
-    const tokens = s => s.match(/[\p{L}\p{M}\p{N}_$\u200c\u200d]+/gu) ?? [];
-    for (const [context] of text.matchAll(/`[^`]*(?:`|$)|(?<![\p{L}\p{N}_$])["'][^"'\r\n]*(?:["']|$)|[a-z0-9_-]*(?:[./\\][a-z0-9_-]+)+/giu)) {
-      for (const token of tokens(context)) identifiers.add(token.toLowerCase());
-    }
-    for (const token of tokens(text)) {
-      const word = token.toLowerCase();
-      if (!forms.has(word)) forms.set(word, new Set());
-      forms.get(word).add(token);
-      // Uppercase prose negation (MISSING) is still prose; explicit quoted/path identifiers retain their case.
-      if ((/^\p{Lu}{2,}$|[0-9_$\u200c\u200d]|\p{Ll}\p{Lu}/u.test(token) && !negations(token))
-        || ([...token].length === 1 && !functionWords.has(word)) || identifiers.has(word)) {
-        identifiers.add(word);
-      }
-      if (functionWords.has(word) && !identifiers.has(word)) continue;
-      words.add(word);
-      order.push(token); // retain repetitions, case and argument order, which a word set erases
-    }
-    // One supported nominal paraphrase: "missing validation of X before Y" / "X validation missing before Y".
-    // Keep X and Y in order; do not infer arbitrary subject/object or clause permutations from overlap.
-    const before = order.findIndex(token => token.toLowerCase() === 'before');
-    if (/^\s*missing\s+validation\s+of\s+/i.test(text) && before > 2
-      && !order.slice(2, before).some(token => identifiers.has(token.toLowerCase()) || verbs.has(token.toLowerCase()))) {
-      order = [...order.slice(2, before), 'validation', 'missing', ...order.slice(before)];
-    }
-    return { words, identifiers, forms, order };
-  };
-  const A = tokenize(a.summary), B = tokenize(b.summary);
-  for (const word of new Set([...A.identifiers, ...B.identifiers])) {
-    const left = A.forms.get(word), right = B.forms.get(word);
-    if (!left || !right || left.size !== right.size || [...left].some(token => !right.has(token))) return false;
+/** R59: deterministic unordered identity, including the lens and category/severity class. */
+const sameGapOrder = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+function sameGapIdentity(f) {
+  const id = normalizeFindingIdentity(f);
+  // The shared grouping identity folds case and quotes. Exact clearance must also retain
+  // case and delimiters: parseUser/parseuser and `admin`/'admin' may name different expressions.
+  // Such differences require a judge decision rather than identifier or expression heuristics.
+  const exactClaim = id && String(f.summary).normalize('NFKC')
+    .replace(/:\d+(?::\d+)?\b/g, ':N')
+    .replace(/\s+/g, ' ').trim().replace(/[\s.,;:!?]+$/, '');
+  return id && [id.path, f.line, [id.normSummary, exactClaim], id.lens,
+    String(f.category ?? '').trim().toLowerCase(), f.lens ?? null, f.class ?? null,
+    ...CARRY_SEVERITY_FIELDS.map(k => f[k] ?? null)];
+}
+
+export function sameGapPairKey(a, b) {
+  return JSON.stringify([JSON.stringify(sameGapIdentity(a)), JSON.stringify(sameGapIdentity(b))].sort());
+}
+
+function sameGapScope(a, b) {
+  const A = sameGapIdentity(a), B = sameGapIdentity(b);
+  return Boolean(A && B && A[0] && A[0] === B[0]
+    && Number.isInteger(a.line) && Number.isInteger(b.line)
+    && JSON.stringify(A.slice(3)) === JSON.stringify(B.slice(3)));
+}
+
+/** PURE, synchronous: exact normalized dedupe or an explicitly recorded judge merge. */
+export function sameGapSameHead(a, b, { decisions } = {}) {
+  if (!sameGapScope(a, b)) return false;
+  if (a.line === b.line && JSON.stringify(sameGapIdentity(a)[2]) === JSON.stringify(sameGapIdentity(b)[2])) return true;
+  return !isSecurityClassFinding(a.original ?? a) && !isSecurityClassFinding(b.original ?? b)
+    && decisions?.get(sameGapPairKey(a, b))?.merged === true;
+}
+
+const SAME_GAP_SHAPE = {
+  type: 'object', additionalProperties: false, required: ['pairs'], properties: {
+    pairs: { type: 'array', items: { type: 'object', additionalProperties: false,
+      required: ['id', 'sameGap', 'confidence', 'reason'], properties: {
+        id: { type: 'integer' }, sameGap: { type: 'boolean' },
+        confidence: { type: 'number', minimum: 0, maximum: 1 }, reason: { type: 'string' },
+      } } },
+  },
+};
+
+async function defaultSameGapJudge(request) {
+  const { codexJudgeSpawn } = await import('./codex-judge-spawn.mjs');
+  const outcome = await codexJudgeSpawn(request);
+  if (outcome.timedOut) throw new Error('same-gap judge timeout');
+  return outcome.value;
+}
+
+/** One bounded batch; errors, omissions and the cap all leave findings distinct for fresh review. */
+export async function judgeSameGapPairs(findings, { judge = defaultSameGapJudge, cap = 20,
+  timeoutMs = 60_000, log = () => {} } = {}) {
+  const decisions = new Map(), records = [], candidates = new Map();
+  const sorted = [...findings].filter(f => sameGapIdentity(f))
+    .sort((a, b) => sameGapOrder(JSON.stringify(sameGapIdentity(a)), JSON.stringify(sameGapIdentity(b))));
+  for (let i = 0; i < sorted.length; i++) for (let j = i + 1; j < sorted.length; j++) {
+    const a = sorted[i], b = sorted[j];
+    if (!sameGapScope(a, b) || Math.abs(a.line - b.line) > 8) continue;
+    const exact = sameGapSameHead(a, b);
+    if (!exact && (isSecurityClassFinding(a.original ?? a) || isSecurityClassFinding(b.original ?? b))) continue;
+    const keyA = JSON.stringify(sameGapIdentity(a)), keyB = JSON.stringify(sameGapIdentity(b));
+    candidates.set(sameGapPairKey(a, b), { a, b, keyA, keyB, exact });
   }
-  let hit = 0;
-  for (const word of new Set([...A.words, ...B.words])) {
-    if (A.words.has(word) && B.words.has(word)) hit += 1;
-    else if (verbs.has(word) || A.identifiers.has(word) || B.identifiers.has(word)) return false;
-  }
-  // A similarity score cannot distinguish arbitrary antonyms. Never substitute content words, even once in a
-  // long claim; only short claims (at most six content words) may gain/lose words under the overlap floor.
-  // Prose case and function-word changes still match for claims of any length.
-  if (hit < Math.min(A.words.size, B.words.size)
-    || (A.words.size !== B.words.size && Math.min(A.words.size, B.words.size) > 6)) return false;
-  if (!hit || hit / (A.words.size + B.words.size - hit) < 0.8) return false;
-  const identifiers = new Set([...A.identifiers, ...B.identifiers]);
-  const ordered = (from, to) => from.order.filter(token => to.words.has(token.toLowerCase()))
-    .map(token => identifiers.has(token.toLowerCase()) ? token : token.toLowerCase());
-  const left = ordered(A, B), right = ordered(B, A);
-  const equal = (x, y) => x.length === y.length && x.every((word, i) => word === y[i]);
-  if (equal(left, right)) return true;
-  // Moving an intact trailing "before ..." adjunct to the front preserves both clauses' internal order.
-  const frontedBefore = (x, y) => {
-    const at = x.indexOf('before');
-    return at > 0 && y[0] === 'before' && x.lastIndexOf('before') === at
-      && equal([...x.slice(at), ...x.slice(0, at)], y);
+  const limit = Number.isInteger(cap) && cap >= 0 ? cap : 0;
+  const batch = [];
+  const record = (key, pair, source, answer = {}) => {
+    const confidence = Number.isFinite(answer.confidence) ? answer.confidence : 0;
+    const entry = { keyA: pair.keyA, keyB: pair.keyB, sameGap: answer.sameGap === true,
+      confidence, reason: answer.reason ?? 'different-gap: fresh review required',
+      merged: answer.sameGap === true && confidence >= 0.9 && confidence <= 1, source };
+    decisions.set(key, entry);
+    records.push(entry);
   };
-  return frontedBefore(left, right) || frontedBefore(right, left);
+  for (const [key, pair] of [...candidates].sort(([a], [b]) => sameGapOrder(a, b))) {
+    if (pair.exact) record(key, pair, 'exact', { sameGap: true, confidence: 1, reason: 'exact normalized match' });
+    else if (batch.length < limit) batch.push({ key, pair });
+    else record(key, pair, 'capped');
+  }
+  if (batch.length) {
+    let timer;
+    try {
+      const answer = await Promise.race([
+        Promise.resolve().then(() => judge({
+          mandate: `Decide whether each pair describes exactly the same underlying defect. Default to different-gap when unsure. Merge only at confidence >= 0.9. Return one answer per supplied id. ${FENCED_DATA_RULE}`,
+          input: fenceUntrusted('findings', JSON.stringify(batch.map(({ pair }, id) => ({ id, a: pair.a, b: pair.b })))),
+          shape: SAME_GAP_SHAPE, timeoutMs,
+        })),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), timeoutMs); }),
+      ]);
+      const rows = answer?.pairs;
+      if (!Array.isArray(rows) || rows.length !== batch.length
+        || new Set(rows.map(r => r?.id)).size !== batch.length
+        || rows.some(r => !Number.isInteger(r?.id) || r.id < 0 || r.id >= batch.length
+          || typeof r.sameGap !== 'boolean' || typeof r.confidence !== 'number'
+          || typeof r.reason !== 'string')) throw new Error('malformed same-gap answer');
+      batch.forEach(({ key, pair }, id) => record(key, pair, 'judge', rows.find(r => r.id === id)));
+    } catch {
+      batch.forEach(({ key, pair }) => record(key, pair, 'error'));
+    } finally { clearTimeout(timer); }
+  }
+  records.sort((a, b) => sameGapOrder(JSON.stringify([a.keyA, a.keyB]), JSON.stringify([b.keyA, b.keyB])));
+  // Model text never enters terminal output. Full records are returned for durable provenance.
+  log(`same-gap: ${batch.length} judged, ${records.filter(r => r.source === 'capped').length} capped, ${records.filter(r => r.source === 'error').length} errors; unmerged pairs require fresh review`);
+  return { decisions, records };
 }
 
 /** Security is the category lens; unreadable findings cannot authorize a not-real clearance. */
@@ -3248,7 +3295,7 @@ export function isSecurityClassFinding(f) {
 }
 
 /** Latest same-head operator clearance of a sibling gap; security-class not-real rulings never inherit. PURE. */
-export function findSameHeadSiblingRuling(referral, { records = [], operatorRulings = [], head, repo, pr } = {}) {
+export function findSameHeadSiblingRuling(referral, { records = [], operatorRulings = [], head, repo, pr, sameGapDecisions } = {}) {
   if (!referral?.key || !referral.finding || !head || !repo || !pr
     || !Array.isArray(records) || !Array.isArray(operatorRulings)) return null;
   const seen = new Set();
@@ -3262,11 +3309,16 @@ export function findSameHeadSiblingRuling(referral, { records = [], operatorRuli
     const finding = ruled?.finding;
     if (!finding) return null; // Unknown newer evidence must not expose an older clearance.
     if (o.key === referral.key) return null; // An own-key decision cannot authorize a sibling carry over itself.
-    if (!sameGapSameHead(finding, referral.finding)) continue;
+    if (!sameGapSameHead({ ...finding, original: ruled.original ?? finding },
+      { ...referral.finding, original: referral.original ?? referral.finding }, { decisions: sameGapDecisions })) continue;
     if (o.result !== 'not-real' && o.result !== 'card') return null;
     if (o.result === 'not-real' && (isSecurityClassFinding(referral.original ?? referral.finding)
       || isSecurityClassFinding(ruled.original ?? finding))) return null;
-    return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
+    const pairKey = sameGapPairKey(finding, referral.finding);
+    const row = sameGapDecisions?.get(pairKey);
+    return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding,
+      ...(!sameGapSameHead(finding, referral.finding) && row?.merged === true
+        ? { sameGap: { pairKey, record: row } } : {}) };
   }
   return null;
 }
@@ -3476,7 +3528,7 @@ export function resolveReferralStampPolicy(env = process.env) {
 export function referralRecordState(record, options = {}) {
   const { head = record?.head, body = record?.authorBody ?? '', createdAt = '',
     cardReadable = () => false, seatDisabled = () => false, operatorRulings = [], records = [],
-    stampPolicy = resolveReferralStampPolicy(), identityTable = null, linkedBlocked } = options;
+    stampPolicy = resolveReferralStampPolicy(), identityTable = null, linkedBlocked, sameGapDecisions } = options;
   if (!validateReferralRecord(record)) return { pending: ['malformed-referral-record'], blocked: [], blockedFindings: [], rulings: [] };
   const pending = [], blocked = [], rulings = [];
   const decision = decideClearerIndependence({ authorId: parseAuthorActorId(body),
@@ -3521,7 +3573,7 @@ export function referralRecordState(record, options = {}) {
       const backing = carried.from.rulingId !== undefined
         ? reviewerCarryBacking(carried, { repo: record.repo, pr: record.pr, operatorRulings, records, identityTable,
           target: f, body, createdAt, cardReadable, stampPolicy, seatDisabled })
-        : operatorCarryBacking(carried, f, { head: record.head, repo: record.repo, pr: record.pr, operatorRulings, records });
+        : operatorCarryBacking(carried, f, { head: record.head, repo: record.repo, pr: record.pr, operatorRulings, records, sameGapDecisions });
       if (head !== record.head || !backing
         || (carried.result === 'card' && !cardReadable(carried.card))) pending.push(f.key);
       else { rulings.push(backing); if (carried.result === 'block') blocked.push(f.key); }
@@ -3687,7 +3739,9 @@ export function readReferralRecords(comments, { head } = {}) {
         seen.add(snapshot);
         const id = JSON.stringify([r.repo, r.pr, r.head, r.runId]);
         const previous = records.get(id);
-        if (previous && (previous.authorBody !== r.authorBody || JSON.stringify(previous.referrals) !== JSON.stringify(r.referrals)
+        // A cumulative snapshot may add obligations, but cannot remove, reorder or rewrite prior referrals.
+        if (previous && (previous.authorBody !== r.authorBody
+          || JSON.stringify(r.referrals.slice(0, previous.referrals.length)) !== JSON.stringify(previous.referrals)
           || (previous.attempted && !r.attempted)
           || JSON.stringify((r.dropped ?? []).slice(0, (previous.dropped ?? []).length)) !== JSON.stringify(previous.dropped ?? [])
           || JSON.stringify((r.carried ?? []).slice(0, (previous.carried ?? []).length)) !== JSON.stringify(previous.carried ?? [])

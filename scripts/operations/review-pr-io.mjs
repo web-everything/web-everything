@@ -6,7 +6,7 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  findCarriedOperatorRuling, findCarriedReviewerRuling, findSameHeadSiblingRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, referralRecheck, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
+  findCarriedOperatorRuling, findCarriedReviewerRuling, findSameHeadSiblingRuling, judgeSameGapPairs, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, referralRecheck, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
   requiresMandatoryReferral, REFERRAL_VERIFY_OUTCOMES, foldVerifyReason, verifierEvidenceCitesClaim } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
@@ -928,6 +928,7 @@ export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
   referralJudge = judgeSpawn,
+  sameGapJudge,
   publishGate = readReviewCiGate,
   readPublishHead = readReviewHead,
   readChangedLines,
@@ -1020,10 +1021,11 @@ export function createReviewPrSinks({
         if (!comparisons.has(key)) comparisons.set(key, Promise.resolve().then(() => lineReader(...args)).catch(() => null));
         return comparisons.get(key);
       };
+      let sameGapDecisions = new Map();
       const commentBudget = 60_000;
       const fresh = () => readReferralState(read.repo, read.pr, read.netBasis.rev);
       const context = (state) => ({ repo: read.repo, pr: read.pr, head: state.headRefOid,
-        body: typeof state.body === 'string' ? state.body : '', createdAt: state.createdAt, cardReadable });
+        body: typeof state.body === 'string' ? state.body : '', createdAt: state.createdAt, cardReadable, sameGapDecisions });
       const park = (state) => {
         const plan = decideParkToHuman({ currentLabels: labelNames(state.labels) });
         const remove = plan.removeLabels.filter(l => labelNames(state.labels).includes(l));
@@ -1226,6 +1228,14 @@ export function createReviewPrSinks({
         if (env.WE_REFERRAL_CARRY_OPERATOR_RULINGS !== '0') {
           const records = readReferralRecords(state.comments, context(state)).records;
           const operatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
+          const relevant = records.filter(r => r.head === read.netBasis.rev && r.repo === read.repo && r.pr === read.pr);
+          const ruled = relevant.flatMap(r => r.referrals.filter(f => operatorRulings.some(o =>
+            o.head === r.head && o.runId === r.runId && o.key === f.key)));
+          const targets = existing.filter(r => r.head === read.netBasis.rev).flatMap(r => activeReferrals(r));
+          const judged = await judgeSameGapPairs([...ruled, ...targets].map(f => ({ ...f.finding, original: f.original ?? f.finding })),
+            { judge: sameGapJudge, log: out });
+          sameGapDecisions = judged.decisions;
+          for (const row of judged.records) out(`same-gap decision: ${JSON.stringify(row).replace(/[\p{C}]/gu, '')}`);
           for (let i = 0; i < existing.length; i++) {
             const record = existing[i], carried = [];
             // Findings a reviewer's ruling on THIS head already settles (counted: independent clearer, readable card).
@@ -1244,7 +1254,7 @@ export function createReviewPrSinks({
                 head: record.head, repo: record.repo, pr: record.pr }),
                 findCarriedReviewerRuling(f, { records, operatorRulings, head: record.head, repo: record.repo,
                   pr: record.pr, body: state.body ?? '', createdAt: state.createdAt ?? '', cardReadable }),
-                findSameHeadSiblingRuling(f, { records, operatorRulings,
+                findSameHeadSiblingRuling(f, { records, operatorRulings, sameGapDecisions,
                   head: record.head, repo: record.repo, pr: record.pr })];
               // `referralRecordState` keeps a carried `card` pending while its card is unreadable, yet `liveReferrals`
               // drops a carried finding from dispatch: that pairing would hold the gate with no reviewer to clear it.
@@ -1262,7 +1272,8 @@ export function createReviewPrSinks({
                     || changesTouchCitedLines(changed.old ?? changed, [match.finding.line])) continue;
                 }
                 carried.push({ key: f.key, reason: REFERRAL_CARRY_REASON, from: match.from,
-                  result: match.result, ...(match.card ? { card: match.card } : {}) });
+                  result: match.result, ...(match.card ? { card: match.card } : {}),
+                  ...(match.sameGap ? { sameGap: match.sameGap } : {}) });
                 break;
               }
             }
