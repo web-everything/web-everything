@@ -687,4 +687,42 @@ describe('the same gap raised by two seats counts once', () => {
       expect(notConvergingText(7, decision)).toContain('merge-bound');
     }
   });
+
+  it('gives equal count and weight across cross-comment arrival orders at 20, 22, 30', () => {
+    const orders = [[20, 22, 30], [30, 22, 20], [22, 20, 30], [22, 30, 20]];
+    const totals = orders.map((lines) => {
+      const comments = lines.map((line, i) => review(T1, 9 + i, [finding(line)]));
+      const { count, weight } = openDefects(comments, T1);
+      return { count, weight };
+    });
+    for (let i = 1; i < orders.length; i++) expect.soft(totals[i], `arrival ${orders[i]}`).toEqual(totals[0]);
+  });
+
+  it('counts the real defect at 22 with a gate hold at 20 in either same-comment listing order', () => {
+    const hold = finding(20, 'broken', 'review-gate red because a dependency PR is not merged');
+    const defect = finding(22);
+    for (const pair of [[defect, hold], [hold, defect]]) {
+      expect.soft(tally(pair), `listing ${pair.map((f) => f[1])}`).toMatchObject({ count: 1 });
+    }
+  });
+
+  it.each(['judgeSecurity', null])('keeps standalone recovered block rulings separate with judge %s (unknown fails closed)', async (judge) => {
+    const { buildOperatorRulingComment, parseOperatorRulingComment } = await import('../../lib/jury-core.mjs');
+    const comments = [20, 24].map((line, i) => {
+      const ruling = { runId: `review-pr-${i}`, key: JSON.stringify([judge, 'src/j.mjs', line, `${claim}${i ? ' silently' : ''}`]), result: 'block' };
+      const comment = { author: BOT, createdAt: at(9 + i), body: buildOperatorRulingComment({
+        version: 1, repo: 'test/repo', pr: 7, head: T1, actor: 'auto-policy', channel: 'test',
+        reason: 'Required referral is blocked', at: at(9 + i), clearerId: 'policy', rulings: [ruling],
+      }) };
+      expect(parseOperatorRulingComment(comment)?.record?.rulings).toEqual([ruling]);
+      return comment;
+    });
+    const rounds = reviewRounds(comments);
+    expect(rounds).toHaveLength(1);
+    expect.soft(rounds[0].findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ file: 'src/j.mjs', line: 20, ruling: 'block' }),
+      expect.objectContaining({ file: 'src/j.mjs', line: 24, ruling: 'block' }),
+    ]));
+    expect(openDefects(comments, T1)).toMatchObject({ count: 2, weight: 2 * findingWeight({ ruling: 'block' }) });
+  });
 });
