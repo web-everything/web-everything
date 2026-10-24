@@ -36,6 +36,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeComment, classifyEvent } from '../operations/coroner-rounds.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { sameGapSameHead, parseOperatorRulingComment } from '../lib/jury-core.mjs';
 import { isReviewVerdictComment, reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { takeoverMarkers, takeoverVoidRefused, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
@@ -44,6 +45,7 @@ import { LIST_COMMENTS_PAGE_SIZE } from './pr-comments-complete.mjs';
 export const TAKEOVER_BUDGET_SETTING = 'takeoverBudget';
 export const TAKEOVER_BUDGET_ENV = 'WE_FIX_TAKEOVER_BUDGET';
 export const TAKEOVER_BUDGET_STANDARD_DEFAULT = 2;
+export const MAX_MERGE_FINDINGS = 200;
 /** The operator-approved manual takeover comment's leading text (shared with `takeover-review.mjs`). */
 export const OPERATOR_TAKEOVER_PREFIX = '**Takeover (operator OK)';
 
@@ -181,16 +183,28 @@ const isOpen = (f) => !CLOSED_RULINGS.has(String(f?.ruling ?? '').toLowerCase())
 /** A trusted fixer turn that changed the PR (a re-arm, an advisory fix): the end of one review round. */
 const FIXER_TURN = /^🔧 conveyor fix —/;
 
-/** Fold one finding into a round's list: the same spot (file, line within 2) or the same file-less claim is one. */
+/**
+ * Fold the same spot (file, line within 2) or file-less claim first, then an exact ruling key or sameGapSameHead.
+ * Compare only kept findings, pairwise, first match; never join groups through a discarded member.
+ * Keep the heavier member's ruling/impact; a later ruling lands. New matches never merge closed findings.
+ * At the bound, count raw findings without merging: a flood can only over-count.
+ */
 function mergeFinding(into, f) {
+  if (into.length >= MAX_MERGE_FINDINGS) { into.push(f); return; }
+  const key = (g) => JSON.stringify([g.file ?? null, g.line ?? null, clip(g.claim, 220)]);
+  const gap = (g) => ({ file: g.file, line: g.line, summary: g.claim, impactIfUnfixed: g.impact ?? null, verdict: g.ruling ?? null });
   const same = into.find((g) => (f.file && g.file === f.file && (f.line == null || g.line == null || Math.abs(g.line - f.line) <= 2))
-    || (!f.file && !g.file && g.claim === f.claim));
+    || (!f.file && !g.file && g.claim === f.claim))
+    ?? into.find((g) => isOpen(g) && isOpen(f)
+      && ((f.lens === 'referral' && f.ruling) || (g.lens === 'referral' && g.ruling)) && key(g) === key(f))
+    ?? into.find((g) => isOpen(g) && isOpen(f) && sameGapSameHead(gap(g), gap(f)));
   if (same) {
+    if (findingWeight(f) > findingWeight(same)) { same.ruling = f.ruling ?? null; same.impact = f.impact ?? null; }
     if (f.ruling) same.ruling = f.ruling;
     if (!same.impact && f.impact) same.impact = f.impact;
     return;
   }
-  into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null });
+  into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null, lens: f.lens ?? null });
 }
 
 /**
@@ -219,6 +233,18 @@ export function reviewRounds(comments) {
     if (FIXER_TURN.test(c.body.split('\n')[0]) || isOperatorTakeover(raw)) { items.push({ t, boundary: true }); continue; }
     if (isPausedReview(raw)) continue;
     const ev = classifyEvent(c);
+    // The prose parser loses ruling locations; recover only validated structured finding keys.
+    const ruled = parseOperatorRulingComment({ author: { login: c.login }, body: c.body })?.record?.rulings.filter((r) => r.result === 'block');
+    if (ev?.type === 'round' && ruled) ev.findings = ruled.map((r, i) => {
+      try {
+        const key = JSON.parse(r.key);
+        if (Array.isArray(key) && key.length === 4 && (key[1] == null || typeof key[1] === 'string')
+          && (key[2] == null || Number.isInteger(key[2])) && typeof key[3] === 'string') {
+          return { file: key[1], line: key[2], claim: clip(key[3], 220), lens: 'referral', ruling: r.result };
+        }
+      } catch { /* An opaque key retains the original raw finding. */ }
+      return ev.findings[i];
+    }).filter(Boolean);
     // A block ruling on a paused review's referrals concludes that review too (the policy or the operator ruled it):
     // otherwise a review that pauses on the same referrals every run would leave the takeover unjudged forever
     // (live #4708, 17:44Z: the woken review paused again on the referrals already ruled block).
