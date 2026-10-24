@@ -344,6 +344,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // express: the declaring module reaches nothing at all, and the io shell reaches `child_process` and NO
     // network — the home is its only route to GitHub.
     [OPEN_PR_OP]: 'open-pr.mjs',
+    'graduate-chain': 'graduate-chain.mjs',
     // #xrk6hmj — `record-verdict`'s `stage` step pushes to the transport branch, so it is emphatically NOT
     // read-only; listed here only for map coverage. Its declaring module still imports nothing that can act
     // (the reader and the git sinks live in `record-verdict-io.mjs`), but that is a discipline its own suite
