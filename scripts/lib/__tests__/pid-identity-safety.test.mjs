@@ -8,6 +8,7 @@ import { isClaimRunnerDead } from '../dispatch-throttle.mjs';
 import { enrichAgents, probePid } from '../../conveyor/reconcile-pass.mjs';
 import { assessLiveness } from '../../conveyor/reconcile-core.mjs';
 import { defaultIsPidAlive } from '../../conveyor/driver-watchdog.mjs';
+import { buildLeaseSignalsFor, classifyReap } from '../../conveyor/lease-reaper.mjs';
 import { acquireFixClaim } from '../../conveyor/fix-procedure.mjs';
 import {
   acquireFixDispatchClaim, readFixDispatchClaim, stampBorrowedRunnerPid,
@@ -27,6 +28,42 @@ const NOW = Date.parse('2026-10-24T12:02:00.000Z');
 afterEach(() => { vi.restoreAllMocks(); vi.mocked(execFileSync).mockReset(); });
 
 describe('PID snapshot safety boundaries', () => {
+  const detachedWrapperSignals = (wrapperPids) => {
+    const lease = { session: 'conveyor-42', acquiredAt: new Date(NOW - 60 * 60_000).toISOString() };
+    const signalsFor = buildLeaseSignalsFor({
+      prStatesByRepo: new Map(), sessionStates: new Map(), sessionPidAlive: new Map(),
+      sessionAgents: [], wrapperPids, nowMs: NOW,
+    });
+    return { lease, signals: signalsFor({ lease, repoKey: 'we' }) };
+  };
+
+  it('unreadable identity for a live detached wrapper keeps the lane (wrapperAlive stays true)', () => {
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    vi.mocked(execFileSync).mockImplementation(() => {
+      throw Object.assign(new Error('ps: permission denied'), { status: 1, stderr: 'ps: permission denied' });
+    });
+    const { lease, signals } = detachedWrapperSignals(new Map([['conveyor-42', PID]]));
+    expect(kill).toHaveBeenCalledWith(PID, 0);
+    expect(execFileSync).toHaveBeenCalledWith('ps',
+      ['-p', String(PID), '-o', 'stat=,lstart=,command='], expect.any(Object));
+    expect(signals.sessionGone).toBe(false);
+    expect(classifyReap(lease, { ...signals, nowMs: NOW })).toEqual({ reap: false, reason: null });
+  });
+
+  it.each([
+    ['matching live wrapper keeps the lane', ROW, false],
+    ['confirmed dead wrapper permits reclamation', `Z+ ${START} ${ARGV}\n`, true],
+    ['missing wrapper permits ordinary absence reclamation', null, true],
+  ])('%s', (_name, output, reap) => {
+    vi.spyOn(process, 'kill').mockReturnValue(true);
+    vi.mocked(execFileSync).mockReturnValue(output);
+    const { lease, signals } = detachedWrapperSignals(output === null ? new Map() : new Map([['conveyor-42', PID]]));
+    expect(signals.sessionGone).toBe(reap);
+    expect(classifyReap(lease, { ...signals, nowMs: NOW }))
+      .toEqual({ reap, reason: reap ? 'session-gone' : null });
+    if (output === null) expect(execFileSync).not.toHaveBeenCalled();
+  });
+
   it('a live worker whose prompt mentions bg-spare is not a recycled spare', () => {
     const argv = 'claude --bg --name fix-1 Investigate bg-spare recycling --bg-spare';
     expect(pidIdentity(PID, { exec: () => `S ${START} ${argv}\n` }))

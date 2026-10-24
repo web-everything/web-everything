@@ -161,7 +161,8 @@ export function createLandAdvanceReader(ports = {}) {
     const ledger = get('follow-ups', () => readFollowUps({ store }), []);
     // A mechanical ci-heal runs as a detached wrapper (`pid:<n>` handle), invisible to `claude agents`: liveness is the kernel's.
     const pidOf = (entry) => /^pid:(\d+)$/.exec(entry.session ?? '')?.[1];
-    const detachedAlive = (entry) => Boolean(pidOf(entry)) && Number(capturedAt) < Date.parse(entry.deadline) && isPidAlive(Number(pidOf(entry)));
+    // Unknown identity retains the worker hold; only explicit death permits another repair.
+    const detachedAlive = (entry) => Boolean(pidOf(entry)) && Number(capturedAt) < Date.parse(entry.deadline) && isPidAlive(Number(pidOf(entry))) !== false;
     const detached = ledger.filter(detachedAlive).map((e) => e.target);
     // The mechanical session verdict (`conveyor/session-verdicts.mjs`), attached once so the pure planner stays pure.
     // No PR lookups here (plan never adds network); the reaper's own pass adds them when it applies.

@@ -1061,6 +1061,7 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  *   session's REAL process-liveness read from {@link sessionPidAliveByName} (`null` when not supplied/unknown —
  *   exact back-compat with every pre-#3383 caller); `wrapperAlive` (#3903) = whether a DETACHED delivery
  *   wrapper the dispatcher started for this session is still running (see {@link detachedWrapperPidsBySession});
+ *   a tracked wrapper with unreadable identity supplies `true`, while an untracked wrapper supplies `null`;
  *   `ownerAlive` (#xbk2is9) = whether the lease's declared occupant (`workerSession`) is confirmed alive in the
  *   same listing (see {@link ownerSessionAliveForLease}) — `null` when not supplied or unknown (back-compat with
  *   every pre-#xbk2is9 caller). Consulted ONLY in the absence branch below, and ONLY there: it can never override
@@ -1078,8 +1079,8 @@ export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DIS
   // or a restricted `claude -p`) in the foreground of its own process, so that slug is NEVER in `claude agents`.
   // Without this check the absence branch below reads a live, hour-long build as "never listed → gone" once the
   // 10-minute grace passes and force-releases its lane mid-build. The wrapper's own pid (the run store's `pid:<n>`
-  // handle) is the direct answer: alive means NOT gone, full stop. `false`/`null` change nothing — a dead
-  // wrapper falls through to the ordinary absence logic, which is what reclaims its lane after it exits.
+  // handle) is the direct answer: alive or unknown identity means NOT gone. `false` (confirmed dead) and
+  // `null` (no tracked wrapper) fall through to the ordinary absence logic.
   if (wrapperAlive === true) return false;
   // #x5wm9ot — was `itemNumFromSession(session) === null`, which after that function narrowed to item-kind-only
   // now reads EVERY PR_KIND session (review-/fix-/ci-heal-/inspect-) as "not dispatcher-minted, don't guess" —
@@ -1431,7 +1432,8 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
     const sessionPidAliveNow = c.lease?.session && sessionPidAlive.has(c.lease.session) ? sessionPidAlive.get(c.lease.session) : null;
     // #3903 — a detached delivery wrapper's own pid (see `detachedWrapperPidsBySession`).
     const wrapperPid = c.lease?.session ? wrapperPids.get(c.lease.session) : undefined;
-    const wrapperAlive = wrapperPid === undefined ? null : Boolean(defaultIsPidAlive(wrapperPid));
+    // Only explicit death lifts the wrapper veto; unreadable identity must keep the lane.
+    const wrapperAlive = wrapperPid === undefined ? null : defaultIsPidAlive(wrapperPid) !== false;
     return {
       prState,
       sessionGone: sessionGoneForLease(c.lease, sessionStates, { nowMs, pidAlive: sessionPidAliveNow, wrapperAlive, ownerAlive }),
