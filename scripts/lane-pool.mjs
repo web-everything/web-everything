@@ -168,6 +168,7 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
 import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
+import { realSalvageIo, salvagePushLane } from './lib/lane-pool-salvage-push.mjs';
 import {
   salvageLane, removeLitterWorktrees, listLitterWorktrees, laneLivenessGate,
 } from './lib/lane-salvage.mjs';
@@ -2809,7 +2810,7 @@ function deliveredLeaseForLane(dir, lease) {
   });
 }
 
-function cmdRelease(repo) {
+async function cmdRelease(repo) {
   assertReleaseReservedScoped();
   if (flags['all-pools']) return cmdReleaseAllPools(repo); // #2667 — cross-pool release-by-session
   const session = defaultSession();
@@ -2918,6 +2919,11 @@ function cmdRelease(repo) {
     // have released and a brand-new acquirer could already be sitting on this exact lane. An unconditional
     // `rmSync` here would destroy that NEW holder's live lease, not the one this call actually decided to drop
     // — the same check-then-act TOCTOU `cmdTrim` already closed for its own reap path with this exact primitive.
+    if (recoveryEnabled()) {
+      const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo }) });
+      if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+      else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
+    }
     releaseTestBarrier();
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
@@ -4665,7 +4671,7 @@ async function recoverRepoPool(repo, lanes = classifyLaneNames(readdirSync(repo.
   const io = realRecoverIo({ repo, lanePoolPath: fileURLToPath(import.meta.url),
     isLeased: n => !!liveLease(laneDir(repo, n), Date.now(), ttlMsFromFlags()) });
   const result = await recoverPool({ lanes, io });
-  log(`auto-recover: reclaimed ${result.reclaimed.length}, kept-unpushed ${result.keptUnpushed.length}, leased ${result.keptLeased.length}, skipped ${result.skipped.length}`);
+  log(`auto-recover: reclaimed ${result.reclaimed.length}, kept-unpushed ${result.keptUnpushed.length}, leased ${result.keptLeased.length}, skipped ${result.skipped.length}, salvaged ${result.salvaged.map(({ lane, ref }) => `lane-${lane}: ${ref}`).join(', ') || 'none'}`);
   return result;
 }
 async function cmdGc(repo) {

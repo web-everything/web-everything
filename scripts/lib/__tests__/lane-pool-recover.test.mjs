@@ -293,7 +293,7 @@ describe('recoverPool salvage push before recovery', () => {
     h.io.proof = vi.fn().mockReturnValueOnce(unpushed()).mockReturnValueOnce(preserved());
     h.io.salvage = vi.fn(() => ({ status, ...(status === 'pushed' ? { ref } : {}) }));
     const result = await h.run({ lanes: [1] });
-    expect(h.io.salvage).toHaveBeenCalledExactlyOnceWith(1);
+    expect(h.io.salvage).toHaveBeenCalledTimes(1); expect(h.io.salvage).toHaveBeenCalledWith(1);
     expect(h.io.proof).toHaveBeenCalledTimes(2);
     expect(result.reclaimed).toEqual([1]);
     expect(result.keptUnpushed).toEqual([]);
@@ -316,7 +316,7 @@ describe('recoverPool salvage push before recovery', () => {
   it('keeps a failed salvage in keptUnpushed with a salvage reason and no backup or reclaim', async () => {
     const h = harness({ proof: vi.fn(() => unpushed()), salvage: vi.fn(() => ({ status: 'failed', reason: 'origin unavailable' })) });
     const result = await h.run({ lanes: [1] });
-    expect(h.io.salvage).toHaveBeenCalledExactlyOnceWith(1);
+    expect(h.io.salvage).toHaveBeenCalledTimes(1); expect(h.io.salvage).toHaveBeenCalledWith(1);
     expect(h.io.proof).toHaveBeenCalledTimes(1);
     expect(result.keptUnpushed).toEqual([{ lane: 1, reason: expect.stringMatching(/salvage/i) }]);
     expect(result.reclaimed).toEqual([]);
@@ -351,7 +351,7 @@ describe('recoverPool salvage push before recovery', () => {
   ])('refuses backup and reclaim when refreshed proof is %s despite successful salvage', async (_label, refreshed) => {
     const h = harness({ proof: vi.fn().mockReturnValueOnce(unpushed()).mockImplementationOnce(refreshed), salvage: vi.fn(() => ({ status: 'pushed', ref })) });
     const result = await h.run({ lanes: [1] });
-    expect(h.io.salvage).toHaveBeenCalledExactlyOnceWith(1);
+    expect(h.io.salvage).toHaveBeenCalledTimes(1); expect(h.io.salvage).toHaveBeenCalledWith(1);
     expect(h.io.proof).toHaveBeenCalledTimes(2);
     expect(result.reclaimed).toEqual([]);
     expect(result.keptUnpushed.map(row => row.lane)).toEqual([1]);
@@ -369,7 +369,7 @@ describe('recoverPool salvage exception isolation', () => {
       salvage: vi.fn(() => { throw new Error('origin unavailable'); }),
     });
     const result = await h.run();
-    expect(h.io.salvage).toHaveBeenCalledExactlyOnceWith(1);
+    expect(h.io.salvage).toHaveBeenCalledTimes(1); expect(h.io.salvage).toHaveBeenCalledWith(1);
     expect(result.keptUnpushed).toEqual([{ lane: 1, reason: expect.stringMatching(/salvage/i) }]);
     expect(result.reclaimed).toEqual([2]);
     expect(result.salvaged).toEqual([]);
