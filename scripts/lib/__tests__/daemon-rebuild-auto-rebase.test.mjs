@@ -816,6 +816,16 @@ describe('established overlay auto rebase', () => {
     expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: 'replacement registration unavailable' } });
   });
 
+  it('escalates a pending swap whose replacement is unregistered before adoption, keeping the original and evidence', async () => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    removeOverlay(f.root, replacement.ref, { env: f.env });
+    expect(() => swaps(f)).not.toThrow();
+    expect(f.calls).not.toContain('remove');
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref]);
+    expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
+    expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: expect.stringContaining('unregistered before adoption') } });
+  });
+
   it('never removes an original the operator re-registers before cleanup takes the list mutex', async () => {
     const f = fixture(); f.moveMain(); const replacement = await job(f);
     ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
@@ -874,6 +884,7 @@ describe('established overlay auto rebase', () => {
 
     it('still holds when the repair carries a force-pushed tip but not the head the running build carries', async () => {
       const { f, replacement } = await pinnedFixture({ forcePush: true });
+      ok(f.root, ['fetch', 'origin']);
       expect(run(['merge-base', '--is-ancestor', f.oldSha, replacement.newSha], { cwd: f.root }).status).toBe(1);
       const held = await prepare(f);
       expect(held.result.reason).toBe('established-overlay-conflict');

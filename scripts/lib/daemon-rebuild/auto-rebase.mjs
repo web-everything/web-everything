@@ -260,7 +260,15 @@ export function finishPendingSwaps({ root, env = process.env, run, removeOverlay
       ref = swap.old;
       const git = args => run(args, { cwd: root, env, timeout: 60_000 });
       const adopted = git(['merge-base', '--is-ancestor', swap.newSha, 'HEAD']);
-      if (adopted.status !== 0 || adopted.error) continue;
+      if (adopted.status !== 0 || adopted.error) {
+        // A replacement unregistered before adoption (withdrawn, or dropped after a failed smoke) is never adopted, and
+        // this file keeps the original from a fresh repair: escalate instead of waiting silently. Retrying is the operator's call.
+        const pendingState = overlays.readOverlayState(root, { env });
+        if (pendingState.corrupt || !pendingState.overlays.some(o => o?.ref === swap.new)) {
+          throw new Error('replacement unregistered before adoption; original stays held — re-register it or remove the pending swap');
+        }
+        continue;
+      }
       requireOk(git(['fetch', 'origin', `+refs/heads/${swap.old}:refs/remotes/origin/${swap.old}`]));
       const currentOld = requireOk(git(['rev-parse', '--verify', `refs/remotes/origin/${swap.old}`]));
       if (!/^[a-f0-9]{40}$/.test(currentOld)) throw new Error('current origin tip unavailable');

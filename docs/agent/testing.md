@@ -17,6 +17,9 @@ fetched origin tip of the old ref. An advanced or unreadable old tip retains bot
 escalates through `auto-rebase-needs-you`. Cleanup requires the replacement's freshly fetched origin
 tip to contain the pending SHA, and `removeOverlay`'s `requireRef` checks the replacement is still
 registered under the same list mutex that removes the original, so a withdrawal up to that write wins;
+its `expectedOverlay` likewise refuses to remove an original re-registered meanwhile. A replacement
+unregistered before adoption escalates every cleanup pass instead of waiting silently;
+the pending file stays, so a fresh repair is the operator's call;
 missing or unreadable evidence retains the old registration and pending file and alerts in both sinks.
 A mechanism-pinned original is never set aside as stack-contained, so the plan still lists it as lost
 beside its applied repair. `prepareRebuild` does not hold for a lost overlay whose current tip the
