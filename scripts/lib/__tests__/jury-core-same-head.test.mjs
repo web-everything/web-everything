@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import {
   normalizeFinding, referralFindingKey, sameGapSameHead, isSecurityClassFinding, findSameHeadSiblingRuling, findCarriedReviewerRuling,
   validateReferralRecord, referralRecordState, mandatoryReferralReviewer, REFERRAL_CARRY_REASON,
-  buildOperatorRulingComment, renderReferralRecord, readReferralRecords,
+  buildOperatorRulingComment, renderReferralRecord, readReferralRecords, mandatoryReferralState,
 } from '../jury-core.mjs';
 import { createReviewPrSinks } from '../../operations/review-pr-io.mjs';
 import { REVIEW_EFFECTS } from '../../operations/review-pr.mjs';
@@ -32,8 +32,65 @@ const world = (over = {}, result = 'not-real') => {
 };
 const carry = (from, target, result = 'not-real', extra = {}) => ({ key: target.key, reason: REFERRAL_CARRY_REASON,
   from: { head, runId: 'run-1', key: from.key }, result, ...(result === 'card' ? { card } : {}), ...extra });
+const serializedGate = (ctx, saved) => {
+  const post = (body, login = 'web-everything') => ({ body, author: { login } });
+  const comments = [...ctx.records, saved].map(r => post(renderReferralRecord(r)));
+  for (const o of ctx.operatorRulings) comments.push(post(buildOperatorRulingComment({
+    version: 1, repo: o.repo, pr: o.pr, head: o.head, actor: 'chalbert', channel: 'test', reason: 'checked',
+    at: '2026-10-24T12:00:00Z', clearerId: '', rulings: [{ runId: o.runId, key: o.key, result: o.result,
+      ...(o.card ? { card: o.card } : {}) }],
+  }), 'chalbert'));
+  const state = mandatoryReferralState(comments, { head, repo: saved.repo, pr: saved.pr, body: saved.authorBody,
+    cardReadable: () => true });
+  expect(state.malformed).toBe(false);
+  expect(state.blocked).toEqual([]);
+  return state;
+};
 
 describe('sameGapSameHead', () => {
+  it.each([
+    ['reversed subject and object', 'The cached record overwrites the request payload before validation',
+      'The request payload overwrites the cached record before validation'],
+    ['reversed relationship', 'The cache writes before validation and reads after validation',
+      'The cache reads before validation and writes after validation'],
+    ['function case', 'parseUser returns cached records before validation',
+      'parseuser returns cached records before validation'],
+    ['quoted identifier case', '`payload` overwrites `record` before validation',
+      '`Payload` overwrites `record` before validation'],
+    ['single-quoted identifier case', "'payload' overwrites 'record' before validation",
+      "'Payload' overwrites 'record' before validation"],
+    ['double-quoted identifier case', '"payload" overwrites "record" before validation',
+      '"Payload" overwrites "record" before validation'],
+    ['path identifier case', 'src/cache.mjs returns cached records before validation',
+      'src/Cache.mjs returns cached records before validation'],
+    ['uppercase identifier case', 'GET returns cached records before validation',
+      'get returns cached records before validation'],
+    ['case-sensitive identifier roles', 'parseUser overwrites parseuser before validation',
+      'parseuser overwrites parseUser before validation'],
+    ['single-letter identifier case', '`x` returns cached records before validation',
+      '`X` returns cached records before validation'],
+    ['bare single-letter identifier case', 'x returns cached records before validation',
+      'X returns cached records before validation'],
+    ['Unicode identifier case', 'parseÜser returns cached records before validation',
+      'parseüser returns cached records before validation'],
+    ['identifier joiner', 'parseUser returns cached records before validation',
+      'parseUser\u200d returns cached records before validation'],
+    ['identifier combining mark', 'parseUser returns cached records before validation',
+      'parseUser\u0301 returns cached records before validation'],
+    ['repeated relationship words', 'The cache writes before validation and after validation',
+      'The cache writes before validation and before validation and after validation'],
+  ])('keeps %s pending through serialized same-head carries', (_label, source, dest) => {
+    const first = { ...base, file: 'src/cache.mjs', summary: source };
+    const second = { ...first, summary: dest };
+    expect(sameGapSameHead(first, second)).toBe(false);
+    expect(sameGapSameHead(second, first)).toBe(false);
+    for (const result of ['not-real', 'card']) {
+      const { ruled, ctx } = world(first, result), target = referral('judgeCorrectness', second);
+      expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
+      expect(serializedGate(ctx, record([target], { runId: 'dest', carried: [carry(ruled, target, result)] })).pending)
+        .toEqual([target.key]);
+    }
+  });
   it('accepts reordered wording and case-insensitive negation tokens', () => {
     expect(sameGapSameHead(base, { ...base, line: 24, summary: 'Request payload validation is MISSING before use' })).toBe(true);
   });
@@ -122,6 +179,13 @@ describe('same-head operator matching and read-time validation', () => {
     expect(referralRecordState(r, { ...ctx, cardReadable: () => true }).pending).toEqual([]);
     expect(referralRecordState(r, { ...ctx, records: [] }).pending).toEqual([target.key]);
   });
+  it('settles the supported validation paraphrase through serialized trusted comments', () => {
+    const { ruled, ctx } = world(), target = referral('judgeCorrectness', {
+      summary: 'Request payload validation is MISSING before use',
+    });
+    expect(findSameHeadSiblingRuling(target, ctx)).toMatchObject({ result: 'not-real' });
+    expect(serializedGate(ctx, record([target], { runId: 'dest', carried: [carry(ruled, target)] })).pending).toEqual([]);
+  });
   it.each([undefined, null, '', '   ', 42, {}, 'security', '  security/authz  ', 'SECURITY/INJECTION'])('refuses not-real with security/unknown category %j on either side', category => {
     expect(isSecurityClassFinding({ category })).toBe(true);
     for (const source of [true, false]) {
@@ -156,6 +220,29 @@ describe('same-head operator matching and read-time validation', () => {
     const { ctx } = world();
     ctx.operatorRulings.push({ ...ctx.operatorRulings[0], ...(missing === 'record' ? { runId: 'missing' } : { key: 'missing' }) });
     expect(findSameHeadSiblingRuling(referral(), ctx)).toBeNull();
+  });
+  it.each(['block', 'not-real', 'card'])('does not skip an unreadable newer %s ruling with the destination key', result => {
+    const { ruled, ctx } = world(), target = referral('judgeCorrectness', {
+      summary: 'Request payload validation is missing before use',
+    });
+    const saved = record([target], { runId: 'dest', carried: [carry(ruled, target)] });
+    ctx.operatorRulings.push({ ...ctx.operatorRulings[0], runId: 'unreadable-newer-run', key: target.key, result,
+      ...(result === 'card' ? { card } : {}) });
+    expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
+    expect(serializedGate(ctx, saved).pending).toEqual([target.key]);
+    // A readable run with no referral for that key is equally unresolved.
+    ctx.records.push(record([ruled], { runId: 'unreadable-newer-run' }));
+    expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
+    expect(serializedGate(ctx, saved).pending).toEqual([target.key]);
+  });
+  it.each(['block', 'not-real', 'card'])('does not carry over a readable newer destination-key %s ruling', result => {
+    const { ruled, ctx } = world(), target = referral('judgeCorrectness');
+    const saved = record([target], { runId: 'dest', carried: [carry(ruled, target)] });
+    ctx.records.push(record([target], { runId: 'newer' }));
+    ctx.operatorRulings.push({ ...ctx.operatorRulings[0], runId: 'newer', key: target.key, result,
+      ...(result === 'card' ? { card } : {}) });
+    expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
+    expect(referralRecordState(saved, ctx).pending).toEqual([target.key]);
   });
   it('refuses a later block, another head/PR, its own key and missing context', () => {
     const { ruled, ctx } = world();
