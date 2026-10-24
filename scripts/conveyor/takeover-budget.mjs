@@ -182,26 +182,60 @@ const isOpen = (f) => !CLOSED_RULINGS.has(String(f?.ruling ?? '').toLowerCase())
 /** A trusted fixer turn that changed the PR (a re-arm, an advisory fix): the end of one review round. */
 const FIXER_TURN = /^🔧 conveyor fix —/;
 
-/**
- * Fold findings using the shared clearing identity without severity, or identical file-less claims.
- * Keep the first member's file, line and claim as the anchor; heavier members upgrade ruling and impact.
- * Equal weights keep existing impact and later ruling. A missing line on either member permits file-level matching.
- */
+/** Fold one finding into a round's list: the same spot (file, line within 2) or the same file-less claim is one. */
 function mergeFinding(into, f) {
-  const same = into.find((g) => (f.file && sameFindingForClearing(
-    { file: g.file, line: f.line == null ? null : g.line, summary: g.claim },
-    { file: f.file, line: g.line == null ? null : f.line, summary: f.claim },
-  ))
+  const same = into.find((g) => (f.file && g.file === f.file && (f.line == null || g.line == null || Math.abs(g.line - f.line) <= 2))
     || (!f.file && !g.file && g.claim === f.claim));
   if (same) {
-    const existingWeight = findingWeight(same), incomingWeight = findingWeight(f);
-    if (incomingWeight > existingWeight) {
-      same.ruling = f.ruling ?? null;
-      same.impact = f.impact ?? null;
-    } else if (f.ruling) same.ruling = f.ruling; // a later ruling (even a closing one) always lands, as before
+    if (f.ruling) same.ruling = f.ruling;
+    if (!same.impact && f.impact) same.impact = f.impact;
     return;
   }
   into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null });
+}
+
+/**
+ * PURE: consolidate open, file-citing findings into connected components of the shared clearing identity,
+ * ignoring severity. Compare every pair so a chain of matching members has the same result in any order.
+ * Anchor at the smallest line (null first), then claim; take ruling and impact together from the heaviest
+ * member. Equal weights use the same deterministic member ordering, with ruling and impact breaking ties.
+ * File-less findings pass through untouched. Call only AFTER closed findings have been removed.
+ */
+export function consolidateFindings(findings) {
+  const compareText = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+  const compareLine = (a, b) => a == null ? (b == null ? 0 : -1) : b == null ? 1 : a - b;
+  const compareAnchor = (a, b) => compareLine(a.line, b.line) || compareText(a.claim, b.claim);
+  const members = findings.filter((f) => f.file).sort((a, b) => compareAnchor(a, b)
+    || compareText(a.file, b.file) || compareText(a.ruling ?? '', b.ruling ?? '') || compareText(a.impact ?? '', b.impact ?? ''));
+  const parents = members.map((_, i) => i);
+  const root = (i) => {
+    while (parents[i] !== i) {
+      parents[i] = parents[parents[i]];
+      i = parents[i];
+    }
+    return i;
+  };
+  for (let i = 0; i < members.length; i++) {
+    for (let j = i + 1; j < members.length; j++) {
+      const a = members[i], b = members[j];
+      const missingLine = a.line == null || b.line == null;
+      if (sameFindingForClearing(
+        { file: a.file, line: missingLine ? null : a.line, summary: a.claim },
+        { file: b.file, line: missingLine ? null : b.line, summary: b.claim },
+      )) parents[root(j)] = root(i);
+    }
+  }
+  const components = new Map();
+  for (let i = 0; i < members.length; i++) {
+    const key = root(i), member = members[i];
+    const component = components.get(key);
+    if (!component) components.set(key, { anchor: member, heaviest: member });
+    else if (findingWeight(member) > findingWeight(component.heaviest)) component.heaviest = member;
+  }
+  return [
+    ...findings.filter((f) => !f.file),
+    ...[...components.values()].map(({ anchor, heaviest }) => ({ ...anchor, ruling: heaviest.ruling, impact: heaviest.impact })),
+  ].sort((a, b) => compareText(a.file ?? '', b.file ?? '') || compareAnchor(a, b));
 }
 
 /**
@@ -269,7 +303,7 @@ export function reviewRounds(comments) {
     for (const f of it.ev.findings ?? []) mergeFinding(r.findings, f);
   }
   close();
-  for (const r of rounds) r.findings = r.findings.filter(isOpen);
+  for (const r of rounds) r.findings = consolidateFindings(r.findings.filter(isOpen));
   return rounds;
 }
 

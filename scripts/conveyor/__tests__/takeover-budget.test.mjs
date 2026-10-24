@@ -1,8 +1,8 @@
 // Takeover budget — fix.takeoverBudget takeovers per PR, a further one only when the previous one reduced the open
 // findings; gate holds never trigger one. Live: #4708 needed a second, operator-approved takeover by hand.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
-  resolveTakeoverBudget, takeoverEpisodes, takeoverProgress, planTakeover, gateHoldReason, findingWeight, openDefects, reviewRounds,
+  resolveTakeoverBudget, takeoverEpisodes, takeoverProgress, planTakeover, gateHoldReason, findingWeight, openDefects, reviewRounds, consolidateFindings,
   notConvergingText, renderPreviousTakeover, OPERATOR_TAKEOVER_PREFIX, TAKEOVER_BUDGET_STANDARD_DEFAULT, isPausedReview,
 } from '../takeover-budget.mjs';
 import { takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover } from '../fix-takeover.mjs';
@@ -14,6 +14,7 @@ import { buildAdvisoryFixComment } from '../advisory-fix-mark.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { briefWithRoundContext } from '../reconcile-fix-dispatch.mjs';
+import * as coronerRounds from '../../operations/coroner-rounds.mjs';
 
 const BOT = { login: 'web-everything' };
 const H = (c) => c.repeat(40);
@@ -594,27 +595,61 @@ describe('duplicate findings from two seats count once', () => {
     expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeUndefined();
   });
 
-  it('upgrades impact while keeping the first claim when a later seat reports broken', () => {
-    // Same line isolates weight selection from the expanded line window.
+  it('upgrades impact while keeping the earliest-line claim when a later seat reports broken', () => {
+    // Beyond the original two-line merge window: both members reach consolidation.
     const thread = [review(T1, 9, [['src/j.mjs', 20, 'degraded', claim]]),
-      review(T1, 10, [['src/j.mjs', 20, 'broken', similar]])];
+      review(T1, 10, [['src/j.mjs', 24, 'broken', similar]])];
     expect(openDefects(thread, T1)).toMatchObject({ count: 1, weight: findingWeight({ impact: 'broken' }) });
     expect(reviewRounds(thread).at(-1).findings).toMatchObject([{ impact: 'broken', claim }]);
   });
 
-  it('keeps the first grouping anchor when heavier duplicates arrive in either order', () => {
+  it('keeps the first impact when reports merge within the original two-line window', () => {
+    const thread = [review(T1, 9, [['src/j.mjs', 20, 'degraded', claim]]),
+      review(T1, 10, [['src/j.mjs', 22, 'broken', similar]])];
+    expect(openDefects(thread, T1)).toMatchObject({ count: 1, weight: findingWeight({ impact: 'degraded' }),
+      findings: [{ line: 20, claim, impact: 'degraded' }] });
+  });
+
+  it('later rulings still override same-spot findings, including closing rulings', () => {
+    const classify = coronerRounds.classifyEvent;
+    const spy = vi.spyOn(coronerRounds, 'classifyEvent').mockImplementation((c) => {
+      const event = classify(c);
+      if (c.at === at(10)) event.findings[0].ruling = 'block';
+      if (c.at === at(11)) event.findings[0].ruling = 'dismissed';
+      return event;
+    });
+    try {
+      const thread = [review(T1, 9, [['src/j.mjs', 20, 'degraded', claim]]),
+        review(T1, 10, [['src/j.mjs', 20, 'cosmetic', claim]])];
+      expect(reviewRounds(thread).at(-1).findings).toEqual([
+        { file: 'src/j.mjs', line: 20, claim, ruling: 'block', impact: 'degraded' },
+      ]);
+      expect(reviewRounds([...thread, review(T1, 11, [['src/j.mjs', 20, 'broken', claim]])]).at(-1).findings).toEqual([]);
+    } finally { spy.mockRestore(); }
+  });
+
+  it.each(['anchor', 'bridge'])('removes a closed %s before consolidation so it cannot absorb or connect open findings', (position) => {
+    // Supply parsed events: the current comment parser only exposes block rulings as findings.
+    const findings = [20, 28, 36].map((line) => ({ file: 'src/j.mjs', line, claim, ruling: null, impact: 'cosmetic' }));
+    const closed = position === 'anchor' ? findings[0] : findings[1];
+    Object.assign(closed, { ruling: 'dismissed', impact: 'broken' });
+    const spy = vi.spyOn(coronerRounds, 'classifyEvent').mockReturnValueOnce({ type: 'round', head: T1, findings });
+    try {
+      const result = reviewRounds([review(T1, 9, [])]).at(-1).findings;
+      expect(result).toEqual(position === 'anchor' ? [findings[1]] : [findings[0], findings[2]]);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('consolidates a transitive chain at its heaviest weight regardless of arrival order', () => {
     const findings = [[20, 'cosmetic'], [28, 'degraded'], [36, 'broken']];
     const results = [findings, [...findings].reverse()].map((order) => {
       const thread = order.map(([line, impact], i) => review(T1, 9 + i, [['src/j.mjs', line, impact, claim]]));
       const result = openDefects(thread, T1);
-      expect(result.findings[0]).toMatchObject({ file: 'src/j.mjs', line: order[0][0], claim });
+      expect(result.findings).toEqual([{ file: 'src/j.mjs', line: 20, claim, ruling: null, impact: 'broken' }]);
       return result;
     });
-    expect(results[0].count).toBe(2);
-    expect(results[1].count).toBe(results[0].count);
-    // The middle finding joins the first anchor, so each order has different group maxima.
-    expect(results[0].weight).toBe(findingWeight({ impact: 'degraded' }) + findingWeight({ impact: 'broken' }));
-    expect(results[1].weight).toBe(findingWeight({ impact: 'broken' }) + findingWeight({ impact: 'cosmetic' }));
+    expect(results[0]).toMatchObject({ count: 1, weight: findingWeight({ impact: 'broken' }) });
+    expect(results[1]).toEqual(results[0]);
   });
 
   it.each([false, true])('merges matching file citations with and without a line (line-less first: %s)', (lineLessFirst) => {
@@ -635,7 +670,7 @@ describe('duplicate findings from two seats count once', () => {
   it.each([
     ['different files', 'src/k.mjs', 20, claim],
     ['lines 30 apart', 'src/j.mjs', 50, claim],
-    ['nearby lines with dissimilar claims', 'src/j.mjs', 21, 'Credentials leak through diagnostic logging during authentication'],
+    ['nearby lines with dissimilar claims', 'src/j.mjs', 24, 'Credentials leak through diagnostic logging during authentication'],
   ])('keeps separate findings for %s', (_name, file, line, otherClaim) => {
     const thread = [review(T1, 9, [['src/j.mjs', 20, 'degraded', claim]]),
       review(T1, 10, [[file, line, 'degraded', otherClaim]])];
@@ -650,5 +685,47 @@ describe('duplicate findings from two seats count once', () => {
     expect(openDefects(thread, T1)).toMatchObject({ count: 1, weight: findingWeight({ ruling: 'block' }),
       findings: [{ file: null, line: null, claim }] });
     expect(reviewRounds(thread).at(-1).findings).toHaveLength(1);
+  });
+});
+
+describe('pure finding consolidation', () => {
+  const claim = 'Retry budget resets before pending requests finish';
+  const finding = (file, line, claim, impact = 'degraded', ruling = null) => ({ file, line, claim, impact, ruling });
+
+  it('anchors at a missing line and connects distant citations through it without changing inputs', () => {
+    const findings = [finding('src/j.mjs', 20, claim, 'broken'), finding('src/j.mjs', null, claim, 'cosmetic'),
+      finding('src/j.mjs', 50, claim)];
+    const original = structuredClone(findings);
+    const expected = [{ ...findings[1], impact: 'broken' }];
+    expect(consolidateFindings(findings)).toEqual(expected);
+    expect(consolidateFindings([...findings].reverse())).toEqual(expected);
+    expect(findings).toEqual(original);
+  });
+
+  it('takes both ruling and impact from a block-ruled member even when its impact is lighter', () => {
+    const findings = [finding('src/j.mjs', 20, claim, 'broken'), finding('src/j.mjs', 28, claim, 'cosmetic', 'block')];
+    const expected = [{ ...findings[0], ruling: 'block', impact: 'cosmetic' }];
+    expect(consolidateFindings(findings)).toEqual(expected);
+    expect(consolidateFindings([...findings].reverse())).toEqual(expected);
+  });
+
+  it('breaks equal-line anchor and equal-weight ties deterministically by claim', () => {
+    const first = finding('src/j.mjs', 20, 'Retry budget resets before pending requests complete', 'high');
+    const second = finding('src/j.mjs', 20, claim, 'broken');
+    expect(consolidateFindings([second, first])).toEqual([first]);
+    expect(consolidateFindings([first, second])).toEqual([first]);
+  });
+
+  it('sorts by file, line with null first, and claim while passing file-less findings through untouched', () => {
+    const fileless = finding(null, null, claim, 'broken');
+    const filelessDuplicate = finding(null, null, claim, 'cosmetic');
+    const findings = [finding('src/z.mjs', 1, 'last'), finding('src/a.mjs', 20, 'later'),
+      finding('src/a.mjs', null, 'first'), finding('src/a.mjs', 10, 'beta'), finding('src/a.mjs', 10, 'alpha'),
+      fileless, filelessDuplicate];
+    const result = consolidateFindings(findings);
+    expect(result).toEqual([fileless, filelessDuplicate, findings[2], findings[4], findings[3], findings[1], findings[0]]);
+    expect(result[0]).toBe(fileless);
+    expect(result[1]).toBe(filelessDuplicate);
+    expect(consolidateFindings([])).toEqual([]);
   });
 });
