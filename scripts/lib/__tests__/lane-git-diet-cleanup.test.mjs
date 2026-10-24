@@ -203,6 +203,14 @@ describe('cleanupEligibility (pure)', () => {
   it('refuses a lane with per-ref reflog expiry', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, gcReflogPatterns: ['gc.refs/heads/*.reflogexpire'] }))
     .toEqual({ ok: false, reason: 'per-ref reflog expiry configured (gc.refs/heads/*.reflogexpire)' }));
   it('refuses a live lease', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, lease: fresh, nowMs })).toMatchObject({ ok: false, reason: expect.stringMatching(/live lease/) }));
+  it('under a claim, accepts only its own marker: another holder\'s, an absent or an unreadable one is a lost claim', () => {
+    const at = { dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, claimHolder: 'me' };
+    expect(cleanupEligibility({ ...at, lease: { ...fresh, holder: 'me' } })).toEqual({ ok: true });
+    for (const lease of [{ ...fresh, holder: 'someone-else' }, null, { unreadable: true }]) {
+      expect(cleanupEligibility({ ...at, lease })).toEqual({ ok: false, reason: 'claim lost (lease marker is no longer ours)' });
+    }
+    expect(cleanupEligibility({ ...at, claimHolder: '', lease: { ...fresh, holder: '' } }).ok).toBe(false);
+  });
   it('refuses a reserved lease even when old', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, lease: { ...stale, reserved: true }, nowMs })).toMatchObject({ ok: false, reason: 'reserved lease' }));
   it('refuses a lane with a git lock', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, locks: ['index.lock'] }).ok).toBe(false));
   it('refuses the drain daemon clone even though it is shaped lane-N', () => expect(cleanupEligibility({ dir: `${poolRoot}/we-drain-daemon/lane-1`, poolRoot, nowMs }).ok).toBe(false));
@@ -681,6 +689,57 @@ describe('real git: cleanup CLI', () => {
       expect(git(dir, 'cat-file', '-t', rescue)).toBe('commit');
       expect(readFileSync(marker, 'utf8')).toBe(theirs);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it.each([true, false])('a claim taken over just before gc skips the repack and the prune (marker rewritten: %s)', async (rewritten) => {
+    const dir = lane(26);
+    git(root, 'clone', '-q', up, dir);
+    const rescue = git(dir, 'commit-tree', git(dir, 'rev-parse', 'HEAD^{tree}'), '-p', 'HEAD', '-m', 'pre-gc taken-over rescue');
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(join(dir, '.git', 'objects', rescue.slice(0, 2), rescue.slice(2)), old, old);
+    const marker = join(dir, '.git', '.lane-lease');
+    const theirs = JSON.stringify({ holder: 'someone-else', session: 'someone-else', purpose: 'busy', acquiredAt: new Date().toISOString() });
+    let countsAtSwap;
+    try {
+      const out = await runPaused(26, 'before-gc', () => {
+        if (rewritten) writeFileSync(marker, theirs); else rmSync(marker);
+        countsAtSwap = git(dir, 'count-objects', '-v');
+      });
+      expect(out.rows[0].skipped).toBe('claim lost (lease marker is no longer ours) (config + ref cleanup done, gc skipped)');
+      expect(git(dir, 'count-objects', '-v')).toBe(countsAtSwap); // no repack ran after the claim was lost
+      expect(git(dir, 'cat-file', '-t', rescue)).toBe('commit');
+      if (rewritten) expect(readFileSync(marker, 'utf8')).toBe(theirs);
+      else expect(existsSync(marker)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  // A symbolic ref that targets an ops ref keeps that ref: deleting it would leave the symref dangling, and prune would
+  // then drop the history it named. HEAD, a linked worktree's HEAD and any other symref are all checked.
+  const OPS = 'refs/remotes/origin/ops/review-requests';
+  it.each([
+    ['the lane HEAD', (dir) => { git(dir, 'symbolic-ref', 'HEAD', OPS); return [dir, 'HEAD']; }],
+    ['a linked worktree HEAD', (dir) => {
+      const wt = join(root, 'symref-worktree');
+      git(dir, 'worktree', 'add', '-q', '--detach', wt);
+      git(wt, 'symbolic-ref', 'HEAD', OPS);
+      return [wt, 'HEAD'];
+    }],
+    ['another symbolic ref', (dir) => { git(dir, 'symbolic-ref', 'refs/heads/alias', OPS); return [dir, 'refs/heads/alias']; }],
+  ])('an ops ref that %s points at is kept, so the symbolic ref still resolves after apply', (_name, plant) => {
+    const dir = lane(25);
+    git(root, 'clone', '-q', up, dir);
+    const tip = git(dir, 'rev-parse', OPS);
+    try {
+      const [cwd, symref] = plant(dir);
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=25', '--json'], { env, encoding: 'utf8' }));
+      expect(out.rows[0]).toMatchObject({ mode: 'apply', opsRefsDeleted: 0, opsRefsKept: [OPS] });
+      expect(git(cwd, 'rev-parse', '--verify', symref)).toBe(tip);
+      expect(git(dir, 'cat-file', '-t', tip)).toBe('commit');
+      expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    } finally {
+      rmSync(join(root, 'symref-worktree'), { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 60_000);
 
   it('loses the O_EXCL claim race to a marker written after the startup check, and leaves that marker', async () => {
