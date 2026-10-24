@@ -35,9 +35,12 @@ export default {
           if (config.includes(`${key}=inherited`) !== keepsConfig) violations.push(`${name}: wrong inherited config policy for ${key}`);
         }
         if (env.GIT_REFERENCE_BACKEND !== undefined || env.GIT_REF_PARANOIA !== '1') violations.push(`${name}: unsafe ref environment`);
-        // A second scrub must retain the repository protection.
-        const again = laneGitHardeningEnv(scrub(env));
-        if (again.GIT_DIR !== undefined || again.GIT_REF_PARANOIA !== '1') violations.push(`${name}: retry lost repository protection`);
+        // A second scrub must retain the repository protection: the hardened env picks up a fresh redirect (a retry
+        // inherits whatever the caller's env gained since), and that redirect must be removed again.
+        const again = laneGitHardeningEnv(scrub({ ...env, GIT_DIR: inherited.GIT_DIR, GIT_WORK_TREE: inherited.GIT_WORK_TREE,
+          GIT_REFERENCE_BACKEND: inherited.GIT_REFERENCE_BACKEND, GIT_REF_PARANOIA: '0' }));
+        if (again.GIT_DIR !== undefined || again.GIT_WORK_TREE !== undefined || again.GIT_REFERENCE_BACKEND !== undefined
+          || again.GIT_REF_PARANOIA !== '1') violations.push(`${name}: retry lost repository protection`);
       } catch { violations.push(`${name}: read-only Git probe failed`); }
     }
     log?.(`lane Git environment replay: ${violations.length} violation(s)`);

@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync, cpSync, realpathSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync, cpSync, realpathSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -720,6 +720,14 @@ describe('real git: cleanup CLI', () => {
   // chain are all checked.
   const OPS = 'refs/remotes/origin/ops/review-requests';
   const HOP = 'refs/remotes/origin/ops/a';
+  const HOP2 = 'refs/remotes/origin/ops/b';
+  // %(symref) resolves a whole chain to its last ref, so a middle hop (ops/b here) is only seen hop by hop.
+  const chain3 = (dir, from) => {
+    git(dir, 'symbolic-ref', HOP2, OPS);
+    git(dir, 'symbolic-ref', HOP, HOP2);
+    git(dir, 'symbolic-ref', from, HOP);
+    return [dir, from, [HOP, HOP2, OPS]];
+  };
   it.each([
     ['the lane HEAD', (dir) => { git(dir, 'symbolic-ref', 'HEAD', OPS); return [dir, 'HEAD', [OPS]]; }],
     ['a linked worktree HEAD', (dir) => {
@@ -735,6 +743,8 @@ describe('real git: cleanup CLI', () => {
       git(dir, 'symbolic-ref', 'HEAD', HOP);
       return [dir, 'HEAD', [HOP, OPS]];
     }],
+    ['HEAD through a three-hop chain of ops refs', (dir) => chain3(dir, 'HEAD')],
+    ['another symbolic ref through a three-hop chain of ops refs', (dir) => chain3(dir, 'refs/heads/alias')],
   ])('an ops ref that %s points at is kept, so the symbolic ref still resolves after apply', (_name, plant) => {
     const dir = lane(25);
     git(root, 'clone', '-q', up, dir);
@@ -1099,6 +1109,58 @@ describe('CLI pools and per-lane failure isolation', () => {
       expect(out.stderr).toMatch(message);
       expect(out.stdout).toBe('');
     }
+  }, 60_000);
+
+  // A typo or a value-less flag must never fall back to a default (e.g. a bare --pool-root reading the real pool).
+  it.each([
+    [['stray'], /^unexpected argument: stray\n$/],
+    [['--aply'], /^unknown flag\(s\): --aply\n$/],
+    [['--apply', '--lane=5'], /^unknown flag\(s\): --lane\n$/],
+    [['--lanes=1', '--lanes=2'], /^--lanes given more than once\n$/],
+    [['--json', '--json'], /^--json given more than once\n$/],
+    [['--pool=we-drain-daemon'], /^--pool must be one of web-everything, frontierui, plateau-app\n$/],
+    ...['lanes', 'pool', 'pool-root', 'scan-root', 'gc-timeout-ms', 'prune-expire'].flatMap((f) => [[[`--${f}`], new RegExp(`^--${f} needs a value\\n$`)], [[`--${f}=`], new RegExp(`^--${f} needs a value\\n$`)]]),
+    [['--apply=no'], /^--apply takes no value\n$/],
+    [['--json=yes'], /^--json takes no value\n$/],
+    ...['abc', '0', '-1', '1.5', '1e3', '1500001'].map((v) => [[`--gc-timeout-ms=${v}`], /^--gc-timeout-ms must be a whole number of milliseconds from 1 to 1500000\n$/]),
+    ...['5,x', '5,', 'x', '-1', '1.5'].map((v) => [[`--lanes=${v}`], /^--lanes must be a comma-separated list of lane numbers\n$/]),
+  ])('argv %j is refused with exit 2 before any lane is read', (args, message) => {
+    // Real roots, except a root flag under test (a second copy would be refused as repeated instead).
+    const roots = ['pool-root', 'scan-root'].filter((f) => !args.some((a) => a.split('=')[0] === `--${f}`)).map((f) => `--${f}=${root}`);
+    const out = spawnSync('node', [CLI, ...roots, ...args], { env, encoding: 'utf8' });
+    expect(out.status).toBe(2);
+    expect(out.stderr).toMatch(message);
+    expect(out.stdout).toBe('');
+  });
+
+  it('a valid --gc-timeout-ms and --lanes list are accepted', () => {
+    const poolRoot = join(root, 'valid-flags');
+    git(root, 'clone', '-q', up, join(poolRoot, 'web-everything', 'lane-3'));
+    expect(cli(poolRoot, '--gc-timeout-ms=1500000', '--lanes=3, 9').rows).toEqual([expect.objectContaining({ lane: 3, mode: 'dry-run' })]);
+  }, 60_000);
+
+  // The lane's own core.hooksPath and core.fsmonitor are live (the controls prove it): only the hardening pins stop
+  // the ops-ref delete (update-ref) running the hook and the repack running the fsmonitor as the operator.
+  it('apply runs neither a lane-configured core.hooksPath hook nor its core.fsmonitor', () => {
+    const poolRoot = join(root, 'hooks-path');
+    const dir = join(poolRoot, 'web-everything', 'lane-1');
+    const ran = join(root, 'hooks-path-ran');
+    git(root, 'clone', '-q', up, dir);
+    mkdirSync(join(dir, '.git', 'evil-hooks'));
+    const script = (path, tag) => { writeFileSync(path, `#!/bin/sh\necho ${tag} >> '${ran}'\nexit 1\n`); chmodSync(path, 0o755); };
+    script(join(dir, '.git', 'evil-hooks', 'reference-transaction'), 'hook');
+    script(join(dir, '.git', 'evil-fsmonitor'), 'fsmonitor');
+    git(dir, 'config', 'core.hooksPath', join(dir, '.git', 'evil-hooks'));
+    git(dir, 'config', 'core.fsmonitor', join(dir, '.git', 'evil-fsmonitor'));
+    // Controls: plain git runs both.
+    try { git(dir, 'update-ref', 'refs/remotes/origin/ops/control', 'HEAD'); } catch { /* the hook's exit 1 aborts the transaction */ }
+    git(dir, 'repack', '-A', '-d', '-l', '--unpack-unreachable=never', '--quiet');
+    expect(readFileSync(ran, 'utf8')).toMatch(/^hook\n(.*\n)*fsmonitor\n/);
+    rmSync(ran);
+    git(dir, '-c', 'core.hooksPath=/dev/null', 'update-ref', 'refs/remotes/origin/ops/x', 'HEAD');
+    const out = cli(poolRoot, '--prune-expire=now', '--apply', '--lanes=1');
+    expect(out.rows).toEqual([expect.objectContaining({ lane: 1, mode: 'apply', opsRefsDeleted: 1 })]);
+    expect(existsSync(ran)).toBe(false);
   }, 60_000);
 
   // The seams are honoured only under vitest: a stray seam variable in an operator's shell must change nothing.

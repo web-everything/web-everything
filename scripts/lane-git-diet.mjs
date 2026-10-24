@@ -6,7 +6,8 @@
  *   node scripts/lane-git-diet.mjs                      # DRY RUN over every lane in the web-everything pool
  *   node scripts/lane-git-diet.mjs --apply --lanes=5,7  # act on those lanes only (an explicit list is required)
  *   flags: --pool=<web-everything|frontierui|plateau-app>  --pool-root=<dir>  --scan-root=<dir>  --json
- *          --extra-scan-roots=<dir>[:<dir>...]  --gc-timeout-ms=N  --prune-expire=<git date, default 1.hour.ago>
+ *          --extra-scan-roots=<dir>[:<dir>...]  --gc-timeout-ms=N (1..1500000, default 900000)  --prune-expire=<git date, default 1.hour.ago>
+ *   A malformed argv (unknown, repeated, value-less or out-of-range flag) exits 2 before any lane is read.
  *
  * Eligibility (`cleanupEligibility`): a real, non-symlinked `<pool>/lane-N` with its own `.git` dir, NO lease
  * marker, no git lock file anywhere under `.git` (`*.lock`, gc.pid), no other repository borrowing its objects (alternates under --scan-root/*,
@@ -51,6 +52,19 @@ for (const a of process.argv.slice(2)) {
 const KNOWN = new Set(['apply', 'lanes', 'pool', 'pool-root', 'scan-root', 'extra-scan-roots', 'json', 'gc-timeout-ms', 'prune-expire']);
 const unknown = Object.keys(flags).filter((f) => !KNOWN.has(f));
 if (unknown.length) { process.stderr.write(`unknown flag(s): ${unknown.map((f) => `--${f}`).join(', ')}\n`); process.exit(2); }
+// A bare or empty value flag would silently fall back to its default (a bare --pool-root reads the real pool), and a
+// valued switch (--apply=no) would silently read as off: refuse both. --extra-scan-roots has its own check below.
+for (const f of ['lanes', 'pool', 'pool-root', 'scan-root', 'gc-timeout-ms', 'prune-expire']) {
+  if (Object.hasOwn(flags, f) && (typeof flags[f] !== 'string' || !flags[f])) { process.stderr.write(`--${f} needs a value\n`); process.exit(2); }
+}
+for (const f of ['apply', 'json']) if (Object.hasOwn(flags, f) && flags[f] !== true) { process.stderr.write(`--${f} takes no value\n`); process.exit(2); }
+// Repack and prune each get up to this long, and both run inside one 60-minute claim (the marker's ttlMinutes).
+const GC_TIMEOUT_MAX_MS = 25 * 60_000;
+if (flags['gc-timeout-ms'] !== undefined && !(/^\d+$/.test(flags['gc-timeout-ms']) && Number(flags['gc-timeout-ms']) >= 1 && Number(flags['gc-timeout-ms']) <= GC_TIMEOUT_MAX_MS)) {
+  process.stderr.write(`--gc-timeout-ms must be a whole number of milliseconds from 1 to ${GC_TIMEOUT_MAX_MS}\n`); process.exit(2);
+}
+const laneList = flags.lanes === undefined ? null : flags.lanes.split(',').map((s) => s.trim());
+if (laneList?.some((s) => !/^\d+$/.test(s))) { process.stderr.write('--lanes must be a comma-separated list of lane numbers\n'); process.exit(2); }
 
 const APPLY = flags.apply === true;
 const POOL = typeof flags.pool === 'string' ? flags.pool : 'web-everything';
@@ -74,9 +88,9 @@ const poolDir = join(POOL_ROOT, POOL);
 let poolEntries = null;
 try { poolEntries = readdirSync(poolDir); } catch { /* absent, not a directory or unlistable: refused below */ }
 if (!poolEntries) { process.stderr.write(`pool directory ${poolDir} does not exist or is not a readable directory\n`); process.exit(2); }
-const GC_TIMEOUT_MS = Number(flags['gc-timeout-ms']) || 900_000;
+const GC_TIMEOUT_MS = flags['gc-timeout-ms'] === undefined ? 15 * 60_000 : Number(flags['gc-timeout-ms']);
 const PRUNE_EXPIRE = typeof flags['prune-expire'] === 'string' ? flags['prune-expire'] : '1.hour.ago';
-const ONLY = typeof flags.lanes === 'string' ? new Set(flags.lanes.split(',').map((s) => Number(s.trim())).filter(Number.isInteger)) : null;
+const ONLY = laneList ? new Set(laneList.map(Number)) : null;
 if (APPLY && !ONLY) { process.stderr.write('--apply needs an explicit --lanes=N,M list (the full apply is the operator\'s call)\n'); process.exit(2); }
 
 // Git env: no inherited repo redirection or env-injected config, plus the lane hardening pins (no fsmonitor/hooks run from lane config).
@@ -157,15 +171,22 @@ const auditGitDir = (dir) => {
   return { symlinkedGitPaths: links, locks };
 };
 // Every ref a symbolic ref points at, seen from the lane's own git dir and from each linked worktree's (its HEAD,
-// root refs and per-worktree refs). Each hop is read unresolved, so every ref along a chain (HEAD → ops/a → ops/b) is
-// kept. Ref names hold no whitespace, so one per line is exact. Any read failure throws: lane error row.
+// root refs and per-worktree refs). `%(symref)` resolves a whole chain to its last ref, so each symbolic ref's own
+// next hop is read unresolved too: every ref along a chain (HEAD → ops/a → ops/b → ops/c) is kept. Ref names hold no
+// whitespace, so one per line and a space separator are exact. Any read failure throws: lane error row.
 const symrefTargets = (dir) => {
   let ids = [];
   try { ids = readdirSync(join(dir, '.git', 'worktrees')); } catch (err) { if (!['ENOENT', 'ENOTDIR'].includes(err.code)) throw err; }
   const targets = new Set();
   for (const gitDir of [join(dir, '.git'), ...ids.map((id) => join(dir, '.git', 'worktrees', id))]) {
-    try { targets.add(git(dir, [`--git-dir=${gitDir}`, 'symbolic-ref', '-q', '--no-recurse', 'HEAD']).trim()); } catch (e) { if (e.status !== 1) throw e; } // 1: detached
-    for (const t of git(dir, [`--git-dir=${gitDir}`, 'for-each-ref', '--include-root-refs', '--format=%(symref)']).split('\n')) if (t) targets.add(t);
+    const nextHop = (ref) => { try { targets.add(git(dir, [`--git-dir=${gitDir}`, 'symbolic-ref', '-q', '--no-recurse', ref]).trim()); } catch (e) { if (e.status !== 1) throw e; } }; // 1: not symbolic (detached HEAD)
+    nextHop('HEAD');
+    for (const line of git(dir, [`--git-dir=${gitDir}`, 'for-each-ref', '--include-root-refs', '--format=%(if)%(symref)%(then)%(refname) %(symref)%(end)']).split('\n')) {
+      if (!line) continue;
+      const [ref, resolved] = line.split(' ');
+      targets.add(resolved);
+      nextHop(ref);
+    }
   }
   return targets;
 };
