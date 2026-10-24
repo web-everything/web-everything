@@ -183,31 +183,48 @@ const isOpen = (f) => !CLOSED_RULINGS.has(String(f?.ruling ?? '').toLowerCase())
 /** A trusted fixer turn that changed the PR (a re-arm, an advisory fix): the end of one review round. */
 const FIXER_TURN = /^🔧 conveyor fix —/;
 
-/** Fold the original spot/claim rule, except recovered rulings require an exact (file, line, clipped claim) key. */
-function mergeFinding(into, f) {
+const isSecurityFinding = (f) => /security/i.test(`${f.lens} ${f.category}`);
+/** Fold an already globally sorted list; security findings and rulings require an exact location/claim key. */
+function mergeFindings(findings) {
   const key = (g) => JSON.stringify([g.file ?? null, g.line ?? null, clip(g.claim, 220)]);
   const referral = (g) => g.lens === 'referral' || g.referral === true;
-  const same = into.find((g) => !referral(f) && !referral(g) && ((f.file && g.file === f.file && (f.line == null || g.line == null || Math.abs(g.line - f.line) <= 2))
-    || (!f.file && !g.file && g.claim === f.claim)))
-    ?? into.find((g) => isOpen(g) && isOpen(f) && (referral(f) || referral(g)) && key(g) === key(f));
-  if (same) {
-    if (f.lens === 'referral') same.referral = true;
-    for (const k of ['lens', 'category']) if (!same[k] || /security/i.test(f[k])) same[k] = f[k] ?? null;
-    if (findingWeight(f) > findingWeight(same)) { same.ruling = f.ruling ?? null; same.impact = f.impact ?? null; }
-    if (f.ruling) same.ruling = f.ruling;
-    if (!same.impact && f.impact) same.impact = f.impact;
-    return;
+  const exactOnly = (g) => referral(g) || isSecurityFinding(g);
+  const into = [];
+  for (let f of findings) {
+    // Legacy prose rulings have no recoverable lens either.
+    if (f.lens === 'referral') f = { ...f, lens: 'security', referral: true };
+    const compatible = (g) => isGateHoldFinding(g) === isGateHoldFinding(f);
+    const same = into.find((g) => compatible(g) && !exactOnly(f) && !exactOnly(g)
+      && ((f.file && g.file === f.file && (f.line == null || g.line == null || Math.abs(g.line - f.line) <= 2))
+        || (!f.file && !g.file && g.claim === f.claim)))
+      ?? into.find((g) => compatible(g) && isOpen(g) && isOpen(f) && (exactOnly(f) || exactOnly(g)) && key(g) === key(f));
+    if (same) {
+      if (referral(f)) same.referral = true;
+      // Ties in the sort's identity/severity fields must not make lens metadata arrival-dependent.
+      for (const k of ['lens', 'category']) if (f[k] && (!same[k]
+        || (/security/i.test(f[k]) && !/security/i.test(same[k]))
+        || (/security/i.test(f[k]) === /security/i.test(same[k]) && f[k].localeCompare(same[k]) < 0))) same[k] = f[k];
+      if (findingWeight(f) > findingWeight(same)) { same.ruling = f.ruling ?? null; same.impact = f.impact ?? null; }
+      if (f.ruling) same.ruling = f.ruling;
+      if (!same.impact && f.impact) same.impact = f.impact;
+      continue;
+    }
+    into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null,
+      lens: f.lens ?? null, category: f.category ?? null, ...(referral(f) ? { referral: true } : {}) });
   }
-  into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null, lens: f.lens ?? null, category: f.category ?? null });
+  return into;
 }
 
-const findingOrder = (a, b) => (a.file ?? '').localeCompare(b.file ?? '') || (a.line ?? -1) - (b.line ?? -1) || a.claim.localeCompare(b.claim);
+const findingOrder = (a, b) => (a.file ?? '').localeCompare(b.file ?? '')
+  || (a.line == null ? (b.line == null ? 0 : -1) : b.line == null ? 1 : a.line - b.line)
+  || (a.claim ?? '').localeCompare(b.claim ?? '') || (a.impact ?? '').localeCompare(b.impact ?? '')
+  || (a.ruling ?? '').localeCompare(b.ruling ?? '');
 /** Sorted, pairwise first match against KEPT representatives only; discarded bridges never join groups. */
 function mergeSameGaps(findings) {
   const gap = (f) => ({ file: f.file, line: f.line, summary: f.claim, impactIfUnfixed: f.impact ?? null, verdict: f.ruling ?? null });
-  const protectedFinding = (f) => isGateHoldFinding(f) || /security/i.test(`${f.lens} ${f.category}`);
+  const protectedFinding = (f) => isGateHoldFinding(f) || isSecurityFinding(f);
   const kept = [];
-  for (const f of findings.sort(findingOrder)) {
+  for (const f of findings) {
     if (protectedFinding(f) || !kept.some((g) => !protectedFinding(g) && sameGapSameHead(gap(g), gap(f)))) kept.push(f);
   }
   return kept;
@@ -246,10 +263,13 @@ export function reviewRounds(comments) {
         const key = JSON.parse(r.key);
         if (Array.isArray(key) && key.length === 4 && (key[1] == null || typeof key[1] === 'string')
           && (key[2] == null || Number.isInteger(key[2])) && typeof key[3] === 'string') {
-          return { file: key[1], line: key[2], claim: clip(key[3], 220), lens: 'referral', ruling: r.result };
+          const lens = r.lens || (typeof key[0] === 'string' && key[0].trim() ? key[0] : null);
+          return { file: key[1], line: key[2], claim: clip(key[3], 220), lens: lens || 'security',
+            category: r.category ?? r.class ?? null, referral: true, ruling: r.result };
         }
       } catch { /* An opaque key retains the original raw finding. */ }
-      return ev.findings[i];
+      const original = ev.findings[i];
+      return original ? { ...original, lens: r.lens || 'security', category: r.category ?? r.class ?? null, referral: true } : null;
     }).filter(Boolean);
     // A block ruling on a paused review's referrals concludes that review too (the policy or the operator ruled it):
     // otherwise a review that pauses on the same referrals every run would leave the takeover unjudged forever
@@ -287,11 +307,12 @@ export function reviewRounds(comments) {
     }
     r.end = it.t;
     if (it.concluded) r.concluded = true;
-    for (const f of (it.ev.findings ?? []).sort(findingOrder)) mergeFinding(r.findings, f);
+    for (const f of it.ev.findings ?? []) r.findings.push(f);
   }
   close();
   for (const r of rounds) {
-    r.findings = r.findings.filter(isOpen);
+    // Keep the original exact folds at any size; the bound guards only the fuzzy pass.
+    r.findings = mergeFindings(r.findings.filter(isOpen).sort(findingOrder));
     if (r.findings.length > MAX_MERGE_FINDINGS) r.overBound = true;
     else r.findings = mergeSameGaps(r.findings);
   }
