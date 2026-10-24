@@ -71,6 +71,7 @@ import {
   renderEarnedShortfall,
   // #3540 — the shared record-decision core and the record-verdict vocabulary mapping.
   planRecordDecision,
+  openSendBackBounceReason,
   confirmAnswerFor,
   // #xqa9ttq — the opt-in third (Codex, advisory) seat.
   ADVISORY_JUDGE_LENS,
@@ -1291,6 +1292,105 @@ describe('#3540 the stageVerdict step stages the write-up alone, ahead of the la
 });
 
 describe('#3540 planRecordDecision and confirmAnswerFor — the shared pure core', () => {
+  const openSendBacks = [
+    { id: 'send-back-5809-a', at: '2026-10-22T12:00:00Z', body: 'Repair the evidence gap. ' + 'x'.repeat(200) + 'OMITTED_TAIL' },
+    { id: 'send-back-5809-b', at: '2026-10-22T13:00:00Z', body: 'Explain the remaining failure.' },
+  ];
+  function bounceView(openOperatorSendBacks, reason) {
+    return {
+      input: { ...BASE_INPUT, actor: 'reviewer', reason },
+      findings: {
+        confirm: 'changes',
+        read: { ...shapeReadFinding(stubReader({})({ pr: 1234, repo: BASE_INPUT.repo }), BASE_INPUT), openOperatorSendBacks },
+      },
+      verdict: { verdict: 'changes', findings: [], lenses: [DEFAULT_LENS] },
+    };
+  }
+
+  it('plans a zero-finding changes verdict with actionable evidence instructions for every open send-back', () => {
+    const plan = planRecordDecision(bounceView(openSendBacks));
+    expect(plan.to).toBe('changes');
+    for (const item of openSendBacks) {
+      expect(plan.body).toContain(item.id);
+      expect(plan.body).toContain(item.at);
+      expect(plan.body).toContain(`\`Send-back ${item.id} at ${item.at}: ${item.body.slice(0, 160)}\``);
+      expect(plan.body).toContain(`\`<!-- addresses-operator-send-back: ${item.id} -->\``);
+    }
+    expect(plan.body).toContain('## Fix evidence');
+    expect(plan.body).toContain('Head: `<fixed head sha>`');
+    expect(plan.body).not.toContain('OMITTED_TAIL');
+  });
+
+  it.each([
+    undefined, [], {}, [{}], [null], [{ id: '' }], [{ id: '  ' }],
+    [{ id: '<>' }], [{ id: 'only-id' }], [{ id: 'metadata', at: {}, body: {} }],
+    [{ ...openSendBacks[0], id: 'bad`<img>\n[id](url)' }],
+    [{ ...openSendBacks[0], at: 'invalid-date' }],
+    [{ ...openSendBacks[0], at: 0 }],
+    [{ ...openSendBacks[0], body: {} }],
+    [{ ...openSendBacks[0], body: ' \n ' }],
+    ...['<>', '\u200b\u200b', '   ', '\u0000\u200c\u200d\u2060', '!!!', '!'.repeat(160) + 'Repair']
+      .map(body => [{ ...openSendBacks[0], body }]),
+  ].map(open => [open]))('still refuses a zero-finding changes verdict without a reason or open send-backs (%j)', open => {
+    expect(openSendBackBounceReason({ openOperatorSendBacks: open })).toBe('');
+    expect(() => planRecordDecision(bounceView(open))).toThrow(/no stated reason/);
+  });
+
+  it('refuses malformed send-backs with non-string metadata', () => {
+    const open = [null, {}, { id: '' }, { id: 12 }, { id: 'metadata', at: {}, body: {} }];
+    expect(openSendBackBounceReason({ openOperatorSendBacks: open })).toBe('');
+    expect(() => planRecordDecision(bounceView(open))).toThrow(/no stated reason/);
+  });
+
+  it('renders only valid send-backs in a mixed list and preserves their ids unchanged', () => {
+    const valid = { ...openSendBacks[0], id: 'IC_kwDORBt1-c8AAAABedLjDQ' };
+    const open = [valid, { id: 'metadata', at: {}, body: {} },
+      ...['<>', '\u200b\u200b', '   ', '!!!'].map(body => ({ ...openSendBacks[1], body }))];
+    const reason = openSendBackBounceReason({ openOperatorSendBacks: open });
+    expect(reason).toBe(openSendBackBounceReason({ openOperatorSendBacks: [valid] }));
+    expect(reason).toContain(`\`<!-- addresses-operator-send-back: ${valid.id} -->\``);
+  });
+
+  it('validates and renders the sanitised send-back excerpt with letters or digits', () => {
+    const plan = planRecordDecision(bounceView([{
+      ...openSendBacks[0], body: ' <>\u200b Répa\u0000ir\u200d\t 42\n ',
+    }]));
+    expect(plan.body).toContain(`\`Send-back ${openSendBacks[0].id} at ${openSendBacks[0].at}: Répair 42\``);
+    expect(plan.body).not.toMatch(/[\u0000\u200b\u200d]/u);
+  });
+
+  it('neutralises HTML and Markdown in single-line code spans for body', () => {
+    const plan = planRecordDecision(bounceView([{
+      ...openSendBacks[0],
+      body: '<img src=x>\n[click](https://example.com) `escape` > quote ' + 'x'.repeat(200),
+    }]));
+    expect(plan.body).toContain(`\`Send-back ${openSendBacks[0].id} at ${openSendBacks[0].at}: `);
+    expect(plan.body).toContain("img src=x [click](https://example.com) 'escape' quote ");
+    expect(plan.body).not.toContain('<img');
+    const reason = openSendBackBounceReason({ openOperatorSendBacks: [{ ...openSendBacks[0], body: 'x'.repeat(200) }] });
+    expect(reason).toContain(`: ${'x'.repeat(160)}\``);
+    expect(reason).not.toContain('x'.repeat(161));
+    const outsideCode = plan.body.replace(/`[^`\n]*`/g, '');
+    expect(outsideCode).not.toMatch(/<img|\]\(|<!-- addresses-operator-send-back:|<fixed head sha>/);
+  });
+
+  it('bounds the send-back list and marker list to five and reports how many remain', () => {
+    const open = Array.from({ length: 8 }, (_, i) => ({ ...openSendBacks[0], id: `bounded-${i}` }));
+    const plan = planRecordDecision(bounceView(open));
+    expect(plan.body).toContain('and 3 more');
+    expect(plan.body.match(/`Send-back /g)).toHaveLength(5);
+    expect(plan.body.match(/`<!-- addresses-operator-send-back:/g)).toHaveLength(5);
+    expect(plan.body).toContain('bounded-4');
+    expect(plan.body).not.toMatch(/bounded-[567]/);
+  });
+
+  it('uses an explicit reason instead of deriving one from open send-backs', () => {
+    const plan = planRecordDecision(bounceView(openSendBacks, '  Repair the failing probe first.  '));
+    expect(plan.body).toContain('> Repair the failing probe first.');
+    expect(plan.body).not.toContain('send-back-5809-a');
+    expect(plan.body).not.toContain('## Fix evidence');
+  });
+
   it('confirmAnswerFor maps record-verdict\'s vocabulary to review-pr\'s, and clear-human to nothing', () => {
     expect(confirmAnswerFor('accepted')).toBe('accept');
     expect(confirmAnswerFor('changes')).toBe('changes');
