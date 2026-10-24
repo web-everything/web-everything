@@ -178,18 +178,19 @@ it('requires the edge loader CLI contract, including bracketed optional flags', 
   await expect(preflightEdge({ opts: { edgeClone: 'control', repo: '/repo' }, io: f.io })).resolves.toBeUndefined();
 });
 
-it('preflights the installed operation CLI before any lane or publication effects', async () => {
-  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
-  const f = fixture();
-  f.io.exec = async (cmd, args, options) => {
-    expect(args).toEqual(['scripts/operations/run.mjs', 'prototype-load', '--help']);
-    return spawnSync(cmd, args, { ...options, cwd: repo, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
-  };
-  // This head has no registered prototype-load operation. Missing dependencies
-  // are also an unavailable prerequisite and must refuse before a lane is leased.
+it.each([false, true])('preflights the loader before any lane or publication effects (available=%s)', async available => {
+  const f = fixture([['prototype-load --help', available ? ok(loaderHelp) : red('unknown operation')]]);
   const { result } = await f.run(['--edge-clone=control']);
-  expect(result).toMatchObject({ ok: false, stopReason: 'register-failed', sha: null });
-  expect(result.lane).toBeUndefined();
+  expect(f.calls[0].args).toEqual(['scripts/operations/run.mjs', 'prototype-load', '--help']);
+  if (available) {
+    expect(result).toMatchObject({ ok: true, registered: true });
+    expect(f.calls.some(c => c.text.includes('lane-pool.mjs acquire'))).toBe(true);
+    expect(f.calls.some(c => c.args.includes('push'))).toBe(true);
+  } else {
+    expect(result).toMatchObject({ ok: false, stopReason: 'register-failed', sha: null });
+    expect(result.lane).toBeUndefined();
+    expect(f.calls).toHaveLength(1);
+  }
 });
 
 it('checks the actual committed content before publishing hook changes', async () => {
@@ -374,7 +375,7 @@ it('stops on deferred admission after a repair without another repair round', as
   const f = fixture([['heavy-admission', (_, n) => n ? { status: 75, stderr: 'DEFER: wait budget exhausted' } : red()]]);
   const { code, result } = await f.run();
   expect(code).toBe(31);
-  expect(result).toMatchObject({ stopReason: 'tests-deferred', tests: { status: 'deferred', repaired: false }, detail: '\nDEFER: wait budget exhausted' });
+  expect(result).toMatchObject({ stopReason: 'tests-deferred', tests: { status: 'deferred', repaired: true }, detail: '\nDEFER: wait budget exhausted' });
   expect(codexCalls(f)).toHaveLength(2);
   expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(2);
   expect(f.writes).toHaveLength(1);
@@ -393,6 +394,18 @@ it('repairs red tests once, includes bounded failure data, and passes on green',
   expect(f.writes[0].data.length).toBeLessThan(6500);
   released(f);
 });
+it('retains repair evidence when the second test invocation throws', async () => {
+  const f = fixture([['heavy-admission', (_, n) => {
+    if (n) throw new Error('test runner unavailable');
+    return red();
+  }]]);
+  const { result } = await f.run();
+  expect(result).toMatchObject({ ok: false, stopReason: 'internal-error', tests: { status: 'red', repaired: true }, detail: 'test runner unavailable' });
+  expect(codexCalls(f)).toHaveLength(2);
+  expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(2);
+  expect(f.calls.some(c => c.args.includes('--review') || c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+  released(f); scopeReleased(f);
+});
 it('repair Codex failure stops before a second test run', async () => {
   const f = fixture([['heavy-admission', red()], ['codex-direct-task.mjs --task-file', (_, n) => n ? red() : report()]]);
   const { code, result } = await f.run();
@@ -406,6 +419,7 @@ it('rechecks scope after a repair or green tests before auditing', async () => {
     const f = fixture([['heavy-admission', (_, n) => repair && !n ? red() : ok()], ['diff --name-only', (_, n) => ok(n ? 'outside\0' : 'scripts/a.mjs\0')]]);
     const { result } = await f.run();
     expect(result.stopReason).toBe('diff-out-of-scope');
+    expect(result.tests).toEqual({ status: repair ? 'red' : 'green', repaired: repair });
     expect(f.calls.some(c => c.args.includes('commit'))).toBe(false); released(f);
   }
 });

@@ -198,7 +198,7 @@ const taskPath = (s, kind) => path.join(s.lane.path, '.git', `codex-job-${s.opts
 export async function runTests(s) {
   const checkDeferred = r => {
     if (r.status !== 75) return;
-    s.result.tests = { status: 'deferred', repaired: false };
+    s.result.tests = { status: 'deferred', repaired: s.result.tests?.repaired ?? false };
     fail('tests-deferred', output(r).slice(-400));
   };
   let r = await exec(s, 'node', testArgs(s), true);
