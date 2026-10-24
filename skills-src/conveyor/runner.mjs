@@ -41,6 +41,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mkdirSync, writeFileSync, renameSync, appendFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { judgeTakeoverGaps, threadMayBeTruncated } from '../../scripts/conveyor/takeover-budget.mjs';
 import { defaultFetchOpenPrs } from '../../scripts/conveyor/open-pr-fetch.mjs';
 import {
   RUNNER_LOCK_ROOT, runnerOwner,
@@ -303,7 +304,7 @@ export const MECHANICAL_PASS_NAMES = Object.freeze([
 
 export function makeCliMechanicalPasses({
   scriptsDir, repo = null, hiccupSession, exec = execFileSync,
-  fetchOpenPrs = defaultFetchOpenPrs, repos = CONSTELLATION_REPOS,
+  fetchOpenPrs = defaultFetchOpenPrs, repos = CONSTELLATION_REPOS, judgeGaps = judgeTakeoverGaps,
   unsupportedPath, skipPasses = new Set(),
 } = {}) {
   const skip = (name) => skipPasses.has(name);
@@ -349,6 +350,10 @@ export function makeCliMechanicalPasses({
         let prsArgs = [];
         try {
           const prs = fetchOpenPrs({ repo: slug });
+          for (const pr of prs) if (!threadMayBeTruncated(pr)) {
+            const { decisions } = await judgeGaps(pr.comments, { log: message => process.stderr.write(`${message}\n`) });
+            if (decisions.size) pr.sameGapDecisions = [...decisions];
+          }
           prsFile = join(tmpdir(), `conveyor-open-prs-${randomUUID()}.json`);
           writeFileSync(prsFile, JSON.stringify(prs), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
           prsArgs = [`--prs-file=${prsFile}`];

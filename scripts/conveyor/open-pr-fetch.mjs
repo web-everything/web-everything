@@ -30,7 +30,8 @@ export function defaultFetchOpenPrs({ repo = null, exec = runGhSync, readComment
 export function readPrsFromFile(path, { readFile = readFileSync } = {}) {
   try {
     const parsed = JSON.parse(readFile(path, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(parsed) ? parsed.map(pr => Array.isArray(pr?.sameGapDecisions)
+      ? { ...pr, sameGapDecisions: new Map(pr.sameGapDecisions) } : pr) : [];
   } catch {
     return [];
   }

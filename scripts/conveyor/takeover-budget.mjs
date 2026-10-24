@@ -29,14 +29,14 @@
  * cascade fails closed (a present but invalid value is 0, not the standard). The resolved value carries its `source`
  * so the daemon logs it.
  *
- * PURE except {@link resolveTakeoverBudget}'s two file reads.
+ * PURE except {@link resolveTakeoverBudget}'s file reads and {@link judgeTakeoverGaps}'s judge IO.
  */
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeComment, classifyEvent, parseFindings } from '../operations/coroner-rounds.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { sameGapSameHead, parseOperatorRulingComment } from '../lib/jury-core.mjs';
+import { sameGapSameHead, judgeSameGapPairs, parseOperatorRulingComment } from '../lib/jury-core.mjs';
 import { isReviewVerdictComment, reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { takeoverMarkers, takeoverVoidRefused, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
@@ -222,13 +222,16 @@ const findingOrder = (a, b) => (a.file ?? '').localeCompare(b.file ?? '')
   || (a.line == null ? (b.line == null ? 0 : -1) : b.line == null ? 1 : a.line - b.line)
   || fullClaimOf(a).localeCompare(fullClaimOf(b)) || (a.impact ?? '').localeCompare(b.impact ?? '')
   || (a.ruling ?? '').localeCompare(b.ruling ?? '');
+// Protected (security/referral/gate-hold) findings are filtered before gap() is used, so a missing category is
+// non-security here; the shared same-gap classifier would otherwise fail closed on the empty lens.
+const gap = (f) => ({ file: f.file, line: f.line, summary: fullClaimOf(f), impactIfUnfixed: f.impact ?? null, verdict: f.ruling ?? null,
+  category: f.category || 'review' });
+const protectedFinding = (f) => isGateHoldFinding(f) || isReferralFinding(f) || isSecurityFinding(f);
 /** Sorted, pairwise first match against KEPT representatives only; discarded bridges never join groups. */
-function mergeSameGaps(findings) {
-  const gap = (f) => ({ file: f.file, line: f.line, summary: fullClaimOf(f), impactIfUnfixed: f.impact ?? null, verdict: f.ruling ?? null });
-  const protectedFinding = (f) => isGateHoldFinding(f) || isReferralFinding(f) || isSecurityFinding(f);
+function mergeSameGaps(findings, sameGapDecisions) {
   const kept = [];
   for (const f of findings) {
-    if (protectedFinding(f) || !kept.some((g) => !protectedFinding(g) && sameGapSameHead(gap(g), gap(f)))) kept.push(f);
+    if (protectedFinding(f) || !kept.some((g) => !protectedFinding(g) && sameGapSameHead(gap(g), gap(f), { decisions: sameGapDecisions }))) kept.push(f);
   }
   return kept;
 }
@@ -247,7 +250,7 @@ function mergeSameGaps(findings) {
  * `repeat: true` marks a round whose head an earlier segment already reviewed; it is also `stale: true` (a late review
  * of older code) when its segment reviews a head no earlier segment had — the new code the segment's push brought.
  */
-export function reviewRounds(comments) {
+export function reviewRounds(comments, { sameGapDecisions } = {}) {
   const list = Array.isArray(comments) ? comments : [];
   const boundaries = new Set(takeoverEpisodes(list).flatMap((e) => [e.start, e.end]));
   const items = [];
@@ -315,12 +318,18 @@ export function reviewRounds(comments) {
   }
   close();
   for (const r of rounds) {
-    // Keep the original exact folds at any size; the bound guards only the fuzzy pass.
+    // Keep the original exact folds at any size; the bound guards only the judged pass.
     r.findings = mergeFindings(r.findings.filter(isOpen).sort(findingOrder));
     if (r.findings.length > MAX_MERGE_FINDINGS) r.overBound = true;
-    else r.findings = mergeSameGaps(r.findings);
+    else r.findings = mergeSameGaps(r.findings, sameGapDecisions);
   }
   return rounds;
+}
+
+/** IO: one bounded judge batch per complete thread; oversized rounds retain the manual merge-bound hold. */
+export function judgeTakeoverGaps(comments, options) {
+  const findings = reviewRounds(comments).filter(r => !r.overBound).flatMap(r => r.findings);
+  return judgeSameGapPairs(findings.filter(f => !protectedFinding(f)).map(gap), options);
 }
 
 const tally = (findings) => {
@@ -396,8 +405,8 @@ const markerStartHead = (episode) => (episode?.kinds?.length === 1 && episode.ki
  * landed yet. Both shapes carry `oldHeads` (heads reviewed before the takeover) and `markerStart` (an automatic
  * marker's start head) for the one-per-head bound.
  */
-export function takeoverProgress(comments, episode) {
-  const rounds = reviewRounds(comments);
+export function takeoverProgress(comments, episode, { sameGapDecisions } = {}) {
+  const rounds = reviewRounds(comments, { sameGapDecisions });
   const before = rounds.filter((r) => r.end < episode.start && !r.stale).at(-1) ?? null;
   const markerStart = markerStartHead(episode);
   const rule = dispatchJudgeRule(comments, { start: episode.start, end: episode.end, startHead: markerStart });
@@ -447,8 +456,8 @@ export function gateHoldReason(pr, { defaultBranch = 'main' } = {}) {
  * stands in for the review of the head the PR is on now. `strict` (the review-cap check): a PR head no round names
  * was never reviewed, so there is no current round (null) — never an older head's round.
  */
-export function currentRound(comments, head = null, { strict = false } = {}) {
-  const all = reviewRounds(comments);
+export function currentRound(comments, head = null, { strict = false, sameGapDecisions } = {}) {
+  const all = reviewRounds(comments, { sameGapDecisions });
   const h = String(head ?? '').toLowerCase();
   // A round naming the PR head always stands for it, stale or not; only the fallbacks skip older code.
   const onHead = h ? all.filter((r) => (r.head ? sameHeadSha(r.head, h) : !r.stale)).at(-1) : null;
@@ -457,8 +466,8 @@ export function currentRound(comments, head = null, { strict = false } = {}) {
 }
 
 /** The open DEFECT findings of the PR's current review round (null when the thread has none). */
-export function openDefects(comments, head = null) {
-  const latest = currentRound(comments, head);
+export function openDefects(comments, head = null, { sameGapDecisions } = {}) {
+  const latest = currentRound(comments, head, { sameGapDecisions });
   return latest ? tally(latest.findings) : null;
 }
 
@@ -473,7 +482,7 @@ export function openDefects(comments, head = null) {
  * `takeoverBudget` defaults to 1 here so the pure core stays byte-identical for a caller that passes nothing; the
  * IO shell passes the resolved cascade value (standard 2).
  */
-export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1, fixerLadder, defaultBranch = 'main', capKind = 'fix' } = {}) {
+export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1, fixerLadder, defaultBranch = 'main', capKind = 'fix', sameGapDecisions = pr?.sameGapDecisions } = {}) {
   const budget = Number.isInteger(takeoverBudget) && takeoverBudget > 0 ? takeoverBudget : 0;
   if (roundCapAction !== 'takeover') return { ok: false, reason: 'setting-person' };
   // A budget of 0 (or one that is not a whole number: it fails closed to 0) turns the takeover off. Checked before the
@@ -483,12 +492,12 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1
   const comments = pr?.comments;
   // A cut thread hides the markers and verdicts after comment 100: a spent takeover would read as unspent.
   if (threadMayBeTruncated(pr)) return { ok: false, reason: 'thread-truncated' };
-  const defects = openDefects(comments, pr?.headRefOid ?? null);
+  const defects = openDefects(comments, pr?.headRefOid ?? null, { sameGapDecisions });
   // The REVIEW round cap leads to a takeover too (one rule for both caps), but only once the current work is judged:
   // the latest review round came after the latest fixer push and left open defects. An unjudged head is owed a
   // review, not a takeover on top of code nobody has looked at.
   if (capKind === 'review') {
-    const latest = currentRound(comments, pr?.headRefOid ?? null, { strict: true });
+    const latest = currentRound(comments, pr?.headRefOid ?? null, { strict: true, sameGapDecisions });
     const lastPush = (Array.isArray(comments) ? comments : [])
       .filter((c) => FIXER_TURN.test(bodyOf(c).trimStart()) && isTrustedMarkerAuthor(c)).map(timeOf).filter(Number.isFinite);
     const pushedAt = lastPush.length ? Math.max(...lastPush) : -Infinity;
@@ -503,7 +512,7 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1
   const latest = episodes.at(-1) ?? null;
   const markerHeads = takeoverMarkers(comments).map((m) => m.head).filter(Boolean);
   if (latest) {
-    const progress = takeoverProgress(comments, latest);
+    const progress = takeoverProgress(comments, latest, { sameGapDecisions });
     // Still on a head it started from = it never pushed (or never ran): the one-per-head bound, judged or not — a
     // verdict cannot authorize a further takeover on a head reviewed before the last one, or on the head its
     // automatic marker started from. Unjudged, any marker head counts too (the old bound), and a takeover with no

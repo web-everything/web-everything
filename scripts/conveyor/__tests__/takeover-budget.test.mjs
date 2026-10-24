@@ -1,8 +1,9 @@
 // Takeover budget — fix.takeoverBudget takeovers per PR, a further one only when the previous one reduced the open
 // findings; gate holds never trigger one. Live: #4708 needed a second, operator-approved takeover by hand.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { sameGapPairKey } from '../../lib/jury-core.mjs';
 import {
-  resolveTakeoverBudget, takeoverEpisodes, takeoverProgress, planTakeover, gateHoldReason, findingWeight, openDefects, reviewRounds,
+  judgeTakeoverGaps, resolveTakeoverBudget, takeoverEpisodes, takeoverProgress, planTakeover, gateHoldReason, findingWeight, openDefects, reviewRounds,
   notConvergingText, renderPreviousTakeover, OPERATOR_TAKEOVER_PREFIX, TAKEOVER_BUDGET_STANDARD_DEFAULT, isPausedReview,
 } from '../takeover-budget.mjs';
 import { takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover } from '../fix-takeover.mjs';
@@ -580,15 +581,98 @@ describe('the same gap raised by two seats counts once', () => {
   const thread = (findings) => [review(T1, 9, findings)];
   const tally = (findings) => openDefects(thread(findings), T1);
 
+  const gap = (f) => ({ file: f.file, line: f.line, summary: f.fullClaim ?? f.claim,
+    impactIfUnfixed: f.impact ?? null, verdict: f.ruling ?? null, category: f.category || 'review' });
+  const decisionsFor = (comments) => {
+    const findings = reviewRounds(comments).flatMap(r => r.findings).map(gap);
+    return new Map(findings.flatMap((a, i) => findings.slice(i + 1)
+      .filter(b => Math.abs(a.line - b.line) <= 8)
+      .map(b => [sameGapPairKey(a, b), { merged: true, confidence: 0.95 }])));
+  };
+  const paraphrases = () => thread([finding(20), finding(24, 'broken', 'Background refresh resets retry limits while requests are still pending')]);
+
+  it('keeps paraphrases separate without a judge decision', () => {
+    expect(openDefects(paraphrases(), T1)).toMatchObject({ count: 2, weight: 6 });
+  });
+
+  it('merges paraphrases only with a confident structured judge decision', async () => {
+    const comments = paraphrases();
+    const judge = vi.fn(async () => ({ pairs: [{ id: 0, sameGap: true, confidence: 0.95, reason: 'same defect' }] }));
+    const { decisions } = await judgeTakeoverGaps(comments, { judge });
+    expect(judge).toHaveBeenCalledTimes(1);
+    const { readPrsFromFile } = await import('../open-pr-fetch.mjs');
+    const [snapshot] = readPrsFromFile('snapshot.json', { readFile: () => JSON.stringify([pr(T1, comments, { sameGapDecisions: [...decisions] })]) });
+    expect(snapshot.sameGapDecisions).toEqual(decisions);
+    expect(openDefects(comments, T1, { sameGapDecisions: decisions })).toMatchObject({ count: 1, weight: 3 });
+  });
+
+  it('batches cross-comment findings once in the async runner and restores decisions for the planner', async () => {
+    const { makeCliMechanicalPasses } = await import('../../../skills-src/conveyor/runner.mjs');
+    const { readPrsFromFile } = await import('../open-pr-fetch.mjs');
+    const comments = [review(T1, 9, [finding(20)]), review(T1, 10, [finding(24, 'broken', 'Background refresh resets retry limits while requests are still pending')])];
+    const judge = vi.fn(async () => ({ pairs: [{ id: 0, sameGap: true, confidence: 0.95, reason: 'same defect' }] }));
+    const judgeGaps = vi.fn((comments, options) => judgeTakeoverGaps(comments, { ...options, judge, log: () => {} }));
+    let snapshot;
+    await makeCliMechanicalPasses({ scriptsDir: 'scripts', repo: 'we',
+      fetchOpenPrs: () => [pr(T1, comments)], judgeGaps,
+      exec: (_file, args) => {
+        const flag = args.find(arg => arg.startsWith('--prs-file='));
+        if (flag) [snapshot] = readPrsFromFile(flag.slice('--prs-file='.length));
+        return JSON.stringify({ dispatch: [], refusals: [] });
+      },
+    })();
+    expect(judgeGaps).toHaveBeenCalledTimes(1);
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(openDefects(snapshot.comments, T1, { sameGapDecisions: snapshot.sameGapDecisions })).toMatchObject({ count: 1 });
+  });
+
+  it.each(['error', 'timeout'])('keeps paraphrases separate on judge %s', async (mode) => {
+    const comments = paraphrases();
+    const judge = mode === 'error' ? async () => { throw new Error('unavailable'); } : () => new Promise(() => {});
+    const { decisions } = await judgeTakeoverGaps(comments, { judge, timeoutMs: 5 });
+    expect(openDefects(comments, T1, { sameGapDecisions: decisions })).toMatchObject({ count: 2, weight: 6 });
+  });
+
+  it('keeps paraphrases separate at the judge cap and names the fresh-review fallback', async () => {
+    const comments = paraphrases();
+    const judge = vi.fn(), log = vi.fn();
+    const { decisions, records } = await judgeTakeoverGaps(comments, { judge, cap: 0, log });
+    expect(judge).not.toHaveBeenCalled();
+    expect(records).toMatchObject([{ source: 'capped', merged: false }]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('unmerged pairs require fresh review'));
+    expect(openDefects(comments, T1, { sameGapDecisions: decisions })).toMatchObject({ count: 2 });
+  });
+
+  it.each(['security', 'referral', 'gate-hold'])('never judge-merges protected %s findings even with a decision', async (kind) => {
+    let comments = paraphrases();
+    if (kind === 'security') comments = comments.map(c => ({ ...c, body: c.body.replace('correctness/logic', 'security/logic') }));
+    if (kind === 'gate-hold') comments = thread([finding(20, 'broken', 'review-gate red because dependency PR is not merged'),
+      finding(24, 'broken', 'review-gate red because dependency PR remains unmerged')]);
+    if (kind === 'referral') {
+      const { buildOperatorRulingComment } = await import('../../lib/jury-core.mjs');
+      comments = [20, 24].map((line, i) => ({ author: BOT, createdAt: at(9 + i), body: buildOperatorRulingComment({
+        version: 1, repo: 'test/repo', pr: 7, head: T1, actor: 'auto-policy', channel: 'test',
+        reason: 'Required referral is blocked', at: at(9 + i), clearerId: 'policy',
+        rulings: [{ runId: `review-pr-${i}`, lens: 'judgeCorrectnessAdvisory', category: 'logic',
+          key: JSON.stringify(['judgeCorrectnessAdvisory', 'src/j.mjs', line, `${claim}${i ? ' silently' : ''}`]), result: 'block' }],
+      }) }));
+    }
+    const judge = vi.fn();
+    expect((await judgeTakeoverGaps(comments, { judge })).decisions.size).toBe(0);
+    expect(judge).not.toHaveBeenCalled();
+    expect(reviewRounds(comments, { sameGapDecisions: decisionsFor(comments) })[0].findings).toHaveLength(2);
+  });
+
   it('counts the live after-takeover duplicate once and allows the next takeover', () => {
     const before = [finding(20), finding(60, 'broken', 'Worker exits before queued jobs complete')];
     const comments = [...rounds5.slice(0, -1), review(R5, 6, before), marker(R5, 7), rearm(8),
       review(T1, 9, [finding(20), finding(24, 'broken', `${claim} silently`)])];
-    expect(openDefects(comments, T1)).toMatchObject({ count: 1, weight: findingWeight({ impact: 'broken' }) });
-    const decision = planTakeover({ pr: pr(T1, comments), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER });
+    const sameGapDecisions = decisionsFor(comments);
+    expect(openDefects(comments, T1, { sameGapDecisions })).toMatchObject({ count: 1, weight: findingWeight({ impact: 'broken' }) });
+    const decision = planTakeover({ sameGapDecisions, pr: pr(T1, comments), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER });
     expect(decision.reason).not.toBe('takeover-not-converging');
     expect(decision).toMatchObject({ ok: true, n: 2 });
-    expect(plan(pr(T1, comments)).dispatch.find((d) => d.prNumber === 7)).toMatchObject({ mode: 'takeover' });
+    expect(plan(pr(T1, comments, { sameGapDecisions })).dispatch.find((d) => d.prNumber === 7)).toMatchObject({ mode: 'takeover' });
   });
 
   it('gives equal count and weight for opposite arrival orders at 20, 22, 30', () => {
@@ -601,7 +685,8 @@ describe('the same gap raised by two seats counts once', () => {
   it('compares only kept findings: a bridge at 28 cannot join the gaps at 20 and 36', () => {
     expect(tally([20, 36].map((line) => finding(line)))).toMatchObject({ count: 2, weight: 6 });
     for (const lines of [[20, 28, 36], [36, 28, 20], [20, 36, 28], [28, 20, 36], [28, 36, 20], [36, 20, 28]]) {
-      const result = tally(lines.map((line) => finding(line)));
+      const comments = thread(lines.map((line) => finding(line)));
+      const result = openDefects(comments, T1, { sameGapDecisions: decisionsFor(comments) });
       expect(result).toMatchObject({ count: 2, weight: 6 });
       expect(result.count).toBeGreaterThanOrEqual(2);
     }
@@ -670,6 +755,9 @@ describe('the same gap raised by two seats counts once', () => {
     const findings = Array.from({ length: MAX_MERGE_FINDINGS + 5 }, (_, i) => finding(20, 'broken', claim, `src/gap-${i}.mjs`));
     expect(tally(findings)).toMatchObject({ count: MAX_MERGE_FINDINGS + 5, weight: 3 * (MAX_MERGE_FINDINGS + 5) });
     expect(reviewRounds(thread(findings)).at(-1).overBound).toBe(true);
+    const judge = vi.fn();
+    expect((await judgeTakeoverGaps(thread(findings), { judge })).decisions.size).toBe(0);
+    expect(judge).not.toHaveBeenCalled();
   });
 
   it('folds exact duplicates at the bound but fails closed on oversized near-duplicates before or after', async () => {
