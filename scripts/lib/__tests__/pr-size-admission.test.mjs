@@ -225,7 +225,7 @@ describe('shared admission effects', () => {
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
     expect(result.body).toContain('split card not filed: operation unavailable');
-    expect(result.body).not.toMatch(/split card \S+ filed/);
+    expect(result.body).not.toMatch(/split card (?!not filed)\S+ filed/);
   });
 
   it('same-ref retries reuse the body marker across fresh runners: one card and one Size section', async () => {
@@ -243,6 +243,28 @@ describe('shared admission effects', () => {
     expect(io.lookupSplitCard).toHaveBeenCalledWith(expect.objectContaining({ ref: request.ref }));
     expect(io.fileItem).not.toHaveBeenCalled();
     expectSizeNote(result.body);
+  });
+
+  it('local split-card lookup keeps prefix-related refs lane/foobar and lane/foo distinct across fresh runners', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'size-split-refs-'));
+    mkdirSync(join(cwd, 'backlog'));
+    const fileItem = vi.fn((fields) => {
+      const num = 9000 + fileItem.mock.calls.length;
+      writeFileSync(join(cwd, 'backlog', `${num}-split.md`), fields.digest);
+      return { run: { verdict: { num } } };
+    });
+    const run = (ref) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence, fileItem })({ ...request, ref, pr: null });
+    try {
+      expect((await run('lane/foobar')).body).toContain('split card 9001 filed');
+      expect((await run('lane/foo')).body).toContain('split card 9002 filed');
+      expect(fileItem).toHaveBeenCalledTimes(2);
+      expect(fileItem.mock.calls[0][0].title).toContain('lane/foobar');
+      expect(fileItem.mock.calls[1][0].title).toContain('lane/foo');
+      // Exact-ref retries reuse their own durable card without a PR-body marker.
+      expect((await run('lane/foobar')).body).toContain('split card 9001 filed');
+      expect((await run('lane/foo')).body).toContain('split card 9002 filed');
+      expect(fileItem).toHaveBeenCalledTimes(2);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 
   it('a different ref cannot inherit another ref’s split-card marker', async () => {

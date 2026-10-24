@@ -86,6 +86,13 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
+import { createSizeAdmissionRunner } from './lib/pr-size-admission.mjs';
+
+/** Shared, injected admission for direct and operation-based producers. */
+export function admitPrSize(request, effects = {}) {
+  return createSizeAdmissionRunner(effects)(request);
+}
+
 import { assertMayMerge, hasNonEmptyBody } from './lib/pr-merge-gate.mjs';
 import { soakPrecheckAtOpen, soakPrecheckEnabled } from './lib/soak-precheck-at-open.mjs';
 import { parseNameStatus } from './soak-replay-gate-cli.mjs';
@@ -621,14 +628,17 @@ export function classifyChecks(rows) {
  * @returns {{label:string|null, apply:boolean, reasons:string[], humanRequired:boolean}}
  */
 export function resolveProducerReviewLabel({
-  changedFiles = [], diffLines = 0, humanBasisFiles = null, cumulativeDiffLines = null, dismissedFindings = 0, crossRepo = false, currentLabels = [], diffHunks = null, basisNarrowed = true, deviation = null,
+  changedFiles = [], diffLines = 0, humanBasisFiles = null, cumulativeDiffLines = null, dismissedFindings = 0, crossRepo = false, currentLabels = [], diffHunks = null, basisNarrowed = true, deviation = null, sizeAdmission = null,
 } = {}) {
   // #3343 — `basisNarrowed` comes from `computeNetDiffSignals`: `false` means the cumulative file set is the
   // un-narrowed base TIP, so it may name files only upstream touched. It never relaxes the human gate (see
   // `scoreEscalation`); it only makes that fact visible on the verdict. Default `true` — a caller that supplies
   // nothing scores exactly as before.
-  const score = scoreEscalation({ changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings, crossRepo, diffHunks, basisNarrowed, deviation });
-  const label = producerReviewLabel(score);
+  // #size-adds-reviewers-never-refuses: 301..399 and unknown sizes use the
+  // existing size signal and review:pending path, preserving stronger human review.
+  const forceSizeReview = ['over', 'unknown'].includes(sizeAdmission?.status);
+  const score = scoreEscalation({ changedFiles, diffLines: forceSizeReview ? Math.max(400, diffLines) : diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings, crossRepo, diffHunks, basisNarrowed, deviation });
+  const label = score.humanRequired ? REVIEW_LABELS.human : forceSizeReview ? REVIEW_LABELS.pending : producerReviewLabel(score);
   // #2635 — expose the advisory care-level too, so the caller can recompute the jury roster (`resolveJuryPlan`)
   // for the SAME care band this rubric scored, then bind + reconcile it against the pre-registered roster.
   // #3317 — `basisFiles` (the honest cumulative-floored file set the rubric actually scored) rides along too, so
@@ -692,7 +702,7 @@ export function pushFailedDetail(message, { SRC, REF, REMOTE }) {
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
 if (IS_CLI) runCli();
 
-function runCli() {
+async function runCli() {
   const gitC = (args) => execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   // #2217 — pr-land is a SANCTIONED main-writer (fallback-git merge, post-land heal/regen). Those pushes go to
   // `main`, so they must carry the MAIN_PUSH_OK=1 override the new pre-push hook (guard-git-push.mjs) checks —
@@ -971,7 +981,7 @@ function runCli() {
   }
 
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
-  try { gitC(['push', REMOTE, `${SRC}:refs/heads/${REF}`]); }
+  try { gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
   catch (e) { emit({ repo: REPO, merged: false, reason: 'push-failed', detail: pushFailedDetail(e.message || e, { SRC, REF, REMOTE }) }, 3); }
 
   // 2b. (#2291 — pruned) The PRE-CHECK id-collision self-heal (#2222) that used to run here is now DEAD wiring:
@@ -987,6 +997,16 @@ function runCli() {
   const buildContext = producerBuildContext();
   let prNum = null;
   try { prNum = forge.listOpenByHead(REF)?.[0]?.number ?? null; } catch { /* gh may be absent */ }
+  let sizeBody = CREATE_BODY;
+  if (prNum != null) {
+    try { sizeBody = composePrBody(forge.viewPr(prNum, 'body').body || ''); } catch { /* local lookup still prevents duplicate cards */ }
+  }
+  const sizeAdmission = await admitPrSize({ ref: REF, pr: prNum, base: `${REMOTE}/${BASE}`, sha: refSha, body: sizeBody }, { cwd: REPO });
+  createParams.body = sizeAdmission.body;
+  if (prNum != null && sizeAdmission.body !== sizeBody) {
+    try { forge.editBody(prNum, sizeAdmission.body); } catch { /* retry will reuse the local split card */ }
+  }
+
   if (prNum == null) {
     // #2332 — fail fast BEFORE creating: never open a bodyless PR (the #2324 drain gate would refuse to land
     // it, stalling the queue for a human to hand-fill the body). Create-path only — an existing PR is exempt.
@@ -1121,7 +1141,7 @@ function runCli() {
     // un-narrowed base TIP. `scored:false` means nothing was measured at all, which is a different fact from a
     // measurement taken on the wrong basis — don't stamp the un-narrowed reason on an empty score.
     const basisNarrowed = sig.scored ? sig.basisNarrowed !== false : true;
-    const rubric = resolveProducerReviewLabel({ changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings, crossRepo, currentLabels, diffHunks, basisNarrowed, deviation: parseDeviationDisclosure(BODY) });
+    const rubric = resolveProducerReviewLabel({ changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings, crossRepo, currentLabels, diffHunks, basisNarrowed, deviation: parseDeviationDisclosure(BODY), sizeAdmission: sizeAdmission });
 
     // #2635 — BIND + RECONCILE the jury roster against the REAL diff. The pre-registered roster (the item's
     // charter roster) rides the lane manifest when a prepare-time slice recorded it (`preRegisteredLenses`);
@@ -1203,13 +1223,18 @@ function runCli() {
   // from HERE. `ready-to-merge` itself keeps its unchanged landing-gate absence-semantics (#2183 F1/#2138 F4):
   // its absence still means "not queued"; the label lander won't collect a red PR either way. A producer that
   // wants the drain to land it must use `--label-on-green` (wait → label when green → hand off).
+  let sizeOpenVerdict = null;
+  if (sizeAdmission.reviewLabel) {
+    try { sizeOpenVerdict = applyReviewEscalationLabel(); } catch { /* best-effort forge IO, as for other review labels */ }
+  }
+
   if (PLAN.mode === 'open-only') {
     // #3902 (live 2026-10-04) — open-only used to skip the #2307 review-escalation score entirely, so a
     // `--no-wait` PR opened with NO review label and depended on the drain's land-time pass to score it — which
     // only sees fully-green merge candidates. PR #3902 went red before that and was never reviewed. The score
     // needs no green (net diff + manifest), so apply it AT OPEN, like every other producer mode. Best-effort.
     let openVerdict = null;
-    try { openVerdict = applyReviewEscalationLabel(); } catch { /* a scoring miss never blocks the open */ }
+    try { openVerdict = sizeOpenVerdict || applyReviewEscalationLabel(); } catch { /* a scoring miss never blocks the open */ }
     if (openVerdict?.label && !AS_JSON) process.stderr.write(`pr-land [${REPO}] · #${prNum} review-escalation at open → ${openVerdict.label}\n`);
     if (!AS_JSON && LABEL) process.stderr.write(`pr-land [${REPO}] · #${prNum} opened UNLABELLED (--no-wait): use --label-on-green so the ${LABEL} label is applied only when required checks pass; the drain's ci-lifecycle reconcile labels its checking/ci:failed/blocked state on its next sweep (#2421)\n`);
     emit({ repo: REPO, merged: false, reason: 'opened', pr: Number(prNum), ref: REF, label: null, labelApplied: false, ...(openVerdict?.label ? { reviewLabel: openVerdict.label, reviewLabelApplied: openVerdict.apply } : {}), detail: `opened self-approved PR #${prNum} for ${REF} (--no-wait, no ready-to-merge label yet — CI not confirmed green; the drain's ci-lifecycle reconcile covers its checking/ci:failed/blocked state, #2421)` }, 0);
