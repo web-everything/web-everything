@@ -287,8 +287,11 @@ describe('real git: cleanup CLI', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 
-  it.each(['scan root', 'pool root', 'pool', 'tmp root', 'late scan root', 'borrower object store', 'alternate target'])('fails closed when borrower discovery cannot inspect the %s', (variant) => {
+  // 'pool' (the pool being cleaned) is refused by the up-front listing, before discovery; 'sibling pool' reaches discovery.
+  it.each(['scan root', 'pool root', 'pool', 'sibling pool', 'tmp root', 'late scan root', 'borrower object store', 'alternate target'])('fails closed when borrower discovery cannot inspect the %s', (variant) => {
     const dir = lane(14);
+    const sibling = join(poolRoot, 'frontierui');
+    if (variant === 'sibling pool') mkdirSync(sibling, { recursive: true });
     git(root, 'clone', '-q', up, dir);
     const late = variant === 'late scan root';
     const borrower = join(root, 'unreadable-borrower');
@@ -301,7 +304,8 @@ describe('real git: cleanup CLI', () => {
       writeFileSync(join(intermediate, 'info', 'alternates'), `${join(dir, '.git', 'objects')}\n`);
     }
     const denied = resolving ? (variant === 'borrower object store' ? join(borrower, 'objects') : intermediate)
-      : variant === 'pool root' ? poolRoot : variant === 'pool' ? join(poolRoot, 'web-everything') : variant === 'tmp root' ? tmpdir() : root;
+      : variant === 'pool root' ? poolRoot : variant === 'pool' ? join(poolRoot, 'web-everything') : variant === 'sibling pool' ? sibling
+        : variant === 'tmp root' ? tmpdir() : root;
     const method = resolving ? 'realpathSync' : 'readdirSync';
     // Patch the builtin in the child process: deterministic EACCES even when tests run as root.
     const preload = `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
@@ -318,6 +322,12 @@ describe('real git: cleanup CLI', () => {
       if (late) {
         expect(out.status).toBe(0);
         expect(JSON.parse(out.stdout).rows[0].error).toContain('injected EACCES');
+      } else if (variant === 'pool') {
+        expect(out.status).toBe(2);
+        expect(out.stderr).toMatch(/^pool directory .*web-everything does not exist or is not a readable directory\n$/);
+        expect(out.stdout).toBe('');
+        expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).toBe(configBefore);
+        expect(refs(dir)).toEqual(refsBefore);
       } else {
         expect(out.status).toBe(1);
         expect(out.stderr).toContain('injected EACCES');
@@ -331,6 +341,7 @@ describe('real git: cleanup CLI', () => {
       rmSync(dir, { recursive: true, force: true });
       rmSync(borrower, { recursive: true, force: true });
       rmSync(join(root, 'unreadable-cache'), { recursive: true, force: true });
+      rmSync(sibling, { recursive: true, force: true });
     }
   }, 60_000);
 
