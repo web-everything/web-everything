@@ -476,6 +476,8 @@ describe('x00g3tt — review-job: the red team is the post-accept hook, after th
       claim: () => ({ ok: true }),
       updateRecord: () => {},
       unclaim: () => calls.push(['unclaim']),
+      redTeamStatus: () => {},
+      prepareLane: () => ({ head: 'a'.repeat(40) }),
       acquireLane: () => ({ lanePath: '/lanes/lane-7' }),
       runLoop: () => ({ status: 0, stdout: JSON.stringify(loop), stderr: '' }),
       releaseLane: () => calls.push(['release']),
