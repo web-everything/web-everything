@@ -136,9 +136,65 @@ describe('review-job red-team skip settlement', () => {
   it.each(['ran', 'resumed'])('completed %s with a visible result does not settle', status => {
     for (const commentStatus of ['posted', 'deduped']) {
       const f = fixture({ status, comment: { status: commentStatus } });
+      f.io.redTeamResultVisible = vi.fn(() => true);
       runReviewJob({ repo, pr }, f.io);
+      expect(f.io.redTeamResultVisible).toHaveBeenCalledWith({ repo, pr, head });
       expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
     }
+  });
+
+  it.each([
+    ['another head', { status: 'ran', comment: { status: 'posted' } }, 'other-head'],
+    ['unreadable comments', { status: 'ran', comment: { status: 'posted' } }, 'unreadable'],
+    ['untrusted author', { status: 'ran', comment: { status: 'posted' } }, 'untrusted'],
+    ['guard deferral', { status: 'resumed', comment: { status: 'deduped' }, deferredByGuard: true }, 'visible'],
+    ['cap deferral', { status: 'ran', comment: { status: 'posted' }, deferredByCap: true }, 'visible'],
+    ['malformed findings', { status: 'ran', comment: { status: 'posted' }, findings: {} }, 'visible'],
+    ['throwing seat derivation', { status: 'ran', comment: { status: 'posted' }, seat: { get startedAt() { throw Error('malformed seat'); } } }, 'visible'],
+    ['missing visibility reader', { status: 'ran', comment: { status: 'posted' } }, 'missing'],
+  ])('completed result with %s notifies without posting or clearing', (_name, redTeam, evidence) => {
+    for (const redTeamOnly of [false, true]) {
+      const root = mkdtempSync(join(tmpdir(), 'review-completion-evidence-'));
+      const postComment = vi.fn(), publishNeedsYou = vi.fn();
+      try {
+        const f = fixture(redTeam);
+        const exec = vi.fn((_file, args) => {
+          if (evidence === 'unreadable') throw Error('comments unavailable');
+          if (args.includes('--paginate')) return [redTeamMarker(pr, evidence === 'other-head' ? 'b'.repeat(40) : head),
+            '2026-10-24T00:00:00Z', evidence === 'untrusted' ? 'outsider' : 'web-everything', 'IC_result', 'https://example.test/comment'].join('\t');
+          return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } });
+        });
+        if (evidence !== 'missing') f.io.redTeamResultVisible = createReviewJobIo({ env: {}, exec }).redTeamResultVisible;
+        f.io.settleRedTeamSkip.mockImplementation(input => {
+          f.events.push('settle');
+          return settleRedTeamSkip({ ...input, io: {
+            env: { WE_SHARED_RUNS_DIR: join(root, 'runs') }, postComment, publishNeedsYou,
+          } });
+        });
+        const out = runReviewJob({ repo, pr, redTeamOnly }, f.io);
+        expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
+        expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({
+          repo, pr, head, redTeam: expect.objectContaining({ status: 'unpublished' }),
+        }));
+        expect(out.redTeam.outcome).toBe('non-policy');
+        expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+        expect(publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
+        expect(postComment).not.toHaveBeenCalled();
+        expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    }
+  });
+
+  it('production visibility reader requires a complete trusted result on the settlement head', () => {
+    const exec = vi.fn((_file, args) => args.includes('--paginate')
+      ? [redTeamMarker(pr, head), '2026-10-24T00:00:00Z', 'web-everything', 'IC_result', 'https://example.test/comment'].join('\t')
+      : JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } }));
+    const f = fixture({ status: 'ran', comment: { status: 'posted' } });
+    f.io.prepareLane = () => ({ head: 'b'.repeat(40) });
+    f.io.redTeamResultVisible = createReviewJobIo({ env: {}, exec }).redTeamResultVisible;
+    runReviewJob({ repo, pr }, f.io);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
   });
 
   it('stored review head takes precedence over the prepared lane head', () => {

@@ -85,7 +85,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { execRead } from '../lib/proc-read.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
-import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../lib/review-red-team-on-skip.mjs';
 import { classifyRedTeamSkip, isRealHead, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
@@ -308,13 +308,15 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     env: { ...env, ...(actorId ? { [ACTOR_ENV]: actorId } : {}), ...(extraEnv ?? {}) },
     ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
+  const readComments = ({ repo, pr }) => readCompletePrComments(Number(pr), {
+    repo, exec: (file, args, options) => exec(file, args, { ...options, cwd: root, env }),
+  });
   return {
+    redTeamResultVisible: ({ repo, pr, head }) => Boolean(redTeamForHead(readComments({ repo, pr }), pr, head)),
     settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
       env,
       log: line => process.stderr.write(`${line}\n`),
-      readComments: ({ repo, pr }) => readCompletePrComments(Number(pr), {
-        repo, exec: (file, args, options) => exec(file, args, { ...options, cwd: root, env }),
-      }),
+      readComments,
       postComment: ({ repo, pr, body }) => exec('gh', [
         'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
       ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 }),
@@ -810,22 +812,31 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     try {
       const status = redTeam?.status;
       const completed = ['ran', 'resumed'].includes(status);
-      const visibleResult = ['posted', 'deduped'].includes(redTeam?.comment?.status);
+      const published = ['posted', 'deduped'].includes(redTeam?.comment?.status);
       // Plain not-owed is exempt; contradictory guard/cap evidence requires an operator.
       const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
-      bypassSettlement = (status === 'not-owed' && !deferred) || (completed && visibleResult);
-      settlementOutcome = completed && !visibleResult
+      // A completion claim remains unpublished until all derivations and live evidence succeed.
+      settlementOutcome = completed
         ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}` }
         : redTeam;
       // Retain status/deferral evidence even when detailed summary rows are malformed.
       out.redTeam = { status: typeof status === 'string' ? status : 'error',
         ...(redTeam?.deferredByGuard ? { deferredByGuard: true } : {}),
         ...(redTeam?.deferredByCap ? { deferredByCap: true } : {}) };
-      try { out.redTeam = summarizeRedTeam(redTeam); }
+      let wellFormed = false;
+      try { out.redTeam = summarizeRedTeam(redTeam); wellFormed = true; }
       catch { /* malformed findings must not suppress settlement or erase retry evidence */ }
       recordSeats(redTeam?.seat ? [redTeam.seat] : []);
       io.log(`review-job ${out.sessionSlug}: red team — ${diagnosticText(status, 'none')}${redTeam?.reason ? ` (${diagnosticText(redTeam.reason, 'unknown')})` : ''}`
         + `${status === 'ran' ? `: ${diagnosticText(redTeam.findings?.length, '0')} break(s), ${diagnosticText(redTeam.confirmedMissCount, '0')} confirmed, comment ${diagnosticText(redTeam.comment?.status, '-')}` : ''}`);
+      if (completed && published && !deferred && wellFormed) {
+        const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
+        const head = isRealHead(rev) ? rev : seatsBox.laneHead;
+        // Missing readers, unreadable threads and stale/untrusted markers cannot authorize bypass.
+        bypassSettlement = io.redTeamResultVisible?.({ repo: out.repo, pr: out.pr, head }) === true;
+      } else {
+        bypassSettlement = status === 'not-owed' && !deferred && wellFormed;
+      }
     } catch { /* malformed diagnostics cannot prevent settlement */ }
     if (!bypassSettlement && typeof io.settleRedTeamSkip === 'function') {
       try {
