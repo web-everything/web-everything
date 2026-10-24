@@ -1,4 +1,5 @@
 ---
+bornAs: xo4hyg3
 kind: story
 size: 3
 status: open
@@ -13,7 +14,7 @@ Track the borrower-discovery prevention owed by PR #5806's advisory review. A bo
 
 Source: [PR #5806 advisory review](https://github.com/web-everything/web-everything/pull/5806), posted 2026-10-24T00:54:30Z, security/data-safety finding at `we:scripts/lane-git-diet.mjs:78`, head `4a5ee48414889ace5d987b240b601ec1734aafa3`. This is prevention debt from an advisory, not a recorded human verdict or a clearance of `review:human`.
 
-The other five owed preventions, including the duplicate later-round card suggestion, are tracked in #xaz2izw. Together these two cards cover every prevention requested by this advisory.
+The other five owed preventions, including the duplicate later-round card suggestion, are tracked in #6965. Together these two cards cover every prevention requested by this advisory.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5806@4a5ee48414889ace5d987b240b601ec1734aafa3
 

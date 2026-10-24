@@ -1,4 +1,5 @@
 ---
+bornAs: xaz2izw
 kind: story
 size: 5
 status: open
@@ -13,7 +14,7 @@ Track the five coverage and error-contract preventions owed by PR #5806's adviso
 
 Source: [PR #5806 advisory review](https://github.com/web-everything/web-everything/pull/5806), posted 2026-10-24T00:54:30Z, head `4a5ee48414889ace5d987b240b601ec1734aafa3`. Findings below are recorded as prevention work, without reopening the supplied `not-real` ruling on lane-pool wiring or changing any review label. The repeated explicit-lanes finding is also the review's later-round card suggestion and belongs here rather than in an implementation change to that PR.
 
-Split from the canonical prevention filing in #xo4hyg3, which carries this advisory head's idempotency key.
+Split from the canonical prevention filing in #6966, which carries this advisory head's idempotency key.
 
 ## Acceptance
 
@@ -26,7 +27,7 @@ Split from the canonical prevention filing in #xo4hyg3, which carries this advis
 
 ## Non-goals
 
-- [N1] Borrower scan expansion, tracked separately in #xo4hyg3.
+- [N1] Borrower scan expansion, tracked separately in #6966.
 - [N2] A new review verdict, human-review clearance, or a claim that the supplied lane-pool ruling was wrong.
 - [N3] Running destructive lane-pool commands against a host pool; all integration fixtures must be isolated temporary repositories.
 
