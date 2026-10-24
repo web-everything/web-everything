@@ -30,7 +30,7 @@ export default {
         const { rebuildClone } = await load('scripts/lib/daemon-rebuild.mjs');
         const { addOverlay, readOverlays } = await load('scripts/lib/daemon-overlays.mjs');
         const git = args => execFileSync('git', args, {
-          cwd: w.simCloneRoot, encoding: 'utf8', timeout: 20_000,
+          cwd: w.simCloneRoot, encoding: 'utf8', timeout: 20_000, maxBuffer: 16 * 1024 * 1024,
         }).trim();
         const branch = (name, from, files) => w.git.createBranch('we', `lane/${name}`, { from, files });
         const register = (name, pinned = false) => addOverlay(w.simCloneRoot, { ref: `lane/${name}`, pinned }, { env: w.env });
