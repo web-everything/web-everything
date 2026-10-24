@@ -627,6 +627,10 @@ describe('setupScratchClone — clones locally and installs deps, over injected 
     expect(result.realOrigin).toBe('https://github.com/x/y.git');
     expect(result.originWired).toBe(true);
     expect(calls.some((c) => c.bin === 'git' && c.args.includes('set-url') && c.args.includes('https://github.com/x/y.git'))).toBe(true);
+    // Both remote reads/writes are bounded, so no sync git call on the scratch path can block signals forever.
+    const remoteCalls = calls.filter((c) => c.bin === 'git' && c.args.includes('remote'));
+    expect(remoteCalls).toHaveLength(2);
+    for (const c of remoteCalls) expect(c.opts?.timeout).toBe(GIT_STEP_TIMEOUT_MS);
   });
 
   it('#3782: wireOriginToRemote:true is a no-op (originWired stays false) when repoRoot has no origin to resolve', () => {
