@@ -183,28 +183,34 @@ const isOpen = (f) => !CLOSED_RULINGS.has(String(f?.ruling ?? '').toLowerCase())
 /** A trusted fixer turn that changed the PR (a re-arm, an advisory fix): the end of one review round. */
 const FIXER_TURN = /^🔧 conveyor fix —/;
 
-/**
- * Fold the same spot (file, line within 2) or file-less claim first, then an exact ruling key or sameGapSameHead.
- * Compare only kept findings, pairwise, first match; never join groups through a discarded member.
- * Keep the heavier member's ruling/impact; a later ruling lands. New matches never merge closed findings.
- * At the bound, count raw findings without merging: a flood can only over-count.
- */
+/** Fold the original spot/claim rule, except recovered rulings require an exact (file, line, clipped claim) key. */
 function mergeFinding(into, f) {
-  if (into.length >= MAX_MERGE_FINDINGS) { into.push(f); return; }
   const key = (g) => JSON.stringify([g.file ?? null, g.line ?? null, clip(g.claim, 220)]);
-  const gap = (g) => ({ file: g.file, line: g.line, summary: g.claim, impactIfUnfixed: g.impact ?? null, verdict: g.ruling ?? null });
-  const same = into.find((g) => (f.file && g.file === f.file && (f.line == null || g.line == null || Math.abs(g.line - f.line) <= 2))
-    || (!f.file && !g.file && g.claim === f.claim))
-    ?? into.find((g) => isOpen(g) && isOpen(f)
-      && ((f.lens === 'referral' && f.ruling) || (g.lens === 'referral' && g.ruling)) && key(g) === key(f))
-    ?? into.find((g) => isOpen(g) && isOpen(f) && sameGapSameHead(gap(g), gap(f)));
+  const referral = (g) => g.lens === 'referral' || g.referral === true;
+  const same = into.find((g) => !referral(f) && !referral(g) && ((f.file && g.file === f.file && (f.line == null || g.line == null || Math.abs(g.line - f.line) <= 2))
+    || (!f.file && !g.file && g.claim === f.claim)))
+    ?? into.find((g) => isOpen(g) && isOpen(f) && (referral(f) || referral(g)) && key(g) === key(f));
   if (same) {
+    if (f.lens === 'referral') same.referral = true;
+    for (const k of ['lens', 'category']) if (!same[k] || /security/i.test(f[k])) same[k] = f[k] ?? null;
     if (findingWeight(f) > findingWeight(same)) { same.ruling = f.ruling ?? null; same.impact = f.impact ?? null; }
     if (f.ruling) same.ruling = f.ruling;
     if (!same.impact && f.impact) same.impact = f.impact;
     return;
   }
-  into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null, lens: f.lens ?? null });
+  into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null, lens: f.lens ?? null, category: f.category ?? null });
+}
+
+const findingOrder = (a, b) => (a.file ?? '').localeCompare(b.file ?? '') || (a.line ?? -1) - (b.line ?? -1) || a.claim.localeCompare(b.claim);
+/** Sorted, pairwise first match against KEPT representatives only; discarded bridges never join groups. */
+function mergeSameGaps(findings) {
+  const gap = (f) => ({ file: f.file, line: f.line, summary: f.claim, impactIfUnfixed: f.impact ?? null, verdict: f.ruling ?? null });
+  const protectedFinding = (f) => isGateHoldFinding(f) || /security/i.test(`${f.lens} ${f.category}`);
+  const kept = [];
+  for (const f of findings.sort(findingOrder)) {
+    if (protectedFinding(f) || !kept.some((g) => !protectedFinding(g) && sameGapSameHead(gap(g), gap(f)))) kept.push(f);
+  }
+  return kept;
 }
 
 /**
@@ -281,10 +287,14 @@ export function reviewRounds(comments) {
     }
     r.end = it.t;
     if (it.concluded) r.concluded = true;
-    for (const f of it.ev.findings ?? []) mergeFinding(r.findings, f);
+    for (const f of (it.ev.findings ?? []).sort(findingOrder)) mergeFinding(r.findings, f);
   }
   close();
-  for (const r of rounds) r.findings = r.findings.filter(isOpen);
+  for (const r of rounds) {
+    r.findings = r.findings.filter(isOpen);
+    if (r.findings.length > MAX_MERGE_FINDINGS) r.overBound = true;
+    else r.findings = mergeSameGaps(r.findings);
+  }
   return rounds;
 }
 
@@ -374,9 +384,10 @@ export function takeoverProgress(comments, episode) {
   if (!after) return { judged: false, ...heads };
   const b = tally(before?.findings ?? []);
   const a = tally(after.findings);
-  const progress = before !== null && ((a.count < b.count && a.weight <= b.weight) || (a.weight < b.weight && a.count <= b.count));
+  const overBound = before?.overBound || after.overBound;
+  const progress = !overBound && before !== null && ((a.count < b.count && a.weight <= b.weight) || (a.weight < b.weight && a.count <= b.count));
   return {
-    judged: true, progress, ...heads,
+    judged: true, progress, ...heads, ...(overBound ? { reason: 'merge-bound' } : {}),
     before: { head: before?.head ?? null, count: b.count, weight: b.weight },
     after: { head: after.head, count: a.count, weight: a.weight },
     remaining: a.findings,
@@ -515,7 +526,7 @@ export function notConvergingText(prNumber, plan) {
   const more = (p.remaining?.length ?? 0) > NOT_CONVERGING_MAX_FINDINGS ? `\n- … and ${p.remaining.length - NOT_CONVERGING_MAX_FINDINGS} more` : '';
   return `PR #${prNumber}: takeover not converging — takeover ${plan?.n ?? '?'} of ${plan?.budget ?? '?'} left `
     + `${p.after?.count ?? '?'} open finding(s) (weight ${p.after?.weight ?? '?'}), against ${p.before?.count ?? '?'} `
-    + `(weight ${p.before?.weight ?? '?'}) before it. No further takeover; a person must decide. Still open:${rest || ' (none parsed)'}${more}`;
+    + `(weight ${p.before?.weight ?? '?'}) before it.${p.reason === 'merge-bound' ? ' Comparison inconclusive: merge-bound.' : ''} No further takeover; a person must decide. Still open:${rest || ' (none parsed)'}${more}`;
 }
 
 export const PREVIOUS_TAKEOVER_DIFF_MAX_CHARS = 12000;

@@ -600,7 +600,7 @@ describe('the same gap raised by two seats counts once', () => {
 
   it('compares only kept findings: a bridge at 28 cannot join the gaps at 20 and 36', () => {
     expect(tally([20, 36].map((line) => finding(line)))).toMatchObject({ count: 2, weight: 6 });
-    for (const lines of [[20, 28, 36], [36, 28, 20], [20, 36, 28]]) {
+    for (const lines of [[20, 28, 36], [36, 28, 20], [20, 36, 28], [28, 20, 36], [28, 36, 20], [36, 20, 28]]) {
       const result = tally(lines.map((line) => finding(line)));
       expect(result).toMatchObject({ count: 2, weight: 6 });
       expect(result.count).toBeGreaterThanOrEqual(2);
@@ -624,6 +624,23 @@ describe('the same gap raised by two seats counts once', () => {
     expect(openDefects(comments, T1)).toMatchObject({ count: 1, weight: 3, findings: [{ claim: defect }] });
   });
 
+  it('protects a high-overlap gate hold in both arrival orders', () => {
+    const hold = 'review-gate dependency failure leaves background refresh requests pending while retry budget resets before queued workers finish';
+    const defect = hold.replace('dependency', 'configuration');
+    for (const pair of [[finding(20, 'broken', hold), finding(24, 'broken', defect)], [finding(24, 'broken', defect), finding(20, 'broken', hold)]]) {
+      expect(reviewRounds(thread(pair)).at(-1).findings).toHaveLength(2);
+      expect(tally(pair)).toMatchObject({ count: 1, weight: 3, findings: [{ claim: defect }] });
+    }
+  });
+  it.each(['Security/logic', 'correctness/Security'])('protects parser lens/category %s in either kept position', (heading) => {
+    for (const line of [20, 24]) {
+      const comments = [review(T1, 9, [finding(line)]), { ...review(T1, 10, [finding(44 - line)]),
+        body: review(T1, 10, [finding(44 - line)]).body.replace('correctness/logic', heading) }];
+      expect(openDefects(comments, T1)).toMatchObject({ count: 2, weight: 6 });
+      expect(reviewRounds(comments).at(-1).findings).toContainEqual(expect.objectContaining({ lens: heading.split('/')[0], category: heading.split('/')[1] }));
+    }
+  });
+
   it.each([
     ['different severity', finding(24, 'degraded'), 5],
     ['different files', finding(24, 'broken', claim, 'src/k.mjs'), 6],
@@ -635,16 +652,16 @@ describe('the same gap raised by two seats counts once', () => {
 
   it('folds an ordinary finding and its policy block ruling into one block-weight finding', async () => {
     const { buildOperatorRulingComment } = await import('../../lib/jury-core.mjs');
-    const key = JSON.stringify(['judgeSecurity', 'src/j.mjs', 20, claim]);
-    const ruling = { author: BOT, createdAt: at(10), body: buildOperatorRulingComment({
+    const ruling = (line = 20, text = claim, h = 10) => ({ author: BOT, createdAt: at(h), body: buildOperatorRulingComment({
       version: 1, repo: 'test/repo', pr: 7, head: T1, actor: 'auto-policy', channel: 'test',
       reason: 'Required referral is blocked', at: at(10), clearerId: 'policy',
-      rulings: [{ runId: 'review-pr-x', key, result: 'block' }],
-    }) };
-    const comments = [...thread([finding(20)]), ruling];
+      rulings: [{ runId: 'review-pr-x', key: JSON.stringify(['judgeSecurity', 'src/j.mjs', line, text]), result: 'block' }],
+    }) });
+    const comments = [...thread([finding(20)]), ruling()];
     expect(reviewRounds(comments).at(-1).findings).toHaveLength(1);
     expect(openDefects(comments, T1)).toMatchObject({ count: 1, weight: findingWeight({ ruling: 'block' }) });
     expect(findingWeight({ ruling: 'block' })).toBe(4);
+    for (const h of [8, 10]) expect(reviewRounds([...thread([finding(20)]), ruling(21, 'Unrelated block ruling', h)]).at(-1).findings).toHaveLength(2);
   });
 
   it('retains MAX_MERGE_FINDINGS + 5 distinct-file findings raw', async () => {
@@ -652,12 +669,22 @@ describe('the same gap raised by two seats counts once', () => {
     expect(MAX_MERGE_FINDINGS).toBe(200);
     const findings = Array.from({ length: MAX_MERGE_FINDINGS + 5 }, (_, i) => finding(20, 'broken', claim, `src/gap-${i}.mjs`));
     expect(tally(findings)).toMatchObject({ count: MAX_MERGE_FINDINGS + 5, weight: 3 * (MAX_MERGE_FINDINGS + 5) });
+    expect(reviewRounds(thread(findings)).at(-1).overBound).toBe(true);
   });
 
-  it('appends three exact duplicates raw once the kept list reaches the merge bound', async () => {
+  it('folds exact duplicates at the bound but fails closed on oversized near-duplicates before or after', async () => {
     const { MAX_MERGE_FINDINGS } = await import('../takeover-budget.mjs');
     expect(MAX_MERGE_FINDINGS).toBe(200);
     const full = Array.from({ length: MAX_MERGE_FINDINGS }, (_, i) => finding(20, 'broken', claim, `src/gap-${i}.mjs`));
-    expect(tally([...full, full[0], full[0], full[0]])).toMatchObject({ count: MAX_MERGE_FINDINGS + 3, weight: 3 * (MAX_MERGE_FINDINGS + 3) });
+    expect(tally([...full, full[0], full[0], full[0]])).toMatchObject({ count: 200, weight: 600 });
+    const oversized = [...full, ...full.slice(0, 3).map(([file]) => finding(24, 'broken', claim, file))];
+    for (const [before, after] of [[oversized, full], [full, oversized]]) {
+      const comments = [review(R5, 6, before), marker(R5, 7), rearm(8), review(T1, 9, after)];
+      expect(reviewRounds(comments).find((r) => r.overBound)?.findings).toHaveLength(203);
+      expect(takeoverProgress(comments, takeoverEpisodes(comments)[0])).toMatchObject({ judged: true, progress: false, reason: 'merge-bound' });
+      const decision = planTakeover({ pr: pr(T1, comments), roundCapAction: 'takeover', takeoverBudget: 2 });
+      expect(decision).toMatchObject({ ok: false, reason: 'takeover-not-converging', progress: { reason: 'merge-bound' } });
+      expect(notConvergingText(7, decision)).toContain('merge-bound');
+    }
   });
 });
