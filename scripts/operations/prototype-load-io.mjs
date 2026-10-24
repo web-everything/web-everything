@@ -76,11 +76,24 @@ async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, 
     };
     const tests = [...testDepths(changedFiles, reverse).keys()].filter(isVitestTestFile).sort();
     if (!tests.length) return { ok: false, reason: 'no-related-tests', testCount: 0 };
-    const args = [join(repo, 'scripts/readiness/heavy-admission.mjs'), 'run', `--wait-ms=${limits.waitMs}`, '--', 'npx', 'vitest', 'run', ...tests];
-    const command = ['node', 'scripts/readiness/heavy-admission.mjs', ...args.slice(1)].map((arg) => JSON.stringify(arg)).join(' ');
+    const reportPath = join(worktree, '.prototype-vitest-results.json');
+    // Admission is shell-backed: execFileSync's timeout may leave descendants alive.
+    // Give admission its own hard ceiling; retain the outer timeout as a backstop.
+    const args = [join(repo, 'scripts/readiness/heavy-admission.mjs'), 'run', `--wait-ms=${limits.waitMs}`,
+      `--ceiling-ms=${limits.timeoutMs}`, '--', 'npx', 'vitest', 'run', '--reporter=json', `--outputFile=${reportPath}`, ...tests];
+    const command = ['node', 'scripts/readiness/heavy-admission.mjs', ...args.slice(1)].map((arg) => JSON.stringify(arg.replaceAll(worktree, '<worktree>'))).join(' ');
     try {
       run('node', args, worktree, limits.timeoutMs);
-      return { ok: true, command, result: `passed ${tests.length} tests`, testCount: tests.length };
+      let report;
+      try { report = JSON.parse(fs.readFileSync(reportPath, 'utf8')); }
+      catch { return { ok: false, reason: 'tests-unproven', command, testCount: tests.length,
+        result: 'unknown passed, unknown skipped; JSON report missing, unreadable or unparseable' }; }
+      const passed = Number.isSafeInteger(report?.numPassedTests) && report.numPassedTests >= 0 ? report.numPassedTests : 'unknown';
+      const skipped = Number.isSafeInteger(report?.numPendingTests) && report.numPendingTests >= 0 ? report.numPendingTests : 'unknown';
+      const proven = report?.success === true && report.numFailedTests === 0 && report.numFailedTestSuites === 0
+        && passed !== 'unknown' && passed > 0 && Array.isArray(report.testResults) && report.testResults.length === tests.length;
+      return { ok: proven, command, result: `${passed} passed, ${skipped} skipped${proven ? '' : '; JSON evidence incomplete or counts mismatch'}`,
+        testCount: tests.length, ...(proven ? {} : { reason: 'tests-unproven' }) };
     } catch (e) {
       if (!Number.isInteger(e.status)) throw e;
       const output = `${e.stdout || ''}${e.stderr || ''}`.replaceAll(worktree, '<worktree>').replaceAll(repo, '<repo>').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
@@ -259,7 +272,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           passed = ok === true;
           failure = `combined-tests-failed: ${reason || 'tests-failed'}`;
         } catch (e) {
-          const message = String(e.message || e);
+          let message = String(e.message || e).replace(/[\p{Cc}\p{Cf}]/gu, '');
+          const roots = [[repo, '<repo>'], [env.HOME, '<home>'], [homedir(), '<home>'],
+            [env.TMPDIR, '<tmp>'], [tmpdir(), '<tmp>'], ['/private/tmp', '<tmp>'], ['/tmp', '<tmp>']]
+            .filter(([root]) => typeof root === 'string' && root.length > 1)
+            .map(([root, placeholder]) => [root.replace(/\/+$/, ''), placeholder])
+            .sort(([a], [b]) => b.length - a.length);
+          for (const [root, placeholder] of roots) message = message.replaceAll(root, placeholder);
+          message = message.slice(0, 300);
           out.combinedTests = { result: message };
           failure = `combined-tests-unrunnable: ${message}`;
         }

@@ -164,6 +164,71 @@ function fixture(options = {}) {
   return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
+describe('default combined-tree test proof', () => {
+  const limits = { waitMs: 1234, timeoutMs: 5678, maxBuffer: 4096 };
+  const report = { success: true, numFailedTests: 0, numFailedTestSuites: 0,
+    numPassedTests: 3, numPendingTests: 2, testResults: [{}, {}] };
+  async function runReport(value, { missing = false } = {}) {
+    const worktree = '/tmp/prototype-combined-proof';
+    const sources = new Map([['one.test.mjs', ''], ['two.test.mjs', '']]);
+    let reportPath;
+    const fs = {
+      mkdtempSync: () => worktree, existsSync: () => false, rmSync: vi.fn(),
+      readFileSync: vi.fn((path) => {
+        if (path === reportPath) {
+          if (missing) throw new Error('missing report');
+          return typeof value === 'string' ? value : JSON.stringify(value);
+        }
+        const source = sources.get(path.slice(worktree.length + 1));
+        if (source === undefined) throw new Error('unexpected read');
+        return source;
+      }),
+    };
+    const exec = vi.fn((command, args) => {
+      if (command === 'node') {
+        reportPath = args.find(arg => arg.startsWith('--outputFile='))?.slice('--outputFile='.length);
+        return ''; // Exit zero alone proves nothing.
+      }
+      if (args[0] === '-C' || args[0] === 'rev-parse') return SHA;
+      if (['fetch', 'merge-base', 'worktree'].includes(args[0])) return '';
+      if (args[0] === 'merge-tree') return TREE;
+      if (args[0] === 'commit-tree') return MERGE;
+      if (args[0] === 'ls-files') return [...sources.keys()].join('\0') + '\0';
+      throw new Error('unexpected command');
+    });
+    const result = await defaultDeps().combinedTest({ clone: '/fixture/clone', candidateSha: SHA,
+      changedFiles: [...sources.keys()], refs: ['lane/old'] }, { exec, fs, env: {}, settings: { combinedTest: limits } });
+    return { result, exec, fs, worktree, reportPath };
+  }
+  it('requires positive JSON proof and reports passed and skipped test counts', async () => {
+    const { result, exec, fs, worktree, reportPath } = await runReport(report);
+    expect(result).toMatchObject({ ok: true, testCount: 2, result: '3 passed, 2 skipped' });
+    const [, args, options] = exec.mock.calls.find(([command]) => command === 'node');
+    expect(args.slice(args.indexOf('vitest'))).toEqual(['vitest', 'run', '--reporter=json',
+      `--outputFile=${reportPath}`, 'one.test.mjs', 'two.test.mjs']);
+    expect(reportPath.startsWith(worktree + '/')).toBe(true);
+    expect(fs.readFileSync).toHaveBeenCalledWith(reportPath, 'utf8');
+    expect(args.slice(0, args.indexOf('--'))).toContain(`--ceiling-ms=${limits.timeoutMs}`);
+    expect(options).toMatchObject({ cwd: worktree, timeout: limits.timeoutMs, maxBuffer: limits.maxBuffer, shell: false });
+    expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
+  });
+  it.each([
+    ['missing JSON', report, { missing: true }], ['unparseable JSON', '{bad'],
+    ['null JSON', 'null'], ['skipped-only', { ...report, numPassedTests: 0 }],
+    ['unsuccessful run', { ...report, success: false }], ['missing success', { ...report, success: undefined }],
+    ['failed tests', { ...report, numFailedTests: 1 }], ['failed suites', { ...report, numFailedTestSuites: 1 }],
+    ['missing counts', { success: true, testResults: [{}, {}] }],
+    ['missing results', { ...report, testResults: undefined }],
+    ['too few files', { ...report, testResults: [{}] }], ['too many files', { ...report, testResults: [{}, {}, {}] }],
+  ])('fails closed on exit zero with %s', async (_name, value, options) => {
+    const { result, fs, worktree } = await runReport(value, options);
+    expect(result).toMatchObject({ ok: false, reason: 'tests-unproven', testCount: 2 });
+    expect(result.result).toMatch(/passed.*skipped/);
+    expect(result.result.length).toBeLessThanOrEqual(300);
+    expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
+  });
+});
+
 describe('prototype-load', () => {
   it('refuses missing readiness evidence and persists the refusal on a real filesystem', async () => {
     await withRealRepo(async ({ root }) => {
@@ -390,6 +455,27 @@ describe('prototype-load', () => {
     expect(mutations(f, 'remove')).toEqual([]);
     expect(f.records).toHaveLength(1);
     expect(f.records[0]).toMatchObject({ stopReason: 'stale-registration', combinedTests: r.combinedTests, staleTolerated: [] });
+  });
+  it('sanitizes and bounds thrown combined-test errors in every persisted refusal field', async () => {
+    const repoPath = new URL('../../../', import.meta.url).pathname.replace(/\/$/, '');
+    const raw = `unavailable \u0000${repoPath}/private.mjs /home/test/secret /tmp/private-log \n` + 'x'.repeat(400);
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      combinedTest: () => { throw new Error(raw); } });
+    const r = await f.run();
+    const message = r.combinedTests.result;
+    expect(message).toContain('<repo>/private.mjs <home>/secret <tmp>/private-log');
+    expect(message).not.toMatch(/[\x00-\x1f\x7f]/);
+    expect(message).toHaveLength(300);
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
+    expect(r.blockingReasons['lane/old']).toBe(`overlap-with-candidate: x; combined-tests-unrunnable: ${message}`);
+    for (const output of [r, ...f.records]) {
+      const serialized = JSON.stringify(output);
+      expect(serialized).not.toContain(repoPath);
+      expect(serialized).not.toContain('/tmp/private-log');
+      expect(serialized).not.toContain('/home/test/secret');
+    }
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
   });
   it('does not run combined tests when the candidate is not clean or the stale files are unknown', async () => {
     for (const options of [
