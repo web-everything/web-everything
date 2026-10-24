@@ -1617,7 +1617,9 @@ export function watchParkedPrConflicts({
         console.error(`parked-pr-conflict-watch: PR #${pr.number}: card file list unavailable; normal conflict owner required: ${conflictWatchCause(error)}`);
       }
       try {
-        if (resolvedRepo == null && cardConflictSettings.value.gitRecheckFiles === true) resolvedRepo = provider.currentRepo();
+        // Discover the repo only when a write (label add) is about to need it anyway; a read-only pass
+        // with nothing to write must never consult currentRepo().
+        if (resolvedRepo == null && plan.add && cardConflictSettings.value.gitRecheckFiles === true) resolvedRepo = provider.currentRepo();
         const evidence = readRealFiles({ pr, repo: resolvedRepo, ghFiles: files,
           enabled: cardConflictSettings.value.gitRecheckFiles === true && recheckCardOnly === gitCardOnlyRecheck });
         cardOnly = isCardOnlyDiff(evidence.files);
