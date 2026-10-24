@@ -725,4 +725,45 @@ describe('the same gap raised by two seats counts once', () => {
     ]));
     expect(openDefects(comments, T1)).toMatchObject({ count: 2, weight: 2 * findingWeight({ ruling: 'block' }) });
   });
+
+  it.each([20, 24])('compares complete claims beyond 220 characters at lines 20/%s (GET versus PUT)', (line) => {
+    const prefix = `${claim} while background workers retain pending requests and retry budgets across repeated refresh cycles `.repeat(2);
+    expect(prefix.length).toBeGreaterThan(220);
+    const result = tally([finding(20, 'broken', `${prefix}GET`), finding(line, 'broken', `${prefix}PUT`)]);
+    expect(result).toMatchObject({ count: 2, weight: 6 });
+    expect(result.findings.map((f) => f.claim)).toEqual([`${prefix.slice(0, 219)}…`, `${prefix.slice(0, 219)}…`]);
+    expect(result.findings.map((f) => f.fullClaim)).toEqual([expect.stringContaining(`${prefix}GET`), expect.stringContaining(`${prefix}PUT`)]);
+  });
+
+  it('keeps non-security referral rulings separate unless their keys match exactly', async () => {
+    const { buildOperatorRulingComment } = await import('../../lib/jury-core.mjs');
+    const comments = [20, 24, 20].map((line, i) => ({ author: BOT, createdAt: at(9 + i), body: buildOperatorRulingComment({
+      version: 1, repo: 'test/repo', pr: 7, head: T1, actor: 'auto-policy', channel: 'test',
+      reason: 'Required referral is blocked', at: at(9 + i), clearerId: 'policy',
+      rulings: [{ runId: `review-pr-${i}`, lens: 'judgeCorrectnessAdvisory', category: 'logic',
+        key: JSON.stringify(['judgeCorrectnessAdvisory', 'src/j.mjs', line, `${claim}${line === 24 ? ' silently' : ''}`]), result: 'block' }],
+    }) }));
+    expect(openDefects(comments, T1)).toMatchObject({ count: 2, weight: 8 });
+    expect(reviewRounds(comments)[0].findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ line: 20, lens: 'judgeCorrectnessAdvisory', referral: true }),
+      expect.objectContaining({ line: 24, lens: 'judgeCorrectnessAdvisory', referral: true }),
+    ]));
+  });
+
+  it.each(['category', 'class'])('fails closed on accepted ruling records with numeric %s without throwing during a fold', async (field) => {
+    const { buildOperatorRulingComment, parseOperatorRulingComment } = await import('../../lib/jury-core.mjs');
+    const comments = [20, 24, 20].map((line, i) => {
+      const ruling = { runId: `review-pr-${i}`, lens: 'judgeCorrectnessAdvisory', [field]: 7,
+        key: JSON.stringify(['judgeCorrectnessAdvisory', 'src/j.mjs', line, claim]), result: 'block' };
+      const comment = { author: BOT, createdAt: at(9 + i), body: buildOperatorRulingComment({
+        version: 1, repo: 'test/repo', pr: 7, head: T1, actor: 'auto-policy', channel: 'test',
+        reason: 'Required referral is blocked', at: at(9 + i), clearerId: 'policy', rulings: [ruling],
+      }) };
+      expect(parseOperatorRulingComment(comment)?.record?.rulings).toEqual([ruling]);
+      return comment;
+    });
+    expect(() => reviewRounds(comments)).not.toThrow();
+    expect(openDefects(comments, T1)).toMatchObject({ count: 2, weight: 8 });
+    expect(reviewRounds(comments)[0].findings.map((f) => f.category)).toEqual(['security', 'security']);
+  });
 });
