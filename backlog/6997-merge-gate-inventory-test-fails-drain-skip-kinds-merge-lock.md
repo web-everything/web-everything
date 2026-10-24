@@ -1,4 +1,5 @@
 ---
+bornAs: xid4mb6
 kind: story
 size: 2
 status: open
@@ -39,7 +40,7 @@ Misclassifying an admission refusal as scheduling can hide a missing merge-gate 
 
 ## Test plan
 
-Run the A1 command on main and on the overlay stack. Both must have exact inventory equality; A2 must cover all three group-hold reasons. Add a new kind temporarily in a test fixture to prove that an unclassified kind fails, without changing production guards. The broader emitted-kind standards gate is tracked by prevention card xp7g4rd.
+Run the A1 command on main and on the overlay stack. Both must have exact inventory equality; A2 must cover all three group-hold reasons. Add a new kind temporarily in a test fixture to prove that an unclassified kind fails, without changing production guards. The broader emitted-kind standards gate is tracked by prevention card 6998.
 
 From the WE checkout:
 

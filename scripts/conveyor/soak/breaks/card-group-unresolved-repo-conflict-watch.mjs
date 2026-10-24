@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 export default {
   id: 'card-group-unresolved-repo-conflict-watch',
   title: 'an unresolved default repo made the conflict watch route open card-group members (exemption failed open)',
-  card: 'PR #5762 / xym8nt4',
+  card: 'PR #5762 / 6532',
   // Pin the commit that introduced the fix so replay keeps targeting it after later commits land.
   fixedBy: { sha: '3797ded9b', where: 'lane/xym8nt4-card-group', paths: ['scripts/conveyor/parked-pr-conflict-watch.mjs'] },
   fixPresent(root) {

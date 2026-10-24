@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 export default {
   id: 'card-group-default-repo-conflict-watch',
   title: 'default conflict sweeps leave grouped sources and combined PRs to reconciliation',
-  card: 'PR #5762 / xym8nt4',
+  card: 'PR #5762 / 6532',
   // Pin the commit that introduced the fix so replay keeps targeting it after later commits land.
   fixedBy: { sha: 'e55ef4474f96748122b3afcd42ca6955afb631fd', where: 'lane/xym8nt4-card-group',
     paths: ['scripts/conveyor/parked-pr-conflict-watch.mjs'] },
