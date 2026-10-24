@@ -83,7 +83,9 @@ export function laneProbeEnv(path) {
   // safety probe.
   const env = scrubInheritedGitEnv(laneGitEnv(path));
   return { ...laneGitHardeningEnv(env), GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0',
-    GIT_NO_LAZY_FETCH: '1' };
+    GIT_NO_LAZY_FETCH: '1',
+    // A lane's refs/replace/* (or a grafts file) can make an unpushed commit read as an already-pushed one.
+    GIT_NO_REPLACE_OBJECTS: '1' };
 }
 
 /**

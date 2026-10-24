@@ -53,7 +53,8 @@ describe('operator send-back regressions', () => {
       GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.worktree', GIT_CONFIG_VALUE_0: '/foreign',
       GIT_CONFIG_PARAMETERS: "'core.fsmonitor=marker'", GIT_DIR: '/foreign/.git', GIT_COMMON_DIR: '/foreign/common',
       GIT_WORK_TREE: '/foreign', GIT_INDEX_FILE: '/foreign/index', GIT_OBJECT_DIRECTORY: '/foreign/objects',
-      GIT_ALTERNATE_OBJECT_DIRECTORIES: '/foreign/alt', GIT_NAMESPACE: 'foreign' };
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: '/foreign/alt', GIT_NAMESPACE: 'foreign',
+      GIT_REPLACE_REF_BASE: 'refs/foreign/', GIT_ATTR_SOURCE: 'foreign' };
     for (const [key, value] of Object.entries(inherited)) vi.stubEnv(key, value);
     try {
       const env = laneProbeEnv('/fixture/lane');
@@ -62,6 +63,7 @@ describe('operator send-back regressions', () => {
         expect(env, key).not.toHaveProperty(key);
       }
       const config = Object.fromEntries(Object.entries(env).filter(([key]) => /^GIT_CONFIG/.test(key)));
+      expect(env.GIT_NO_REPLACE_OBJECTS).toBe('1');
       expect(config).toEqual({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: String(LANE_GIT_CONFIG_PINS.length),
         ...Object.fromEntries(LANE_GIT_CONFIG_PINS.flatMap(([key, value], i) =>
           [[`GIT_CONFIG_KEY_${i}`, key], [`GIT_CONFIG_VALUE_${i}`, value]])) });
@@ -589,6 +591,17 @@ describe('lane action guard with real Git', () => {
       expect(guardLaneAction({ path, action, log: vi.fn() }))
         .toMatchObject({ act: false, fresh: { hasUnsafeWork: true } });
     }
+  });
+
+  it('stays unsafe when a lane-local replace ref makes an unpushed commit look already pushed', () => {
+    const { path, git } = fixture();
+    const pushed = git(['rev-parse', 'HEAD']).trim();
+    git(['-c', 'user.name=Guard Fixture', '-c', 'user.email=guard@example.invalid', '-c', 'commit.gpgSign=false',
+      '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '--allow-empty', '-m', 'unpushed']);
+    const unpushed = git(['rev-parse', 'HEAD']).trim();
+    git(['replace', unpushed, pushed]);
+    expect(guardLaneAction({ path, action: 'reclaim', log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { hasUnsafeWork: true, reason: '1 unpushed commit(s)' } });
   });
 
   it('stays unsafe for a lane-local filter even when inherited GIT_CONFIG_GLOBAL points at the lane config', () => {
