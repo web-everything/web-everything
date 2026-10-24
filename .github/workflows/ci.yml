@@ -162,12 +162,13 @@ jobs:
 
   test-shard:
     needs: changes
-    # #5027 — Arm-runner experiment switch. The repo is public, so `ubuntu-24.04-arm` is free; paid larger
-    # runners were rejected on cost. `vars.WE_SHARD_RUNNER` unset (the default) = x86 `ubuntu-latest`; set it to
-    # `ubuntu-24.04-arm` to trial the shards on Arm, unset it to abort — no PR needed either way. ONLY this job
-    # reads the variable; `test` and every other job stay on `ubuntu-latest`. Compare with
-    # `node scripts/ci/shard-runner-compare.mjs`.
-    runs-on: ${{ vars.WE_SHARD_RUNNER || 'ubuntu-latest' }}
+    # #5027 — runner switch. `vars.WE_SHARD_RUNNER` names the paid larger runner (currently `we-8core`). It is used
+    # for `merge_group` (merge-queue) runs, which wait behind ordinary `pull_request` runs for the same paid
+    # machines (slow merges), and for PRs labelled `ci:priority`. The label is read at run time: adding it takes
+    # effect on the next push or re-run (this workflow has no `labeled` trigger). Everything else runs on free `ubuntu-latest`.
+    # Unset var = `ubuntu-latest` everywhere. ONLY this job reads the variable; `test` and every other job stay on
+    # `ubuntu-latest`. Compare runners with `node scripts/ci/shard-runner-compare.mjs`.
+    runs-on: ${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci:priority')) && vars.WE_SHARD_RUNNER || 'ubuntu-latest' }}
     # xd1sfms (#4075/#3383) — LIVE 2026-09-25: PR #2636's `test-shard (1)` (run 36161558017) hung
     # `in_progress` 3h+ while its 3 sibling shards finished in ~90-260s; with no `timeout-minutes` set,
     # GitHub's 360-min job default applied, so a single hung shard blocked the PR for 6 hours. Sized at
