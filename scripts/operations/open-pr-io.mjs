@@ -18,7 +18,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { classifySubmit } from './open-pr.mjs';
+import { classifySubmit, measureNonTestLines, OPEN_PR_MAX_NON_TEST_LINES } from './open-pr.mjs';
 import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
@@ -132,6 +132,12 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
   // a caller that injected `spawn` is a rehearsal/test and writes no shim.
   env: envOpt, resolveEnv = spawn !== spawnSync ? () => process.env : resolveGhCredentialEnv,
   git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
+  diffStat = spawn !== spawnSync ? () => '' : ({ base, sha }) => {
+    if (!base || base.startsWith('-') || !sha || sha.startsWith('-')) throw new Error('invalid diff ref');
+    let ref = base;
+    try { git(['rev-parse', '--verify', '--quiet', `origin/${base}`]); ref = `origin/${base}`; } catch { /* use local base */ }
+    return git(['diff', '--numstat', '--no-renames', `${ref}...${sha}`]);
+  },
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
   dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
 } = {}) {
@@ -160,6 +166,18 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
         catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
       }
       if (gate.action === 'advise') process.stderr.write(`open-pr: advisory — ${gate.message}\n`);
+      if (!gate.bypass) {
+        let size;
+        try { size = measureNonTestLines(diffStat({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD' })); }
+        catch {
+          cleanupBody();
+          return { outcome: 'refused', reason: 'pr-size-unreadable', detail: 'Could not measure the PR diff. Restore readable git numstat evidence and try again.' };
+        }
+        if (size.lines > OPEN_PR_MAX_NON_TEST_LINES && !size.exempt) {
+          cleanupBody();
+          return { outcome: 'refused', reason: 'pr-too-large', detail: `The PR changes ${size.lines} non-test lines, exceeding the ${OPEN_PR_MAX_NON_TEST_LINES} limit. Split the PR into smaller PRs.` };
+        }
+      }
     }
     // xsjn0uf-incident — advisory: a card this PR adds whose bornAs is already on main / in another open PR.
     if (!argv.includes('--dry-run')) {

@@ -47,6 +47,30 @@ export const SUPERSEDES_LINE_GUIDANCE = 'A PR that folds in another open PR\'s f
 
 export const OPEN_PR_OP = 'open-pr';
 
+export const OPEN_PR_MAX_NON_TEST_LINES = 300;
+
+/** Pure git --numstat accounting; unreadable evidence must never become a zero-sized diff. */
+export function measureNonTestLines(numstatText) {
+  if (typeof numstatText !== 'string') throw new Error('numstat must be text');
+  if (!numstatText) return { lines: 0, exempt: false };
+  const rows = numstatText.replace(/\n$/, '').split('\n');
+  let lines = 0;
+  let exempt = true;
+  for (const row of rows) {
+    const match = /^(\d+)\t(\d+)\t([^\t\r\n]+)$/.exec(row);
+    if (!match) throw new Error('unreadable numstat line');
+    const [, additions, deletions, path] = match;
+    const changed = Number(additions) + Number(deletions);
+    if (!Number.isSafeInteger(changed)) throw new Error('numstat count exceeds safe integer range');
+    exempt = exempt && path.startsWith('backlog/');
+    if (!/(^|\/)__tests__\//.test(path) && !/(^|\/)[^/]*\.(test|spec)\.[^/]+$/.test(path)) {
+      lines += changed;
+      if (!Number.isSafeInteger(lines)) throw new Error('numstat total exceeds safe integer range');
+    }
+  }
+  return { lines, exempt };
+}
+
 /** The one effect: hand the planned argv to the home. */
 export const SUBMIT_PR_EFFECT = 'open-pr.submit';
 
