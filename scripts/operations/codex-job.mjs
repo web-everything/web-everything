@@ -6,7 +6,8 @@
  */
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstatSync, readlinkSync, readFileSync, writeFileSync } from 'node:fs';
+import { lstatSync, readlinkSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { laneGitHardeningEnv, hardenLaneGitArgs, LANE_CONFIG_LIST_ARGS, riskyLaneConfig } from '../lib/lane-git-hardening.mjs';
@@ -26,6 +27,8 @@ const defaults = {
   lstat: file => lstatSync(file),
   readlink: file => readlinkSync(file, { encoding: 'buffer' }),
   writeFile: (file, data) => writeFileSync(file, data, { mode: 0o600 }),
+  makeTemp: () => mkdtempSync(path.join(tmpdir(), 'codex-job-publish-')),
+  removeTemp: dir => rmSync(dir, { recursive: true, force: true }),
   now: Date.now,
   log: line => process.stderr.write(`${String(line).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}\n`),
 };
@@ -33,6 +36,7 @@ const fail = (reason, detail) => { throw Object.assign(new Error(reason), { stop
 const output = r => `${r.stdout ?? ''}\n${r.stderr ?? ''}`;
 const good = r => r.status === 0;
 const lines = s => String(s ?? '').split('\n').filter(Boolean);
+const MAX_PATCH_BYTES = 16 * 1024 * 1024;
 
 export function parseArgs(argv) {
   const opts = { base: 'origin/main', waitMs: 7200000, dryRun: false };
@@ -77,12 +81,17 @@ export function pathsWithinScope(files, scopeEntries) {
     return file === scope || (scope.endsWith('/') && file.startsWith(scope));
   }));
 }
+// Inherited repository/index/config selectors must never redirect a trusted command.
+const gitEnv = (session = {}) => laneGitHardeningEnv({
+  ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))),
+  GIT_NO_REPLACE_OBJECTS: '1', ...session,
+});
 const exec = (s, cmd, args, lane = false, session = false, options = {}) => s.io.exec(cmd, args, {
   cwd: lane ? s.lane.path : s.opts.repo,
-  env: laneGitHardeningEnv({ ...process.env, ...(lane ? { GIT_NO_REPLACE_OBJECTS: '1' } : {}), ...(session ? { LANE_SESSION: s.lane.holder } : {}) }),
+  env: gitEnv(session ? { LANE_SESSION: s.lane.holder } : {}),
   ...options,
 });
-const git = async (s, args, session = false) => {
+const git = async (s, args, session = false, options = {}) => {
   // Re-read after every worker/test/audit boundary. Reading config executes no helpers.
   const config = await exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...LANE_CONFIG_LIST_ARGS], true);
   if (!good(config) || typeof config.stdout !== 'string' ||
@@ -93,7 +102,7 @@ const git = async (s, args, session = false) => {
   const hardened = hardenLaneGitArgs(args);
   const missing = hardened.slice(1).filter(a => !args.includes(a));
   const end = args.includes('--') ? args.indexOf('--') : args.length;
-  return exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...args.slice(0, end), ...missing, ...args.slice(end)], true, session);
+  return exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...args.slice(0, end), ...missing, ...args.slice(end)], true, session, options);
 };
 function unsafePublicationConfig(output, originUrl) {
   const parts = output.split('\0');
@@ -103,6 +112,8 @@ function unsafePublicationConfig(output, originUrl) {
     if (/^(?:diff\.ignoresubmodules|submodule\..+\.ignore)$/i.test(key)) return true;
     // Clone fetch refspecs map incoming refs; they cannot redirect publication.
     if (/^remote\..+\.fetch$/i.test(key)) continue;
+    // clone --no-tags persists this restrictive fetch option in the clean clone.
+    if (key === 'remote.origin.tagopt' && entry.slice(newline + 1) === '--no-tags') continue;
     // Inspect every effective scope: even a URL passed literally can be rewritten.
     if (/^(url|remote)\./i.test(key) &&
         !(key === 'remote.origin.url' && newline >= 0 && entry.slice(newline + 1) === originUrl)) return true;
@@ -142,6 +153,18 @@ export async function resetLane(s) {
   const head = await git(s, ['rev-parse', 'HEAD']);
   if (!good(head) || !head.stdout?.trim() || head.stdout.trim() !== s.baseSha) fail('lane-reset-failed');
   s.startSha = head.stdout.trim();
+}
+// Created before running worker-controlled code. Never clone the worker repository:
+// only its scoped binary patch will cross into this independent object database.
+export async function preparePublication(s) {
+  s.publicationRoot = await s.io.makeTemp();
+  s.publisher = { ...s, lane: { ...s.lane, path: path.join(s.publicationRoot, 'checkout') } };
+  const clone = await exec(s, 'git', ['clone', '--no-local', '--no-hardlinks', '--no-tags',
+    '--no-checkout', '--template=', '--', s.originUrl, s.publisher.lane.path], false, false, { timeout: 120000 });
+  if (!good(clone)) fail('commit-failed', 'Cannot create clean publication checkout; retry after checking the trusted origin');
+  if (!good(await git(s.publisher, ['reset', '--hard', s.startSha], true))) {
+    fail('commit-failed', 'Starting commit is unavailable in the clean publication checkout; fetch the base from the trusted origin before retrying');
+  }
 }
 const codexArgs = (s, file, review = false) => ['scripts/codex-direct-task.mjs', ...(review ? ['--review'] : []), `--task-file=${file}`, `--dir=${s.lane.path}`, '--gate=none', '--no-stream', '--json'];
 async function codex(s, file, review = false) {
@@ -213,7 +236,7 @@ export async function checkDiffScope(s) {
   s.auditUntracked = untracked;
   s.auditFingerprint = await worktreeFingerprint(s, untracked, 'diff-out-of-scope');
 }
-const heavyPath = s => path.resolve(s.lane.path, 'scripts/readiness/heavy-admission.mjs');
+const heavyPath = s => path.resolve(s.opts.repo, 'scripts/readiness/heavy-admission.mjs');
 const testArgs = s => [heavyPath(s), 'run', `--wait-ms=${s.opts.waitMs}`, '--', 'npx', 'vitest', 'run', ...s.opts.tests];
 // Keep generated task files outside the worktree, while staying inside the owned lane.
 const taskPath = (s, kind) => path.join(s.lane.path, '.git', `codex-job-${s.opts.purpose}-${s.io.now()}-${kind}.md`);
@@ -300,43 +323,59 @@ export async function commitAndPush(s) {
   await checkAuditedFiles(s);
   const tree = await git(s, ['write-tree']);
   if (!good(tree) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})\n?$/.test(tree.stdout ?? '')) fail('commit-failed', 'Cannot snapshot the audited index');
-  if (!good(await git(s, ['commit', '-m', title, '-m', 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>'], true))) fail('commit-failed');
-  const parent = await git(s, ['rev-parse', 'HEAD^']);
-  const count = await git(s, ['rev-list', '--count', `${s.startSha}..HEAD`]);
+  const patch = await git(s, ['diff', '--cached', '--binary', '--full-index', '--no-renames',
+    '--ignore-submodules=none', s.startSha, '--', ...s.files.map(file => `:(top,literal)${file}`)], false,
+    { maxBuffer: MAX_PATCH_BYTES, timeout: 120000 });
+  if (!good(patch) || typeof patch.stdout !== 'string' || !patch.stdout.length || Buffer.byteLength(patch.stdout) > MAX_PATCH_BYTES) {
+    fail('commit-failed', 'Cannot export the complete allowed-file patch within 16 MiB; inspect or split the scoped change before retrying');
+  }
+  await checkAuditedFiles(s);
+  const publisher = s.publisher;
+  if (!publisher || !good(await git(publisher, ['apply', '--index', '--binary', '--whitespace=nowarn', '-'], true,
+    { input: patch.stdout, timeout: 120000 }))) {
+    fail('commit-failed', 'Cannot apply the allowed-file patch to the clean checkout; inspect the patch before retrying');
+  }
+  const appliedTree = await git(publisher, ['write-tree']);
+  if (!good(appliedTree) || appliedTree.stdout?.trim() !== tree.stdout.trim()) {
+    fail('changed-after-audit', 'Clean checkout tree differs from the audited snapshot; inspect the exported patch before retrying');
+  }
+  if (!good(await git(publisher, ['commit', '-m', title, '-m', 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>'], true))) fail('commit-failed');
+  const parent = await git(publisher, ['rev-parse', 'HEAD^']);
+  const count = await git(publisher, ['rev-list', '--count', `${s.startSha}..HEAD`]);
   if (!good(parent) || parent.stdout?.trim() !== s.startSha || !good(count) || count.stdout?.trim() !== '1') {
     fail('changed-after-audit', 'Published history must contain exactly one commit on the starting commit; inspect the local history before retrying');
   }
-  const sha = await git(s, ['rev-parse', 'HEAD']);
+  const sha = await git(publisher, ['rev-parse', 'HEAD']);
   if (!good(sha) || !sha.stdout?.trim()) fail('commit-failed');
   s.result.sha = sha.stdout.trim();
   // HEAD can move between subprocesses; also bind ancestry to the SHA we publish.
-  const pinnedParent = await git(s, ['rev-parse', `${s.result.sha}^`]);
-  const pinnedCount = await git(s, ['rev-list', '--count', `${s.startSha}..${s.result.sha}`]);
+  const pinnedParent = await git(publisher, ['rev-parse', `${s.result.sha}^`]);
+  const pinnedCount = await git(publisher, ['rev-list', '--count', `${s.startSha}..${s.result.sha}`]);
   if (!good(pinnedParent) || pinnedParent.stdout?.trim() !== s.startSha || !good(pinnedCount) || pinnedCount.stdout?.trim() !== '1') {
     fail('changed-after-audit', 'Publication SHA has unexpected ancestry; inspect the local history before retrying');
   }
   // Hooks or another writer may have replaced the index during commit. Check the
   // immutable committed tree, including added paths, modes, deletions and link blobs.
-  const committedTree = await git(s, ['rev-parse', `${s.result.sha}^{tree}`]);
+  const committedTree = await git(publisher, ['rev-parse', `${s.result.sha}^{tree}`]);
   if (!good(committedTree) || committedTree.stdout?.trim() !== tree.stdout.trim()) {
     fail('changed-after-audit', 'Committed tree differs from the audited index; inspect the local commit before retrying');
   }
   let branch;
   for (let n = 1; n <= 9; n++) {
     const name = `lane/${s.opts.purpose}${n === 1 ? '' : `-${n}`}`;
-    const r = await git(s, ['ls-remote', '--heads', s.originUrl, name]);
+    const r = await git(publisher, ['ls-remote', '--heads', s.originUrl, name]);
     if (!good(r)) fail('push-failed', 'Cannot check remote branch');
     if (!r.stdout?.trim()) { branch = name; break; }
   }
   if (!branch) fail('branch-name-exhausted');
   s.result.branch = branch;
-  if (!good(await git(s, ['push', s.originUrl, `${s.result.sha}:refs/heads/${branch}`], true))) fail('push-failed');
+  if (!good(await git(publisher, ['push', '--no-follow-tags', s.originUrl, `${s.result.sha}:refs/heads/${branch}`], true))) fail('push-failed');
 }
 export async function markReady(s) {
-  try { await s.io.readFile(path.join(s.lane.path, 'scripts/fix-ready.mjs')); }
+  try { await s.io.readFile(path.join(s.opts.repo, 'scripts/fix-ready.mjs')); }
   catch (error) { if (error.code !== 'ENOENT') { s.result.ready = 'failed'; s.io.log('fix-ready unreadable'); return; } s.result.ready = 'skipped'; return; }
   try {
-    const r = await exec(s, 'node', ['scripts/fix-ready.mjs', 'mark', `--branch=${s.result.branch}`, `--sha=${s.result.sha}`], true);
+    const r = await exec(s, 'node', ['scripts/fix-ready.mjs', 'mark', `--branch=${s.result.branch}`, `--sha=${s.result.sha}`]);
     s.result.ready = good(r) ? 'marked' : 'failed';
   } catch { s.result.ready = 'failed'; }
   if (s.result.ready === 'failed') s.io.log('fix-ready mark failed');
@@ -362,6 +401,10 @@ export async function registerEdge(s) {
   if (!good(r)) fail('register-failed', (r.stdout ?? '').slice(-6000));
 }
 export async function releaseResources(s) {
+  if (s.publicationRoot) {
+    try { await s.io.removeTemp(s.publicationRoot); }
+    catch { (s.result.releaseWarning ??= []).push('publication checkout cleanup failed'); }
+  }
   const jobs = [];
   if (s.lane?.lane != null && s.lane?.holder) jobs.push(['lane', ['scripts/lane-pool.mjs', 'release', `--lane=${s.lane.lane}`, `--session=${s.lane.holder}`]]);
   if (s.scopeRegistered) jobs.push(['scope', ['scripts/operations/free-scope-cli.mjs', 'release', ...scopeArgs(s)]]);
@@ -374,6 +417,7 @@ export async function releaseResources(s) {
 function plan(s) {
   const show = (cmd, args) => [cmd, ...args].map(a => JSON.stringify(a)).join(' ');
   return [show('node', codexArgs(s, s.opts.brief)), show('node', testArgs(s)),
+    'Before Codex: clone the trusted origin without tags into a private clean checkout at the pinned starting commit',
     'On test failure: write repair brief, run Codex, check diff scope, run tests once more',
     'Recheck changed and untracked file scope after tests',
     show('node', codexArgs(s, '<audit-task-file>', true)),
@@ -383,10 +427,11 @@ function plan(s) {
     'git diff --cached --name-only --no-renames --ignore-submodules=none -z (require scoped paths to match the audited file list)',
     'git diff --quiet --exit-code --no-ext-diff --no-textconv --ignore-submodules=none -- (require the complete index to match the worktree)',
     'Recheck audited file list and content fingerprint immediately before commit',
+    'Export a binary full-index patch of only literal allowed paths; apply --index in the clean checkout and compare its tree with the audited snapshot',
     'git commit -m <brief title> -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"',
     'Verify exactly one commit on the starting commit and committed tree equals the audited index snapshot before publishing its pinned SHA',
     `${show('git', ['ls-remote', '--heads', s.originUrl])} <branch> (try suffixes -2 through -9 if occupied)`,
-    show('git', ['push', s.originUrl, `<checked-sha>:refs/heads/${s.result.branch}`]),
+    show('git', ['push', '--no-follow-tags', s.originUrl, `<checked-sha>:refs/heads/${s.result.branch}`]),
     'node scripts/fix-ready.mjs mark --branch=<branch> --sha=<sha> (if present)',
     ...(s.opts.edgeClone ? [show('node', prototypeLoadArgs(s))] : [])];
 }
@@ -394,7 +439,7 @@ export async function runJob(opts, io = {}) {
   const s = { claimId: `codex-job-${randomUUID()}`, opts: { ...opts }, io: { ...defaults, ...io }, result: { ok: false, branch: opts.purpose ? `lane/${opts.purpose}` : null, sha: null, tests: null, audit: null, registered: opts.edgeClone ? false : null, stopReason: null } };
   try {
     if (!s.opts.repo) {
-      const r = await s.io.exec('git', ['rev-parse', '--show-toplevel'], { env: laneGitHardeningEnv() });
+      const r = await s.io.exec('git', ['rev-parse', '--show-toplevel'], { env: gitEnv() });
       if (!good(r) || !r.stdout?.trim()) fail('bad-args', 'Cannot resolve repository');
       s.opts.repo = r.stdout.trim();
     }
@@ -404,6 +449,7 @@ export async function runJob(opts, io = {}) {
     await checkFreeScope(s); await acquireLane(s); await resetLane(s);
     if (s.opts.dryRun) { s.result.dryRun = true; s.result.plan = plan(s); }
     else {
+      await preparePublication(s);
       await runCodex(s); await checkDiffScope(s); await runTests(s);
       // Tests and their subprocesses can write files and stage changes too.
       await checkDiffScope(s);

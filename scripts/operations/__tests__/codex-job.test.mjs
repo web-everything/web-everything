@@ -4,7 +4,7 @@
  */
 import { it, expect } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, lstatSync, readlinkSync, readFileSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, resetLane, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
@@ -18,7 +18,7 @@ const loaderHelp = '--branch= --sha= --daemon= --why= --tests-run= --audit= --js
 const originUrl = 'https://github.com/example/trusted.git';
 const laneConfig = `local\0remote.origin.url\n${originUrl}\0local\0remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0local\0remote.origin.fetch\n^refs/heads/ops/*\0`;
 function fixture(rules = [], { ready = true } = {}) {
-  const calls = [], writes = [], logs = [], output = [];
+  const calls = [], writes = [], logs = [], output = [], removed = [];
   const counts = new Map();
   const io = {
     exec: async (cmd, args, options) => {
@@ -48,7 +48,7 @@ function fixture(rules = [], { ready = true } = {}) {
         if (args.includes('--binary')) return ok('audited binary diff');
         if (args.includes('hash-object')) return ok(args.slice(args.indexOf('--') + 1).map(() => 'a'.repeat(40) + '\n').join(''));
         if (args.includes('diff')) return ok('scripts/a.mjs\0');
-        if (['reset', 'ls-files', 'add', 'commit', 'ls-remote', 'push'].some(x => args.includes(x))) return ok();
+        if (['clone', 'apply', 'reset', 'ls-files', 'add', 'commit', 'ls-remote', 'push'].some(x => args.includes(x))) return ok();
       }
       throw new Error(`Unscripted command: ${call.text}`);
     },
@@ -62,6 +62,8 @@ function fixture(rules = [], { ready = true } = {}) {
       throw new Error(`Unexpected read ${file}`);
     },
     writeFile: async (file, data) => { writes.push({ file, data }); },
+    makeTemp: () => '/publication',
+    removeTemp: dir => { removed.push(dir); },
     now: () => 1234,
     log: line => logs.push(line),
     stdout: { write: line => output.push(line) },
@@ -70,7 +72,7 @@ function fixture(rules = [], { ready = true } = {}) {
     const code = await main([...flags, ...extra], io);
     return { code, result: JSON.parse(output.at(-1)) };
   };
-  return { io, calls, writes, logs, output, run };
+  return { io, calls, writes, logs, output, removed, run };
 }
 const released = f => expect(f.calls.some(c => c.text.includes('lane-pool.mjs release --lane=4 --session=session'))).toBe(true);
 const scopeReleased = f => {
@@ -79,6 +81,85 @@ const scopeReleased = f => {
   expect(f.calls.find(c => c.text.includes('free-scope-cli.mjs release')).args.slice(2)).toEqual(claim.args.slice(2, 4));
 };
 const codexCalls = f => f.calls.filter(c => c.text.includes('codex-direct-task.mjs') && !c.args.includes('--review'));
+
+it('publishes only an allowed-file patch from a clean checkout with tag following disabled', async () => {
+  const f = fixture([['config --show-scope', call => ok(`${laneConfig}local\0push.followTags\ntrue\0${call.cwd === '/publication/checkout' ? 'local\0remote.origin.tagopt\n--no-tags\0' : ''}`)]]);
+  expect((await f.run()).result.ok).toBe(true);
+  const push = f.calls.find(c => c.args.includes('push'));
+  expect(push.args).toContain('--no-follow-tags');
+  expect(push.cwd).not.toBe('/lane');
+  const clone = f.calls.find(c => c.args.includes('clone'));
+  expect(clone).toBeDefined();
+  expect(f.calls.indexOf(clone)).toBeLessThan(f.calls.indexOf(codexCalls(f)[0]));
+  const patch = f.calls.find(c => c.args.includes('--full-index'));
+  expect(patch.args).toContain('--cached');
+  expect(patch.args.slice(patch.args.indexOf('--') + 1)).toEqual([':(top,literal)scripts/a.mjs']);
+  const apply = f.calls.find(c => c.args.includes('apply'));
+  expect(apply.cwd).toBe(push.cwd);
+  expect(apply.input).toBe('audited binary diff');
+  expect(apply.args).toContain('--index');
+  expect(f.calls.find(c => c.args.includes('commit')).cwd).toBe(push.cwd);
+  expect(clone.args).toEqual(['clone', '--no-local', '--no-hardlinks', '--no-tags',
+    '--no-checkout', '--template=', '--', originUrl, '/publication/checkout']);
+  expect(f.removed).toEqual(['/publication']);
+});
+
+it.each(['clone', 'apply'])('refuses failed %s and cleans the publication checkout without pushing', async command => {
+  const f = fixture([[`git ${command}`, red()], [`--no-replace-objects ${command}`, red()]]);
+  expect((await f.run()).result.stopReason).toBe('commit-failed');
+  expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
+  expect(f.removed).toEqual(['/publication']);
+  released(f); scopeReleased(f);
+});
+
+it.each([red(), { status: 0 }, ok('')])('refuses missing or unreadable exported patch (%j)', async response => {
+  const f = fixture([['--full-index', response]]);
+  expect((await f.run()).result.stopReason).toBe('commit-failed');
+  expect(f.calls.some(c => c.args.includes('apply') || c.args.includes('push'))).toBe(false);
+  expect(f.removed).toEqual(['/publication']);
+});
+
+it('refuses oversized patches with an explicit split-change fallback', async () => {
+  const f = fixture([['--full-index', ok('x'.repeat(16 * 1024 * 1024 + 1))]]);
+  const { result } = await f.run();
+  expect(result.stopReason).toBe('commit-failed');
+  expect(result.detail).toContain('inspect or split the scoped change');
+  expect(f.calls.some(c => c.args.includes('apply') || c.args.includes('push'))).toBe(false);
+  expect(f.removed).toEqual(['/publication']);
+});
+
+it('uses trusted admission and ready-marking scripts outside the worker checkout', async () => {
+  const f = fixture();
+  expect((await f.run()).result.ok).toBe(true);
+  expect(f.calls.find(c => c.text.includes('heavy-admission')).args[0]).toBe('/repo/scripts/readiness/heavy-admission.mjs');
+  const ready = f.calls.find(c => c.text.includes('fix-ready.mjs'));
+  expect(ready.cwd).toBe('/repo');
+});
+
+it.each([red(), { status: 0 }, ok('b'.repeat(40) + '\n')])('refuses a clean applied tree that does not match the audited tree (%j)', async response => {
+  const f = fixture([['write-tree', call => call.cwd === '/lane' ? ok('a'.repeat(40) + '\n') : response]]);
+  expect((await f.run()).result.stopReason).toBe('changed-after-audit');
+  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+  expect(f.removed).toEqual(['/publication']);
+});
+
+it('strips inherited repository, index, object and config selectors from every subprocess', async () => {
+  const names = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG_PARAMETERS',
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
+  const saved = names.map(name => process.env[name]);
+  try {
+    for (const name of names) process.env[name] = 'worker-controlled';
+    const f = fixture();
+    expect((await f.run()).result.ok).toBe(true);
+    for (const call of f.calls) {
+      for (const name of names) expect(call.env[name]).not.toBe('worker-controlled');
+      expect(call.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+    }
+  } finally {
+    names.forEach((name, i) => { if (saved[i] === undefined) delete process.env[name]; else process.env[name] = saved[i]; });
+  }
+});
 
 it('forces submodule visibility in every diff, including the complete-index comparison', async () => {
   const f = fixture();
@@ -142,7 +223,7 @@ it.each([
 
 it('refuses extra ancestors when HEAD changes after the post-commit history checks', async () => {
   const f = fixture([
-    ['rev-parse HEAD', (call, n) => call.args.includes('HEAD^') || n < 3 ? ok('abc123\n') : ok('worker-tip\n')],
+    ['rev-parse HEAD', call => call.cwd === '/publication/checkout' && call.args.includes('HEAD') ? ok('worker-tip\n') : ok('abc123\n')],
     ['rev-parse worker-tip^', ok('abc123\n')],
     ['rev-list --count abc123..worker-tip', ok('2\n')],
   ]);
@@ -176,9 +257,10 @@ it.each([red(), { status: 0 }, ok('')])('refuses unresolved base commits before 
   expect(f.calls.some(c => c.args.includes('reset') || c.args.includes('push'))).toBe(false);
 });
 
-// Publication effects remain intercepted; only the disposable repository uses real Git.
-async function withPublicationRepo(run) {
+// Network effects remain intercepted; real Git only touches disposable repositories.
+async function withPublicationRepo(run, seed = () => {}) {
   const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-publication-'));
+  const publication = mkdtempSync(path.join(tmpdir(), 'codex-job-clean-'));
   const gitEnv = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
     GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test',
     GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test' };
@@ -195,21 +277,99 @@ async function withPublicationRepo(run) {
     git(['config', 'remote.origin.url', originUrl]);
     mkdirSync(path.join(repo, 'scripts'));
     writeFileSync(path.join(repo, 'scripts/a.mjs'), 'original\n');
-    git(['add', '--', 'scripts/a.mjs']);
+    seed(repo);
+    git(['add', '--', 'scripts']);
     const startSha = commit('baseline');
     git(['update-ref', 'refs/remotes/origin/main', startSha]);
     const f = fixture([['lane-pool.mjs acquire', ok(JSON.stringify({ lane: 4, path: repo, holder: 'session' }))]]);
+    f.io.makeTemp = () => publication;
+    f.io.removeTemp = () => {}; // Keep the clean checkout available for assertions until finally.
     const exec = f.io.exec;
     f.io.exec = async (cmd, args, options) => {
       const scripted = await exec(cmd, args, options);
       if (cmd !== 'git' || args.includes('ls-remote') || args.includes('push')) return scripted;
-      return spawnSync(cmd, ['-C', repo, ...args.slice(2)], {
-        ...options, cwd: repo, encoding: 'utf8', env: { ...options.env, ...gitEnv },
+      const realArgs = args.includes('clone') ? args.map(arg => arg === originUrl ? repo : arg)
+        : args.map(arg => arg === '/repo' ? repo : arg);
+      const result = spawnSync(cmd, realArgs, {
+        ...options, cwd: options.cwd === '/repo' ? repo : options.cwd, encoding: 'utf8', env: { ...options.env, ...gitEnv },
       });
+      if (args.includes('clone') && result.status === 0) {
+        execFileSync('git', ['-C', path.join(publication, 'checkout'), 'remote', 'set-url', 'origin', originUrl], { env: { ...process.env, ...gitEnv } });
+      }
+      return result;
     };
-    await run({ repo, git, commit, startSha, f });
-  } finally { rmSync(repo, { recursive: true, force: true }); }
+    await run({ repo, publication, git, commit, startSha, f });
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(publication, { recursive: true, force: true });
+  }
 }
+
+it('publishes one clean commit and no unaudited tags with push.followTags enabled (real Git)', async () => {
+  await withPublicationRepo(async ({ repo, publication, git, startSha, f }) => {
+    const remote = path.join(publication, 'receiver.git');
+    execFileSync('git', ['init', '--bare', '--quiet', '--template=', remote]);
+    const exec = f.io.exec;
+    f.io.exec = async (cmd, args, options) => {
+      if (args[0] === 'scripts/codex-direct-task.mjs' && !args.includes('--review')) {
+        writeFileSync(path.join(repo, 'scripts/a.mjs'), 'scoped edit\n');
+        git(['config', 'push.followTags', 'true']);
+        git(['tag', '-a', 'worker-secret-tag', '-m', 'unaudited message', startSha]);
+      }
+      const result = await exec(cmd, args, options);
+      if (cmd === 'git' && args.includes('push')) {
+        const clean = path.join(publication, 'checkout');
+        expect(options.cwd).toBe(clean);
+        expect(execFileSync('git', ['-C', clean, 'tag', '--list'], { encoding: 'utf8' })).toBe('');
+        // Even a reachable tag in the publisher must not ride along with this branch.
+        const env = { ...options.env, GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test' };
+        execFileSync('git', ['-C', clean, 'config', 'push.followTags', 'true'], { env });
+        execFileSync('git', ['-C', clean, 'tag', '-a', 'publisher-tag', '-m', 'not audited', startSha], { env });
+        return spawnSync(cmd, args.map(arg => arg === originUrl ? remote : arg), { ...options, encoding: 'utf8' });
+      }
+      return result;
+    };
+    const { result } = await f.run();
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    const remoteGit = args => execFileSync('git', ['--git-dir', remote, ...args], { encoding: 'utf8' });
+    expect(remoteGit(['for-each-ref', '--format=%(refname)'])).toBe('refs/heads/lane/example\n');
+    expect(remoteGit(['rev-parse', `${result.sha}^`]).trim()).toBe(startSha);
+    expect(remoteGit(['show', `${result.sha}:scripts/a.mjs`])).toBe('scoped edit\n');
+    expect(git(['rev-parse', 'HEAD']).trim()).toBe(startSha);
+  });
+});
+
+it('transfers binary files, deletions, literal names, symlinks and executable modes in the allowed patch (real Git)', async () => {
+  const binary = Buffer.from([0, 255, 128, 1, 10]);
+  await withPublicationRepo(async ({ repo, publication, f }) => {
+    const exec = f.io.exec;
+    f.io.lstat = lstatSync;
+    f.io.readlink = file => readlinkSync(file, { encoding: 'buffer' });
+    f.io.exec = async (cmd, args, options) => {
+      if (args[0] === 'scripts/codex-direct-task.mjs' && !args.includes('--review')) {
+        writeFileSync(path.join(repo, 'scripts/a.mjs'), 'scoped edit\n');
+        writeFileSync(path.join(repo, 'scripts/lib/binary'), binary);
+        writeFileSync(path.join(repo, 'scripts/lib/[literal].mjs'), 'literal name\n');
+        rmSync(path.join(repo, 'scripts/lib/deleted'));
+        chmodSync(path.join(repo, 'scripts/lib/executable'), 0o755);
+        symlinkSync('missing-target', path.join(repo, 'scripts/lib/link'));
+      }
+      return exec(cmd, args, options);
+    };
+    const { result } = await f.run();
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    const clean = path.join(publication, 'checkout');
+    expect(readFileSync(path.join(clean, 'scripts/lib/binary'))).toEqual(binary);
+    expect(readFileSync(path.join(clean, 'scripts/lib/[literal].mjs'), 'utf8')).toBe('literal name\n');
+    expect(() => lstatSync(path.join(clean, 'scripts/lib/deleted'))).toThrow();
+    expect(lstatSync(path.join(clean, 'scripts/lib/executable')).mode & 0o100).toBe(0o100);
+    expect(readlinkSync(path.join(clean, 'scripts/lib/link'))).toBe('missing-target');
+  }, repo => {
+    mkdirSync(path.join(repo, 'scripts/lib'));
+    writeFileSync(path.join(repo, 'scripts/lib/deleted'), 'remove me\n');
+    writeFileSync(path.join(repo, 'scripts/lib/executable'), 'executable\n', { mode: 0o644 });
+  });
+});
 
 it('refuses a worker-hidden out-of-scope gitlink and never pushes (real Git)', async () => {
   await withPublicationRepo(async ({ repo, git, startSha, f }) => {
@@ -560,7 +720,7 @@ it('publishes the checked commit SHA when HEAD moves during remote branch select
   let head = 'abc123', published;
   const f = fixture([
     ['ls-remote', () => { head = 'different-commit'; return ok(); }],
-    [`push ${originUrl}`, call => {
+    [`push --no-follow-tags ${originUrl}`, call => {
       const source = call.args.at(-1).split(':')[0];
       published = source === 'HEAD' ? head : source;
       return ok();
@@ -599,14 +759,18 @@ it('happy path orders gates, captures one JSON line, uses session env and releas
   expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1);
   expect(f.output).toHaveLength(1);
   expect(f.output[0].split('\n')).toHaveLength(2);
-  const expected = ['scripts/operations/run.mjs prototype-load --help', 'free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'remote get-url origin', 'rev-parse --verify origin/main^{commit}', 'reset --hard', 'rev-parse HEAD', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'diff --binary', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'diff --binary', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'diff --binary', 'add --', 'rev-parse HEAD', 'ls-files --stage -z', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --ignore-submodules=none --', 'diff --name-only', 'ls-files', 'diff --binary', 'write-tree', 'commit -m', 'rev-parse HEAD^', 'rev-list --count abc123..HEAD', 'rev-parse HEAD', 'rev-parse abc123^', 'rev-list --count abc123..abc123', 'rev-parse abc123^{tree}', 'ls-remote', `push ${originUrl}`, 'fix-ready.mjs mark', 'scripts/operations/run.mjs prototype-load', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
+  const expected = ['scripts/operations/run.mjs prototype-load --help', 'free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'remote get-url origin', 'rev-parse --verify origin/main^{commit}', 'reset --hard', 'rev-parse HEAD',
+    'git clone --no-local --no-hardlinks --no-tags --no-checkout --template=', 'reset --hard',
+    'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'diff --binary', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'diff --binary', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'diff --binary', 'add --', 'rev-parse HEAD', 'ls-files --stage -z', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --ignore-submodules=none --', 'diff --name-only', 'ls-files', 'diff --binary', 'write-tree',
+    'diff --cached --binary --full-index', 'diff --name-only', 'ls-files', 'diff --binary', 'apply --index --binary', 'write-tree',
+    'commit -m', 'rev-parse HEAD^', 'rev-list --count abc123..HEAD', 'rev-parse HEAD', 'rev-parse abc123^', 'rev-list --count abc123..abc123', 'rev-parse abc123^{tree}', 'ls-remote', `push --no-follow-tags ${originUrl}`, 'fix-ready.mjs mark', 'scripts/operations/run.mjs prototype-load', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
   const commands = f.calls.filter(c => !(c.cmd === 'git' && c.args.includes('config')));
   expect(commands).toHaveLength(expected.length);
   expected.forEach((part, i) => expect(commands[i].text).toContain(part));
   expect(f.calls.every(c => c.args.every(a => !a.includes('--force') && !a.includes('--allow-conflict')))).toBe(true);
   expect(f.calls.some(c => c.args.includes('checkout'))).toBe(false);
   for (const part of ['reset --hard', 'commit -m']) expect(f.calls.find(c => c.text.includes(part)).env.LANE_SESSION).toBe('session');
-  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/lane', '--no-replace-objects', 'push', originUrl, 'abc123:refs/heads/lane/example']);
+  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/publication/checkout', '--no-replace-objects', 'push', '--no-follow-tags', originUrl, 'abc123:refs/heads/lane/example']);
   const add = f.calls.find(c => c.args.includes('add') && c.cmd === 'git');
   expect(add.args).toEqual(['-C', '/lane', '--no-replace-objects', 'add', '--', 'scripts/a.mjs']);
   expect(f.calls.find(c => c.args.includes('commit')).args).toContain('Build the example');
@@ -657,7 +821,7 @@ const failures = [
   ['audit-weakened', 40, [['codex-direct-task.mjs --review', report({ lastMessage: 'WEAKENED: deleted guard' })]], true],
   ['audit-failed', 41, [['codex-direct-task.mjs --review', red()]], true],
   ['commit-failed', 50, [['commit -m', red()]], true],
-  ['push-failed', 51, [[`push ${originUrl}`, red()]], true],
+  ['push-failed', 51, [[`push --no-follow-tags ${originUrl}`, red()]], true],
   ['branch-name-exhausted', 52, [['ls-remote', ok('abc refs/heads/occupied')]], true],
   ['register-failed', 60, [['scripts/operations/run.mjs prototype-load', c => c.args.includes('--help') ? ok(loaderHelp) : red('overlay conflict')]], true],
   ['internal-error', 99, [['diff --name-only', () => { throw new Error('boom'); }]], true],
@@ -880,7 +1044,7 @@ it.each([
       if (cmd === 'git' && ['diff', 'ls-files', 'hash-object', 'add'].some(v => args.includes(v))) {
         await exec(cmd, args, options);
         const realArgs = args.slice(2).map(v => v === 'abc123' ? (untracked ? emptyTree : baseline) : v);
-        if (realArgs.includes('--cached')) realArgs.push(untracked ? emptyTree : baseline);
+        if (realArgs.includes('--cached') && !realArgs.includes('--full-index')) realArgs.push(untracked ? emptyTree : baseline);
         try { return ok(git(realArgs)); }
         catch (error) { return { status: error.status, stdout: error.stdout, stderr: error.stderr }; }
       }
@@ -1088,7 +1252,7 @@ it('uses branch suffix -2 on collision and never forces the push', async () => {
   const f = fixture([['ls-remote', (_, n) => n ? ok() : ok('existing')]]);
   const { result } = await f.run(['--edge-clone=/edge']);
   expect(result.branch).toBe('lane/example-2');
-  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/lane', '--no-replace-objects', 'push', originUrl, 'abc123:refs/heads/lane/example-2']);
+  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/publication/checkout', '--no-replace-objects', 'push', '--no-follow-tags', originUrl, 'abc123:refs/heads/lane/example-2']);
   expect(f.calls.find(c => c.text.includes('run.mjs prototype-load') && !c.args.includes('--help')).args).toContain('--branch=lane/example-2');
 });
 it('skips missing fix-ready and omits prototype-load without edge-clone', async () => {
@@ -1116,6 +1280,24 @@ it('release failures warn without changing success or blocking other cleanup', a
   const { result } = await f.run();
   expect(result.ok).toBe(true); expect(result.stopReason).toBeNull();
   expect(result.releaseWarning).toEqual(['lane release failed', 'scope release failed']); scopeReleased(f);
+});
+it('continues lane and scope release when clean publication checkout cleanup fails', async () => {
+  const f = fixture();
+  f.io.removeTemp = () => { throw new Error('cleanup failed'); };
+  const { result } = await f.run();
+  expect(result.ok).toBe(true);
+  expect(result.releaseWarning).toEqual(['publication checkout cleanup failed']);
+  released(f); scopeReleased(f);
+});
+it('refuses an unavailable base in the clean checkout before running the worker', async () => {
+  const f = fixture([['reset --hard', call => call.cwd === '/publication/checkout' ? red() : ok()]]);
+  const { result } = await f.run();
+  expect(result.stopReason).toBe('commit-failed');
+  expect(result.detail).toContain('Starting commit is unavailable');
+  expect(codexCalls(f)).toHaveLength(0);
+  expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
+  expect(f.removed).toEqual(['/publication']);
+  released(f); scopeReleased(f);
 });
 it('register refusal releases a potentially written scope entry', async () => {
   const f = fixture([['free-scope-cli.mjs register', red()]]); const { result } = await f.run();
@@ -1151,7 +1333,7 @@ it('includes untracked paths and safely stages filenames as literal argv', async
   expect((await f.run()).result.ok).toBe(true);
   expect(f.calls.find(c => c.cmd === 'git' && c.args.includes('add')).args).toContain('scripts/lib/$(touch secret).mjs');
 });
-it('resolves repo from git when omitted and uses the fixed lane heavy path and explicit wait setting', async () => {
+it('resolves repo from git when omitted and uses the trusted heavy path and explicit wait setting', async () => {
   const f = fixture();
   const code = await main([...flags.filter(x => !x.startsWith('--repo=')), '--wait-ms=42'], f.io);
   expect(code).toBe(0);
@@ -1160,7 +1342,7 @@ it('resolves repo from git when omitted and uses the fixed lane heavy path and e
   expect(await main([...flags, '--wait-ms=42'], g.io)).toBe(0);
   for (const job of [f, g]) {
     expect(job.calls.find(c => c.text.includes('heavy-admission')).args).toEqual([
-      '/lane/scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=42', '--',
+      '/repo/scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=42', '--',
       'npx', 'vitest', 'run', 'scripts/a.test.mjs',
     ]);
   }
