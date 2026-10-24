@@ -67,7 +67,7 @@ function fixture(options = {}) {
         if (options.checkRaw) return options.checkRaw;
         if (options.unverifiable === ref) return fail(1, JSON.stringify({ check: { ok: false } }));
         const clean = !(options.conflicts || []).includes(ref);
-        const data = JSON.stringify({ check: { ok: true, clean, candSha: remoteTip, ...(clean ? {} : { files: ['x'], conflicting: [{ ref: 'lane/other' }] }) }, wouldRegister: clean });
+        const data = JSON.stringify({ check: { ok: true, clean, candSha: remoteTip, ...(clean ? {} : { files: options.checkFiles?.[ref] ?? ['x'], conflicting: [{ ref: 'lane/other' }] }) }, wouldRegister: clean });
         if (options.advanceAfterCheck && ref === (options.behind ? 'lane/new-m1' : BASE.branch)) remoteTip = TREE;
         return clean ? data : fail(3, data);
       }
@@ -117,6 +117,12 @@ function fixture(options = {}) {
       return options.tip || remoteTip;
     }
     if (args[0] === 'diff') return args.at(-1).startsWith('origin/main...') ? 'M\0x\0' : options.diff ?? 'M\0x\0';
+    if (args[0] === 'cherry') {
+      expect(args.slice(1, 2)).toEqual(['origin/main']);
+      const ref = args[2]?.replace(/^origin\//, '');
+      expect(registrations.has(ref)).toBe(true);
+      return options.cherry?.[ref] ?? `+ ${SHA}\n`;
+    }
     if (args[0] === 'merge-base') {
       if (args[2] === 'origin/main') return options.behind ? fail(1) : '';
       if (args[2] === TREE) return options.advancedContained ? '' : fail(1);
@@ -190,7 +196,68 @@ describe('prototype-load', () => {
     const f = fixture({ behind: true, diff: 'M\0x\0D\0main-fix\0' }); const r = await f.run(); expect(r.stopReason).toBe('reverts-main'); expect(r.offendingPaths).toEqual(['main-fix']); expect(f.calls.some((c) => c.cmd === 'node' || c.args[0] === 'push')).toBe(false);
   });
   it.each([false, true])('stale-registration names blocker and stops before add (candidate conflict: %s)', async (candidateConflict) => {
-    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old', ...(candidateConflict ? [BASE.branch] : [])] }); const r = await f.run(); expect(r.stopReason).toBe('stale-registration'); expect(r.message).toBe('stale-registration: lane/old'); expect(mutations(f, 'add')).toHaveLength(0);
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old', ...(candidateConflict ? [BASE.branch] : [])] }); const r = await f.run(); expect(r.stopReason).toBe('stale-registration'); expect(r.message).toBe(`stale-registration: lane/old (${candidateConflict ? 'candidate-not-clean' : 'overlap-with-candidate: x'})`); expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('tolerates a pre-existing stale ref when the candidate is clean and file-disjoint', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] } });
+    const r = await f.run();
+    expect(r.check).toMatchObject({ ok: true, clean: true });
+    expect(r.mainCheck.effectivePaths).toEqual(['x']);
+    expect(r.staleChecks['lane/old']).toMatchObject({ ok: true, clean: false, files: ['old-only.mjs'] });
+    expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, stale: ['lane/old'], contained: [] });
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: false, why: expect.stringMatching(/\S/) }]);
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ ok: true, staleTolerated: r.staleTolerated });
+  });
+  it('refuses a stale ref whose changed files overlap the candidate files', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs', 'x'] } });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x' } });
+    expect(r.message).toMatch(/^stale-registration: lane\/old/);
+    expect(r.message).toContain('overlap-with-candidate: x');
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it('refuses a stale ref when the candidate is not clean', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old', BASE.branch], checkFiles: { 'lane/old': ['old-only.mjs'] } });
+    const r = await f.run();
+    expect(r.check).toMatchObject({ ok: true, clean: false });
+    expect(r.ok).toBe(false);
+    expect(['stale-registration', 'check-conflict']).toContain(r.stopReason);
+    expect(r.blockingReasons).toEqual({ 'lane/old': 'candidate-not-clean' });
+    expect(r.message).toMatch(/^stale-registration: lane\/old/);
+    expect(r.message).toContain('candidate-not-clean');
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it('flags a content-landed stale ref as harmless in staleTolerated', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, cherry: { 'lane/old': `- ${SHA}\n- ${TREE}\n` } });
+    const r = await f.run();
+    expect(r.ok).toBe(true);
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: true, why: expect.stringMatching(/\S/) }]);
+    expect(f.calls.some(c => c.cmd === 'git' && c.args.join(' ') === 'cherry origin/main origin/lane/old')).toBe(true);
+    expect(f.records[0].staleTolerated).toEqual(r.staleTolerated);
+    expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it('a stale ref with unlanded commits is tolerated but flagged landedByContent=false', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, cherry: { 'lane/old': `- ${SHA}\n+ ${TREE}\n` } });
+    const r = await f.run();
+    expect(r.ok).toBe(true);
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: false, why: expect.stringMatching(/\S/) }]);
+    expect(f.calls.some(c => c.cmd === 'git' && c.args.join(' ') === 'cherry origin/main origin/lane/old')).toBe(true);
+    expect(f.records[0].staleTolerated).toEqual(r.staleTolerated);
+    expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it('never removes a tolerated stale registration', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] } });
+    const r = await f.run();
+    expect(r.ok).toBe(true);
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: false, why: expect.stringMatching(/\S/) }]);
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(r.removed).toEqual([]);
+    expect(r.removedTips).toEqual({});
+    expect([...f.registrations.keys()]).toEqual(['lane/old']);
   });
   it('contained stale and clean registrations remain after replacement adoption', async () => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'] }); const r = await f.run();
