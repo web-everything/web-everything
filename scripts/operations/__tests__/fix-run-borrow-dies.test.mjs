@@ -101,12 +101,17 @@ describe('claims on disk: release by session, stamp, sweep dead runners', () => 
     expect(readFixDispatchClaim({ repo: 'we', pr: 4231, lockRoot })).toBeNull();
   }));
   it('stamp + sweep: a dead runner pid releases the claim with a reason; a live one is refreshed', () => withRoot((lockRoot) => {
+    const stamp = { runnerStart: 'Sat Oct 24 12:00:00 2026', runnerArgv: 'node fixture-runner.mjs' };
+    const identityOf = () => stamp;
+    const identity = vi.fn(() => ({ alive: true, reason: 'match' }));
     acquireFixDispatchClaim({ repo: 'we', pr: 1, owner: 'Mac:1', lockRoot, borrowed: { executor: 'codex' } });
     acquireFixDispatchClaim({ repo: 'we', pr: 2, owner: 'Mac:1', lockRoot, borrowed: { executor: 'codex' } });
-    expect(stampBorrowedRunnerPid({ repo: 'we', pr: 1, owner: 'Mac:1', pid: 111, lockRoot })).toBe(true);
-    expect(stampBorrowedRunnerPid({ repo: 'we', pr: 2, owner: 'Mac:1', pid: 222, lockRoot })).toBe(true);
+    expect(stampBorrowedRunnerPid({ repo: 'we', pr: 1, owner: 'Mac:1', pid: 111, lockRoot, identityOf })).toBe(true);
+    expect(stampBorrowedRunnerPid({ repo: 'we', pr: 2, owner: 'Mac:1', pid: 222, lockRoot, identityOf })).toBe(true);
     expect(stampBorrowedRunnerPid({ repo: 'we', pr: 2, owner: 'someone-else', pid: 5, lockRoot })).toBe(false);
-    const out = refreshLiveFixDispatchClaims({ lockRoot, listAgentsAll: () => [], awaitingVerifyFor: null, alive: (p) => p === 222 });
+    const out = refreshLiveFixDispatchClaims({ lockRoot, listAgentsAll: () => [], awaitingVerifyFor: null, alive: (p) => p === 222, identity });
+    expect(identity).toHaveBeenCalledTimes(1);
+    expect(identity).toHaveBeenCalledWith(222, { expectStart: stamp.runnerStart, expectArgv: stamp.runnerArgv });
     expect(out.released).toEqual([expect.objectContaining({ pr: 1, reason: expect.stringContaining('borrowed-runner-dead') })]);
     expect(out.refreshed.map((r) => r.pr)).toEqual([2]);
     expect(readFixDispatchClaim({ repo: 'we', pr: 1, lockRoot })).toBeNull();
@@ -118,10 +123,13 @@ describe('(2) the fixer cap counts only live sessions', () => {
   const claim = (kind, extra = {}) => ({ meta: { kind, ...extra } });
   it('a borrowed claim whose runner pid is dead does not count; unstamped and live ones do', () => {
     const alive = (p) => p === 2;
+    const identity = vi.fn((p) => ({ alive: alive(p), reason: alive(p) ? 'match' : 'gone' }));
     const claims = [claim('fix', { borrowed: { executor: 'codex' }, runnerPid: 1 }), claim('fix', { borrowed: { executor: 'codex' }, runnerPid: 2 }),
       claim('fix', { borrowed: { executor: 'codex' } }), claim('ci-heal'), claim('fixing')];
     expect(isBorrowedRunnerDead(claims[0], alive)).toBe(true);
-    expect(countLiveFixSessions(claims, { alive })).toBe(3);
+    expect(countLiveFixSessions(claims, { alive, identity })).toBe(3);
+    expect(identity).toHaveBeenCalledTimes(1);
+    expect(identity).toHaveBeenCalledWith(2, { expectStart: undefined, expectArgv: undefined });
   });
   it('the throttle admits when the only claims at the cap are dead borrows', () => {
     const dead = claim('fix', { borrowed: { executor: 'codex' }, runnerPid: 1 });
