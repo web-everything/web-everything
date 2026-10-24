@@ -79,21 +79,33 @@ export function pathsWithinScope(files, scopeEntries) {
 }
 const exec = (s, cmd, args, lane = false, session = false, options = {}) => s.io.exec(cmd, args, {
   cwd: lane ? s.lane.path : s.opts.repo,
-  env: laneGitHardeningEnv({ ...process.env, ...(session ? { LANE_SESSION: s.lane.holder } : {}) }),
+  env: laneGitHardeningEnv({ ...process.env, ...(lane ? { GIT_NO_REPLACE_OBJECTS: '1' } : {}), ...(session ? { LANE_SESSION: s.lane.holder } : {}) }),
   ...options,
 });
 const git = async (s, args, session = false) => {
   // Re-read after every worker/test/audit boundary. Reading config executes no helpers.
-  const config = await exec(s, 'git', ['-C', s.lane.path, ...LANE_CONFIG_LIST_ARGS], true);
+  const config = await exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...LANE_CONFIG_LIST_ARGS], true);
   if (!good(config) || typeof config.stdout !== 'string' ||
-      (config.stdout && !config.stdout.endsWith('\0')) || riskyLaneConfig(config.stdout).length) {
+      (config.stdout && !config.stdout.endsWith('\0')) || riskyLaneConfig(config.stdout).length ||
+      unsafePublicationConfig(config.stdout, s.originUrl)) {
     fail('unsafe-git-config', 'Cannot trust lane Git configuration; inspect its local/worktree configuration before retrying');
   }
   const hardened = hardenLaneGitArgs(args);
   const missing = hardened.slice(1).filter(a => !args.includes(a));
   const end = args.includes('--') ? args.indexOf('--') : args.length;
-  return exec(s, 'git', ['-C', s.lane.path, ...args.slice(0, end), ...missing, ...args.slice(end)], true, session);
+  return exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...args.slice(0, end), ...missing, ...args.slice(end)], true, session);
 };
+function unsafePublicationConfig(output, originUrl) {
+  const parts = output.split('\0');
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const entry = parts[i + 1], newline = entry.indexOf('\n');
+    const key = newline < 0 ? entry : entry.slice(0, newline);
+    // Inspect every effective scope: even a URL passed literally can be rewritten.
+    if (/^(url|remote)\./i.test(key) &&
+        !(key === 'remote.origin.url' && newline >= 0 && entry.slice(newline + 1) === originUrl)) return true;
+  }
+  return false;
+}
 const scopeArgs = s => [`--agent=${s.claimId}`, `--owner=${s.claimId}`];
 
 export async function checkFreeScope(s) {
@@ -115,6 +127,10 @@ export async function acquireLane(s) {
   s.result.lane = s.lane.lane;
 }
 export async function resetLane(s) {
+  // Capture the publication destination from the primary checkout before any worker runs.
+  const origin = await exec(s, 'git', ['-C', s.opts.repo, 'remote', 'get-url', 'origin']);
+  if (!good(origin) || typeof origin.stdout !== 'string' || !origin.stdout.trim()) fail('push-failed', 'Cannot read trusted origin URL');
+  s.originUrl = origin.stdout.trim();
   if (!good(await git(s, ['reset', '--hard', s.opts.base], true))) fail('lane-reset-failed');
   const head = await git(s, ['rev-parse', 'HEAD']);
   const base = await git(s, ['rev-parse', s.opts.base]);
@@ -270,20 +286,20 @@ export async function commitAndPush(s) {
   s.result.sha = sha.stdout.trim();
   // Hooks or another writer may have replaced the index during commit. Check the
   // immutable committed tree, including added paths, modes, deletions and link blobs.
-  const committedTree = await git(s, ['--no-replace-objects', 'rev-parse', `${s.result.sha}^{tree}`]);
+  const committedTree = await git(s, ['rev-parse', `${s.result.sha}^{tree}`]);
   if (!good(committedTree) || committedTree.stdout?.trim() !== tree.stdout.trim()) {
     fail('changed-after-audit', 'Committed tree differs from the audited index; inspect the local commit before retrying');
   }
   let branch;
   for (let n = 1; n <= 9; n++) {
     const name = `lane/${s.opts.purpose}${n === 1 ? '' : `-${n}`}`;
-    const r = await git(s, ['ls-remote', '--heads', 'origin', name]);
+    const r = await git(s, ['ls-remote', '--heads', s.originUrl, name]);
     if (!good(r)) fail('push-failed', 'Cannot check remote branch');
     if (!r.stdout?.trim()) { branch = name; break; }
   }
   if (!branch) fail('branch-name-exhausted');
   s.result.branch = branch;
-  if (!good(await git(s, ['push', 'origin', `${s.result.sha}:refs/heads/${branch}`], true))) fail('push-failed');
+  if (!good(await git(s, ['push', s.originUrl, `${s.result.sha}:refs/heads/${branch}`], true))) fail('push-failed');
 }
 export async function markReady(s) {
   try { await s.io.readFile(path.join(s.lane.path, 'scripts/fix-ready.mjs')); }
@@ -337,8 +353,8 @@ function plan(s) {
     'Recheck audited file list and content fingerprint immediately before commit',
     'git commit -m <brief title> -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"',
     'Verify committed tree equals the audited index snapshot before publishing its pinned SHA',
-    'git ls-remote --heads origin <branch> (try suffixes -2 through -9 if occupied)',
-    `git push origin <checked-sha>:refs/heads/${s.result.branch}`,
+    `${show('git', ['ls-remote', '--heads', s.originUrl])} <branch> (try suffixes -2 through -9 if occupied)`,
+    show('git', ['push', s.originUrl, `<checked-sha>:refs/heads/${s.result.branch}`]),
     'node scripts/fix-ready.mjs mark --branch=<branch> --sha=<sha> (if present)',
     ...(s.opts.edgeClone ? [show('node', prototypeLoadArgs(s))] : [])];
 }
