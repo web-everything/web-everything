@@ -1,4 +1,5 @@
 ---
+bornAs: x5ioz96
 kind: decision
 size: 3
 status: resolved
@@ -29,7 +30,7 @@ Operator 2026-10-18 "Ok", verbatim idea: "group more finding in a single pr, cou
 - **Fork 5 = (a).** Every member is numbered at seal, before the PR is marked ready.
 - **Fork 6 = (a).** The coordinator owns the collector branch and retires a stuck sealed state from GitHub truth.
 
-**Build:** epic x87psvt. First slice, top priority (unblocking): x5nmdnt, the self-heal (live case: prevention batch 9 sealed since 2026-10-14, 327 cards spooled). Then x1mmp60 (numbering at seal), x245i7o (resumable seal timeout), xf1z2w3 (age escape), xpabefb (ruling stream declared, follow-up and expedite folded into filing), x7nf3f5 (ruling filer wired and the stream enabled; the Fork 1 skeptic amendment).
+**Build:** epic 6944. First slice, top priority (unblocking): 6941, the self-heal (live case: prevention batch 9 sealed since 2026-10-14, 327 cards spooled). Then 6942 (numbering at seal), 6943 (resumable seal timeout), 6945 (age escape), 6947 (ruling stream declared, follow-up and expedite folded into filing), 6948 (ruling filer wired and the stream enabled; the Fork 1 skeptic amendment).
 
 ## Digest
 
@@ -141,7 +142,7 @@ Screen: flagged(impl) -> tooling ownership, invisible across the WE-FUI boundary
 
 ## Acceptance
 
-- [A1] **Executable** - after the carved child lands: x5nmdnt's [A1] cases pass, among them `retires a sealed state whose PR merged on the next admission` (we:scripts/operations/__tests__/card-batch.test.mjs) and `closed-unmerged batch is archived, retired and surfaced` (we:scripts/operations/__tests__/card-batch-io.test.mjs), and the 327-card spool drains into a new batch (live before/after count).
+- [A1] **Executable** - after the carved child lands: 6941's [A1] cases pass, among them `retires a sealed state whose PR merged on the next admission` (we:scripts/operations/__tests__/card-batch.test.mjs) and `closed-unmerged batch is archived, retired and surfaced` (we:scripts/operations/__tests__/card-batch-io.test.mjs), and the 327-card spool drains into a new batch (live before/after count).
 
 ## Non-goals
 
@@ -151,8 +152,8 @@ Screen: flagged(impl) -> tooling ownership, invisible across the WE-FUI boundary
 
 1. **Untrusted text** - n/a: a decision card; no input is parsed.
 2. **Truncated reads** - n/a: no reads.
-3. **Shared state files** - the collector state file is shared; retirement runs under the existing lease (the carved child, x5nmdnt).
+3. **Shared state files** - the collector state file is shared; retirement runs under the existing lease (the carved child, 6941).
 4. **Fail closed** - an unreadable PR state keeps the batch sealed and holds, never retires.
 5. **Identity scoping** - state is keyed by repo and kind.
-6. **State over time** - the stuck state is exactly this class; GitHub is the truth source. Open: stays sealed. Merged: retire. Closed by a split: retire (the survivors are on the remainder PR). Closed otherwise: archive with its members, retire, and surface the members as needs-you. Unreadable: stay sealed and held. Each row has a named case in x5nmdnt.
+6. **State over time** - the stuck state is exactly this class; GitHub is the truth source. Open: stays sealed. Merged: retire. Closed by a split: retire (the survivors are on the remainder PR). Closed otherwise: archive with its members, retire, and surface the members as needs-you. Unreadable: stay sealed and held. Each row has a named case in 6941.
 7. **Who wrote it** - n/a: mechanical filers only.

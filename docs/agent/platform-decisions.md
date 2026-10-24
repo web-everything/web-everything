@@ -6486,7 +6486,7 @@ from its class list) and the drain's existing proof-of-land gate (base lands fir
 ### Collector PRs batch card-only filings per stream; the coordinator owns each batch and heals it from GitHub {#collector-pr-card-batching-streams}
 
 **Ratified 2026-10-18 by the operator (Nicolas Gilbert), in conversation, all six forks at the card's default
-(`#x5ioz96`).** The operator's words: *"All ok"*. Builds on the rolling card-only PRs of epic #4703.
+(`#6940`).** The operator's words: *"All ok"*. Builds on the rolling card-only PRs of epic #4703.
 
 **The rule:**
 1. **Streams.** `prevention` and `filing` (follow-up and expedite cards fold into `filing`), plus `ruling`,
@@ -6502,16 +6502,16 @@ from its class list) and the drain's existing proof-of-land gate (base lands fir
 6. **Ownership.** The coordinator owns the collector branch (lease plus state file). A sealed state whose PR is
    merged or closed on GitHub is retired on the next admission; an unreadable PR state keeps it sealed and held.
 
-**Defended by (planned cases, named in each slice's [A1]):** rules 1 to 3 by xpabefb (`code changes refuse
+**Defended by (planned cases, named in each slice's [A1]):** rules 1 to 3 by 6947 (`code changes refuse
 collection`, `count wins simultaneous count and age thresholds`, `every stream value is a cascade setting with its
 source logged`, `high and urgent bypass with shipped defaults`, `follow-up and expedite origins route to filing`, `expedite origin is
 collected unless its priority bypasses`)
-and x7nf3f5 (`ruling ships enabled with 8/60 defaults`, `disabled ruling refuses kind-disabled, not unknown kind`);
-rule 4 by xf1z2w3 (`extracted member cannot re-enter a collector`); rule 5 by x1mmp60 (`numbering failure retains
-the hold and never reaches ready`); rule 6 by x5nmdnt, one case per PR state (`open sealed PR stays sealed and keeps
+and 6948 (`ruling ships enabled with 8/60 defaults`, `disabled ruling refuses kind-disabled, not unknown kind`);
+rule 4 by 6945 (`extracted member cannot re-enter a collector`); rule 5 by 6942 (`numbering failure retains
+the hold and never reaches ready`); rule 6 by 6941, one case per PR state (`open sealed PR stays sealed and keeps
 refusing batch-sealed`, `retires a sealed state whose PR merged on the next admission`, `split-closed batch retires
 and surfaces nothing`, `closed-unmerged batch is archived, retired and surfaced`, `unreadable PR state stays sealed
-and held`; their `sealed/` archive counterparts are listed in x5nmdnt's edge case 6), plus the fault-injection case
+and held`; their `sealed/` archive counterparts are listed in 6941's edge case 6), plus the fault-injection case
 `archive failure preserves the active slot and retry preserves every member`.
 
-**Lineage:** `#x5ioz96` (ruled 2026-10-18). Epic x87psvt.
+**Lineage:** `#6940` (ruled 2026-10-18). Epic 6944.

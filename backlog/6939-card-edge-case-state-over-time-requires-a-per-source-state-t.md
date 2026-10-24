@@ -1,4 +1,5 @@
 ---
+bornAs: x2ini8y
 kind: story
 size: 5
 status: open
@@ -11,7 +12,7 @@ tags: []
 
 # Card edge-case State over time requires a per-source-state table when a change retires or discards stateful records
 
-Prevention owed by PR 5608 review (finding on x5nmdnt: a closed-unmerged collector batch would retire and silently drop its members, because the card's State over time line named only merged). When a card retires, discards or resets a stateful record, its State over time edge case must list every source state that triggers it (for a PR: merged, closed-unmerged, unreadable), what happens to the record and to its dependents in each, and one named test case per row. A card whose line names a retirement but only one source state is refused by the edge-case lint with the missing rows named.
+Prevention owed by PR 5608 review (finding on 6941: a closed-unmerged collector batch would retire and silently drop its members, because the card's State over time line named only merged). When a card retires, discards or resets a stateful record, its State over time edge case must list every source state that triggers it (for a PR: merged, closed-unmerged, unreadable), what happens to the record and to its dependents in each, and one named test case per row. A card whose line names a retirement but only one source state is refused by the edge-case lint with the missing rows named.
 
 PR 5608's round-4 review owed more guards of the same kind (a card promises a guarantee that no planned case pins). The lint enforces them together, on cards with `status: open` that carry a Planned cases block:
 

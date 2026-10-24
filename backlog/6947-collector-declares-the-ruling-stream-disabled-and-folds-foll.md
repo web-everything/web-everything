@@ -1,9 +1,10 @@
 ---
+bornAs: xpabefb
 kind: story
 size: 3
-parent: "x87psvt"
+parent: "6944"
 status: open
-blockedBy: ["x5nmdnt"]
+blockedBy: ["6941"]
 scope: ["we:scripts/lib/card-batch-policy.mjs", "we:scripts/lib/card-batch-policy.json", "we:scripts/operations/card-batch-file.mjs", "we:scripts/lib/card-batch-settings.mjs", "we:scripts/lib/__tests__/card-batch-policy.test.mjs", "we:scripts/lib/__tests__/card-batch-settings.test.mjs", "we:scripts/operations/__tests__/card-batch-file.test.mjs"]
 dateOpened: "2026-10-18"
 tags: []
@@ -11,7 +12,7 @@ tags: []
 
 # Collector declares the ruling stream disabled and folds follow-up and expedite cards into filing
 
-Per decision x5ioz96 forks 1 to 3: add ruling to CARD_BATCH_KINDS with policy enabled false, maxCards 8, maxAgeMinutes 60, highPriorityBypass true; keep prevention at 10 cards / 120 min and filing at 10 / 60; a follow-up or expedite-origin card routes to the filing stream; high and urgent cards keep bypassing via highPriorityBypass. No filer routes to ruling here: wiring the ruling filer and enabling the stream is x7nf3f5 (the fork 1 skeptic amendment).
+Per decision 6940 forks 1 to 3: add ruling to CARD_BATCH_KINDS with policy enabled false, maxCards 8, maxAgeMinutes 60, highPriorityBypass true; keep prevention at 10 cards / 120 min and filing at 10 / 60; a follow-up or expedite-origin card routes to the filing stream; high and urgent cards keep bypassing via highPriorityBypass. No filer routes to ruling here: wiring the ruling filer and enabling the stream is 6948 (the fork 1 skeptic amendment).
 
 ## Acceptance
 
@@ -31,7 +32,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] No filer routes to ruling and the stream ships disabled; x7nf3f5 wires and enables it.
+- [N1] No filer routes to ruling and the stream ships disabled; 6948 wires and enables it.
 
 ## Edge cases this change must handle
 
@@ -43,4 +44,4 @@ One line per class: either the handling, or `n/a: <why>`.
 4. **Fail closed** — a disabled stream refuses `kind-disabled`, distinct from an unknown kind (case `disabled ruling refuses kind-disabled, not unknown kind`).
 5. **Identity scoping** — each stream has its own policy block; routing is by the card's origin, and bypass by its priority alone (cases `ruling is declared with disabled 8/60 defaults`, `follow-up and expedite origins route to filing`, `expedite origin is collected unless its priority bypasses`).
 6. **State over time** — n/a: no stored state.
-7. **Who wrote it** — n/a: config and routing only; who may file a ruling card is x7nf3f5's.
+7. **Who wrote it** — n/a: config and routing only; who may file a ruling card is 6948's.

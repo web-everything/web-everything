@@ -1,9 +1,10 @@
 ---
+bornAs: x1mmp60
 kind: story
 size: 3
-parent: "x87psvt"
+parent: "6944"
 status: open
-blockedBy: ["x5nmdnt"]
+blockedBy: ["6941"]
 scope: ["we:scripts/operations/card-batch-seal.mjs", "we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/operations/card-batch-extract.mjs", "we:scripts/operations/__tests__/card-batch-seal.test.mjs", "we:scripts/operations/__tests__/card-batch-seal-io.test.mjs", "we:scripts/operations/__tests__/card-batch-extract.test.mjs"]
 scopeRationale: "The numbered backlog paths in Acceptance are disposable fixtures created in temporary test repositories. Scope covers the seal and extraction modules and their tests."
 dateOpened: "2026-10-18"
@@ -12,7 +13,7 @@ tags: []
 
 # Collector seal numbers every member before the PR is marked ready
 
-Per decision x5ioz96 fork 5 (statute backlog-ids-numbered-before-publish): add a number-members seal step after record-sealed and before verify, calling the declared numbering operation once over the whole branch so sibling references resolve together. It fails closed: if numbering fails the batch stays held and never reaches ready.
+Per decision 6940 fork 5 (statute backlog-ids-numbered-before-publish): add a number-members seal step after record-sealed and before verify, calling the declared numbering operation once over the whole branch so sibling references resolve together. It fails closed: if numbering fails the batch stays held and never reaches ready.
 
 The `number-members` step must record each member's old->new path map in the batch journal. After numbering, each member carries BOTH `admissionPath` (for the original blob read from `${member.commitSha}:${member.admissionPath}` in `we:scripts/operations/card-batch-extract.mjs:214-218`) and `numberedPath` (for attribution of findings on the renamed card). Member attribution in `we:scripts/operations/card-batch-extract.mjs` (the `cardPath` derivation at lines 199-207) must resolve a member by either path, applying the journal map or following the rename with `git diff-tree -M`. Findings citing the numbered path must still be attributed to the original member. Extraction rebuilds BOTH the standalone card and every surviving batch member at their `numberedPath`, with the numbering operation’s rewritten text taken from the recorded numbering commit, preserving rewritten sibling cross-references. Persist that commit with the path map so extraction can reconstruct the numbered content after restart; never read a numbered path from an original admission commit or emit an admission-path card with stale text.
 
@@ -46,5 +47,5 @@ One line per class: either the handling, or `n/a: <why>`.
 3. **Shared state files** — the step runs under the seal lease on the collector branch; the rewritten head is recorded before verify runs on it (case `crash after the numbering push and before the head is recorded resumes without head-mismatch`).
 4. **Fail closed** — any numbering failure keeps the batch held and never reaches ready (case `numbering failure retains the hold and never reaches ready`).
 5. **Identity scoping** — numbers are allocated per repo through the declared operation (case `members are numbered through the batch repo's own operation`).
-6. **State over time** — a re-run after a timeout must not renumber (x245i7o's case `timeout during number-members then resume leaves each member numbered exactly once`).
-7. **Who wrote it** — the numbering commit is not an admit commit; if the batch is later closed, x5nmdnt surfaces it through the PR link.
+6. **State over time** — a re-run after a timeout must not renumber (6943's case `timeout during number-members then resume leaves each member numbered exactly once`).
+7. **Who wrote it** — the numbering commit is not an admit commit; if the batch is later closed, 6941 surfaces it through the PR link.

@@ -1,9 +1,10 @@
 ---
+bornAs: x245i7o
 kind: story
 size: 3
-parent: "x87psvt"
+parent: "6944"
 status: open
-blockedBy: ["x5nmdnt", "x1mmp60"]
+blockedBy: ["6941", "6942"]
 scope: ["we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/operations/card-batch-seal.mjs", "we:scripts/operations/__tests__/card-batch-seal-io.test.mjs", "we:scripts/operations/__tests__/card-batch-seal.test.mjs"]
 dateOpened: "2026-10-18"
 tags: []
@@ -11,7 +12,7 @@ tags: []
 
 # Collector seal timeout is resumable with bounded retries then a held reason
 
-Per decision x5ioz96 fork 6 skeptic amendment: the root cause of the stuck batch is the seal job timing out (spawnSync ETIMEDOUT) and leaving step ready terminal. A seal timeout resumes from the last completed step with a bounded retry count (a setting with its source logged), then holds with a named reason.
+Per decision 6940 fork 6 skeptic amendment: the root cause of the stuck batch is the seal job timing out (spawnSync ETIMEDOUT) and leaving step ready terminal. A seal timeout resumes from the last completed step with a bounded retry count (a setting with its source logged), then holds with a named reason.
 
 ## Acceptance
 
@@ -22,8 +23,8 @@ Per decision x5ioz96 fork 6 skeptic amendment: the root cause of the stuck batch
   - `retry count is bounded by the setting, with its source logged` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs).
   - `retry exhaustion holds with a named reason` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — the state keeps sealedAt and the held reason names the timed-out step.
   - `seal scan does not relaunch a batch whose retries are exhausted` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — after exhaustion, three further `sealDueBatches` scans spawn no seal job, the retry count does not grow, the held reason is unchanged, and the PR is never marked ready.
-  - `retry count is per batch and starts at zero for a fresh batch` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — with one batch at its retry limit, (a) the next fresh batch of the same repo and kind, opened after that batch retired (its PR merged, per x5nmdnt), (b) a batch of another kind in the same repo, and (c) a batch of the same kind in another repo each start at zero retries and are not held.
-  - `timeout during number-members then resume leaves each member numbered exactly once` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — a timeout injected partway through x1mmp60's numbering step, then a resume, leaves every member with exactly one number, no half-renumbered head, and no extra numbers allocated. This is a cross-slice case, so x245i7o lands after x1mmp60.
+  - `retry count is per batch and starts at zero for a fresh batch` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — with one batch at its retry limit, (a) the next fresh batch of the same repo and kind, opened after that batch retired (its PR merged, per 6941), (b) a batch of another kind in the same repo, and (c) a batch of the same kind in another repo each start at zero retries and are not held.
+  - `timeout during number-members then resume leaves each member numbered exactly once` (we:scripts/operations/__tests__/card-batch-seal-io.test.mjs) — a timeout injected partway through 6942's numbering step, then a resume, leaves every member with exactly one number, no half-renumbered head, and no extra numbers allocated. This is a cross-slice case, so 6943 lands after 6942.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -31,7 +32,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] Numbering itself (x1mmp60) and retiring a finished batch (x5nmdnt) are their own slices.
+- [N1] Numbering itself (6942) and retiring a finished batch (6941) are their own slices.
 
 ## Edge cases this change must handle
 

@@ -1,7 +1,8 @@
 ---
+bornAs: x5nmdnt
 kind: story
 size: 5
-parent: "x87psvt"
+parent: "6944"
 status: open
 scope: ["we:scripts/operations/card-batch-seal-io.mjs", "we:scripts/operations/card-batch.mjs", "we:scripts/operations/card-batch-io.mjs", "we:scripts/operations/__tests__/card-batch-seal-io.test.mjs", "we:scripts/operations/__tests__/card-batch.test.mjs", "we:scripts/operations/__tests__/card-batch-io.test.mjs"]
 dateOpened: "2026-10-18"
@@ -54,7 +55,7 @@ Proof required: before/after on the live 327-card spool draining into a fresh ba
 
 ## Non-goals
 
-- [N1] The seal timeout itself (x245i7o), numbering at seal (x1mmp60) and the unextractable-finding age escape (xf1z2w3) are their own slices.
+- [N1] The seal timeout itself (6943), numbering at seal (6942) and the unextractable-finding age escape (6945) are their own slices.
 - [N2] No automatic re-admission of a closed batch's cards: a person decides from the escalation.
 - [N3] No new setting: retirement is unconditional.
 

@@ -87,7 +87,7 @@ Format: **id — name** · ~lines / files · behaviour · overlays that depend o
    - Evidence: drain log `saved-red-team-ignored: no matching completed saved result` (152 provenance lines).
    - Tests: `we:scripts/lib/__tests__/saved-red-team-provenance.test.mjs`.
    - Depends on: none.
-6. **S28 — collector retires a stuck sealed batch from GitHub truth (x5nmdnt)** · ~210 / 3 · `we:scripts/operations/card-batch-io.mjs`, `we:scripts/operations/card-batch-seal-io.mjs`, `we:scripts/operations/__tests__/card-batch-io.test.mjs` (retire cases).
+6. **S28 — collector retires a stuck sealed batch from GitHub truth (6941)** · ~210 / 3 · `we:scripts/operations/card-batch-io.mjs`, `we:scripts/operations/card-batch-seal-io.mjs`, `we:scripts/operations/__tests__/card-batch-io.test.mjs` (retire cases).
    - Note: PR #5612 was closed on 2026-10-19 so this lands as a graduation PR.
    - Tests: `we:scripts/operations/__tests__/card-batch-io.test.mjs`.
    - Depends on: none.
