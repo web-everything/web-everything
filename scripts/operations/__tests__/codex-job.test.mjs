@@ -624,7 +624,7 @@ it('changes the fingerprint when only an originally untracked file owner execute
     writeFileSync(file, 'unchanged contents\n');
     const f = fixture([['ls-files', ok('scripts/a.mjs\0')]]);
     f.io.lstat = file => lstatSync(file);
-    const state = { opts: { repo, scope: ['we:scripts/'] }, lane: { path: repo }, startSha: 'abc123', io: f.io };
+    const state = { opts: { repo, scope: ['we:scripts/'] }, lane: { path: repo }, startSha: 'abc123', originUrl, io: f.io };
     chmodSync(file, 0o644);
     await checkDiffScope(state);
     const before = state.auditFingerprint;
