@@ -37,6 +37,27 @@ describe('sameGapSameHead', () => {
   it('accepts reordered wording and case-insensitive negation tokens', () => {
     expect(sameGapSameHead(base, { ...base, line: 24, summary: 'Request payload validation is MISSING before use' })).toBe(true);
   });
+  it('refuses GET versus PUT despite otherwise identical authorization claims', () => {
+    const summary = 'GET handler skips the authorization check when the cached credential expires';
+    expect(sameGapSameHead({ ...base, summary },
+      { ...base, line: 24, summary: summary.replace('GET', 'PUT') })).toBe(false);
+  });
+  it.each([['ID', 'IP'], ['parseUser', 'parseUsers'], ['v2', 'v3']])('refuses identifier %s versus %s', (a, b) => {
+    const summary = `${a} handler skips the authorization check when the cached credential expires`;
+    expect(sameGapSameHead({ ...base, summary },
+      { ...base, line: 24, summary: summary.replace(a, b) })).toBe(false);
+  });
+  it.each([
+    ['read', 'write', 'The handler can read cached credential records before checking authorization during request processing'],
+    ['allows', 'denies', 'The handler allows cached credential access before checking authorization during request processing'],
+  ])('refuses verb %s versus %s despite high word overlap', (a, b, summary) => {
+    expect(sameGapSameHead({ ...base, summary },
+      { ...base, line: 24, summary: summary.replace(a, b) })).toBe(false);
+  });
+  it('accepts the existing positive claim with a harmless article change', () => {
+    expect(sameGapSameHead(base,
+      { ...base, line: 24, summary: base.summary.replace('the request', 'a request') })).toBe(true);
+  });
   it.each([
     ['another file', { file: 'other.md' }], ['distant line', { line: 60 }], ['missing line', { line: undefined }],
     ['fractional line', { line: 20.5 }], ['severity', { impactIfUnfixed: 'unrecoverable' }],
