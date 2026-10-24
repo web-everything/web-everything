@@ -1406,12 +1406,12 @@ describe('detached jobs', () => {
   beforeEach(() => { jobsDir = mkdtempSync(join(tmpdir(), 'codex-jobs-test-')); });
   afterEach(() => { rmSync(jobsDir, { recursive: true, force: true }); });
 
-  function fixture() {
+  function fixture({ pid = 123 } = {}) {
     let time = 0;
-    let record = { id: 'test-job', pid: 123, status: 'running', startedAt: new Date(0).toISOString(),
+    let record = { id: 'test-job', pid, status: 'running', startedAt: new Date(0).toISOString(),
       resultPath: 'test-job.result.json', exitCode: null };
     const child = new EventEmitter();
-    child.pid = 123;
+    child.pid = pid;
     child.unref = vi.fn();
     child.on('exit', code => { record = { ...record, status: code === 0 ? 'done' : 'failed', exitCode: code }; });
     const readRecord = vi.fn(() => ({ ...record }));
@@ -1901,7 +1901,9 @@ describe('detached jobs', () => {
     ['ESRCH', 'failed', 1, 1],
     ['EIO', 'failed', null, 2],
   ])('default PID probe receiving %s returns %s with code %s/%s', async (errorCode, status, exitCode, code) => {
-    const f = fixture();
+    // A real, live, non-zombie PID: the default state probe runs real ps after an EPERM, so a made-up PID
+    // would (correctly) read as gone.
+    const f = fixture({ pid: process.pid });
     const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
       throw Object.assign(new Error(errorCode), { code: errorCode });
     });
@@ -1909,7 +1911,7 @@ describe('detached jobs', () => {
       expect(await waitForJob({ ...f.options, isAlive: undefined, maxMs: 1000 }))
         .toMatchObject({ status, exitCode, code });
       expect(kill).toHaveBeenCalledTimes(1);
-      expect(kill).toHaveBeenCalledWith(123, 0);
+      expect(kill).toHaveBeenCalledWith(process.pid, 0);
       if (errorCode === 'ESRCH') {
         expect(f.writeRecord).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', exitCode: 1 }));
       } else {
