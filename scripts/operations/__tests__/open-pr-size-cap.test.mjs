@@ -4,23 +4,22 @@
  */
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as openPr from '../open-pr.mjs';
-import { createPrLandRunner } from '../open-pr-io.mjs';
+import { createPrLandRunner, createPrDiffStatReader } from '../open-pr-io.mjs';
 
-// Keep the default reader under test without allowing a regression to invoke pr-land.
-vi.mock('node:child_process', async (importOriginal) => {
-  const actual = await importOriginal();
-  return {
-    ...actual,
-    execFileSync: vi.fn(actual.execFileSync),
-    spawnSync: vi.fn(() => { throw new Error('unexpected submission'); }),
-  };
+// Explicitly opt into the production Git reader while keeping every other runner IO hermetic.
+const submit = vi.fn(() => { throw new Error('unexpected submission'); });
+const defaultReaderRunner = (options = {}) => createPrLandRunner({
+  ...options, spawn: submit, diffStat: createPrDiffStatReader(options),
 });
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.clearAllMocks();
+  submit.mockReset().mockImplementation(() => { throw new Error('unexpected submission'); });
+});
 
 const argv = ['--ref=lane/size-cap'];
 const opened = { outcome: 'opened', pr: 7, url: 'u' };
@@ -154,17 +153,17 @@ describe('real git numstat evidence', () => {
       git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'oversized']);
       expect(git(['-C', join(dir, 'backlog'), 'diff', '--numstat', '-z', 'main...HEAD']))
         .toBe('400\t0\tcard.md\0');
-      const run = createPrLandRunner({ cwd: join(dir, 'backlog'), prePrReview: () => ({ action: 'pass' }), dupBornAs: () => [], env: {} });
+      const run = defaultReaderRunner({ cwd: join(dir, 'backlog'), prePrReview: () => ({ action: 'pass' }), dupBornAs: () => [], env: {} });
       expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-too-large', detail: expect.stringMatching(/701/) });
-      expect(spawnSync).not.toHaveBeenCalled();
+      expect(submit).not.toHaveBeenCalled();
 
       git(['rm', '--quiet', 'production.mjs']);
       git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'backlog only']);
       const sha = git(['rev-parse', 'HEAD']).trim();
-      vi.mocked(spawnSync).mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) });
+      submit.mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) });
       expect(run({ argv: [...argv, '--sha=HEAD'] })).toMatchObject(opened);
-      expect(spawnSync).toHaveBeenCalledTimes(1);
-      expect(spawnSync.mock.calls[0][1].filter((a) => a.startsWith('--sha='))).toEqual([`--sha=${sha}`]);
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(submit.mock.calls[0][1].filter((a) => a.startsWith('--sha='))).toEqual([`--sha=${sha}`]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -190,9 +189,9 @@ describe('real git numstat evidence', () => {
         git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'oversized']);
         // Prove the fixture really hides the production count without the hardened reader.
         expect(git(['diff', '--numstat', '-z', 'main...HEAD'])).toContain('-\t-\tproduction.mjs\0');
-        const run = createPrLandRunner({ cwd: dir, prePrReview: () => ({ action: 'pass' }), env: {} });
+        const run = defaultReaderRunner({ cwd: dir, prePrReview: () => ({ action: 'pass' }), env: {} });
         expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-too-large' });
-        expect(spawnSync).not.toHaveBeenCalled();
+        expect(submit).not.toHaveBeenCalled();
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -234,7 +233,94 @@ describe('real git numstat evidence', () => {
   });
 });
 
+describe('default size reader — binary fallback evidence', () => {
+  const headBlob = 'a'.repeat(40);
+  const baseBlob = 'b'.repeat(40);
+  const binaryFixture = ({ paths = ['scripts/a.mjs'], read = () => undefined } = {}) => {
+    const git = vi.fn((args, options) => {
+      const result = read(args, options);
+      if (result !== undefined) return result;
+      if (args.includes('--show-toplevel')) return 'repo-top\n';
+      if (args[0] === 'rev-parse') return 'resolved-sha\n';
+      if (args.includes('diff')) return paths.map((path) => `-\t-\t${path}\0`).join('');
+      if (args.includes('merge-base')) return 'merge-base-sha\n';
+      if (args.includes('ls-tree')) {
+        return `100644 blob ${args.includes('resolved-sha') ? headBlob : baseBlob}\t${args.at(-1)}\0`;
+      }
+      if (args.includes('cat-file')) return 'code\n';
+      throw new Error('unexpected git read');
+    });
+    // A fail-open regression must reach a successful submission rather than a throwing mock.
+    submit.mockReturnValue({ status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) });
+    return { git, run: defaultReaderRunner({ prePrReview: () => ({ action: 'pass' }), env: {}, git }) };
+  };
+
+  it.each(['resolved-sha', 'merge-base-sha'])(
+    'fails closed with pr-size-unreadable and no submission when the binary fallback tree read fails for %s', (revision) => {
+      const { git, run } = binaryFixture({ read: (args) => {
+        if (args.includes('ls-tree') && args.includes(revision)) throw new Error('tree unavailable');
+      } });
+      expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+      expect(git).toHaveBeenCalledWith(expect.arrayContaining(['ls-tree', revision]), expect.any(Object));
+      expect(submit).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([['head', headBlob], ['base', baseBlob]])(
+    'fails closed with pr-size-unreadable and no submission when the binary fallback %s blob read fails', (_side, blob) => {
+      const { git, run } = binaryFixture({ read: (args) => {
+        if (args.includes('cat-file') && args.includes(blob)) throw new Error('blob unavailable');
+      } });
+      expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+      expect(git).toHaveBeenCalledWith(expect.arrayContaining(['cat-file', 'blob', blob]), expect.any(Object));
+      expect(submit).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['resolved-sha', 'merge-base-sha'])(
+    'admits a binary addition or deletion only after a successful empty tree result proves the absent side at %s', (revision) => {
+      const { git, run } = binaryFixture({ read: (args) => {
+        if (args.includes('ls-tree') && args.includes(revision)) return '';
+      } });
+      expect(run({ argv })).toMatchObject(opened);
+      expect(git.mock.calls.filter(([args]) => args.includes('ls-tree'))).toHaveLength(2);
+      const blobReads = git.mock.calls.filter(([args]) => args.includes('cat-file'));
+      expect(blobReads).toHaveLength(1);
+      expect(blobReads[0][0]).toContain(revision === 'resolved-sha' ? baseBlob : headBlob);
+      expect(submit).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('fails closed with pr-size-unreadable and no submission when multiple binary rows exhaust the shared 60-second budget', () => {
+    let elapsed = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => elapsed);
+    try {
+      const { git, run } = binaryFixture({ paths: ['scripts/a.mjs', 'scripts/b.mjs'], read: (args) => {
+        if (args.includes('merge-base') || args.includes('ls-tree') || args.includes('cat-file')) elapsed += 10_000;
+      } });
+      expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+      const fallbackReads = git.mock.calls.filter(([args]) =>
+        args.includes('merge-base') || args.includes('ls-tree') || args.includes('cat-file'));
+      expect(fallbackReads.map(([, options]) => options.timeout)).toEqual([60_000, 50_000, 40_000, 30_000, 20_000, 10_000]);
+      // The first row finished; the second tree read consumed the remaining shared budget.
+      expect(fallbackReads.at(-1)[0]).toEqual(expect.arrayContaining(['ls-tree', 'scripts/b.mjs']));
+      expect(git.mock.calls.filter(([args]) => args.includes('cat-file'))).toHaveLength(2);
+      expect(elapsed).toBe(60_000);
+      expect(submit).not.toHaveBeenCalled();
+    } finally { clock.mockRestore(); }
+  });
+});
+
 describe('createPrLandRunner — non-test size admission', () => {
+  it('keeps spawn-injected defaults hermetic unless a size reader is explicitly supplied', () => {
+    const git = vi.fn(() => { throw new Error('unexpected Git access'); });
+    submit.mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) });
+    const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), spawn: submit, git });
+    expect(run({ argv })).toMatchObject(opened);
+    expect(git).not.toHaveBeenCalled();
+    expect(submit).toHaveBeenCalledTimes(1);
+  });
+
   it.each([300, 301])('enforces the inclusive 300-line boundary at %i lines', (lines) => {
     const { run, diffStat, spawn } = fixture(`${lines - 100}\t100\tscripts/a.mjs\n`);
     const result = run({ argv });
@@ -307,8 +393,8 @@ describe('createPrLandRunner — non-test size admission', () => {
   it('the default reader pins the commit, clears attributes, disables external diff/textconv and forces text numstat', () => {
     const git = vi.fn((args) => args.includes('diff') ? '301\t0\tscripts/a.mjs\0'
       : args.includes('--show-toplevel') ? 'repo-top\n' : 'resolved-sha\n');
-    // Use the default spawn identity to select the production reader; the spawn is mocked above.
-    const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env: {}, git });
+    // Select the same reader as production without enabling any other production IO.
+    const run = defaultReaderRunner({ prePrReview: () => ({ action: 'pass' }), env: {}, git });
     expect(run({ argv: [...argv, '--base=release', '--sha=abc123'] }))
       .toMatchObject({ outcome: 'refused', reason: 'pr-too-large' });
     expect(git.mock.calls).toEqual([
@@ -317,33 +403,34 @@ describe('createPrLandRunner — non-test size admission', () => {
       [['rev-parse', '--show-toplevel']],
       [['-C', 'repo-top', '-c', 'core.attributesFile=', 'diff', '--no-relative', '--text', '--numstat', '-z', '--find-renames', '--no-ext-diff', '--no-textconv', 'origin/release...resolved-sha'], { timeout: 60_000 }],
     ]);
-    expect(spawnSync).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
   });
 
   it.each(['', 'HEAD', 'lane/moving-ref'])('submits the resolved commit measured by the default reader for sha %j', (sha) => {
     const extra = sha ? [`--sha=${sha}`] : [];
     const git = vi.fn((args) => args.includes('diff') ? '1\t0\tscripts/a.mjs\0'
       : args.includes('--show-toplevel') ? 'repo-top\n' : 'resolved-sha\n');
-    vi.mocked(spawnSync).mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) });
-    const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), dupBornAs: () => [], env: {}, git });
+    submit.mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) });
+    const run = defaultReaderRunner({ prePrReview: () => ({ action: 'pass' }), dupBornAs: () => [], env: {}, git });
     const requested = [...argv, ...extra];
     expect(run({ argv: requested })).toMatchObject(opened);
     expect(git).toHaveBeenCalledWith(expect.arrayContaining(['diff', 'origin/main...resolved-sha']), { timeout: 60_000 });
-    expect(spawnSync).toHaveBeenCalledTimes(1);
-    expect(spawnSync.mock.calls[0][1].filter((a) => a.startsWith('--sha='))).toEqual(['--sha=resolved-sha']);
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(submit.mock.calls[0][1].filter((a) => a.startsWith('--sha='))).toEqual(['--sha=resolved-sha']);
     expect(requested).toEqual([...argv, ...extra]);
   });
 
   it('fails closed with pr-size-unreadable when the bounded size read times out, without timing out other git calls', () => {
-    vi.mocked(execFileSync)
+    const exec = vi.fn()
       .mockReturnValueOnce('resolved-sha\n')
       .mockReturnValueOnce('base-sha\n')
       .mockReturnValueOnce('repo-top\n')
       .mockImplementationOnce(() => { throw Object.assign(new Error('git timed out'), { code: 'ETIMEDOUT' }); });
-    const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env: {} });
+    const run = defaultReaderRunner({ prePrReview: () => ({ action: 'pass' }), env: {}, exec });
     expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable', detail: expect.stringMatching(/Restore readable git numstat evidence/) });
-    expect(execFileSync).toHaveBeenCalledTimes(4);
-    for (const [, args, options] of execFileSync.mock.calls) {
+    expect(exec).toHaveBeenCalledTimes(4);
+    for (const [command, args, options] of exec.mock.calls) {
+      expect(command).toBe('git');
       if (args.includes('diff')) {
         expect(args).toEqual(expect.arrayContaining(['-C', 'repo-top', '--no-relative']));
         expect(options).toMatchObject({ timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
@@ -351,7 +438,7 @@ describe('createPrLandRunner — non-test size admission', () => {
         expect(options).not.toHaveProperty('timeout');
       }
     }
-    expect(spawnSync).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
   });
 
   it.each(['', 'HEAD'])('preserves argv for a plain-text injected reader with sha %j', (sha) => {
@@ -364,10 +451,10 @@ describe('createPrLandRunner — non-test size admission', () => {
 
   it('the default reader refuses an unresolved commit before attempting a diff', () => {
     const git = vi.fn(() => { throw new Error('not a commit'); });
-    const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env: {}, git });
+    const run = defaultReaderRunner({ prePrReview: () => ({ action: 'pass' }), env: {}, git });
     expect(run({ argv: [...argv, '--sha=missing'] })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
     expect(git.mock.calls).toEqual([[['rev-parse', '--verify', 'missing^{commit}']]]);
-    expect(spawnSync).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
   });
 
   it('checks size after the pre-PR review gate and before spawning', () => {

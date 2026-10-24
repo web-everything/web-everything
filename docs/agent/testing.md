@@ -165,6 +165,30 @@ The host queue needs write access to the admission pool's parent as well as the 
 An `EPERM` on that rename is an admission infrastructure failure, not a suite result.
 Keep the host queue; do not switch to a private pool or run tests directly.
 
+## Open-PR size evidence
+
+An injected runner `spawn` keeps the default size reader and duplicate-card scan hermetic.
+To exercise production size evidence, inject `diffStat: createPrDiffStatReader({ cwd })`
+with a temporary Git repo (or inject its `git`/`exec`); keep submission injected. Do not
+select production IO through a module-wide child-process mock's function identity.
+
+Exercise the default size reader with real Git fixtures for `-diff`/binary attributes and NUL
+content. It must pin `sha` with `^{commit}`, force `--text`, disable external diff/textconv,
+and clear `core.attributesFile`. Attributes can still force binary numstat rows despite `--text`.
+The production reader recovers those rows by conservatively counting all lines in both the pinned
+head blob and the merge-base blob, preserving both rename paths. A successful tree read must
+prove an absent side; failed tree/blob reads or an exhausted shared 60-second fallback budget
+refuse as `pr-size-unreadable` (restore readable Git evidence and retry). Injected binary numstat
+without recovered counts still refuses. Both rename paths participate in backlog exemptions and test exclusions;
+moving production into either cannot hide its changed lines. Only a gate-returned, recorded
+bypass waives size admission; operator skip arguments alone do not.
+
+`open-pr-size-cap.test.mjs`'s **default size reader — binary fallback evidence** cases inject
+head/base tree and blob failures and require `pr-size-unreadable` with no submission. Pair
+those failures with successful empty tree results for additions/deletions. Its shared-budget
+case advances a mocked monotonic clock across two binary rows, checks shrinking subprocess
+timeouts, and requires refusal before a further blob read once the 60-second budget is spent.
+
 ## Prepare throughput
 
 Prepare batches use `prepare.batchSize` (6) and the just-in-time window uses
