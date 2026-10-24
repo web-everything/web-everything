@@ -2,8 +2,9 @@
 /**
  * @file scripts/ci/runner-fallback.mjs
  * @description Detect stalled paid CI shards and switch forward to the fallback runner.
- * Dry-run guarantees no GitHub mutation, no feed append. Read-only throttle bookkeeping
- * (local slots, budgets and call logs) is excluded: gh-throttle has no no-state option.
+ * Dry-run guarantees no GitHub mutation, no feed append. The shared gh-throttle
+ * wrapper is required repo-wide; its own slot/budget bookkeeping and call logs
+ * are outside this guarantee.
  * Pure decisions are separate from bounded, injected GitHub IO. Defaults to dry-run;
  * --apply sets the variable before cancelling and rerunning affected runs. Never restores
  * the paid runner. Incomplete discovery requires operator inspection, never a partial repair.
@@ -23,7 +24,7 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export const RUNNER_FALLBACK_POLICY = Object.freeze({ queuedMinutes: 10, fallbackRunner: 'ubuntu-latest' });
 const CANCEL_BOUNDS = Object.freeze({ cancelPollAttempts: 6, cancelPollIntervalMs: 1000 });
-const READ_BOUNDS = Object.freeze({ maxRuns: 40, maxJobs: 100, maxCalls: 160 });
+const READ_BOUNDS = Object.freeze({ maxRuns: 40, maxJobs: 100, maxCalls: 160, maxAttemptsPerCall: 5 });
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0;
 const runnerLabel = value => typeof value === 'string' && /^ubuntu-(?:latest|\d{2}\.04)(?:-arm)?$/.test(value);
 // Match needs-you-feed field bounds; sanitize every nested string before publication.
@@ -37,7 +38,7 @@ const epoch = value => typeof value === 'string' && value ? Date.parse(value) : 
 export function resolveRunnerFallbackSettings({ env = process.env, platform, tool, log } = {}) {
   const envValues = {};
   for (const [key, name] of Object.entries({ queuedMinutes: 'QUEUED_MINUTES', fallbackRunner: 'RUNNER',
-    maxRuns: 'MAX_RUNS', maxJobs: 'MAX_JOBS', maxCalls: 'MAX_CALLS',
+    maxRuns: 'MAX_RUNS', maxJobs: 'MAX_JOBS', maxCalls: 'MAX_CALLS', maxAttemptsPerCall: 'MAX_ATTEMPTS_PER_CALL',
     cancelPollAttempts: 'CANCEL_POLL_ATTEMPTS', cancelPollIntervalMs: 'CANCEL_POLL_INTERVAL_MS' })) {
     const raw = env[`WE_RUNNER_FALLBACK_${name}`];
     if (raw !== undefined) envValues[key] = key === 'fallbackRunner' ? raw : /^\d+$/.test(raw) ? Number(raw) : NaN;
@@ -45,7 +46,7 @@ export function resolveRunnerFallbackSettings({ env = process.env, platform, too
   const result = cascadePolicy('runnerFallback', tool, {
     standard: { ...RUNNER_FALLBACK_POLICY, ...READ_BOUNDS, ...CANCEL_BOUNDS }, platform, env, envValues, log,
     valid: { queuedMinutes: positiveInteger, fallbackRunner: runnerLabel,
-      maxRuns: positiveInteger, maxJobs: positiveInteger, maxCalls: positiveInteger,
+      maxRuns: positiveInteger, maxJobs: positiveInteger, maxCalls: positiveInteger, maxAttemptsPerCall: positiveInteger,
       cancelPollAttempts: positiveInteger, cancelPollIntervalMs: positiveInteger },
   });
   return { ...result.value, sources: result.sources };
@@ -86,8 +87,13 @@ export function decideRunnerFallback({ jobs = [], runnerVar, settings = RUNNER_F
     stuck, runIds: [...new Set(stuck.map(j => j.runId))].sort((a, b) => a - b), setVariableTo: settings.fallbackRunner };
 }
 
-/** Pure: missing group or visibility evidence is explicitly unreadable. */
+/**
+ * Report only: missing group or visibility evidence is explicitly unreadable.
+ * Blocked/unreadable preflight never vetoes fallback: only stuck-job evidence decides,
+ * and a blocked group can be exactly why the shards stall.
+ */
 export function evaluatePreflight({ runnerVar, repoVisibility, runnerGroup, settings = RUNNER_FALLBACK_POLICY }) {
+  if (runnerLabel(runnerVar)) return { status: 'ok', reason: 'Standard hosted label; no org runner group preflight required' };
   if (!runnerVar || runnerVar === settings.fallbackRunner) return { status: 'ok', reason: 'Default or fallback runner' };
   if (!['public', 'private', 'internal'].includes(repoVisibility) || !runnerGroup?.name
     || typeof runnerGroup.allows_public_repositories !== 'boolean') return { status: 'unreadable', reason: 'Unreadable repository or runner group evidence; inspect runner configuration' };
@@ -105,18 +111,19 @@ export function formatFeedLine(event) {
 }
 
 /** Translate the injectable CLI vocabulary to single, real REST requests in production. */
-function restExec(cmd, args, { charge, ...options }) {
+function restExec(cmd, args, { charge, maxAttemptsPerCall, ...options }) {
   const flag = key => args[args.indexOf(key) + 1];
   const repo = flag('--repo');
   let request = args;
   if (args[0] === 'run' && args[1] === 'list') {
-    request = ['api', `repos/${repo}/actions/workflows/ci.yml/runs?status=${flag('--status')}&per_page=${flag('--limit')}${args.includes('--created') ? `&created=${encodeURIComponent(flag('--created'))}` : ''}`];
+    request = ['api', `repos/${repo}/actions/workflows/ci.yml/runs?status=${flag('--status')}&per_page=${flag('--limit')}`];
   } else if (args[0] === 'variable' && args[1] === 'set') {
     request = ['api', '--method', 'PATCH', `repos/${repo}/actions/variables/WE_SHARD_RUNNER`, '-f', 'name=WE_SHARD_RUNNER', '-f', `value=${flag('--body')}`];
   } else if (args[0] === 'run' && ['cancel', 'rerun'].includes(args[1])) {
     request = ['api', '--method', 'POST', `repos/${repo}/actions/runs/${args[2]}/${args[1]}`];
   }
   return execFileSyncThrottled(cmd, request, { ...options, throttle: {
+    maxAttempts: maxAttemptsPerCall,
     // Charge actual attempts, including any retry/auth fallback inside the shared helper.
     // The custom executor also disables cached run-job proofs and read memoization.
     exec: (argv, childOptions) => { charge(); return execFileSync(cmd, argv, childOptions); },
@@ -136,9 +143,18 @@ export async function runRunnerFallback(options = {}) {
     if (++calls > settings.maxCalls) throw new Error('GitHub call bound exceeded; inspect CI manually or raise maxCalls');
   };
   const call = async args => {
-    if (exec !== restExec) charge();
+    let attempts = 0;
+    const chargeAttempt = () => {
+      // Also cap auth/JSON/probe retries that can bypass throttle.maxAttempts.
+      if (++attempts > settings.maxAttemptsPerCall) throw new Error('GitHub per-call attempt bound exceeded; inspect CI manually');
+      charge();
+    };
+    // Simple injected executors cost one attempt; retrying executors charge each
+    // additional attempt through the same callback used by the production wrapper.
+    if (exec !== restExec) chargeAttempt();
     return exec('gh', args, { encoding: 'utf8', shell: false, maxBuffer: 4 * 1024 * 1024, timeout: 30000,
-      ...(exec === restExec ? { charge } : {}) });
+      charge: chargeAttempt,
+      maxAttemptsPerCall: settings.maxAttemptsPerCall });
   };
   const json = async args => JSON.parse(String(await call(args)));
   const api = endpoint => json(['api', endpoint]);
@@ -165,28 +181,43 @@ export async function runRunnerFallback(options = {}) {
         : (await api(`repos/${repo}/actions/variables/WE_SHARD_RUNNER`)).value;
     if (typeof runnerVar !== 'string' && runnerVar != null) throw new Error('Unreadable runner variable');
     let repoVisibility = options.repoVisibility, runnerGroup = options.runnerGroup;
-    if (!offline && runnerVar && runnerVar !== settings.fallbackRunner) {
+    if (!offline && runnerVar && runnerVar !== settings.fallbackRunner && !runnerLabel(runnerVar)) {
       if (!Object.hasOwn(options, 'repoVisibility')) repoVisibility = (await api(`repos/${repo}`)).visibility;
       if (!Object.hasOwn(options, 'runnerGroup')) {
+        let incompleteLookup = false;
         try {
           const org = repo.split('/')[0];
           const hosted = await api(`orgs/${org}/actions/hosted-runners?per_page=100`);
-          if (!complete(hosted, hosted.runners)) throw new Error('Incomplete hosted runner lookup');
+          if (!complete(hosted, hosted.runners)) {
+            incompleteLookup = true;
+            throw new Error('Incomplete hosted runner lookup');
+          }
           const runner = hosted.runners.find(r => r.name === runnerVar);
           if (!positiveInteger(runner?.runner_group_id)) throw new Error('Runner group unresolved');
           const groups = await api(`orgs/${org}/actions/runner-groups?per_page=100`);
-          if (!complete(groups, groups.runner_groups)) throw new Error('Incomplete runner group lookup');
-          runnerGroup = groups.runner_groups.find(g => g.id === runner.runner_group_id) ?? 'unreadable';
-        } catch (error) { throw new Error(`Unreadable runner group discovery: ${clean(error.message)}`); }
+          if (!complete(groups, groups.runner_groups)) {
+            incompleteLookup = true;
+            throw new Error('Incomplete runner group lookup');
+          }
+          runnerGroup = groups.runner_groups.find(g => g.id === runner.runner_group_id);
+          if (!runnerGroup) throw new Error('Runner group unresolved');
+        } catch (error) {
+          if (incompleteLookup) throw new Error(`Unreadable runner group discovery: ${clean(error.message)}`);
+          // Incomplete lists retain the fail-closed discovery bound. Resolution
+          // failures are report-only and must not prevent stuck-job discovery.
+          preflight = { status: 'unreadable', reason: `Unreadable runner group discovery: ${clean(error.message)}; inspect runner configuration` };
+        }
       }
     }
-    preflight = evaluatePreflight({ runnerVar, repoVisibility, runnerGroup, settings });
+    preflight ??= evaluatePreflight({ runnerVar, repoVisibility, runnerGroup, settings });
     let jobs = options.jobs;
     if (!offline) {
       const runs = new Map();
+      // REST has no activity-time filter. Read a bounded complete set, then let
+      // job started_at bound recent activity; creation time cannot exclude work.
+      // Oversized evidence requires operator inspection rather than a partial repair.
       for (const status of ['queued', 'in_progress', 'completed']) {
         const response = await json(['run', 'list', '--repo', repo, '--workflow', 'ci.yml', '--status', status,
-          ...(status === 'completed' ? ['--created', `>=${new Date(now - settings.queuedMinutes * 60000).toISOString()}`] : []),
           '--limit', String(Math.min(settings.maxRuns, 100)), '--json', 'databaseId,status']);
         const list = response.workflow_runs;
         if (!complete(response, list) || list.length >= Math.min(settings.maxRuns, 100)) {
@@ -215,8 +246,9 @@ export async function runRunnerFallback(options = {}) {
       if (preflight.status !== 'ok') notice(preflight.reason, decision.runIds, 'runner-preflight');
       return { preflight, ...decision, planned };
     }
-    // Reserve worst-case polling plus every mutation before making the first write.
-    if (calls + 1 + decision.runIds.length * (2 + settings.cancelPollAttempts) > settings.maxCalls) throw new Error('Repair exceeds call bound; inspect CI manually or raise maxCalls');
+    // Reserve every attempt of worst-case polling and mutations before the first write.
+    const repairCalls = 1 + decision.runIds.length * (2 + settings.cancelPollAttempts);
+    if (calls + repairCalls * settings.maxAttemptsPerCall > settings.maxCalls) throw new Error('Repair exceeds call bound; inspect CI manually or raise maxCalls');
     await call(['variable', 'set', 'WE_SHARD_RUNNER', '--body', decision.setVariableTo, '--repo', repo]);
     const cancelFailures = new Set();
     for (const id of decision.runIds) {
@@ -264,7 +296,7 @@ export async function runRunnerFallback(options = {}) {
       skipped.length ? 'cancel-not-completed; inspect CI manually' : ''].filter(Boolean);
     const reason = [...failures, decision.reason, preflight.status !== 'ok' ? preflight.reason : '']
       .filter(Boolean).join('; ');
-    notice(reason, decision.runIds, 'runner-fallback', { rerunResults });
+    notice(reason, decision.runIds, 'runner-fallback', { rerunResults, preflight });
     return { preflight, ...decision, reason, planned, applied: true, rerunResults };
   } catch (error) {
     const reason = `Runner fallback incomplete: ${clean(error.message)}; inspect CI manually`;

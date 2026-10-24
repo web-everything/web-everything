@@ -261,6 +261,22 @@ describe('runner fallback policy cascade', () => {
         sources: { cancelPollAttempts: 'platform', cancelPollIntervalMs: 'platform' } });
     });
 
+  it('resolves the named maxAttemptsPerCall reservation leaf with provenance and rejects invalid overrides', () => {
+    const log = vi.fn();
+    expect(resolveRunnerFallbackSettings({ env: { WE_POLICY_CASCADE_LOG: '1',
+      WE_RUNNER_FALLBACK_MAX_ATTEMPTS_PER_CALL: '3' },
+    platform: { maxAttemptsPerCall: 8 }, tool: { maxAttemptsPerCall: 4 }, log }))
+      .toMatchObject({ maxAttemptsPerCall: 3, sources: { maxAttemptsPerCall: 'env' } });
+    expect(log.mock.calls.flat().join('\n')).toContain('maxAttemptsPerCall=3 (env)');
+    expect(resolveRunnerFallbackSettings({ env: {}, platform: null, log: vi.fn() }))
+      .toMatchObject({ maxAttemptsPerCall: 5, sources: { maxAttemptsPerCall: 'standard' } });
+    for (const value of ['0', '-1', '1.5', 'invalid', '9007199254740992']) {
+      expect(resolveRunnerFallbackSettings({ env: { WE_RUNNER_FALLBACK_MAX_ATTEMPTS_PER_CALL: value },
+        platform: { maxAttemptsPerCall: 2 }, log: vi.fn() }))
+        .toMatchObject({ maxAttemptsPerCall: 2, sources: { maxAttemptsPerCall: 'platform' } });
+    }
+  });
+
   it('keeps the only literal threshold and default runner inside the policy defaults object', () => {
     const source = readFileSync(new URL('../runner-fallback.mjs', import.meta.url), 'utf8');
     expect(source.match(/\b10\b/g)).toHaveLength(1);
@@ -480,7 +496,7 @@ describe('hostile feed fields', () => {
 });
 
 describe('runRunnerFallback (injected gh, temporary feed)', () => {
-  it('dry-run guarantees no GitHub mutation, no feed append (read-only throttle bookkeeping excluded)', async () => {
+  it('dry-run guarantees no GitHub mutation and no feed append; required shared throttle slot/budget bookkeeping is out of scope', async () => {
     const h = harness();
     writeFileSync(h.feedPath, 'existing feed\n');
     const before = snapshot(h.dir);
@@ -490,16 +506,17 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
     expect(snapshot(h.dir)).toEqual(before);
   });
 
-  it('discovers recently created completed ci.yml runs and counts their paid runner start', async () => {
+  it.each([3, 30])('discovers a completed ci.yml run created %s minutes ago by its recent paid job activity', async createdMinutes => {
     const h = harness();
     const exec = vi.fn((cmd, args, options) => {
       if (args[0] === 'run' && args[1] === 'list' && args.includes('completed')) {
-        expect(args).toEqual(expect.arrayContaining(['--workflow', 'ci.yml', '--created', `>=${ago(10)}`]));
-        return JSON.stringify({ total_count: 1, workflow_runs: [{ id: 202, status: 'completed' }] });
+        expect(args).toEqual(['run', 'list', '--repo', REPO, '--workflow', 'ci.yml',
+          '--status', 'completed', '--limit', '40', '--json', 'databaseId,status']);
+        return JSON.stringify({ total_count: 1, workflow_runs: [{ id: 202, status: 'completed', created_at: ago(createdMinutes), updated_at: ago(1) }] });
       }
       if (args[0] === 'api' && args[1].includes('/runs/202/jobs')) {
         return JSON.stringify({ total_count: 1, jobs: [job({ runId: 202, jobId: 2001,
-          status: 'completed', createdAt: ago(3), startedAt: ago(2) })] });
+          status: 'completed', createdAt: ago(createdMinutes), startedAt: ago(2) })] });
       }
       return h.exec(cmd, args, options);
     });
@@ -509,6 +526,161 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
     expect(exec.mock.calls.some(([, args]) => args[1]?.includes('/runs/202/jobs'))).toBe(true);
     expect(h.mutations).toEqual([]);
     expect(snapshot(h.dir)).toEqual([]);
+  });
+
+  it.each(['ubuntu-latest', 'ubuntu-22.04', 'ubuntu-24.04', 'ubuntu-24.04-arm'])(
+    'standard hosted label %s skips org runner-group preflight and continues discovery', async runnerVar => {
+      const h = harness({ runnerVar, jobs: [] });
+      const options = { ...h.options };
+      delete options.repoVisibility;
+      delete options.runnerGroup;
+      const result = await runRunnerFallback(options);
+      expect(result).toMatchObject({ decision: 'no-action', preflight: {
+        status: 'ok', reason: expect.stringMatching(/standard hosted label/i) } });
+      expect(result.error).toBeUndefined();
+      expect(h.exec.mock.calls.map(([, args]) => args[0])).toEqual(['run', 'run', 'run']);
+      expect(h.mutations).toEqual([]);
+    });
+
+  // Each row passes one runner list; Vitest otherwise spreads the list into arguments.
+  it.each([[], [{ name: 'we-8core' }]].map(runners => [runners]))(
+    'unresolved non-standard runner label reports unreadable preflight and continues stuck-job discovery (%j)', async runners => {
+      const h = harness();
+      const exec = vi.fn((cmd, args, options) => args[1]?.includes('/hosted-runners')
+        ? JSON.stringify({ total_count: runners.length, runners }) : h.exec(cmd, args, options));
+      const options = { ...h.options, exec, apply: true };
+      delete options.runnerGroup;
+      const result = await runRunnerFallback(options);
+      expect(result.error).toBeUndefined();
+      expect(result).toMatchObject({ decision: 'fallback', applied: true, preflight: { status: 'unreadable' },
+        rerunResults: [{ runId: 101, rerun: true }] });
+      expect(result.preflight.reason).toMatch(/Runner group unresolved/);
+      expect(h.mutations.map(args => args[1])).toEqual(['set', 'cancel', 'rerun']);
+      expect(feedLines(h.feedPath)).toHaveLength(1);
+      expect(parseEvent(feedLines(h.feedPath)[0]).preflight.status).toBe('unreadable');
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'run' && args[1] === 'list')).toHaveLength(3);
+      expect(exec.mock.calls.some(([, args]) => args[1]?.includes('/runner-groups'))).toBe(false);
+    });
+
+  it.each([[], [{ name: 'we-8core' }]].map(runners => [runners]))(
+    'unresolved non-standard runner label without stuck jobs reports unreadable preflight without fallback (%j)', async runners => {
+      const h = harness({ jobs: [] });
+      const exec = vi.fn((cmd, args, options) => args[1]?.includes('/hosted-runners')
+        ? JSON.stringify({ total_count: runners.length, runners }) : h.exec(cmd, args, options));
+      const options = { ...h.options, exec, apply: true };
+      delete options.runnerGroup;
+      const result = await runRunnerFallback(options);
+      expect(result).toMatchObject({ decision: 'no-action', preflight: { status: 'unreadable' },
+        planned: { setVariable: null, cancel: [], rerun: [] } });
+      expect(result.error).toBeUndefined();
+      expect(result.preflight.reason).toMatch(/Runner group unresolved/);
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'run' && args[1] === 'list')).toHaveLength(3);
+      expect(h.mutations).toEqual([]);
+      const lines = feedLines(h.feedPath);
+      expect(lines).toHaveLength(1);
+      expect(parseEvent(lines[0]).kind).toBe('runner-preflight');
+    });
+
+  it.each(['hosted-runners', 'runner-groups'].flatMap(read => [true, false].map(stuck => [read, stuck])))(
+    'throwing %s resolution reports unreadable preflight and continues discovery (stuck=%s)', async (read, stuck) => {
+      const h = harness({ jobs: stuck ? [job()] : [] });
+      const exec = vi.fn((cmd, args, options) => {
+        if (args[0] === 'api' && args[1].includes(`/${read}?`)) throw new Error('Runner lookup denied');
+        if (args[0] === 'api' && args[1].includes('/hosted-runners?')) {
+          return JSON.stringify({ total_count: 1, runners: [{ name: 'we-8core', runner_group_id: 7 }] });
+        }
+        return h.exec(cmd, args, options);
+      });
+      const options = { ...h.options, exec, apply: true };
+      delete options.runnerGroup;
+      const result = await runRunnerFallback(options);
+      expect(result.error).toBeUndefined();
+      expect(result.preflight).toMatchObject({ status: 'unreadable',
+        reason: expect.stringMatching(/Runner lookup denied.*inspect runner configuration/) });
+      expect(result.decision).toBe(stuck ? 'fallback' : 'no-action');
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'run' && args[1] === 'list')).toHaveLength(3);
+      expect(h.mutations.map(args => args[1])).toEqual(stuck ? ['set', 'cancel', 'rerun'] : []);
+      expect(feedLines(h.feedPath)).toHaveLength(1);
+      const event = parseEvent(feedLines(h.feedPath)[0]);
+      if (stuck) expect(event.preflight).toEqual(result.preflight);
+      else expect(event.kind).toBe('runner-preflight');
+    });
+
+  it.each([
+    ['blocked', { ...GROUP, allows_public_repositories: false }],
+    ['unreadable', null],
+  ])('preflight is REPORT only: stuck jobs still fall back with %s preflight, both reported in one feed line', async (status, runnerGroup) => {
+    const h = harness({ runnerGroup });
+    const result = await runRunnerFallback({ ...h.options, apply: true });
+    expect(result).toMatchObject({ decision: 'fallback', applied: true, preflight: { status },
+      rerunResults: [{ runId: 101, rerun: true }] });
+    expect(h.mutations.map(args => args[1])).toEqual(['set', 'cancel', 'rerun']);
+    const lines = feedLines(h.feedPath);
+    expect(lines).toHaveLength(1);
+    const event = parseEvent(lines[0]);
+    expect(event.kind).toBe('runner-fallback');
+    expect(event.reason).toMatch(/Paid shards queued/);
+    expect(event.preflight).toEqual(result.preflight);
+    expect(event.preflight.reason).toMatch(status === 'blocked' ? /prohibits public/ : /unreadable/i);
+  });
+
+  it.each([15, 16])('reserves all throttle retries before cancel so reruns cannot starve (maxCalls=%s)', async maxCalls => {
+    const h = harness({ cancelStatuses: ['queued', 'completed'] });
+    let attempts = 0;
+    const exec = vi.fn((cmd, args, options) => {
+      // The executor retries a real injected failure on each repair call;
+      // discovery succeeds immediately. Only the successful attempt reaches gh.
+      const repair = !(args[0] === 'run' && args[1] === 'list') && !args[1]?.includes('/jobs?');
+      expect(options.maxAttemptsPerCall).toBe(2);
+      for (let attempt = 0; attempt < options.maxAttemptsPerCall; attempt++) {
+        if (attempt > 0) options.charge(); // first attempt is already charged
+        attempts++;
+        try {
+          if (repair && attempt === 0) throw new Error('Injected rate limit');
+          return h.exec(cmd, args, options);
+        } catch (error) {
+          if (error.message !== 'Injected rate limit' || attempt + 1 === options.maxAttemptsPerCall) throw error;
+        }
+      }
+      throw new Error('Unreachable retry exhaustion');
+    });
+    const result = await runRunnerFallback({ ...h.options, exec, apply: true,
+      settings: { ...SETTINGS, maxCalls, maxAttemptsPerCall: 2, cancelPollAttempts: 3 } });
+    if (maxCalls === 15) {
+      expect(result).toMatchObject({ decision: 'no-action', applied: false });
+      expect(result.error).toMatch(/Repair exceeds call bound.*inspect CI/i);
+      expect(h.mutations).toEqual([]);
+      expect(attempts).toBe(4);
+    } else {
+      expect(result).toMatchObject({ applied: true, rerunResults: [{ runId: 101, rerun: true }] });
+      expect(h.mutations.map(args => args[1])).toEqual(['set', 'cancel', 'rerun']);
+      expect(h.pollCounts.get(101)).toBe(2);
+      expect(attempts).toBe(14);
+    }
+  });
+
+  it('caps excessive retry attempts per call so a rejected cancel cannot spend the reserved rerun budget', async () => {
+    const h = harness();
+    let cancelAttempts = 0;
+    const exec = vi.fn((cmd, args, options) => {
+      if (args[0] === 'run' && args[1] === 'cancel') {
+        cancelAttempts++;
+        options.charge();
+        cancelAttempts++;
+        options.charge(); // third attempt is refused before any GitHub execution
+        throw new Error('Unreachable third cancellation attempt');
+      }
+      return h.exec(cmd, args, options);
+    });
+    const result = await runRunnerFallback({ ...h.options, exec, apply: true,
+      settings: { ...SETTINGS, maxCalls: 12, maxAttemptsPerCall: 2, cancelPollAttempts: 1 } });
+    expect(cancelAttempts).toBe(2);
+    expect(result).toMatchObject({ applied: true,
+      rerunResults: [{ runId: 101, cancelFailed: true, rerun: true }] });
+    expect(result.error).toBeUndefined();
+    expect(h.mutations.map(args => args[1])).toEqual(['set', 'rerun']);
+    expect(h.pollCounts.get(101)).toBe(1);
+    expect(feedLines(h.feedPath)).toHaveLength(1);
   });
 
   it.each(['runs', 'jobs', 'hosted-runners', 'runner-groups'].flatMap(read =>
