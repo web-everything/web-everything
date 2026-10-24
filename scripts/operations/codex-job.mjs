@@ -100,6 +100,8 @@ function unsafePublicationConfig(output, originUrl) {
   for (let i = 0; i + 1 < parts.length; i += 2) {
     const entry = parts[i + 1], newline = entry.indexOf('\n');
     const key = newline < 0 ? entry : entry.slice(0, newline);
+    // Clone fetch refspecs map incoming refs; they cannot redirect publication.
+    if (/^remote\..+\.fetch$/i.test(key)) continue;
     // Inspect every effective scope: even a URL passed literally can be rewritten.
     if (/^(url|remote)\./i.test(key) &&
         !(key === 'remote.origin.url' && newline >= 0 && entry.slice(newline + 1) === originUrl)) return true;

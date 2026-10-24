@@ -16,6 +16,7 @@ const red = (stdout = 'failure output') => ({ status: 1, stdout, stderr: 'test e
 const report = (extra = {}) => ok(`progress\n${JSON.stringify({ exitCode: 0, timedOut: false, lastMessage: 'NOT WEAKENED', ...extra })}\n`);
 const loaderHelp = '--branch= --sha= --daemon= --why= --tests-run= --audit= --json\n';
 const originUrl = 'https://github.com/example/trusted.git';
+const laneConfig = `local\0remote.origin.url\n${originUrl}\0local\0remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0local\0remote.origin.fetch\n^refs/heads/ops/*\0`;
 function fixture(rules = [], { ready = true } = {}) {
   const calls = [], writes = [], logs = [], output = [];
   const counts = new Map();
@@ -38,7 +39,7 @@ function fixture(rules = [], { ready = true } = {}) {
       if (call.text.includes('fix-ready.mjs') || call.text.includes('scripts/operations/run.mjs prototype-load')) return ok();
       if (cmd === 'git') {
         if (args.includes('get-url')) return ok(`${originUrl}\n`);
-        if (args.includes('config')) return ok();
+        if (args.includes('config')) return ok(laneConfig);
         if (args.includes('write-tree') || args.some(a => a.endsWith('^{tree}'))) return ok('a'.repeat(40) + '\n');
         if (args.includes('--show-toplevel')) return ok('/repo\n');
         if (args.includes('rev-parse')) return ok('abc123\n');
@@ -77,6 +78,32 @@ const scopeReleased = f => {
   expect(f.calls.find(c => c.text.includes('free-scope-cli.mjs release')).args.slice(2)).toEqual(claim.args.slice(2, 4));
 };
 const codexCalls = f => f.calls.filter(c => c.text.includes('codex-direct-task.mjs') && !c.args.includes('--review'));
+
+it('completes a job with standard cloned-origin configuration', async () => {
+  const f = fixture();
+  expect((await f.run()).result.ok).toBe(true);
+  expect(f.calls.some(c => c.cmd === 'git' && c.args.includes('reset'))).toBe(true);
+  expect(codexCalls(f)).toHaveLength(1);
+  expect(f.calls.some(c => c.cmd === 'git' && c.args.includes('push'))).toBe(true);
+  released(f);
+  scopeReleased(f);
+});
+
+it.each(['codex-direct-task.mjs --task-file', 'heavy-admission', 'codex-direct-task.mjs --review'])('allows fetch mappings changed at the %s boundary', async boundary => {
+  for (const scope of ['local', 'worktree', 'global']) {
+    for (const key of ['remote.origin.fetch', 'remote.backup.mirror.fetch', 'REMOTE.origin.FETCH']) {
+      let changed = false;
+      const f = fixture([
+        [boundary, () => { changed = true; return boundary.includes('codex') ? report() : ok(); }],
+        ['config --show-scope', () => ok(`${laneConfig}${changed ? `${scope}\0${key}\n+refs/heads/main:refs/remotes/origin/main\0` : ''}`)],
+      ]);
+      expect((await f.run()).result.ok, `${scope} ${key}`).toBe(true);
+      expect(changed).toBe(true);
+      expect(f.calls.some(c => c.args.includes('push'))).toBe(true);
+      released(f); scopeReleased(f);
+    }
+  }
+});
 
 it.each([false, true])('passes exact lane argv with --gate=none to initial, repair and audit Codex invocations (repair=%s)', async repair => {
   const f = fixture(repair ? [['heavy-admission', (_, n) => n === 0 ? red() : ok()]] : []);
@@ -140,7 +167,7 @@ it('rejects outside changes hidden by a replacement root commit (real Git)', asy
 });
 
 it('captures the primary origin once before the worker and publishes only to that URL', async () => {
-  const f = fixture([['config --show-scope', ok(`local\0remote.origin.url\n${originUrl}\0`)]]);
+  const f = fixture();
   expect((await f.run()).result.ok).toBe(true);
   const reads = f.calls.filter(c => c.args.includes('get-url'));
   expect(reads).toHaveLength(1);
@@ -166,7 +193,7 @@ it('refuses remote redirects at every worker, test and audit boundary', async ()
     ['remote.origin.url', 'https://evil.example/x.git'],
     ['remote.origin.pushurl', 'https://evil.example/x.git'],
     ['remote.other.url', originUrl],
-    ['remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*'],
+    ['remote.other.pushurl', 'https://evil.example/x.git'],
     ['url.https://evil.example/.insteadof', 'https://github.com/'],
     ['url.https://evil.example/.pushinsteadof', 'https://github.com/'],
     ['url.https://evil.example/.unknown', 'value'],
@@ -177,7 +204,7 @@ it('refuses remote redirects at every worker, test and audit boundary', async ()
         let poisoned = false;
         const f = fixture([
           [boundary, () => { poisoned = true; return boundary.includes('codex') ? report() : ok(); }],
-          ['config --show-scope', () => ok(`local\0remote.origin.url\n${originUrl}\0${poisoned ? `${scope}\0${key}\n${value}\0` : ''}`)],
+          ['config --show-scope', () => ok(`${laneConfig}${poisoned ? `${scope}\0${key}\n${value}\0` : ''}`)],
         ]);
         expect((await f.run()).result.stopReason, `${boundary}: ${scope} ${key}`).toBe('unsafe-git-config');
         expect(f.calls.some(c => c.args.includes('add') || c.args.includes('ls-remote') || c.args.includes('push'))).toBe(false);
@@ -193,7 +220,7 @@ it.each(['unchanged', 'remote', 'insteadOf', 'pushInsteadOf'])('checks real lane
   try {
     execFileSync('git', ['-C', repo, 'init', '--quiet', '--template='], { env });
     const configFile = path.join(repo, '.git/config');
-    const baseline = `[remote "origin"]\n\turl = ${originUrl}\n`;
+    const baseline = `[remote "origin"]\n\turl = ${originUrl}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\tfetch = ^refs/heads/ops/*\n`;
     writeFileSync(configFile, baseline);
     const f = fixture([
       ['config --show-scope', (call) => spawnSync('git', ['-C', repo, ...call.args.slice(2)], {
