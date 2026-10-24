@@ -138,10 +138,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         if (!evidence.clean) {
           out.stale.push(ref);
           if (!included) {
-            const staleFiles = Array.isArray(evidence.files) ? evidence.files : [];
-            const overlap = effectivePaths.filter((file) => staleFiles.includes(file));
-            const reason = out.check.ok !== true || out.check.clean !== true ? 'candidate-not-clean'
-              : !staleFiles.length ? 'stale-files-unknown'
+            let staleChanged = [];
+            try {
+              staleChanged = changedPaths(requireGit('diff', '--name-status', '-z', `origin/main...origin/${ref}`));
+            } catch { /* Unreadable changed-file evidence keeps this registration blocking. */ }
+            const staleFiles = new Set([...staleChanged, ...(Array.isArray(evidence.files) ? evidence.files : [])]);
+            const overlap = effectivePaths.filter((file) => staleFiles.has(file));
+            const reason = !staleChanged.length ? 'stale-files-unknown'
+              : out.check.ok !== true || out.check.clean !== true ? 'candidate-not-clean'
               : overlap.length ? `overlap-with-candidate: ${overlap.join(', ')}` : null;
             if (reason) { blocking.push(ref); blockingReasons[ref] = reason; }
             else {
