@@ -48,16 +48,10 @@ export function readHostMemoryHeadroom({ env = process.env, platform = process.p
   if (platform === 'darwin') {
     const opts = { encoding: 'utf8', timeout: 5000 };
     const vm = () => exec('vm_stat', [], opts);
+    // memory_pressure includes file cache, inflating headroom and bypassing the admission minimum.
     const probes = [
       ['vm_stat+swapusage', () => parseDarwinMemoryHeadroomMb(vm(), exec('sysctl', ['vm.swapusage'], opts))],
       ['vm_stat', () => parseDarwinMemoryHeadroomMb(vm(), 'free = 0M')],
-      ['memory_pressure', () => {
-        const output = exec('memory_pressure', ['-Q'], opts);
-        const bytes = Number(/The system has (\d+)\s/.exec(output)?.[1]);
-        const percent = Number(/System-wide memory free percentage:\s*([\d.]+)%/.exec(output)?.[1]);
-        if (!Number.isFinite(bytes) || bytes <= 0 || !Number.isFinite(percent) || percent < 0 || percent > 100) throw Error('unparseable memory_pressure');
-        return (bytes / 1048576) * (percent / 100);
-      }],
       ['hw.memsize+vm_stat', () => {
         const bytes = Number(/^hw\.memsize:\s*(\d+)\s*$/.exec(exec('sysctl', ['hw.memsize'], opts))?.[1]);
         const output = vm();

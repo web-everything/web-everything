@@ -15,7 +15,7 @@ const denied = () => { throw Object.assign(Error('denied'), { code: 'EPERM' }); 
 const opts = { encoding: 'utf8', timeout: 5000 };
 const calls = [
   ['vm_stat', [], opts], ['sysctl', ['vm.swapusage'], opts], ['vm_stat', [], opts],
-  ['memory_pressure', ['-Q'], opts], ['sysctl', ['hw.memsize'], opts], ['vm_stat', [], opts],
+  ['sysctl', ['hw.memsize'], opts], ['vm_stat', [], opts],
 ];
 const read = (exec, log) => hostLoad.readHostMemoryHeadroom({ env: {}, platform: 'darwin', exec, free: denied, log });
 const sequence = (...steps) => steps.reduce((exec, step) => exec.mockImplementationOnce(
@@ -36,13 +36,19 @@ describe('Darwin memory probe fallback chain', () => {
     expect(read(exec)).toEqual({ mb: 704, probe: 'vm_stat' });
     expect(exec.mock.calls).toEqual(calls.slice(0, 3));
   });
-  it('uses memory_pressure when vm_stat and sysctl fail', () => {
-    const exec = vi.fn((cmd) => cmd === 'memory_pressure' ? pressure : denied());
-    expect(read(exec)).toEqual({ mb: 50462.72, probe: 'memory_pressure' });
-    expect(exec.mock.calls).toEqual([calls[0], calls[2], calls[3]]);
+  it('never invokes memory_pressure and throws/refuses admission when vm_stat and swapusage fail', () => {
+    const exec = vi.fn((cmd, args) => {
+      if (cmd === 'memory_pressure') return pressure;
+      if (cmd === 'sysctl' && args[0] === 'hw.memsize') return 'hw.memsize: 68719476736';
+      return denied();
+    }).mockImplementationOnce(() => vm);
+    expect(() => read(exec)).toThrow('denied');
+    expect(exec.mock.calls).toEqual(calls);
+    expect(admission(() => read(exec).mb)).toMatchObject({ admitted: false, reason: expect.stringContaining('host memory unknown') });
+    expect(exec.mock.calls.some(([cmd]) => cmd === 'memory_pressure')).toBe(false);
   });
   it('uses hw.memsize times the vm_stat page ratio after earlier probes fail', () => {
-    const exec = sequence(vm, denied, 'bad vm_stat', 'bad pressure', 'hw.memsize: 68719476736', vm);
+    const exec = sequence(vm, denied, 'bad vm_stat', 'hw.memsize: 68719476736', vm);
     expect(read(exec)).toEqual({ mb: 512, probe: 'hw.memsize+vm_stat' });
     expect(exec.mock.calls).toEqual(calls);
   });
