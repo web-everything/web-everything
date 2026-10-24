@@ -1087,6 +1087,7 @@
   "scripts/conveyor/soak/breaks/incomplete-check-evidence-drops-pr-from-planning.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/infra-cancelled-ci-refused-forever.soak.test.mjs": 0.76,
   "scripts/conveyor/soak/breaks/lane-acquire-under-load.soak.test.mjs": 61.27,
+  "scripts/conveyor/soak/breaks/lane-git-inherited-location.soak.test.mjs": 0.28,
   "scripts/conveyor/soak/breaks/large-queue-slow-already-done.soak.test.mjs": 5.97,
   "scripts/conveyor/soak/breaks/large-reap-backlog-starves-dispatch.soak.test.mjs": 59.84,
   "scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.soak.test.mjs": 0.32,
