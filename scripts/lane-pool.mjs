@@ -2935,9 +2935,24 @@ async function cmdRelease(repo) {
     // `rmSync` here would destroy that NEW holder's live lease, not the one this call actually decided to drop
     // — the same check-then-act TOCTOU `cmdTrim` already closed for its own reap path with this exact primitive.
     if (recoveryEnabled()) {
-      const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo }) });
-      if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
-      else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
+      // --pool changes repo.name without changing the caller's origin. Resolve the selected primary
+      // independently, as in the bulk path; neither the caller nor the lane remote is a fallback.
+      const callerName = basename(repo.originUrl || '').replace(/\.git$/, '');
+      let salvageRepo = repo;
+      try {
+        if (flags.pool && flags.pool !== callerName) {
+          salvageRepo = resolveRepo({ reference: primarySiblingPath(repo, flags.pool), pool: flags.pool });
+        }
+      } catch {
+        salvageRepo = null;
+      }
+      if (!salvageRepo?.originUrl) {
+        log(`  WARNING lane-${n}: canonical origin unresolved for pool ${repo.name}; skipping salvage and releasing anyway — inspect the lane before reuse`);
+      } else {
+        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo: salvageRepo }) });
+        if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+        else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
+      }
     }
     releaseTestBarrier();
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {

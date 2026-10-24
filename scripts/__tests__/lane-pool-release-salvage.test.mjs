@@ -10,9 +10,9 @@ const git = (args, cwd) => execFileSync('git', args, {
   cwd, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
 }).trim();
 let fixtureRoot, sharedFixture, origin, reference, base, poolRoot, backupRoot, laneDir, lane;
-const poolArgs = (originUrl = origin) => [...(originUrl === null ? [] : [`--origin=${originUrl}`]), `--reference=${reference}`, '--name=releasesalvage', '--branch=main', '--no-install'];
-function runPool(args, env = {}, { stderr, cwd, originUrl = origin } = {}) {
-  const result = spawnSync(process.execPath, [script, ...args, ...poolArgs(originUrl), '--session=salvage-holder', '--json'], {
+const poolArgs = (originUrl = origin, referencePath = reference) => [...(originUrl === null ? [] : [`--origin=${originUrl}`]), ...(referencePath === null ? [] : [`--reference=${referencePath}`]), '--name=releasesalvage', '--branch=main', '--no-install'];
+function runPool(args, env = {}, { stderr, cwd, originUrl = origin, referencePath = reference } = {}) {
+  const result = spawnSync(process.execPath, [script, ...args, ...poolArgs(originUrl, referencePath), '--session=salvage-holder', '--json'], {
     cwd,
     encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
     env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, WE_LANE_BACKUP_ROOT: backupRoot, ...env }),
@@ -85,6 +85,50 @@ afterEach(() => {
 });
 
 describe('lane-pool release salvage push against a throwaway origin', () => {
+  function primaryCaller(originName = 'caller') {
+    const callerOrigin = join(base, `${originName}.git`);
+    const cwd = join(base, 'caller');
+    git(['clone', '--quiet', '--bare', origin, callerOrigin]);
+    git(['clone', '--quiet', callerOrigin, cwd]);
+    return { callerOrigin, cwd, originUrl: null, referencePath: null };
+  }
+
+  it('release --pool resolves the selected pool\'s canonical origin', () => {
+    const sha = commitLocalWork();
+    const caller = primaryCaller();
+    git(['clone', '--quiet', origin, join(base, 'releasesalvage')]);
+    // Neither the caller's origin nor the lane-controlled remote is the selected pool's authority.
+    git(['remote', 'set-url', 'origin', caller.callerOrigin], laneDir);
+    assertReleased(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, caller));
+    expect(salvageBranches()).toEqual([[sha, expect.stringMatching(/^refs\/heads\/salvage\/lane-1-/)]]);
+    expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd)).toBe('');
+  });
+
+  it.each(['missing primary', 'primary without origin'])('skips salvage and still releases when --pool has a %s', state => {
+    commitLocalWork();
+    const caller = primaryCaller();
+    if (state === 'primary without origin') {
+      const selectedPrimary = join(base, 'releasesalvage');
+      git(['clone', '--quiet', origin, selectedPrimary]);
+      git(['remote', 'remove', 'origin'], selectedPrimary);
+    }
+    assertReleased(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, {
+      ...caller, stderr: /WARNING.*canonical origin unresolved.*skipping salvage/,
+    }));
+    expect(salvageBranches()).toEqual([]);
+    expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd)).toBe('');
+    expect(recordFiles(backupRoot)).toEqual([]);
+  });
+
+  it('uses the caller repo for a same-pool release without requiring a sibling primary', () => {
+    const sha = commitLocalWork();
+    const caller = primaryCaller('releasesalvage');
+    assertReleased(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, caller));
+    expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd))
+      .toMatch(new RegExp(`^${sha}\\s+refs/heads/salvage/lane-1-`));
+    expect(salvageBranches()).toEqual([]);
+  });
+
   it('resolves a configured relative origin against the primary checkout when release runs elsewhere', () => {
     const sha = commitLocalWork();
     const { cwd, competingOrigin } = competingRelativeOrigin();
