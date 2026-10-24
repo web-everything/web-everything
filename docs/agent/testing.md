@@ -2,6 +2,14 @@
 
 ## Established-overlay auto-rebase
 
+Operator withdrawal wins over a detached repair: the worker rechecks its source registration
+before push, then `addOverlay` compares the same snapshot under the overlay list mutex before
+registering a replacement. An absent, changed (including a new `addedAt`) or corrupt source refuses registration,
+creates no pending swap and reports `auto-rebase-needs-you`. A removal during push can leave an
+unregistered remote branch; it never authorizes loading that branch. Unrelated list edits are preserved.
+The `operator withdrawal during detached repair` tests cover each async phase and the final write boundary;
+the `auto-rebase-operator-withdrawal` soak scenario uses the real removal CLI with injected Git and agents.
+
 The detached worker in `scripts/lib/daemon-rebuild/auto-rebase.mjs` merges main into a new
 `<ref>-auto-<n>` branch so ancestry preserves the original tip. It retains the old registration
 until the verified adopted HEAD contains the replacement SHA and the replacement contains a freshly

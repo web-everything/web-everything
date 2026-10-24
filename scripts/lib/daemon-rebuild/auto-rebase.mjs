@@ -5,6 +5,7 @@ import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import * as overlays from '../daemon-overlays.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
@@ -224,9 +225,14 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     if (requireAgentSuccess(audit).lastMessage !== 'NOT WEAKENED') throw new Error('audit did not certify NOT WEAKENED');
     if (requireOk(git(['rev-parse', 'HEAD'], scratch)) !== candidate || requireOk(git(['status', '--porcelain'], scratch))) throw new Error('candidate changed after tests');
     stage = 'push';
+    const current = (deps.readOverlayState ?? overlays.readOverlayState)(root, { env });
+    if (current.corrupt || !isDeepStrictEqual(current.overlays?.find(o => o?.ref === ref), old)) {
+      throw new Error('source registration unavailable or changed; refusing replacement');
+    }
     requireOk(git(['push', 'origin', `HEAD:refs/heads/${next}`], scratch));
     stage = 'register';
-    add(root, { ref: next, pr: old.pr, stackBases: [ref], reason: `auto-rebase of ${ref}` }, { env });
+    // Recheck under the list mutex: removal during push or lock acquisition must win too.
+    add(root, { ref: next, pr: old.pr, stackBases: [ref], reason: `auto-rebase of ${ref}` }, { env, expectedOverlay: old });
     io.mkdirSync(p.dir, { recursive: true });
     writePending(io, p.pending, { old: ref, new: next, newSha: candidate, rule, at: now() });
     event(root, { kind: 'auto-rebase-registered', ref, new: next, newSha: candidate, rule }, { env });

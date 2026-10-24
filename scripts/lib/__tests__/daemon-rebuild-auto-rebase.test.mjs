@@ -88,6 +88,82 @@ const swaps = f => finishPendingSwaps({ root: f.root, env: f.env, run,
   appendOverlayEvent: (...args) => { f.calls.push(args[1].kind); return appendOverlayEvent(...args); } });
 
 describe('established overlay auto rebase', () => {
+  describe('operator withdrawal during detached repair', () => {
+    it.each(['codex', 'testRunner', 'auditor', 'push', 'register'])(
+      'does not resurrect an overlay removed during %s', async phase => {
+        const f = fixture(); f.moveMain();
+        const withdraw = () => removeOverlay(f.root, ref, { env: f.env });
+        if (phase === 'push') {
+          f.deps.git = (args, opts) => {
+            if (args[0] === 'push') withdraw();
+            return run(args, opts);
+          };
+        } else {
+          const key = phase === 'register' ? 'addOverlay' : phase;
+          const original = f.deps[key];
+          f.deps[key] = (...args) => { withdraw(); return original(...args); };
+        }
+        await expect(job(f)).rejects.toThrow(/registration.*(unavailable|changed)/i);
+        expect(readOverlays(f.root, { env: f.env })).toEqual([]);
+        expect(f.calls).not.toContain('auto-rebase-registered');
+        expect(fs.existsSync(pendingDir(f)) ? fs.readdirSync(pendingDir(f)).filter(n => n.endsWith('.json')) : []).toEqual([]);
+        expect(f.scratched.every(p => !fs.existsSync(p))).toBe(true);
+        expect(needsYouAlert(f).detail.stage).toBe(phase === 'push' || phase === 'register' ? 'register' : 'push');
+        if (!['push', 'register'].includes(phase)) {
+          expect(ok(f.root, ['ls-remote', 'origin', `${ref}-auto-*`])).toBe('');
+        }
+      },
+    );
+
+    it.each(['changed', 're-added', 'corrupt'])('refuses a %s source registration after audit', async kind => {
+      const f = fixture(); f.moveMain();
+      const audit = f.deps.auditor;
+      f.deps.auditor = async (...args) => {
+        if (kind === 'corrupt') fs.writeFileSync(overlayFilePath(f.root, f.env), '{');
+        else {
+          if (kind === 're-added') removeOverlay(f.root, ref, { env: f.env });
+          addOverlay(f.root, { ...overlay, reason: 'new operator intent', now: '2099-01-01T00:00:00.000Z' }, { env: f.env });
+        }
+        return audit(...args);
+      };
+      await expect(job(f)).rejects.toThrow(/registration.*(unavailable|changed)/i);
+      expect(f.calls).not.toContain('add');
+      expect(f.calls).not.toContain('auto-rebase-registered');
+      expect(ok(f.root, ['ls-remote', 'origin', `${ref}-auto-*`])).toBe('');
+      expect(fs.existsSync(pendingDir(f)) ? fs.readdirSync(pendingDir(f)).filter(n => n.endsWith('.json')) : []).toEqual([]);
+      expect(needsYouAlert(f).detail.stage).toBe('push');
+    });
+
+    it.each(['changed', 're-added', 'corrupt'])('refuses a %s source at the locked registration boundary', async kind => {
+      const f = fixture(); f.moveMain();
+      const add = f.deps.addOverlay;
+      f.deps.addOverlay = (...args) => {
+        if (kind === 'corrupt') fs.writeFileSync(overlayFilePath(f.root, f.env), '{');
+        else {
+          if (kind === 're-added') removeOverlay(f.root, ref, { env: f.env });
+          addOverlay(f.root, { ...overlay, reason: 'new operator intent', now: '2099-01-01T00:00:00.000Z' }, { env: f.env });
+        }
+        return add(...args);
+      };
+      await expect(job(f)).rejects.toThrow(/corrupt|registration.*(unavailable|changed)/i);
+      expect(readOverlays(f.root, { env: f.env }).some(o => o.ref === `${ref}-auto-1`)).toBe(false);
+      expect(f.calls).not.toContain('auto-rebase-registered');
+      expect(fs.existsSync(pendingDir(f)) ? fs.readdirSync(pendingDir(f)).filter(n => n.endsWith('.json')) : []).toEqual([]);
+      expect(needsYouAlert(f).detail.stage).toBe('register');
+    });
+
+    it('preserves an unrelated registration added during audit', async () => {
+      const f = fixture(); f.moveMain();
+      const audit = f.deps.auditor;
+      f.deps.auditor = async (...args) => {
+        addOverlay(f.root, { ref: 'lane/other', pr: 456 }, { env: f.env });
+        return audit(...args);
+      };
+      const result = await job(f);
+      expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref, 'lane/other', result.ref]);
+    });
+  });
+
   describe('test-selection fallback and durable evidence', () => {
     const records = file => fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
     const events = f => records(overlayFilePath(f.root, f.env).replace(/\.json$/, '.events.jsonl'));
