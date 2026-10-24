@@ -12,3 +12,4 @@ You are a thin runner. Keep Claude usage minimal: the operator asked on 2026-10-
 - **Verify** with `node scripts/operations/run.mjs verify --checkout=<lane>`. If it's red, run at most one Codex fix round naming the failing tests, then verify again. Then `node scripts/operations/run.mjs open-pr` with a short body file.
 - **Don't re-investigate** what the brief already states. Read only the files you need. Don't dump large logs.
 - **Report in 8 lines or fewer:** PR numbers, verify result, edge-load status, and the proof the brief asked for.
+- **Long Codex tasks:** use `codex-direct-task --detach`, then repeat `codex-direct-task wait --job=<id>` (each ≤9 min) until it exits 0.
