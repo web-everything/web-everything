@@ -811,7 +811,8 @@ export function runGate({ dir, mode, execFn = defaultExecFn, asyncExecFn, env = 
       .then(output => result(true, output), failed);
   }
   try {
-    return result(true, execFn(bin, args, { cwd: dir, env: gateEnv }));
+    // Same wall the async gate gets: a descendant holding the pipes must not block the sync gate forever.
+    return result(true, execFn(bin, args, { cwd: dir, env: gateEnv, timeout: DEFAULT_TIMEOUT_MS }));
   } catch (e) {
     return failed(e);
   }
@@ -891,11 +892,14 @@ export async function runCodexDirectExec({
       process.removeListener('SIGINT', onSigint);
       process.removeListener('SIGTERM', onSigterm);
     };
-    const onSignal = (signal) => {
+    const killWorker = () => {
       try {
         if (Number.isInteger(child.pid) && child.pid > 0) process.kill(-child.pid, 'SIGKILL');
       } catch { /* already gone, or process-group kill is unavailable */ }
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    };
+    const onSignal = (signal) => {
+      killWorker();
       removeSignalListeners();
       process.kill(process.pid, signal);
     };
@@ -914,6 +918,8 @@ export async function runCodexDirectExec({
     const startGrace = () => {
       if (settled || graceTimer) return;
       graceTimer = setTimeout(() => {
+        // Same-group stragglers must not keep editing the worktree that diff capture and the gate read next.
+        killWorker();
         child.stdout?.destroy?.();
         child.stderr?.destroy?.();
         recordStdout(stdoutDecoder.decode());
@@ -927,10 +933,7 @@ export async function runCodexDirectExec({
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         killed = true;
-        try {
-          if (Number.isInteger(child.pid) && child.pid > 0) process.kill(-child.pid, 'SIGKILL');
-        } catch { /* already gone, or process-group kill is unavailable */ }
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        killWorker();
         startGrace();
       }, timeoutMs);
       if (typeof timer.unref === 'function') timer.unref();

@@ -854,6 +854,8 @@ describe('runGate — none/standards/full, never commits', () => {
     const r = runGate({ dir: '/d', mode: 'standards', execFn });
     expect(r.steps.map((s) => s.cmd)).toEqual(['npm run check:standards']);
     expect(r.pass).toBe(true);
+    // The sync gate gets the async gate's wall, so a descendant holding its pipes cannot block it forever.
+    expect(execFn.mock.calls[0][2]).toMatchObject({ timeout: DEFAULT_TIMEOUT_MS });
   });
 
   it('mode "full" runs verify-lane with the whole unit tier and standards', () => {
@@ -1084,6 +1086,29 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
         stream: false, timeoutMs: 1000, closeGraceMs: 300, spawnFn });
       expect(r.timedOut).toBe(true);
       expect(Date.now() - started).toBeLessThan(1000 + 300 + 2000);
+    } finally {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  it('kills a same-group straggler when a finished run settles without close', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-straggler-test-'));
+    const pidFile = join(dir, 'straggler.pid');
+    const straggler = keepAliveScript({ maxLifetimeMs: 8000 });
+    const script = `const g = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(straggler)}],
+      { stdio: 'inherit' });
+      require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid)); process.exit(0);`;
+    const spawnFn = (_cli, _argv, opts) => spawn(process.execPath, ['-e', script], opts);
+    const started = Date.now();
+    try {
+      const r = await runCodexDirectExec({ dir, gitDir: dir, task: 't', logFile: join(dir, 'events.jsonl'),
+        stream: false, closeGraceMs: 300, spawnFn });
+      expect(r).toMatchObject({ code: 0, timedOut: false });
+      expect(Date.now() - started).toBeLessThan(300 + 2000);
+      const pid = Number(readFileSync(pidFile, 'utf8'));
+      await new Promise(resolveWait => setTimeout(resolveWait, 200));
+      expect(() => process.kill(pid, 0)).toThrow();
     } finally {
       try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
       rmSync(dir, { recursive: true, force: true });
