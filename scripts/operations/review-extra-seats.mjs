@@ -1492,7 +1492,7 @@ export async function speculateRedTeam({
     // or empty destination lists and malformed source lists must still probe.
     if (settings.value.skipCardOnly && redTeamCardOnly(read)) {
       io.log('red team skipped: card-only');
-      return { status: 'skipped', reason: 'red team skipped: card-only' };
+      return { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
     }
     // Card xn2wf9t — each provider's OWN cap, same treatment as `runExtraSeats`: a provider already at its cap is
     // excluded from `available` up front, so `selectReviewSeatProvider` picks whichever else has budget rather

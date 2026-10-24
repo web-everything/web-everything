@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus } from './drain-red-team-evidence.mjs';
 import { redTeamForHead } from './red-team-gate.mjs';
-import { redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 
 /** Normalize both persisted production result shapes at the recovery boundary. */
@@ -13,6 +13,12 @@ export function normalizeRedTeamResult(result) {
     priorResult: typeof result === 'string' ? result : result?.status,
     priorComment: typeof result === 'object' ? (result?.comment?.status ?? result?.comment) : undefined,
   };
+}
+
+/** Historical card-only skips need a result comment, not a resumed model pass. PURE. */
+export function redTeamSkipNeedsSettlement(status) {
+  return status?.status === 'finished' && normalizeRedTeamResult(status.result).priorResult === 'skipped'
+    && status.skipCardOnly === true && redTeamCardOnly(status.loopPayload?.findings?.read);
 }
 
 export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = readFileSync,
@@ -56,7 +62,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       // pass can resume effects without risking another model call.
       if (status?.status === 'finished' && ['ran', 'resumed'].includes(prior) && evidence.recorded === true) {
         mode = 'resume';
-      } else if (status == null && evidence.recorded === false) mode = 'fresh';
+      } else if (redTeamSkipNeedsSettlement(status)) mode = 'fresh';
+      else if (status == null && evidence.recorded === false) mode = 'fresh';
       else return skip(`prior result ${typeof prior === 'string' ? prior : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');

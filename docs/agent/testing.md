@@ -98,7 +98,30 @@ mode (`--red-team-only=resume|fresh`; the bare flag retains fresh guards). A rec
 resumes its missing comment/effects without another model call; a failed recovery persists `resumed` and remains eligible after cooldown, subject to the same clean-row guards;
 only a head with neither status nor row starts fresh. A trusted result comment, live pass,
 non-accept, unreadable evidence, recorded row without a status, or any prior result other than `ran` or `resumed`
-prevents dispatch. The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying.
+prevents dispatch, except a finished `skipped` status with `skipCardOnly === true` and a
+stored card-only net read: that historical gap dispatches fresh to settle the skip.
+The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head; admission treats the validated historical card-only skip as fresh while retaining the seat-row and comment guards. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying.
+
+Skip settlement runs before the finished status write and gate in both normal and red-team-only jobs.
+Only structured `status: 'skipped', policy: 'card-only'` produces a trusted, head-bound zero-finding
+result comment. Reason strings never grant clearance. Other skips and failed policy comment posts
+publish needs-you, deduplicated by repo/PR/head/reason under `red-team-status/skip-published`;
+write the atomic marker only after successful publication so failures remain retryable.
+Regressions: `red-team-skip-outcome.test.mjs`, `review-job-red-team-skip.test.mjs`, and the
+historical card-only cases in `review-red-team-on-skip.test.mjs`.
+The companion `red-team-skip-outcome-regressions.test.mjs` maps the clearance and notification
+guarantees to named assertions:
+
+- **policy predicate requires both structured fields: %s cannot clear** removes or changes
+  each discriminator independently and checks `non-policy`, zero result posts, needs-you
+  publication, and no `red-team:clear` label, even when the reason says card-only.
+- **failed publication leaves no marker; retry succeeds before deduplication begins** checks
+  an empty marker directory after failure and during the retry's publish callback, then one
+  marker after success and no third publication.
+- **successful publication deduplicates by repo/PR/head/reason: changing %s publishes again**
+  checks the SHA-256 filename for all four fields and changes each field independently;
+  identical repeats publish once, while the changed key publishes once more.
+
 Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a confirmed-dead queued
 `ran`/`resumed` prior into the shared guard before writing its own queued status. A guard
 refusal that launches no call rolls back admission (removes queued status when no prior exists, or restores the

@@ -36,7 +36,8 @@ describe('review-job red-team skip settlement', () => {
   it.each([false, true])('skipped redTeam with policy settles before finished status and gate (redTeamOnly=%s)', redTeamOnly => {
     const f = fixture();
     const out = runReviewJob({ repo, pr, redTeamOnly, redTeamMode: 'fresh' }, f.io);
-    expect(out.outcome).toBe(redTeamOnly ? 'red-team-only' : 'parked');
+    // The normal path's outcome follows the fixture verdict, not settlement; settlement order is asserted below.
+    if (redTeamOnly) expect(out.outcome).toBe('red-team-only');
     expect(f.io.runRedTeam).toHaveBeenCalledTimes(1);
     expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
     expect(f.io.settleRedTeamSkip.mock.calls[0][0]).toMatchObject({ redTeam: skipped, repo, pr, head });

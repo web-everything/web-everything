@@ -87,7 +87,9 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
+import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../lib/review-red-team-on-skip.mjs';
+import { settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
+import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -307,6 +309,17 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
   return {
+    settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
+      env,
+      log: line => process.stderr.write(`${line}\n`),
+      readComments: ({ repo, pr }) => readCompletePrComments(Number(pr), {
+        repo, exec: (file, args, options) => exec(file, args, { ...options, cwd: root, env }),
+      }),
+      postComment: ({ repo, pr, body }) => exec('gh', [
+        'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
+      ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 }),
+      publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
+    } }),
     clearRedTeamQueued: ({ repo, pr, head }) => {
       rmSync(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`), { force: true });
     },
@@ -332,6 +345,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // the guard before replacing that evidence with our own queued writer.
           admissionPrior = input.redTeamMode
             ? readRedTeamRecoveryStatus(key, { readStatus: () => prior, readEvidence }) : prior;
+          // A healed policy skip has no model result to resume. Let the fresh seat
+          // apply today's policy; its independent comment and scorecard guards remain active.
+          if (input.redTeamMode === 'fresh' && redTeamSkipNeedsSettlement(admissionPrior)
+            && admissionPrior.loopPayload?.findings?.read?.netBasis?.rev === head) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(prior?.result).priorResult)) priorResult = prior.result;
           input = { ...input, result: priorResult };
         }
@@ -784,6 +801,15 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
     recordSeats(redTeam?.seat ? [redTeam.seat] : []);
     out.redTeam = summarizeRedTeam(redTeam);
+    if (redTeam?.status === 'skipped' && typeof io.settleRedTeamSkip === 'function') {
+      try {
+        const settled = io.settleRedTeamSkip({ redTeam, repo: out.repo, pr: out.pr,
+          head: seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev });
+        out.redTeam = { ...out.redTeam, ...settled };
+      } catch (error) {
+        io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`);
+      }
+    }
   }
   if (accepted) {
     // Deferrals launch no model call or seat row. Roll back admission so the next
