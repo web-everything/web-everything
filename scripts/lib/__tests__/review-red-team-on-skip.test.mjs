@@ -29,10 +29,17 @@ describe('planRedTeamOnSkip — heal a previously skipped card-only head', () =>
     ...over,
   });
 
-  it.each(['skipped', { status: 'skipped', reason: 'red team skipped: card-only' }])(
-    'card-only skipped status %j dispatches fresh even without a structured policy in historical state', result => {
+  it.each(['skipped', { status: 'skipped', policy: 'card-only' }])(
+    'legacy string or explicit card-only object %j dispatches fresh', result => {
       expect(decide(heal({ readStatus: () => ({ status: 'finished', head, result, skipCardOnly: true, loopPayload: cardPayload() }) })))
         .toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    });
+
+  it.each([{ status: 'skipped' }, { status: 'skipped', reason: 'quota exhausted' },
+    { status: 'skipped', reason: 'red team skipped: card-only' }])(
+    'policy-absent object %j never heals even with a complete card-only read', result => {
+      expect(decide(heal({ readStatus: () => ({ status: 'finished', head, result, skipCardOnly: true, loopPayload: cardPayload() }) })))
+        .toMatchObject({ action: 'skip', why: 'prior result skipped (status finished); not re-run' });
     });
 
   it.each(['other', null, false, ''])('does not heal an explicit non-card-only policy %j', policy => {

@@ -6,6 +6,8 @@ import { publishAttention, replay } from '../needs-you-feed.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runReviewJob, createReviewJobIo } from '../review-job.mjs';
+import { readDrainRedTeamEvidence, readRedTeamStatus } from '../../lib/drain-red-team-evidence.mjs';
+import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../../lib/review-red-team-on-skip.mjs';
 import { speculateRedTeam } from '../review-extra-seats.mjs';
 
 const repo = 'web-everything/web-everything', pr = 5872, head = 'a'.repeat(40);
@@ -36,6 +38,40 @@ function fixture(redTeam = skipped) {
 }
 
 describe('review-job red-team skip settlement', () => {
+  it.each([
+    [{ status: 'skipped', policy: 'card-only' }, { status: 'skipped', policy: 'card-only' }],
+    [{ status: 'skipped', reason: 'quota exhausted' }, { status: 'skipped' }],
+    [{ status: 'skipped', policy: 'other' }, { status: 'skipped' }],
+    ...['ran', 'resumed', 'error', 'disabled', 'not-owed'].map(status => [{ status }, status]),
+  ])('persists skip provenance and keeps other outcomes as strings: %j', (redTeam, result) => {
+    const f = fixture(redTeam);
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.redTeamStatus.mock.calls.filter(([row]) => row.status === 'finished').map(([row]) => row.result))
+      .toEqual([result]);
+  });
+
+  it.each([true, false])('real persisted skip survives drain reads and recovery admission (policy=%s)', cardOnly => {
+    const root = mkdtempSync(join(tmpdir(), 'skip-provenance-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: '1', WE_RED_TEAM_STATUS_LABELS: '0' };
+    const key = { repo, pr, head, env };
+    const readEvidence = () => readDrainRedTeamEvidence({ ...key, list: () => [], readScorecards: () => [] });
+    const production = createReviewJobIo({ env, readEvidence });
+    const f = fixture(cardOnly ? skipped : { status: 'skipped', reason: 'quota exhausted' });
+    f.io.redTeamStatus = production.redTeamStatus;
+    try {
+      runReviewJob({ repo, pr }, f.io);
+      const stored = readRedTeamStatus(key);
+      expect(stored.result).toEqual(cardOnly ? { status: 'skipped', policy: 'card-only' } : { status: 'skipped' });
+      expect(normalizeRedTeamResult(stored.result)).toEqual({ priorResult: 'skipped', priorComment: undefined });
+      expect(redTeamSkipNeedsSettlement(stored)).toBe(cardOnly);
+      expect(readEvidence()).toMatchObject({ loopPayload: f.loopPayload, scheduled: false, recorded: false, inFlight: false, skipCardOnly: true });
+      const admission = production.redTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'queued', redTeamMode: 'fresh' });
+      expect(admission.redTeamAdmission.prior).toEqual(cardOnly ? null : {
+        repo, pr, head, status: 'finished', result: { status: 'skipped' },
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each([false, true])('skipped redTeam with policy settles before finished status and gate (redTeamOnly=%s)', redTeamOnly => {
     const f = fixture();
     const out = runReviewJob({ repo, pr, redTeamOnly, redTeamMode: 'fresh' }, f.io);

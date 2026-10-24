@@ -687,6 +687,7 @@ export function summarizeRedTeam(r) {
     ...(r.deferredByCap === true ? { deferredByCap: true } : {}),
     ...(r.deferredByGuard === true ? { deferredByGuard: true } : {}),
     ...(r.reason ? { reason: r.reason } : {}),
+    ...(r.status === 'skipped' && r.policy === 'card-only' ? { policy: 'card-only' } : {}),
     ...(r.status === 'ran' ? {
       provider: r.provider, model: r.model, seatStatus: r.seat?.status ?? null, foldedVerdict: r.foldedVerdict ?? null,
       recheckStatus: r.recheckStatus ?? null, confirmedMissCount: r.confirmedMissCount ?? 0,
@@ -841,7 +842,9 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       // An unsuccessful effects retry must keep the durable clean pass eligible for recovery.
       const result = guardDeferred && prior ? prior.result
         : seatsBox.priorRedTeamResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
-          ? seatsBox.priorRedTeamResult : out.redTeam?.status ?? null;
+          ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
+            ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
+            : out.redTeam?.status ?? null;
       io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
     }
   }

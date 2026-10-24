@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyRedTeamSkip, settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
@@ -134,14 +134,61 @@ describe('red-team skip pre-review regressions', () => {
     expect(f.pending()).toEqual([]);
   });
 
-  it('unreadable pending evidence stays pending and cannot prevent current settlement', () => {
+  it('unparseable pending evidence is quarantined and cannot prevent current settlement', () => {
     const f = fixture();
     f.settle({ status: 'skipped', reason: 'provider unavailable' });
     writeFileSync(join(f.pendingDir, `${'f'.repeat(64)}.json`), '{bad json');
     expect(f.settle({ status: 'skipped', policy: 'card-only' }).outcome).toBe('policy-clear');
     expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
-    expect(f.pending()).toEqual([`${'f'.repeat(64)}.json`]);
+    expect(f.pending()).toEqual([`${'f'.repeat(64)}.json.bad`]);
     expect(f.io.log).toHaveBeenCalled();
+  });
+
+  it('30 invalid records do not consume the attempt budget; one valid record publishes and poison is never rescanned', () => {
+    const f = fixture();
+    mkdirSync(f.pendingDir, { recursive: true });
+    for (let n = 0; n < 30; n++) {
+      const path = join(f.pendingDir, `${n.toString(16).padStart(64, '0')}.json`);
+      writeJsonAtomic(path, n % 2 ? { repo: 'invalid' } : {});
+      if (n % 2 === 0) writeFileSync(path, '{broken');
+      utimesSync(path, 1, 1);
+    }
+    const name = `${'f'.repeat(64)}.json`;
+    const item = { ...f.input, kind: `red-team-skip-${'f'.repeat(26)}`, reason: 'pending valid', title: '' };
+    writeJsonAtomic(join(f.pendingDir, name), item);
+    expect(f.settle({ status: 'skipped', policy: 'card-only' }).outcome).toBe('policy-clear');
+    expect(f.io.publishNeedsYou.mock.calls).toEqual([[item]]);
+    expect(f.markers()).toEqual([name]);
+    expect(f.pending()).toHaveLength(30);
+    expect(f.pending().every(name => name.endsWith('.json.bad'))).toBe(true);
+    const logCount = f.io.log.mock.calls.length;
+    f.settle({ status: 'skipped', policy: 'card-only' });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(f.io.log).toHaveBeenCalledTimes(logCount);
+  });
+
+  it.each([100, 4_000_000_000])('failed valid publications count toward 25 attempts and rotate oldest-first across settlements (mtime=%s)', baseTime => {
+    const f = fixture(), items = [];
+    mkdirSync(f.pendingDir, { recursive: true });
+    for (let n = 0; n < 30; n++) {
+      const name = `${n.toString(16).padStart(64, '0')}.json`;
+      const item = { ...f.input, kind: `red-team-skip-${name.slice(0, 26)}`, reason: `valid ${n}`, title: '' };
+      items.push(item);
+      const path = join(f.pendingDir, name);
+      writeJsonAtomic(path, item);
+      // Reverse filename order to prove that age, rather than directory order, wins.
+      utimesSync(path, baseTime - n, baseTime - n);
+    }
+    f.io.publishNeedsYou.mockImplementation(() => { throw Error('feed unavailable'); });
+    f.settle({ status: 'skipped', policy: 'card-only' });
+    expect(f.io.publishNeedsYou.mock.calls.map(([item]) => item)).toEqual(items.slice(5).reverse());
+    expect(f.pending()).toHaveLength(30);
+    expect(f.io.log).toHaveBeenCalledWith(expect.stringContaining('remaining records retry on the next settlement'));
+    f.io.publishNeedsYou.mockReset();
+    f.settle({ status: 'skipped', policy: 'card-only' });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(25);
+    expect(f.io.publishNeedsYou.mock.calls.slice(0, 5).map(([item]) => item)).toEqual(items.slice(0, 5).reverse());
+    expect(f.pending()).toHaveLength(5);
   });
 
   it('already-published pending records are removed without republication', () => {

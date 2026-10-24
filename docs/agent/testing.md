@@ -131,12 +131,15 @@ guarantees to named assertions:
 - **colliding 32-bit reason prefixes produce two real feed lines with 40-character kinds** pins
   the two known colliding reasons through real feed publication, with exact 26-hex suffixes.
 - **does not heal an explicit non-card-only policy %j** refuses a structured policy override;
-  **card-only skipped status %j dispatches fresh even without a structured policy in historical state**
-  preserves legacy string and policy-absent object recovery.
+  **legacy string or explicit card-only object %j dispatches fresh** preserves legacy
+  string recovery and structured card-only provenance; **policy-absent object %j never heals
+  even with a complete card-only read** refuses object skips without explicit provenance.
+  **non-card-only skipped status still skips with its existing not-re-run reason** refuses
+  legacy strings with a non-card-only read.
 - **failed publication persists the item before publishing and another PR retries it exactly once**
   checks the durable item before the failed publish, cross-PR retry, marker, cleanup and no duplicate.
 - **pending retry failure does not block current policy settlement or discard the item** and
-  **unreadable pending evidence stays pending and cannot prevent current settlement** check
+  **unparseable pending evidence is quarantined and cannot prevent current settlement** check
   closed failure paths while the current policy result still posts.
 - **flushes at most 25 pending records and leaves overflow for the next settlement** checks
   the exact call bound, operator-visible retry fallback and eventual overflow delivery;
@@ -144,6 +147,19 @@ guarantees to named assertions:
 - **malformed reason cannot prevent settlement or throw (redTeamOnly=%s)** uses
   `{status:'skipped', reason:{toString:null}}` in normal and red-team-only jobs, requiring exactly
   one settlement before the gate.
+
+- **persists skip provenance and keeps other outcomes as strings: %j** checks exact finished
+  results for policy/non-policy skips and unchanged strings for every other named outcome.
+- **real persisted skip survives drain reads and recovery admission (policy=%s)** exercises
+  the real status writer/reader, normalization, drain evidence and fresh admission: explicit
+  card-only provenance heals; an object without policy retains its prior status and refuses healing.
+- **30 invalid records do not consume the attempt budget; one valid record publishes and poison
+  is never rescanned** checks parse and validation failures, all 30 quarantines, valid delivery
+  in one settlement, and no repeated diagnostics on the next settlement.
+- **failed valid publications count toward 25 attempts and rotate oldest-first across settlements
+  (mtime=%s)** checks the call bound, mtime ordering independent of filenames, durable failures,
+  operator-visible overflow fallback and delivery of untouched records on the next settlement,
+  including future-dated records.
 
 Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a confirmed-dead queued
 `ran`/`resumed` prior into the shared guard before writing its own queued status. A guard

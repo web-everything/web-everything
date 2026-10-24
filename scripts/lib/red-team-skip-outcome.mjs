@@ -1,6 +1,6 @@
 /** Settle skipped red teams: explicit policy produces a result; everything else needs an operator. */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
@@ -21,29 +21,47 @@ function flushPending(io, note) {
     const base = redTeamStatusDir(io?.env ?? process.env);
     const pendingDir = join(base, 'skip-pending');
     if (!existsSync(pendingDir)) return;
-    const records = readdirSync(pendingDir).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
-    let attempted = 0;
-    for (const name of records) {
+    const records = readdirSync(pendingDir).filter(name => /^[a-f0-9]{64}\.json$/.test(name))
+      .map(name => ({ name, mtime: statSync(join(pendingDir, name)).mtimeMs }))
+      .sort((a, b) => a.mtime - b.mtime || a.name.localeCompare(b.name));
+    let newestMtime = records.reduce((latest, record) => Math.max(latest, record.mtime), Date.now());
+    let attempted = 0, overflow = false;
+    for (const { name } of records) {
       const pending = join(pendingDir, name), published = join(base, 'skip-published', name);
       try {
         if (existsSync(published)) { unlinkSync(pending); continue; }
-        if (attempted >= 25) break; // Overflow remains durable for the next settlement.
-        attempted++;
-        const item = JSON.parse(readFileSync(pending, 'utf8'));
-        if (!item || typeof item.repo !== 'string' || !item.repo
-          || !Number.isSafeInteger(Number(item.pr)) || Number(item.pr) <= 0
-          || !/^(?:[a-f0-9]{40}|unknown)$/i.test(item.head ?? '')
-          || item.kind !== `red-team-skip-${name.slice(0, 26)}`
-          || typeof item.reason !== 'string' || !item.reason || typeof item.title !== 'string') {
-          throw Error(`invalid pending red-team skip record ${name}`);
+        let item;
+        try {
+          item = JSON.parse(readFileSync(pending, 'utf8'));
+          if (!item || typeof item.repo !== 'string' || !item.repo
+            || !Number.isSafeInteger(Number(item.pr)) || Number(item.pr) <= 0
+            || !/^(?:[a-f0-9]{40}|unknown)$/i.test(item.head ?? '')
+            || item.kind !== `red-team-skip-${name.slice(0, 26)}`
+            || typeof item.reason !== 'string' || !item.reason || typeof item.title !== 'string') {
+            throw Error(`invalid pending red-team skip record ${name}`);
+          }
+        } catch (error) {
+          // Poison evidence must never consume publication slots or be scanned again.
+          renameSync(pending, `${pending}.bad`);
+          note(`quarantined ${name}.bad: ${error.message}`);
+          continue;
         }
-        io.publishNeedsYou(item);
-        mkdirSync(dirname(published), { recursive: true });
-        writeJsonAtomic(published, item);
-        unlinkSync(pending);
+        if (attempted >= 25) { overflow = true; continue; }
+        attempted++;
+        try {
+          io.publishNeedsYou(item);
+          mkdirSync(dirname(published), { recursive: true });
+          writeJsonAtomic(published, item);
+          unlinkSync(pending);
+        } catch (error) {
+          // A failed valid attempt uses its slot but goes behind untouched records.
+          const retryAt = new Date(newestMtime = Math.max(Date.now(), newestMtime + 1));
+          utimesSync(pending, retryAt, retryAt);
+          throw error;
+        }
       } catch (error) { note(error); }
     }
-    if (attempted >= 25 && readdirSync(pendingDir).length) {
+    if (overflow) {
       note('pending notification flush limit reached; remaining records retry on the next settlement');
     }
   } catch (error) { note(error); }

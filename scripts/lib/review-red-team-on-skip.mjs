@@ -19,7 +19,11 @@ export function normalizeRedTeamResult(result) {
 export function redTeamSkipNeedsSettlement(status) {
   const read = status?.loopPayload?.findings?.read;
   const result = status?.result;
-  if (result && typeof result === 'object' && 'policy' in result && result.policy !== 'card-only') return false;
+  if (result && typeof result === 'object' && result.policy !== 'card-only') return false;
+  // Legacy plain-string records carry no policy. With the writer's skipCardOnly=true,
+  // a non-empty card-only read and matching pinned head, the producer's card-only
+  // branch runs before every other applicable skip reason, so this combination
+  // can only be a card-only skip. Never infer that provenance for object results.
   return typeof read?.diffText === 'string' && read.diffText.trim().length > 0
     && /^[a-f0-9]{40}$/i.test(status?.head ?? '') && read.netBasis?.rev === status.head
     && status?.status === 'finished' && normalizeRedTeamResult(status.result).priorResult === 'skipped'
