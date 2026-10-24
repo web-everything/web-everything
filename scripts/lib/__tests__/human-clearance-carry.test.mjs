@@ -600,6 +600,33 @@ describe('PR #4715 context movement and manifest-drop replay', () => {
 });
 
 describe('tamper-park callback through the durable human carry writer', () => {
+  it.each([null, 'sibling/project'])('the default live reader proves the complete thread for repo %s', repo => {
+    const comment = { ...clearHumanComment(CLEARED, null), id: 'IC_clearance' };
+    const posted = [], calls = [];
+    const slug = repo || 'owner/repo';
+    const exec = (cmd, args) => {
+      calls.push([cmd, args]);
+      if (cmd === 'git' && args[0] === 'remote') return 'git@github.com:owner/repo.git\n';
+      if (cmd !== 'gh') throw Error('unexpected git proof');
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: HEAD });
+      if (args[0] === 'pr' && args[1] === 'comment') { posted.push(args); return ''; }
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } });
+      if (args.includes(`repos/${slug}/issues/5463/comments`)) return `${comment.body.replace(/\n/g, '\\n')}\t2026-10-01T00:00:00Z\tchalbert\t${comment.id}\n`;
+      if (args.includes(`repos/${slug}/pulls/5463/reviews`)) return '';
+      throw Error('unexpected gh read');
+    };
+    const callback = createTamperParkCarryCallback({ pr: 5463, repo, exec,
+      setting: ON, numberingSetting: ON, log: quiet, proveNumbering: () => ({ ok: true, reason: 'exact numbering' }) });
+    const result = callback({ humanClearance: latestHumanClearance([comment]), headSha: HEAD,
+      headDiffSha: HEAD, headDiff: DIFF.replace('+new', '+numbered') });
+    expect(result).toMatchObject({ carried: { recorded: true, tier: 'numbering' } });
+    expect(posted).toHaveLength(1);
+    const countArgs = calls.find(([cmd, args]) => cmd === 'gh' && args[1] === 'graphql')?.[1];
+    const [owner, name] = slug.split('/');
+    expect(countArgs).toEqual(expect.arrayContaining([`owner=${owner}`, `name=${name}`, 'n=5463']));
+    expect(calls.filter(([cmd]) => cmd === 'git')).toHaveLength(repo ? 0 : 1);
+  });
+
   it.each([true, false].flatMap(fingerprint => ['valid', 'mixed change', 'live hold', 'numbering off', 'master off', 'unpinned'].map(shape => [fingerprint, shape])))('numbering callback with fingerprint=%s, %s', (fingerprint, shape) => {
     const comments = [clearHumanComment(CLEARED, fingerprint ? FP : null)], posted = [];
     const headDiff = DIFF.replace('+new', '+numbered');
