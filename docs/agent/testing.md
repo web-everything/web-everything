@@ -2,43 +2,17 @@
 
 ## Remote verification routing
 
-Plain `scripts/verify-lane.mjs verify` reads the heavy queue's projected and heavy waits
-and the one-minute host load before its local gate. Routing uses the projected wait for
-lane checks and the heavy wait for full checks, with strict greater-than thresholds.
-Unknown queue/load/readiness evidence keeps the gate local. A remote attempt requires
-a clean tree and HEAD pushed to a GitHub origin branch; any dispatch, polling or marker
-import failure falls back to the local gate. Explicit `--gate` commands stay local;
-`request`, `run`, `check`, `reset`, dry-run and `remote` never auto-dispatch.
+Plain `scripts/verify-lane.mjs verify` routes remotely when the projected wait (lane checks) or heavy wait (full checks) exceeds `thresholdMinutes`, or one-minute host load exceeds `loadCap`.
+Remote routing requires a clean tree and HEAD pushed to a GitHub origin branch; unknown queue/load/readiness evidence or any dispatch, polling or marker-import failure falls back to the local gate.
+Explicit `--gate` commands stay local; `request`, `run`, `check`, `reset`, dry-run and `remote` never auto-dispatch.
+`remoteRoute` resolves standard → platform preferences → `scripts/settings/remote-route.json` → environment; defaults: `thresholdMinutes: 10`, `loadCap: 36`, `enabled: true`.
+Override with `WE_REMOTE_ROUTE_THRESHOLD_MINUTES`, `WE_REMOTE_ROUTE_LOAD_CAP`; opt out with `WE_REMOTE_ROUTE=off`.
+Invalid numeric environment bounds visibly fall back to standard values; an unknown enable setting disables routing. `verify-lane route:` reports the reason, effective settings and provenance on stderr.
 
-`remoteRoute` settings resolve standard → platform preferences →
-`scripts/settings/remote-route.json` → environment. Defaults are `thresholdMinutes: 10`,
-`loadCap: 36`, `enabled: true`; override with `WE_REMOTE_ROUTE_THRESHOLD_MINUTES`,
-`WE_REMOTE_ROUTE_LOAD_CAP`, or opt out with `WE_REMOTE_ROUTE=off`. The single
-`verify-lane route:` stderr line reports the reason, effective settings and provenance.
-Invalid numeric environment bounds visibly fall back to standard values; an unknown
-enable setting disables routing.
-
-`scripts/remote-test.mjs --ref <branch-or-SHA> --mode <lane-check|full|targeted>` dispatches
-the workflow with argv inputs. Targeted mode requires exactly one of `--tests=<files>`
-or `--operation <name>` and never records a marker. Only a new exact-HEAD dispatch run
-may count. The CLI snapshots existing run IDs before dispatch, then accepts unseen IDs
-created in the dispatch second or later; this handles GitHub's second-precision timestamps
-without accepting pre-existing same-second runs. An incomplete or oversized snapshot
-refuses dispatch and leaves local verification as the fallback. The CLI regression
-**accepts a newly dispatched same-second run while rejecting pre-existing same-second runs**
-uses a fixed clock and tests this boundary without future-dated evidence.
-The workflow publishes `toJSON(inputs)` in its `run-name`; the CLI matches the resulting
-GitHub `display_title` against the requested mode, normalized tests, operation and optional
-target ref during both selection and polling. Missing, malformed or mismatched input
-evidence cannot satisfy the request, even for a successful concurrent run at the same SHA.
-The CLI regression **rejects successful concurrent same-SHA dispatches with different inputs
-and preserves the requested failure** covers that case; old workflows without this metadata
-remain unavailable to the CLI and use the local fallback.
-Polling is bounded and all GitHub reads pin `GH_HOST=github.com` and bypass
-the read memo and finished-CI cache. Green lane/full results delegate marker import to
-`node scripts/verify-lane.mjs remote`, which verifies the successful required job again.
-Test this contract through heavy admission using `remote-route.test.mjs`,
-`remote-test-cli.test.mjs`, `remote-verify.test.mjs` and `lane-verify.test.mjs`.
+`scripts/remote-test.mjs --ref <branch-or-SHA> --mode <lane-check|full|targeted>` dispatches the workflow; targeted requires exactly one of `--tests=<files>` or `--operation <name>` and never records a marker.
+Only a new exact-HEAD dispatch matching the requested inputs may count; unavailable or incomplete evidence leaves local verification as the fallback.
+Green lane/full results import markers through `node scripts/verify-lane.mjs remote`, which rechecks the successful required job.
+Test through heavy admission: `remote-route.test.mjs`, `remote-test-cli.test.mjs`, `remote-verify.test.mjs`, `lane-verify.test.mjs`.
 
 ## Daemon entry boot smoke
 
