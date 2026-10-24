@@ -1525,17 +1525,17 @@ function dispatchReviewRow({
   // whose verdict run re-applies the label — carrying `relabelOwed: true` so the report names why.
   const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
   const reviewedSha = headSha ? parseReviewedSha(pr?.comments) : null;
+  if (headSha && headEverHumanCleared(pr.comments, headSha)) {
+    refuse('already-reviewed-head', {
+      ...withPhase, headSha, reviewedSha, ...extra,
+      why: `this exact head (\`${headSha}\`) already carries a human clearance — no further advisory review is owed`,
+    });
+    return;
+  }
   const relabelOwed = !!(headSha && reviewedSha && reviewedSha === headSha)
     && acceptLabelDropped({ labels: withPhase?.labels, comments: pr?.comments, headSha, now });
   if (relabelOwed) extra = { ...extra, relabelOwed: true };
   if (headSha && reviewedSha && reviewedSha === headSha && !relabelOwed) {
-    if (headEverHumanCleared(pr.comments, headSha)) {
-      refuse('already-reviewed-head', {
-        ...withPhase, headSha, reviewedSha, ...extra,
-        why: `this exact head (\`${headSha}\`) already carries a human clearance — no further advisory review is owed`,
-      });
-      return;
-    }
     // #xconv1 (web-everything/web-everything#2766/#2767 unblock, epic #3383/#4075) — a `needs-human` PR in this
     // EXACT shape (accepted, then escalated — never a fresh push, or `reviewedSha` would no longer equal
     // `headSha`) is NOT the #2588 risk this refusal exists for: `review-pr.mjs`'s own `confirm` step

@@ -3199,6 +3199,54 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       }
     });
 
+  describe.each(['initial', 'fresh'])('%s full-thread read', read => {
+    const fresh = read === 'fresh';
+    const attempt = (comments, readComments, freshHead = 'b'.repeat(40)) => fresh
+      ? run(['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`], [],
+        { readComments, freshState: { comments, headRefOid: freshHead } })
+      : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+
+    it('refuses matching ids with a stale body lacking an embedded older-head clearance', () => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
+        id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'web-everything' },
+      }));
+      comments[0].body = buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'c'.repeat(40) });
+      const readComments = vi.fn(() => [
+        ...comments.map((c, i) => i === 0 ? { ...c, body: 'stale discussion' } : c),
+        { id: 'IC_extra', body: 'later discussion' },
+      ]);
+      const result = attempt(comments, readComments);
+      expect(readComments).toHaveBeenCalledTimes(1);
+      expect(result.exitCode).toBe(1);
+      expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+      expect(result.calls).toEqual([]);
+      expect(result.ledgerWrites).toEqual([]);
+    });
+
+    it('refuses an exactly page-sized covering read because the thread may be truncated at the page size', () => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
+      const readComments = vi.fn(() => [...comments]);
+      const result = attempt(comments, readComments);
+      expect(readComments).toHaveBeenCalledTimes(1);
+      expect(result.exitCode).toBe(1);
+      expect(result.payload.reason).toContain('thread may be truncated at the page size');
+      expect(result.calls).toEqual([]);
+      expect(result.ledgerWrites).toEqual([]);
+    });
+
+    it.each([PR_COMMENTS_PAGE_SIZE - 1, PR_COMMENTS_PAGE_SIZE])('allows a complete covering read for an embedded page of %i comments', count => {
+      const comments = Array.from({ length: count }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
+      const readComments = vi.fn(() => [...comments, { id: 'IC_extra', body: 'later discussion' }]);
+      const result = attempt(comments, readComments, 'a'.repeat(40));
+      // The fresh variant's mocked label never shows the handoff; coverage is not the refusal there.
+      if (fresh) { expect(result.payload.reason ?? '').not.toMatch(/cannot prove|truncated/); return; }
+      expect(result.exitCode).toBe(0);
+      expect(result.calls).toEqual(['postComment', 'setLabels']);
+      if (count < PR_COMMENTS_PAGE_SIZE) expect(readComments).not.toHaveBeenCalled();
+      else expect(readComments).toHaveBeenCalled();
+    });
+  });
+
   it.each(['', null, {}])('CLI rearm fails closed without writes when the head is empty or unreadable (%j)', (headRefOid) => {
     const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { headRefOid });
     expect(result.exitCode).toBe(1);
@@ -3321,7 +3369,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
     const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
       author: { login: 'web-everything' } };
-    const readComments = vi.fn().mockReturnValueOnce(comments).mockReturnValue([...comments, clearance]);
+    const readComments = vi.fn().mockReturnValueOnce([...comments, { body: 'later discussion' }]).mockReturnValue([...comments, clearance]);
     const result = run(missingArgs, [], { comments, readComments, freshState: { comments } });
     expect(result.readPrState).toHaveBeenCalledTimes(2);
     expect(readComments.mock.calls).toEqual([['o/n', '9'], ['o/n', '9']]);
@@ -3335,7 +3383,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     ['undefined', undefined], ['null', null], ['object', {}], ['string', 'unreadable'], ['throw', new Error('thread unavailable')],
   ])('missing-only rearm fails closed without writes when the fresh paginated thread is unreadable (%s)', (_name, pagedComments) => {
     const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
-    const readComments = vi.fn().mockReturnValueOnce(comments).mockImplementation(() => {
+    const readComments = vi.fn().mockReturnValueOnce([...comments, { body: 'later discussion' }]).mockImplementation(() => {
       if (pagedComments instanceof Error) throw pagedComments;
       return pagedComments;
     });

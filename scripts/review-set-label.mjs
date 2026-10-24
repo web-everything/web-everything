@@ -1448,17 +1448,19 @@ export function runReviewLabelCli({
     if (to === 'rearm') {
       const ids = c => [c?.node_id, c?.id, c?.url, c?.html_url].filter(v => v !== undefined && v !== null && v !== '');
       const covered = comments.length >= page.length && page.every(c => comments.some(full => {
+        if (typeof c?.body !== 'string' || c.body !== full?.body) return false;
         const embeddedIds = ids(c), fullIds = ids(full);
         if (embeddedIds.length && fullIds.length) return embeddedIds.some(id => fullIds.includes(id));
-        return typeof c?.body === 'string' && c.body === full?.body
-          && (c.createdAt ?? c.created_at) === (full.createdAt ?? full.created_at);
+        return (c.createdAt ?? c.created_at) === (full.createdAt ?? full.created_at);
       }));
       if (!covered) {
         // Even an incomplete read cannot undo clearance already visible on the embedded page.
         if (headEverHumanCleared(page, threadHead.trim())) refuseRearm('head carries a human clearance — a rearm never undoes it');
         refuseRearm('comments unreadable — cannot prove no human clearance');
       }
-      // Matching ids prove coverage, but stale bodies must never erase an embedded clearance.
+      if (comments.length === page.length && page.length === PR_COMMENTS_PAGE_SIZE) {
+        refuseRearm('thread may be truncated at the page size — retry with a complete paginated thread');
+      }
       return [...page, ...comments];
     }
     return comments;

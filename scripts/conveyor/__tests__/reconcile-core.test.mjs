@@ -4217,6 +4217,43 @@ describe('human clearance and complete evidence before review dispatch (live #55
     });
   });
 
+  it('refuses clearance for HEAD followed by a plain accept of another sha', () => {
+    const pr = prFor('advisoryOwed');
+    pr.comments = [
+      { author: AUTOMATION, body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` },
+      { ...accept, body: `✅ review — accepted\n\n${buildReviewedShaMarker(OLD)}` },
+    ];
+    const plan = run(pr);
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({
+      kind: 'already-reviewed-head', headSha: HEAD, reviewedSha: OLD,
+      why: expect.stringContaining('human clearance'),
+    })]);
+  });
+
+  it('refuses a label-dropped cleared head without relabel dispatch', () => {
+    const pr = prFor('relabelOwed');
+    expect(run(pr).dispatch).toEqual([expect.objectContaining(expected('relabelOwed'))]);
+    pr.comments.unshift({ author: AUTOMATION,
+      body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` });
+    const plan = run(pr);
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({
+      kind: 'already-reviewed-head', headSha: HEAD, reviewedSha: HEAD,
+      why: expect.stringContaining('human clearance'),
+    })]);
+    expect(plan.refusals[0].relabelOwed).toBeUndefined();
+  });
+
+  it('still reviews a different head after human clearance of an older head', () => {
+    const pr = prFor('advisoryOwed');
+    pr.comments = [{ author: AUTOMATION,
+      body: `${buildReviewedShaMarker(OLD)}\n${buildClearedHumanMarker('chalbert')}` }];
+    const plan = run(pr);
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 5530 })]);
+    expect(plan.refusals).toEqual([]);
+  });
+
   it.each(['relabelOwed', 'advisoryOwed', 'convert-advisory'])('refuses %s on an unproved full comment page', branch => {
     const pr = prFor(branch);
     pr.comments.push(...Array.from({ length: 100 - pr.comments.length }, (_, i) => ({ body: `discussion ${i}` })));

@@ -4,6 +4,7 @@ import { countGrantedRoundExtensions, buildRoundExtensionComment } from '../roun
 import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
 import { standDownOf } from '../health-smells/stood-down-prs.mjs';
 import { planNoteComment } from '../reconcile-note-comment.mjs';
+import { buildClearedHumanMarker, buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
 
 const repo = 'web-everything/web-everything';
 const filler = (n) => Array.from({ length: n }, (_, i) => ({ author: { login: 'web-everything' }, body: `drain park-reason spam ${i} ${'x'.repeat(10_000)}` }));
@@ -74,8 +75,36 @@ describe('complete PR comments', () => {
     expect(onError).toHaveBeenCalledWith(incomplete, expect.any(Error));
   });
 
-  it('short threads are untouched and never re-read', () => {
-    const prs = [{ number: 2, comments: filler(3) }];
+  it.each([
+    ['id', { id: 'IC_clearance' }, { id: 'IC_clearance' }],
+    ['node_id', { id: 'IC_clearance' }, { node_id: 'IC_clearance' }],
+    ['url', { url: 'https://github.com/o/n/issues/4017#issuecomment-1' },
+      { html_url: 'https://github.com/o/n/issues/4017#issuecomment-1' }],
+  ])('drops a matching %s read whose stale body omits the embedded human clearance', (_name, listedIds, fullIds) => {
+    const listed = { ...listedIds, author: { login: 'web-everything' },
+      body: `${buildReviewedShaMarker('a'.repeat(40))}\n${buildClearedHumanMarker('chalbert')}` };
+    const pr = { number: 4017, comments: [listed, ...firstPage.slice(1)] };
+    const onError = vi.fn();
+    const annotate = vi.fn(p => p);
+    const complete = [...firstPage.slice(1), { ...fullIds, body: 'stale discussion' }, { body: 'later discussion' }];
+    expect(enrichPrsWithCompleteComments([pr], { repo, readComments: () => complete, onError, annotate })).toEqual([]);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(pr, expect.objectContaining({ message: 'complete comments read did not cover the listed page' }));
+    expect(annotate).not.toHaveBeenCalled();
+  });
+
+  it('drops an exactly page-sized covering read because the thread may be truncated at the page size', () => {
+    const pr = { number: 4017, comments: firstPage };
+    const onError = vi.fn();
+    const annotate = vi.fn(p => p);
+    expect(enrichPrsWithCompleteComments([pr], { repo, readComments: () => [...firstPage], onError, annotate })).toEqual([]);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(pr, expect.objectContaining({ message: expect.stringContaining('thread may be truncated at the page size') }));
+    expect(annotate).not.toHaveBeenCalled();
+  });
+
+  it.each([3, LIST_COMMENTS_PAGE_SIZE - 1])('short threads of %i comments are untouched and never re-read', count => {
+    const prs = [{ number: 2, comments: filler(count) }];
     expect(enrichPrsWithCompleteComments(prs, { readComments: () => { throw new Error('no'); } })).toEqual(prs);
   });
 
@@ -99,17 +128,17 @@ describe('complete PR comments', () => {
   });
 
   it.each([
-    ['node_id matches id', { id: 'IC_listed' }, { node_id: 'IC_listed', body: 'edited discussion' }],
-    ['id matches id', { id: 'IC_listed' }, { id: 'IC_listed', body: 'edited discussion' }],
+    ['node_id matches id', { id: 'IC_listed' }, { node_id: 'IC_listed' }],
+    ['id matches id', { id: 'IC_listed' }, { id: 'IC_listed' }],
     ['url matches html_url', { url: 'https://github.com/o/n/issues/4017#issuecomment-1' },
-      { html_url: 'https://github.com/o/n/issues/4017#issuecomment-1', body: 'edited discussion' }],
+      { html_url: 'https://github.com/o/n/issues/4017#issuecomment-1' }],
     ['body and timestamp without ids', {}, {}],
     ['body and timestamp when only listed has an id', { id: 'IC_listed' }, {}],
     ['body and timestamp when only complete has an id', {}, { id: 'IC_listed' }],
-  ])('marks an equal-length covering read complete: %s', (_name, listedFields, fullFields) => {
+  ])('marks a longer-than-page covering read with matching bodies complete: %s', (_name, listedFields, fullFields) => {
     const listed = { body: 'listed discussion', createdAt: '2026-10-06T00:00:00Z', ...listedFields };
     const pr = { number: 4017, comments: [listed, ...firstPage.slice(1)] };
-    const complete = [...firstPage.slice(1), { body: listed.body, created_at: listed.createdAt, ...fullFields }];
+    const complete = [...firstPage.slice(1), { body: listed.body, created_at: listed.createdAt, ...fullFields }, { body: 'later discussion' }];
     const onError = vi.fn();
     const readComments = vi.fn(() => complete);
     expect(enrichPrsWithCompleteComments([pr], { repo, readComments, onError, annotate: p => p }))
@@ -133,7 +162,7 @@ describe('complete PR comments', () => {
 it('annotates short and complete threads through the injected reader', () => {
   const seen = [];
   const annotate = (pr) => { seen.push(pr.number); return { ...pr, annotated: true }; };
-  const out = enrichPrsWithCompleteComments([{ number: 1, comments: [] }, { number: 2, comments: filler(100) }], { annotate, readComments: () => filler(100) });
+  const out = enrichPrsWithCompleteComments([{ number: 1, comments: [] }, { number: 2, comments: filler(100) }], { annotate, readComments: () => [...filler(100), { body: 'later discussion' }] });
   expect(seen).toEqual([1, 2]);
   expect(out.every((pr) => pr.annotated)).toBe(true);
 });
