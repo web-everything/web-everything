@@ -7,6 +7,9 @@ const testPath = p => /(?:^|\/)__(?:tests|fixtures)__\//.test(p) || /\.test\.[^/
 const lines = s => String(s).trim().split('\n').filter(Boolean);
 const json = r => JSON.parse(r.stdout);
 const stop = (reason, detail = {}) => { throw Object.assign(new Error(reason), { reason, detail }); };
+// gh's PR JSON spells App authors as app/slug; GraphQL viewer uses slug[bot].
+const authorLogin = login => typeof login === 'string' && login.trim() === login && /^(?:app\/)?[a-z0-9-]+(?:\[bot\])?$/i.test(login)
+  ? login.toLowerCase().replace(/^app\/([^[]+)(?:\[bot\])?$/, '$1[bot]') : null;
 
 function validateInput(input) {
   if (typeof input.purpose !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(input.purpose)
@@ -73,9 +76,13 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
     const repo = command('repository', 'gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']).stdout.trim();
     if (!repo) stop('repository');
     const prs = json(command('caps', 'gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--json', 'number,author,headRefName', '--limit', '1000']));
-    const user = json(command('caps', 'gh', ['api', 'user']));
-    if (!Array.isArray(prs) || prs.length >= 1000 || !user.login || prs.some(p => !p.author?.login)) stop('caps-unreadable');
-    if (prs.filter(p => p.author.login === user.login).length >= caps.value.callerMax) stop('cap-caller');
+    // GraphQL viewer supports installation credentials as well as personal tokens.
+    // Pin the shim to this repository's installation, including cross-owner runs.
+    const identity = json(command('caps', 'gh', ['api', 'graphql', '-f', 'query={ viewer { login } }'], cwd, { GH_REPO: repo }));
+    const caller = authorLogin(identity?.data?.viewer?.login);
+    if (!Array.isArray(prs) || prs.length >= 1000 || identity?.errors?.length || !caller
+      || prs.some(p => !authorLogin(p?.author?.login))) stop('caps-unreadable');
+    if (prs.filter(p => authorLogin(p.author.login) === caller).length >= caps.value.callerMax) stop('cap-caller');
     if (prs.length > caps.value.repoMax) stop('cap-repo');
     let baseRef = 'main';
     let base = git('source', ['rev-parse', '--verify', 'origin/main^{commit}']);
@@ -102,6 +109,11 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
     // of its reachable commits from both branch sources and explicit ranges.
     const commits = lines(git('source', ['rev-list', '--reverse', '--topo-order', range, `^${base}`], checkCwd));
     if (!commits.length) stop('empty-source');
+    // Replaying a merge needs an explicit mainline and may duplicate its parents.
+    // Refuse the same selected history in both modes before any replay or sizing.
+    const merges = lines(git('source', ['rev-list', '--merges', range, `^${base}`], checkCwd));
+    if (merges.length) stop('source-merges', { merges,
+      detail: 'Select a linear source slice without merge commits (split or flatten the source first).' });
     const mergeEnv = mergeEnvironment(git('merge-objects', ['rev-parse', '--git-path', 'objects'], checkCwd), checkCwd);
     const merged = command('merge-tree', 'git', ['merge-tree', '--write-tree', '--name-only', `--merge-base=${start}`, base, tip],
       checkCwd, mergeEnv, true);

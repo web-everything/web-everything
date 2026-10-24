@@ -38,7 +38,7 @@ function fixture({ change = () => undefined, over = {}, options = {} } = {}) {
     if (override) return override;
     const value = v => ({ status: 0, stdout: typeof v === 'string' ? v : JSON.stringify(v), stderr: '' });
     if (cmd === 'gh') {
-      if (args[0] === 'api') return value({ login: 'me' });
+      if (args[0] === 'api') return value({ data: { viewer: { login: 'me' } } });
       if (args[1] === 'view') return value({ headRefName: 'lane/parent', headRefOid: base, isCrossRepository: false });
       return value([]);
     }
@@ -46,7 +46,7 @@ function fixture({ change = () => undefined, over = {}, options = {} } = {}) {
       if (args[0] === 'merge-tree') return value(sha + '\n');
       if (args[0] === 'merge-base') return value(base);
       if (args[0] === 'rev-parse') return value(args.at(-1).startsWith('origin/') ? base : sha);
-      if (args[0] === 'rev-list') return value(sha);
+      if (args[0] === 'rev-list') return value(args.includes('--merges') ? '' : sha);
       if (args[0] === 'diff') return value(args[1] === '--numstat' ? '12\t3\tscripts/file.mjs\n4\t1\tscripts/__tests__/file.test.mjs' : '2 files changed');
       if (args[0] === 'log') return value('abc A commit');
       return value('');
@@ -68,6 +68,114 @@ const released = calls => calls.some(c => c.args[1] === 'release');
 const prs = n => Array.from({ length: n }, (_, i) => ({ number: i + 1, author: { login: 'me' }, headRefName: `lane/${i}` }));
 
 describe('graduate-chain', () => {
+  for (const dryRun of [false, true]) {
+    for (const login of ['slice-worker[bot]', 'app/slice-worker', 'app/Slice-Worker']) {
+      it(`installation credentials count the posting bot (${login}, dryRun=${dryRun})`, () => {
+        const change = (count) => (cmd, args) => {
+          if (cmd !== 'gh') return;
+          if (args[0] === 'repo') return reply('owner/repo');
+          if (args[1] === 'list') return reply(prs(count).map(p => ({ ...p, author: { login } })));
+          if (args[0] === 'api') return args[1] === 'user'
+            ? reply({ message: 'Resource not accessible by integration' }, 403)
+            : reply({ data: { viewer: { login: 'slice-worker[bot]' } } });
+        };
+        const below = fixture({ over: { dryRun }, change: change(3) });
+        expect(below.result.ok).toBe(true);
+        const identity = below.calls.find(c => c.cmd === 'gh' && c.args[0] === 'api');
+        expect(identity.args).toEqual(['api', 'graphql', '-f', 'query={ viewer { login } }']);
+        expect(identity.env.GH_REPO).toBe('owner/repo');
+        const capped = fixture({ over: { dryRun }, change: change(4) });
+        expect(capped.result.stopReason).toBe('cap-caller');
+        expect(capped.calls.some(c => c.cmd === 'node')).toBe(false);
+      });
+    }
+    for (const source of ['lane/source', 'old..new']) {
+      it(`rejects merge history before replay (${source}, dryRun=${dryRun})`, () => {
+        const merge = 'c'.repeat(40);
+        const { result, calls } = fixture({ over: { source, dryRun }, change: (cmd, args) => {
+          if (cmd === 'git' && args[0] === 'rev-list') return reply(args.includes('--merges') ? merge : `${sha}\n${merge}`);
+        } });
+        expect(result).toMatchObject({ ok: false, stopReason: 'source-merges', merges: [merge] });
+        expect(result.detail).toContain('linear');
+        expect(calls.some(c => ['merge-tree', 'reset', 'cherry-pick'].includes(c.args[0]))).toBe(false);
+        expect(released(calls)).toBe(!dryRun);
+        const check = calls.find(c => c.args.includes('--merges'));
+        expect(check.args).toContain(`^${base}`);
+        expect(check.cwd).toBe(dryRun ? '/repo' : '/lane');
+      });
+    }
+  }
+  for (const response of [null, {}, { data: { viewer: null } }, { data: { viewer: { login: '' } } },
+    { data: { viewer: { login: 'me\n' } } },
+    { data: { viewer: { login: 'me' } }, errors: [{ message: 'partial response' }] }]) {
+    it(`installation identity fails closed on incomplete GraphQL evidence: ${JSON.stringify(response)}`, () => {
+      const { result, calls } = fixture({ change: (cmd, args) => cmd === 'gh' && args[0] === 'api' && reply(response) });
+      expect(result.stopReason).toBe('caps-unreadable');
+      expect(calls.some(c => c.cmd === 'node')).toBe(false);
+    });
+  }
+  it('merge history checks fail closed and release the acquired lane', () => {
+    const { result, calls } = fixture({ change: (cmd, args) =>
+      cmd === 'git' && args.includes('--merges') && reply('', 128) });
+    expect(result.stopReason).toBe('source');
+    expect(released(calls)).toBe(true);
+    expect(calls.some(c => c.args[0] === 'cherry-pick')).toBe(false);
+  });
+  it('installation identity command failures stop before acquisition', () => {
+    const { result, calls } = fixture({ change: (cmd, args) =>
+      cmd === 'gh' && args[0] === 'api' && reply('', 1) });
+    expect(result.stopReason).toBe('caps');
+    expect(calls.some(c => c.cmd === 'node')).toBe(false);
+  });
+  it('installation identity cannot turn a truncated PR list into cap evidence', () => {
+    const { result, calls } = fixture({ change: (cmd, args) =>
+      cmd === 'gh' && args[1] === 'list' && reply(prs(1000)) });
+    expect(result.stopReason).toBe('caps-unreadable');
+    expect(calls.some(c => c.cmd === 'node')).toBe(false);
+  });
+  it('installation bot identity does not conflate a human with the same bare login', () => {
+    const { result } = fixture({ change: (cmd, args) => {
+      if (cmd === 'gh' && args[0] === 'api') return reply({ data: { viewer: { login: 'me[bot]' } } });
+      if (cmd === 'gh' && args[1] === 'list') return reply(prs(4));
+    } });
+    expect(result.ok).toBe(true);
+  });
+  it('real merge history is refused in both modes; a merge already in the stack base is excluded', async () => {
+    await withBareOrigin(ctx => {
+      ctx.seedOriginBranch('lane/left', { 'left.mjs': 'export const left = 1;\n' });
+      ctx.seedOriginBranch('lane/right', { 'right.mjs': 'export const right = 1;\n' });
+      ctx.git(['fetch', 'origin']);
+      ctx.git(['switch', '-c', 'source', 'origin/lane/left']);
+      ctx.git(['merge', '--no-edit', 'origin/lane/right']);
+      const merge = ctx.git(['rev-parse', 'HEAD']).trim();
+      const start = ctx.git(['rev-parse', 'origin/main']).trim();
+      const calls = [];
+      const exec = (cmd, args, opts) => {
+        calls.push({ cmd, args });
+        if (cmd === 'gh') return reply(args[0] === 'api' ? { data: { viewer: { login: 'me' } } }
+          : args[0] === 'repo' ? 'owner/repo' : args[1] === 'view'
+            ? { headRefName: 'lane/merged', headRefOid: merge, isCrossRepository: false } : []);
+        if (cmd === 'node' && args[1] === 'acquire') return reply({ lane: 8, path: ctx.clone, holder: 'held' });
+        if (cmd === 'node' && args[1] === 'release') return reply({ released: 1 });
+        if (cmd !== 'git') throw Error('unexpected publication');
+        return spawnSync(cmd, args, { ...opts, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      };
+      const run = createGraduateChainRunner({ exec, cwd: ctx.clone, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } });
+      for (const dryRun of [true, false]) {
+        for (const source of [merge, `${start}..${merge}`]) {
+          calls.length = 0;
+          expect(run({ ...input, source, dryRun })).toMatchObject({ ok: false, stopReason: 'source-merges', merges: [merge] });
+          expect(calls.some(c => ['reset', 'cherry-pick', 'merge-tree'].includes(c.args[0]))).toBe(false);
+          expect(released(calls)).toBe(!dryRun);
+        }
+      }
+      ctx.commit({ 'slice.mjs': 'export const slice = 1;\n' });
+      const tip = ctx.git(['rev-parse', 'HEAD']).trim();
+      const result = run({ ...input, source: `${start}..${tip}`, stackOn: '7', dryRun: true });
+      expect(result).toMatchObject({ ok: true, size: { nonTest: 1, test: 0, files: 1 } });
+      expect(result.steps.find(s => s.step === 'cherry-pick').would).toBe(`apply ${tip} over ${merge}`);
+    });
+  });
   for (const source of ['lane/source', 'old..new']) {
     for (const dryRun of [false, true]) {
       it(`refuses the parent destination before any mutation (${source}, dryRun=${dryRun})`, () => {
@@ -88,7 +196,7 @@ describe('graduate-chain', () => {
         const ancestor = 'c'.repeat(40);
         const { result, calls } = fixture({ over: { source, stackOn: '7', dryRun }, change: (cmd, args) => {
           if (cmd === 'git' && args[0] === 'merge-base') return reply(ancestor);
-          if (cmd === 'git' && args[0] === 'rev-list') return reply(args.includes(`^${base}`) ? sha : `${base}\n${sha}`);
+          if (cmd === 'git' && args[0] === 'rev-list') return reply(args.includes('--merges') ? '' : args.includes(`^${base}`) ? sha : `${base}\n${sha}`);
         } });
         expect(result.ok).toBe(true);
         expect(calls.find(c => c.args[0] === 'rev-list').args).toContain(`^${base}`);
@@ -149,7 +257,7 @@ describe('graduate-chain', () => {
       const calls = [];
       const exec = (cmd, args, opts) => {
         calls.push({ cmd, args });
-        if (cmd === 'gh') return reply(args[0] === 'api' ? { login: 'me' } : args[1] === 'view'
+        if (cmd === 'gh') return reply(args[0] === 'api' ? { data: { viewer: { login: 'me' } } } : args[1] === 'view'
           ? { headRefName: 'lane/stack', headRefOid: stackSha, isCrossRepository: false } : []);
         if (cmd !== 'git') throw Error('dry-run attempted mutation');
         return spawnSync(cmd, args, { ...opts, encoding: 'utf8', maxBuffer: 1024 * 1024 });
@@ -169,7 +277,7 @@ describe('graduate-chain', () => {
       const stackSha = ctx.git(['rev-parse', 'origin/lane/stack']).trim();
       const sourceSha = ctx.git(['rev-parse', 'origin/lane/source']).trim();
       const exec = (cmd, args, opts) => {
-        if (cmd === 'gh') return reply(args[0] === 'api' ? { login: 'me' } : args[1] === 'view'
+        if (cmd === 'gh') return reply(args[0] === 'api' ? { data: { viewer: { login: 'me' } } } : args[1] === 'view'
           ? { headRefName: 'lane/stack', headRefOid: stackSha, isCrossRepository: false } : []);
         if (cmd !== 'git') throw Error('dry-run attempted mutation');
         return spawnSync(cmd, args, { ...opts, encoding: 'utf8', maxBuffer: 1024 * 1024 });
