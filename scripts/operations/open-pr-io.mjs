@@ -76,7 +76,7 @@ export function resolveGhCredentialEnv({ env = process.env, exists = existsSync,
 function pathWithShimFirst(dir, pathEnv) {
   return [dir, ...pathEnv.split(':').filter((d) => d && d !== dir)].join(':');
 }
-import { checkPrePrReview, loadPrePrSettings, renderBypassNote, codeSpan } from '../lib/pre-pr-review.mjs';
+import { checkPrePrReview, loadPrePrSettings, renderBypassNote, codeSpan, authoriseBypass, sessionRole } from '../lib/pre-pr-review.mjs';
 import { prepareItemFromRef, preparePrTitle, verifyPreparePr, prepareBatchIds, verifyPrepareBatchPr } from './prepare-pr.mjs';
 
 /** The single home. Resolved from THIS file's location, never cwd — the lane being opened is not this repo. */
@@ -136,7 +136,7 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
     if (!base || base.startsWith('-') || !sha || sha.startsWith('-')) throw new Error('invalid diff ref');
     let ref = base;
     try { git(['rev-parse', '--verify', '--quiet', `origin/${base}`]); ref = `origin/${base}`; } catch { /* use local base */ }
-    return git(['diff', '--numstat', '--no-renames', `${ref}...${sha}`]);
+    return git(['diff', '--numstat', '-z', '--find-renames', `${ref}...${sha}`]);
   },
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
   dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
@@ -166,7 +166,9 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
         catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
       }
       if (gate.action === 'advise') process.stderr.write(`open-pr: advisory — ${gate.message}\n`);
-      if (!gate.bypass) {
+      const authorisedSkip = typeof skipPrePrReview === 'string' && skipPrePrReview.trim() !== ''
+        && authoriseBypass({ role: sessionRole(env), actor, operatorInstruction }).ok;
+      if (!gate.bypass && !authorisedSkip) {
         let size;
         try { size = measureNonTestLines(diffStat({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD' })); }
         catch {

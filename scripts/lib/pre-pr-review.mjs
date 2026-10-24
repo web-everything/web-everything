@@ -326,4 +326,4 @@ export function workingTreeOf(cwd) {
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
 
-const sessionRole = (env) => classifySession(env).role;
+export const sessionRole = (env) => classifySession(env).role;

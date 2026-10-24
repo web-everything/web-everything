@@ -49,18 +49,31 @@ export const OPEN_PR_OP = 'open-pr';
 
 export const OPEN_PR_MAX_NON_TEST_LINES = 300;
 
-/** Pure git --numstat accounting; unreadable evidence must never become a zero-sized diff. */
+/** Pure git --numstat -z accounting (also accepts legacy unquoted newline rows).
+ * Binary rows have no line count; malformed or incomplete evidence must never become a zero-sized diff.
+ */
 export function measureNonTestLines(numstatText) {
   if (typeof numstatText !== 'string') throw new Error('numstat must be text');
   if (!numstatText) return { lines: 0, exempt: false };
-  const rows = numstatText.replace(/\n$/, '').split('\n');
+  const nulDelimited = numstatText.includes('\0');
+  if (nulDelimited && !numstatText.endsWith('\0')) throw new Error('unterminated numstat record');
+  const rows = nulDelimited ? numstatText.slice(0, -1).split('\0') : numstatText.replace(/\n$/, '').split('\n');
   let lines = 0;
   let exempt = true;
-  for (const row of rows) {
-    const match = /^(\d+)\t(\d+)\t([^\t\r\n]+)$/.exec(row);
+  for (let i = 0; i < rows.length; i++) {
+    const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(rows[i]);
     if (!match) throw new Error('unreadable numstat line');
-    const [, additions, deletions, path] = match;
-    const changed = Number(additions) + Number(deletions);
+    const [, additions, deletions] = match;
+    let path = match[3];
+    // -z represents a rename as counts + empty path, then the old and new paths.
+    if (nulDelimited && !path) {
+      const source = rows[++i];
+      path = rows[++i];
+      if (!source || !path) throw new Error('incomplete numstat rename');
+    }
+    if (!path || (!nulDelimited && /[\t\r\n]|^"/.test(path))) throw new Error('unreadable numstat path');
+    if ((additions === '-') !== (deletions === '-')) throw new Error('unreadable numstat counts');
+    const changed = additions === '-' ? 0 : Number(additions) + Number(deletions);
     if (!Number.isSafeInteger(changed)) throw new Error('numstat count exceeds safe integer range');
     exempt = exempt && path.startsWith('backlog/');
     if (!/(^|\/)__tests__\//.test(path) && !/(^|\/)[^/]*\.(test|spec)\.[^/]+$/.test(path)) {
