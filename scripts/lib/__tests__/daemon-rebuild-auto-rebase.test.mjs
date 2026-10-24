@@ -210,10 +210,48 @@ describe('established overlay auto rebase', () => {
       expect(f.deps.auditor).not.toHaveBeenCalled();
     });
 
-    it.each(['overlay', 'main'])('fails closed before audit when the %s deleted-test diff cannot be read', async parent => {
+    it.each(['overlay', 'main'])('rejects renaming an existing %s test to a non-test filename', async parent => {
+      const file = 'regression.test.mjs', renamed = 'regression.mjs';
+      const f = fixture({ [parent === 'overlay' ? 'branchFiles' : 'mainFiles']: { [file]: '// existing test\n' } });
+      f.moveMain();
+      const parentSha = parent === 'overlay' ? f.oldSha : ok(f.root, ['rev-parse', 'HEAD']);
+      const resolveConflicts = f.deps.codex;
+      f.deps.codex = async options => {
+        const result = await resolveConflicts(options);
+        ok(options.root, ['mv', file, renamed]);
+        expect(ok(options.root, ['diff', '--cached', '--name-status', '--find-renames', parentSha]))
+          .toContain(`R100\t${file}\t${renamed}`);
+        return result;
+      };
+      await expect(job(f)).rejects.toThrow('existing test removed by resolution; human review required');
+      assertUnregistered(f);
+      expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'tests' } });
+      expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(f.deps.auditor).not.toHaveBeenCalled();
+    });
+
+    it.each(['overlay', 'main'])('rejects deleting an existing %s Playwright .spec.ts test', async parent => {
+      const file = 'browser.spec.ts';
+      const f = fixture({ [parent === 'overlay' ? 'branchFiles' : 'mainFiles']: { [file]: '// existing Playwright test\n' } });
+      f.moveMain();
+      const resolveConflicts = f.deps.codex;
+      f.deps.codex = async options => {
+        const result = await resolveConflicts(options);
+        fs.unlinkSync(join(options.root, file));
+        return result;
+      };
+      await expect(job(f)).rejects.toThrow('existing test removed by resolution; human review required');
+      assertUnregistered(f);
+      expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'tests' } });
+      expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(f.deps.auditor).not.toHaveBeenCalled();
+    });
+
+    it.each(['overlay', 'main', 'candidate'])('fails closed before audit when the %s file list cannot be read', async parent => {
       const f = fixture({ workerTest: false }); f.moveMain();
       const parentSha = parent === 'overlay' ? f.oldSha : ok(f.root, ['rev-parse', 'HEAD']);
-      f.deps.git = (args, opts) => args.includes('--diff-filter=D') && args.includes(parentSha)
+      f.deps.git = (args, opts) => args[0] === 'ls-tree' && (parent === 'candidate'
+        ? !args.includes(f.oldSha) && !args.includes(parentSha) : args.includes(parentSha))
         ? { status: 1, stdout: '' } : run(args, opts);
       await expect(job(f)).rejects.toThrow('command failed or incomplete');
       assertUnregistered(f);
