@@ -4,102 +4,77 @@ import * as hostLoad from '../host-load.mjs';
 const policy = { settings: { host: { maxLoadPerCore: 2, minMemoryHeadroomMb: 1000 } }, sources: {} };
 const vm = `Mach Virtual Memory Statistics: (page size of 4096 bytes)
 Pages free: 131072.
-Pages speculative: 0.
-Pages purgeable: 0.`;
+Pages active: 262144.
+Pages inactive: 65536.
+Pages speculative: 32768.
+Pages purgeable: 16384.
+Pages wired down: 32768.`;
 const swap = 'vm.swapusage: total = 2048.00M  used = 1024.00M  free = 1024.00M';
-const probeFailures = [
-  ['sysctl vm.swapusage denied (EPERM)', (command) => {
-    if (command === 'sysctl') throw Object.assign(Error('sysctl vm.swapusage denied'), { code: 'EPERM' });
-    return vm;
-  }],
-  ['malformed vm_stat', (command) => command === 'vm_stat' ? 'unparseable vm_stat' : swap],
-  ['malformed swapusage', (command) => command === 'vm_stat' ? vm : 'unparseable swapusage'],
-  ['exec timeout (ETIMEDOUT)', () => { throw Object.assign(Error('probe timed out'), { code: 'ETIMEDOUT' }); }],
+const pressure = 'The system has 68719476736 (4194304 pages with a page size of 16384).\nSystem-wide memory free percentage: 77%';
+const denied = () => { throw Object.assign(Error('denied'), { code: 'EPERM' }); };
+const opts = { encoding: 'utf8', timeout: 5000 };
+const calls = [
+  ['vm_stat', [], opts], ['sysctl', ['vm.swapusage'], opts], ['vm_stat', [], opts],
+  ['memory_pressure', ['-Q'], opts], ['sysctl', ['hw.memsize'], opts], ['vm_stat', [], opts],
 ];
-const admission = (options = {}) => hostLoad.hostLoadAdmission({
-  policy, interactive: false, load: () => [1], cores: () => 4, ...options,
-});
-const memoryProbe = (exec) => () => hostLoad.readHostMemoryHeadroomMb({ env: {}, platform: 'darwin', exec });
+const read = (exec, log) => hostLoad.readHostMemoryHeadroom({ env: {}, platform: 'darwin', exec, free: denied, log });
+const sequence = (...steps) => steps.reduce((exec, step) => exec.mockImplementationOnce(
+  typeof step === 'function' ? step : () => step,
+), vi.fn(denied));
+const admission = (memory) => hostLoad.hostLoadAdmission({ policy, memory, load: () => [1], cores: () => 4, interactive: false });
+beforeEach(() => hostLoad.resetProbeLogForTests());
 
-beforeEach(() => {
-  // Keep behavioral regressions runnable before the required helper is implemented.
-  if (typeof hostLoad.resetProbeFailureLogForTests === 'function') hostLoad.resetProbeFailureLogForTests();
-});
-
-describe('host admission tolerates unavailable memory probes', () => {
-  it('exports a test reset helper for the process-wide probe failure log', () => {
-    expect(hostLoad.resetProbeFailureLogForTests).toBeTypeOf('function');
+describe('Darwin memory probe fallback chain', () => {
+  it('uses vm_stat+swapusage first and preserves the MB-only wrapper', () => {
+    const exec = vi.fn((cmd) => cmd === 'vm_stat' ? vm : swap);
+    expect(read(exec)).toEqual({ mb: 1728, probe: 'vm_stat+swapusage' });
+    expect(exec.mock.calls).toEqual(calls.slice(0, 2));
+    expect(hostLoad.readHostMemoryHeadroomMb({ env: {}, platform: 'darwin', exec })).toBe(1728);
   });
-
-  it.each(probeFailures)('admits under CPU rules without throwing and logs once across repeated admissions: %s', (_name, implementation) => {
-    const exec = vi.fn(implementation); const log = vi.fn();
-    const memory = memoryProbe(exec);
-    for (let i = 0; i < 3; i++) {
-      let result;
-      expect(() => { result = admission({ memory, log }); }).not.toThrow();
-      expect(result.admitted).toBe(true);
-      expect(result.reason).toContain('host memory unknown');
-      expect(result.reason).toContain('no memory headroom credit');
-    }
-    expect(exec).toHaveBeenCalled();
-    expect(log).toHaveBeenCalledTimes(1);
-    expect(log.mock.calls.flat().join(' ')).toContain('host memory unknown');
+  it('uses vm_stat without swap credit when sandbox sysctl throws EPERM, in order', () => {
+    const exec = sequence(vm, denied, vm);
+    expect(read(exec)).toEqual({ mb: 704, probe: 'vm_stat' });
+    expect(exec.mock.calls).toEqual(calls.slice(0, 3));
   });
-
-  it('logs only once across different failure types and admission callers in the same process', () => {
-    const firstLog = vi.fn(); const laterLog = vi.fn();
-    for (const [index, [, exec]] of probeFailures.entries()) {
-      expect(admission({ memory: memoryProbe(exec), log: index === 0 ? firstLog : laterLog }).admitted).toBe(true);
-    }
-    expect(firstLog).toHaveBeenCalledTimes(1);
-    expect(laterLog).not.toHaveBeenCalled();
+  it('uses memory_pressure when vm_stat and sysctl fail', () => {
+    const exec = vi.fn((cmd) => cmd === 'memory_pressure' ? pressure : denied());
+    expect(read(exec)).toEqual({ mb: 50462.72, probe: 'memory_pressure' });
+    expect(exec.mock.calls).toEqual([calls[0], calls[2], calls[3]]);
   });
-
-  it('reset helper permits logging a subsequent probe failure again', () => {
-    expect(hostLoad.resetProbeFailureLogForTests).toBeTypeOf('function');
-    const log = vi.fn(); const memory = memoryProbe(probeFailures[0][1]);
-    admission({ memory, log });
-    expect(log).toHaveBeenCalledTimes(1);
-    hostLoad.resetProbeFailureLogForTests();
-    admission({ memory, log });
-    expect(log).toHaveBeenCalledTimes(2);
+  it('uses hw.memsize times the vm_stat page ratio after earlier probes fail', () => {
+    const exec = sequence(vm, denied, 'bad vm_stat', 'bad pressure', 'hw.memsize: 68719476736', vm);
+    expect(read(exec)).toEqual({ mb: 16384, probe: 'hw.memsize+vm_stat' });
+    expect(exec.mock.calls).toEqual(calls);
   });
-
-  it.each(probeFailures)('still refuses over-limit CPU load with a failing memory probe: %s', (_name, exec) => {
-    const result = admission({ memory: memoryProbe(exec), load: () => [9], log: vi.fn() });
-    expect(result.admitted).toBe(false);
-    expect(result.reason).toContain('host load');
-    expect(result.reason).toContain('host.maxLoadPerCore=2');
-  });
-
   it.each([
-    ['non-finite load', () => [NaN]],
-    ['unreadable load', () => { throw Error('load unavailable'); }],
-  ])('still refuses unknown CPU load with a failing memory probe: %s', (_name, load) => {
-    const result = admission({ memory: memoryProbe(probeFailures[0][1]), load, log: vi.fn() });
+    ['EPERM', denied],
+    ['ETIMEDOUT', () => { throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' }); }],
+    ['malformed outputs', () => 'unparseable'],
+    ['non-finite output', () => 'Infinity'],
+    ['negative output', () => '-1'],
+  ])('throws when all probes fail (%s) and refuses admission with host memory unknown', (_name, fail) => {
+    const exec = vi.fn(fail);
+    expect(() => read(exec)).toThrow();
+    expect(exec).toHaveBeenCalled();
+    const result = admission(() => hostLoad.readHostMemoryHeadroomMb({ env: {}, platform: 'darwin', exec, free: denied }));
     expect(result.admitted).toBe(false);
-    expect(result.reason).toContain('host load unknown');
+    expect(result.reason).toContain('host memory unknown');
   });
-
-  it('still refuses known memory headroom below the minimum', () => {
-    const log = vi.fn();
-    const result = admission({ memory: () => 999, log });
-    expect(result.admitted).toBe(false);
-    expect(result.reason).toContain('host memory headroom 999MB');
-    expect(result.reason).toContain('host.minMemoryHeadroomMb=1000');
-    expect(log).not.toHaveBeenCalled();
+  it('rejects malformed swapusage and accepts zero headroom as a valid fallback', () => {
+    const exec = sequence(vm, 'bad swapusage', vm.replace(/\d+\./g, '0.'));
+    expect(read(exec)).toEqual({ mb: 0, probe: 'vm_stat' });
+    expect(exec.mock.calls).toEqual(calls.slice(0, 3));
   });
-
-  it('still admits a healthy macOS memory probe without logging a failure', () => {
-    const exec = vi.fn((command) => command === 'vm_stat' ? vm : swap); const log = vi.fn();
-    const result = admission({ memory: memoryProbe(exec), log });
-    expect(result.admitted).toBe(true);
-    expect(result.reason).toContain('host memory headroom 1536MB');
-    expect(result.reason).not.toContain('host memory unknown');
-    expect(exec.mock.calls).toEqual([
-      ['vm_stat', [], { encoding: 'utf8', timeout: 5000 }],
-      ['sysctl', ['vm.swapusage'], { encoding: 'utf8', timeout: 5000 }],
-    ]);
-    expect(log).not.toHaveBeenCalled();
+  it('logs the selected probe once per process across callers and resets for tests', () => {
+    const log = vi.fn(); const laterLog = vi.fn();
+    read(sequence(vm, denied, vm), log);
+    read(sequence(vm, swap), laterLog);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0]).toEqual([expect.stringContaining('vm_stat')]);
+    expect(laterLog).not.toHaveBeenCalled();
+    hostLoad.resetProbeLogForTests();
+    read(sequence(vm, swap), laterLog);
+    expect(laterLog).toHaveBeenCalledTimes(1);
+    expect(laterLog.mock.calls[0]).toEqual([expect.stringContaining('vm_stat+swapusage')]);
   });
 });
