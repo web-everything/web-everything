@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import {
   startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart,
+  PID_START_TIMEOUT_MS, JOB_RECORD_INIT_DEADLINE_MS,
   CODEX_CLI,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_INSTALL_TIMEOUT_MS,
@@ -1639,8 +1640,10 @@ describe('detached jobs', () => {
     const execFn = vi.fn(() => '  Fri Oct 23  1:10:13 2026\n');
     expect(readPidStart(42, { execFn })).toBe('Fri Oct 23 1:10:13 2026');
     expect(execFn).toHaveBeenCalledWith('ps', ['-o', 'lstart=', '-p', '42'], expect.objectContaining({
-      timeout: expect.any(Number), env: expect.objectContaining({ LC_ALL: 'C', TZ: 'UTC' }),
+      timeout: PID_START_TIMEOUT_MS, env: expect.objectContaining({ LC_ALL: 'C', TZ: 'UTC' }),
     }));
+    // The probe runs between spawn and the record write: a slow ps must never outlast the child's wait for it.
+    expect(PID_START_TIMEOUT_MS * 2).toBeLessThanOrEqual(JOB_RECORD_INIT_DEADLINE_MS);
     expect(readPidStart(42, { execFn: () => { throw Object.assign(new Error('ps exited 1'), { status: 1 }); } })).toBeNull();
     expect(readPidStart(42, { execFn: () => '\n' })).toBeNull();
     expect(() => readPidStart(42, { execFn: () => { throw Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }); } }))

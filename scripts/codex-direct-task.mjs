@@ -1207,12 +1207,18 @@ export async function startDetachedJob({
   }
 }
 const jobSleep = (ms, options) => delay(ms, undefined, options);
+/** How long the job child waits for the launcher to write its record before giving up. */
+export const JOB_RECORD_INIT_DEADLINE_MS = 5000;
+/** One start-time probe's deadline: it runs between spawn and the record write, well inside the child's wait. */
+export const PID_START_TIMEOUT_MS = 1000;
 /**
- * The shared bounded `ps -o lstart=` probe (null when the pid does not exist; throws when ps does not answer),
- * with the zone pinned too, so a launcher and a later `wait` from another shell format one instant identically.
+ * The shared `ps -o lstart=` probe (null when the pid does not exist; throws when ps does not answer), with a
+ * short deadline and the zone pinned too, so a launcher and a later `wait` from another shell agree.
  */
-export function readPidStart(pid, { execFn = execFileSync } = {}) {
-  return readProcStart(pid, { execFn: (bin, args, opts) => execFn(bin, args, { ...opts, env: { ...opts.env, TZ: 'UTC' } }) });
+export function readPidStart(pid, { execFn = execFileSync, timeoutMs = PID_START_TIMEOUT_MS } = {}) {
+  return readProcStart(pid, {
+    execFn: (bin, args, opts) => execFn(bin, args, { ...opts, timeout: timeoutMs, env: { ...opts.env, TZ: 'UTC' } }),
+  });
 }
 const pidStartOrNull = (readStart, pid) => { try { return readStart(pid); } catch { return null; } };
 /** Whether the job's own process is alive: the PID exists AND, when recorded, still has the same start time. */
@@ -1518,7 +1524,7 @@ if (isMain) {
   (async () => {
     if (internalJob) {
       // The launcher persists the PID after spawn. Do not let a fast child finish before that write.
-      const deadline = Date.now() + 5000;
+      const deadline = Date.now() + JOB_RECORD_INIT_DEADLINE_MS;
       for (;;) {
         try { if (readJobRecord(flags.job).pid === process.pid) break; } catch { /* launcher is writing */ }
         if (Date.now() >= deadline) throw new Error('job record was not initialized by launcher');
