@@ -15,13 +15,20 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { annotateLapsedStandDowns, standDownComments, standDownHead, standDownHeadChangeAt, resolveStandDownHoldsAcrossHeads, STAND_DOWN_MARKER } from './stand-down.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { defaultListPrComments } from './pr-comments-list.mjs'; // the leaf — parked-pr-conflict-watch would close an import cycle via rearm-review
+import { GH_ARGV, assertCompletePrComments } from '../lib/review-label-provider.mjs';
 
 /** `gh pr list --json comments` page size; a listed thread this long may be truncated. */
 export const LIST_COMMENTS_PAGE_SIZE = 100;
 
-/** Complete, paginated read of one PR's comments; throws ProcReadError on any failed read. */
+/** Complete, paginated read, proved by count, unique node ids, string bodies and author logins; throws on missing proof. */
 export function readCompletePrComments(number, { repo = null, exec = execRead } = {}) {
-  return defaultListPrComments({ number, repo, exec: (file, args, opts) => exec(file, args, opts) });
+  const countArgv = GH_ARGV.readCommentsTotalCount(repo, number);
+  const comments = defaultListPrComments({ number, repo, exec: (file, args, opts) => exec(file, args, opts) });
+  const response = JSON.parse(exec('gh', countArgv, {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024,
+  }));
+  assertCompletePrComments(comments, response);
+  return comments;
 }
 
 /** Complete edit history metadata: REST updated_at cannot prove a comment was never edited. Throws on any
@@ -96,9 +103,20 @@ export function enrichPrsWithCompleteComments(prs, {
     try {
       const comments = readComments(pr.number, { repo });
       if (!Array.isArray(comments)) throw new Error('comments read returned no array');
-      // `commentsComplete`: this reader proved the thread complete, whatever its length (a complete thread can be
-      // exactly the page size). The planner trusts this mark, never the length, before counting markers off it
-      // (`takeover-budget.mjs#threadMayBeTruncated`).
+      if (comments.length < pr.comments.length) throw new Error('complete comments read returned fewer comments than the listed page');
+      const ids = c => [c?.node_id, c?.id, c?.url, c?.html_url].filter(v => v !== undefined && v !== null && v !== '');
+      const normalizeLogin = login => typeof login === 'string' ? login.toLowerCase().replace(/\[bot\]$/, '') : login;
+      const covered = pr.comments.every(c => comments.some(full => {
+        if (typeof c?.body !== 'string' || c.body !== full?.body) return false;
+        const author = c?.author?.login ?? c?.user?.login;
+        if (author && normalizeLogin(author) !== normalizeLogin(full?.author?.login ?? full?.user?.login)) return false;
+        const embeddedIds = ids(c), fullIds = ids(full);
+        if (embeddedIds.length && fullIds.length) return embeddedIds.some(id => fullIds.includes(id));
+        return (c.createdAt ?? c.created_at) === (full.createdAt ?? full.created_at);
+      }));
+      if (!covered) throw new Error('complete comments read did not cover the listed page');
+      // The reader proves completeness against GraphQL totalCount, including an exactly full first page. The planner trusts
+      // `commentsComplete` before counting markers (`takeover-budget.mjs#threadMayBeTruncated`).
       out.push(annotatePr({ ...pr, comments, commentsComplete: true }));
     } catch (e) { onError(pr, e); }
   }

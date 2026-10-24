@@ -18,7 +18,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { classifySubmit } from './open-pr.mjs';
+import { classifySubmit, measureNonTestLines, OPEN_PR_MAX_NON_TEST_LINES } from './open-pr.mjs';
 import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
@@ -122,6 +122,78 @@ function failedGate(e, loadSettings) {
     : { action: 'refuse', why: 'check-error', reason: 'pre-pr-review-error', message: `${message} — refusing (fail closed). Fix the cause and open the PR again.` };
 }
 
+function createGitReader(cwd, exec = execFileSync) {
+  // A replacement character changes filename identity: an empty lookup for the
+  // substituted path could otherwise be mistaken for proof that a blob is absent.
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+  return (args, options = {}) => {
+    const output = exec('git', args, { cwd, encoding: null, maxBuffer: 64 * 1024 * 1024, ...options });
+    return typeof output === 'string' ? output : decoder.decode(output);
+  };
+}
+
+/** Attributes can override --text. Recover binary rows from immutable blobs, counting the
+ * whole old and new files conservatively. Only a successful tree read proves a missing side.
+ */
+function countBinaryDiffRows(text, { git, topLevel, base, sha }) {
+  if (!text.includes('-\t-\t')) return text;
+  if (!text.endsWith('\0')) throw new Error('unterminated numstat record');
+  const rows = text.slice(0, -1).split('\0');
+  let mergeBase;
+  // Bound the entire fallback, including every tree/blob read, rather than each file alone.
+  const deadline = performance.now() + 60_000;
+  const read = (args, options = {}) => {
+    const timeout = Math.ceil(deadline - performance.now());
+    if (timeout <= 0) throw new Error('binary size read timed out');
+    return git(['-C', topLevel, ...args], { ...options, timeout });
+  };
+  const lines = (revision, path) => {
+    const entry = read(['ls-tree', '-z', '--full-tree', revision, '--', path]);
+    if (entry === '') return 0;
+    const match = /^\d+ blob ([a-f0-9]+)\t([\s\S]*)\0$/.exec(entry);
+    if (!match || match[2] !== path) throw new Error('unreadable diff blob');
+    // Blob contents are arbitrary bytes, not filename metadata. Latin-1 preserves
+    // one character per byte so newline counting never needs lossy UTF-8 decoding.
+    const blob = read(['cat-file', 'blob', match[1]], { encoding: 'latin1' });
+    let count = blob.length && !blob.endsWith('\n') ? 1 : 0;
+    for (let i = 0; i < blob.length; i++) if (blob[i] === '\n') count++;
+    return count;
+  };
+  for (let i = 0; i < rows.length; i++) {
+    const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(rows[i]);
+    if (!match) throw new Error('unreadable numstat line');
+    const rowIndex = i;
+    const source = match[3] || rows[++i];
+    const destination = match[3] || rows[++i];
+    if (!source || !destination) throw new Error('incomplete numstat path');
+    if (match[1] !== '-' || match[2] !== '-') continue;
+    mergeBase ??= read(['merge-base', base, sha]).trim();
+    if (!mergeBase) throw new Error('missing diff merge base');
+    rows[rowIndex] = `${lines(sha, destination)}\t${lines(mergeBase, source)}\t${match[3]}`;
+  }
+  return rows.join('\0') + '\0';
+}
+
+/** Local Git size evidence, separately constructible with a temp cwd or injected git/exec.
+ * Tests can opt into the production reader without enabling credential resolution or the GitHub advisory.
+ */
+export function createPrDiffStatReader({ cwd = process.cwd(), exec = execFileSync, git = createGitReader(cwd, exec) } = {}) {
+  return ({ base, sha }) => {
+    if (!base || base.startsWith('-') || !sha || sha.startsWith('-')) throw new Error('invalid diff ref');
+    const resolvedSha = git(['rev-parse', '--verify', `${sha}^{commit}`]).trim();
+    let ref = base;
+    try { git(['rev-parse', '--verify', '--quiet', `origin/${base}`]); ref = `origin/${base}`; } catch { /* use local base */ }
+    // Remove Git's record terminator only; trailing whitespace can belong to the
+    // directory name, and trimming it could select a different repository.
+    const topLevel = git(['rev-parse', '--show-toplevel']).replace(/\n$/, '');
+    const text = git(['-C', topLevel, '-c', 'core.attributesFile=', 'diff', '--no-relative', '--text', '--numstat', '-z', '--find-renames', '--no-ext-diff', '--no-textconv', `${ref}...${resolvedSha}`], { timeout: 60_000 });
+    return {
+      text: countBinaryDiffRows(text, { git, topLevel, base: ref, sha: resolvedSha }),
+      sha: resolvedSha,
+    };
+  };
+}
+
 /**
  * The runner the declaration is injected with. ONE spawn; `spawn` is injected so every branch of
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
@@ -131,10 +203,13 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
   // outcome before any gh call (never a crash where run.mjs builds the sinks). An explicit `env` skips resolution;
   // a caller that injected `spawn` is a rehearsal/test and writes no shim.
   env: envOpt, resolveEnv = spawn !== spawnSync ? () => process.env : resolveGhCredentialEnv,
-  git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
+  git: gitOpt,
+  // Injected git or spawn keeps size evidence hermetic; opt in with an explicit diffStat reader.
+  diffStat = spawn !== spawnSync || gitOpt !== undefined ? () => '' : createPrDiffStatReader({ cwd }),
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
   dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
 } = {}) {
+  const git = gitOpt === undefined ? createGitReader(cwd) : gitOpt;
   return ({ argv, skipPrePrReview = '', actor = '', operatorInstruction = '' }) => {
     let env;
     try { env = envOpt ?? resolveEnv(); }
@@ -160,6 +235,26 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
         catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
       }
       if (gate.action === 'advise') process.stderr.write(`open-pr: advisory — ${gate.message}\n`);
+      // Only the gate's audited bypass, recorded in the body above, can waive size admission.
+      if (!gate.bypass) {
+        let size;
+        let measuredSha;
+        try {
+          const evidence = diffStat({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD' });
+          // Plain-text injected readers retain their caller's argv; the production reader also pins its commit.
+          size = measureNonTestLines(typeof evidence === 'string' ? evidence : evidence.text);
+          measuredSha = typeof evidence === 'string' ? '' : evidence.sha;
+        }
+        catch {
+          cleanupBody();
+          return { outcome: 'refused', reason: 'pr-size-unreadable', detail: 'Could not measure the PR diff. Restore readable git numstat evidence and try again.' };
+        }
+        if (size.lines > OPEN_PR_MAX_NON_TEST_LINES && !size.exempt) {
+          cleanupBody();
+          return { outcome: 'refused', reason: 'pr-too-large', detail: `The PR changes ${size.lines} non-test lines, exceeding the ${OPEN_PR_MAX_NON_TEST_LINES} limit. Split the PR into smaller PRs.` };
+        }
+        if (measuredSha) argv = [...argv.filter((a) => !a.startsWith('--sha=')), `--sha=${measuredSha}`];
+      }
     }
     // xsjn0uf-incident — advisory: a card this PR adds whose bornAs is already on main / in another open PR.
     if (!argv.includes('--dry-run')) {

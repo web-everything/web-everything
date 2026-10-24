@@ -1128,7 +1128,7 @@ describe('#5414 human clearance through the drain gate', () => {
   function replay({ mixed = false, fingerprint = true, workflow = false, human = true, liveHold = false, numberingSetting } = {}) {
     const r = repo();
     const head = r.number(mixed);
-    const comments = [{ author: { login: 'chalbert' }, createdAt: '2026-10-15T23:45:00Z',
+    const comments = [{ id: 'IC_clearance', author: { login: 'chalbert' }, createdAt: '2026-10-15T23:45:00Z',
       body: `${human ? '✅ review — \`review:human\` cleared via the sanctioned path' : '✅ review — accepted'}\n`
         + `<!-- reviewed-sha: ${r.base} -->\n`
         + (fingerprint ? `<!-- reviewed-diff: ${normalizeDiffFingerprint('old diff')} -->\n` : '')
@@ -1137,13 +1137,16 @@ describe('#5414 human clearance through the drain gate', () => {
     let views = 0;
     const exec = (cmd, args, opts) => {
       if (cmd === 'git') return execFileSync(cmd, args, { ...opts, cwd: r.cwd });
+      const thread = liveHold ? [...comments, { id: 'IC_hold', author: { login: 'chalbert' }, body: 'Please hold this PR.' }] : comments;
+      if (args[0] === 'api' && args[1] === 'graphql') {
+        return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: thread.length } } } } });
+      }
       if (args[0] === 'api') return args.some(a => a.includes('/comments'))
-        ? (liveHold ? [...comments, { author: { login: 'chalbert' }, body: 'Please hold this PR.' }] : comments)
-          .map(c => [c.body.replaceAll('\n', '\\n'), c.createdAt || '', c.author.login].join('\t')).join('\n') : '';
+        ? thread.map(c => [c.body.replaceAll('\n', '\\n'), c.createdAt || '', c.author.login, c.id].join('\t')).join('\n') : '';
       if (args[1] === 'view') {
         views++;
         return JSON.stringify({ headRefOid: head, headRefName: 'lane/5414', comments: views > 1 && liveHold
-          ? [...comments, { author: { login: 'chalbert' }, body: 'Please hold this PR.' }] : comments });
+          ? thread : comments });
       }
       if (args[1] === 'comment') { posted.push(args[args.indexOf('--body') + 1]); return ''; }
       throw Error(`unexpected command ${cmd} ${args}`);
