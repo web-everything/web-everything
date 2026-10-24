@@ -153,6 +153,48 @@ describe('established overlay auto rebase', () => {
       assertRule(f, result, 'overlay-branch-tests+import-graph');
     });
 
+    it.each(['non-conflicting', 'conflicting', 'leading whitespace'])('runs a directly importing non-ASCII test for a %s module changed by the fixer', async kind => {
+      const prefix = kind === 'leading whitespace' ? ' ' : '';
+      const file = `${prefix}café.mjs`, test = `${prefix}café.test.mjs`;
+      const f = fixture({
+        baseFiles: { [file]: 'export const value = 1;\n', [test]: `import './${file}';\n` },
+        branchFiles: kind === 'conflicting' ? { [file]: 'export const value = 2;\n' } : {},
+        mainFiles: kind === 'conflicting' ? { [file]: 'export const value = 3;\n' } : {},
+        resolvedFiles: { [file]: 'export const value = 4;\n' },
+      });
+      f.deps.git = (args, opts) => run(['-c', 'core.quotepath=true', ...args], opts);
+      f.moveMain();
+      f.deps.testRunner = vi.fn(async ({ root, args }) => {
+        expect(args.slice(7).sort()).toEqual([test, 'worker.test.mjs']);
+        expect(ok(root, ['show', `HEAD:${file}`])).toBe('export const value = 4;');
+        return { status: 0 };
+      });
+      const result = await job(f);
+      expect(f.deps.testRunner).toHaveBeenCalledOnce();
+      assertRule(f, result, 'related-tests');
+      const evidence = records(alertsFilePath(f.root, f.env)).find(e => e.kind === 'auto-rebase-evidence');
+      expect(evidence.detail).toMatchObject({ rule: 'related-tests', noTestFiles: [] });
+      if (kind === 'conflicting') expect(evidence.detail.conflicts[file]).toContain('<<<<<<<');
+    });
+
+    it('finds a non-ASCII overlay source and its importing test in the branch fallback', async () => {
+      const file = 'café.mjs', test = 'café.test.mjs';
+      const f = fixture({
+        workerTest: false,
+        baseFiles: { [file]: 'export const value = 1;\n', [test]: `import './${file}';\n` },
+        branchFiles: { [file]: 'export const value = 2;\n' },
+      });
+      f.deps.git = (args, opts) => run(['-c', 'core.quotepath=true', ...args], opts);
+      f.moveMain();
+      f.deps.testRunner = vi.fn(async ({ args }) => {
+        expect(args.slice(7)).toEqual([test]);
+        return { status: 0 };
+      });
+      const result = await job(f);
+      expect(f.deps.testRunner).toHaveBeenCalledOnce();
+      assertRule(f, result, 'overlay-branch-tests+import-graph');
+    });
+
     it('requires a Codex review and registers its rule when there are no tests anywhere', async () => {
       const f = fixture({ workerTest: false }); f.moveMain();
       const result = await job(f);
