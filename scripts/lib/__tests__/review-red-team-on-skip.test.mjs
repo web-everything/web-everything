@@ -35,6 +35,12 @@ describe('planRedTeamOnSkip — heal a previously skipped card-only head', () =>
         .toMatchObject({ action: 'dispatch', mode: 'fresh' });
     });
 
+  it.each(['other', null, false, ''])('does not heal an explicit non-card-only policy %j', policy => {
+    const result = { status: 'skipped', policy, reason: 'quota exhausted' };
+    expect(decide(heal({ readStatus: () => ({ status: 'finished', head, result, skipCardOnly: true, loopPayload: cardPayload() }) })))
+      .toMatchObject({ action: 'skip', why: 'prior result skipped (status finished); not re-run' });
+  });
+
   it.each([
     { diffText: '' }, { diffText: '  \n ' }, { diffText: undefined },
     { netBasis: { rev: 'b'.repeat(40) } }, { netBasis: {} },

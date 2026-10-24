@@ -76,6 +76,15 @@ describe('review-job red-team skip settlement', () => {
       expect(out.redTeam.outcome).toBe('non-policy');
     });
 
+  it.each([false, true])('malformed reason cannot prevent settlement or throw (redTeamOnly=%s)', redTeamOnly => {
+    const redTeam = { status: 'skipped', reason: { toString: null } };
+    const f = fixture(redTeam);
+    expect(() => runReviewJob({ repo, pr, redTeamOnly }, f.io)).not.toThrow();
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ redTeam, repo, pr, head }));
+    expect(f.events.indexOf('settle')).toBeLessThan(f.events.indexOf('gate'));
+  });
+
   it.each(['ran', 'resumed'])('completed %s does not settle', status => {
     const f = fixture({ status });
     runReviewJob({ repo, pr }, f.io);

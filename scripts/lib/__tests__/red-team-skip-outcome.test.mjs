@@ -106,7 +106,7 @@ describe('settleRedTeamSkip', () => {
     await f.settle(redTeam);
     expect(f.io.postComment).not.toHaveBeenCalled();
     expect(redTeamForHead(f.comments, pr, head)).toBeNull();
-    expect(f.io.publishNeedsYou.mock.calls).toEqual([[{ repo, pr, head, kind: `red-team-skip-${createHash('sha256').update(JSON.stringify([repo, pr, head, reason])).digest('hex').slice(0, 8)}`,
+    expect(f.io.publishNeedsYou.mock.calls).toEqual([[{ repo, pr, head, kind: `red-team-skip-${createHash('sha256').update(JSON.stringify([repo, pr, head, reason])).digest('hex').slice(0, 26)}`,
       reason: `red team skipped (${reason}); not cleared`, title: '' }]]);
     expect(f.markers()).toHaveLength(1);
     expect(f.markers()[0]).toMatch(/^[a-f0-9]{64}\.json$/);
@@ -132,7 +132,10 @@ describe('settleRedTeamSkip', () => {
     const f = fixture();
     f.io.publishNeedsYou.mockImplementation(() => {
       expect(f.markers()).toEqual([]);
-      expect(writeJsonAtomic).not.toHaveBeenCalled();
+      expect(writeJsonAtomic.mock.calls).toEqual([[
+        expect.stringContaining('skip-pending'),
+        expect.objectContaining({ repo, pr, head, kind: expect.stringMatching(/^red-team-skip-[a-f0-9]{26}$/) }),
+      ]]);
     });
     await f.settle({ status: 'skipped', reason: 'provider unavailable' });
     expect(writeJsonAtomic).toHaveBeenCalledWith(join(f.markerDir, f.markers()[0]), expect.any(Object));
@@ -156,7 +159,7 @@ describe('settleRedTeamSkip', () => {
     const result = await f.settle();
     expect(result.outcome).not.toBe('policy-clear');
     expect(redTeamForHead(f.comments, pr, head)).toBeNull();
-    expect(f.io.publishNeedsYou.mock.calls).toEqual([[{ repo, pr, head, kind: `red-team-skip-${createHash('sha256').update(JSON.stringify([repo, pr, head, 'policy-clear comment failed: GitHub unavailable'])).digest('hex').slice(0, 8)}`,
+    expect(f.io.publishNeedsYou.mock.calls).toEqual([[{ repo, pr, head, kind: `red-team-skip-${createHash('sha256').update(JSON.stringify([repo, pr, head, 'policy-clear comment failed: GitHub unavailable'])).digest('hex').slice(0, 26)}`,
       reason: 'red team skipped (policy-clear comment failed: GitHub unavailable); not cleared', title: '' }]]);
     await f.settle();
     expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);

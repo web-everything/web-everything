@@ -797,8 +797,10 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       }
     }
     if (out.redTeamSpeculative) delete out.redTeamSpeculative.result;
-    io.log(`review-job ${out.sessionSlug}: red team — ${redTeam?.status ?? 'none'}${redTeam?.reason ? ` (${redTeam.reason})` : ''}`
-      + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
+    try {
+      io.log(`review-job ${out.sessionSlug}: red team — ${redTeam?.status ?? 'none'}${redTeam?.reason ? ` (${redTeam.reason})` : ''}`
+        + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
+    } catch { /* malformed diagnostics cannot prevent skip settlement */ }
     recordSeats(redTeam?.seat ? [redTeam.seat] : []);
     out.redTeam = summarizeRedTeam(redTeam);
     if (!['ran', 'resumed'].includes(redTeam?.status) && typeof io.settleRedTeamSkip === 'function') {

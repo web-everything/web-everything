@@ -1,6 +1,6 @@
 /** Settle skipped red teams: explicit policy produces a result; everything else needs an operator. */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
@@ -15,6 +15,40 @@ export function classifyRedTeamSkip(redTeam) {
     ? 'policy' : 'non-policy', reason };
 }
 
+/** Retry notification IO only; old failures must not prevent this job's settlement. */
+function flushPending(io, note) {
+  try {
+    const base = redTeamStatusDir(io?.env ?? process.env);
+    const pendingDir = join(base, 'skip-pending');
+    if (!existsSync(pendingDir)) return;
+    const records = readdirSync(pendingDir).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+    let attempted = 0;
+    for (const name of records) {
+      const pending = join(pendingDir, name), published = join(base, 'skip-published', name);
+      try {
+        if (existsSync(published)) { unlinkSync(pending); continue; }
+        if (attempted >= 25) break; // Overflow remains durable for the next settlement.
+        attempted++;
+        const item = JSON.parse(readFileSync(pending, 'utf8'));
+        if (!item || typeof item.repo !== 'string' || !item.repo
+          || !Number.isSafeInteger(Number(item.pr)) || Number(item.pr) <= 0
+          || !/^(?:[a-f0-9]{40}|unknown)$/i.test(item.head ?? '')
+          || item.kind !== `red-team-skip-${name.slice(0, 26)}`
+          || typeof item.reason !== 'string' || !item.reason || typeof item.title !== 'string') {
+          throw Error(`invalid pending red-team skip record ${name}`);
+        }
+        io.publishNeedsYou(item);
+        mkdirSync(dirname(published), { recursive: true });
+        writeJsonAtomic(published, item);
+        unlinkSync(pending);
+      } catch (error) { note(error); }
+    }
+    if (attempted >= 25 && readdirSync(pendingDir).length) {
+      note('pending notification flush limit reached; remaining records retry on the next settlement');
+    }
+  } catch (error) { note(error); }
+}
+
 /** Synchronous IO, matching the review-job arc. Failures must never turn into a clear result. */
 export function settleRedTeamSkip(input = {}) {
   let io;
@@ -23,10 +57,11 @@ export function settleRedTeamSkip(input = {}) {
     catch { /* diagnostics cannot abort settlement */ }
   };
   try {
+    io = input.io;
+    flushPending(io, note);
     const { redTeam, pr, repo, comments } = input;
     const realHead = /^[a-f0-9]{40}$/i.test(input.head ?? '');
     const head = realHead ? input.head : 'unknown';
-    io = input.io;
     const classified = classifyRedTeamSkip(redTeam);
     let { reason } = classified;
     if (classified.kind === 'policy') {
@@ -47,9 +82,14 @@ export function settleRedTeamSkip(input = {}) {
     const key = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
     const path = join(redTeamStatusDir(io?.env ?? process.env), 'skip-published', `${key}.json`);
     if (existsSync(path)) return { outcome: 'non-policy', reason };
-    io.publishNeedsYou({ repo, pr, head, kind: `red-team-skip-${key.slice(0, 8)}`, reason: `red team skipped (${reason}); not cleared`, title: '' });
+    const pending = join(redTeamStatusDir(io?.env ?? process.env), 'skip-pending', `${key}.json`);
+    const item = { repo, pr, head, kind: `red-team-skip-${key.slice(0, 26)}`, reason: `red team skipped (${reason}); not cleared`, title: '' };
+    mkdirSync(dirname(pending), { recursive: true });
+    writeJsonAtomic(pending, item);
+    io.publishNeedsYou(item);
     mkdirSync(dirname(path), { recursive: true });
-    writeJsonAtomic(path, { repo, pr, head, reason });
+    writeJsonAtomic(path, item);
+    unlinkSync(pending);
     return { outcome: 'non-policy', reason };
   } catch (error) {
     note(error);
