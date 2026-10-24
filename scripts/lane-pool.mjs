@@ -2935,12 +2935,13 @@ async function cmdRelease(repo) {
     // `rmSync` here would destroy that NEW holder's live lease, not the one this call actually decided to drop
     // — the same check-then-act TOCTOU `cmdTrim` already closed for its own reap path with this exact primitive.
     if (recoveryEnabled()) {
-      // --pool changes repo.name without changing the caller's origin. Resolve the selected primary
-      // independently, as in the bulk path; neither the caller nor the lane remote is a fallback.
+      // --pool alone changes repo.name without changing the caller's origin. Discover its primary
+      // only when no canonical --origin or --reference was supplied; keep explicit resolution,
+      // including an unresolved origin, rather than replacing it with a guessed sibling.
       const callerName = basename(repo.originUrl || '').replace(/\.git$/, '');
       let salvageRepo = repo;
       try {
-        if (flags.pool && flags.pool !== callerName) {
+        if (flags.pool && flags.pool !== callerName && !flags.origin && !flags.reference) {
           salvageRepo = resolveRepo({ reference: primarySiblingPath(repo, flags.pool), pool: flags.pool });
         }
       } catch {

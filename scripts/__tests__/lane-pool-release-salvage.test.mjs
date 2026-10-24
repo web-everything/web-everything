@@ -104,6 +104,35 @@ describe('lane-pool release salvage push against a throwaway origin', () => {
     expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd)).toBe('');
   });
 
+  it.each(['--origin', '--reference', '--origin + --reference'])('release --pool honours explicit %s over sibling discovery', selector => {
+    const sha = commitLocalWork();
+    const caller = primaryCaller();
+    git(['clone', '--quiet', caller.callerOrigin, join(base, 'releasesalvage')]);
+    git(['remote', 'set-url', 'origin', caller.callerOrigin], laneDir);
+    assertReleased(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, {
+      ...caller,
+      originUrl: selector.includes('--origin') ? origin : null,
+      referencePath: selector.includes('--reference') ? reference : null,
+    }));
+    expect(salvageBranches()).toEqual([[sha, expect.stringMatching(/^refs\/heads\/salvage\/lane-1-/)]]);
+    expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd)).toBe('');
+  });
+
+  it('does not replace an explicit reference without an origin with sibling discovery', () => {
+    const sha = commitLocalWork();
+    const caller = primaryCaller();
+    git(['clone', '--quiet', origin, join(base, 'releasesalvage')]);
+    git(['remote', 'remove', 'origin'], caller.cwd);
+    assertReleased(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, {
+      ...caller, referencePath: caller.cwd,
+      stderr: /WARNING.*canonical origin unresolved.*skipping salvage/,
+    }));
+    expect(git(['rev-parse', 'HEAD'], laneDir)).toBe(sha);
+    expect(salvageBranches()).toEqual([]);
+    expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd)).toBe('');
+    expect(recordFiles(backupRoot)).toEqual([]);
+  });
+
   it.each(['missing primary', 'primary without origin'])('skips salvage and still releases when --pool has a %s', state => {
     commitLocalWork();
     const caller = primaryCaller();
