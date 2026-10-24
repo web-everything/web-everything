@@ -57,6 +57,14 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
   });
+  it('a newer accepting run does not hide a finished but unpublished result on the same head', () => {
+    const f = fixture();
+    const result = { status: 'ran', foldedVerdict: 'changes', comment: 'withheld', findings: [] };
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result }, f);
+    utimesSync(join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`), new Date(1_000_000), new Date(1_000_000));
+    writeRun({ ...newRunRecord({ id: 'review-pr-3', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) }, f.runsDir);
+    expect(readDrainRedTeamEvidence(f).status?.result?.comment).toBe('withheld');
+  });
   it('recognizes queued scheduling for the live head only while its writer is alive', () => {
     const f = fixture();
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'queued' }, { ...f, readPidStart: () => 'start' });

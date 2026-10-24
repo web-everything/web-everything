@@ -63,7 +63,12 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // of an unchanged head labels its accept before its job writes `queued`).
     if (!['queued', 'running'].includes(status.status)) {
       const latest = latestRun();
-      if (latest.at > statusAt && owes(latest.run)) return { loopPayload: latest.run, inFlight: false, scheduled: true, recorded, skipCardOnly: false };
+      if (latest.at > statusAt && owes(latest.run)) {
+        // A finished result that was never published still reaches the recovery path: a re-review of the same head must not
+        // strand it behind a pass that may never come (#5759, #5762).
+        const unpublished = status.status === 'finished' && ['withheld', 'error'].includes(status.result?.comment);
+        return { loopPayload: latest.run, inFlight: false, scheduled: true, recorded, skipCardOnly: false, ...(unpublished ? { status } : {}) };
+      }
     }
     // A local pid probe says nothing about another host or namespace: keep that pass held for its result.
     // For local records, a changed birth time proves pid reuse. An unavailable birth time is unknown,
