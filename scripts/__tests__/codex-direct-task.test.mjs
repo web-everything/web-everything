@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import {
-  startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode,
+  startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart,
   CODEX_CLI,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_INSTALL_TIMEOUT_MS,
@@ -1594,6 +1594,85 @@ describe('detached jobs', () => {
     }
   });
 
+  it('default PID probe fails a running job whose live PID now belongs to a different process (PID reuse)', async () => {
+    // process.pid is alive, but its start time is not the one recorded at spawn — the job's own process is gone.
+    const record = { id: 'pid-reused', pid: process.pid, pidStart: 'Thu Jan  1 00:00:00 1970', status: 'running',
+      exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 1000 }))
+      .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
+    expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
+  });
+
+  it('default PID probe keeps a running job alive while its recorded start time still matches', async () => {
+    const pidStart = readPidStart(process.pid);
+    expect(pidStart).toMatch(/\S/);
+    const record = { id: 'pid-same', pid: process.pid, pidStart, status: 'running', exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 250, pollMs: 50 }))
+      .toMatchObject({ status: 'running', exitCode: null, code: 75 });
+    expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'running' });
+  });
+
+  it.each([
+    ['no start time recorded (legacy record)', undefined, () => 'anything', true],
+    ['a null start time (ps failed at spawn)', null, () => 'anything', true],
+    ['a matching start time', 'Fri Oct 23 20:10:13 2026', () => 'Fri Oct 23 20:10:13 2026', true],
+    ['a different start time', 'Fri Oct 23 20:10:13 2026', () => 'Sat Oct 24 01:00:00 2026', false],
+    ['a live PID with no readable start time', 'Fri Oct 23 20:10:13 2026', () => null, false],
+  ])('jobIsAlive with %s', (_label, pidStart, readStart, expected) => {
+    expect(jobIsAlive({ pid: process.pid, pidStart }, { readStart })).toBe(expected);
+  });
+
+  it('jobIsAlive never consults the start time for a PID that is gone', () => {
+    const readStart = vi.fn(() => 'x');
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+    });
+    try {
+      expect(jobIsAlive({ pid: 123, pidStart: 'x' }, { readStart })).toBe(false);
+      expect(readStart).not.toHaveBeenCalled();
+    } finally { kill.mockRestore(); }
+  });
+
+  it('readPidStart reads a bounded, locale- and zone-pinned ps start time; null for no such pid, throws when ps does not answer', () => {
+    const execFn = vi.fn(() => '  Fri Oct 23  1:10:13 2026\n');
+    expect(readPidStart(42, { execFn })).toBe('Fri Oct 23 1:10:13 2026');
+    expect(execFn).toHaveBeenCalledWith('ps', ['-o', 'lstart=', '-p', '42'], expect.objectContaining({
+      timeout: expect.any(Number), env: expect.objectContaining({ LC_ALL: 'C', TZ: 'UTC' }),
+    }));
+    expect(readPidStart(42, { execFn: () => { throw Object.assign(new Error('ps exited 1'), { status: 1 }); } })).toBeNull();
+    expect(readPidStart(42, { execFn: () => '\n' })).toBeNull();
+    expect(() => readPidStart(42, { execFn: () => { throw Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }); } }))
+      .toThrow('timed out');
+  });
+
+  it('a start-time probe that does not answer fails the wait closed (exit 2) without marking the job failed', async () => {
+    const record = { id: 'ps-hung', pid: process.pid, pidStart: 'Fri Oct 23 20:10:13 2026', status: 'running',
+      exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    const isAlive = rec => jobIsAlive(rec, { readStart: () => { throw new Error('ps timed out'); } });
+    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 })).toMatchObject({ code: 2 });
+    expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'running', exitCode: null });
+  });
+
+  it('startDetachedJob records a null pidStart when the start-time probe fails', async () => {
+    const child = new EventEmitter();
+    child.pid = 321;
+    child.unref = vi.fn();
+    const spawnFn = vi.fn(() => { queueMicrotask(() => child.emit('spawn')); return child; });
+    const job = await startDetachedJob({ args: ['--task=x', '--detach'], jobsDir, spawnFn, now: () => 0, random: () => 'nostart',
+      nodePath: 'node', scriptPath: 'scripts/codex-direct-task.mjs', env: {}, readStart: () => { throw new Error('no ps'); } });
+    expect(job.pidStart).toBeNull();
+    expect(readJobRecord(job.id, { jobsDir })).toMatchObject({ pid: 321, pidStart: null, status: 'running' });
+  });
+
+  it.each([['', 'an empty string'], [7, 'a number']])('rejects a record whose pidStart is %j (%s)', (pidStart) => {
+    writeFileSync(join(jobsDir, 'bad-start.json'), JSON.stringify({ id: 'bad-start', pid: 1, pidStart, status: 'running',
+      exitCode: null, resultPath: 'r.json' }));
+    expect(() => readJobRecord('bad-start', { jobsDir })).toThrow('incomplete job record');
+  });
+
   it('clears the budget timer after an immediate asynchronous read', async () => {
     vi.useFakeTimers();
     try {
@@ -2111,9 +2190,11 @@ describe('detached jobs', () => {
     child.unref = vi.fn();
     const spawnFn = vi.fn(() => { queueMicrotask(() => child.emit('spawn')); return child; });
     const args = ['--task=literal $(no-shell)', detachFlag, '--dir=checkout'];
+    const readStart = vi.fn(() => 'Fri Oct 23 20:10:13 2026');
     const job = await startDetachedJob({ args, jobsDir, spawnFn, now: () => 0, random: () => 'random',
-      nodePath: 'node', scriptPath: 'scripts/codex-direct-task.mjs', env: {} });
-    expect(job).toEqual({ id: '0-random', pid: 321, status: 'running', startedAt: new Date(0).toISOString(),
+      nodePath: 'node', scriptPath: 'scripts/codex-direct-task.mjs', env: {}, readStart });
+    expect(readStart).toHaveBeenCalledWith(321);
+    expect(job).toEqual({ id: '0-random', pid: 321, pidStart: 'Fri Oct 23 20:10:13 2026', status: 'running', startedAt: new Date(0).toISOString(),
       resultPath: join(jobsDir, '0-random.result.json'), exitCode: null, recordPath: join(jobsDir, '0-random.json') });
     const { recordPath, ...record } = job;
     expect(readJobRecord(job.id, { jobsDir })).toEqual(record);

@@ -103,6 +103,7 @@ import { resolveBuildPolicy, appendBuildRequirements } from './lib/build-policy.
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
 import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
+import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
 } from 'node:fs';
@@ -1164,6 +1165,8 @@ function validateJobRecord(record, id) {
   if (record.id !== id || !['running', 'done', 'failed'].includes(record.status)
     || typeof record.resultPath !== 'string' || !record.resultPath
     || !Number.isInteger(record.pid) || record.pid <= 0
+    // Optional: records written before PID start times were captured carry none.
+    || (record.pidStart != null && (typeof record.pidStart !== 'string' || !record.pidStart))
     || (record.status === 'done' && record.exitCode !== 0)
     || (record.status === 'running' && record.exitCode !== null)
     || (record.status === 'failed' && record.exitCode !== null
@@ -1175,7 +1178,7 @@ function validateJobRecord(record, id) {
 export async function startDetachedJob({
   args = process.argv.slice(2), spawnFn = nodeSpawn, fsDeps = jobFs, now = Date.now,
   random = randomUUID, jobsDir = resolveJobsDir(), nodePath = process.execPath,
-  scriptPath = fileURLToPath(import.meta.url), env = process.env,
+  scriptPath = fileURLToPath(import.meta.url), env = process.env, readStart = readPidStart,
 } = {}) {
   const startedAt = new Date(now()).toISOString();
   const id = `${Date.parse(startedAt)}-${random()}`;
@@ -1193,7 +1196,9 @@ export async function startDetachedJob({
       child.once('spawn', resolveSpawn);
       child.once('error', reject);
     });
-    const record = { id, pid: child.pid, status: 'running', startedAt, resultPath, exitCode: null };
+    // The start time pins the PID to this child, so `wait` can tell a reused PID from a live job.
+    const record = { id, pid: child.pid, pidStart: pidStartOrNull(readStart, child.pid), status: 'running', startedAt, resultPath,
+      exitCode: null };
     writeJobRecord(record, { jobsDir, fsDeps });
     child.unref();
     return { ...record, recordPath };
@@ -1202,12 +1207,25 @@ export async function startDetachedJob({
   }
 }
 const jobSleep = (ms, options) => delay(ms, undefined, options);
-function jobIsAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (error) {
-    if (error.code === 'EPERM') return true;
+/**
+ * The shared bounded `ps -o lstart=` probe (null when the pid does not exist; throws when ps does not answer),
+ * with the zone pinned too, so a launcher and a later `wait` from another shell format one instant identically.
+ */
+export function readPidStart(pid, { execFn = execFileSync } = {}) {
+  return readProcStart(pid, { execFn: (bin, args, opts) => execFn(bin, args, { ...opts, env: { ...opts.env, TZ: 'UTC' } }) });
+}
+const pidStartOrNull = (readStart, pid) => { try { return readStart(pid); } catch { return null; } };
+/** Whether the job's own process is alive: the PID exists AND, when recorded, still has the same start time. */
+export function jobIsAlive({ pid, pidStart }, { readStart = readPidStart } = {}) {
+  try { process.kill(pid, 0); } catch (error) {
     if (error.code === 'ESRCH') return false;
-    throw error;
+    if (error.code !== 'EPERM') throw error;
   }
+  // Legacy records (or a ps failure at spawn) carry no start time: the PID probe alone decides.
+  if (typeof pidStart !== 'string' || !pidStart) return true;
+  // A different (or no) start time means the PID now names another process. A probe that does not
+  // answer throws, so `wait` fails closed (exit 2) instead of marking a possibly-live job failed.
+  return readStart(pid) === pidStart;
 }
 export async function waitForJob({
   jobId, maxMs = MAX_JOB_WAIT_MS,
@@ -1293,7 +1311,7 @@ export async function waitForJob({
     if (record.status !== 'running') return terminalResult();
     if (now() >= deadline) return { ...result(), code: 75 };
     let alive;
-    try { alive = await withinBudget(() => isAlive(record.pid)); }
+    try { alive = await withinBudget(() => isAlive(record)); }
     catch { return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 }; }
     if (alive === expired) return { ...result(), code: 75 };
     if (!alive) {
