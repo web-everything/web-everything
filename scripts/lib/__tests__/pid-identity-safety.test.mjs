@@ -26,6 +26,39 @@ const NOW = Date.parse('2026-10-24T12:02:00.000Z');
 afterEach(() => { vi.restoreAllMocks(); vi.mocked(execFileSync).mockReset(); });
 
 describe('PID snapshot safety boundaries', () => {
+  it('a live worker whose prompt mentions bg-spare is not a recycled spare', () => {
+    const argv = 'claude --bg --name fix-1 Investigate bg-spare recycling --bg-spare';
+    expect(pidIdentity(PID, { exec: () => `S ${START} ${argv}\n` }))
+      .toEqual({ alive: true, reason: 'match' });
+  });
+
+  it('path-prefixed claude bg-spare is a recycled spare', () => {
+    const argv = '/usr/local/bin/claude bg-spare --bg-spare /tmp/x.sock';
+    expect(pidIdentity(PID, { exec: () => `S ${START} ${argv}\n` }))
+      .toEqual({ alive: false, reason: 'recycled-spare' });
+  });
+
+  it.each([
+    'node /opt/tools/claude.mjs bg-spare --bg-spare /tmp/x.sock',
+    '/usr/local/bin/node /opt/tools/claude.mjs bg-spare --bg-spare /tmp/x.sock',
+    '/opt/tools/claude-code bg-spare --bg-spare /tmp/x.sock',
+  ])('recognizes a Claude spare launcher: %s', argv => {
+    expect(pidIdentity(PID, { exec: () => `S ${START} ${argv}\n` }))
+      .toEqual({ alive: false, reason: 'recycled-spare' });
+  });
+
+  it.each([
+    'claude --bg-spare=spare.sock',
+    'claude bg-spare-worker',
+    'other-worker bg-spare --bg-spare /tmp/x.sock',
+    '/opt/claude/other-worker bg-spare --bg-spare /tmp/x.sock',
+    'node -e script -- claude bg-spare --bg-spare /tmp/x.sock',
+    'node worker.mjs claude bg-spare --bg-spare /tmp/x.sock',
+  ])('spare words without the Claude subcommand preserve liveness: %s', argv => {
+    expect(pidIdentity(PID, { exec: () => `S ${START} ${argv}\n` }))
+      .toEqual({ alive: true, reason: 'match' });
+  });
+
   it('ps exit 1 with diagnostic stderr preserves a live runner claim', () => {
     const exec = vi.fn(() => { throw Object.assign(new Error('ps'), { status: 1, stderr: 'ps: permission denied' }); });
     expect(pidIdentity(PID, { exec })).toMatchObject({ alive: null });
@@ -88,7 +121,7 @@ describe('positive identity evidence controls claim release', () => {
   it.each([
     ['zombie releases claim', 'Z+', START, ARGV, 'zombie'],
     ['recycled-spare subcommand releases claim', 'Ss', START, 'claude bg-spare', 'recycled-spare'],
-    ['recycled-spare flag releases claim', 'S', START, 'claude --bg-spare=spare.sock', 'recycled-spare'],
+    ['recycled-spare subcommand with flag releases claim', 'S', START, 'claude bg-spare --bg-spare=spare.sock', 'recycled-spare'],
     ['start mismatch releases claim', 'S', 'Sat Oct 24 12:01:00 2026', ARGV, 'start-mismatch'],
     ['argv mismatch releases claim', 'S', START, 'node scripts/other-runner.mjs', 'argv-mismatch'],
     ['matching identity retains claim', 'S+', START, ARGV, 'match'],
@@ -96,6 +129,7 @@ describe('positive identity evidence controls claim release', () => {
     ['similar spare subcommand retains claim', 'S', START, `${ARGV} bg-spare-worker`, 'match'],
     ['similar spare flag retains claim', 'S', START, `${ARGV} --bg-spare-count=2`, 'match'],
     ['spare token within filename retains claim', 'S', START, `${ARGV} scripts/bg-spare.mjs`, 'match'],
+    ['prompt mentioning spare tokens retains claim', 'S', START, `${ARGV} Investigate bg-spare recycling --bg-spare`, 'match'],
   ])('%s', (_name, stat, start, argv, reason) => {
     const lockRoot = mkdtempSync(join(tmpdir(), 'pid-identity-release-'));
     const claim = { repo: 'we', pr: 42, kind: 'fix', owner: 'fixture-owner', lockRoot };

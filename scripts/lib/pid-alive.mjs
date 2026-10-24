@@ -57,7 +57,8 @@ export function pidIdentity(pid, { expectStart = null, expectArgv = null, exec =
   const row = readPidIdentity(pid, exec);
   if ('alive' in row) return row;
   if (row.stat.startsWith('Z')) return { alive: false, reason: 'zombie' };
-  if (/(?:^|\s)(?:bg-spare|--bg-spare)(?:\s|=|$)/.test(row.runnerArgv)) {
+  // Only the Claude launcher's first subcommand proves recycling; prompt text is not identity evidence.
+  if (/^(?:(?:\S*\/)?node\s+)?(?:\S*\/)?[^/\s]*claude[^/\s]*\s+bg-spare(?:\s|$)/.test(row.runnerArgv)) {
     return { alive: false, reason: 'recycled-spare' };
   }
   if (expectStart && row.runnerStart !== String(expectStart).trim().replace(/\s+/g, ' ')) {

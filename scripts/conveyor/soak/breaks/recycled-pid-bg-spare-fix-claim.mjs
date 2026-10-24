@@ -21,6 +21,7 @@ import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../../../lib/required-status-ch
 import { fullSessionId, shortId, withStoreLock } from '../../../operations/__tests__/helpers/fake-claude-shim.mjs';
 
 const ROUNDS = 4;
+const SPARE_ARGV = 'claude bg-spare --bg-spare /tmp/x.sock';
 // Run clone-owned readers/writers with the world's isolated HOME, clock and tools.
 function inClone(w, source, args = []) {
   return execFileSync(process.execPath, ['--input-type=module', '-e', source, ...args], {
@@ -57,12 +58,11 @@ export default {
   async run({ log } = {}) {
     let sleeper;
     try {
-      // Extra argv belongs here, not in the shared fake-claude helper. An IPC
-      // ready message ensures ps cannot race exec; the timer bounds leaks even
-      // if the runner dies. finally owns cleanup, including setup failures.
+      // Set the real spare's command shape before IPC readiness so ps cannot
+      // mistake spare words in a Node script/argument for the subcommand.
+      // The timer bounds leaks if the runner dies; finally owns cleanup.
       sleeper = spawn(process.execPath, ['-e',
-        'setTimeout(() => process.exit(0), 300000); process.send("ready");',
-        '--', 'claude', 'bg-spare', '--bg-spare', '/tmp/x.sock'],
+        `process.title = ${JSON.stringify(SPARE_ARGV)}; setTimeout(() => process.exit(0), 300000); process.send("ready");`],
       { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('bg-spare sleeper readiness timed out')), 5000);
@@ -81,7 +81,7 @@ export default {
           process.kill(sleeper.pid, 0);
           const argv = execFileSync('ps', ['-p', String(sleeper.pid), '-o', 'command='],
             { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
-          if (!argv.includes('claude bg-spare --bg-spare /tmp/x.sock')) throw new Error('sleeper argv mismatch');
+          if (argv.trim() !== SPARE_ARGV) throw new Error('sleeper argv mismatch');
           ctx.psChecks += 1;
           const evidence = JSON.parse(inClone(w, `
             import { gateHost } from './scripts/lib/dispatch-throttle.mjs';
