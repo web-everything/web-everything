@@ -573,3 +573,91 @@ describe('a thread cut at the list cap grants no takeover and no takeover review
     expect(plan(read).dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'fix', mode: 'takeover', takeover: { n: 1 } });
   });
 });
+
+describe('the same gap raised by two seats counts once', () => {
+  const claim = 'Retry budget resets before pending requests finish during background refresh';
+  const finding = (line, impact = 'broken', text = claim, file = 'src/j.mjs') => [file, line, impact, text];
+  const thread = (findings) => [review(T1, 9, findings)];
+  const tally = (findings) => openDefects(thread(findings), T1);
+
+  it('counts the live after-takeover duplicate once and allows the next takeover', () => {
+    const before = [finding(20), finding(60, 'broken', 'Worker exits before queued jobs complete')];
+    const comments = [...rounds5.slice(0, -1), review(R5, 6, before), marker(R5, 7), rearm(8),
+      review(T1, 9, [finding(20), finding(24, 'broken', `${claim} silently`)])];
+    expect(openDefects(comments, T1)).toMatchObject({ count: 1, weight: findingWeight({ impact: 'broken' }) });
+    const decision = planTakeover({ pr: pr(T1, comments), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER });
+    expect(decision.reason).not.toBe('takeover-not-converging');
+    expect(decision).toMatchObject({ ok: true, n: 2 });
+    expect(plan(pr(T1, comments)).dispatch.find((d) => d.prNumber === 7)).toMatchObject({ mode: 'takeover' });
+  });
+
+  it('gives equal count and weight for opposite arrival orders at 20, 22, 30', () => {
+    const forward = tally([20, 22, 30].map((line) => finding(line)));
+    const reverse = tally([30, 22, 20].map((line) => finding(line)));
+    expect({ count: forward.count, weight: forward.weight }).toEqual({ count: reverse.count, weight: reverse.weight });
+    expect(forward).toMatchObject({ count: 2, weight: 6 });
+  });
+
+  it('compares only kept findings: a bridge at 28 cannot join the gaps at 20 and 36', () => {
+    expect(tally([20, 36].map((line) => finding(line)))).toMatchObject({ count: 2, weight: 6 });
+    for (const lines of [[20, 28, 36], [36, 28, 20], [20, 36, 28]]) {
+      const result = tally(lines.map((line) => finding(line)));
+      expect(result).toMatchObject({ count: 2, weight: 6 });
+      expect(result.count).toBeGreaterThanOrEqual(2);
+    }
+  });
+
+  it('keeps the closed Read versus Write authorization path separate', async () => {
+    const { sameGapSameHead } = await import('../../lib/jury-core.mjs');
+    const read = 'Read handler skips authorization when cached credentials expire';
+    const write = read.replace('Read', 'Write');
+    expect(sameGapSameHead({ file: 'src/j.mjs', line: 20, summary: read, impactIfUnfixed: 'broken' },
+      { file: 'src/j.mjs', line: 24, summary: write, impactIfUnfixed: 'broken' })).toBe(false);
+    expect(tally([finding(20, 'broken', read), finding(24, 'broken', write)])).toMatchObject({ count: 2, weight: 6 });
+  });
+
+  it('keeps a gate hold separate from the nearby real defect and counts the defect', () => {
+    const hold = 'review-gate red because required dependency change is not merged';
+    const defect = 'review-gate red because required configuration change is not applied';
+    const comments = thread([finding(20, 'broken', hold), finding(24, 'broken', defect)]);
+    expect(reviewRounds(comments).at(-1).findings).toHaveLength(2);
+    expect(openDefects(comments, T1)).toMatchObject({ count: 1, weight: 3, findings: [{ claim: defect }] });
+  });
+
+  it.each([
+    ['different severity', finding(24, 'degraded'), 5],
+    ['different files', finding(24, 'broken', claim, 'src/k.mjs'), 6],
+    ['30 lines apart', finding(50), 6],
+    ['different negation tokens', finding(24, 'broken', `${claim} without`), 6],
+  ])('keeps %s separate', (_name, other, weight) => {
+    expect(tally([finding(20), other])).toMatchObject({ count: 2, weight });
+  });
+
+  it('folds an ordinary finding and its policy block ruling into one block-weight finding', async () => {
+    const { buildOperatorRulingComment } = await import('../../lib/jury-core.mjs');
+    const key = JSON.stringify(['judgeSecurity', 'src/j.mjs', 20, claim]);
+    const ruling = { author: BOT, createdAt: at(10), body: buildOperatorRulingComment({
+      version: 1, repo: 'test/repo', pr: 7, head: T1, actor: 'auto-policy', channel: 'test',
+      reason: 'Required referral is blocked', at: at(10), clearerId: 'policy',
+      rulings: [{ runId: 'review-pr-x', key, result: 'block' }],
+    }) };
+    const comments = [...thread([finding(20)]), ruling];
+    expect(reviewRounds(comments).at(-1).findings).toHaveLength(1);
+    expect(openDefects(comments, T1)).toMatchObject({ count: 1, weight: findingWeight({ ruling: 'block' }) });
+    expect(findingWeight({ ruling: 'block' })).toBe(4);
+  });
+
+  it('retains MAX_MERGE_FINDINGS + 5 distinct-file findings raw', async () => {
+    const { MAX_MERGE_FINDINGS } = await import('../takeover-budget.mjs');
+    expect(MAX_MERGE_FINDINGS).toBe(200);
+    const findings = Array.from({ length: MAX_MERGE_FINDINGS + 5 }, (_, i) => finding(20, 'broken', claim, `src/gap-${i}.mjs`));
+    expect(tally(findings)).toMatchObject({ count: MAX_MERGE_FINDINGS + 5, weight: 3 * (MAX_MERGE_FINDINGS + 5) });
+  });
+
+  it('appends three exact duplicates raw once the kept list reaches the merge bound', async () => {
+    const { MAX_MERGE_FINDINGS } = await import('../takeover-budget.mjs');
+    expect(MAX_MERGE_FINDINGS).toBe(200);
+    const full = Array.from({ length: MAX_MERGE_FINDINGS }, (_, i) => finding(20, 'broken', claim, `src/gap-${i}.mjs`));
+    expect(tally([...full, full[0], full[0], full[0]])).toMatchObject({ count: MAX_MERGE_FINDINGS + 3, weight: 3 * (MAX_MERGE_FINDINGS + 3) });
+  });
+});
