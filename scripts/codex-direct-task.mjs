@@ -684,13 +684,13 @@ function finishScratchClone({
   // that matters.
   let realOrigin = null;
   try {
-    const url = execFn('git', ['-C', repoRoot, 'remote', 'get-url', 'origin'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
+    const url = execFn('git', ['-C', repoRoot, 'remote', 'get-url', 'origin']).trim();
     if (url) realOrigin = url;
   } catch { /* no origin on repoRoot, or remote command unavailable */ }
   let originWired = false;
   if (wireOriginToRemote && realOrigin) {
     try {
-      execFn('git', ['-C', dest, 'remote', 'set-url', 'origin', realOrigin], { timeout: GIT_STEP_TIMEOUT_MS });
+      execFn('git', ['-C', dest, 'remote', 'set-url', 'origin', realOrigin]);
       originWired = true;
     } catch { /* set-url failed — clone still works with the local-path origin */ }
   }
@@ -1345,7 +1345,7 @@ function isWaitInvocation(args) {
 }
 
 function repoRootFromCwd() {
-  return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+  return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: GIT_STEP_TIMEOUT_MS }).trim();
 }
 
 async function main() {
