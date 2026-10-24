@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 
 const clean = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, 2000);
@@ -41,37 +41,38 @@ export async function salvagePushLane({ lane, laneDir, io, now = () => new Date(
   }
 }
 
-export function realSalvageIo({ repo, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup') }) {
+export function realSalvageIo({ repo, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), runGit = execFileSync }) {
   const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
-  const git = (dir, args, timeout = 120_000) => execFileSync('git', args, {
+  // resolveRepo makes configured local origins absolute; explicit --origin paths remain invocation-relative.
+  const origin = repo.originUrl ? (/^[^/]*:/.test(repo.originUrl) ? repo.originUrl : resolve(repo.originUrl)) : null;
+  const transport = (command, ...args) => {
+    if (!origin) throw new Error('canonical origin unresolved; supply --origin or a primary --reference');
+    return ['-c', 'remote.origin.uploadpack=git-upload-pack', '-c', 'remote.origin.receivepack=git-receive-pack',
+      '-c', 'remote.origin.pushurl=', command, ...args];
+  };
+  const git = (dir, args, timeout = 120_000) => runGit('git', args, {
     cwd: dir, env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
   return {
     aheadShas: dir => git(dir, ['rev-list', `origin/${repo.branch}..HEAD`]).split('\n').filter(Boolean),
     unmatchedShas: (dir, ahead) => {
-      git(dir, ['fetch', 'origin']);
-      const refs = git(dir, ['for-each-ref', '--format=%(refname)', 'refs/remotes/origin'])
-        .split('\n').filter(ref => ref && ref !== 'refs/remotes/origin/HEAD');
-      if (refs.length > 400) throw new Error('more than 400 origin refs; inspect remote branches manually before retrying salvage');
-      const preferred = `refs/remotes/origin/${repo.branch}`;
-      refs.sort((a, b) => Number(b === preferred) - Number(a === preferred) || a.localeCompare(b));
-      const matched = new Set(), deadline = Date.now() + 120_000;
-      for (const ref of refs) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) throw new Error('salvage patch scan timed out; inspect lane manually or retry');
-        for (const line of git(dir, ['cherry', ref, 'HEAD'], remaining).split('\n')) {
-          if (line.startsWith('- ')) matched.add(line.slice(2).trim());
-        }
+      // All branch tips are needed for exact-SHA reachability, but only the integration branch
+      // participates in patch equivalence. Explicit refspecs also make pruning independent of lane config.
+      git(dir, transport('fetch', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*'));
+      const matched = new Set();
+      for (const line of git(dir, ['cherry', `origin/${repo.branch}`, 'HEAD']).split('\n')) {
+        if (line.startsWith('- ')) matched.add(line.slice(2).trim());
       }
-      return ahead.filter(sha => !matched.has(sha));
+      return ahead.filter(sha => !matched.has(sha)
+        && !git(dir, ['for-each-ref', '--contains', sha, 'refs/remotes/origin', '--count=1']));
     },
     push: (dir, ref, sha) => {
-      git(dir, ['push', 'origin', `${sha}:refs/heads/${ref}`]);
+      git(dir, transport('push', origin, `${sha}:refs/heads/${ref}`));
       return { ok: true };
     },
     remoteSha: ref => {
-      const output = git(repo.referencePath, ['ls-remote', 'origin', `refs/heads/${ref}`]);
+      const output = git(repo.referencePath, transport('ls-remote', origin, `refs/heads/${ref}`));
       if (!output) return null;
       const lines = output.split('\n');
       const [sha, name] = lines[0].split(/\s+/);

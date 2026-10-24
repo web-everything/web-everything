@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
+import { LANE_GIT_CONFIG_PINS } from '../lane-git-hardening.mjs';
 
 // Intentionally absent in this red-first change: no implementation or import stub.
 let salvageStamp, salvageRefName, salvagePushLane, realSalvageIo;
@@ -49,7 +50,7 @@ describe('salvage push contract', () => {
     expect(h.io.record).not.toHaveBeenCalled();
   });
 
-  it('returns matched without pushing when every ahead commit has a remote patch-id match', async () => {
+  it('returns matched without pushing when every ahead commit is already preserved', async () => {
     const h = harness({ unmatchedShas: vi.fn(() => []) });
     expect(await h.run()).toMatchObject({ status: 'matched', unmatched: [] });
     expect(h.io.unmatchedShas).toHaveBeenCalledWith(laneDir, [head, older]);
@@ -151,5 +152,78 @@ describe('salvage push contract', () => {
   it('exports realSalvageIo with the five IO functions', () => {
     const io = realSalvageIo({ repo: { name: 'fixture', poolDir: 'pool', referencePath: 'reference', originUrl: 'origin.git', branch: 'main' }, backupRoot: 'backups' });
     for (const method of ['aheadShas', 'unmatchedShas', 'push', 'remoteSha', 'record']) expect(io[method]).toBeTypeOf('function');
+  });
+});
+
+describe('real salvage preservation and transport', () => {
+  const repo = { branch: 'main', originUrl: 'https://example.test/canonical.git', referencePath: 'reference' };
+  function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', fail } = {}) {
+    const runGit = vi.fn((_command, args) => {
+      if (fail && args.includes(fail)) throw new Error(`${fail} unavailable`);
+      if (args.includes('rev-list')) return `${head}\n${older}`;
+      if (args.includes('cherry')) return cherry;
+      if (args.includes('for-each-ref')) return contains;
+      return '';
+    });
+    return { runGit, io: realSalvageIo({ repo, runGit }) };
+  }
+
+  it('fetches pruned branch refs and pushes/verifies against the explicit canonical URL with transport pins and hardened env', () => {
+    const { io, runGit } = realHarness();
+    io.aheadShas(laneDir);
+    io.unmatchedShas(laneDir, [head, older]);
+    io.push(laneDir, ref, head);
+    io.remoteSha(ref);
+    for (const command of ['fetch', 'push', 'ls-remote']) {
+      const call = runGit.mock.calls.find(([, args]) => args.includes(command));
+      expect(call).toBeDefined();
+      const [, args, options] = call;
+      expect(args).toEqual(expect.arrayContaining([
+        '-c', 'remote.origin.uploadpack=git-upload-pack',
+        '-c', 'remote.origin.receivepack=git-receive-pack', '-c', 'remote.origin.pushurl=', repo.originUrl,
+      ]));
+      expect(args).not.toContain('origin');
+      for (const [key, value] of LANE_GIT_CONFIG_PINS) {
+        const index = Object.keys(options.env).find(k => /^GIT_CONFIG_KEY_\d+$/.test(k) && options.env[k] === key).replace('KEY', 'VALUE');
+        expect(options.env[index]).toBe(value);
+      }
+    }
+    const fetchArgs = runGit.mock.calls.find(([, args]) => args.includes('fetch'))[1];
+    expect(fetchArgs).toEqual(expect.arrayContaining(['--prune', '--no-tags', '+refs/heads/*:refs/remotes/origin/*']));
+    const pushArgs = runGit.mock.calls.find(([, args]) => args.includes('push'))[1];
+    expect(pushArgs.slice(pushArgs.indexOf('push'))).toEqual(['push', repo.originUrl, `${head}:refs/heads/${ref}`]);
+    expect(runGit.mock.calls.findIndex(([, args]) => args.includes('fetch')))
+      .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('for-each-ref')));
+  });
+
+  it('uses one integration-branch patch check and exact-SHA reachability without enumerating or capping remote refs', () => {
+    const { io, runGit } = realHarness({ cherry: `- ${head}\n+ ${older}` });
+    expect(io.unmatchedShas(laneDir, [head, older])).toEqual([older]);
+    expect(runGit.mock.calls.filter(([, args]) => args.includes('cherry')).map(([, args]) => args))
+      .toEqual([['cherry', 'origin/main', 'HEAD']]);
+    expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref')).map(([, args]) => args))
+      .toEqual([['for-each-ref', '--contains', older, 'refs/remotes/origin', '--count=1']]);
+  });
+
+  it('returns matched without pushing when the exact SHAs are reachable from remote branches', async () => {
+    const { io, runGit } = realHarness({ contains: 'refs/remotes/origin/work/published' });
+    expect(await salvagePushLane({ lane: 7, laneDir, io })).toMatchObject({ status: 'matched', unmatched: [] });
+    expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
+    expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref'))).toHaveLength(2);
+  });
+
+  it.each(['fetch', 'cherry', 'for-each-ref'])('fails closed without pushing when %s evidence is unreadable', async fail => {
+    const { io, runGit } = realHarness({ fail });
+    expect(await salvagePushLane({ lane: 7, laneDir, io })).toMatchObject({ status: 'failed', reason: expect.stringContaining(fail) });
+    expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
+  });
+
+  it('fails closed with an operator fallback when the canonical origin is unresolved', async () => {
+    const runGit = vi.fn(() => head);
+    const io = realSalvageIo({ repo: { ...repo, originUrl: null }, runGit });
+    expect(await salvagePushLane({ lane: 7, laneDir, io })).toMatchObject({
+      status: 'failed', reason: expect.stringContaining('supply --origin or a primary --reference'),
+    });
+    expect(runGit.mock.calls.map(([, args]) => args)).toEqual([['rev-list', 'origin/main..HEAD']]);
   });
 });

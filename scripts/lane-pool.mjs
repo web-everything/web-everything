@@ -344,9 +344,9 @@ try {
 }
 
 // ── repo descriptor resolution ──────────────────────────────────────────────────────────────────────
-function resolveRepo() {
-  const repoPath = resolve(expandHome(flags.repo) || (CWD_TOP_LEVEL ? process.cwd() : CHECKOUT_ROOT));
-  const referencePath = resolve(expandHome(flags.reference) || repoPath);
+function resolveRepo(repoFlags = flags) {
+  const repoPath = resolve(expandHome(repoFlags.repo) || (CWD_TOP_LEVEL ? process.cwd() : CHECKOUT_ROOT));
+  const referencePath = resolve(expandHome(repoFlags.reference) || repoPath);
   // An inherited lane Git context must not override an explicitly selected primary.
   // Scrub BEFORE hardening: the hardening appends its pins after any inherited GIT_CONFIG_COUNT entries, so an
   // inherited GIT_CONFIG_KEY_n=remote.origin.url would otherwise survive as the "canonical" origin.
@@ -361,10 +361,10 @@ function resolveRepo() {
   const gitOptions = { timeout: LOCAL_GIT_TIMEOUT_MS, env };
   const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, gitOptions) || referencePath;
   const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
-    || (cmd === 'list' && flags.acquirable);
-  // GC can maintain a pool without a trusted origin, but its recovery must never forward a lane remote.
+    || (cmd === 'list' && repoFlags.acquirable);
+  // GC and release can maintain leases without a trusted origin, but recovery must never forward a lane remote.
   let canonicalOrigin = true;
-  if (!flags.origin && (needsOrigin || cmd === 'gc')) {
+  if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
     const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
     // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
     // (the git dir and the common dir) is checked too: a worktree of a lane is refused wherever it sits on
@@ -391,24 +391,27 @@ function resolveRepo() {
       if (needsOrigin) fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
     }
   }
-  const originUrl = flags.origin || tryGit(['remote', 'get-url', 'origin'], topLevel, gitOptions);
+  const rawOrigin = repoFlags.origin || tryGit(['remote', 'get-url', 'origin'], topLevel, gitOptions);
+  // A configured local path belongs to the primary checkout. Explicit --origin paths belong to the caller.
+  const originUrl = !repoFlags.origin && rawOrigin && !/^[^/]*:/.test(rawOrigin)
+    ? resolve(topLevel, rawOrigin) : rawOrigin;
   // #2667 — `--pool=<name>` selects a pool DIRECTLY by its directory name under POOL_ROOT, bypassing origin-URL
   // derivation. It is the pool selector for the READ / RELEASE ops (status / list / path / release) that need
   // only `poolDir` — e.g. the main session releasing a cross-locus couple's lingering lease in the `plateau-app`
   // pool from the WE checkout, without needing a plateau-app checkout path. When `--pool` names the pool an
   // undeterminable origin URL is NOT fatal for metadata-only operations. Operations that clone, fetch,
   // or prove preservation need a canonical origin at startup; a lane-controlled remote is no fallback.
-  const explicitPool = typeof flags.pool === 'string' && flags.pool ? flags.pool : null;
+  const explicitPool = typeof repoFlags.pool === 'string' && repoFlags.pool ? repoFlags.pool : null;
   if (!originUrl && !explicitPool) {
     fail(`could not determine an origin URL — pass --origin=<url> (looked in ${topLevel})`);
   }
   if (!originUrl && needsOrigin) {
     fail(`${cmd} requires a canonical origin for pool ${explicitPool} — pass --origin=<url> (looked in ${topLevel})`);
   }
-  const name = explicitPool || flags.name || basename(originUrl).replace(/\.git$/, '');
+  const name = explicitPool || repoFlags.name || basename(originUrl).replace(/\.git$/, '');
   // Only discover a default when --branch is absent; explicit-branch acquire must not pay for an unused probe.
-  const head = flags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
-  const branch = flags.branch || (head ? head.replace(/^origin\//, '') : 'main');
+  const head = repoFlags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
+  const branch = repoFlags.branch || (head ? head.replace(/^origin\//, '') : 'main');
   return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, branch, poolDir: join(POOL_ROOT, name) };
 }
 
@@ -2688,7 +2691,7 @@ function assertReleaseReservedScoped() {
 // by-session sweep needs no separate `(pool, lane)` ledger — the markers ARE that record. A blanket cross-pool
 // `--all` would nuke every session's leases everywhere, so `--all-pools` REQUIRES `--session` and refuses
 // `--all`. Reserved (permanent memory) leases are always skipped — a sweep never un-reserves.
-function cmdReleaseAllPools(repo) {
+async function cmdReleaseAllPools(repo) {
   const session = flags.session || process.env.LANE_SESSION || null;
   // #x2psfwz — an OPTIONAL co-selector alongside `--session`, never alone: a PR_KIND session name (`review-`/
   // `fix-`/`ci-heal-`/`inspect-<PR>`) carries no attempt suffix, so it is REUSED VERBATIM by a round-2 dispatch
@@ -2747,6 +2750,7 @@ function cmdReleaseAllPools(repo) {
   for (const name of pools) {
     const poolDir = join(POOL_ROOT, name);
     const lanes = [];
+    let salvageRepo;
     for (const n of laneIndicesIn(poolDir)) {
       const dir = join(poolDir, `lane-${n}`);
       const lease = readLease(dir);
@@ -2758,7 +2762,18 @@ function cmdReleaseAllPools(repo) {
         log(`  ${name}/lane-${n}: ${describeLease(lease)} — reserved; skipped (un-reserve is single-lane --release-reserved)`);
         continue;
       }
-      rmSync(LEASE_MARKER(dir), { force: true });
+      if (recoveryEnabled()) {
+        // Other pools must resolve their own primary's origin; never reuse this pool's URL or a lane remote.
+        salvageRepo ??= name === repo.name ? repo
+          : resolveRepo({ reference: primarySiblingPath(repo, name), pool: name });
+        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo: salvageRepo }) });
+        if (salvage.status === 'failed') log(`  WARNING ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+        else if (salvage.status === 'pushed') log(`  ${name}/lane-${n}: salvaged to ${salvage.ref}`);
+      }
+      if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
+        log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
+        continue;
+      }
       journalLaneEvent(dir, {
         action: 'release', reason: typeof flags.reason === 'string' ? flags.reason : `release --all-pools (${selectorLabel})`,
         before: laneStateSnapshot(dir, 'origin/HEAD'), leaseSession: lease.session, leaseOwnerSession: lease.ownerSession || undefined,

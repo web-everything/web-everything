@@ -73,6 +73,28 @@ function assertRaceRefused({ result, card, saved }) {
 }
 
 describe('automatic reclaim backup-to-reset guard', () => {
+  it('keeps the real lane when matched salvage is followed by an unpreserved reclaim re-proof', async () => {
+    writeFileSync(join(laneDir, 'unpublished.txt'), 'unpublished work\n');
+    git(['add', 'unpublished.txt'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'unpublished work'], laneDir);
+    const sha = git(['rev-parse', 'HEAD'], laneDir).trim();
+    const io = realRecoverIo({ repo, lanePoolPath: script, backupRoot: join(base, 'backups'), isLeased: () => false });
+    const proof = io.proof;
+    io.proof = vi.fn(proof);
+    io.salvage = vi.fn(() => ({ status: 'matched', unmatched: [] }));
+    io.backup = vi.fn(io.backup);
+    io.reclaim = vi.fn(io.reclaim);
+    const result = await recoverPool({ lanes: [1], io });
+    expect(io.proof).toHaveBeenCalledTimes(2);
+    expect(io.salvage).toHaveBeenCalledTimes(1);
+    expect(result.keptUnpushed).toEqual([{ lane: 1, reason: expect.stringMatching(/salvage|unpreserved/i) }]);
+    expect(result.reclaimed).toEqual([]);
+    expect(io.backup).not.toHaveBeenCalled();
+    expect(io.reclaim).not.toHaveBeenCalled();
+    expect(git(['rev-parse', 'HEAD'], laneDir).trim()).toBe(sha);
+    expect(readFileSync(join(laneDir, 'unpublished.txt'), 'utf8')).toBe('unpublished work\n');
+  });
+
   it('auto-recovery refuses card edits introduced after backup', async () => {
     assertRaceRefused(await recoverWithRace());
   });

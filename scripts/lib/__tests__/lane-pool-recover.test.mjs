@@ -313,6 +313,24 @@ describe('recoverPool salvage push before recovery', () => {
     expect(result.salvaged).toEqual([{ lane: 1, ref }]);
   });
 
+  it('keeps a matched lane when the real-shaped re-proof still reports unpreserved commits', async () => {
+    const h = harness({
+      proof: vi.fn().mockReturnValueOnce(unpushed()).mockReturnValueOnce({
+        ...unpushed(), reason: '1 unpreserved commit(s)',
+      }),
+      salvage: vi.fn(() => ({ status: 'matched', unmatched: [] })),
+    });
+    const result = await h.run({ lanes: [1] });
+    expect(h.io.proof).toHaveBeenCalledTimes(2);
+    expect(h.io.salvage).toHaveBeenCalledTimes(1);
+    expect(h.io.salvage).toHaveBeenCalledWith(1);
+    expect(result.keptUnpushed).toEqual([{ lane: 1, reason: expect.stringMatching(/salvage|unpreserved/i) }]);
+    expect(result.reclaimed).toEqual([]);
+    expect(result.backedUp).toEqual([]);
+    expect(result.salvaged).toEqual([]);
+    expect(h.calls).toEqual([]);
+  });
+
   it('keeps a failed salvage in keptUnpushed with a salvage reason and no backup or reclaim', async () => {
     const h = harness({ proof: vi.fn(() => unpushed()), salvage: vi.fn(() => ({ status: 'failed', reason: 'origin unavailable' })) });
     const result = await h.run({ lanes: [1] });

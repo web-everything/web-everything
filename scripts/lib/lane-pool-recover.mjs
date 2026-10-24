@@ -125,6 +125,9 @@ export async function recoverPool({ lanes, io, budgetMs = recoveryBudget(), now 
         if (salvage.status === 'pushed') result.salvaged.push({ lane: n, ref: salvage.ref });
         proof = await io.proof(n);
         if (proof?.error) throw new Error(proof.error);
+        if (Array.isArray(proof?.unpreservedCommitShas) && proof.unpreservedCommitShas.length) {
+          throw new Error(`salvage re-proof still has unpreserved commits: ${proof.reason || 'preservation incomplete'}`);
+        }
       }
       const override = qualifiesForCardBackup(proof);
       const preserved = proof?.preserved === true && Array.isArray(proof.unpreservedFiles)
