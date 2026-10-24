@@ -388,6 +388,10 @@ describe('confirmed dequeue', () => {
     expect(q.logs).toHaveLength(0);
   });
   it.each(['review:changes', 'review:human', 'review:pending'])('recognizes %s even if ready remains', label => expect(sendBackReason([label, 'ready-to-merge'])).toContain(label));
+  it.each(['red-team:blocked', 'red-team:pending'])('recognizes %s even if ready remains', label => expect(sendBackReason([label, 'ready-to-merge'])).toContain(label));
+  it('allows ready-to-merge with red-team:clear', () => {
+    expect(sendBackReason(['ready-to-merge', 'red-team:clear'])).toBeNull();
+  });
   it('recognizes ready removal and leaves ready accepted PRs alone', () => {
     expect(sendBackReason([])).toContain('ready-to-merge');
     expect(sendBackReason(['review:accepted', 'ready-to-merge'])).toBeNull();
