@@ -14,7 +14,9 @@ import {
   laterReviewHold, isKnownMachineBody,
 } from '../accept-carry-forward.mjs';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../review-set-label.mjs';
-import { redTeamMarker, redTeamGateMarker } from '../red-team-gate.mjs';
+import { redTeamGateMarker } from '../red-team-gate.mjs';
+import { buildGateComment } from '../../operations/red-team-gate-apply.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import {
   parseLatestHumanClearedSha, parseOperatorClearance, REVIEW_LABELS, decideMechanicalPark, isReviewHoldLabel, hasUnclearedReviewLabel,
 } from '../review-escalation.mjs';
@@ -1166,15 +1168,77 @@ describe('plateau-app #217 replay — clearance stamped with reviewed-sha only (
 });
 
 describe('red-team machine-body boundary (#5828)', () => {
+  const advisory = (findings = []) => renderRedTeamComment({ pr: 5828, rev: NEW, provider: 'codex', model: 'm',
+    findings, recheckStatus: 'ok', foldedVerdict: 'accept' });
+  const finding = { category: 'edge-case', impactIfUnfixed: 'degraded', summary: 'Follow-up finding.', confirmedByRecheck: true };
+  const gate = (outcome = 'no-send-back') => buildGateComment({ pr: 5828, head: NEW, outcome,
+    plan: { sendBack: [], card: outcome === 'card-queued' ? [{ index: 1 }] : [], advisory: [] },
+    cardResult: { ok: true, session: 'prevention-card-123' } });
   const bodies = [
-    ['gate record', `${redTeamGateMarker(5828, NEW, 'no-send-back')}\nRed-team gate result.`],
-    ['advisory', `${redTeamMarker(5828, NEW)}\nRed-team advisory result.`],
+    ['gate record', gate()],
+    ['advisory', advisory()],
   ];
   const laterRecord = (body, metadata = {}) => latestAcceptRecord([fx.comments[0], { body, ...metadata }]);
 
   it.each(bodies)('trusted %s after an accept does not supersede it', (_kind, body) => {
     expect(laterRecord(body, { author: { login: 'web-everything[bot]' } }).laterVerdict).toBe(false);
   });
+
+  it.each(['broken', 'impact?', 'unknown'])('refuses carry after a trusted confirmed finding with %s impact', (impact) => {
+    const body = advisory([{ ...finding, impactIfUnfixed: impact }]);
+    const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
+    expect(record.laterVerdict).toBe(true);
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+  });
+
+  it.each(['sent-back', 'round-cap', 'error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed', 'unknown'])
+    ('refuses carry after a trusted %s gate outcome', (outcome) => {
+      const record = laterRecord(redTeamGateMarker(5828, NEW, outcome), { author: { login: 'web-everything[bot]' } });
+      expect(record.laterVerdict).toBe(true);
+      expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+    });
+
+  it.each([
+    gate('card-queued'),
+    advisory([{ ...finding, confirmedByRecheck: false, impactIfUnfixed: 'broken', filesRead: ['scripts/lib/accept-carry-forward.mjs'] }]),
+    advisory([finding]),
+    advisory([{ ...finding, impactIfUnfixed: 'cosmetic', failure_scenario: 'Open the page.', recheckReason: 'demonstrated break',
+      filesRead: ['scripts/lib/accept-carry-forward.mjs'] }]),
+    buildGateComment({ pr: 5828, head: NEW, outcome: 'card-queued', result: 'a'.repeat(16), grantIds: ['b'.repeat(16)],
+      plan: { sendBack: [], card: [{ index: 1 }], advisory: [{ index: 2 }] }, cardResult: { ok: true, handle: 'pid:123' } }),
+  ])('retains carry for a trusted non-blocking red-team result: %s', (body) => {
+    const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('carry');
+  });
+
+  it.each([
+    '1. [**confirmed**] (edge-case) — Missing impact.',
+    '1. [**confirmed**] (edge-case, ) — Empty impact.',
+    '1. [**confirmed**] (edge-case, broken — Malformed finding.',
+    '1. [confirmed] (edge-case, broken) — Malformed tag.',
+    '[**confirmed**] (edge-case, broken) — Missing index.',
+    '1. [not confirmed] (edge-case) — Malformed unconfirmed finding.',
+  ])('refuses carry for an unparseable finding, even beside a valid non-blocking finding: %s', malformed => {
+    const original = advisory([finding]);
+    for (const body of [
+      original.replace(/^1\. .*$/m, malformed),
+      original.replace('\n\nA confirmed break', `\n${malformed}\n\nA confirmed break`),
+    ]) {
+      const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
+      expect(isKnownMachineBody(body, { author: { login: 'web-everything[bot]' } })).toBe(false);
+      expect(record.laterVerdict).toBe(true);
+      expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+    }
+  });
+
+  it.each([...bodies, ['card gate record', gate('card-queued')], ['finding advisory', advisory([finding])]])
+    ('refuses carry when a trusted %s has appended prose or extra content', (_kind, body) => {
+      for (const suffix of ['\nDo not merge; this approval is withdrawn.', ' Do not merge; this approval is withdrawn.', '\n', '\n' + body]) {
+        const record = laterRecord(body + suffix, { author: { login: 'web-everything[bot]' } });
+        expect(record.laterVerdict).toBe(true);
+        expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+      }
+    });
 
   it.each(bodies)('%s requires trusted author metadata, including for body-only calls', (_kind, body) => {
     expect(isKnownMachineBody(body)).toBe(false);

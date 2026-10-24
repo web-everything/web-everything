@@ -36,7 +36,7 @@ import { fileURLToPath } from 'node:url';
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { MARKER_RE, JOB_RE } from './approval-prevention-notice.mjs';
-import { parseRedTeamComment, parseRedTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
+import { breakClass, GATE_OUTCOMES, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
 
 export const ACCEPT_CARRY_FORWARD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'accept-carry-forward.json');
 
@@ -146,21 +146,67 @@ function isApprovalPreventionNotice(text, comment) {
   return fixedText.exec(rest)?.[0] === rest;
 }
 
+/** A marker parser deliberately ignores trailing text; a carry exemption must consume the entire machine body. */
+function isNonBlockingRedTeamGate(text) {
+  const gate = parseRedTeamGateMarker(text);
+  if (!gate || ![GATE_OUTCOMES.NOTHING_TO_SEND, GATE_OUTCOMES.CARD_QUEUED].includes(gate.outcome)) return false;
+  const lines = text.split('\n');
+  if (lines[0] !== redTeamGateMarker(gate.pr, gate.rev, gate.outcome, gate.result, gate.grantIds)
+    || lines[1] !== `**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${gate.rev.slice(0, 12)}\`:`) return false;
+  // Only successful card/advisory action lines. Landing handles are machine tokens, never free prose.
+  const card = /^- [1-9]\d* finding\(s\) filed as a follow-up card \(#[1-9]\d*(?:, #[1-9]\d*)*\) — landing job [A-Za-z0-9:._-]{0,120}\.$/;
+  const advisory = /^- [1-9]\d* finding\(s\) left advisory \(#[1-9]\d*(?:, #[1-9]\d*)*\)\.$/;
+  const actions = lines.slice(2);
+  return actions.every(line => card.test(line) || advisory.test(line))
+    && (gate.outcome !== GATE_OUTCOMES.CARD_QUEUED || actions.some(line => card.test(line)));
+}
+
+/** Validate the rendered envelope and every finding line: the shared evidence parser skips malformed lines. */
+function isNonBlockingRedTeamAdvisory(text) {
+  const parsed = parseRedTeamComment(text);
+  if (!parsed) return false;
+  const lines = text.split('\n');
+  const { findings } = parsed;
+  const heading = findings.length
+    ? `${findings.length} possible break(s), ${findings.filter(f => f.confirmed).length} confirmed by Claude's re-check`
+    : 'no break found';
+  const prefix = 'Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. '
+    + `Head \`${parsed.rev.slice(0, 12)}\` · red team `;
+  if (lines[0] !== redTeamMarker(parsed.pr, parsed.rev) || lines[1] !== `### Post-accept red team — ${heading}`
+    || lines[2] !== '' || !lines[3]?.startsWith(prefix)
+    || !/^[^\s`]+\/[^\s`]+(?: · re-check (?:ok|pending|not-needed|error))? · recorded verdict `(accept|changes|null)`\.$/.test(lines[3].slice(prefix.length))
+    || lines[4] !== '') return false;
+  if (!findings.length) return lines.length === 6 && lines[5] === 'The red team tried to break this change and reported nothing.';
+  if (lines.at(-2) !== '' || lines.at(-1) !== "A confirmed break is recorded as a miss for the accepting review and for the builder's model.") return false;
+  let count = 0;
+  for (const line of lines.slice(5, -2)) {
+    const finding = parseRedTeamComment(`${lines[0]}\n${line}`).findings[0];
+    if (finding) {
+      if (finding.index !== ++count || !finding.category || !finding.summary || breakClass(finding) === 'broken') return false;
+    } else if (!count || !/^ {3}- (?:Scenario|Re-check|Files read): [^\r\n]*$/.test(line)) return false;
+  }
+  return count === findings.length;
+}
+
 /**
  * Pure: is this comment body a recognised machine shape that cannot be a hold?
  * Approval-prevention notices require a trusted author when the caller supplies comment metadata. An empty body says nothing.
- * Red-team gate records and advisories require trusted author metadata and a well-formed marker at the body's start.
+ * Red-team gate records and advisories require trusted author metadata, the complete machine shape, and no blocking result.
  * Verdicts, re-arms, stand-downs and non-mechanical drain parks are NOT machine shapes (they supersede the accept).
  */
 export function isKnownMachineBody(body, comment = undefined) {
   const text = typeof body === 'string' ? body : '';
   if (!text.trim()) return true;
   if (isLaterVerdictBody(text)) return false;
-  // These report through the red-team gate's own path; neither records an acceptance nor withholds one here.
-  if (isTrustedMarkerAuthor(comment) && (
-    (text.startsWith(RED_TEAM_GATE_MARKER) && parseRedTeamGateMarker(text))
-    || (text.startsWith(RED_TEAM_COMMENT_MARKER) && parseRedTeamComment(text))
-  )) return true;
+  // Only non-blocking results are machine notes: a confirmed break or a failed/unknown gate still supersedes the accept.
+  if (isTrustedMarkerAuthor(comment)) {
+    if (text.startsWith(RED_TEAM_GATE_MARKER)) {
+      return isNonBlockingRedTeamGate(text);
+    }
+    if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
+      return isNonBlockingRedTeamAdvisory(text);
+    }
+  }
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
   return isApprovalPreventionNotice(text, comment) || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
