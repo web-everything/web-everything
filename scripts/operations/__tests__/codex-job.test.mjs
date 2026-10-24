@@ -18,6 +18,139 @@ const report = (extra = {}) => ok(`progress\n${JSON.stringify({ exitCode: 0, tim
 const loaderHelp = '--branch= --sha= --daemon= --why= --tests-run= --audit= --json\n';
 const originUrl = 'https://github.com/example/trusted.git';
 const laneConfig = `local\0remote.origin.url\n${originUrl}\0local\0remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0local\0remote.origin.fetch\n^refs/heads/ops/*\0`;
+
+it.each(['unknown', 'system'])('accepts the OS credential helper with %s scope and a CLT file origin', async scope => {
+  const f = fixture([['--get-regexp', ok(`${scope}\0file:/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig\0credential.helper\nosxkeychain\0`)]]);
+  expect((await f.run()).result.ok).toBe(true);
+  for (const verb of ['clone', 'push']) {
+    expect(f.calls.find(c => c.args.includes(verb)).args).toContain('credential.helper=osxkeychain');
+  }
+});
+
+it.each(['unknown', 'system', 'local', 'worktree', 'global'])(
+  'rejects the same credential helper from a lane file with %s scope', async scope => {
+    const f = fixture([['--get-regexp', ok(`${scope}\0file:/lane/.git/config\0credential.helper\nosxkeychain\0`)]]);
+    expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
+    expect(codexCalls(f)).toHaveLength(0);
+    released(f);
+  });
+
+it.each(['unknown', 'system'])('rejects unlisted or non-file system helper origins with %s scope', async scope => {
+  for (const origin of ['file:/tmp/gitconfig', 'file:/etc/gitconfig.extra', 'file:/etc/../etc/gitconfig',
+    'command line:', 'file:/Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig/extra']) {
+    const f = fixture([['--get-regexp', ok(`${scope}\0${origin}\0credential.helper\nosxkeychain\0`)]]);
+    expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
+    expect(codexCalls(f)).toHaveLength(0);
+  }
+});
+
+it.each(['diff.orderFile', 'diff.relative', 'diff.driver.textconv', 'diff.driver.command',
+  'core.excludesFile', 'core.attributesFile', 'core.hooksPath', 'core.worktree', 'core.fsmonitor', 'core.sshCommand'])(
+  'refuses worker-controlled file/path setting %s before running another diff', async key => {
+    for (const scope of ['local', 'worktree', 'unknown']) {
+      let poisoned = false;
+      const f = fixture([
+        ['--get-regexp', { status: 1, stdout: '', stderr: '' }],
+        ['codex-direct-task.mjs', () => { poisoned = true; return report(); }],
+        ['config --show-scope', () => ok(`${laneConfig}${poisoned ? `${scope}\0${key}\n/lane/blocked\0` : ''}`)],
+      ]);
+      expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
+      released(f);
+      scopeReleased(f);
+    }
+  });
+
+it('fails closed on a FIFO diff.orderFile and releases the job instead of hanging', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'codex-job-fifo-'));
+  const fifo = path.join(dir, 'order');
+  execFileSync('mkfifo', [fifo]);
+  writeFileSync(path.join(dir, 'before'), 'before\n');
+  writeFileSync(path.join(dir, 'after'), 'after\n');
+  let poisoned = false;
+  const f = fixture([
+    ['--get-regexp', { status: 1, stdout: '', stderr: '' }],
+    ['codex-direct-task.mjs', () => { poisoned = true; return report(); }],
+    ['config --show-scope', () => ok(`${laneConfig}${poisoned ? `local\0diff.orderFile\n${fifo}\0` : ''}`)],
+  ]);
+  const exec = f.io.exec;
+  f.io.exec = async (cmd, args, options) => {
+    if (cmd === 'git' && args.includes('diff') && poisoned) {
+      // Exercise Git's actual FIFO read without mutating any checkout. The outer
+      // cap keeps the regression test bounded even on the vulnerable runner.
+      const pins = args.flatMap((arg, i) => arg === '-c' ? ['-c', args[i + 1]] : []);
+      return spawnSync('git', ['-c', `diff.orderFile=${fifo}`, ...pins, 'diff', '--no-index',
+        path.join(dir, 'before'), path.join(dir, 'after')], { ...options, cwd: dir, encoding: 'utf8', timeout: 250, killSignal: 'SIGKILL' });
+    }
+    return exec(cmd, args, options);
+  };
+  try {
+    expect((await f.run()).result.stopReason).toMatch(/^(unsafe-git-config|timeout)$/);
+    released(f);
+    scopeReleased(f);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('bounds every Git subprocess and pins file ordering and fsmonitor on hardened calls', async () => {
+  const f = fixture();
+  expect((await f.run()).result.ok).toBe(true);
+  for (const c of f.calls.filter(c => c.cmd === 'git')) {
+    expect(c.timeout).toBeGreaterThan(0);
+    expect(c.timeout).toBeLessThanOrEqual(120000);
+    if (!c.args.includes('--get-regexp')) {
+      expect(c.args).toContain('diff.orderFile=');
+      expect(c.args).toContain('core.fsmonitor=false');
+    }
+    if (c.args.includes('diff')) expect(c.args).toContain('-O/dev/null');
+  }
+});
+
+it('cancels FIFO ordering on a real diff even when Git treats an empty orderFile as a filename', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'codex-job-order-pin-'));
+  const fifo = path.join(dir, 'order');
+  execFileSync('mkfifo', [fifo]);
+  const before = path.join(dir, 'before'), after = path.join(dir, 'after');
+  writeFileSync(before, 'before\n'); writeFileSync(after, 'after\n');
+  let diffResult;
+  const state = { opts: { repo: dir, scope: ['we:scripts/'] }, lane: { path: dir }, startSha: 'abc', io: {
+    exec: async (cmd, args, options) => {
+      if (args.includes('config')) return ok();
+      const pins = args.flatMap((arg, i) => arg === '-c' ? ['-c', args[i + 1]] : []);
+      diffResult = spawnSync(cmd, ['-c', `diff.orderFile=${fifo}`, ...pins, 'diff', '--no-index',
+        ...args.filter(arg => arg.startsWith('-O')), before, after], {
+        ...options, encoding: 'utf8', timeout: 1000,
+        env: { ...options.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+      });
+      throw new Error('diff probe complete');
+    },
+  } };
+  try {
+    await expect(checkDiffScope(state)).rejects.toThrow('diff probe complete');
+    expect(diffResult.error).toBeUndefined();
+    expect(diffResult.status).toBe(1); // --no-index reports the differing bytes.
+    expect(diffResult.stdout).toContain('+after');
+    expect(diffResult.stderr).toBe('');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each(['--get-regexp', 'remote get-url origin', 'config --show-scope', 'reset --hard',
+  'diff --name-only', 'clone --no-local', 'ls-remote --heads', 'push --no-tags'])(
+  'returns timeout and cleans up when Git stalls at %s', async command => {
+    const f = fixture([[command, { status: null, stdout: '', stderr: '', error: { code: 'ETIMEDOUT' } }]]);
+    const { code, result } = await f.run();
+    expect(result.stopReason).toBe('timeout');
+    expect(code).toBe(EXIT_CODES.timeout);
+    expect(result.detail).toContain('inspect lane configuration and remote availability');
+    released(f);
+    scopeReleased(f);
+    for (const dir of f.temps) expect(f.removals).toContainEqual({ file: dir, options: { recursive: true, force: true } });
+  });
+
+it('bounds repository discovery and returns timeout before acquiring resources', async () => {
+  const f = fixture([['--show-toplevel', { status: null, stdout: '', error: { code: 'ETIMEDOUT' } }]]);
+  expect(await main(flags.filter(arg => !arg.startsWith('--repo=')), f.io)).toBe(EXIT_CODES.timeout);
+  expect(f.calls).toHaveLength(1);
+  expect(f.calls[0]).toMatchObject({ timeout: 120000, killSignal: 'SIGKILL' });
+});
 // Stage what the publisher wrote, independently of the source lane's bytes/modes.
 function stagedEntries(writes, dir, files) {
   const out = [];
@@ -37,6 +170,8 @@ function fixture(rules = [], { ready = true } = {}) {
       const call = { cmd, args, ...options, text: [cmd, ...args].join(' ') };
       calls.push(call);
       for (const [match, response] of rules) {
+        // Credential capture now has its own origin-bearing wire format.
+        if (match === 'config --show-scope' && args.includes('--get-regexp')) continue;
         if (call.text.includes(match)) {
           const n = counts.get(match) ?? 0; counts.set(match, n + 1);
           return typeof response === 'function' ? response(call, n) : response;
@@ -50,6 +185,7 @@ function fixture(rules = [], { ready = true } = {}) {
       if (args.includes('prototype-load') && args.includes('--help')) return ok(loaderHelp);
       if (call.text.includes('fix-ready.mjs') || call.text.includes('scripts/operations/run.mjs prototype-load')) return ok();
       if (cmd === 'git') {
+        if (args.includes('--get-regexp')) return { status: 1, stdout: '', stderr: '' };
         if (args.includes('clone')) return ok();
         if (args.includes('get-url')) return ok(`${originUrl}\n`);
         if (args.includes('config')) return ok(laneConfig);
@@ -530,7 +666,7 @@ it('captures the primary origin once before the worker and publishes only to tha
   expect((await f.run()).result.ok).toBe(true);
   const reads = f.calls.filter(c => c.args.includes('get-url'));
   expect(reads).toHaveLength(1);
-  expect(reads[0]).toMatchObject({ cwd: '/repo', args: ['-C', '/repo', 'remote', 'get-url', 'origin'] });
+  expect(reads[0]).toMatchObject({ cwd: '/repo', args: ['-C', '/repo', '-c', 'diff.orderFile=', '-c', 'core.fsmonitor=false', 'remote', 'get-url', 'origin'] });
   expect(f.calls.indexOf(reads[0])).toBeLessThan(f.calls.findIndex(c => c.text.includes('codex-direct-task.mjs')));
   const publication = f.calls.filter(c => c.args.includes('ls-remote') || c.args.includes('push'));
   expect(publication).toHaveLength(2);
@@ -589,7 +725,7 @@ it.each([false, true])('neutralizes inherited fsmonitor commands on a real read-
 
 it('refuses risky config introduced by a worker, tests or audit before another Git command', async () => {
   for (const boundary of ['codex-direct-task.mjs --task-file', 'heavy-admission', 'codex-direct-task.mjs --review']) {
-    for (const key of ['filter.host.clean', 'filter.host.process', 'credential.helper', 'remote.origin.receivepack', 'url.host.insteadof', 'http.https://github.com/.extraheader']) {
+    for (const key of ['filter.host.clean', 'filter.host.process', 'credential.helper', 'remote.origin.receivepack', 'url.host.insteadof', 'http.https://github.com/.extraheader', 'diff.orderFile', 'core.excludesFile']) {
       let poisoned = false;
       const f = fixture([
         [boundary, () => { poisoned = true; return boundary.includes('codex') ? report() : ok(); }],
@@ -1151,7 +1287,7 @@ it('resolves repo from git when omitted and uses the fixed lane heavy path and e
   const f = fixture();
   const code = await main([...flags.filter(x => !x.startsWith('--repo=')), '--wait-ms=42'], f.io);
   expect(code).toBe(0);
-  expect(f.calls[0].args).toEqual(['rev-parse', '--show-toplevel']); released(f);
+  expect(f.calls[0].args).toEqual(['-c', 'diff.orderFile=', '-c', 'core.fsmonitor=false', 'rev-parse', '--show-toplevel']); released(f);
   const g = fixture();
   expect(await main([...flags, '--wait-ms=42'], g.io)).toBe(0);
   for (const job of [f, g]) {
@@ -1313,10 +1449,10 @@ it('preserves only trusted operator credential helpers for clone and push, captu
   const helpers = ['credential.helper=operator-system-helper', 'credential.helper=store --file=/operator/credentials', 'credential.helper=',
     'credential.https://github.com.helper=!operator-helper "$@"\n'];
   const f = fixture([
-    ['config --show-scope', () => ok(`${laneConfig}system\0credential.helper\noperator-system-helper\0` +
-      'global\0credential.helper\nstore --file=/operator/credentials\0' +
-      'command\0credential.helper\n\0command\0credential.https://github.com.helper\n!operator-helper "$@"\n\0' +
-      `global\0core.fsmonitor\nunsafe-monitor\0${workerRan ? 'global\0credential.helper\nlate-helper\0' : ''}`)],
+    ['--get-regexp', () => ok('system\0file:/etc/gitconfig\0credential.helper\noperator-system-helper\0' +
+      'global\0file:/operator/.gitconfig\0credential.helper\nstore --file=/operator/credentials\0' +
+      'command\0command line:\0credential.helper\n\0command\0command line:\0credential.https://github.com.helper\n!operator-helper "$@"\n\0' +
+      `global\0file:/operator/.gitconfig\0core.fsmonitor\nunsafe-monitor\0${workerRan ? 'global\0file:/operator/.gitconfig\0credential.helper\nlate-helper\0' : ''}`)],
     ['codex-direct-task.mjs', () => { workerRan = true; return report(); }],
   ]);
   expect((await f.run()).result.ok).toBe(true);
@@ -1393,7 +1529,7 @@ it('reads global and inherited command credential helpers without inheriting Git
   }
 });
 
-it.each([red(), { status: 0 }, ok('global\0credential.helper\ntruncated'), ok('global\0missing-value-separator\0')])(
+it.each([red(), { status: 0 }, ok('global\0file:/operator/.gitconfig\0credential.helper\ntruncated'), ok('global\0file:/operator/.gitconfig\0missing-value-separator\0')])(
   'refuses unreadable or incomplete operator credential configuration (%j)', async response => {
   const f = fixture([['--get-regexp', response]]);
   expect((await f.run()).result.stopReason).toBe('unsafe-git-config');

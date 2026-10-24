@@ -12,7 +12,7 @@ import { lstatSync, readlinkSync, readFileSync, writeFileSync, mkdtempSync, mkdi
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { laneGitHardeningEnv, hardenLaneGitArgs, LANE_CONFIG_LIST_ARGS, riskyLaneConfig } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, hardenLaneGitArgs, LANE_CONFIG_LIST_ARGS, riskyLaneConfig as sharedRiskyLaneConfig } from '../lib/lane-git-hardening.mjs';
 
 export const EXIT_CODES = Object.freeze({
   'bad-args': 2, 'scope-occupied': 10, 'scope-unknown': 11,
@@ -20,7 +20,7 @@ export const EXIT_CODES = Object.freeze({
   'no-changes': 21, 'diff-out-of-scope': 22, 'changed-after-audit': 23, 'unsafe-git-config': 24, 'tests-red': 30, 'tests-deferred': 31,
   'audit-weakened': 40, 'audit-failed': 41, 'commit-failed': 50,
   'push-failed': 51, 'branch-name-exhausted': 52, 'register-failed': 60,
-  'internal-error': 99,
+  'timeout': 25, 'internal-error': 99,
 });
 export const STOP_REASONS = Object.freeze(Object.fromEntries(Object.keys(EXIT_CODES).map(k => [k, k])));
 const defaults = {
@@ -83,11 +83,35 @@ export function pathsWithinScope(files, scopeEntries) {
     return file === scope || (scope.endsWith('/') && file.startsWith(scope));
   }));
 }
-const exec = (s, cmd, args, lane = false, session = false, options = {}) => s.io.exec(cmd, args, {
-  cwd: lane ? s.lane.path : s.opts.repo,
-  env: laneGitHardeningEnv({ ...process.env, ...(lane ? { GIT_NO_REPLACE_OBJECTS: '1' } : {}), ...(session ? { LANE_SESSION: s.lane.holder } : {}) }),
-  ...options,
-});
+const GIT_TIMEOUT_MS = 120000;
+const GIT_FILE_PINS = ['-c', 'diff.orderFile=', '-c', 'core.fsmonitor=false'];
+const exec = async (s, cmd, args, lane = false, session = false, options = {}) => {
+  // Preserve -C first for callers that relocate a checkout, then pin before the verb.
+  const prefix = args[0] === '-C' ? 2 : 0;
+  const r = await s.io.exec(cmd, cmd === 'git'
+    ? [...args.slice(0, prefix), ...GIT_FILE_PINS, ...args.slice(prefix)] : args, {
+    cwd: lane ? s.lane.path : s.opts.repo,
+    env: laneGitHardeningEnv({ ...process.env, ...(lane ? { GIT_NO_REPLACE_OBJECTS: '1' } : {}), ...(session ? { LANE_SESSION: s.lane.holder } : {}) }),
+    ...(cmd === 'git' ? { timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL' } : {}),
+    ...options,
+  });
+  if (cmd === 'git' && r.error?.code === 'ETIMEDOUT') {
+    fail('timeout', 'Git timed out; inspect lane configuration and remote availability before retrying');
+  }
+  return r;
+};
+// Keep this runner's stricter file-read policy local: even a non-executable path
+// can name a FIFO/device. Command pins do not make worker-owned file settings safe.
+function riskyLaneConfig(listOutput) {
+  const found = sharedRiskyLaneConfig(listOutput);
+  const parts = listOutput.split('\0');
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const key = parts[i + 1].split('\n')[0];
+    if (['local', 'worktree', 'unknown'].includes(parts[i]) &&
+        /^(diff\.(orderfile|relative|external|.*\.(command|textconv))|core\.(.*(?:file|path)|worktree|fsmonitor|sshcommand|alternaterefscommand|pager))$/i.test(key)) found.push(key);
+  }
+  return found;
+}
 const git = async (s, args, session = false) => {
   // Re-read after every worker/test/audit boundary. Reading config executes no helpers.
   const config = await exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...LANE_CONFIG_LIST_ARGS], true);
@@ -96,6 +120,9 @@ const git = async (s, args, session = false) => {
     fail('unsafe-git-config', 'Cannot trust lane Git configuration; inspect its local/worktree configuration before retrying');
   }
   const hardened = hardenLaneGitArgs(args);
+  // Apple Git still tries to open an empty diff.orderFile. -O explicitly cancels
+  // ordering on every diff while retaining the config pin on all Git commands.
+  if (args[0] === 'diff') hardened.splice(1, 0, '-O/dev/null');
   const missing = hardened.slice(1).filter(a => !args.includes(a));
   const end = args.includes('--') ? args.indexOf('--') : args.length;
   return exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...args.slice(0, end), ...missing, ...args.slice(end)], true, session);
@@ -121,27 +148,46 @@ export async function acquireLane(s) {
   if (!good(r) || !Number.isInteger(s.lane.lane) || !s.lane.path || !s.lane.holder) fail('lane-acquire-failed');
   s.result.lane = s.lane.lane;
 }
+const SYSTEM_GIT_CONFIG_FILES = new Set([
+  '/etc/gitconfig',
+  '/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig',
+  '/Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig',
+]);
 async function captureCredentialHelpers(s) {
   // Read operator config before the worker runs. Only credential helpers from
-  // system/global/command scope cross into publication; lane config never does.
+  // known system files (including Apple's unknown scope), global and command
+  // scope cross into publication; lane config never does.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_') ||
     /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM)$/.test(key)));
-  const r = await exec(s, 'git', ['-C', s.opts.repo, 'config', '--show-scope', '--includes', '-z',
+  const r = await exec(s, 'git', ['-C', s.opts.repo, 'config', '--show-scope', '--show-origin', '--includes', '-z',
     '--get-regexp', '^credential(\\..*)?\\.helper$'], false, false,
     { env, timeout: 30000, maxBuffer: 1024 * 1024 });
   if (r.status === 1 && r.stdout === '') return [];
   const parts = typeof r.stdout === 'string' ? r.stdout.split('\0') : [];
-  if (!good(r) || parts.pop() !== '' || parts.length % 2) {
+  if (!good(r) || parts.pop() !== '' || parts.length % 3) {
     fail('unsafe-git-config', 'Cannot read trusted credential helpers; inspect operator Git configuration before retrying');
   }
   const helpers = [];
-  for (let i = 0; i < parts.length; i += 2) {
-    const split = parts[i + 1].indexOf('\n');
-    if (split < 0 || !['system', 'global', 'local', 'worktree', 'command'].includes(parts[i])) {
+  for (let i = 0; i < parts.length; i += 3) {
+    const [scope, origin, entry] = parts.slice(i, i + 3);
+    const split = entry.indexOf('\n');
+    if (split < 0 || !origin || !['unknown', 'system', 'global', 'local', 'worktree', 'command'].includes(scope)) {
       fail('unsafe-git-config', 'Cannot parse trusted credential helpers; inspect operator Git configuration before retrying');
     }
-    const key = parts[i + 1].slice(0, split), value = parts[i + 1].slice(split + 1);
-    if (['system', 'global', 'command'].includes(parts[i]) && /^credential(?:\..*)?\.helper$/i.test(key)) {
+    const key = entry.slice(0, split), value = entry.slice(split + 1);
+    if (/^credential(?:\..*)?\.helper$/i.test(key)) {
+      const systemFile = origin.startsWith('file:') && SYSTEM_GIT_CONFIG_FILES.has(origin.slice(5));
+      const file = origin.startsWith('file:') ? path.resolve(s.opts.repo, origin.slice(5)) : null;
+      const laneRelative = file ? path.relative(s.lane.path, file) : null;
+      if (file && (file.split(path.sep).some(part => part.toLowerCase() === '.git') ||
+          laneRelative === '' || (laneRelative !== '..' && !laneRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(laneRelative)))) {
+        fail('unsafe-git-config', 'Lane-owned credential helper origin; inspect operator Git configuration before retrying');
+      }
+      if (!(['unknown', 'system'].includes(scope) && systemFile) &&
+          !(scope === 'global' && origin.startsWith('file:')) &&
+          !(scope === 'command' && origin === 'command line:')) {
+        fail('unsafe-git-config', 'Untrusted credential helper origin; inspect operator Git configuration before retrying');
+      }
       helpers.push(`${key}=${value}`);
     }
   }
@@ -349,10 +395,10 @@ export async function commitAndPush(s) {
     GIT_COMMITTER_NAME: 'Codex Job', GIT_COMMITTER_EMAIL: 'codex-job@users.noreply.github.com' });
   const dir = await s.io.mkdtemp(path.join(tmpdir(), 'codex-job-publish-'));
   // Stage and query the same literal paths, including names containing * ? or [].
-  const trustedGit = args => s.io.exec('git', ['-C', dir, '--literal-pathspecs', '-c', 'core.hooksPath=/dev/null',
+  const trustedGit = args => exec(s, 'git', ['-C', dir, '--literal-pathspecs', '-c', 'core.hooksPath=/dev/null',
     ...(s.credentialHelpers ?? []).flatMap(helper => ['-c', helper]),
     '-c', 'user.name=Codex Job', '-c', 'user.email=codex-job@users.noreply.github.com', ...args],
-    { cwd: dir, env, timeout: 120000, maxBuffer: 64 * 1024 * 1024 });
+    false, false, { cwd: dir, env, maxBuffer: 64 * 1024 * 1024 });
   try {
     if (!good(await trustedGit(['clone', '--no-local', '--no-checkout', '--template=', '--', s.originUrl, dir]))) fail('commit-failed', 'Cannot create trusted publication clone');
     const baseRef = `refs/remotes/origin/${s.opts.base.replace(/^origin\//, '')}`;
@@ -468,7 +514,7 @@ export async function runJob(opts, io = {}) {
   const s = { claimId: `codex-job-${randomUUID()}`, opts: { ...opts }, io: { ...defaults, ...io }, result: { ok: false, branch: opts.purpose ? `lane/${opts.purpose}` : null, sha: null, tests: null, audit: null, registered: opts.edgeClone ? false : null, stopReason: null } };
   try {
     if (!s.opts.repo) {
-      const r = await s.io.exec('git', ['rev-parse', '--show-toplevel'], { env: laneGitHardeningEnv() });
+      const r = await exec(s, 'git', ['rev-parse', '--show-toplevel']);
       if (!good(r) || !r.stdout?.trim()) fail('bad-args', 'Cannot resolve repository');
       s.opts.repo = r.stdout.trim();
     }
