@@ -96,8 +96,10 @@ describe('live replays: each PR is paused today, and every live-head finding is 
 
   it('#5773: its one finished review left NO advisory on the PR (write-up to a local file, label swap refused), so the review resumes once', () => {
     const p = plan(enrich(FX[5773]));
-    expect(p.refusals).toEqual([]);
-    expect(p.dispatch.map(d => d.kind)).toEqual(['review']);
+    // Its live head also carries a trusted human clearance, which is final: the hold is resolved, but no further review
+    // is dispatched for the head (already-reviewed-head), where the same fixture used to resume a review.
+    expect(p.refusals.map(r => r.kind)).toEqual(['already-reviewed-head']);
+    expect(p.dispatch).toEqual([]);
     expect(p.notes.filter(n => n.kind === 'referral-hold-auto-resolved')).toEqual([expect.objectContaining({
       prNumber: 5773, head: FX[5773].headRefOid, outcome: 'resume', next: 'advisory-review', counts: { 'not-real': 3 } })]);
   });

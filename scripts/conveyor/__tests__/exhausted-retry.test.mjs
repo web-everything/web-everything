@@ -674,7 +674,9 @@ describe('retried CI verdicts', () => {
   });
   it('preserves the node id in the reader and sends the edit via GraphQL', () => {
     const comment = { ...trusted('original'), id: 'IC_spent' };
-    const read = vi.fn(() => `${comment.body}\t${comment.createdAt}\t${comment.author.login}\t${comment.id}\n`);
+    const read = vi.fn((_file, args) => args[1] === 'graphql'
+      ? JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } })
+      : `${comment.body}\t${comment.createdAt}\t${comment.author.login}\t${comment.id}\n`);
     expect(defaultReadPrComments(5169, { repo: 'o/r', exec: read })).toEqual([comment]);
     expect(read.mock.calls[0][1]).toContain('--paginate');
     expect(() => defaultReadPrComments(5169, { repo: 'o/r', exec: () => { throw Error('unreadable'); } })).toThrow('unreadable');
