@@ -639,7 +639,7 @@ describe('remote-verify workflow — source contract', () => {
     const workflow = yaml.safeLoad(source());
     const step = workflow.jobs.verify.steps.find((step) => step.env?.VERIFY_MODE);
     expect(step.name).toBe("${{ inputs.mode == 'targeted' && 'Targeted tests' || 'Required lane gate' }}");
-    expect(step.run).toContain("from './scripts/lib/remote-verify-dispatch.mjs'");
+    expect(step.run).toContain("from '../remote-verify-source/scripts/lib/remote-verify-dispatch.mjs'");
     expect(step.run).toContain('remoteVerifyCommands(');
     expect(step.run).toContain('execFileSync(file, args,');
     expect(step.env).toEqual({ VERIFY_MODE: "${{ inputs.mode || 'lane-check' }}",
@@ -671,11 +671,22 @@ describe('remote-verify workflow — source contract', () => {
     expect(setup.with['cache-dependency-path']).toContain('frontierui/package-lock.json');
   });
 
-  it('executes the workflow dispatcher with literal env inputs and rejects hostile values before spawning', () => {
+  it('executes the workflow dispatcher against a historical target without its own dispatcher and rejects hostile values before spawning', () => {
     const step = yaml.safeLoad(source()).jobs.verify.steps.find(step => step.env?.VERIFY_MODE);
     const root = mkdtempSync(join(tmpdir(), 'remote-dispatch-wiring-'));
     const calls = join(root, 'calls.jsonl');
     try {
+      const target = join(root, 'web-everything');
+      const dispatcherDir = join(root, 'remote-verify-source/scripts/lib');
+      mkdirSync(dispatcherDir, { recursive: true });
+      writeFileSync(join(dispatcherDir, 'remote-verify-dispatch.mjs'),
+        readFileSync(join(process.cwd(), 'scripts/lib/remote-verify-dispatch.mjs'), 'utf8'));
+      for (const file of ['scripts/__tests__/remote-verify.test.mjs',
+        'scripts/operations/review-pr.mjs', 'scripts/operations/review-pr-io.mjs']) {
+        mkdirSync(join(target, file, '..'), { recursive: true });
+        writeFileSync(join(target, file), '');
+      }
+      expect(existsSync(join(target, 'scripts/lib/remote-verify-dispatch.mjs'))).toBe(false);
       for (const command of ['npm', 'node']) {
         writeFileSync(join(root, command), `#!${process.execPath}\n` +
           `require('node:fs').appendFileSync(${JSON.stringify(calls)}, JSON.stringify([${JSON.stringify(command)}, process.argv.slice(2)]) + '\\n');\n`);
@@ -692,7 +703,7 @@ describe('remote-verify workflow — source contract', () => {
           expected: [['npm', ['run', 'test:unit', '--', 'scripts/__tests__/remote-verify.test.mjs']]] },
         { mode: 'targeted', operation: 'review-pr', expected: [['node',
           ['scripts/readiness/heavy-admission.mjs', 'run', '--', 'npx', 'vitest', 'related', '--run',
-            ...[declaration, io].filter(existsSync)]]] },
+            declaration, io]]] },
         { mode: 'targeted', tests: '--config=evil' },
         { mode: 'targeted', tests: 'missing.test.mjs' },
         { mode: 'targeted', operation: '../evil' },
@@ -702,7 +713,7 @@ describe('remote-verify workflow — source contract', () => {
       for (const { mode, tests = '', operation = '', expected } of cases) {
         writeFileSync(calls, '');
         const result = spawnSync(process.execPath, ['--input-type=module'], {
-          cwd: process.cwd(), input: script, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+          cwd: target, input: script, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
           env: { ...process.env, PATH: `${root}:${process.env.PATH}`,
             VERIFY_MODE: mode, VERIFY_TESTS: tests, VERIFY_OPERATION: operation },
         });
@@ -718,6 +729,17 @@ describe('remote-verify workflow — source contract', () => {
     const workflow = yaml.safeLoad(source());
     const checkout = workflow.jobs.verify.steps.find(step => step.name === 'Checkout WE');
     expect(checkout.with.ref).toBe("${{ inputs.mode == 'targeted' && (inputs.ref || github.sha) || github.sha }}");
+  });
+
+  it('checks out the dispatcher from the triggering SHA independently of the targeted ref', () => {
+    const steps = yaml.safeLoad(source()).jobs.verify.steps;
+    const dispatcher = steps.find(step => step.name === 'Checkout verification dispatcher');
+    expect(dispatcher?.uses).toBe('actions/checkout@v4');
+    expect(dispatcher?.if).toBeUndefined();
+    expect(dispatcher?.with).toEqual({ path: 'remote-verify-source', ref: '${{ github.sha }}',
+      'sparse-checkout': 'scripts/lib/remote-verify-dispatch.mjs', 'sparse-checkout-cone-mode': false,
+      'persist-credentials': false });
+    expect(steps.indexOf(dispatcher)).toBeLessThan(steps.findIndex(step => step.env?.VERIFY_MODE));
   });
 
   it('checks the actual checkout head for lane-check/full and fails on mismatches', () => {

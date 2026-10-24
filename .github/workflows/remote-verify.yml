@@ -39,6 +39,15 @@ jobs:
       run:
         working-directory: web-everything
     steps:
+      # Targeted refs may predate the dispatcher; keep orchestration with the workflow.
+      - name: Checkout verification dispatcher
+        uses: actions/checkout@v4
+        with:
+          path: remote-verify-source
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/lib/remote-verify-dispatch.mjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Checkout WE
         uses: actions/checkout@v4
         with:
@@ -91,7 +100,7 @@ jobs:
           node --input-type=module <<'NODE'
           import { execFileSync } from 'node:child_process';
           import { existsSync } from 'node:fs';
-          import { remoteVerifyCommands } from './scripts/lib/remote-verify-dispatch.mjs';
+          import { remoteVerifyCommands } from '../remote-verify-source/scripts/lib/remote-verify-dispatch.mjs';
           const commands = remoteVerifyCommands({ mode: process.env.VERIFY_MODE,
             tests: process.env.VERIFY_TESTS, operation: process.env.VERIFY_OPERATION }, existsSync);
           for (const [file, args] of commands) {
