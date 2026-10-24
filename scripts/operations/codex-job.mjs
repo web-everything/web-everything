@@ -6,7 +6,8 @@
  */
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstatSync, readlinkSync, readFileSync, writeFileSync } from 'node:fs';
+import { lstatSync, readlinkSync, readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { laneGitHardeningEnv, hardenLaneGitArgs, LANE_CONFIG_LIST_ARGS, riskyLaneConfig } from '../lib/lane-git-hardening.mjs';
@@ -22,10 +23,13 @@ export const EXIT_CODES = Object.freeze({
 export const STOP_REASONS = Object.freeze(Object.fromEntries(Object.keys(EXIT_CODES).map(k => [k, k])));
 const defaults = {
   exec: (cmd, args, options) => spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options }),
-  readFile: file => readFileSync(file, 'utf8'),
+  readFile: (file, encoding = 'utf8') => readFileSync(file, encoding),
+  mkdtemp: prefix => mkdtempSync(prefix),
+  mkdir: (dir, options) => mkdirSync(dir, options),
+  rm: (file, options) => rmSync(file, options),
   lstat: file => lstatSync(file),
   readlink: file => readlinkSync(file, { encoding: 'buffer' }),
-  writeFile: (file, data) => writeFileSync(file, data, { mode: 0o600 }),
+  writeFile: (file, data, options = { mode: 0o600 }) => writeFileSync(file, data, options),
   now: Date.now,
   log: line => process.stderr.write(`${String(line).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}\n`),
 };
@@ -86,8 +90,7 @@ const git = async (s, args, session = false) => {
   // Re-read after every worker/test/audit boundary. Reading config executes no helpers.
   const config = await exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...LANE_CONFIG_LIST_ARGS], true);
   if (!good(config) || typeof config.stdout !== 'string' ||
-      (config.stdout && !config.stdout.endsWith('\0')) || riskyLaneConfig(config.stdout).length ||
-      unsafePublicationConfig(config.stdout, s.originUrl)) {
+      (config.stdout && !config.stdout.endsWith('\0')) || riskyLaneConfig(config.stdout).length) {
     fail('unsafe-git-config', 'Cannot trust lane Git configuration; inspect its local/worktree configuration before retrying');
   }
   const hardened = hardenLaneGitArgs(args);
@@ -95,20 +98,6 @@ const git = async (s, args, session = false) => {
   const end = args.includes('--') ? args.indexOf('--') : args.length;
   return exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...args.slice(0, end), ...missing, ...args.slice(end)], true, session);
 };
-function unsafePublicationConfig(output, originUrl) {
-  const parts = output.split('\0');
-  for (let i = 0; i + 1 < parts.length; i += 2) {
-    const entry = parts[i + 1], newline = entry.indexOf('\n');
-    const key = newline < 0 ? entry : entry.slice(0, newline);
-    if (/^(?:diff\.ignoresubmodules|submodule\..+\.ignore)$/i.test(key)) return true;
-    // Clone fetch refspecs map incoming refs; they cannot redirect publication.
-    if (/^remote\..+\.fetch$/i.test(key)) continue;
-    // Inspect every effective scope: even a URL passed literally can be rewritten.
-    if (/^(url|remote)\./i.test(key) &&
-        !(key === 'remote.origin.url' && newline >= 0 && entry.slice(newline + 1) === originUrl)) return true;
-  }
-  return false;
-}
 const scopeArgs = s => [`--agent=${s.claimId}`, `--owner=${s.claimId}`];
 
 export async function checkFreeScope(s) {
@@ -119,7 +108,8 @@ export async function checkFreeScope(s) {
   if (!s.opts.dryRun) {
     // A register may have written its entry even when its final check refuses admission.
     s.scopeRegistered = true;
-    r = await exec(s, 'node', [...args, 'register', ...scopeArgs(s), `--purpose=${s.opts.purpose}`, files]);
+    r = await exec(s, 'node', [...args, 'register', ...scopeArgs(s), `--purpose=${s.opts.purpose}`, files,
+      `--ttl-hours=${Math.ceil(2 * s.opts.waitMs / 3600000) + 24}`]);
     if (!good(r)) fail(r.status === 1 ? 'scope-occupied' : 'scope-unknown');
   }
 }
@@ -164,9 +154,9 @@ async function changedFiles(s, reason = 'diff-out-of-scope') {
     untracked: untracked.stdout.split('\0').filter(Boolean).sort(),
   };
 }
-async function worktreeFingerprint(s, untracked, reason) {
+async function worktreeFingerprint(s, untracked, reason, runGit = args => git(s, args)) {
   // Keep originally untracked files separate even after git add moves them into the index.
-  const diff = await git(s, ['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', s.startSha, '--',
+  const diff = await runGit(['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', s.startSha, '--',
     '.', ...untracked.map(file => `:(top,literal,exclude)${file}`)]);
   if (!good(diff) || typeof diff.stdout !== 'string') {
     fail(reason, 'Cannot read worktree fingerprint; inspect the lane diff before retrying');
@@ -194,7 +184,7 @@ async function worktreeFingerprint(s, untracked, reason) {
   }
   let hashes = '';
   if (regular.length) {
-    const r = await git(s, ['hash-object', '--no-filters', '--', ...regular]);
+    const r = await runGit(['hash-object', '--no-filters', '--', ...regular]);
     if (!good(r) || typeof r.stdout !== 'string' || !r.stdout.endsWith('\n') ||
         r.stdout.trimEnd().split('\n').length !== regular.length ||
         r.stdout.trimEnd().split('\n').some(hash => !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(hash))) {
@@ -261,76 +251,87 @@ export async function checkAuditedFiles(s) {
     fail('changed-after-audit', 'Worktree contents differ from the audit input; inspect the lane diff before retrying');
   }
 }
-export async function checkStagedScope(s) {
-  const head = await git(s, ['rev-parse', 'HEAD']);
-  if (!good(head) || head.stdout?.trim() !== s.startSha) {
-    fail('changed-after-audit', 'Lane HEAD differs from the starting commit; inspect worker-created history before retrying');
-  }
-  const index = await git(s, ['ls-files', '--stage', '-z']);
-  if (!good(index) || typeof index.stdout !== 'string' || (index.stdout && !index.stdout.endsWith('\0'))) {
-    fail('diff-out-of-scope', 'Cannot read complete index modes; inspect the lane index before retrying');
-  }
-  for (const entry of index.stdout.split('\0').filter(Boolean)) {
-    const record = /^([0-7]{6}) [a-f0-9]{40}(?:[a-f0-9]{24})? [0-3]\t[\s\S]+$/.exec(entry);
-    if (!record || record[1] === '160000') {
-      fail('diff-out-of-scope', 'Invalid index entry or gitlink; gitlinks are never in scope');
-    }
-  }
-  const staged = await git(s, ['diff', '--cached', '--name-only', '--no-renames', '--ignore-submodules=none', '-z']);
-  if (!good(staged) || typeof staged.stdout !== 'string' || (staged.stdout && !staged.stdout.endsWith('\0'))) {
-    fail('diff-out-of-scope', 'Cannot read complete staged file list; inspect the lane index before retrying');
-  }
-  const files = [...new Set(staged.stdout.split('\0').filter(Boolean))];
-  const outside = files.filter(f => !pathsWithinScope([f], s.opts.scope));
-  if (outside.length) fail('diff-out-of-scope', outside);
-  if (files.length !== s.files.length || files.some(file => !s.files.includes(file))) {
-    fail('diff-out-of-scope', 'Staged file list differs from the audited worktree; inspect the lane index before retrying');
-  }
-  // Compare the entire index with the worktree, including paths absent from s.files.
-  const match = await git(s, ['diff', '--quiet', '--exit-code', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--']);
-  if (!good(match)) {
-    fail('diff-out-of-scope', 'Cannot verify staged contents match the audited worktree; inspect the lane index before retrying');
-  }
-}
 export async function commitAndPush(s) {
-  const title = (s.brief.split('\n')[0] ?? '').replace(/^\s*#+\s*/, '').replace(/^Task:\s*/i, '').trim().slice(0, 72);
-  if (!good(await git(s, ['add', '--', ...s.files], true))) fail('commit-failed');
-  // Commit consumes the whole index, including anything staged by subprocesses.
-  await checkStagedScope(s);
-  await checkAuditedFiles(s);
-  const tree = await git(s, ['write-tree']);
-  if (!good(tree) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})\n?$/.test(tree.stdout ?? '')) fail('commit-failed', 'Cannot snapshot the audited index');
-  if (!good(await git(s, ['commit', '-m', title, '-m', 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>'], true))) fail('commit-failed');
-  const parent = await git(s, ['rev-parse', 'HEAD^']);
-  const count = await git(s, ['rev-list', '--count', `${s.startSha}..HEAD`]);
-  if (!good(parent) || parent.stdout?.trim() !== s.startSha || !good(count) || count.stdout?.trim() !== '1') {
-    fail('changed-after-audit', 'Published history must contain exactly one commit on the starting commit; inspect the local history before retrying');
+  // Export plain bytes only. Lane history, index, config, hooks and refs are not
+  // publication inputs. Missing/deleted entries fail closed for operator inspection.
+  if (!Array.isArray(s.files) || !s.files.length || !pathsWithinScope(s.files, s.opts.scope) ||
+      s.files.some(file => !file || file.includes('\\') || file.includes('\0') ||
+        file.split('/').some(part => !part || part.toLowerCase() === '.git'))) {
+    fail('diff-out-of-scope', 'Invalid export paths; inspect the lane diff before retrying');
   }
-  const sha = await git(s, ['rev-parse', 'HEAD']);
-  if (!good(sha) || !sha.stdout?.trim()) fail('commit-failed');
-  s.result.sha = sha.stdout.trim();
-  // HEAD can move between subprocesses; also bind ancestry to the SHA we publish.
-  const pinnedParent = await git(s, ['rev-parse', `${s.result.sha}^`]);
-  const pinnedCount = await git(s, ['rev-list', '--count', `${s.startSha}..${s.result.sha}`]);
-  if (!good(pinnedParent) || pinnedParent.stdout?.trim() !== s.startSha || !good(pinnedCount) || pinnedCount.stdout?.trim() !== '1') {
-    fail('changed-after-audit', 'Publication SHA has unexpected ancestry; inspect the local history before retrying');
+  const exported = [];
+  try {
+    for (const file of s.files) {
+      const stat = await s.io.lstat(path.join(s.lane.path, file));
+      if (stat.isSymbolicLink() || !stat.isFile() || !Number.isInteger(stat.mode) || stat.mode < 0) throw new Error('Non-regular export');
+      const parts = file.split('/');
+      for (let n = 1; n < parts.length; n++) {
+        if ((await s.io.lstat(path.join(s.lane.path, ...parts.slice(0, n)))).isSymbolicLink()) throw new Error('Symlink ancestor');
+      }
+      const bytes = await s.io.readFile(path.join(s.lane.path, file), null);
+      if (!Buffer.isBuffer(bytes)) throw new Error('Unreadable bytes');
+      exported.push({ file, bytes: Buffer.from(bytes), mode: stat.mode & 0o100 ? 0o755 : 0o644 });
+    }
+  } catch {
+    fail('diff-out-of-scope', 'Cannot export regular file bytes; inspect the lane diff before retrying');
   }
-  // Hooks or another writer may have replaced the index during commit. Check the
-  // immutable committed tree, including added paths, modes, deletions and link blobs.
-  const committedTree = await git(s, ['rev-parse', `${s.result.sha}^{tree}`]);
-  if (!good(committedTree) || committedTree.stdout?.trim() !== tree.stdout.trim()) {
-    fail('changed-after-audit', 'Committed tree differs from the audited index; inspect the local commit before retrying');
-  }
-  let branch;
-  for (let n = 1; n <= 9; n++) {
-    const name = `lane/${s.opts.purpose}${n === 1 ? '' : `-${n}`}`;
-    const r = await git(s, ['ls-remote', '--heads', s.originUrl, name]);
-    if (!good(r)) fail('push-failed', 'Cannot check remote branch');
-    if (!r.stdout?.trim()) { branch = name; break; }
-  }
-  if (!branch) fail('branch-name-exhausted');
-  s.result.branch = branch;
-  if (!good(await git(s, ['push', s.originUrl, `${s.result.sha}:refs/heads/${branch}`], true))) fail('push-failed');
+  // Drop inherited Git overrides as well as user/system configuration. The clean
+  // checkout must never inherit a lane's object store, helpers or identity.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_AUTHOR_NAME: 'Codex Job', GIT_AUTHOR_EMAIL: 'codex-job@users.noreply.github.com',
+    GIT_COMMITTER_NAME: 'Codex Job', GIT_COMMITTER_EMAIL: 'codex-job@users.noreply.github.com' });
+  const dir = await s.io.mkdtemp(path.join(tmpdir(), 'codex-job-publish-'));
+  const trustedGit = args => s.io.exec('git', ['-C', dir, ...(args[0] === 'add' ? ['--literal-pathspecs'] : []), '-c', 'core.hooksPath=/dev/null',
+    '-c', 'user.name=Codex Job', '-c', 'user.email=codex-job@users.noreply.github.com', ...args],
+    { cwd: dir, env, timeout: 120000, maxBuffer: 64 * 1024 * 1024 });
+  try {
+    if (!good(await trustedGit(['clone', '--no-local', '--no-checkout', '--template=', '--', s.originUrl, dir]))) fail('commit-failed', 'Cannot create trusted publication clone');
+    const baseRef = `refs/remotes/origin/${s.opts.base.replace(/^origin\//, '')}`;
+    const base = await trustedGit(['rev-parse', '--verify', `${baseRef}^{commit}`]);
+    if (!good(base) || typeof base.stdout !== 'string' || !base.stdout.trim()) fail('lane-reset-failed', 'Cannot resolve base from trusted remote; inspect the remote branch before retrying');
+    if (!s.startSha || base.stdout.trim() !== s.startSha) {
+      fail('changed-after-audit', 'Trusted remote base differs from the audited starting commit; restart the job against the new base');
+    }
+    if (!good(await trustedGit(['checkout', '--detach', base.stdout.trim()]))) fail('commit-failed');
+    for (const { file, bytes, mode } of exported) {
+      const parts = file.split('/');
+      for (let n = 1; n < parts.length; n++) {
+        try {
+          const stat = await s.io.lstat(path.join(dir, ...parts.slice(0, n)));
+          if (stat.isSymbolicLink()) fail('diff-out-of-scope', 'Publication path traverses a symlink; inspect the remote base before retrying');
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
+      const target = path.join(dir, file);
+      await s.io.mkdir(path.dirname(target), { recursive: true });
+      // Replace any base symlink rather than following it, and preserve Git's execute bit.
+      await s.io.rm(target, { force: true });
+      await s.io.writeFile(target, bytes, { mode });
+    }
+    // Verify the frozen export itself, including execute bits, against the audit.
+    // Rechecking the mutable lane after readFile would not bind these saved bytes.
+    const snapshot = { ...s, lane: { path: dir } };
+    if (!s.auditFingerprint || !Array.isArray(s.auditUntracked) ||
+        await worktreeFingerprint(snapshot, s.auditUntracked, 'changed-after-audit', trustedGit) !== s.auditFingerprint) {
+      fail('changed-after-audit', 'Exported bytes or modes differ from the audit input; rerun tests and audit before retrying');
+    }
+    if (!good(await trustedGit(['add', '--', ...s.files]))) fail('commit-failed');
+    const title = (s.brief.split('\n')[0] ?? '').replace(/^\s*#+\s*/, '').replace(/^Task:\s*/i, '').trim().slice(0, 72);
+    if (!good(await trustedGit(['commit', '-m', title]))) fail('commit-failed');
+    const sha = await trustedGit(['rev-parse', 'HEAD']);
+    if (!good(sha) || !sha.stdout?.trim()) fail('commit-failed');
+    s.result.sha = sha.stdout.trim();
+    let branch;
+    for (let n = 1; n <= 9; n++) {
+      const name = `lane/${s.opts.purpose}${n === 1 ? '' : `-${n}`}`;
+      const r = await trustedGit(['ls-remote', '--heads', s.originUrl, name]);
+      if (!good(r) || typeof r.stdout !== 'string') fail('push-failed', 'Cannot check remote branch');
+      if (!r.stdout.trim()) { branch = name; break; }
+    }
+    if (!branch) fail('branch-name-exhausted');
+    s.result.branch = branch;
+    if (!good(await trustedGit(['push', '--no-tags', '--no-follow-tags', s.originUrl, `${s.result.sha}:refs/heads/${branch}`]))) fail('push-failed');
+  } finally { await s.io.rm(dir, { recursive: true, force: true }); }
 }
 export async function markReady(s) {
   try { await s.io.readFile(path.join(s.lane.path, 'scripts/fix-ready.mjs')); }
@@ -378,15 +379,14 @@ function plan(s) {
     'Recheck changed and untracked file scope after tests',
     show('node', codexArgs(s, '<audit-task-file>', true)),
     'Check changed and untracked file list and content fingerprint are unchanged since audit started',
-    'git add -- <scope-checked changed files>',
-    'Verify HEAD still equals the starting commit and git ls-files --stage -z contains no gitlinks',
-    'git diff --cached --name-only --no-renames --ignore-submodules=none -z (require scoped paths to match the audited file list)',
-    'git diff --quiet --exit-code --no-ext-diff --no-textconv --ignore-submodules=none -- (require the complete index to match the worktree)',
-    'Recheck audited file list and content fingerprint immediately before commit',
-    'git commit -m <brief title> -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"',
-    'Verify exactly one commit on the starting commit and committed tree equals the audited index snapshot before publishing its pinned SHA',
+    'Export scoped regular file bytes with lstat/readFile; reject symlinks, gitlinks and unreadable entries',
+    'Create a fresh clone of the trusted primary origin with system/global Git config disabled and hooks pinned to /dev/null',
+    'Require the trusted remote base to equal the audited starting commit; otherwise restart the job',
+    'Apply exported bytes and require their content and execute-mode fingerprint to equal the audit snapshot',
+    'Stage only the allowed paths and commit once with the fixed Codex Job identity',
     `${show('git', ['ls-remote', '--heads', s.originUrl])} <branch> (try suffixes -2 through -9 if occupied)`,
-    show('git', ['push', s.originUrl, `<checked-sha>:refs/heads/${s.result.branch}`]),
+    show('git', ['push', '--no-tags', '--no-follow-tags', s.originUrl, `<checked-sha>:refs/heads/${s.result.branch}`]),
+    'Remove the publication clone in finally on success or failure; retain the scope claim until job cleanup',
     'node scripts/fix-ready.mjs mark --branch=<branch> --sha=<sha> (if present)',
     ...(s.opts.edgeClone ? [show('node', prototypeLoadArgs(s))] : [])];
 }
