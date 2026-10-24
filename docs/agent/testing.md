@@ -103,63 +103,44 @@ stored card-only net read with non-empty trimmed `diffText` and `netBasis.rev` m
 The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head; admission treats the validated historical card-only skip as fresh while retaining the seat-row and comment guards. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying.
 
 Settlement runs for every outcome except `ran` and `resumed`, before the finished status write and gate in both normal and red-team-only jobs.
-Only structured `status: 'skipped', policy: 'card-only'` produces a trusted, head-bound zero-finding
-result comment. Reason strings never grant clearance. Other skips and failed policy comment posts
+Only structured `status: 'skipped', policy: 'card-only'` with a real 40-hex `readHead`
+(the loop read's `netBasis.rev`) matching the settlement head case-insensitively produces a trusted,
+head-bound zero-finding result comment. An absent, invalid or mismatched read head publishes
+needs-you with reason `policy skip head not bound to the reviewed read`. Reason strings never grant clearance. Other skips and failed policy comment posts
 publish needs-you with kind `red-team-skip-<first 26 hex of the SHA-256 identity key>`, so distinct reasons survive feed deduplication. Markers deduplicate by repo/PR/head/reason under `red-team-status/skip-published`;
-Write the item atomically to `red-team-status/skip-pending/<key>.json` before publication, then write the published marker and remove the pending record after success. Every settlement first retries up to 25 unpublished pending records without a model call, even when settling another PR. Failures retain their records and do not abort the current settlement; overflow is logged and remains for the next settlement. Already-published pending records are removed without republication. Settlement uses the stored review head, then the prepared lane head, then the live PR head from the existing carry evidence reader. If no real head is available, publish with `head: 'unknown'` and include the run ID in the identity key (a fresh attempt ID if absent); policy clearance still requires a real 40-hex head.
+Write the item atomically to `red-team-status/skip-pending/<key>.json` before publication, then write the published marker and remove the pending record after success. Every settlement first retries up to 25 unpublished pending records without a model call, even when settling another PR. Failures retain their records and do not abort the current settlement; overflow is logged and remains for the next settlement. Already-published pending records are removed without republication. Settlement uses the stored review head, then the prepared lane head, then the live PR head from the existing carry evidence reader. If no real head is available, publish with `head: 'unknown'` and include the run ID in the identity key (a fresh attempt ID if absent); fallback heads identify needs-you items but cannot authorize policy clearance.
 Regressions: `red-team-skip-outcome.test.mjs`, `review-job-red-team-skip.test.mjs`, and the
 historical card-only cases in `review-red-team-on-skip.test.mjs`.
-The companion `red-team-skip-outcome-regressions.test.mjs` maps the clearance and notification
-guarantees to named assertions:
+Regression mapping (one representative assertion per guarantee; names are in the files above unless noted):
 
-- **policy predicate requires both structured fields: %s cannot clear** removes or changes
-  each discriminator independently and checks `non-policy`, zero result posts, needs-you
-  publication, and no `red-team:clear` label, even when the reason says card-only.
-- **failed publication leaves no marker; retry succeeds before deduplication begins** checks
-  an empty marker directory after failure and during the retry's publish callback, then one
-  marker after success and no third publication.
-- **successful publication deduplicates by repo/PR/head/reason: changing %s publishes again**
-  checks the SHA-256 filename for all four fields and changes each field independently;
-  identical repeats publish once, while the changed key publishes once more.
-
-- **distinct reasons on one head survive real feed deduplication** exercises real `publishAttention`/`diffFeed` publication to a temporary feed and requires two events plus exact hashed kinds.
-- **unknown heads deduplicate within a run but retain different attempts** requires distinct feed kinds and markers for different run IDs; **policy cannot clear without a real head (%s)** checks the closed path.
-- **production dispatch settles every incomplete outcome %j** covers error, disabled, unknown object, null and undefined; **completed %s does not settle** preserves ran/resumed behavior.
-- **two real lane heads without netBasis.rev publish twice** checks production dispatch through real settlement and feed publication. **stored review head takes precedence over the prepared lane head** and **missing prepared head falls back to live head or unknown (%s)** check head selection.
-- **does not heal incomplete or mismatched stored read %j** refuses empty/whitespace/missing diffs and missing or mismatched revisions while retaining the historical healing assertions.
-
-- **colliding 32-bit reason prefixes produce two real feed lines with 40-character kinds** pins
-  the two known colliding reasons through real feed publication, with exact 26-hex suffixes.
-- **does not heal an explicit non-card-only policy %j** refuses a structured policy override;
-  **legacy string or explicit card-only object %j dispatches fresh** preserves legacy
-  string recovery and structured card-only provenance; **policy-absent object %j never heals
-  even with a complete card-only read** refuses object skips without explicit provenance.
-  **non-card-only skipped status still skips with its existing not-re-run reason** refuses
-  legacy strings with a non-card-only read.
-- **failed publication persists the item before publishing and another PR retries it exactly once**
-  checks the durable item before the failed publish, cross-PR retry, marker, cleanup and no duplicate.
-- **pending retry failure does not block current policy settlement or discard the item** and
-  **unparseable pending evidence is quarantined and cannot prevent current settlement** check
-  closed failure paths while the current policy result still posts.
-- **flushes at most 25 pending records and leaves overflow for the next settlement** checks
-  the exact call bound, operator-visible retry fallback and eventual overflow delivery;
-  **already-published pending records are removed without republication** checks crash cleanup.
-- **malformed reason cannot prevent settlement or throw (redTeamOnly=%s)** uses
-  `{status:'skipped', reason:{toString:null}}` in normal and red-team-only jobs, requiring exactly
-  one settlement before the gate.
-
-- **persists skip provenance and keeps other outcomes as strings: %j** checks exact finished
-  results for policy/non-policy skips and unchanged strings for every other named outcome.
-- **real persisted skip survives drain reads and recovery admission (policy=%s)** exercises
-  the real status writer/reader, normalization, drain evidence and fresh admission: explicit
-  card-only provenance heals; an object without policy retains its prior status and refuses healing.
-- **30 invalid records do not consume the attempt budget; one valid record publishes and poison
-  is never rescanned** checks parse and validation failures, all 30 quarantines, valid delivery
-  in one settlement, and no repeated diagnostics on the next settlement.
-- **failed valid publications count toward 25 attempts and rotate oldest-first across settlements
-  (mtime=%s)** checks the call bound, mtime ordering independent of filenames, durable failures,
-  operator-visible overflow fallback and delivery of untouched records on the next settlement,
-  including future-dated records.
+- Structured policy provenance: **policy predicate requires both structured fields: %s cannot clear**.
+- Read/head binding fails closed: **policy cannot clear an unbound reviewed read (%s)**.
+- Case-insensitive read/head binding: **policy read head binding is case-insensitive**.
+- Missing read revision cannot clear a lane head: **policy skip without a valid netBasis.rev cannot clear the lane head (%s)**.
+- Publication precedes deduplication: **failed publication leaves no marker; retry succeeds before deduplication begins**.
+- Identity includes repo, PR, head and reason: **successful publication deduplicates by repo/PR/head/reason: changing %s publishes again**.
+- Feed kinds preserve distinct reasons: **distinct reasons on one head survive real feed deduplication**.
+- Kind collision regression: **colliding 32-bit reason prefixes produce two real feed lines with 40-character kinds**.
+- Unknown heads retain run identity: **unknown heads deduplicate within a run but retain different attempts**.
+- Absent run IDs retain attempt identity: **unknown-head skips without runId both publish with fresh attempt identities**.
+- Unknown heads cannot clear policy: **policy cannot clear without a real head (%s)**.
+- Incomplete outcomes reach settlement: **production dispatch settles every incomplete outcome %j**.
+- Completed passes bypass settlement: **completed %s does not settle**.
+- Fallback head identity survives feed deduplication: **two real lane heads without netBasis.rev publish twice**.
+- Read head takes precedence: **stored review head takes precedence over the prepared lane head**.
+- Prepared lane head fallback: **a missing pinned rev falls back to the prepared lane head, never a null identity**.
+- Historical recovery rejects incomplete reads: **does not heal incomplete or mismatched stored read %j** in `review-red-team-on-skip.test.mjs`.
+- Historical recovery requires provenance: **policy-absent object %j never heals even with a complete card-only read** in `review-red-team-on-skip.test.mjs`.
+- Durable cross-PR retry: **failed publication persists the item before publishing and another PR retries it exactly once**.
+- Retry failure retains pending evidence: **pending retry failure does not block current policy settlement or discard the item**.
+- Parse failures quarantine pending evidence: **unparseable pending evidence is quarantined and cannot prevent current settlement**.
+- Retry bound and overflow fallback: **flushes at most 25 pending records and leaves overflow for the next settlement**.
+- Crash cleanup avoids duplicates: **already-published pending records are removed without republication**.
+- Malformed diagnostics cannot abort settlement: **malformed reason cannot prevent settlement or throw (redTeamOnly=%s)**.
+- Finished status preserves provenance: **persists skip provenance and keeps other outcomes as strings: %j**.
+- Persisted recovery honors policy: **real persisted skip survives drain reads and recovery admission (policy=%s)**.
+- Poison records cannot consume retry slots: **30 invalid records do not consume the attempt budget; one valid record publishes and poison is never rescanned**.
+- Failed attempts count toward the bound and rotate fairly: **failed valid publications count toward 25 attempts and rotate oldest-first across settlements (mtime=%s)**.
 
 Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a confirmed-dead queued
 `ran`/`resumed` prior into the shared guard before writing its own queued status. A guard

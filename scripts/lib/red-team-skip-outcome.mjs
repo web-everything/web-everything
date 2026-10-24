@@ -82,7 +82,11 @@ export function settleRedTeamSkip(input = {}) {
     const head = realHead ? input.head : 'unknown';
     const classified = classifyRedTeamSkip(redTeam);
     let { reason } = classified;
-    if (classified.kind === 'policy') {
+    const boundRead = typeof input.readHead === 'string' && /^[a-f0-9]{40}$/i.test(input.readHead)
+      && realHead && input.readHead.toLowerCase() === head.toLowerCase();
+    if (classified.kind === 'policy' && !boundRead) {
+      reason = 'policy skip head not bound to the reviewed read';
+    } else if (classified.kind === 'policy') {
       try {
         if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || typeof repo !== 'string' || !repo
           || !/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing or invalid PR/head');

@@ -57,7 +57,7 @@ function fixture() {
   const markerDir = join(redTeamStatusDir(env), 'skip-published');
   const markers = () => existsSync(markerDir) ? readdirSync(markerDir) : [];
   function settle(redTeam, overrides = {}) {
-    return settleRedTeamSkip({ redTeam: arguments.length === 0 ? policy : redTeam, repo, pr, head, comments, io, ...overrides });
+    return settleRedTeamSkip({ redTeam: arguments.length === 0 ? policy : redTeam, repo, pr, head, readHead: head, comments, io, ...overrides });
   }
   return { io, comments, settle, markers, markerDir };
 }

@@ -347,8 +347,9 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
             ? readRedTeamRecoveryStatus(key, { readStatus: () => prior, readEvidence }) : prior;
           // A healed policy skip has no model result to resume. Let the fresh seat
           // apply today's policy; its independent comment and scorecard guards remain active.
-          if (input.redTeamMode === 'fresh' && redTeamSkipNeedsSettlement(admissionPrior)
-            && admissionPrior.loopPayload?.findings?.read?.netBasis?.rev === head) admissionPrior = null;
+          // readRedTeamStatus binds status.head to this job's head; the predicate
+          // separately requires the stored read's netBasis.rev to equal status.head.
+          if (input.redTeamMode === 'fresh' && redTeamSkipNeedsSettlement(admissionPrior)) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(prior?.result).priorResult)) priorResult = prior.result;
           input = { ...input, result: priorResult };
         }
@@ -807,7 +808,9 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     if (!['ran', 'resumed'].includes(redTeam?.status) && typeof io.settleRedTeamSkip === 'function') {
       try {
         const isHead = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
-        let head = [seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev, seatsBox.laneHead].find(isHead);
+        const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
+        const readHead = isHead(rev) ? rev : null;
+        let head = [readHead, seatsBox.laneHead].find(isHead);
         if (!head) {
           try {
             const live = io.readCarryEvidence?.({ repo: out.repo, pr: out.pr })?.headSha;
@@ -815,7 +818,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
           } catch { /* unavailable head escalates under a per-run unknown identity */ }
         }
         const settled = io.settleRedTeamSkip({ redTeam, repo: out.repo, pr: out.pr,
-          head: head ?? 'unknown', runId: out.runId });
+          head: head ?? 'unknown', readHead, runId: out.runId });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
         io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`);

@@ -79,7 +79,7 @@ describe('review-job red-team skip settlement', () => {
     if (redTeamOnly) expect(out.outcome).toBe('red-team-only');
     expect(f.io.runRedTeam).toHaveBeenCalledTimes(1);
     expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
-    expect(f.io.settleRedTeamSkip.mock.calls[0][0]).toMatchObject({ redTeam: skipped, repo, pr, head });
+    expect(f.io.settleRedTeamSkip.mock.calls[0][0]).toMatchObject({ redTeam: skipped, repo, pr, head, readHead: head });
     expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
     expect(f.io.runRedTeamGate.mock.calls).toEqual([[{ repo, pr }]]);
     expect(out.redTeam).toMatchObject({ status: 'skipped', outcome: 'policy-clear' });
@@ -132,6 +132,24 @@ describe('review-job red-team skip settlement', () => {
     f.io.prepareLane = () => ({ head: 'b'.repeat(40) });
     runReviewJob({ repo, pr }, f.io);
     expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ head }));
+  });
+
+  it.each([undefined, 'invalid'])('policy skip without a valid netBasis.rev cannot clear the lane head (%s)', rev => {
+    const root = mkdtempSync(join(tmpdir(), 'review-policy-read-head-'));
+    try {
+      const f = fixture(), postComment = vi.fn(), publishNeedsYou = vi.fn();
+      if (rev === undefined) delete f.loopPayload.findings.read.netBasis.rev;
+      else f.loopPayload.findings.read.netBasis.rev = rev;
+      f.io.settleRedTeamSkip.mockImplementation(input => settleRedTeamSkip({ ...input, comments: [], io: {
+        env: { WE_SHARED_RUNS_DIR: join(root, 'runs') }, postComment, publishNeedsYou,
+      } }));
+      const out = runReviewJob({ repo, pr }, f.io);
+      expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ head, readHead: null }));
+      expect(out.redTeam).toMatchObject({ outcome: 'non-policy', reason: 'policy skip head not bound to the reviewed read' });
+      expect(postComment).not.toHaveBeenCalled();
+      expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+      expect(publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ head }));
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('two real lane heads without netBasis.rev publish twice', () => {

@@ -19,7 +19,7 @@ function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'red-team-skip-regressions-'));
   roots.push(root);
   const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') };
-  const input = { repo: 'web-everything/web-everything', pr: 5872, head: 'a'.repeat(40), comments: [] };
+  const input = { repo: 'web-everything/web-everything', pr: 5872, head: 'a'.repeat(40), readHead: 'a'.repeat(40), comments: [] };
   const io = { env, postComment: vi.fn(), publishNeedsYou: vi.fn(), log: vi.fn() };
   const markerDir = join(redTeamStatusDir(env), 'skip-published');
   const markers = () => existsSync(markerDir) ? readdirSync(markerDir) : [];
@@ -207,6 +207,36 @@ describe('red-team skip pre-review regressions', () => {
     expect(f.io.postComment).not.toHaveBeenCalled();
     expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
     expect(f.io.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ head: 'unknown' }));
+  });
+
+  it.each([undefined, null, 'unknown', 'abc', 'b'.repeat(40)])('policy cannot clear an unbound reviewed read (%s)', readHead => {
+    const f = fixture();
+    expect(f.settle({ status: 'skipped', policy: 'card-only' }, { readHead })).toEqual({
+      outcome: 'non-policy', reason: 'policy skip head not bound to the reviewed read',
+    });
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(f.io.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({
+      head: f.input.head, reason: 'red team skipped (policy skip head not bound to the reviewed read); not cleared',
+    }));
+  });
+
+  it('policy read head binding is case-insensitive', () => {
+    const f = fixture();
+    expect(f.settle({ status: 'skipped', policy: 'card-only' }, { readHead: f.input.head.toUpperCase() }).outcome).toBe('policy-clear');
+    expect(f.io.postComment).toHaveBeenCalledTimes(1);
+    expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+  });
+
+  it('unknown-head skips without runId both publish with fresh attempt identities', () => {
+    const f = fixture(), path = join(f.pendingDir, '..', 'feed.jsonl');
+    f.io.publishNeedsYou.mockImplementation(item => publishAttention(item, { path }));
+    for (let n = 0; n < 2; n++) f.settle({ status: 'skipped', reason: 'missing head' }, { head: 'unknown' });
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(2);
+    expect(f.markers()).toHaveLength(2);
+    const items = replay({ path });
+    expect(items).toHaveLength(2);
+    expect(items.every(item => item.head === 'unknown')).toBe(true);
+    expect(new Set(items.map(item => item.kind)).size).toBe(2);
   });
 
   it('unknown heads deduplicate within a run but retain different attempts', () => {
