@@ -36,7 +36,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeComment, classifyEvent } from '../operations/coroner-rounds.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { sameFindingForClearing } from '../lib/jury-core.mjs';
+import { CORROBORATION_LINE_WINDOW, exactCitedPath } from '../lib/jury-core.mjs';
 import { isReviewVerdictComment, reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { takeoverMarkers, takeoverVoidRefused, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
@@ -182,60 +182,79 @@ const isOpen = (f) => !CLOSED_RULINGS.has(String(f?.ruling ?? '').toLowerCase())
 /** A trusted fixer turn that changed the PR (a re-arm, an advisory fix): the end of one review round. */
 const FIXER_TURN = /^🔧 conveyor fix —/;
 
-/** Fold one finding into a round's list: the same spot (file, line within 2) or the same file-less claim is one. */
-function mergeFinding(into, f) {
-  const same = into.find((g) => (f.file && g.file === f.file && (f.line == null || g.line == null || Math.abs(g.line - f.line) <= 2))
-    || (!f.file && !g.file && g.claim === f.claim));
-  if (same) {
-    if (f.ruling) same.ruling = f.ruling;
-    if (!same.impact && f.impact) same.impact = f.impact;
-    return;
+// Round-local observation times let explicit rulings supersede earlier reports without arrival-order dependence.
+// This private metadata is stripped from the public findings.
+const FINDING_AT = Symbol('findingAt');
+const FINDING_JACCARD_FLOOR = 0.85;
+const SECURITY_CLAIM = /\b(security|auth(?:entication|orization)?|credential|secret|token|injection|xss|csrf|privilege|permission|leak|exfiltrat)/i;
+const normalizedText = (s) => String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+const compareText = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+const compareLine = (a, b) => a == null ? (b == null ? 0 : -1) : b == null ? 1 : a - b;
+const sameClass = (a, b) => ['class', 'category'].every((key) => normalizedText(a[key]) === normalizedText(b[key]));
+
+/** Symmetric word Jaccard, retaining short words so changing e.g. "not" cannot disappear from the comparison. */
+function findingJaccard(a, b) {
+  const words = (s) => new Set(normalizedText(s).split(/[^a-z0-9_]+/).filter(Boolean));
+  const A = words(a), B = words(b);
+  if (!A.size || !B.size) return 0;
+  const shared = [...A].filter((word) => B.has(word)).length;
+  return shared / (A.size + B.size - shared);
+}
+
+/** A ruling only supersedes an earlier observation of this exact instance, never a fuzzy neighbour. */
+function sameRulingInstance(a, b) {
+  return exactCitedPath(a.file) === exactCitedPath(b.file) && a.line === b.line
+    && normalizedText(a.claim) === normalizedText(b.claim) && sameClass(a, b)
+    && normalizedText(a.impact) === normalizedText(b.impact)
+    && isGateHoldFinding(a) === isGateHoldFinding(b);
+}
+
+function findingsMatch(a, b) {
+  if (findingWeight(a) !== findingWeight(b)
+    || normalizedText(a.impact) !== normalizedText(b.impact)
+    || normalizedText(a.ruling) !== normalizedText(b.ruling) || !sameClass(a, b)) return false;
+  if (exactCitedPath(a.file) !== exactCitedPath(b.file)) return false;
+  if (a.line != null && b.line != null && Math.abs(a.line - b.line) > CORROBORATION_LINE_WINDOW) return false;
+  const exact = normalizedText(a.claim) === normalizedText(b.claim);
+  if (isGateHoldFinding(a) || isGateHoldFinding(b)) {
+    // A gate hold can only dedupe an identical hold, including its citation.
+    return isGateHoldFinding(a) && isGateHoldFinding(b) && a.line === b.line && exact;
   }
-  into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null });
+  if (!a.file || !b.file || SECURITY_CLAIM.test(a.claim) || SECURITY_CLAIM.test(b.claim)) return exact;
+  return exact || findingJaccard(a.claim, b.claim) >= FINDING_JACCARD_FLOOR;
 }
 
 /**
- * PURE: consolidate open, file-citing findings into connected components of the shared clearing identity,
- * ignoring severity. Compare every pair so a chain of matching members has the same result in any order.
- * Anchor at the smallest line (null first), then claim; take ruling and impact together from the heaviest
- * member. Equal weights use the same deterministic member ordering, with ruling and impact breaking ties.
- * File-less findings pass through untouched. Call only AFTER closed findings have been removed.
+ * PURE: resolve explicit later rulings on exact instances, then group all raw open observations once.
+ * Sort by file, line (null first), claim and severity/class tie-breakers; greedily add to the first group
+ * matching EVERY member. This deterministic complete linkage cannot bridge distant or dissimilar defects.
+ * Members must share weight, impact, ruling and any parsed class/category; the first sorted member anchors
+ * each group. Closed findings never enter a group, and cannot clear a later open observation.
  */
 export function consolidateFindings(findings) {
-  const compareText = (a, b) => a < b ? -1 : a > b ? 1 : 0;
-  const compareLine = (a, b) => a == null ? (b == null ? 0 : -1) : b == null ? 1 : a - b;
-  const compareAnchor = (a, b) => compareLine(a.line, b.line) || compareText(a.claim, b.claim);
-  const members = findings.filter((f) => f.file).sort((a, b) => compareAnchor(a, b)
-    || compareText(a.file, b.file) || compareText(a.ruling ?? '', b.ruling ?? '') || compareText(a.impact ?? '', b.impact ?? ''));
-  const parents = members.map((_, i) => i);
-  const root = (i) => {
-    while (parents[i] !== i) {
-      parents[i] = parents[parents[i]];
-      i = parents[i];
-    }
-    return i;
-  };
-  for (let i = 0; i < members.length; i++) {
-    for (let j = i + 1; j < members.length; j++) {
-      const a = members[i], b = members[j];
-      const missingLine = a.line == null || b.line == null;
-      if (sameFindingForClearing(
-        { file: a.file, line: missingLine ? null : a.line, summary: a.claim },
-        { file: b.file, line: missingLine ? null : b.line, summary: b.claim },
-      )) parents[root(j)] = root(i);
-    }
+  const open = findings.map((f) => {
+    if (!isOpen(f) || !Number.isFinite(f[FINDING_AT])) return f;
+    const later = findings.filter((g) => g.ruling && g[FINDING_AT] > f[FINDING_AT] && sameRulingInstance(f, g));
+    const latestAt = later.reduce((at, g) => Math.max(at, g[FINDING_AT]), -Infinity);
+    const latest = later.filter((g) => g[FINDING_AT] === latestAt);
+    // Conflicting simultaneous rulings provide no ordering evidence: retain the open finding.
+    return latest.length && latest.every((g) => normalizedText(g.ruling) === normalizedText(latest[0].ruling))
+      ? { ...f, ruling: latest[0].ruling } : f;
+  }).filter(isOpen).map((f) => {
+    const { [FINDING_AT]: at, ...finding } = f;
+    return finding;
+  });
+  const compare = (a, b) => compareText(a.file ?? '', b.file ?? '') || compareLine(a.line, b.line)
+    || compareText(a.claim, b.claim) || compareText(a.impact ?? '', b.impact ?? '')
+    || compareText(a.ruling ?? '', b.ruling ?? '') || compareText(a.class ?? '', b.class ?? '')
+    || compareText(a.category ?? '', b.category ?? '');
+  const groups = [];
+  for (const member of open.sort(compare)) {
+    const group = groups.find((members) => members.every((other) => findingsMatch(member, other)));
+    if (group) group.push(member);
+    else groups.push([member]);
   }
-  const components = new Map();
-  for (let i = 0; i < members.length; i++) {
-    const key = root(i), member = members[i];
-    const component = components.get(key);
-    if (!component) components.set(key, { anchor: member, heaviest: member });
-    else if (findingWeight(member) > findingWeight(component.heaviest)) component.heaviest = member;
-  }
-  return [
-    ...findings.filter((f) => !f.file),
-    ...[...components.values()].map(({ anchor, heaviest }) => ({ ...anchor, ruling: heaviest.ruling, impact: heaviest.impact })),
-  ].sort((a, b) => compareText(a.file ?? '', b.file ?? '') || compareAnchor(a, b));
+  return groups.map(([anchor]) => anchor);
 }
 
 /**
@@ -300,10 +319,14 @@ export function reviewRounds(comments) {
     }
     r.end = it.t;
     if (it.concluded) r.concluded = true;
-    for (const f of it.ev.findings ?? []) mergeFinding(r.findings, f);
+    for (const f of it.ev.findings ?? []) r.findings.push({
+      file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null,
+      ...(f.class != null ? { class: f.class } : {}), ...(f.category != null ? { category: f.category } : {}),
+      [FINDING_AT]: it.t,
+    });
   }
   close();
-  for (const r of rounds) r.findings = consolidateFindings(r.findings.filter(isOpen));
+  for (const r of rounds) r.findings = consolidateFindings(r.findings);
   return rounds;
 }
 
