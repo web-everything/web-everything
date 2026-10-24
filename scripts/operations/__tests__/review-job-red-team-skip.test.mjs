@@ -303,10 +303,12 @@ describe('review-job red-team skip settlement', () => {
       });
       const out = runReviewJob({ repo, pr, redTeamOnly }, f.io);
       expect(f.io.runRedTeam).toHaveBeenCalledOnce();
-      expect(f.io.settleRedTeamSkip).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
+      expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({
         redTeam: { status: 'not-owed', reason: 'red team reported not-owed on an accepted head' }, repo, pr, head,
       }));
-      expect(publishNeedsYou).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+      expect(publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({
         repo, pr, head, reason: 'red team skipped (red team reported not-owed on an accepted head); not cleared',
       }));
       expect(postComment).not.toHaveBeenCalled();
@@ -323,7 +325,8 @@ describe('review-job red-team skip settlement', () => {
     });
     f.io.settleRedTeamSkip.mockImplementation(() => { f.events.push('settle'); return { outcome: 'non-policy' }; });
     const out = runReviewJob({ repo, pr, redTeamOnly }, f.io);
-    expect(f.io.settleRedTeamSkip).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({
       redTeam: { status: 'error', reason: 'unprintable error' }, repo, pr, head,
     }));
     expect(out.redTeam).toMatchObject({ status: 'error', reason: 'unprintable error', outcome: 'non-policy' });

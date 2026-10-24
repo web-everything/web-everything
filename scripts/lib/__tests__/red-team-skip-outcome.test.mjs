@@ -178,7 +178,8 @@ describe('settleRedTeamSkip', () => {
       throw Error('feed unavailable');
     });
     expect(f.settle()).toEqual({ outcome: 'non-policy' });
-    expect(f.io.publishNeedsYou).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    expect(f.io.publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(f.io.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({
       repo, pr, head, reason: `red team skipped (${reason}); not cleared`,
     }));
     // Assert outside the IO callback: settlement intentionally catches publication failures.
