@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { platformPreference, resolveCascade } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { DIRTY_PROBE_ARGS, hasHiddenIndexFlags, laneGitEnv } from './git-transport-branch.mjs';
-import { hardenLaneGitArgs, laneGitHardeningEnv, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from './lane-git-hardening.mjs';
+import { hardenLaneGitArgs, laneGitHardeningEnv, scrubInheritedGitEnv, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from './lane-git-hardening.mjs';
 
 export function resolveLaneScanPolicy({ env = process.env,
   platform = platformPreference('healthWatch', { env }), tool = readDeclaredSettings().settings?.healthWatch,
@@ -78,12 +78,10 @@ export function laneRedirectConfig(listOutput) {
 
 /** Env every lane probe git runs under, on top of the repo's lane hardening. */
 export function laneProbeEnv(path) {
-  const env = laneGitEnv(path);
-  // Command-scope parameters outrank the indexed pins. Drop every inherited override before installing our own,
-  // including orphaned indexed entries and malformed counts; none is trusted input to a safety probe.
-  for (const key of Object.keys(env)) {
-    if (/^GIT_CONFIG_(PARAMETERS|COUNT|KEY_.*|VALUE_.*)$/.test(key)) delete env[key];
-  }
+  // Command-scope parameters outrank the indexed pins, and GIT_CONFIG_GLOBAL/SYSTEM/GIT_CONFIG can re-scope the lane's own
+  // keys. Drop every inherited override and location variable before installing our own pins; none is trusted input to a
+  // safety probe.
+  const env = scrubInheritedGitEnv(laneGitEnv(path));
   return { ...laneGitHardeningEnv(env), GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0',
     GIT_NO_LAZY_FETCH: '1' };
 }

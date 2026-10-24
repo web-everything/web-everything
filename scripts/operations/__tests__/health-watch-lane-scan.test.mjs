@@ -48,6 +48,26 @@ describe('operator send-back regressions', () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it('drops every inherited Git config/location override; only lane pins and GIT_CONFIG_NOSYSTEM remain', () => {
+    const inherited = { GIT_CONFIG_GLOBAL: '/foreign/global', GIT_CONFIG_SYSTEM: '/foreign/system', GIT_CONFIG: '/foreign/config',
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.worktree', GIT_CONFIG_VALUE_0: '/foreign',
+      GIT_CONFIG_PARAMETERS: "'core.fsmonitor=marker'", GIT_DIR: '/foreign/.git', GIT_COMMON_DIR: '/foreign/common',
+      GIT_WORK_TREE: '/foreign', GIT_INDEX_FILE: '/foreign/index', GIT_OBJECT_DIRECTORY: '/foreign/objects',
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: '/foreign/alt', GIT_NAMESPACE: 'foreign' };
+    for (const [key, value] of Object.entries(inherited)) vi.stubEnv(key, value);
+    try {
+      const env = laneProbeEnv('/fixture/lane');
+      for (const key of Object.keys(inherited)) {
+        if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(key)) continue; // replaced by the lane pins, asserted below
+        expect(env, key).not.toHaveProperty(key);
+      }
+      const config = Object.fromEntries(Object.entries(env).filter(([key]) => /^GIT_CONFIG/.test(key)));
+      expect(config).toEqual({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: String(LANE_GIT_CONFIG_PINS.length),
+        ...Object.fromEntries(LANE_GIT_CONFIG_PINS.flatMap(([key, value], i) =>
+          [[`GIT_CONFIG_KEY_${i}`, key], [`GIT_CONFIG_VALUE_${i}`, value]])) });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   const cachedReader = (initial = {}) => {
     const lane = { path: '/fixture/lane-1', clean: true,
       lease: { workerSession: 'old-worker', pid: 10, agentPid: 11 }, ...initial };
@@ -569,6 +589,22 @@ describe('lane action guard with real Git', () => {
       expect(guardLaneAction({ path, action, log: vi.fn() }))
         .toMatchObject({ act: false, fresh: { hasUnsafeWork: true } });
     }
+  });
+
+  it('stays unsafe for a lane-local filter even when inherited GIT_CONFIG_GLOBAL points at the lane config', () => {
+    const { path, git } = fixture();
+    const marker = join(temp(), 'executed');
+    writeFileSync(join(path, '.gitattributes'), 'tracked.txt filter=marker\n');
+    writeFileSync(join(path, 'tracked.txt'), 'modified content\n');
+    git(['config', 'filter.marker.clean', `echo executed >> '${marker}'`]);
+    // Re-scopes the lane's local keys to "global", which laneFilterDrivers ignores unless the probe env drops it.
+    vi.stubEnv('GIT_CONFIG_GLOBAL', join(path, '.git', 'config'));
+    vi.stubEnv('GIT_CONFIG_SYSTEM', join(path, '.git', 'config'));
+    try {
+      expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'lane Git filter drivers present' });
+      expect(guardLaneAction({ path, action: 'reclaim', log: vi.fn() }).act).toBe(false);
+      expect(existsSync(marker)).toBe(false);
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it.each(['clean', 'smudge', 'process'])('refuses a lane-local %s filter without executing it', driver => {

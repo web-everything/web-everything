@@ -27,6 +27,29 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
 /** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line. */
 export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => ['-c', `${k}=${v}`]);
 
+/** Inherited variables that choose WHICH config, repository or object store git reads. Inherited, none is trusted by a
+ *  process that inspects an agent-writable lane: `GIT_CONFIG_GLOBAL` pointed at the lane's own config re-scopes its
+ *  `filter.*` / redirect keys to "global", which {@link laneFilterDrivers} ignores. */
+const INHERITED_GIT_LOCATION_VARS = Object.freeze(['GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_PARAMETERS',
+  'GIT_CONFIG_COUNT', 'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE']);
+const INHERITED_GIT_INDEXED_CONFIG_RE = /^GIT_CONFIG_(KEY|VALUE)_.*$/;
+
+/**
+ * A copy of `env` with every inherited git config override and repository-location variable removed, including orphaned
+ * or malformed `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` entries. Run it BEFORE {@link laneGitHardeningEnv} so the pins are
+ * the only command-scope config. Pure.
+ * @param {Record<string,string|undefined>} env
+ * @returns {Record<string,string|undefined>}
+ */
+export function scrubInheritedGitEnv(env = process.env) {
+  const out = { ...env };
+  for (const key of Object.keys(out)) {
+    if (INHERITED_GIT_LOCATION_VARS.includes(key) || INHERITED_GIT_INDEXED_CONFIG_RE.test(key)) delete out[key];
+  }
+  return out;
+}
+
 /**
  * `env` with the pins appended to git's environment config list. An existing `GIT_CONFIG_COUNT` is preserved (the pins
  * come AFTER its entries, so they win). `GIT_EXTERNAL_DIFF` is dropped: an inherited one would run on every `git diff`.
