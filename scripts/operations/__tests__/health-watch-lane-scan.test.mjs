@@ -493,10 +493,11 @@ describe('untrusted lane Git configuration', () => {
   });
 
   it('hardens every probe and reads filter configuration before examining the worktree', () => {
-    const exec = vi.fn((bin, argv) => argv[0] === 'rev-list' ? '0\n' : '');
+    const exec = vi.fn((bin, argv) => argv[0] === 'rev-list' ? '0\n' : argv[0] === 'rev-parse' ? '.git/info/grafts\n' : '');
     expect(freshLaneSafety({ path: '/fixture/lane', exec }).hasUnsafeWork).toBe(false);
     expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([
       [...LANE_CONFIG_LIST_ARGS], ['ls-files', '--stage', '-z'], [...DIRTY_PROBE_ARGS], ['ls-files', '-v'], ['stash', 'list', '--no-show-signature'],
+      ['rev-parse', '--git-path', 'info/grafts'],
       ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin'],
     ]);
     for (const [, , { env }] of exec.mock.calls) {
@@ -619,7 +620,7 @@ describe('lane action guard with real Git', () => {
   });
 
   it('refuses a lane whose grafts path cannot be resolved (fail closed)', () => {
-    const exec = vi.fn((bin, argv) => argv[0] === 'rev-parse' ? '' : argv[0] === 'status' ? '' : '0\n');
+    const exec = vi.fn((bin, argv) => argv[0] === 'rev-list' ? '0\n' : '');
     expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({ hasUnsafeWork: true, reason: 'lane grafts path unreadable' });
   });
 
