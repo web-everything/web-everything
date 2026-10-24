@@ -1,0 +1,504 @@
+// @vitest-environment node
+// RED contract: runner-fallback.mjs is deliberately not supplied by this change.
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { resetCascadeLogForTest, resolveCascade } from '../../lib/policy-cascade.mjs';
+import {
+  RUNNER_FALLBACK_POLICY, resolveRunnerFallbackSettings, decideRunnerFallback,
+  evaluatePreflight, formatFeedLine, runRunnerFallback, main,
+} from '../runner-fallback.mjs';
+
+// A missed injection must fail locally, never spawn gh (including through gh-throttle).
+vi.mock('node:child_process', async (importOriginal) => {
+  const original = await importOriginal();
+  const forbidden = () => { throw new Error('Uninjected subprocess in runner-fallback test'); };
+  return { ...original, exec: forbidden, execSync: forbidden, execFile: forbidden,
+    execFileSync: forbidden, spawn: forbidden, spawnSync: forbidden, fork: forbidden };
+});
+
+const REPO = 'owner/public-repo';
+const NOW_ISO = '2026-10-24T12:00:00.000Z';
+const NOW = Date.parse(NOW_ISO);
+const SETTINGS = Object.freeze({ queuedMinutes: 10, fallbackRunner: 'ubuntu-latest' });
+const GROUP = Object.freeze({ name: 'larger-runners', allows_public_repositories: true });
+const dirs = [];
+let savedExitCode;
+
+beforeEach(() => {
+  resetCascadeLogForTest();
+  savedExitCode = process.exitCode;
+  process.exitCode = 0;
+});
+afterEach(() => {
+  process.exitCode = savedExitCode;
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function temp() {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-fallback-'));
+  dirs.push(dir);
+  return dir;
+}
+const ago = minutes => new Date(NOW - minutes * 60000).toISOString();
+function job(overrides = {}) {
+  return { runId: 101, jobId: 1001, name: 'test-shard (1)', status: 'queued',
+    labels: ['we-8core'], createdAt: ago(11), startedAt: null, runnerName: null, ...overrides };
+}
+function decide(jobs, overrides = {}) {
+  return decideRunnerFallback({ jobs, runnerVar: 'we-8core', settings: SETTINGS, now: NOW, ...overrides });
+}
+function preflight(overrides = {}) {
+  return evaluatePreflight({ runnerVar: 'we-8core', repoVisibility: 'public',
+    runnerGroup: GROUP, settings: SETTINGS, ...overrides });
+}
+const planned = (runIds = [101], value = 'ubuntu-latest') => ({
+  setVariable: { name: 'WE_SHARD_RUNNER', value }, cancel: runIds, rerun: runIds,
+});
+
+// Same suffix boundary as operations/needs-you-feed.mjs#parseFeedLine: braces in
+// the human reason must not be mistaken for the event JSON, whose first key is at.
+function parseEvent(line) {
+  expect(line).toMatch(/^NEEDS-YOU owner\/public-repo#\d+ [\w-]+: .+/);
+  const start = line.lastIndexOf(' {"at":');
+  expect(start).toBeGreaterThan(0);
+  const event = JSON.parse(line.slice(start + 1));
+  expect(event).toMatchObject({ at: NOW_ISO, repo: REPO });
+  return event;
+}
+function feedLines(path) {
+  return existsSync(path) ? readFileSync(path, 'utf8').trimEnd().split('\n').filter(Boolean) : [];
+}
+function snapshot(dir) {
+  return readdirSync(dir, { recursive: true }).sort().map(name => [name, readFileSync(join(dir, name), 'utf8')]);
+}
+
+// IO fixtures inject the var reader and preflight evidence. Only job discovery
+// uses gh reads. Mutations use the repo's exec(cmd, argv, options) convention.
+function harness({ jobs = [job()], runnerVar = 'we-8core', runnerGroup = GROUP,
+  repoVisibility = 'public', failVariableSet = false } = {}) {
+  const dir = temp();
+  const feedPath = join(dir, 'events.jsonl');
+  const mutations = [];
+  const exec = vi.fn((cmd, args, options = {}) => {
+    expect(cmd).toBe('gh');
+    expect(Array.isArray(args)).toBe(true);
+    expect(args.every(arg => typeof arg === 'string')).toBe(true);
+    expect(options.shell).not.toBe(true);
+    if (args[0] === 'variable' && args[1] === 'set') {
+      mutations.push([...args]);
+      if (failVariableSet) throw new Error('variable-set denied by fixture');
+      return '';
+    }
+    if (args[0] === 'run' && ['cancel', 'rerun'].includes(args[1])) {
+      mutations.push([...args]);
+      return '';
+    }
+    if (args[0] === 'run' && args[1] === 'list') {
+      return JSON.stringify([...new Set(jobs.map(j => j.runId ?? j.run_id))]
+        .map(databaseId => ({ databaseId, status: 'queued' })));
+    }
+    if (args[0] === 'api') {
+      const endpoint = args.find(arg => /\/actions\/runs\/\d+\/jobs(?:\?|$)/.test(arg));
+      if (endpoint) {
+        const runId = Number(/\/runs\/(\d+)\/jobs/.exec(endpoint)[1]);
+        return JSON.stringify({ jobs: jobs.filter(j => (j.runId ?? j.run_id) === runId).map(j => ({
+          id: j.jobId, run_id: j.runId, name: j.name, status: j.status, labels: j.labels,
+          created_at: j.createdAt, started_at: j.startedAt, runner_name: j.runnerName,
+        })) });
+      }
+    }
+    throw new Error(`Unexpected gh argv: ${JSON.stringify(args)}`);
+  });
+  const log = vi.fn();
+  const options = { repo: REPO, exec, now: NOW, feedPath, settings: SETTINGS,
+    readRunnerVar: vi.fn(() => runnerVar), repoVisibility, runnerGroup, log,
+    env: {}, platform: null };
+  return { dir, feedPath, exec, mutations, log, options };
+}
+
+describe('runner fallback policy cascade', () => {
+  it('exports the standard defaults and resolves them with standard provenance', () => {
+    expect(RUNNER_FALLBACK_POLICY).toEqual(SETTINGS);
+    expect(resolveRunnerFallbackSettings({ env: {}, platform: null, log: vi.fn() }))
+      .toMatchObject({ ...SETTINGS, sources: { queuedMinutes: 'standard', fallbackRunner: 'standard' } });
+  });
+
+  it('honours platform preferences independently for each leaf', () => {
+    expect(resolveRunnerFallbackSettings({ env: {}, platform: { queuedMinutes: 7 }, log: vi.fn() }))
+      .toMatchObject({ queuedMinutes: 7, fallbackRunner: 'ubuntu-latest',
+        sources: { queuedMinutes: 'platform', fallbackRunner: 'standard' } });
+  });
+
+  it('resolves the tool layer above platform and below environment', () => {
+    // `tool` is the injected settings block; no host settings file is read.
+    const platform = { queuedMinutes: 7, fallbackRunner: 'platform-runner' };
+    const tool = { queuedMinutes: 6, fallbackRunner: 'tool-runner' };
+    const env = { WE_RUNNER_FALLBACK_RUNNER: 'env-runner' };
+    const expected = resolveCascade({ standard: SETTINGS, platform, tool,
+      envValues: { fallbackRunner: 'env-runner' } });
+    expect(resolveRunnerFallbackSettings({ env, platform, tool, log: vi.fn() }))
+      .toMatchObject({ ...expected.value, sources: expected.sources });
+  });
+
+  it('honours both named environment overrides above platform preferences', () => {
+    const result = resolveRunnerFallbackSettings({
+      env: { WE_RUNNER_FALLBACK_QUEUED_MINUTES: '3', WE_RUNNER_FALLBACK_RUNNER: 'ubuntu-24.04' },
+      platform: { queuedMinutes: 8, fallbackRunner: 'platform-runner' }, log: vi.fn(),
+    });
+    expect(result).toMatchObject({ queuedMinutes: 3, fallbackRunner: 'ubuntu-24.04',
+      sources: { queuedMinutes: 'env', fallbackRunner: 'env' } });
+  });
+
+  it.each(['0', '-1', '1.5', 'garbage', '3minutes', 'Infinity'])
+  ('reports invalid env queuedMinutes=%s and retains the valid lower platform layer', value => {
+    const log = vi.fn();
+    const result = resolveRunnerFallbackSettings({
+      env: { WE_POLICY_CASCADE_LOG: '1', WE_RUNNER_FALLBACK_QUEUED_MINUTES: value },
+      platform: { queuedMinutes: 7 }, log,
+    });
+    expect(result).toMatchObject({ queuedMinutes: 7, sources: { queuedMinutes: 'platform' } });
+    expect(log.mock.calls.flat().join('\n')).toMatch(/invalid.*queuedMinutes|queuedMinutes.*invalid/i);
+  });
+
+  it.each([0, -2, 1.5])('reports invalid platform queuedMinutes=%s and retains the standard', queuedMinutes => {
+    const log = vi.fn();
+    const result = resolveRunnerFallbackSettings({ env: { WE_POLICY_CASCADE_LOG: '1' },
+      platform: { queuedMinutes }, log });
+    expect(result).toMatchObject({ queuedMinutes: 10, sources: { queuedMinutes: 'standard' } });
+    expect(log.mock.calls.flat().join('\n')).toMatch(/invalid.*queuedMinutes|queuedMinutes.*invalid/i);
+  });
+
+  it.each(['', '   '])('reports an empty env runner %j and retains the platform runner', fallbackRunner => {
+    const log = vi.fn();
+    const result = resolveRunnerFallbackSettings({
+      env: { WE_POLICY_CASCADE_LOG: '1', WE_RUNNER_FALLBACK_RUNNER: fallbackRunner },
+      platform: { fallbackRunner: 'ubuntu-24.04' }, log,
+    });
+    expect(result).toMatchObject({ fallbackRunner: 'ubuntu-24.04', sources: { fallbackRunner: 'platform' } });
+    expect(log.mock.calls.flat().join('\n')).toMatch(/invalid.*fallbackRunner|fallbackRunner.*invalid/i);
+  });
+
+  it('reports an empty platform runner and retains the standard runner', () => {
+    const log = vi.fn();
+    const result = resolveRunnerFallbackSettings({ env: { WE_POLICY_CASCADE_LOG: '1' },
+      platform: { fallbackRunner: '' }, log });
+    expect(result).toMatchObject({ fallbackRunner: 'ubuntu-latest', sources: { fallbackRunner: 'standard' } });
+    expect(log.mock.calls.flat().join('\n')).toMatch(/invalid.*fallbackRunner|fallbackRunner.*invalid/i);
+  });
+
+  it('logs effective values and sources once for the same resolved settings', () => {
+    const log = vi.fn();
+    const options = { env: { WE_POLICY_CASCADE_LOG: '1' }, platform: { queuedMinutes: 4 }, log };
+    resolveRunnerFallbackSettings(options);
+    resolveRunnerFallbackSettings(options);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toMatch(/queuedMinutes=4 \(platform\)/);
+    expect(log.mock.calls[0][0]).toMatch(/fallbackRunner="ubuntu-latest" \(standard\)/);
+  });
+
+  it('keeps the only literal threshold and default runner inside the policy defaults object', () => {
+    const source = readFileSync(new URL('../runner-fallback.mjs', import.meta.url), 'utf8');
+    expect(source.match(/\b10\b/g)).toHaveLength(1);
+    expect(source.match(/(['"`])ubuntu-latest\1/g)).toHaveLength(1);
+    const declaration = source.slice(source.indexOf('export const RUNNER_FALLBACK_POLICY'));
+    const defaults = /\{[^{}]*\}/.exec(declaration)?.[0];
+    expect(defaults).toMatch(/queuedMinutes\s*:\s*10\b/);
+    expect(defaults).toMatch(/fallbackRunner\s*:\s*(['"`])ubuntu-latest\1/);
+  });
+});
+
+describe('decideRunnerFallback (pure)', () => {
+  it('takes no action when there are no jobs', () => {
+    expect(decide([])).toMatchObject({ decision: 'no-action', stuck: [], runIds: [] });
+  });
+
+  it('falls back for an eleven-minute queued paid shard and identifies its evidence', () => {
+    expect(decide([job()])).toMatchObject({ decision: 'fallback', reason: expect.any(String),
+      stuck: [{ runId: 101, jobId: 1001, name: 'test-shard (1)', queuedMinutes: 11 }],
+      setVariableTo: 'ubuntu-latest', runIds: [101] });
+  });
+
+  it('deduplicates and numerically sorts stuck run IDs', () => {
+    expect(decide([job({ runId: 20 }), job({ runId: 3, jobId: 1002 }),
+      job({ runId: 20, jobId: 1003 }), job({ runId: 11, jobId: 1004 })]).runIds).toEqual([3, 11, 20]);
+  });
+
+  it('does not fall back for a nine-minute queue', () => {
+    expect(decide([job({ createdAt: ago(9) })]).decision).toBe('no-action');
+  });
+
+  it('recognizes an in-progress job on the same label as saturation', () => {
+    const result = decide([job(), job({ jobId: 1002, status: 'in_progress', startedAt: ago(20) })]);
+    expect(result.decision).toBe('no-action');
+    expect(result.reason).toMatch(/saturat/i);
+  });
+
+  it('does not fall back when a job on the same label started within the window', () => {
+    const result = decide([job(), job({ jobId: 1002, status: 'completed', startedAt: ago(2) })]);
+    expect(result.decision).toBe('no-action');
+  });
+
+  it('allows fallback when the only completed job started before the window', () => {
+    expect(decide([job(), job({ jobId: 1002, status: 'completed', startedAt: ago(20) })]).decision).toBe('fallback');
+  });
+
+  it('does not mistake work on another label for paid-runner saturation', () => {
+    expect(decide([job(), job({ jobId: 1002, labels: ['other-runner'],
+      status: 'in_progress', startedAt: ago(1) })]).decision).toBe('fallback');
+  });
+
+  it('never loops or flips back to paid when already using the fallback', () => {
+    expect(decide([job({ labels: ['ubuntu-latest'] })], { runnerVar: 'ubuntu-latest' }).decision).toBe('no-action');
+  });
+
+  it.each(['', undefined, null])('takes no action with an empty or unset runner var %j', runnerVar => {
+    expect(decide([job()], { runnerVar }).decision).toBe('no-action');
+  });
+
+  it('honours a custom three-minute threshold and custom fallback runner', () => {
+    expect(decide([job({ createdAt: ago(4) })], {
+      settings: { queuedMinutes: 3, fallbackRunner: 'ubuntu-24.04' },
+    })).toMatchObject({ decision: 'fallback', setVariableTo: 'ubuntu-24.04', runIds: [101] });
+  });
+
+  it('honours the custom threshold on the no-action path', () => {
+    expect(decide([job({ createdAt: ago(2) })], {
+      settings: { queuedMinutes: 3, fallbackRunner: 'ubuntu-24.04' },
+    }).decision).toBe('no-action');
+  });
+
+  it('does not loop when already using a custom fallback', () => {
+    expect(decide([job({ labels: ['ubuntu-24.04'] })], { runnerVar: 'ubuntu-24.04',
+      settings: { queuedMinutes: 3, fallbackRunner: 'ubuntu-24.04' } }).decision).toBe('no-action');
+  });
+
+  it('ignores long queues on other labels', () => {
+    expect(decide([job({ labels: ['other-runner'], createdAt: ago(90) })]).decision).toBe('no-action');
+  });
+
+  it('ignores long queues for non-shard jobs', () => {
+    expect(decide([job({ name: 'build', createdAt: ago(90) })]).decision).toBe('no-action');
+  });
+
+  it('accepts REST snake_case job IDs and timestamps', () => {
+    expect(decide([{ run_id: 101, id: 1001, name: 'test-shard (1)', status: 'queued',
+      labels: ['we-8core'], created_at: ago(11), started_at: null, runner_name: null }]))
+      .toMatchObject({ decision: 'fallback', runIds: [101],
+        stuck: [{ runId: 101, jobId: 1001, name: 'test-shard (1)', queuedMinutes: 11 }] });
+  });
+
+  it.each([undefined, null, '', 'not-a-date'])('fails closed without crashing on unreadable createdAt=%j', createdAt => {
+    const result = decide([job({ createdAt })]);
+    expect(result).toMatchObject({ decision: 'no-action', stuck: [], runIds: [] });
+    expect(result.reason).toMatch(/unreadable/i);
+  });
+
+  it('ignores unreadable timestamps while retaining independently valid stuck evidence', () => {
+    const result = decide([job({ jobId: 1002, runId: 202, createdAt: 'garbage' }), job()]);
+    expect(result).toMatchObject({ decision: 'fallback', runIds: [101],
+      stuck: [{ runId: 101, jobId: 1001, name: 'test-shard (1)', queuedMinutes: 11 }] });
+  });
+
+  it('does not mutate the supplied jobs or settings', () => {
+    const jobs = [Object.freeze({ ...job(), labels: Object.freeze(['we-8core']) })];
+    Object.freeze(jobs);
+    const before = JSON.stringify(jobs);
+    decide(jobs);
+    expect(JSON.stringify(jobs)).toBe(before);
+    expect(SETTINGS).toEqual({ queuedMinutes: 10, fallbackRunner: 'ubuntu-latest' });
+  });
+});
+
+describe('evaluatePreflight (pure)', () => {
+  it('reports a public repo blocked by its named runner group', () => {
+    const result = preflight({ runnerGroup: { ...GROUP, allows_public_repositories: false } });
+    expect(result.status).toBe('blocked');
+    expect(result.reason).toContain(GROUP.name);
+  });
+
+  it('allows a group that permits public repositories', () => {
+    expect(preflight()).toMatchObject({ status: 'ok' });
+  });
+
+  it.each([undefined, null, {}, { name: 'unknown' },
+    { name: 'unknown', allows_public_repositories: 'false' }])
+  ('reports missing or unreadable group evidence %j', runnerGroup => {
+    expect(preflight({ runnerGroup })).toMatchObject({ status: 'unreadable' });
+  });
+
+  it('allows a private repo even when its group prohibits public repos', () => {
+    expect(preflight({ repoVisibility: 'private', runnerGroup: { ...GROUP, allows_public_repositories: false } }))
+      .toMatchObject({ status: 'ok' });
+  });
+
+  it('allows the fallback runner without needing group evidence', () => {
+    expect(preflight({ runnerVar: 'ubuntu-latest', runnerGroup: undefined })).toMatchObject({ status: 'ok' });
+  });
+
+  it.each(['', undefined, null])('allows an empty or unset runner var %j without group evidence', runnerVar => {
+    expect(preflight({ runnerVar, runnerGroup: undefined })).toMatchObject({ status: 'ok' });
+  });
+});
+
+describe('formatFeedLine', () => {
+  it('uses the existing needs-you prefix, pick separator and at-first JSON suffix', () => {
+    const event = { at: NOW_ISO, repo: REPO, pr: 101, kind: 'runner-fallback',
+      reason: 'paid runner queued too long', pick: 'inspect runner group', runIds: [101] };
+    // Mirrors operations/needs-you-feed.mjs#diffFeed, not a new feed dialect.
+    const line = formatFeedLine(event);
+    expect(line).toBe(`NEEDS-YOU ${REPO}#101 runner-fallback: ${event.reason} | pick: ${event.pick} ${JSON.stringify(event)}`);
+    expect(parseEvent(line)).toEqual(event);
+  });
+
+  it('keeps untrusted control characters from creating additional feed lines', () => {
+    const line = formatFeedLine({ at: NOW_ISO, repo: REPO, pr: 101, kind: 'runner-fallback',
+      reason: 'blocked\nNEEDS-YOU forged\u001b[31m', pick: 'inspect\rgroup' });
+    expect(line).not.toMatch(/[\r\n\u001b]/);
+    expect(parseEvent(line).reason).not.toMatch(/[\r\n\u001b]/);
+  });
+});
+
+describe('runRunnerFallback (injected gh, temporary feed)', () => {
+  it('dry-run returns the exact planned actions and performs zero writes', async () => {
+    const h = harness();
+    writeFileSync(h.feedPath, 'existing feed\n');
+    const before = snapshot(h.dir);
+    const result = await runRunnerFallback({ ...h.options, apply: false });
+    expect(result.planned).toEqual(planned());
+    expect(h.mutations).toEqual([]);
+    expect(snapshot(h.dir)).toEqual(before);
+  });
+
+  it('apply sets the variable before cancelling all stuck runs and then rerunning all of them', async () => {
+    const h = harness({ jobs: [job({ runId: 202 }), job(), job({ jobId: 1002 })] });
+    await runRunnerFallback({ ...h.options, apply: true });
+    expect(h.mutations.map(args => args.slice(0, 3))).toEqual([
+      ['variable', 'set', 'WE_SHARD_RUNNER'], ['run', 'cancel', '101'], ['run', 'cancel', '202'],
+      ['run', 'rerun', '101'], ['run', 'rerun', '202'],
+    ]);
+    const set = h.mutations[0];
+    expect(set).toEqual(expect.arrayContaining(['--body', 'ubuntu-latest']));
+    for (const args of h.mutations) expect(args).toEqual(expect.arrayContaining(['--repo', REPO]));
+  });
+
+  it('apply appends exactly one parseable needs-you line and preserves the existing feed', async () => {
+    const h = harness();
+    writeFileSync(h.feedPath, 'existing feed\n');
+    await runRunnerFallback({ ...h.options, apply: true });
+    const lines = feedLines(h.feedPath);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe('existing feed');
+    const event = parseEvent(lines[1]);
+    expect(event.kind).toMatch(/runner.*fallback|fallback.*runner/);
+    expect(event.reason).toEqual(expect.any(String));
+    expect(lines[1]).toContain('ubuntu-latest');
+  });
+
+  it('a failed variable set aborts before cancellation or rerun and reports the failure', async () => {
+    const h = harness({ failVariableSet: true });
+    await runRunnerFallback({ ...h.options, apply: true });
+    expect(h.mutations.map(args => args.slice(0, 3))).toEqual([['variable', 'set', 'WE_SHARD_RUNNER']]);
+    expect(h.log.mock.calls.flat().join('\n')).toContain('variable-set denied by fixture');
+  });
+
+  it('a blocked preflight appends one needs-you line even without stuck jobs', async () => {
+    const h = harness({ jobs: [], runnerGroup: { ...GROUP, allows_public_repositories: false } });
+    await runRunnerFallback({ ...h.options, apply: true });
+    const lines = feedLines(h.feedPath);
+    expect(lines).toHaveLength(1);
+    expect(parseEvent(lines[0]).reason).toContain(GROUP.name);
+    expect(h.mutations).toEqual([]);
+  });
+
+  it('deduplicates the same blocked preflight across two invocations', async () => {
+    const h = harness({ jobs: [], runnerGroup: { ...GROUP, allows_public_repositories: false } });
+    await runRunnerFallback({ ...h.options, apply: true });
+    await runRunnerFallback({ ...h.options, apply: true });
+    expect(feedLines(h.feedPath)).toHaveLength(1);
+    expect(parseEvent(feedLines(h.feedPath)[0]).reason).toContain(GROUP.name);
+  });
+
+  it('a blocked preflight in dry-run appends no feed and makes no mutations', async () => {
+    const h = harness({ jobs: [], runnerGroup: { ...GROUP, allows_public_repositories: false } });
+    await runRunnerFallback({ ...h.options, apply: false });
+    expect(h.mutations).toEqual([]);
+    expect(snapshot(h.dir)).toEqual([]);
+  });
+
+  it('reports unreadable preflight evidence without using it alone to trigger fallback', async () => {
+    const h = harness({ jobs: [], runnerGroup: null });
+    const result = await runRunnerFallback({ ...h.options, apply: true });
+    expect(JSON.stringify(result) + h.log.mock.calls.flat().join('\n')).toMatch(/unreadable/i);
+    expect(h.mutations).toEqual([]);
+  });
+
+  it('no-action appends nothing and makes no mutations', async () => {
+    const h = harness({ jobs: [job({ createdAt: ago(9) })] });
+    await runRunnerFallback({ ...h.options, apply: true });
+    expect(h.mutations).toEqual([]);
+    expect(snapshot(h.dir)).toEqual([]);
+  });
+
+  it('all gh calls use the injected executor with argv arrays and no shell', async () => {
+    const h = harness();
+    await runRunnerFallback({ ...h.options, apply: true });
+    expect(h.exec).toHaveBeenCalled();
+    for (const [cmd, args, options] of h.exec.mock.calls) {
+      expect(cmd).toBe('gh');
+      expect(Array.isArray(args)).toBe(true);
+      expect(options?.shell).not.toBe(true);
+    }
+  });
+});
+
+describe('main offline simulation', () => {
+  async function simulate(flags) {
+    const h = harness();
+    const input = join(h.dir, 'jobs.json');
+    writeFileSync(input, JSON.stringify([job()]));
+    const before = snapshot(h.dir);
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw new Error(`Unexpected process.exit(${code})`); });
+    const exec = vi.fn(() => { throw new Error('Offline simulation must not invoke gh'); });
+    const readRunnerVar = vi.fn(() => { throw new Error('Offline runner var must come from argv'); });
+    const result = await main([`--repo=${REPO}`, `--input=${input}`, '--runner-var=we-8core',
+      `--now=${NOW_ISO}`, '--repo-visibility=public', '--group-allows-public=false', '--json', ...flags],
+    { ...h.options, exec, readRunnerVar });
+    // main may return an exit status or set process.exitCode; neither needs a child process.
+    const code = typeof result === 'number' ? result : process.exitCode;
+    return { h, before, code, exec, readRunnerVar, exit,
+      stdout: stdout.mock.calls.map(([s]) => String(s)).join(''),
+      stderr: stderr.mock.calls.map(([s]) => String(s)).join('') };
+  }
+
+  it('defaults to dry-run and prints the exact simulated planned fallback with exit zero', async () => {
+    const s = await simulate([]);
+    expect(s.code).toBe(0);
+    expect(JSON.parse(s.stdout).planned).toEqual(planned());
+    expect(s.exec).not.toHaveBeenCalled();
+    expect(s.readRunnerVar).not.toHaveBeenCalled();
+    expect(snapshot(s.h.dir)).toEqual(s.before);
+  });
+
+  it('accepts explicit --dry-run for an offline simulation without any writes', async () => {
+    const s = await simulate(['--dry-run']);
+    expect(s.code).toBe(0);
+    expect(JSON.parse(s.stdout).planned).toEqual(planned());
+    expect(s.exec).not.toHaveBeenCalled();
+    expect(snapshot(s.h.dir)).toEqual(s.before);
+  });
+
+  it('refuses --apply with --input with exit two before any gh calls or writes', async () => {
+    const s = await simulate(['--apply']);
+    expect(s.code).toBe(2);
+    expect(s.stderr + s.stdout).toMatch(/apply.*input|input.*apply/i);
+    expect(s.exec).not.toHaveBeenCalled();
+    expect(s.readRunnerVar).not.toHaveBeenCalled();
+    expect(snapshot(s.h.dir)).toEqual(s.before);
+  });
+});
