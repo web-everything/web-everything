@@ -7,7 +7,10 @@ export const MAX_REMOTE_WAIT_MS = 540000;
 
 export function selectRemoteVerifyRun(runs, sha) {
   if (!Array.isArray(runs) || !fullSha(sha)) return null;
-  return runs.filter((run) => sameSha(run?.head_sha, sha))
+  // Targeted dispatches are diagnostics, not lane-gate evidence. Keep them out of
+  // both the initial selection and the final attempt re-check.
+  return runs.filter((run) => sameSha(run?.head_sha, sha)
+    && !(run.event === 'workflow_dispatch' && run.display_title === 'remote-verify (targeted)'))
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id)[0] ?? null;
 }
 

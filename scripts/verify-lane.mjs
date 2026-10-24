@@ -218,7 +218,10 @@ if (MODE === 'remote') {
     if (!match || ['.', '..'].includes(match[1]) || ['.', '..'].includes(match[2])) {
       throw new Error('Unsupported origin URL; use local verify');
     }
-    const slug = `${match[1]}/${match[2]}`;
+    const slug = 'web-everything/web-everything';
+    if (`${match[1]}/${match[2]}`.toLowerCase() !== slug) {
+      throw new Error('Remote verification requires the canonical origin; use local verify');
+    }
     const pushed = execFileSync('git', hardenLaneGitArgs(['-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
       '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never', 'ls-remote', '--heads', 'origin']), {
       cwd: REPO, encoding: 'utf8', env: GIT_ENV, timeout: 15000, maxBuffer: 2 * 1024 * 1024,

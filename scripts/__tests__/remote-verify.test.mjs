@@ -64,6 +64,20 @@ describe('selectRemoteVerifyRun — newest run for the exact full SHA', () => {
     expect(selectRemoteVerifyRun([run()], SHA.toUpperCase())?.id).toBe(123);
   });
 
+  it('newer targeted dispatch cannot hide a push lane gate or become lane evidence', () => {
+    const push = run();
+    const targeted = run({ id: 456, event: 'workflow_dispatch', display_title: 'remote-verify (targeted)',
+      created_at: new Date(T0 + 1000).toISOString() });
+    expect(selectRemoteVerifyRun([targeted, push], SHA)).toEqual(push);
+    expect(selectRemoteVerifyRun([targeted], SHA)).toBeNull();
+    // A push's title is not a reliable mode indicator on legacy runs.
+    expect(selectRemoteVerifyRun([{ ...targeted, event: 'push' }], SHA)?.id).toBe(456);
+    for (const mode of ['lane-check', 'full']) {
+      const gate = { ...targeted, display_title: `remote-verify (${mode})` };
+      expect(selectRemoteVerifyRun([push, gate], SHA)).toEqual(gate);
+    }
+  });
+
   it.each([SHA.slice(0, 7), SHA.slice(0, 39), `${SHA}0`, `${SHA.slice(0, 39)}2`, 'g'.repeat(40), '', null, undefined])(
     'never accepts a prefix, different or malformed SHA (%s)', (badSha) => {
       expect(selectRemoteVerifyRun([run({ head_sha: badSha })], SHA)).toBeNull();
@@ -205,6 +219,16 @@ describe('waitForRemoteVerify — hermetic bounded polling', () => {
     expect(opts.sleep).not.toHaveBeenCalled();
   });
 
+  it('omitted waitMs probes once without sleeping', async () => {
+    const fetchRuns = vi.fn(async () => []);
+    const clock = fakeClock();
+    expect(await waitForRemoteVerify({ sha: SHA, fetchRuns, ...clock }))
+      .toEqual({ ok: false, state: 'timeout', run: null });
+    expect(fetchRuns).toHaveBeenCalledTimes(1);
+    expect(clock.sleep).not.toHaveBeenCalled();
+    expect(clock.now()).toBe(T0);
+  });
+
   it.each([540001, 5_400_000])('caps oversized waitMs=%s at 540000 and returns the explicit timeout fallback', async (waitMs) => {
     const opts = options(vi.fn(async () => []), { waitMs, pollMs: 200000 });
     expect(await waitForRemoteVerify(opts)).toEqual({ ok: false, state: 'timeout', run: null });
@@ -297,6 +321,7 @@ describe('remote CLI — local preconditions', () => {
       let data = args.includes('view') ? 'ambient/wrong' : args.some(a => a.includes('/jobs?'))
         ? { total_count: 1, jobs: [{ name: 'verify', run_id: 123, head_sha: ${JSON.stringify(initial)},
           status: 'completed', conclusion: 'success', steps: [{ name: 'Required lane gate', status: 'completed', conclusion: 'success' }] }] }
+        : process.env.FIXTURE_ABSENT ? { total_count: 0, workflow_runs: [] }
         : { total_count: 1, workflow_runs: ${JSON.stringify([successful])} };
       if (process.env.FIXTURE_RERUN && data.workflow_runs
         && readFileSync(${JSON.stringify(calls)}, 'utf8').trim().split('\\n').length > 1) {
@@ -309,8 +334,8 @@ describe('remote CLI — local preconditions', () => {
       WE_GH_THROTTLE_LOCK_ROOT: join(root, 'throttle'), WE_GH_THROTTLE_COST_HEADERS: '0' } };
   }
 
-  it.each(['https://github.com/example/repo.git', 'git@github.com:example/repo.git',
-    'https://github.com/example/repo', 'git@github.com:example/repo'])('binds every GitHub call to origin %s despite ambient GH_REPO', (url) => {
+  it.each(['https://github.com/web-everything/web-everything.git', 'git@github.com:web-everything/web-everything.git',
+    'https://github.com/web-everything/web-everything', 'git@github.com:web-everything/web-everything'])('binds every GitHub call to canonical origin %s despite ambient GH_REPO', (url) => {
     fixture((ctx) => {
       const mock = mockRemote(ctx, url);
       const result = ctx.invoke(mock.env);
@@ -320,11 +345,40 @@ describe('remote CLI — local preconditions', () => {
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       expect(calls).toHaveLength(3);
       for (const call of calls) {
-        expect(call.repo).toBe('example/repo');
+        expect(call.repo).toBe('web-everything/web-everything');
         expect(call.args[0]).toBe('api');
-        expect(call.args.some(arg => arg.startsWith('repos/example/repo/actions/'))).toBe(true);
+        expect(call.args.some(arg => arg.startsWith('repos/web-everything/web-everything/actions/'))).toBe(true);
       }
       expect(existsSync(ctx.marker)).toBe(true);
+    });
+  }, 20000);
+
+  it.each(['https://github.com/hostile/fork.git', 'git@github.com:hostile/fork.git',
+    'https://github.com/web-everything/fork', 'https://github.com/hostile/web-everything',
+    'https://github.com/web-everything/web-everything.evil'])('refuses non-canonical GitHub origin %s before remote IO', (url) => {
+    fixture((ctx) => {
+      const mock = mockRemote(ctx, url);
+      expect(ctx.invoke(mock.env).status).toBe(2);
+      expect(existsSync(mock.calls)).toBe(false);
+      const calls = readFileSync(mock.gitCalls, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(calls.some(args => args.includes('ls-remote'))).toBe(false);
+      expect(existsSync(ctx.marker)).toBe(false);
+    });
+  }, 20000);
+
+  it('omitted --wait probes once for absent evidence without polling or a marker', () => {
+    fixture((ctx) => {
+      const mock = mockRemote(ctx, 'https://github.com/web-everything/web-everything.git');
+      const noSleep = join(ctx.root, 'no-sleep.cjs');
+      writeFileSync(noSleep, "globalThis.setTimeout = () => { throw new Error('unexpected polling sleep'); };\n");
+      const result = ctx.invoke({ ...mock.env, FIXTURE_ABSENT: '1', NODE_OPTIONS: `--require=${noSleep}` });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(2);
+      expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, state: 'timeout' });
+      const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].args.some(arg => arg.includes('/runs?'))).toBe(true);
+      expect(existsSync(ctx.marker)).toBe(false);
     });
   }, 20000);
 
@@ -345,7 +399,7 @@ describe('remote CLI — local preconditions', () => {
 
   it('pins the GitHub host for every API read despite ambient GH_HOST', () => {
     fixture((ctx) => {
-      const mock = mockRemote(ctx, 'https://github.com/example/repo.git');
+      const mock = mockRemote(ctx, 'https://github.com/web-everything/web-everything.git');
       const result = ctx.invoke({ ...mock.env, GH_HOST: 'enterprise.example.test' });
       expect(result.status).toBe(0);
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(JSON.parse);
@@ -359,7 +413,7 @@ describe('remote CLI — local preconditions', () => {
 
   it.each([false, true])('bypasses inherited read memo for listing, jobs and final re-check (rerun=%s)', (rerun) => {
     fixture((ctx) => {
-      const mock = mockRemote(ctx, 'https://github.com/example/repo.git');
+      const mock = mockRemote(ctx, 'https://github.com/web-everything/web-everything.git');
       const memo = join(ctx.root, 'memo');
       mkdirSync(memo);
       const result = ctx.invoke({ ...mock.env, WE_GH_READ_MEMO_DIR: memo,
@@ -378,7 +432,7 @@ describe('remote CLI — local preconditions', () => {
 
   it('validates origin before ls-remote and restricts its allowed protocols', () => {
     fixture((ctx) => {
-      const mock = mockRemote(ctx, 'git@github.com:example/repo.git');
+      const mock = mockRemote(ctx, 'git@github.com:web-everything/web-everything.git');
       expect(ctx.invoke(mock.env).status).toBe(0);
       const calls = readFileSync(mock.gitCalls, 'utf8').trim().split('\n').map(JSON.parse);
       const contact = calls.findIndex(args => args.includes('ls-remote'));
@@ -421,7 +475,7 @@ describe('remote CLI — local preconditions', () => {
       git(lane, ['update-ref', 'refs/heads/main', unpushed]);
       expect(git(lane, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
       expect(git(lane, ['ls-remote', '--heads', 'origin'])).not.toContain(unpushed);
-      const mock = mockRemote(ctx, 'https://github.com/example/repo.git');
+      const mock = mockRemote(ctx, 'https://github.com/web-everything/web-everything.git');
       const result = invoke(mock.env);
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(2);
@@ -492,6 +546,14 @@ describe('remote lane marker import — required gate evidence', () => {
     expect(order).toEqual(['jobs', 'runs', 'write']);
   });
 
+  it('a targeted dispatch during job verification does not invalidate the required lane run', async () => {
+    const targeted = run({ id: 456, event: 'workflow_dispatch', display_title: 'remote-verify (targeted)',
+      created_at: new Date(T0 + 1000).toISOString() });
+    const writeMarker = vi.fn();
+    await importRun([job()], { fetchRuns: async () => [successful, targeted], writeMarker });
+    expect(writeMarker).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['newer queued run', [successful, run({ id: 456, created_at: new Date(T0 + 1000).toISOString(), status: 'queued', conclusion: null })]],
     ['newer successful run', [successful, run({ id: 456, created_at: new Date(T0 + 1000).toISOString() })]],
@@ -522,6 +584,54 @@ describe('remote lane marker import — required gate evidence', () => {
   });
 });
 
+describe('remote verification dispatcher — validated argv', () => {
+  async function commands(input, files = []) {
+    const { remoteVerifyCommands } = await import('../lib/remote-verify-dispatch.mjs');
+    return remoteVerifyCommands(input, (file) => files.includes(file));
+  }
+
+  it('lane-check and full invoke the required gates in order', async () => {
+    expect(await commands({ mode: 'lane-check' })).toEqual([['node', ['scripts/verify-lane.mjs', 'run']]]);
+    expect(await commands({ mode: 'full' })).toEqual([
+      ['npm', ['run', 'check:standards']], ['npm', ['run', 'test:unit']],
+    ]);
+  });
+
+  it('targeted tests remain separate literal argv and take precedence over operation', async () => {
+    const files = ['scripts/a.test.mjs', 'scripts/`echo`.test.mjs', "scripts/a'b.test.mjs"];
+    expect(await commands({ mode: 'targeted', tests: ` ${files.join('\n')} `, operation: '../evil' }, files))
+      .toEqual([['npm', ['run', 'test:unit', '--', ...files]]]);
+  });
+
+  it.each(['--config=evil', '-t', 'missing.test.mjs', 'scripts/good.test.mjs --config=evil'])(
+    'targeted mode rejects option-like or nonexistent test paths: %s', async (tests) => {
+      await expect(commands({ mode: 'targeted', tests }, ['--config=evil', '-t', 'scripts/good.test.mjs']))
+        .rejects.toThrow(/existing test file paths/);
+    });
+
+  it.each(['', '--config=evil', '../evil', 'name/io', 'foo;bar', 'foo`bar`', 'foo\nbar',
+    'foo\rbar', 'foo\u2028bar', 'ｆoo', 'foo\u200b', 'FOO', 'a_b', 'a.b', "a'b"])(
+    'targeted mode rejects malformed operation %j', async (operation) => {
+      await expect(commands({ mode: 'targeted', operation })).rejects.toThrow(/operation name/);
+    });
+
+  it('targeted mode rejects an unknown operation even when its IO companion exists', async () => {
+    await expect(commands({ mode: 'targeted', operation: 'missing' }, ['scripts/operations/missing-io.mjs']))
+      .rejects.toThrow(/Unknown operation/);
+  });
+
+  it.each([false, true])('targets operation declaration and optional IO companion (companion=%s)', async (companion) => {
+    const files = ['scripts/operations/review-pr.mjs', ...(companion ? ['scripts/operations/review-pr-io.mjs'] : [])];
+    expect(await commands({ mode: 'targeted', operation: ' review-pr ' }, files)).toEqual([
+      ['node', ['scripts/readiness/heavy-admission.mjs', 'run', '--', 'npx', 'vitest', 'related', '--run', ...files]],
+    ]);
+  });
+
+  it.each(['unknown', '', 'targeted;full'])('rejects unknown mode %j', async (mode) => {
+    await expect(commands({ mode })).rejects.toThrow(/Unknown verification mode/);
+  });
+});
+
 describe('remote-verify workflow — source contract', () => {
   const source = () => readFileSync(join(process.cwd(), '.github/workflows/remote-verify.yml'), 'utf8');
 
@@ -529,10 +639,79 @@ describe('remote-verify workflow — source contract', () => {
     const workflow = yaml.safeLoad(source());
     const step = workflow.jobs.verify.steps.find((step) => step.env?.VERIFY_MODE);
     expect(step.name).toBe("${{ inputs.mode == 'targeted' && 'Targeted tests' || 'Required lane gate' }}");
-    expect(step.run).toContain("case 'lane-check':");
-    expect(step.run).toContain("run('node', ['scripts/verify-lane.mjs', 'run'])");
-    expect(step.run).toContain("run('npm', ['run', 'check:standards'])");
-    expect(step.run).toContain("run('npm', ['run', 'test:unit'])");
+    expect(step.run).toContain("from './scripts/lib/remote-verify-dispatch.mjs'");
+    expect(step.run).toContain('remoteVerifyCommands(');
+    expect(step.run).toContain('execFileSync(file, args,');
+    expect(step.env).toEqual({ VERIFY_MODE: "${{ inputs.mode || 'lane-check' }}",
+      VERIFY_TESTS: '${{ inputs.tests }}', VERIFY_OPERATION: '${{ inputs.operation }}' });
+  });
+
+  it('targeted, full and lane-check dispatch groups can never cancel a push group', () => {
+    const workflow = yaml.safeLoad(source());
+    expect(workflow['run-name']).toBe("remote-verify (${{ inputs.mode || 'lane-check' }})");
+    const group = (inputs, event = 'workflow_dispatch', ref = 'refs/heads/lane/x') =>
+      workflow.concurrency.group.replace(/\$\{\{([\s\S]*?)\}\}/g, (_, expression) =>
+        Function('inputs', 'github', `return (${expression});`)(inputs, { event_name: event, ref }));
+    const pushGroup = group({}, 'push');
+    for (const mode of ['targeted', 'lane-check', 'full']) {
+      for (const ref of ['', 'refs/heads/lane/x', SHA]) {
+        expect(group({ mode, ref })).not.toBe(pushGroup);
+      }
+    }
+    expect(group({ mode: 'targeted' })).not.toBe(group({ mode: 'lane-check' }));
+    expect(group({ mode: 'targeted', ref: SHA })).not.toBe(group({ mode: 'full', ref: SHA }));
+    expect(workflow.concurrency['cancel-in-progress']).toBe(true);
+  });
+
+  it('caches npm downloads rather than node_modules that npm ci deletes', () => {
+    const steps = yaml.safeLoad(source()).jobs.verify.steps;
+    expect(steps.some(step => step.uses?.startsWith('actions/cache@'))).toBe(false);
+    const setup = steps.find(step => step.uses?.startsWith('actions/setup-node@'));
+    expect(setup.with.cache).toBe('npm');
+    expect(setup.with['cache-dependency-path']).toContain('frontierui/package-lock.json');
+  });
+
+  it('executes the workflow dispatcher with literal env inputs and rejects hostile values before spawning', () => {
+    const step = yaml.safeLoad(source()).jobs.verify.steps.find(step => step.env?.VERIFY_MODE);
+    const root = mkdtempSync(join(tmpdir(), 'remote-dispatch-wiring-'));
+    const calls = join(root, 'calls.jsonl');
+    try {
+      for (const command of ['npm', 'node']) {
+        writeFileSync(join(root, command), `#!${process.execPath}\n` +
+          `require('node:fs').appendFileSync(${JSON.stringify(calls)}, JSON.stringify([${JSON.stringify(command)}, process.argv.slice(2)]) + '\\n');\n`);
+        chmodSync(join(root, command), 0o755);
+      }
+      const script = /^node --input-type=module <<'NODE'\n([\s\S]*)\nNODE\s*$/.exec(step.run)?.[1];
+      expect(script).toBeTruthy();
+      const declaration = 'scripts/operations/review-pr.mjs';
+      const io = 'scripts/operations/review-pr-io.mjs';
+      const cases = [
+        { mode: 'lane-check', expected: [['node', ['scripts/verify-lane.mjs', 'run']]] },
+        { mode: 'full', expected: [['npm', ['run', 'check:standards']], ['npm', ['run', 'test:unit']]] },
+        { mode: 'targeted', tests: 'scripts/__tests__/remote-verify.test.mjs',
+          expected: [['npm', ['run', 'test:unit', '--', 'scripts/__tests__/remote-verify.test.mjs']]] },
+        { mode: 'targeted', operation: 'review-pr', expected: [['node',
+          ['scripts/readiness/heavy-admission.mjs', 'run', '--', 'npx', 'vitest', 'related', '--run',
+            ...[declaration, io].filter(existsSync)]]] },
+        { mode: 'targeted', tests: '--config=evil' },
+        { mode: 'targeted', tests: 'missing.test.mjs' },
+        { mode: 'targeted', operation: '../evil' },
+        { mode: 'targeted', operation: 'no-such-operation-for-remote-verify' },
+        { mode: 'unknown' },
+      ];
+      for (const { mode, tests = '', operation = '', expected } of cases) {
+        writeFileSync(calls, '');
+        const result = spawnSync(process.execPath, ['--input-type=module'], {
+          cwd: process.cwd(), input: script, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+          env: { ...process.env, PATH: `${root}:${process.env.PATH}`,
+            VERIFY_MODE: mode, VERIFY_TESTS: tests, VERIFY_OPERATION: operation },
+        });
+        expect(result.error).toBeUndefined();
+        expect(result.status, result.stderr).toBe(expected ? 0 : 1);
+        const text = readFileSync(calls, 'utf8').trim();
+        expect(text ? text.split('\n').map(JSON.parse) : []).toEqual(expected ?? []);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('pins lane-check/full and push checkout to github.sha; only targeted may choose ref', () => {
@@ -600,8 +779,24 @@ describe('remote-verify workflow — source contract', () => {
     }
   });
 
-  it('references no secrets except secrets.GITHUB_TOKEN', () => {
-    expect(source().replace(/\bsecrets\.GITHUB_TOKEN\b/g, '')).not.toMatch(/secrets\./i);
+  it('uses CI App-token authentication and fallback for every external checkout', () => {
+    const ci = yaml.safeLoad(readFileSync(join(process.cwd(), '.github/workflows/ci.yml'), 'utf8'));
+    const canonical = Object.values(ci.jobs).flatMap(job => job.steps ?? [])
+      .find(step => step.with?.repository === 'frontier-ui/frontierui');
+    const steps = yaml.safeLoad(source()).jobs.verify.steps;
+    const mint = steps.find(step => step.id === 'fui-app-token');
+    expect(mint?.uses).toBe('actions/create-github-app-token@v2');
+    expect(mint?.if).toBe("vars.WE_APP_ID != ''");
+    expect(mint?.with).toEqual({ 'app-id': '${{ vars.WE_APP_ID }}', 'private-key': '${{ secrets.WE_APP_PRIVATE_KEY }}',
+      owner: 'frontier-ui', repositories: 'frontierui', 'permission-contents': 'read' });
+    const external = steps.filter(step => step.uses?.startsWith('actions/checkout@') && step.with?.repository);
+    expect(external).toHaveLength(1);
+    for (const checkout of external) {
+      expect(checkout.with.token).toBe(canonical.with.token);
+      expect(steps.indexOf(mint)).toBeLessThan(steps.indexOf(checkout));
+    }
+    expect(source().replace(/\bsecrets\.(GITHUB_TOKEN|WE_APP_PRIVATE_KEY|FUI_READ_TOKEN)\b/g, ''))
+      .not.toMatch(/secrets\./i);
   });
 
   it('contains no model-provider or agent references, case-insensitively', () => {
