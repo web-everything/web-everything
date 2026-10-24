@@ -345,6 +345,14 @@ export async function commitAndPush(s) {
     }
     // Only the frozen bytes and modes verified above are staged here.
     if (!good(await trustedGit(['add', '--', ...s.files]))) fail('commit-failed');
+    // In-tree .gitattributes can make add rewrite bytes (eol, ident, encoding). Require the
+    // staged blobs and modes to equal the frozen export exactly, else refuse to commit.
+    const staged = await trustedGit(['ls-files', '--stage', '-z', '--', ...s.files]);
+    const want = exported.map(({ file, bytes, mode }) => `${mode === 0o755 ? '100755' : '100644'} ${
+      createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')} 0\t${file}`).sort();
+    if (!good(staged) || typeof staged.stdout !== 'string' || JSON.stringify(staged.stdout.split('\0').filter(Boolean).sort()) !== JSON.stringify(want)) {
+      fail('changed-after-audit', 'Staged blobs differ from the exported bytes (attribute filters?); inspect the lane files before retrying');
+    }
     const title = (s.brief.split('\n')[0] ?? '').replace(/^\s*#+\s*/, '').replace(/^Task:\s*/i, '').trim().slice(0, 72);
     if (!good(await trustedGit(['commit', '-m', title]))) fail('commit-failed');
     const sha = await trustedGit(['rev-parse', 'HEAD']);

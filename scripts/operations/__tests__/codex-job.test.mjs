@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, resetLane, commitAndPush, captureAuditExport, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
 import { registerScope, releaseScope, assessFreeScope } from '../free-scope.mjs';
 
@@ -17,6 +18,16 @@ const report = (extra = {}) => ok(`progress\n${JSON.stringify({ exitCode: 0, tim
 const loaderHelp = '--branch= --sha= --daemon= --why= --tests-run= --audit= --json\n';
 const originUrl = 'https://github.com/example/trusted.git';
 const laneConfig = `local\0remote.origin.url\n${originUrl}\0local\0remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0local\0remote.origin.fetch\n^refs/heads/ops/*\0`;
+// Model a faithful `git add`: staged blobs and modes equal the exported bytes and modes.
+async function stagedEntries(io, reads, stats, files) {
+  const keep = [reads.length, stats.length], out = [];
+  for (const file of files) {
+    const bytes = await io.readFile(`/lane/${file}`, null), stat = await io.lstat(`/lane/${file}`);
+    out.push(`${stat.mode & 0o100 ? '100755' : '100644'} ${createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')} 0\t${file}\0`);
+  }
+  reads.length = keep[0]; stats.length = keep[1];
+  return out.join('');
+}
 function fixture(rules = [], { ready = true } = {}) {
   const calls = [], writes = [], logs = [], output = [], reads = [], stats = [], temps = [], removals = [];
   const counts = new Map();
@@ -49,6 +60,7 @@ function fixture(rules = [], { ready = true } = {}) {
         if (args.includes('--binary')) return ok('audited binary diff');
         if (args.includes('hash-object')) return ok(args.slice(args.indexOf('--') + 1).map(() => 'a'.repeat(40) + '\n').join(''));
         if (args.includes('diff')) return ok('scripts/a.mjs\0');
+        if (args.includes('--stage') && args.includes('ls-files')) return ok(await stagedEntries(io, reads, stats, args.slice(args.indexOf('--') + 1)));
         if (['reset', 'checkout', 'switch', 'ls-files', 'add', 'commit', 'ls-remote', 'push'].some(x => args.includes(x))) return ok();
       }
       throw new Error(`Unscripted command: ${call.text}`);
@@ -121,6 +133,7 @@ async function publicationFixture({ config = '', laneTip = 'abc123', files = ['s
       if (['reset', 'checkout', 'switch'].some(v => args.includes(v))) {
         if (args.some(a => a === remoteBase || a.includes('origin/'))) freshHead = remoteBase;
       }
+      if (args.includes('ls-files')) return ok(await stagedEntries(f.io, f.reads, f.stats, s.files));
       if (args.includes('commit')) {
         commits.push({ sha: publishedSha, parent: freshHead });
         freshHead = publishedSha;
@@ -1197,6 +1210,16 @@ it('malformed lane acquisition fails closed without destructive commands', async
 it('refuses to publish when the trusted remote base moved since the audited starting commit', async () => {
   const f = await publicationFixture();
   f.s.startSha = 'c'.repeat(40);
+  expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'changed-after-audit' });
+  expect(pushes(f)).toHaveLength(0);
+  expect(f.calls.some(c => c.args.includes('commit'))).toBe(false);
+});
+
+it('refuses to commit when staging rewrote bytes through in-tree attributes (eol/ident filters)', async () => {
+  const f = await publicationFixture();
+  const exec = f.io.exec;
+  f.io.exec = (cmd, args, options) => cmd === 'git' && args.includes('ls-files') && f.isFresh({ cwd: options.cwd, args })
+    ? Promise.resolve(ok(`100644 ${'0'.repeat(40)} 0\tscripts/a.mjs\0`)) : exec(cmd, args, options);
   expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'changed-after-audit' });
   expect(pushes(f)).toHaveLength(0);
   expect(f.calls.some(c => c.args.includes('commit'))).toBe(false);
