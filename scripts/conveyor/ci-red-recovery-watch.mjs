@@ -604,9 +604,7 @@ export function buildHungCiComment({
   actor = 'conveyor CI-hung-recovery', runId = null, headSha = null, jobName = null,
   kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null, cancelError = null,
 } = {}) {
-  const outcome = reason === 'run-not-found-retrigger-deferred'
-    ? `could not cancel run ${runId ?? '?'}; CI retrigger deferred — retrying trigger preflight next tick: ${markerFreeText(error ?? action)}.`
-    : ok
+  const outcome = ok
     ? (reason === 'run-not-found-retrigger'
       ? `could not cancel run ${runId ?? '?'}; triggered CI for the current PR head via "${markerFreeText(action)}".`
       : kind === 'repeat-hang'
@@ -905,7 +903,6 @@ export function sweepHungCiRecovery({
   const prs = readOpenPrs({ repo });
   const rawCandidates = buildHungCandidates(prs, { requiredCheck, workflowName });
   const retriggerRefusals = [];
-  const deferredRetriggers = new Map();
   // The `gh pr view --json comments` read (to recover the durable per-sha AND per-job attempt counts) only
   // matters for a candidate this tick has ALREADY found hung — mirrors `sweepCiRedRecovery`'s own "pay for it
   // only when needed" discipline (there, gating the `gh run list --branch main` read on `candidates.length`).
@@ -922,23 +919,10 @@ export function sweepHungCiRecovery({
       return !outcome.includes(' and it FAILED:') && outcome.includes('; triggered CI for the current PR head via "');
     });
     const successfulRetriggerCount = countHungCiComments(successfulRetriggers, c.headSha);
-    // Unknown outcomes also consume the failure budget, rather than allowing unbounded attempts.
-    const failedRetriggers = countHungCiComments(retriggerComments, c.headSha) - successfulRetriggerCount;
     if (successfulRetriggerCount > 0) {
       retriggerRefusals.push({ ...c, kind: 'run-not-found-retriggered',
         why: 'This head already has a recorded retrigger outcome that succeeded; see its run-not-found-retrigger comment. No further attempt owed.' });
       return null;
-    }
-    if (failedRetriggers >= maxRetriesPerSha) {
-      retriggerRefusals.push({ ...c, kind: 'run-not-found-retrigger-exhausted',
-        why: `This head has ${failedRetriggers} failed retriggers (cap ${maxRetriesPerSha}); human/ci-heal diagnosis required.` });
-      return null;
-    }
-    const deferred = countHungCiComments(retriggerComments, c.headSha) === 0 && comments.find((cm) => bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, 'reason: run-not-found-retrigger-deferred')
-      && countHungCiComments([cm], c.headSha) > 0);
-    if (deferred) {
-      const body = typeof deferred === 'string' ? deferred : deferred.body;
-      deferredRetriggers.set(c.prNumber, body.split('\n').find((line) => line.startsWith('Original cancel error: '))?.slice('Original cancel error: '.length) ?? '(original cancel error unavailable)');
     }
     // `hungAttemptsForJob` must answer "has this job hung on a DIFFERENT head sha before" — the repeat-hang
     // signal (main-red-recovery.mjs#planHungCiRecoveries) is about the shard surviving a rebase/refresh, not
@@ -948,9 +932,7 @@ export function sweepHungCiRecovery({
     const otherShaComments = comments.filter((cm) => !bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, `sha: ${c.headSha}`));
     return {
       ...c,
-      // Retriggers have their own failure cap; do not prematurely turn their retries into cancel-only escalation.
-      hungAttemptsForSha: countHungCiComments(comments.filter((cm) => !bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, 'reason: run-not-found-retrigger')
-        && !bodyHasExactLine(typeof cm === 'string' ? cm : cm?.body, 'reason: run-not-found-retrigger-deferred')), c.headSha),
+      hungAttemptsForSha: countHungCiComments(comments, c.headSha),
       hungAttemptsForJob: countHungCiCommentsByJob(otherShaComments, c.jobName),
     };
   }).filter(Boolean);
@@ -962,24 +944,22 @@ export function sweepHungCiRecovery({
   const applied = [];
   if (apply) {
     for (const d of plan.dispatch) {
-      const wasDeferred = d.kind === 'hung-cancel-rerun' && deferredRetriggers.has(d.prNumber);
-      let result = wasDeferred
-        ? { ok: false, action: 'cancel-failed', error: deferredRetriggers.get(d.prNumber) }
-        : d.runId == null
+      let result = d.runId == null
         ? { ok: false, action: 'no-run-id', error: `PR #${d.prNumber}'s hung check has no resolvable run id (detailsUrl missing/unparseable)` }
         // #4075/#3383, 2026-09-25 18:55 ET correction — `hung-cap-escalate` cancels only, exactly like
         // `repeat-hang`: both hand the PR to the existing ci-red -> ci-heal path rather than retrying.
         : ((d.kind === 'repeat-hang' || d.kind === 'hung-cap-escalate') ? cancelOnly(d.runId, { repo }) : cancelAndRerun(d.runId, { repo }));
       let reason = null;
       let cancelError = null;
-      if (d.kind === 'hung-cancel-rerun' && (wasDeferred || (!result.ok && result.action === 'cancel-failed' && isRunNotFoundError(result.error)))) {
+      if (d.kind === 'hung-cancel-rerun' && !result.ok && result.action === 'cancel-failed' && isRunNotFoundError(result.error)) {
         const triggered = trigger(d, { repo: repoSlug(repo), defaultBranch });
-        cancelError = result.error;
-        result = triggered;
-        reason = triggered.deferred ? 'run-not-found-retrigger-deferred' : 'run-not-found-retrigger';
+        if (!triggered.deferred) {
+          cancelError = result.error;
+          result = triggered;
+          reason = 'run-not-found-retrigger';
+        }
       }
-      // Deferred preflights share one durable marker until a non-deferred outcome is recorded.
-      if (d.runId != null && !(wasDeferred && result.deferred)) {
+      if (d.runId != null) {
         postComment(d.prNumber, {
           repo, runId: d.runId, headSha: d.headSha, jobName: d.jobName, kind: d.kind, ok: result.ok, action: result.action, error: result.error ?? null,
           ...(reason ? { reason, cancelError } : {}),
