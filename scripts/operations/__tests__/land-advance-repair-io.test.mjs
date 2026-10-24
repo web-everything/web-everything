@@ -63,6 +63,18 @@ describe('reader: repair evidence', () => {
     expect(dead.detached).toEqual([]); expect(dead.followUps[0].evidence.liveness).toBe('dead-record');
     expect(planLandAdvance(dead).rows.find((r) => r.pr === 2349).owedAction).toBe('dispatch-ci-heal'); // one dead attempt is under the cap
   });
+  it('unknown detached wrapper liveness keeps the repair hold and prevents duplicate dispatch', () => {
+    const store = createMemoryRunStore();
+    writeFollowUp({ session: 'pid:4242', kind: 'ci-heal', target: 'we#2349',
+      launchedAt: '2026-09-20T19:00:00Z', deadline: '2026-09-20T21:00:00Z',
+      expectedResultPath: '/completion/ci-heal-2349.json', permissionsGranted: [] }, { store });
+    const isPidAlive = vi.fn(() => null);
+    const inputs = createLandAdvanceReader(ports({ store, isPidAlive }))();
+    expect(isPidAlive).toHaveBeenCalledWith(4242);
+    expect(inputs.detached).toEqual(['we#2349']);
+    expect(inputs.followUps[0].evidence.liveness).toBe('live-active');
+    expect(planLandAdvance(inputs).rows.find((r) => r.pr === 2349).owedAction).toBe('none');
+  });
   it('a repair follow-up is finished once the PR is no longer red / conflicting', () => {
     const store = createMemoryRunStore(), t = (kind, target) => ({ session: 's', kind, target, launchedAt: '2026-09-20T19:00:00Z', deadline: '2026-09-20T21:00:00Z', expectedResultPath: `/r/${kind}.md`, permissionsGranted: [] });
     writeFollowUp(t('ci-heal', 'we#2349'), { store }); writeFollowUp(t('conflict-fix', 'we#2344'), { store });

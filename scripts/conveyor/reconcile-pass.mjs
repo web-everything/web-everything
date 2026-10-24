@@ -1,3 +1,4 @@
+import { pidIdentity } from '../lib/pid-alive.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 /**
  * reconcile-pass.mjs — the thin IO shell around `we:scripts/conveyor/reconcile-core.mjs` (#3296): read the four
@@ -410,24 +411,23 @@ export function resolveLaneHead(cwd, exec = execFileSync) {
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#probePid — `process.kill(pid, 0)`, three-valued.
  *
- * `true` = the process exists. `false` = it provably does not (`ESRCH`). `null` = THE QUESTION COULD NOT BE
- * ASKED — no `pid` on the entry (4 of 17 today), a non-integer, or `EPERM` (the process exists but belongs to
- * another user, which is emphatically not death). `null` reaches the core as UNKNOWN and refuses. Defaulting any
- * of these to `false` would report a live agent as idle and hand its lane to a second one.
+ * `true` = an ordinary live process. `false` = ESRCH or a dead identity (zombie/recycled spare).
+ * `null` = invalid input or unreadable evidence. Unknown refuses lane reuse rather than reporting death.
+ * EPERM establishes existence but still requires the identity probe.
  * @param {*} pid
  * @param {Function} [kill]
+ * @param {Function} [identity]
  * @returns {boolean|null}
  */
-export function probePid(pid, kill = (p, s) => process.kill(p, s)) {
+export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pidIdentity) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
     kill(pid, 0);
-    return true;
   } catch (e) {
     if (e && e.code === 'ESRCH') return false;
-    if (e && e.code === 'EPERM') return true; // it exists; it just is not ours to signal.
-    return null;
+    if (e?.code !== 'EPERM') return null;
   }
+  try { return identity(pid).alive; } catch { return null; }
 }
 
 /**
