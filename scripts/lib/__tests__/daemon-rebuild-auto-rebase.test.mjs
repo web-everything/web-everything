@@ -19,14 +19,15 @@ const write = (root, name, text) => { fs.mkdirSync(dirname(join(root, name)), { 
 const ref = 'lane/fix';
 const overlay = { ref, pr: 123 };
 const agentResult = (report = {}) => ({ status: 0, stdout: JSON.stringify({ exitCode: 0, timedOut: false, events: { terminal: 'turn.completed' }, ...report }) });
-function fixture({ extraModule = false } = {}) {
+function fixture({ extraModule = false, workerTest = true, baseFiles = {}, branchFiles = {}, mainFiles = {}, resolvedFiles = {} } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
   ok(base, ['init', '--bare', '-q', origin]);
   ok(root, ['init', '-q', '-b', 'main']);
   write(root, '.gitignore', 'node_modules/\n');
   write(root, 'worker.mjs', 'base\n');
-  write(root, 'worker.test.mjs', "import './worker.mjs';\n");
+  if (workerTest) write(root, 'worker.test.mjs', "import './worker.mjs';\n");
+  for (const [file, content] of Object.entries(baseFiles)) write(root, file, content);
   if (extraModule) {
     write(root, 'extra.mjs', 'original extra module\n');
     write(root, 'extra.test.mjs', "import './extra.mjs';\n");
@@ -35,12 +36,16 @@ function fixture({ extraModule = false } = {}) {
   ok(root, ['remote', 'add', 'origin', origin]); ok(root, ['push', '-qu', 'origin', 'main']);
   const baseSha = ok(root, ['rev-parse', 'HEAD']);
   ok(root, ['checkout', '-qb', ref]); write(root, 'worker.mjs', 'overlay\n');
+  for (const [file, content] of Object.entries(branchFiles)) write(root, file, content);
+  if (Object.keys(branchFiles).length) ok(root, ['add', '.']);
   ok(root, ['commit', '-qam', 'hotfix']); ok(root, ['push', '-q', 'origin', ref]);
   const oldSha = ok(root, ['rev-parse', 'HEAD']);
   ok(root, ['checkout', '-q', 'main']);
   const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'), WE_DAEMON_STATE_DIR: join(base, 'state'), WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_AUTO_REBASE: '1', WE_DAEMON_REBUILD_SKIP_UNRELATED: '0' };
   addOverlay(root, overlay, { env });
   const moveMain = () => {
+    for (const [file, content] of Object.entries(mainFiles)) write(root, file, content);
+    if (Object.keys(mainFiles).length) ok(root, ['add', '.']);
     write(root, 'worker.mjs', 'main\n'); ok(root, ['commit', '-qam', 'main moved']);
     ok(root, ['push', '-q', 'origin', 'main']);
   };
@@ -52,6 +57,9 @@ function fixture({ extraModule = false } = {}) {
       expect(args).toContain('--gate=none'); expect(args).toContain('--task-kind=fix');
       expect(fs.readFileSync(taskFile, 'utf8')).toContain('BOTH');
       write(scratch, 'worker.mjs', 'overlay + main\n'); ok(scratch, ['add', 'worker.mjs']);
+      for (const [file, content] of Object.entries(resolvedFiles)) {
+        write(scratch, file, content); ok(scratch, ['add', file]);
+      }
       return agentResult();
     }),
     testRunner: vi.fn(async ({ args }) => {
@@ -73,6 +81,170 @@ const swaps = f => finishPendingSwaps({ root: f.root, env: f.env, run,
   appendOverlayEvent: (...args) => { f.calls.push(args[1].kind); return appendOverlayEvent(...args); } });
 
 describe('established overlay auto rebase', () => {
+  describe('test-selection fallback and durable evidence', () => {
+    const records = file => fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+    const events = f => records(overlayFilePath(f.root, f.env).replace(/\.json$/, '.events.jsonl'));
+    const assertRule = (f, result, rule) => {
+      expect(events(f).filter(e => e.kind === 'auto-rebase-registered')).toEqual([
+        expect.objectContaining({ ref, new: result.ref, rule }),
+      ]);
+      const pending = fs.readdirSync(pendingDir(f)).filter(n => n.endsWith('.json'));
+      expect(pending).toHaveLength(1);
+      expect(JSON.parse(fs.readFileSync(join(pendingDir(f), pending[0]), 'utf8'))).toMatchObject({
+        old: ref, new: result.ref, rule,
+      });
+    };
+    const assertUnregistered = f => {
+      expect(f.calls).not.toContain('add');
+      expect(events(f).some(e => e.kind === 'auto-rebase-registered')).toBe(false);
+      expect(readOverlays(f.root, { env: f.env })).toEqual([expect.objectContaining(overlay)]);
+      expect(ok(f.root, ['ls-remote', 'origin', `${ref}-auto-*`])).toBe('');
+      expect(fs.existsSync(pendingDir(f)) ? fs.readdirSync(pendingDir(f)).filter(n => n.endsWith('.json')) : []).toEqual([]);
+      expect(f.scratched).toHaveLength(1);
+      expect(f.scratched.every(p => !fs.existsSync(p))).toBe(true);
+    };
+
+    it.each(['added', 'changed'])('runs an overlay-%s test even without an import edge to the uncovered conflict', async kind => {
+      const f = fixture({
+        baseFiles: { 'uncovered.txt': 'base\n', ...(kind === 'changed' ? { 'branch.test.mjs': '// original test\n' } : {}) },
+        branchFiles: { 'uncovered.txt': 'overlay\n', 'branch.test.mjs': '// overlay regression test\n' },
+        mainFiles: { 'uncovered.txt': 'main\n' },
+        resolvedFiles: { 'uncovered.txt': 'overlay + main\n' },
+      });
+      f.moveMain();
+      f.deps.testRunner = vi.fn(async ({ args }) => {
+        expect(args.slice(0, 7)).toEqual(['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run']);
+        expect(args.slice(7).sort()).toEqual(['branch.test.mjs', 'worker.test.mjs']);
+        return { status: 0 };
+      });
+      const result = await job(f);
+      expect(f.deps.testRunner).toHaveBeenCalledOnce();
+      assertRule(f, result, 'overlay-branch-tests+import-graph');
+    });
+
+    it('reaches a main-only test through imports of an overlay-changed source module', async () => {
+      const f = fixture({
+        baseFiles: {
+          'uncovered.txt': 'base\n', 'feature.mjs': 'export const value = 1;\n',
+          'bridge.mjs': "export { value } from './feature.mjs';\n",
+          'feature.test.mjs': "import './bridge.mjs';\n",
+        },
+        branchFiles: { 'uncovered.txt': 'overlay\n', 'feature.mjs': 'export const value = 2;\n' },
+        mainFiles: { 'uncovered.txt': 'main\n' },
+        resolvedFiles: { 'uncovered.txt': 'overlay + main\n' },
+      });
+      f.moveMain();
+      // This module is unchanged by the merge; only the overlay's branch diff identifies it.
+      expect(ok(f.root, ['diff', '--name-only', f.baseSha, f.oldSha]).split('\n')).not.toContain('feature.test.mjs');
+      f.deps.testRunner = vi.fn(async ({ root, args }) => {
+        expect(ok(root, ['show', 'HEAD:feature.mjs'])).toBe('export const value = 2;');
+        expect(args.slice(7).sort()).toEqual(['feature.test.mjs', 'worker.test.mjs']);
+        return { status: 0 };
+      });
+      const result = await job(f);
+      expect(f.deps.testRunner).toHaveBeenCalledOnce();
+      assertRule(f, result, 'overlay-branch-tests+import-graph');
+    });
+
+    it('requires a Codex review and registers its rule when there are no tests anywhere', async () => {
+      const f = fixture({ workerTest: false }); f.moveMain();
+      const result = await job(f);
+      expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(f.deps.auditor).toHaveBeenCalledOnce();
+      expect(f.deps.auditor.mock.calls[0][0].args).toContain('--review');
+      expect(f.calls).toEqual(['codex', 'audit', 'add', 'auto-rebase-registered']);
+      assertRule(f, result, 'codex-audit-required');
+    });
+
+    it.each(['WEAKENED', 'Probably NOT WEAKENED', undefined])('refuses empty-fallback registration without an exact audit certification: %s', async lastMessage => {
+      const f = fixture({ workerTest: false }); f.moveMain();
+      f.deps.auditor = vi.fn(async () => agentResult({ lastMessage }));
+      await expect(job(f)).rejects.toThrow(/audit/i);
+      expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(f.deps.auditor).toHaveBeenCalledOnce();
+      expect(f.deps.auditor.mock.calls[0][0].args).toContain('--review');
+      assertUnregistered(f);
+    });
+
+    it.each(['success', 'audit failure'])('persists original conflict markers and noTestFiles before audit, surviving cleanup on %s', async outcome => {
+      const f = fixture({ workerTest: false }); f.moveMain();
+      let conflicted;
+      const resolveConflicts = f.deps.codex;
+      f.deps.codex = async options => {
+        conflicted = fs.readFileSync(join(options.root, 'worker.mjs'), 'utf8');
+        expect(conflicted).toContain('<<<<<<<');
+        expect(conflicted).toContain('=======');
+        expect(conflicted).toContain('>>>>>>>');
+        return resolveConflicts(options);
+      };
+      const evidence = () => records(alertsFilePath(f.root, f.env)).filter(e => e.kind === 'auto-rebase-evidence');
+      const assertEvidence = () => expect(evidence()).toEqual([expect.objectContaining({
+        detail: { ref, rule: 'codex-audit-required', noTestFiles: ['worker.mjs'], conflicts: { 'worker.mjs': conflicted } },
+      })]);
+      f.deps.auditor = vi.fn(async ({ root }) => {
+        expect(fs.existsSync(root)).toBe(true);
+        assertEvidence();
+        return agentResult({ lastMessage: outcome === 'success' ? 'NOT WEAKENED' : 'WEAKENED' });
+      });
+      if (outcome === 'success') await job(f);
+      else await expect(job(f)).rejects.toThrow(/audit/i);
+      expect(f.deps.auditor).toHaveBeenCalledOnce();
+      expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(f.scratched).toHaveLength(1);
+      expect(f.scratched.every(p => !fs.existsSync(p))).toBe(true);
+      assertEvidence();
+      if (outcome === 'audit failure') assertUnregistered(f);
+    });
+
+    it('caps each persisted conflict at 64KB and retains the audit escalation for oversized evidence', async () => {
+      const f = fixture({
+        workerTest: false,
+        baseFiles: { 'large.txt': 'base\n' },
+        branchFiles: { 'large.txt': `${'overlay\n'.repeat(10_000)}` },
+        mainFiles: { 'large.txt': `${'main\n'.repeat(15_000)}` },
+        resolvedFiles: { 'large.txt': 'overlay + main\n' },
+      });
+      f.moveMain();
+      let conflicted;
+      const resolveConflicts = f.deps.codex;
+      f.deps.codex = async options => {
+        conflicted = fs.readFileSync(join(options.root, 'large.txt'), 'utf8');
+        expect(Buffer.byteLength(conflicted)).toBeGreaterThan(64 * 1024);
+        return resolveConflicts(options);
+      };
+      await job(f);
+      const evidence = records(alertsFilePath(f.root, f.env)).find(e => e.kind === 'auto-rebase-evidence');
+      expect(evidence).toBeDefined();
+      expect(evidence.detail.rule).toBe('codex-audit-required');
+      expect(evidence.detail.noTestFiles.sort()).toEqual(['large.txt', 'worker.mjs']);
+      const captured = evidence.detail.conflicts['large.txt'];
+      expect(captured).toBe(conflicted.slice(0, 64 * 1024));
+      expect(Buffer.byteLength(captured)).toBeLessThanOrEqual(64 * 1024);
+      expect(evidence.detail.conflicts['worker.mjs']).toContain('<<<<<<<');
+      expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(f.deps.auditor).toHaveBeenCalledOnce();
+    });
+
+    it('records related-tests in the registration event and pending swap on the existing path', async () => {
+      const f = fixture(); f.moveMain();
+      const result = await job(f);
+      expect(f.deps.testRunner).toHaveBeenCalledOnce();
+      assertRule(f, result, 'related-tests');
+    });
+
+    it('records related-tests evidence before a failing test run and never registers a pass', async () => {
+      const f = fixture(); f.moveMain();
+      f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'regression failed' }));
+      await expect(job(f)).rejects.toThrow();
+      expect(f.deps.testRunner).toHaveBeenCalledOnce();
+      expect(f.deps.auditor).not.toHaveBeenCalled();
+      assertUnregistered(f);
+      expect(records(alertsFilePath(f.root, f.env))).toContainEqual(expect.objectContaining({
+        kind: 'auto-rebase-evidence', detail: expect.objectContaining({ ref, rule: 'related-tests', noTestFiles: [] }),
+      }));
+    });
+  });
+
   it('defaults on, follows policy sources, and logs every consultation', () => {
     const dir = temp(), settingsPath = join(dir, 'settings.json');
     const env = { WE_PLATFORM_PREFERENCES_FILE: join(dir, 'missing') };
