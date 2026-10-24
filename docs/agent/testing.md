@@ -160,6 +160,10 @@ does not imply its host process group is gone. Signal-zero probes can return `EP
 restricted execution environment, which correctly retains the entry. The real-process adoption
 test additionally requires permission to inspect child argv with `ps`.
 
+Runner fixtures using synthetic PIDs must inject `identity` alongside `alive`: a successful
+existence probe still checks process identity. Stamp fixtures must also inject `identityOf`
+or supply both `runnerStart` and `runnerArgv`, so stamping cannot inspect a host process.
+
 The host queue needs write access to the admission pool's parent as well as the pool:
 `releaseLockDirIf` atomically renames a lock to a sibling tombstone before removal.
 An `EPERM` on that rename is an admission infrastructure failure, not a suite result.

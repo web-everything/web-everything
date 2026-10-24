@@ -162,8 +162,8 @@ export function isClaimRunnerDead(claim, alive = isPidAlive, identity = pidIdent
 
 /** Count LIVE fix/ci-heal claims (`fixing` is not a session). A claim whose runner pid is dead is not live:
  *  it must not hold a cap slot while it waits out its TTL. */
-export function countLiveFixSessions(claims = [], { alive = isPidAlive } = {}) {
-  return claims.filter((c) => (c?.meta?.kind === 'fix' || c?.meta?.kind === 'ci-heal') && !isClaimRunnerDead(c, alive)).length;
+export function countLiveFixSessions(claims = [], { alive = isPidAlive, identity = pidIdentity } = {}) {
+  return claims.filter((c) => (c?.meta?.kind === 'fix' || c?.meta?.kind === 'ci-heal') && !isClaimRunnerDead(c, alive, identity)).length;
 }
 
 /**

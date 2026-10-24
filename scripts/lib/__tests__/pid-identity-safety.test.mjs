@@ -55,7 +55,10 @@ describe('PID snapshot safety boundaries', () => {
       .toEqual({ alive: null, reason: 'unreadable' });
   });
 
-  it('default exec supplies both identity verdict and launch stamp from a single snapshot each', () => {
+  it('default exec supplies both identity verdict and launch stamp from a single snapshot each', async () => {
+    // Reload under this file's subprocess mock, even if another import cached the helper first.
+    vi.resetModules();
+    const { pidIdentity, pidIdentityStamp } = await import('../pid-alive.mjs');
     vi.mocked(execFileSync).mockReturnValue(ROW);
     expect(pidIdentity(PID)).toEqual({ alive: true, reason: 'match' });
     expect(pidIdentityStamp(PID)).toEqual({ runnerStart: START, runnerArgv: ARGV });
