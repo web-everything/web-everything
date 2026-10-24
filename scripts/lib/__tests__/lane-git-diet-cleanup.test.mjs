@@ -1124,6 +1124,8 @@ describe('CLI pools and per-lane failure isolation', () => {
     [['--json=yes'], /^--json takes no value\n$/],
     ...['abc', '0', '-1', '1.5', '1e3', '1500001'].map((v) => [[`--gc-timeout-ms=${v}`], /^--gc-timeout-ms must be a whole number of milliseconds from 1 to 1500000\n$/]),
     ...['5,x', '5,', 'x', '-1', '1.5'].map((v) => [[`--lanes=${v}`], /^--lanes must be a comma-separated list of lane numbers\n$/]),
+    // Refused before any lane is touched, not at `git prune` after the ops refs are gone.
+    ...['garbage', ' '].map((v) => [[`--prune-expire=${v}`, '--apply', '--lanes=1'], new RegExp(`^--prune-expire ${JSON.stringify(v)} is not an expiry date git can parse\\n$`)]),
   ])('argv %j is refused with exit 2 before any lane is read', (args, message) => {
     // Real roots, except a root flag under test (a second copy would be refused as repeated instead).
     const roots = ['pool-root', 'scan-root'].filter((f) => !args.some((a) => a.split('=')[0] === `--${f}`)).map((f) => `--${f}=${root}`);
@@ -1136,7 +1138,9 @@ describe('CLI pools and per-lane failure isolation', () => {
   it('a valid --gc-timeout-ms and --lanes list are accepted', () => {
     const poolRoot = join(root, 'valid-flags');
     git(root, 'clone', '-q', up, join(poolRoot, 'web-everything', 'lane-3'));
-    expect(cli(poolRoot, '--gc-timeout-ms=1500000', '--lanes=3, 9').rows).toEqual([expect.objectContaining({ lane: 3, mode: 'dry-run' })]);
+    for (const expire of ['now', '2.weeks.ago']) {
+      expect(cli(poolRoot, '--gc-timeout-ms=1500000', '--lanes=3, 9', `--prune-expire=${expire}`).rows).toEqual([expect.objectContaining({ lane: 3, mode: 'dry-run' })]);
+    }
   }, 60_000);
 
   // The lane's own core.hooksPath and core.fsmonitor are live (the controls prove it): only the hardening pins stop

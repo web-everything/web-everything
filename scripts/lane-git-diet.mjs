@@ -63,6 +63,12 @@ const GC_TIMEOUT_MAX_MS = 25 * 60_000;
 if (flags['gc-timeout-ms'] !== undefined && !(/^\d+$/.test(flags['gc-timeout-ms']) && Number(flags['gc-timeout-ms']) >= 1 && Number(flags['gc-timeout-ms']) <= GC_TIMEOUT_MAX_MS)) {
   process.stderr.write(`--gc-timeout-ms must be a whole number of milliseconds from 1 to ${GC_TIMEOUT_MAX_MS}\n`); process.exit(2);
 }
+// A malformed --prune-expire would fail only at `git prune`, after the ops refs are deleted and the repack ran: parse it
+// up front with git's own expiry parser (`now` stays valid: a deliberate operator choice the tests use too).
+if (flags['prune-expire'] !== undefined) {
+  try { execFileSync('git', ['-c', `lanegitdiet.pruneexpire=${flags['prune-expire']}`, 'config', '--type=expiry-date', 'lanegitdiet.pruneexpire'], { cwd: tmpdir(), env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)), stdio: 'ignore', timeout: 10_000 }); }
+  catch { process.stderr.write(`--prune-expire ${JSON.stringify(flags['prune-expire'])} is not an expiry date git can parse\n`); process.exit(2); }
+}
 const laneList = flags.lanes === undefined ? null : flags.lanes.split(',').map((s) => s.trim());
 if (laneList?.some((s) => !/^\d+$/.test(s))) { process.stderr.write('--lanes must be a comma-separated list of lane numbers\n'); process.exit(2); }
 
