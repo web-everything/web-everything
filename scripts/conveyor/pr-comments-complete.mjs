@@ -100,6 +100,8 @@ export function enrichPrsWithCompleteComments(prs, {
       const ids = c => [c?.node_id, c?.id, c?.url, c?.html_url].filter(v => v !== undefined && v !== null && v !== '');
       const covered = pr.comments.every(c => comments.some(full => {
         if (typeof c?.body !== 'string' || c.body !== full?.body) return false;
+        const author = c?.author?.login ?? c?.user?.login;
+        if (author && author !== (full?.author?.login ?? full?.user?.login)) return false;
         const embeddedIds = ids(c), fullIds = ids(full);
         if (embeddedIds.length && fullIds.length) return embeddedIds.some(id => fullIds.includes(id));
         return (c.createdAt ?? c.created_at) === (full.createdAt ?? full.created_at);

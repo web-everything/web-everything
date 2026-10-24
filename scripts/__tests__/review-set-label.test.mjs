@@ -3223,6 +3223,46 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       expect(result.ledgerWrites).toEqual([]);
     });
 
+    describe.each(['id', 'timestamp'])('author coverage with matching %s and body', identity => {
+      const listed = { ...(identity === 'id' ? { id: 'IC_author' } : { createdAt: '2026-10-06T00:00:00Z' }), body: 'listed discussion' };
+      const complete = { ...(identity === 'id' ? { node_id: 'IC_author' } : { created_at: listed.createdAt }), body: listed.body };
+      const page = author => [{ ...listed, ...author }, ...Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, (_, i) => ({
+        id: `IC_${i}`, body: `discussion ${i}`,
+      }))];
+
+      it.each([
+        ['author missing', { author: { login: 'web-everything' } }, {}],
+        ['user missing', { user: { login: 'web-everything' } }, {}],
+        ['author changed to another user', { author: { login: 'web-everything' } }, { user: { login: 'other' } }],
+        ['user changed to another author', { user: { login: 'web-everything' } }, { author: { login: 'other' } }],
+      ])('fails closed without writes when the complete comment has its %s', (_name, listedAuthor, fullAuthor) => {
+        const comments = page(listedAuthor);
+        const readComments = vi.fn(() => [...comments.slice(1), { ...complete, ...fullAuthor }, { body: 'later discussion' }]);
+        const result = attempt(comments, readComments, 'a'.repeat(40));
+        expect(readComments).toHaveBeenCalledTimes(1);
+        expect(result.exitCode).toBe(1);
+        expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+      });
+
+      if (!fresh) it.each([
+        ['author / author', { author: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
+        ['author / user', { author: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
+        ['user / author', { user: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
+        ['user / user', { user: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
+        ['neither has an author', {}, {}],
+        ['only the complete comment has an author', {}, { user: { login: 'web-everything' } }],
+      ])('allows complete coverage with %s', (_name, listedAuthor, fullAuthor) => {
+        const comments = page(listedAuthor);
+        const readComments = vi.fn(() => [...comments.slice(1), { ...complete, ...fullAuthor }, { body: 'later discussion' }]);
+        const result = attempt(comments, readComments, 'a'.repeat(40));
+        expect(readComments).toHaveBeenCalled();
+        expect(result.exitCode).toBe(0);
+        expect(result.calls).toEqual(['postComment', 'setLabels']);
+      });
+    });
+
     it('refuses an exactly page-sized covering read because the thread may be truncated at the page size', () => {
       const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
       const readComments = vi.fn(() => [...comments]);

@@ -93,6 +93,47 @@ describe('complete PR comments', () => {
     expect(annotate).not.toHaveBeenCalled();
   });
 
+  describe.each(['id', 'timestamp'])('author coverage with matching %s and body', identity => {
+    const listed = { ...(identity === 'id' ? { id: 'IC_author' } : { createdAt: '2026-10-06T00:00:00Z' }), body: 'listed discussion' };
+    const complete = { ...(identity === 'id' ? { node_id: 'IC_author' } : { created_at: listed.createdAt }), body: listed.body };
+
+    it.each([
+      ['author missing', { author: { login: 'web-everything' } }, {}],
+      ['user missing', { user: { login: 'web-everything' } }, {}],
+      ['author changed to another user', { author: { login: 'web-everything' } }, { user: { login: 'other' } }],
+      ['user changed to another author', { user: { login: 'web-everything' } }, { author: { login: 'other' } }],
+    ])('fails closed and skips annotation when the complete comment has its %s', (_name, listedAuthor, fullAuthor) => {
+      const pr = { number: 4017, comments: [{ ...listed, ...listedAuthor }, ...firstPage.slice(1)] };
+      const onError = vi.fn();
+      const annotate = vi.fn(p => p);
+      const out = enrichPrsWithCompleteComments([pr], {
+        repo, readComments: () => [...firstPage.slice(1), { ...complete, ...fullAuthor }, { body: 'later discussion' }],
+        onError, annotate,
+      });
+      expect(out.map(p => p.number)).toEqual([]);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(pr,
+        expect.objectContaining({ message: 'complete comments read did not cover the listed page' }));
+      expect(annotate).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['author / author', { author: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
+      ['author / user', { author: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
+      ['user / author', { user: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
+      ['user / user', { user: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
+      ['neither has an author', {}, {}],
+      ['only the complete comment has an author', {}, { user: { login: 'web-everything' } }],
+    ])('accepts complete coverage with %s', (_name, listedAuthor, fullAuthor) => {
+      const pr = { number: 4017, comments: [{ ...listed, ...listedAuthor }, ...firstPage.slice(1)] };
+      const comments = [...firstPage.slice(1), { ...complete, ...fullAuthor }, { body: 'later discussion' }];
+      const onError = vi.fn();
+      expect(enrichPrsWithCompleteComments([pr], { repo, readComments: () => comments, onError, annotate: p => p }))
+        .toEqual([{ ...pr, comments, commentsComplete: true }]);
+      expect(onError).not.toHaveBeenCalled();
+    });
+  });
+
   it('drops an exactly page-sized covering read because the thread may be truncated at the page size', () => {
     const pr = { number: 4017, comments: firstPage };
     const onError = vi.fn();
