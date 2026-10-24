@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
+import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, resetLane, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
 import { registerScope, releaseScope, assessFreeScope } from '../free-scope.mjs';
 
 const flags = ['--brief=brief.md', '--purpose=example', '--scope=we:scripts/a.mjs,we:scripts/lib/', '--tests=scripts/a.test.mjs', '--repo=/repo'];
@@ -43,6 +43,7 @@ function fixture(rules = [], { ready = true } = {}) {
         if (args.includes('write-tree') || args.some(a => a.endsWith('^{tree}'))) return ok('a'.repeat(40) + '\n');
         if (args.includes('--show-toplevel')) return ok('/repo\n');
         if (args.includes('rev-parse')) return ok('abc123\n');
+        if (args.includes('rev-list')) return ok('1\n');
         if (args.includes('diff') && args.includes('--quiet')) return ok();
         if (args.includes('--binary')) return ok('audited binary diff');
         if (args.includes('hash-object')) return ok(args.slice(args.indexOf('--') + 1).map(() => 'a'.repeat(40) + '\n').join(''));
@@ -78,6 +79,192 @@ const scopeReleased = f => {
   expect(f.calls.find(c => c.text.includes('free-scope-cli.mjs release')).args.slice(2)).toEqual(claim.args.slice(2, 4));
 };
 const codexCalls = f => f.calls.filter(c => c.text.includes('codex-direct-task.mjs') && !c.args.includes('--review'));
+
+it('forces submodule visibility in every diff, including the complete-index comparison', async () => {
+  const f = fixture();
+  expect((await f.run()).result.ok).toBe(true);
+  const diffs = f.calls.filter(c => c.cmd === 'git' && c.args.includes('diff'));
+  expect(diffs.length).toBeGreaterThan(0);
+  for (const call of diffs) expect(call.args).toContain('--ignore-submodules=none');
+});
+
+it.each(['diff.ignoreSubmodules', 'submodule.outside.ignore', 'SUBMODULE.nested.name.IGNORE'])('refuses worker submodule suppression through %s', async key => {
+  for (const scope of ['local', 'worktree', 'global']) {
+    let changed = false;
+    const f = fixture([
+      ['codex-direct-task.mjs --task-file', () => { changed = true; return report(); }],
+      ['config --show-scope', () => ok(`${laneConfig}${changed ? `${scope}\0${key}\nall\0` : ''}`)],
+      ['ls-files --stage', () => ok(`160000 ${'a'.repeat(40)} 0\toutside-submodule\0`)],
+    ]);
+    expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
+    expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+    released(f); scopeReleased(f);
+  }
+});
+
+it.each(['outside-submodule', 'scripts/lib/submodule'])('rejects index gitlinks even when diff omits %s', async file => {
+  const f = fixture([['ls-files --stage', ok(`160000 ${'a'.repeat(40)} 0\t${file}\0`)]]);
+  expect((await f.run()).result.stopReason).toBe('diff-out-of-scope');
+  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+  released(f); scopeReleased(f);
+});
+
+it.each([red(), { status: 0 }, ok('100644 missing fields\0'), ok(`100644 ${'a'.repeat(40)} 0\tscripts/a.mjs`)])('fails closed on unreadable or incomplete index modes (%j)', async response => {
+  const f = fixture([['ls-files --stage', response]]);
+  expect((await f.run()).result.stopReason).toBe('diff-out-of-scope');
+  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+});
+
+it('refuses worker commits even when their net diff cancels before the scoped edit', async () => {
+  let workerCommitted = false;
+  const f = fixture([
+    ['codex-direct-task.mjs --task-file', () => { workerCommitted = true; return report(); }],
+    ['rev-parse HEAD', () => ok(workerCommitted ? 'worker-removal-commit\n' : 'abc123\n')],
+  ]);
+  expect((await f.run()).result.stopReason).toBe('changed-after-audit');
+  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+  released(f); scopeReleased(f);
+});
+
+it.each([
+  ['rev-parse HEAD^', ok('other-parent\n')],
+  ['rev-list --count abc123..HEAD', ok('2\n')],
+  ['rev-parse abc123^', ok('other-parent\n')],
+  ['rev-list --count abc123..abc123', ok('2\n')],
+  ...['rev-parse HEAD^', 'rev-list --count abc123..HEAD', 'rev-parse abc123^', 'rev-list --count abc123..abc123'].flatMap(command =>
+    [red(), { status: 0 }, ok('')].map(response => [command, response])),
+])('refuses changed or unreadable commit ancestry: %s (%j)', async (command, response) => {
+  const f = fixture([[command, response]]);
+  expect((await f.run()).result.stopReason).toBe('changed-after-audit');
+  expect(f.calls.some(c => c.args.includes('commit'))).toBe(true);
+  expect(f.calls.some(c => c.args.includes('ls-remote') || c.args.includes('push'))).toBe(false);
+});
+
+it('refuses extra ancestors when HEAD changes after the post-commit history checks', async () => {
+  const f = fixture([
+    ['rev-parse HEAD', (call, n) => call.args.includes('HEAD^') || n < 3 ? ok('abc123\n') : ok('worker-tip\n')],
+    ['rev-parse worker-tip^', ok('abc123\n')],
+    ['rev-list --count abc123..worker-tip', ok('2\n')],
+  ]);
+  expect((await f.run()).result.stopReason).toBe('changed-after-audit');
+  expect(f.calls.some(c => c.args.includes('worker-tip^'))).toBe(true);
+  expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
+});
+
+it.each([red(), { status: 0 }, ok('')])('fails closed when pre-commit HEAD cannot be read (%j)', async response => {
+  const f = fixture([['rev-parse HEAD', (_, n) => n === 0 ? ok('abc123\n') : response]]);
+  expect((await f.run()).result.stopReason).toBe('changed-after-audit');
+  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+});
+
+it('resolves a remote-only base once and resets to its pinned commit', async () => {
+  const f = fixture([
+    ['rev-parse --verify lane/predecessor^{commit}', red()],
+    ['rev-parse --verify origin/lane/predecessor^{commit}', ok('abc123\n')],
+  ]);
+  const s = { opts: { repo: '/repo', base: 'lane/predecessor' }, lane: { path: '/lane', holder: 'session' }, io: f.io };
+  await resetLane(s);
+  expect(s.baseSha).toBe('abc123');
+  expect(s.startSha).toBe(s.baseSha);
+  expect(f.calls.find(c => c.args.includes('reset')).args).toContain(s.baseSha);
+  expect(f.calls.filter(c => c.args.includes('--verify'))).toHaveLength(2);
+});
+
+it.each([red(), { status: 0 }, ok('')])('refuses unresolved base commits before resetting (%j)', async response => {
+  const f = fixture([['rev-parse --verify', response]]);
+  expect((await f.run()).result.stopReason).toBe('lane-reset-failed');
+  expect(f.calls.some(c => c.args.includes('reset') || c.args.includes('push'))).toBe(false);
+});
+
+// Publication effects remain intercepted; only the disposable repository uses real Git.
+async function withPublicationRepo(run) {
+  const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-publication-'));
+  const gitEnv = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test',
+    GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test' };
+  const git = args => execFileSync('git', ['-C', repo, ...args], {
+    encoding: 'utf8', env: { ...process.env, ...gitEnv },
+  });
+  const commit = (message, parent) => {
+    const sha = git(['commit-tree', git(['write-tree']).trim(), ...(parent ? ['-p', parent] : []), '-m', message]).trim();
+    git(['update-ref', 'HEAD', sha]);
+    return sha;
+  };
+  try {
+    git(['init', '--quiet', '--template=']);
+    git(['config', 'remote.origin.url', originUrl]);
+    mkdirSync(path.join(repo, 'scripts'));
+    writeFileSync(path.join(repo, 'scripts/a.mjs'), 'original\n');
+    git(['add', '--', 'scripts/a.mjs']);
+    const startSha = commit('baseline');
+    git(['update-ref', 'refs/remotes/origin/main', startSha]);
+    const f = fixture([['lane-pool.mjs acquire', ok(JSON.stringify({ lane: 4, path: repo, holder: 'session' }))]]);
+    const exec = f.io.exec;
+    f.io.exec = async (cmd, args, options) => {
+      const scripted = await exec(cmd, args, options);
+      if (cmd !== 'git' || args.includes('ls-remote') || args.includes('push')) return scripted;
+      return spawnSync(cmd, ['-C', repo, ...args.slice(2)], {
+        ...options, cwd: repo, encoding: 'utf8', env: { ...options.env, ...gitEnv },
+      });
+    };
+    await run({ repo, git, commit, startSha, f });
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+}
+
+it('refuses a worker-hidden out-of-scope gitlink and never pushes (real Git)', async () => {
+  await withPublicationRepo(async ({ repo, git, startSha, f }) => {
+    const exec = f.io.exec;
+    f.io.exec = async (cmd, args, options) => {
+      if (args[0] === 'scripts/codex-direct-task.mjs' && !args.includes('--review')) {
+        writeFileSync(path.join(repo, 'scripts/a.mjs'), 'scoped edit\n');
+        git(['config', 'diff.ignoreSubmodules', 'all']);
+        git(['update-index', '--add', '--cacheinfo', `160000,${startSha},outside-submodule`]);
+        expect(git(['diff', '--name-only', startSha])).toBe('scripts/a.mjs\n');
+      }
+      return exec(cmd, args, options);
+    };
+    const { result } = await f.run();
+    expect(['diff-out-of-scope', 'unsafe-git-config']).toContain(result.stopReason);
+    expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
+    released(f); scopeReleased(f);
+  });
+});
+
+it('refuses worker add/remove ancestor commits with only a scoped net diff (real Git)', async () => {
+  await withPublicationRepo(async ({ repo, git, commit, startSha, f }) => {
+    const exec = f.io.exec;
+    f.io.exec = async (cmd, args, options) => {
+      if (args[0] === 'scripts/codex-direct-task.mjs' && !args.includes('--review')) {
+        writeFileSync(path.join(repo, 'outside.txt'), 'outside history\n');
+        git(['add', '--', 'outside.txt']);
+        const added = commit('outside addition', startSha);
+        git(['rm', '--', 'outside.txt']);
+        commit('outside removal', added);
+        writeFileSync(path.join(repo, 'scripts/a.mjs'), 'scoped edit\n');
+        expect(git(['diff', '--name-only', startSha])).toBe('scripts/a.mjs\n');
+        expect(git(['rev-list', '--count', `${startSha}..HEAD`]).trim()).toBe('2');
+      }
+      return exec(cmd, args, options);
+    };
+    const { result } = await f.run();
+    expect(result.stopReason).toBe('changed-after-audit');
+    expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+    released(f); scopeReleased(f);
+  });
+});
+
+it('resets to origin/lane/predecessor when no local predecessor exists (real Git)', async () => {
+  await withPublicationRepo(async ({ repo, git, startSha, f }) => {
+    git(['update-ref', 'refs/remotes/origin/lane/predecessor', startSha]);
+    expect(git(['for-each-ref', '--format=%(refname)', 'refs/heads/lane/predecessor'])).toBe('');
+    const s = { opts: { repo, base: 'lane/predecessor' }, lane: { path: repo, holder: 'session' }, io: f.io };
+    await resetLane(s);
+    expect(s.baseSha).toBe(startSha);
+    expect(s.startSha).toBe(startSha);
+    expect(git(['rev-parse', 'HEAD']).trim()).toBe(startSha);
+    expect(f.calls.find(c => c.args.includes('reset')).args).toContain(startSha);
+  });
+});
 
 it('completes a job with standard cloned-origin configuration', async () => {
   const f = fixture();
@@ -412,7 +599,7 @@ it('happy path orders gates, captures one JSON line, uses session env and releas
   expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1);
   expect(f.output).toHaveLength(1);
   expect(f.output[0].split('\n')).toHaveLength(2);
-  const expected = ['scripts/operations/run.mjs prototype-load --help', 'free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'remote get-url origin', 'reset --hard', 'rev-parse HEAD', 'rev-parse origin/main', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'diff --binary', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'diff --binary', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'diff --binary', 'add --', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --', 'diff --name-only', 'ls-files', 'diff --binary', 'write-tree', 'commit -m', 'rev-parse HEAD', 'rev-parse abc123^{tree}', 'ls-remote', `push ${originUrl}`, 'fix-ready.mjs mark', 'scripts/operations/run.mjs prototype-load', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
+  const expected = ['scripts/operations/run.mjs prototype-load --help', 'free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'remote get-url origin', 'rev-parse --verify origin/main^{commit}', 'reset --hard', 'rev-parse HEAD', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'diff --binary', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'diff --binary', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'diff --binary', 'add --', 'rev-parse HEAD', 'ls-files --stage -z', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --ignore-submodules=none --', 'diff --name-only', 'ls-files', 'diff --binary', 'write-tree', 'commit -m', 'rev-parse HEAD^', 'rev-list --count abc123..HEAD', 'rev-parse HEAD', 'rev-parse abc123^', 'rev-list --count abc123..abc123', 'rev-parse abc123^{tree}', 'ls-remote', `push ${originUrl}`, 'fix-ready.mjs mark', 'scripts/operations/run.mjs prototype-load', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
   const commands = f.calls.filter(c => !(c.cmd === 'git' && c.args.includes('config')));
   expect(commands).toHaveLength(expected.length);
   expected.forEach((part, i) => expect(commands[i].text).toContain(part));
@@ -745,7 +932,7 @@ it('fails closed when untracked audit entry metadata or symlink targets cannot b
 it.each([undefined, -1, NaN, '100644', 0.5])('fails closed on invalid untracked regular-file mode %s after audit', async mode => {
   let audited = false;
   const f = fixture([
-    ['ls-files', ok('scripts/a.mjs\0')],
+    ['ls-files --others', ok('scripts/a.mjs\0')],
     ['codex-direct-task.mjs --review', () => { audited = true; return report(); }],
   ]);
   f.io.lstat = () => ({ mode: audited ? mode : 0o100644, isSymbolicLink: () => false, isFile: () => true });
@@ -759,7 +946,7 @@ it.each([undefined, -1, NaN, '100644', 0.5])('fails closed on invalid untracked 
 it.each(['content', 'mode'])('rechecks the %s fingerprint immediately before committing', async change => {
   let changed = false;
   const f = fixture([
-    ['ls-files', ok('scripts/a.mjs\0')],
+    ['ls-files --others', ok('scripts/a.mjs\0')],
     ['diff --quiet', () => { changed = true; return ok(); }],
     ['diff --binary', () => ok(changed && change === 'content' ? 'changed contents at the same path' : 'audited contents')],
   ]);
@@ -943,7 +1130,7 @@ it('fails closed on missing report exit code, timeout, or malformed report', asy
 it('fails closed on unreadable diff and mismatched reset evidence', async () => {
   for (const [rules, reason] of [
     [[['ls-files', red()]], 'diff-out-of-scope'],
-    [[['rev-parse origin/main', ok('different')]], 'lane-reset-failed'],
+    [[['rev-parse --verify origin/main^{commit}', ok('different')]], 'lane-reset-failed'],
     [[['rev-parse HEAD', ok('')]], 'lane-reset-failed'],
     [[['ls-remote', red()]], 'push-failed'],
   ]) {
@@ -958,7 +1145,7 @@ it('audit accepts only the exact first nonempty line', async () => {
 });
 it('includes untracked paths and safely stages filenames as literal argv', async () => {
   const f = fixture([
-    ['ls-files', ok('scripts/lib/$(touch secret).mjs\0')],
+    ['ls-files --others', ok('scripts/lib/$(touch secret).mjs\0')],
     ['diff --cached', ok('scripts/a.mjs\0scripts/lib/$(touch secret).mjs\0')],
   ]);
   expect((await f.run()).result.ok).toBe(true);
