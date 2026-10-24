@@ -6,6 +6,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { readSharedOpenPrs } from '../../lib/pr-snapshot.mjs';
+import { resolveRealFiles } from '../../lib/pr-real-files.mjs';
+import { loadCardRebaseSettings } from '../../lib/card-squash-rebuild.mjs';
 
 vi.mock('../../lib/pr-snapshot.mjs', async (importOriginal) => ({
   ...await importOriginal(), readSharedOpenPrs: vi.fn(() => null),
@@ -18,7 +20,7 @@ import {
   rearmIsOwed,
   planConflictLabelChange,
   buildConflictComment,
-  watchParkedPrConflicts,
+  watchParkedPrConflicts as watchWithIo,
   formatConflictWatchSummary,
   defaultAttemptCardConflictRebase,
   defaultListParkedPrs,
@@ -98,6 +100,19 @@ vi.mock('../branch-sync.mjs', async (importOriginal) => ({
 // injects a no-op fake for both, exactly as it already fakes `provider` — no real `node`/`gh` process runs from
 // this file.
 const noopRouting = () => ({ postFinding: () => {}, postStandDown: () => {} });
+
+// Keep git/backlog probes hermetic. GitHub readers already run through the mocked
+// child_process/gh-throttle boundary below: let them consume each case's evidence
+// rather than replacing file lists, patches or comment threads with blanket empties.
+function watchParkedPrConflicts(options = {}) {
+  return watchWithIo({
+    listAgents: () => [],
+    computeConflictingPaths: () => null, computeConflictDisposition: () => null,
+    labelRemovedAtMs: () => null, standingRulingFor: () => null,
+    resolveRealFiles: options => resolveRealFiles({ ...options, run: () => ({ status: 1, stdout: '' }) }),
+    ...options,
+  });
+}
 
 describe('the real incident that motivated this pass — WE PR #1920, captured live 2026-09-04T23:26Z', () => {
   // The EXACT `gh pr view 1920 --json ...` payload shape observed while diagnosing this gap (before the
@@ -3825,7 +3840,7 @@ describe('conflict watch diagnostics', () => {
       attemptCardRebase, postRearm: () => {}, ...noopRouting(),
     });
     expect(listPrFiles).toHaveBeenCalledWith({ number: 5697, repo: 'o/n' });
-    expect(attemptCardRebase).toHaveBeenCalledWith({ pr, repo: 'o/n', cardConflictSettings: {
+    expect(attemptCardRebase).toHaveBeenCalledWith({ pr, repo: 'o/n', cardRebaseSettings: loadCardRebaseSettings(), cardConflictSettings: {
       value: { autoResolveRaisedBy: true }, sources: { autoResolveRaisedBy: 'test' },
     } });
     expect(result.routedTo).toBe('card-conflict-resolver');

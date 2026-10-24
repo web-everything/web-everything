@@ -358,16 +358,20 @@ describe('standDownRow', () => {
 describe('main — STOOD DOWN section', () => {
   const list = (...prs) => execFileSync.mockReset().mockReturnValueOnce(JSON.stringify(prs));
 
-  it('lists an open PR with a leading-line stand-down comment regardless of labels, with its reason', () => {
+  it('lists an unresolved needs-judgment stand-down in NEEDS YOU regardless of labels', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const body = buildStandDownComment({ reason: 'needs-judgment' });
     list(fixture({ number: 99, labels: [], comments: [{ body, createdAt: '2026-09-20T00:00:00Z', author: { login: 'web-everything' } }] }));
     main(['--repo=o/n', '--json'], { unsupportedPath: NO_UNSUPPORTED });
-    expect(JSON.parse(log.mock.calls[0][0]).stoodDown).toEqual([{
+    // The overlay makes the answer reader importable; the declared needs-you default
+    // now applies instead of the missing-reader fallback to the legacy STOOD DOWN section.
+    // Pin that intended behavior and the full row so the question cannot disappear.
+    const report = JSON.parse(log.mock.calls[0][0]);
+    expect(report.stoodDown).toEqual([]);
+    expect(report.needsYouStandDowns).toEqual([{
       repo: 'o/n', number: 99, title: 'Ready for review',
       standDownAt: '2026-09-20T00:00:00Z',
-      reason: 'the reviewer\'s finding needs a judgment the fix agent could not safely make, so it did NOT guess',
-      alsoReviewHuman: false,
+      question: '', remaining: [],
     }]);
   });
 

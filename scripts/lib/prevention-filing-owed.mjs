@@ -6,9 +6,12 @@ import { acquireLease, atomicRecord, cardBatchStateDir, tokenOf } from '../opera
 
 const directory = stateDir => join(stateDir, 'owed-prevention');
 // Session/transport flags are not the obligation. Both spawn and CLI use the same card input.
-const identity = input => JSON.stringify([['repo', input.retractTo?.repo ?? input.retract?.repo ?? input.source?.repo ?? ''],
-  ['pr', String(input.retractTo?.pr ?? input.retract?.pr ?? input.source?.pr ?? '')], ...['title', 'kind', 'size', 'digest', 'scope', 'parent', 'queue']
-  .map(key => [key, String(input[key] ?? '')])]);
+const identity = input => JSON.stringify(Object.entries({
+  repo: input.retractTo?.repo ?? input.retract?.repo ?? input.source?.repo ?? '',
+  pr: String(input.retractTo?.pr ?? input.retract?.pr ?? input.source?.pr ?? ''),
+  ...Object.fromEntries(['title', 'kind', 'size', 'digest', 'scope', 'parent', 'queue']
+    .map(key => [key, String(input[key] ?? '')])),
+}));
 export const preventionFilingKey = input => /^[a-f0-9]{64}$/.test(input.owedKey ?? '') ? input.owedKey : createHash('sha256').update(identity(input)).digest('hex');
 const pathOf = (input, stateDir) => join(directory(stateDir), `${preventionFilingKey(input)}.json`);
 const read = path => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };

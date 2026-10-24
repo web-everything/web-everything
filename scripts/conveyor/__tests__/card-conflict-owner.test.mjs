@@ -3,9 +3,17 @@ import { describe, it, expect, vi } from 'vitest';
 import { watchParkedPrConflicts, CONFLICT_LABEL, defaultAttemptCardConflictRebase, gitCardOnlyRecheck } from '../parked-pr-conflict-watch.mjs';
 import { gitRun } from '../../lib/git-run.mjs';
 import { filterFixesByInFlightScope } from '../reconcile-fix-dispatch.mjs';
-import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP } from '../unowned-rebase-attempt-count.mjs';
+import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP,
+  formatUnownedRebaseAttemptMarker, formatUnownedRebaseInfraMarker } from '../unowned-rebase-attempt-count.mjs';
 import { MISSING_RUN_CREDENTIAL_REFUSAL } from '../main-red-recovery.mjs';
 import { mintSessionSlug } from '../session-slug.mjs';
+
+vi.mock('../reconcile-note-comment.mjs', async importOriginal => ({
+  ...await importOriginal(), postNoteComment: vi.fn(() => ({ ok: true })),
+}));
+vi.mock('../branch-sync.mjs', async importOriginal => ({
+  ...await importOriginal(), notifyDesktopChecked: vi.fn(() => ({ ok: true })),
+}));
 
 const cardPath = 'backlog/5360-parent.md';
 function sweep(labels, files, action = 'rebased', extra = {}) {
@@ -24,11 +32,11 @@ function sweep(labels, files, action = 'rebased', extra = {}) {
 }
 
 describe('conflicts always have an owner, outside the fixer scope queue for mechanical cards', () => {
-  it.each([[], ['review:pending'], ['review:changes', CONFLICT_LABEL], ['ready-to-merge', 'review:accepted']].map(labels => [labels]))
-  ('tries the resolver this tick for unowned, parked, already bounced and queued cards: %j', labels => {
+  it.each([[[], 0], [['review:pending'], 0], [['review:changes', CONFLICT_LABEL], 1], [['ready-to-merge', 'review:accepted'], 1]])
+  ('tries the resolver and rearms only a live verdict for unowned, parked, bounced and queued cards: %j', (labels, rearms) => {
     const s = sweep(labels, [cardPath]);
     expect(s.attemptCardRebase).toHaveBeenCalledOnce();
-    expect(s.postRearm).toHaveBeenCalledOnce();
+    expect(s.postRearm).toHaveBeenCalledTimes(rearms);
     expect(s.postFinding).not.toHaveBeenCalled();
     expect(s.result[0]).toMatchObject({ routedTo: 'card-conflict-resolver', owner: 'review',
       cardConflictSetting: { value: true, source: 'standard' } });
@@ -38,11 +46,15 @@ describe('conflicts always have an owner, outside the fixer scope queue for mech
     expect(s.attemptCardRebase).toHaveBeenCalledOnce();
     expect(s.postFinding).toHaveBeenCalledOnce();
     expect(s.postRearm).not.toHaveBeenCalled();
-    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42, UNOWNED_REBASE_ATTEMPT_MARKER);
+    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42,
+      formatUnownedRebaseAttemptMarker({ action: 'skip', reason: 'not a list' }));
   });
-  it('counts error results against the same cap', () => {
+  it('counts error results against the infrastructure cap without spending a content round', () => {
     const s = sweep([], [cardPath], 'error');
-    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42, UNOWNED_REBASE_ATTEMPT_MARKER);
+    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42,
+      formatUnownedRebaseInfraMarker({ action: 'error', reason: 'not a list' }));
+    expect(s.provider.postComment.mock.calls.some(([, , body]) => body.startsWith(UNOWNED_REBASE_ATTEMPT_MARKER))).toBe(false);
+    expect(s.postFinding).toHaveBeenCalledOnce();
   });
   it('non-card owed-elsewhere conflicts are sent to the existing conflict finding/fixer path', () => {
     const s = sweep([], ['scripts/code.mjs']);
@@ -84,9 +96,11 @@ describe('conflicts always have an owner, outside the fixer scope queue for mech
     expect(s.postRearm).not.toHaveBeenCalled();
     expect(s.result[0].owner).toBe('fixer');
   });
-  it('records a thrown rebase attempt under the existing bounded retry marker', () => {
+  it('records a thrown rebase attempt under the bounded infrastructure retry marker', () => {
     const s = sweep([], [cardPath], 'rebased', { attemptCardRebase: () => { throw new Error('git unavailable'); } });
-    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42, UNOWNED_REBASE_ATTEMPT_MARKER);
+    expect(s.provider.postComment).toHaveBeenCalledWith('o/r', 42,
+      formatUnownedRebaseInfraMarker({ action: 'error', reason: 'card rebase unavailable; normal conflict owner required' }));
+    expect(s.provider.postComment.mock.calls.some(([, , body]) => body.startsWith(UNOWNED_REBASE_ATTEMPT_MARKER))).toBe(false);
     expect(s.postFinding).toHaveBeenCalledOnce();
   });
   it.each([
@@ -101,7 +115,7 @@ describe('conflicts always have an owner, outside the fixer scope queue for mech
   });
   it('retries rearm after a resolver push and a failed review write', () => {
     const postRearm = vi.fn(() => { throw new Error('write unavailable'); });
-    const s = sweep([], [cardPath], 'rebased', { postRearm });
+    const s = sweep(['review:accepted'], [cardPath], 'rebased', { postRearm });
     expect(s.result[0]).toMatchObject({ owner: 'conflict-watch', routedTo: 'card-conflict-rearm-pending' });
     const retry = sweep([CONFLICT_LABEL, 'review:accepted'], [cardPath], 'current', {
       listPrs: () => [{ ...s.pr, mergeable: 'MERGEABLE', labels: [CONFLICT_LABEL, 'review:accepted'] }],

@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 import { pidAlive } from '../lib/pid-alive.mjs';
 
-import { defaultListAgents } from './dispatch-lane-io.mjs';
+import { defaultListAgents } from './dispatch-agent-list.mjs';
 import { listWrappedWorkerAgents } from './worker-wrapper-launch.mjs';
 
 export { pidAlive } from '../lib/pid-alive.mjs';

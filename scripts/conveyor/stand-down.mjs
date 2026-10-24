@@ -813,8 +813,8 @@ if (IS_CLI) {
   let labeled = false;
   if (!concurrent && !loadHold && !redispatch) {
     try {
-      ensureLabelCached(['label', 'create', STAND_DOWN_LABEL, ...repoArgs, '--color', 'b60205', '--description', 'a fixer stood down; a person is the next step (auto-managed)'], { exec: args => execFileSync('gh', args, { encoding: 'utf8', timeout: resolveChildTimeoutMs(), stdio: ['ignore', 'pipe', 'pipe'] }) });
-      if (supersededBy) ensureLabelCached(['label', 'create', SUPERSEDED_LABEL, ...repoArgs, '--color', '6e7781', '--description', 'a merged PR declares it supersedes this one; closing needs an operator decision (auto-managed)'], { exec: args => execFileSync('gh', args, { encoding: 'utf8', timeout: resolveChildTimeoutMs(), stdio: ['ignore', 'pipe', 'pipe'] }) });
+      ensureLabelCached(['label', 'create', STAND_DOWN_LABEL, ...repoArgs, '--color', 'b60205', '--description', 'a fixer stood down; a person is the next step (auto-managed)'], { exec: args => execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), stdio: ['ignore', 'pipe', 'pipe'] }) });
+      if (supersededBy) ensureLabelCached(['label', 'create', SUPERSEDED_LABEL, ...repoArgs, '--color', '6e7781', '--description', 'a merged PR declares it supersedes this one; closing needs an operator decision (auto-managed)'], { exec: args => execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), stdio: ['ignore', 'pipe', 'pipe'] }) });
       gh(['pr', 'edit', String(pr), ...repoArgs, '--add-label', supersededBy ? `${STAND_DOWN_LABEL},${SUPERSEDED_LABEL}` : STAND_DOWN_LABEL]);
       labeled = true;
     } catch (e) {

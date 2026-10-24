@@ -17,6 +17,7 @@ describe('workflow human hold through the drain CLI', () => {
   beforeAll(() => {
     root = realpathSync(mkdtempSync(join(tmpdir(), 'workflow-cli-')));
     // Real modules and a private settings file: never edit the working checkout's policy.
+    // Intentionally omit skills-src: a drain import must not load the dispatch/runner graph.
     cpSync(join(source, 'scripts'), join(root, 'scripts'), {
       recursive: true, filter: (path) => !path.includes('__tests__'),
     });

@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { resolveRealFiles } from '../../lib/pr-real-files.mjs';
 import {
   decideConflictReassert, resolveConflictReassertSettings,
   CONFLICT_REASSERT_ENV, CONFLICT_REASSERT_OFF,
@@ -23,6 +24,8 @@ function replay(overrides = {}) {
     postFinding: (call) => findings.push(call),
     postStandDown: unexpected, postRearm: unexpected, postSupersedeComment: unexpected,
     listAgents: () => [], listPrFiles: () => ['docs/agent/platform-decisions.md'],
+    // This replay owns its file evidence; never fetch live refs to recheck the captured PR.
+    resolveRealFiles: options => resolveRealFiles({ ...options, run: () => ({ status: 1, stdout: '' }) }),
     listPrPatches: () => null, listMainStatutePatches: () => null,
     computeConflictingPaths: () => ['docs/agent/platform-decisions.md'], computeConflictDisposition: () => 'conflicting',
     labelAgeMs: unexpected, labelRemovedAtMs: unexpected, attemptMechanicalRebase: unexpected,

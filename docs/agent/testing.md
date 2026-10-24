@@ -1,5 +1,14 @@
 # Testing — Three-Tier Strategy
 
+## Drain import isolation
+
+The review-job store reads agent liveness through `operations/dispatch-agent-list.mjs`,
+not the launch graph in `dispatch-lane-io.mjs`. The latter re-exports the existing
+listing and timeout API. Keep that leaf independent of `skills-src`: the drain's
+workflow CLI fixture deliberately stages scripts without skills, so import-time
+dispatch dependencies fail visibly. `dispatch-lane-defaults.test.mjs` pins listing
+argv, child bounds, environment forwarding and malformed timeout refusal.
+
 ## Paused review recovery
 
 The ruling ledger omits unattempted referrals and suppresses findings after an operator verdict.
