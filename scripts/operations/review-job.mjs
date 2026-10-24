@@ -941,7 +941,7 @@ function runReviewArc({
         io.log(`review-job: carryAcrossRebase=${setting.value} (${setting.source})`);
         if (setting.value === 'on') {
           const evidence = io.readCarryEvidence({ pr: planned.pr, repo: planned.repo });
-          if (!isRealHead(evidence?.headSha) || !Array.isArray(evidence?.comments)) throw Error('carry evidence unreadable');
+          if (!/^[0-9a-f]{40}$/.test(evidence?.headSha ?? '') || !Array.isArray(evidence?.comments)) throw Error('carry evidence unreadable');
           const prior = findCarriableVerdict({ ...evidence, pr: planned.pr });
           if (prior) {
             const priorPatchId = io.contributionPatchId({ sha: prior.sha, repo: planned.repo });
@@ -1204,6 +1204,7 @@ export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stack
   return named(dispatchReviewJob(opts));
 }
 
+const STACK_CARRY_HEAD = /^[0-9a-f]{40}$/;
 const STACK_CARRY_FINGERPRINT = /^[0-9a-f]{64}$/;
 
 /**
@@ -1229,7 +1230,7 @@ export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = proce
   let stackFingerprint = null;
   let mainFingerprint = null;
   if (base) { try { stackFingerprint = fingerprintOf(stackText(base)); } catch { stackFingerprint = null; } }
-  else if (thread?.headRefName && isRealHead(thread.headRefOid)) {
+  else if (thread?.headRefName && STACK_CARRY_HEAD.test(String(thread.headRefOid ?? ''))) {
     // The fingerprint is of THIS commit (`headRefOid`), not of whatever the branch name points at by now; the carry
     // below is bound to that same commit and fingerprint.
     try { const net = mainText({ headRefName: thread.headRefName, headRefOid: thread.headRefOid }); mainFingerprint = net?.scored ? fingerprintOf(net.text) : null; } catch { mainFingerprint = null; }
@@ -1267,7 +1268,7 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
   try {
     const head = String(decision?.head ?? '');
     const fingerprint = String(decision?.fingerprint ?? '');
-    if (!isRealHead(head) || !STACK_CARRY_FINGERPRINT.test(fingerprint)) {
+    if (!STACK_CARRY_HEAD.test(head) || !STACK_CARRY_FINGERPRINT.test(fingerprint)) {
       return { ok: false, error: 'carry refused: the compared head and fingerprint are not both known' };
     }
     const bodyPath = join('/tmp', `review-stack-carry-${String(repo).replace(/[^\w.-]+/g, '-')}-${pr}-${randomUUID()}.md`);
