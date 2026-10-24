@@ -820,7 +820,7 @@ export function buildPrGraphqlView(repoState, pr, { originPath, callerActor, fie
     mergeable,
     mergeStateStatus,
     labels: pr.labels.map((name) => ({ name })),
-    comments: pr.comments.map((c) => ({ ...c, viewerDidAuthor: c.author.login === callerActor })),
+    comments: pr.comments.map((c) => ({ ...c, id: `IC_fake_${c.id}`, viewerDidAuthor: c.author.login === callerActor })),
     statusCheckRollup: pr.checks.map((c) => ({
       __typename: 'CheckRun', name: c.name, status: c.status, conclusion: c.conclusion,
       startedAt: c.startedAt, completedAt: c.completedAt,

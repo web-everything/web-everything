@@ -266,6 +266,9 @@ it.each(['paged-relabel', 'unreadable', 'malformed-pages', 'post-head-moved'])('
   const escape = s => s.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
   const exec = (_file, args, options) => {
     calls.push(args);
+    if (args[0] === 'api' && args[1] === 'graphql') {
+      return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: pr.comments.length } } } } });
+    }
     if (args.includes(`repos/${repo}/issues/7/comments`)) return pr.comments.map(c =>
       [c.body, c.createdAt, c.author.login, String(c.id)].map(escape).join('\t')).join('\n');
     if (args.includes(`repos/${repo}/issues/7/events?per_page=100`)) {

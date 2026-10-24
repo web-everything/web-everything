@@ -860,7 +860,8 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
 }
 
 /** Fresh head, complete thread and formal reviews for the numbering carry's pre-write guard. */
-function readLiveDrainCarryEvidence({ pr, repo, exec = execFileSync, readReviews } = {}) {
+function readLiveDrainCarryEvidence({ pr, repo, cwd, exec = execFileSync, readReviews } = {}) {
+  repo ||= localRepoSlug({ cwd, exec });
   const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 };
   const d = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
     '--json', 'headRefOid'], opts));
@@ -5437,7 +5438,7 @@ async function runCli() {
     try {
       const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
       if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
-      const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo,
+      const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
         expectedHead: headSha, exec: (file, args, opts) => file === 'gh' ? readGh(args, opts) : execFileSync(file, args, { ...opts, cwd }) });
       if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
       return decision.hold;

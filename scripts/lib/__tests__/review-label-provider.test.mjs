@@ -267,8 +267,10 @@ describe('the gh adapter', () => {
     const argv = GH_ARGV.readComments('o/n', 9);
     expect(argv.slice(0, 7)).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/9/comments']);
     expect(argv.join(' ')).toContain('createdAt: .created_at');
-    const line = '{"author":{"login":"x"},"body":"b","createdAt":"2026-10-09T16:00:00Z"}';
-    expect(createGhProvider({ exec: () => `${line}\n${line}\n${line}\n` }).readComments('o/n', 9)).toHaveLength(3);
+    const comments = Array.from({ length: 3 }, (_, i) => ({ id: `IC_${i}`, author: { login: 'x' }, body: 'b', createdAt: '2026-10-09T16:00:00Z' }));
+    const exec = vi.fn().mockReturnValueOnce(comments.map(c => JSON.stringify(c)).join('\n'))
+      .mockReturnValueOnce(JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 3 } } } } }));
+    expect(createGhProvider({ exec }).readComments('o/n', 9)).toHaveLength(3);
     expect(() => createGhProvider({ exec: () => { throw new Error('gh failed'); } }).readComments('o/n', 9)).toThrow(/gh failed/);
     expect(PR_COMMENTS_PAGE_SIZE).toBe(100);
   });
@@ -276,6 +278,86 @@ describe('the gh adapter', () => {
   it('readPrReviews throws on a malformed line or a gh failure (never "no reviews")', () => {
     expect(() => createGhProvider({ exec: () => 'not json\n' }).readPrReviews('o/n', 9)).toThrow();
     expect(() => createGhProvider({ exec: () => { throw new Error('gh failed'); } }).readPrReviews('o/n', 9)).toThrow(/gh failed/);
+  });
+});
+
+describe('comment completeness proof through the provider exec seam', () => {
+  const countResponse = totalCount => JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount } } } } });
+  const transport = (comments, response = countResponse(comments.length)) => vi.fn()
+    .mockReturnValueOnce(comments.map(c => JSON.stringify(c)).join('\n')).mockReturnValueOnce(response);
+
+  it.each([0, 1, 100, 201])('accepts %i unique comments only with an equal GraphQL count through the same exec', count => {
+    const comments = Array.from({ length: count }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'chalbert' } }));
+    const exec = transport(comments);
+    expect(createGhProvider({ exec }).readComments('o/n', 9)).toEqual(comments);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec.mock.calls[0][0]).toEqual(GH_ARGV.readComments('o/n', 9));
+    const [args, options] = exec.mock.calls[1];
+    expect(args).toEqual(GH_ARGV.readCommentsTotalCount('o/n', 9));
+    expect(args.slice(0, 2)).toEqual(['api', 'graphql']);
+    expect(args).toEqual(expect.arrayContaining(['owner=o', 'name=n', 'n=9']));
+    expect(args.find(a => a.startsWith('query='))).toMatch(/repository\(owner:\$owner,name:\$name\)\{pullRequest\(number:\$n\)\{comments\{totalCount\}\}\}/);
+    expect(options.maxBuffer).toBeGreaterThanOrEqual(1024 * 1024);
+  });
+
+  it('rejects a 300-comment thread silently read as 200', () => {
+    const comments = Array.from({ length: 200 }, (_, i) => ({ id: `IC_${i}` }));
+    const exec = transport(comments, countResponse(300));
+    expect(() => createGhProvider({ exec }).readComments('o/n', 9)).toThrow();
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['missing body', { body: undefined }], ['null body', { body: null }], ['non-string body', { body: 42 }],
+    ['missing author', { author: undefined }], ['null author', { author: null }],
+    ['missing login', { author: {} }], ['empty login', { author: { login: '' } }],
+    ['blank login', { author: { login: ' ' } }], ['non-string login', { author: { login: 42 } }],
+    ['empty user login', { author: undefined, user: { login: '' } }],
+  ])('rejects %s despite an equal count and unique ids', (_name, fields) => {
+    const comments = [
+      { id: 'IC_1', body: 'valid discussion', author: { login: 'chalbert' } },
+      { id: 'IC_2', body: 'discussion', author: { login: 'chalbert' }, ...fields },
+    ];
+    expect(() => createGhProvider({ exec: transport(comments) }).readComments('o/n', 9)).toThrow(/string body|author login/);
+  });
+
+  it.each([{ author: { login: 'chalbert' } }, { user: { login: 'chalbert' } }])('accepts an empty string body with a valid author: %j', author => {
+    const comments = [{ id: 'IC_1', body: '', ...author }];
+    expect(createGhProvider({ exec: transport(comments) }).readComments('o/n', 9)).toEqual(comments);
+  });
+
+  it.each([
+    ['duplicate ids', [{ id: 'IC_1' }, { id: 'IC_1' }]], ['missing id', [{}]],
+    ['null id', [{ id: null }]], ['empty id', [{ id: '' }]], ['blank id', [{ id: ' ' }]],
+    ['numeric REST id without node id', [{ id: 123 }]], ['malformed comment', [null]],
+  ])('rejects %s despite an equal count', (_name, comments) => {
+    const records = comments.map(c => c && ({ body: 'discussion', author: { login: 'chalbert' }, ...c }));
+    expect(() => createGhProvider({ exec: transport(records) }).readComments('o/n', 9)).toThrow(/comment node ids/);
+  });
+
+  it.each([
+    ['missing count', '{}'], ['invalid JSON', 'not json'],
+    ...[null, '1', 1.5, -1, 0, 2].map(count => [`invalid or unequal count ${count}`, countResponse(count)]),
+    ['GraphQL errors with partial data', JSON.stringify({ ...JSON.parse(countResponse(1)), errors: [{ message: 'denied' }] })],
+    ['malformed GraphQL errors', JSON.stringify({ ...JSON.parse(countResponse(1)), errors: {} })],
+  ])('fails closed on %s', (_name, response) => {
+    expect(() => createGhProvider({ exec: transport([{ id: 'IC_1' }], response) }).readComments('o/n', 9)).toThrow();
+  });
+
+  it('propagates a GraphQL transport failure after a successful paged read', () => {
+    const exec = vi.fn().mockReturnValueOnce('{"id":"IC_1"}\n').mockImplementation(() => { throw new Error('graphql failed'); });
+    expect(() => createGhProvider({ exec }).readComments('o/n', 9)).toThrow('graphql failed');
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects malformed paged comment JSON', () => {
+    expect(() => createGhProvider({ exec: () => 'not json' }).readComments('o/n', 9)).toThrow();
+  });
+
+  it.each([undefined, null, '', 'owner', '/repo', 'owner/', 'owner/repo/extra', 'owner/repo\n', 'owner name/repo', 'owner/..', {}])('requires an explicit valid repository: %j', repo => {
+    const exec = transport([{ id: 'IC_1' }]);
+    expect(() => createGhProvider({ exec }).readComments(repo, 9)).toThrow(/explicit valid.*repository/);
+    expect(exec).not.toHaveBeenCalled();
   });
 });
 
