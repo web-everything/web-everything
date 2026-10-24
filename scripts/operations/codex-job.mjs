@@ -121,7 +121,34 @@ export async function acquireLane(s) {
   if (!good(r) || !Number.isInteger(s.lane.lane) || !s.lane.path || !s.lane.holder) fail('lane-acquire-failed');
   s.result.lane = s.lane.lane;
 }
+async function captureCredentialHelpers(s) {
+  // Read operator config before the worker runs. Only credential helpers from
+  // system/global/command scope cross into publication; lane config never does.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_') ||
+    /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM)$/.test(key)));
+  const r = await exec(s, 'git', ['-C', s.opts.repo, 'config', '--show-scope', '--includes', '-z',
+    '--get-regexp', '^credential(\\..*)?\\.helper$'], false, false,
+    { env, timeout: 30000, maxBuffer: 1024 * 1024 });
+  if (r.status === 1 && r.stdout === '') return [];
+  const parts = typeof r.stdout === 'string' ? r.stdout.split('\0') : [];
+  if (!good(r) || parts.pop() !== '' || parts.length % 2) {
+    fail('unsafe-git-config', 'Cannot read trusted credential helpers; inspect operator Git configuration before retrying');
+  }
+  const helpers = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    const split = parts[i + 1].indexOf('\n');
+    if (split < 0 || !['system', 'global', 'local', 'worktree', 'command'].includes(parts[i])) {
+      fail('unsafe-git-config', 'Cannot parse trusted credential helpers; inspect operator Git configuration before retrying');
+    }
+    const key = parts[i + 1].slice(0, split), value = parts[i + 1].slice(split + 1);
+    if (['system', 'global', 'command'].includes(parts[i]) && /^credential(?:\..*)?\.helper$/i.test(key)) {
+      helpers.push(`${key}=${value}`);
+    }
+  }
+  return helpers;
+}
 export async function resetLane(s) {
+  s.credentialHelpers = await captureCredentialHelpers(s);
   // Capture the publication destination from the primary checkout before any worker runs.
   const origin = await exec(s, 'git', ['-C', s.opts.repo, 'remote', 'get-url', 'origin']);
   if (!good(origin) || typeof origin.stdout !== 'string' || !origin.stdout.trim()) fail('push-failed', 'Cannot read trusted origin URL');
@@ -314,14 +341,16 @@ export async function commitAndPush(s) {
     exportEntry(file, bytes, mode))) !== s.auditExportFingerprint) {
     fail('changed-after-audit', 'Exported bytes or modes differ from the audit input; rerun tests and audit before retrying');
   }
-  // Drop inherited Git overrides as well as user/system configuration. The clean
-  // checkout must never inherit a lane's object store, helpers or identity.
+  // Drop inherited Git overrides and config, then restore only the operator's
+  // frozen credential helpers. Lane helpers, object stores and identity stay out.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
   Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1',
     GIT_AUTHOR_NAME: 'Codex Job', GIT_AUTHOR_EMAIL: 'codex-job@users.noreply.github.com',
     GIT_COMMITTER_NAME: 'Codex Job', GIT_COMMITTER_EMAIL: 'codex-job@users.noreply.github.com' });
   const dir = await s.io.mkdtemp(path.join(tmpdir(), 'codex-job-publish-'));
-  const trustedGit = args => s.io.exec('git', ['-C', dir, ...(args[0] === 'add' ? ['--literal-pathspecs'] : []), '-c', 'core.hooksPath=/dev/null',
+  // Stage and query the same literal paths, including names containing * ? or [].
+  const trustedGit = args => s.io.exec('git', ['-C', dir, '--literal-pathspecs', '-c', 'core.hooksPath=/dev/null',
+    ...(s.credentialHelpers ?? []).flatMap(helper => ['-c', helper]),
     '-c', 'user.name=Codex Job', '-c', 'user.email=codex-job@users.noreply.github.com', ...args],
     { cwd: dir, env, timeout: 120000, maxBuffer: 64 * 1024 * 1024 });
   try {

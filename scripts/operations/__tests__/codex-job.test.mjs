@@ -1308,6 +1308,99 @@ it('publication review: scrubs inherited Git overrides from clone, commit and pu
   }
 });
 
+it('preserves only trusted operator credential helpers for clone and push, captured before the worker', async () => {
+  let workerRan = false;
+  const helpers = ['credential.helper=operator-system-helper', 'credential.helper=store --file=/operator/credentials', 'credential.helper=',
+    'credential.https://github.com.helper=!operator-helper "$@"\n'];
+  const f = fixture([
+    ['config --show-scope', () => ok(`${laneConfig}system\0credential.helper\noperator-system-helper\0` +
+      'global\0credential.helper\nstore --file=/operator/credentials\0' +
+      'command\0credential.helper\n\0command\0credential.https://github.com.helper\n!operator-helper "$@"\n\0' +
+      `global\0core.fsmonitor\nunsafe-monitor\0${workerRan ? 'global\0credential.helper\nlate-helper\0' : ''}`)],
+    ['codex-direct-task.mjs', () => { workerRan = true; return report(); }],
+  ]);
+  expect((await f.run()).result.ok).toBe(true);
+  for (const verb of ['clone', 'push']) {
+    const call = f.calls.find(c => c.args.includes(verb));
+    const config = call.args.flatMap((arg, i) => arg === '-c' ? [call.args[i + 1]] : []);
+    expect(config.filter(value => value.startsWith('credential.'))).toEqual(helpers);
+    expect(config).not.toContain('core.fsmonitor=unsafe-monitor');
+    expect(call.env).not.toHaveProperty('GIT_DIR');
+    expect(call.env).not.toHaveProperty('GIT_WORK_TREE');
+    expect(call.env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+  }
+});
+
+it.each(['codex-job*.mjs', 'codex-jo?.mjs', 'codex-jo[b].mjs'])(
+  'publishes literal %s beside tracked codex-job.mjs without changed-after-audit', async name => {
+  const file = `scripts/operations/${name}`;
+  const f = await publicationFixture();
+  f.s.opts.scope = ['we:scripts/operations/'];
+  f.s.files = [file];
+  f.s.auditExportFingerprint = await captureAuditExport(f.s);
+  const exec = f.io.exec;
+  f.io.exec = async (cmd, args, options) => {
+    if (cmd === 'git' && args.includes('ls-files') && f.isFresh({ args, cwd: options.cwd })) {
+      // Query the real tracked sibling without modifying this checkout's index.
+      // The newly exported wildcard-named entry is supplied by the write fixture.
+      const literal = args.includes('--literal-pathspecs') ? ['--literal-pathspecs'] : [];
+      const sibling = spawnSync('git', [...literal, 'ls-files', '--stage', '-z', '--', file], {
+        cwd: process.cwd(), env: options.env, encoding: 'utf8',
+      });
+      expect(sibling.status).toBe(0);
+      return ok(stagedEntries(f.writes, options.cwd, [file]) + sibling.stdout);
+    }
+    return exec(cmd, args, options);
+  };
+  expect(await f.publish()).toMatchObject({ ok: true });
+  expectFreshPush(f);
+});
+
+it('reads global and inherited command credential helpers without inheriting Git directory overrides (real Git)', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'codex-job-credentials-'));
+  const config = path.join(dir, 'operator.config');
+  writeFileSync(config, '[credential]\n\thelper = operator-global-helper\n');
+  const injected = { GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: 'operator-command-helper',
+    GIT_CONFIG_KEY_1: 'core.fsmonitor', GIT_CONFIG_VALUE_1: 'unsafe-monitor',
+    GIT_DIR: '/untrusted/git', GIT_WORK_TREE: '/untrusted/worktree' };
+  const saved = Object.fromEntries(Object.keys(injected).map(key => [key, process.env[key]]));
+  try {
+    Object.assign(process.env, injected);
+    const f = fixture();
+    const exec = f.io.exec;
+    f.io.exec = async (cmd, args, options) => {
+      if (cmd === 'git' && args.includes('--get-regexp')) {
+        return spawnSync(cmd, args.slice(2), { ...options, cwd: dir, encoding: 'utf8' });
+      }
+      return exec(cmd, args, options);
+    };
+    expect((await f.run()).result.ok).toBe(true);
+    for (const verb of ['clone', 'push']) {
+      const call = f.calls.find(c => c.args.includes(verb));
+      expect(call.args).toContain('credential.helper=operator-global-helper');
+      expect(call.args).toContain('credential.helper=operator-command-helper');
+      expect(call.args).not.toContain('core.fsmonitor=unsafe-monitor');
+      expect(call.env).not.toHaveProperty('GIT_CONFIG_COUNT');
+      expect(call.env).not.toHaveProperty('GIT_DIR');
+      expect(call.env).not.toHaveProperty('GIT_WORK_TREE');
+    }
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it.each([red(), { status: 0 }, ok('global\0credential.helper\ntruncated'), ok('global\0missing-value-separator\0')])(
+  'refuses unreadable or incomplete operator credential configuration (%j)', async response => {
+  const f = fixture([['--get-regexp', response]]);
+  expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
+  expect(codexCalls(f)).toHaveLength(0);
+  expect(pushes(f)).toHaveLength(0);
+});
+
 it.each(['bytes', 'executable mode'])('publication review: rejects export bytes or modes changed after the post-audit check (%s)', async change => {
   const f = await publicationFixture();
   await checkAuditedFiles(f.s);
