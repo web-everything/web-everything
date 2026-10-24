@@ -1,3 +1,4 @@
+import { pidIdentity, pidIdentityStamp } from '../lib/pid-alive.mjs';
 /**
  * @file scripts/conveyor/fix-dispatch-claim.mjs
  * @description #x0jphk5 (parent #4075, epic #3383) — THE REAL PER-(REPO, KIND, PR) CLAIM the fix-dispatch
@@ -148,13 +149,22 @@ export function acquireFixDispatchClaim({
  * @returns {boolean} whether the stamp landed
  */
 export function stampBorrowedRunnerPid({
-  repo, pr, kind = 'fix', owner, pid, nowIso = new Date().toISOString(), lockRoot = fixDispatchClaimRoot(),
+  repo, pr, kind = 'fix', owner, pid, runnerStart, runnerArgv, identityOf = pidIdentityStamp,
+  nowIso = new Date().toISOString(), lockRoot = fixDispatchClaimRoot(),
 } = {}) {
   if (!owner || !Number.isInteger(pid) || pid <= 0) return false;
   const resource = fixDispatchResource({ repo, pr, kind });
   const current = readLockEntry(lockRoot, resource);
   if (!current || current.owner !== owner) return false;
-  return heartbeat(lockRoot, resource, owner, nowIso, current.pid ?? null, { ...(current.meta ?? {}), runnerPid: pid });
+  if (runnerStart == null || runnerArgv == null) {
+    let stamp;
+    try { stamp = identityOf(pid); } catch { stamp = null; }
+    runnerStart ??= stamp?.runnerStart ?? null;
+    runnerArgv ??= stamp?.runnerArgv ?? null;
+  }
+  return heartbeat(lockRoot, resource, owner, nowIso, current.pid ?? null, {
+    ...(current.meta ?? {}), runnerPid: pid, runnerStart, runnerArgv,
+  });
 }
 
 /** Release only dispatch claims minted for the session that just posted its stand-down. */
@@ -260,6 +270,7 @@ export function refreshLiveFixDispatchClaims({
   awaitingVerifyFor = makeAwaitingVerifyResolver(),
   hungThresholdMs = resolveHungThresholdMs(),
   alive = isPidAlive,
+  identity = pidIdentity,
   nowIso = () => new Date().toISOString(),
   nowMs = Date.parse(nowIso()),
 } = {}) {
@@ -289,9 +300,15 @@ export function refreshLiveFixDispatchClaims({
     if (Number.isInteger(entry.meta.runnerPid)) {
       const cur = readLockEntry(lockRoot, fixDispatchResource({ repo, pr, kind }));
       if (!cur || cur.owner !== entry.owner) continue;
-      if (isClaimRunnerDead(cur, alive)) {
+      let identityReason = null;
+      const probeIdentity = (pid, expectations) => {
+        const verdict = identity(pid, expectations);
+        if (verdict.alive === false) identityReason = verdict.reason;
+        return verdict;
+      };
+      if (isClaimRunnerDead(cur, alive, probeIdentity)) {
         const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
-        if (result.released) released.push({ repo, pr, kind, owner: entry.owner, reason: `${entry.meta.borrowed ? 'borrowed' : 'wrapped'}-runner-dead (pid ${entry.meta.runnerPid} is gone)` });
+        if (result.released) released.push({ repo, pr, kind, owner: entry.owner, reason: identityReason ? `runner-identity-dead (${identityReason})` : `${entry.meta.borrowed ? 'borrowed' : 'wrapped'}-runner-dead (pid ${entry.meta.runnerPid} is gone)` });
       } else {
         heartbeat(lockRoot, fixDispatchResource({ repo, pr, kind }), cur.owner, nowIso(), cur.pid ?? null, cur.meta);
         refreshed.push({ repo, pr, kind, headSha, owner: entry.owner });

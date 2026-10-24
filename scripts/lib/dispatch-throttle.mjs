@@ -1,3 +1,4 @@
+import { pidIdentity } from './pid-alive.mjs';
 /**
  * @file scripts/lib/dispatch-throttle.mjs
  * @description Declared dispatch-throttle settings + the two DEFER-ONLY launch gates (live incident 2026-10-06:
@@ -150,9 +151,13 @@ export function isBorrowedRunnerDead(claim, alive = isPidAlive) {
 /** 117 S3b — ANY claim whose stamped runner process is gone: a borrowed fix, or a Claude fix / ci-heal launched through
  *  the detached worker wrapper (neither has a `claude agents` row; the runner pid IS its liveness). No pid stamped
  *  yet -> not dead (only the plain TTL can end it). Pure given `alive`. */
-export function isClaimRunnerDead(claim, alive = isPidAlive) {
+export function isClaimRunnerDead(claim, alive = isPidAlive, identity = pidIdentity) {
   const pid = claim?.meta?.runnerPid;
-  return Number.isInteger(pid) && pid > 0 && !alive(pid);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (alive(pid) === false) return true;
+  try {
+    return identity(pid, { expectStart: claim.meta.runnerStart, expectArgv: claim.meta.runnerArgv }).alive === false;
+  } catch { return false; }
 }
 
 /** Count LIVE fix/ci-heal claims (`fixing` is not a session). A claim whose runner pid is dead is not live:
