@@ -35,10 +35,10 @@ export function formatRouteLog(decision, settings) {
   return cleanRouteText(`verify-lane route: ${decision.path} — ${decision.reason}; ` +
     Object.keys(ROUTE_DEFAULTS).map(key => `${key}=${settings[key]} (${settings.source[key]})`).join(', '));
 }
-export async function autoRouteVerify({ settings, mode, eligible = true, readQueue, readLoad, readiness, remote, log }) {
-  let decision = { path: 'local', reason: settings.enabled ? 'explicit gate requires local verification' : 'remote routing disabled' };
+export async function autoRouteVerify({ settings, mode, eligible, readQueue, readLoad, readiness, remote, log }) {
+  let decision = { path: 'local', reason: settings.enabled ? 'caller is not eligible for remote verification' : 'remote routing disabled' };
   let ref;
-  if (settings.enabled && eligible) {
+  if (settings.enabled && eligible === true) {
     try {
       const queue = await readQueue();
       const load1 = await readLoad();

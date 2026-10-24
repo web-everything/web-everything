@@ -550,29 +550,6 @@ if (!resolvedGate && typeof flags.gate === 'string') {
 SELECTION = summarizeSelection({ gate: resolvedGate, explicitGate: typeof flags.gate === 'string' });
 if (DISPATCHED_RUN && MODE === 'verify') process.stderr.write(`${selectionNotice({ sha: headSha, summary: SELECTION })}\n`);
 
-if (MODE === 'verify') {
-  let tool;
-  try { tool = JSON.parse(readFileSync(new URL('./settings/remote-route.json', import.meta.url), 'utf8')); } catch { /* no tool override */ }
-  const cascade = resolveCascade({ standard: ROUTE_DEFAULTS, platform: platformPreference('remoteRoute'), tool,
-    valid: { enabled: v => typeof v === 'boolean', thresholdMinutes: v => typeof v === 'number' && Number.isFinite(v) && v >= 0,
-      loadCap: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 } });
-  const settings = resolveRouteSettings(process.env, { ...cascade.value, source: cascade.sources });
-  const remotePassed = await autoRouteVerify({ settings, eligible: flags.gate === undefined,
-    mode: resolvedGate?.decision?.mode === 'full' ? 'full' : 'lane-check',
-    readQueue: () => JSON.parse(execFileSync(process.execPath, ['scripts/readiness/heavy-admission.mjs', 'queue-status', '--json'], {
-      cwd: REPO, encoding: 'utf8', timeout: 15000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })),
-    readLoad: () => loadavg()[0],
-    readiness: () => {
-      const ready = remoteIO(REPO).ready();
-      if (ready.sha !== headSha) throw new Error('HEAD changed before routing');
-      return ready;
-    },
-    remote: options => runRemoteCLI(options, { repo: REPO, json: AS_JSON, quietFailure: true }),
-    log: line => process.stderr.write(`${line}\n`),
-  });
-  if (remotePassed) process.exit(0);
-}
-
 // 1. Stamp the `running` marker BEFORE the suites start, so a kill mid-run leaves a stranded (detectably
 //    unfinished) marker rather than nothing.
 //    #2833 finding 4 protected a TERMINAL (`green`/`red`) record for a DIFFERENT sha from being destroyed by the
@@ -673,6 +650,31 @@ if (MODE === 'request') {
       detail: `No verify daemon is alive (${verdict.reason}; lease ${VERIFY_DAEMON_LEASE_KEY}; last heartbeat: ${leaseStatus.heartbeatAt || 'none'}); no marker was written. Start it with launchctl kickstart -k gui/$(id -u)/com.we.verify-daemon, or run node skills-src/conveyor/verify-daemon.mjs (we:skills-src/conveyor/verify-daemon.mjs), then re-run request.`,
     }, 3);
   }
+}
+
+// Route only work that survived the cache/card-only fast paths. A dispatched child
+// must finish locally so its run-id marker and dispatcher verdict remain intact.
+if (MODE === 'verify' && flags.gate === undefined && !DISPATCHED_RUN) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(new URL('./settings/remote-route.json', import.meta.url), 'utf8')); } catch { /* no tool override */ }
+  const cascade = resolveCascade({ standard: ROUTE_DEFAULTS, platform: platformPreference('remoteRoute'), tool,
+    valid: { enabled: v => typeof v === 'boolean', thresholdMinutes: v => typeof v === 'number' && Number.isFinite(v) && v >= 0,
+      loadCap: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 } });
+  const settings = resolveRouteSettings(process.env, { ...cascade.value, source: cascade.sources });
+  const remotePassed = await autoRouteVerify({ settings, eligible: true,
+    mode: resolvedGate?.decision?.mode === 'full' ? 'full' : 'lane-check',
+    readQueue: () => JSON.parse(execFileSync(process.execPath, ['scripts/readiness/heavy-admission.mjs', 'queue-status', '--json'], {
+      cwd: REPO, encoding: 'utf8', timeout: 15000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })),
+    readLoad: () => loadavg()[0],
+    readiness: () => {
+      const ready = remoteIO(REPO).ready();
+      if (ready.sha !== headSha) throw new Error('HEAD changed before routing');
+      return ready;
+    },
+    remote: options => runRemoteCLI(options, { repo: REPO, json: AS_JSON, quietFailure: true }),
+    log: line => process.stderr.write(`${line}\n`),
+  });
+  if (remotePassed) process.exit(0);
 }
 
 if (MODE !== 'run') writeMarker(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined }));

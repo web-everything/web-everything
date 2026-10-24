@@ -1,7 +1,9 @@
-// Test-first contract: no subprocesses, network, live git state, or implementation mocks.
+// Live IO uses injected children; the argument-error script probe performs no git/network IO.
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { parseArgs, buildDispatchArgs, runRemoteTest, runRemoteCLI, remoteIO } from '../remote-test.mjs';
 
 const REF = 'lane/remote-tests';
@@ -10,6 +12,42 @@ const CREATED_AFTER = '2026-10-24T12:00:00.000Z';
 const tests = ['scripts/__tests__/remote-route.test.mjs', 'blocks/example.test.ts'];
 
 describe('live IO construction with injected children', () => {
+  function readinessFixture({ dirty = '', pushed = `${SHA}\trefs/heads/${REF}`, authenticated = true } = {}) {
+    const execFile = vi.fn((file, args) => {
+      if (file !== 'git') throw new Error('unexpected child');
+      if (args.includes('get-url')) return 'https://github.com/example/repo.git';
+      if (args.includes('status')) return dirty;
+      if (args.includes('rev-parse')) return SHA;
+      if (args.includes('ls-remote')) return pushed;
+      throw new Error(`unexpected git args: ${args}`);
+    });
+    const execGh = vi.fn((file, args) => {
+      if (args[0] !== 'auth') throw new Error('unexpected dispatch or API call');
+      if (!authenticated) throw new Error('authentication unavailable');
+      return '';
+    });
+    return { live: remoteIO('.', { env: {}, execFile, execGh }), execFile, execGh };
+  }
+  it.each([
+    ['dirty worktree', { dirty: ' M scripts/example.mjs' }, /dirty/],
+    ['untracked worktree', { dirty: '?? example.txt' }, /dirty/],
+    ['HEAD absent from origin branches', { pushed: `${'b'.repeat(40)}\trefs/heads/main` }, /not pushed/],
+    ['HEAD present only as a tag', { pushed: `${SHA}\trefs/tags/v1` }, /not pushed/],
+    ['unavailable authentication', { authenticated: false }, /authentication/],
+  ])('ready rejects %s before dispatch', async (_name, changes, reason) => {
+    const io = readinessFixture(changes);
+    expect(() => io.live.ready()).toThrow(reason);
+    const importer = vi.fn();
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, { live: io.live, execFile: importer, quietFailure: true })).toBe(2);
+    expect(io.execGh.mock.calls.every(([, args]) => args[0] === 'auth')).toBe(true);
+    expect(importer).not.toHaveBeenCalled();
+  });
+  it('ready returns the authenticated clean HEAD and its pushed branch', () => {
+    const io = readinessFixture();
+    expect(io.live.ready()).toEqual({ sha: SHA, ref: REF });
+    expect(io.execGh).toHaveBeenCalledWith('gh', ['auth', 'status', '--hostname', 'github.com'], expect.any(Object));
+    expect(io.execFile.mock.calls.find(([, args]) => args.includes('status'))[1]).toContain('--untracked-files=all');
+  });
   it('pins GitHub host, bypasses both caches, and bounds argv-only children', () => {
     const execFile = vi.fn().mockReturnValue('https://github.com/example/repo.git\n');
     const execGh = vi.fn().mockReturnValue('{}');
@@ -28,6 +66,14 @@ describe('live IO construction with injected children', () => {
     expect(execFile.mock.calls[0][2]).toMatchObject({ timeout: 15000, maxBuffer: 2 * 1024 * 1024 });
     expect(options.shell).toBeUndefined();
   });
+});
+
+it('remote-test script rejects invalid arguments with usage and exit 3', () => {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../remote-test.mjs', import.meta.url)), '--mode=invalid'],
+    { encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024 });
+  expect(result.status).toBe(3);
+  expect(result.stderr).toContain('Usage: remote-test');
+  expect(result.stdout).toBe('');
 });
 
 describe('CLI marker delegation', () => {
@@ -53,6 +99,21 @@ describe('CLI marker delegation', () => {
     expect(io.execFile).toHaveBeenCalledTimes(1);
     expect(io.execFile).toHaveBeenCalledWith(process.execPath, ['scripts/verify-lane.mjs', 'remote'],
       expect.objectContaining({ timeout: 60000, maxBuffer: 2 * 1024 * 1024 }));
+  });
+  it.each(['pretty', 'whitespace-normalized'])('matches toJSON dispatch inputs with %s whitespace', async format => {
+    const io = fixture();
+    const api = io.live.api.getMockImplementation();
+    io.live.api.mockImplementation(path => {
+      const data = api(path);
+      const changeTitle = run => {
+        const pretty = JSON.stringify(JSON.parse(run.display_title.slice('remote-verify '.length)), null, 2);
+        return { ...run, display_title: `remote-verify ${format === 'pretty' ? pretty : pretty.replace(/\s+/g, ' ')}` };
+      };
+      return data.workflow_runs ? { ...data, workflow_runs: data.workflow_runs.map(changeTitle) }
+        : data.display_title ? changeTitle(data) : data;
+    });
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, io)).toBe(0);
+    expect(io.execFile).toHaveBeenCalledOnce();
   });
   it('returns failure when the marker importer refuses, allowing auto-route local fallback', async () => {
     const io = fixture();
