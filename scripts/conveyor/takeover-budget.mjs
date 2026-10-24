@@ -34,7 +34,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { normalizeComment, classifyEvent } from '../operations/coroner-rounds.mjs';
+import { normalizeComment, classifyEvent, parseFindings } from '../operations/coroner-rounds.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { sameGapSameHead, parseOperatorRulingComment } from '../lib/jury-core.mjs';
 import { isReviewVerdictComment, reviewedHeadsOf } from './mechanical-round-cap.mjs';
@@ -183,20 +183,23 @@ const isOpen = (f) => !CLOSED_RULINGS.has(String(f?.ruling ?? '').toLowerCase())
 /** A trusted fixer turn that changed the PR (a re-arm, an advisory fix): the end of one review round. */
 const FIXER_TURN = /^🔧 conveyor fix —/;
 
+const fullClaimOf = (f) => f.fullClaim ?? f.claim ?? '';
+const rulingMetadata = (value) => typeof value === 'string' && value.trim() ? value.trim() : 'security';
+const isReferralFinding = (f) => f.lens === 'referral' || f.referral === true;
 const isSecurityFinding = (f) => /security/i.test(`${f.lens} ${f.category}`);
 /** Fold an already globally sorted list; security findings and rulings require an exact location/claim key. */
 function mergeFindings(findings) {
   const key = (g) => JSON.stringify([g.file ?? null, g.line ?? null, clip(g.claim, 220)]);
-  const referral = (g) => g.lens === 'referral' || g.referral === true;
+  const referral = isReferralFinding;
   const exactOnly = (g) => referral(g) || isSecurityFinding(g);
   const into = [];
   for (let f of findings) {
     // Legacy prose rulings have no recoverable lens either.
     if (f.lens === 'referral') f = { ...f, lens: 'security', referral: true };
     const compatible = (g) => isGateHoldFinding(g) === isGateHoldFinding(f);
-    const same = into.find((g) => compatible(g) && !exactOnly(f) && !exactOnly(g)
+    const same = into.find((g) => compatible(g) && !exactOnly(f) && !exactOnly(g) && fullClaimOf(g) === fullClaimOf(f)
       && ((f.file && g.file === f.file && (f.line == null || g.line == null || Math.abs(g.line - f.line) <= 2))
-        || (!f.file && !g.file && g.claim === f.claim)))
+        || (!f.file && !g.file)))
       ?? into.find((g) => compatible(g) && isOpen(g) && isOpen(f) && (exactOnly(f) || exactOnly(g)) && key(g) === key(f));
     if (same) {
       if (referral(f)) same.referral = true;
@@ -209,7 +212,7 @@ function mergeFindings(findings) {
       if (!same.impact && f.impact) same.impact = f.impact;
       continue;
     }
-    into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null,
+    into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', fullClaim: fullClaimOf(f), ruling: f.ruling ?? null, impact: f.impact ?? null,
       lens: f.lens ?? null, category: f.category ?? null, ...(referral(f) ? { referral: true } : {}) });
   }
   return into;
@@ -217,12 +220,12 @@ function mergeFindings(findings) {
 
 const findingOrder = (a, b) => (a.file ?? '').localeCompare(b.file ?? '')
   || (a.line == null ? (b.line == null ? 0 : -1) : b.line == null ? 1 : a.line - b.line)
-  || (a.claim ?? '').localeCompare(b.claim ?? '') || (a.impact ?? '').localeCompare(b.impact ?? '')
+  || fullClaimOf(a).localeCompare(fullClaimOf(b)) || (a.impact ?? '').localeCompare(b.impact ?? '')
   || (a.ruling ?? '').localeCompare(b.ruling ?? '');
 /** Sorted, pairwise first match against KEPT representatives only; discarded bridges never join groups. */
 function mergeSameGaps(findings) {
-  const gap = (f) => ({ file: f.file, line: f.line, summary: f.claim, impactIfUnfixed: f.impact ?? null, verdict: f.ruling ?? null });
-  const protectedFinding = (f) => isGateHoldFinding(f) || isSecurityFinding(f);
+  const gap = (f) => ({ file: f.file, line: f.line, summary: fullClaimOf(f), impactIfUnfixed: f.impact ?? null, verdict: f.ruling ?? null });
+  const protectedFinding = (f) => isGateHoldFinding(f) || isReferralFinding(f) || isSecurityFinding(f);
   const kept = [];
   for (const f of findings) {
     if (protectedFinding(f) || !kept.some((g) => !protectedFinding(g) && sameGapSameHead(gap(g), gap(f)))) kept.push(f);
@@ -256,6 +259,8 @@ export function reviewRounds(comments) {
     if (FIXER_TURN.test(c.body.split('\n')[0]) || isOperatorTakeover(raw)) { items.push({ t, boundary: true }); continue; }
     if (isPausedReview(raw)) continue;
     const ev = classifyEvent(c);
+    const complete = parseFindings(c.body, { maxClaimChars: Infinity, fullClaim: true });
+    if (ev?.findings && complete.length) ev.findings = ev.findings.map((f, i) => ({ ...f, fullClaim: complete[i]?.claim ?? f.claim }));
     // The prose parser loses ruling locations; recover only validated structured finding keys.
     const ruled = parseOperatorRulingComment({ author: { login: c.login }, body: c.body })?.record?.rulings.filter((r) => r.result === 'block');
     if (ev?.type === 'round' && ruled) ev.findings = ruled.map((r, i) => {
@@ -263,13 +268,12 @@ export function reviewRounds(comments) {
         const key = JSON.parse(r.key);
         if (Array.isArray(key) && key.length === 4 && (key[1] == null || typeof key[1] === 'string')
           && (key[2] == null || Number.isInteger(key[2])) && typeof key[3] === 'string') {
-          const lens = r.lens || (typeof key[0] === 'string' && key[0].trim() ? key[0] : null);
-          return { file: key[1], line: key[2], claim: clip(key[3], 220), lens: lens || 'security',
-            category: r.category ?? r.class ?? null, referral: true, ruling: r.result };
+          return { file: key[1], line: key[2], claim: clip(key[3], 220), fullClaim: key[3], lens: rulingMetadata(r.lens ?? key[0]),
+            category: rulingMetadata(r.category ?? r.class), referral: true, ruling: r.result };
         }
       } catch { /* An opaque key retains the original raw finding. */ }
       const original = ev.findings[i];
-      return original ? { ...original, lens: r.lens || 'security', category: r.category ?? r.class ?? null, referral: true } : null;
+      return original ? { ...original, lens: rulingMetadata(r.lens), category: rulingMetadata(r.category ?? r.class), referral: true } : null;
     }).filter(Boolean);
     // A block ruling on a paused review's referrals concludes that review too (the policy or the operator ruled it):
     // otherwise a review that pauses on the same referrals every run would leave the takeover unjudged forever
