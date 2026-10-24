@@ -96,6 +96,7 @@ export function enrichPrsWithCompleteComments(prs, {
     try {
       const comments = readComments(pr.number, { repo });
       if (!Array.isArray(comments)) throw new Error('comments read returned no array');
+      if (comments.length < pr.comments.length) throw new Error('complete comments read returned fewer comments than the listed page');
       // `commentsComplete`: this reader proved the thread complete, whatever its length (a complete thread can be
       // exactly the page size). The planner trusts this mark, never the length, before counting markers off it
       // (`takeover-budget.mjs#threadMayBeTruncated`).

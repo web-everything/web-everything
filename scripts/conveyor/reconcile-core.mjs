@@ -181,7 +181,7 @@ import {
 // second derivation): `parseReviewedSha` recovers the head an ACCEPT-shaped verdict (`accepted`/`clear-human`/
 // `restamp`) covered. See {@link planReconcile}'s ONE-REVIEW-PER-HEAD refusal for why this pass needs it too.
 import {
-  parseReviewedSha, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS,
+  parseReviewedSha, headEverHumanCleared, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS,
 } from '../lib/review-escalation.mjs';
 // live incident, web-everything/web-everything PR #2752 (#4034/#2748) — a PR whose own content is ALREADY on `main`,
 // carried there by a different PR that stacked on its branch and merged first, never owes a fix or a review.
@@ -1529,6 +1529,13 @@ function dispatchReviewRow({
     && acceptLabelDropped({ labels: withPhase?.labels, comments: pr?.comments, headSha, now });
   if (relabelOwed) extra = { ...extra, relabelOwed: true };
   if (headSha && reviewedSha && reviewedSha === headSha && !relabelOwed) {
+    if (headEverHumanCleared(pr.comments, headSha)) {
+      refuse('already-reviewed-head', {
+        ...withPhase, headSha, reviewedSha, ...extra,
+        why: `this exact head (\`${headSha}\`) already carries a human clearance — no further advisory review is owed`,
+      });
+      return;
+    }
     // #xconv1 (web-everything/web-everything#2766/#2767 unblock, epic #3383/#4075) — a `needs-human` PR in this
     // EXACT shape (accepted, then escalated — never a fresh push, or `reviewedSha` would no longer equal
     // `headSha`) is NOT the #2588 risk this refusal exists for: `review-pr.mjs`'s own `confirm` step

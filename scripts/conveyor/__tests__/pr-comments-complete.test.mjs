@@ -70,7 +70,8 @@ describe('complete PR comments', () => {
       repo, readComments: () => firstPage.slice(0, count), onError,
     });
     expect(out).toEqual([short]);
-    expect(onError).toHaveBeenCalledExactlyOnceWith(incomplete, expect.any(Error));
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(incomplete, expect.any(Error));
   });
 
   it('short threads are untouched and never re-read', () => {

@@ -3264,6 +3264,31 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     }
   });
 
+  describe.each(['initial read', 'fresh changed-head reread'])('embedded-page human clearance on %s', read => {
+    it.each(['empty', 'shorter', 'same-size non-covering', 'longer non-covering'])(
+      'refuses rearm without label, comment or ledger writes when pagination is %s', shape => {
+        const fresh = read === 'fresh changed-head reread';
+        const head = (fresh ? 'b' : 'a').repeat(40);
+        const comments = [{ id: 'IC_clearance', author: { login: 'web-everything' },
+          body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: head }) },
+        ...Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }))];
+        const pagedComments = shape === 'empty' ? [] : shape === 'shorter' ? comments.slice(1)
+          : [...comments.slice(1), { id: 'IC_other', body: 'other discussion' },
+            ...(shape === 'longer non-covering' ? [{ id: 'IC_extra', body: 'extra discussion' }] : [])];
+        const readComments = vi.fn(() => pagedComments);
+        const result = fresh
+          ? run(missingArgs, [], { readComments, freshState: { comments, headRefOid: head } })
+          : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+        expect(result.readPrState).toHaveBeenCalledTimes(fresh ? 2 : 1);
+        expect(readComments).toHaveBeenCalledTimes(1);
+        expect(readComments).toHaveBeenCalledWith('o/n', '9');
+        expect(result.exitCode).toBe(1);
+        expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+      });
+  });
+
   it.each([undefined, null, {}, 'unreadable'])('missing-only rearm fails closed without writes when fresh comments are not an array (%j)', (comments) => {
     const result = run(missingArgs, [], { freshState: { comments } });
     expect(result.readPrState).toHaveBeenCalledTimes(2);
