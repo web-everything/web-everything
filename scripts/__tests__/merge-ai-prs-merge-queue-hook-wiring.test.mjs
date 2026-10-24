@@ -26,7 +26,15 @@ const landed = n => fs.existsSync(F + '.merged-' + n);
 const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
-if (a[0] === 'api' && a[1] === 'graphql') out(openPrPageFixture(prs.filter(p => !landed(p.number)), a.find(v => v.startsWith('query=')) || ''));
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const query = a.find(v => v.startsWith('query=')) || '';
+  if (query.includes('comments{totalCount}')) {
+    const p = prs.find(p => 'n=' + p.number === a.find(v => v.startsWith('n=')));
+    if (!p || !a.includes('owner=fixture') || !a.includes('name=drain-mq')) process.exit(1);
+    out({ data: { repository: { pullRequest: { comments: { totalCount: p.comments.length } } } } });
+  }
+  out(openPrPageFixture(prs.filter(p => !landed(p.number)), query));
+}
 if (a[0] === 'pr' && a[1] === 'view') {
   const p = prs.find(p => String(p.number) === a[2]);
   if (!p) process.exit(1);

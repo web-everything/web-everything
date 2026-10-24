@@ -1114,6 +1114,8 @@
   "scripts/conveyor/soak/breaks/operator-supersede-answer-sent-to-fixer.soak.test.mjs": 0.67,
   "scripts/conveyor/soak/breaks/operator-supersede-reclosed-or-misread.soak.test.mjs": 0.58,
   "scripts/conveyor/soak/breaks/owed-main-rule-strands-repair.soak.test.mjs": 0.6,
+  "scripts/conveyor/soak/breaks/overlay-admission-finalize-wait.soak.test.mjs": 14.99,
+  "scripts/conveyor/soak/breaks/overlay-pin-partial-retry.soak.test.mjs": 52.32,
   "scripts/conveyor/soak/breaks/pinned-overlay-conflict-skipped.soak.test.mjs": 160.75,
   "scripts/conveyor/soak/breaks/postmortem-poison-merge.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/pr-scoped-gate-red-never-healed.soak.test.mjs": 0.64,

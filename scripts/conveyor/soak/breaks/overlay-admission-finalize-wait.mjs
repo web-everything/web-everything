@@ -67,6 +67,9 @@ export default {
         const result = await runDaemonLoadOverlay({
           clone: root, ref: 'lane/overlay', pr: 1, versions: null, env, log: { error() {} }, clock: () => time,
           settings: { noPr: 'allow', dispatchSmoke: 'off' },
+          // This break exercises the rebuild finalize wait, not admission: register without add's conflict guard
+          // (that guard is covered by daemon-load-overlay-guard.test.mjs and would make live gh reads here).
+          admit: async ({ register }) => { register(null); return { registered: true }; },
           sleep: async (ms) => { time += ms; },
           rebuild: async (options) => {
             if (attempts++ < variant.busy) return { adopted: false, reason: 'rebuild-in-progress' };

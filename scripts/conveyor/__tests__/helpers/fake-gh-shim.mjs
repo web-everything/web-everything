@@ -49,6 +49,7 @@
  *       `repos/{o}/{r}/commits/{sha}/check-runs` and `…/status` (only for an open PR's current head sha;
  *       `…/status` always lists no legacy statuses)
  *   - `api graphql -f query=…` for pr-list-paged.mjs's light open-PR query (paged, CREATED_AT DESC)
+ *       and the issue-comment totalCount proof (explicit owner/name/n variables)
  *   - Fields produced with GitHub's real shape (camelCase for `--json`, snake_case for `api`'s REST JSON) —
  *     see `fake-gh.mjs`'s `buildPrGraphqlView` / `restEvent` / `listChangedFilesRest`.
  *
@@ -74,6 +75,7 @@ import {
   buildPrGraphqlView, pushCommitToRef,
 } from './fake-gh.mjs';
 import { buildOpenPrPageQuery, PAGED_LIGHT_FIELDS } from '../../../lib/pr-list-paged.mjs';
+import { GH_ARGV } from '../../../lib/review-label-provider.mjs';
 
 const STORE_PATH = process.env.FAKE_GH_STORE;
 const LOG_PATH = process.env.FAKE_GH_LOG;
@@ -443,7 +445,15 @@ function handleLabelCreate(store, rest) {
 // -------------------------------------------------------------------------------------------------------
 
 function handleOpenPrPage(store, rest) {
-  const query = [...flagValues(rest, '-f'), ...flagValues(rest, '-F')].find(v => v?.startsWith('query='))?.slice(6);
+  const fields = [...flagValues(rest, '-f'), ...flagValues(rest, '-F')];
+  const query = fields.find(v => v?.startsWith('query='))?.slice(6);
+  const countQuery = GH_ARGV.readCommentsTotalCount('owner/repo', 1).find(v => v.startsWith('query=')).slice(6);
+  if (query === countQuery) {
+    const value = key => fields.find(v => v.startsWith(`${key}=`))?.slice(key.length + 1);
+    const repoState = requireRepo(store, `${value('owner')}/${value('name')}`);
+    const pr = requirePr(repoState, Number(value('n')));
+    return jsonResult({ data: { repository: { pullRequest: { comments: { totalCount: pr.comments.length } } } } });
+  }
   const repoMatch = query?.match(/repository\(owner:("[^"\n]+"),name:("[^"\n]+")\)/);
   const pageMatch = query?.match(/pullRequests\(states:OPEN,first:(\d+)(?:,after:("(?:[^"\\]|\\.)*"))?,orderBy:/);
   if (!repoMatch || !pageMatch) return { stderr: 'fake-gh: unsupported graphql query\n', exitCode: 1 };
@@ -537,7 +547,9 @@ function handleApi(store, rest) {
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/issues\/(\d+)\/comments$/))) {
       const slug = `${m[1]}/${m[2]}`; const num = Number(m[3]);
       const repoState = requireRepo(store, slug); const pr = requirePr(repoState, num);
-      return jsonResult(pr.comments.map((c) => ({ id: c.id, user: c.author, body: c.body, created_at: c.createdAt })), jq);
+      return jsonResult(pr.comments.map((c) => ({ id: c.id, node_id: `IC_fake_${c.id}`,
+        html_url: `https://github.com/${slug}/pull/${num}#issuecomment-${c.id}`,
+        user: c.author, body: c.body, created_at: c.createdAt })), jq, { compact: true });
     }
     // Soak harness gap (PR #2821 ci-heal) — `promote-draft-pr-dispatch.mjs#defaultReadHeadCheckState` re-reads a
     // draft's checks for its EXACT head sha (`pr-status-io.mjs#checksArgv`) right before `gh pr ready`. Without
