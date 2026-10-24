@@ -225,7 +225,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     expect(state.overlays.map((o) => o.ref)).toEqual(['lane/fix-procedure']); // #2826 never registered
   });
 
-  it.each(['yes register 2826', 'yes register 2826 despite the conflict'])('--allow-conflict accepts three or more words (%s) and prints the conflict', (instruction) => {
+  function expectAuthorizedConflict(instruction) {
     const { originDir, cloneDir, overlayDir, env } = makeFixture();
     advanceMain(originDir, (dir) => writeFile(dir, 'shared.mjs', 'export const X = 1;\n'));
     pushBranch(originDir, 'lane/fix-procedure', (dir) => writeFile(dir, 'shared.mjs', 'export const X = 2;\n'));
@@ -246,6 +246,14 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     expect(state.overlays.find((o) => o.ref === 'lane/promote-stale-green').conflictOverride).toMatchObject({
       instruction, actor: 'chalbert', files: ['shared.mjs'],
     });
+  }
+
+  it('--allow-conflict --reason=... registers anyway, and PRINTS which overlay/file conflicts', () => {
+    expectAuthorizedConflict('yes register 2826 despite the conflict');
+  });
+
+  it('--allow-conflict accepts an operator instruction at the three-word minimum', () => {
+    expectAuthorizedConflict('yes register 2826');
   });
 
   it.each([
