@@ -402,6 +402,48 @@ describe('ruled parked heads: #5806-shaped pending and #5762-shaped human replay
   });
 
   it.each([
+    ['operator block', 'chalbert'],
+    ['policy hold', AUTO_POLICY_ACTOR],
+  ])('#5806-shaped: a stale enriched resume followed by a superseding %s retains review-referrals-pending', (_name, actor) => {
+    const pr = pending();
+    expect(pr.referralHoldAutoResolve.outcome).toBe('resume');
+    pr.comments = [...pr.comments, operatorRuling(fx, { key: rec.referrals[0].key, runId: rec.runId,
+      result: 'block', actor, at: '2026-10-21T17:25:00.000Z' })];
+    expect(liveReferralState(pr, { repo, pr: fx.number, cardReadable: noCards }).blocked).toContain(rec.referrals[0].key);
+    const p = plan(pr);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals).toContainEqual(expect.objectContaining({ kind: 'review-referrals-pending' }));
+    expect(p.notes.some(n => n.kind === 'referral-hold-auto-resolved')).toBe(false);
+    expectLabelsKept(pr, p);
+  });
+
+  it.each(['pending', 'block'])('#5806-shaped: one historical clean ruling cannot hide another current %s finding after enrichment', result => {
+    const pr = pending();
+    expect(pr.referralHoldAutoResolve.outcome).toBe('resume');
+    pr.comments = pr.comments.map(c => {
+      const m = /<!-- mandatory-referrals-v1: (\S+) -->/.exec(c.body);
+      if (!m) return c;
+      const record = JSON.parse(decodeURIComponent(m[1]));
+      if (record.head !== fx.headRefOid) return c;
+      const orig = record.referrals[0];
+      const summary = `${orig.finding.summary} (new finding)`;
+      const key = JSON.stringify([orig.seat, orig.finding.file, orig.finding.line, summary]);
+      return { ...c, body: c.body.replace(m[1], encodeURIComponent(JSON.stringify({ ...record,
+        referrals: [...record.referrals, { ...orig, key, finding: { ...orig.finding, summary }, original: { ...orig.original, summary } }],
+        rulings: [...record.rulings, ...(result === 'block' ? [{ ...record.rulings[0], id: `${record.runId}:9`, key, result }] : [])],
+      }))) };
+    });
+    const live = liveReferralState(pr, { repo, pr: fx.number, cardReadable: noCards });
+    expect(live.malformed).toBe(false);
+    expect(live[result === 'pending' ? 'pending' : 'blocked'].length).toBeGreaterThan(0);
+    const p = plan(pr);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals).toContainEqual(expect.objectContaining({ kind: 'review-referrals-pending' }));
+    expect(p.notes.some(n => n.kind === 'referral-hold-auto-resolved')).toBe(false);
+    expectLabelsKept(pr, p);
+  });
+
+  it.each([
     ['two attempts', { attemptsSinceWake: 2 }, /head reviewed 2 time\(s\)/],
     ['two finished reviews', { count: 2, attemptsSinceWake: 2 }, /head reviewed 2 time\(s\)/],
     ['two finished reviews with an inconsistent attempt count', { count: 2 }, /head reviewed 1 time\(s\)/],

@@ -2056,6 +2056,19 @@ export function planReconcile({
             || operator.rulings.some(x => x.repo === r.repo && x.pr === r.pr && x.head === r.head
               && x.runId === r.runId && x.key === f.key && x.result === f.result))));
       if (!recorded) return pr;
+      // Revalidate EVERY current finding with the gate's reader: historical clean evidence cannot override a
+      // later operator block or a new pending finding. Card readability was established by enrichment; reuse
+      // that proof only for the same run/finding already reported as card.
+      const clean = records.records.filter(r => r.head === pr.headRefOid).every(r => {
+        const proved = (key, result) => findings.some(f => f?.runId === r.runId && f.key === key && f.result === result);
+        const state = referralRecordState(r, { head: pr.headRefOid, body: pr.body, createdAt: pr.createdAt,
+          records: records.records, operatorRulings: operator.rulings,
+          cardReadable: card => [...r.rulings, ...(r.carried ?? []), ...operator.rulings.filter(x => x.repo === r.repo && x.pr === r.pr
+            && x.head === r.head && x.runId === r.runId)].some(x => x.result === 'card' && x.card === card && proved(x.key, 'card')) });
+        return r.pr === Number(pr.number) && !state.pending.length && !state.blocked.length
+          && activeReferrals(r).every(f => proved(f.key, 'card') || proved(f.key, 'not-real'));
+      });
+      if (!clean) return pr;
     }
     // Every attempt since the wake counts, finished or not (a review that dies before `advise` is an attempt too). A
     // hold that cannot say (a ledger-derived hold carries only finished runs) is never resumed: fail closed.
