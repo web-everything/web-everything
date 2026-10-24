@@ -233,7 +233,8 @@ describe('same-head operator matching and read-time validation', () => {
     // A readable run with no referral for that key is equally unresolved.
     ctx.records.push(record([ruled], { runId: 'unreadable-newer-run' }));
     expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
-    expect(serializedGate(ctx, saved).pending).toEqual([target.key]);
+    // This run also introduces its own unruled referral: the operator's original run-scoped clearance cannot settle it.
+    expect(serializedGate(ctx, saved).pending).toEqual([ruled.key, target.key]);
   });
   it.each(['block', 'not-real', 'card'])('does not carry over a readable newer destination-key %s ruling', result => {
     const { ruled, ctx } = world(), target = referral('judgeCorrectness');
@@ -242,7 +243,16 @@ describe('same-head operator matching and read-time validation', () => {
     ctx.operatorRulings.push({ ...ctx.operatorRulings[0], runId: 'newer', key: target.key, result,
       ...(result === 'card' ? { card } : {}) });
     expect(findSameHeadSiblingRuling(target, ctx)).toBeNull();
-    expect(referralRecordState(saved, ctx).pending).toEqual([target.key]);
+    // Isolate carry validation first: the newer own-key decision withdraws the old sibling clearance.
+    const carryState = referralRecordState(saved, { ...ctx, linkedBlocked: null });
+    expect(carryState.pending).toEqual([target.key]);
+    expect(carryState.rulings).toEqual([]);
+    expect(carryState.blocked).toEqual([]);
+    // At the full gate, a counted same-head block also holds every linked instance of this finding.
+    const state = referralRecordState(saved, ctx);
+    expect(state.pending).toEqual(result === 'block' ? [] : [target.key]);
+    expect(state.blocked).toEqual(result === 'block' ? [target.key] : []);
+    expect(state.rulings.map(r => r.result)).toEqual(result === 'block' ? ['block'] : []);
   });
   it('refuses a later block, another head/PR, its own key and missing context', () => {
     const { ruled, ctx } = world();
