@@ -6,10 +6,15 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
+import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, readDrainRedTeamEvidence, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
 import { createReviewJobIo, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
 
 vi.mock('../../lib/red-team-status-labels.mjs', () => ({ syncRedTeamStatusLabels: vi.fn() }));
+vi.mock('../../lib/atomic-json-file.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, writeJsonAtomic: vi.fn(actual.writeJsonAtomic) };
+});
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
@@ -73,16 +78,18 @@ function fakeIo(over = {}) {
 }
 
 // Exercise the async shared seat through the same synchronous child boundary as the job.
-function runSharedRecovery(input, { status, records = [], recordsUnreadable = false, commentsUnreadable = false, comments = [] } = {}) {
+function runSharedRecovery(input, { status, records = [], recordsUnreadable = false, commentsUnreadable = false, comments = [], env = {} } = {}) {
   const source = `
     import { readFileSync } from 'node:fs';
     import { runRedTeam } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
-    const { input, status, records, recordsUnreadable, commentsUnreadable, comments } = JSON.parse(readFileSync(0, 'utf8'));
+    import { readStore } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/run-scorecard-store.mjs')).href)};
+    const { input, status, records, recordsUnreadable, commentsUnreadable, comments, env } = JSON.parse(readFileSync(0, 'utf8'));
     const calls = { provider: 0, reserve: 0, model: 0, recheck: 0 };
     const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
-    const result = await runRedTeam({ ...input, env: {} }, {
+    const result = await runRedTeam({ ...input, env }, {
       now: () => 1000, log: () => {},
-      readRecords: () => { if (recordsUnreadable) throw Error('transient EIO'); return records; },
+      readRecords: options => recordsUnreadable ? readStore({ ...options, path: 'injected-scorecards.json',
+        exists: () => true, read: () => { throw Object.assign(Error('transient EIO'), { code: 'EIO' }); } }).records : records,
       readRedTeamStatus: () => status,
       readRecoveryComments: () => { if (commentsUnreadable) throw Error('transient EIO'); return comments; },
       cliAvailable: forbid('provider'), reserveCalls: forbid('reserve'),
@@ -93,12 +100,113 @@ function runSharedRecovery(input, { status, records = [], recordsUnreadable = fa
     process.stdout.write(JSON.stringify({ result, calls, comments }));
   `;
   return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
-    input: JSON.stringify({ input, status, records, recordsUnreadable, commentsUnreadable, comments }), encoding: 'utf8',
+    input: JSON.stringify({ input, status, records, recordsUnreadable, commentsUnreadable, comments, env }), encoding: 'utf8',
+    timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
+  }));
+}
+
+// Keep the recorded effects between synchronous job children, including partial writes.
+function runStoredRecovery(input, { status, prior, saved, failComment = false, failStore = false } = {}) {
+  const source = `
+    import { readFileSync } from 'node:fs';
+    import { runRedTeam } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
+    import { readStore } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/run-scorecard-store.mjs')).href)};
+    const { input, status, prior, saved, failComment, failStore } = JSON.parse(readFileSync(0, 'utf8'));
+    const comments = saved?.comments ?? [], rows = saved?.rows ?? [];
+    const calls = { model: 0, recheck: 0, reserve: 0, provider: 0 };
+    const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
+    const result = await runRedTeam({ ...input, env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' } }, {
+      now: () => 1000, log: () => {},
+      readRecords: options => failStore ? readStore({ ...options, path: 'injected-scorecards.json', exists: () => true,
+        read: () => { throw Object.assign(Error('temporary store failure'), { code: 'EIO' }); } }).records : [prior, ...rows],
+      readRedTeamStatus: () => status, readRecoveryComments: () => comments,
+      cliAvailable: forbid('provider'), reserveCalls: forbid('reserve'),
+      runSeat: forbid('model'), runRecheck: forbid('recheck'),
+      listComments: () => comments,
+      postComment: ({ body }) => {
+        if (failComment) throw Error('transient comment failure');
+        comments.push({ body, author: { login: 'web-everything' } });
+      },
+      append: row => rows.push(row),
+    });
+    process.stdout.write(JSON.stringify({ result, comments, rows, calls }));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
+    input: JSON.stringify({ input, status, prior, saved, failComment, failStore }), encoding: 'utf8',
     timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
   }));
 }
 
 describe('red-team-only review job', () => {
+  it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])(
+    '%s disabled plus transient scorecard EIO leaves fresh recovery eligible after restoration', switchName => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-disabled-retry-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      const read = () => readRedTeamStatus({ repo, pr, head, env });
+      const production = createReviewJobIo({ env });
+      const observations = [];
+      let disabled = true;
+      const io = fakeIo({ redTeamStatus: vi.fn(production.redTeamStatus),
+        clearRedTeamQueued: vi.fn(production.clearRedTeamQueued),
+        runRedTeam: input => {
+          const observed = runSharedRecovery(input, { status: read(), recordsUnreadable: true,
+            env: { [switchName]: disabled ? '0' : '1' } });
+          observations.push(observed);
+          return observed.result;
+        },
+      });
+      const history = new Map();
+      let job;
+      const recover = (at, dispatch = options => { job = runReviewJob(options, io); return { jobPid: 42 }; }) => runRedTeamOnSkip({ repo,
+        plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+        rawPrs: [{ number: pr, headRefOid: head, comments: [] }],
+        readEvidence: () => ({ loopPayload: payload(), recorded: false, inFlight: false }), readStatus: read,
+        setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: history, now: () => at,
+        capacity: { lanes: 1 }, dispatch,
+      });
+      try {
+        expect(recover(1000).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
+        expect(job.redTeam).toMatchObject({ status: 'disabled' });
+        expect(read()).toBeNull();
+        expect(io.runRedTeamGate).toHaveBeenCalledOnce();
+        disabled = false;
+        expect(recover(1001).rows[0].why).toBe('retry cooldown active');
+        expect(recover(1_801_000).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
+        expect(job.redTeam).toMatchObject({ status: 'not-owed', deferredByGuard: true,
+          reason: expect.stringContaining('scorecard store unreadable') });
+        expect(read()).toBeNull();
+        expect(io.runRedTeamGate).toHaveBeenCalledTimes(2);
+        expect(io.clearRedTeamQueued).toHaveBeenCalledTimes(2);
+        expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(['queued', 'queued']);
+        expect(recover(3_601_000, () => ({ jobPid: 43 })).dispatched)
+          .toEqual([{ prNumber: pr, jobPid: 43, mode: 'fresh' }]);
+        expect(observations).toHaveLength(2);
+        for (const observed of observations) {
+          expect(observed.calls).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0 });
+          expect(observed.comments).toEqual([]);
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])(
+    'normal review still persists finished/disabled when %s is off', switchName => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-normal-disabled-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      const read = () => readRedTeamStatus({ repo, pr, head, env });
+      const production = createReviewJobIo({ env });
+      const io = fakeIo({ redTeamStatus: vi.fn(production.redTeamStatus),
+        clearRedTeamQueued: vi.fn(production.clearRedTeamQueued),
+        runLoop: () => ({ status: 0, stdout: JSON.stringify({ ...payload(), stopped: 'complete', runId: 'review-pr-disabled' }) }),
+        runRedTeam: input => runSharedRecovery(input, { status: read(), recordsUnreadable: true,
+          env: { [switchName]: '0' } }).result,
+      });
+      try {
+        expect(runReviewJob({ repo, pr }, io)).toMatchObject({ outcome: 'auto-cleared', redTeam: { status: 'disabled' } });
+        expect(read()).toMatchObject({ status: 'finished', result: 'disabled' });
+        expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(['queued', 'finished']);
+        expect(io.clearRedTeamQueued).not.toHaveBeenCalled();
+        expect(io.runRedTeamGate).toHaveBeenCalledOnce();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
   it.each(['comments', 'scorecard'])('a transient %s-unreadable guard refusal rolls back fresh admission, runs the gate once and leaves recovery eligible', unreadable => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-guard-retry-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
@@ -137,6 +245,189 @@ describe('red-team-only review job', () => {
       expect(retry.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it.each([
+    ['recorded-result recovery finishes missing comment and miss rows with zero model invocations', null],
+    ['two consecutive recovery attempts retry a failed comment then succeed with zero model invocations', 'comment'],
+    ['a transient production scorecard EIO preserves resume eligibility and retries with zero model invocations', 'store'],
+    ['card-only recovery publishes a recorded result after the skip setting is restored', 'card-only'],
+  ])('%s', (_name, failure) => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-effects-recovery-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
+    const status = () => readRedTeamStatus({ repo, pr, head, env });
+    const failFirstComment = failure === 'comment';
+    const cardOnly = failure === 'card-only';
+    const needsRetry = failure === 'comment' || failure === 'store';
+    const loopPayload = payload();
+    Object.assign(loopPayload.findings.read, { title: 'Recover stored result', netChangedFiles: [cardOnly ? 'backlog/123-card.md' : 'scripts/example.mjs'],
+      diffText: cardOnly ? '+card update' : 'diff --git a/scripts/example.mjs b/scripts/example.mjs\n+export const example = true;\n' });
+    const prior = { dispatchKind: 'review-seat', seat: 'red-team', lens: 'red-team', status: 'ok',
+      pr, repo, rev: head, callId: 'recorded-call', provider: 'codex', model: 'm', foldedVerdict: cardOnly ? 'accept' : 'changes',
+      changedFiles: loopPayload.findings.read.netChangedFiles, findings: cardOnly ? [] : [{ summary: 'Stored confirmed break', category: 'failing-input',
+        file: 'scripts/example.mjs', line: 1, impactIfUnfixed: 'degraded', confirmedByRecheck: true,
+        recheckReason: 'demonstrated break' }] };
+    const evidence = () => readDrainRedTeamEvidence({ repo, pr, head, env,
+      list: () => [], readScorecards: () => [prior, ...(observed?.rows ?? [])] });
+    let observed, job, attempt = 0;
+    const observations = [];
+    const production = createReviewJobIo({ env, readEvidence: evidence });
+    const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }),
+      redTeamStatus: vi.fn(production.redTeamStatus), clearRedTeamQueued: vi.fn(production.clearRedTeamQueued),
+      runRedTeam: input => {
+        expect(status()).toMatchObject({ status: 'queued', pid: process.pid });
+        observed = runStoredRecovery(input, { status: status(), prior, saved: observed,
+          failComment: failFirstComment && attempt === 0, failStore: failure === 'store' && attempt === 0 });
+        observations.push(observed);
+        attempt++;
+        return observed.result;
+      },
+    });
+    const history = new Map();
+    const recover = at => runRedTeamOnSkip({ repo,
+      plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+      rawPrs: [{ number: pr, headRefOid: head, comments: observed?.comments ?? [] }],
+      readEvidence: evidence,
+      readStatus: status,
+      setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: history, now: () => at,
+      capacity: { lanes: 1 }, dispatch: options => { job = runReviewJob(options, io); return { jobPid: 42 }; },
+    });
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished',
+        result: cardOnly ? 'ran' : { status: 'ran', comment: 'error' } },
+      { env: { ...env, WE_RED_TEAM_SKIP_CARD_ONLY: '0' } });
+      expect(status().skipCardOnly).toBe(false);
+      const before = status();
+      expect(recover(1_000).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'resume' }]);
+      if (failure === 'store') {
+        expect(job).toMatchObject({ outcome: 'red-team-only', redTeam: { status: 'not-owed', deferredByGuard: true,
+          reason: expect.stringContaining('scorecard store unreadable') } });
+        expect(status()).toMatchObject({ status: before.status, result: before.result });
+        expect(observed.calls).toEqual({ model: 0, recheck: 0, reserve: 0, provider: 0 });
+        expect(observed.comments).toEqual([]);
+        expect(observed.rows).toEqual([]);
+        expect(recover(1_001).rows[0].why).toBe('retry cooldown active');
+        expect(recover(1_801_000).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'resume' }]);
+      }
+      expect(job).toMatchObject({ outcome: 'red-team-only', redTeam: { status: 'resumed' } });
+      if (failFirstComment) {
+        expect(observed.result).toMatchObject({ status: 'resumed', comment: { status: 'error' }, rowsWritten: 2 });
+        expect(observed.calls).toEqual({ model: 0, recheck: 0, reserve: 0, provider: 0 });
+        expect(observed.comments).toEqual([]);
+        expect(status()).toMatchObject({ status: 'finished', result: 'resumed' });
+        expect(recover(1_001).rows[0].why).toBe('retry cooldown active');
+        expect(recover(1_801_000).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'resume' }]);
+        expect(job).toMatchObject({ outcome: 'red-team-only', redTeam: { status: 'resumed' } });
+      }
+      expect(observed.result).toMatchObject({ status: 'resumed', callId: prior.callId,
+        comment: { status: 'posted' }, rowsWritten: failFirstComment || cardOnly ? 0 : 2 });
+      expect(observed.calls).toEqual({ model: 0, recheck: 0, reserve: 0, provider: 0 });
+      expect(observed.comments).toHaveLength(1);
+      expect(redTeamForHead(observed.comments, pr, head)).toMatchObject({ pr, rev: head });
+      expect(observed.rows.map(row => row.missRole).sort()).toEqual(cardOnly ? [] : ['accepting-review', 'builder']);
+      expect(observed.rows.every(row => row.redTeamCallId === prior.callId && row.rev === head && row.repo === repo && row.pr === pr)).toBe(true);
+      expect(io.runRedTeamGate).toHaveBeenCalledWith({ pr, repo });
+      expect(io.runRedTeamGate).toHaveBeenCalledTimes(needsRetry ? 2 : 1);
+      expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(
+        needsRetry ? ['queued', 'finished', 'queued', 'finished'] : ['queued', 'finished']);
+      expect(status()).toMatchObject({ status: 'finished', result: 'resumed', skipCardOnly: true });
+      expect(recover(3_601_000).dispatched).toEqual([]);
+      // Re-enter the ordinary seat's real effects path to prove row/comment dedup, too.
+      const deduped = runStoredRecovery({ repo, pr, loopPayload }, { prior, saved: observed });
+      expect(deduped.result).toMatchObject({ status: 'already-ran' });
+      expect(deduped.rows).toEqual(observed.rows);
+      expect(deduped.comments).toEqual(observed.comments);
+      observations.push(deduped);
+      for (const observation of observations) expect(observation.calls).toEqual({ model: 0, recheck: 0, reserve: 0, provider: 0 });
+      expect(attempt).toBe(needsRetry ? 2 : 1);
+      expect(io.runLoop).not.toHaveBeenCalled(); expect(io.runExtraSeats).not.toHaveBeenCalled();
+      expect(io.prepareLane).toHaveBeenCalledTimes(attempt);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['final-write', 'queued-readback'].flatMap(failure =>
+    ['ran', { status: 'resumed', comment: 'error' }].map(prior => ({ failure, prior }))))(
+    'recovers a durable queued resume after $failure fails and the writer dies: $prior', ({ failure, prior }) => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-dead-resume-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      const loopPayload = payload();
+      loopPayload.findings.read.diffText = '+export const example = true;';
+      const cleanRow = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', pr, repo, rev: head,
+        callId: 'recorded-call', provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' };
+      const rawStatus = () => readRedTeamStatus({ repo, pr, head, env });
+      let live = true, fault = true, observed;
+      const observations = [];
+      const evidence = () => readDrainRedTeamEvidence({ repo, pr, head, env,
+        list: () => [], readScorecards: () => [cleanRow], isAlive: () => live });
+      const status = () => readRedTeamRecoveryStatus({ repo, pr, head, env }, {
+        readStatus: rawStatus, readEvidence: evidence,
+      });
+      const production = createReviewJobIo({ env, readEvidence: evidence,
+        writeStatus: (input, options) => {
+          if (fault && failure === 'final-write' && input.status === 'finished') throw Error('final status EIO');
+          recordRedTeamStatus(input, options);
+        },
+        readStatus: input => {
+          const stored = readRedTeamStatus(input);
+          if (fault && failure === 'queued-readback' && stored?.status === 'queued') {
+            // The queued write succeeded. Fail its readback AND the real catch's
+            // atomic rollback, retaining the new writer's durable queued record.
+            vi.mocked(writeJsonAtomic).mockImplementationOnce(() => { throw Error('rollback EIO'); });
+            throw Error('queued readback EIO');
+          }
+          return stored;
+        },
+      });
+      const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }),
+        redTeamStatus: vi.fn(production.redTeamStatus),
+        runRedTeam: vi.fn(input => {
+          observed = runStoredRecovery(input, { status: rawStatus(), prior: cleanRow, saved: observed,
+            failComment: fault });
+          observations.push(observed);
+          return observed.result;
+        }),
+      });
+      try {
+        recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: prior }, { env });
+        const initial = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'resume' }, io);
+        if (failure === 'queued-readback') {
+          expect(initial).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('queued red-team status could not be persisted') });
+          expect(io.runRedTeam).not.toHaveBeenCalled();
+          expect(io.runRedTeamGate).not.toHaveBeenCalled();
+          expect(vi.mocked(writeJsonAtomic).mock.results.at(-1)).toMatchObject({ type: 'throw', value: expect.objectContaining({ message: 'rollback EIO' }) });
+        } else {
+          expect(initial.redTeam).toMatchObject({ status: 'resumed' });
+          expect(observed.result.comment.status).toBe('error');
+          expect(observed.comments).toEqual([]);
+        }
+        expect(rawStatus()).toMatchObject({ status: 'queued', result: prior, pid: process.pid });
+        expect(status().status).toBe('queued');
+        // Once the transient IO fault clears, liveness alone still refuses entry.
+        fault = false;
+        const callsBefore = io.runRedTeam.mock.calls.length;
+        expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'resume' }, io).outcome).toBe('blocked-on-infra');
+        expect(io.runRedTeam).toHaveBeenCalledTimes(callsBefore);
+        live = false;
+        expect(status()).toMatchObject({ status: 'finished', result: prior });
+        const retry = runRedTeamOnSkip({ repo,
+          plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+          rawPrs: [{ number: pr, headRefOid: head, comments: observed?.comments ?? [] }],
+          readEvidence: evidence, readStatus: status, capacity: { lanes: 1 },
+          setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
+          dispatch: options => {
+            expect(options.redTeamMode).toBe('resume');
+            expect(runReviewJob(options, io)).toMatchObject({ outcome: 'red-team-only', redTeam: { status: 'resumed' } });
+            return { jobPid: 42 };
+          },
+        });
+        expect(retry.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'resume' }]);
+        expect(rawStatus()).toMatchObject({ status: 'finished', result: 'resumed' });
+        expect(observed.result).toMatchObject({ status: 'resumed', callId: cleanRow.callId, comment: { status: 'posted' } });
+        expect(observed.comments).toHaveLength(1);
+        expect(redTeamForHead(observed.comments, pr, head)).toMatchObject({ pr, rev: head });
+        expect(observed.rows).toEqual([]);
+        for (const observation of observations) expect(observation.calls).toEqual({ model: 0, recheck: 0, reserve: 0, provider: 0 });
+        expect(io.runLoop).not.toHaveBeenCalled(); expect(io.runExtraSeats).not.toHaveBeenCalled();
+        expect(io.releaseLane).toHaveBeenCalledTimes(3); expect(io.unclaim).toHaveBeenCalledTimes(3);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
   it('a confirmed-dead queued/ran prior admits and reaches the shared resume path without a model call', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-crashed-resume-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };

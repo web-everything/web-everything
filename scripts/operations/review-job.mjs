@@ -778,7 +778,8 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   if (accepted) {
     // Deferrals launch no model call or seat row. Roll back admission so the next
     // tick can retry after cooldown, retaining any pre-admission evidence.
-    const guardDeferred = out.redTeam?.deferredByGuard === true;
+    const guardDeferred = out.redTeam?.deferredByGuard === true
+      || (seatsBox.input.redTeamMode !== undefined && out.redTeam?.status === 'disabled');
     const prior = seatsBox.input?.redTeamAdmission?.prior;
     if ((guardDeferred || (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true))
       && seatsBox.priorRedTeamResult == null && prior == null) {
