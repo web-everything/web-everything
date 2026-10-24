@@ -181,7 +181,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
-import { laneGitHardeningEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
 import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
@@ -217,7 +217,9 @@ const isReadOnlyGit = (args) => READ_ONLY_GIT.has(args[0]) || (args[0] === 'remo
 // the agent may have released, so no git call it makes there may execute a lane-chosen `core.fsmonitor` / hook
 // (scripts/lib/lane-git-hardening.mjs). That includes the MUTATING ones: acquire's `checkout -B --force` and refresh's
 // `reset --hard` ran a lane-set fsmonitor and post-checkout / reference-transaction hooks (PR #5775 self-review).
-const readOnlyGitEnv = (args) => ({ env: laneGitHardeningEnv(isReadOnlyGit(args) ? { ...process.env, GIT_OPTIONAL_LOCKS: '0' } : process.env) });
+// No inherited GIT_DIR / GIT_REFERENCE_BACKEND-style redirect either: a lane write must never land in another repository.
+const LANE_GIT_ENV = scrubGitLocationEnv(process.env);
+const readOnlyGitEnv = (args) => ({ env: laneGitHardeningEnv(isReadOnlyGit(args) ? { ...LANE_GIT_ENV, GIT_OPTIONAL_LOCKS: '0' } : LANE_GIT_ENV) });
 // The transport keys those pins cannot reach (PR #5775 self-review): a lane-set `remote.origin.uploadpack` is multi-valued
 // and git uses the FIRST, so no `-c` beats it — `--upload-pack` on the command line does; `protocol.ext.allow=never` beats a
 // lane-set `always` for an `ext::` url or `remote.origin.vcs=ext`. The other command-naming transport keys (credential
@@ -264,7 +266,7 @@ const defaultGitTimeoutOpt = () => ({ timeout: resolveChildTimeoutMs(), killSign
 const git = (args, cwd, opts = {}) =>
   readGit(laneTransportArgs(args), { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim(); // #74d: throws on failure/oversize
 const gitQuiet = (args, cwd, opts = {}) =>
-  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts });
+  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', env: LANE_GIT_ENV, ...opts });
 const tryGit = (args, cwd, opts = {}) => {
   try {
     return git(args, cwd, opts);
@@ -347,14 +349,7 @@ function resolveRepo() {
   // An inherited lane Git context must not override an explicitly selected primary.
   // Scrub BEFORE hardening: the hardening appends its pins after any inherited GIT_CONFIG_COUNT entries, so an
   // inherited GIT_CONFIG_KEY_n=remote.origin.url would otherwise survive as the "canonical" origin.
-  const inherited = { ...process.env, GIT_OPTIONAL_LOCKS: '0' };
-  for (const key of Object.keys(inherited)) {
-    if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) delete inherited[key];
-  }
-  for (const key of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
-    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS',
-    'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_NAMESPACE']) delete inherited[key];
-  const env = laneGitHardeningEnv(inherited);
+  const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
   const gitOptions = { timeout: LOCAL_GIT_TIMEOUT_MS, env };
   const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, gitOptions) || referencePath;
   const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
@@ -1252,9 +1247,7 @@ function liveRemoteShasProbe(repo) {
     // No lane config, including worktree config or includes, may affect a live proof. A literal
     // URL alone is insufficient: url.*.insteadOf can rewrite it to an executable remote helper.
     probeDir = mkdtempSync(join(tmpdir(), 'lane-remote-probe-'));
-    const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CEILING_DIRECTORIES: dirname(probeDir) }, { remoteProbe: true });
-    for (const key of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
-      'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS']) delete env[key];
+    const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0', GIT_CEILING_DIRECTORIES: dirname(probeDir) }, { remoteProbe: true });
     // Explicit local pool origins are supported too. Permit file transport only for that canonical
     // path, in this isolated process; lane protocol settings never participate in this decision.
     // GIT_ALLOW_PROTOCOL overrides even per-protocol inherited config and a parent's wider allowlist.
@@ -2978,7 +2971,7 @@ function printStatus(repo) {
 // (`git var`, see `laneIdentityReport`), so any per-lane config syntax is covered.
 function warnPlaceholderIdentity(lanes) {
   try {
-    const env = laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' });
+    const env = laneGitHardeningEnv({ ...LANE_GIT_ENV, GIT_OPTIONAL_LOCKS: '0' });
     // REPORT-only here: `status` writes no state (stale-state and other readers pin that); provision/refresh/acquire set it.
     // Same allow-list as writeLaneEnv, so any other status (incl. a non-executable pre-commit → error) is flagged.
     const unhooked = lanes.filter(({ dir }) => !['ok', 'set', 'skipped'].includes(ensureLaneHooksPath(dir, { write: false, log }).status)).map((l) => `lane-${l.lane}`);
@@ -4363,8 +4356,8 @@ function cmdReclaim(repo) {
     return;
   }
   scrubClaimedLaneConfig(dir, 'before reclaim reset');
-  execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
-  execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
+  execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
+  execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
   rmSync(file, { force: true }); // back to the free-pool state — the same end state a normal `release` leaves
   journalLaneEvent(dir, {
     action: 'reclaim-reset', before, headAfter: laneHead(dir),
@@ -4456,8 +4449,8 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
   const before = laneStateSnapshot(dir, `origin/${repo.branch}`);
   const removedWorktrees = removeLitterWorktrees(dir, salvage.worktrees);
   scrubClaimedLaneConfig(dir, 'before reclaim reset');
-  execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
-  execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
+  execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
+  execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
   rmSync(file, { force: true });
   // #4370 — unpushed content here was SAVED first (a verified bundle), and the owner was proven gone (g2).
   journalLaneEvent(dir, {
