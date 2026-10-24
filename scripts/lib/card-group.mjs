@@ -871,6 +871,11 @@ export function createCardGrouping({
                   onRetarget: n => say(`${tag}: retargeted #${n} off ${headRef} to main before closing source #${s.num}`),
                   onFailed: n => say(`${tag}: could not retarget #${n} off source #${s.num}`),
                 });
+                if (retargeted.listed !== true) { // unknown stacked children: closing could strand one (fail closed)
+                  say(`${tag}: source #${s.num} left open because stacked PR listing failed — retried`);
+                  retry = true;
+                  continue;
+                }
                 if (retargeted.failed.length > 0) {
                   say(`${tag}: source #${s.num} left open because stacked PR retargeting failed — retried`);
                   retry = true;

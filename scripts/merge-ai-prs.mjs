@@ -6872,6 +6872,9 @@ async function runCli() {
           }
           const landLock = withLandWriteLock(() => {
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
+            // xym8nt4 — re-check group ownership under the mutex: a group may have claimed this PR since the pre-pass hold.
+            const groupHeld = cardGrouping.holdFor(c);
+            if (groupHeld) return { skipped: 'card-group-hold', reason: groupHeld.reason };
             if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
@@ -6879,6 +6882,13 @@ async function runCli() {
             return { merged: true };
           }, mergeStrategy.enqueues(c.repo) ? { runUnlockedOnContention: false } : {}); // xtpxusq — the enqueue's state write must never run unserialized; a refused lock retries next pass
           if (landLock.ran === false) { enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'merge-lock-held', reason: `merge-write mutex held by ${landLock.heldBy || '?'}` }); if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
+          if (landLock.result?.skipped === 'card-group-hold') {
+            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'card-group-hold', reason: landLock.result.reason });
+            if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(c.repo)}${c.num} not landed: ${landLock.result.reason} — claimed by a card group after the pass-start check (xym8nt4)\n`);
+            c.decision = 'skip'; c.reason = landLock.result.reason;
+            const cc = remaining.find((x) => sameCand(x, c)); if (cc) { cc.decision = 'skip'; cc.reason = landLock.result.reason; }
+            continue;
+          }
           if (landLock.contended && !AS_JSON) process.stderr.write(`  ⚠ merge-write mutex not acquired (held by ${landLock.heldBy || '?'}) — merged under the per-PR idempotency guard instead (#2683)\n`);
           if (landLock.result && landLock.result.skipped === 'already-merged') {
             // xvzc4v4 (merge-safety review, bug 2) — THIS BRANCH USED TO withhold the PR from `merged` on the

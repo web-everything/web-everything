@@ -692,6 +692,7 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       calls.push(args.join(' '));
       if (args[0] === 'pr' && args[1] === 'view') return args[2] === '77' ? JSON.stringify({ state: 'MERGED', labels: [] })
         : JSON.stringify({ state: closed.has(args[2]) ? 'CLOSED' : 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
+      if (args[0] === 'pr' && args[1] === 'list') return '[]'; // nothing stacked on the source (a failed listing keeps it open)
       if (args[0] === 'pr' && args[1] === 'close') { closed.add(args[2]); return ''; }
       if (args[0] === 'pr' && args[1] === 'comment') return '';
       throw new Error(`unexpected ${args.join(' ')}`);
@@ -708,7 +709,9 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     // Main after the merge carries source 1's head A. `views[n]` is the sequence of live reads of source n (the last
     // repeats); a read after a `pr close` reports CLOSED with the head GitHub recorded.
     // `second`: add source #2 (head B, not on main) whose reads fail, so the group keeps retrying.
-    function mergedRace(views, { closedAt, reopenFails = false, closeThrows = false, second = false, stacked = [] } = {}) {
+    // `listing`: null (normal) | 'throw' | 'nonarray' — how the stacked-PR listing of the source's branch answers; an
+    // object (`{ mode }`) so a test can heal it between passes.
+    function mergedRace(views, { closedAt, reopenFails = false, closeThrows = false, second = false, stacked = [], listing = { mode: null } } = {}) {
       const t = setup();
       const statePath = join(tmp(), 's.json');
       git(t.cwd, 'checkout', '-q', '-b', 'merged', t.base);
@@ -733,6 +736,8 @@ describe('createCardGrouping — claim under the land mutex, close on current he
         }
         if (args[0] === 'pr' && args[1] === 'list') {
           expect(args).toEqual(['pr', 'list', '--state', 'open', '--base', 'lane/x', '--repo', 'o/r', '--json', 'number,baseRefName']);
+          if (listing.mode === 'throw') throw new Error('gh: 502');
+          if (listing.mode === 'nonarray') return JSON.stringify({ message: 'Bad credentials' });
           return JSON.stringify(stacked.filter(p => p.base === 'lane/x').map(p => ({ number: p.number })));
         }
         if (args[0] === 'pr' && args[1] === 'edit') {
@@ -777,6 +782,24 @@ describe('createCardGrouping — claim under the land mutex, close on current he
       expect(calls.filter(c => /^pr (edit|close) /.test(c))).toEqual([
         'pr edit 101 --repo o/r --base main', 'pr edit 101 --repo o/r --base main', expect.stringMatching(/^pr close 1 /),
       ]);
+      expect(readGroupState(statePath).groups).toEqual([]);
+    });
+
+    it.each(['throw', 'nonarray'])('a failed stacked-PR listing (%s) never closes the source: it stays open and is retried (xym8nt4)', (mode) => {
+      const child = { number: 101, base: 'lane/x' };
+      const listing = { mode };
+      const { r, calls, out, state, again, statePath } = mergedRace(h => [{ head: h.a }], { stacked: [child], listing });
+      expect(r.done).toEqual([]);
+      expect(calls.some(c => c.startsWith('pr close '))).toBe(false);
+      expect(calls.some(c => c.startsWith('pr edit '))).toBe(false);
+      expect(child.base).toBe('lane/x');
+      expect(state.groups.map(x => x.id)).toEqual(['g']);
+      expect(state.groups[0].mergedRetries).toBe(1);
+      expect(out.join('')).toContain('source #1 left open because stacked PR listing failed — retried');
+      listing.mode = null; // the listing heals: the child is retargeted first, then the source closes
+      expect(again().done).toEqual(['g']);
+      expect(child.base).toBe('main');
+      expect(calls.filter(c => /^pr (edit|close) /.test(c))).toEqual(['pr edit 101 --repo o/r --base main', expect.stringMatching(/^pr close 1 /)]);
       expect(readGroupState(statePath).groups).toEqual([]);
     });
 
