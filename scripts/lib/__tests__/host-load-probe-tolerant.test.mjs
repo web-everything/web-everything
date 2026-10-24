@@ -43,7 +43,7 @@ describe('Darwin memory probe fallback chain', () => {
   });
   it('uses hw.memsize times the vm_stat page ratio after earlier probes fail', () => {
     const exec = sequence(vm, denied, 'bad vm_stat', 'bad pressure', 'hw.memsize: 68719476736', vm);
-    expect(read(exec)).toEqual({ mb: 16384, probe: 'hw.memsize+vm_stat' });
+    expect(read(exec)).toEqual({ mb: 512, probe: 'hw.memsize+vm_stat' });
     expect(exec.mock.calls).toEqual(calls);
   });
   it.each([

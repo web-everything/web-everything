@@ -19,28 +19,66 @@ export function readHostLoad({ env = process.env, load = loadavg } = {}) {
   }
   return load();
 }
+const darwinPages = (vm, name) => Number(new RegExp(`^Pages ${name}:\\s+(\\d+)\\.?(?:\\s|$)`, 'm').exec(vm)?.[1] ?? NaN);
 /** Parse macOS `vm_stat` + `sysctl vm.swapusage` into headroom MB: free + speculative + purgeable pages (never the
  *  inactive file cache) plus free swap. Pure. Throws on unparseable input (the caller fails closed). */
 export function parseDarwinMemoryHeadroomMb(vmStat, swapUsage) {
   const page = Number(/page size of (\d+) bytes/.exec(vmStat)?.[1]);
-  const pages = (name) => Number(new RegExp(`Pages ${name}:\\s+(\\d+)`).exec(vmStat)?.[1] ?? NaN);
+  const pages = (name) => darwinPages(vmStat, name);
   const free = pages('free'); const spec = pages('speculative'); const purge = pages('purgeable');
   const swapFree = /free = ([\d.]+)M/.exec(swapUsage)?.[1];
-  if (![page, free, spec].every(Number.isFinite) || swapFree === undefined) throw Error('unparseable vm_stat/swapusage');
+  if (![page, free, spec, Number(swapFree)].every(Number.isFinite) || page <= 0) throw Error('unparseable vm_stat/swapusage');
   return ((free + spec + (Number.isFinite(purge) ? purge : 0)) * page) / 1048576 + Number(swapFree);
 }
-/** Free memory + free swap headroom in MB. Subprocess fixtures may supply it only under Vitest. */
-export function readHostMemoryHeadroomMb({ env = process.env, platform = process.platform, exec = execFileSync, free = freemem } = {}) {
+let probeLogged = false;
+export function resetProbeLogForTests() { probeLogged = false; }
+/** Bounded memory probes, strongest first; no swap credit when swap cannot be read. */
+export function readHostMemoryHeadroom({ env = process.env, platform = process.platform, exec = execFileSync, free = freemem,
+  log = (m) => process.stderr.write(`${m}\n`) } = {}) {
+  const selected = (mb, probe) => {
+    if (!Number.isFinite(mb) || mb < 0) throw Error('invalid host memory reading');
+    if (!probeLogged) { log(`host memory probe: ${probe}`); probeLogged = true; }
+    return { mb, probe };
+  };
   if (env.VITEST === 'true' && env.WE_TEST_HOST_MEMORY_MB !== undefined) {
     const value = Number(env.WE_TEST_HOST_MEMORY_MB);
     if (env.WE_TEST_HOST_MEMORY_MB.trim() === '' || !Number.isFinite(value) || value < 0) throw Error('invalid test host memory');
-    return value;
+    return selected(value, 'test');
   }
   if (platform === 'darwin') {
     const opts = { encoding: 'utf8', timeout: 5000 };
-    return parseDarwinMemoryHeadroomMb(exec('vm_stat', [], opts), exec('sysctl', ['vm.swapusage'], opts));
+    const vm = () => exec('vm_stat', [], opts);
+    const probes = [
+      ['vm_stat+swapusage', () => parseDarwinMemoryHeadroomMb(vm(), exec('sysctl', ['vm.swapusage'], opts))],
+      ['vm_stat', () => parseDarwinMemoryHeadroomMb(vm(), 'free = 0M')],
+      ['memory_pressure', () => {
+        const output = exec('memory_pressure', ['-Q'], opts);
+        const bytes = Number(/The system has (\d+)\s/.exec(output)?.[1]);
+        const percent = Number(/System-wide memory free percentage:\s*([\d.]+)%/.exec(output)?.[1]);
+        if (!Number.isFinite(bytes) || bytes <= 0 || !Number.isFinite(percent) || percent < 0 || percent > 100) throw Error('unparseable memory_pressure');
+        return (bytes / 1048576) * (percent / 100);
+      }],
+      ['hw.memsize+vm_stat', () => {
+        const bytes = Number(/^hw\.memsize:\s*(\d+)\s*$/.exec(exec('sysctl', ['hw.memsize'], opts))?.[1]);
+        const output = vm();
+        // Partial page-category sums omit compressor memory; only credit observed free-page bytes.
+        const page = Number(/page size of (\d+) bytes/.exec(output)?.[1]);
+        const freeBytes = darwinPages(output, 'free') * page;
+        if (!Number.isFinite(bytes) || bytes <= 0 || !Number.isFinite(page) || page <= 0 || !Number.isFinite(freeBytes) || freeBytes > bytes) throw Error('unparseable hw.memsize/vm_stat');
+        return freeBytes / 1048576;
+      }],
+    ];
+    let failure;
+    for (const [probe, read] of probes) {
+      try { return selected(read(), probe); } catch (e) { failure = e; }
+    }
+    throw failure;
   }
-  return free() / 1048576;
+  return selected(free() / 1048576, 'freemem');
+}
+/** Numeric compatibility wrapper for admission and existing callers. */
+export function readHostMemoryHeadroomMb(options) {
+  return readHostMemoryHeadroom(options).mb;
 }
 export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => cpus().length, memory = readHostMemoryHeadroomMb, interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
@@ -58,7 +96,7 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => c
   try {
     // A hand-built policy without the leaf takes the standard value; a loaded policy always carries it.
     const min = policy.settings.host.minMemoryHeadroomMb ?? DEFAULT_MIN_MEMORY_HEADROOM_MB;
-    const mb = memory({ env });
+    const mb = memory({ env, log });
     if (!Number.isFinite(mb) || mb < 0 || !Number.isFinite(min) || min <= 0) throw Error('unknown host memory');
     const reason = `host memory headroom ${Math.round(mb)}MB (free+swap); host.minMemoryHeadroomMb=${min} (${policy.sources?.['host.minMemoryHeadroomMb'] ?? 'standard'})`;
     return mb >= min ? { admitted: true, reason: `${loadVerdict.reason}; ${reason}` } : { admitted: false, reason };
