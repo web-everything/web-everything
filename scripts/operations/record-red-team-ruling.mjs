@@ -108,6 +108,16 @@ export function conflictingPendingCardJobs(comments, { pr, head, resultId, jobKe
   return out;
 }
 
+/** A trusted intent for this exact job, including one started under another host's state root. PURE. */
+export function hasPendingCardIntent(comments, { pr, head, resultId, jobKey }) {
+  const marker = redTeamGateMarker(pr, head, CARD_PENDING_OUTCOME, resultId);
+  return (Array.isArray(comments) ? comments : []).some((c) => {
+    const body = String(c?.body ?? '').trimStart();
+    return body.startsWith(marker) && isHumanOperatorComment(c)
+      && /Operator card ruling pending \(job ([0-9a-f]{12}), break\(s\) (#\d+(?:, #\d+)*)\)/.exec(body)?.[1] === jobKey;
+  });
+}
+
 /** THE VERDICT. Validate, select, and describe the writes. PURE. */
 export function planRedTeamRuling(read, input) {
   const { pr, ruling, actor, channel, reason } = input;

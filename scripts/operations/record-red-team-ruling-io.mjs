@@ -20,7 +20,7 @@ import { buildGateComment } from './red-team-gate-apply.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
-import { CARD_PENDING_OUTCOME, conflictingPendingCardJobs, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulableBreaks } from './record-red-team-ruling.mjs';
+import { CARD_PENDING_OUTCOME, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulableBreaks } from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
@@ -131,6 +131,10 @@ export function createFileClaims({ dir = join(automationStateRoot(), 'red-team-r
     } catch { return null; } // Missing, unreadable, partial and legacy unbound receipts prove nothing.
   };
   return {
+    hasClaim(key) {
+      try { return latest(key).gen >= 0; }
+      catch (e) { if (e?.code === 'ENOENT') return false; throw e; }
+    },
     claim(key) {
       mkdirSync(dir, { recursive: true });
       const cur = latest(key);
@@ -307,6 +311,13 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
       }
       const session = p.session;
+      // Observe the prior thread and local evidence BEFORE creating any claim or writing an intent.
+      const hasIntent = hasPendingCardIntent(comments, p);
+      if (hasIntent && !claims.hasClaim(p.jobKey) && !claims.attempted(p.jobKey)
+        && !claims.spawned(p.jobKey, p) && !claims.completed(p.jobKey, p)) {
+        throw new Error(`card job ${p.jobKey} already has a trusted pending intent but no local claim, attempt, spawn or completion evidence; nothing written. `
+          + `Check the landing log for session ${session}; recover the owed card and re-run citing its readable --card reference`);
+      }
       // 0. Each selected BREAK belongs to at most one card job (atomic, local): an overlapping concurrent selection loses.
       const breakKeys = p.indices.map((i) => breakClaimKey(p, i));
       const owners = p.indices.map((i, n) => ({ i, owner: claims.claimBreak(breakKeys[n], p.jobKey, breakKeys) })).filter((o) => o.owner !== p.jobKey);
@@ -325,7 +336,6 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         if (!claims.reclaim(p.jobKey, claim.gen)) throw new Error(`another invocation just took over the claim for job ${p.jobKey}; re-run later`);
       }
       // 2. The bare intent marker, BEFORE the spawn (no action line, so the hold stands). Written once per job.
-      const hasIntent = comments.some((c) => String(c?.body ?? '').includes(`outcome=${CARD_PENDING_OUTCOME} result=${p.resultId}`) && String(c?.body ?? '').includes(`job ${p.jobKey}`));
       if (!hasIntent) post(p.repo, p.pr, intentBody(p));
       // 3. Spawn exactly once: a job with a spawn receipt is reconciled, never spawned again.
       let card = { ok: true, session };
