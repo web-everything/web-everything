@@ -260,6 +260,35 @@ describe('sameGapSameHead', () => {
   it('refuses unreadable inputs', () => expect(sameGapSameHead(null, base)).toBe(false));
 });
 
+describe('cumulative referral snapshots', () => {
+  const readSnapshots = (...snapshots) => readReferralRecords(snapshots.map(snapshot => ({
+    body: renderReferralRecord(snapshot), author: { login: 'web-everything' },
+  })), { head });
+  const initialReferrals = () => [referral('judge'), referral('judgeCorrectness')];
+
+  it('accepts additions while retaining prior referrals in order', () => {
+    const initial = record(initialReferrals());
+    const appended = record([...initial.referrals, referral('judgeSecurity')]);
+    expect(readSnapshots(initial, appended)).toEqual({ records: [appended], malformed: false });
+  });
+
+  it.each([
+    ['removal', referrals => referrals.slice(0, 1)],
+    ['reordering', referrals => [...referrals].reverse()],
+    ['rewriting a claim', referrals => [referral(referrals[0].seat, {
+      summary: 'A different claim replaces the original evidence',
+    }), referrals[1]]],
+    ['rewriting evidence under the same key', referrals => [referral(referrals[0].seat, {
+      impactIfUnfixed: 'unrecoverable',
+    }), referrals[1]]],
+  ])('rejects %s of prior referrals and retains the last valid snapshot', (_label, change) => {
+    const initial = record(initialReferrals());
+    // Both snapshots must be individually valid, so rejection exercises the cumulative guard.
+    const altered = record(change(initial.referrals));
+    expect(readSnapshots(initial, altered)).toEqual({ records: [initial], malformed: true });
+  });
+});
+
 describe('same-head operator matching and read-time validation', () => {
   it.each(['not-real', 'card'])('persists a valid %s carry and settles the sibling', result => {
     const { ruled, ctx } = world({}, result), target = referral();
