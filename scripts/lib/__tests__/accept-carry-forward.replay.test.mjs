@@ -14,6 +14,7 @@ import {
   laterReviewHold, isKnownMachineBody,
 } from '../accept-carry-forward.mjs';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../review-set-label.mjs';
+import { redTeamMarker, redTeamGateMarker } from '../red-team-gate.mjs';
 import {
   parseLatestHumanClearedSha, parseOperatorClearance, REVIEW_LABELS, decideMechanicalPark, isReviewHoldLabel, hasUnclearedReviewLabel,
 } from '../review-escalation.mjs';
@@ -1161,6 +1162,35 @@ describe('plateau-app #217 replay — clearance stamped with reviewed-sha only (
 
   it('setting off = today', () => {
     expect(acceptanceCoversHead(read({ [OLD217]: DIFF, [NEW217]: DIFF }, 'off')).covers).toBe(false);
+  });
+});
+
+describe('red-team machine-body boundary (#5828)', () => {
+  const bodies = [
+    ['gate record', `${redTeamGateMarker(5828, NEW, 'no-send-back')}\nRed-team gate result.`],
+    ['advisory', `${redTeamMarker(5828, NEW)}\nRed-team advisory result.`],
+  ];
+  const laterRecord = (body, metadata = {}) => latestAcceptRecord([fx.comments[0], { body, ...metadata }]);
+
+  it.each(bodies)('trusted %s after an accept does not supersede it', (_kind, body) => {
+    expect(laterRecord(body, { author: { login: 'web-everything[bot]' } }).laterVerdict).toBe(false);
+  });
+
+  it.each(bodies)('%s requires trusted author metadata, including for body-only calls', (_kind, body) => {
+    expect(isKnownMachineBody(body)).toBe(false);
+    expect(laterRecord(body).laterVerdict).toBe(true);
+    expect(laterRecord(body, { author: { login: 'mallory' } }).laterVerdict).toBe(true);
+  });
+
+  it.each(bodies)('%s must start the body and have a well-formed marker', (_kind, body) => {
+    for (const invalid of ['Prose before the marker.\n' + body, '\n' + body, body.replace(NEW, 'not-a-sha'), body.replace(' -->', '')]) {
+      expect(laterRecord(invalid, { author: { login: 'web-everything[bot]' } }).laterVerdict).toBe(true);
+    }
+  });
+
+  it.each(bodies)('%s never overrides a later verdict or hold', (_kind, body) => {
+    expect(laterRecord(body + '\n' + parkBody('manifest baseline mismatch — post-review tamper'),
+      { author: { login: 'web-everything[bot]' } }).laterVerdict).toBe(true);
   });
 });
 
