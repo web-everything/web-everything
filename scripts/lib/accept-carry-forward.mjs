@@ -36,7 +36,7 @@ import { fileURLToPath } from 'node:url';
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { MARKER_RE, JOB_RE } from './approval-prevention-notice.mjs';
-import { parseRedTeamComment, parseRedTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
+import { breakClass, GATE_OUTCOMES, parseRedTeamComment, parseRedTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
 
 export const ACCEPT_CARRY_FORWARD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'accept-carry-forward.json');
 
@@ -149,18 +149,24 @@ function isApprovalPreventionNotice(text, comment) {
 /**
  * Pure: is this comment body a recognised machine shape that cannot be a hold?
  * Approval-prevention notices require a trusted author when the caller supplies comment metadata. An empty body says nothing.
- * Red-team gate records and advisories require trusted author metadata and a well-formed marker at the body's start.
+ * Red-team gate records and advisories require trusted author metadata, a leading well-formed marker, and no blocking result.
  * Verdicts, re-arms, stand-downs and non-mechanical drain parks are NOT machine shapes (they supersede the accept).
  */
 export function isKnownMachineBody(body, comment = undefined) {
   const text = typeof body === 'string' ? body : '';
   if (!text.trim()) return true;
   if (isLaterVerdictBody(text)) return false;
-  // These report through the red-team gate's own path; neither records an acceptance nor withholds one here.
-  if (isTrustedMarkerAuthor(comment) && (
-    (text.startsWith(RED_TEAM_GATE_MARKER) && parseRedTeamGateMarker(text))
-    || (text.startsWith(RED_TEAM_COMMENT_MARKER) && parseRedTeamComment(text))
-  )) return true;
+  // Only non-blocking results are machine notes: a confirmed break or a failed/unknown gate still supersedes the accept.
+  if (isTrustedMarkerAuthor(comment)) {
+    if (text.startsWith(RED_TEAM_GATE_MARKER)) {
+      const gate = parseRedTeamGateMarker(text);
+      return !!gate && [GATE_OUTCOMES.NOTHING_TO_SEND, GATE_OUTCOMES.CARD_QUEUED].includes(gate.outcome);
+    }
+    if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
+      const advisory = parseRedTeamComment(text);
+      return !!advisory && !advisory.findings.some((finding) => breakClass(finding) === 'broken');
+    }
+  }
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
   return isApprovalPreventionNotice(text, comment) || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));

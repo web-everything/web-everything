@@ -1176,6 +1176,29 @@ describe('red-team machine-body boundary (#5828)', () => {
     expect(laterRecord(body, { author: { login: 'web-everything[bot]' } }).laterVerdict).toBe(false);
   });
 
+  it.each(['broken', 'impact?', 'unknown'])('refuses carry after a trusted confirmed finding with %s impact', (impact) => {
+    const body = `${redTeamMarker(5828, NEW)}\n1. [**confirmed**] (edge-case, ${impact}) — Demonstrated break.`;
+    const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
+    expect(record.laterVerdict).toBe(true);
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+  });
+
+  it.each(['sent-back', 'round-cap', 'error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed', 'unknown'])
+    ('refuses carry after a trusted %s gate outcome', (outcome) => {
+      const record = laterRecord(redTeamGateMarker(5828, NEW, outcome), { author: { login: 'web-everything[bot]' } });
+      expect(record.laterVerdict).toBe(true);
+      expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
+    });
+
+  it.each([
+    redTeamGateMarker(5828, NEW, 'card-queued'),
+    `${redTeamMarker(5828, NEW)}\n1. [not confirmed] (edge-case, broken) — Unconfirmed claim.`,
+    `${redTeamMarker(5828, NEW)}\n1. [**confirmed**] (edge-case, degraded) — Follow-up finding.`,
+  ])('retains carry for a trusted non-blocking red-team result: %s', (body) => {
+    const record = laterRecord(body, { author: { login: 'web-everything[bot]' } });
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('carry');
+  });
+
   it.each(bodies)('%s requires trusted author metadata, including for body-only calls', (_kind, body) => {
     expect(isKnownMachineBody(body)).toBe(false);
     expect(laterRecord(body).laterVerdict).toBe(true);
