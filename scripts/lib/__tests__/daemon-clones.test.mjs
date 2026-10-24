@@ -41,7 +41,7 @@ describe('daemon clone resolver', () => {
     expect(clones[0].labels).toEqual(['com.we.fix', 'com.we.review']);
   });
 
-  it('tolerates missing directories, unreadable plists and absent clone fields', () => {
+  it('retains an empty result for unreadable discovery evidence', () => {
     expect(resolveDaemonClones({ env: {}, readdir: () => { throw new Error('missing'); }, exec })).toEqual([]);
     expect(resolveDaemonClones({ env: {}, readdir, exec: () => { throw new Error('bad plist'); } })).toEqual([]);
     expect(resolveDaemonClones({ env: {}, readdir, exec: () => '{}' })).toEqual([]);
@@ -59,19 +59,18 @@ describe('adoption matrix settings', () => {
     expect(settings.fixReadyPath).toBe('/fixes');
   });
 
-  it('validates fields independently and retains defaults for invalid values', () => {
-    expect(validateAdoptionMatrixSettings({ clones: ['/clone'], excludeClones: 'bad', fixReadyPath: 42 }))
+  it('rejects malformed settings instead of substituting defaults', () => {
+    expect(validateAdoptionMatrixSettings({ clones: ['/clone'] }))
       .toEqual({ clones: ['/clone'], excludeClones: [], fixReadyPath: null });
-    for (const raw of [null, [], { clones: [1], excludeClones: [''], fixReadyPath: '' }]) {
-      expect(validateAdoptionMatrixSettings(raw)).toEqual({ clones: [], excludeClones: [], fixReadyPath: null });
+    for (const raw of [null, [], { clones: [1] }, { excludeClones: 'bad' }, { excludeClones: [''] }, { fixReadyPath: 42 }, { fixReadyPath: '' }]) {
+      expect(() => validateAdoptionMatrixSettings(raw)).toThrow(/settings/i);
     }
   });
 
-  it('loads injected file text and falls back on missing or malformed JSON', () => {
+  it('loads injected file text and throws on unreadable or malformed JSON', () => {
     expect(loadAdoptionMatrixSettingsFile('/settings', { readText: () => '{"fixReadyPath":"/fixes"}' }).fixReadyPath).toBe('/fixes');
     for (const readText of [() => '{', () => { throw new Error('missing'); }]) {
-      expect(loadAdoptionMatrixSettingsFile('/settings', { readText }))
-        .toEqual({ clones: [], excludeClones: [], fixReadyPath: null });
+      expect(() => loadAdoptionMatrixSettingsFile('/settings', { readText })).toThrow();
     }
   });
 });
@@ -104,3 +103,28 @@ it.each(['ENOENT', 'EACCES'])('reports discovery directory failures except missi
   })).toEqual([]);
   expect(incomplete).toEqual(code === 'ENOENT' ? [] : ['daemon discovery directory unreadable']);
 });
+
+it.each([
+  ['com.we.review', {}],
+  ['com.we.review', { WorkingDirectory: ' ' }],
+  ['com.we.review', { WorkingDirectory: 42 }],
+  ['com.plateau.drain-daemon', { WorkingDirectory: '/wrong-clone' }],
+  ['com.plateau.drain-daemon', { EnvironmentVariables: { DRAIN_DAEMON_WE_CLONE: '' } }],
+])('reports a readable %s plist missing a valid expected clone field (%j)', (label, plist) => {
+  const incomplete = [];
+  expect(resolveDaemonClones({ env: {}, readdir: () => [`${label}.plist`],
+    exec: () => JSON.stringify(plist),
+    onIncomplete: reason => incomplete.push(reason),
+  })).toEqual([]);
+  expect(incomplete).toEqual(['daemon plist clone field missing or invalid']);
+});
+
+it.each([{ env: { WE_LAUNCH_AGENTS_DIR: '/configured' } }, { env: {}, launchAgentsDir: '/configured' }])(
+  'reports ENOENT for an explicitly configured discovery directory (%j)', options => {
+    const incomplete = [];
+    expect(resolveDaemonClones({ ...options,
+      readdir: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); },
+      onIncomplete: reason => incomplete.push(reason),
+    })).toEqual([]);
+    expect(incomplete).toEqual(['daemon discovery directory unreadable']);
+  });

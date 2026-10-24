@@ -70,7 +70,7 @@ export function createAdoptionMatrixReader({
         if (error?.code !== 'ENOENT' || env.WE_FIX_READY_PATH || config.fixReadyPath) note('fix-ready log unreadable');
         text = '';
       }
-      fixes = parseFixReadyLines(text, { onTruncated: () => { truncated = true; } });
+      fixes = parseFixReadyLines(text, { onIncomplete: note, onTruncated: () => { truncated = true; } });
       fixes.sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0));
     }
     if (fixes.length > MAX_ADOPTION_REFS) {

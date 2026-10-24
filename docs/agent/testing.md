@@ -2122,3 +2122,10 @@ is explicitly truncated; log/discovery read failures are incomplete. Operators m
 source evidence and retry smaller explicit batches. Only ENOENT on the default log is empty
 complete evidence. Both matrix and PR table cells strip Unicode Cc/Cf controls; PR table mode
 must retain the same truncated-listing warning and exit code as normal output.
+
+Every nonblank corrupt JSON line or missing/invalid timestamp marks the adoption snapshot
+incomplete, even when an older valid revision remains available. Missing clone fields in
+readable daemon plists are incomplete too. Only the built-in LaunchAgents directory may
+be absent silently; ENOENT on an explicit discovery directory is incomplete. Unreadable,
+invalid JSON or malformed adoption settings throw instead of selecting defaults; repair
+the settings before retrying. Omitted settings fields still use their built-in defaults.

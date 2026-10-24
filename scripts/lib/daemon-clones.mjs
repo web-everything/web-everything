@@ -10,9 +10,11 @@ const MAX_DISCOVERY_PLISTS = 100;
 
 export function resolveDaemonClones({
   env = process.env, home = homedir(),
-  launchAgentsDir = env.WE_LAUNCH_AGENTS_DIR || join(home, 'Library', 'LaunchAgents'),
+  launchAgentsDir,
   readdir = readdirSync, exec = execFileSync, clones = [], excludeClones = [], onIncomplete = () => {},
 } = {}) {
+  const explicitDiscoveryDir = launchAgentsDir !== undefined || Boolean(env.WE_LAUNCH_AGENTS_DIR);
+  launchAgentsDir ??= env.WE_LAUNCH_AGENTS_DIR || join(home, 'Library', 'LaunchAgents');
   const expand = path => resolve(path === '~' ? home : path.startsWith('~/') ? join(home, path.slice(2)) : path);
   const excluded = new Set(excludeClones.map(expand));
   const byPath = new Map();
@@ -30,7 +32,7 @@ export function resolveDaemonClones({
   };
   const labels = listDaemonPlistFiles(launchAgentsDir, { readdir: dir => {
     try { return readdir(dir); } catch (error) {
-      if (error?.code !== 'ENOENT') onIncomplete('daemon discovery directory unreadable');
+      if (error?.code !== 'ENOENT' || explicitDiscoveryDir) onIncomplete('daemon discovery directory unreadable');
       return [];
     }
   } });
@@ -38,8 +40,13 @@ export function resolveDaemonClones({
   for (const label of labels.slice(0, MAX_DISCOVERY_PLISTS)) {
     const plist = readPlistAsJson(join(launchAgentsDir, `${label}.plist`), { exec });
     if (!plist) { onIncomplete('daemon plist unreadable'); continue; }
-    if (label.startsWith('com.we.')) add(plist.WorkingDirectory, label);
-    if (label === 'com.plateau.drain-daemon') add(plist.EnvironmentVariables?.DRAIN_DAEMON_WE_CLONE, label);
+    const clone = label === 'com.plateau.drain-daemon'
+      ? plist.EnvironmentVariables?.DRAIN_DAEMON_WE_CLONE : plist.WorkingDirectory;
+    if (typeof clone !== 'string' || !clone.trim()) {
+      onIncomplete('daemon plist clone field missing or invalid');
+      continue;
+    }
+    add(clone, label);
   }
   for (const path of clones) add(path);
   const result = [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));

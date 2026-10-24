@@ -6,14 +6,16 @@ export const ADOPTION_MATRIX_OP = 'adoption-matrix';
 export const MAX_ADOPTION_REFS = 50;
 
 /** Latest timestamp per ref, retaining at most the 50 most recent refs; later lines break ties. */
-export function parseFixReadyLines(text, { onTruncated = () => {} } = {}) {
+export function parseFixReadyLines(text, { onTruncated = () => {}, onIncomplete = () => {} } = {}) {
   const latest = new Map();
   for (const line of String(text ?? '').split('\n')) {
+    if (!line.trim()) continue;
     let entry;
-    try { entry = JSON.parse(line); } catch { continue; }
+    try { entry = JSON.parse(line); } catch { onIncomplete('fix-ready log malformed'); continue; }
+    const at = typeof entry?.at === 'string' ? Date.parse(entry.at) : NaN;
+    if (!Number.isFinite(at)) { onIncomplete('fix-ready log malformed'); continue; }
     if (typeof entry?.ref !== 'string' || !entry.ref.trim()) continue;
     const previous = latest.get(entry.ref);
-    const at = Date.parse(entry.at);
     if (!previous || !Number.isFinite(Date.parse(previous.at)) || at >= Date.parse(previous.at)) {
       latest.set(entry.ref, { ref: entry.ref, at: entry.at, sha: typeof entry.sha === 'string' ? entry.sha : '' });
     }
