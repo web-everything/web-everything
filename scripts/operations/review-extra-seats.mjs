@@ -1453,7 +1453,11 @@ export async function speculateRedTeam({
     for (const p of REVIEW_SEAT_PROVIDERS) {
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
       const hold = quotaHoldOrProbe(records, p, now, env);
-      if (hold) { unavailable.push(`${p}: ${hold}`); continue; }
+      if (hold) {
+        deferredByCap = true;
+        unavailable.push(`${p}: ${hold}`);
+        continue;
+      }
       if (usedByProvider[p] >= caps[p]) {
         deferredByCap = true;
         unavailable.push(`${p}: daily-cap: ${usedByProvider[p]}/${caps[p]} non-Claude seat calls already used today`);
@@ -1474,7 +1478,7 @@ export async function speculateRedTeam({
       try {
         reservation = io.reserveCalls({ provider: pick.provider, want: 1, dailyCap: caps[pick.provider], now });
       } catch (e) {
-        return { status: 'skipped', reason: `could not reserve the daily seat budget for ${pick.provider} (${String(e?.message ?? e).slice(0, 200)}) — no call launched` };
+        return { status: 'skipped', deferredByCap: true, reason: `could not reserve the daily seat budget for ${pick.provider} (${String(e?.message ?? e).slice(0, 200)}) — no call launched` };
       }
       usedByProvider[pick.provider] = reservation.used;
       if (reservation.callIds.length) { provider = pick.provider; callId = reservation.callIds[0]; }

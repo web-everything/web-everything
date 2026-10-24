@@ -57,6 +57,27 @@ const loopPayload = { verdict: { verdict: 'accept' }, findings: { read } };
 const prior = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', pr, rev,
   callId: 'stored-call', provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' };
 
+describe('runRedTeam pre-launch deferrals', () => {
+  it.each(['quota-hold', 'reservation-error'])('marks %s retryable without a model call or seat row', async failure => {
+    const now = Date.parse('2026-10-23T15:00:00Z');
+    const io = {
+      now: () => now, log: () => {},
+      readRecords: () => failure === 'quota-hold' ? [{
+        dispatchKind: 'review-seat', provider: 'codex', status: 'quota-exhausted',
+        scoredAt: new Date(now).toISOString(), quotaResetsAt: new Date(now + 3_600_000).toISOString(),
+      }] : [],
+      cliAvailable: provider => provider === 'codex',
+      reserveCalls: vi.fn(() => { throw Error('reservation EIO'); }),
+      runSeat: vi.fn(), append: vi.fn(), postComment: vi.fn(), makeScratch: vi.fn(),
+    };
+    const result = await runRedTeam({ pr, repo, read, loopPayload, env: {} }, io);
+    expect(result).toMatchObject({ status: 'skipped', deferredByCap: true,
+      reason: expect.stringContaining(failure === 'quota-hold' ? 'quota' : 'no call launched') });
+    expect(io.reserveCalls).toHaveBeenCalledTimes(failure === 'quota-hold' ? 0 : 1);
+    for (const key of ['runSeat', 'append', 'postComment', 'makeScratch']) expect(io[key], key).not.toHaveBeenCalled();
+  });
+});
+
 for (const entry of [runRedTeam, speculateRedTeam]) {
   describe(`${entry.name} resumeOnly`, () => {
     const run = io => entry({ pr, repo, read, loopPayload, env: {}, resumeOnly: true }, io);

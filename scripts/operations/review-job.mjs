@@ -751,8 +751,8 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     }
   }
   if (accepted) {
-    // No model call or seat row exists after a cap deferral. Remove our queued
-    // admission so the next tick can retry fresh after cooldown/budget reset.
+    // Cap, quota-hold and reservation-error deferrals launch no model call or seat
+    // row. Remove our queued admission so the next tick can retry after cooldown.
     // A recorded resume keeps its prior clean result through the branch below.
     if (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true
       && seatsBox.redTeamResumeResult == null) {

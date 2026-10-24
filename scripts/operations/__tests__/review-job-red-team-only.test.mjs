@@ -73,8 +73,8 @@ function fakeIo(over = {}) {
 }
 
 describe('red-team-only review job', () => {
-  it.each(['snapshot', 'reservation'].flatMap(cap => [true, false].map(redTeamOnly => ({ cap, redTeamOnly }))))(
-    'retries after the daily $cap cap resets (initial red-team-only=$redTeamOnly)', ({ cap, redTeamOnly }) => {
+  it.each(['snapshot', 'reservation', 'quota-hold', 'reservation-error'].flatMap(cap => [true, false].map(redTeamOnly => ({ cap, redTeamOnly }))))(
+    'retries after the $cap deferral clears (initial red-team-only=$redTeamOnly)', ({ cap, redTeamOnly }) => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-cap-retry-'));
       const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
       const write = input => recordRedTeamStatus(input, { env });
@@ -94,12 +94,16 @@ describe('red-team-only review job', () => {
         const { input, at, cap, saved } = JSON.parse(readFileSync(0, 'utf8'));
         const spent = { dispatchKind: 'review-seat', seat: 'juror', provider: 'codex', status: 'ok',
           callId: 'spent', scoredAt: '2026-10-23T15:00:00Z' };
-        const records = [...(cap === 'snapshot' ? [spent] : []), ...saved.rows];
+        const held = { ...spent, status: 'quota-exhausted', quotaResetsAt: '2026-10-23T16:00:00Z' };
+        const records = [...(cap === 'snapshot' ? [spent] : cap === 'quota-hold' ? [held] : []), ...saved.rows];
         const ledger = { version: 1, reservations: [{ callId: 'spent', provider: 'codex', at: spent.scoredAt }] };
-        const result = await runRedTeam({ ...input, env: { WE_REVIEW_SEAT_CAP_CODEX: '1' } }, {
+        const result = await runRedTeam({ ...input, env: { WE_REVIEW_SEAT_CAP_CODEX: cap === 'quota-hold' ? '100' : '1' } }, {
           now: () => at, log: () => {}, readRecords: () => records,
           cliAvailable: provider => provider === 'codex',
-          reserveCalls: options => reserveSeatCalls({ ...options, records, ledger, newId: () => 'retry-call' }),
+          reserveCalls: options => {
+            if (cap === 'reservation-error' && at < Date.parse('2026-10-24T15:00:00Z')) throw Error('reservation EIO');
+            return reserveSeatCalls({ ...options, records, ledger, newId: () => 'retry-call' });
+          },
           makeScratch: () => '/fixture', removeScratch: () => {}, writeFile: () => {}, readHeadMessage: () => '',
           runSeat: async () => { saved.modelCalls++; return { report: { exitCode: 0,
             lastMessage: JSON.stringify({ lenses: { 'red-team': { verdict: 'accept', findings: [] } } }) } }; },
@@ -115,7 +119,7 @@ describe('red-team-only review job', () => {
         readRedTeamStatus: read, readRedTeamRecords: () => observed.rows,
         readRedTeamComments: () => observed.comments,
         recordRedTeamQueued: write, redTeamStatus: vi.fn(write),
-        restoreRedTeamStatus: createReviewJobIo({ env }).restoreRedTeamStatus,
+        restoreRedTeamStatus: vi.fn(createReviewJobIo({ env }).restoreRedTeamStatus),
         runLoop: () => ({ status: 0, stdout: JSON.stringify(loopPayload), stderr: '' }),
         runRedTeam: input => {
           observed = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
@@ -137,15 +141,19 @@ describe('red-team-only review job', () => {
       try {
         if (redTeamOnly) expect(recover().dispatched).toHaveLength(1);
         else job = runReviewJob({ repo, pr }, io);
-        expect(job.redTeam).toMatchObject({ status: 'skipped', reason: expect.stringContaining('daily-cap:') });
+        const reason = cap === 'quota-hold' ? 'quota' : cap === 'reservation-error' ? 'no call launched' : 'daily-cap:';
+        expect(job.redTeam).toMatchObject({ status: 'skipped', deferredByCap: true, reason: expect.stringContaining(reason) });
         expect(observed.modelCalls).toBe(0);
         expect(observed.rows).toEqual([]);
         expect(observed.comments).toEqual([]);
         expect(read()).toBeNull();
+        expect(io.restoreRedTeamStatus).toHaveBeenCalledOnce();
+        expect(io.restoreRedTeamStatus).toHaveBeenCalledWith({ repo, pr, head, status: null });
+        expect(io.redTeamStatus).not.toHaveBeenCalled();
         expect(evidence()).toMatchObject({ scheduled: true, recorded: false, inFlight: false });
         expect(io.runRedTeamGate).not.toHaveBeenCalled();
         if (redTeamOnly) expect(recover().rows[0].why).toBe('retry cooldown active');
-        at += 24 * 60 * 60_000;
+        at += cap === 'quota-hold' ? 60 * 60_000 + 1 : 24 * 60 * 60_000;
         expect(recover().dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
         expect(job.redTeam).toMatchObject({ status: 'ran', comment: 'posted' });
         expect(observed.modelCalls).toBe(1);
@@ -221,6 +229,7 @@ describe('red-team-only review job', () => {
       expect(io.runRedTeamGate).toHaveBeenCalledWith({ pr, repo });
       expect(out.redTeamGate.status).toBe(gateCase === 'clean' ? 'advisory-only' : gateCase === 'degraded' ? 'applied' : 'error');
       expect(gate.labels).toEqual(expect.arrayContaining(['review:accepted', 'review:human']));
+      expect(gate.mutations.flatMap(({ remove }) => remove)).not.toContain('review:human');
       expect(gate.mutations.flatMap(({ add, remove }) => [add, ...remove]).filter(name => name?.startsWith('review:'))).toEqual([]);
       expect(gate.effects).toEqual(gateCase === 'degraded' ? ['card'] : []);
       if (gateCase !== 'read-error') expect(gate.mutations).toEqual([{ add: 'red-team:clear', remove: ['red-team:pending'] }]);
