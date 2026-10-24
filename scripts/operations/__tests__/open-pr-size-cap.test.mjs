@@ -186,6 +186,24 @@ describe('direct pr-land uses the same admission and existing review-label path'
     expect(verdict).toMatchObject({ label: REVIEW_LABELS.human, humanRequired: true });
   });
 
+  it.each([
+    ['301-line admission requests review:pending', 'over', null, REVIEW_LABELS.pending],
+    ['unknown evidence requests review:pending', 'unknown', null, REVIEW_LABELS.pending],
+    ['301-line admission preserves human-required escalation', 'over', 'operator ruling required', REVIEW_LABELS.human],
+    ['unknown evidence preserves human-required escalation', 'unknown', 'operator ruling required', REVIEW_LABELS.human],
+  ])('%s through the admission-to-producer review-label path', async (_name, status, deviation, label) => {
+    const { run } = direct(status === 'unknown' ? {
+      diffStat: vi.fn(() => { throw new Error('diff unavailable'); }),
+    } : {});
+    const admission = await run();
+    expect(admission.status).toBe(status);
+    const verdict = prLand.resolveProducerReviewLabel({
+      changedFiles: ['docs/example.md'], diffLines: admission.lines ?? 0,
+      sizeAdmission: admission, deviation,
+    });
+    expect(verdict).toMatchObject({ label, apply: true, humanRequired: label === REVIEW_LABELS.human });
+  });
+
   it('the production opening paths contain no legacy size refusal outcomes', () => {
     for (const path of ['scripts/operations/open-pr-io.mjs', 'scripts/operations/open-pr.mjs', 'scripts/pr-land.mjs']) {
       expect(readFileSync(join(process.cwd(), path), 'utf8')).not.toMatch(/pr-too-large|pr-size-unreadable/);
