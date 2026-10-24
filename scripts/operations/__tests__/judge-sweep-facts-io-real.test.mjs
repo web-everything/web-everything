@@ -1,9 +1,15 @@
 /** Real subprocess + disk-cache fidelity; GitHub and host ledgers stay injected. */
-import { expect, it } from 'vitest';
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { expect, it, vi } from 'vitest';
+import { readFileSync, statSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO } from '../judge-sweep-facts-io.mjs';
+
+vi.mock('node:fs', async original => {
+  const fs = await original();
+  return { ...fs, readFileSync: vi.fn(fs.readFileSync) };
+});
 
 it('runs the real shape child and reuses its head-and-base result from an owner-only disk cache in a fresh reader', async () => {
   await withRealRepo(async ctx => {
@@ -19,8 +25,10 @@ it('runs the real shape child and reuses its head-and-base result from an owner-
     expect(first.humanRequired).toBe(false);
     expect(first.evidenceErrors).toEqual([]);
     const file = join(cacheDir, 'judge-sweep-shape-cache.json');
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [`${JUDGE_SWEEP_REPO}:${head}:${head}`]: false });
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ rulesVersion: 1,
+      entries: { [`${JUDGE_SWEEP_REPO}:${head}:${head}`]: false } });
     expect(statSync(file).mode & 0o077).toBe(0);
+    expect(statSync(cacheDir).mode & 0o077).toBe(0);
     const second = createJudgeSweepFactsReader({ ...options, cache: createShapeCache({ cacheDir }),
       shape: () => { throw new Error('cache hit must not spawn shape'); } })().prs[0];
     expect(second.humanRequired).toBe(false);
@@ -28,16 +36,21 @@ it('runs the real shape child and reuses its head-and-base result from an owner-
   });
 });
 
-it('treats an oversized cache file as a miss and replaces it with a small valid result', async () => {
-  await withRealRepo(async ctx => {
-    const cacheDir = join(ctx.tmp, 'conveyor'), key = `${JUDGE_SWEEP_REPO}:${ctx.head()}:${ctx.head()}`;
-    mkdirSync(cacheDir);
+it.each([128 * 1024, 128 * 1024 + 1])('checks the cache byte bound before reading valid JSON (%i bytes)', size => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'judge-sweep-cache-'));
+  try {
+    const key = `${JUDGE_SWEEP_REPO}:${'a'.repeat(40)}:${'b'.repeat(40)}`;
     const file = join(cacheDir, 'judge-sweep-shape-cache.json');
-    writeFileSync(file, ' '.repeat(128 * 1024 + 1));
+    const data = JSON.stringify({ rulesVersion: 1, entries: { [key]: false }, padding: '' });
+    writeFileSync(file, data.replace('"padding":""', `"padding":"${'x'.repeat(size - Buffer.byteLength(data))}"`));
+    expect(statSync(file).size).toBe(size);
+    // Clear startup/module-loader reads; only observe this cache read.
+    readFileSync.mockClear();
     const cache = createShapeCache({ cacheDir });
-    expect(cache.get(key)).toBeUndefined();
+    expect(cache.get(key)).toBe(size > 128 * 1024 ? undefined : false);
+    expect(readFileSync).toHaveBeenCalledTimes(size > 128 * 1024 ? 0 : 1);
     cache.set(key, true);
     expect(statSync(file).size).toBeLessThan(128 * 1024);
     expect(createShapeCache({ cacheDir }).get(key)).toBe(true);
-  });
+  } finally { rmSync(cacheDir, { recursive: true, force: true }); }
 });

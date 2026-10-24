@@ -32,6 +32,8 @@ const rootDir = () => join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const MAX_CALLS = 128;
 const CACHE_ENTRIES = 256;
 const CACHE_BYTES = 128 * 1024;
+// Bump whenever review-core-cli's shape/human-required rules change. Old envelopes are disposable misses.
+const SHAPE_RULES_VERSION = 1;
 const RED_TEAM_JUDGMENT_LABELS = new Set(['red-team:blocked', 'red-team:clear']);
 const failure = what => new Error(`judge-sweep-facts: ${what}; inspect PR evidence and rerun a narrower/operator query`);
 
@@ -44,8 +46,9 @@ export function operatorGh(args, options = {}) {
     throttle: { bin: '/opt/homebrew/bin/gh', personalRoute: false, maxAttempts: 1 } });
 }
 
-/** A disposable, bounded head-and-base cache. Legacy head-only entries are misses. */
+/** A disposable, bounded head-and-base cache, scoped to a shape-rules version. Legacy entries are misses. */
 export function createShapeCache({ cacheDir = join(homedir(), '.claude', 'conveyor'),
+  rulesVersion = SHAPE_RULES_VERSION,
   read = path => {
     if (statSync(path).size > CACHE_BYTES) throw failure('shape cache oversized');
     return readFileSync(path, 'utf8');
@@ -62,7 +65,9 @@ export function createShapeCache({ cacheDir = join(homedir(), '.claude', 'convey
       if (!entries) {
         try {
           const parsed = JSON.parse(read(path));
-          entries = new Map(Object.entries(parsed).filter(([k, v]) =>
+          if (parsed?.rulesVersion !== rulesVersion || !parsed.entries || typeof parsed.entries !== 'object'
+            || Array.isArray(parsed.entries)) throw failure('shape cache version or entries unreadable');
+          entries = new Map(Object.entries(parsed.entries).filter(([k, v]) =>
             /^[\w.-]+\/[\w.-]+:[a-f0-9]{40}:[a-f0-9]{40}$/.test(k) && typeof v === 'boolean').slice(-CACHE_ENTRIES));
         } catch { entries = new Map(); }
       }
@@ -73,7 +78,7 @@ export function createShapeCache({ cacheDir = join(homedir(), '.claude', 'convey
       entries.delete(key);
       entries.set(key, value);
       while (entries.size > CACHE_ENTRIES) entries.delete(entries.keys().next().value);
-      write(path, JSON.stringify(Object.fromEntries(entries)));
+      write(path, JSON.stringify({ rulesVersion, entries: Object.fromEntries(entries) }));
     },
   };
 }
