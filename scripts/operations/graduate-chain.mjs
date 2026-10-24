@@ -118,8 +118,10 @@ export function runGraduateChain(input, { exec, cwd, env = {}, capsTool, capsPla
     const merges = lines(git('source', ['rev-list', '--merges', range, `^${base}`], checkCwd));
     if (merges.length) stop('source-merges', { merges,
       detail: 'Select a linear source slice without merge commits (split or flatten the source first).' });
+    // Preflight the same linear slice as replay, excluding shared base history.
+    const sliceParent = git('source', ['rev-parse', `${commits[0]}^`], checkCwd);
     const mergeEnv = mergeEnvironment(git('merge-objects', ['rev-parse', '--git-path', 'objects'], checkCwd), checkCwd);
-    const merged = command('merge-tree', 'git', ['merge-tree', '--write-tree', '--name-only', `--merge-base=${start}`, base, tip],
+    const merged = command('merge-tree', 'git', ['merge-tree', '--write-tree', '--name-only', `--merge-base=${sliceParent}`, base, tip],
       checkCwd, mergeEnv, true);
     if (merged.status === 1) stop('conflict', { files: lines(merged.stdout.split('\n\n')[0]).slice(1) });
     if (merged.status !== 0 || !/^[0-9a-f]{40,64}$/.test(lines(merged.stdout)[0] || '')) stop('merge-tree');

@@ -332,6 +332,53 @@ describe('graduate-chain', () => {
       expect(result.steps.find(s => s.step === 'cherry-pick').would).toBe(`apply ${sourceSha} over ${stackSha}`);
     });
   });
+  for (const dryRun of [true, false]) {
+    for (const explicitRange of [false, true]) {
+      it(`preflights only B when the stack advances shared A (dryRun=${dryRun}, range=${explicitRange})`, async () => {
+        await withBareOrigin(ctx => {
+          ctx.seedOriginBranch('main', { 'f.txt': 'v0\n' });
+          ctx.seedOriginBranch('lane/shared', { 'f.txt': 'v1\n' });
+          ctx.seedOriginBranch('lane/source', { 'slice.mjs': 'export const slice = 1;\n' }, 'lane/shared');
+          ctx.seedOriginBranch('lane/stack', { 'f.txt': 'v2\n' }, 'lane/shared');
+          ctx.git(['fetch', 'origin']);
+          const start = ctx.git(['rev-parse', 'origin/main']).trim();
+          const tip = ctx.git(['rev-parse', 'origin/lane/source']).trim();
+          const stack = ctx.git(['rev-parse', 'origin/lane/stack']).trim();
+          const calls = [];
+          const exec = (cmd, args, opts) => {
+            calls.push({ cmd, args, cwd: opts.cwd });
+            if (cmd === 'gh') return reply(args[0] === 'api' ? { data: { viewer: { login: 'me' } } }
+              : args[0] === 'repo' ? 'owner/repo' : args[1] === 'view'
+                ? { headRefName: 'lane/stack', headRefOid: stack, isCrossRepository: false } : []);
+            if (cmd === 'node') {
+              if (args[1] === 'acquire') return reply({ lane: 8, path: ctx.clone, holder: 'held' });
+              if (args[1] === 'release') return reply({ released: 1 });
+              if (args[0].endsWith('graduation-import-check.mjs')) return reply({ findings: [] });
+              if (args[1] === 'verify') return reply(goodVerify);
+              if (args[1] === 'open-pr') return reply(opened);
+            }
+            if (cmd !== 'git') throw Error('unexpected command');
+            return spawnSync(cmd, args, { ...opts, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+          };
+          const result = createGraduateChainRunner({ exec, cwd: ctx.clone,
+            env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } })({ ...input,
+            source: explicitRange ? `${start}..${tip}` : 'origin/lane/source',
+            stackOn: '7', dryRun, bodyTemplate: 'README.md' });
+          expect(result.stopReason).not.toBe('conflict');
+          expect(result).toMatchObject({ ok: true, size: { nonTest: 1, test: 0, files: 1 } });
+          if (dryRun) {
+            expect(result.steps.find(s => s.step === 'cherry-pick').would).toBe(`apply ${tip} over ${stack}`);
+            expect(calls.some(c => c.args[0] === 'cherry-pick')).toBe(false);
+          } else {
+            expect(calls.find(c => c.args[0] === 'cherry-pick').args).toEqual(['cherry-pick', tip]);
+            expect(ctx.git(['rev-parse', 'HEAD^']).trim()).toBe(stack);
+            expect(ctx.git(['show', 'HEAD:f.txt'])).toBe('v2\n');
+            expect(ctx.git(['show', 'HEAD:slice.mjs'])).toBe('export const slice = 1;\n');
+          }
+        });
+      });
+    }
+  }
   it('IO isolates merge objects and cleans temporary files with fake exec', () => {
     const f = fixture();
     f.calls.length = 0;
