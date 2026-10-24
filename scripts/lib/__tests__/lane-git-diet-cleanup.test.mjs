@@ -171,6 +171,8 @@ describe('cleanupEligibility (pure)', () => {
   const nowMs = Date.parse('2026-10-21T15:00:00Z');
   const fresh = { acquiredAt: '2026-10-21T14:50:00Z', purpose: 'x' };
   const stale = { acquiredAt: '2026-10-20T00:00:00Z' };
+  // The CLI documents exactly these pools: a pool dropped from the list must go red, not just lose its case below.
+  it('allow-lists exactly the documented pools', () => expect(CLEANUP_POOLS).toEqual(['web-everything', 'frontierui', 'plateau-app']));
   // Every allow-listed pool gets a positive case, so a pool added to CLEANUP_POOLS is covered automatically.
   it.each(CLEANUP_POOLS)('allows an unleased lane in the %s pool', (pool) => expect(cleanupEligibility({ dir: `${poolRoot}/${pool}/lane-5`, poolRoot, nowMs }).ok).toBe(true));
   it('refuses even a stale lease marker (the cleanup only claims an ABSENT marker, O_EXCL)', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, lease: stale, nowMs })).toMatchObject({ ok: false, reason: expect.stringMatching(/stale lease marker/) }));
