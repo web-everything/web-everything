@@ -42,6 +42,7 @@ import {
   restPullToPrStateShape,
   detachedWrapperPidsBySession,
   liveWrapperSessionsFromPs,
+  claimRunnerPidsBySession,
   readDetachedWrapperPids,
   laneBranchItemNum,
   laneQuietSincePr,
@@ -53,12 +54,14 @@ import {
   prTerminalPredatesLease,
   laneIndicesIn,
 } from '../lease-reaper.mjs';
+import { fixDispatchSessionName } from '../fix-claim-store.mjs';
 import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
 import { DISPATCH_GUARD_LISTING_GRACE_MINUTES } from '../../operations/dispatch-lane.mjs';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
+import { runInNewContext } from 'node:vm';
 
 const NOW = Date.parse('2026-07-26T12:00:00Z');
 const TTL_MS = DEFAULT_LEASE_TTL_MINUTES * 60_000;
@@ -545,6 +548,277 @@ describe('#3903 — a lease held by a detached delivery wrapper (Codex build) is
     ];
     expect([...detachedWrapperPidsBySession(runs)]).toEqual([['conveyor-3622', 4242]]);
     expect(detachedWrapperPidsBySession(undefined).size).toBe(0);
+  });
+});
+
+describe('claimRunnerPidsBySession — borrowed fixer runner pids (PR #5806 regression)', () => {
+  const claim = (over = {}) => ({ owner: 'borrowed-fixer', pid: 456, meta: { repo: 'we', pr: 5806, kind: 'fix', runnerPid: 123, ...over } });
+
+  it('maps meta.runnerPid to fix-5806, never the acquiring dispatcher pid; leaves claims untouched', () => {
+    const entry = claim();
+    Object.freeze(entry.meta);
+    Object.freeze(entry);
+    const claims = Object.freeze([entry]);
+    expect(claimRunnerPidsBySession(claims)).toEqual(new Map([['fix-5806', 123]]));
+    expect(entry.pid).toBe(456);
+    expect(entry.meta.runnerPid).toBe(123);
+  });
+
+  it('uses the shared session naming for repo and kind, including ci-heal claims', () => {
+    const claims = [claim(), claim({ kind: 'ci-heal' }), claim({ repo: 'frontierui' })];
+    expect(claimRunnerPidsBySession(claims)).toEqual(new Map(claims.map(({ meta }) => [fixDispatchSessionName(meta), meta.runnerPid])));
+  });
+
+  it('ignores a 24-hour-old claim even with a LIVE runner pid when nowMs is supplied', () => {
+    const entry = { ...claim({ runnerPid: process.pid }), heartbeatAt: new Date(NOW - 24 * 60 * 60_000).toISOString() };
+    expect(claimRunnerPidsBySession([entry], { nowMs: NOW })).toEqual(new Map());
+    expect(claimRunnerPidsBySession([entry], { nowMs: null })).toEqual(new Map([['fix-5806', process.pid]]));
+  });
+
+  it.each([undefined, null, '', 'garbage'])('fails closed for missing/unparseable heartbeatAt %s when nowMs is supplied', (heartbeatAt) => {
+    const entry = { ...claim({ runnerPid: process.pid }), heartbeatAt };
+    expect(claimRunnerPidsBySession([entry], { nowMs: NOW })).toEqual(new Map());
+  });
+
+  it('keeps a claim whose heartbeat is one minute before nowMs', () => {
+    const entry = { ...claim({ runnerPid: process.pid }), heartbeatAt: new Date(NOW - 60_000).toISOString() };
+    expect(claimRunnerPidsBySession([entry], { nowMs: NOW })).toEqual(new Map([['fix-5806', process.pid]]));
+  });
+
+  it('ignores a heartbeat 24 hours in the future', () => {
+    const entry = { ...claim({ runnerPid: process.pid }), heartbeatAt: new Date(NOW + 24 * 60 * 60_000).toISOString() };
+    expect(claimRunnerPidsBySession([entry], { nowMs: NOW })).toEqual(new Map());
+  });
+
+  it.each([30_000, 60_000])('keeps a heartbeat %s ms ahead within the clock-skew allowance', (aheadMs) => {
+    const entry = { ...claim({ runnerPid: process.pid }), heartbeatAt: new Date(NOW + aheadMs).toISOString() };
+    expect(claimRunnerPidsBySession([entry], { nowMs: NOW })).toEqual(new Map([['fix-5806', process.pid]]));
+  });
+
+  it('rejects a heartbeat one millisecond beyond the future clock-skew allowance', () => {
+    const entry = { ...claim({ runnerPid: process.pid }), heartbeatAt: new Date(NOW + 60_001).toISOString() };
+    expect(claimRunnerPidsBySession([entry], { nowMs: NOW })).toEqual(new Map());
+  });
+
+  it.each([0, -1, '12', 1.5, undefined, null, NaN, Infinity])('ignores invalid or missing runnerPid %s, even with a dispatcher pid', (runnerPid) => {
+    expect(claimRunnerPidsBySession([claim({ runnerPid })])).toEqual(new Map());
+  });
+
+  it('skips null/corrupt/missing metadata without throwing or dropping a later valid claim', () => {
+    const corrupt = [null, undefined, {}, { meta: null }, { meta: 'corrupt' }, { meta: [] },
+      { meta: { runnerPid: 123 } }, { meta: { repo: 'we', pr: 5806, kind: 'fix' } },
+      claim({ repo: 'unknown-repo' }), claim({ pr: null }), claim({ kind: 'unknown-kind' })];
+    expect(claimRunnerPidsBySession(corrupt)).toEqual(new Map());
+    expect(claimRunnerPidsBySession([...corrupt, claim()])).toEqual(new Map([['fix-5806', 123]]));
+  });
+
+  it.each([null, undefined, {}, 'corrupt', 123])('non-array claims %s → empty Map', (claims) => {
+    expect(claimRunnerPidsBySession(claims)).toEqual(new Map());
+  });
+});
+
+describe('main — claim freshness after slow I/O (PR #5846)', () => {
+  // Execute the checked-in CLI shell with real claim/signal/reap helpers. Only I/O
+  // is replaced, so a stale clock passed by main cannot hide behind a unit fixture.
+  const source = readFileSync(join(process.cwd(), 'scripts/conveyor/lease-reaper.mjs'), 'utf8');
+  const shell = source.slice(source.indexOf('function parseFlags('), source.indexOf('// Run the IO shell only'));
+  const dryRun = ({ delayAt, heartbeatOffset = 0 }) => {
+    let clock = NOW;
+    let stdout = '';
+    const logs = [];
+    const advance = (stage) => { if (stage === delayAt) clock += 61_000; };
+    const lease = { session: 'fix-5806', acquiredAt: new Date(NOW - 20 * 60_000).toISOString(), ttlMinutes: 240 };
+    runInNewContext(`${shell}\nmain(['--dry-run', '--json']);`, {
+      Date: class extends Date { static now() { return clock; } },
+      Map, Set, Number, JSON,
+      DEFAULT_LEASE_TTL_MINUTES,
+      POOL_ROOT: '/unused-lease-reaper-fixture', join,
+      log: (line) => logs.push(line),
+      process: { env: {}, stdout: { write: (s) => { stdout += s; } }, exit: (code) => expect(code).toBe(0) },
+      fetchSessionSignals: () => {
+        advance('listing');
+        return { states: new Map([['conveyor-1', 'working']]), pidAlive: new Map(), agents: [] };
+      },
+      readWrapperPidsForPass: () => { advance('run-store'); return new Map(); },
+      listFixDispatchClaims: () => {
+        advance('claims');
+        return [{ heartbeatAt: new Date(clock + heartbeatOffset).toISOString(),
+          meta: { repo: 'we', pr: 5806, kind: 'fix', runnerPid: process.pid } }];
+      },
+      claimRunnerPidsBySession,
+      poolsToScan: () => ['fixture'], repoKeyForPool: () => null,
+      laneIndicesIn: () => [53], readLease: () => lease,
+      fetchPrStatesForRepo: () => { throw new Error('no PR lookup expected'); },
+      buildLeaseSignalsFor: (opts) => buildLeaseSignalsFor({ ...opts,
+        pidCommand: () => 'node fix-run.mjs --session=fix-5806' }),
+      reapPlan, applyLaneHold: (plan) => plan,
+      releaseLane: () => { throw new Error('dry-run must never release'); },
+    }, { timeout: 1000 });
+    return { report: JSON.parse(stdout), logs };
+  };
+
+  it.each(['listing', 'run-store', 'claims'])('keeps a live borrowed fixer after a 61-second %s delay', (delayAt) => {
+    const { report, logs } = dryRun({ delayAt });
+    expect(logs).toContain('lease-reaper: added 1 claim runner pid(s)');
+    expect(report).toMatchObject({ scanned: 1, kept: 1, wouldReap: [], sessionAxis: 'on' });
+  });
+
+  it.each([
+    ['expired', -24 * 60 * 60_000],
+    ['future-dated', 60_001],
+  ])('still rejects a truly %s heartbeat after a slow scan', (_label, heartbeatOffset) => {
+    const { report, logs } = dryRun({ delayAt: 'run-store', heartbeatOffset });
+    expect(logs).toContain('lease-reaper: added 0 claim runner pid(s)');
+    expect(report.wouldReap).toEqual([{ pool: 'fixture', lane: 53, reason: 'session-gone', session: 'fix-5806' }]);
+  });
+});
+
+describe('claimRunnerPidsBySession — configurable TTL boundary', () => {
+  it('honours nowMs and ttlMinutes, keeping the TTL boundary and rejecting older claims', () => {
+    const claims = [
+      { heartbeatAt: new Date(NOW - 2 * 60_000).toISOString(), meta: { repo: 'we', pr: 5806, kind: 'fix', runnerPid: process.pid } },
+      { heartbeatAt: new Date(NOW - 2 * 60_000 - 1).toISOString(), meta: { repo: 'we', pr: 5807, kind: 'fix', runnerPid: process.pid } },
+    ];
+    expect(claimRunnerPidsBySession(claims, { nowMs: NOW, ttlMinutes: 2 })).toEqual(new Map([['fix-5806', process.pid]]));
+  });
+});
+
+describe('buildLeaseSignalsFor + reapPlan — borrowed Codex fixer absent from claude agents (PR #5806)', () => {
+  const lease = { session: 'fix-5806', acquiredAt: new Date(NOW - 20 * 60_000).toISOString(), ttlMinutes: DEFAULT_LEASE_TTL_MINUTES };
+  const cand = { pool: 'web-everything', lane: 53, dir: join(tmpdir(), 'lease-reaper-5806-no-such-lane'), repoKey: 'we', lease };
+  const signalsWith = (claimRunnerPids, overrides = {}) => buildLeaseSignalsFor({
+    prStatesByRepo: new Map(),
+    sessionStates: sessionStateByName([{ kind: 'background', name: 'conveyor-9999', state: 'working' }]),
+    sessionPidAlive: new Map(), sessionAgents: [], wrapperPids: new Map(), claimRunnerPids, nowMs: NOW,
+    pidCommand: () => 'node fix-run.mjs --pr=5806 --session=fix-5806',
+    ...overrides,
+  });
+  const claimsWith = (runnerPid) => [{ owner: 'borrowed-fixer', pid: 456, heartbeatAt: new Date(NOW).toISOString(), meta: { repo: 'we', pr: 5806, kind: 'fix', runnerPid } }];
+
+  it('reaps a twenty-minute-old fixer as session-gone despite a stale claim with a LIVE runner pid', () => {
+    const claims = claimsWith(process.pid).map((claim) => ({
+      ...claim, heartbeatAt: new Date(NOW - 24 * 60 * 60_000).toISOString(),
+    }));
+    const claimRunnerPids = claimRunnerPidsBySession(claims, { nowMs: NOW });
+    expect(claimRunnerPids).toEqual(new Map());
+    expect(signalsWith(claimRunnerPids)(cand).sessionGone).toBe(true);
+    const signalsFor = buildLeaseSignalsFor({
+      prStatesByRepo: new Map(),
+      sessionStates: new Map([['fix-5806', 'done']]),
+      sessionPidAlive: new Map([['fix-5806', false]]),
+      sessionAgents: [], wrapperPids: new Map(), claimRunnerPids, nowMs: NOW,
+    });
+    const sig = signalsFor(cand);
+    expect(sig.sessionGone).toBe(true);
+    expect(classifyReap(lease, { nowMs: NOW, ttlMs: TTL_MS, ...sig })).toEqual({ reap: true, reason: 'session-gone' });
+  });
+
+  it.each(['', ' --other=argument', '\n'])('LIVE claim runner pid with matching session token followed by %j keeps the unlisted fixer lease', (suffix) => {
+    const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
+      pidCommand: (pid) => {
+        expect(pid).toBe(process.pid);
+        return `node fix-run.mjs --pr=5806 --session=fix-5806${suffix}`;
+      },
+    });
+    const sig = signalsFor(cand);
+    expect(sig.sessionGone).toBe(false);
+    expect(classifyReap(lease, { nowMs: NOW, ttlMs: TTL_MS, ...sig })).toEqual({ reap: false, reason: null });
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap).toEqual([]);
+    expect(keep).toHaveLength(1);
+    expect(keep[0].lease).toEqual(lease);
+  });
+
+  it.each([
+    ['unrelated live process', 'node unrelated.mjs'],
+    ['session prefix collision', 'node fix-run.mjs --session=fix-58061'],
+    ['embedded session token', 'node fix-run.mjs --other=--session=fix-5806'],
+    ['unknown command', null],
+    ['missing command', undefined],
+    ['empty command', ''],
+  ])('reaps a claim with an %s as session-gone', (_name, command) => {
+    const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
+      pidCommand: () => command,
+    });
+    expect(signalsFor(cand).sessionGone).toBe(true);
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap.map((r) => r.reason)).toEqual(['session-gone']);
+    expect(keep).toEqual([]);
+  });
+
+  it('fails closed when reading the live claim runner command throws', () => {
+    const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
+      pidCommand: () => { throw new Error('ps unavailable'); },
+    });
+    expect(signalsFor(cand).sessionGone).toBe(true);
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap.map((r) => r.reason)).toEqual(['session-gone']);
+    expect(keep).toEqual([]);
+  });
+
+  it('dead claim runner pid lets the unlisted fixer be reaped as session-gone', () => {
+    const deadPid = 2147483647;
+    expect(() => process.kill(deadPid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+    const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(deadPid), { nowMs: NOW }));
+    expect(signalsFor(cand).sessionGone).toBe(true);
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap.map((r) => r.reason)).toEqual(['session-gone']);
+    expect(keep).toEqual([]);
+  });
+
+  it('a live claim runner pid cannot override a direct session PID death signal', () => {
+    const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
+      sessionPidAlive: new Map([['fix-5806', false]]),
+    });
+    expect(signalsFor(cand).sessionGone).toBe(true);
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap.map((r) => r.reason)).toEqual(['session-gone']);
+    expect(keep).toEqual([]);
+  });
+
+  it('a live claim runner pid cannot override a listed done session', () => {
+    const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
+      sessionStates: new Map([['fix-5806', 'done']]),
+    });
+    expect(signalsFor(cand).sessionGone).toBe(true);
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap.map((r) => r.reason)).toEqual(['session-gone']);
+    expect(keep).toEqual([]);
+  });
+
+  it('run-store PID evidence still decides a session also present in claims', () => {
+    const deadPid = 2147483647;
+    expect(() => process.kill(deadPid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+    const wrapperPids = new Map([['fix-5806', process.pid]]);
+    const claims = claimsWith(deadPid);
+    const claimRunnerPids = claimRunnerPidsBySession(claims, { nowMs: NOW });
+    const signalsFor = signalsWith(claimRunnerPids, {
+      wrapperPids,
+      sessionPidAlive: new Map([['fix-5806', false]]),
+      sessionStates: new Map([['fix-5806', 'done']]),
+    });
+    expect(signalsFor(cand).sessionGone).toBe(false);
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap).toEqual([]);
+    expect(keep).toHaveLength(1);
+    expect(keep[0].lease).toEqual(lease);
+    expect(wrapperPids).toEqual(new Map([['fix-5806', process.pid]]));
+    expect(claimRunnerPids).toEqual(new Map([['fix-5806', deadPid]]));
+    expect(claims[0].meta.runnerPid).toBe(deadPid);
+
+    const deadWrapperSignals = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
+      wrapperPids: new Map([['fix-5806', deadPid]]),
+      sessionPidAlive: new Map([['fix-5806', false]]),
+    });
+    expect(deadWrapperSignals(cand).sessionGone).toBe(true);
+  });
+
+  it('old behaviour: without the claim pid, the same unlisted fixer is reaped mid-run', () => {
+    const signalsFor = signalsWith(new Map());
+    expect(signalsFor(cand).sessionGone).toBe(true);
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap.map((r) => r.reason)).toEqual(['session-gone']);
+    expect(keep).toEqual([]);
   });
 });
 
