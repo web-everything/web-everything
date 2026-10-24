@@ -36,6 +36,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeComment, classifyEvent } from '../operations/coroner-rounds.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { sameFindingForClearing } from '../lib/jury-core.mjs';
 import { isReviewVerdictComment, reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { takeoverMarkers, takeoverVoidRefused, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
@@ -181,13 +182,24 @@ const isOpen = (f) => !CLOSED_RULINGS.has(String(f?.ruling ?? '').toLowerCase())
 /** A trusted fixer turn that changed the PR (a re-arm, an advisory fix): the end of one review round. */
 const FIXER_TURN = /^🔧 conveyor fix —/;
 
-/** Fold one finding into a round's list: the same spot (file, line within 2) or the same file-less claim is one. */
+/**
+ * Fold findings using the shared clearing identity without severity, or identical file-less claims.
+ * Keep the heavier member's ruling, impact, claim and line; equal weights keep existing impact and later ruling.
+ */
 function mergeFinding(into, f) {
-  const same = into.find((g) => (f.file && g.file === f.file && (f.line == null || g.line == null || Math.abs(g.line - f.line) <= 2))
+  const same = into.find((g) => (f.file && sameFindingForClearing(
+    { file: g.file, line: g.line, summary: g.claim },
+    { file: f.file, line: f.line, summary: f.claim },
+  ))
     || (!f.file && !g.file && g.claim === f.claim));
   if (same) {
-    if (f.ruling) same.ruling = f.ruling;
-    if (!same.impact && f.impact) same.impact = f.impact;
+    const existingWeight = findingWeight(same), incomingWeight = findingWeight(f);
+    if (incomingWeight > existingWeight) {
+      same.ruling = f.ruling ?? null;
+      same.impact = f.impact ?? null;
+      same.claim = f.claim ?? '';
+      same.line = f.line ?? null;
+    } else if (f.ruling) same.ruling = f.ruling; // a later ruling (even a closing one) always lands, as before
     return;
   }
   into.push({ file: f.file ?? null, line: f.line ?? null, claim: f.claim ?? '', ruling: f.ruling ?? null, impact: f.impact ?? null });
