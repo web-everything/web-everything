@@ -10,8 +10,22 @@ const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.met
 const jobs = yaml.load(raw).jobs;
 
 describe('ci.yml test-shard runner switch (#5027)', () => {
-  it('test-shard runs on vars.WE_SHARD_RUNNER with an ubuntu-latest fallback', () => {
-    expect(jobs['test-shard']['runs-on']).toMatch(/^\$\{\{\s*vars\.WE_SHARD_RUNNER\s*\|\|\s*'ubuntu-latest'\s*\}\}$/);
+  it('test-shard uses the paid runner var ONLY for merge_group, ubuntu-latest otherwise', () => {
+    const expr = jobs['test-shard']['runs-on'];
+    expect(expr).toMatch(
+      /^\$\{\{\s*github\.event_name\s*==\s*'merge_group'\s*&&\s*vars\.WE_SHARD_RUNNER\s*\|\|\s*'ubuntu-latest'\s*\}\}$/,
+    );
+    // Evaluate the expression: `a && b || c` as GitHub does (falsy var falls through to the fallback).
+    const run = (event, runner) => {
+      const m = expr.match(/'merge_group'\s*&&\s*vars\.WE_SHARD_RUNNER\s*\|\|\s*'([^']+)'/);
+      return (event === 'merge_group' && runner) || m[1];
+    };
+    expect(run('merge_group', 'we-8core')).toBe('we-8core');
+    expect(run('merge_group', '')).toBe('ubuntu-latest');
+    expect(run('merge_group', undefined)).toBe('ubuntu-latest');
+    for (const ev of ['pull_request', 'push', 'workflow_dispatch', 'schedule']) {
+      expect(run(ev, 'we-8core')).toBe('ubuntu-latest');
+    }
   });
 
   it('exactly one job (test-shard) reads WE_SHARD_RUNNER', () => {
