@@ -12,7 +12,7 @@ tags: []
 
 Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5530 (reviewed head `d3bee73707c865028ad58cdd40863e624e69101c`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:backlog/x44bz7l-we-stacked-pr-policy-slice-4-closed-or-rejected-base-handlin.md:24` — (edge-case, broken) Closed-base recovery omits removal of the rejected parent's durable stack edge.
+1. `we:backlog/6901-we-stacked-pr-policy-slice-4-closed-or-rejected-base-handlin.md:24` — (edge-case, broken) Closed-base recovery omits removal of the rejected parent's durable stack edge.
    - Scenario: A low-risk child has stackParents:["xbase01"] in its PR-body lane manifest. Its base is closed without merging; the child rebases cleanly onto main with an unchanged delta fingerprint and passes fresh review and CI. The specified recovery never requires updating that manifest, which survives a Git rebase. The existing planLabelDrain still requires positive landing proof for xbase01, so the child remains blocked indefinitely. A read-only probe of the checked-out planner returned ready:[] and deferred:[{waitOn:["xbase01"],...}]; clearing that obsolete edge made the same child ready. Recovery sho
    - Claude's re-check: demonstrated break
 
