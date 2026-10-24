@@ -11,7 +11,7 @@ import { isSafeBranchName } from '../daemon-self-sync.mjs';
 import { alertsFilePath } from './state.mjs';
 import { REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../mandate-fence.mjs';
-import { buildReverseImportGraph, testDepths, isGraphSourceFile } from '../related-test-selection.mjs';
+import { buildReverseImportGraph, testDepths, isGraphSourceFile, isVitestTestFile } from '../related-test-selection.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
@@ -137,9 +137,30 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     const merge = git(['merge', '--no-edit', 'origin/main'], scratch);
     const conflicts = requireOk(git(['diff', '--name-only', '--diff-filter=U'], scratch)).split('\n').filter(Boolean);
     if (merge.status !== 0 && !conflicts.length) throw new Error('merge failed without conflicts');
+    // Capture before the fixer removes markers; a truncated UTF-8 sequence is outside the cap.
+    const conflictContents = Object.create(null);
+    for (const file of conflicts) {
+      try {
+        const path = join(scratch, file);
+        if (!io.lstatSync(path).isFile() || fs.constants.O_NOFOLLOW === undefined) continue;
+        const fd = io.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        try {
+          const buffer = Buffer.alloc(64 * 1024);
+          let length = 0;
+          while (length < buffer.length) {
+            const read = io.readSync(fd, buffer, length, buffer.length - length, length);
+            if (read === 0) break;
+            length += read;
+          }
+          conflictContents[file] = new TextDecoder('utf-8', { ignoreBOM: true }).decode(buffer.subarray(0, length), { stream: true });
+        } finally {
+          io.closeSync(fd);
+        }
+      } catch { /* best-effort evidence; selection and audit remain mandatory */ }
+    }
     const task = join(scratch, '.git', 'auto-rebase-task.txt');
-    const agent = async (review, text) => {
-      io.writeFileSync(task, `${FENCED_DATA_RULE}\n${text}\n${fenceUntrusted('material', JSON.stringify({ ref, conflicts, oldSha, mainSha }))}`);
+    const agent = async (review, text, material = {}) => {
+      io.writeFileSync(task, `${FENCED_DATA_RULE}\n${text}\n${fenceUntrusted('material', JSON.stringify({ ref, conflicts, oldSha, mainSha, ...material }))}`);
       const args = ['scripts/codex-direct-task.mjs', `--task-file=${task}`, `--dir=${scratch}`, '--gate=none', '--task-kind=fix', '--no-self-review', '--no-stream', '--json', '--timeout-ms=600000', ...(review ? ['--review'] : [])];
       const agentFn = review ? deps.auditor : deps.codex;
       return agentFn ? await agentFn({ root: scratch, args, taskFile: task }) : execAsync(process.execPath, args, { cwd: root, env });
@@ -159,19 +180,40 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     const contents = new Map(files.filter(isGraphSourceFile).map(f => [f, io.readFileSync(join(scratch, f), 'utf8')]));
     const reverse = buildReverseImportGraph({ files, readFile: f => contents.get(f) });
     const selected = new Set();
+    const noTestFiles = [];
     for (const file of changed) {
       const related = [...testDepths([file], reverse).keys()];
-      if (!related.length) throw new Error('no related tests; human review required');
+      if (!related.length) noTestFiles.push(file);
       related.forEach(f => selected.add(f));
     }
-    if (!selected.size || selected.size > 100) throw new Error('test selection empty or over 100; human review required');
-    io.appendFileSync(join(scratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
-    io.statSync(join(root, 'node_modules'));
-    io.symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
-    const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected];
-    requireOk(await (deps.testRunner ?? ((o) => execAsync(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }));
+    let rule = 'related-tests';
+    if (noTestFiles.length) {
+      const base = requireOk(git(['merge-base', 'origin/main', oldSha], scratch));
+      if (!/^[a-f0-9]{40}$/.test(base)) throw new Error('overlay merge base unavailable; human review required');
+      const branchFiles = requireOk(git(['diff', '--name-only', '--diff-filter=ACMRT', base, oldSha], scratch)).split('\n').filter(Boolean);
+      const candidateFiles = new Set(files);
+      const fallback = new Set(branchFiles.filter(f => candidateFiles.has(f) && isVitestTestFile(f)));
+      const sources = branchFiles.filter(f => isGraphSourceFile(f) && !isVitestTestFile(f));
+      for (const test of testDepths(sources, reverse).keys()) fallback.add(test);
+      fallback.forEach(f => selected.add(f));
+      rule = fallback.size ? 'overlay-branch-tests+import-graph' : 'codex-audit-required';
+    }
+    try {
+      const file = alertsFilePath(root, env);
+      io.mkdirSync(dirname(file), { recursive: true });
+      io.appendFileSync(file, `${JSON.stringify({ at: now(), kind: 'auto-rebase-evidence', detail: { ref, rule, noTestFiles, conflicts: conflictContents } })}\n`);
+    } catch { /* best-effort persistence only; never catch selection failures */ }
+    if (selected.size > 100) throw new Error('test selection over 100; human review required');
+    if (!selected.size && rule !== 'codex-audit-required') throw new Error('test selection empty; human review required');
+    if (selected.size) {
+      io.appendFileSync(join(scratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
+      io.statSync(join(root, 'node_modules'));
+      io.symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
+      const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected];
+      requireOk(await (deps.testRunner ?? ((o) => execAsync(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }));
+    }
     stage = 'audit';
-    const audit = await agent(true, 'Read-only audit: inspect the merge against BOTH parent tips, especially conflict resolutions, tests and guards. Answer exactly NOT WEAKENED only if neither side’s intent, tests nor guards were weakened; otherwise report failure.');
+    const audit = await agent(true, 'Read-only audit: inspect the merge against BOTH parent tips, especially conflict resolutions, tests and guards. Review every file listed in noTestFiles in the material: these files have no related tests, so certification requires inspecting their changes directly. This audit is REQUIRED even when no tests can run. Answer exactly NOT WEAKENED only if neither side’s intent, tests nor guards were weakened; otherwise report failure.', { noTestFiles, rule });
     if (requireAgentSuccess(audit).lastMessage !== 'NOT WEAKENED') throw new Error('audit did not certify NOT WEAKENED');
     if (requireOk(git(['rev-parse', 'HEAD'], scratch)) !== candidate || requireOk(git(['status', '--porcelain'], scratch))) throw new Error('candidate changed after tests');
     stage = 'push';
@@ -179,8 +221,8 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     stage = 'register';
     add(root, { ref: next, pr: old.pr, stackBases: [ref], reason: `auto-rebase of ${ref}` }, { env });
     io.mkdirSync(p.dir, { recursive: true });
-    writePending(io, p.pending, { old: ref, new: next, newSha: candidate, at: now() });
-    event(root, { kind: 'auto-rebase-registered', ref, new: next, newSha: candidate }, { env });
+    writePending(io, p.pending, { old: ref, new: next, newSha: candidate, rule, at: now() });
+    event(root, { kind: 'auto-rebase-registered', ref, new: next, newSha: candidate, rule }, { env });
     return { ref: next, newSha: candidate };
   } catch (e) {
     reportFailure(e);

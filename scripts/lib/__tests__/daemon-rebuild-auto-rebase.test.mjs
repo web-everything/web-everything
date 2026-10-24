@@ -74,6 +74,13 @@ function fixture({ extraModule = false, workerTest = true, baseFiles = {}, branc
   };
   return { base, root, origin, baseSha, oldSha, env, moveMain, calls, scratched, deps };
 }
+const needsYouAlerts = f => fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8')
+  .trim().split('\n').map(JSON.parse).filter(e => e.kind === 'auto-rebase-needs-you');
+const needsYouAlert = f => {
+  const alerts = needsYouAlerts(f);
+  expect(alerts).toHaveLength(1);
+  return alerts[0];
+};
 const pendingDir = f => `${overlayFilePath(f.root, f.env)}.auto-rebase`;
 const job = f => runAutoRebase({ root: f.root, ref, env: f.env, deps: f.deps });
 const swaps = f => finishPendingSwaps({ root: f.root, env: f.env, run,
@@ -225,6 +232,99 @@ describe('established overlay auto rebase', () => {
       expect(f.deps.auditor).toHaveBeenCalledOnce();
     });
 
+    it('never captures an external secret through a conflicted symlink in alerts', async () => {
+      const f = fixture();
+      const secret = 'EXTERNAL_SECRET_MUST_NEVER_REACH_ALERTS';
+      const external = join(f.base, 'external-secret.txt');
+      fs.writeFileSync(external, secret);
+      ok(f.root, ['checkout', '-q', ref]);
+      fs.symlinkSync(external, join(f.root, 'secret.txt'));
+      ok(f.root, ['add', 'secret.txt']); ok(f.root, ['commit', '-qm', 'overlay symlink']);
+      ok(f.root, ['push', '-q', 'origin', ref]);
+      ok(f.root, ['checkout', '-q', 'main']);
+      fs.symlinkSync('main-target.txt', join(f.root, 'secret.txt'));
+      ok(f.root, ['add', 'secret.txt']);
+      f.moveMain();
+      f.deps.io.lstatSync = vi.fn(fs.lstatSync);
+      f.deps.io.openSync = vi.fn(fs.openSync);
+      const resolveConflicts = f.deps.codex;
+      f.deps.codex = async options => {
+        const path = join(options.root, 'secret.txt');
+        expect(ok(options.root, ['diff', '--name-only', '--diff-filter=U']).split('\n')).toContain('secret.txt');
+        expect(fs.lstatSync(path).isSymbolicLink()).toBe(true);
+        expect(fs.readlinkSync(path)).toBe(external);
+        expect(f.deps.io.lstatSync).toHaveBeenCalledWith(path);
+        expect(f.deps.io.openSync.mock.calls.some(([file]) => file === path)).toBe(false);
+        fs.unlinkSync(path);
+        write(options.root, 'secret.txt', 'resolved\n');
+        ok(options.root, ['add', 'secret.txt']);
+        return resolveConflicts(options);
+      };
+      await job(f);
+      const alerts = alertsFilePath(f.root, f.env);
+      expect(fs.readFileSync(alerts, 'utf8')).not.toContain(secret);
+      const evidence = records(alerts).find(e => e.kind === 'auto-rebase-evidence');
+      expect(evidence.detail.conflicts).not.toHaveProperty('secret.txt');
+      expect(evidence.detail.conflicts['worker.mjs']).toContain('<<<<<<<');
+      expect(fs.readFileSync(external, 'utf8')).toBe(secret);
+      expect(f.deps.auditor).toHaveBeenCalledOnce();
+    });
+
+    it('reads at most 64KB per conflict and closes descriptors after read failure', async () => {
+      const f = fixture({
+        workerTest: false,
+        baseFiles: { 'large.txt': 'base\n' },
+        branchFiles: { 'large.txt': 'overlay\n'.repeat(10_000) },
+        mainFiles: { 'large.txt': 'main\n'.repeat(15_000) },
+        resolvedFiles: { 'large.txt': 'overlay + main\n' },
+      });
+      f.moveMain();
+      const captures = [], descriptors = new Map();
+      f.deps.io.openSync = (path, flags) => {
+        const fd = fs.openSync(path, flags);
+        const capture = { path, flags, fd, reads: [], bytes: 0, closed: false };
+        captures.push(capture); descriptors.set(fd, capture);
+        return fd;
+      };
+      f.deps.io.readSync = (fd, buffer, offset, length, position) => {
+        const capture = descriptors.get(fd);
+        capture.reads.push({ offset, length, position, capacity: buffer.length });
+        if (capture.path.endsWith('worker.mjs')) throw new Error('injected read failure');
+        const bytes = fs.readSync(fd, buffer, offset, Math.min(length, 4096), position);
+        capture.bytes += bytes;
+        return bytes;
+      };
+      f.deps.io.closeSync = vi.fn(fd => {
+        descriptors.get(fd).closed = true;
+        descriptors.delete(fd);
+        fs.closeSync(fd);
+      });
+      await job(f);
+      expect(captures).toHaveLength(2);
+      for (const capture of captures) {
+        expect(capture.flags).toBe(fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        expect(capture.bytes).toBeLessThanOrEqual(64 * 1024);
+        expect(capture.closed).toBe(true);
+        expect(f.deps.io.closeSync).toHaveBeenCalledWith(capture.fd);
+        for (const read of capture.reads) {
+          expect(read.capacity).toBe(64 * 1024);
+          expect(read.offset + read.length).toBeLessThanOrEqual(64 * 1024);
+          expect(read.position + read.length).toBeLessThanOrEqual(64 * 1024);
+        }
+      }
+      const large = captures.find(c => c.path.endsWith('large.txt'));
+      expect(large.reads.length).toBeGreaterThan(1);
+      expect(large.bytes).toBe(64 * 1024);
+      const failed = captures.find(c => c.path.endsWith('worker.mjs'));
+      expect(failed.reads).toHaveLength(1);
+      expect(descriptors.size).toBe(0);
+      const evidence = records(alertsFilePath(f.root, f.env)).find(e => e.kind === 'auto-rebase-evidence');
+      expect(Buffer.byteLength(evidence.detail.conflicts['large.txt'])).toBe(64 * 1024);
+      expect(evidence.detail.conflicts).not.toHaveProperty('worker.mjs');
+      expect(f.deps.testRunner).not.toHaveBeenCalled();
+      expect(f.deps.auditor).toHaveBeenCalledOnce();
+    });
+
     it('records related-tests in the registration event and pending swap on the existing path', async () => {
       const f = fixture(); f.moveMain();
       const result = await job(f);
@@ -346,7 +446,7 @@ describe('established overlay auto rebase', () => {
     expect(events.filter(e => e.kind === 'auto-rebase-needs-you')).toEqual([
       expect.objectContaining({ ref, stage: 'launch', reason: expect.any(String) }),
     ]);
-    expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim())).toMatchObject({
+    expect(needsYouAlert(f)).toMatchObject({
       kind: 'auto-rebase-needs-you', detail: { ref, stage: 'launch', reason: expect.any(String) },
     });
     expect(readOverlays(f.root, { env: f.env })).toEqual([expect.objectContaining(overlay)]);
@@ -419,7 +519,7 @@ describe('established overlay auto rebase', () => {
     expect(probe).toHaveBeenCalledWith(['fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], expect.objectContaining({ cwd: f.root }));
     expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref, replacement.ref]);
     expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
-    expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim())).toMatchObject({
+    expect(needsYouAlert(f)).toMatchObject({
       kind: 'auto-rebase-needs-you', detail: { ref, stage: 'swap' },
     });
     const events = fs.readFileSync(overlayFilePath(f.root, f.env).replace(/\.json$/, '.events.jsonl'), 'utf8');
@@ -458,7 +558,7 @@ describe('established overlay auto rebase', () => {
         expect.objectContaining({ ref, stage: 'swap', reason: expect.any(String) }),
       ]);
       expect(events.some(e => e.kind === 'auto-rebase-swapped')).toBe(false);
-      expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim())).toMatchObject({
+      expect(needsYouAlert(f)).toMatchObject({
         kind: 'auto-rebase-needs-you', detail: { ref, stage: 'swap', reason: expect.any(String) },
       });
     },
@@ -476,7 +576,7 @@ describe('established overlay auto rebase', () => {
     expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([replacement.ref]);
     expect(fs.readdirSync(pendingDir(f))).toEqual([]);
     expect(f.calls.slice(-2)).toEqual(['remove', 'auto-rebase-swapped']);
-    expect(fs.existsSync(alertsFilePath(f.root, f.env))).toBe(false);
+    expect(needsYouAlerts(f)).toEqual([]);
   });
 
   describe.each(['codex', 'auditor'])('%s JSON report validation', agent => {
@@ -495,7 +595,7 @@ describe('established overlay auto rebase', () => {
       if (agent === 'codex') expect(f.deps.testRunner).not.toHaveBeenCalled();
       expect(readOverlays(f.root, { env: f.env })).toEqual([expect.objectContaining(overlay)]);
       expect(ok(f.root, ['ls-remote', 'origin', `${ref}-auto-*`])).toBe('');
-      expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim())).toMatchObject({
+      expect(needsYouAlert(f)).toMatchObject({
         kind: 'auto-rebase-needs-you', detail: { ref, stage: agent === 'codex' ? 'resolve' : 'audit' },
       });
       expect(f.scratched.every(p => !fs.existsSync(p))).toBe(true);
@@ -550,24 +650,23 @@ describe('established overlay auto rebase', () => {
     },
   );
 
-  it.each(['codex', 'testRunner', 'auditor', 'ambiguous-audit', 'missing-audit', 'unreadable-graph', 'no-tests', 'oversized-tests'])('fails closed on %s, alerts needs-you, cleans scratch, and leaves old registration', async failure => {
+  it.each(['codex', 'testRunner', 'auditor', 'ambiguous-audit', 'missing-audit', 'unreadable-graph', 'oversized-tests'])('fails closed on %s, alerts needs-you, cleans scratch, and leaves old registration', async failure => {
     const f = fixture(); f.moveMain();
     if (failure === 'ambiguous-audit') f.deps.auditor = async () => agentResult({ lastMessage: 'Probably NOT WEAKENED' });
     else if (failure === 'missing-audit') f.deps.auditor = async () => agentResult();
     else if (failure === 'unreadable-graph') f.deps.io.readFileSync = (p, ...args) => { if (p.endsWith('worker.test.mjs')) throw new Error('unreadable test'); return fs.readFileSync(p, ...args); };
-    else if (failure === 'no-tests' || failure === 'oversized-tests') {
+    else if (failure === 'oversized-tests') {
       const original = f.deps.codex;
       f.deps.codex = async o => {
         const r = await original(o);
-        if (failure === 'no-tests') fs.unlinkSync(join(o.root, 'worker.test.mjs'));
-        else for (let n = 0; n < 101; n++) write(o.root, `x${n}.test.mjs`, "import './worker.mjs';\n");
+        for (let n = 0; n < 101; n++) write(o.root, `x${n}.test.mjs`, "import './worker.mjs';\n");
         ok(o.root, ['add', '-A']); return r;
       };
     } else f.deps[failure] = async () => ({ status: 1 });
     await expect(job(f)).rejects.toThrow();
     expect(readOverlays(f.root, { env: f.env })).toEqual([expect.objectContaining(overlay)]);
     expect(f.calls).not.toContain('add'); expect(f.calls).toContain('auto-rebase-needs-you');
-    const alert = JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim());
+    const alert = needsYouAlert(f);
     expect(alert).toMatchObject({ kind: 'auto-rebase-needs-you', detail: { ref } });
     expect(alert.detail.stage).toBeTruthy(); expect(alert.detail.reason).toBeTruthy();
     expect(ok(f.root, ['ls-remote', 'origin', `${ref}-auto-*`])).toBe('');
@@ -588,7 +687,7 @@ describe('established overlay auto rebase', () => {
     ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
     expect(() => finishPendingSwaps({ root: f.root, env: f.env, run,
       removeOverlay: () => { throw new Error('busy list'); } })).not.toThrow();
-    expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim())).toMatchObject({
+    expect(needsYouAlert(f)).toMatchObject({
       kind: 'auto-rebase-needs-you', detail: { ref, stage: 'swap', reason: 'busy list' },
     });
     expect(fs.readFileSync(overlayFilePath(f.root, f.env).replace(/\.json$/, '.events.jsonl'), 'utf8')).toContain('auto-rebase-needs-you');
@@ -637,7 +736,7 @@ describe('established overlay auto rebase', () => {
     f.deps.io.rmSync = (p, opts) => { fs.rmSync(p, opts); throw new Error('cleanup failed'); };
     await expect(job(f)).rejects.toThrow('cleanup failed');
     expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toContain(ref);
-    expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()).detail.stage).toBe('cleanup');
+    expect(needsYouAlert(f).detail.stage).toBe('cleanup');
     expect(f.scratched.every(p => !fs.existsSync(p))).toBe(true);
   });
 
@@ -654,7 +753,7 @@ describe('established overlay auto rebase', () => {
     const file = join(pendingDir(f), fs.readdirSync(pendingDir(f))[0]); fs.writeFileSync(file, '{}');
     expect(() => swaps(f)).not.toThrow(); expect(f.calls).not.toContain('remove');
     expect(f.calls).toContain('auto-rebase-needs-you');
-    expect(JSON.parse(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim())).toMatchObject({
+    expect(needsYouAlert(f)).toMatchObject({
       kind: 'auto-rebase-needs-you', detail: { stage: 'swap', reason: 'invalid pending swap' },
     });
     expect(fs.readFileSync(file, 'utf8')).toBe('{}');

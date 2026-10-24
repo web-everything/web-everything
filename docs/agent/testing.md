@@ -27,6 +27,10 @@ Select scoped tests from the completed candidate diff against the old tip as wel
 original conflict paths: the fixer can edit modules beyond those conflicts. The static
 reverse-import graph supplies scoped tests, so dynamic-only relationships require human intervention. Exercise both registration and adoption with real git in temporary repos;
 Codex and the queued test runner stay fake in `daemon-rebuild-auto-rebase.test.mjs`.
+The existing [test-selection fallback and durable evidence](../../scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs) cases cover overlay tests, reverse imports, skipped empty runners and exact audit refusal.
+Missing related tests fall back to overlay-branch tests plus import reach; fenced `noTestFiles` reaches the required audit, which must certify exactly `NOT WEAKENED`.
+Selection rules and original conflict markers persist as JSONL evidence before tests; each conflict read and capture is capped at 65,536 bytes, with its descriptor closed in `finally`.
+Capture skips non-regular files and platforms without `O_NOFOLLOW`; inspection, open and read failures remain best-effort omissions from evidence.
 
 ## Daemon entry boot smoke
 
