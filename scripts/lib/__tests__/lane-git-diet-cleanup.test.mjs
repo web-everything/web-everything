@@ -210,6 +210,8 @@ describe('cleanupEligibility (pure)', () => {
       expect(cleanupEligibility({ ...at, lease })).toEqual({ ok: false, reason: 'claim lost (lease marker is no longer ours)' });
     }
     expect(cleanupEligibility({ ...at, claimHolder: '', lease: { ...fresh, holder: '' } }).ok).toBe(false);
+    // Our own marker past its TTL reads as free to lane-pool: another acquirer may hold the lane now.
+    expect(cleanupEligibility({ ...at, lease: { ...stale, holder: 'me', ttlMinutes: 60 } })).toEqual({ ok: false, reason: 'claim expired (our lease marker is past its TTL)' });
   });
   it('refuses a reserved lease even when old', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, lease: { ...stale, reserved: true }, nowMs })).toMatchObject({ ok: false, reason: 'reserved lease' }));
   it('refuses a lane with a git lock', () => expect(cleanupEligibility({ dir: `${poolRoot}/web-everything/lane-5`, poolRoot, nowMs, locks: ['index.lock'] }).ok).toBe(false));
@@ -714,25 +716,33 @@ describe('real git: cleanup CLI', () => {
   }, 60_000);
 
   // A symbolic ref that targets an ops ref keeps that ref: deleting it would leave the symref dangling, and prune would
-  // then drop the history it named. HEAD, a linked worktree's HEAD and any other symref are all checked.
+  // then drop the history it named. HEAD, a linked worktree's HEAD, a root ref, any other symref and every hop of a
+  // chain are all checked.
   const OPS = 'refs/remotes/origin/ops/review-requests';
+  const HOP = 'refs/remotes/origin/ops/a';
   it.each([
-    ['the lane HEAD', (dir) => { git(dir, 'symbolic-ref', 'HEAD', OPS); return [dir, 'HEAD']; }],
+    ['the lane HEAD', (dir) => { git(dir, 'symbolic-ref', 'HEAD', OPS); return [dir, 'HEAD', [OPS]]; }],
     ['a linked worktree HEAD', (dir) => {
       const wt = join(root, 'symref-worktree');
       git(dir, 'worktree', 'add', '-q', '--detach', wt);
       git(wt, 'symbolic-ref', 'HEAD', OPS);
-      return [wt, 'HEAD'];
+      return [wt, 'HEAD', [OPS]];
     }],
-    ['another symbolic ref', (dir) => { git(dir, 'symbolic-ref', 'refs/heads/alias', OPS); return [dir, 'refs/heads/alias']; }],
+    ['another symbolic ref', (dir) => { git(dir, 'symbolic-ref', 'refs/heads/alias', OPS); return [dir, 'refs/heads/alias', [OPS]]; }],
+    ['a root ref', (dir) => { git(dir, 'symbolic-ref', 'FOO_HEAD', OPS); return [dir, 'FOO_HEAD', [OPS]]; }],
+    ['HEAD through a chain of ops refs', (dir) => {
+      git(dir, 'symbolic-ref', HOP, OPS);
+      git(dir, 'symbolic-ref', 'HEAD', HOP);
+      return [dir, 'HEAD', [HOP, OPS]];
+    }],
   ])('an ops ref that %s points at is kept, so the symbolic ref still resolves after apply', (_name, plant) => {
     const dir = lane(25);
     git(root, 'clone', '-q', up, dir);
     const tip = git(dir, 'rev-parse', OPS);
     try {
-      const [cwd, symref] = plant(dir);
+      const [cwd, symref, kept] = plant(dir);
       const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=25', '--json'], { env, encoding: 'utf8' }));
-      expect(out.rows[0]).toMatchObject({ mode: 'apply', opsRefsDeleted: 0, opsRefsKept: [OPS] });
+      expect(out.rows[0]).toMatchObject({ mode: 'apply', opsRefsDeleted: 0, opsRefsKept: kept });
       expect(git(cwd, 'rev-parse', '--verify', symref)).toBe(tip);
       expect(git(dir, 'cat-file', '-t', tip)).toBe('commit');
       expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);

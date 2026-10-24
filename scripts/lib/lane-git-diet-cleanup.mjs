@@ -43,7 +43,8 @@ export function parseGitAlternates(text) {
  * `gc.<pattern>.reflogExpire[Unreachable]` (it overrides the generic keys the gc pins to `never`, so reflog-only work
  * could expire and be pruned).
  * Under a claim, pass `claimHolder`: the real `lease` must then be that holder's marker (absent, unreadable or another
- * holder's → refused as a lost claim), and only then is the marker read as ours rather than as a live lease.
+ * holder's → refused as a lost claim; ours but past its TTL → refused as expired), and only then is the marker read
+ * as ours rather than as a live lease.
  * @param {{dir: string, poolRoot: string, realDir?: string, realGitDir?: string, lease?: object|null, claimHolder?: string, nowMs: number,
  *   realCommonDir?: string, realObjectsDir?: string, ttlMs?: number, locks?: string[], borrowers?: string[],
  *   gcHooks?: string[], gcRepackFilters?: string[], gcReflogPatterns?: string[], configHooks?: string[], refStorage?: string[], symlinkedGitPaths?: string[]}} o  `realCommonDir`/`realObjectsDir` = resolved `git rev-parse --git-common-dir` and
@@ -65,6 +66,8 @@ export function cleanupEligibility({ dir, poolRoot, realDir, realGitDir, realCom
   if (symlinkedGitPaths.length) return { ok: false, reason: `symlinked git paths (${symlinkedGitPaths.join(', ')})` };
   if (claimHolder !== undefined) {
     if (!claimHolder || lease?.holder !== claimHolder) return { ok: false, reason: 'claim lost (lease marker is no longer ours)' };
+    // Our marker past its TTL reads as free to lane-pool, so another acquirer may already be working the lane.
+    if (isLeaseStale(lease, nowMs, ttlMs)) return { ok: false, reason: 'claim expired (our lease marker is past its TTL)' };
   } else if (lease && !isLeaseStale(lease, nowMs, ttlMs)) {
     return { ok: false, reason: lease.reserved ? 'reserved lease' : `live lease (${lease.purpose || lease.holder || lease.ownerSession || 'unknown holder'})` };
   }

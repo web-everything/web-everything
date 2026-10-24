@@ -156,19 +156,20 @@ const auditGitDir = (dir) => {
   visit('');
   return { symlinkedGitPaths: links, locks };
 };
-// Never trimmed: a common dir `<lane>/.git ` must not read as the lane's own `.git`. Unreadable → null → refused.
-// Every ref a symbolic ref points at, seen from the lane's own git dir and from each linked worktree's (its HEAD and
-// per-worktree refs). Ref names hold no whitespace, so one per line is exact. Any read failure throws: lane error row.
+// Every ref a symbolic ref points at, seen from the lane's own git dir and from each linked worktree's (its HEAD,
+// root refs and per-worktree refs). Each hop is read unresolved, so every ref along a chain (HEAD → ops/a → ops/b) is
+// kept. Ref names hold no whitespace, so one per line is exact. Any read failure throws: lane error row.
 const symrefTargets = (dir) => {
   let ids = [];
   try { ids = readdirSync(join(dir, '.git', 'worktrees')); } catch (err) { if (!['ENOENT', 'ENOTDIR'].includes(err.code)) throw err; }
   const targets = new Set();
   for (const gitDir of [join(dir, '.git'), ...ids.map((id) => join(dir, '.git', 'worktrees', id))]) {
-    try { targets.add(git(dir, [`--git-dir=${gitDir}`, 'symbolic-ref', '-q', 'HEAD']).trim()); } catch (e) { if (e.status !== 1) throw e; } // 1: detached
-    for (const t of git(dir, [`--git-dir=${gitDir}`, 'for-each-ref', '--format=%(symref)']).split('\n')) if (t) targets.add(t);
+    try { targets.add(git(dir, [`--git-dir=${gitDir}`, 'symbolic-ref', '-q', '--no-recurse', 'HEAD']).trim()); } catch (e) { if (e.status !== 1) throw e; } // 1: detached
+    for (const t of git(dir, [`--git-dir=${gitDir}`, 'for-each-ref', '--include-root-refs', '--format=%(symref)']).split('\n')) if (t) targets.add(t);
   }
   return targets;
 };
+// Never trimmed: a common dir `<lane>/.git ` must not read as the lane's own `.git`. Unreadable → null → refused.
 const commonDir = (dir) => { try { return real(gitPath(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir'])); } catch { return null; } };
 
 const eligible = (dir) => {
@@ -236,13 +237,14 @@ for (const n of lanes) {
     if (!holder) { rows.push({ lane: n, skipped: 'lost the claim race (someone took the lane)' }); continue; }
     try {
       testPause('after-claim');
-      // Before any write: a marker rewritten or removed by another holder means the claim is lost.
+      // Measure and read first, so the ownership check sits right before the writes: a marker rewritten or removed by
+      // another holder means the claim is lost.
+      const before = duBytes(join(dir, '.git'));
+      const pinned = symrefTargets(dir);
       const recheck = recheckUnderClaim(dir, holder);
       if (!recheck.ok) { rows.push({ lane: n, skipped: recheck.reason }); continue; }
-      const before = duBytes(join(dir, '.git'));
       const applied = applyLaneDietConfig((args) => git(dir, args));
       const refsNow = opsRefs(dir);
-      const pinned = symrefTargets(dir);
       const kept = refsNow.filter((ref) => pinned.has(ref));
       for (const ref of refsNow) if (!pinned.has(ref)) git(dir, ['update-ref', '--no-deref', '-d', ref]);
       // Re-scan borrowers right before pruning: a repo that started borrowing this lane's objects since startup
@@ -270,10 +272,11 @@ for (const n of lanes) {
       // index, destroying its HEAD-only reachability root. Repack expires neither worktree metadata nor reflogs.
       git(dir, ['repack', '-A', '-d', '-l', '--unpack-unreachable=never', '--quiet'], GC_TIMEOUT_MS);
       testPause('before-prune');
-      const final = recheckUnderClaim(dir, holder);
-      if (!final.ok) { rows.push({ lane: n, skipped: `${final.reason} (repack done, prune skipped)` }); continue; }
+      // The borrower scan walks every scan root, so it runs first and the claim recheck sits right before prune.
       const finalBorrowers = borrowerMap().get(real(join(dir, '.git', 'objects'))) || [];
       if (finalBorrowers.length) { rows.push({ lane: n, skipped: `objects borrowed by ${finalBorrowers.join(', ')} (repack done, prune skipped)` }); continue; }
+      const final = recheckUnderClaim(dir, holder);
+      if (!final.ok) { rows.push({ lane: n, skipped: `${final.reason} (repack done, prune skipped)` }); continue; }
       git(dir, ['prune', `--expire=${PRUNE_EXPIRE}`], GC_TIMEOUT_MS);
       const after = duBytes(join(dir, '.git'));
       const freed = before - after;
