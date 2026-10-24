@@ -153,6 +153,23 @@ describe('default git reader — filename encoding', () => {
   };
 
   it.each([
+    ['truncated sequence', [0xe2, 0x82]],
+    ['overlong sequence', [0xc0, 0xaf]],
+    ['encoded surrogate', [0xed, 0xa0, 0x80]],
+    ['out-of-range code point', [0xf4, 0x90, 0x80, 0x80]],
+  ])('refuses %s in numeric and binary filename evidence', (_kind, bytes) => {
+    for (const counts of ['301\t0\t', '-\t-\t']) {
+      const numstat = Buffer.concat([
+        Buffer.from(`${counts}production-`), Buffer.from(bytes), Buffer.from('.mjs\0'),
+      ]);
+      const { exec, run, spawn } = encodedFixture({ numstat });
+      expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+      expect(spawn).not.toHaveBeenCalled();
+      expect(exec.mock.calls.some(([, args]) => args.includes('ls-tree'))).toBe(false);
+    }
+  });
+
+  it.each([
     ['ordinary path', Buffer.from('production-'), Buffer.from('.mjs')],
     ['rename source', Buffer.from('\0production-'), Buffer.from('.mjs\0replacement.mjs')],
     ['rename destination', Buffer.from('\0original.mjs\0production-'), Buffer.from('.mjs')],
