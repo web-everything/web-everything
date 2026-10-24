@@ -250,6 +250,7 @@ describe('automatic card filing', () => {
     const gens = new Map(), receipts = new Set(), breakOwners = sharedBreaks ?? new Map();
     let clock = 1_000_000;
     const memClaims = {
+      hasClaim: (k) => gens.has(k),
       claim: (k) => { if (!gens.has(k)) { gens.set(k, { gen: 0, at: clock }); return { created: true, gen: 0, at: clock }; } return { created: false, ...gens.get(k) }; },
       reclaim: (k, g) => { if (gens.get(k).gen !== g) return false; gens.set(k, { gen: g + 1, at: clock }); return true; },
       completed: (k) => completed && receipts.has(k),
@@ -338,6 +339,44 @@ describe('automatic card filing', () => {
     expect(synced).toEqual([]);
   });
   describe('card spawn and retry', () => {
+    it('card: a prior trusted pending intent with empty local state refuses every retry without spawning or writing claims', async () => {
+      const { mkdtempSync, readdirSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { createFileClaims } = await import('../record-red-team-ruling-io.mjs');
+      const original = fake({ completed: false });
+      const p = payloadFor();
+      expect(original.sinks[RED_TEAM_RULING_CARD_EFFECT](p)).toMatchObject({ pending: true });
+      const dir = mkdtempSync(join(tmpdir(), 'ruling-other-root-'));
+      try {
+        const other = fake({ initial: original.comments, claims: createFileClaims({ dir }) });
+        for (let i = 0; i < 2; i++) {
+          const retry = planRedTeamRuling(read({ comments: other.comments }), input());
+          expect(() => other.sinks[RED_TEAM_RULING_CARD_EFFECT](retry))
+            .toThrow(/trusted pending intent.*no local.*Check the landing log.*recover the owed card.*re-run citing its readable --card reference/);
+          expect(readdirSync(dir)).toEqual([]);
+        }
+        expect(other.cards).toEqual([]);
+        expect(other.posted).toEqual([]);
+        expect(other.labelSyncs).toEqual([]);
+        expect(heldAfter(other.comments)).toHaveLength(1);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('card: a same-root retry of a prior pending intent waits for completion without respawning', () => {
+      const f = fake({ completed: false });
+      const p = payloadFor();
+      expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](p)).toMatchObject({ pending: true });
+      const retry = () => planRedTeamRuling(read({ comments: f.comments }), input());
+      expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](retry())).toMatchObject({ pending: true, card: { reconciled: true } });
+      expect(f.cards).toHaveLength(1);
+      expect(f.posted).toHaveLength(1);
+      f.complete();
+      expect(f.sinks[RED_TEAM_RULING_CARD_EFFECT](retry())).toMatchObject({ card: { reconciled: true } });
+      expect(f.cards).toHaveLength(1);
+      expect(heldAfter(f.comments)).toEqual([]);
+    });
+
     it('card: queues the card, persists the reason then releases, and the break stops being held', () => {
       const f = fake();
       expect(heldAfter(f.comments)).toHaveLength(1);
