@@ -42,6 +42,7 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -207,7 +208,9 @@ export function writeOverlays(root, list, { env = process.env } = {}) {
  * stacked on lane/b, itself on lane/a). The rebuild reads it only when gh cannot answer; leaving it out keeps it as is.
  * @param {{ref:string, pr?:number|null, addedBy?:string|null, reason?:string|null, now?:string, pinned?:boolean,
  *   stackBases?:string[]}} entry
- * @param {{env?:NodeJS.ProcessEnv}} [o]
+ * @param {{env?:NodeJS.ProcessEnv, expectedOverlay?:object}} [o]
+ * `expectedOverlay`, when supplied, must still match the source registration under the list mutex.
+ * Detached repairs use this snapshot to avoid undoing a concurrent unload or update.
  * @returns {Array<object>} the new list
  */
 /**
@@ -245,7 +248,7 @@ export async function readOverrideViewerLogin() {
 
 export function addOverlay(root, {
   ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
-} = {}, { env = process.env } = {}) {
+} = {}, { env = process.env, expectedOverlay } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
   }
@@ -253,6 +256,10 @@ export function addOverlay(root, {
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env).slice();
     pause();
+    if (expectedOverlay !== undefined && (!expectedOverlay || !isSafeBranchName(expectedOverlay.ref)
+      || !isDeepStrictEqual(list.find(o => o?.ref === expectedOverlay.ref), expectedOverlay))) {
+      throw new Error('source registration unavailable or changed; refusing replacement');
+    }
     const idx = list.findIndex((o) => o && o.ref === ref);
     if (idx === -1) {
       list.push({
