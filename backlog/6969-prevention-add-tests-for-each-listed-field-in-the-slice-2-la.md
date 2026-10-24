@@ -1,22 +1,21 @@
 ---
+bornAs: xisc05p
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs"]
+scope: ["we:scripts/operations/judge-sweep-facts-io.mjs", "we:scripts/operations/__tests__/judge-sweep-facts-io.test.mjs"]
 dateOpened: "2026-10-23"
 tags: []
 ---
 
-# Prevention — Add a negative twin to the soak break (stale claim with live, session-bound pid, expecting a reap… (from web-everything/web-everything#5846 review)
+# Prevention — Add tests for each listed field in the slice-2 lane. Initialise ignoredFindingReturned to null in… (from web-everything/web-everything#5842 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/lease-reaper.mjs:1529` — Add a negative twin to the soak break (stale claim with live, session-bound pid, expecting a reap). A lint or standards rule could also require every soak break that guards a keep-decision to carry a stale-evidence counterpart.
-2. `we:scripts/conveyor/lease-reaper.mjs:1535` — Add the named fault-injection test to the automated test gate; this guard needs a future backlog item.
-3. `we:scripts/conveyor/lease-reaper.mjs:1534` — Add the named fault-injection regression test to the deterministic test gate, asserting that a claim-read failure preserves run-store protection.
+1. `we:scripts/operations/judge-sweep-facts-io.mjs:210` — Add tests for each listed field in the slice-2 lane. Initialise `ignoredFindingReturned` to null in `result`. As a durable guard, add a check that every key of the reader's `result` literal is asserted in at least one test.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5846@91634d2eada0e35716682de89ae20bdfed08f99c
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5842@9af7a603ec095b1b23ae71900e7d5e3f371daa85
 
 ## Acceptance
 
