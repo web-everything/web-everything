@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, resetLane, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
+import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, resetLane, commitAndPush, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
 import { registerScope, releaseScope, assessFreeScope } from '../free-scope.mjs';
 
 const flags = ['--brief=brief.md', '--purpose=example', '--scope=we:scripts/a.mjs,we:scripts/lib/', '--tests=scripts/a.test.mjs', '--repo=/repo'];
@@ -18,7 +18,7 @@ const loaderHelp = '--branch= --sha= --daemon= --why= --tests-run= --audit= --js
 const originUrl = 'https://github.com/example/trusted.git';
 const laneConfig = `local\0remote.origin.url\n${originUrl}\0local\0remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0local\0remote.origin.fetch\n^refs/heads/ops/*\0`;
 function fixture(rules = [], { ready = true } = {}) {
-  const calls = [], writes = [], logs = [], output = [];
+  const calls = [], writes = [], logs = [], output = [], reads = [], stats = [], temps = [], removals = [];
   const counts = new Map();
   const io = {
     exec: async (cmd, args, options) => {
@@ -38,6 +38,7 @@ function fixture(rules = [], { ready = true } = {}) {
       if (args.includes('prototype-load') && args.includes('--help')) return ok(loaderHelp);
       if (call.text.includes('fix-ready.mjs') || call.text.includes('scripts/operations/run.mjs prototype-load')) return ok();
       if (cmd === 'git') {
+        if (args.includes('clone')) return ok();
         if (args.includes('get-url')) return ok(`${originUrl}\n`);
         if (args.includes('config')) return ok(laneConfig);
         if (args.includes('write-tree') || args.some(a => a.endsWith('^{tree}'))) return ok('a'.repeat(40) + '\n');
@@ -48,17 +49,22 @@ function fixture(rules = [], { ready = true } = {}) {
         if (args.includes('--binary')) return ok('audited binary diff');
         if (args.includes('hash-object')) return ok(args.slice(args.indexOf('--') + 1).map(() => 'a'.repeat(40) + '\n').join(''));
         if (args.includes('diff')) return ok('scripts/a.mjs\0');
-        if (['reset', 'ls-files', 'add', 'commit', 'ls-remote', 'push'].some(x => args.includes(x))) return ok();
+        if (['reset', 'checkout', 'switch', 'ls-files', 'add', 'commit', 'ls-remote', 'push'].some(x => args.includes(x))) return ok();
       }
       throw new Error(`Unscripted command: ${call.text}`);
     },
-    lstat: () => ({ mode: 0o100644, isSymbolicLink: () => false, isFile: () => true }),
+    lstat: file => { stats.push(file); return { mode: 0o100644, isSymbolicLink: () => false, isDirectory: () => false, isFile: () => true }; },
+    mkdtemp: async prefix => { const dir = `${prefix}fixture-${temps.length + 1}`; temps.push(dir); return dir; },
+    mkdir: async () => {},
+    rm: async (file, options) => { removals.push({ file, options }); },
     readFile: async file => {
+      reads.push(file);
       if (file.endsWith('fix-ready.mjs')) {
         if (!ready) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
         return '// ready';
       }
       if (file.endsWith('brief.md')) return '# Task: Build the example\nDetailed brief.';
+      if (file.startsWith('/lane/scripts/')) return Buffer.from([0x00, 0xff, 0x61, 0x0a]);
       throw new Error(`Unexpected read ${file}`);
     },
     writeFile: async (file, data) => { writes.push({ file, data }); },
@@ -70,7 +76,7 @@ function fixture(rules = [], { ready = true } = {}) {
     const code = await main([...flags, ...extra], io);
     return { code, result: JSON.parse(output.at(-1)) };
   };
-  return { io, calls, writes, logs, output, run };
+  return { io, calls, writes, logs, output, reads, stats, temps, removals, run };
 }
 const released = f => expect(f.calls.some(c => c.text.includes('lane-pool.mjs release --lane=4 --session=session'))).toBe(true);
 const scopeReleased = f => {
@@ -80,81 +86,259 @@ const scopeReleased = f => {
 };
 const codexCalls = f => f.calls.filter(c => c.text.includes('codex-direct-task.mjs') && !c.args.includes('--review'));
 
-it('forces submodule visibility in every diff, including the complete-index comparison', async () => {
+// The publication boundary starts after the existing scope/test/audit gates. Its
+// input is a declared path list, never the lane's index, refs or Git configuration.
+// These contracts replace checkStagedScope and the old lane-ancestry/index tests.
+const remoteBase = 'e'.repeat(40), publishedSha = 'f'.repeat(40);
+async function publicationFixture({ config = '', laneTip = 'abc123', files = ['scripts/a.mjs'], base = 'origin/main', laneRefs = {} } = {}) {
   const f = fixture();
-  expect((await f.run()).result.ok).toBe(true);
-  const diffs = f.calls.filter(c => c.cmd === 'git' && c.args.includes('diff'));
-  expect(diffs.length).toBeGreaterThan(0);
-  for (const call of diffs) expect(call.args).toContain('--ignore-submodules=none');
+  const s = { opts: { ...parseArgs(flags), base }, lane: { path: '/lane', holder: 'session' },
+    io: f.io, originUrl, startSha: 'abc123', baseSha: 'abc123',
+    brief: '# Task: Build the example\nDetailed brief.', result: { branch: 'lane/example', sha: null } };
+  await checkDiffScope(s);
+  s.files = files;
+  f.calls.length = 0;
+  const exec = f.io.exec;
+  let freshHead = 'd'.repeat(40);
+  const commits = [];
+  const isFresh = c => f.temps.some(dir => c.cwd === dir || c.args.includes(dir));
+  f.io.exec = async (cmd, args, options) => {
+    const call = { cmd, args, ...options };
+    if (cmd === 'git' && isFresh(call) && !args.includes('clone')) {
+      // Log through the shared transcript, then model only the trusted checkout.
+      await exec(cmd, args, options);
+      if (args.includes('rev-parse')) {
+        const ref = args.at(-1);
+        if (ref.includes('origin/')) return ok(`${remoteBase}\n`);
+        if (ref.endsWith('^')) return ok(`${commits.at(-1)?.parent ?? remoteBase}\n`);
+        if (ref.endsWith('^{tree}')) return ok('a'.repeat(40) + '\n');
+        return ok(`${freshHead}\n`);
+      }
+      if (['reset', 'checkout', 'switch'].some(v => args.includes(v))) {
+        if (args.some(a => a === remoteBase || a.includes('origin/'))) freshHead = remoteBase;
+      }
+      if (args.includes('commit')) {
+        commits.push({ sha: publishedSha, parent: freshHead });
+        freshHead = publishedSha;
+      }
+      return args.includes('rev-list') ? ok(`${commits.length}\n`) : ok();
+    }
+    if (cmd === 'git' && args.includes('/lane')) {
+      if (args.includes('config')) { await exec(cmd, args, options); return ok(`${laneConfig}${config}`); }
+      const laneRef = args.at(-1).replace(/\^\{commit\}$/, '');
+      if (args.includes('rev-parse') && Object.hasOwn(laneRefs, laneRef)) {
+        await exec(cmd, args, options); return ok(`${laneRefs[laneRef]}\n`);
+      }
+      if (args.includes('rev-parse') && args.at(-1) === 'HEAD') {
+        await exec(cmd, args, options); return ok(`${laneTip}\n`);
+      }
+    }
+    return exec(cmd, args, options);
+  };
+  const publish = async () => {
+    try { await commitAndPush(s); return { ok: true, ...s.result }; }
+    catch (error) { return { ok: false, stopReason: error.stopReason ?? 'internal-error', detail: error.detail ?? error.message }; }
+  };
+  return { ...f, s, commits, isFresh, publish };
+}
+const pushes = f => f.calls.filter(c => c.cmd === 'git' && c.args.includes('push'));
+const publicationGit = f => f.calls.filter(c => c.cmd === 'git');
+const expectFreshPush = f => {
+  expect(pushes(f)).toHaveLength(1);
+  expect(f.temps).toHaveLength(1);
+  expect(f.isFresh(pushes(f)[0])).toBe(true);
+  expect(pushes(f)[0].args).not.toContain('/lane');
+};
+
+it('replace refs in the lane cannot affect the published commit', async () => {
+  const f = await publicationFixture();
+  // A lane replacement would change the SHA returned without the replacement guard.
+  const exec = f.io.exec;
+  f.io.exec = (cmd, args, options) => cmd === 'git' && args.includes('/lane') &&
+    args.includes('rev-parse') && options.env.GIT_NO_REPLACE_OBJECTS !== '1'
+    ? Promise.resolve(ok('replacement-commit\n')) : exec(cmd, args, options);
+  expect((await f.publish()).ok).toBe(true);
+  expectFreshPush(f);
+  expect(pushes(f)[0].env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+  expect(pushes(f)[0].args).toContain(`${publishedSha}:refs/heads/lane/example`);
+  expect(publicationGit(f).some(c => c.args.includes('/lane'))).toBe(false);
 });
 
-it.each(['diff.ignoreSubmodules', 'submodule.outside.ignore', 'SUBMODULE.nested.name.IGNORE'])('refuses worker submodule suppression through %s', async key => {
-  for (const scope of ['local', 'worktree', 'global']) {
-    let changed = false;
-    const f = fixture([
-      ['codex-direct-task.mjs --task-file', () => { changed = true; return report(); }],
-      ['config --show-scope', () => ok(`${laneConfig}${changed ? `${scope}\0${key}\nall\0` : ''}`)],
-      ['ls-files --stage', () => ok(`160000 ${'a'.repeat(40)} 0\toutside-submodule\0`)],
-    ]);
-    expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
-    expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
-    released(f); scopeReleased(f);
+it('rewritten lane origin and insteadOf cannot redirect the push from the primary origin URL', async () => {
+  for (const config of [
+    'local\0remote.origin.url\nhttps://evil.example/repo.git\0',
+    'local\0url.https://evil.example/.insteadof\nhttps://github.com/\0',
+  ]) {
+    const f = await publicationFixture({ config });
+    expect((await f.publish()).ok).toBe(true);
+    expectFreshPush(f);
+    const clone = f.calls.find(c => c.cmd === 'git' && c.args.includes('clone'));
+    expect(clone.args).toContain(originUrl);
+    const push = pushes(f)[0];
+    expect(push.args.slice(push.args.indexOf('push') + 1).filter(a => !a.startsWith('--')))
+      .toEqual([originUrl, `${publishedSha}:refs/heads/lane/example`]);
+    expect(push.args).not.toContain('origin');
+    expect(push.args.some(a => a.includes('evil.example'))).toBe(false);
   }
 });
 
-it.each(['outside-submodule', 'scripts/lib/submodule'])('rejects index gitlinks even when diff omits %s', async file => {
-  const f = fixture([['ls-files --stage', ok(`160000 ${'a'.repeat(40)} 0\t${file}\0`)]]);
-  expect((await f.run()).result.stopReason).toBe('diff-out-of-scope');
-  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
-  released(f); scopeReleased(f);
+it('lane submodule diff config cannot hide publication bytes and no lane git diff is used', async () => {
+  for (const key of ['diff.ignoreSubmodules', 'submodule.x.ignore']) {
+    const f = await publicationFixture({ config: `local\0${key}\nall\0` });
+    expect((await f.publish()).ok).toBe(true);
+    expectFreshPush(f);
+    expect(f.stats).toContain('/lane/scripts/a.mjs');
+    expect(f.reads).toEqual(['/lane/scripts/a.mjs']);
+    const applied = f.writes.filter(w => f.temps.some(dir => w.file.startsWith(`${dir}/`)));
+    expect(applied).toHaveLength(1);
+    expect(applied[0].file).toBe(path.join(f.temps[0], 'scripts/a.mjs'));
+    expect(Buffer.isBuffer(applied[0].data)).toBe(true);
+    expect(applied[0].data).toEqual(Buffer.from([0x00, 0xff, 0x61, 0x0a]));
+    expect(publicationGit(f).some(c => c.args.includes('/lane'))).toBe(false);
+    const add = f.calls.find(c => c.cmd === 'git' && c.args.includes('add'));
+    expect(f.isFresh(add)).toBe(true);
+    expect(add.args.slice(add.args.indexOf('add'))).toEqual(['add', '--', 'scripts/a.mjs']);
+  }
 });
 
-it.each([red(), { status: 0 }, ok('100644 missing fields\0'), ok(`100644 ${'a'.repeat(40)} 0\tscripts/a.mjs`)])('fails closed on unreadable or incomplete index modes (%j)', async response => {
-  const f = fixture([['ls-files --stage', response]]);
-  expect((await f.run()).result.stopReason).toBe('diff-out-of-scope');
-  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+it('ancestor and extra lane commits never reach the push: one commit has the fresh remote base as parent', async () => {
+  const f = await publicationFixture({ laneTip: 'worker-add-then-remove-tip' });
+  expect((await f.publish()).ok).toBe(true);
+  expectFreshPush(f);
+  expect(f.commits).toEqual([{ sha: publishedSha, parent: remoteBase }]);
+  expect(f.calls.filter(c => c.cmd === 'git' && c.args.includes('commit'))).toHaveLength(1);
+  expect(pushes(f)[0].args).toContain(`${publishedSha}:refs/heads/lane/example`);
+  expect(publicationGit(f).some(c => c.args.some(a => a.includes('worker-add-then-remove-tip')))).toBe(false);
 });
 
-it('refuses worker commits even when their net diff cancels before the scoped edit', async () => {
-  let workerCommitted = false;
-  const f = fixture([
-    ['codex-direct-task.mjs --task-file', () => { workerCommitted = true; return report(); }],
-    ['rev-parse HEAD', () => ok(workerCommitted ? 'worker-removal-commit\n' : 'abc123\n')],
-  ]);
-  expect((await f.run()).result.stopReason).toBe('changed-after-audit');
-  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
-  released(f); scopeReleased(f);
+it('push.followTags in lane config is inert: push disables tags and names only one branch refspec', async () => {
+  const f = await publicationFixture({ config: 'local\0push.followTags\ntrue\0' });
+  expect((await f.publish()).ok).toBe(true);
+  expectFreshPush(f);
+  const push = pushes(f)[0];
+  expect(push.args).toContain('--no-tags');
+  expect(push.args).toContain('--no-follow-tags');
+  for (const flag of ['--tags', '--follow-tags', '--mirror', '--all']) expect(push.args).not.toContain(flag);
+  expect(push.args.slice(push.args.indexOf('push') + 1).filter(a => !a.startsWith('--')))
+    .toEqual([originUrl, `${publishedSha}:refs/heads/lane/example`]);
+  expect(push.args.some(a => a.includes('refs/tags/'))).toBe(false);
+});
+
+it('remote-only base is resolved in the fresh trusted clone and ignores a bogus local lane ref', async () => {
+  const f = await publicationFixture({ base: 'lane/predecessor',
+    laneRefs: { 'lane/predecessor': 'b'.repeat(40) } });
+  expect((await f.publish()).ok).toBe(true);
+  expectFreshPush(f);
+  const resolutions = publicationGit(f).filter(c => c.args.includes('rev-parse') &&
+    c.args.some(a => a.includes('origin/lane/predecessor')));
+  expect(resolutions.length).toBeGreaterThan(0);
+  expect(resolutions.every(f.isFresh)).toBe(true);
+  expect(f.commits).toEqual([{ sha: publishedSha, parent: remoteBase }]);
+  expect(publicationGit(f).some(c => c.args.includes('/lane'))).toBe(false);
 });
 
 it.each([
-  ['rev-parse HEAD^', ok('other-parent\n')],
-  ['rev-list --count abc123..HEAD', ok('2\n')],
-  ['rev-parse abc123^', ok('other-parent\n')],
-  ['rev-list --count abc123..abc123', ok('2\n')],
-  ...['rev-parse HEAD^', 'rev-list --count abc123..HEAD', 'rev-parse abc123^', 'rev-list --count abc123..abc123'].flatMap(command =>
-    [red(), { status: 0 }, ok('')].map(response => [command, response])),
-])('refuses changed or unreadable commit ancestry: %s (%j)', async (command, response) => {
-  const f = fixture([[command, response]]);
-  expect((await f.run()).result.stopReason).toBe('changed-after-audit');
-  expect(f.calls.some(c => c.args.includes('commit'))).toBe(true);
-  expect(f.calls.some(c => c.args.includes('ls-remote') || c.args.includes('push'))).toBe(false);
+  ['symlink', { isSymbolicLink: () => true, isDirectory: () => false, isFile: () => false }],
+  ['gitlink/directory', { isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false }],
+  ['non-regular entry', { isSymbolicLink: () => false, isDirectory: () => false, isFile: () => false }],
+])('rejects an exported %s with diff-out-of-scope and never reads its bytes or pushes', async (_, stat) => {
+  const f = await publicationFixture();
+  f.io.lstat = file => { f.stats.push(file); return { mode: 0o100644, ...stat }; };
+  const result = await f.publish();
+  expect(result).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope' });
+  expect(f.stats).toContain('/lane/scripts/a.mjs');
+  expect(f.reads).toEqual([]);
+  expect(pushes(f)).toHaveLength(0);
+  expect(f.calls.some(c => c.args.includes('commit'))).toBe(false);
 });
 
-it('refuses extra ancestors when HEAD changes after the post-commit history checks', async () => {
-  const f = fixture([
-    ['rev-parse HEAD', (call, n) => call.args.includes('HEAD^') || n < 3 ? ok('abc123\n') : ok('worker-tip\n')],
-    ['rev-parse worker-tip^', ok('abc123\n')],
-    ['rev-list --count abc123..worker-tip', ok('2\n')],
-  ]);
-  expect((await f.run()).result.stopReason).toBe('changed-after-audit');
-  expect(f.calls.some(c => c.args.includes('worker-tip^'))).toBe(true);
-  expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
+it('rejects an out-of-scope export path with diff-out-of-scope before reading or staging it', async () => {
+  for (const file of ['outside.mjs', '../outside.mjs', '/outside.mjs']) {
+    const f = await publicationFixture({ files: [file] });
+    expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope' });
+    expect(f.reads).toEqual([]);
+    expect(f.stats).toEqual([]);
+    expect(pushes(f)).toHaveLength(0);
+    expect(f.calls.some(c => c.args.includes('add') || c.args.includes('commit'))).toBe(false);
+  }
 });
 
-it.each([red(), { status: 0 }, ok('')])('fails closed when pre-commit HEAD cannot be read (%j)', async response => {
-  const f = fixture([['rev-parse HEAD', (_, n) => n === 0 ? ok('abc123\n') : response]]);
-  expect((await f.run()).result.stopReason).toBe('changed-after-audit');
-  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
+it.each(['lstat', 'readFile'])('fails closed with diff-out-of-scope when export %s is unreadable', async method => {
+  const f = await publicationFixture();
+  f.io[method] = () => { throw new Error('unreadable export'); };
+  expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope' });
+  expect(pushes(f)).toHaveLength(0);
+});
+
+it('every fresh-clone git call pins the exact security env and hooks path, and commit has a fixed identity', async () => {
+  const identities = [];
+  for (const worker of ['Worker One', 'Worker Two']) {
+    const f = await publicationFixture({ config: `local\0user.name\n${worker}\0local\0user.email\nworker@evil.example\0` });
+    expect((await f.publish()).ok).toBe(true);
+    const git = publicationGit(f).filter(c => c.args.includes('clone') || f.isFresh(c));
+    expect(git.some(c => c.args.includes('clone'))).toBe(true);
+    expect(publicationGit(f).some(c => c.args.includes('/lane'))).toBe(false);
+    for (const call of git) {
+      expect(call.env).toMatchObject({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1' });
+      expect(call.args.some((arg, i) => arg === '-c' && call.args[i + 1] === 'core.hooksPath=/dev/null')).toBe(true);
+    }
+    const commit = git.find(c => c.args.includes('commit'));
+    const config = Object.fromEntries(commit.args.flatMap((arg, i) => arg === '-c' ? [commit.args[i + 1].split(/=(.*)/s).slice(0, 2)] : []));
+    expect(config['user.name']).toEqual(expect.any(String));
+    expect(config['user.email']).toEqual(expect.any(String));
+    expect(config['user.name'].trim()).not.toBe('');
+    expect(config['user.email']).toContain('@');
+    expect(config['user.name']).not.toBe(worker);
+    expect(config['user.email']).not.toBe('worker@evil.example');
+    identities.push([config['user.name'], config['user.email']]);
+  }
+  expect(identities[0]).toEqual(identities[1]);
+});
+
+it.each([false, true])('removes the fresh throwaway clone after publication (push failure=%s)', async fails => {
+  const f = fixture();
+  const exec = f.io.exec;
+  let removedAt;
+  const rm = f.io.rm;
+  f.io.rm = async (...args) => { removedAt = f.calls.length; return rm(...args); };
+  f.io.exec = async (cmd, args, options) => {
+    const result = await exec(cmd, args, options);
+    return cmd === 'git' && args.includes('push') && fails ? red('push refused') : result;
+  };
+  const { result } = await f.run();
+  expect(result).toMatchObject(fails ? { ok: false, stopReason: 'push-failed' } : { ok: true });
+  expect(f.temps).toHaveLength(1);
+  expect(f.removals).toContainEqual({ file: f.temps[0], options: { recursive: true, force: true } });
+  expect(removedAt).toBeGreaterThan(f.calls.findIndex(c => c.args.includes('push')));
+  expect(f.removals.some(r => r.file === '/lane' || r.file === '/repo')).toBe(false);
+  released(f); scopeReleased(f);
+});
+
+it('scope-claim ttl-hours covers waitMs and the claim remains held until finally on success and failure', async () => {
+  const waitMs = 49 * 60 * 60 * 1000 + 1;
+  for (const fails of [false, true]) {
+    const f = fixture();
+    const exec = f.io.exec;
+    const held = () => {
+      expect(f.calls.some(c => c.text.includes('free-scope-cli.mjs register'))).toBe(true);
+      expect(f.calls.some(c => c.text.includes('free-scope-cli.mjs release'))).toBe(false);
+    };
+    f.io.exec = async (cmd, args, options) => {
+      if (args.some(a => a.includes('heavy-admission')) || args.includes('--review') || args.includes('push')) held();
+      const result = await exec(cmd, args, options);
+      return args.includes('push') && fails ? red('push refused') : result;
+    };
+    const { result } = await f.run([`--wait-ms=${waitMs}`]);
+    expect(result).toMatchObject(fails ? { ok: false, stopReason: 'push-failed' } : { ok: true });
+    const claim = f.calls.find(c => c.text.includes('free-scope-cli.mjs register'));
+    const ttl = claim.args.find(a => a.startsWith('--ttl-hours='));
+    expect(ttl).toBeDefined();
+    expect(Number(ttl.split('=')[1]) * 3600000).toBeGreaterThanOrEqual(waitMs);
+    const releases = f.calls.filter(c => c.text.includes('free-scope-cli.mjs release'));
+    expect(releases).toHaveLength(1);
+    expect(f.calls.indexOf(releases[0])).toBeGreaterThan(f.calls.findIndex(c => c.args.includes('push')));
+    scopeReleased(f);
+  }
 });
 
 it('resolves a remote-only base once and resets to its pinned commit', async () => {
@@ -210,48 +394,6 @@ async function withPublicationRepo(run) {
     await run({ repo, git, commit, startSha, f });
   } finally { rmSync(repo, { recursive: true, force: true }); }
 }
-
-it('refuses a worker-hidden out-of-scope gitlink and never pushes (real Git)', async () => {
-  await withPublicationRepo(async ({ repo, git, startSha, f }) => {
-    const exec = f.io.exec;
-    f.io.exec = async (cmd, args, options) => {
-      if (args[0] === 'scripts/codex-direct-task.mjs' && !args.includes('--review')) {
-        writeFileSync(path.join(repo, 'scripts/a.mjs'), 'scoped edit\n');
-        git(['config', 'diff.ignoreSubmodules', 'all']);
-        git(['update-index', '--add', '--cacheinfo', `160000,${startSha},outside-submodule`]);
-        expect(git(['diff', '--name-only', startSha])).toBe('scripts/a.mjs\n');
-      }
-      return exec(cmd, args, options);
-    };
-    const { result } = await f.run();
-    expect(['diff-out-of-scope', 'unsafe-git-config']).toContain(result.stopReason);
-    expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
-    released(f); scopeReleased(f);
-  });
-});
-
-it('refuses worker add/remove ancestor commits with only a scoped net diff (real Git)', async () => {
-  await withPublicationRepo(async ({ repo, git, commit, startSha, f }) => {
-    const exec = f.io.exec;
-    f.io.exec = async (cmd, args, options) => {
-      if (args[0] === 'scripts/codex-direct-task.mjs' && !args.includes('--review')) {
-        writeFileSync(path.join(repo, 'outside.txt'), 'outside history\n');
-        git(['add', '--', 'outside.txt']);
-        const added = commit('outside addition', startSha);
-        git(['rm', '--', 'outside.txt']);
-        commit('outside removal', added);
-        writeFileSync(path.join(repo, 'scripts/a.mjs'), 'scoped edit\n');
-        expect(git(['diff', '--name-only', startSha])).toBe('scripts/a.mjs\n');
-        expect(git(['rev-list', '--count', `${startSha}..HEAD`]).trim()).toBe('2');
-      }
-      return exec(cmd, args, options);
-    };
-    const { result } = await f.run();
-    expect(result.stopReason).toBe('changed-after-audit');
-    expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
-    released(f); scopeReleased(f);
-  });
-});
 
 it('resets to origin/lane/predecessor when no local predecessor exists (real Git)', async () => {
   await withPublicationRepo(async ({ repo, git, startSha, f }) => {
@@ -375,65 +517,6 @@ it.each([red(), ok(''), ok(' \n'), { status: 0 }])('fails closed before the work
   released(f); scopeReleased(f);
 });
 
-it('refuses remote redirects at every worker, test and audit boundary', async () => {
-  const entries = [
-    ['remote.origin.url', 'https://evil.example/x.git'],
-    ['remote.origin.pushurl', 'https://evil.example/x.git'],
-    ['remote.other.url', originUrl],
-    ['remote.other.pushurl', 'https://evil.example/x.git'],
-    ['url.https://evil.example/.insteadof', 'https://github.com/'],
-    ['url.https://evil.example/.pushinsteadof', 'https://github.com/'],
-    ['url.https://evil.example/.unknown', 'value'],
-  ];
-  for (const boundary of ['codex-direct-task.mjs --task-file', 'heavy-admission', 'codex-direct-task.mjs --review']) {
-    for (const scope of ['local', 'worktree', 'global']) {
-      for (const [key, value] of entries) {
-        let poisoned = false;
-        const f = fixture([
-          [boundary, () => { poisoned = true; return boundary.includes('codex') ? report() : ok(); }],
-          ['config --show-scope', () => ok(`${laneConfig}${poisoned ? `${scope}\0${key}\n${value}\0` : ''}`)],
-        ]);
-        expect((await f.run()).result.stopReason, `${boundary}: ${scope} ${key}`).toBe('unsafe-git-config');
-        expect(f.calls.some(c => c.args.includes('add') || c.args.includes('ls-remote') || c.args.includes('push'))).toBe(false);
-        released(f); scopeReleased(f);
-      }
-    }
-  }
-});
-
-it.each(['unchanged', 'remote', 'insteadOf', 'pushInsteadOf'])('checks real lane config after worker mutation (%s) before publication', async kind => {
-  const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-origin-'));
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
-  try {
-    execFileSync('git', ['-C', repo, 'init', '--quiet', '--template='], { env });
-    const configFile = path.join(repo, '.git/config');
-    const baseline = `[remote "origin"]\n\turl = ${originUrl}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\tfetch = ^refs/heads/ops/*\n`;
-    writeFileSync(configFile, baseline);
-    const f = fixture([
-      ['config --show-scope', (call) => spawnSync('git', ['-C', repo, ...call.args.slice(2)], {
-        encoding: 'utf8', env: { ...call.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
-      })],
-      ['codex-direct-task.mjs --task-file', () => {
-        writeFileSync(configFile, kind === 'unchanged' ? baseline : kind === 'remote'
-          ? '[remote "origin"]\n\turl = https://evil.example/x.git\n'
-          : `${baseline}[url "https://evil.example/"]\n\t${kind} = https://github.com/\n`);
-        return report();
-      }],
-    ]);
-    const { result } = await f.run();
-    expect(result.ok).toBe(kind === 'unchanged');
-    const publication = f.calls.filter(c => c.args.includes('ls-remote') || c.args.includes('push'));
-    if (kind === 'unchanged') {
-      expect(publication).toHaveLength(2);
-      for (const call of publication) expect(call.args).toContain(originUrl);
-    } else {
-      expect(result.stopReason).toBe('unsafe-git-config');
-      expect(publication).toHaveLength(0);
-    }
-    released(f); scopeReleased(f);
-  } finally { rmSync(repo, { recursive: true, force: true }); }
-});
-
 it.each([false, true])('neutralizes inherited fsmonitor commands on a real read-only Git diff (changed=%s)', async changed => {
   const names = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
   const saved = names.map(name => process.env[name]);
@@ -534,33 +617,11 @@ it.each([false, true])('preflights the loader before any lane or publication eff
   }
 });
 
-it('checks the actual committed content before publishing hook changes', async () => {
-  const f = fixture([['rev-parse abc123^{tree}', ok('b'.repeat(40) + '\n')]]);
-  const { result } = await f.run();
-  expect(result.ok).toBe(false);
-  expect(result.stopReason).toBe('changed-after-audit');
-  expect(f.calls.some(c => c.args.includes('commit'))).toBe(true);
-  expect(f.calls.find(c => c.args.includes('abc123^{tree}')).args).toContain('--no-replace-objects');
-  expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
-});
-
-it('fails closed on missing snapshots and unreadable committed-tree evidence', async () => {
-  for (const command of ['write-tree', 'rev-parse abc123^{tree}']) {
-    for (const response of [red(), { status: 0 }, ok('invalid-tree')]) {
-      const f = fixture([[command, response]]);
-      const { result } = await f.run();
-      expect(result.stopReason).toBe(command === 'write-tree' ? 'commit-failed' : 'changed-after-audit');
-      expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
-      released(f); scopeReleased(f);
-    }
-  }
-});
-
 it('publishes the checked commit SHA when HEAD moves during remote branch selection', async () => {
   let head = 'abc123', published;
   const f = fixture([
     ['ls-remote', () => { head = 'different-commit'; return ok(); }],
-    [`push ${originUrl}`, call => {
+    [' push ', call => {
       const source = call.args.at(-1).split(':')[0];
       published = source === 'HEAD' ? head : source;
       return ok();
@@ -599,16 +660,27 @@ it('happy path orders gates, captures one JSON line, uses session env and releas
   expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1);
   expect(f.output).toHaveLength(1);
   expect(f.output[0].split('\n')).toHaveLength(2);
-  const expected = ['scripts/operations/run.mjs prototype-load --help', 'free-scope-cli.mjs check', 'free-scope-cli.mjs register', 'lane-pool.mjs acquire', 'remote get-url origin', 'rev-parse --verify origin/main^{commit}', 'reset --hard', 'rev-parse HEAD', 'codex-direct-task.mjs --task-file', 'diff --name-only', 'ls-files', 'diff --binary', 'heavy-admission.mjs run', 'diff --name-only', 'ls-files', 'diff --binary', 'codex-direct-task.mjs --review', 'diff --name-only', 'ls-files', 'diff --binary', 'add --', 'rev-parse HEAD', 'ls-files --stage -z', 'diff --cached --name-only --no-renames', 'diff --quiet --exit-code --no-ext-diff --no-textconv --ignore-submodules=none --', 'diff --name-only', 'ls-files', 'diff --binary', 'write-tree', 'commit -m', 'rev-parse HEAD^', 'rev-list --count abc123..HEAD', 'rev-parse HEAD', 'rev-parse abc123^', 'rev-list --count abc123..abc123', 'rev-parse abc123^{tree}', 'ls-remote', `push ${originUrl}`, 'fix-ready.mjs mark', 'scripts/operations/run.mjs prototype-load', 'lane-pool.mjs release', 'free-scope-cli.mjs release'];
-  const commands = f.calls.filter(c => !(c.cmd === 'git' && c.args.includes('config')));
-  expect(commands).toHaveLength(expected.length);
-  expected.forEach((part, i) => expect(commands[i].text).toContain(part));
+  const gates = [
+    c => c.text.includes('free-scope-cli.mjs register'),
+    c => c.text.includes('lane-pool.mjs acquire'),
+    c => c.args.includes('get-url'),
+    c => c.text.includes('codex-direct-task.mjs --task-file'),
+    c => c.text.includes('heavy-admission'),
+    c => c.args.includes('--review'),
+    c => c.cmd === 'git' && c.args.includes('add'),
+    c => c.cmd === 'git' && c.args.includes('commit'),
+    c => c.cmd === 'git' && c.args.includes('push'),
+    c => c.text.includes('fix-ready.mjs mark'),
+    c => c.args.includes('prototype-load') && !c.args.includes('--help'),
+    c => c.text.includes('lane-pool.mjs release'),
+    c => c.text.includes('free-scope-cli.mjs release'),
+  ].map(match => f.calls.findIndex(match));
+  expect(gates.every((index, i) => index >= 0 && (!i || index > gates[i - 1]))).toBe(true);
   expect(f.calls.every(c => c.args.every(a => !a.includes('--force') && !a.includes('--allow-conflict')))).toBe(true);
-  expect(f.calls.some(c => c.args.includes('checkout'))).toBe(false);
-  for (const part of ['reset --hard', 'commit -m']) expect(f.calls.find(c => c.text.includes(part)).env.LANE_SESSION).toBe('session');
-  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/lane', '--no-replace-objects', 'push', originUrl, 'abc123:refs/heads/lane/example']);
+  expect(f.calls.find(c => c.args.includes('reset')).env.LANE_SESSION).toBe('session');
+  expect(f.calls.find(c => c.args.includes('push')).args).toContain('abc123:refs/heads/lane/example');
   const add = f.calls.find(c => c.args.includes('add') && c.cmd === 'git');
-  expect(add.args).toEqual(['-C', '/lane', '--no-replace-objects', 'add', '--', 'scripts/a.mjs']);
+  expect(add.args.slice(add.args.indexOf('add'))).toEqual(['add', '--', 'scripts/a.mjs']);
   expect(f.calls.find(c => c.args.includes('commit')).args).toContain('Build the example');
   expect(f.calls.find(c => c.text.includes('heavy-admission')).cwd).toBe('/lane');
   expect(f.calls.find(c => c.text.includes('codex-direct-task')).cwd).toBe('/repo');
@@ -657,7 +729,7 @@ const failures = [
   ['audit-weakened', 40, [['codex-direct-task.mjs --review', report({ lastMessage: 'WEAKENED: deleted guard' })]], true],
   ['audit-failed', 41, [['codex-direct-task.mjs --review', red()]], true],
   ['commit-failed', 50, [['commit -m', red()]], true],
-  ['push-failed', 51, [[`push ${originUrl}`, red()]], true],
+  ['push-failed', 51, [[' push ', red()]], true],
   ['branch-name-exhausted', 52, [['ls-remote', ok('abc refs/heads/occupied')]], true],
   ['register-failed', 60, [['scripts/operations/run.mjs prototype-load', c => c.args.includes('--help') ? ok(loaderHelp) : red('overlay conflict')]], true],
   ['internal-error', 99, [['diff --name-only', () => { throw new Error('boom'); }]], true],
@@ -841,10 +913,8 @@ it.each([
   { untracked: true, change: false, mode: 0o755, name: 'unchanged executable' },
   { untracked: true, change: false, mode: 0o644, nextMode: 0o600, name: 'non-Git permission change' },
   { untracked: true, change: false, mode: 0o644, nextMode: 0o654, name: 'group execute bit is not a Git mode change' },
-  { untracked: true, change: false, link: 'missing-target', name: 'dangling symlink' },
-  { untracked: true, change: false, link: '../target-directory', name: 'directory symlink' },
   { untracked: true, change: true, link: 'missing-target', name: 'changed dangling symlink' },
-])('fingerprints audited content before staging: untracked=$untracked, changed=$change, $name (real Git)', async ({ untracked, change, link, mode, nextMode }) => {
+])('fingerprints audited content and leaves the lane index untouched: untracked=$untracked, changed=$change, $name (real Git)', async ({ untracked, change, link, mode, nextMode }) => {
   const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-audit-'));
   const git = args => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
   try {
@@ -896,13 +966,7 @@ it.each([
     } else {
       expect(code).toBe(0); expect(result.ok).toBe(true);
       expect(f.calls.some(c => c.args.includes('commit'))).toBe(true);
-      expect(git(['diff', '--cached', '--name-only', emptyTree])).toBe('scripts/a.mjs\n');
-      if (link) {
-        expect(git(['ls-files', '--stage'])).toMatch(/^120000 /);
-        expect(git(['show', ':scripts/a.mjs'])).toBe(link);
-      } else if (mode !== undefined) {
-        expect(git(['ls-files', '--stage'])).toMatch(mode === 0o755 ? /^100755 / : /^100644 /);
-      }
+      expect(git(['diff', '--cached', '--name-only', untracked ? emptyTree : baseline])).toBe('');
     }
     released(f); scopeReleased(f);
   } finally { rmSync(repo, { recursive: true, force: true }); }
@@ -941,20 +1005,6 @@ it.each([undefined, -1, NaN, '100644', 0.5])('fails closed on invalid untracked 
   expect(result.stopReason).toBe('changed-after-audit');
   expect(result.detail).toContain('Cannot read untracked audit entries');
   expect(f.calls.some(c => ['add', 'commit', 'push'].some(v => c.args.includes(v)))).toBe(false);
-  released(f); scopeReleased(f);
-});
-it.each(['content', 'mode'])('rechecks the %s fingerprint immediately before committing', async change => {
-  let changed = false;
-  const f = fixture([
-    ['ls-files --others', ok('scripts/a.mjs\0')],
-    ['diff --quiet', () => { changed = true; return ok(); }],
-    ['diff --binary', () => ok(changed && change === 'content' ? 'changed contents at the same path' : 'audited contents')],
-  ]);
-  f.io.lstat = () => ({ mode: changed && change === 'mode' ? 0o100755 : 0o100644, isSymbolicLink: () => false, isFile: () => true });
-  const { code, result } = await f.run();
-  expect(code).toBe(23); expect(result.stopReason).toBe('changed-after-audit');
-  expect(f.calls.some(c => c.args.includes('add'))).toBe(true);
-  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
   released(f); scopeReleased(f);
 });
 it('fails closed on unreadable or incomplete content fingerprint evidence', async () => {
@@ -998,97 +1048,13 @@ it('rejects out-of-scope files staged by tests before auditing', async () => {
   expect(f.calls.some(c => c.args.includes('--review') || c.args.includes('commit') || c.args.includes('push'))).toBe(false);
   released(f); scopeReleased(f);
 });
-it('checks the complete index even when a test-staged file has no net working-tree diff', async () => {
-  let stagedByTests = false;
-  const f = fixture([
-    ['heavy-admission', () => { stagedByTests = true; return ok(); }],
-    // Test staged an outside file, then restored its working-tree contents.
-    ['diff --cached', () => ok(`scripts/a.mjs\0${stagedByTests ? 'outside.mjs\0' : ''}`)],
-  ]);
-  const { code, result } = await f.run();
-  expect(code).toBe(22);
-  expect(result).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope', detail: ['outside.mjs'] });
-  const stagedCheck = f.calls.findIndex(c => c.args.includes('--cached'));
-  expect(stagedCheck).toBeGreaterThan(f.calls.findIndex(c => c.cmd === 'git' && c.args.includes('add')));
-  expect(f.calls[stagedCheck].args).toContain('--no-renames');
-  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
-  released(f); scopeReleased(f);
-});
-it('rejects an in-scope file staged by tests then restored in the working tree (real Git)', async () => {
-  const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-index-'));
-  const git = args => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
-  try {
-    git(['init', '--quiet']);
-    mkdirSync(path.join(repo, 'scripts/lib'), { recursive: true });
-    writeFileSync(path.join(repo, 'scripts/a.mjs'), 'original A\n');
-    writeFileSync(path.join(repo, 'scripts/lib/b.mjs'), 'original B\n');
-    git(['add', '--', 'scripts/a.mjs', 'scripts/lib/b.mjs']);
-    // A tree object supplies the baseline without creating a commit.
-    const baseline = git(['write-tree']).trim();
-    writeFileSync(path.join(repo, 'scripts/a.mjs'), 'tested A\n');
-    const f = fixture([['heavy-admission', () => {
-      writeFileSync(path.join(repo, 'scripts/lib/b.mjs'), 'untested staged B\n');
-      git(['add', '--', 'scripts/lib/b.mjs']);
-      writeFileSync(path.join(repo, 'scripts/lib/b.mjs'), 'original B\n');
-      return ok();
-    }]]);
-    const exec = f.io.exec;
-    f.io.exec = async (cmd, args, options) => {
-      if (cmd === 'git' && ['diff', 'ls-files', 'add'].some(v => args.includes(v))) {
-        // Preserve the hermetic transcript while executing these gates against real Git.
-        await exec(cmd, args, options);
-        const realArgs = args.slice(2).map(v => v === 'abc123' ? baseline : v);
-        // This commit-free fixture uses the baseline tree in place of HEAD.
-        if (realArgs.includes('--cached')) realArgs.push(baseline);
-        try { return ok(git(realArgs)); }
-        catch (error) { return { status: error.status, stdout: error.stdout, stderr: error.stderr }; }
-      }
-      return exec(cmd, args, options);
-    };
-    const { code, result } = await f.run();
-    expect(git(['diff', '--name-only', baseline])).toBe('scripts/a.mjs\n');
-    expect(git(['diff', '--cached', '--name-only', baseline])).toBe('scripts/a.mjs\nscripts/lib/b.mjs\n');
-    expect(code).toBe(22); expect(result.stopReason).toBe('diff-out-of-scope');
-    expect(result.detail).toContain('Staged file list differs');
-    expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1);
-    expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
-    released(f); scopeReleased(f);
-  } finally { rmSync(repo, { recursive: true, force: true }); }
-});
-it('rejects missing audited staged paths before committing', async () => {
-  const f = fixture([['diff --cached', ok()]]);
-  const { code, result } = await f.run();
-  expect(code).toBe(22); expect(result.stopReason).toBe('diff-out-of-scope');
-  expect(result.detail).toContain('Staged file list differs');
-  expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
-  released(f); scopeReleased(f);
-});
-it('fails closed when staged contents differ from the worktree or cannot be compared', async () => {
-  for (const response of [red(), { status: 128 }, { status: null, error: new Error('spawn failed') }]) {
-    const f = fixture([['diff --quiet', response]]);
-    const { code, result } = await f.run();
-    expect(code).toBe(22); expect(result.stopReason).toBe('diff-out-of-scope');
-    expect(result.detail).toContain('inspect the lane index before retrying');
-    expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
-    released(f); scopeReleased(f);
-  }
-});
-it('refuses unreadable or incomplete staged evidence before committing', async () => {
-  for (const response of [red(), { status: 0 }, ok('scripts/a.mjs')]) {
-    const f = fixture([['diff --cached', response]]);
-    const { code, result } = await f.run();
-    expect(code).toBe(22);
-    expect(result.stopReason).toBe('diff-out-of-scope');
-    expect(result.detail).toContain('inspect the lane index before retrying');
-    expect(f.calls.some(c => c.args.includes('commit') || c.args.includes('push'))).toBe(false);
-    released(f); scopeReleased(f);
-  }
-});
 it('uses branch suffix -2 on collision and never forces the push', async () => {
   const f = fixture([['ls-remote', (_, n) => n ? ok() : ok('existing')]]);
   const { result } = await f.run(['--edge-clone=/edge']);
   expect(result.branch).toBe('lane/example-2');
-  expect(f.calls.find(c => c.args.includes('push')).args).toEqual(['-C', '/lane', '--no-replace-objects', 'push', originUrl, 'abc123:refs/heads/lane/example-2']);
+  const push = f.calls.find(c => c.args.includes('push'));
+  expect(push.args).toContain('abc123:refs/heads/lane/example-2');
+  expect(push.args).not.toContain('--force');
   expect(f.calls.find(c => c.text.includes('run.mjs prototype-load') && !c.args.includes('--help')).args).toContain('--branch=lane/example-2');
 });
 it('skips missing fix-ready and omits prototype-load without edge-clone', async () => {
