@@ -9,6 +9,13 @@
  * --apply sets the variable before cancelling and rerunning affected runs. Never restores
  * the paid runner. Incomplete discovery requires operator inspection, never a partial repair.
  *
+ * Completed discovery enumerates runs created within the lookback window. Deliberate
+ * residual: GitHub's created filter cannot enumerate a run CREATED before the window
+ * and re-run inside it once completed. Queued and in-progress reruns are covered by
+ * the complete, age-independent queued/in_progress lists, so only completed old
+ * reruns remain outside coverage. A false fallback costs a reversible switch to
+ * the free runner (this script itself never switches back).
+ *
  * Usage: node scripts/ci/runner-fallback.mjs --repo=owner/repo [--apply] [--json]
  * Offline: --input=jobs.json --runner-var=label [--now=ISO] (dry-run only).
  */
@@ -24,7 +31,7 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export const RUNNER_FALLBACK_POLICY = Object.freeze({ queuedMinutes: 10, fallbackRunner: 'ubuntu-latest' });
 const CANCEL_BOUNDS = Object.freeze({ cancelPollAttempts: 6, cancelPollIntervalMs: 1000 });
-const READ_BOUNDS = Object.freeze({ completedLookbackMinutes: 120, maxRuns: 40, maxJobs: 100, maxCalls: 160, maxAttemptsPerCall: 5 });
+const READ_BOUNDS = Object.freeze({ completedLookbackMinutes: 120, maxCompletedPages: 5, maxRuns: 40, maxJobs: 100, maxCalls: 160, maxAttemptsPerCall: 5 });
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0;
 const runnerLabel = value => typeof value === 'string' && /^ubuntu-(?:latest|\d{2}\.04)(?:-arm)?$/.test(value);
 // Match needs-you-feed field bounds; sanitize every nested string before publication.
@@ -38,7 +45,7 @@ const epoch = value => typeof value === 'string' && value ? Date.parse(value) : 
 export function resolveRunnerFallbackSettings({ env = process.env, platform, tool, log } = {}) {
   const envValues = {};
   for (const [key, name] of Object.entries({ queuedMinutes: 'QUEUED_MINUTES', fallbackRunner: 'RUNNER',
-    completedLookbackMinutes: 'COMPLETED_LOOKBACK_MINUTES', maxRuns: 'MAX_RUNS', maxJobs: 'MAX_JOBS', maxCalls: 'MAX_CALLS', maxAttemptsPerCall: 'MAX_ATTEMPTS_PER_CALL',
+    completedLookbackMinutes: 'COMPLETED_LOOKBACK_MINUTES', maxCompletedPages: 'MAX_COMPLETED_PAGES', maxRuns: 'MAX_RUNS', maxJobs: 'MAX_JOBS', maxCalls: 'MAX_CALLS', maxAttemptsPerCall: 'MAX_ATTEMPTS_PER_CALL',
     cancelPollAttempts: 'CANCEL_POLL_ATTEMPTS', cancelPollIntervalMs: 'CANCEL_POLL_INTERVAL_MS' })) {
     const raw = env[`WE_RUNNER_FALLBACK_${name}`];
     if (raw !== undefined) envValues[key] = key === 'fallbackRunner' ? raw : /^\d+$/.test(raw) ? Number(raw) : NaN;
@@ -46,7 +53,7 @@ export function resolveRunnerFallbackSettings({ env = process.env, platform, too
   const result = cascadePolicy('runnerFallback', tool, {
     standard: { ...RUNNER_FALLBACK_POLICY, ...READ_BOUNDS, ...CANCEL_BOUNDS }, platform, env, envValues, log,
     valid: { queuedMinutes: positiveInteger, fallbackRunner: runnerLabel,
-      completedLookbackMinutes: positiveInteger, maxRuns: positiveInteger, maxJobs: positiveInteger, maxCalls: positiveInteger, maxAttemptsPerCall: positiveInteger,
+      completedLookbackMinutes: positiveInteger, maxCompletedPages: positiveInteger, maxRuns: positiveInteger, maxJobs: positiveInteger, maxCalls: positiveInteger, maxAttemptsPerCall: positiveInteger,
       cancelPollAttempts: positiveInteger, cancelPollIntervalMs: positiveInteger },
   });
   return { ...result.value, sources: result.sources };
@@ -116,7 +123,10 @@ function restExec(cmd, args, { charge, maxAttemptsPerCall, ...options }) {
   const repo = flag('--repo');
   let request = args;
   if (args[0] === 'run' && args[1] === 'list') {
-    request = ['api', `repos/${repo}/actions/workflows/ci.yml/runs?status=${flag('--status')}&per_page=${flag('--limit')}`];
+    const query = new URLSearchParams({ status: flag('--status'), per_page: flag('--limit') });
+    if (args.includes('--created')) query.set('created', flag('--created'));
+    if (args.includes('--page')) query.set('page', flag('--page'));
+    request = ['api', `repos/${repo}/actions/workflows/ci.yml/runs?${query}`];
   } else if (args[0] === 'variable' && args[1] === 'set') {
     request = ['api', '--method', 'PATCH', `repos/${repo}/actions/variables/WE_SHARD_RUNNER`, '-f', 'name=WE_SHARD_RUNNER', '-f', `value=${flag('--body')}`];
   } else if (args[0] === 'run' && ['cancel', 'rerun'].includes(args[1])) {
@@ -229,18 +239,38 @@ export async function runRunnerFallback(options = {}) {
     let jobs = options.jobs;
     if (!offline) {
       const runs = new Map();
-      // Active runs are age-independent. Completed reruns can have old creation
-      // dates: inspect the latest page, then select by activity on the client.
+      // Active runs are age-independent; completed runs require every filtered page.
       const limit = Math.min(settings.maxRuns, 100);
       const cutoff = now - settings.completedLookbackMinutes * 60000;
       for (const status of ['queued', 'in_progress', 'completed']) {
-        const response = await json(['run', 'list', '--repo', repo, '--workflow', 'ci.yml', '--status', status,
-          '--limit', String(limit), '--json', status === 'completed' ? 'databaseId,status,updatedAt,startedAt' : 'databaseId,status']);
-        let list = response.workflow_runs;
+        let list;
         if (status === 'completed') {
-          if (!Array.isArray(list) || !Number.isSafeInteger(response.total_count)
-            || response.total_count < 0 || list.length !== Math.min(response.total_count, limit)) {
-            throw new Error('Unreadable completed run page; inspect CI manually or raise maxRuns');
+          list = [];
+          let total;
+          const ids = new Set();
+          for (let page = 1; page <= settings.maxCompletedPages; page++) {
+            const response = await json(['run', 'list', '--repo', repo, '--workflow', 'ci.yml', '--status', status,
+              '--limit', '100', '--created', `>=${new Date(cutoff).toISOString()}`, '--page', String(page),
+              '--json', 'databaseId,status,updatedAt,startedAt']);
+            if (!Number.isSafeInteger(response.total_count) || response.total_count < 0
+              || (total !== undefined && response.total_count !== total)) {
+              throw new Error('Unreadable completed run total; inspect CI manually');
+            }
+            total = response.total_count;
+            if (Math.ceil(total / 100) > settings.maxCompletedPages) {
+              throw new Error('Completed coverage exceeds maxCompletedPages; inspect CI manually or raise maxCompletedPages');
+            }
+            const rows = response.workflow_runs;
+            if (!Array.isArray(rows) || rows.length !== Math.min(100, total - list.length)) {
+              throw new Error('Run read bound reached or unreadable completed run page; inspect CI manually or raise maxRuns');
+            }
+            for (const run of rows) {
+              const id = Number(run?.databaseId ?? run?.id);
+              if (!positiveInteger(id) || ids.has(id)) throw new Error('Unreadable or duplicate completed run ID; inspect CI manually');
+              ids.add(id);
+            }
+            list.push(...rows);
+            if (list.length === total) break;
           }
           const activity = run => {
             const times = [run?.updated_at ?? run?.updatedAt, run?.run_started_at ?? run?.startedAt]
@@ -250,13 +280,15 @@ export async function runRunnerFallback(options = {}) {
             }
             return Math.max(...times);
           };
-          const recent = list.map(run => activity(run) >= cutoff);
-          if (list.length === limit && recent.at(-1)) {
-            throw new Error('Run read bound reached with recent completed activity; inspect CI manually or raise maxRuns');
+          // Validate all returned activity, even when it does not affect the decision.
+          list.forEach(activity);
+        } else {
+          const response = await json(['run', 'list', '--repo', repo, '--workflow', 'ci.yml', '--status', status,
+            '--limit', String(limit), '--json', 'databaseId,status']);
+          list = response.workflow_runs;
+          if (!complete(response, list) || list.length >= limit) {
+            throw new Error('Run read bound reached or unreadable runs; inspect CI manually or raise maxRuns');
           }
-          list = list.filter((_, index) => recent[index]);
-        } else if (!complete(response, list) || list.length >= limit) {
-          throw new Error('Run read bound reached or unreadable runs; inspect CI manually or raise maxRuns');
         }
         for (const run of list) {
           const id = Number(run.databaseId ?? run.id);
@@ -264,7 +296,7 @@ export async function runRunnerFallback(options = {}) {
           runs.set(id, run);
         }
       }
-      if (runs.size > settings.maxRuns) throw new Error('Run bound exceeded; inspect CI manually or raise maxRuns');
+      if (runs.size > settings.maxRuns) throw new Error('Run read bound exceeded; inspect CI manually or raise maxRuns');
       jobs = [];
       for (const id of runs.keys()) {
         const body = await api(`repos/${repo}/actions/runs/${id}/jobs?per_page=${Math.min(settings.maxJobs, 100)}`);

@@ -302,6 +302,25 @@ describe('runner fallback policy cascade', () => {
       expect(log.mock.calls.flat().join('\n')).toMatch(/invalid.*completedLookbackMinutes/);
     });
 
+  it('resolves maxCompletedPages through all cascade layers with provenance and rejects invalid overrides', () => {
+    for (const [platform, tool, env, value, source] of [
+      [null, undefined, {}, 5, 'standard'],
+      [{ maxCompletedPages: 4 }, undefined, {}, 4, 'platform'],
+      [{ maxCompletedPages: 4 }, { maxCompletedPages: 3 }, {}, 3, 'tool'],
+      [{ maxCompletedPages: 4 }, { maxCompletedPages: 3 }, { WE_RUNNER_FALLBACK_MAX_COMPLETED_PAGES: '2' }, 2, 'env'],
+    ]) {
+      const log = vi.fn();
+      expect(resolveRunnerFallbackSettings({ platform, tool, env: { ...env, WE_POLICY_CASCADE_LOG: '1' }, log }))
+        .toMatchObject({ maxCompletedPages: value, sources: { maxCompletedPages: source } });
+      expect(log.mock.calls.flat().join('\n')).toContain(`maxCompletedPages=${value} (${source})`);
+    }
+    for (const raw of ['0', '-1', '1.5', 'bad', 'Infinity', '9007199254740992']) {
+      expect(resolveRunnerFallbackSettings({ platform: { maxCompletedPages: 4 },
+        env: { WE_RUNNER_FALLBACK_MAX_COMPLETED_PAGES: raw }, log: vi.fn() }))
+        .toMatchObject({ maxCompletedPages: 4, sources: { maxCompletedPages: 'platform' } });
+    }
+  });
+
   it('keeps the only literal threshold and default runner inside the policy defaults object', () => {
     const source = readFileSync(new URL('../runner-fallback.mjs', import.meta.url), 'utf8');
     expect(source.match(/\b10\b/g)).toHaveLength(1);
@@ -556,13 +575,56 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
       expect(existsSync(h.feedPath)).toBe(false);
     });
 
-  it.each([120, 60])('150 old completed runs outside the %s minute activity window do not abort fallback', async lookback => {
+  it.each([false, true])('reads all 150 in-window completed runs over two pages; page-two recent start vetoes fallback (recent=%s)', async recent => {
     const h = harness();
-    const oldRuns = Array.from({ length: 150 }, (_, i) => ({ id: 200 + i, created_at: ago(1440), updated_at: ago(lookback + 1) }));
+    const runs = Array.from({ length: 150 }, (_, i) => ({ id: 200 + i,
+      created_at: ago(60), updated_at: ago(20) }));
+    const pages = [];
+    const readJobs = [];
     const exec = vi.fn((cmd, args, options) => {
       if (args[0] === 'run' && args[1] === 'list' && args.includes('completed')) {
-        expect(args).not.toContain('--created');
-        return JSON.stringify({ total_count: oldRuns.length, workflow_runs: oldRuns.slice(0, 40) });
+        expect(args).toEqual(expect.arrayContaining(['--created', `>=${ago(120)}`, '--limit', '100']));
+        const page = Number(args[args.indexOf('--page') + 1]);
+        pages.push(page);
+        return JSON.stringify({ total_count: runs.length, workflow_runs: runs.slice((page - 1) * 100, page * 100) });
+      }
+      const match = /\/runs\/(\d+)\/jobs/.exec(args[1] ?? '');
+      if (args[0] === 'api' && match && Number(match[1]) >= 200) {
+        const id = Number(match[1]);
+        readJobs.push(id);
+        return JSON.stringify({ total_count: 1, jobs: [job({ runId: id, jobId: id * 100,
+          status: 'completed', createdAt: ago(60), startedAt: ago(recent && id === 349 ? 2 : 30) })] });
+      }
+      return h.exec(cmd, args, options);
+    });
+    const result = await runRunnerFallback({ ...h.options, exec, apply: true,
+      settings: { ...SETTINGS, maxRuns: 200, maxJobs: 200, maxCalls: 250 } });
+    expect(result.error).toBeUndefined();
+    expect(pages).toEqual([1, 2]);
+    expect(readJobs).toEqual(runs.map(run => run.id));
+    if (recent) {
+      expect(result).toMatchObject({ decision: 'no-action', planned: { setVariable: null, cancel: [], rerun: [] } });
+      expect(result.reason).toMatch(/recent start/i);
+      expect(h.mutations).toEqual([]);
+      expect(snapshot(h.dir)).toEqual([]);
+    } else {
+      expect(result).toMatchObject({ decision: 'fallback', applied: true, rerunResults: [{ runId: 101, rerun: true }] });
+      expect(h.mutations.map(args => args[1])).toEqual(['set', 'cancel', 'rerun']);
+      expect(feedLines(h.feedPath)).toHaveLength(1);
+      expect(exec.mock.calls.filter(([, args]) => args[1]?.includes('/jobs?'))).toHaveLength(151);
+    }
+  });
+
+  it.each([120, 60])('created filter excludes old runs outside the %s minute window from counts and job reads', async lookback => {
+    const h = harness();
+    const oldRuns = Array.from({ length: 150 }, (_, i) => ({ id: 200 + i,
+      created_at: ago(1440), updated_at: ago(1) }));
+    const exec = vi.fn((cmd, args, options) => {
+      if (args[0] === 'run' && args.includes('completed')) {
+        expect(args).toEqual(expect.arrayContaining(['--created', `>=${ago(lookback)}`, '--limit', '100', '--page', '1']));
+        const cutoff = Date.parse(args[args.indexOf('--created') + 1].slice(2));
+        const workflow_runs = oldRuns.filter(run => Date.parse(run.created_at) >= cutoff);
+        return JSON.stringify({ total_count: workflow_runs.length, workflow_runs });
       }
       return h.exec(cmd, args, options);
     });
@@ -575,11 +637,60 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
     expect(exec.mock.calls.filter(([, args]) => args[1]?.includes('/jobs?'))).toHaveLength(1);
   });
 
-  it.each([40, 41])('full completed page with oldest activity in-window fails closed with operator escalation (total=%s)', async total_count => {
+  it.each([1, 5])('total beyond maxCompletedPages=%s fails closed before any job reads or mutation', async maxCompletedPages => {
+    const h = harness();
+    const exec = vi.fn((cmd, args, options) => {
+      if (args[0] === 'run' && args.includes('completed')) {
+        return JSON.stringify({ total_count: maxCompletedPages * 100 + 1,
+          workflow_runs: Array.from({ length: 100 }, (_, i) => ({ id: 200 + i, updated_at: ago(1) })) });
+      }
+      return h.exec(cmd, args, options);
+    });
+    const result = await runRunnerFallback({ ...h.options, exec, apply: true,
+      settings: { ...SETTINGS, maxCompletedPages } });
+    expect(result).toMatchObject({ decision: 'no-action', applied: false,
+      planned: { setVariable: null, cancel: [], rerun: [] } });
+    expect(result.error).toMatch(/incomplete.*maxCompletedPages.*inspect CI manually or raise maxCompletedPages/);
+    expect(exec.mock.calls.filter(([, args]) => args.includes('completed'))).toHaveLength(1);
+    expect(exec.mock.calls.filter(([, args]) => args[1]?.includes('/jobs?'))).toHaveLength(0);
+    expect(h.mutations).toEqual([]);
+    expect(snapshot(h.dir)).toEqual([]);
+  });
+
+  it.each(['short page', 'changed total', 'duplicate ID', 'missing total'])(
+    'incomplete second completed page fails closed with zero writes: %s', async fault => {
+      const h = harness();
+      const rows = Array.from({ length: 150 }, (_, i) => ({ id: 200 + i, updated_at: ago(20) }));
+      const exec = vi.fn((cmd, args, options) => {
+        if (args[0] === 'run' && args.includes('completed')) {
+          const page = Number(args[args.indexOf('--page') + 1]);
+          const body = { total_count: 150, workflow_runs: rows.slice((page - 1) * 100, page * 100) };
+          if (page === 2) {
+            if (fault === 'short page') body.workflow_runs.pop();
+            if (fault === 'changed total') body.total_count++;
+            if (fault === 'duplicate ID') body.workflow_runs[0] = rows[0];
+            if (fault === 'missing total') delete body.total_count;
+          }
+          return JSON.stringify(body);
+        }
+        return h.exec(cmd, args, options);
+      });
+      const result = await runRunnerFallback({ ...h.options, exec, apply: true,
+        settings: { ...SETTINGS, maxRuns: 200 } });
+      expect(result).toMatchObject({ decision: 'no-action', applied: false,
+        planned: { setVariable: null, cancel: [], rerun: [] } });
+      expect(result.error).toMatch(/incomplete.*inspect CI/i);
+      expect(exec.mock.calls.filter(([, args]) => args.includes('completed'))).toHaveLength(2);
+      expect(exec.mock.calls.filter(([, args]) => args[1]?.includes('/jobs?'))).toHaveLength(0);
+      expect(h.mutations).toEqual([]);
+      expect(snapshot(h.dir)).toEqual([]);
+    });
+
+  it.each([40, 41])('oversized or incomplete completed evidence fails closed with operator escalation (total=%s)', async total_count => {
     const h = harness();
     const exec = vi.fn((cmd, args, options) => {
       if (args[0] === 'run' && args[1] === 'list' && args.includes('completed')) {
-        expect(args).not.toContain('--created');
+        expect(args).toEqual(expect.arrayContaining(['--created', `>=${ago(120)}`, '--limit', '100']));
         return JSON.stringify({ total_count, workflow_runs: Array.from({ length: 40 }, (_, i) =>
           ({ id: 200 + i, created_at: ago(1440), updated_at: ago(1) })) });
       }
@@ -613,7 +724,7 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
     expect(snapshot(h.dir)).toEqual([]);
   });
 
-  it('production REST translation reads the latest completed page without a creation filter', async () => {
+  it('production REST translation uses the completed created filter and explicit pagination', async () => {
     const h = harness({ jobs: [] });
     const gh = vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation((cmd, args, options) => {
       expect(cmd).toBe('gh');
@@ -627,7 +738,7 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
     expect(gh.mock.calls.map(([, args]) => args)).toEqual([
       ['api', `repos/${REPO}/actions/workflows/ci.yml/runs?status=queued&per_page=40`],
       ['api', `repos/${REPO}/actions/workflows/ci.yml/runs?status=in_progress&per_page=40`],
-      ['api', `repos/${REPO}/actions/workflows/ci.yml/runs?status=completed&per_page=40`],
+      ['api', `repos/${REPO}/actions/workflows/ci.yml/runs?status=completed&per_page=100&created=${encodeURIComponent(`>=${ago(120)}`)}&page=1`],
     ]);
     expect(snapshot(h.dir)).toEqual([]);
   });
@@ -659,12 +770,12 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
     [1440, { updated_at: ago(1) }],
     [1440, { updated_at: ago(1440), run_started_at: ago(2) }],
     [1440, { run_started_at: ago(2) }],
-  ])('discovers a completed ci.yml run created %s minutes ago by its recent paid job activity (%j)', async (createdMinutes, activity) => {
+  ])('discovers a completed ci.yml run created %s minutes ago within the configured lookback by recent paid job activity (%j)', async (createdMinutes, activity) => {
     const h = harness();
     const exec = vi.fn((cmd, args, options) => {
       if (args[0] === 'run' && args[1] === 'list' && args.includes('completed')) {
         expect(args).toEqual(['run', 'list', '--repo', REPO, '--workflow', 'ci.yml',
-          '--status', 'completed', '--limit', '40', '--json', 'databaseId,status,updatedAt,startedAt']);
+          '--status', 'completed', '--limit', '100', '--created', `>=${ago(2880)}`, '--page', '1', '--json', 'databaseId,status,updatedAt,startedAt']);
         return JSON.stringify({ total_count: 1, workflow_runs: [{ id: 202, status: 'completed', created_at: ago(createdMinutes), ...activity }] });
       }
       if (args[0] === 'api' && args[1].includes('/runs/202/jobs')) {
@@ -673,7 +784,8 @@ describe('runRunnerFallback (injected gh, temporary feed)', () => {
       }
       return h.exec(cmd, args, options);
     });
-    const result = await runRunnerFallback({ ...h.options, exec, apply: true });
+    const result = await runRunnerFallback({ ...h.options, exec, apply: true,
+      settings: { ...SETTINGS, completedLookbackMinutes: 2880 } });
     expect(result).toMatchObject({ decision: 'no-action', planned: { setVariable: null, cancel: [], rerun: [] } });
     expect(result.reason).toMatch(/recent start/i);
     expect(exec.mock.calls.some(([, args]) => args[1]?.includes('/runs/202/jobs'))).toBe(true);
