@@ -720,6 +720,12 @@ describe('sessionGoneForLease — stale terminal rows give no verdict (PR #5848)
       nowMs: NOW, staleTerminalRows: true, pidAlive: false, claimRunnerAlive: true,
     })).toBe(false);
   });
+
+  it('a live wrapper still returns not-gone before the stale-row no-verdict guard', () => {
+    expect(sessionGoneForLease(fresh({ session: 'fix-5848' }), new Map([['fix-5848', 'stopped']]), {
+      nowMs: NOW, staleTerminalRows: true, pidAlive: false, wrapperAlive: true,
+    })).toBe(false);
+  });
 });
 
 describe('buildLeaseSignalsFor + reapPlan — lane-8 old stopped rounds (PR #5848)', () => {
