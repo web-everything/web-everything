@@ -16,7 +16,7 @@ const lines = [
   { at: '2026-10-22T00:00:00Z', ref: 'fix/b', sha: 'dddddddddddddddddddddddddddddddddddddddd' },
 ].map(JSON.stringify).join('\n');
 const settings = { clones: ['/clones/yes', '/clones/no', '/clones/error', '/clones/missing'] };
-const defaults = { env: {}, home: '/home', cwd: '/repo', settings, readdir: () => [],
+const defaults = { env: {}, home: '/fixture-home', cwd: '/repo', settings, readdir: () => [],
   exec: () => { throw new Error('unexpected plist read'); },
   realpath: path => path, readText: () => lines, isDirectory: path => !path.endsWith('/missing'),
 };
@@ -204,8 +204,8 @@ describe('adoption matrix', () => {
   it('uses env before settings before the built-in log path and reports generic read errors incomplete', () => {
     for (const [env, config, expected] of [
       [{ WE_FIX_READY_PATH: '/env' }, { fixReadyPath: '/file' }, '/env'],
-      [{}, { fixReadyPath: '~/file' }, '/home/file'],
-      [{}, {}, '/home/workspace/.operations/coordination/fix-ready.jsonl'],
+      [{}, { fixReadyPath: '~/file' }, '/fixture-home/file'],
+      [{}, {}, '/fixture-home/workspace/.operations/coordination/fix-ready.jsonl'],
     ]) {
       const paths = [];
       const result = createAdoptionMatrixReader({ ...defaults, env, settings: config,

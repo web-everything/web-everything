@@ -9,7 +9,7 @@ const fixtures = {
   'com.we.fix': { WorkingDirectory: '/clones/we/' },
   'com.we.other': { WorkingDirectory: '/other/we' },
   'com.plateau.drain-daemon': {
-    WorkingDirectory: '/plateau', EnvironmentVariables: { DRAIN_DAEMON_WE_CLONE: '/home/workspace/.lanes/we-drain-daemon/lane-1' },
+    WorkingDirectory: '/plateau', EnvironmentVariables: { DRAIN_DAEMON_WE_CLONE: '/fixture-home/workspace/.lanes/we-drain-daemon/lane-1' },
   },
 };
 const readdir = () => [...Object.keys(fixtures).map(label => `${label}.plist`), 'unrelated.plist', 'notes.txt'];
@@ -25,22 +25,22 @@ const exec = (bin, argv) => {
 
 describe('daemon clone resolver', () => {
   it('discovers WorkingDirectory and the configured drain code clone, deduping paths and retaining every daemon label', () => {
-    const clones = resolveDaemonClones({ env: {}, home: '/home', readdir, exec, readPrototypeSettings });
+    const clones = resolveDaemonClones({ env: {}, home: '/fixture-home', readdir, exec, readPrototypeSettings });
     expect(clones).toEqual([
       { path: '/clones/we', name: 'we', labels: ['com.we.fix', 'com.we.review'] },
-      { path: '/home/workspace/.lanes/we-drain-daemon/code', name: 'code', labels: ['com.plateau.drain-daemon'] },
+      { path: '/fixture-home/workspace/.lanes/we-drain-daemon/code', name: 'code', labels: ['com.plateau.drain-daemon'] },
       { path: '/other/we', name: 'we-2', labels: ['com.we.other'] },
     ]);
   });
 
   it('honors the LaunchAgents env dir, configured extra paths, home expansion and exclusions', () => {
     const seen = [];
-    const clones = resolveDaemonClones({ env: { WE_LAUNCH_AGENTS_DIR: '/agents' }, home: '/home',
+    const clones = resolveDaemonClones({ env: { WE_LAUNCH_AGENTS_DIR: '/agents' }, home: '/fixture-home',
       readdir: dir => { seen.push(dir); return readdir(); }, exec, readPrototypeSettings,
       clones: ['~/extra', '/clones/we'], excludeClones: ['~/workspace/.lanes/we-drain-daemon/code', '/other/we/'],
     });
     expect(seen).toEqual(['/agents']);
-    expect(clones.map(clone => clone.path)).toEqual(['/clones/we', '/home/extra']);
+    expect(clones.map(clone => clone.path)).toEqual(['/clones/we', '/fixture-home/extra']);
     expect(clones[0].labels).toEqual(['com.we.fix', 'com.we.review']);
   });
 
@@ -96,9 +96,9 @@ it('rejects relative extra clone paths without resolving against cwd, retaining 
 
 it('accepts plist clone paths after absolute home expansion', () => {
   const incomplete = [];
-  expect(resolveDaemonClones({ env: {}, home: '/home', readdir: () => ['com.we.review.plist'],
+  expect(resolveDaemonClones({ env: {}, home: '/fixture-home', readdir: () => ['com.we.review.plist'],
     exec: () => JSON.stringify({ WorkingDirectory: '~/clone' }), onIncomplete: reason => incomplete.push(reason),
-  })).toEqual([{ path: '/home/clone', name: 'clone', labels: ['com.we.review'] }]);
+  })).toEqual([{ path: '/fixture-home/clone', name: 'clone', labels: ['com.we.review'] }]);
   expect(incomplete).toEqual([]);
 });
 
@@ -158,10 +158,10 @@ it.each([{ env: { WE_LAUNCH_AGENTS_DIR: '/configured' } }, { env: {}, launchAgen
 
 it.each([fixtures['com.plateau.drain-daemon'], { WorkingDirectory: '/wrong-clone' },
   { EnvironmentVariables: { DRAIN_DAEMON_WE_CLONE: '' } }])('uses prototype-load code settings rather than drain plist paths (%j)', plist => {
-  expect(resolveDaemonClones({ env: {}, home: '/home',
+  expect(resolveDaemonClones({ env: {}, home: '/fixture-home',
     readdir: () => ['com.plateau.drain-daemon.plist'], exec: () => JSON.stringify(plist),
     readPrototypeSettings: () => ({ workspaceRoot: '~/custom', daemons: { drain: { clone: 'code-target' } } }),
-  })).toEqual([{ path: '/home/custom/code-target', name: 'code-target', labels: ['com.plateau.drain-daemon'] }]);
+  })).toEqual([{ path: '/fixture-home/custom/code-target', name: 'code-target', labels: ['com.plateau.drain-daemon'] }]);
 });
 
 it.each([
@@ -183,10 +183,10 @@ it.each([
 it.each(['relative/clone', '.', '', ' ', null, undefined, 42, {}])(
   'reports an invalid exclusion %j while retaining clones and honoring valid exclusions', entry => {
     const incomplete = [];
-    const clones = resolveDaemonClones({ env: {}, home: '/home', readdir: () => [],
-      clones: ['/home/keep', '/home/excluded'], excludeClones: [entry, '~/excluded'],
+    const clones = resolveDaemonClones({ env: {}, home: '/fixture-home', readdir: () => [],
+      clones: ['/fixture-home/keep', '/fixture-home/excluded'], excludeClones: [entry, '~/excluded'],
       onIncomplete: reason => incomplete.push(reason),
     });
-    expect(clones).toEqual([{ path: '/home/keep', name: 'keep', labels: [] }]);
+    expect(clones).toEqual([{ path: '/fixture-home/keep', name: 'keep', labels: [] }]);
     expect(incomplete).toEqual(['excluded clone path missing or invalid']);
   });
