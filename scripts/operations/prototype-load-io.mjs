@@ -18,7 +18,8 @@ const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
 const VITEST_BOUNDS = Object.freeze({ testTimeout: 30000, hookTimeout: 60000, teardownTimeout: 10000 });
-const ABSOLUTE_POSIX_PATH = /(?<![\w.<])\/[^/\s"'()]+(?:\/[^/\s"'()]+)+/g;
+const ABSOLUTE_POSIX_PATH = /(?<![\w.<>])\/[^\s"'()<>]+/g;
+const ANSI_SEQUENCE = /\x1b\[[0-9;?]*[ -\/]*[@-~]/g;
 const CHILD_PROCESS_NOTE = 'child processes may outlive the timeout; heavy-admission owns them';
 // prototypeLoad.combinedTest settings, resolved and recorded through the usual cascade.
 // Defaults: ten minutes for admission, twenty minutes before SIGTERM, 16 MiB child output.
@@ -127,7 +128,7 @@ async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, 
       return outcome = { ok: proven, command, result: `${summary}${proven ? '' : '; JSON evidence incomplete or counts mismatch'}`,
         testCount: tests.length, ...(proven ? {} : { reason: 'tests-unproven' }) };
     } catch (e) {
-      const output = `${e.stdout || ''}${e.stderr || ''}`.replaceAll(worktree, '<worktree>').replaceAll(repo, '<repo>').replaceAll(env.HOME || homedir(), '<home>').replace(ABSOLUTE_POSIX_PATH, '<path>').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+      const output = `${e.stdout || ''}${e.stderr || ''}`.replace(ANSI_SEQUENCE, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').replaceAll(worktree, '<worktree>').replaceAll(repo, '<repo>').replaceAll(env.HOME || homedir(), '<home>').replace(ABSOLUTE_POSIX_PATH, '<path>').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
       return outcome = { ok: false, command, result: `exit ${Number.isInteger(e.status) ? e.status : 'unknown'}: ${output.slice(-400)}`, testCount: tests.length, reason: 'tests-failed' };
     }
   } finally {
@@ -307,7 +308,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           passed = ok === true;
           failure = `combined-tests-failed: ${reason || 'tests-failed'}`;
         } catch (e) {
-          let message = String(e.message || e).replace(/[\p{Cc}\p{Cf}]/gu, '');
+          let message = String(e.message || e).replace(ANSI_SEQUENCE, '').replace(/[\p{Cc}\p{Cf}]/gu, '');
           const roots = [[repo, '<repo>'], [env.HOME, '<home>'], [homedir(), '<home>'],
             [env.TMPDIR, '<tmp>'], [tmpdir(), '<tmp>'], ['/private/tmp', '<tmp>'], ['/tmp', '<tmp>']]
             .filter(([root]) => typeof root === 'string' && root.length > 1)

@@ -329,6 +329,11 @@ describe('default combined-tree test proof', () => {
       expect(mutations(f, 'remove')).toEqual([]);
     },
   );
+  it('redacts ANSI-prefixed and single-component absolute paths from failed-run output', async () => {
+    const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), { status: 1, stderr: '\u001b[31m/srv/private/file and /secret end' }) });
+    expect(result.result).not.toMatch(/srv|private\/file|\/secret/);
+    expect(result.result).not.toMatch(/\u001b/);
+  });
   it('redacts home and other absolute paths from failed-run output', async () => {
     const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), { status: 1, stderr: 'at /Users/someone/secret/dir/file.mjs:3 and /private/var/x/y' }) });
     expect(result.result).not.toMatch(/\/Users\/someone|\/private\/var/);
