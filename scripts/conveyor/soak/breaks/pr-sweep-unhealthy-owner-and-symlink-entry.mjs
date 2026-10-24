@@ -144,6 +144,30 @@ export default {
           violations.push({ invariant: 'same-head-publication-count', detail: JSON.stringify({ mode, digest, events, notifications }) });
         }
       }
+      // PR #5856 round 2: retained PR-level refusals cannot age a newly pushed head;
+      // progress must filter every reason group before choosing the current repetition.
+      const oldLines = Array.from({ length: 10 }, (_, i) =>
+        `[${new Date(now - (55 - i) * 60000).toISOString()}] review-daemon: ${repo}#12 not dispatched — old refusal`).join('\n');
+      for (const variant of ['moved-head', 'post-progress', 'agents-offline']) {
+        const currentHead = variant === 'moved-head' ? 'b'.repeat(40) : head;
+        const currentClock = `${key}@${currentHead}|${label}`;
+        const recentLines = Array.from({ length: 6 }, (_, i) =>
+          `[${new Date(now - (18 - i) * 60000).toISOString()}] review-daemon: ${repo}#12 not dispatched — current refusal`).join('\n');
+        const line = variant === 'post-progress' ? `${oldLines}\n[${new Date(now - 20 * 60000).toISOString()}] review-daemon: ${repo}#12 dispatched as session\n${recentLines}` : oldLines;
+        const saved = variant === 'post-progress' ? now - 59 * 60000 : now - 90 * 60000;
+        const report = await runPrSweep({ now, dryRun: true, env: detectorEnv, config: {}, settings: { value, sources: {} },
+          readPrevious: () => ({ stallDetector: { [clock]: saved } }),
+          readPrs: () => [{ ...stalledPr, headRefOid: currentHead }], readQueue: () => ({ ready: [], rulingNeeded: [] }),
+          readSignals: args => collectOwnerSignals({ ...args, readAgents: () => {
+            if (variant === 'agents-offline') throw new Error('agent listing unavailable'); return [];
+          }, readHealth: () => ({}), cloneRoots: () => ['fixture-clone'], listLogs: () => ['review-daemon.log'], readTail: () => line }) });
+        const item = report.stallDetector?.items?.[0];
+        if (variant === 'moved-head' ? report.stallDetector?.stalled !== 0 || report.nextState.stallDetector[currentClock] !== now
+          : variant === 'post-progress' ? item?.repeatCount !== 6 || !item?.repeatingReason.includes('current refusal')
+            : report.stallDetector?.stalled !== 1) {
+          violations.push({ invariant: `detector-${variant}`, detail: JSON.stringify(report.stallDetector) });
+        }
+      }
       const alias = join(root, 'conveyor-link'); symlinkSync(CONVEYOR, alias, 'dir');
       const env = { ...process.env, NODE_NO_WARNINGS: '1' };
       for (const key of ['DAEMON_JOB_ID', 'DAEMON_JOB_ATTEMPT', 'OPERATION_RUNS_DIR']) delete env[key];

@@ -7,7 +7,7 @@ import {
   DETECTOR_DEFAULTS, REMEDIES, detectStalls, normalizeReason, resolveDetectorSettings, runDetector,
 } from '../pr-stall-detector.mjs';
 import { collectOwnerSignals, runPrSweep } from '../pr-sweep.mjs';
-import { publishStalledDigest } from '../pr-stall-digest.mjs';
+import { feedItem, publishStalledDigest } from '../pr-stall-digest.mjs';
 import { replay } from '../../operations/needs-you-feed.mjs';
 
 // runDetector has no settings-reader argument. Keep its real settings resolver while
@@ -37,7 +37,7 @@ const env = (patch = {}) => ({ WE_PLATFORM_PREFERENCES_FILE: 'fixture/platform-p
   WE_PR_STALL_DETECTOR_ENABLED: 'true', WE_PR_STALL_DETECTOR_SAME_LABEL_MINUTES: '60',
   WE_PR_STALL_DETECTOR_REPEATED_REASON_COUNT: '5', ...patch });
 const skips = (count, { reason = REASON, start = NOW - 18 * MINUTE } = {}) => Array.from({ length: count }, (_, i) => ({
-  name: 'review-daemon', at: new Date(start + i * 3 * MINUTE).toISOString(), kind: 'refusal', reason,
+  name: 'review-daemon', head: HEAD, at: new Date(start + i * 3 * MINUTE).toISOString(), kind: 'refusal', reason,
 }));
 const detect = (patch = {}) => detectStalls({ prs: [pr()], daemons: {}, seen: {}, now: NOW, settings: settings(), ...patch });
 const settingsRead = (tool = {}, platform = {}) => path => JSON.stringify({
@@ -151,9 +151,33 @@ describe('detectStalls', () => {
 
   it('moved head resets age and drops the previous seen key', () => {
     const moved = 'b'.repeat(40);
-    const out = detect({ prs: [pr({ headRefOid: moved })], seen: { [key()]: NOW - 540 * MINUTE } });
+    const out = detect({ prs: [pr({ headRefOid: moved })], seen: { [key()]: NOW - 540 * MINUTE },
+      daemons: { [PR_KEY]: skips(10, { start: NOW - 540 * MINUTE }).map(({ head, ...entry }) => entry) } });
     expect(out.items).toEqual([]);
     expect(out.nextSeen).toEqual({ [key(LABEL, moved)]: NOW });
+  });
+
+  it('ignores refusals explicitly attributed to another head', () => {
+    const out = detect({ prs: [pr({ headRefOid: 'b'.repeat(40) })],
+      daemons: { [PR_KEY]: skips(10, { start: NOW - 540 * MINUTE }) } });
+    expect(out.items).toEqual([]);
+    expect(Object.values(out.nextSeen)).toEqual([NOW]);
+  });
+
+  it('unattributed history cannot predate the observed current head across repeated passes', () => {
+    const daemons = { [PR_KEY]: skips(10, { start: NOW - 540 * MINUTE }).map(({ head, ...entry }) => entry) };
+    const first = detect({ daemons });
+    const next = detect({ daemons, now: NOW + MINUTE, seen: first.nextSeen });
+    expect(first.items).toEqual([]);
+    expect(next.items).toEqual([]);
+    expect(next.nextSeen).toEqual({ [key()]: NOW });
+  });
+
+  it('counts unattributed refusals observed during the current head without backdating its clock', () => {
+    const out = detect({ seen: { [key()]: NOW - 20 * MINUTE }, daemons: { [PR_KEY]:
+      skips(6).map(({ head, ...entry }) => entry) } });
+    expect(out.items).toMatchObject([{ repeatCount: 6, stalledMinutes: 20 }]);
+    expect(out.nextSeen[key()]).toBe(NOW - 20 * MINUTE);
   });
 
   it('drops closed PRs and removed labels while preserving current first-seen values', () => {
@@ -210,6 +234,25 @@ describe('detectStalls', () => {
     expect(detect({ daemons: { [PR_KEY]: [...skips(6), progress] } }).items).toHaveLength(1);
   });
 
+  it.each([false, true])('selects a qualifying post-progress group over the dominant old group (reversed=%s)', reversed => {
+    const entries = [...skips(10, { reason: 'old refusal', start: NOW - 55 * MINUTE }),
+      { head: HEAD, at: NOW - 20 * MINUTE, kind: 'progress' },
+      ...skips(6, { reason: 'current refusal' })];
+    const out = detect({ daemons: { [PR_KEY]: reversed ? entries.reverse() : entries } });
+    expect(out.items).toMatchObject([{ repeatingReason: 'current refusal', repeatCount: 6 }]);
+  });
+
+  it('does not add pre-progress occurrences to a post-progress reason count', () => {
+    const out = detect({ daemons: { [PR_KEY]: [...skips(6, { start: NOW - 55 * MINUTE }),
+      { head: HEAD, at: NOW - 20 * MINUTE, kind: 'progress' }, ...skips(2)] } });
+    expect(out.items).toEqual([]);
+  });
+
+  it('another head progress cannot clear current head repetitions', () => {
+    expect(detect({ daemons: { [PR_KEY]: [...skips(6),
+      { head: 'b'.repeat(40), at: NOW, kind: 'progress' }] } }).items).toHaveLength(1);
+  });
+
   it('progress does not clear the independent same-label age rule', () => {
     expect(detect({ seen: { [key()]: NOW - 120 * MINUTE }, daemons: { [PR_KEY]: [
       ...skips(6), { name: 'review-daemon', at: new Date(NOW).toISOString(), kind: 'progress' },
@@ -244,6 +287,18 @@ describe('detectStalls', () => {
       expect(value).not.toContain('[31m');
     }
     expect(item.remedy).toContain('red-team-on-skip not live on review daemon');
+  });
+
+  it('sanitizes PR titles before reporting and feed publication', () => {
+    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz012345';
+    const title = `title\x1b[31m\r\n\x00\u2028\u202e ${secret} --token="private value"`;
+    const item = detect({ prs: [pr({ title })], seen: { [key()]: NOW - 90 * MINUTE } }).items[0];
+    for (const value of [item.title, feedItem(item).title]) {
+      expect(value).not.toMatch(/[\p{Cc}\p{Cf}\u2028\u2029]/u);
+      expect(value).not.toContain(secret);
+      expect(value).not.toContain('private value');
+      expect(value).not.toContain('[31m');
+    }
   });
 
   it.each([null, undefined, {}, true, 'invalid', Infinity, NaN])('rejects unreadable daemon timestamp %j', at => {
@@ -288,6 +343,20 @@ describe('detectStalls', () => {
 });
 
 describe('runDetector', () => {
+  it.each(['head', 'headRefOid'])('preserves explicit health refusal %s attribution through detection', async field => {
+    const signals = await collectOwnerSignals({ prs: [pr()], env: {}, errors: [],
+      readAgents: () => [], cloneRoots: () => [],
+      readHealth: () => ({ daemons: { 'fix-dispatch-daemon': { prRefusals: {
+        'we#5759': { at: NOW - 120 * MINUTE, reason: REASON, [field]: HEAD.toUpperCase() },
+      } }, 'review-daemon': { prRefusals: {
+        'we#5759': { at: NOW - 119 * MINUTE, reason: REASON, [field]: HEAD.toUpperCase() },
+      } } } }) });
+    expect(signals[PR_KEY].daemons[0].head).toBe(HEAD.toUpperCase());
+    const daemons = { [PR_KEY]: signals[PR_KEY].daemons };
+    expect(detect({ daemons }).items).toMatchObject([{ stalledMinutes: 120 }]);
+    expect(detect({ prs: [pr({ headRefOid: 'b'.repeat(40) })], daemons }).items).toEqual([]);
+  });
+
   it.each(['health', 'log-T', 'log-space'])('accepts the collectOwnerSignals %s producer timestamp contract', async source => {
     const errors = [];
     const readSignals = args => collectOwnerSignals({ ...args, env: {}, errors,
@@ -345,7 +414,12 @@ describe('runDetector', () => {
     const readSignals = args => collectOwnerSignals({ ...args, env: {}, errors,
       readAgents: () => [], readHealth: () => ({}), cloneRoots: () => ['fixture-clone'],
       listLogs: () => ['review-daemon.log'], readTail: () => logText });
-    const out = await runDetector({ prs: [pr()], readSignals, seen: {}, now: NOW, env: env(), log: () => {} });
+    // A saved head clock establishes the log window; PR-only history cannot
+    // establish that clock on a first observation of this head.
+    const fresh = await runDetector({ prs: [pr()], readSignals, seen: {}, now: NOW, env: env(), log: () => {} });
+    expect(fresh.items).toEqual([]);
+    expect(fresh.nextSeen[key()]).toBe(NOW);
+    const out = await runDetector({ prs: [pr()], readSignals, seen: { [key()]: start }, now: NOW, env: env(), log: () => {} });
     expect(errors).toEqual([]);
     expect(out.items).toHaveLength(1);
     expect(out.items[0]).toMatchObject({ pr: 5759, head: HEAD, label: LABEL, repeatCount: 181 });
@@ -440,6 +514,44 @@ describe('runPrSweep detector integration', () => {
     expect(options.persist.mock.results.at(-1).value.nextState.stallDetector).toEqual(saved);
     expect(options.stallDigest.mock.calls[0][0].incomplete).toBe(true);
     expect(options.stallDigest.mock.calls[0][0].items).toEqual([]);
+  });
+
+  it('a failing agent listing alone does not suppress detection or mark the digest incomplete', async () => {
+    const options = sweepOptions({ readSignals: args => collectOwnerSignals({ ...args,
+      readAgents: () => { throw new Error('agents offline'); }, readHealth: () => ({}),
+      cloneRoots: () => ['fixture-clone'], listLogs: () => [], readTail: () => '' }) });
+    const report = await runPrSweep(options);
+    expect(report.stallDetector.stalled).toBe(1);
+    expect(report.errors.join(' ')).toContain('agents offline');
+    expect(options.stallDigest.mock.calls[0][0]).toMatchObject({ incomplete: false,
+      items: [expect.objectContaining({ action: 'stalled-detector' })] });
+  });
+
+  it.each(['health', 'roots', 'logs', 'tail'])('a failed %s signal read still preserves clocks and marks the digest incomplete', async source => {
+    const fail = () => { throw new Error('unreadable'); };
+    const options = sweepOptions({ readSignals: args => collectOwnerSignals({ ...args,
+      readAgents: () => [], readHealth: source === 'health' ? fail : () => ({}),
+      cloneRoots: source === 'roots' ? fail : () => ['fixture-clone'],
+      listLogs: source === 'logs' ? fail : () => ['review-daemon.log'], readTail: source === 'tail' ? fail : () => '' }) });
+    const report = await runPrSweep(options);
+    expect(report.nextState.stallDetector).toEqual({ [key()]: NOW - 90 * MINUTE });
+    expect(options.stallDigest.mock.calls[0][0]).toMatchObject({ incomplete: true, items: [] });
+  });
+
+  it('disabled detector and off sweep call the digest with enabled=false to clear open stalls', async () => {
+    const options = sweepOptions({ env: env({ WE_PR_STALL_DETECTOR_ENABLED: 'false' }) });
+    await runPrSweep(options);
+    expect(options.stallDigest).toHaveBeenCalledTimes(1);
+    expect(options.stallDigest.mock.calls[0][1].enabled).toBe(false);
+  });
+
+  it.each(['not due', 'throws'])('a %s stall sweep does not publish and still persists the detector clock', async outcome => {
+    const options = sweepOptions({ readPrevious: () => ({}), readSignals: async () => ({ [PR_KEY]: { daemons: [] } }),
+      stallSweep: async () => { if (outcome === 'throws') throw new Error('sweep failed'); return { skipped: 'not due' }; } });
+    const report = await runPrSweep(options);
+    expect(options.stallDigest).not.toHaveBeenCalled();
+    expect(report.nextState.stallDetector).toEqual({ [key()]: NOW });
+    expect(options.persist.mock.results.at(-1).value.nextState.stallDetector).toEqual({ [key()]: NOW });
   });
 
   it('preserves only the errored PR clock when daemon data is malformed', async () => {

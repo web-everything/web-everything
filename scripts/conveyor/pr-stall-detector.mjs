@@ -101,22 +101,40 @@ export function detectStalls({ prs, daemons = {}, seen = {}, now = Date.now(), s
       if (!blocking.length) continue;
       const entries = Object.hasOwn(daemons, key) ? daemons[key] : [];
       if (!Array.isArray(entries)) throw new Error('daemon signals are not an array');
-      const groups = new Map(); let progress = -Infinity;
+      const savedClocks = [...new Set(blocking)].map(label => seen[`${key}@${head}|${label}`]).filter(v => v !== undefined);
+      if (savedClocks.some(v => !Number.isFinite(v))) throw new Error('invalid first-seen clock');
+      const observedSince = Math.min(now, ...savedClocks);
+      const eligible = []; let progress = -Infinity;
       for (const entry of entries) {
         // Health refusals carry epoch milliseconds; log entries carry ISO dates (T or space separator).
         const at = typeof entry?.at === 'number' ? entry.at
           : typeof entry?.at === 'string' && /^\d{4}-\d{2}-\d{2}[T ]/.test(entry.at) ? Date.parse(entry.at) : NaN;
         if (!Number.isFinite(at) || !['progress', 'refusal', 'diagnostic'].includes(entry?.kind)) throw new Error('unreadable daemon timestamp or kind');
+        // PR-level logs do not identify a head. Only observations made during this
+        // head's saved lifetime may count; historical backdating requires attribution.
+        const entryHead = entry.head ?? entry.headRefOid;
+        const attributed = typeof entryHead === 'string' && entryHead.toLowerCase() === head;
+        if (entryHead != null ? !attributed : at < observedSince) continue;
         if (entry.kind === 'progress') { progress = Math.max(progress, at); continue; }
         if (typeof entry.reason !== 'string') throw new Error('unreadable daemon reason');
         const reason = message(entry.reason);
-        const normalized = normalizeReason(reason);
-        const group = groups.get(normalized) ?? { count: 0, first: at, last: at, raw: reason };
-        group.count++; group.first = Math.min(group.first, at); group.last = Math.max(group.last, at);
-        groups.set(normalized, group);
+        eligible.push({ at, reason, attributed });
       }
-      const top = [...groups.values()].sort((a, b) => b.count - a.count)[0];
-      const repeating = [...groups.values()].filter(g => g.count > 1);
+      const groupReasons = rows => {
+        const groups = new Map();
+        for (const { at, reason } of rows) {
+          const normalized = normalizeReason(reason);
+          const group = groups.get(normalized) ?? { count: 0, first: at, raw: reason };
+          group.count++; group.first = Math.min(group.first, at);
+          groups.set(normalized, group);
+        }
+        return [...groups.values()].sort((a, b) => b.count - a.count);
+      };
+      // Count only occurrences after the newest progress, then select the reason.
+      // Keep historical age independent: progress clears repetition, not label age.
+      const currentTop = groupReasons(eligible.filter(e => e.at > progress))[0];
+      const top = currentTop ?? groupReasons(eligible)[0];
+      const repeating = groupReasons(eligible.filter(e => e.attributed)).filter(g => g.count > 1);
       const earliest = repeating.length ? Math.min(...repeating.map(g => g.first)) : now;
       const candidates = [], clocks = {};
       for (const label of new Set(blocking)) {
@@ -125,11 +143,11 @@ export function detectStalls({ prs, daemons = {}, seen = {}, now = Date.now(), s
         const since = Math.min(seen[clock] ?? now, earliest);
         clocks[clock] = since;
         if (now - since <= settings.sameLabelMinutes * 60000
-          && !(top?.count > settings.repeatedReasonCount && progress <= top.last)) continue;
+          && !(currentTop?.count > settings.repeatedReasonCount)) continue;
         const stalledMinutes = Math.max(0, Math.floor((now - since) / 60000));
         const reasonLine = top?.raw ?? 'no repeating reason observed';
         candidates.push({ lane: 'operator', repo: pr.repo, pr: pr.number, head, state: 'stalled-same-head',
-          title: pr.title, label, stalledMinutes, reason: `${label} on same head ${stalledMinutes} min; repeating: ${reasonLine}`,
+          title: message(pr.title ?? ''), label, stalledMinutes, reason: `${label} on same head ${stalledMinutes} min; repeating: ${reasonLine}`,
           repeatingReason: top?.raw ?? '', repeatCount: top?.count ?? 0,
           remedy: REMEDIES.find(r => (!r.label || r.label === label) && r.match.test(reasonLine)).remedy,
           command: `gh pr view ${pr.number} --repo ${pr.repo} --comments`,
