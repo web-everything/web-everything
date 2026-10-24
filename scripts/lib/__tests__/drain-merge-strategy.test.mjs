@@ -608,7 +608,8 @@ describe('merge-ai-prs hook wiring', () => {
   it('the enqueue\'s own land lock also refuses on contention, and a refused enqueue is skipped, not merged', () => {
     const at = src.indexOf('const landLock = withLandWriteLock(');
     const block = src.slice(at, src.indexOf('if (landLock.contended', at));
-    expect(block).toContain('mergeStrategy.enqueues(c.repo) ? { runUnlockedOnContention: false } : {}');
+    // xym8nt4 — a direct merge also refuses while card grouping may hold (its in-lock group re-check must be serialized).
+    expect(block).toContain('(mergeStrategy.enqueues(c.repo) || cardGrouping.mayHold()) ? { runUnlockedOnContention: false } : {}');
     expect(block).toContain('if (landLock.ran === false)');
     expect(src.slice(src.indexOf('if (landLock.ran === false)'), src.indexOf('if (landLock.contended', at))).toMatch(/decision = 'skip'; continue;/);
   });
