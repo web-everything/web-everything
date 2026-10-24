@@ -28,7 +28,7 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
 export const queueLabels = labels => (labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
 export function sendBackReason(labels) {
   const names = queueLabels(labels);
-  const hold = ['review:changes', 'review:human', 'review:pending'].find(l => names.includes(l));
+  const hold = ['review:changes', 'review:human', 'review:pending', 'red-team:blocked', 'red-team:pending'].find(l => names.includes(l));
   return hold ? `state is ${hold}` : !names.includes('ready-to-merge') ? 'ready-to-merge was removed' : null;
 }
 
