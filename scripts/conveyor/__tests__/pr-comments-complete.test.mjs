@@ -62,6 +62,17 @@ describe('complete PR comments', () => {
     expect(errors).toEqual([4017]);
   });
 
+  it.each([0, LIST_COMMENTS_PAGE_SIZE - 1])('skips a PR when the complete read returns only %i comments, fewer than the listed page', count => {
+    const onError = vi.fn();
+    const short = { number: 1, comments: [] };
+    const incomplete = { number: 4017, comments: firstPage };
+    const out = enrichPrsWithCompleteComments([short, incomplete], {
+      repo, readComments: () => firstPage.slice(0, count), onError,
+    });
+    expect(out).toEqual([short]);
+    expect(onError).toHaveBeenCalledExactlyOnceWith(incomplete, expect.any(Error));
+  });
+
   it('short threads are untouched and never re-read', () => {
     const prs = [{ number: 2, comments: filler(3) }];
     expect(enrichPrsWithCompleteComments(prs, { readComments: () => { throw new Error('no'); } })).toEqual(prs);
@@ -81,7 +92,7 @@ describe('complete PR comments', () => {
 it('annotates short and complete threads through the injected reader', () => {
   const seen = [];
   const annotate = (pr) => { seen.push(pr.number); return { ...pr, annotated: true }; };
-  const out = enrichPrsWithCompleteComments([{ number: 1, comments: [] }, { number: 2, comments: filler(100) }], { annotate, readComments: () => [] });
+  const out = enrichPrsWithCompleteComments([{ number: 1, comments: [] }, { number: 2, comments: filler(100) }], { annotate, readComments: () => filler(100) });
   expect(seen).toEqual([1, 2]);
   expect(out.every((pr) => pr.annotated)).toBe(true);
 });
@@ -101,7 +112,7 @@ it('builds red-main context once, lazily, including markers on complete threads'
   }))));
   const readConfig = vi.fn(() => ({ hold: true, maxSessions: 3, windowHours: 6, redMainDiscount: 'on',
     redMainWindows: [{ start: '2026-10-13T21:33:48Z', end: '2026-10-13T23:32:06Z' }] }));
-  const options = { repo, readRows, readConfig, readComments: () => [comment] };
+  const options = { repo, readRows, readConfig, readComments: () => [...filler(100), comment] };
   enrichPrsWithCompleteComments([{ number: 1, comments: [] }], options);
   expect(readRows).not.toHaveBeenCalled();
   const result = enrichPrsWithCompleteComments([

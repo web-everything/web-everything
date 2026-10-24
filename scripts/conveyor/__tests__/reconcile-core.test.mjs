@@ -56,7 +56,7 @@ import { NEGOTIATION_ROUND_CAP } from '../../lib/jury-core.mjs';
 import { defaultReadPrs, defaultReadAgents, PR_LIST_JSON_FIELDS, PR_LIST_LIMIT, enrichPrsWithIgnoredRulings } from '../reconcile-pass.mjs';
 import { reviewSessionSlug } from '../review-session-slug.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
-import { buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
+import { buildClearedHumanMarker, headEverHumanCleared, parseLatestHumanClearedSha, buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
 import { classifyPr } from '../../progress-board.mjs';
 import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
 import { readFileSync } from 'node:fs';
@@ -4163,5 +4163,55 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     const result = plan({ comments }, options);
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toMatchObject([{ kind: 'cap-exhausted', capKind: 'stale-base-rebase' }]);
+  });
+});
+
+describe('human clearance and complete evidence before review dispatch (live #5530)', () => {
+  const HEAD = '7596f3621'.padEnd(40, 'a');
+  const OLD = 'b'.repeat(40);
+  const accept = { author: AUTOMATION, createdAt: new Date(NOW - ACCEPT_LABEL_GRACE_MS - 60_000).toISOString(),
+    body: `✅ review — accepted\n\n${buildReviewedShaMarker(HEAD)}` };
+  const escalation = { author: AUTOMATION, createdAt: new Date(NOW - 30_000).toISOString(),
+    body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\ntest-gaming suspected — tests removed' };
+  const prFor = branch => pr1563({ number: 5530, headRefOid: HEAD,
+    labels: lbl(branch === 'relabelOwed' ? 'review:pending' : 'review:human'),
+    comments: branch === 'convert-advisory' ? [accept, escalation] : [accept] });
+  const run = pr => planReconcile({ prs: [pr], agents: [], now: NOW });
+  const expected = branch => branch === 'convert-advisory'
+    ? { kind: 'convert-advisory' } : { kind: 'review', [branch]: true };
+
+  describe.each(['advisoryOwed', 'convert-advisory'])('%s', branch => {
+    it.each([
+      ['current-head latest', HEAD, AUTOMATION, true],
+      ['current-head followed by plain accept', HEAD, AUTOMATION, true],
+      ['older-head', OLD, AUTOMATION, false],
+      ['untrusted current-head', HEAD, { login: 'drive-by' }, false],
+    ])('honors %s clearance before considering advisory dispatch', (_name, sha, author, cleared) => {
+      const clearance = { author, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('chalbert')}` };
+      expect(parseLatestHumanClearedSha([clearance])).toBe(author === AUTOMATION ? sha : null);
+      const pr = prFor(branch);
+      if (_name === 'current-head latest') pr.comments.push(clearance);
+      else pr.comments.unshift(clearance); // A later plain accept cannot erase clearance.
+      expect(headEverHumanCleared(pr.comments, HEAD)).toBe(cleared);
+      const plan = run(pr);
+      if (cleared) {
+        expect(plan.dispatch).toEqual([]);
+        expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'already-reviewed-head', prNumber: 5530 })]);
+      } else {
+        expect(plan.dispatch).toEqual([expect.objectContaining(expected(branch))]);
+      }
+    });
+  });
+
+  it.each(['relabelOwed', 'advisoryOwed', 'convert-advisory'])('refuses %s on an unproved full comment page', branch => {
+    const pr = prFor(branch);
+    pr.comments.push(...Array.from({ length: 100 - pr.comments.length }, (_, i) => ({ body: `discussion ${i}` })));
+    // Control: this is the requested dispatch path when the reader proves completeness.
+    expect(run({ ...pr, commentsComplete: true }).dispatch).toEqual([expect.objectContaining(expected(branch))]);
+    for (const commentsComplete of [undefined, false]) {
+      const plan = run({ ...pr, commentsComplete });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'thread-truncated', prNumber: 5530 })]);
+    }
   });
 });

@@ -3179,6 +3179,26 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
   });
 
+  it.each(['empty', 'shorter', 'same-size non-covering', 'longer non-covering'])(
+    'CLI rearm refuses a %s paginated array without proof of the embedded page', shape => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
+      const pagedComments = shape === 'empty' ? [] : shape === 'shorter' ? comments.slice(0, -1)
+        : [...comments.slice(1), { id: 'IC_other', body: 'other discussion' },
+          ...(shape === 'longer non-covering' ? [{ id: 'IC_extra', body: 'extra discussion' }] : [])];
+      for (const fresh of [false, true]) {
+        const readComments = vi.fn(() => pagedComments);
+        const result = fresh
+          ? run(['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`], [],
+            { readComments, freshState: { comments } })
+          : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+        expect(readComments).toHaveBeenCalledOnce();
+        expect(result.exitCode).toBe(1);
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+        expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+      }
+    });
+
   it.each(['', null, {}])('CLI rearm fails closed without writes when the head is empty or unreadable (%j)', (headRefOid) => {
     const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { headRefOid });
     expect(result.exitCode).toBe(1);
