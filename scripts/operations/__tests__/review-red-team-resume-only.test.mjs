@@ -365,7 +365,7 @@ for (const entry of [runRedTeam, speculateRedTeam]) {
       expect(await entry({ pr, repo, read: cardRead,
         loopPayload: { ...loopPayload, findings: { read: cardRead } },
         env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' } }, io)).toEqual({
-        status: 'skipped', reason: 'red team skipped: card-only',
+        status: 'skipped', reason: 'red team skipped: card-only', policy: 'card-only',
       });
       expect(io.postComment).not.toHaveBeenCalled();
       noCalls(io);
