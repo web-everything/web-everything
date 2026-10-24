@@ -63,7 +63,7 @@ export function cachedLaneScan(scan, { dir, root, now = Date.now(), write = true
 
 // Lane-owned config that points git at another worktree, or lets a missing object trigger a lazy fetch that runs a
 // lane-chosen transport command (promisor remotes, upload-pack, git proxy). Env pins cannot switch these off on every git.
-const LANE_REDIRECT_KEY_RE = /^(core\.(worktree|gitproxy|alternaterefscommand)|extensions\.partialclone|remote\..+\.(promisor|partialclonefilter|uploadpack|vcs))$/i;
+const LANE_REDIRECT_KEY_RE = /^(core\.(worktree|gitproxy|alternaterefscommand)|extensions\.partialclone|remote\..+\.(promisor|partialclonefilter|uploadpack|vcs))$/is;
 
 /** The local/worktree-scope config keys in {@link LANE_CONFIG_LIST_ARGS} output that redirect the probe or run a transport. Pure. */
 export function laneRedirectConfig(listOutput) {

@@ -33,7 +33,7 @@ export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => 
 const INHERITED_GIT_LOCATION_VARS = Object.freeze(['GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_PARAMETERS',
   'GIT_CONFIG_COUNT', 'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
   'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_REPLACE_REF_BASE', 'GIT_ATTR_SOURCE', 'GIT_GRAFT_FILE']);
-const INHERITED_GIT_INDEXED_CONFIG_RE = /^GIT_CONFIG_(KEY|VALUE)_.*$/;
+const INHERITED_GIT_INDEXED_CONFIG_RE = /^GIT_CONFIG_(KEY|VALUE)_.*$/s;
 
 /**
  * A copy of `env` with every inherited git config override and repository-location variable removed, including orphaned
@@ -73,7 +73,7 @@ export function laneGitHardeningEnv(env = process.env) {
  *  config executes nothing. */
 export const LANE_CONFIG_LIST_ARGS = Object.freeze(['config', '--show-scope', '--list', '--includes', '-z']);
 
-const FILTER_DRIVER_KEY_RE = /^filter\..+\.(clean|smudge|process)$/i;
+const FILTER_DRIVER_KEY_RE = /^filter\..+\.(clean|smudge|process)$/is;
 
 /**
  * The `filter.<name>.clean|smudge|process` keys a lane's OWN config (local / worktree scope, includes followed) defines,
@@ -112,7 +112,7 @@ export function hardenLaneGitArgs(args) {
 /** Lane-local config keys that name a command, proxy, remote rewrite or credential source and are NOT pinned inert
  *  (a pin to a fixed value would break legitimate auth). A lane whose local/worktree scope defines one is refused
  *  BEFORE the agent runs and again before the push — a baseline an earlier agent poisoned is not trusted. Pure. */
-export const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+)$/i;
+export const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+)$/is;
 export const SAFE_REMOTE_URL_RE = /^(https:\/\/|ssh:\/\/|git@[\w.-]+:)/i;
 export function riskyLaneConfig(listOutput) {
   const parts = String(listOutput ?? '').split('\0');
@@ -122,7 +122,7 @@ export function riskyLaneConfig(listOutput) {
     if (scope !== 'local' && scope !== 'worktree') continue;
     const [key, ...rest] = parts[i + 1].split('\n');
     if (RISKY_LANE_CONFIG_RE.test(key)) found.push(key);
-    else if (/^remote\..+\.url$/i.test(key) && !SAFE_REMOTE_URL_RE.test(rest.join('\n'))) found.push(key);
+    else if (/^remote\..+\.url$/is.test(key) && !SAFE_REMOTE_URL_RE.test(rest.join('\n'))) found.push(key);
   }
   return found;
 }
@@ -145,7 +145,7 @@ export function scrubRiskyLaneConfig(dir, {
       const scope = parts[i], entry = parts[i + 1];
       const [key] = riskyLaneConfig(`${scope}\0${entry}\0`);
       if (!key) continue;
-      const remote = /^remote\.(.+)\.[^.]+$/i.exec(key);
+      const remote = /^remote\.(.+)\.[^.]+$/is.exec(key);
       if (remote?.[1] === 'origin') { kept.push(key); continue; }
       try {
         if (remote) {

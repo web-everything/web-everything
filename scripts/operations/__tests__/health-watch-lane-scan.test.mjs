@@ -3,11 +3,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction, laneProbeEnv } from '../../lib/health-watch-lane-scan.mjs';
+import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction, laneProbeEnv, laneRedirectConfig } from '../../lib/health-watch-lane-scan.mjs';
 import { createStaleStateReader } from '../stale-state-io.mjs';
 import { OPERATIONS } from '../run.mjs';
 import { DIRTY_PROBE_ARGS, laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
-import { LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
+import { LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS, laneFilterDrivers, riskyLaneConfig, scrubInheritedGitEnv } from '../../lib/lane-git-hardening.mjs';
 
 vi.mock('../stale-state-io.mjs', async original => {
   const real = await original();
@@ -514,6 +514,32 @@ describe('untrusted lane Git configuration', () => {
     expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec, log: vi.fn() }))
       .toMatchObject({ act: false, fresh: { reason: 'lane Git filter drivers present' } });
     expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([[...LANE_CONFIG_LIST_ARGS]]);
+  });
+
+  // `.` does not match a line terminator, so a key such as `filter.red<U+2028>team.clean` slipped past every `.+` key regex.
+  const LINE_TERMINATORS = [['U+2028', '\u2028'], ['U+2029', '\u2029'], ['CR', '\r'], ['CRLF', '\r\n'], ['VT/FF', '\v\f']];
+  it.each(LINE_TERMINATORS)('line-terminator filter name (%s) still refuses the lane and never calls status', (_label, term) => {
+    for (const driver of ['clean', 'smudge', 'process']) {
+      const exec = vi.fn(() => `local\0filter.red${term}team.${driver}\nmarker-command\0`);
+      expect(freshLaneSafety({ path: '/fixture/lane', exec }))
+        .toMatchObject({ hasUnsafeWork: true, reason: 'lane Git filter drivers present' });
+      expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([[...LANE_CONFIG_LIST_ARGS]]);
+      expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(false);
+    }
+  });
+
+  it.each(LINE_TERMINATORS)('every config-key regex sees through a line terminator (%s) inside the name', (_label, term) => {
+    const entry = (scope, key, value = 'x') => `${scope}\0${key}\n${value}\0`;
+    expect(laneFilterDrivers(entry('local', `filter.a${term}b.clean`))).toEqual([`filter.a${term}b.clean`]);
+    expect(laneFilterDrivers(entry('worktree', `filter.a${term}b.process`))).toHaveLength(1);
+    expect(laneRedirectConfig(entry('local', `remote.o${term}rigin.promisor`, 'true'))).toHaveLength(1);
+    expect(laneRedirectConfig(entry('local', `remote.o${term}rigin.uploadpack`))).toHaveLength(1);
+    expect(riskyLaneConfig(entry('local', `credential.a${term}b.helper`))).toHaveLength(1);
+    expect(riskyLaneConfig(entry('local', `url.a${term}b.insteadOf`))).toHaveLength(1);
+    expect(riskyLaneConfig(entry('local', `remote.o${term}rigin.url`, 'ext::sh -c evil'))).toHaveLength(1);
+    expect(riskyLaneConfig(entry('local', `alias.a${term}b`))).toHaveLength(1);
+    expect(scrubInheritedGitEnv({ [`GIT_CONFIG_KEY_0${term}x`]: 'core.fsmonitor', [`GIT_CONFIG_VALUE_${term}`]: 'x', KEEP: '1' }))
+      .toEqual({ KEEP: '1' });
   });
 
   it('refuses submodules before status can enter their untrusted configuration', () => {
