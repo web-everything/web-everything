@@ -164,6 +164,12 @@ Runner fixtures using synthetic PIDs must inject `identity` alongside `alive`: a
 existence probe still checks process identity. Stamp fixtures must also inject `identityOf`
 or supply both `runnerStart` and `runnerArgv`, so stamping cannot inspect a host process.
 
+Keep production PID caller tests in a dedicated file using injected IO: the Vitest
+`node:child_process` module mock does not reach `pid-alive.mjs` in this configuration.
+Inject `buildLeaseSignalsFor`'s `isPidAlive`, composing `defaultIsPidAlive` with a fake
+`kill` and `pidIdentity` with a fake `exec`. Assert the `ps` call as well as liveness
+and reclamation outcomes; see `pid-identity-lease-reaper.test.mjs`.
+
 The host queue needs write access to the admission pool's parent as well as the pool:
 `releaseLockDirIf` atomically renames a lock to a sibling tombstone before removal.
 An `EPERM` on that rename is an admission infrastructure failure, not a suite result.

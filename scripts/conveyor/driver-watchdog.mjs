@@ -201,9 +201,9 @@ export function splitQueue(queue, agents) {
 }
 
 /** Existence plus identity; unreadable probes are unknown and never prove death. */
-export function defaultIsPidAlive(pid, identity = pidIdentity) {
+export function defaultIsPidAlive(pid, identity = pidIdentity, kill = process.kill.bind(process)) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  try { process.kill(pid, 0); } catch (e) {
+  try { kill(pid, 0); } catch (e) {
     if (e?.code === 'ESRCH') return false;
     if (e?.code !== 'EPERM') return null;
   }

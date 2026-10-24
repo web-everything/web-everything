@@ -1405,8 +1405,9 @@ export const LEASE_REAPER_ACTOR = 'lease-reaper';
 /**
  * #4332 — the per-lease reap-signal builder `main()` drives (extracted so tests exercise the real wiring).
  * `ownerAlive` is computed BEFORE item resolution so it can veto the branch-derived PR-terminal fallback.
+ * `isPidAlive` defaults to the driver's existence-and-identity probe; tests can inject both IO seams.
  */
-export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, nowMs }) {
+export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, nowMs, isPidAlive = defaultIsPidAlive }) {
   return (c) => {
     // #x5wm9ot — an item-kind session (`conveyor-`/`prepare-`/`prepare-decision-`) checks `byItem` by its item
     // number; a PR_KIND session (`review-`/`fix-`/`ci-heal-`/`inspect-`) checks `byPr` by its OWN PR number —
@@ -1433,7 +1434,7 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
     // #3903 — a detached delivery wrapper's own pid (see `detachedWrapperPidsBySession`).
     const wrapperPid = c.lease?.session ? wrapperPids.get(c.lease.session) : undefined;
     // Only explicit death lifts the wrapper veto; unreadable identity must keep the lane.
-    const wrapperAlive = wrapperPid === undefined ? null : defaultIsPidAlive(wrapperPid) !== false;
+    const wrapperAlive = wrapperPid === undefined ? null : isPidAlive(wrapperPid) !== false;
     return {
       prState,
       sessionGone: sessionGoneForLease(c.lease, sessionStates, { nowMs, pidAlive: sessionPidAliveNow, wrapperAlive, ownerAlive }),
