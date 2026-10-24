@@ -1195,6 +1195,7 @@
   "scripts/conveyor/soak/breaks/needs-human-codeql-retirement.soak.test.mjs": 1.12,
   "scripts/conveyor/soak/breaks/not-a-ci-break-pinned-red.soak.test.mjs": 3.21,
   "scripts/conveyor/soak/breaks/prepare-lane-busy-burns-retry-budget.soak.test.mjs": 0.03,
+  "scripts/conveyor/soak/breaks/red-team-finished-result-never-published.soak.test.mjs": 0.36,
   "scripts/conveyor/soak/breaks/resource-sampler-two-writers-and-stale-config.soak.test.mjs": 0.23,
   "scripts/conveyor/soak/breaks/review-human-conflict-idle.soak.test.mjs": 0.77,
   "scripts/conveyor/soak/breaks/ruling-rereview-spends-advisory-round.soak.test.mjs": 0.28,
