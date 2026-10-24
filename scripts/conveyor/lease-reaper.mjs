@@ -114,9 +114,9 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // #xr4ygg7 (multi-repo slice 9, we:reports/2026-09-23-conveyor-multi-repo-gap-map.md) — the constellation table,
 // so a lease's POOL (ground truth) and a `fix-<tag>-<id>` session's own tag both resolve through the ONE source
 // every other conveyor script already keys off, never a private re-derivation here.
-import { CONSTELLATION_REPOS, repoKeyForDir } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, repoKeyForDir, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { isCherryOutputAllPatchEquivalent } from '../lib/git-patch-equivalence.mjs';
-import { LANE_JOURNAL_ACTOR_ENV } from '../lib/lane-history.mjs';
+import { LANE_JOURNAL_ACTOR_ENV, readLaneJournalTail } from '../lib/lane-history.mjs';
 import { timestampLines } from '../lib/log-timestamp.mjs';
 // xbdixjc — the lane hold rule: a lane whose fixer is parked awaiting verify, whose verify is running, or that holds
 // a verified unpushed commit is never reaped (the pure rule is `laneHoldVerdict`, we:scripts/lib/lane-lease.mjs).
@@ -1133,22 +1133,32 @@ export function detachedWrapperPidsBySession(runs) {
 }
 
 /**
- * PURE. Live dispatcher wrapper session slugs from the shared `ps aux` snapshot. Fix wrappers need not
+ * PURE. Live dispatcher wrapper PIDs and repositories by session from the shared `ps aux` snapshot. Fix wrappers need not
  * have a run-store effect, and older terminal Claude rows may reuse their slug. A failed scan supplies
- * no positive evidence; an empty set never asserts that a wrapper died.
+ * no positive evidence; an empty map never asserts that a wrapper died.
  * @param {string|null} psOutput
- * @returns {Set<string>}
+ * @returns {Map<string, Map<number, string>>}
  */
 export function liveWrapperSessionsFromPs(psOutput) {
-  const sessions = new Set();
+  const sessions = new Map();
   if (typeof psOutput !== 'string') return sessions;
   for (const line of psOutput.split('\n')) {
     // ps aux has ten columns before COMMAND; require Node itself to execute the wrapper.
-    const command = line.match(/^\s*(?:\S+\s+){10}(.*)$/)?.[1];
+    const row = line.match(/^\s*\S+\s+(\d+)\s+(?:\S+\s+){8}(.*)$/);
+    const command = row?.[2];
     const wrapper = command?.match(/^(?:\S*\/)?node\s+(?:\S*\/)?(?:fix-run|deliver-item-run|ci-heal-run)\.mjs(?=\s|$)/);
     if (!wrapper) continue;
-    const found = [...command.slice(wrapper[0].length).matchAll(/(?:^|\s)--session=([^\s]+)(?=\s|$)/g)].map((m) => m[1]);
-    if (found.length === 1) sessions.add(found[0]); // zero or ambiguous (duplicate) --session= gives no evidence
+    const args = command.slice(wrapper[0].length).trim().split(/\s+/);
+    const uniqueFlag = (name) => {
+      const flags = args.filter((arg) => arg === `--${name}` || arg.startsWith(`--${name}=`));
+      return flags.length === 1 && flags[0].startsWith(`--${name}=`) ? flags[0].slice(name.length + 3) : null;
+    };
+    const session = uniqueFlag('session');
+    const repoKey = repoKeyForSlug(uniqueFlag('repo'));
+    const pid = Number(row[1]);
+    if (!session || !repoKey || !Number.isSafeInteger(pid) || pid <= 0) continue;
+    if (!sessions.has(session)) sessions.set(session, new Map());
+    sessions.get(session).set(pid, repoKey);
   }
   return sessions;
 }
@@ -1359,13 +1369,13 @@ export function fetchPrStatesForRepo(repoKey, flags, { exec } = {}) {
  * (whose #1921 concern is specifically about the background-only population) degrade on that shape.
  */
 export function fetchSessionSignals(flags, { exec = execFileSync } = {}) {
-  if (flags['no-check-sessions']) return { states: null, pidAlive: new Map(), agents: null, liveWrapperSessions: new Set() };
+  if (flags['no-check-sessions']) return { states: null, pidAlive: new Map(), agents: null, liveWrapperSessions: new Map() };
   let sessions;
   try {
     sessions = defaultListAgents({ exec, all: true });
   } catch (e) {
     log(`  ⚠ \`claude agents --json --all\` failed — session-gone reap axis OFF this run (TTL-stale still applies): ${String(e?.message || e).split('\n')[0]}`);
-    return { states: null, pidAlive: new Map(), agents: null, liveWrapperSessions: new Set() };
+    return { states: null, pidAlive: new Map(), agents: null, liveWrapperSessions: new Map() };
   }
   const states = sessionStatesForReap(sessions);
   if (!states) log('  ⚠ `claude agents --json --all` listed zero background session(s) — session-gone reap axis OFF this run (indistinguishable from a bad read; TTL-stale still applies)');
@@ -1426,7 +1436,8 @@ export const LEASE_REAPER_ACTOR = 'lease-reaper';
  * #4332 — the per-lease reap-signal builder `main()` drives (extracted so tests exercise the real wiring).
  * `ownerAlive` is computed BEFORE item resolution so it can veto the branch-derived PR-terminal fallback.
  */
-export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, liveWrapperSessions = new Set(), nowMs }) {
+export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, liveWrapperSessions = new Map(), readJournal = readLaneJournalTail, nowMs }) {
+  const journals = new Map();
   return (c) => {
     // #x5wm9ot — an item-kind session (`conveyor-`/`prepare-`/`prepare-decision-`) checks `byItem` by its item
     // number; a PR_KIND session (`review-`/`fix-`/`ci-heal-`/`inspect-`) checks `byPr` by its OWN PR number —
@@ -1452,9 +1463,23 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
     const sessionPidAliveNow = c.lease?.session && sessionPidAlive.has(c.lease.session) ? sessionPidAlive.get(c.lease.session) : null;
     // #3903 — a detached delivery wrapper's own pid (see `detachedWrapperPidsBySession`).
     const wrapperPid = c.lease?.session ? wrapperPids.get(c.lease.session) : undefined;
-    // A detached fixer may have no run-store pid: a matching live argv still overrides stale Claude rows.
+    // Argv is host-wide: require this repository AND this lease's exact acquire/holder, whose CLI parent
+    // was the live wrapper. Cache the bounded journal tail per pool. Missing/rotated/unreadable evidence
+    // leaves the existing listing/death checks in force; the pool journal is available for operator diagnosis.
+    const wrappers = liveWrapperSessions.get(c.lease?.session);
+    let ownsLane = false;
+    if (wrapperPid === undefined && c.repoKey && typeof c.lease?.holder === 'string' && c.lease.holder
+      && Number.isSafeInteger(c.lease.pid) && c.lease.pid > 0 && c.lease.host === hostname()
+      && wrappers && [...wrappers.values()].includes(c.repoKey)) {
+      const poolDir = dirname(c.dir);
+      if (!journals.has(poolDir)) journals.set(poolDir, readJournal(poolDir));
+      ownsLane = journals.get(poolDir).some((e) => e?.action === 'acquire' && e.lane === c.lane
+        && e.session === c.lease.session && e.holder === c.lease.holder
+        && e.actor?.host === c.lease.host && e.actor?.pid === c.lease.pid
+        && wrappers.get(e.actor?.ppid) === c.repoKey);
+    }
     const wrapperAlive = wrapperPid === undefined
-      ? (liveWrapperSessions.has(c.lease?.session) ? true : null)
+      ? (ownsLane ? true : null)
       : Boolean(defaultIsPidAlive(wrapperPid));
     return {
       prState,
