@@ -2158,7 +2158,9 @@ describe('#4315 durable referral effects', () => {
     let finishJudge;
     h.judge.mockImplementationOnce(() => new Promise(resolve => { finishJudge = resolve; }));
     const running = h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
-    expect(h.judge).toHaveBeenCalledTimes(1);
+    // Same-gap comparison can yield before dispatch; inject the send-back only once the
+    // mandatory judge is in flight, held open by finishJudge until after the label write.
+    await vi.waitFor(() => expect(h.judge).toHaveBeenCalledTimes(1));
     // 02:02:39Z: --to=changes lands while the referral judge is still running.
     h.provider.setLabels('o/r', 7, { add: 'review:changes', remove: [] });
     h.state.comments.push({ body: '🔁 review — changes requested' });
