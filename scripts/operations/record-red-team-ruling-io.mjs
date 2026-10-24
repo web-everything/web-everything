@@ -4,7 +4,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { liveResultGateState, readConfirmedBreaks, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
@@ -105,9 +105,9 @@ export function createRecordRedTeamRulingReader({ env = process.env, readThread 
 
 /**
  * A local, atomic claim per card job, in numbered GENERATIONS (`<key>.<n>.claim`, each made with `wx`). Taking over an
- * expired claim means creating generation n+1, which only one caller can do. The spawn PROOF is a separate receipt
- * (`<key>.spawned`) written only after the child's start was confirmed (a pid), never the landing job's log file
- * (that is opened before the spawn, so it proves nothing).
+ * expired claim means creating generation n+1, which only one caller can do. A validated `.spawned` receipt
+ * proves only the child start; the child writes `.completed` after the card exists or is durably spooled.
+ * Neither a PID nor the landing log alone permits release.
  */
 export function createFileClaims({ dir = join(automationStateRoot(), 'red-team-ruling-claims'), nowMs = Date.now } = {}) {
   const latest = (key) => {
@@ -121,6 +121,14 @@ export function createFileClaims({ dir = join(automationStateRoot(), 'red-team-r
   const make = (key, gen) => {
     try { writeFileSync(join(dir, `${key}.${gen}.claim`), JSON.stringify({ at: nowMs() }), { flag: 'wx' }); return true; }
     catch (e) { if (e?.code === 'EEXIST') return false; throw e; }
+  };
+  const receipt = (key, suffix, expected) => {
+    try {
+      const saved = JSON.parse(readFileSync(join(dir, `${key}.${suffix}`), 'utf8'));
+      if (!expected?.head || saved.head !== expected.head || saved.session !== expected.session
+        || saved.session !== `red-team-ruling-card-${key}` || !Number.isFinite(saved.at) || saved.at < 0) return null;
+      return saved;
+    } catch { return null; } // Missing, unreadable, partial and legacy unbound receipts prove nothing.
   };
   return {
     claim(key) {
@@ -172,7 +180,22 @@ export function createFileClaims({ dir = join(automationStateRoot(), 'red-team-r
         return jobKey;
       } finally { rmSync(lock, { recursive: true }); }
     },
-    spawned(key) { return existsSync(join(dir, `${key}.spawned`)); },
+    spawned(key, expected) {
+      const saved = receipt(key, 'spawned', expected);
+      return !!saved && /^pid:[1-9]\d*$/.test(saved.handle);
+    },
+    completed(key, expected) {
+      const saved = receipt(key, 'completed', expected);
+      return !!saved && cardLandingExists(saved.result);
+    },
+    markCompleted(key, info) {
+      mkdirSync(dir, { recursive: true });
+      const temporary = join(dir, `${key}.completed.${process.pid}.tmp`);
+      try {
+        writeFileSync(temporary, JSON.stringify({ ...info, at: nowMs() }));
+        renameSync(temporary, join(dir, `${key}.completed`));
+      } finally { rmSync(temporary, { force: true }); }
+    },
     attempted(key) { return existsSync(join(dir, `${key}.attempt`)); },
     /** Exclusive (`wx`): exactly one invocation ever holds a job's attempt; false when another already does. */
     markAttempt(key) {
@@ -193,10 +216,12 @@ export const breakClaimKey = (p, index) => createHash('sha256').update(JSON.stri
 export const CLAIM_IN_PROGRESS_MS = 120_000;
 
 /** Spawn the landing job under a STABLE session, so the job (and its log) is identified by the ruling, not by a fresh random slug. */
-const spawnStableCardJob = (input, session) => {
+const spawnStableCardJob = (input, session, { jobKey, head }) => {
   const logPath = preventionCardLandingLogPath(session);
   const r = spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-ruling-card',
-    spawnDetached: (argv, o) => defaultSpawnDetached(argv.map((a) => (a.startsWith('--session=') ? `--session=${session}` : a)), { ...o, logPath }) });
+    spawnDetached: (argv, o) => defaultSpawnDetached([fileURLToPath(import.meta.url), '--land-card-receipt',
+      JSON.stringify({ jobKey, head, session }),
+      ...argv.slice(1).map((a) => (a.startsWith('--session=') ? `--session=${session}` : a))], { ...o, logPath }) });
   return r.ok ? { ...r, session } : r;
 };
 
@@ -291,7 +316,8 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
       }
       // 1. Serialize: one atomic claim per (PR, head, result, breaks); taking over an expired one is atomic too.
       const claim = claims.claim(p.jobKey);
-      const spawned = claims.spawned(p.jobKey);
+      const completed = claims.completed(p.jobKey, p);
+      const spawned = claims.spawned(p.jobKey, p) || completed;
       if (!claim.created && !spawned) {
         if (claims.now() - claim.at < CLAIM_IN_PROGRESS_MS) {
           throw new Error(`another invocation holds the claim for job ${p.jobKey} and has not spawned it yet; wait ${Math.round(CLAIM_IN_PROGRESS_MS / 1000)}s and re-run`);
@@ -309,18 +335,25 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         // receipt), so a re-run refuses instead of spawning a second filing.
         if (claims.attempted(p.jobKey) || !claims.markAttempt(p.jobKey)) {
           throw new Error(`an earlier attempt of card job ${p.jobKey} may have started its landing job (no spawn receipt was recorded); nothing written. `
-            + `Check the landing log for session ${session}; the job is owed, not lost`);
+            + `Check the landing log for session ${session}; recover the owed card and cite its readable --card reference if the job failed`);
         }
-        card = fileCard(p.cardInput, session);
+        card = fileCard(p.cardInput, session, p);
         if (!card?.ok) {
           claims.clearAttempt(p.jobKey); // the spawn itself reported no child
           throw new Error(`the follow-up card was not queued (${card?.error ?? 'unknown'}); the intent is recorded and a re-run retries the same job`);
         }
         // The proof of a spawn is the child's confirmed start (a pid), recorded durably; the job's log file proves nothing.
-        if (!/^pid:\d+$/.test(String(card.handle ?? ''))) throw new Error('the landing job reported no confirmed child start; not recorded as spawned, and not retried automatically (a child may be running)');
-        claims.markSpawned(p.jobKey, { session, handle: card.handle });
+        if (!/^pid:[1-9]\d*$/.test(String(card.handle ?? ''))) throw new Error('the landing job reported no confirmed child start; not recorded as spawned, and not retried automatically (a child may be running)');
+        claims.markSpawned(p.jobKey, { head: p.head, session, handle: card.handle });
       }
-      // 4. The release record, only now that the job is accepted. Its failure is retry-safe: the next run sees the spawned job.
+      // A PID proves only a start: acquire/file-item can still fail before a card reaches the spool.
+      // Keep the attempt/receipt intact so an exact retry observes completion without a second spawn.
+      if (!claims.completed(p.jobKey, p)) {
+        return { ruling: 'card', head: p.head, indices: p.indices, pending: true, released: false,
+          card: { session, reconciled: spawned },
+          message: `No card completion receipt yet; the break stays held. Re-run the exact ruling to check again. If it persists, inspect the landing log for session ${session}; if the job failed, recover the owed card and cite its readable --card reference. Keep the attempt marker to prevent duplicate automatic filings.` };
+      }
+      // 4. Release only with positive child evidence that the card exists or is durably spooled.
       const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
         plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card });
       post(p.repo, p.pr, reasonBody(p, `Follow-up card queued through the prevention landing job (${session}); filing may be paused, in which case it is owed in the spool.`));
@@ -336,4 +369,24 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
 export function recordRedTeamRulingEntry() {
   return { declaration: recordRedTeamRulingOperation({ readRulingContext: createRecordRedTeamRulingReader() }),
     sinks: createRecordRedTeamRulingSinks() };
+}
+
+/** Accept only landing outcomes reached after filing/spooling or recording an existing card. */
+const cardLandingExists = (result) => result?.ok === true && (
+  (['held', 'batched', 'done'].includes(result.step) && /^backlog\/[A-Za-z0-9][A-Za-z0-9._-]*\.md$/.test(result.rel ?? ''))
+  || (['mentioned', 'done'].includes(result.step) && Number.isInteger(result.mentions) && result.mentions > 0));
+
+/** Child-side receipt: a successful spawn never calls this writer in the parent. */
+export async function runCardLandingWithReceipt(binding, argv, { claims = createFileClaims(),
+  land = async (args) => (await import('./land-prevention-card.mjs')).runLandPreventionCardCli(args) } = {}) {
+  const landed = await land(argv);
+  if (landed.code === 0 && cardLandingExists(landed.result)) {
+    claims.markCompleted(binding.jobKey, { head: binding.head, session: binding.session, result: landed.result });
+  }
+  return landed;
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url) && process.argv[2] === '--land-card-receipt') {
+  const { code } = await runCardLandingWithReceipt(JSON.parse(process.argv[3]), process.argv.slice(4));
+  process.exitCode = code;
 }
