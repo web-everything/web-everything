@@ -761,12 +761,15 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
   // is replaced, so a stale clock passed by main cannot hide behind a unit fixture.
   const source = readFileSync(join(process.cwd(), 'scripts/conveyor/lease-reaper.mjs'), 'utf8');
   const shell = source.slice(source.indexOf('function parseFlags('), source.indexOf('// Run the IO shell only'));
-  const dryRun = ({ delayAt, heartbeatOffset = 0, retainedRound = false }) => {
+  const dryRun = ({ delayAt, heartbeatOffset = 0, retainedRound = false, terminalStartOffsets = null }) => {
     let clock = NOW;
     let stdout = '';
     const logs = [];
     const advance = (stage) => { if (stage === delayAt) clock += 61_000; };
-    const lease = { session: 'fix-5806', acquiredAt: new Date(NOW - 20 * 60_000).toISOString(), ttlMinutes: 240 };
+    const claimedAt = new Date(NOW - 93_000).toISOString();
+    const lease = terminalStartOffsets
+      ? { session: 'fix-5848', acquiredAt: claimedAt, ttlMinutes: 240 }
+      : { session: 'fix-5806', acquiredAt: new Date(NOW - 20 * 60_000).toISOString(), ttlMinutes: 240 };
     runInNewContext(`${shell}\nmain(['--dry-run', '--json']);`, {
       Date: class extends Date { static now() { return clock; } },
       Map, Set, Number, JSON,
@@ -776,6 +779,13 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
       process: { env: {}, stdout: { write: (s) => { stdout += s; } }, exit: (code) => expect(code).toBe(0) },
       fetchSessionSignals: () => {
         advance('listing');
+        if (terminalStartOffsets) {
+          const agents = terminalStartOffsets.map((offset, i) => ({
+            kind: 'background', name: 'fix-5848', state: 'stopped',
+            startedAt: new Date(Date.parse(claimedAt) + offset).toISOString(), sessionId: `listed-round-${i}`,
+          }));
+          return { states: sessionStateByName(agents), pidAlive: new Map([['fix-5848', false]]), agents };
+        }
         return retainedRound
           ? { states: new Map([['fix-5806', 'done']]), pidAlive: new Map([['fix-5806', false]]), agents: [] }
           : { states: new Map([['conveyor-1', 'working']]), pidAlive: new Map(), agents: [] };
@@ -784,11 +794,13 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
       listFixDispatchClaims: () => {
         advance('claims');
         return [{ heartbeatAt: new Date(clock + heartbeatOffset).toISOString(),
-          meta: { repo: 'we', pr: 5806, kind: 'fix', runnerPid: process.pid } }];
+          meta: terminalStartOffsets
+            ? { repo: 'we', pr: 5848, kind: 'fix', claimedAt, sessionId: 'current-round' }
+            : { repo: 'we', pr: 5806, kind: 'fix', runnerPid: process.pid } }];
       },
-      claimRunnerPidsBySession,
+      claimRunnerPidsBySession, staleTerminalNamesForClaims,
       poolsToScan: () => ['fixture'], repoKeyForPool: () => null,
-      laneIndicesIn: () => [53], readLease: () => lease,
+      laneIndicesIn: () => [terminalStartOffsets ? 8 : 53], readLease: () => lease,
       fetchPrStatesForRepo: () => { throw new Error('no PR lookup expected'); },
       buildLeaseSignalsFor: (opts) => buildLeaseSignalsFor({ ...opts,
         pidCommand: () => 'node fix-run.mjs --session=fix-5806' }),
@@ -808,6 +820,18 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
     const { report, logs } = dryRun({ delayAt, retainedRound: true });
     expect(logs).toContain('lease-reaper: added 1 claim runner pid(s)');
     expect(report).toMatchObject({ scanned: 1, kept: 1, wouldReap: [], sessionAxis: 'on' });
+  });
+
+  it.each([
+    ['earlier stopped rounds', [-20 * 60_000, -5 * 60_000], true],
+    ['stopped rounds starting at/after claimedAt', [0, 1000], false],
+  ])('threads claim freshness through main for lane-8: %s', (_label, terminalStartOffsets, kept) => {
+    // No runner PID can mask a dropped staleTerminalNames option at the main boundary.
+    const { report, logs } = dryRun({ terminalStartOffsets });
+    expect(logs).toContain('lease-reaper: added 0 claim runner pid(s)');
+    expect(logs).toContain(`lease-reaper: ignored ${kept ? 1 : 0} stale terminal session name(s)`);
+    expect(report).toMatchObject({ scanned: 1, kept: kept ? 1 : 0, sessionAxis: 'on',
+      wouldReap: kept ? [] : [{ pool: 'fixture', lane: 8, reason: 'session-gone', session: 'fix-5848' }] });
   });
 
   it.each([

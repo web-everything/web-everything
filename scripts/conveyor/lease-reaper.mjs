@@ -1488,8 +1488,7 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
     // into sessionGoneForLease's phantom-listing widening. Distinct from `pidAliveForLease` below, which
     // remains the dormant future-`agentPid` axis (today's leases carry no durable per-agent pid at all).
     const staleTerminalRows = staleTerminalNames.has(c.lease?.session);
-    let sessionPidAliveNow = c.lease?.session && sessionPidAlive.has(c.lease.session) ? sessionPidAlive.get(c.lease.session) : null;
-    if (staleTerminalRows && sessionPidAliveNow === false) sessionPidAliveNow = null;
+    const sessionPidAliveNow = c.lease?.session && sessionPidAlive.has(c.lease.session) ? sessionPidAlive.get(c.lease.session) : null;
     // #3903 — a detached delivery wrapper's own pid (see `detachedWrapperPidsBySession`).
     const wrapperPid = c.lease?.session ? wrapperPids.get(c.lease.session) : undefined;
     const wrapperAlive = wrapperPid === undefined ? null : Boolean(defaultIsPidAlive(wrapperPid));
