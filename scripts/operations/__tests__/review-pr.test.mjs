@@ -1360,6 +1360,32 @@ describe('#3540 planRecordDecision and confirmAnswerFor — the shared pure core
     expect(() => planRecordDecision(bounceView(open))).toThrow(/no stated reason/);
   });
 
+  it.each([
+    'Operator send-back',
+    'Operator send-back at head abc1234',
+    'Operator send-back at head e5ed9cb74',
+    'Operator send-back at head `e5ed9cb74`.',
+    'Operator send-back (human review ceremony), 2026-10-14 ~16:20 ET, at head e5ed9cb74.',
+    'Operator send-back, at head `e5ed9cb74`. Operator: "Send back".',
+    'Operator send-back, at head `e5ed9cb74`. Operator: "ok".',
+    'Operator send-back at head e5ed9cb74.\n!!!',
+    'Operator send-back at head e5ed9cb74.\nx',
+    'Operator send-back at head e5ed9cb74.\nok',
+    'Operator send-back at head e5ed9cb74.\n12345678',
+    'Operator send-back at head e5ed9cb74.\n' + '!'.repeat(160) + 'Restore the guard.',
+  ])('retains the reasonless-bounce refusal for ceremony boilerplate or trivial repair text: %s', body => {
+    const view = bounceView([{ ...openSendBacks[0], body }]);
+    expect(openSendBackBounceReason(view.findings.read)).toBe('');
+    expect(() => planRecordDecision(view)).toThrow(/no stated reason/);
+  });
+
+  it.each(['. ', '\n'])('uses the repair instruction beyond the ceremony prefix (%j)', separator => {
+    const view = bounceView([{ ...openSendBacks[0],
+      body: `Operator send-back at head e5ed9cb74${separator}Restore the original guard.`,
+    }]);
+    expect(planRecordDecision(view).body).toContain(': Restore the original guard.`');
+  });
+
   it('renders only valid send-backs in a mixed list and preserves their ids unchanged', () => {
     const valid = { ...openSendBacks[0], id: 'IC_kwDORBt1-c8AAAABedLjDQ' };
     const open = [valid, { id: 'metadata', at: {}, body: {} },
@@ -1385,8 +1411,8 @@ describe('#3540 planRecordDecision and confirmAnswerFor — the shared pure core
     expect(plan.body).toContain(`\`Send-back ${openSendBacks[0].id} at ${openSendBacks[0].at}: `);
     expect(plan.body).toContain("img src=x [click](https://example.com) 'escape' quote ");
     expect(plan.body).not.toContain('<img');
-    const reason = openSendBackBounceReason(bounceView([{ ...openSendBacks[0], body: 'x'.repeat(200) }]).findings.read);
-    expect(reason).toContain(`: ${'x'.repeat(160)}\``);
+    const reason = openSendBackBounceReason(bounceView([{ ...openSendBacks[0], body: 'Repair ' + 'x'.repeat(200) }]).findings.read);
+    expect(reason).toContain(`: Repair ${'x'.repeat(153)}\``);
     expect(reason).not.toContain('x'.repeat(161));
     const outsideCode = plan.body.replace(/`[^`\n]*`/g, '');
     expect(outsideCode).not.toMatch(/<img|\]\(|<!-- addresses-operator-send-back:|<fixed head sha>/);
@@ -2182,6 +2208,18 @@ describe('an override must say why', () => {
       expect(out.lines.join('\n')).toMatch(/no stated reason/);
       expect(calls).toEqual([]);
     }
+  });
+
+  it('refuses a boilerplate-only operator send-back before staging or recording any effects', async () => {
+    const comments = [{ id: 'SB1', author: { login: 'chalbert' }, createdAt: '2026-10-14T20:07:00Z',
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via console.\n\n'
+        + 'Operator send-back at head e5ed9cb74.' }];
+    const { out, calls } = await driveToAnswer({ answer: 'changes', id: 'run-send-back-boilerplate', comments,
+      netRev: 'e5ed9cb74' + 'a'.repeat(31) });
+    expect(out.code).toBe(1);
+    expect(out.stopped).toBe('step-refused');
+    expect(out.lines.join('\n')).toMatch(/no stated reason/);
+    expect(calls).toEqual([]);
   });
 
   // THE TEST THE OLD BLOCK COULD NOT HAVE FAILED. `--reason` here travels the whole real path: parsed by

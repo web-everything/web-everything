@@ -2054,8 +2054,13 @@ export function openSendBackBounceReason(read) {
       && typeof item.id === 'string' && /^[A-Za-z0-9_.:=-]+$/.test(item.id)
       && typeof item.at === 'string' && Number.isFinite(Date.parse(item.at))
       && typeof item.body === 'string')
-      .map(item => ({ ...item, body: plain(item.body).slice(0, 160) }))
-      .filter(item => /[\p{L}\p{N}]/u.test(item.body))
+      .map(item => ({ ...item, body: plain(item.body)
+        // Ceremony metadata and a bare operator acknowledgement give the fixer nothing to repair.
+        .replace(/^Operator send-back\b(?: \(human review ceremony\))?[, ]*(?:\d{4}-\d{2}-\d{2} )?(?:~?\d{1,2}:\d{2} ET[, ]*)?(?:(?:at|on) head ['"]?[a-f0-9]{7,40}['"]?)?[.,:\s]*/i, '')
+        .replace(/^Operator:\s*['"](?:send[ -]?back|ok|changes requested)['"][.\s]*/i, '')
+        .slice(0, 160) }))
+      // Require at least two words, including a substantive word, in the rendered repair excerpt.
+      .filter(item => (item.body.match(/[\p{L}\p{N}]+/gu)?.length ?? 0) >= 2 && /\p{L}{3}/u.test(item.body))
     : [];
   if (open.length === 0) return '';
   const shown = open.slice(0, 5);
