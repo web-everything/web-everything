@@ -96,9 +96,22 @@ export function enrichPrsWithCompleteComments(prs, {
     try {
       const comments = readComments(pr.number, { repo });
       if (!Array.isArray(comments)) throw new Error('comments read returned no array');
-      // `commentsComplete`: this reader proved the thread complete, whatever its length (a complete thread can be
-      // exactly the page size). The planner trusts this mark, never the length, before counting markers off it
-      // (`takeover-budget.mjs#threadMayBeTruncated`).
+      if (comments.length < pr.comments.length) throw new Error('complete comments read returned fewer comments than the listed page');
+      const ids = c => [c?.node_id, c?.id, c?.url, c?.html_url].filter(v => v !== undefined && v !== null && v !== '');
+      const covered = pr.comments.every(c => comments.some(full => {
+        if (typeof c?.body !== 'string' || c.body !== full?.body) return false;
+        const author = c?.author?.login ?? c?.user?.login;
+        if (author && author !== (full?.author?.login ?? full?.user?.login)) return false;
+        const embeddedIds = ids(c), fullIds = ids(full);
+        if (embeddedIds.length && fullIds.length) return embeddedIds.some(id => fullIds.includes(id));
+        return (c.createdAt ?? c.created_at) === (full.createdAt ?? full.created_at);
+      }));
+      if (!covered) throw new Error('complete comments read did not cover the listed page');
+      if (comments.length === pr.comments.length && comments.length === LIST_COMMENTS_PAGE_SIZE) {
+        throw new Error('thread may be truncated at the page size — retry with a complete paginated thread');
+      }
+      // The covering read extends beyond a full first page, proving pagination advanced. The planner trusts
+      // `commentsComplete` before counting markers (`takeover-budget.mjs#threadMayBeTruncated`).
       out.push(annotatePr({ ...pr, comments, commentsComplete: true }));
     } catch (e) { onError(pr, e); }
   }

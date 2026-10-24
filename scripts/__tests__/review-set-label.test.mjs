@@ -3179,6 +3179,114 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
   });
 
+  it.each(['empty', 'shorter', 'same-size non-covering', 'longer non-covering'])(
+    'CLI rearm refuses a %s paginated array without proof of the embedded page', shape => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
+      const pagedComments = shape === 'empty' ? [] : shape === 'shorter' ? comments.slice(0, -1)
+        : [...comments.slice(1), { id: 'IC_other', body: 'other discussion' },
+          ...(shape === 'longer non-covering' ? [{ id: 'IC_extra', body: 'extra discussion' }] : [])];
+      for (const fresh of [false, true]) {
+        const readComments = vi.fn(() => pagedComments);
+        const result = fresh
+          ? run(['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`], [],
+            { readComments, freshState: { comments } })
+          : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+        expect(readComments).toHaveBeenCalledOnce();
+        expect(result.exitCode).toBe(1);
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+        expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+      }
+    });
+
+  describe.each(['initial', 'fresh'])('%s full-thread read', read => {
+    const fresh = read === 'fresh';
+    const attempt = (comments, readComments, freshHead = 'b'.repeat(40)) => fresh
+      ? run(['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`], [],
+        { readComments, freshState: { comments, headRefOid: freshHead } })
+      : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+
+    it('refuses matching ids with a stale body lacking an embedded older-head clearance', () => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
+        id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'web-everything' },
+      }));
+      comments[0].body = buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'c'.repeat(40) });
+      const readComments = vi.fn(() => [
+        ...comments.map((c, i) => i === 0 ? { ...c, body: 'stale discussion' } : c),
+        { id: 'IC_extra', body: 'later discussion' },
+      ]);
+      const result = attempt(comments, readComments);
+      expect(readComments).toHaveBeenCalledTimes(1);
+      expect(result.exitCode).toBe(1);
+      expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+      expect(result.calls).toEqual([]);
+      expect(result.ledgerWrites).toEqual([]);
+    });
+
+    describe.each(['id', 'timestamp'])('author coverage with matching %s and body', identity => {
+      const listed = { ...(identity === 'id' ? { id: 'IC_author' } : { createdAt: '2026-10-06T00:00:00Z' }), body: 'listed discussion' };
+      const complete = { ...(identity === 'id' ? { node_id: 'IC_author' } : { created_at: listed.createdAt }), body: listed.body };
+      const page = author => [{ ...listed, ...author }, ...Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, (_, i) => ({
+        id: `IC_${i}`, body: `discussion ${i}`,
+      }))];
+
+      it.each([
+        ['author missing', { author: { login: 'web-everything' } }, {}],
+        ['user missing', { user: { login: 'web-everything' } }, {}],
+        ['author changed to another user', { author: { login: 'web-everything' } }, { user: { login: 'other' } }],
+        ['user changed to another author', { user: { login: 'web-everything' } }, { author: { login: 'other' } }],
+      ])('fails closed without writes when the complete comment has its %s', (_name, listedAuthor, fullAuthor) => {
+        const comments = page(listedAuthor);
+        const readComments = vi.fn(() => [...comments.slice(1), { ...complete, ...fullAuthor }, { body: 'later discussion' }]);
+        const result = attempt(comments, readComments, 'a'.repeat(40));
+        expect(readComments).toHaveBeenCalledTimes(1);
+        expect(result.exitCode).toBe(1);
+        expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+      });
+
+      if (!fresh) it.each([
+        ['author / author', { author: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
+        ['author / user', { author: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
+        ['user / author', { user: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
+        ['user / user', { user: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
+        ['neither has an author', {}, {}],
+        ['only the complete comment has an author', {}, { user: { login: 'web-everything' } }],
+      ])('allows complete coverage with %s', (_name, listedAuthor, fullAuthor) => {
+        const comments = page(listedAuthor);
+        const readComments = vi.fn(() => [...comments.slice(1), { ...complete, ...fullAuthor }, { body: 'later discussion' }]);
+        const result = attempt(comments, readComments, 'a'.repeat(40));
+        expect(readComments).toHaveBeenCalled();
+        expect(result.exitCode).toBe(0);
+        expect(result.calls).toEqual(['postComment', 'setLabels']);
+      });
+    });
+
+    it('refuses an exactly page-sized covering read because the thread may be truncated at the page size', () => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
+      const readComments = vi.fn(() => [...comments]);
+      const result = attempt(comments, readComments);
+      expect(readComments).toHaveBeenCalledTimes(1);
+      expect(result.exitCode).toBe(1);
+      expect(result.payload.reason).toContain('thread may be truncated at the page size');
+      expect(result.calls).toEqual([]);
+      expect(result.ledgerWrites).toEqual([]);
+    });
+
+    it.each([PR_COMMENTS_PAGE_SIZE - 1, PR_COMMENTS_PAGE_SIZE])('allows a complete covering read for an embedded page of %i comments', count => {
+      const comments = Array.from({ length: count }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
+      const readComments = vi.fn(() => [...comments, { id: 'IC_extra', body: 'later discussion' }]);
+      const result = attempt(comments, readComments, 'a'.repeat(40));
+      // The fresh variant's mocked label never shows the handoff; coverage is not the refusal there.
+      if (fresh) { expect(result.payload.reason ?? '').not.toMatch(/cannot prove|truncated/); return; }
+      expect(result.exitCode).toBe(0);
+      expect(result.calls).toEqual(['postComment', 'setLabels']);
+      if (count < PR_COMMENTS_PAGE_SIZE) expect(readComments).not.toHaveBeenCalled();
+      else expect(readComments).toHaveBeenCalled();
+    });
+  });
+
   it.each(['', null, {}])('CLI rearm fails closed without writes when the head is empty or unreadable (%j)', (headRefOid) => {
     const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { headRefOid });
     expect(result.exitCode).toBe(1);
@@ -3244,6 +3352,50 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     }
   });
 
+  describe.each(['initial read', 'fresh changed-head reread'])('embedded-page human clearance on %s', read => {
+    it('refuses rearm when matching paginated ids have stale bodies without the embedded clearance', () => {
+      const fresh = read === 'fresh changed-head reread';
+      const head = (fresh ? 'b' : 'a').repeat(40);
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
+        id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'web-everything' },
+      }));
+      comments[0].body = buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: head });
+      const readComments = vi.fn(() => comments.map(c => ({ ...c, body: 'stale discussion' })));
+      const result = fresh
+        ? run(missingArgs, [], { readComments, freshState: { comments, headRefOid: head } })
+        : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+      expect(readComments).toHaveBeenCalledTimes(1);
+      expect(readComments).toHaveBeenCalledWith('o/n', '9');
+      expect(result.exitCode).toBe(1);
+      expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+      expect(result.calls).toEqual([]);
+      expect(result.ledgerWrites).toEqual([]);
+    });
+
+    it.each(['empty', 'shorter', 'same-size non-covering', 'longer non-covering'])(
+      'refuses rearm without label, comment or ledger writes when pagination is %s', shape => {
+        const fresh = read === 'fresh changed-head reread';
+        const head = (fresh ? 'b' : 'a').repeat(40);
+        const comments = [{ id: 'IC_clearance', author: { login: 'web-everything' },
+          body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: head }) },
+        ...Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }))];
+        const pagedComments = shape === 'empty' ? [] : shape === 'shorter' ? comments.slice(1)
+          : [...comments.slice(1), { id: 'IC_other', body: 'other discussion' },
+            ...(shape === 'longer non-covering' ? [{ id: 'IC_extra', body: 'extra discussion' }] : [])];
+        const readComments = vi.fn(() => pagedComments);
+        const result = fresh
+          ? run(missingArgs, [], { readComments, freshState: { comments, headRefOid: head } })
+          : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+        expect(result.readPrState).toHaveBeenCalledTimes(fresh ? 2 : 1);
+        expect(readComments).toHaveBeenCalledTimes(1);
+        expect(readComments).toHaveBeenCalledWith('o/n', '9');
+        expect(result.exitCode).toBe(1);
+        expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+      });
+  });
+
   it.each([undefined, null, {}, 'unreadable'])('missing-only rearm fails closed without writes when fresh comments are not an array (%j)', (comments) => {
     const result = run(missingArgs, [], { freshState: { comments } });
     expect(result.readPrState).toHaveBeenCalledTimes(2);
@@ -3257,7 +3409,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
     const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
       author: { login: 'web-everything' } };
-    const readComments = vi.fn().mockReturnValueOnce(comments).mockReturnValue([...comments, clearance]);
+    const readComments = vi.fn().mockReturnValueOnce([...comments, { body: 'later discussion' }]).mockReturnValue([...comments, clearance]);
     const result = run(missingArgs, [], { comments, readComments, freshState: { comments } });
     expect(result.readPrState).toHaveBeenCalledTimes(2);
     expect(readComments.mock.calls).toEqual([['o/n', '9'], ['o/n', '9']]);
@@ -3271,7 +3423,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     ['undefined', undefined], ['null', null], ['object', {}], ['string', 'unreadable'], ['throw', new Error('thread unavailable')],
   ])('missing-only rearm fails closed without writes when the fresh paginated thread is unreadable (%s)', (_name, pagedComments) => {
     const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
-    const readComments = vi.fn().mockReturnValueOnce(comments).mockImplementation(() => {
+    const readComments = vi.fn().mockReturnValueOnce([...comments, { body: 'later discussion' }]).mockImplementation(() => {
       if (pagedComments instanceof Error) throw pagedComments;
       return pagedComments;
     });

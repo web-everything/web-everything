@@ -4,6 +4,7 @@ import { countGrantedRoundExtensions, buildRoundExtensionComment } from '../roun
 import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
 import { standDownOf } from '../health-smells/stood-down-prs.mjs';
 import { planNoteComment } from '../reconcile-note-comment.mjs';
+import { buildClearedHumanMarker, buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
 
 const repo = 'web-everything/web-everything';
 const filler = (n) => Array.from({ length: n }, (_, i) => ({ author: { login: 'web-everything' }, body: `drain park-reason spam ${i} ${'x'.repeat(10_000)}` }));
@@ -62,9 +63,130 @@ describe('complete PR comments', () => {
     expect(errors).toEqual([4017]);
   });
 
-  it('short threads are untouched and never re-read', () => {
-    const prs = [{ number: 2, comments: filler(3) }];
+  it.each([0, LIST_COMMENTS_PAGE_SIZE - 1])('skips a PR when the complete read returns only %i comments, fewer than the listed page', count => {
+    const onError = vi.fn();
+    const short = { number: 1, comments: [] };
+    const incomplete = { number: 4017, comments: firstPage };
+    const out = enrichPrsWithCompleteComments([short, incomplete], {
+      repo, readComments: () => firstPage.slice(0, count), onError,
+    });
+    expect(out).toEqual([short]);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(incomplete, expect.any(Error));
+  });
+
+  it.each([
+    ['id', { id: 'IC_clearance' }, { id: 'IC_clearance' }],
+    ['node_id', { id: 'IC_clearance' }, { node_id: 'IC_clearance' }],
+    ['url', { url: 'https://github.com/o/n/issues/4017#issuecomment-1' },
+      { html_url: 'https://github.com/o/n/issues/4017#issuecomment-1' }],
+  ])('drops a matching %s read whose stale body omits the embedded human clearance', (_name, listedIds, fullIds) => {
+    const listed = { ...listedIds, author: { login: 'web-everything' },
+      body: `${buildReviewedShaMarker('a'.repeat(40))}\n${buildClearedHumanMarker('chalbert')}` };
+    const pr = { number: 4017, comments: [listed, ...firstPage.slice(1)] };
+    const onError = vi.fn();
+    const annotate = vi.fn(p => p);
+    const complete = [...firstPage.slice(1), { ...fullIds, body: 'stale discussion' }, { body: 'later discussion' }];
+    expect(enrichPrsWithCompleteComments([pr], { repo, readComments: () => complete, onError, annotate })).toEqual([]);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(pr, expect.objectContaining({ message: 'complete comments read did not cover the listed page' }));
+    expect(annotate).not.toHaveBeenCalled();
+  });
+
+  describe.each(['id', 'timestamp'])('author coverage with matching %s and body', identity => {
+    const listed = { ...(identity === 'id' ? { id: 'IC_author' } : { createdAt: '2026-10-06T00:00:00Z' }), body: 'listed discussion' };
+    const complete = { ...(identity === 'id' ? { node_id: 'IC_author' } : { created_at: listed.createdAt }), body: listed.body };
+
+    it.each([
+      ['author missing', { author: { login: 'web-everything' } }, {}],
+      ['user missing', { user: { login: 'web-everything' } }, {}],
+      ['author changed to another user', { author: { login: 'web-everything' } }, { user: { login: 'other' } }],
+      ['user changed to another author', { user: { login: 'web-everything' } }, { author: { login: 'other' } }],
+    ])('fails closed and skips annotation when the complete comment has its %s', (_name, listedAuthor, fullAuthor) => {
+      const pr = { number: 4017, comments: [{ ...listed, ...listedAuthor }, ...firstPage.slice(1)] };
+      const onError = vi.fn();
+      const annotate = vi.fn(p => p);
+      const out = enrichPrsWithCompleteComments([pr], {
+        repo, readComments: () => [...firstPage.slice(1), { ...complete, ...fullAuthor }, { body: 'later discussion' }],
+        onError, annotate,
+      });
+      expect(out.map(p => p.number)).toEqual([]);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(pr,
+        expect.objectContaining({ message: 'complete comments read did not cover the listed page' }));
+      expect(annotate).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['author / author', { author: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
+      ['author / user', { author: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
+      ['user / author', { user: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
+      ['user / user', { user: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
+      ['neither has an author', {}, {}],
+      ['only the complete comment has an author', {}, { user: { login: 'web-everything' } }],
+    ])('accepts complete coverage with %s', (_name, listedAuthor, fullAuthor) => {
+      const pr = { number: 4017, comments: [{ ...listed, ...listedAuthor }, ...firstPage.slice(1)] };
+      const comments = [...firstPage.slice(1), { ...complete, ...fullAuthor }, { body: 'later discussion' }];
+      const onError = vi.fn();
+      expect(enrichPrsWithCompleteComments([pr], { repo, readComments: () => comments, onError, annotate: p => p }))
+        .toEqual([{ ...pr, comments, commentsComplete: true }]);
+      expect(onError).not.toHaveBeenCalled();
+    });
+  });
+
+  it('drops an exactly page-sized covering read because the thread may be truncated at the page size', () => {
+    const pr = { number: 4017, comments: firstPage };
+    const onError = vi.fn();
+    const annotate = vi.fn(p => p);
+    expect(enrichPrsWithCompleteComments([pr], { repo, readComments: () => [...firstPage], onError, annotate })).toEqual([]);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(pr, expect.objectContaining({ message: expect.stringContaining('thread may be truncated at the page size') }));
+    expect(annotate).not.toHaveBeenCalled();
+  });
+
+  it.each([3, LIST_COMMENTS_PAGE_SIZE - 1])('short threads of %i comments are untouched and never re-read', count => {
+    const prs = [{ number: 2, comments: filler(count) }];
     expect(enrichPrsWithCompleteComments(prs, { readComments: () => { throw new Error('no'); } })).toEqual(prs);
+  });
+
+  it.each([
+    ['different ids despite matching body and timestamp', { id: 'IC_listed' }, { node_id: 'IC_other' }],
+    ['different bodies without ids', {}, { body: 'other discussion' }],
+    ['different timestamps without ids', {}, { created_at: '2026-10-07T00:00:00Z' }],
+  ])('rejects an equal-length read omitting an embedded comment: %s', (_name, listedFields, fullFields) => {
+    const listed = { body: 'listed discussion', createdAt: '2026-10-06T00:00:00Z', ...listedFields };
+    const replacement = { body: listed.body, created_at: listed.createdAt, ...fullFields };
+    const pr = { number: 4017, comments: [listed, ...firstPage.slice(1)] };
+    const onError = vi.fn();
+    const annotate = vi.fn(p => p);
+    const out = enrichPrsWithCompleteComments([pr], {
+      repo, readComments: () => [...firstPage.slice(1), replacement], onError, annotate,
+    });
+    expect(out).toEqual([]);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(pr, expect.any(Error));
+    expect(annotate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['node_id matches id', { id: 'IC_listed' }, { node_id: 'IC_listed' }],
+    ['id matches id', { id: 'IC_listed' }, { id: 'IC_listed' }],
+    ['url matches html_url', { url: 'https://github.com/o/n/issues/4017#issuecomment-1' },
+      { html_url: 'https://github.com/o/n/issues/4017#issuecomment-1' }],
+    ['body and timestamp without ids', {}, {}],
+    ['body and timestamp when only listed has an id', { id: 'IC_listed' }, {}],
+    ['body and timestamp when only complete has an id', {}, { id: 'IC_listed' }],
+  ])('marks a longer-than-page covering read with matching bodies complete: %s', (_name, listedFields, fullFields) => {
+    const listed = { body: 'listed discussion', createdAt: '2026-10-06T00:00:00Z', ...listedFields };
+    const pr = { number: 4017, comments: [listed, ...firstPage.slice(1)] };
+    const complete = [...firstPage.slice(1), { body: listed.body, created_at: listed.createdAt, ...fullFields }, { body: 'later discussion' }];
+    const onError = vi.fn();
+    const readComments = vi.fn(() => complete);
+    expect(enrichPrsWithCompleteComments([pr], { repo, readComments, onError, annotate: p => p }))
+      .toEqual([{ ...pr, comments: complete, commentsComplete: true }]);
+    expect(readComments).toHaveBeenCalledTimes(1);
+    expect(readComments).toHaveBeenCalledWith(pr.number, { repo });
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it('reads through the safe reader with a large buffer and surfaces failures', () => {
@@ -81,7 +203,7 @@ describe('complete PR comments', () => {
 it('annotates short and complete threads through the injected reader', () => {
   const seen = [];
   const annotate = (pr) => { seen.push(pr.number); return { ...pr, annotated: true }; };
-  const out = enrichPrsWithCompleteComments([{ number: 1, comments: [] }, { number: 2, comments: filler(100) }], { annotate, readComments: () => [] });
+  const out = enrichPrsWithCompleteComments([{ number: 1, comments: [] }, { number: 2, comments: filler(100) }], { annotate, readComments: () => [...filler(100), { body: 'later discussion' }] });
   expect(seen).toEqual([1, 2]);
   expect(out.every((pr) => pr.annotated)).toBe(true);
 });
@@ -101,7 +223,7 @@ it('builds red-main context once, lazily, including markers on complete threads'
   }))));
   const readConfig = vi.fn(() => ({ hold: true, maxSessions: 3, windowHours: 6, redMainDiscount: 'on',
     redMainWindows: [{ start: '2026-10-13T21:33:48Z', end: '2026-10-13T23:32:06Z' }] }));
-  const options = { repo, readRows, readConfig, readComments: () => [comment] };
+  const options = { repo, readRows, readConfig, readComments: () => [...filler(100), comment] };
   enrichPrsWithCompleteComments([{ number: 1, comments: [] }], options);
   expect(readRows).not.toHaveBeenCalled();
   const result = enrichPrsWithCompleteComments([
