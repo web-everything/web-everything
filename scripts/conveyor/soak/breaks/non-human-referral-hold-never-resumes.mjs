@@ -88,7 +88,8 @@ const module_default = {
         const again = { ...last, id: `${last.id}-again`, startedAt: last.completedAt + 60_000, completedAt: last.completedAt + 120_000 };
         const twice = planFor(f, {}, { runs: [...f.runs, again] });
         check((twice.dispatch ?? []).length === 0, '#5775 (review:pending): a second attempt on the head must not resume a review again');
-        check(kinds(twice).length > 0, '#5775 (review:pending): the second-attempt plan must still carry a refusal, not vanish');
+        check(kinds(twice).includes(PAUSED) && /reviewed 2 time/.test(JSON.stringify(twice.refusals)),
+          `#5775 (review:pending): the second-review plan must keep ${PAUSED} with the attempt-bound reason`);
       }
     } catch (error) {
       violations.push(`scenario failed: ${error.stack ?? error}`);
