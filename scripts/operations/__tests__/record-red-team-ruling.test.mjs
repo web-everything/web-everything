@@ -1,6 +1,6 @@
 /** Cap-held card rulings: declaration and retry-safe automatic filing, with injected IO. */
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createActionStore } from '../action-store.mjs';
@@ -270,12 +270,13 @@ describe('automatic card filing with shared durable claims', () => {
   const heldAfter = comments => readRedTeamDisposition({ comments: operatorBoundComments(comments), repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).held;
   const result = { ok: true, step: 'held', rel: 'backlog/xabcdef-card.md' };
   function fake({ coordinationRoot = root(), initial = thread(), fileCard, postFails, changeAfterReason,
-    cardOk = true, noPid = false, transitionFails, liveHead = () => HEAD } = {}) {
+    cardOk = true, noPid = false, transitionFails, liveHead = () => HEAD,
+    env = {}, resolveCard = ref => ({ ref, readable: true }) } = {}) {
     const comments = [...initial], posted = [], cards = [], labelSyncs = [];
     const actions = createActionStore({ root: coordinationRoot });
     const realTransition = actions.transition;
     if (transitionFails) actions.transition = (...args) => transitionFails(...args) || realTransition(...args);
-    const sinks = createRecordRedTeamRulingSinks({ coordinationRoot, actions,
+    const sinks = createRecordRedTeamRulingSinks({ coordinationRoot, actions, env, resolveCard,
       readThread: () => ({ headRefOid: liveHead(), labels: [], comments: [...comments] }),
       resolveIdentity: () => OP, readStandingRulingScope: () => null,
       fileCard: (input, session, binding) => {
@@ -746,6 +747,93 @@ describe('automatic card filing with shared durable claims', () => {
     expect(f.posted.filter(body => body.includes('outcome=card-pending'))).toHaveLength(1);
     expect(heldAfter(f.comments)).toEqual([]);
     expect(f.labelSyncs).toHaveLength(1);
+  });
+  it.each(['present', 'missing', 'malformed', 'wrong card'])('persisted completion retry rereads %s spool evidence before release', async evidence => {
+    const stateDir = root(), pending = join(stateDir, 'pending-prevention');
+    mkdirSync(pending);
+    const spoolPath = join(pending, 'xabcdef.json');
+    const spool = { cardId: 'xabcdef', rel: result.rel, content: '---\nstatus: open\n---\n# Follow-up\n' };
+    writeFileSync(spoolPath, JSON.stringify(spool));
+    let failRecord = true;
+    const f = fake({ env: { WE_CARD_BATCH_STATE_DIR: stateDir }, resolveCard: ref => ({ ref, readable: false }),
+      postFails: body => failRecord && body.includes('outcome=operator-card') });
+    const p = payloadFor(); f.act(p); await f.complete();
+    const completed = f.actions.read(rulingCardResource(p), 1);
+    expect(() => f.act(p)).toThrow(/gh down/);
+    failRecord = false;
+    if (evidence === 'missing') unlinkSync(spoolPath);
+    if (evidence === 'malformed') writeFileSync(spoolPath, '{');
+    if (evidence === 'wrong card') writeFileSync(spoolPath, JSON.stringify({ ...spool, rel: 'backlog/xbcdefg-other.md' }));
+    const retry = () => f.act(payloadFor({}, f.comments));
+    if (evidence === 'present') {
+      expect(retry()).toMatchObject({ card: { reconciled: true, ref: `we:${result.rel}` } });
+      expect(heldAfter(f.comments)).toEqual([]);
+      expect(f.labelSyncs).toHaveLength(1);
+    } else {
+      expect(retry).toThrow(/evidence no longer resolves.*no release record written.*recover the owed card/);
+      expect(f.posted.some(body => body.includes('outcome=operator-card'))).toBe(false);
+      expect(heldAfter(f.comments)).toHaveLength(1);
+      expect(f.labelSyncs).toEqual([]);
+    }
+    expect(f.cards).toHaveLength(1);
+    expect(f.actions.attempts(rulingCardResource(p))).toEqual([completed]);
+  });
+  it.each(['present', 'closed', 'unreadable', 'different ref'])('persisted completion retry re-resolves the exact PR card (%s)', async evidence => {
+    let readable = true, failRecord = true;
+    const refs = [];
+    const f = fake({ resolveCard: ref => {
+      refs.push(ref);
+      if (!readable && evidence === 'unreadable') throw new Error('card source unavailable');
+      return { ref: !readable && evidence === 'different ref' ? 'we:backlog/other.md' : ref,
+        readable: readable || evidence === 'different ref' };
+    }, postFails: body => failRecord && body.includes('outcome=operator-card') });
+    const p = payloadFor(); f.act(p);
+    await f.complete({ code: 0, result: { ...result, step: 'done', pr: 123 } });
+    expect(() => f.act(p)).toThrow(/gh down/);
+    failRecord = false; readable = evidence === 'present';
+    const retry = () => f.act(payloadFor({}, f.comments));
+    if (readable) {
+      expect(retry()).toMatchObject({ card: { reconciled: true } });
+      expect(heldAfter(f.comments)).toEqual([]);
+    } else {
+      expect(retry).toThrow(/no release record written/);
+      expect(heldAfter(f.comments)).toHaveLength(1);
+      expect(f.posted.some(body => body.includes('outcome=operator-card'))).toBe(false);
+    }
+    expect(refs).toEqual([`we:${result.rel}@pr123`, `we:${result.rel}@pr123`]);
+    expect(f.cards).toHaveLength(1);
+  });
+  it('refuses evidence removed during the reason POST immediately before release', async () => {
+    let readable = true;
+    const f = fake({ resolveCard: ref => ({ ref, readable }), changeAfterReason: () => { readable = false; } });
+    const p = payloadFor(); f.act(p); await f.complete();
+    expect(() => f.act(p)).toThrow(/no release record written/);
+    expect(heldAfter(f.comments)).toHaveLength(1);
+    expect(f.posted.some(body => body.includes('outcome=operator-card'))).toBe(false);
+  });
+  it('a loser reusing a completion that raced its claim refuses vanished backing evidence', () => {
+    const f = fake({ resolveCard: ref => ({ ref, readable: false }) }), p = payloadFor(); f.act(p);
+    const claim = f.actions.claim;
+    f.actions.claim = request => {
+      const r = f.actions.read(rulingCardResource(p), 1);
+      expect(f.actions.transition(r.resource, r.attempt, { token: r.ownerToken, rev: r.rev, from: 'observed', to: 'terminal',
+        patch: { outcome: 'settled', evidence: { ...r.evidence, at: Date.now(), result: { ...result, step: 'done' },
+          card: { session: p.session, ref: `we:${result.rel}` } } } }).ok).toBe(true);
+      return claim(request);
+    };
+    expect(() => f.act(p)).toThrow(/evidence no longer resolves.*no release record written/);
+    expect(f.actions.attempts(rulingCardResource(p)).map(r => r.outcome)).toEqual(['settled', 'not-started']);
+    expect(f.cards).toHaveLength(1);
+    expect(heldAfter(f.comments)).toHaveLength(1);
+    expect(f.posted.some(body => body.includes('outcome=operator-card'))).toBe(false);
+  });
+  it('a persisted mention count without a resolvable card reference cannot release', async () => {
+    const f = fake(), p = payloadFor(); f.act(p);
+    await f.complete({ code: 0, result: { ok: true, step: 'mentioned', mentions: 1 } });
+    expect(f.actions.read(rulingCardResource(p), 1)).toMatchObject({ state: 'terminal', outcome: 'settled' });
+    expect(() => f.act(p)).toThrow(/no release record written.*cite its readable --card reference/);
+    expect(heldAfter(f.comments)).toHaveLength(1);
+    expect(f.cards).toHaveLength(1);
   });
   it.each(['head', 'grant'])('automatic filing rechecks before release when the %s changes during the reason POST', async variant => {
     let head = HEAD;

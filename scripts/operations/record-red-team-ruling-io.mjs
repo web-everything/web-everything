@@ -3,7 +3,8 @@
  * @description Live reader and retry-safe card sink for cap-held operator rulings. IO is injectable.
  */
 import { spawnSync } from 'node:child_process';
-import { basename, dirname, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { liveResultGateState, readConfirmedBreaks, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
@@ -12,6 +13,7 @@ import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/refe
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
 import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { createActionStore } from './action-store.mjs';
+import { cardBatchStateDir } from './card-batch-io.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { defaultSpawnDetached } from './detached-dispatch.mjs';
 import { preventionCardLandingLogPath, spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
@@ -275,6 +277,25 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card });
       post(p.repo, p.pr, reasonBody(p, `Follow-up card queued through the prevention landing job (${session}); filing may be paused, in which case it is owed in the spool.`));
       recheck(p, 'card queued and reason posted; no release record written');
+      // A receipt survives its backing card/spool. Re-read that evidence on every release attempt.
+      const result = r.evidence.result, ref = landingRef(result);
+      let readable = false;
+      try {
+        if (ref) {
+          const exact = Number.isInteger(result.pr) && result.pr > 0 ? `${ref}@pr${result.pr}` : ref;
+          const current = resolveCard(exact, { repo: p.repo, pr: p.pr, head: p.head });
+          readable = current?.readable === true && current.ref === exact;
+          if (!readable && result.step === 'held') {
+            const id = /^backlog\/([^/-]+)-[^/]+\.md$/.exec(result.rel)?.[1];
+            if (id) {
+              const spool = JSON.parse(readFileSync(join(cardBatchStateDir(env), 'pending-prevention', `${id}.json`), 'utf8'));
+              readable = spool.rel === result.rel && spool.cardId === id
+                && /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(spool.content ?? '');
+            }
+          }
+        }
+      } catch { readable = false; }
+      if (!readable) throw new Error(`card completion evidence no longer resolves to a readable card or spool; no release record written — inspect the landing log for ${session}; recover the owed card and cite its readable --card reference`);
       post(p.repo, p.pr, record);
       proveReleased(p, 'the operator-card record', record);
       return { ruling: 'card', head: p.head, indices: p.indices, card, labels: resync(p) };
