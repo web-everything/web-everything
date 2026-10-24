@@ -1447,13 +1447,18 @@ export async function speculateRedTeam({
     // available provider — bounded to the provider count.
     let available = [];
     const unavailable = [];
+    let deferredByCap = false;
     const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, resolveProviderCap(p, env)]));
     const usedByProvider = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     for (const p of REVIEW_SEAT_PROVIDERS) {
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
       const hold = quotaHoldOrProbe(records, p, now, env);
       if (hold) { unavailable.push(`${p}: ${hold}`); continue; }
-      if (usedByProvider[p] >= caps[p]) { unavailable.push(`${p}: daily-cap: ${usedByProvider[p]}/${caps[p]} non-Claude seat calls already used today`); continue; }
+      if (usedByProvider[p] >= caps[p]) {
+        deferredByCap = true;
+        unavailable.push(`${p}: daily-cap: ${usedByProvider[p]}/${caps[p]} non-Claude seat calls already used today`);
+        continue;
+      }
       available.push(p);
     }
     let provider = null;
@@ -1473,9 +1478,14 @@ export async function speculateRedTeam({
       }
       usedByProvider[pick.provider] = reservation.used;
       if (reservation.callIds.length) { provider = pick.provider; callId = reservation.callIds[0]; }
-      else { lastReason = `daily-cap: ${reservation.used}/${caps[pick.provider]} non-Claude seat calls used today for ${pick.provider}`; available = available.filter((x) => x !== pick.provider); }
+      else {
+        deferredByCap = true;
+        lastReason = `daily-cap: ${reservation.used}/${caps[pick.provider]} non-Claude seat calls used today for ${pick.provider}`;
+        available = available.filter((x) => x !== pick.provider);
+      }
     }
-    if (!callId) return { status: 'skipped', reason: `${lastReason ?? 'no provider available'}${unavailable.length ? ` (${unavailable.join('; ')})` : ''}` };
+    if (!callId) return { status: 'skipped', ...(deferredByCap ? { deferredByCap: true } : {}),
+      reason: `${lastReason ?? 'no provider available'}${unavailable.length ? ` (${unavailable.join('; ')})` : ''}` };
     const { model: defaultModel, effort: defaultEffort } = RED_TEAM_MODELS[provider];
     const effort = configuredRoute?.effort ?? resolveOperationEffort("review-seat", provider, RED_TEAM_SEAT.key);
     const model = configuredRoute?.model ?? defaultModel;

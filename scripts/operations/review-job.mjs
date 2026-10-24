@@ -620,6 +620,7 @@ export function summarizeRedTeam(r) {
   if (!r || typeof r !== 'object') return null;
   return {
     status: r.status ?? null,
+    ...(r.deferredByCap === true ? { deferredByCap: true } : {}),
     ...(r.reason ? { reason: r.reason } : {}),
     ...(r.status === 'ran' ? {
       provider: r.provider, model: r.model, seatStatus: r.seat?.status ?? null, foldedVerdict: r.foldedVerdict ?? null,
@@ -741,7 +742,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
     // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
     // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
-    if (typeof io.runRedTeamGate === 'function') {
+    if (!redTeam?.deferredByCap && typeof io.runRedTeamGate === 'function') {
       let gate;
       try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
       io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);
@@ -750,6 +751,19 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     }
   }
   if (accepted) {
+    // No model call or seat row exists after a cap deferral. Remove our queued
+    // admission so the next tick can retry fresh after cooldown/budget reset.
+    // A recorded resume keeps its prior clean result through the branch below.
+    if (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true
+      && seatsBox.redTeamResumeResult == null) {
+      try {
+        io.restoreRedTeamStatus({ repo: out.repo, pr: out.pr,
+          head: seatsBox.input.loopPayload.findings.read.netBasis.rev, status: null });
+      } catch (e) {
+        io.log(`review-job ${out.sessionSlug}: cap deferral status cleanup failed (${tail(e?.message ?? e, 300)})`);
+      }
+      return out;
+    }
     // A resume only retries effects of an already-clean pass. A transient child/store failure
     // must not replace that admission evidence with skipped/error and strand the next retry.
     const result = seatsBox.redTeamResumeResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)

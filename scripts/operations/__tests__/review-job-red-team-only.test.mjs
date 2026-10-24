@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -73,6 +73,88 @@ function fakeIo(over = {}) {
 }
 
 describe('red-team-only review job', () => {
+  it.each(['snapshot', 'reservation'].flatMap(cap => [true, false].map(redTeamOnly => ({ cap, redTeamOnly }))))(
+    'retries after the daily $cap cap resets (initial red-team-only=$redTeamOnly)', ({ cap, redTeamOnly }) => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-cap-retry-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      const write = input => recordRedTeamStatus(input, { env });
+      const read = () => readRedTeamStatus({ repo, pr, head, env });
+      const loopPayload = payload();
+      Object.assign(loopPayload, { stopped: 'complete', runId: 'review-pr-cap' });
+      Object.assign(loopPayload.findings.read, { diffText: '+export const value = true;', netChangedFiles: ['x.mjs'] });
+      const review = { ...loopPayload, op: 'review-pr', input: { repo, pr } };
+      writeFileSync(join(dir, 'review-pr-cap.json'), JSON.stringify(review));
+      let at = Date.parse('2026-10-23T15:00:00Z');
+      let observed = { rows: [], comments: [], modelCalls: 0 };
+      const evidence = () => readDrainRedTeamEvidence({ repo, pr, head, env, runsDir: dir,
+        list: () => ['review-pr-cap'], read: () => review, readScorecards: () => observed.rows });
+      const source = `
+        import { readFileSync } from 'node:fs';
+        import { runRedTeam, reserveSeatCalls } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
+        const { input, at, cap, saved } = JSON.parse(readFileSync(0, 'utf8'));
+        const spent = { dispatchKind: 'review-seat', seat: 'juror', provider: 'codex', status: 'ok',
+          callId: 'spent', scoredAt: '2026-10-23T15:00:00Z' };
+        const records = [...(cap === 'snapshot' ? [spent] : []), ...saved.rows];
+        const ledger = { version: 1, reservations: [{ callId: 'spent', provider: 'codex', at: spent.scoredAt }] };
+        const result = await runRedTeam({ ...input, env: { WE_REVIEW_SEAT_CAP_CODEX: '1' } }, {
+          now: () => at, log: () => {}, readRecords: () => records,
+          cliAvailable: provider => provider === 'codex',
+          reserveCalls: options => reserveSeatCalls({ ...options, records, ledger, newId: () => 'retry-call' }),
+          makeScratch: () => '/fixture', removeScratch: () => {}, writeFile: () => {}, readHeadMessage: () => '',
+          runSeat: async () => { saved.modelCalls++; return { report: { exitCode: 0,
+            lastMessage: JSON.stringify({ lenses: { 'red-team': { verdict: 'accept', findings: [] } } }) } }; },
+          runRecheck: () => { throw Error('empty findings need no recheck'); },
+          append: row => saved.rows.push(row), logTrial: () => {},
+          listComments: () => saved.comments,
+          postComment: ({ body }) => saved.comments.push({ body, author: { login: 'web-everything' } }),
+        });
+        process.stdout.write(JSON.stringify({ ...saved, result }));
+      `;
+      const io = fakeIo({
+        readRedTeamOnlyPayload: () => ({ head, loopPayload }),
+        readRedTeamStatus: read, readRedTeamRecords: () => observed.rows,
+        readRedTeamComments: () => observed.comments,
+        recordRedTeamQueued: write, redTeamStatus: vi.fn(write),
+        restoreRedTeamStatus: createReviewJobIo({ env }).restoreRedTeamStatus,
+        runLoop: () => ({ status: 0, stdout: JSON.stringify(loopPayload), stderr: '' }),
+        runRedTeam: input => {
+          observed = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
+            input: JSON.stringify({ input, at, cap, saved: observed }), encoding: 'utf8',
+            timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
+          }));
+          return observed.result;
+        },
+      });
+      const history = new Map();
+      let job;
+      const recover = () => runRedTeamOnSkip({ repo,
+        plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+        rawPrs: [{ number: pr, headRefOid: head, comments: observed.comments }],
+        readEvidence: evidence, readStatus: read,
+        setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: history, now: () => at,
+        capacity: { lanes: 1 }, dispatch: options => { job = runReviewJob(options, io); return { jobPid: 42 }; },
+      });
+      try {
+        if (redTeamOnly) expect(recover().dispatched).toHaveLength(1);
+        else job = runReviewJob({ repo, pr }, io);
+        expect(job.redTeam).toMatchObject({ status: 'skipped', reason: expect.stringContaining('daily-cap:') });
+        expect(observed.modelCalls).toBe(0);
+        expect(observed.rows).toEqual([]);
+        expect(observed.comments).toEqual([]);
+        expect(read()).toBeNull();
+        expect(evidence()).toMatchObject({ scheduled: true, recorded: false, inFlight: false });
+        expect(io.runRedTeamGate).not.toHaveBeenCalled();
+        if (redTeamOnly) expect(recover().rows[0].why).toBe('retry cooldown active');
+        at += 24 * 60 * 60_000;
+        expect(recover().dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
+        expect(job.redTeam).toMatchObject({ status: 'ran', comment: 'posted' });
+        expect(observed.modelCalls).toBe(1);
+        expect(read()).toMatchObject({ status: 'finished', result: 'ran' });
+        expect(redTeamForHead(observed.comments, pr, head)).toMatchObject({ pr, rev: head });
+        expect(io.runRedTeamGate).toHaveBeenCalledOnce();
+        expect(recover().dispatched).toEqual([]);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
   it.each(['fresh', 'resume'].flatMap(redTeamMode => ['clean', 'degraded', 'read-error'].map(gateCase => ({ redTeamMode, gateCase }))))(
     '$redTeamMode recovery preserves acceptance, review:human and completion through the real gate ($gateCase)', ({ redTeamMode, gateCase }) => {
       // The job invokes the asynchronous gate in a synchronous child in production.

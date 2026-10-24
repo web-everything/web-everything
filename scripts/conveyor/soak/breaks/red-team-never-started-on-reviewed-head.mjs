@@ -51,6 +51,7 @@ export default {
       const { planReconcile } = await load('scripts/conveyor/reconcile-core.mjs');
       const { buildReviewedShaMarker } = await load('scripts/lib/review-escalation.mjs');
       const { renderRedTeamComment, runRedTeam } = await load('scripts/operations/review-extra-seats.mjs');
+      const { runReviewJob } = await load('scripts/operations/review-job.mjs');
       const recovery = existsSync(join(sourceRoot, RECOVERY)) ? await load(RECOVERY) : null;
       const head = 'a'.repeat(40);
       const payload = verdict => ({ verdict: { verdict }, findings: { read: { netBasis: { rev: head } } } });
@@ -158,6 +159,48 @@ export default {
       for (const c of cases.filter(c => c.mode)) {
         check(starts.some(s => s.pr === c.number), `#${c.number}: owed red team never started for the already-reviewed head`);
       }
+      // #5838: a cap refusal must not become a permanent finished/skipped result.
+      // Exercise the real cap check, then the planner/job status lifecycle across a reset.
+      const cappedPayload = { verdict: { verdict: 'accept' }, findings: { read: {
+        netBasis: { rev: head }, netChangedFiles: ['x.mjs'], diffText: '+export const value = true;',
+      } } };
+      const capped = await runRedTeam({ repo, pr: 5839, loopPayload: cappedPayload,
+        env: { WE_REVIEW_SEAT_CAP_CODEX: '0' } }, {
+        now: () => at, log: () => {}, readRecords: () => [], cliAvailable: p => p === 'codex',
+        reserveCalls: () => { throw Error('cap check must precede reservation'); },
+      });
+      check(capped.status === 'skipped' && capped.reason.includes('daily-cap:'), '#5838: cap fixture did not hit the daily cap');
+      let status = null, calls = 0, capReset = false, job;
+      const capHistory = new Map();
+      const io = {
+        root: sourceRoot, now: () => at, newActorId: () => 'soak-cap',
+        readPrevCompletion: () => null, claim: () => ({ ok: true }), updateRecord: () => {},
+        unclaim: () => {}, acquireLane: () => ({ lanePath: sourceRoot }), releaseLane: () => {}, log: () => {},
+        readRedTeamOnlyPayload: () => ({ head, loopPayload: cappedPayload }),
+        readRedTeamStatus: () => status, readRedTeamRecords: () => [], readRedTeamComments: () => [],
+        recordRedTeamQueued: input => { status = { status: input.status, result: null }; },
+        redTeamStatus: input => { status = { status: input.status, result: input.result }; },
+        restoreRedTeamStatus: input => { status = input.status; },
+        runRedTeam: () => { calls++; return capReset ? { status: 'ran', findings: [], comment: { status: 'posted' } } : capped; },
+        runRedTeamGate: () => { check(capReset, '#5838: cap deferral ran the gate'); return { status: 'ok' }; },
+        report: () => { throw Error('recovery must not write review completion'); },
+        runLoop: () => { throw Error('recovery must not run a new review'); },
+      };
+      const retryCap = () => recovery?.runRedTeamOnSkip({ repo,
+        plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: 5839, headSha: head }] },
+        rawPrs: [{ number: 5839, headRefOid: head, comments: [] }],
+        readEvidence: () => ({ loopPayload: cappedPayload, recorded: false }), readStatus: () => status,
+        setting, lastDispatch: capHistory, now: () => at, capacity: { lanes: 1 },
+        dispatch: options => { job = runReviewJob(options, io); return { jobPid: 42 }; },
+      });
+      retryCap();
+      check(calls === 1 && status == null, '#5838: capped recovery persisted terminal evidence');
+      check(retryCap()?.rows[0]?.why === 'retry cooldown active', '#5838: cap retry ignored cooldown');
+      at += 24 * 60 * 60_000;
+      capReset = true;
+      retryCap();
+      check(calls === 2 && job?.redTeam?.status === 'ran' && status?.result === 'ran',
+        '#5838: recovery never ran after the daily cap reset');
     } catch (error) {
       violations.push(`scenario failed: ${error.stack ?? error}`);
     }
