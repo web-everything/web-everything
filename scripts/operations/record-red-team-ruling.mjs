@@ -9,6 +9,7 @@
  * Reader and sink: ./record-red-team-ruling-io.mjs. Other ruling kinds come later.
  */
 import { createHash } from 'node:crypto';
+import { actionResource } from './action-record.mjs';
 import { buildRedTeamCardInput } from './red-team-gate-apply.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -29,6 +30,11 @@ export const CARD_PENDING_OUTCOME = 'card-pending';
 export function cardJobKey({ repo, pr, head, resultId, indices }) {
   return createHash('sha256').update(JSON.stringify(['v1', repo, Number(pr), head, resultId, [...indices].sort((a, b) => a - b)])).digest('hex').slice(0, 12);
 }
+
+/** Shared resource: bind the full repo/PR/head/result/break identity into a safe item id. */
+export const rulingCardResource = (p, scope = 'card') => actionResource(p.repo, {
+  type: 'item', id: `rtr-${p.pr}-${p.head.slice(0, 12)}-${cardJobKey(p)}${scope === 'break' ? '-break' : ''}`,
+});
 
 const where = (f) => `${f.file ?? '(no file cited)'}${f.line ? `:${f.line}` : ''}`;
 

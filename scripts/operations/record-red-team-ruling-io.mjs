@@ -3,9 +3,7 @@
  * @description Live reader and retry-safe card sink for cap-held operator rulings. IO is injectable.
  */
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { liveResultGateState, readConfirmedBreaks, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
@@ -13,14 +11,15 @@ import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
 import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
-import { automationStateRoot } from '../lib/automation-home.mjs';
+import { createActionStore } from './action-store.mjs';
+import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { defaultSpawnDetached } from './detached-dispatch.mjs';
 import { preventionCardLandingLogPath, spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
 import { buildGateComment } from './red-team-gate-apply.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
-import { CARD_PENDING_OUTCOME, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulableBreaks } from './record-red-team-ruling.mjs';
+import { CARD_PENDING_OUTCOME, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, rulableBreaks } from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
@@ -103,128 +102,33 @@ export function createRecordRedTeamRulingReader({ env = process.env, readThread 
   };
 }
 
-/**
- * A local, atomic claim per card job, in numbered GENERATIONS (`<key>.<n>.claim`, each made with `wx`). Taking over an
- * expired claim means creating generation n+1, which only one caller can do. A validated `.spawned` receipt
- * proves only the child start; the child writes `.completed` after the card exists or is durably spooled.
- * Neither a PID nor the landing log alone permits release.
- */
-export function createFileClaims({ dir = join(automationStateRoot(), 'red-team-ruling-claims'), nowMs = Date.now } = {}) {
-  const latest = (key) => {
-    let gen = -1, at = 0;
-    for (const f of readdirSync(dir)) {
-      const m = f.startsWith(`${key}.`) ? /\.(\d+)\.claim$/.exec(f) : null;
-      if (m && Number(m[1]) > gen) { gen = Number(m[1]); try { at = Number(JSON.parse(readFileSync(join(dir, f), 'utf8')).at) || 0; } catch { at = 0; } }
-    }
-    return { gen, at };
-  };
-  const make = (key, gen) => {
-    try { writeFileSync(join(dir, `${key}.${gen}.claim`), JSON.stringify({ at: nowMs() }), { flag: 'wx' }); return true; }
-    catch (e) { if (e?.code === 'EEXIST') return false; throw e; }
-  };
-  const receipt = (key, suffix, expected) => {
-    try {
-      const saved = JSON.parse(readFileSync(join(dir, `${key}.${suffix}`), 'utf8'));
-      if (!expected?.head || saved.head !== expected.head || saved.session !== expected.session
-        || saved.session !== `red-team-ruling-card-${key}` || !Number.isFinite(saved.at) || saved.at < 0) return null;
-      return saved;
-    } catch { return null; } // Missing, unreadable, partial and legacy unbound receipts prove nothing.
-  };
-  return {
-    hasClaim(key) {
-      try { return latest(key).gen >= 0; }
-      catch (e) { if (e?.code === 'ENOENT') return false; throw e; }
-    },
-    claim(key) {
-      mkdirSync(dir, { recursive: true });
-      const cur = latest(key);
-      if (cur.gen < 0 && make(key, 0)) return { created: true, gen: 0, at: nowMs() };
-      const seen = latest(key);
-      return { created: false, gen: seen.gen, at: seen.at };
-    },
-    /** Take over the claim observed at `gen`. Exactly one caller wins generation gen+1. */
-    reclaim(key, gen) { return make(key, gen + 1); },
-    /** Reserve the entire selection under one lock and in one file. Legacy per-break claims still bind.
-     * A rejected selection writes nothing, so it cannot strand its otherwise unowned breaks. */
-    claimBreak(breakKey, jobKey, breakKeys = [breakKey]) {
-      mkdirSync(dir, { recursive: true });
-      const lock = join(dir, 'break-selection.lock');
-      try { mkdirSync(lock); }
-      catch (e) {
-        if (e?.code !== 'EEXIST') throw e;
-        throw new Error('break selection is locked; retry later. If it persists, verify no ruling invocation is running before removing break-selection.lock from the claims directory');
-      }
-      try {
-        const keys = [...new Set(breakKeys)].sort();
-        if (!keys.includes(breakKey)) throw new Error('break selection does not include the requested break; nothing claimed');
-        // Read every owner before writing anything. Corrupt persisted evidence refuses the entire selection.
-        for (const key of keys) {
-          const f = join(dir, `${key}.break`);
-          let text;
-          try { text = readFileSync(f, 'utf8'); }
-          catch (e) { if (e?.code === 'ENOENT') continue; throw e; }
-          const owner = JSON.parse(text).jobKey;
-          if (typeof owner !== 'string' || !owner) throw new Error('unreadable legacy break owner; inspect the claims directory before retrying');
-          if (owner !== jobKey) return owner;
-        }
-        for (const name of readdirSync(dir).filter((f) => f.endsWith('.selection'))) {
-          const saved = JSON.parse(readFileSync(join(dir, name), 'utf8'));
-          if (typeof saved.jobKey !== 'string' || !saved.jobKey || name !== `${saved.jobKey}.selection` || !Array.isArray(saved.keys)
-            || !saved.keys.length || saved.keys.some((k) => typeof k !== 'string' || !k)) {
-            throw new Error('unreadable break selection; inspect the claims directory before retrying');
-          }
-          if (saved.jobKey !== jobKey && saved.keys.some((key) => keys.includes(key))) return saved.jobKey;
-          if (saved.jobKey === jobKey && JSON.stringify(saved.keys) !== JSON.stringify(keys)) {
-            throw new Error('card job already owns a different break selection; retry with its exact selection');
-          }
-        }
-        const f = join(dir, `${jobKey}.selection`);
-        try { writeFileSync(f, JSON.stringify({ jobKey, keys, at: nowMs() }), { flag: 'wx' }); }
-        catch (e) { if (e?.code !== 'EEXIST') throw e; }
-        return jobKey;
-      } finally { rmSync(lock, { recursive: true }); }
-    },
-    spawned(key, expected) {
-      const saved = receipt(key, 'spawned', expected);
-      return !!saved && /^pid:[1-9]\d*$/.test(saved.handle);
-    },
-    completed(key, expected) {
-      const saved = receipt(key, 'completed', expected);
-      return !!saved && cardLandingExists(saved.result);
-    },
-    markCompleted(key, info) {
-      mkdirSync(dir, { recursive: true });
-      const temporary = join(dir, `${key}.completed.${process.pid}.tmp`);
-      try {
-        writeFileSync(temporary, JSON.stringify({ ...info, at: nowMs() }));
-        renameSync(temporary, join(dir, `${key}.completed`));
-      } finally { rmSync(temporary, { force: true }); }
-    },
-    attempted(key) { return existsSync(join(dir, `${key}.attempt`)); },
-    /** Exclusive (`wx`): exactly one invocation ever holds a job's attempt; false when another already does. */
-    markAttempt(key) {
-      mkdirSync(dir, { recursive: true });
-      try { writeFileSync(join(dir, `${key}.attempt`), JSON.stringify({ at: nowMs() }), { flag: 'wx' }); return true; }
-      catch (e) { if (e?.code === 'EEXIST') return false; throw e; }
-    },
-    clearAttempt(key) { rmSync(join(dir, `${key}.attempt`), { force: true }); },
-    markSpawned(key, info) { writeFileSync(join(dir, `${key}.spawned`), JSON.stringify({ ...info, at: nowMs() })); },
-    now: nowMs,
-  };
-}
-
-/** The claim key binding ONE break of one result to its card job. PURE. */
-export const breakClaimKey = (p, index) => createHash('sha256').update(JSON.stringify(['break-v1', p.repo, Number(p.pr), p.head, p.resultId, Number(index)])).digest('hex').slice(0, 16);
-
-/** How long a claim with no spawned job counts as another invocation still working. */
-export const CLAIM_IN_PROGRESS_MS = 120_000;
+const CARD_KIND = 'red-team-ruling-card';
+const transition = (actions, r, to, patch) => {
+  const changed = actions.transition(r.resource, r.attempt, { token: r.ownerToken, rev: r.rev, from: r.state, to, patch });
+  if (!changed.ok && changed.reason === 'stale-rev' && r.state === 'dispatching' && to === 'observed') {
+    // Parent bookkeeping and child completion may both observe the same dispatch. Reuse only a
+    // bound observation by the same owner; completion then uses its fresh revision for the terminal CAS.
+    const fresh = actions.read(r.resource, r.attempt);
+    if (fresh.ownerToken === r.ownerToken && fresh.rev > r.rev && bound(fresh, r.evidence)
+      && fresh.handle === r.evidence.session && (fresh.state === 'observed' || completion(fresh, r.evidence))) return fresh;
+  }
+  if (!changed.ok) throw new Error(`card claim transition refused (${changed.reason}); inspect the shared coordination record before retrying`);
+  return changed.record;
+};
+const bound = (r, p) => r.kind === CARD_KIND && r.evidence?.head === p.head
+  && r.evidence?.jobKey === p.jobKey && r.evidence?.session === p.session
+  && p.session === `red-team-ruling-card-${p.jobKey}`;
+const landingRef = result => /^backlog\/[A-Za-z0-9][A-Za-z0-9._-]*\.md$/.test(result?.rel ?? '') ? `we:${result.rel}` : undefined;
+const completion = (r, p) => bound(r, p) && r.state === 'terminal' && r.outcome === 'settled'
+  && r.evidence.card?.session === p.session && r.evidence.card?.ref === landingRef(r.evidence.result)
+  && Number.isFinite(r.evidence?.at) && r.evidence.at >= 0 && cardLandingExists(r.evidence.result);
 
 /** Spawn the landing job under a STABLE session, so the job (and its log) is identified by the ruling, not by a fresh random slug. */
-const spawnStableCardJob = (input, session, { jobKey, head }) => {
+const spawnStableCardJob = (input, session, binding) => {
   const logPath = preventionCardLandingLogPath(session);
   const r = spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-ruling-card',
     spawnDetached: (argv, o) => defaultSpawnDetached([fileURLToPath(import.meta.url), '--land-card-receipt',
-      JSON.stringify({ jobKey, head, session }),
+      JSON.stringify(binding),
       ...argv.slice(1).map((a) => (a.startsWith('--session=') ? `--session=${session}` : a))], { ...o, logPath }) });
   return r.ok ? { ...r, session } : r;
 };
@@ -234,7 +138,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
   runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = () => resolveOperatorIdentity({ env }),
-  claims = createFileClaims(), fileCard = spawnStableCardJob,
+  coordinationRoot = resolveCoordinationRoot(), actions = createActionStore({ root: coordinationRoot }), fileCard = spawnStableCardJob,
   post = (repo, pr, body) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env),
   syncLabels = ({ repo, pr, head }) => syncRedTeamStatusLabels({ repo, pr, head, env }),
   warn = (m) => process.stderr.write(`${m}\n`) } = {}) {
@@ -310,59 +214,62 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         proveReleased(p, 'the operator-card record', record);
         return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
       }
-      const session = p.session;
-      // Observe the prior thread and local evidence BEFORE creating any claim or writing an intent.
+      const session = p.session, resource = rulingCardResource(p);
       const hasIntent = hasPendingCardIntent(comments, p);
-      if (hasIntent && !claims.hasClaim(p.jobKey) && !claims.attempted(p.jobKey)
-        && !claims.spawned(p.jobKey, p) && !claims.completed(p.jobKey, p)) {
-        throw new Error(`card job ${p.jobKey} already has a trusted pending intent but no local claim, attempt, spawn or completion evidence; nothing written. `
-          + `Check the landing log for session ${session}; recover the owed card and re-run citing its readable --card reference`);
-      }
-      // 0. Each selected BREAK belongs to at most one card job (atomic, local): an overlapping concurrent selection loses.
-      const breakKeys = p.indices.map((i) => breakClaimKey(p, i));
-      const owners = p.indices.map((i, n) => ({ i, owner: claims.claimBreak(breakKeys[n], p.jobKey, breakKeys) })).filter((o) => o.owner !== p.jobKey);
-      if (owners.length) {
-        throw new Error(`break(s) ${owners.map((o) => `#${o.i}`).join(', ')} already belong to another card job (${[...new Set(owners.map((o) => o.owner || 'unreadable'))].join(', ')}); `
-          + 'nothing written — re-run with that job\'s exact --break selection');
-      }
-      // 1. Serialize: one atomic claim per (PR, head, result, breaks); taking over an expired one is atomic too.
-      const claim = claims.claim(p.jobKey);
-      const completed = claims.completed(p.jobKey, p);
-      const spawned = claims.spawned(p.jobKey, p) || completed;
-      if (!claim.created && !spawned) {
-        if (claims.now() - claim.at < CLAIM_IN_PROGRESS_MS) {
-          throw new Error(`another invocation holds the claim for job ${p.jobKey} and has not spawned it yet; wait ${Math.round(CLAIM_IN_PROGRESS_MS / 1000)}s and re-run`);
+      const rows = actions.attempts(resource), prior = rows.at(-1);
+      // A legacy intent with no shared record is ambiguous: never automatically duplicate its child.
+      if (hasIntent && !prior) throw new Error(`trusted pending intent has no shared claim; inspect the landing log for ${session}; recover the owed card and cite its readable --card reference`);
+      const settled = rows.findLast(r => r.state === 'terminal' && r.outcome === 'settled');
+      let claim = settled ? { ok: false, record: settled } : actions.claim({ resource, kind: CARD_KIND,
+        owner: `record-red-team-ruling:${process.pid}`, evidence: { head: p.head, jobKey: p.jobKey, session } });
+      // Completion can race the pre-read and claim, allocating an unused next attempt. Never dispatch it.
+      if (claim.ok) {
+        const finished = actions.attempts(resource).findLast(r => r.attempt !== claim.record.attempt && r.state === 'terminal' && r.outcome === 'settled');
+        if (finished) {
+          transition(actions, claim.record, 'terminal', { outcome: 'not-started' });
+          claim = { ok: false, record: finished };
         }
-        if (!claims.reclaim(p.jobKey, claim.gen)) throw new Error(`another invocation just took over the claim for job ${p.jobKey}; re-run later`);
       }
-      // 2. The bare intent marker, BEFORE the spawn (no action line, so the hold stands). Written once per job.
-      if (!hasIntent) post(p.repo, p.pr, intentBody(p));
-      // 3. Spawn exactly once: a job with a spawn receipt is reconciled, never spawned again.
-      let card = { ok: true, session };
-      if (!spawned) {
-        // AT MOST ONCE: an attempt marker is written BEFORE the spawn and cleared only when the spawn reported that it
-        // did not start. A marker with no receipt means a child MAY be running (a crash between the spawn and the
-        // receipt), so a re-run refuses instead of spawning a second filing.
-        if (claims.attempted(p.jobKey) || !claims.markAttempt(p.jobKey)) {
-          throw new Error(`an earlier attempt of card job ${p.jobKey} may have started its landing job (no spawn receipt was recorded); nothing written. `
-            + `Check the landing log for session ${session}; recover the owed card and cite its readable --card reference if the job failed`);
+      let r = claim.record;
+      if (!r || !bound(r, p)) throw new Error('card claim binding is unreadable; inspect the shared coordination record before retrying');
+      const spawned = !claim.ok;
+      if (claim.ok) {
+        // Durable per-break reservations also exclude different, overlapping selections.
+        const reserved = [];
+        for (const index of [...p.indices].sort((a, b) => a - b)) {
+          const key = rulingCardResource({ ...p, indices: [index] }, 'break');
+          const held = actions.claim({ resource: key, kind: 'red-team-ruling-break', owner: r.owner,
+            evidence: { jobKey: p.jobKey } });
+          if (held.ok) reserved.push(held.record);
+          else if (held.record?.kind !== 'red-team-ruling-break' || held.record?.evidence?.jobKey !== p.jobKey) {
+            for (const owned of reserved) actions.release(owned.resource, owned.attempt, { token: owned.ownerToken, rev: owned.rev });
+            actions.release(resource, r.attempt, { token: r.ownerToken, rev: r.rev });
+            throw new Error('break(s) already belong to another card job; nothing written — retry its exact selection');
+          }
         }
-        card = fileCard(p.cardInput, session, p);
+        // Fence BEFORE any side effect. Ambiguous spawn failures remain dispatching, never auto-reclaimed.
+        r = transition(actions, r, 'dispatching', { dispatchingSince: Date.now() });
+        try { if (!hasIntent) post(p.repo, p.pr, intentBody(p)); }
+        catch (error) {
+          // Even an ambiguously published intent cannot have started a child: fileCard has not run.
+          transition(actions, r, 'terminal', { outcome: 'not-started' });
+          throw error;
+        }
+        const card = fileCard(p.cardInput, session, { resource, attempt: r.attempt, ownerToken: r.ownerToken,
+          jobKey: p.jobKey, head: p.head, session, coordinationRoot });
         if (!card?.ok) {
-          claims.clearAttempt(p.jobKey); // the spawn itself reported no child
-          throw new Error(`the follow-up card was not queued (${card?.error ?? 'unknown'}); the intent is recorded and a re-run retries the same job`);
+          transition(actions, r, 'terminal', { outcome: 'not-started' });
+          throw new Error(`the follow-up card was not queued (${card?.error ?? 'unknown'}); retry the same ruling`);
         }
-        // The proof of a spawn is the child's confirmed start (a pid), recorded durably; the job's log file proves nothing.
-        if (!/^pid:[1-9]\d*$/.test(String(card.handle ?? ''))) throw new Error('the landing job reported no confirmed child start; not recorded as spawned, and not retried automatically (a child may be running)');
-        claims.markSpawned(p.jobKey, { head: p.head, session, handle: card.handle });
-      }
-      // A PID proves only a start: acquire/file-item can still fail before a card reaches the spool.
-      // Keep the attempt/receipt intact so an exact retry observes completion without a second spawn.
-      if (!claims.completed(p.jobKey, p)) {
-        return { ruling: 'card', head: p.head, indices: p.indices, pending: true, released: false,
-          card: { session, reconciled: spawned },
-          message: `No card completion receipt yet; the break stays held. Re-run the exact ruling to check again. If it persists, inspect the landing log for session ${session}; if the job failed, recover the owed card and cite its readable --card reference. Keep the attempt marker to prevent duplicate automatic filings.` };
-      }
+        if (!/^pid:[1-9]\d*$/.test(String(card.handle ?? ''))) throw new Error('the landing job reported no confirmed child start; inspect the landing log and recover with a readable --card reference');
+        r = actions.read(resource, r.attempt); // The child may already have recorded completion.
+        if (r.state === 'dispatching') r = transition(actions, r, 'observed', { handle: session,
+          evidence: { ...r.evidence, card: { session, handle: card.handle } } });
+      } else r = actions.read(resource, r.attempt);
+      const card = { ok: true, session, reconciled: spawned,
+        ...(completion(r, p) && r.evidence.card.ref ? { ref: r.evidence.card.ref } : {}) };
+      if (!completion(r, p)) return { ruling: 'card', head: p.head, indices: p.indices, pending: true, released: false, card,
+        message: `No validated card completion yet; retry later. If it persists, inspect the landing log for ${session}; recover the owed card and cite its readable --card reference. Do not remove the shared claim.` };
       // 4. Release only with positive child evidence that the card exists or is durably spooled.
       const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
         plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card });
@@ -370,7 +277,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
       recheck(p, 'card queued and reason posted; no release record written');
       post(p.repo, p.pr, record);
       proveReleased(p, 'the operator-card record', record);
-      return { ruling: 'card', head: p.head, indices: p.indices, card: { session, reconciled: spawned }, labels: resync(p) };
+      return { ruling: 'card', head: p.head, indices: p.indices, card, labels: resync(p) };
     },
   };
 }
@@ -387,11 +294,24 @@ const cardLandingExists = (result) => result?.ok === true && (
   || (['mentioned', 'done'].includes(result.step) && Number.isInteger(result.mentions) && result.mentions > 0));
 
 /** Child-side receipt: a successful spawn never calls this writer in the parent. */
-export async function runCardLandingWithReceipt(binding, argv, { claims = createFileClaims(),
+export async function runCardLandingWithReceipt(binding, argv, {
+  actions = createActionStore({ root: binding.coordinationRoot ?? resolveCoordinationRoot() }),
   land = async (args) => (await import('./land-prevention-card.mjs')).runLandPreventionCardCli(args) } = {}) {
+  const readBound = () => {
+    const r = actions.read(binding.resource, binding.attempt);
+    if (!bound(r, binding) || r.ownerToken !== binding.ownerToken || !['dispatching', 'observed'].includes(r.state)) {
+      throw new Error('landing receipt does not match an active card claim');
+    }
+    return r;
+  };
+  readBound(); // Refuse an invalid receipt binding before filing anything.
   const landed = await land(argv);
   if (landed.code === 0 && cardLandingExists(landed.result)) {
-    claims.markCompleted(binding.jobKey, { head: binding.head, session: binding.session, result: landed.result });
+    let r = readBound();
+    if (r.state === 'dispatching') r = transition(actions, r, 'observed', { handle: binding.session });
+    if (!completion(r, binding)) transition(actions, r, 'terminal', { outcome: 'settled',
+      evidence: { ...r.evidence, card: { session: binding.session,
+        ...(landingRef(landed.result) ? { ref: landingRef(landed.result) } : {}) }, result: landed.result, at: Date.now() } });
   }
   return landed;
 }
