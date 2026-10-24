@@ -2117,13 +2117,19 @@ stay unknown rather than resolving a mutable branch. Probe commit presence befor
 other 128 failures (including an invalid repository) remain unknown. Keep a real-Git fixture
 alongside injected exit-code cases so the distinction stays observed.
 The reader reads at most a 1 MiB log tail, retains 50 recent refs, discovers at most 20 clones through at most 100 plist reads,
-and shares a 500-call Git budget across resolution, presence and ancestry. Omitted evidence
+and shares a 500-call Git budget across resolution, presence, ancestry and shallow-history checks. Omitted evidence
 is explicitly truncated; log/discovery read failures are incomplete. Operators must inspect
 source evidence and retry smaller explicit batches. Only ENOENT on the default log is empty
 complete evidence. Both matrix and PR table cells strip Unicode Cc/Cf controls; PR table mode
 must retain the same truncated-listing warning and exit code as normal output.
 
-Every nonblank corrupt JSON line or missing/invalid timestamp marks the adoption snapshot
+Every Git probe passes `GIT_NO_LAZY_FETCH=1` and `GIT_TERMINAL_PROMPT=0`; presence checks
+must never fetch missing objects. Negative ancestry is definitive only after a successful
+`rev-parse --is-shallow-repository` returns `false`; shallow or unreadable history stays unknown.
+The drain adoption target comes from prototype-load settings (`workspaceRoot` + `daemons.drain.clone`),
+not the plist's `DRAIN_DAEMON_WE_CLONE` data clone. Missing code-target settings mark discovery incomplete.
+
+Every nonblank corrupt JSON line or missing/invalid timestamp or ref marks the adoption snapshot
 incomplete, even when an older valid revision remains available. Missing clone fields in
 readable daemon plists are incomplete too. Only the built-in LaunchAgents directory may
 be absent silently; ENOENT on an explicit discovery directory is incomplete. Unreadable,

@@ -9,7 +9,7 @@ const fixtures = {
   'com.we.fix': { WorkingDirectory: '/clones/we/' },
   'com.we.other': { WorkingDirectory: '/other/we' },
   'com.plateau.drain-daemon': {
-    WorkingDirectory: '/plateau', EnvironmentVariables: { DRAIN_DAEMON_WE_CLONE: '/clones/drain' },
+    WorkingDirectory: '/plateau', EnvironmentVariables: { DRAIN_DAEMON_WE_CLONE: '/home/workspace/.lanes/we-drain-daemon/lane-1' },
   },
 };
 const readdir = () => [...Object.keys(fixtures).map(label => `${label}.plist`), 'unrelated.plist', 'notes.txt'];
@@ -21,11 +21,11 @@ const exec = (bin, argv) => {
 };
 
 describe('daemon clone resolver', () => {
-  it('discovers WorkingDirectory and the drain WE clone, deduping paths and retaining every daemon label', () => {
+  it('discovers WorkingDirectory and the configured drain code clone, deduping paths and retaining every daemon label', () => {
     const clones = resolveDaemonClones({ env: {}, home: '/home', readdir, exec });
     expect(clones).toEqual([
-      { path: '/clones/drain', name: 'drain', labels: ['com.plateau.drain-daemon'] },
       { path: '/clones/we', name: 'we', labels: ['com.we.fix', 'com.we.review'] },
+      { path: '/home/workspace/.lanes/we-drain-daemon/code', name: 'code', labels: ['com.plateau.drain-daemon'] },
       { path: '/other/we', name: 'we-2', labels: ['com.we.other'] },
     ]);
   });
@@ -34,7 +34,7 @@ describe('daemon clone resolver', () => {
     const seen = [];
     const clones = resolveDaemonClones({ env: { WE_LAUNCH_AGENTS_DIR: '/agents' }, home: '/home',
       readdir: dir => { seen.push(dir); return readdir(); }, exec,
-      clones: ['~/extra', '/clones/we'], excludeClones: ['/clones/drain', '/other/we/'],
+      clones: ['~/extra', '/clones/we'], excludeClones: ['~/workspace/.lanes/we-drain-daemon/code', '/other/we/'],
     });
     expect(seen).toEqual(['/agents']);
     expect(clones.map(clone => clone.path)).toEqual(['/clones/we', '/home/extra']);
@@ -44,7 +44,7 @@ describe('daemon clone resolver', () => {
   it('retains an empty result for unreadable discovery evidence', () => {
     expect(resolveDaemonClones({ env: {}, readdir: () => { throw new Error('missing'); }, exec })).toEqual([]);
     expect(resolveDaemonClones({ env: {}, readdir, exec: () => { throw new Error('bad plist'); } })).toEqual([]);
-    expect(resolveDaemonClones({ env: {}, readdir, exec: () => '{}' })).toEqual([]);
+    expect(resolveDaemonClones({ env: {}, readdir: () => ['com.we.review.plist'], exec: () => '{}' })).toEqual([]);
   });
 });
 
@@ -108,8 +108,6 @@ it.each([
   ['com.we.review', {}],
   ['com.we.review', { WorkingDirectory: ' ' }],
   ['com.we.review', { WorkingDirectory: 42 }],
-  ['com.plateau.drain-daemon', { WorkingDirectory: '/wrong-clone' }],
-  ['com.plateau.drain-daemon', { EnvironmentVariables: { DRAIN_DAEMON_WE_CLONE: '' } }],
 ])('reports a readable %s plist missing a valid expected clone field (%j)', (label, plist) => {
   const incomplete = [];
   expect(resolveDaemonClones({ env: {}, readdir: () => [`${label}.plist`],
@@ -128,3 +126,25 @@ it.each([{ env: { WE_LAUNCH_AGENTS_DIR: '/configured' } }, { env: {}, launchAgen
     })).toEqual([]);
     expect(incomplete).toEqual(['daemon discovery directory unreadable']);
   });
+
+it.each([fixtures['com.plateau.drain-daemon'], { WorkingDirectory: '/wrong-clone' },
+  { EnvironmentVariables: { DRAIN_DAEMON_WE_CLONE: '' } }])('uses prototype-load code settings rather than drain plist paths (%j)', plist => {
+  expect(resolveDaemonClones({ env: {}, home: '/home',
+    readdir: () => ['com.plateau.drain-daemon.plist'], exec: () => JSON.stringify(plist),
+    readPrototypeSettings: () => ({ workspaceRoot: '~/custom', daemons: { drain: { clone: 'code-target' } } }),
+  })).toEqual([{ path: '/home/custom/code-target', name: 'code-target', labels: ['com.plateau.drain-daemon'] }]);
+});
+
+it.each([
+  () => { throw new Error('unreadable'); },
+  () => null,
+  () => ({}),
+  () => ({ workspaceRoot: '/workspace', daemons: { drain: { clone: ' ' } } }),
+  () => ({ workspaceRoot: 42, daemons: { drain: { clone: 'code' } } }),
+])('reports incomplete when the drain code target cannot be determined', readPrototypeSettings => {
+  const incomplete = [];
+  expect(resolveDaemonClones({ env: {}, readdir: () => ['com.plateau.drain-daemon.plist'], exec,
+    readPrototypeSettings, onIncomplete: reason => incomplete.push(reason),
+  })).toEqual([]);
+  expect(incomplete).toEqual(['drain code clone settings unreadable or invalid']);
+});

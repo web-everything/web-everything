@@ -1,7 +1,7 @@
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, statSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, it, expect } from 'vitest';
 import { adoptionMatrixOperation, ADOPTION_MATRIX_OP, parseFixReadyLines,
@@ -35,6 +35,9 @@ describe('adoption matrix', () => {
     ['invalid timestamp', JSON.stringify({ ref: 'fix/a', at: 'invalid', sha: 'eeeeeee' })],
     ['missing timestamp', JSON.stringify({ ref: 'fix/a', sha: 'eeeeeee' })],
     ['non-string timestamp', JSON.stringify({ ref: 'fix/a', at: 123, sha: 'eeeeeee' })],
+    ['missing ref', JSON.stringify({ at: '2026-10-23T00:00:00Z' })],
+    ['blank ref', JSON.stringify({ ref: '  ', at: '2026-10-23T00:00:00Z' })],
+    ['non-string ref', JSON.stringify({ ref: 42, at: '2026-10-23T00:00:00Z' })],
     ['corrupt JSON', '{broken'],
   ])('marks older evidence incomplete after a record with %s', (_name, record) => {
     const result = createAdoptionMatrixReader({ ...defaults,
@@ -60,6 +63,10 @@ describe('adoption matrix', () => {
       if (argv[2] === 'cat-file') {
         expect(argv.slice(2)).toEqual(['cat-file', '-e', expect.stringMatching(/^(bbbbbbb|ddddddd)\^\{commit\}$/)]);
         return { status: 0 };
+      }
+      if (argv[2] === 'rev-parse') {
+        expect(argv.slice(2)).toEqual(['rev-parse', '--is-shallow-repository']);
+        return { status: 0, stdout: 'false\n' };
       }
       expect(argv.slice(2)).toEqual(['merge-base', '--is-ancestor', expect.stringMatching(/^(bbbbbbb|ddddddd)$/), 'HEAD']);
       return { status: argv[1].endsWith('/yes') ? 0 : argv[1].endsWith('/no') ? 1 : 128 };
@@ -345,4 +352,50 @@ it('bounds the real log read to a recent byte window and marks omitted evidence 
     expect(result.truncated).toBe(true);
     expect(renderAdoptionMatrix(result)).toMatch(/INCOMPLETE.*truncated.*inspect.*retry/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('passes read-only and noninteractive environment to every spawned git probe', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'adoption-git-env-'));
+  try {
+    const log = join(dir, 'calls.jsonl');
+    writeFileSync(join(dir, 'git'), `#!${process.execPath}
+const { appendFileSync } = require('node:fs');
+const argv = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv, env: { PATH: process.env.PATH,
+  GIT_NO_LAZY_FETCH: process.env.GIT_NO_LAZY_FETCH, GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT } }) + '\\n');
+if (argv.includes('--is-shallow-repository')) process.stdout.write('false');
+else if (argv[0] === 'rev-parse') process.stdout.write('abcdef0');
+else if (argv.includes('merge-base')) process.exitCode = 1;
+`, { mode: 0o755 });
+    const env = { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH}`,
+      GIT_NO_LAZY_FETCH: '0', GIT_TERMINAL_PROMPT: '1' };
+    const result = createAdoptionMatrixReader({ ...defaults, cwd: dir, settings: { clones: ['/clone'] }, env,
+      run: spawnSync,
+    })({ branches: 'fix/a' });
+    expect(result.rows[0].cells).toEqual(['no']);
+    const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(calls.map(call => call.argv[0] === '-C' ? call.argv[2] : call.argv[0]))
+      .toEqual(['rev-parse', 'cat-file', 'merge-base', 'rev-parse']);
+    for (const call of calls) {
+      expect(call.env).toMatchObject({ PATH: env.PATH, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' });
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each([
+  ['shallow', { status: 0, stdout: 'true\n' }, '?'],
+  ['non-shallow', { status: 0, stdout: 'false\n' }, 'no'],
+  ['failed', { status: 128 }, '?'],
+  ['malformed', { status: 0, stdout: '' }, '?'],
+])('negative ancestry is definitive only with proven non-shallow history (%s)', (_name, shallow, expected) => {
+  const calls = [];
+  const result = createAdoptionMatrixReader({ ...defaults, settings: { clones: ['/clone'] },
+    run: (_bin, argv) => {
+      calls.push(argv);
+      return argv[2] === 'rev-parse' ? shallow : { status: argv[2] === 'merge-base' ? 1 : 0 };
+    },
+  })();
+  expect(result.rows.map(row => row.cells)).toEqual([[expected], [expected]]);
+  expect(calls.filter(argv => argv[2] === 'rev-parse')).toEqual(
+    Array(2).fill(['-C', '/clone', 'rev-parse', '--is-shallow-repository']));
 });

@@ -14,7 +14,7 @@ export function parseFixReadyLines(text, { onTruncated = () => {}, onIncomplete 
     try { entry = JSON.parse(line); } catch { onIncomplete('fix-ready log malformed'); continue; }
     const at = typeof entry?.at === 'string' ? Date.parse(entry.at) : NaN;
     if (!Number.isFinite(at)) { onIncomplete('fix-ready log malformed'); continue; }
-    if (typeof entry?.ref !== 'string' || !entry.ref.trim()) continue;
+    if (typeof entry?.ref !== 'string' || !entry.ref.trim()) { onIncomplete('fix-ready log malformed'); continue; }
     const previous = latest.get(entry.ref);
     if (!previous || !Number.isFinite(Date.parse(previous.at)) || at >= Date.parse(previous.at)) {
       latest.set(entry.ref, { ref: entry.ref, at: entry.at, sha: typeof entry.sha === 'string' ? entry.sha : '' });

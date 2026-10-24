@@ -1,8 +1,9 @@
 /** Shared read-only launchd plist -> clone discovery. No git or launchctl calls. */
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { listDaemonPlistFiles, readPlistAsJson } from '../operations/daemon-status-io.mjs';
 
 export const MAX_DAEMON_CLONES = 20;
@@ -11,6 +12,7 @@ const MAX_DISCOVERY_PLISTS = 100;
 export function resolveDaemonClones({
   env = process.env, home = homedir(),
   launchAgentsDir,
+  readPrototypeSettings = () => JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'prototype-load.json'), 'utf8')),
   readdir = readdirSync, exec = execFileSync, clones = [], excludeClones = [], onIncomplete = () => {},
 } = {}) {
   const explicitDiscoveryDir = launchAgentsDir !== undefined || Boolean(env.WE_LAUNCH_AGENTS_DIR);
@@ -40,8 +42,21 @@ export function resolveDaemonClones({
   for (const label of labels.slice(0, MAX_DISCOVERY_PLISTS)) {
     const plist = readPlistAsJson(join(launchAgentsDir, `${label}.plist`), { exec });
     if (!plist) { onIncomplete('daemon plist unreadable'); continue; }
-    const clone = label === 'com.plateau.drain-daemon'
-      ? plist.EnvironmentVariables?.DRAIN_DAEMON_WE_CLONE : plist.WorkingDirectory;
+    let clone = plist.WorkingDirectory;
+    if (label === 'com.plateau.drain-daemon') {
+      // Match prototype-load: overlays run in the configured code clone, never the plist's data clone.
+      try {
+        const settings = readPrototypeSettings();
+        const target = settings?.daemons?.drain?.clone;
+        if (typeof target !== 'string' || !target.trim()
+          || typeof settings?.workspaceRoot !== 'string' || !settings.workspaceRoot.trim()) throw new Error('invalid code target');
+        const expandHome = path => path.startsWith('~/') ? join(home, path.slice(2)) : path;
+        clone = resolve(expandHome(settings.workspaceRoot), expandHome(target));
+      } catch {
+        onIncomplete('drain code clone settings unreadable or invalid');
+        continue;
+      }
+    }
     if (typeof clone !== 'string' || !clone.trim()) {
       onIncomplete('daemon plist clone field missing or invalid');
       continue;

@@ -37,7 +37,7 @@ export function createAdoptionMatrixReader({
   const git = argv => {
     if (probes >= MAX_ADOPTION_PROBES) { truncated = true; return null; }
     probes++;
-    try { return run('git', argv, { cwd, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 }); }
+    try { return run('git', argv, { cwd, env: { ...env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' }, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 }); }
     catch { return null; }
   };
   const tipFor = ref => {
@@ -90,7 +90,11 @@ export function createAdoptionMatrixReader({
           === `fatal: Not a valid object name ${tipSha}^{commit}`) return 'no (not in clone)';
         if (object?.status !== 0) return '?';
         const result = git(['-C', clone.path, 'merge-base', '--is-ancestor', tipSha, 'HEAD']);
-        return result?.status === 0 ? 'yes' : result?.status === 1 ? 'no' : '?';
+        if (result?.status === 0) return 'yes';
+        if (result?.status !== 1) return '?';
+        // A shallow boundary can hide ancestors; only complete history proves non-adoption.
+        const shallow = git(['-C', clone.path, 'rev-parse', '--is-shallow-repository']);
+        return shallow?.status === 0 && shallow.stdout?.trim() === 'false' ? 'no' : '?';
       });
       return { ref: fix.ref, tipSha, cells };
     });
