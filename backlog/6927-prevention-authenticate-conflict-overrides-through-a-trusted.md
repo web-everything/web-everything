@@ -4,7 +4,7 @@ kind: story
 size: 5
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-overlays.mjs", "we:scripts/lib/marker-authorship.mjs", "we:scripts/operations/extend-rounds-io.mjs", "we:scripts/__tests__/daemon-overlay.test.mjs", "we:scripts/lib/__tests__/daemon-load-overlay-guard.test.mjs"]
+scope: ["we:scripts/lib/daemon-overlays.mjs", "we:scripts/lib/marker-authorship.mjs", "we:scripts/operations/extend-rounds-io.mjs", "we:scripts/operations/__tests__/extend-rounds-io.test.mjs", "we:scripts/__tests__/daemon-overlay.test.mjs", "we:scripts/lib/__tests__/daemon-load-overlay-guard.test.mjs"]
 dateOpened: "2026-10-21"
 tags: []
 ---

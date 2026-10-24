@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/", "we:scripts/lib/__tests__/", "we:scripts/check-standards-rules.mjs", "we:backlog/6936-follow-up-overlay-review-named-test-mappings.md", "we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md"]
+scope: ["we:scripts/lib/daemon-rebuild/", "we:scripts/lib/__tests__/", "we:scripts/__tests__/daemon-overlay.test.mjs", "we:scripts/check-standards-rules.mjs", "we:backlog/6936-follow-up-overlay-review-named-test-mappings.md", "we:backlog/5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md"]
 dateOpened: "2026-10-21"
 tags: []
 ---
