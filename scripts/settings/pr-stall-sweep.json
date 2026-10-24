@@ -1,4 +1,10 @@
 {
+  "prStallDetector": {
+    "enabled": true,
+    "sameLabelMinutes": 60,
+    "repeatedReasonCount": 5,
+    "blockingLabels": ["red-team:pending", "review:pending", "status:fixing"]
+  },
   "prStallSweep": {
     "mode": "off",
     "intervalMinutes": 15,

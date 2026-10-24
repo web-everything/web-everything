@@ -339,6 +339,19 @@ describe('runPrSweep detector integration', () => {
     expect(options.stallDigest.mock.calls[0][1].enabled).toBe(true);
   });
 
+  it.each(['shadow', 'on', 'off'])('digest:false excludes %s sweep items while the enabled detector still publishes', async mode => {
+    const sweepItem = { lane: 'operator', repo: REPO, pr: 42, head: 'b'.repeat(40), state: 'needs-decision:note' };
+    const options = sweepOptions({ stallSweep: async () => ({ mode, digest: false, state: {},
+      dir: 'fixture/pr-stall-sweep', items: [sweepItem], act: [] }) });
+    const report = await runPrSweep(options);
+    expect(report.stallDetector).toMatchObject({ enabled: true, stalled: 1 });
+    expect(options.stallDigest).toHaveBeenCalledTimes(1);
+    const [pass, digestOptions] = options.stallDigest.mock.calls[0];
+    expect(pass.items).toEqual([expect.objectContaining({ pr: 5759, action: 'stalled-detector' })]);
+    expect(pass.items).not.toContainEqual(sweepItem);
+    expect(digestOptions.enabled).toBe(true);
+  });
+
   it('an enabled empty detector pass still calls the digest so resolved stalls can clear', async () => {
     const options = sweepOptions({ readPrs: () => [], readSignals: async () => ({}) });
     const report = await runPrSweep(options);

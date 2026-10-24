@@ -19,6 +19,7 @@ import { flushDigest } from '../lib/quiet-hours-io.mjs';
 import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession } from './pr-sweep-core.mjs';
 import { runStallSweep } from './pr-stall-sweep.mjs';
 import { publishStalledDigest } from './pr-stall-digest.mjs';
+import { runDetector } from './pr-stall-detector.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
@@ -163,6 +164,16 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   const owners = Object.fromEntries(idle.map((p) => [prKey(p), resolveOwner(p, { ...value, now, ...(signals ?? {})[prKey(p)], operator: needsYou?.some((n) => prKey(n) === prKey(p)) })]));
   const planned = planSweep({ idle, owners, prevState: previous ?? {}, needsYou, now, settings: value, ownerReadsOk, prsReadOk });
   const report = { at: new Date(now).toISOString(), settings: value, sources: resolved.sources, ...planned.report, alerts: planned.alerts, diagnose: planned.diagnose, nextState: planned.nextState, errors };
+  const detect = async () => {
+    const out = await runDetector({ prs, seen: previous?.stallDetector ?? {}, now, env,
+      readSignals: ({ prs }) => readSignals({ prs, now, dir, env, errors: detectorErrors, sourceRoot }) });
+    detectorErrors.push(...out.errors);
+    errors.push(...detectorErrors.map(e => `stall detector: ${e}`));
+    report.stallDetector = { enabled: out.enabled, stalled: out.items.length, ...(dryRun ? { items: out.items } : {}) };
+    report.nextState.stallDetector = prsReadOk ? out.nextSeen : previous?.stallDetector ?? {};
+    return out;
+  };
+  const detectorErrors = [];
   if (!dryRun) {
     await safe('quiet digest', () => flush({ send: (n) => notify(n, { quietGate: null }) }));
     let needsYouSendFailed = false;
@@ -187,14 +198,21 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     // The automatic stall sweep (shadow until slice 5) runs AFTER this sweep's own state is saved, so a slow or failing
     // stall pass can never cost the card-335 sweep its state. It keeps its own `prStallSweep.intervalMinutes`.
     const stalled = await safe('stall sweep', async () => {
-      const out = await stallSweep({ now, env, state: previous?.stallSweep ?? {} });
+      const out = await safe('stall sweep', () => stallSweep({ now, env, state: previous?.stallSweep ?? {} }),
+        { mode: 'off', incomplete: true });
+      const detector = await detect();
       report.nextState.stallSweep = out.state ?? report.nextState.stallSweep;
       report.stallSweep = { mode: out.mode, skipped: out.skipped ?? null, wouldDo: out.act?.length ?? 0, incomplete: out.incomplete ?? null,
         lanes: Object.fromEntries(['system', 'policy', 'operator'].map((l) => [l, (out.items ?? []).filter((i) => i.lane === l).length])) };
       errors.push(...(out.errors ?? []).map((e) => `stall sweep: ${e}`));
       // Operator items go to the needs-you feed (kind `stalled`) and one quiet-hours-gated alert per pass.
+      const sweepDigestEnabled = out.mode !== 'off' && out.digest !== false;
+      // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
       if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
-        const d = stallDigest(out, { now, env, stateDir: out.dir, notify, enabled: out.mode !== 'off' && out.digest !== false });
+        const d = stallDigest({ ...out, items: [...(sweepDigestEnabled ? out.items ?? [] : []), ...detector.items],
+          incomplete: out.incomplete || !prsReadOk || detectorErrors.length > 0 },
+        { now, env, stateDir: out.dir, notify,
+          enabled: sweepDigestEnabled || detector.items.length > 0 || detector.enabled });
         report.stallSweep.digest = { published: d.lines?.length ?? 0, alerted: d.fresh?.length ?? 0, notified: !!d.notified };
         errors.push(...(d.errors ?? []).map((e) => `stall digest: ${e}`));
       }
@@ -202,6 +220,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     }, false);
     if (stalled || errors.some((e) => e.startsWith('stall sweep'))) await write();
   }
+  else await detect();
   return report;
 }
 // Match the detached job's entry check, including snapshots reached through /var symlinks.
