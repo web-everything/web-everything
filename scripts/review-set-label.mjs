@@ -1460,9 +1460,6 @@ export function runReviewLabelCli({
         if (headEverHumanCleared(page, threadHead.trim())) refuseRearm('head carries a human clearance — a rearm never undoes it');
         refuseRearm('comments unreadable — cannot prove no human clearance');
       }
-      if (comments.length === page.length && page.length === PR_COMMENTS_PAGE_SIZE) {
-        refuseRearm('thread may be truncated at the page size — retry with a complete paginated thread');
-      }
       return [...page, ...comments];
     }
     return comments;

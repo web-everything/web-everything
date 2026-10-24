@@ -11,6 +11,58 @@ const filler = (n) => Array.from({ length: n }, (_, i) => ({ author: { login: 'w
 const grant = (by) => ({ author: { login: 'chalbert' }, body: buildRoundExtensionComment({ repo, pr: 4017, by, actor: 'chalbert', channel: 'test', reason: 'more', at: '2026-10-06T10:44:55Z' }) });
 const note = { kind: 'round-cap-exhausted', prNumber: 4017, attempts: 6, cap: 5, text: 'PR #4017: review auto-repair rounds exhausted (6/5)' };
 
+describe('complete PR comment count proof', () => {
+  const countResponse = totalCount => JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount } } } } });
+  const restOutput = ids => ids.map(id => `discussion\t2026-01-01T00:00:00Z\tchalbert\t${id ?? ''}\n`).join('');
+  const transport = (ids, response = countResponse(ids.length)) => vi.fn()
+    .mockReturnValueOnce(restOutput(ids)).mockReturnValueOnce(response);
+
+  it.each([0, 1, 100, 201])('accepts %i comments only with an equal GraphQL count through the same exec', count => {
+    const ids = Array.from({ length: count }, (_, i) => `IC_${i}`);
+    const exec = transport(ids);
+    expect(readCompletePrComments(7, { repo, exec }).map(c => c.id)).toEqual(ids);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec.mock.calls[0][1]).toContain(`repos/${repo}/issues/7/comments`);
+    const [file, args, options] = exec.mock.calls[1];
+    expect(file).toBe('gh');
+    expect(args.slice(0, 2)).toEqual(['api', 'graphql']);
+    expect(args).toEqual(expect.arrayContaining(['owner=web-everything', 'name=web-everything', 'n=7']));
+    expect(args.find(a => a.startsWith('query='))).toMatch(/repository\(owner:\$owner,name:\$name\)\{pullRequest\(number:\$n\)\{comments\{totalCount\}\}\}/);
+    expect(options.maxBuffer).toBeGreaterThanOrEqual(1024 * 1024);
+  });
+
+  it('rejects a 300-comment thread silently read as 200', () => {
+    const exec = transport(Array.from({ length: 200 }, (_, i) => `IC_${i}`), countResponse(300));
+    expect(() => readCompletePrComments(7, { repo, exec })).toThrow();
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([['duplicate ids', ['IC_1', 'IC_1']], ['missing id', [null]], ['blank id', [' ']]])('rejects %s despite an equal count', (_name, ids) => {
+    expect(() => readCompletePrComments(7, { repo, exec: transport(ids) })).toThrow();
+  });
+
+  it.each([
+    ['missing count', '{}'], ['invalid JSON', 'not json'],
+    ...[null, '1', 1.5, -1, 0, 2].map(count => [`invalid or unequal count ${count}`, countResponse(count)]),
+    ['GraphQL errors with partial data', JSON.stringify({ ...JSON.parse(countResponse(1)), errors: [{ message: 'denied' }] })],
+    ['malformed GraphQL errors', JSON.stringify({ ...JSON.parse(countResponse(1)), errors: {} })],
+  ])('fails closed on %s', (_name, response) => {
+    expect(() => readCompletePrComments(7, { repo, exec: transport(['IC_1'], response) })).toThrow();
+  });
+
+  it('propagates a GraphQL transport failure after a successful paged read', () => {
+    const exec = vi.fn().mockReturnValueOnce(restOutput(['IC_1'])).mockImplementation(() => { throw new Error('graphql failed'); });
+    expect(() => readCompletePrComments(7, { repo, exec })).toThrow('graphql failed');
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([undefined, null, '', 'owner', '/repo', 'owner/', 'owner/repo/extra', 'owner/repo\n', 'owner name/repo', 'owner/..', {}])('requires an explicit valid repository: %j', repo => {
+    const exec = transport(['IC_1']);
+    expect(() => readCompletePrComments(7, { repo, exec })).toThrow(/explicit valid.*repository/);
+    expect(exec).not.toHaveBeenCalled();
+  });
+});
+
 describe('complete comment edit history failures', () => {
   const page = (nodes, pageInfo) => JSON.stringify({ data: { repository: { pullRequest: { comments: { nodes, pageInfo } } } } });
   const first = page([{ id: 'IC_1', lastEditedAt: null }], { hasNextPage: true, endCursor: 'next' });
@@ -134,14 +186,15 @@ describe('complete PR comments', () => {
     });
   });
 
-  it('drops an exactly page-sized covering read because the thread may be truncated at the page size', () => {
+  it('accepts an exactly page-sized covering read proved complete by the reader', () => {
     const pr = { number: 4017, comments: firstPage };
     const onError = vi.fn();
     const annotate = vi.fn(p => p);
-    expect(enrichPrsWithCompleteComments([pr], { repo, readComments: () => [...firstPage], onError, annotate })).toEqual([]);
-    expect(onError).toHaveBeenCalledTimes(1);
-    expect(onError).toHaveBeenCalledWith(pr, expect.objectContaining({ message: expect.stringContaining('thread may be truncated at the page size') }));
-    expect(annotate).not.toHaveBeenCalled();
+    expect(enrichPrsWithCompleteComments([pr], { repo, readComments: () => [...firstPage], onError, annotate }))
+      .toEqual([{ ...pr, commentsComplete: true }]);
+    expect(onError).not.toHaveBeenCalled();
+    expect(annotate).toHaveBeenCalledTimes(1);
+    expect(annotate).toHaveBeenCalledWith({ ...pr, commentsComplete: true });
   });
 
   it.each([3, LIST_COMMENTS_PAGE_SIZE - 1])('short threads of %i comments are untouched and never re-read', count => {
@@ -191,7 +244,12 @@ describe('complete PR comments', () => {
 
   it('reads through the safe reader with a large buffer and surfaces failures', () => {
     const seen = [];
-    const exec = (f, a, o) => { seen.push(o.maxBuffer); return 'hi\t2026-01-01T00:00:00Z\tchalbert\tIC_1\n'; };
+    const exec = (f, a, o) => {
+      seen.push(o.maxBuffer);
+      return a[1] === 'graphql'
+        ? JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } })
+        : 'hi\t2026-01-01T00:00:00Z\tchalbert\tIC_1\n';
+    };
     const c = readCompletePrComments(7, { repo, exec });
     expect(c[0].author.login).toBe('chalbert');
     expect(seen[0]).toBeGreaterThanOrEqual(1024 * 1024);

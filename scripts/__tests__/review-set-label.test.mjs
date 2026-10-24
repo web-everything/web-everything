@@ -3052,7 +3052,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     rmSync(`${ledgerDir}-locks`, { recursive: true, force: true });
   });
   // The caller read `accepted`; by the child's own read a reviewer has flipped it to `changes`.
-  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), freshState = {}, swapState = freshState } = {}) {
+  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), freshState = {}, swapState = freshState, postSwapState = null } = {}) {
     const calls = [];
     const initial = { labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '',
       ...(omitComments ? {} : { comments }) };
@@ -3064,7 +3064,10 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       readPrState,
       readComments,
       readLabels: () => labels.map((name) => ({ name })),
-      setLabels: () => { calls.push('setLabels'); },
+      setLabels: () => {
+        calls.push('setLabels');
+        if (postSwapState) readPrState.mockReturnValue({ ...initial, ...swapState, ...postSwapState });
+      },
       postComment: () => { calls.push('postComment'); },
     };
     const chunks = [];
@@ -3263,15 +3266,18 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       });
     });
 
-    it('refuses an exactly page-sized covering read because the thread may be truncated at the page size', () => {
+    it('allows an exactly page-sized covering read proved complete by the reader', () => {
       const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
       const readComments = vi.fn(() => [...comments]);
-      const result = attempt(comments, readComments);
-      expect(readComments).toHaveBeenCalledTimes(1);
-      expect(result.exitCode).toBe(1);
-      expect(result.payload.reason).toContain('thread may be truncated at the page size');
-      expect(result.calls).toEqual([]);
-      expect(result.ledgerWrites).toEqual([]);
+      const result = fresh
+        ? run(['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`], [], {
+          readComments, freshState: { comments }, postSwapState: { labels: [{ name: REVIEW_LABELS.pending }] },
+        })
+        : attempt(comments, readComments);
+      expect(readComments).toHaveBeenCalledTimes(fresh ? 3 : 2);
+      expect(result.exitCode).toBe(0);
+      expect(result.calls).toEqual(['postComment', 'setLabels']);
+      expect(result.ledgerWrites).toHaveLength(1);
     });
 
     it.each([PR_COMMENTS_PAGE_SIZE - 1, PR_COMMENTS_PAGE_SIZE])('allows a complete covering read for an embedded page of %i comments', count => {

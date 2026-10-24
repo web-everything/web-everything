@@ -15,13 +15,20 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { annotateLapsedStandDowns, standDownComments, standDownHead, standDownHeadChangeAt, resolveStandDownHoldsAcrossHeads, STAND_DOWN_MARKER } from './stand-down.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { defaultListPrComments } from './pr-comments-list.mjs'; // the leaf — parked-pr-conflict-watch would close an import cycle via rearm-review
+import { GH_ARGV, assertCompletePrComments } from '../lib/review-label-provider.mjs';
 
 /** `gh pr list --json comments` page size; a listed thread this long may be truncated. */
 export const LIST_COMMENTS_PAGE_SIZE = 100;
 
-/** Complete, paginated read of one PR's comments; throws ProcReadError on any failed read. */
+/** Complete, paginated read, proved by GraphQL totalCount and unique node ids; throws on missing proof. */
 export function readCompletePrComments(number, { repo = null, exec = execRead } = {}) {
-  return defaultListPrComments({ number, repo, exec: (file, args, opts) => exec(file, args, opts) });
+  const countArgv = GH_ARGV.readCommentsTotalCount(repo, number);
+  const comments = defaultListPrComments({ number, repo, exec: (file, args, opts) => exec(file, args, opts) });
+  const response = JSON.parse(exec('gh', countArgv, {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024,
+  }));
+  assertCompletePrComments(comments, response);
+  return comments;
 }
 
 /** Complete edit history metadata: REST updated_at cannot prove a comment was never edited. Throws on any
@@ -107,10 +114,7 @@ export function enrichPrsWithCompleteComments(prs, {
         return (c.createdAt ?? c.created_at) === (full.createdAt ?? full.created_at);
       }));
       if (!covered) throw new Error('complete comments read did not cover the listed page');
-      if (comments.length === pr.comments.length && comments.length === LIST_COMMENTS_PAGE_SIZE) {
-        throw new Error('thread may be truncated at the page size — retry with a complete paginated thread');
-      }
-      // The covering read extends beyond a full first page, proving pagination advanced. The planner trusts
+      // The reader proves completeness against GraphQL totalCount, including an exactly full first page. The planner trusts
       // `commentsComplete` before counting markers (`takeover-budget.mjs#threadMayBeTruncated`).
       out.push(annotatePr({ ...pr, comments, commentsComplete: true }));
     } catch (e) { onError(pr, e); }
