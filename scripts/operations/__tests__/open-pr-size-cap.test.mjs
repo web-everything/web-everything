@@ -2,7 +2,7 @@
  * @file open-pr-size-cap.test.mjs — red-first contract for the pre-submit size cap.
  * Runner submissions are injected; real git fixtures exercise NUL-delimited evidence.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -11,10 +11,16 @@ import * as openPr from '../open-pr.mjs';
 import { createPrLandRunner } from '../open-pr-io.mjs';
 
 // Keep the default reader under test without allowing a regression to invoke pr-land.
-vi.mock('node:child_process', async (importOriginal) => ({
-  ...await importOriginal(),
-  spawnSync: vi.fn(() => { throw new Error('unexpected submission'); }),
-}));
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    execFileSync: vi.fn(actual.execFileSync),
+    spawnSync: vi.fn(() => { throw new Error('unexpected submission'); }),
+  };
+});
+
+afterEach(() => vi.clearAllMocks());
 
 const argv = ['--ref=lane/size-cap'];
 const opened = { outcome: 'opened', pr: 7, url: 'u' };
@@ -132,6 +138,38 @@ describe('measureNonTestLines — pure numstat accounting', () => {
 });
 
 describe('real git numstat evidence', () => {
+  it('counts production outside a subdirectory and keeps backlog paths rooted with diff.relative enabled', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'open-pr-relative-'));
+    const git = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+    try {
+      git(['init', '--quiet', '--initial-branch=main']);
+      git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '--allow-empty', '-m', 'base']);
+      git(['update-ref', 'refs/remotes/origin/main', 'main']);
+      git(['checkout', '--quiet', '-b', 'lane/size-cap']);
+      git(['config', 'diff.relative', 'true']);
+      mkdirSync(join(dir, 'backlog'));
+      writeFileSync(join(dir, 'production.mjs'), 'code\n'.repeat(301));
+      writeFileSync(join(dir, 'backlog/card.md'), 'card\n'.repeat(400));
+      git(['add', '.']);
+      git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'oversized']);
+      expect(git(['-C', join(dir, 'backlog'), 'diff', '--numstat', '-z', 'main...HEAD']))
+        .toBe('400\t0\tcard.md\0');
+      const run = createPrLandRunner({ cwd: join(dir, 'backlog'), prePrReview: () => ({ action: 'pass' }), dupBornAs: () => [], env: {} });
+      expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-too-large', detail: expect.stringMatching(/701/) });
+      expect(spawnSync).not.toHaveBeenCalled();
+
+      git(['rm', '--quiet', 'production.mjs']);
+      git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'backlog only']);
+      const sha = git(['rev-parse', 'HEAD']).trim();
+      vi.mocked(spawnSync).mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) });
+      expect(run({ argv: [...argv, '--sha=HEAD'] })).toMatchObject(opened);
+      expect(spawnSync).toHaveBeenCalledTimes(1);
+      expect(spawnSync.mock.calls[0][1].filter((a) => a.startsWith('--sha='))).toEqual([`--sha=${sha}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['worktree -diff', 'worktree binary', 'info -diff', 'global -diff', 'NUL bytes'])(
     'the production reader counts oversized production content despite %s', (kind) => {
       const dir = mkdtempSync(join(tmpdir(), 'open-pr-size-reader-'));
@@ -267,7 +305,8 @@ describe('createPrLandRunner — non-test size admission', () => {
   });
 
   it('the default reader pins the commit, clears attributes, disables external diff/textconv and forces text numstat', () => {
-    const git = vi.fn((args) => args.includes('diff') ? '301\t0\tscripts/a.mjs\0' : 'resolved-sha\n');
+    const git = vi.fn((args) => args.includes('diff') ? '301\t0\tscripts/a.mjs\0'
+      : args.includes('--show-toplevel') ? 'repo-top\n' : 'resolved-sha\n');
     // Use the default spawn identity to select the production reader; the spawn is mocked above.
     const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env: {}, git });
     expect(run({ argv: [...argv, '--base=release', '--sha=abc123'] }))
@@ -275,9 +314,52 @@ describe('createPrLandRunner — non-test size admission', () => {
     expect(git.mock.calls).toEqual([
       [['rev-parse', '--verify', 'abc123^{commit}']],
       [['rev-parse', '--verify', '--quiet', 'origin/release']],
-      [['-c', 'core.attributesFile=', 'diff', '--text', '--numstat', '-z', '--find-renames', '--no-ext-diff', '--no-textconv', 'origin/release...resolved-sha']],
+      [['rev-parse', '--show-toplevel']],
+      [['-C', 'repo-top', '-c', 'core.attributesFile=', 'diff', '--no-relative', '--text', '--numstat', '-z', '--find-renames', '--no-ext-diff', '--no-textconv', 'origin/release...resolved-sha'], { timeout: 60_000 }],
     ]);
     expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it.each(['', 'HEAD', 'lane/moving-ref'])('submits the resolved commit measured by the default reader for sha %j', (sha) => {
+    const extra = sha ? [`--sha=${sha}`] : [];
+    const git = vi.fn((args) => args.includes('diff') ? '1\t0\tscripts/a.mjs\0'
+      : args.includes('--show-toplevel') ? 'repo-top\n' : 'resolved-sha\n');
+    vi.mocked(spawnSync).mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) });
+    const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), dupBornAs: () => [], env: {}, git });
+    const requested = [...argv, ...extra];
+    expect(run({ argv: requested })).toMatchObject(opened);
+    expect(git).toHaveBeenCalledWith(expect.arrayContaining(['diff', 'origin/main...resolved-sha']), { timeout: 60_000 });
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+    expect(spawnSync.mock.calls[0][1].filter((a) => a.startsWith('--sha='))).toEqual(['--sha=resolved-sha']);
+    expect(requested).toEqual([...argv, ...extra]);
+  });
+
+  it('fails closed with pr-size-unreadable when the bounded size read times out, without timing out other git calls', () => {
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('resolved-sha\n')
+      .mockReturnValueOnce('base-sha\n')
+      .mockReturnValueOnce('repo-top\n')
+      .mockImplementationOnce(() => { throw Object.assign(new Error('git timed out'), { code: 'ETIMEDOUT' }); });
+    const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env: {} });
+    expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable', detail: expect.stringMatching(/Restore readable git numstat evidence/) });
+    expect(execFileSync).toHaveBeenCalledTimes(4);
+    for (const [, args, options] of execFileSync.mock.calls) {
+      if (args.includes('diff')) {
+        expect(args).toEqual(expect.arrayContaining(['-C', 'repo-top', '--no-relative']));
+        expect(options).toMatchObject({ timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+      } else {
+        expect(options).not.toHaveProperty('timeout');
+      }
+    }
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it.each(['', 'HEAD'])('preserves argv for a plain-text injected reader with sha %j', (sha) => {
+    const extra = sha ? [`--sha=${sha}`] : [];
+    const { run, spawn } = fixture('1\t0\tscripts/a.mjs\0');
+    const requested = [...argv, ...extra];
+    expect(run({ argv: requested })).toMatchObject(opened);
+    expect(spawn.mock.calls[0][1]).toEqual([expect.stringMatching(/pr-land\.mjs$/), ...requested, '--json']);
   });
 
   it('the default reader refuses an unresolved commit before attempting a diff', () => {

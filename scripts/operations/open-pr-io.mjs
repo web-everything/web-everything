@@ -131,13 +131,17 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
   // outcome before any gh call (never a crash where run.mjs builds the sinks). An explicit `env` skips resolution;
   // a caller that injected `spawn` is a rehearsal/test and writes no shim.
   env: envOpt, resolveEnv = spawn !== spawnSync ? () => process.env : resolveGhCredentialEnv,
-  git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
+  git = (args, options = {}) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options }),
   diffStat = spawn !== spawnSync ? () => '' : ({ base, sha }) => {
     if (!base || base.startsWith('-') || !sha || sha.startsWith('-')) throw new Error('invalid diff ref');
     const resolvedSha = git(['rev-parse', '--verify', `${sha}^{commit}`]).trim();
     let ref = base;
     try { git(['rev-parse', '--verify', '--quiet', `origin/${base}`]); ref = `origin/${base}`; } catch { /* use local base */ }
-    return git(['-c', 'core.attributesFile=', 'diff', '--text', '--numstat', '-z', '--find-renames', '--no-ext-diff', '--no-textconv', `${ref}...${resolvedSha}`]);
+    const topLevel = git(['rev-parse', '--show-toplevel']).trim();
+    return {
+      text: git(['-C', topLevel, '-c', 'core.attributesFile=', 'diff', '--no-relative', '--text', '--numstat', '-z', '--find-renames', '--no-ext-diff', '--no-textconv', `${ref}...${resolvedSha}`], { timeout: 60_000 }),
+      sha: resolvedSha,
+    };
   },
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
   dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
@@ -170,7 +174,13 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       // Only the gate's audited bypass, recorded in the body above, can waive size admission.
       if (!gate.bypass) {
         let size;
-        try { size = measureNonTestLines(diffStat({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD' })); }
+        let measuredSha;
+        try {
+          const evidence = diffStat({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD' });
+          // Plain-text injected readers retain their caller's argv; the production reader also pins its commit.
+          size = measureNonTestLines(typeof evidence === 'string' ? evidence : evidence.text);
+          measuredSha = typeof evidence === 'string' ? '' : evidence.sha;
+        }
         catch {
           cleanupBody();
           return { outcome: 'refused', reason: 'pr-size-unreadable', detail: 'Could not measure the PR diff. Restore readable git numstat evidence and try again.' };
@@ -179,6 +189,7 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
           cleanupBody();
           return { outcome: 'refused', reason: 'pr-too-large', detail: `The PR changes ${size.lines} non-test lines, exceeding the ${OPEN_PR_MAX_NON_TEST_LINES} limit. Split the PR into smaller PRs.` };
         }
+        if (measuredSha) argv = [...argv.filter((a) => !a.startsWith('--sha=')), `--sha=${measuredSha}`];
       }
     }
     // xsjn0uf-incident — advisory: a card this PR adds whose bornAs is already on main / in another open PR.
