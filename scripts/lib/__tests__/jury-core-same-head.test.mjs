@@ -49,6 +49,51 @@ const serializedGate = (ctx, saved) => {
 
 describe('sameGapSameHead', () => {
   it.each([
+    ['arithmetic', '`a + b`', '`a - b`'],
+    ['comparison', '`a < b`', '`a > b`'],
+    ['equality', '`a == b`', '`a === b`'],
+    ['logical', '`a && b`', '`a || b`'],
+    ['unary', '`!a`', '`a`'],
+    ['grouping', '`(a + b) * c`', '`a + (b * c)`'],
+    ['operator placement', '`a + b - c`', '`a - b + c`'],
+    ['member access', '`a.b`', '`a[b]`'],
+    ['optional access', '`a?.b`', '`a.b`'],
+    ['single quotes', "'a + b'", "'a - b'"],
+    ['double quotes', '"a + b"', '"a - b"'],
+    ['escaped quotes', String.raw`"a \" + b"`, String.raw`"a \" - b"`],
+    ['unterminated backtick', '`a + b', '`a - b'],
+    ['bare operators', 'a + b', 'a - b'],
+    ['Unicode symbols', '`a × b`', '`a ÷ b`'],
+    ['path separators', '`src/a/b`', '`src/a.b`'],
+    ['token boundary', '`a ++ b`', '`a + + b`'],
+    ['line break', '`a\n++b`', '`a++\nb`'],
+    ['invisible character', '`a + b`', '`a\u200b + b`'],
+  ])('refuses different operators inside quoted expressions: %s', (_label, source, dest) => {
+    const first = { ...base, file: 'src/cache.mjs', summary: `Handler evaluates ${source} before validation` };
+    const second = { ...first, summary: `Handler evaluates ${dest} before validation` };
+    expect.soft(sameGapSameHead(first, second)).toBe(false);
+    expect.soft(sameGapSameHead(second, first)).toBe(false);
+    for (const result of ['not-real', 'card']) {
+      const { ruled, ctx } = world(first, result), target = referral('judgeCorrectness', second);
+      expect.soft(findSameHeadSiblingRuling(target, ctx)).toBeNull();
+      expect.soft(serializedGate(ctx, record([target], { runId: 'dest', carried: [carry(ruled, target, result)] })).pending)
+        .toEqual([target.key]);
+    }
+  });
+  it.each(['not-real', 'card'])('keeps an identical expression eligible for a serialized %s carry', result => {
+    const first = { ...base, file: 'src/cache.mjs', summary: 'Handler evaluates `a + b` before validation' };
+    const second = { ...first, line: 24 };
+    expect(sameGapSameHead(first, second)).toBe(true);
+    const { ruled, ctx } = world(first, result), target = referral('judgeCorrectness', second);
+    expect(findSameHeadSiblingRuling(target, ctx)).toMatchObject({ result });
+    expect(serializedGate(ctx, record([target], { runId: 'dest', carried: [carry(ruled, target, result)] })).pending)
+      .toEqual([]);
+  });
+  it('requires exact summaries for symbolic claims even when only surrounding prose changes', () => {
+    const first = { ...base, summary: 'The handler evaluates `a + b` before validation' };
+    expect(sameGapSameHead(first, { ...first, summary: 'A handler evaluates `a + b` before validation' })).toBe(false);
+  });
+  it.each([
     ['reversed subject and object', 'The cached record overwrites the request payload before validation',
       'The request payload overwrites the cached record before validation'],
     ['reversed relationship', 'The cache writes before validation and reads after validation',

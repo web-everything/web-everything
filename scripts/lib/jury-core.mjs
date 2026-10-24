@@ -3170,6 +3170,12 @@ export function sameGapSameHead(a, b) {
   if (!(a && b && typeof a === 'object' && typeof b === 'object'
     && Number.isInteger(a.line) && Number.isInteger(b.line) && sameFindingForClearing(a, b)
     && negations(a.summary) === negations(b.summary))) return false;
+  // Word overlap cannot prove equivalence of expressions: punctuation, its placement, and even whitespace
+  // can change a computation. Without a language parser, require identical summaries when either contains
+  // punctuation, symbols or control/format characters. Keep the prose paraphrases below for plain text only.
+  // This also protects bare operators, escaped/unterminated quotes, paths and Unicode symbols on gate reads.
+  const symbolic = s => /[\p{P}\p{S}\p{C}]/u.test(String(s ?? ''));
+  if ((symbolic(a.summary) || symbolic(b.summary)) && a.summary !== b.summary) return false;
   const verbs = new Set(('read reads write writes get put post patch delete deletes create creates update updates '
     + 'remove removes add adds allow allows deny denies enable disables disable enables grant grants revoke revokes '
     + 'load save send receive open close').split(' '));
