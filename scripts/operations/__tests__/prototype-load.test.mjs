@@ -3,7 +3,7 @@
  * WHY (incident 2026-10-22): pin main preservation, ready evidence, adopt-before-remove, stale
  * replacement, and adoption refusal with injected doubles, plus real filesystem refusal persistence.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -155,10 +155,13 @@ function fixture(options = {}) {
     if (args[0] === 'push') { remoteTip = MERGE; return ''; }
     throw new Error(`unexpected command ${cmd} ${args}`);
   };
-  const load = createPrototypeLoader({ exec, fs, env, settings: structuredClone(settings), now: () => clock,
+  const combinedTest = vi.fn(async (input) => typeof options.combinedTest === 'function'
+    ? options.combinedTest(input)
+    : options.combinedTest ?? { ok: false, command: 'fixture-related-tests', result: 'failed', reason: 'tests-failed' });
+  const load = createPrototypeLoader({ exec, fs, env, combinedTest, settings: structuredClone(settings), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('prototype-load', () => {
@@ -204,7 +207,7 @@ describe('prototype-load', () => {
     const f = fixture({ behind: true, diff: 'M\0x\0D\0main-fix\0' }); const r = await f.run(); expect(r.stopReason).toBe('reverts-main'); expect(r.offendingPaths).toEqual(['main-fix']); expect(f.calls.some((c) => c.cmd === 'node' || c.args[0] === 'push')).toBe(false);
   });
   it.each([false, true])('stale-registration names blocker and stops before add (candidate conflict: %s)', async (candidateConflict) => {
-    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old', ...(candidateConflict ? [BASE.branch] : [])] }); const r = await f.run(); expect(r.stopReason).toBe('stale-registration'); expect(r.message).toBe(`stale-registration: lane/old (${candidateConflict ? 'candidate-not-clean' : 'overlap-with-candidate: x'})`); expect(mutations(f, 'add')).toHaveLength(0);
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old', ...(candidateConflict ? [BASE.branch] : [])] }); const r = await f.run(); expect(r.stopReason).toBe('stale-registration'); expect(r.message).toBe(`stale-registration: lane/old (${candidateConflict ? 'candidate-not-clean' : 'overlap-with-candidate: x; combined-tests-failed: tests-failed'})`); expect(mutations(f, 'add')).toHaveLength(0);
   });
   it('tolerates a pre-existing stale ref when the candidate is clean and file-disjoint', async () => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' } });
@@ -222,9 +225,9 @@ describe('prototype-load', () => {
   it('refuses a stale ref whose changed files overlap the candidate files', async () => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs', 'x'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' } });
     const r = await f.run();
-    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x' } });
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: tests-failed' } });
     expect(r.message).toMatch(/^stale-registration: lane\/old/);
-    expect(r.message).toContain('overlap-with-candidate: x');
+    expect(r.message).toContain('overlap-with-candidate: x; combined-tests-failed: tests-failed');
     expect(mutations(f, 'add')).toEqual([]);
   });
   it('refuses a stale ref whose non-conflicting changed file overlaps the candidate', async () => {
@@ -232,10 +235,119 @@ describe('prototype-load', () => {
       staleChanged: { 'lane/old': 'M\0old-only.mjs\0M\0x\0' } });
     const r = await f.run();
     expect(r.staleChecks['lane/old'].files).toEqual(['old-only.mjs']);
-    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x' } });
-    expect(r.message).toContain('overlap-with-candidate: x');
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: tests-failed' } });
+    expect(r.message).toContain('overlap-with-candidate: x; combined-tests-failed: tests-failed');
     expect(mutations(f, 'add')).toEqual([]);
     expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('allows an overlapping stale ref when combined-tree tests pass', async () => {
+    const combinedTests = { command: 'fixture-related-tests', result: '2 passed', testCount: 2 };
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      staleChanged: { 'lane/old': 'M\0z-old.mjs\0M\0x\0M\0a-old.mjs\0' },
+      combinedTest: { ok: true, ...combinedTests } });
+    const r = await f.run();
+    expect(f.combinedTest).toHaveBeenCalledTimes(1);
+    expect(f.combinedTest).toHaveBeenCalledWith({ clone: '/home/test/workspace/wev-control', candidateSha: SHA,
+      changedFiles: ['a-old.mjs', 'x', 'z-old.mjs'], refs: ['lane/old'] });
+    expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, contained: [] });
+    expect(r.combinedTests).toEqual(combinedTests);
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: false,
+      why: expect.stringMatching(/combined/i), combinedTests }]);
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ ok: true, combinedTests, staleTolerated: r.staleTolerated });
+  });
+  it('refuses an overlapping stale ref when combined-tree tests fail', async () => {
+    for (const reason of ['tests-failed', 'combined-merge-conflict', 'no-related-tests', 'unrunnable']) {
+      const combinedTests = { command: 'fixture-related-tests', result: 'no passing evidence', testCount: 0 };
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+        combinedTest: { ok: false, reason, ...combinedTests } });
+      const r = await f.run();
+      expect(f.combinedTest).toHaveBeenCalledTimes(1);
+      expect(r).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'stale-registration',
+        blocking: ['lane/old'], blockingReasons: { 'lane/old': `overlap-with-candidate: x; combined-tests-failed: ${reason}` },
+        combinedTests });
+      expect(r.message).toBe(`stale-registration: lane/old (overlap-with-candidate: x; combined-tests-failed: ${reason})`);
+      expect(r.staleTolerated).toEqual([]);
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+      expect(f.records).toHaveLength(1);
+      expect(f.records[0]).toMatchObject({ stopReason: 'stale-registration', combinedTests: r.combinedTests, staleTolerated: [] });
+    }
+  });
+  it('refuses an overlapping stale ref when combined-tree tests are unrunnable (throws)', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      combinedTest: () => { throw new Error('test runner unavailable'); } });
+    const r = await f.run();
+    expect(f.combinedTest).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'stale-registration',
+      blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-unrunnable: test runner unavailable' } });
+    expect(r.message).toBe('stale-registration: lane/old (overlap-with-candidate: x; combined-tests-unrunnable: test runner unavailable)');
+    expect(r.combinedTests).toEqual(expect.any(Object));
+    expect(r.staleTolerated).toEqual([]);
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ stopReason: 'stale-registration', combinedTests: r.combinedTests, staleTolerated: [] });
+  });
+  it('does not run combined tests when the candidate is not clean or the stale files are unknown', async () => {
+    for (const options of [
+      { conflicts: ['lane/old', BASE.branch], reason: 'candidate-not-clean' },
+      { unverifiable: BASE.branch, reason: 'candidate-not-clean' },
+      { staleDiffFails: 'lane/old', reason: 'stale-files-unknown' },
+      { staleChanged: { 'lane/old': '' }, reason: 'stale-files-unknown' },
+      { staleChanged: { 'lane/old': 'M\0' }, reason: 'stale-files-unknown' },
+    ]) {
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+        combinedTest: { ok: true, command: 'fixture-related-tests', result: 'passed' }, ...options });
+      const r = await f.run();
+      expect(f.combinedTest).not.toHaveBeenCalled();
+      expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'],
+        blockingReasons: { 'lane/old': options.reason } });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    }
+  });
+  it('runs combined tests once for several overlapping stale refs', async () => {
+    const combinedTests = { command: 'fixture-related-tests', result: '3 passed', testCount: 3 };
+    const f = fixture({ list: ['lane/old', 'lane/also'], conflicts: ['lane/old', 'lane/also'],
+      staleChanged: { 'lane/old': 'M\0z-old.mjs\0M\0x\0', 'lane/also': 'M\0x\0M\0a-also.mjs\0' },
+      cherry: { 'lane/also': `- ${SHA}\n` },
+      combinedTest: { ok: true, ...combinedTests } });
+    const r = await f.run();
+    expect(f.combinedTest).toHaveBeenCalledTimes(1);
+    expect(f.combinedTest).toHaveBeenCalledWith({ clone: '/home/test/workspace/wev-control', candidateSha: SHA,
+      changedFiles: ['a-also.mjs', 'x', 'z-old.mjs'], refs: ['lane/old', 'lane/also'] });
+    expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null });
+    expect(r.combinedTests).toEqual(combinedTests);
+    expect(r.staleTolerated).toEqual([
+      { ref: 'lane/old', landedByContent: false, why: expect.stringMatching(/combined/i), combinedTests },
+      { ref: 'lane/also', landedByContent: true, why: expect.stringMatching(/combined/i), combinedTests },
+    ]);
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect([...f.registrations.keys()]).toEqual(['lane/old', 'lane/also']);
+    expect(f.records[0]).toMatchObject({ combinedTests, staleTolerated: r.staleTolerated });
+  });
+  it('runs combined-tree tests during dry-run without adding or removing registrations', async () => {
+    for (const ok of [true, false]) {
+      const combinedTests = { command: 'fixture-related-tests', result: ok ? 'passed' : 'failed', testCount: 1 };
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+        combinedTest: { ok, ...combinedTests, ...(ok ? {} : { reason: 'tests-failed' }) } });
+      const r = await f.run({ dryRun: true });
+      expect(f.combinedTest).toHaveBeenCalledTimes(1);
+      expect(f.combinedTest).toHaveBeenCalledWith({ clone: '/home/test/workspace/wev-control', candidateSha: SHA,
+        changedFiles: ['x'], refs: ['lane/old'] });
+      expect(r).toMatchObject({ ok, dryRun: true, registered: false, adopted: false,
+        stopReason: ok ? null : 'stale-registration', combinedTests });
+      if (ok) expect(r.wouldRegister).toBe(true);
+      else expect(r.blockingReasons).toEqual({ 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: tests-failed' });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+      expect(f.records[0]).toMatchObject({ ok, combinedTests, staleTolerated: r.staleTolerated });
+    }
   });
   it('fails closed when the stale ref changed-file diff is unreadable', async () => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleDiffFails: 'lane/old' });
