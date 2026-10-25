@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'nod
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { planOpen } from '../open-pr.mjs';
-import { createPrLandRunner } from '../open-pr-io.mjs';
+import { createPrLandRunner, createPrDiffStatReader } from '../open-pr-io.mjs';
 import { prepareItemFromRef } from '../prepare-pr.mjs';
 
 const title = 'WE #4368: prepare — [subject unavailable for 4368]';
@@ -137,8 +137,20 @@ describe('prepare guard scope (only prepare-item PRs are guarded)', () => {
   });
 
   it('the default git runner has an explicit large maxBuffer (no 1 MB ENOBUFS cliff on the backlog listing)', () => {
-    const src = readFileSync(join(process.cwd(), 'scripts/operations/open-pr-io.mjs'), 'utf8');
-    expect(src).toMatch(/execFileSync\('git', args, \{[^}]*maxBuffer: 64 \* 1024 \* 1024/);
+    const sha = 'a'.repeat(40);
+    const text = '1\t0\tbacklog/card.md\0';
+    const exec = vi.fn((_command, args) => {
+      if (args.includes('--show-toplevel')) return Buffer.from('/repo\n');
+      if (args.includes('diff')) return Buffer.from(text);
+      return Buffer.from(`${sha}\n`);
+    });
+    const read = createPrDiffStatReader({ cwd: '/repo', exec });
+    expect(read({ base: 'main', sha: 'HEAD' })).toEqual({ text, sha });
+    expect(exec).toHaveBeenCalledTimes(4);
+    for (const [command, , options] of exec.mock.calls) {
+      expect(command).toBe('git');
+      expect(options).toMatchObject({ cwd: '/repo', maxBuffer: 64 * 1024 * 1024 });
+    }
   });
 });
 

@@ -56,15 +56,19 @@ describe('fresh complete ruling-label decisions', () => {
       exec: (file, args) => { trace.push('state'); expect(args).toContain(repo); expect(args).toContain('3794'); return JSON.stringify(live()); },
       readComments: (number, opts) => readCompletePrComments(number, { ...opts,
         exec: (file, args) => {
+          if (args[1] === 'graphql') {
+            trace.push('thread-count');
+            return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } });
+          }
           trace.push('thread');
           expect(args).toContain('--paginate');
           expect(args).toContain(`repos/${repo}/issues/3794/comments`);
-          return [pending.body, pending.createdAt, pending.author.login].map((field) => field.replaceAll('\\', '\\\\').replaceAll('\n', '\\n').replaceAll('\t', '\\t')).join('\t');
+          return [pending.body, pending.createdAt, pending.author.login, 'IC_pending'].map((field) => field.replaceAll('\\', '\\\\').replaceAll('\n', '\\n').replaceAll('\t', '\\t')).join('\t');
         } }),
     });
     const out = sweepRulingNeededLabels({ provider: p, readPr, listPrs: () => [live()] });
     expect(out).toEqual([{ num: 3794, action: 'add' }]);
-    expect(trace).toEqual(['repo', 'state', 'thread']);
+    expect(trace).toEqual(['repo', 'state', 'thread', 'thread-count']);
   });
   it('isolates failed reads and retries next tick; dry-run uses the same fresh plan', () => {
     const p = provider();

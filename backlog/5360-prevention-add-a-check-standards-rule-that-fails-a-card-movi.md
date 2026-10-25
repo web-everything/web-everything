@@ -14,7 +14,13 @@ tags: []
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
 1. `we:backlog/5358-wip-deep-links-card-n-highlights-a-card-agent-session-opens.md:26` — Add a check:standards rule that fails a card moving from open to ready while its Done-when or Edge-cases section still contains 'TODO:'.
-2. `we:backlog/5358-wip-deep-links-card-n-highlights-a-card-agent-session-opens.md:12` — Add a backlog validation gate requiring behavioral acceptance entries to specify a repository-qualified test file, planned case name, and observable assertion before preparation is complete.
+2. `we:backlog/5358-wip-deep-links-card-n-highlights-a-card-agent-session-opens.md:12` — Add a backlog validation gate requiring behavioral acceptance entries to specify a repository-qualified test file, planned case name, and observable assertion before preparation is complete. For each promised operation, require its fixture input and observable result; mapping-presence checks alone cannot stand in for tests of the operation itself. Enforce structural completeness deterministically and review that the assertions exercise the promised operation.
+
+PR #5809 prevention follow-up (2026-10-22, simplicity/COVERAGE and codex-correctness/COVERAGE): the direct checker cases are planned in `we:backlog/6928-prevention-map-overlay-audit-guards-to-named-regression-test.md`. Add these planned gate fixtures in `we:scripts/lib/__tests__/overlay-review-test-mappings.test.mjs` as part of this card (not claims of implemented coverage):
+
+- `rejects an acceptance mapping without operation inputs and results`: remove the operation, fixture input or observable result separately from an otherwise complete acceptance mapping; each run must refuse preparation and identify the missing field and acceptance ID.
+- `rejects mapping-presence evidence for a behavioral checker promise`: supply a stale-reference rejection promise with only a fixture asserting that a mapping exists; the structured mapping lacks an input that deletes/renames a referenced test and a checker-refusal result, so preparation must fail for that operation. Do the same for fallback enumeration and evidence classification. This structural check does not claim to infer arbitrary test semantics.
+- `accepts operation-specific behavioral acceptance mappings`: provide complete mappings for stale-reference rejection, fallback enumeration and evidence classification, each with a repository-qualified planned case, operation, input and asserted checker result; preparation passes without missing-operation diagnostics. Review still checks that those assertions substantiate the promises.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4414@7551d840758044850fb35cf5ee8b7e557145c562
 

@@ -329,6 +329,7 @@ export async function planOverlayStacks({
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
+  noPin = new Set(),
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -357,6 +358,10 @@ export async function planRebuild({
   // an early overlay in a large running stack needs the same protection as its last overlay.
   const carriedRefs = new Set(establishedRefs);
   const carriedHeads = new Map();
+  // overlay-pin (live 2026-10-21 11:59 ET, review clone) — the head each overlay was last ADOPTED at: the second parent of
+  // the newest rebuild-committed merge record for that ref (same ref AND PR) on the running build's first-parent line.
+  // Hard evidence only (no merge-base inference), so a pin always names content this exact clone already smoked + adopted.
+  const adoptedTips = new Map();
   if (headSha && listed.some((o) => o?.ref && !establishedRefs.has(o.ref))) {
     const prKey = (pr) => (pr == null || pr === '' ? null : Number(pr));
     const registered = new Map(listed.filter((o) => o?.ref).map((o) => [o.ref, prKey(o.pr)]));
@@ -377,6 +382,7 @@ export async function planRebuild({
         if (git(['merge-base', '--is-ancestor', ps[1], mainSha]).status === 0) continue;
         carriedRefs.add(hit[1]);
         carriedHeads.set(hit[1], [...(carriedHeads.get(hit[1]) ?? []), ps[1]]);
+        if (!adoptedTips.has(hit[1])) adoptedTips.set(hit[1], ps[1]);
       }
       // A stack base may have entered the build only through its top, with no merge record of its own.
       // Shared ancestry outside main proves a carried part of its old tip even after a docs-only advance.
@@ -567,19 +573,54 @@ export async function planRebuild({
       if (edgeResolve) resolution = resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha: recordedEdgeSha(raw) });
       if (resolution?.ok) tree = resolution.tree;
       else {
+        const files = resolution?.files ?? conflictFilesOf(mt.stdout);
+        // overlay-pin — a moving branch whose NEW tip conflicts with the stack keeps the head this clone last adopted
+        // it at, instead of dropping out of the build (which x9diisp then turns into a whole-clone hold). Only when
+        // that adopted head itself still merges cleanly onto the stack, with no conflict resolution at all: pinned
+        // content is exactly what already passed smoke here, and the build it lands in is still smoked as usual.
+        // A ref with no adopted head (a brand-new registration) falls through to the plain drop below, as before.
+        const adoptedTip = adoptedTips.get(ref);
+        if (adoptedTip && adoptedTip !== ovSha && !establishedRefs.has(ref) && !noPin.has(ref)) {
+          const pmt = git(['merge-tree', '--write-tree', '--no-messages', cur, adoptedTip]);
+          const ptree = String(pmt.stdout ?? '').split('\n')[0].trim();
+          // Adopted content already carried by another overlay (merge changes nothing): no pin — a pin that applies
+          // nothing would be invisible to the smoke fallbacks — so the plain drop below decides, exactly as before.
+          if (pmt.status === 0 && ptree && ptree !== verifyRev(git, `${cur}^{tree}`)) {
+            const pin = { ref, pr, adopted: adoptedTip, newTip: ovSha, files };
+            alerts.push({
+              kind: 'overlay-pinned',
+              detail: {
+                ...pin,
+                message: `overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} pinned at its adopted head ${adoptedTip.slice(0, 10)}: new tip ${ovSha.slice(0, 10)} conflicts on ${files.join(', ') || '?'} — the rest of the stack still builds; merge the conflicting overlays (or main) into the branch to advance it`,
+              },
+            });
+            const pct = git(['commit-tree', ptree, '-p', cur, '-p', adoptedTip, '-m',
+              `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (pinned at adopted head; new tip ${ovSha} conflicts)`], {
+              env: rebuildCommitEnv(git, cur, adoptedTip),
+            });
+            const pSha = String(pct.stdout ?? '').trim();
+            if (pct.status === 0 && pSha) {
+              cur = pSha;
+              applied.push({ ref, pr, sha: adoptedTip, pinnedFrom: ovSha });
+              decisions.push({ ref, pr, action: 'apply', reason: 'applied-pinned', sha: adoptedTip, pinned: pin });
+              continue;
+            }
+            alerts.pop(); // the pin could not be minted: fall through to the plain drop (and its x9diisp hold)
+          }
+        }
         if (resolution) alerts.push({
           kind: 'overlay-conflict-unresolved',
           detail: { ref, pr, sha: ovSha, files: resolution.files, tried: resolution.tried },
         });
-        conflictFiles.set(ref, resolution?.files ?? conflictFilesOf(mt.stdout));
+        conflictFiles.set(ref, files);
         const refused = dropOrRefuse('conflict', resolution ? { files: resolution.files } : {});
-        if (refused) return refused;
+        if (refused) return retryPins(refused);
         continue;
       }
     }
     if (mt.status !== 0 && !resolution?.ok) {
       const refused = dropOrRefuse('merge-tree-failed');
-      if (refused) return refused;
+      if (refused) return retryPins(refused);
       continue;
     }
 
@@ -610,7 +651,7 @@ export async function planRebuild({
     const newSha = String(ct.stdout ?? '').trim();
     if (ct.status !== 0 || !newSha) {
       const refused = dropOrRefuse('commit-tree-failed');
-      if (refused) return refused;
+      if (refused) return retryPins(refused);
       continue;
     }
     cur = newSha;
@@ -654,7 +695,9 @@ export async function planRebuild({
   //     vanish silently: the whole plan is run again with that base as an ordinary independent overlay, so the normal
   //     rules decide (an established base goes first and the newcomer is parked; a pinned one refuses). Each pass adds
   //     at least one ref to `keepIndependent`, and a kept ref can no longer be set aside, so this ends.
-  const appliedRefs = () => new Set(applied.map((a) => a.ref));
+  // A top applied only at its PINNED old head (overlay-pin) is not the tip that contained or replaced the base, so it
+  // never suppresses the fallback: the base comes back (or the plan re-runs with it independent), never lost silently.
+  const appliedRefs = () => new Set(applied.filter((a) => !a.pinnedFrom).map((a) => a.ref));
   const lostBases = [];
   for (const d of decisions) {
     if (d.action !== 'skip' || !['stack-base-moved', 'stack-contained'].includes(d.reason) || !d.sha) continue;
@@ -678,7 +721,7 @@ export async function planRebuild({
   if (lostBases.length > 0) {
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]),
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin,
     });
   }
 
@@ -689,16 +732,21 @@ export async function planRebuild({
   // without because they conflict-dropped. `prepareRebuild` holds the clone on its last-good build instead of building
   // (and later adopting) a tree that lost live hotfixes. A pinned overlay SKIPPED by xpinskip is not counted: that
   // ruling deliberately builds without it (loudly, `pinned-overlay-conflict-skipped`) so the fleet keeps moving.
+  // Live 2026-10-21 ~17:12 ET (review clone): after #5771 merged, the registered top lane/unfreeze-review-top-1021c — a
+  // mechanism-pinned overlay the running build CARRIED — conflicted with main; xpinskip SKIPPED it and the plan built
+  // main + one overlay, dropping the whole live review stack (and the superseded rule would have adopted it). A pinned
+  // overlay skipped by xpinskip counts as lost too when the running build carries it: hold, never build without it.
   const establishedLost = [];
   for (const d of decisions) {
-    if (d.action !== 'drop' || d.reason !== 'conflict') continue;
+    const pinSkipped = d.action === 'skip' && d.reason === 'pinned-overlay-conflict-skipped';
+    if (!pinSkipped && (d.action !== 'drop' || d.reason !== 'conflict')) continue;
     const files = conflictFiles.get(d.ref) ?? [];
     const carriedSurvives = carriedHeads.has(d.ref)
       && carriedHeads.get(d.ref).every((sha) => git(['merge-base', '--is-ancestor', sha, cur]).status === 0);
     // An ESTABLISHED current tip always holds: another carrier preserving only an OLDER recorded tip says nothing
     // about the newer live changes. The carriedSurvives exception applies only to changed-tip newcomers.
     if (establishedRefs.has(d.ref) || (carriedRefs.has(d.ref) && !carriedSurvives)) {
-      establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: 'conflict', files });
+      establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: pinSkipped ? 'pinned-conflict-skipped' : 'conflict', files });
       alerts.push({
         kind: 'established-overlay-dropped',
         detail: {
@@ -733,7 +781,69 @@ export async function planRebuild({
     .digest('hex')
     .slice(0, 16);
 
-  return {
+  const plan = {
     ok: true, mainSha, finalSha: cur, applied, decisions, alerts, inputsKey, upToDate: cur === headSha, establishedLost,
   };
+  return retryPins(plan);
+
+  // A temporary adopted-head pin can cause a later explicit pin to refuse before the ordinary retry pass.
+  // Explore the same alternatives from that partial pass, but preserve the original refusal if none is safe.
+  async function retryPins(original) {
+    if (!original.ok && original.reason !== 'pinned-overlay-conflict') return original;
+    // A pin is applied in place, so the ordinary retry never offers its NEW tip a second chance after later overlays.
+    // Keep the combined retry and give every pin an independent retry while retaining its siblings. Also consider
+    // joint subsets: two new tips can need each other while a third overlay must remain pinned. Always compare to
+    // the original plan; accepting an intermediate held plan can lock in a new tip that blocks a carried overlay.
+    const explicitRefs = new Set(listed.filter((o) => o?.pinned === true).map((o) => o.ref));
+    const pinnedRefs = decisions.filter((d) => d.pinned && !explicitRefs.has(d.ref)).map((d) => d.ref);
+    if (pinnedRefs.length > 0 && noPin.size === 0) {
+      function* retryPinGroups() {
+        yield pinnedRefs;
+        if (pinnedRefs.length === 1) return;
+        for (const ref of pinnedRefs) yield [ref];
+        // Lazy, deterministic combinations; never build a powerset or recursively branch through planners.
+        // All pins and every singleton are always tried. Limit extra joint subsets to 64 replans per tick;
+        // exhaustion conservatively retains the original pins/hold. This exhausts all subsets for <=6 pins.
+        let remaining = 64;
+        for (let size = 2; size < pinnedRefs.length; size++) {
+          const indices = Array.from({ length: size }, (_, i) => i);
+          for (;;) {
+            if (remaining-- === 0) return;
+            yield indices.map((i) => pinnedRefs[i]);
+            let i = size - 1;
+            while (i >= 0 && indices[i] === pinnedRefs.length - size + i) i--;
+            if (i < 0) break;
+            indices[i]++;
+            for (let j = i + 1; j < size; j++) indices[j] = indices[j - 1] + 1;
+          }
+        }
+      }
+      for (const refs of retryPinGroups()) {
+        const alt = await planRebuild({
+          git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
+          keepIndependent, noPin: new Set(refs),
+        });
+        if (!alt.ok || alt.establishedLost.length > 0) continue;
+        const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));
+        if (!original.ok) {
+          // Never accept a plan that discards a flag-pinned overlay, including one after the refusal point.
+          // An explicit pin may survive at its adopted head, through a stack top, or already in main.
+          const keepsExplicit = [...explicitRefs].every((ref) => {
+            if (altApplied.has(ref)) return true;
+            const sha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
+            return !!sha && git(['merge-base', '--is-ancestor', sha, alt.finalSha]).status === 0;
+          });
+          if (keepsExplicit) return alt;
+          continue;
+        }
+        // A retried stack top can carry an original base without its own applied row (or at a newer sha).
+        // Retain that plan only with ancestry proof for the original head; a genuinely dropped head still fails.
+        if (refs.every((ref) => altApplied.has(ref) && !altApplied.get(ref).pinnedFrom)
+          && applied.every((a) => (altApplied.has(a.ref)
+            && (a.pinnedFrom || (!altApplied.get(a.ref).pinnedFrom && altApplied.get(a.ref).sha === a.sha)))
+            || git(['merge-base', '--is-ancestor', a.sha, alt.finalSha]).status === 0)) return alt;
+      }
+    }
+    return original;
+  }
 }

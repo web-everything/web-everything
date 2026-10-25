@@ -57,6 +57,8 @@ import { selectSupervisionLevel, DEFAULT_BACKDOWN_THRESHOLDS } from '../lib/prov
 import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
 import { prStatusOperation, PR_STATUS_OP } from './pr-status.mjs';
 import { createPrReader } from './pr-status-io.mjs';
+import { judgeSweepFactsOperation, JUDGE_SWEEP_FACTS_OP, finishJudgeSweep } from './judge-sweep-facts.mjs';
+import { createJudgeSweepFactsReader } from './judge-sweep-facts-io.mjs';
 import { staleStateOperation, STALE_STATE_OP } from './stale-state.mjs';
 import { createStaleStateReader } from './stale-state-io.mjs';
 import { prReconcileOperation, PR_RECONCILE_OP } from './pr-reconcile.mjs';
@@ -109,6 +111,8 @@ import { scaffoldOperation, SCAFFOLD_OP } from './scaffold.mjs';
 import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
 import { fileItemOperation, FILE_ITEM_OP } from './file-item.mjs';
 import { createFileItemReader, createFileItemSinks } from './file-item-io.mjs';
+import { graduateChainOperation, GRADUATE_CHAIN_OP, finishGraduateChain } from './graduate-chain.mjs';
+import { createGraduateChainSinks } from './graduate-chain-io.mjs';
 import { openPrOperation, OPEN_PR_OP } from './open-pr.mjs';
 import { createOpenPrSinks, deriveLaneRef } from './open-pr-io.mjs';
 import { PARK_LABELS } from '../pr-land.mjs';
@@ -176,6 +180,11 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  */
 
 export const OPERATIONS = Object.freeze({
+  [JUDGE_SWEEP_FACTS_OP]: () => ({
+    declaration: judgeSweepFactsOperation({ readFacts: createJudgeSweepFactsReader() }),
+    sinks: {},
+    finish: finishJudgeSweep,
+  }),
   ...Object.fromEntries(CONTROL_OPS.map(name => [name, ({ preview = false } = {}) => {
     const readContext = createOperatorControlsReader(preview ? {
       runGh: args => execFileSync('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 64 * 1024 * 1024 }),
@@ -491,6 +500,7 @@ export const OPERATIONS = Object.freeze({
   //
   // PARK_LABELS is the home's own, injected rather than restated: a second list here could ask for a park the
   // home refuses.
+  [GRADUATE_CHAIN_OP]: () => ({ declaration: graduateChainOperation({}), sinks: createGraduateChainSinks(), finish: finishGraduateChain }),
   [OPEN_PR_OP]: () => ({
     declaration: openPrOperation({ parkLabels: PARK_LABELS, deriveRef: () => deriveLaneRef() }),
     sinks: createOpenPrSinks(),
@@ -735,7 +745,7 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: controlPolicy.zeroWrites || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
@@ -745,7 +755,7 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    : [JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

@@ -76,11 +76,13 @@ describe('runner freshness policy', () => {
         "free-scope",
         "gap-sweep-status",
         "gate-health",
+        "graduate-chain",
         "graduation-progress-report",
         "grant-rounds",
         "health-respond",
         "heavy-queue",
         "item-activity",
+        "judge-sweep-facts",
         "land-advance",
         "land-human-only",
         "live-state",
@@ -123,7 +125,7 @@ describe('runner freshness policy', () => {
         "why",
       ]
     `);
-    for (const name of ['close-items', 'reopen-items', 'prototype-load']) {
+    for (const name of ['close-items', 'reopen-items', 'graduate-chain', 'prototype-load']) {
       expect(isReadOnlyOperation(resolveOperation(name).declaration), name).toBe(false);
     }
     for (const name of names) {

@@ -263,8 +263,11 @@ const graphExec = ({ parents, main, onComment = () => {}, view = null, tip = vie
   } // the sha the branch tip (the net diff's rev) resolves to
   if (cmd === 'gh' && args[1] === 'comment') { onComment(args[args.indexOf('--body') + 1]); return ''; }
   // PR #4631 round 11: a moved head's coverage reads the PR's formal reviews (`gh api …/reviews`); none stand here.
+  if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+    return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: view.comments.length } } } } });
+  }
   if (cmd === 'gh' && args[0] === 'api') return args.some(a => a.includes('/comments'))
-    ? view.comments.map(c => [c.body.replaceAll('\n', '\\n'), c.createdAt || '', c.author?.login || 'chalbert'].join('\t')).join('\n') : '';
+    ? view.comments.map((c, i) => [c.body.replaceAll('\n', '\\n'), c.createdAt || '', c.author?.login || 'chalbert', c.id ?? `IC_${i}`].join('\t')).join('\n') : '';
   if (cmd !== 'git') throw new Error(`unexpected ${cmd}`);
   const ancestors = (sha) => { const seen = new Set(); const st = [sha]; while (st.length) { const s = st.pop(); if (seen.has(s)) continue; seen.add(s); st.push(...(parents[s] || [])); } return seen; };
   const mainSet = new Set([...main].flatMap((m) => [...ancestors(m)]));
@@ -597,6 +600,33 @@ describe('PR #4715 context movement and manifest-drop replay', () => {
 });
 
 describe('tamper-park callback through the durable human carry writer', () => {
+  it.each([null, 'sibling/project'])('the default live reader proves the complete thread for repo %s', repo => {
+    const comment = { ...clearHumanComment(CLEARED, null), id: 'IC_clearance' };
+    const posted = [], calls = [];
+    const slug = repo || 'owner/repo';
+    const exec = (cmd, args) => {
+      calls.push([cmd, args]);
+      if (cmd === 'git' && args[0] === 'remote') return 'git@github.com:owner/repo.git\n';
+      if (cmd !== 'gh') throw Error('unexpected git proof');
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: HEAD });
+      if (args[0] === 'pr' && args[1] === 'comment') { posted.push(args); return ''; }
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } });
+      if (args.includes(`repos/${slug}/issues/5463/comments`)) return `${comment.body.replace(/\n/g, '\\n')}\t2026-10-01T00:00:00Z\tchalbert\t${comment.id}\n`;
+      if (args.includes(`repos/${slug}/pulls/5463/reviews`)) return '';
+      throw Error('unexpected gh read');
+    };
+    const callback = createTamperParkCarryCallback({ pr: 5463, repo, exec,
+      setting: ON, numberingSetting: ON, log: quiet, proveNumbering: () => ({ ok: true, reason: 'exact numbering' }) });
+    const result = callback({ humanClearance: latestHumanClearance([comment]), headSha: HEAD,
+      headDiffSha: HEAD, headDiff: DIFF.replace('+new', '+numbered') });
+    expect(result).toMatchObject({ carried: { recorded: true, tier: 'numbering' } });
+    expect(posted).toHaveLength(1);
+    const countArgs = calls.find(([cmd, args]) => cmd === 'gh' && args[1] === 'graphql')?.[1];
+    const [owner, name] = slug.split('/');
+    expect(countArgs).toEqual(expect.arrayContaining([`owner=${owner}`, `name=${name}`, 'n=5463']));
+    expect(calls.filter(([cmd]) => cmd === 'git')).toHaveLength(repo ? 0 : 1);
+  });
+
   it.each([true, false].flatMap(fingerprint => ['valid', 'mixed change', 'live hold', 'numbering off', 'master off', 'unpinned'].map(shape => [fingerprint, shape])))('numbering callback with fingerprint=%s, %s', (fingerprint, shape) => {
     const comments = [clearHumanComment(CLEARED, fingerprint ? FP : null)], posted = [];
     const headDiff = DIFF.replace('+new', '+numbered');
@@ -684,13 +714,17 @@ it('#5414 recorded heads: carries chalbert and updates acceptance as well as cle
   const before = 'fc7b05325a715a0f5f5dd07bed6223044fd92f2f39475906c5f7c4f4c303cd0a';
   const after = 'dc5d53c7d39b4f24465cf98f24122e860e479d5b6513b9e2e41471c0c410ad56';
   const comment = clearHumanComment(old, before);
+  comment.id = 'IC_clearance';
   comment.createdAt = '2026-10-15T23:41:24Z';
   comment.body += '\n<!-- reviewed-contribution: 39a4211c1e0740f32e484ba867419a7ae9eb137b670c574790ce23e1de14ba40 -->';
   const posted = []; const logs = []; const proofs = [];
   const exec = (cmd, args) => {
     if (cmd === 'gh' && args[1] === 'view') return JSON.stringify({ headRefOid: head, headRefName: 'lane/5414', comments: [comment] });
+    if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+      return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } });
+    }
     if (cmd === 'gh' && args[0] === 'api') return args.some(a => a.includes('/comments'))
-      ? [comment.body.replaceAll('\n', '\\n'), comment.createdAt, 'chalbert'].join('\t') : '';
+      ? [comment.body.replaceAll('\n', '\\n'), comment.createdAt, 'chalbert', comment.id].join('\t') : '';
     if (cmd === 'gh' && args[1] === 'comment') { posted.push(args[args.indexOf('--body') + 1]); return ''; }
     throw Error('unexpected command');
   };

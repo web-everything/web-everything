@@ -66,7 +66,33 @@ import {
 import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { readRoutingPolicy, resolvePolicyModel } from './dispatch-routing-policy-io.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
-import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
+import {
+  addOverlay, removeOverlay, appendOverlayEvent, allowConflictGate, readOverrideViewerLogin, readOverlayState,
+} from './daemon-overlays.mjs';
+
+/**
+ * The SAME admission `daemon-overlay add` runs (2026-10-21, Codex audit of PR #5809: load-overlay registered with no
+ * conflict check at all, a side door around add's guard). Under add's per-clone add-guard lock: preview the ref against
+ * origin/main + every other registered overlay (stack-aware, merge-tree), then register only when it merges clean, or
+ * when it is a CONFIRMED conflict and the operator-credential `--allow-conflict` gate passed. A check that cannot run
+ * (corrupt store, fetch/merge-tree error) refuses: fail closed, as add does.
+ * @returns {Promise<{registered:true, check:object}|{registered:false, reason:string, check?:object}>}
+ */
+export async function guardedRegister({ root, ref, pr, env, gate, register }) {
+  // Lazy: daemon-overlay.mjs imports this module (overlaySafetySettings), so a static import would be a cycle.
+  const { stackAwareOverlayCheck, withAddGuardLock } = await import('../daemon-overlay.mjs');
+  return withAddGuardLock(root, env, async () => {
+    const st = readOverlayState(root, { env });
+    if (st.corrupt) return { registered: false, reason: 'overlay-store-corrupt' };
+    const check = await stackAwareOverlayCheck({
+      root, ref, pr, existingOverlays: st.overlays.filter((o) => o?.ref !== ref), env,
+    });
+    if (!check.ok) return { registered: false, reason: 'conflict-check-failed', check };
+    if (!check.clean && !gate.override) return { registered: false, reason: 'conflict', check };
+    register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null);
+    return { registered: true, check };
+  });
+}
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
 import { DEFAULT_REBUILD_LOCK_WAIT_MS, REBUILD_LOCK_WAIT_ENV } from './daemon-rebuild/lease.mjs';
 import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
@@ -630,8 +656,8 @@ export function withDispatchSmoke({
  */
 export async function runDaemonLoadOverlay({
   clone, ref, pr = null, base = 'main', dryRun = false, env = process.env, log = console,
-  addedBy, reason = null, now,
-  addOverlayFn = addOverlay, rebuild = rebuildClone, dryRunRebuildFn = dryRunRebuild,
+  addedBy, reason = null, now, allowConflict = false, operatorInstruction = null, readViewer = readOverrideViewerLogin,
+  addOverlayFn = addOverlay, admit, rebuild = rebuildClone, dryRunRebuildFn = dryRunRebuild,
   wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult, rollbackVersionFn = rollbackVersionIfCurrent,
   settings, baseSmoke = runLiveSmokeWithRetry, dispatchSmoke = runRealDispatchSmoke, inspect = overlayDispatchFiles,
   removeOverlayFn = removeOverlay, appendEventFn = appendOverlayEvent,
@@ -641,6 +667,16 @@ export async function runDaemonLoadOverlay({
   if (!ref || typeof ref !== 'string') throw new TypeError('daemon-load-overlay: --ref=<branch to overlay> is required');
   const root = resolve(clone);
   const by = addedBy ?? (typeof env?.USER === 'string' && env.USER ? env.USER : null);
+
+  // allow-conflict gate (2026-10-21) — refused before anything, dry-run included, unless the operator's own words
+  // come with it and the caller's GitHub credential is the operator's; the quote is stored on the registration.
+  const gate = allowConflictGate({
+    allowConflict, operatorInstruction, viewerLogin: allowConflict ? await readViewer() : null, now,
+  });
+  if (!gate.ok) {
+    log.error?.(`daemon-load-overlay: REFUSED — ${gate.error}`);
+    return { root, ref, homeBranch: base, registered: false, refused: true, reason: 'allow-conflict-needs-operator-instruction' };
+  }
 
   if (dryRun) {
     const preview = await dryRunRebuildFn({ root, env, extraOverlays: [{ ref, pr }] });
@@ -659,9 +695,27 @@ export async function runDaemonLoadOverlay({
     log.error?.(`daemon-load-overlay: WARNING — loading ${ref} with NO PR. Nothing reviewed this code and nothing ties it to a merge; pass --pr=<N>. (overlaySafety.noPr=warn; set refuse to block this.)`);
   }
 
-  addOverlayFn(root, {
-    ref, pr, addedBy: by, reason, now,
+  // Every REAL registration goes through add's guard (guardedRegister). An injected `addOverlayFn` (unit wiring tests)
+  // registers nothing real, so it is not guarded unless the caller also injects `admit`.
+  const register = (override) => addOverlayFn(root, {
+    ref, pr, addedBy: by, reason, now, ...(override ? { conflictOverride: override } : {}),
   }, { env });
+  const admitFn = admit ?? (addOverlayFn === addOverlay ? guardedRegister : null);
+  if (admitFn) {
+    const admitted = await admitFn({ root, ref, pr, env, gate, register });
+    if (!admitted.registered) {
+      const c = admitted.check;
+      log.error?.(`daemon-load-overlay: REFUSED — ${ref} ${admitted.reason === 'conflict'
+        ? `conflicts on ${(c?.files ?? []).join(', ') || '?'} with ${(c?.conflicting ?? []).map((o) => o.ref).join(', ') || 'main'} — rebase it first (or the operator's --allow-conflict)`
+        : `could not be checked (${admitted.reason}${c?.reason ? `: ${c.reason}` : ''}) — refusing to register`}`);
+      return {
+        root, ref, homeBranch: base, registered: false, refused: true, reason: admitted.reason,
+        ...(c ? { conflictCheck: c } : {}),
+      };
+    }
+  } else {
+    register(gate.override);
+  }
   // Card 89 S5: a versioned clone has no lock to take and is never rebuilt from this CLI. The request file is
   // the daemon's in-tick updater's input; `--wait` blocks on its result file instead of on a clone lock.
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
@@ -882,6 +936,8 @@ if (IS_CLI) {
   const waitMs = flags['wait-ms'] !== undefined && Number(flags['wait-ms']) > 0 ? Number(flags['wait-ms']) : undefined;
   runDaemonLoadOverlay({
     clone, ref, pr, base, dryRun, addedBy, reason, wait, waitMs,
+    allowConflict: !!flags['allow-conflict'],
+    operatorInstruction: typeof flags['operator-instruction'] === 'string' ? flags['operator-instruction'] : null,
   })
     .then((result) => {
       if (flags.json) {

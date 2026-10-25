@@ -913,14 +913,20 @@ describe('catch-up fill and stable acceptance ordering', () => {
 
 it('reads an acceptance beyond the first comments page', async () => {
   let calls = 0;
+  const comments = [
+    ...Array.from({ length: 100 }, (_, i) => `ordinary comment\t2026-10-01\tbot\tIC_${i}`),
+    '✅ review — `review:human` cleared via the sanctioned path\t2026-10-02\tbot\tIC_accepted',
+  ];
   const result = await readCatchUpCandidates({ repo: REPO,
     readComments: (number, opts) => readCompletePrComments(number, { ...opts, exec: (cmd, args) => {
       expect(cmd).toBe('gh');
+      if (args[1] === 'graphql') {
+        return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } });
+      }
       expect(args).toContain('--paginate');
       expect(args).toContain(`repos/${REPO}/issues/42/comments`);
       // gh --paginate emits all pages through the shared reader's TSV projection.
-      return Array.from({ length: 100 }, () => 'ordinary comment\t2026-10-01\tbot').join('\n') +
-        '\n✅ review — `review:human` cleared via the sanctioned path\t2026-10-02\tbot\n';
+      return comments.join('\n') + '\n';
     } }),
     execFileImpl: (_cmd, args, _opts, cb) => {
       calls++;

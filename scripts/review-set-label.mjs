@@ -1437,7 +1437,7 @@ export function runReviewLabelCli({
   // PR #5482: RULING NEEDED advertises this ceremony as the not-real ruling on a red-team break held at the round cap.
   // On an accepted PR the ceremony's comment is that ruling. It never manufactures an acceptance: a PR without
   // `review:accepted` still owes its review first. A round-capped thread is long, so read all of it when the page is full.
-  const fullThread = (page = prComments) => {
+  const fullThread = (page = prComments, threadHead = headSha) => {
     if (page.length < PR_COMMENTS_PAGE_SIZE) return page;
     let comments;
     try { comments = provider.readComments(repo, pr); } catch (e) {
@@ -1445,7 +1445,25 @@ export function runReviewLabelCli({
       return fail(ghErr(e, 'complete comment thread unreadable'), 1);
     }
     if (to === 'rearm' && !Array.isArray(comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
-    return to === 'rearm' ? [...page, ...comments] : comments;
+    if (to === 'rearm') {
+      const ids = c => [c?.node_id, c?.id, c?.url, c?.html_url].filter(v => v !== undefined && v !== null && v !== '');
+      const normalizeLogin = login => typeof login === 'string' ? login.toLowerCase().replace(/\[bot\]$/, '') : login;
+      const covered = comments.length >= page.length && page.every(c => comments.some(full => {
+        if (typeof c?.body !== 'string' || c.body !== full?.body) return false;
+        const author = c?.author?.login ?? c?.user?.login;
+        if (author && normalizeLogin(author) !== normalizeLogin(full?.author?.login ?? full?.user?.login)) return false;
+        const embeddedIds = ids(c), fullIds = ids(full);
+        if (embeddedIds.length && fullIds.length) return embeddedIds.some(id => fullIds.includes(id));
+        return (c.createdAt ?? c.created_at) === (full.createdAt ?? full.created_at);
+      }));
+      if (!covered) {
+        // Even an incomplete read cannot undo clearance already visible on the embedded page.
+        if (headEverHumanCleared(page, threadHead.trim())) refuseRearm('head carries a human clearance — a rearm never undoes it');
+        refuseRearm('comments unreadable — cannot prove no human clearance');
+      }
+      return [...page, ...comments];
+    }
+    return comments;
   };
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
@@ -1820,7 +1838,7 @@ export function runReviewLabelCli({
     try { fresh = provider.readPrState(repo, pr); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (!Array.isArray(fresh.comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
     if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
-    const freshComments = fullThread(fresh.comments).filter(isTrustedMarkerAuthor);
+    const freshComments = fullThread(fresh.comments, fresh.headRefOid).filter(isTrustedMarkerAuthor);
     if (headEverHumanCleared(freshComments, fresh.headRefOid.trim())) refuseRearm('head carries a human clearance — a rearm never undoes it');
     return { fresh, freshComments };
   };
