@@ -64,6 +64,18 @@ function flagValue(argv, flag) {
   return i === -1 ? undefined : argv[i + 1];
 }
 
+describe('codex-runner detached wait contract', () => {
+  it('retries only on exit 75 and stops and reports terminal nonzero exits', () => {
+    const runner = readFileSync(join(process.cwd(), '.claude/agents/codex-runner.md'), 'utf8');
+    const instruction = runner.split('\n').find(line => line.startsWith('- **Long Codex tasks:**'));
+    expect(instruction).toContain('codex-direct-task wait --job=<id>');
+    expect(instruction).toContain('Repeat only on exit 75 (still running).');
+    expect(instruction).toContain('Stop on exit 0 (success)');
+    expect(instruction).toContain('stop and report any other nonzero exit as a terminal failure.');
+    expect(instruction).not.toMatch(/until it exits 0/);
+  });
+});
+
 describe('defaultExecFn — real child-process output buffering', () => {
   it('returns the full stdout when output exceeds Node’s default 1 MiB buffer', () => {
     const outputSize = 2 * 1024 * 1024;
@@ -2029,6 +2041,33 @@ describe('detached jobs', () => {
     const f = fixture();
     expect(await waitForJob({ ...f.options, isAlive: () => false })).toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
     expect(f.writeRecord).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', exitCode: 1, finishedAt: new Date(0).toISOString() }));
+  });
+
+  it.each(Array.from({ length: 255 }, (_, index) => index + 1))(
+    'terminal task exit %s never requests another wait on either terminal read path', async exitCode => {
+      const f = fixture();
+      f.child.emit('exit', exitCode);
+      const expected = { status: 'failed', exitCode, code: exitCode === 75 ? 1 : exitCode };
+      expect(await waitForJob(f.options)).toMatchObject(expected);
+      const raced = fixture();
+      expect(await waitForJob({ ...raced.options, isAlive: () => false,
+        updateRecord: () => ({ ...raced.options.readRecord(), status: 'failed', exitCode }),
+      })).toMatchObject(expected);
+    },
+  );
+
+  it('terminal task exit 75 does not request another wait and preserves exitCode in CLI JSON', () => {
+    const record = { id: 'terminal-75', pid: 123, status: 'failed', exitCode: 75,
+      resultPath: 'terminal-75.result.json' };
+    writeJobRecord(record, { jobsDir });
+    const run = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait', `--job=${record.id}`], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(run.error).toBeUndefined();
+    expect(run.status, run.stderr).toBe(1);
+    expect(JSON.parse(run.stdout)).toEqual({ status: 'failed', exitCode: 75, resultPath: record.resultPath });
+    expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
   });
 
   it.each([

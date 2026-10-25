@@ -82,6 +82,7 @@ import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constell
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
 import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision } from './fix-scope-policy.mjs';
+import { createFixWaitingObserver } from './fix-waiting.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
@@ -1823,6 +1824,7 @@ export function runReconcileFixDispatch({
   listFixClaims = () => listFixDispatchClaims(undefined, { liveOnly: true }),
   // fix-cap / host-load: a DEFER-ONLY throttle (`dispatch-throttle.mjs#createDispatchThrottle`); null = no gate.
   dispatchThrottle = null,
+  waiting: suppliedWaiting,
   // Card 87 — `createFixBorrowGate`: a fix held ONLY by the fixer cap may borrow a free builder slot. null = never.
   borrowGate = null,
   fixExecutorRoute = null,
@@ -1836,6 +1838,9 @@ export function runReconcileFixDispatch({
   const mainFixCapacity = resolveMainFixCapacity();
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
+  const waiting = suppliedWaiting ?? (isUnderTestEnv() ? null : createFixWaitingObserver({
+    repo: CONSTELLATION_REPOS[repoKey].slug, notify: notifyQueueCapOperator, now,
+  }));
   // #x1rr9rh (multi-repo slice 2) — this staleness check guards the DISPATCHING checkout (this WE checkout's
   // own import path), not the target repo: the fix path always runs WE's own code, whatever repo it dispatches
   // (or, for an unsupported repo, merely records as unsupported) a fix for. Gating it on `repoKey === 'we'`
@@ -1983,9 +1988,18 @@ export function runReconcileFixDispatch({
   const lanes = [...(typeof pickFreeLanes === 'function' ? pickFreeLanes() : freeLaneNumbers({ root, lanePoolRepo: profile.lanePoolRepo }))];
   const queueBudget = queueBudgetFrom(queueAdmission, { root, repo: repoKey });
   const dispatched = [];
+  const waitingEntry = entry => {
+    const row = dispatchEntries.find(row => Number(row.prNumber) === Number(entry.pr));
+    return {
+      ...entry,
+      labels: row?.labels ?? entry.labels,
+      operatorSendBack: entry.operatorSendBack ?? row?.operatorSendBack,
+    };
+  };
   for (const entry of planned) {
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
     const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) : { admit: true };
+    if (!t.admit && t.kind === 'host-load') waiting?.deferred(waitingEntry(entry));
     if (t.admit && t.note) console.error(`reconcile-fix-dispatch: PR #${entry.pr} fix launch admitted: ${t.note}`);
     // Card 87 — ONLY the fixer cap may be borrowed past (never host-load, never a scope wait: those never get here).
     let borrowed = null;
@@ -2056,6 +2070,7 @@ export function runReconcileFixDispatch({
       if (attempt.resumed) {
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
         dispatched.push(attempt.result);
+        waiting?.dispatched(waitingEntry(entry));
         continue; // no lane ever popped for this entry
       }
       resumeAttempt = attempt.resumeAttempt;
@@ -2073,6 +2088,7 @@ export function runReconcileFixDispatch({
       if (attempt?.resumed) {
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
         dispatched.push(attempt.result);
+        waiting?.dispatched(waitingEntry(entry));
         continue; // no lane ever popped for this entry
       }
       if (attempt?.resumeAttempt) {
@@ -2101,6 +2117,7 @@ export function runReconcileFixDispatch({
         continue;
       }
       dispatched.push(borrowed ? { ...result, borrowed, reason: BORROW_REASON } : result);
+      waiting?.dispatched(waitingEntry(entry));
       if (entry.restack) {
         markRestackUsed(entry, restackedHeads);
         const pair = stacks.pairs.find(pair => pair.top === entry.pr);
@@ -2242,9 +2259,11 @@ export function recordQueueCapRefusal({
  * the exact SAME plan {@link runReconcileFixDispatch} would dispatch against (reused, not re-derived), but
  * never spawns, resumes, acquires, or releases anything — for each planned `fix` entry it only asks
  * {@link ../conveyor/fix-claim-store.mjs#readFixDispatchClaim} whether that PR's `(repo, pr, headRefOid)`
- * claim is currently free or already held, and by whom. This is the live introspection this item's own proof
- * needs (a `--dry-run` before/after showing a claim taken, then refused for a duplicate, with zero side
- * effects on the real system) and a genuine standing tool: an operator — or a future health-daemon check — can
+ * claim is currently free or already held, and by whom. It also previews resource admission and waiting
+ * label/alert changes without label, alert, waiting-state, lane-pool or planner-ledger writes.
+ * Reads still use the gh throttle (accounting kept on purpose) and may refresh local git
+ * remote-tracking refs or the agent-list cache. Lane availability is unknown unless injected.
+ * This is live introspection: an operator — or a future health-daemon check — can
  * ask "is a fix about to be double-dispatched?" without risking a real dispatch itself.
  * @param {object} [o] — the same read-only inputs `runReconcileFixDispatch` itself takes (`repo`, `root`,
  *   `findItemFn`, `loadItems`, `reconcile`, the scope resolvers, `resolveProfile`, `checkStaleness`, `prsFile`).
@@ -2266,19 +2285,37 @@ export function planFixDispatchClaimStatus({
   prsFile,
   readClaim = readFixDispatchClaim,
   claimRoot,
+  dispatchThrottle = null, waiting = null, pickFreeLanes = null,
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
-  assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
-  const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  // Preview must not fetch, fast-forward or rebuild the checkout.
+  if (checkStaleness) assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
+  const reconciled = reconcile({ repo, readOnly: true, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
   const profile = resolveProfile(repoKey);
   if (!profile?.capabilities?.fix) return { repo: repoKey, entries: [] };
-  const { planned } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
-  const entries = planned.map((entry) => ({
-    pr: entry.pr, itemNum: entry.itemNum, headRefOid: entry.headRefOid,
-    claim: readClaim({ repo: repoKey, pr: entry.pr, headSha: entry.headRefOid, lockRoot: claimRoot }),
-  }));
+  const { planned } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef, { includeLabels: true });
+  // lane-pool list writes scan locks/caches and can reap; preview must never call it.
+  const lanes = typeof pickFreeLanes === 'function' ? [...pickFreeLanes()] : null;
+  const entries = planned.map((entry) => {
+    const row = dispatchEntries.find(row => Number(row.prNumber) === Number(entry.pr));
+    const labels = row?.labels ?? entry.labels;
+    const operatorSendBack = entry.operatorSendBack ?? row?.operatorSendBack;
+    const claim = readClaim({ repo: repoKey, pr: entry.pr, headSha: entry.headRefOid, lockRoot: claimRoot });
+    const throttle = dispatchThrottle?.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) ?? null;
+    if (throttle?.admit === false && throttle.kind === 'host-load') waiting?.deferred({ ...entry, labels, operatorSendBack });
+    // A preview can only propose a launch. The live path clears exclusively after dispatched.push().
+    const launch = throttle?.admit && !claim
+      ? lanes === null ? 'would launch if a lane is free' : lanes.length ? 'would launch' : 'no free lane'
+      : null;
+    if (launch && launch !== 'no free lane') {
+      lanes?.shift();
+      waiting?.dispatched({ ...entry, labels, operatorSendBack }, { condition: 'if a lane is free and launch succeeds' });
+    }
+    return { pr: entry.pr, itemNum: entry.itemNum, headRefOid: entry.headRefOid, claim,
+      ...(throttle ? { throttle } : {}), ...(launch ? { launch } : {}) };
+  });
   return { repo: repoKey, entries };
 }
 
@@ -2375,7 +2412,18 @@ if (IS_CLI) {
     // #x0jphk5 — read-only: reports claim status, never dispatches/resumes/acquires/releases anything.
     let status;
     try {
-      status = planFixDispatchClaimStatus({ repo: typeof flags.repo === 'string' ? flags.repo : null, prsFile: flags['prs-file'] });
+      const { createResourceFixThrottle, gateLaunch } = await import('../lib/resource-gate.mjs');
+      const { decideAdmission, readSnapshot, loadResourcePolicy } = await import('../lib/resource-admission.mjs');
+      const { defaultSlotCountedFixClaims } = await import('./await-verify-loop.mjs');
+      const repo = typeof flags.repo === 'string' ? flags.repo : 'we';
+      const waiting = createFixWaitingObserver({ repo: ghRepoSlug(repoKeyForSlug(repo) ?? repo), dryRun: true });
+      // Same gate and cap, with the optional shadow journal sink disabled in this read-only preview.
+      const readAdmission = ({ kind, env, nowMs, root }) => decideAdmission({ kind,
+        snapshot: readSnapshot(root ? { root } : {}), policy: loadResourcePolicy({ env }).policy, nowMs });
+      const dispatchThrottle = createResourceFixThrottle({ listClaims: () => defaultSlotCountedFixClaims(),
+        gate: kind => gateLaunch({ kind, shadow: readAdmission, admitFn: readAdmission }),
+      });
+      status = planFixDispatchClaimStatus({ repo, prsFile: flags['prs-file'], dispatchThrottle, waiting });
     } catch (e) {
       process.stderr.write(`✗ reconcile-fix-dispatch --dry-run failed: ${String((e && e.message) || e).split('\n')[0]}\n`);
       process.exit(1);
@@ -2389,9 +2437,10 @@ if (IS_CLI) {
       const lines = [`reconcile-fix-dispatch --dry-run — ${status.entries.length} PR(s) planned for repo "${status.repo}"`];
       for (const e of status.entries) {
         const itemLabel = e.itemNum ? `item #${e.itemNum}` : 'no backlog item';
+        if (e.throttle) lines.push(`  PR #${e.pr} throttle: ${e.throttle.admit ? (e.launch ?? 'admitted (launch not attempted)') : `${e.throttle.kind} — ${e.throttle.why}`}`);
         lines.push(e.claim
           ? `  ⚠ PR #${e.pr} (${itemLabel}) — claim ALREADY HELD by ${e.claim.owner} (since ${e.claim.heartbeatAt}) — a real dispatch attempt right now would be REFUSED`
-          : `  ✓ PR #${e.pr} (${itemLabel}) — claim free — a real dispatch attempt right now would proceed`);
+          : `  ✓ PR #${e.pr} (${itemLabel}) — claim free (other dispatch gates still apply)`);
       }
       writeLineSync(1, lines.join('\n'));
     }
