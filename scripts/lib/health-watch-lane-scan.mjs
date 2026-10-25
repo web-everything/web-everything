@@ -174,11 +174,17 @@ function graftsFilePresent(file) {
 
 /**
  * FRESH safety read of ONE lane, right now (never the cache). Unsafe when the worktree has any change (tracked or
- * untracked or ignored), index flags that may hide edits, any stash, or any commit absent from local origin refs. Any git error,
+ * untracked or ignored), index flags that may hide edits, any stash, or any commit absent from trusted published history. Any git error,
  * timeout or unparseable output is UNSAFE: this answers "may I destroy this lane's state?", so not knowing is no.
+ * `readPublishedTips({path})` is a TRUSTED caller capability: synchronously read the intended repository's published
+ * commit OIDs from an authenticated remote or daemon-owned authority outside the lane. Bind the repository identity
+ * outside the lane too; neither its origin URL, tracking refs, nor cached scan can establish publication. Called on
+ * every check; the provider must bound its IO and throw on read errors. No provider is installed by default:
+ * an unwired actor refuses, with no local-ref fallback.
+ * The caller must hold the lane's exclusive ownership through the check and subsequent action.
  * @returns {{hasUnsafeWork:boolean, fresh:true, observedAt:string, reason:string, error?:string}}
  */
-export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = {}) {
+export function freshLaneSafety({ path, exec = execFileSync, now = Date.now, readPublishedTips } = {}) {
   const observedAt = new Date(now()).toISOString();
   const unsafe = (reason, error) => ({ hasUnsafeWork: true, fresh: true, observedAt, reason, ...(error ? { error } : {}) });
   if (typeof path !== 'string' || !path) return unsafe('no lane path');
@@ -211,8 +217,19 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
     const grafts = git(['rev-parse', '--git-path', 'info/grafts']).trim();
     if (!grafts) return unsafe('lane grafts path unreadable');
     if (graftsFilePresent(resolve(path, grafts))) return unsafe('lane has legacy grafts file');
-    // Protect work held by other branches, tags or custom refs, plus a detached HEAD.
-    const ahead = git(['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']).trim();
+    // The lane can forge loose AND packed tracking refs. Only caller-owned publication evidence may exclude
+    // commits from the count. Exact object IDs also prevent option/ref-expression injection. The cap bounds argv;
+    // an empty/unavailable/oversized authority requires operator inspection, never an origin-ref fallback.
+    if (typeof readPublishedTips !== 'function') return unsafe('trusted publication reader required');
+    const tips = readPublishedTips({ path });
+    if (!Array.isArray(tips) || tips.length === 0 || tips.length > 4096
+      || Array.from(tips).some(oid => typeof oid !== 'string' || ![40, 64].includes(oid.length)
+        || /[^0-9a-f]/.test(oid))) {
+      return unsafe('trusted publication tips unreadable or empty (limit 4096)');
+    }
+    // Protect work held by other branches, tags or custom refs, plus a detached HEAD. A missing published object
+    // makes Git fail (unsafe); do not fetch through lane-owned transport configuration to try to repair it.
+    const ahead = git(['rev-list', '--count', '--all', 'HEAD', '--not', ...new Set(tips)]).trim();
     if (!/^\d+$/.test(ahead)) return unsafe('ahead count unreadable');
     if (Number(ahead) > 0) return unsafe(`${ahead} unpushed commit(s)`);
     return { hasUnsafeWork: false, fresh: true, observedAt, reason: 'clean, no stash, nothing unpushed' };
@@ -227,9 +244,9 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
  * way. Never throws (a throwing checker is a refusal).
  * @returns {{act:boolean, action:string, path:string, fresh:object, reason:string}}
  */
-export function guardLaneAction({ path, action, check = freshLaneSafety, exec, log = line => console.error(line) } = {}) {
+export function guardLaneAction({ path, action, check = freshLaneSafety, exec, readPublishedTips, log = line => console.error(line) } = {}) {
   let fresh;
-  try { fresh = check({ path, ...(exec ? { exec } : {}) }); }
+  try { fresh = check({ path, ...(exec ? { exec } : {}), readPublishedTips }); }
   catch (error) { fresh = { hasUnsafeWork: true, fresh: true, reason: 'fresh safety check threw', error: String(error?.message ?? error) }; }
   const act = fresh?.fresh === true && fresh.hasUnsafeWork === false;
   const reason = act ? `fresh check safe (${fresh.reason})` : `refused: fresh check ${fresh?.hasUnsafeWork === false ? 'not fresh' : 'unsafe'} (${fresh?.reason ?? 'no result'}${fresh?.error ? `: ${fresh.error}` : ''})`;

@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction, laneProbeEnv, laneRedirectConfig, laneMaskingConfig, withHonestReportingPins, LANE_HONEST_REPORTING_PINS } from '../../lib/health-watch-lane-scan.mjs';
+import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety as checkFreshLaneSafety, guardLaneAction as checkGuardLaneAction, laneProbeEnv, laneRedirectConfig, laneMaskingConfig, withHonestReportingPins, LANE_HONEST_REPORTING_PINS } from '../../lib/health-watch-lane-scan.mjs';
 import { createStaleStateReader } from '../stale-state-io.mjs';
 import { OPERATIONS } from '../run.mjs';
 import { DIRTY_PROBE_ARGS, laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
@@ -15,6 +15,14 @@ vi.mock('../stale-state-io.mjs', async original => {
 });
 
 const dirs = [];
+// Publication belongs to the test driver, never to a lane-owned tracking ref.
+// Unit probes use a fixed OID; real-Git fixtures register their initial published
+// commit once, before creating local work or forging any refs.
+const PUBLISHED_TIP = 'a'.repeat(40);
+const publishedTips = new Map();
+const readPublishedTips = ({ path }) => [publishedTips.get(path) ?? PUBLISHED_TIP];
+const freshLaneSafety = options => checkFreshLaneSafety({ readPublishedTips, ...options });
+const guardLaneAction = options => checkGuardLaneAction({ readPublishedTips, ...options });
 const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'health-lane-scan-')); dirs.push(dir); return dir; };
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const policy = { interval: 300, source: 'standard', invalid: [] };
@@ -278,7 +286,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     ['git', ['ls-files', '-v']],
     ['git', ['stash', 'list', '--no-show-signature']],
     ['git', ['rev-parse', '--git-path', 'info/grafts']],
-    ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']],
+    ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', PUBLISHED_TIP]],
   ];
   const gitMocks = [];
   // Assert outside the checker: it catches exec errors, including failed assertions inside a mock.
@@ -323,7 +331,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
         });
       }
     });
-  it('pins the exact git argv: untracked files listed in full, all refs and HEAD counted against origin refs only', () => {
+  it('pins the exact git argv: untracked files listed in full, all refs and HEAD counted against trusted publication only', () => {
     const exec = git({ status: '', stash: '', 'rev-list': '0\n' });
     freshLaneSafety({ path: '/l', exec });
     expect(exec.mock.calls.map(([bin, argv]) => [bin, argv])).toEqual([
@@ -333,7 +341,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
       ['git', ['ls-files', '-v']],
       ['git', ['stash', 'list', '--no-show-signature']],
       ['git', ['rev-parse', '--git-path', 'info/grafts']],
-      ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']],
+      ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', PUBLISHED_TIP]],
     ]);
     for (const [, , options] of exec.mock.calls) {
       expect(options).toMatchObject({ cwd: '/l', encoding: 'utf8', timeout: 30_000 });
@@ -393,7 +401,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
       if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']])) return status;
       if (command === JSON.stringify(['git', ['ls-files', '-v']])) return 'H tracked.txt\n';
       if (command === JSON.stringify(['git', ['stash', 'list', '--no-show-signature']])) return '';
-      if (command === JSON.stringify(['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']])) return count;
+      if (command === JSON.stringify(['git', ['rev-list', '--count', '--all', 'HEAD', '--not', PUBLISHED_TIP]])) return count;
       if (argv.includes('status') || argv[1] === '--stage') return '';
       return '0\n';
     });
@@ -498,7 +506,7 @@ describe('untrusted lane Git configuration', () => {
     expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([
       [...LANE_CONFIG_LIST_ARGS], ['ls-files', '--stage', '-z'], [...DIRTY_PROBE_ARGS], ['ls-files', '-v'], ['stash', 'list', '--no-show-signature'],
       ['rev-parse', '--git-path', 'info/grafts'],
-      ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin'],
+      ['rev-list', '--count', '--all', 'HEAD', '--not', PUBLISHED_TIP],
     ]);
     for (const [, , { env }] of exec.mock.calls) {
       const config = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
@@ -670,7 +678,8 @@ describe('lane action guard with real Git', () => {
     const commit = () => git(['-c', 'user.name=Guard Fixture', '-c', 'user.email=guard@example.invalid',
       '-c', 'commit.gpgSign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', 'fixture']);
     commit();
-    // Model an already-pushed HEAD using a local ref; no network or remote is needed.
+    publishedTips.set(path, git(['rev-parse', 'HEAD']).trim());
+    // A tracking ref may agree with publication, but is never its authority.
     git(['update-ref', 'refs/remotes/origin/fixture', 'HEAD']);
     for (const action of actions) {
       expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
@@ -696,6 +705,23 @@ describe('lane action guard with real Git', () => {
     writeFileSync(join(path, 'tracked.txt'), 'modified content\n');
     expect(guardLaneAction({ path, action: 'reclaim', log: vi.fn() }).act).toBe(false);
     expect(existsSync(marker)).toBe(false);
+  });
+
+  it.each(['loose', 'packed'])('refuses forged %s origin refs for every destructive action with real Git', storage => {
+    const { path, git, commit } = fixture();
+    writeFileSync(join(path, 'tracked.txt'), 'never published\n');
+    git(['add', 'tracked.txt']);
+    commit();
+    git(['update-ref', 'refs/remotes/origin/forged', 'HEAD']);
+    if (storage === 'packed') git(['pack-refs', '--all', '--prune']);
+    // Reproduce the exact old false-safe count without treating it as authority.
+    expect(git(['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin'])).toBe('0\n');
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
+        act: false, fresh: { hasUnsafeWork: true, reason: '1 unpushed commit(s)' },
+      });
+    }
+    expect(readFileSync(join(path, 'tracked.txt'), 'utf8')).toBe('never published\n');
   });
 
   it.each([
