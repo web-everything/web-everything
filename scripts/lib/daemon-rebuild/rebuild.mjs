@@ -3,6 +3,8 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
+import { basename } from 'node:path';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
@@ -32,11 +34,35 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
  *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
- *   dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — `dispatchSmoke` (xhiqxz3): injected
+ *   emitEvent?:Function, dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — injected
  *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
  * @returns {Promise<object>}
  */
-export async function rebuildClone({
+export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
+  const result = await rebuildCloneInternal(options);
+  try {
+    const idle = new Set([
+      'up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted',
+      'ready-recorded', 'rebuild-in-progress',
+      'rebuild-job-started', 'rebuild-job-running', 'rebuild-job-spaced',
+      'already-head', 'already-on-main', 'no-change', 'none', 'in-main', 'skipped-unrelated',
+      'deps-job-running', 'deps-job-spaced', 'deps-job-started', 'applied-pinned', 'stack-contained',
+      'pinned-contained-in-applied', 'overlay-no-longer-wanted', 'clone-recloned', 'smoke-harness-broken-backoff',
+    ]);
+    if (result.adopted || result.moved) {
+      await emitEvent({
+        kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
+      }, { env: options.env });
+    } else if (result.reason && !idle.has(result.reason)) {
+      await emitEvent({
+        kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
+      }, { env: options.env });
+    }
+  } catch { /* Event failures must never change the rebuild outcome. */ }
+  return result;
+}
+
+async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
@@ -48,7 +74,7 @@ export async function rebuildClone({
   if (!readyOnly && !adoptOnly && (asJob === undefined ? resolveRebuildAsJob({ entries, env }) : asJob)) {
     return rebuildCloneAsJob({
       root, env, log, mainOnly, entries,
-      adopt: (o = {}) => rebuildClone({
+      adopt: (o = {}) => rebuildCloneInternal({
         root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
         dispatchSmoke, admissionWaitMs, ...o, adoptOnly: true, asJob: false,
       }),
