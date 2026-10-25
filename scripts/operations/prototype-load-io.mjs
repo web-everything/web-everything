@@ -182,7 +182,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     : (input) => defaultCombinedTest(input, { exec, fs, env: childEnv, settings: config });
   const execute = (command, args) => {
     try { return { code: 0, stdout: String(exec(command, args, { cwd: repo, env: childEnv, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) || '') }; }
-    catch (e) { return { code: Number.isInteger(e.status) ? e.status : -1, stdout: String(e.stdout || ''), error: String(e.stderr || e.message || e) }; }
+    catch (e) { return { code: Number.isInteger(e.status) ? e.status : -1, stdout: String(e.stdout || ''), stderr: String(e.stderr || ''), error: String(e.stderr || e.message || e) }; }
   };
   const git = (...args) => execute('git', args);
   const requireGit = (...args) => { const r = git(...args); if (r.code !== 0) throw new Error(r.error || `git ${args[0]} failed (${r.code})`); return r.stdout.trim(); };
@@ -196,14 +196,15 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const check = (clone, ref, expectedSha) => {
     const result = loader('add', clone, ref, ['--check', ...(expectedSha ? [`--expected-sha=${expectedSha}`] : [])]);
     const data = lastJson(result);
+    const noPrWarning = result.code === 1 && /\bWARNING\b[^\r\n]*\bNO PR\b/.test(result.stderr || '');
     if (result.code < 0 || data?.check?.ok !== true || typeof data.check.clean !== 'boolean'
       // A clean check carries no `files`/`conflicting` (the loader only adds them on a conflict); default them.
       || (data.check.files !== undefined && (!Array.isArray(data.check.files) || !data.check.files.every((file) => typeof file === 'string')))
       || (data.check.conflicting !== undefined && !Array.isArray(data.check.conflicting))
       || (!data.check.clean && (!Array.isArray(data.check.files) || !Array.isArray(data.check.conflicting)))
       || (expectedSha && data.check.candSha !== expectedSha)
-      // A clean JSON check remains valid when a no-PR warning makes the CLI exit nonzero.
-      || (!data.check.clean && result.code !== 3)) return { ok: false, ...result, reason: data?.check?.reason || 'incomplete loader check' };
+      // Only the known no-PR warning exit may accompany a clean check.
+      || (data.check.clean ? result.code !== 0 && !noPrWarning : result.code !== 3)) return { ok: false, ...result, reason: data?.check?.reason || 'incomplete loader check' };
     return { files: [], conflicting: [], ...data.check, exit: result.code, wouldRegister: data.wouldRegister };
   };
   return async function load(input) {
@@ -213,14 +214,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
-    // Once the replacement is registered, failures name the retained registrations and explain
-    // how to recover if a stale registration prevents the daemon from adopting the replacement.
+    // Once the replacement is registered, failures name the retained contained registrations.
     const keptNote = () => {
       if (!out.registered) return '';
       const kept = (out.contained || []).filter((ref) => !out.removed.includes(ref));
-      const stale = out.adopted ? [] : kept.filter((ref) => out.stale.includes(ref));
-      return (kept.length ? ` Prior registrations retained: ${kept.join(', ')}.` : '')
-        + (stale.length ? ` If stale registrations block adoption, rebase and retest them, include their new tips in a tested replacement, and rerun: ${stale.join(', ')}.` : '');
+      return kept.length ? ` Prior registrations retained: ${kept.join(', ')}.` : '';
     };
     try {
       const daemon = Object.hasOwn(config.daemons || {}, input.daemon) ? config.daemons[input.daemon] : null;
@@ -296,9 +294,16 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         }
         const included = ancestor(`origin/${ref}`, out.effectiveSha);
         const landed = landedByContent(ref);
-        if (included || landed) {
+        if (included) {
           contained.push(ref);
           out.staleChecks[ref] = { skipped: 'contained', included, landed };
+          continue;
+        }
+        if (landed) {
+          // Patch equivalence on main does not imply tip ancestry in the replacement.
+          // Leave these registrations for normal rebuild cleanup, outside the swap path.
+          out.staleChecks[ref] = { skipped: 'landed', included, landed };
+          out.staleTolerated.push({ ref, landedByContent: true, why: 'commits already on main by patch-id' });
           continue;
         }
         const evidence = check(out.clone, ref);

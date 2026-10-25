@@ -76,6 +76,12 @@ function fixture(options = {}) {
         const data = JSON.stringify({ check: { ok: true, clean, candSha: remoteTip, ...(clean ? {} : { files: options.checkFiles?.[ref] ?? ['x'], conflicting: [{ ref: 'lane/other' }] }) }, wouldRegister: clean });
         if (options.advanceAfterCheck && ref === (options.behind ? 'lane/new-m1' : BASE.branch)) remoteTip = TREE;
         if (options.noPrWarning === ref) return fail(1, data, 'WARNING overlay NO PR');
+        if (options.checkExit?.ref === ref && options.checkExit.code !== 0) {
+          if (options.checkExit.message) throw Object.assign(new Error(options.checkExit.message), {
+            status: options.checkExit.code, stdout: data, stderr: options.checkExit.stderr,
+          });
+          return fail(options.checkExit.code, data, options.checkExit.stderr);
+        }
         return clean ? data : fail(3, data);
       }
       if (action === 'add' && options.addFails) return fail(1);
@@ -955,15 +961,32 @@ describe('prototype-load', () => {
     expect(r.message).toContain('candidate-not-clean');
     expect(mutations(f, 'add')).toEqual([]);
   });
-  it('skips pairwise checks for a content-landed stale ref and hands it to swap', async () => {
+  it('adopts with a content-landed stale ref without pairwise checks or ancestry-only swap', async () => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' }, cherry: { 'lane/old': `- ${SHA}\n- ${TREE}\n` } });
     const r = await f.run();
-    expect(r).toMatchObject({ adopted: true, contained: ['lane/old'], swap: { contained: ['lane/old'] }, staleChecks: { 'lane/old': { skipped: 'contained', included: false, landed: true } } });
-    expect(r.staleTolerated).toEqual([]);
+    expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, contained: [],
+      swap: { contained: [], removed: [] }, staleChecks: { 'lane/old': { skipped: 'landed', included: false, landed: true } } });
+    expect(r.swap.failed).toBeUndefined();
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: true, why: expect.stringMatching(/main.*patch-id/) }]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect([...f.registrations.keys()]).toEqual(['lane/old']);
     expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check'))).toHaveLength(1);
     expect(f.calls.some(c => c.cmd === 'git' && c.args.join(' ') === 'cherry origin/main origin/lane/old')).toBe(true);
     expect(f.records[0].staleTolerated).toEqual(r.staleTolerated);
     expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it.each([
+    ['overlapping paths', { staleChanged: { 'lane/old': 'M\0x\0' } }],
+    ['unresolved pairwise preview', { unverifiable: 'lane/old' }],
+    ['already registered candidate', { list: [BASE.branch, 'lane/old'] }],
+  ])('retains a landed-only registration without a swap failure: %s', async (_, options) => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], cherry: { 'lane/old': `- ${SHA}\n` }, ...options });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: true, adopted: true, stopReason: null, contained: [], swap: { contained: [], removed: [] } });
+    expect(r.swap.failed).toBeUndefined();
+    expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check'))).toHaveLength(1);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
   });
   it('a stale ref with unlanded commits is tolerated but flagged landedByContent=false', async () => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' }, cherry: { 'lane/old': `- ${SHA}\n+ ${TREE}\n` } });
@@ -1005,6 +1028,25 @@ describe('prototype-load', () => {
   it.each([BASE.branch, 'lane/old'])('accepts a clean JSON check with a nonzero no-PR warning: %s', async (noPrWarning) => {
     const f = fixture({ list: ['lane/old'], noPrWarning, safetySettings: { overlaySafety: { noPr: 'warn' } } });
     expect(await f.run()).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null });
+  });
+  it.each([BASE.branch, 'lane/old'].flatMap(ref => [0, 1, 2, 70, 128, -1].flatMap(code =>
+    ['', 'daemon-overlay: WARNING — lane/new is being added with NO PR.'].map(stderr => ({ ref, code, stderr })),
+  )))('bounds clean check exits: $ref code=$code stderr=$stderr', async (checkExit) => {
+    const f = fixture({ list: ['lane/old'], checkExit });
+    const accepted = checkExit.code === 0 || (checkExit.code === 1 && checkExit.stderr.includes('WARNING'));
+    expect(await f.run()).toMatchObject({ ok: accepted, registered: accepted, adopted: accepted,
+      stopReason: accepted ? null : 'check-unverifiable' });
+    expect(mutations(f, 'add')).toHaveLength(accepted ? 1 : 0);
+  });
+  it.each([BASE.branch, 'lane/old'].flatMap(ref => [
+    { ref, code: 1, stderr: '', message: 'WARNING overlay NO PR' },
+    { ref, code: 1, stderr: 'WARNING unrelated error' },
+    { ref, code: 1, stderr: 'NO PR' },
+    { ref, code: 1, stderr: 'WARNING unrelated error\nNO PR' },
+  ]))('rejects incomplete warning evidence: $ref stderr=$stderr message=$message', async (checkExit) => {
+    const f = fixture({ list: ['lane/old'], checkExit });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'check-unverifiable' });
+    expect(mutations(f, 'add')).toEqual([]);
   });
   it.each([
     ['included in the candidate', { contained: ['lane/old'] }],
@@ -1090,6 +1132,7 @@ describe('prototype-load', () => {
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
     expect(r.staleChecks['lane/old']).toEqual({ skipped: 'contained', included: true, landed: false });
+    expect(r.fallback).not.toContain('If stale registrations block adoption');
   });
   it.each([false, true])('retains registrations while adoption is pending and if the wait is interrupted (already registered: %s)', async (already) => {
     const f = fixture({
