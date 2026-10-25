@@ -1,0 +1,4 @@
+{
+  "$comment": "prMergeWatch resolves standard → platform → tool → WE_PR_MERGE_WATCH_READY_MINUTES, logging the effective value and source. Alert only after strictly more than readyNotMergingMinutes of observed readiness.",
+  "prMergeWatch": { "readyNotMergingMinutes": 60 }
+}
