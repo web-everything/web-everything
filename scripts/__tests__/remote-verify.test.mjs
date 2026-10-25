@@ -680,14 +680,24 @@ describe('remote lane marker import — required gate evidence', () => {
   });
 
   it.each([
-    ['pending rerun attempt', [{ ...successful, run_attempt: 2, status: 'in_progress', conclusion: null }]],
-    ['failed rerun attempt', [{ ...successful, run_attempt: 2, conclusion: 'failure' }]],
+    ['pending rerun attempt', [{ ...successful, run_attempt: successful.run_attempt + 1, status: 'in_progress', conclusion: null }]],
+    ['failed rerun attempt', [{ ...successful, run_attempt: successful.run_attempt + 1, conclusion: 'failure' }]],
+    ['successful rerun attempt', [{ ...successful, run_attempt: successful.run_attempt + 1 }]],
     ['newer queued run', [successful, run({ id: 456, created_at: new Date(T0 + 1000).toISOString(), status: 'queued', conclusion: null })]],
     ['unreadable listing', null],
   ])('writes no marker when a %s appears during the final definition read', async (_label, laterRuns) => {
     const writeMarker = vi.fn();
-    const fetchRuns = vi.fn().mockResolvedValueOnce([successful]).mockResolvedValue(laterRuns);
-    await expect(importRun([job()], { fetchRuns, writeMarker })).rejects.toThrow(/local verify/);
+    let currentRuns = [successful];
+    const fetchRuns = vi.fn(async () => currentRuns);
+    const fetchDefinition = vi.fn()
+      .mockResolvedValueOnce(definition())
+      .mockImplementationOnce(async () => {
+        expect(fetchRuns).toHaveBeenCalledTimes(1);
+        currentRuns = laterRuns;
+        return definition();
+      });
+    await expect(importRun([job()], { fetchDefinition, fetchRuns, writeMarker })).rejects.toThrow(/local verify/);
+    expect(fetchDefinition).toHaveBeenCalledTimes(2);
     expect(fetchRuns).toHaveBeenCalledTimes(2);
     expect(writeMarker).not.toHaveBeenCalled();
   });
