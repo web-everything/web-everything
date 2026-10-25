@@ -65,8 +65,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (redTeamForHead(rawPr.comments, pr, head)) return skip('red-team result already on head');
       const evidence = readEvidence({ repo, pr, head });
       if (!redTeamOwedFor(evidence?.loopPayload)) {
+        if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
         if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
-          && Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted')) {
+          && Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted')
+          && readStatus({ repo, pr, head }) == null && evidence.recorded !== true) {
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
         return skip('stored review does not owe a red team');
