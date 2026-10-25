@@ -794,6 +794,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       out.redTeamSpeculative = { decision: 'error', reason: tail(e?.message ?? e, 300) };
     }
   }
+  let redTeamDeferredByCap = false;
   if (accepted && (out.redTeamSpeculative?.result || typeof io.runRedTeam === 'function')) {
     let redTeam = out.redTeamSpeculative?.result ?? null;
     if (!redTeam) {
@@ -813,7 +814,13 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     let bypassSettlement = false;
     out.redTeam = settlementOutcome;
     try {
+      // Gate admission must survive failures while deriving the printable summary.
+      redTeamDeferredByCap = Boolean(redTeam?.deferredByCap);
       const status = redTeam?.status;
+      // Retain lifecycle evidence before reading comment or summary diagnostics.
+      out.redTeam = { status: typeof status === 'string' ? status : 'error',
+        ...(redTeam?.deferredByGuard ? { deferredByGuard: true } : {}),
+        ...(redTeamDeferredByCap ? { deferredByCap: true } : {}) };
       const completed = ['ran', 'resumed'].includes(status);
       const published = ['posted', 'deduped'].includes(redTeam?.comment?.status);
       // Acceptance already established that a pass was owed; not-owed cannot exempt it.
@@ -823,10 +830,6 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}` }
         : status === 'not-owed' && !deferred
           ? { status, reason: 'red team reported not-owed on an accepted head' } : redTeam;
-      // Retain status/deferral evidence even when detailed summary rows are malformed.
-      out.redTeam = { status: typeof status === 'string' ? status : 'error',
-        ...(redTeam?.deferredByGuard ? { deferredByGuard: true } : {}),
-        ...(redTeam?.deferredByCap ? { deferredByCap: true } : {}) };
       let wellFormed = false;
       try { out.redTeam = summarizeRedTeam(redTeam); wellFormed = true; }
       catch { /* malformed findings must not suppress settlement or erase retry evidence */ }
@@ -884,7 +887,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
   // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
   // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
-  if (out.redTeam && !out.redTeam.deferredByCap && typeof io.runRedTeamGate === 'function') {
+  if (out.redTeam && !redTeamDeferredByCap && !out.redTeam.deferredByCap && typeof io.runRedTeamGate === 'function') {
     let gate;
     try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
     io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);

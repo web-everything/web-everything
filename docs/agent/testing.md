@@ -111,6 +111,9 @@ status write and gate. Runner exceptions and policy-comment post failures use th
 `unprintable error`; post failures still persist pending needs-you before publication and retry.
 Guard deferrals clear queued admission for retry instead of writing finished status, while cap
 deferrals suppress the gate; completion-evidence tests assert those exact lifecycle differences.
+Gate suppression retains the runner's cap flag before reading comment diagnostics, so a throwing
+comment-status accessor cannot turn a cap deferral into a gate run in either job mode.
+The fallback summary also retains guard deferrals before diagnostics, preserving admission rollback.
 Coerce diagnostic values with `String()` inside a catch boundary, using `unknown`
 for an unreadable comment status; retain the original completed status when summary rows fail.
 Only structured `status: 'skipped', policy: 'card-only'` without any truthy `deferredByGuard`

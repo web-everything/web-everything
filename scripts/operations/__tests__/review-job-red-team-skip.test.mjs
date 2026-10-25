@@ -193,6 +193,26 @@ describe('review-job red-team skip settlement', () => {
     }
   });
 
+  it.each(['deferredByCap', 'deferredByGuard'])('%s preserves lifecycle decisions when comment diagnostics throw', flag => {
+    for (const status of ['ran', 'resumed']) for (const redTeamOnly of [false, true]) {
+      const f = fixture({ status, [flag]: true,
+        comment: { get status() { throw Error('comment status unavailable'); } },
+      });
+      f.io.settleRedTeamSkip.mockImplementation(() => {
+        f.events.push('settle');
+        return { outcome: 'non-policy' };
+      });
+      const out = runReviewJob({ repo, pr, redTeamOnly }, f.io);
+      expect(f.events).toEqual(flag === 'deferredByCap'
+        ? ['queued', 'red-team', 'settle', 'finished'] : ['queued', 'red-team', 'settle', 'gate']);
+      expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
+      expect(f.io.clearRedTeamQueued.mock.calls).toEqual(flag === 'deferredByGuard' ? [[{ repo, pr, head }]] : []);
+      expect(f.io.runRedTeamGate).toHaveBeenCalledTimes(flag === 'deferredByCap' ? 0 : 1);
+      expect(out.redTeam).toMatchObject({ status, [flag]: true, outcome: 'non-policy' });
+      if (flag === 'deferredByCap') expect(out).not.toHaveProperty('redTeamGate');
+    }
+  });
+
   it('production visibility reader requires a complete trusted result on the settlement head', () => {
     const exec = vi.fn((_file, args) => args.includes('--paginate')
       ? [redTeamMarker(pr, head), '2026-10-24T00:00:00Z', 'web-everything', 'IC_result', 'https://example.test/comment'].join('\t')
