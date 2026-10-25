@@ -13,6 +13,7 @@ const repo = 'web-everything/web-everything';
 const head = 'b'.repeat(40), staleHead = 'a'.repeat(40);
 const at = '2026-10-20T12:00:00.000Z';
 const detail = 'all confirmed findings already ruled';
+const autoResolvedReason = 'referral hold auto-resolved — every referral finding on head 5e8db5677 is ruled (1 not-real)';
 const item = (pr = 42, kind = 'ruling-needed') => ({ repo, pr, head: staleHead, kind, reason: 'parked' });
 const view = { labels: [{ name: 'advisory:ruling-needed' }], headRefOid: head,
   body: '<!-- authored-by-actor: author -->', createdAt: at };
@@ -179,7 +180,59 @@ describe('gateRulingItems: suppress only live findings that already have rulings
   });
 });
 
+describe('gateRulingItems: reporter auto-resolved referral holds', () => {
+  it.each(['readable PR', 'unreadable PR', 'pending findings', 'mixed-case reason'])(
+    'drops incident #5922 with the exact suppression log and event without live IO: %s', async scenario => {
+      const original = { ...item(5922), reason: scenario === 'mixed-case reason'
+        ? autoResolvedReason.replace('referral hold auto-resolved', 'Referral Hold Auto-Resolved') : autoResolvedReason };
+      const gh = scenario === 'unreadable PR' ? vi.fn(async () => { throw new Error('unreadable PR'); }) : fakeGh();
+      const lookup = vi.fn(() => scenario === 'pending findings' ? { findings: [{ key: 'still-pending' }] } : null);
+      const opts = options({ gh, lookup });
+      const { kept } = await feed.gateRulingItems([original], opts);
+      expect(kept).toHaveLength(0);
+      expect(gh).not.toHaveBeenCalled();
+      expect(lookup).not.toHaveBeenCalled();
+      expectOnce(opts.log, `needs-you-feed ${repo}#5922 needs-you-suppressed: referral hold auto-resolved`);
+      expectOnce(opts.emitEvent, { kind: 'needs-you-suppressed', repo, pr: 5922, detail: 'referral hold auto-resolved' });
+    });
+
+  it.each([null, { findings: [{ key: 'still-pending' }] }])(
+    'uses the live check for a findings reason without auto-resolved (lookup returns %j)', async liveResult => {
+      const original = { ...item(5922), reason: 'every referral finding on head 5e8db5677 is ruled (1 not-real)' };
+      const opts = options({ lookup: vi.fn(() => liveResult) });
+      const { kept } = await feed.gateRulingItems([original], opts);
+      expect(opts.gh).toHaveBeenCalledTimes(2);
+      expectOnce(opts.lookup, expect.objectContaining({ number: 5922, headRefOid: head }));
+      expect([...kept]).toEqual(liveResult === null ? [] : [original]);
+      if (liveResult === null) expectOnce(opts.emitEvent, event(5922));
+      else expect(opts.emitEvent).not.toHaveBeenCalled();
+    });
+});
+
 describe('runOnce liveGate ruling suppression', () => {
+  it('does not publish the auto-resolved incident #5922 to the feed file when live PR reads are unavailable', async () => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'needs-you-auto-resolved-'));
+    roots.push(root);
+    const path = join(root, 'needs-you-events.jsonl');
+    writeFileSync(path, '');
+    const report = { ready: [], rulingNeeded: [{ repo, number: 5922, head: '5e8db5677', reason: autoResolvedReason }],
+      stoodDown: [{ repo, number: 43, head, reason: 'operator answer still needed' }] };
+    const exec = vi.fn(async () => JSON.stringify(report));
+    const gh = vi.fn(async () => { throw new Error('unreadable PR'); });
+    const log = vi.fn();
+    const settings = feed.resolveSettings({ env: {}, home: root, file: { path, allowPrimary: true } });
+    const result = await feed.runOnce({ exec, gh, home: root, checkoutRoot: root, settings,
+      env: {}, now: new Date(at), log, liveGate: true });
+    expect(result.lines).toHaveLength(1);
+    expect(result.openKeys).toEqual([`${repo}#43@${head}:stood-down`]);
+    expect(feed.replay({ path })).toEqual([expect.objectContaining({ pr: 43, kind: 'stood-down' })]);
+    expect(readFileSync(path, 'utf8')).not.toContain('5922');
+    expect(readFileSync(path, 'utf8')).not.toContain('ruling-needed');
+    expect(gh).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(`needs-you-feed ${repo}#5922 needs-you-suppressed: referral hold auto-resolved`);
+    expectOnce(appendDaemonEvent, { kind: 'needs-you-suppressed', repo, pr: 5922, detail: 'referral hold auto-resolved' });
+  });
+
   it('does not publish an already-ruled alert to the feed file, while retaining another alert', async () => {
     const root = mkdtempSync(join(process.env.TMPDIR, 'needs-you-suppress-'));
     roots.push(root);
