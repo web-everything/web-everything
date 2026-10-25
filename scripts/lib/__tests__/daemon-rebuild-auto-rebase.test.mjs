@@ -696,13 +696,20 @@ describe('established overlay auto rebase', () => {
       assertRule(f, result, 'related-tests');
     });
 
-    it('records related-tests evidence before a failing test run and never registers a pass', async () => {
+    it.each([
+      ['nonzero exit', { status: 1, stderr: 'regression failed' }],
+      ['signal exit', { status: null, signal: 'SIGTERM' }],
+      ['process error', { status: 0, error: new Error('runner error') }],
+      ['missing status', {}],
+      ['missing result', undefined],
+    ])('records related-tests evidence before a failing test run (%s) and never registers a pass', async (_mode, result) => {
       const f = fixture(); f.moveMain();
-      f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'regression failed' }));
-      await expect(job(f)).rejects.toThrow();
+      f.deps.testRunner = vi.fn(async () => result);
+      await expect(job(f)).rejects.toThrow('selected test failed or incomplete');
       expect(f.deps.testRunner).toHaveBeenCalledOnce();
       expect(f.deps.auditor).not.toHaveBeenCalled();
       assertUnregistered(f);
+      expect(needsYouAlert(f).detail).toMatchObject({ stage: 'tests', reason: 'selected test failed or incomplete' });
       expect(records(alertsFilePath(f.root, f.env))).toContainEqual(expect.objectContaining({
         kind: 'auto-rebase-evidence', detail: expect.objectContaining({ ref, rule: 'related-tests', noTestFiles: [] }),
       }));

@@ -79,8 +79,8 @@ const executeAsync = (bin, args, opts) => new Promise(resolve => {
   execFile(bin, args, { encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024, ...opts },
     (error, stdout, stderr) => resolve({ status: error ? 1 : 0, error, stdout, stderr }));
 });
-const requireOutput = r => { if (r?.status !== 0 || r?.error) throw new Error('command failed or incomplete'); return String(r.stdout ?? ''); };
-const requireOk = r => requireOutput(r).trim();
+const requireOutput = (r, failure = 'command failed or incomplete') => { if (r?.status !== 0 || r?.error) throw new Error(failure); return String(r.stdout ?? ''); };
+const requireOk = (r, failure) => requireOutput(r, failure).trim();
 // Git -z listings preserve literal paths, including non-ASCII characters and whitespace.
 const requirePaths = r => requireOutput(r).split('\0').filter(Boolean);
 const requireAgentSuccess = result => {
@@ -240,7 +240,7 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
       testReport = join(p.dir, `${randomUUID()}.vitest-report`);
       const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected,
         '--reporter=default', '--reporter=json', `--outputFile.json=${testReport}`];
-      requireOk(await (deps.testRunner ?? ((o) => execAsync(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }));
+      requireOk(await (deps.testRunner ?? ((o) => execAsync(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }), 'selected test failed or incomplete');
       let reportText;
       try {
         if (io.statSync(testReport).size > 8 * 1024 * 1024) throw new Error('test inventory over 8 MiB');
