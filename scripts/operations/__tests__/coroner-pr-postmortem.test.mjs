@@ -4,11 +4,13 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildPostmortem, shouldPostmortem, publishPostmortem, resolvePostmortemSettings, collectPrTimeline, withCoronerLock } from '../coroner-pr-postmortem.mjs';
-import { runPostmortemPass, listMergedSince } from '../../conveyor/pass-daemons/pr-postmortem-pass.mjs';
+import { runPostmortemPass as runPass, listMergedSince, listOpenPrs } from '../../conveyor/pass-daemons/pr-postmortem-pass.mjs';
 import { hostname } from 'node:os';
 import { reserve } from '../../readiness/file-locks.mjs';
 import { buildOperatorRulingComment } from '../../lib/jury-core.mjs';
 
+// Historical merged-only fixtures explicitly inject an empty open listing.
+const runPostmortemPass = options => runPass({ listOpen:() => [], ...options });
 const at = m => new Date(Date.UTC(2026, 9, 17, 0, m)).toISOString();
 const comment = (m, body) => ({ createdAt: at(m), body, author: { login: 'web-everything' } });
 function fixture(pr = 1) {
@@ -968,5 +970,54 @@ describe('per PR postmortem', () => {
       expect(fs.existsSync(join(dir, 'postmortem-example%2Frepo-1.md'))).toBe(false);
       expect(JSON.parse(fs.readFileSync(join(dir, 'merge-cursor-example%2Frepo.json')))).toMatchObject({cursor:at(702),done:[1,2],failures:{}});
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('stuck open PR phase', () => {
+  const open = () => ({...fixture(7),state:'open',openedAt:at(-4000),mergedAt:null});
+  it('collects an open timeline only when explicitly enabled', () => {
+    const gh = collectorGh({'/pulls/1':{state:'open',merged_at:null,created_at:at(0),changed_files:0,head:{ref:'lane/no-card'},base:{sha:'z'}}});
+    expect(() => collectWith(gh)).toThrow('not merged');
+    expect(collectPrTimeline('example/repo',1,{gh,comments:() => [],env:{},allowOpen:true})).toMatchObject({state:'open',mergedAt:null});
+  });
+  it('bounds open pages and refuses oversized or malformed listings with operator fallback', () => {
+    let calls = 0;
+    expect(() => listOpenPrs('example/repo',{gh:() => {calls++; return Array.from({length:100},(_,i) => ({number:i+1,state:'open'}));},maxPages:2})).toThrow(/human|operator/);
+    expect(calls).toBe(2);
+    expect(() => listOpenPrs('example/repo',{gh:() => null})).toThrow(/invalid/);
+  });
+  it('persists identity before filing, retries the same payload after failure, and dedupes reruns', async () => {
+    const dir = temp(), plans = [], writes = [], batches = [];
+    const stateFile = join(dir,'open-stuck-example%2Frepo.json');
+    const args = {repo:'example/repo',dir,now:at(700),settings,listMerged:() => [],listOpen:() => [{number:7}],collectOpen:open,
+      planCard:input => {plans.push(input); return {num:'xabcdef',rel:'backlog/xabcdef-improve.md',content:'card'};},
+      fileCard:async payload => {expect(JSON.parse(fs.readFileSync(stateFile)).cards['example/repo#7:open-age'].payload).toEqual(payload); writes.push(payload); if(writes.length === 1) throw Error('disk failed');},
+      batchCard:async payload => {batches.push(payload); return {batched:true};}};
+    try {
+      const failed = await runPostmortemPass(args);
+      expect(failed.open.incomplete).toBe(true);
+      await runPostmortemPass(args); await runPostmortemPass(args);
+      expect(plans).toHaveLength(1); expect(writes).toHaveLength(2); expect(writes[0]).toEqual(writes[1]); expect(batches).toHaveLength(1);
+      expect(JSON.parse(fs.readFileSync(join(dir,'merge-cursor-example%2Frepo.json'))).done).toEqual([]);
+      const text = fs.readFileSync(join(dir,'stuck-example%2Frepo-7.md'),'utf8');
+      expect(text).toContain('## What would have prevented this');
+    } finally {fs.rmSync(dir,{recursive:true,force:true});}
+  });
+  it('dry-run records intended cards without filing or consuming identity', async () => {
+    const dir = temp(), fileCard = vi.fn(), planCard = vi.fn(() => ({num:'xabcdef',rel:'backlog/xabcdef-improve.md',content:'card'}));
+    const args = {repo:'example/repo',dir,now:at(700),settings,listMerged:() => [],listOpen:() => [{number:7}],collectOpen:open,planCard,fileCard,batchCard:async () => ({batched:true})};
+    try {
+      const result = await runPostmortemPass({...args,dryRun:true});
+      expect(result.open.wouldFile).toEqual(['example/repo#7:open-age']); expect(fileCard).not.toHaveBeenCalled(); expect(planCard).not.toHaveBeenCalled();
+      await runPostmortemPass(args); expect(fileCard).toHaveBeenCalledTimes(1);
+    } finally {fs.rmSync(dir,{recursive:true,force:true});}
+  });
+  it('failed open reads leave the merged flow complete and report an operator escalation', async () => {
+    const dir = temp();
+    try {
+      const result = await runPostmortemPass({repo:'example/repo',dir,now:at(700),settings,listMerged:() => [],listOpen:() => {throw Error('unreadable');}});
+      expect(result.cursor).toBe(at(700)); expect(result.open).toMatchObject({incomplete:true}); expect(result.open.fallback).toMatch(/operator/);
+    } finally {fs.rmSync(dir,{recursive:true,force:true});}
   });
 });

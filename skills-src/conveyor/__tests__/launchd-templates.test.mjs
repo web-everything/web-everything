@@ -18,6 +18,15 @@ describe('launchd templates', () => {
     }
   });
 
+  it('launches the PR postmortem watcher with portable placeholders', () => {
+    const template = templates.find(({name}) => name === 'com.we.conveyor-pass-daemon.pr-postmortem.plist.example')?.text ?? '';
+    expect(template).toContain('INSTALL');
+    expect(template).toContain('scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs');
+    expect(template).toContain('--repo='); expect(template).toContain('--watch');
+    expect(template).toContain('&lt;app-id&gt;'); expect(template).toContain('&lt;installation-id&gt;');
+    expect(template).not.toMatch(/\/Users\/|\/home\//);
+  });
+
   it('pins the load-flake reverify settings', () => {
     const env = envFor('com.we.conveyor-pass-daemon.load-flake-reverify.plist.example');
     expect(env).toMatch(/<key>WE_LOAD_FLAKE_REVERIFY_MAX_LOAD_PER_CORE<\/key>\s*<string>1\.25<\/string>/);
