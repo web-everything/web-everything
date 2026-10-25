@@ -294,17 +294,26 @@ describe('#4229 — runReconcileFixDispatch: the durable count survives across p
     const ALWAYS_REFUSE = { tryAdmit: () => ({ admit: false, projectedMinutes: 45, maxWaitMinutes: 30, demandMinutes: 8 }) };
     for (const [repo, slug] of [[undefined, 'web-everything/web-everything'], ['we', 'web-everything/web-everything'], ['web-everything/web-everything', 'web-everything/web-everything']]) {
       const argvs = [];
-      const exec = (_cmd, argv) => { argvs.push(argv); return ''; }; // empty paginated TSV thread
+      const exec = (_cmd, argv) => {
+        argvs.push(argv);
+        if (argv[0] === 'api' && argv[1] === 'graphql') {
+          return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 0 } } } } });
+        }
+        return ''; // empty paginated TSV thread, or successful marker post
+      };
       runFix([1854], ALWAYS_REFUSE, {
         ...(repo === undefined ? {} : { repo }),
         readPrComments: (pr, o) => defaultReadPrComments(pr, { ...o, exec }),
         postQueueCapComment: (o) => postNoteComment({ ...o, exec }),
       });
-      expect(argvs).toHaveLength(2); // one read + one marker post
-      const [readArgv, postArgv] = argvs;
+      expect(argvs).toHaveLength(3); // paginated read + independent count proof + marker post
+      const [readArgv, countArgv, postArgv] = argvs;
       expect(readArgv[0]).toBe('api');
       expect(readArgv).toContain('--paginate');
       expect(readArgv).toContain(`repos/${slug}/issues/1854/comments`);
+      expect(countArgv.slice(0, 2)).toEqual(['api', 'graphql']);
+      const [owner, name] = slug.split('/');
+      expect(countArgv).toEqual(expect.arrayContaining([`owner=${owner}`, `name=${name}`, 'n=1854']));
       expect(postArgv.slice(0, 3)).toEqual(['pr', 'comment', '1854']);
       expect(postArgv.slice(postArgv.indexOf('--repo'), postArgv.indexOf('--repo') + 2)).toEqual(['--repo', slug]);
     }

@@ -18,6 +18,10 @@ import { join } from 'node:path';
 import { createFakeGithub, addLabelsPure, removeLabelsPure, applyBranchDeletionPure, requirePr } from './helpers/fake-gh.mjs';
 import { git, writeLocalIdentity, DEFAULT_BRANCH } from '../../operations/__tests__/helpers/real-repo.mjs';
 import { buildOpenPrPageQuery, listOpenPrsPagedHydrated, listOpenPrsLightPaged } from '../../lib/pr-list-paged.mjs';
+import { createGhProvider, GH_ARGV } from '../../lib/review-label-provider.mjs';
+import { readCompletePrComments } from '../pr-comments-complete.mjs';
+import { buildStandDownComment } from '../stand-down.mjs';
+import { buildOperatorAnswer, isOperatorAnswerStandDownSuperseded } from '../stand-down-answer-core.mjs';
 
 const execFileAsync = promisify(execFile);
 const cleanups = [];
@@ -331,6 +335,68 @@ describe('fake-gh generation 2 — stateful fake GitHub (#3383)', () => {
       if (++reads === 2) gh.fault({ verb: 'api', kind: '5xx', times: 1 });
       return exec(command, args, opts);
     } })).toThrow(/page 2 failed/);
+  });
+
+  it('serves complete comment reads with count proof and stable node ids, including an empty thread', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-comment-count-');
+    const gh = makeGithub(originPath);
+    seedBranchAt(originPath, 'lane/comment-count');
+    const number = gh.openPr({ repo: SLUG, head: 'lane/comment-count', title: 'count proof' });
+    const exec = (command, args, opts) => execFileSync(command, args, { ...opts, cwd: clonePath,
+      env: { ...process.env, ...gh.env } });
+    const read = () => readCompletePrComments(number, { repo: SLUG, exec });
+    expect(read()).toEqual([]);
+    const bodies = ['first\nline\twith\\escapes', 'second'];
+    for (const body of bodies) gh.comment(SLUG, number, body, { author: 'chalbert' });
+    const comments = read();
+    expect(createGhProvider({ exec: (args, opts) => exec('gh', args, { encoding: 'utf8', ...opts }) })
+      .readComments(SLUG, number)).toEqual(comments);
+    expect(comments.map(c => c.body)).toEqual(bodies);
+    expect(comments.map(c => c.author.login)).toEqual(['chalbert', 'chalbert']);
+    const embedded = JSON.parse(ghExec(gh, ['pr', 'view', String(number), '--repo', SLUG, '--json', 'comments'], clonePath));
+    expect(comments.map(c => c.id)).toEqual(embedded.comments.map(c => c.id));
+    expect(new Set(comments.map(c => c.id)).size).toBe(2);
+    const countArgs = GH_ARGV.readCommentsTotalCount(SLUG, number);
+    expect(JSON.parse(ghExec(gh, countArgs, clonePath)).data.repository.pullRequest.comments.totalCount).toBe(2);
+    expect(() => ghExec(gh, GH_ARGV.readCommentsTotalCount(SLUG, number + 1), clonePath)).toThrow(/no pull requests found/i);
+    expect(() => readCompletePrComments(number, { repo: SLUG, exec: (command, args, opts) => {
+      const out = exec(command, args, opts);
+      if (args[1] === 'graphql') {
+        gh.comment(SLUG, number, 'concurrent comment');
+        return exec(command, args, opts);
+      }
+      return out;
+    } })).toThrow(/totalCount/);
+  });
+
+  it('an operator answer names the same stand-down node id through the embedded and complete readers', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-answer-id-');
+    const gh = makeGithub(originPath);
+    seedBranchAt(originPath, 'lane/answer-id');
+    const number = gh.openPr({ repo: SLUG, head: 'lane/answer-id', title: 'operator answer identity' });
+    const inserted = gh.comment(SLUG, number, buildStandDownComment({ reason: 'needs-judgment' }), { author: 'web-everything' });
+    const stop = gh.pr(SLUG, number).comments[0];
+    expect(stop.id).not.toBe(String(inserted.id));
+    const body = buildOperatorAnswer({ standDownId: stop.id, actor: 'chalbert', channel: 'chat', reason: 'Proceed with the repair' });
+    const provider = createGhProvider({ exec: (args) => ghExec(gh, args, clonePath) });
+    const readers = [
+      () => provider.readPrState(SLUG, number).comments,
+      () => provider.readComments(SLUG, number),
+      () => readCompletePrComments(number, { repo: SLUG,
+        exec: (_command, args) => ghExec(gh, args, clonePath) }),
+    ];
+    gh.comment(SLUG, number, body, { author: 'outsider' });
+    for (const read of readers) {
+      const comments = read();
+      expect(comments[0].id).toBe(stop.id);
+      expect(isOperatorAnswerStandDownSuperseded(comments, 0)).toBe(false);
+    }
+    gh.comment(SLUG, number, body, { author: 'web-everything' });
+    for (const read of readers) {
+      const comments = read();
+      expect(comments[0].id).toBe(stop.id);
+      expect(isOperatorAnswerStandDownSuperseded(comments, 0)).toBe(true);
+    }
   });
 
   it('rejects unsupported GraphQL queries and invalid pagination cursors', () => {

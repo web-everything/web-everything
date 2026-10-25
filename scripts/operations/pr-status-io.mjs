@@ -34,7 +34,7 @@ export const LIST_LIMIT = 200;
  * cannot return check runs keyed to a sha.
  */
 export function listArgv({ repo, pr = 0, state = 'open', limit = LIST_LIMIT }) {
-  const fields = 'number,title,labels,mergeable,headRefOid' + (state === 'all' ? ',state' : '');
+  const fields = 'number,title,labels,mergeable,headRefOid,updatedAt' + (state === 'all' ? ',state' : '');
   return pr > 0
     ? ['pr', 'view', String(pr), '--repo', repo, '--json', fields]
     : ['pr', 'list', '--repo', repo, '--state', state, '--limit', String(limit), '--json', fields];
@@ -95,7 +95,7 @@ export function labelNames(labels) {
  * exact alarm the operation exists to raise, and the next person to see a false `unchecked` would learn to
  * ignore a true one.
  */
-export function createPrReader({ run = execFileSync, reconcile = false } = {}) {
+export function createPrReader({ run = execFileSync, reconcile = false, now = Date.now } = {}) {
   return ({ repo, pr = 0 }) => {
     let limit = LIST_LIMIT;
     let rows;
@@ -144,6 +144,7 @@ export function createPrReader({ run = execFileSync, reconcile = false } = {}) {
         ...detail,
         number: Number(r.number),
         title: String(r.title ?? ''),
+        updatedAt: String(r.updatedAt ?? ''),
         labels: labelNames(r.labels),
         mergeable: String(r.mergeable ?? 'UNKNOWN').toLowerCase(),
         headSha,
@@ -153,7 +154,7 @@ export function createPrReader({ run = execFileSync, reconcile = false } = {}) {
 
     // A listing that came back FULL may have been cut off — `gh` does not say. Reported rather than assumed
     // either way: the reader's job is to state what it knows, and `assessPrs` turns it into a finding.
-    return { repo, prs, truncated: !reconcile && pr === 0 && rows.length >= LIST_LIMIT };
+    return { repo, prs, nowMs: now(), truncated: !reconcile && pr === 0 && rows.length >= LIST_LIMIT };
   };
 }
 

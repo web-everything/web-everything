@@ -77,15 +77,19 @@ describe('App identity only, personal read routing off', () => {
 describe('complete App thread reads', () => {
   it('includes grants beyond the first page using the same App transport', () => {
     const grant = autoGrant();
-    const rows = [...Array.from({ length: 100 }, () => 'filler\t2026-10-20T12:00:00Z\tweb-everything[bot]'),
-      `${grant.body.replace(/\n/g, '\\n')}\t${grant.createdAt}\t${grant.author.login}\t${grant.id}`].join('\n');
-    const gh = vi.fn((args) => args[0] === 'pr' ? JSON.stringify({ state: 'OPEN', headRefOid: HEAD }) : rows);
+    const comments = [...Array.from({ length: 100 }, (_, i) => `filler\t2026-10-20T12:00:00Z\tweb-everything[bot]\tIC_filler_${i}`),
+      `${grant.body.replace(/\n/g, '\\n')}\t${grant.createdAt}\t${grant.author.login}\t${grant.id}`];
+    const gh = vi.fn((args) => {
+      if (args[0] === 'pr') return JSON.stringify({ state: 'OPEN', headRefOid: HEAD });
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } });
+      return comments.join('\n');
+    });
     const thread = readPrThread(WE, 5654, { gh });
     expect(thread.comments).toHaveLength(101);
     expect(thread.comments[100]).toMatchObject(grant);
     expect(gh.mock.calls[0][0]).toContain('--paginate');
     expect(gh.mock.calls[0][0]).toContain(`repos/${WE}/issues/5654/comments`);
-    expect(gh.mock.calls[1][0]).toContain('state,headRefOid');
+    expect(gh.mock.calls[2][0]).toContain('state,headRefOid');
   });
 
   it('propagates incomplete comment reads instead of counting zero grants', () => {

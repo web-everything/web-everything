@@ -603,7 +603,9 @@ describe('applyRedTeamGate', () => {
       it('the label provider keeps the comment id (the node id the unedited read returns)', () => {
         expect(GH_ARGV.readComments(REPO, 4722).join(' ')).toMatch(/\{id: \.node_id, url: \.html_url, author: \{login: \.user\.login\}, body, createdAt: \.created_at\}/);
         const line = JSON.stringify(labelProvider(autoGrant, 2));
-        const comments = [comment([F()]), capRecord(), ...createGhProvider({ exec: () => `${line}\n` }).readComments(REPO, 4722)];
+        const comments = [comment([F()]), capRecord(), ...createGhProvider({ exec: args => args[1] === 'graphql'
+          ? JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } })
+          : `${line}\n` }).readComments(REPO, 4722)];
         expect(countGrantedRoundExtensions(comments, { repo: REPO, pr: 4722, standingRuling: scope })).toBe(1);
       });
 
@@ -730,6 +732,8 @@ describe('review-job runs the gate right after the red team', () => {
     const io = {
       root: '/daemon', now: (() => { let t = 0; return () => { t += 10; return t; }; })(), newActorId: () => 'a',
       readPrevCompletion: () => null, report: () => {}, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
+      redTeamStatus: () => {},
+      prepareLane: () => ({ head: 'a'.repeat(40) }),
       acquireLane: () => ({ lanePath: '/lanes/lane-7' }), runLoop: () => ({ status: 0, stdout: JSON.stringify(loop(verdict)), stderr: '' }),
       releaseLane: () => {}, log: () => {},
       runExtraSeats: () => ({ status: 'ran', seats: [] }),
