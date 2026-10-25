@@ -9,7 +9,7 @@ export default {
   id: 'pinned-stack-clean-base-order',
   title: 'a clean pinned base enables its pinned top after main reverts their newer merge base',
   card: 'PR #5937 / x1b8hlo',
-  fixedBy: { sha: '5937-conflict-only-deferral', where: 'lane/rebuild-contained-base-after-top', paths: ['scripts/lib/daemon-rebuild/plan.mjs'] },
+  fixedBy: { sha: 'eb2d383675daf4dc54076ae3dd061642abaa1752', where: 'lane/rebuild-contained-base-after-top', paths: ['scripts/lib/daemon-rebuild/plan.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/lib/daemon-rebuild/plan.mjs'), 'utf8').includes('const deferredContainers = new Map();');
   },
