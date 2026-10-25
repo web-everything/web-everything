@@ -1,4 +1,7 @@
 /** Shared admission for background work; operator interactive commands bypass this check.
+ * Memory readings report provenance: macOS pages + free swap, pages alone, then os.freemem.
+ * Unavailable memory admits with an explicit unknown reason after the load check; measured low
+ * headroom still refuses. Native probe timeouts and legacy numeric-reader failures fail closed.
  * No network endpoint: body size/rate/CSRF do not apply. Scan/GC triggers use host single-flight locks.
  */
 import { createHash } from 'node:crypto';
@@ -20,7 +23,7 @@ export function readHostLoad({ env = process.env, load = loadavg } = {}) {
   return load();
 }
 /** Parse macOS `vm_stat` + `sysctl vm.swapusage` into headroom MB: free + speculative + purgeable pages (never the
- *  inactive file cache) plus free swap. Pure. Throws on unparseable input (the caller fails closed). */
+ *  inactive file cache) plus free swap. Pure. Throws on unparseable input. */
 export function parseDarwinMemoryHeadroomMb(vmStat, swapUsage) {
   const page = Number(/page size of (\d+) bytes/.exec(vmStat)?.[1]);
   const pages = (name) => Number(new RegExp(`Pages ${name}:\\s+(\\d+)`).exec(vmStat)?.[1] ?? NaN);
@@ -29,20 +32,43 @@ export function parseDarwinMemoryHeadroomMb(vmStat, swapUsage) {
   if (![page, free, spec].every(Number.isFinite) || swapFree === undefined) throw Error('unparseable vm_stat/swapusage');
   return ((free + spec + (Number.isFinite(purge) ? purge : 0)) * page) / 1048576 + Number(swapFree);
 }
-/** Free memory + free swap headroom in MB. Subprocess fixtures may supply it only under Vitest. */
-export function readHostMemoryHeadroomMb({ env = process.env, platform = process.platform, exec = execFileSync, free = freemem } = {}) {
+/** Headroom in MB with its probe source; unavailable probes fall back without inventing headroom. */
+export function readHostMemoryReading({ env = process.env, platform = process.platform, exec = execFileSync, free = freemem } = {}) {
   if (env.VITEST === 'true' && env.WE_TEST_HOST_MEMORY_MB !== undefined) {
     const value = Number(env.WE_TEST_HOST_MEMORY_MB);
     if (env.WE_TEST_HOST_MEMORY_MB.trim() === '' || !Number.isFinite(value) || value < 0) throw Error('invalid test host memory');
-    return value;
+    return { mb: value, source: 'test-env' };
   }
   if (platform === 'darwin') {
     const opts = { encoding: 'utf8', timeout: 5000 };
-    return parseDarwinMemoryHeadroomMb(exec('vm_stat', [], opts), exec('sysctl', ['vm.swapusage'], opts));
+    try {
+      const vm = exec('vm_stat', [], opts);
+      const pagesMb = parseDarwinMemoryHeadroomMb(vm, 'free = 0M');
+      try {
+        const mb = parseDarwinMemoryHeadroomMb(vm, exec('sysctl', ['vm.swapusage'], opts));
+        if (!Number.isFinite(mb) || mb < 0) throw Error('invalid swap headroom');
+        return { mb, source: 'vm_stat+swap' };
+      } catch (e) {
+        if (e.code === 'ETIMEDOUT' || e.message === 'ETIMEDOUT') throw e;
+        return { mb: pagesMb, source: 'vm_stat' };
+      }
+    } catch (e) {
+      if (e.code === 'ETIMEDOUT' || e.message === 'ETIMEDOUT') throw e;
+    }
   }
-  return free() / 1048576;
+  try {
+    const mb = free() / 1048576;
+    if (Number.isFinite(mb) && mb >= 0) return { mb, source: 'os.freemem' };
+  } catch { /* No usable memory source remains. */ }
+  return { mb: null, source: 'unknown' };
 }
-export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => cpus().length, memory = readHostMemoryHeadroomMb, interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
+/** Numeric compatibility reader: unknown memory is NaN; invalid test overrides still throw. */
+export function readHostMemoryHeadroomMb(options = {}) {
+  return readHostMemoryReading(options).mb ?? NaN;
+}
+export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => cpus().length, memory,
+  memoryReading = memory ? (options) => ({ mb: memory(options), source: 'injected' }) : readHostMemoryReading,
+  interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
   let loadVerdict;
   try {
@@ -54,13 +80,15 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => c
     loadVerdict = { admitted: ratio <= limit, reason: `host load ${l.toFixed(2)}/${c}=${ratio.toFixed(2)}; host.maxLoadPerCore=${limit} (${policy.sources['host.maxLoadPerCore']})` };
   } catch (e) { return { admitted: false, reason: `host load unknown: ${e.message}` }; }
   if (!loadVerdict.admitted) return loadVerdict;
-  // Memory is checked only once load admits; unknown memory fails closed (wait), like unknown load.
+  // Memory is checked only once load admits; only an explicit unavailable reading bypasses it.
   try {
     // A hand-built policy without the leaf takes the standard value; a loaded policy always carries it.
     const min = policy.settings.host.minMemoryHeadroomMb ?? DEFAULT_MIN_MEMORY_HEADROOM_MB;
-    const mb = memory({ env });
-    if (!Number.isFinite(mb) || mb < 0 || !Number.isFinite(min) || min <= 0) throw Error('unknown host memory');
-    const reason = `host memory headroom ${Math.round(mb)}MB (free+swap); host.minMemoryHeadroomMb=${min} (${policy.sources?.['host.minMemoryHeadroomMb'] ?? 'standard'})`;
+    if (!Number.isFinite(min) || min <= 0) throw Error('invalid host memory threshold');
+    const { mb, source } = memoryReading({ env });
+    if (mb === null && source === 'unknown') return { admitted: true, reason: `${loadVerdict.reason}; host memory unknown; source=unknown` };
+    if (!Number.isFinite(mb) || mb < 0) throw Error('unknown host memory');
+    const reason = `host memory headroom ${Math.round(mb)}MB (free+swap); host.minMemoryHeadroomMb=${min} (${policy.sources?.['host.minMemoryHeadroomMb'] ?? 'standard'}); source=${source}`;
     return mb >= min ? { admitted: true, reason: `${loadVerdict.reason}; ${reason}` } : { admitted: false, reason };
   } catch (e) { return { admitted: false, reason: `host memory unknown: ${e.message}` }; }
 }
