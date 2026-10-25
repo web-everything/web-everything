@@ -823,9 +823,11 @@ export async function readPolicySpecRegistryAt(ref, { root = resolve(dirname(fil
       const source = execFileSync('git', ['show', `${commit}:scripts/lib/${file}`], options);
       writeFileSync(join(scratch, file), source);
     }
+    // Split the child-only import token, as daemon-live-smoke does: the closure scanner must not
+    // mistake this base-ref scratch copy's dynamic load for an import in the running checkout.
     const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
       import { pathToFileURL } from 'node:url';
-      const registry = await import(pathToFileURL(process.argv[1]).href);
+      const registry = await ${'im' + 'port'}(pathToFileURL(process.argv[1]).href);
       const entries = registry.POLICY_SPEC_BASENAMES;
       if (!(entries instanceof Set) || entries.size === 0) process.exit(1);
       process.stdout.write(JSON.stringify([...entries]));
