@@ -716,8 +716,8 @@ export async function defaultAwaitVerifyIo({
     // fix.pushBeforeGate through the policy cascade, re-read every pass so a settings flip applies without a restart.
     pushPolicy: () => loadFixPushPolicy({ env }),
     retryPolicy: () => loadVerifyRecoverySettings({ env }),
-    // fix.selfReviewParallel (card xloi1c0): the PR's self-review record, read fresh every pass.
-    readSelfReview: (record) => readSelfReview({ repo: record.repo, pr: record.pr }, { dir: selfReviewStoreDir(env) }),
+    // Match fix-end: missing is allowed; unreadable/malformed must retain the waiter and report the error.
+    readSelfReview: (record) => readSelfReview({ repo: record.repo, pr: record.pr }, { dir: selfReviewStoreDir(env), strict: true }),
     listRecords: () => listStoredAwaitVerify(),
     writeRecord: (record) => writeStoredAwaitVerify(record),
     clearRecord: (key, record) => {

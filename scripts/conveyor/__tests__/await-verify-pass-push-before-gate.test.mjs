@@ -4,7 +4,11 @@
  * real reconcile planner, ci-heal admission and drain classifier.
  */
 import { describe, it, expect } from 'vitest';
-import { runAwaitVerifyPass, isEarlyPushOwed, buildAwaitVerifyResumePrompt, formatAwaitVerifyLines, AWAIT_VERIFY_LIMITS, pushShaFromScratch } from '../await-verify-pass.mjs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runAwaitVerifyPass, defaultAwaitVerifyIo, isEarlyPushOwed, buildAwaitVerifyResumePrompt, formatAwaitVerifyLines, AWAIT_VERIFY_LIMITS, pushShaFromScratch } from '../await-verify-pass.mjs';
+import { selfReviewKey, selfReviewStoreDir } from '../await-verify.mjs';
 import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
 // This historical fixture exercises the serial policy; new defaults have their own timing suite.
 const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
@@ -184,6 +188,60 @@ describe('push-before-gate: the early push', () => {
     expect(h.calls.resume).toEqual([]);
     expect(h.store.has(SESSION)).toBe(true);
     expect(rows).toContainEqual(expect.objectContaining({ result: 'error: unreadable review' }));
+  });
+  it.each(['wait', 'rerequest', 'green', 'saved-no-op', 'saved-green'].flatMap(path =>
+    ['malformed-json', 'invalid-state', 'null-json', 'unreadable'].map(failure => [path, failure])))
+  ('retains the %s waiter on production reader %s errors and retries after repair', async (path, failure) => {
+    const root = mkdtempSync(join(tmpdir(), 'await-self-review-'));
+    try {
+      const env = { WE_AWAIT_VERIFY_STORE: root };
+      const dir = selfReviewStoreDir(env);
+      const file = join(dir, `${selfReviewKey(rec())}.json`);
+      if (failure === 'unreadable') writeFileSync(dir, 'not a directory');
+      else {
+        mkdirSync(dir);
+        writeFileSync(file, { 'malformed-json': '{', 'invalid-state': '{"state":"unknown"}', 'null-json': 'null' }[failure]);
+      }
+      const production = await defaultAwaitVerifyIo({ env, dispatchIo: {}, stopSessionFn: () => {},
+        pushRefusalFn: () => null, readClaimFn: () => null,
+        exec: () => { throw new Error('unexpected external command'); } });
+      const h = harness({ records: [rec(path.startsWith('saved-')
+        ? { pendingResume: { kind: path === 'saved-green' ? 'green' : 'no-new-commit' } } : {})] });
+      h.io.readSelfReview = production.readSelfReview;
+      h.io.push = a => { h.calls.push.push(a); return { ok: true, upToDate: true }; };
+      if (path === 'rerequest') h.state.marker = null;
+      if (path === 'green') h.state.marker = marker('green');
+      // A read error must not become an overdue-review recovery, either.
+      for (const nowMs of [T0 + 30_000, T0 + AWAIT_VERIFY_LIMITS.selfReviewMaxMs + 1]) {
+        const { rows } = await pass(h, { nowMs });
+        expect(rows).toContainEqual(expect.objectContaining({ result: expect.stringMatching(
+          failure === 'unreadable' ? /error: self-review record .* unreadable \(ENOTDIR\)/ : /error: self-review record .* malformed/) }));
+        expect(h.calls.resume).toEqual([]);
+        expect(h.calls.rerequest).toEqual([]);
+        expect(h.store.has(SESSION)).toBe(true);
+      }
+      expect(h.calls.push).toHaveLength(['wait', 'rerequest'].includes(path) ? 1 : 0);
+      if (failure === 'unreadable') { rmSync(dir); mkdirSync(dir); }
+      const repairedAt = T0 + AWAIT_VERIFY_LIMITS.selfReviewMaxMs + 60_000;
+      writeFileSync(file, JSON.stringify({ ...rec(), state: 'clean', returnedAt: new Date(repairedAt).toISOString() }));
+      await pass(h, { nowMs: repairedAt + 10_000 });
+      await pass(h, { nowMs: repairedAt + 20_000 });
+      expect(h.calls.resume).toHaveLength(1);
+      expect(h.store.has(SESSION)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('allows an absent production self-review record for the existing serial flow', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'await-no-self-review-'));
+    try {
+      const production = await defaultAwaitVerifyIo({ env: { WE_AWAIT_VERIFY_STORE: root }, dispatchIo: {},
+        stopSessionFn: () => {}, pushRefusalFn: () => null, readClaimFn: () => null });
+      const h = harness();
+      h.io.readSelfReview = production.readSelfReview;
+      h.io.push = () => ({ ok: true, upToDate: true });
+      await pass(h);
+      expect(h.calls.resume).toHaveLength(1);
+      expect(h.store.has(SESSION)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it.each(['clean', 'repaired', 'foreign-owner'])('allows a no-op completion for a %s review', async (state) => {
     const h = harness();
