@@ -9,6 +9,7 @@ import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
+import { completedRedTeamSeat } from './red-team-run-result.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
@@ -38,8 +39,10 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
-  const recorded = readScorecards().some(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
+  const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
+  const recorded = seats.length > 0;
+  const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat) };
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const latestRun = () => {
     // Read, test and drop one run at a time (xwu9oxh S1a): same reads, order and errors as map-then-filter.
@@ -68,7 +71,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         // A finished result that was never published still reaches the recovery path: a re-review of the same head must not
         // strand it behind a pass that may never come (#5759, #5762).
         const unpublished = status.status === 'finished' && ['withheld', 'error'].includes(status.result?.comment);
-        return { loopPayload: latest.run, inFlight: false, scheduled: true, recorded, skipCardOnly: false, ...(unpublished ? { status } : {}) };
+        return { loopPayload: latest.run, inFlight: false, scheduled: true, recorded, ...seatEvidence, skipCardOnly: false, ...(unpublished ? { status } : {}) };
       }
     }
     // A local pid probe says nothing about another host or namespace: keep that pass held for its result.
@@ -85,11 +88,11 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         live = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    return { status, loopPayload: status.loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+    return { status, loopPayload: status.loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const loopPayload = latestRun().run;
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
   // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
-  return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
+  return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...seatEvidence, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
 }

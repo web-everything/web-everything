@@ -329,8 +329,7 @@ describe('review-job red-team skip settlement', () => {
     expect(f.io.log).toHaveBeenCalledWith(expect.stringContaining('settlement unavailable'));
   });
 
-  it.each([false, true])('not-owed on an accepted head publishes needs-you (redTeamOnly=%s)', redTeamOnly => {
-    // Acceptance already established that a pass was owed; plain not-owed cannot exempt it.
+  it.each([false, true])('not-owed on an accepted head publishes a policy clear (redTeamOnly=%s)', redTeamOnly => {
     const root = mkdtempSync(join(tmpdir(), 'review-not-owed-'));
     const postComment = vi.fn(), publishNeedsYou = vi.fn();
     try {
@@ -345,14 +344,13 @@ describe('review-job red-team skip settlement', () => {
       expect(f.io.runRedTeam).toHaveBeenCalledOnce();
       expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
       expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({
-        redTeam: { status: 'not-owed', reason: 'red team reported not-owed on an accepted head' }, repo, pr, head,
+        redTeam: { status: 'not-owed' }, repo, pr, head, readHead: head,
       }));
-      expect(publishNeedsYou).toHaveBeenCalledTimes(1);
-      expect(publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({
-        repo, pr, head, reason: 'red team skipped (red team reported not-owed on an accepted head); not cleared',
-      }));
-      expect(postComment).not.toHaveBeenCalled();
-      expect(out.redTeam.outcome).toBe('non-policy');
+      expect(publishNeedsYou).not.toHaveBeenCalled();
+      expect(postComment).toHaveBeenCalledOnce();
+      expect(postComment.mock.calls[0][0].body).toMatch(/not required.*policy/i);
+      expect(postComment.mock.calls[0][0].body).not.toContain('card-only');
+      expect(out.redTeam.outcome).toBe('policy-clear');
       expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -557,5 +555,46 @@ describe('writer skipCardOnly setting on a code PR', () => {
       expect(planRedTeamStatusLabels({ repo, pr, head, evidence, env, comments: [] }))
         .toEqual({ add: 'red-team:pending', remove: [] });
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('PR 5890 settlement provenance and visible dedupe', () => {
+  it.each(['ran', 'resumed'])('ignores a %s review-pr payload without red-team run fields', status => {
+    const f = fixture({ status, comment: { status: 'error' }, loopPayload: { ...payload(), op: 'review-pr' } });
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
+    expect(f.io.runRedTeamGate).toHaveBeenCalledOnce();
+  });
+  it.each(['ran', 'resumed'].flatMap(status => [
+    { status, provider: 'codex', model: 'm' }, { status, findings: [] },
+  ]))('a real run %j still alerts when its review-pr-shaped result is unpublished', fields => {
+    const f = fixture({ ...fields, comment: { status: 'error' }, loopPayload: { ...payload(), op: 'review-pr' } });
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({
+      redTeam: { status: 'unpublished', reason: `red team ${fields.status} but its result comment is error` },
+    }));
+    expect(f.io.runRedTeamGate).toHaveBeenCalledOnce();
+  });
+  it.each(['already-ran', 'prior-row'])('%s with a visible head result is already settled', status => {
+    const f = fixture({ status });
+    f.io.redTeamResultVisible = vi.fn(() => true);
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
+    expect(f.io.redTeamResultVisible).toHaveBeenCalledWith({ repo, pr, head });
+    expect(f.io.runRedTeamGate).toHaveBeenCalledOnce();
+  });
+  it.each(['already-ran', 'prior-row'])('%s without a visible result still alerts', status => {
+    const f = fixture({ status });
+    f.io.redTeamResultVisible = () => false;
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledOnce();
+  });
+  it.each(['already-ran', 'prior-row'])('%s with an unreadable result still alerts', status => {
+    const f = fixture({ status });
+    f.io.redTeamResultVisible = () => { throw Error('thread unreadable'); };
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledOnce();
+    expect(f.io.runRedTeamGate).toHaveBeenCalledOnce();
   });
 });

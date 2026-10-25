@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence } from '../drain-red-team-evidence.mjs';
@@ -165,7 +165,7 @@ describe('planRedTeamOnSkip', () => {
       .toMatchObject({ action: 'skip', why: `prior result ${prior ?? 'unknown'} (status finished); not re-run` });
   });
   it.each(['resumed', { status: 'resumed', comment: 'error' }, { status: 'resumed', comment: { status: 'error' } }])('f: a failed recovery result %j remains eligible with recorded evidence', result => {
-    expect(decide({ readEvidence: () => ({ loopPayload: payload(), recorded: true }),
+    expect(decide({ readEvidence: () => ({ loopPayload: payload(), recorded: true, completedRecorded: true }),
       readStatus: () => ({ status: 'finished', result }) })).toMatchObject({ action: 'dispatch', mode: 'resume' });
   });
   it('f: a string error result never resumes', () => {
@@ -179,7 +179,7 @@ describe('planRedTeamOnSkip', () => {
     }
   });
   it('f: a legacy string ran result authorizes resume', () => {
-    expect(decide({ readEvidence: () => ({ loopPayload: payload(), recorded: true }),
+    expect(decide({ readEvidence: () => ({ loopPayload: payload(), recorded: true, completedRecorded: true }),
       readStatus: () => ({ status: 'finished', result: 'ran' }) })).toMatchObject({ action: 'dispatch', mode: 'resume' });
   });
   it('f: missing recorded evidence cannot authorize a fresh pass', () => {
@@ -188,9 +188,18 @@ describe('planRedTeamOnSkip', () => {
   it('f: fresh dispatch only when neither status nor row exists', () => {
     expect(decide()).toMatchObject({ action: 'dispatch', mode: 'fresh' });
   });
-  it.each(['error', 'skipped', 'disabled', 'not-owed', 'ran', 'resumed', null])('f: never re-runs an unrecorded prior result %s', prior => {
-    expect(decide({ readStatus: () => ({ status: 'finished', result: prior }) }).action).toBe('skip');
-    expect(decide({ readStatus: () => ({ status: 'finished', result: { status: prior } }) }).action).toBe('skip');
+  it.each(['error', 'skipped', 'disabled', 'not-owed', 'ran', 'resumed', null])('f: handles an unrecorded prior result %s according to its run evidence', prior => {
+    expect(decide({ readStatus: () => ({ status: 'finished', result: prior }) }).action)
+      .toBe(['ran', 'resumed'].includes(prior) ? 'dispatch' : 'skip');
+    expect(decide({ readStatus: () => ({ status: 'finished', result: { status: prior } }) }).action)
+      .toBe(prior === 'resumed' ? 'dispatch' : 'skip');
+  });
+  it.each(['ran', 'resumed', { status: 'resumed' }])('f: %j without a seat result dispatches fresh', result => {
+    expect(decide({ readStatus: () => ({ status: 'finished', result }) }))
+      .toMatchObject({ action: 'dispatch', mode: 'fresh' });
+  });
+  it('f: a real ran payload without a scorecard never launches another model call', () => {
+    expect(decide({ readStatus: () => ({ status: 'finished', result: { status: 'ran' } }) }).action).toBe('skip');
   });
   it('g: observes cooldown then allows retry at the boundary', () => {
     const lastDispatch = new Map([[`${repo}#${pr}@${head}`, 200_001]]);
@@ -326,5 +335,32 @@ describe('runRedTeamOnSkip', () => {
     o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: 5530, headSha: head });
     o.rawPrs.push({ number: 5530, headRefOid: head, comments: [] });
     expect(runRedTeamOnSkip(o).dispatched).toHaveLength(1); expect(o.dispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('PR 5890 review-pr status payloads', () => {
+  it('bare resumed is not a red-team run result', () => {
+    expect(normalizeRedTeamResult('resumed')).toEqual({ priorResult: undefined, priorComment: undefined });
+  });
+  it.each(['resumed', 'ran', { status: 'resumed' }])('review-pr row %j with no seat dispatches fresh', result => {
+    const loopPayload = { ...payload(), op: 'review-pr' };
+    const row = { repo, pr: 5762, head, status: 'finished', result, loopPayload };
+    expect(decide({ readStatus: () => row })).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+  });
+  it('bare resumed with a clean seat dispatches from that seat', () => {
+    const row = { repo, pr: 5762, head, status: 'finished', result: 'resumed', loopPayload: { ...payload(), op: 'review-pr' } };
+    expect(decide({ readStatus: () => row,
+      readEvidence: () => ({ loopPayload: payload(), recorded: true, cleanRecorded: true }) }))
+      .toMatchObject({ action: 'dispatch', mode: 'resume' });
+  });
+  it('an incomplete seat cannot authorize legacy string ran recovery', () => {
+    expect(decide({ readStatus: () => ({ repo, pr, head, status: 'finished', result: 'ran', loopPayload: { ...payload(), op: 'review-pr' } }),
+      readEvidence: () => ({ loopPayload: payload(), recorded: true, seatRecorded: true, completedRecorded: false }) }).action).toBe('skip');
+  });
+  it('a completed seat with confirmed breaks resumes effects without authorizing another model call', () => {
+    expect(decide({ readStatus: () => ({ repo, pr, head, status: 'finished', result: 'ran', loopPayload: { ...payload(), op: 'review-pr' } }),
+      readEvidence: () => ({ loopPayload: payload(), recorded: true, seatRecorded: true, completedRecorded: true }) }))
+      .toMatchObject({ action: 'dispatch', mode: 'resume' });
   });
 });

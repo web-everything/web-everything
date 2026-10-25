@@ -89,6 +89,7 @@ import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, bu
 import { liveResultGateState, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../lib/review-red-team-on-skip.mjs';
+import { redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
 
@@ -352,8 +353,9 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // apply today's policy; its independent comment and scorecard guards remain active.
           // readRedTeamStatus binds status.head to this job's head; the predicate
           // separately requires the stored read's netBasis.rev to equal status.head.
-          if (input.redTeamMode === 'fresh' && redTeamSkipNeedsSettlement(admissionPrior)) admissionPrior = null;
-          if (['ran', 'resumed'].includes(normalizeRedTeamResult(prior?.result).priorResult)) priorResult = prior.result;
+          if (input.redTeamMode === 'fresh' && (redTeamSkipNeedsSettlement(admissionPrior)
+            || redTeamStatusWithoutRun(admissionPrior))) admissionPrior = null;
+          if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
           input = { ...input, result: priorResult };
         }
         attempted = true;
@@ -693,7 +695,7 @@ export function summarizeRedTeam(r) {
     ...(r.deferredByCap ? { deferredByCap: true } : {}),
     ...(r.deferredByGuard ? { deferredByGuard: true } : {}),
     ...(r.reason ? { reason: r.reason } : {}),
-    ...(classifyRedTeamSkip(r).kind === 'policy' ? { policy: 'card-only' } : {}),
+    ...(r.status === 'skipped' && classifyRedTeamSkip(r).kind === 'policy' ? { policy: 'card-only' } : {}),
     ...(r.status === 'ran' ? {
       provider: r.provider, model: r.model, seatStatus: r.seat?.status ?? null, foldedVerdict: r.foldedVerdict ?? null,
       recheckStatus: r.recheckStatus ?? null, confirmedMissCount: r.confirmedMissCount ?? 0,
@@ -824,20 +826,22 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         ...(redTeam?.deferredByGuard ? { deferredByGuard: true } : {}),
         ...(redTeamDeferredByCap ? { deferredByCap: true } : {}) };
       const published = ['posted', 'deduped'].includes(redTeam?.comment?.status);
-      // Acceptance already established that a pass was owed; not-owed cannot exempt it.
       const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
       // A completion claim remains unpublished until all derivations and live evidence succeed.
       settlementOutcome = completed
         ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}` }
-        : status === 'not-owed' && !deferred
-          ? { status, reason: 'red team reported not-owed on an accepted head' } : redTeam;
+        : redTeam;
+      // A stored review run is not evidence of an unpublished red-team run.
+      const reviewOnly = completed && !deferred && reviewOnlyRedTeamResult(redTeam);
       let wellFormed = false;
       try { out.redTeam = summarizeRedTeam(redTeam); wellFormed = true; }
       catch { /* malformed findings must not suppress settlement or erase retry evidence */ }
       recordSeats(redTeam?.seat ? [redTeam.seat] : []);
       io.log(`review-job ${out.sessionSlug}: red team — ${diagnosticText(status, 'none')}${redTeam?.reason ? ` (${diagnosticText(redTeam.reason, 'unknown')})` : ''}`
         + `${status === 'ran' ? `: ${diagnosticText(redTeam.findings?.length, '0')} break(s), ${diagnosticText(redTeam.confirmedMissCount, '0')} confirmed, comment ${diagnosticText(redTeam.comment?.status, '-')}` : ''}`);
-      if (completed && published && !deferred && wellFormed) {
+      bypassSettlement = reviewOnly && wellFormed;
+      if (((completed && published && !reviewOnly) || ['already-ran', 'prior-row'].includes(status))
+        && !deferred && wellFormed) {
         const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
         const head = isRealHead(rev) ? rev : seatsBox.laneHead;
         // Missing readers, unreadable threads and stale/untrusted markers cannot authorize bypass.

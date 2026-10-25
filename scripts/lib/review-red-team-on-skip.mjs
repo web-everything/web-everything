@@ -7,11 +7,12 @@ import { redTeamForHead } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { isRealHead } from './red-team-skip-outcome.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { redTeamStatusWithoutRun } from './red-team-run-result.mjs';
 
 /** Normalize both persisted production result shapes at the recovery boundary. */
 export function normalizeRedTeamResult(result) {
   return {
-    priorResult: typeof result === 'string' ? result : result?.status,
+    priorResult: typeof result === 'string' ? (result === 'resumed' ? undefined : result) : result?.status,
     priorComment: typeof result === 'object' ? (result?.comment?.status ?? result?.comment) : undefined,
   };
 }
@@ -66,13 +67,19 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
       const status = readStatus({ repo, pr, head });
       const { priorResult: prior, priorComment: comment } = normalizeRedTeamResult(status?.result);
+      const completedSeat = evidence.completedRecorded === true || evidence.cleanRecorded === true;
+      const placeholder = redTeamStatusWithoutRun(status);
       let mode;
       if (comment === 'posted') return skip('result posted; comment not visible yet');
-      // Any seat row (including an error) counts as recorded. Only a finished, clean
-      // pass can resume effects without risking another model call.
-      if (status?.status === 'finished' && ['ran', 'resumed'].includes(prior) && evidence.recorded === true) {
+      // Any seat row (including an error) blocks a new call. Successful execution
+      // can resume effects even when its verdict contains confirmed breaks.
+      if (status?.status === 'finished' && (['ran', 'resumed'].includes(prior) || status.result === 'resumed')
+        && (completedSeat || (!placeholder && typeof status.result === 'object'
+          && evidence.recorded === true && evidence.completedRecorded !== false))) {
         mode = 'resume';
       } else if (redTeamSkipNeedsSettlement(status)) mode = 'fresh';
+      else if (placeholder && (evidence.seatRecorded === false
+        || (evidence.seatRecorded === undefined && evidence.recorded === false))) mode = 'fresh';
       else if (status == null && evidence.recorded === false) mode = 'fresh';
       else return skip(`prior result ${typeof prior === 'string' ? prior : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);

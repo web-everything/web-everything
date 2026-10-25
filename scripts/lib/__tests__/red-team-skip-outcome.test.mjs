@@ -213,3 +213,34 @@ describe('settleRedTeamSkip', () => {
     expect(labels()).toEqual({ add: 'red-team:clear', remove: ['red-team:pending'] });
   });
 });
+
+
+describe('PR 5890 not-owed settlement', () => {
+  it('not-owed posts a head-bound policy marker without claiming card-only and dedupes', () => {
+    const f = fixture();
+    expect(f.settle({ status: 'not-owed' }).outcome).toBe('policy-clear');
+    const body = f.io.postComment.mock.calls[0][0].body;
+    expect(body).toContain(redTeamMarker(pr, head));
+    expect(body).toMatch(/not required.*policy/i);
+    expect(body).not.toContain('card-only');
+    expect(planRedTeamStatusLabels({ pr, head, comments: f.comments, evidence: {} }).add).toContain('red-team:clear');
+    expect(f.settle({ status: 'not-owed' }).outcome).toBe('already');
+    expect(f.io.postComment).toHaveBeenCalledTimes(1);
+    expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+  });
+  it.each([
+    { deferredByGuard: true }, { deferredByCap: true },
+    { deferredByGuard: 'yes' }, { deferredByCap: {} },
+  ])('deferred not-owed never clears: %j', flags => {
+    const f = fixture();
+    expect(f.settle({ status: 'not-owed', ...flags }).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+  });
+  it.each([undefined, null, '', 'unknown', 'b'.repeat(40), {}])('not-owed with unbound read %j never clears', readHead => {
+    const f = fixture();
+    expect(f.settle({ status: 'not-owed' }, { readHead }).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+  });
+});

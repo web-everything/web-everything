@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
+import { completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
@@ -1015,14 +1016,14 @@ export function redTeamCommentPosted(comments, pr, rev) {
   });
 }
 
-/** The latest red-team seat row that ran cleanly for this `(repo, pr, head)`, or null. PURE. */
+/** The latest completed execution for this identity, including confirmed breaks. PURE. */
 export function priorRedTeamRow(records, pr, rev, repo) {
   if (typeof repo !== 'string' || !repo.trim()) return null;
-  return seatRows(records).filter((r) => r.seat === RED_TEAM_SEAT.seat && r.repo === repo && r.pr === Number(pr) && r.rev === rev && r.status === 'ok').at(-1) ?? null;
+  return seatRows(records).filter((r) => r.seat === RED_TEAM_SEAT.seat && r.repo === repo && r.pr === Number(pr) && r.rev === rev && completedRedTeamSeat(r)).at(-1) ?? null;
 }
 
 /**
- * Has this `(repo, pr, head)` already had a red-team pass that ran cleanly? PURE. A clean row only stops the MODEL from
+ * Has this `(repo, pr, head)` already had a completed red-team execution? PURE. A completed row stops the MODEL from
  * running again — the effects after it (miss rows, delegation trial, comment) are re-checked and finished by
  * {@link runRedTeam} on the next run, so a failure between the row and those effects never strands them.
  */
@@ -1337,12 +1338,27 @@ async function finishRedTeamEffects({
 }
 
 /**
- * A clean row for this head already exists: rebuild the pass from it and finish any effect that did not land
+ * A completed row for this head already exists: rebuild the pass from it and finish any effect that did not land
  * (PR #2735 review). The model never runs again and no call is spent. Rows written before `failure_scenario` and
  * `builder` were recorded still resume; they just render without the scenario / count the builder as unknown.
  */
 async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, record }, io) {
-  const findings = (Array.isArray(prior.findings) ? prior.findings : []).map((f) => withFileReadEvidence({
+  // Legacy rows without findings can dedupe a visible result, but cannot manufacture
+  // a zero-finding comment from missing evidence.
+  if (prior.findings === undefined && redTeamCommentPosted(io.listComments({ pr, repo }), pr, rev)) {
+    return { status: 'already-ran', reason: `a completed red-team seat row already exists for #${pr} at ${rev.slice(0, 12)}` };
+  }
+  if (!Array.isArray(prior.findings)) {
+    return { status: 'error', reason: 'completed red-team row has unreadable findings; inspect stored evidence — no call launched' };
+  }
+  const confirmedCount = (prior.findings ?? []).filter(f => f?.confirmedByRecheck === true).length;
+  if ((prior.confirmedMissCount !== undefined && (!Number.isSafeInteger(prior.confirmedMissCount)
+    || prior.confirmedMissCount < 0 || prior.confirmedMissCount !== confirmedCount))
+    || (['changes', 'needs-human'].includes(prior.foldedVerdict) && confirmedCount === 0)
+    || (prior.foldedVerdict != null && !['accept', 'changes', 'needs-human'].includes(prior.foldedVerdict))) {
+    return { status: 'error', reason: 'completed red-team row has incomplete verdict evidence; inspect stored evidence — no call launched' };
+  }
+  const findings = prior.findings.map((f) => withFileReadEvidence({
     summary: f.summary, category: f.category ?? null, file: f.file ?? null, line: f.line ?? null, impactIfUnfixed: f.impactIfUnfixed ?? null,
     recheckOutcome: f.recheckOutcome ?? (f.confirmedByRecheck ? 'confirmed' : f.filesRead?.length ? 'not confirmed' : 'unverifiable'), filesRead: f.filesRead,
     failure_scenario: f.failure_scenario ?? null, confirmedByRecheck: f.confirmedByRecheck === true, recheckReason: f.recheckReason ?? null,
@@ -1359,10 +1375,10 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
     // rather than defaulting through a null seatRow.
     changedFiles: prior.changedFiles ?? null,
   }, io);
-  if (!done.didWork && !done.failed) return { status: 'already-ran', reason: `a clean red-team row already exists for #${pr} at ${rev.slice(0, 12)}` };
+  if (!done.didWork && !done.failed) return { status: 'already-ran', reason: `a completed red-team seat row already exists for #${pr} at ${rev.slice(0, 12)}` };
   return {
     status: 'resumed', rev, callId: prior.callId, provider: prior.provider, model: prior.model,
-    reason: `${done.failed ? 'retried (still failing)' : 'finished'} what the clean pass for #${pr} at ${rev.slice(0, 12)} left undone — ${done.rowsWritten} row(s) written, delegation trial ${done.delegationTrial}, comment ${done.comment.status}`,
+    reason: `${done.failed ? 'retried (still failing)' : 'finished'} what the completed pass for #${pr} at ${rev.slice(0, 12)} left undone — ${done.rowsWritten} row(s) written, delegation trial ${done.delegationTrial}, comment ${done.comment.status}`,
     rowsWritten: done.rowsWritten, delegationTrial: done.delegationTrial, comment: done.comment,
   };
 }
@@ -1434,12 +1450,13 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
   } catch { return refuse('PR comments unreadable'); }
   if (redTeamForHead(comments, pr, head)) return refuse('red-team result already on head', true);
   if (redTeamMode === 'fresh') {
-    if (status != null) return refuse('prior red-team status; not re-run');
+    if (status != null && !redTeamStatusWithoutRun(status)) return refuse('prior red-team status; not re-run');
     if (seatRows(records).some(row => row.seat === RED_TEAM_SEAT.seat && row.repo === repo
       && Number(row.pr) === Number(pr) && row.rev === head)) return refuse('prior red-team seat row; not re-run');
   } else {
     const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
-    if (status?.status !== 'finished' || !['ran', 'resumed'].includes(priorResult) || priorComment === 'posted') return refuse('prior red-team result is not resumable');
+    if (status?.status !== 'finished' || (!['ran', 'resumed'].includes(priorResult) && status.result !== 'resumed')
+      || priorComment === 'posted') return refuse('prior red-team result is not resumable');
     if (!priorRedTeamRow(records, pr, head, repo)) return refuse('no clean prior red-team row');
   }
   return { records };
@@ -1462,8 +1479,8 @@ export function redTeamReadFingerprint(read) {
  * (the same status the sequential pass returns). `onReserved` (optional) learns the reservation the moment it is
  * taken, so a speculative pass that is killed mid-call can still have its spend recorded.
  * `claudeFindings` is null for a speculative pass (the jurors have not answered yet), and `resume: false` makes a
- * prior clean row a `prior-row` status instead of finishing that row's effects (no effect before the verdict).
- * `resumeOnly` refuses an unreadable store or missing clean prior row before provider selection or reservation.
+ * prior completed row a `prior-row` status instead of finishing that row's effects (no effect before the verdict).
+ * `resumeOnly` refuses an unreadable store or missing completed prior row before provider selection or reservation.
  */
 export async function speculateRedTeam({
   pr, repo, lanePath, read, claudeFindings = null, env = process.env, post = true, record = true, onReserved = null, onTiming = () => {}, resume = true, resumeOnly = false,
@@ -1484,7 +1501,7 @@ export async function speculateRedTeam({
     if (resumeOnly && !prior) return { status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' };
     // A speculative pass (`resume: false`) must not finish a prior pass's effects before the verdict is known: it
     // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
-    if (prior && !resume) return { status: 'prior-row', reason: `a clean red-team row already exists for #${pr} at ${rev.slice(0, 12)}` };
+    if (prior && !resume) return { status: 'prior-row', reason: `a completed red-team seat row already exists for #${pr} at ${rev.slice(0, 12)}` };
     if (prior) return await resumeRedTeam({ pr, repo, rev, title: read.title, prior, records, post, record }, io);
     // Launch policy applies only to new calls: a recorded pass must finish its effects even if policy changed.
     // The net path list names only rename/copy destinations. Include sources so
@@ -1711,7 +1728,7 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     }
     let records = [];
     try { records = io.readRecords(); } catch { records = []; }
-    if (priorRedTeamRow(records, pr, pass.rev, repo)) return { status: 'superseded', reason: `a clean red-team row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
+    if (priorRedTeamRow(records, pr, pass.rev, repo)) return { status: 'superseded', reason: `a completed red-team seat row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
     const recording = loopPayload?.replay !== true;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);
   } catch (e) {

@@ -39,7 +39,8 @@ export function classifyRedTeamSkip(redTeam) {
   const valid = redTeam != null && typeof redTeam === 'object' && !Array.isArray(redTeam);
   const reason = valid && typeof redTeam.reason === 'string' && redTeam.reason.trim()
     ? redTeam.reason : 'unknown red-team outcome';
-  return { kind: valid && redTeam.status === 'skipped' && redTeam.policy === 'card-only'
+  return { kind: valid && (redTeam.status === 'not-owed'
+    || (redTeam.status === 'skipped' && redTeam.policy === 'card-only'))
     && !redTeam.deferredByGuard && !redTeam.deferredByCap
     ? 'policy' : 'non-policy', reason };
 }
@@ -136,7 +137,9 @@ export function settleRedTeamSkip(input = {}) {
         const thread = comments ?? io.readComments({ repo, pr });
         if (!Array.isArray(thread)) throw Error('PR comments unreadable');
         if (redTeamForHead(thread, pr, head)) return { outcome: 'already' };
-        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: card-only diff (policy redTeam.skipCardOnly)` });
+        const policyReason = redTeam.status === 'not-owed'
+          ? 'not owed under red-team policy' : 'card-only diff (policy redTeam.skipCardOnly)';
+        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: ${policyReason}` });
         return { outcome: 'policy-clear' };
       } catch (error) {
         reason = `policy-clear comment failed: ${safeErrorText(error)}`;
