@@ -9,8 +9,10 @@ export function reviewOnlyRedTeamResult(result) {
     && !Array.isArray(result.findings) && !result.provider && !result.model;
 }
 
-/** Null completions require original queued provenance; historical strings carry no seat evidence. */
-export function redTeamStatusWithoutRun(row, originalStatus) {
+/** Null completions require the original queued record from confirmed-dead recovery.
+ * Without that provenance, a null result may conceal a run whose seat evidence was lost.
+ */
+export function redTeamStatusWithoutRun(row, { originalStatus } = {}) {
   if (row?.status !== 'finished') return false;
   return (row.result === null && originalStatus?.status === 'queued')
     || row.result === 'ran' || row.result === 'resumed'

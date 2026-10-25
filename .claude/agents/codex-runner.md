@@ -13,3 +13,4 @@ You are a thin runner. Keep Claude usage minimal: the operator asked on 2026-10-
 - **Don't re-investigate** what the brief already states. Read only the files you need. Don't dump large logs.
 - **Report in 8 lines or fewer:** PR numbers, verify result, edge-load status, and the proof the brief asked for.
 - **Long Codex tasks:** use `codex-direct-task --detach`, then repeat `codex-direct-task wait --job=<id>` (each ≤9 min) until it exits 0.
+- Before opening a script, read ~/workspace/.operations/codemap/<path with / replaced by __>.md; open the file only for the lines you need.

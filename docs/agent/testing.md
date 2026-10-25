@@ -240,8 +240,8 @@ Regression mapping (one representative assertion per guarantee; names are in the
 - Legacy unknown-head retries fail closed: **legacy unknown-head pending records without attempt identity are quarantined**.
 - Production comment and feed effects: **production settlement posts marker via gh argv/body and publishes real needs-you**.
 - Budget/guard deferrals escalate once per head/reason without posting a result: **unfinished publication or deferral publishes needs-you once without a result comment: %j**.
-- A plain `not-owed` on an accepted code head is contradictory evidence and escalates in both job modes: **not-owed on an accepted head publishes needs-you (redTeamOnly=%s)** in `review-job-red-team-skip.test.mjs`.
-- A terminal `not-owed` cannot grant policy clearance even with a card-only policy or a misleading reason, and repeated settlement notifies once: **contradictory not-owed never clears and notifies once: %j** in `red-team-skip-outcome.test.mjs`.
+- A plain `not-owed` on an accepted code head settles policy-clear in both job modes: **not-owed on an accepted head settles policy-clear without an alert (redTeamOnly=%s)** in `review-job-red-team-skip.test.mjs`.
+- Accepted-head `not-owed` publishes a reasoned clear marker without an alert: **not-owed on an ACCEPTED head clears with a reasoned marker and no alert: %j** in `red-team-skip-outcome.test.mjs`. Non-accepted, deferred, and unbound-read outcomes remain closed: **not-owed on a NON-accepted head (accepted=%j) never clears and alerts once**, **deferred not-owed never clears: %j**, and **not-owed with unbound read %j never clears**.
 - Finished but unpublished results escalate once without posting or clearing: **unfinished publication or deferral publishes needs-you once without a result comment: %j**.
 - Writer setting never classifies a code PR as card-only: **never exempts a code read from speculation, recovery guards or an owed pending label**.
 - A throwing settlement logger preserves finished status and gate: **throwing settlement and logger still write finished status and run the gate**.
@@ -285,10 +285,21 @@ Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a co
 queued writer without a resumable prior becomes a finished null-result placeholder, so the planner
 can dispatch fresh only when seat evidence establishes that no pass ran and the evidence reader
 retains the original queued status. An ordinary finished null result has unknown run provenance
-and never authorizes fresh dispatch. The planner, admission writer and execution guard share
-`redTeamStatusWithoutRun` so admission cannot erase that unknown history. Regression in
-`review-red-team-resume-only.test.mjs`: **refuses a finished null result without queued provenance
-and with no seat or comment (admitted=%s)**. Live or unknown liveness
+and never authorizes fresh dispatch. The shared placeholder predicate requires explicit original
+queued provenance for null results; admission supplies its pre-write record only after recovery
+normalization. The execution guard supplies no such provenance, so direct fresh calls and queued
+handoffs carrying an ordinary finished/null prior both refuse before provider selection.
+Regression prevention in `review-job-red-team-skip.test.mjs`:
+**fresh guard refuses a finished null prior without queued provenance (admitted=%s)** and
+**fresh admission preserves unknown null completion but recovers a dead queued writer (prior=%s)**.
+The back-port from `8173660fcf` also pins the guard in `review-red-team-resume-only.test.mjs`:
+**refuses a finished null result without queued provenance and with no seat or comment (admitted=%s)**.
+Its production admission regression in `review-job-red-team-only.test.mjs` is
+**fresh recovery preserves unknown finished-null history through production admission and launches no call**;
+it verifies that refusal restores the original finished/null status and publishes no comment.
+These exercise the shared execution guard and production admission, alongside the planner's
+**f: a null completion without queued provenance skips (stored status %s)** in
+`review-red-team-on-skip.test.mjs`. Live or unknown liveness
 and invalid writer PIDs keep the queued record blocked. Regressions in `review-job-red-team-skip.test.mjs`:
 **accepted code head dispatches fresh after queued fresh recovery crashes before running with no seat or result comment**,
 **queued fresh recovery still skips with %s**, and

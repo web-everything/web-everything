@@ -322,15 +322,15 @@ export function ghPages(path, gh = ghJson) {
 /** All remote operations are GETs; comments use the shared paginated, throttled leaf reader.
  * Optional ledger/card reads are explicitly marked incomplete on failure. Core timeline failures abort.
  */
-export function collectPrTimeline(repo, pr, { gh = ghJson, comments = defaultListPrComments, env = process.env } = {}) {
-  try { return collectCompletePrTimeline(repo,pr,{gh,comments,env}); }
+export function collectPrTimeline(repo, pr, { gh = ghJson, comments = defaultListPrComments, env = process.env, allowOpen = false } = {}) {
+  try { return collectCompletePrTimeline(repo,pr,{gh,comments,env,allowOpen}); }
   catch (cause) { const error = new Error(`incomplete PR timeline: ${cause?.message ?? cause}`,{cause}); error.incomplete = true; throw error; }
 }
-function collectCompletePrTimeline(repo, pr, { gh, comments, env }) {
+function collectCompletePrTimeline(repo, pr, { gh, comments, env, allowOpen }) {
   validateSubject(repo,pr);
   const root = `repos/${repo}`;
   const p = gh(['api',`${root}/pulls/${pr}`]);
-  if (!p.merged_at) throw Error('PR has not merged');
+  if (!p.merged_at && !(allowOpen && p.state === 'open')) throw Error('PR has not merged');
   const completeness = {core:'complete',verdicts:'unknown',fixLoop:'unknown',card:'unknown'};
   const warnings = [], optional = (label, key, fn, fallback) => {
     try { const value = fn(); completeness[key] = 'complete'; return value; }
@@ -395,7 +395,7 @@ function collectCompletePrTimeline(repo, pr, { gh, comments, env }) {
     completeness.core = 'incomplete';
     warnings.push(`PR file list incomplete: collected ${files.length} of ${p.changed_files} changed files; scope verdict is unknown.`);
   }
-  return { repo, pr: Number(pr), openedAt:p.created_at, mergedAt:p.merged_at, url:p.html_url, labels, comments:thread, commits, checks, verdicts, fixLoop,
+  return { repo, pr: Number(pr), state:p.state, openedAt:p.created_at, mergedAt:p.merged_at, url:p.html_url, labels, comments:thread, commits, checks, verdicts, fixLoop,
     files, scope, prepares, warnings, completeness };
 }
 

@@ -102,6 +102,57 @@ describe('review-job red-team skip settlement', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it.each([false, true])('fresh guard refuses a finished null prior without queued provenance (admitted=%s)', async admitted => {
+    const loopPayload = payload();
+    loopPayload.findings.read.netChangedFiles = ['scripts/example.mjs'];
+    const prior = { repo, pr, head, status: 'finished', result: null };
+    const io = {
+      now: () => 1_000, log: vi.fn(),
+      readRecords: () => [], readRecoveryComments: () => [],
+      readRedTeamStatus: () => admitted ? { status: 'queued', pid: 42, result: null } : prior,
+      cliAvailable: vi.fn(() => { throw Error('provider reached'); }),
+      reserveCalls: vi.fn(), runSeat: vi.fn(), runRecheck: vi.fn(),
+    };
+    const result = await runRedTeam({ repo, pr, loopPayload, redTeamMode: 'fresh',
+      env: { WE_REVIEW_RED_TEAM: '1', WE_REVIEW_EXTRA_SEATS: '1', WE_RED_TEAM_SKIP_CARD_ONLY: '0' },
+      ...(admitted ? { redTeamAdmission: { pid: 42, prior } } : {}),
+    }, io);
+    expect(result).toMatchObject({ status: 'not-owed', deferredByGuard: true,
+      reason: expect.stringContaining('prior red-team status; not re-run') });
+    for (const hook of ['cliAvailable', 'reserveCalls', 'runSeat', 'runRecheck']) expect(io[hook]).not.toHaveBeenCalled();
+  });
+
+  it.each(['finished', 'queued'])('fresh admission preserves unknown null completion but recovers a dead queued writer (prior=%s)', async status => {
+    const root = mkdtempSync(join(tmpdir(), 'null-admission-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_STATUS_LABELS: '0',
+      WE_REVIEW_RED_TEAM: '1', WE_REVIEW_EXTRA_SEATS: '1', WE_RED_TEAM_SKIP_CARD_ONLY: '0' };
+    const key = { repo, pr, head, env };
+    const loopPayload = payload();
+    loopPayload.findings.read.netChangedFiles = ['scripts/example.mjs'];
+    try {
+      const production = createReviewJobIo({ env, readEvidence: () => ({ inFlight: false, queued: false }) });
+      production.redTeamStatus({ repo, pr, loopPayload, status, result: null });
+      const { redTeamAdmission } = production.redTeamStatus({ repo, pr, loopPayload, status: 'queued', redTeamMode: 'fresh' });
+      expect(redTeamAdmission.prior).toEqual(status === 'queued' ? null : { repo, pr, head, status, result: null });
+      const io = {
+        now: () => 1_000, log: vi.fn(), readRecords: () => [], readRecoveryComments: () => [],
+        readRedTeamStatus: () => readRedTeamStatus(key),
+        cliAvailable: vi.fn(() => { throw Error('provider reached'); }),
+        reserveCalls: vi.fn(), runSeat: vi.fn(), runRecheck: vi.fn(),
+      };
+      const result = await runRedTeam({ repo, pr, loopPayload, env, redTeamMode: 'fresh', redTeamAdmission }, io);
+      if (status === 'queued') {
+        expect(result).toEqual({ status: 'error', reason: 'provider reached' });
+        expect(io.cliAvailable).toHaveBeenCalledOnce();
+      } else {
+        expect(result).toMatchObject({ status: 'not-owed', deferredByGuard: true,
+          reason: expect.stringContaining('prior red-team status; not re-run') });
+        expect(io.cliAvailable).not.toHaveBeenCalled();
+      }
+      for (const hook of ['reserveCalls', 'runSeat', 'runRecheck']) expect(io[hook]).not.toHaveBeenCalled();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   function freshRecoveryFixture(check) {
     const root = mkdtempSync(join(tmpdir(), 'fresh-recovery-'));
     const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_STATUS_LABELS: '0' };

@@ -354,8 +354,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // apply today's policy; its independent comment and scorecard guards remain active.
           // readRedTeamStatus binds status.head to this job's head; the predicate
           // separately requires the stored read's netBasis.rev to equal status.head.
+          // A null result is eligible only when normalized from the original queued
+          // writer above. An ordinary finished/null prior must reach the guard intact.
           if (input.redTeamMode === 'fresh' && (redTeamSkipNeedsSettlement(admissionPrior)
-            || redTeamStatusWithoutRun(admissionPrior, prior))) admissionPrior = null;
+            || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior }))) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
           input = { ...input, result: priorResult };
         }
