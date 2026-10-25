@@ -10,14 +10,14 @@
  * here, matching the no-fs/no-subprocess convention every sibling operation test already uses.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { readRaisedBy, raisedByFile } from '../../lib/raised-by.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   landPreventionCard as realLandPreventionCard, parseLandPreventionCardArgv, parseRunJsonTail, runLandPreventionCardCli,
   boundCardText, boundLandPreventionCardInput, CARD_TEXT_CAPS, buildLandingRetractionComment, postLandingRetraction,
-  runCardDedupe, foldOpenSingles,
+  runCardDedupe, foldOpenSingles, drainPendingPrevention,
 } from '../land-prevention-card.mjs';
 import {
   hasApprovalPreventionMarkerForHead, buildApprovalPreventionMarker, buildApprovalPreventionJobMarker,
@@ -265,6 +265,66 @@ describe('landPreventionCard — dedupe before filing', () => {
     scope: `we:${file}`,
   });
   const cleanup = () => rmSync(lane, { recursive: true, force: true });
+
+  it.each([false, true])('batches each file in a mention filing (mixed=%s) and dedupes a retry', async mixed => {
+    const acquire = setup();
+    const pendingDir = join(lane, 'pending');
+    try {
+      const filing = input();
+      if (mixed) {
+        filing.digest = filing.digest.replace('\n\nIdempotency key', '\n\n2. `we:scripts/other.mjs:1` — Reject malformed flags before dispatch.\n\nIdempotency key');
+        filing.scope += ',we:scripts/other.mjs';
+      }
+      const { exec, calls } = scriptedExec([acquire, 'staged', ...(mixed ? [FILE_ITEM_OK] : []), 'released']);
+      const batch = vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-1' }));
+      const result = await realLandPreventionCard(filing, { exec, dedupe, batch, pendingDir, write: () => {} });
+      expect(result).toMatchObject({ ok: true, step: 'batched', pr: null });
+      expect(batch).toHaveBeenCalledTimes(mixed ? 2 : 1);
+      const paths = batch.mock.calls.map(([entry]) => entry.cardPath);
+      const sidecar = paths.find(path => path.startsWith('backlog/raised-by/'));
+      expect(sidecar).toMatch(/^backlog\/raised-by\/4706\/77-[a-f0-9]{24}\.md$/);
+      expect(batch.mock.calls.find(([entry]) => entry.cardPath === sidecar)[0].idemKey)
+        .toBe(`prevention:raised-by:4706:${sidecar.split('/').at(-1).slice(0, -3)}`);
+      if (mixed) expect(batch.mock.calls.find(([entry]) => entry.cardPath === 'backlog/9001-file-the-prevention.md')[0].idemKey).toBe('prevention:9001');
+      expect(calls.some(({ args }) => ['commit', 'verify', 'open-pr'].some(op => args.includes(op)))).toBe(false);
+      if (!mixed) {
+        const retry = scriptedExec([acquire, 'released']);
+        expect(await realLandPreventionCard(filing, { exec: retry.exec, dedupe, batch, pendingDir, write: () => {} }))
+          .toMatchObject({ step: 'mentioned' });
+        expect(batch).toHaveBeenCalledTimes(1);
+      }
+    } finally { cleanup(); }
+  });
+
+  it.each(['all', 'sidecar'])('spools every unbatched file on refusal (%s) and drains sidecars', async refused => {
+    const acquire = setup();
+    const pendingDir = join(lane, 'pending');
+    try {
+      const filing = input();
+      filing.digest = filing.digest.replace('\n\nIdempotency key', '\n\n2. `we:scripts/other.mjs:1` — Reject malformed flags before dispatch.\n\nIdempotency key');
+      const { exec, calls } = scriptedExec([acquire, 'staged', FILE_ITEM_OK, 'released']);
+      const batch = vi.fn(async entry => refused === 'sidecar' && !entry.cardPath.includes('/raised-by/')
+        ? { batched: true, batchRef: 'lane/card-batch-prevention-1' }
+        : { batched: false, reason: 'lease-held' });
+      expect(await realLandPreventionCard(filing, { exec, dedupe, batch, pendingDir, readFile: path => existsSync(path) ? readFileSync(path, 'utf8') : 'new card bytes', write: () => {} }))
+        .toMatchObject({ ok: true, step: 'held', pr: null });
+      expect(batch).toHaveBeenCalledTimes(2);
+      const entries = readdirSync(pendingDir).map(name => JSON.parse(readFileSync(join(pendingDir, name), 'utf8')));
+      expect(entries).toHaveLength(refused === 'all' ? 2 : 1);
+      for (const entry of entries) expect(entry.idemKey).toBe(`prevention:${entry.cardId}`);
+      expect(entries.some(entry => entry.rel.includes('/raised-by/'))).toBe(true);
+      expect(calls.some(({ args }) => ['commit', 'verify', 'open-pr'].some(op => args.includes(op)))).toBe(false);
+      const recoveredLane = join(lane, 'recovery');
+      const drain = vi.fn(async entry => {
+        expect(readFileSync(join(recoveredLane, entry.cardPath), 'utf8')).toBe(entries.find(saved => saved.rel === entry.cardPath).content);
+        return { batched: true, batchRef: 'lane/card-batch-prevention-1' };
+      });
+      await drainPendingPrevention({ lane: recoveredLane }, { pendingDir, exec: () => '', batch: drain, write: () => {} });
+      expect(drain).toHaveBeenCalledTimes(entries.length);
+      expect(readdirSync(pendingDir)).toEqual([]);
+      for (const entry of entries) expect(existsSync(join(recoveredLane, entry.rel))).toBe(false);
+    } finally { cleanup(); }
+  });
 
   it('A1 duplicate creates one raise file and leaves the parent byte-identical', async () => {
     const acquire = setup();
