@@ -1840,6 +1840,7 @@ export function runReviewLabelCli({
     try { fresh = provider.readPrState(repo, pr); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (!Array.isArray(fresh.comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
     if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
+    if (pinnedRearm && onlyIf !== 'missing' && fresh.headRefOid.trim() !== expectedHead) fail('live head differs from --expect-head', 1);
     const freshComments = fullThread(fresh.comments, fresh.headRefOid).filter(isTrustedMarkerAuthor);
     if (headEverHumanCleared(freshComments, fresh.headRefOid.trim())) refuseRearm('head carries a human clearance — a rearm never undoes it');
     return { fresh, freshComments };

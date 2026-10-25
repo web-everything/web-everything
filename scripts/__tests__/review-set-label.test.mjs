@@ -3098,6 +3098,19 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     expect(calls).toContain('setLabels');
   });
 
+  it('pinned plain rearm refuses a head change between the swap head check and clearance reread without setting labels', () => {
+    const expectedHead = 'a'.repeat(40);
+    const result = run(['9', '--repo=o/n', `--expect-head=${expectedHead}`], [REVIEW_LABELS.changes], {
+      headRefOid: expectedHead,
+      secondHead: expectedHead,
+      swapState: { headRefOid: 'b'.repeat(40) },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.payload.error).toContain('live head differs from --expect-head');
+    expect(result.readPrState).toHaveBeenCalledTimes(3);
+    expect(result.calls).not.toContain('setLabels');
+  });
+
   it('without the flag a live review:changes is still re-armed (fix-agent path)', () => {
     const { exitCode, calls } = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes]);
     expect(exitCode).toBe(0);
