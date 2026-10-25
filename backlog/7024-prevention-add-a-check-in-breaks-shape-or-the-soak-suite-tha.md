@@ -1,21 +1,24 @@
 ---
+bornAs: xjskqyj
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/review-job.mjs", "we:scripts/operations/__tests__/review-job.test.mjs"]
+scope: ["we:scripts/conveyor/soak/breaks/hung-ci-cancel-run-not-found-loops.mjs", "we:scripts/conveyor/ci-red-recovery-watch.mjs", "we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs", "we:scripts/conveyor/soak/breaks/__tests__/hung-ci-cancel-run-not-found-loops.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Parametrize the prepareLane failure test over redTeamOnly in {false,true}. (from web-everything/web-everything#5838 review)
+# Prevention — Add a check in breaks-shape or the soak suite that fixPresent returns false against the break's p… (from web-everything/web-everything#5883 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/review-job.mjs:930` — Parametrize the prepareLane failure test over redTeamOnly in {false,true}.
-2. `we:scripts/operations/review-job.mjs:930` — Add a deterministic test named 'recovery preparation fetches the pinned head exactly once' in we:scripts/operations/__tests__/review-job-red-team-only.test.mjs, composing both production hooks with an injected command recorder and asserting one fetch before admission.
+1. `we:scripts/conveyor/soak/breaks/hung-ci-cancel-run-not-found-loops.mjs:27` — Add a check in breaks-shape or the soak suite that fixPresent returns false against the break's pre-fix tree. Run it with the fix's production lines reverted, or against a pinned pre-fix fixture.
+2. `we:scripts/conveyor/ci-red-recovery-watch.mjs:952` — Review lens: for every guard in a sweep branch, require a test of the sibling outcome that the guard excludes.
+3. `we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs:693` — Add a deterministic regression test using the default trigger with lower-level IO stubbed; assert the expected-head preflight occurs and a moved head prevents the push.
+4. `we:scripts/conveyor/ci-red-recovery-watch.mjs:958` — Add a deterministic integration test exercising the default trigger after a cancel 404, with a changed remote head, and assert that no push occurs.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5838@cb6fd324f5788f4b111bb90d84e93e6708a778b9
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5883@5eb92b1825b646e261dedcfc754b7f09a446e18c
 
 ## Acceptance
 
