@@ -60,15 +60,15 @@ export default {
         pr, rev: head, provider: 'codex', model: 'soak', findings: [], foldedVerdict: 'accept',
       }) });
       const cases = [
-        { number: 5762, mode: 'resume', evidence: evidence({ recorded: true }),
+        { number: 5762, mode: 'resume', evidence: evidence({ recorded: true, seatRecorded: true, completedRecorded: true }),
           status: { status: 'finished', result: { status: 'ran', comment: 'error' } } },
-        { number: 5530, mode: 'resume', evidence: evidence({ recorded: true }),
+        { number: 5530, mode: 'resume', evidence: evidence({ recorded: true, seatRecorded: true, completedRecorded: true }),
           status: { status: 'finished', result: 'ran' } },
         { number: 5759, queued: true, mode: 'fresh', evidence: evidence(), status: null },
-        { number: 5760, queued: true, mode: 'resume', evidence: evidence({ recorded: true }),
+        { number: 5760, queued: true, mode: 'resume', evidence: evidence({ recorded: true, seatRecorded: true, completedRecorded: true }),
           status: { status: 'finished', result: 'ran' } },
         // #5838: the original call ran with card-only probes enabled; policy changed before recovery.
-        { number: 5838, queued: true, mode: 'resume', evidence: evidence({ recorded: true,
+        { number: 5838, queued: true, mode: 'resume', evidence: evidence({ recorded: true, seatRecorded: true, completedRecorded: true,
           loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head },
             netChangedFiles: ['backlog/123-card.md'], diffText: '+card update' } } } }),
           status: { status: 'finished', result: 'ran' } },
@@ -80,6 +80,10 @@ export default {
         { number: 9005, queued: true, evidence: evidence({ recorded: true }),
           status: { status: 'finished', result: { status: 'error' } } },
         { number: 9006, queued: true, evidence: evidence({ recorded: true }), status: null },
+        { number: 9007, queued: true, evidence: evidence({ recorded: true, seatRecorded: true, completedRecorded: false }),
+          status: { status: 'finished', result: 'ran' } },
+        { number: 9008, queued: true, evidence: evidence({ recorded: true }),
+          status: { status: 'finished', result: 'resumed' } },
       ];
       const byPr = new Map(cases.map(c => [c.number, c]));
       const history = new Map(), starts = [];

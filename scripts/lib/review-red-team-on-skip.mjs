@@ -4,8 +4,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus } from './drain-red-team-evidence.mjs';
 import { redTeamForHead } from './red-team-gate.mjs';
-import { redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
+import { isRealHead } from './red-team-skip-outcome.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { redTeamStatusWithoutRun } from './red-team-run-result.mjs';
 
 /** Normalize both persisted production result shapes at the recovery boundary. */
 export function normalizeRedTeamResult(result) {
@@ -13,6 +15,21 @@ export function normalizeRedTeamResult(result) {
     priorResult: typeof result === 'string' ? result : result?.status,
     priorComment: typeof result === 'object' ? (result?.comment?.status ?? result?.comment) : undefined,
   };
+}
+
+/** Historical card-only skips need a result comment, not a resumed model pass. PURE. */
+export function redTeamSkipNeedsSettlement(status) {
+  const read = status?.loopPayload?.findings?.read;
+  const result = status?.result;
+  if (result && typeof result === 'object' && result.policy !== 'card-only') return false;
+  // Legacy plain-string records carry no policy. With the writer's skipCardOnly=true,
+  // a non-empty card-only read and matching pinned head, the producer's card-only
+  // branch runs before every other applicable skip reason, so this combination
+  // can only be a card-only skip. Never infer that provenance for object results.
+  return typeof read?.diffText === 'string' && read.diffText.trim().length > 0
+    && isRealHead(status?.head) && read.netBasis?.rev === status.head
+    && status?.status === 'finished' && normalizeRedTeamResult(status.result).priorResult === 'skipped'
+    && status.skipCardOnly === true && redTeamCardOnly(status.loopPayload?.findings?.read);
 }
 
 export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = readFileSync,
@@ -40,7 +57,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const skip = why => ({ ...row, why });
     try {
       if (!setting.enabled) return skip('reviewRedTeamOnSkip.enabled=false');
-      if (!/^[a-f0-9]{40}$/i.test(head ?? '') || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
+      if (!isRealHead(head) || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
       // Unknown comments cannot establish that no result was published.
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
       if (redTeamForHead(rawPr.comments, pr, head)) return skip('red-team result already on head');
@@ -50,13 +67,20 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
       const status = readStatus({ repo, pr, head });
       const { priorResult: prior, priorComment: comment } = normalizeRedTeamResult(status?.result);
+      const completedSeat = evidence.completedRecorded === true || evidence.cleanRecorded === true;
+      const placeholder = redTeamStatusWithoutRun(status);
       let mode;
       if (comment === 'posted') return skip('result posted; comment not visible yet');
-      // Any seat row (including an error) counts as recorded. Only a finished, clean
-      // pass can resume effects without risking another model call.
-      if (status?.status === 'finished' && ['ran', 'resumed'].includes(prior) && evidence.recorded === true) {
+      // Any seat row (including an error) blocks a new call. Successful execution
+      // can resume effects even when its verdict contains confirmed breaks.
+      if (status?.status === 'finished' && (['ran', 'resumed'].includes(prior) || status.result === 'resumed')
+        && (completedSeat || (!placeholder && typeof status.result === 'object'
+          && evidence.recorded === true && evidence.completedRecorded !== false))) {
         mode = 'resume';
-      } else if (status == null && evidence.recorded === false) mode = 'fresh';
+      } else if (redTeamSkipNeedsSettlement(status)) mode = 'fresh';
+      else if (placeholder && (evidence.seatRecorded === false
+        || (evidence.seatRecorded === undefined && evidence.recorded === false))) mode = 'fresh';
+      else if (status == null && evidence.recorded === false) mode = 'fresh';
       else return skip(`prior result ${typeof prior === 'string' ? prior : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
