@@ -133,6 +133,14 @@ export default {
           check(!sent, `wait=${wait ?? 'default'} / ${status}: merge-queue enqueue mutation was sent despite the hold label`);
           check(result.enqueued !== true, `wait=${wait ?? 'default'} / ${status}: returned enqueued: true despite the hold label`);
         }
+        if (!overdue && status === 'red-team:pending') {
+          check(labels.includes(status), `wait=${wait ?? 'default'}: first refused admission removed the pending label`);
+          const retry = s.enqueue({ num: PR }, HEAD, { comments });
+          check(retry.enqueued === false && retry.kind === 'red-team-pending',
+            `wait=${wait ?? 'default'}: second attempt lost the label-only pending hold`);
+          check(!calls.some(c => c.some(isMutation)),
+            `wait=${wait ?? 'default'}: repeated admission sent an enqueue mutation without a result`);
+        }
         // Existing queue membership is independent of admission: pending is normal there; blocked is sent back.
         labels = ['review:accepted', 'ready-to-merge', status];
         queued = true;

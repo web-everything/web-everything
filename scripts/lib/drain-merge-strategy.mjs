@@ -387,13 +387,23 @@ export function createDrainMergeStrategy({
         const standingRuling = grantScopeFor(c, headSha, pages.flat());
         const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
         try {
-          const plan = syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
-            live, comments: pages.flat(), provider: statusProvider, dryRun, log: say });
+          const statusInput = { repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
+            live, comments: pages.flat(), provider: statusProvider, log: say };
+          const plan = syncRedTeamStatusLabels({ ...statusInput, dryRun: true });
           const syncedLabels = admissionLabels.filter(label => !plan.remove.includes(label));
           if (plan.add) syncedLabels.push(plan.add);
-          // A successfully published clear result releases pending in this call. Merely cleaning up labels
-          // when no pass is owed is not clearance; preserve the label-only admission hold in that case.
-          if (syncedLabels.includes('red-team:clear')) admissionLabels = syncedLabels;
+          // Cleanup without a result must preserve the hold on GitHub, too: the next attempt (or a
+          // restarted drain) reads those labels afresh and must not mistake our cleanup for clearance.
+          const dropsPendingHold = admissionLabels.includes('red-team:pending')
+            && plan.remove.includes('red-team:pending')
+            && !syncedLabels.includes('red-team:clear') && !syncedLabels.includes('red-team:blocked');
+          if (!dropsPendingHold) {
+            const published = syncRedTeamStatusLabels({ ...statusInput, dryRun });
+            const publishedLabels = admissionLabels.filter(label => !published.remove.includes(label));
+            if (published.add) publishedLabels.push(published.add);
+            // Release pending in this call only after the clear result was successfully published.
+            if (publishedLabels.includes('red-team:clear')) admissionLabels = publishedLabels;
+          }
         }
         catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
         if (reason) {

@@ -907,6 +907,30 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     expect(after.state().redTeamPending['cwd#5283']).toBeUndefined();
   });
 
+  it.each(['string', 'object'])('a label-only pending hold survives repeated attempts and restart (%s labels)', shape => {
+    const labels = [...ACCEPTED, 'red-team:pending'].map(name => shape === 'object' ? { name } : name);
+    const thread = [];
+    const labelProvider = { ensureLabel: vi.fn(), setLabels: vi.fn((_repo, _pr, { add, remove }) => {
+      const next = labels.filter(label => !remove.includes(typeof label === 'string' ? label : label.name));
+      if (add) next.push(shape === 'object' ? { name: add } : add);
+      labels.splice(0, labels.length, ...next);
+    }) };
+    const opts = { strategy: 'github-merge-queue', labels, liveComments: thread, labelProvider,
+      env: { WE_UNDER_TEST: '1' }, evidence: { scheduled: false, inFlight: false, queued: false, recorded: false } };
+    const h = harness(opts);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    }
+    const restarted = harness({ ...opts, initial: h.state() });
+    expect(restarted.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(labels.map(label => typeof label === 'string' ? label : label.name)).toContain('red-team:pending');
+    expect(labelProvider.setLabels).not.toHaveBeenCalled();
+    expect(enqueuedAny(h) || enqueuedAny(restarted)).toBe(false);
+    thread.push(clean);
+    expect(restarted.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
+    expect(labelProvider.setLabels).toHaveBeenCalledWith(LOCAL, 5283, { add: 'red-team:clear', remove: ['red-team:pending'] });
+  });
+
   it('a failed pending-to-clear sync holds admission, then retries successfully', () => {
     let fail = true;
     const labelProvider = { ensureLabel: vi.fn(), setLabels: vi.fn(() => { if (fail) throw new Error('label write failed'); }) };
