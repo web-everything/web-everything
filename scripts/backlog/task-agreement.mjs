@@ -21,9 +21,9 @@
  */
 export const ACCEPTANCE_HEADING = '## Acceptance';
 export const NON_GOALS_HEADING = '## Non-goals';
-/** On its own line directly under either heading: the section was machine-drafted (the one-off refresh of open
+/** First non-blank line under either heading: the section was machine-drafted (the one-off refresh of open
  *  stories) and no author or preparer has confirmed it yet. The reader reports it as `draft: true`. */
-export const AGREEMENT_DRAFT_MARKER = '<!-- agreement: draft -->';
+export const AGREEMENT_DRAFT_MARKER = 'Draft: model-written, not yet confirmed.';
 /** Matches the TEXT of a level-2 heading (after `## `). Gates import it so `## Acceptance` and the legacy
  *  `## Done when` stay one rule. */
 export const ACCEPTANCE_HEADING_RE = /^(?:acceptance|done when)\b/i;
@@ -150,6 +150,7 @@ export function readTaskAgreement(body) {
     };
     for (const line of groups[0]) {
       const trimmed = line.trim();
+      if (trimmed === AGREEMENT_DRAFT_MARKER) continue;
       // HTML comments are skipped by state (see commentOpenAfter): pass 1 already kept their headings out of sections.
       if (inComment) { inComment = commentOpenAfter(line, true); continue; }
       const open = commentOpenAfter(line, false);
