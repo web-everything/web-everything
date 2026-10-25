@@ -138,6 +138,103 @@ describe('push-before-gate: the early push', () => {
     await pass(h);
     expect(h.calls.resume).toHaveLength(1);
   });
+  it.each(['paused', 'busy', 'failed'])('rechecks verification after a %s no-op resume', async (deferred) => {
+    const h = harness();
+    h.io.push = a => { h.calls.push.push(a); return { ok: true, upToDate: true }; };
+    const sessions = h.io.listSessions;
+    const resume = h.io.resume;
+    if (deferred === 'busy') h.io.listSessions = () => [{ ...sessions()[0], state: 'running', status: 'running' }];
+    if (deferred === 'failed') h.io.resume = () => ({ resumed: false, reason: 'temporary failure' });
+    await pass(h, { allowResume: deferred !== 'paused' });
+    expect(h.store.get(SESSION).pendingResume.kind).toBe('no-new-commit');
+    h.io.listSessions = sessions;
+    h.io.resume = resume;
+    h.state.marker = marker('red', { failureDetails: { summary: 'regression failed after the no-op push' } });
+    await pass(h, { nowMs: T0 + 60_000 });
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('RED');
+    expect(h.calls.resume[0].prompt).toContain('regression failed after the no-op push');
+    expect(h.calls.resume[0].prompt).not.toContain('## Fix evidence');
+    expect(h.state.claimHeld).toBe(true);
+    expect(h.calls.push).toHaveLength(1);
+    expect(h.store.size).toBe(0);
+  });
+  it.each(['moved', 'dirty', 'unreadable'])('voids a saved no-op when its lane becomes %s', async (change) => {
+    const h = harness();
+    h.io.push = () => ({ ok: true, upToDate: true });
+    await pass(h, { allowResume: false });
+    if (change === 'moved') h.state.lane.head = SHA2;
+    if (change === 'dirty') h.state.lane.dirty = true;
+    if (change === 'unreadable') h.state.lane = null;
+    const { rows } = await pass(h);
+    expect(rows).toContainEqual(expect.objectContaining({ reason: `lane-${change}`, result: 'resumed:void' }));
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).not.toContain('## Fix evidence');
+  });
+  it.each(['running', 'green', 'absent'])('delivers a saved no-op once without re-pushing when verification is %s', async (status) => {
+    const h = harness();
+    h.io.push = a => { h.calls.push.push(a); return { ok: true, upToDate: true }; };
+    await pass(h, { allowResume: false });
+    h.state.marker = status === 'absent' ? null : marker(status);
+    await pass(h);
+    await pass(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('## Fix evidence');
+    expect(h.calls.push).toHaveLength(1);
+    expect(h.store.size).toBe(0);
+  });
+  it.each(['lane-read', 'marker-read', 'replacement-write'])('retains a saved no-op after a %s failure and delivers red after recovery', async (failure) => {
+    const h = harness();
+    h.io.push = () => ({ ok: true, upToDate: true });
+    await pass(h, { allowResume: false });
+    h.state.marker = marker('red', { failureDetails: { summary: 'latest red detail' } });
+    const original = { ...h.io };
+    if (failure === 'lane-read') h.io.laneState = () => { throw new Error('lane read failed'); };
+    if (failure === 'marker-read') h.io.readMarker = () => { throw new Error('marker read failed'); };
+    if (failure === 'replacement-write') h.io.writeRecord = () => ({ ok: false });
+    const { rows } = await pass(h);
+    expect(rows.some(row => /error:|persist-failed/.test(row.result))).toBe(true);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(SESSION).pendingResume.kind).toBe('no-new-commit');
+    Object.assign(h.io, original);
+    await pass(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Verify is RED');
+    expect(h.calls.resume[0].prompt).toContain('latest red detail');
+    expect(h.store.size).toBe(0);
+  });
+  it('persists the replacement red while resumes stay paused, including its latest failure detail', async () => {
+    const h = harness();
+    h.io.push = () => ({ ok: true, upToDate: true });
+    await pass(h, { allowResume: false });
+    h.state.marker = marker('red', { failureDetails: { summary: 'red while paused' } });
+    await pass(h, { allowResume: false });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(SESSION).pendingResume.kind).toBe('red');
+    h.state.marker = null;
+    await pass(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('red while paused');
+    expect(h.calls.resume[0].prompt).not.toContain('## Fix evidence');
+  });
+  it.each(['pending', 'must-fix', 'overdue'])('prioritizes red over a deferred no-op with %s self-review', async (state) => {
+    const h = harness();
+    h.io.push = () => ({ ok: true, upToDate: true });
+    await pass(h, { allowResume: false });
+    h.io.readSelfReview = () => ({ ...rec(), state: state === 'overdue' ? 'pending' : state,
+      startedAt: new Date(T0).toISOString(), returnedAt: new Date(T0).toISOString() });
+    if (state === 'overdue') {
+      await pass(h, { nowMs: T0 + AWAIT_VERIFY_LIMITS.selfReviewMaxMs + 1, allowResume: true,
+        io: { ...h.io, listSessions: () => [{ sessionId: SESSION, name: 'fix-4115', status: 'running' }] } });
+      expect(h.store.get(SESSION).pendingResume.selfReviewOverdue).toBeTruthy();
+    }
+    h.state.marker = marker('red');
+    await pass(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Verify is RED');
+    expect(h.calls.resume[0].prompt).not.toContain('## Fix evidence');
+    expect(h.store.size).toBe(0);
+  });
   it.each(['pending', 'must-fix'].flatMap(state => ['wait', 'rerequest'].map(action => [state, action])))
   ('holds a no-op %s review on the %s path until it returns clean', async (state, action) => {
     const h = harness();

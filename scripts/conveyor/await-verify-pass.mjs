@@ -356,9 +356,18 @@ export async function runAwaitVerifyPass({
       if (record?.kind === 'fix' && record.pendingResume?.kind === 'infra') {
         record = { ...record }; delete record.pendingResume;
       }
-      const lane = isHarnessRecord(record) && !record.pendingResume ? io.laneState(record.lane, { hashDirty: isNoPushRecord(record) }) : null;
+      const pendingNoOp = record?.pendingResume?.kind === 'no-new-commit';
+      const lane = isHarnessRecord(record) && (!record.pendingResume || pendingNoOp) ? io.laneState(record.lane, { hashDirty: isNoPushRecord(record) }) : null;
       const marker = lane ? io.readMarker(record.lane) : null;
       let d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits });
+      if (pendingNoOp) {
+        // A deferred no-op is not a verify verdict. Red/void/infra recovery takes precedence over hand-back,
+        // even after an auth pause, busy session or failed delivery. Preserve valid no-ops without re-pushing.
+        const current = { ...record }; delete current.pendingResume;
+        const fresh = classifyAwaitVerdict({ record: current, marker, lane, nowMs, ttlMs, limits });
+        if (fresh.action === 'resume') { record = current; d = fresh; }
+        // Replacement is persisted below before any resume/retry effect; read/write errors retain the waiter.
+      }
       Object.assign(row, { action: d.action, reason: d.reason });
       // Every counter that bounds an effect is persisted BEFORE the effect, and a failed write skips the effect: a store that
       // went unwritable would otherwise reload the old counters every tick and repeat the request / push / resume forever.

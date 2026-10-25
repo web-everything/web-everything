@@ -14,16 +14,59 @@ const NOW = Date.parse('2026-10-25T17:03:10Z');
 
 export default {
   id: 'await-verify-no-op-self-review',
-  title: 'a no-op early push retains the self-review hold and bounded recovery',
+  title: 'a no-op early push retains self-review holds and rechecks deferred hand-back',
   card: 'PR #5919, send-back x1b8hlo item 1',
   fixedBy: { sha: 'HEAD', where: 'lane/port-1023a-b', paths: [PASS] },
   fixPresent(root) {
     const source = readFileSync(join(root, PASS), 'utf8');
     return source.includes("['green', 'no-new-commit'].includes(record.pendingResume?.kind)")
-      && source.includes('dir: selfReviewStoreDir(env), strict: true');
+      && source.includes('dir: selfReviewStoreDir(env), strict: true')
+      && source.includes('if (pendingNoOp)');
   },
   async run({ log } = {}) {
     const violations = [];
+    for (const deferred of ['paused', 'busy', 'failed']) {
+      const record = { v: 1, sessionId: 'fix-5919-deferred', who: 'fix-5919', repo: CONSTELLATION_REPOS.we.slug,
+        pr: 5919, kind: 'fix', sha: SHA, lane: '/lanes/lane-2', ref: 'lane/port-1023a-b', attempt: 1,
+        requestedAt: new Date(NOW).toISOString() };
+      const store = new Map([[record.sessionId, record]]);
+      const prompts = [];
+      let delayed = true;
+      let pushes = 0;
+      const io = {
+        pushPolicy: () => ({ pushBeforeGate: true, source: 'standard', invalid: [] }),
+        listRecords: () => [...store.entries()].map(([key, record]) => ({ key, record })),
+        writeRecord: r => { store.set(r.sessionId, r); return { ok: true }; },
+        clearRecord: key => { store.delete(key); },
+        laneState: () => ({ head: SHA, dirty: false, treeHash: TREE }),
+        readMarker: () => ({ sha: SHA, status: delayed ? 'running' : 'red', exitCode: delayed ? null : 1,
+          treeHash: TREE, startedAt: record.requestedAt, failureDetails: { summary: 'deferred verification failed' } }),
+        readSelfReview: () => null,
+        push: () => { pushes++; return { ok: true, upToDate: true }; },
+        rerequest: () => { violations.push(`${deferred}: unexpectedly re-requested verify`); },
+        listSessions: () => [{ sessionId: record.sessionId, name: record.who,
+          status: delayed && deferred === 'busy' ? 'running' : 'idle' }],
+        resume: ({ prompt }) => {
+          if (delayed && deferred === 'failed') return { resumed: false };
+          prompts.push(prompt); return { resumed: true };
+        },
+      };
+      const tick = allowResume => runAwaitVerifyPass({ io, allowResume, nowMs: NOW + 30_000,
+        ttlMs: 150 * 60_000, loggedPolicyLine: { value: null }, resumedUnclearable: new Set() });
+      await tick(deferred !== 'paused');
+      if (store.get(record.sessionId)?.pendingResume?.kind !== 'no-new-commit' || prompts.length) {
+        violations.push(`${deferred}: no-op resume was not deferred`);
+      }
+      delayed = false;
+      await tick(true);
+      await tick(true);
+      log?.(`${deferred}: delivered=${prompts.length}, waiter=${store.has(record.sessionId)}`);
+      if (prompts.length !== 1 || !prompts[0].includes('Verify is RED')
+        || !prompts[0].includes('deferred verification failed') || prompts[0].includes('## Fix evidence')
+        || store.size || pushes !== 1) {
+        violations.push(`${deferred}: deferred no-op hand-back displaced the red repair path`);
+      }
+    }
     for (const state of ['pending', 'must-fix']) {
       const record = { v: 1, sessionId: 'fix-5919-session', who: 'fix-5919', repo: CONSTELLATION_REPOS.we.slug,
         pr: 5919, kind: 'fix', sha: SHA, lane: '/lanes/lane-2', ref: 'lane/port-1023a-b', attempt: 1,
