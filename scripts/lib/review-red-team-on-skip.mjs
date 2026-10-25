@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus } from './drain-red-team-evidence.mjs';
 import { redTeamForHead } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
-import { isRealHead } from './red-team-skip-outcome.mjs';
+import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
+import { runGhSync } from './gh-throttle.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { redTeamStatusWithoutRun } from './red-team-run-result.mjs';
 
@@ -62,7 +64,13 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
       if (redTeamForHead(rawPr.comments, pr, head)) return skip('red-team result already on head');
       const evidence = readEvidence({ repo, pr, head });
-      if (!redTeamOwedFor(evidence?.loopPayload)) return skip('stored review does not owe a red team');
+      if (!redTeamOwedFor(evidence?.loopPayload)) {
+        if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
+          && Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted')) {
+          return { ...row, action: 'clear', why: 'not owed (stored review)' };
+        }
+        return skip('stored review does not owe a red team');
+      }
       if (evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
       const status = readStatus({ repo, pr, head });
@@ -100,7 +108,7 @@ const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, 
  */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
   env = process.env, setting, readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
-  now = Date.now, lastDispatch: history = lastDispatch, preferLane } = {}) {
+  now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip } = {}) {
   const rows = [], dispatched = [], notStarted = [];
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
   try {
@@ -110,6 +118,29 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       now: at, setting: resolved, lastDispatch: history }));
     for (const row of rows) {
       let started = false;
+      if (row.action === 'clear') {
+        if (dryRun) row.why = 'dry run (clear)';
+        else {
+          try {
+            const rawPr = rawPrs.find(p => Number(p?.number) === row.prNumber);
+            const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
+              head: row.head, readHead: row.head, accepted: true, comments: rawPr.comments, reason: row.why,
+              io: { env, log: note,
+                postComment: ({ repo, pr, body }) => runGhSync([
+                  'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
+                ], { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 }),
+                publishNeedsYou: publishAttention,
+              } });
+            if (!['policy-clear', 'already'].includes(result?.outcome)) {
+              row.action = 'skip';
+              row.why = `clear failed: ${result?.reason ?? result?.outcome ?? 'unknown outcome'}`;
+            }
+          } catch (error) {
+            row.action = 'skip';
+            row.why = `clear failed: ${safeErrorText(error)}`;
+          }
+        }
+      }
       if (row.action === 'dispatch') {
         const budget = capacity?.budget;
         if (!(capacity?.lanes > 0) || (budget && !(budget.left > 0))
@@ -144,7 +175,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         }
         if (!started) { row.action = 'skip'; notStarted.push({ prNumber: row.prNumber, reason: row.why }); }
       }
-      note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — red team ${started ? `dispatched (${row.mode})` : 'not dispatched'} for head ${String(row.head ?? 'unknown').slice(0, 12)}: ${row.why}`);
+      note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — red team ${started ? `dispatched (${row.mode})` : row.action === 'clear' && !dryRun ? 'cleared' : 'not dispatched'} for head ${String(row.head ?? 'unknown').slice(0, 12)}: ${row.why}`);
     }
   } catch {
     rows.push({ prNumber: null, head: null, action: 'skip', why: 'red-team recovery inputs unreadable' });
