@@ -1,18 +1,19 @@
 ---
+bornAs: xut7p2m
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/remote-test.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/auto-rebase.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5881 (head cd877c8ef)
+# Red-team follow-ups from web-everything/web-everything#5848 (head e32b7421a)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5881 (reviewed head `cd877c8ef9c9f5f79d5595781fe9d319ac6e4d80`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5848 (reviewed head `e32b7421aba9dab01294fae74b697d2d6024f5a3`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/remote-test.mjs:45` — (edge-case, degraded) A client clock one second ahead rejects a newly dispatched successful run
-   - Scenario: A complete pre-dispatch snapshot is empty, the client's createdAfter is 2026-10-25T12:00:01.100Z, and GitHub creates the new successful exact-SHA run at 2026-10-25T12:00:00Z. Despite its new run ID, freshDispatchRun rejects it because its server timestamp precedes the client's rounded timestamp. Discovery consequently times out and returns exit 2. An offline comparison reproduced success with createdAfter=12:00:00.100Z and failure without waiting on the run when only that timestamp advanced one second. Freshness should accommodate bounded clock skew or use server-derived timing alongside the I
+1. `we:scripts/lib/daemon-rebuild/auto-rebase.mjs:229` — (edge-case, degraded) Running admission from the temporary clone bypasses the host's heavy-command queue.
+   - Scenario: On a workstation with an existing workspace/.lanes pool, leave LANE_POOL_ROOT unset and start a repair with selected tests while the host's admission slots are occupied. The worker executes the scratch clone's we:heavy-admission.mjs from that same temporary clone. Both checkoutRoot and the module's ownCheckout therefore derive the temporary directory's absent .lanes pool; admissionBypassReason returns no-pool and Vitest runs without acquiring a host slot. A probe of the real exported helpers confirmed that the daemon checkout uses the workspace pool while the scratch checkout bypasses it. Multipl
    - Claude's re-check: demonstrated break
 
 ## Acceptance

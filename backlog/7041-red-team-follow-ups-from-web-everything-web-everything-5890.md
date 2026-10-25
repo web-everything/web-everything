@@ -1,18 +1,19 @@
 ---
+bornAs: x2leb5q
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/auto-rebase.mjs"]
+scope: ["we:scripts/operations/review-job.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5848 (head e32b7421a)
+# Red-team follow-ups from web-everything/web-everything#5890 (head 83fe32fcf)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5848 (reviewed head `e32b7421aba9dab01294fae74b697d2d6024f5a3`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5890 (reviewed head `83fe32fcf5320af6a16b244b24fcc97160399461`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lib/daemon-rebuild/auto-rebase.mjs:229` — (edge-case, degraded) Running admission from the temporary clone bypasses the host's heavy-command queue.
-   - Scenario: On a workstation with an existing workspace/.lanes pool, leave LANE_POOL_ROOT unset and start a repair with selected tests while the host's admission slots are occupied. The worker executes the scratch clone's we:heavy-admission.mjs from that same temporary clone. Both checkoutRoot and the module's ownCheckout therefore derive the temporary directory's absent .lanes pool; admissionBypassReason returns no-pool and Vitest runs without acquiring a host slot. A probe of the real exported helpers confirmed that the daemon checkout uses the workspace pool while the scratch checkout bypasses it. Multipl
+1. `we:scripts/operations/review-job.mjs:820` — (edge-case, degraded) An already-completed red team generates a false needs-you escalation on re-review.
+   - Scenario: Re-review an accepted, unchanged head that already has a clean red-team seat row and its trusted result comment. runRedTeam returns status 'already-ran' when all effects are complete (we:review-extra-seats.mjs:1362). The new completion check excludes this status, so the job invokes non-policy settlement and publishes 'red team skipped (...); not cleared' despite the existing result. A read-only probe reproduced 'already-ran', confirmed redTeamForHead returned a result, and observed settlement execute with zero visibility-reader calls. Verify the existing head-bound result and suppress escalation
    - Claude's re-check: demonstrated break
 
 ## Acceptance

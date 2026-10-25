@@ -1,18 +1,19 @@
 ---
+bornAs: xawyw6o
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/review-job.mjs"]
+scope: ["we:scripts/remote-test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5890 (head 83fe32fcf)
+# Red-team follow-ups from web-everything/web-everything#5881 (head cd877c8ef)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5890 (reviewed head `83fe32fcf5320af6a16b244b24fcc97160399461`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5881 (reviewed head `cd877c8ef9c9f5f79d5595781fe9d319ac6e4d80`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/review-job.mjs:820` — (edge-case, degraded) An already-completed red team generates a false needs-you escalation on re-review.
-   - Scenario: Re-review an accepted, unchanged head that already has a clean red-team seat row and its trusted result comment. runRedTeam returns status 'already-ran' when all effects are complete (we:review-extra-seats.mjs:1362). The new completion check excludes this status, so the job invokes non-policy settlement and publishes 'red team skipped (...); not cleared' despite the existing result. A read-only probe reproduced 'already-ran', confirmed redTeamForHead returned a result, and observed settlement execute with zero visibility-reader calls. Verify the existing head-bound result and suppress escalation
+1. `we:scripts/remote-test.mjs:45` — (edge-case, degraded) A client clock one second ahead rejects a newly dispatched successful run
+   - Scenario: A complete pre-dispatch snapshot is empty, the client's createdAfter is 2026-10-25T12:00:01.100Z, and GitHub creates the new successful exact-SHA run at 2026-10-25T12:00:00Z. Despite its new run ID, freshDispatchRun rejects it because its server timestamp precedes the client's rounded timestamp. Discovery consequently times out and returns exit 2. An offline comparison reproduced success with createdAfter=12:00:00.100Z and failure without waiting on the run when only that timestamp advanced one second. Freshness should accommodate bounded clock skew or use server-derived timing alongside the I
    - Claude's re-check: demonstrated break
 
 ## Acceptance
