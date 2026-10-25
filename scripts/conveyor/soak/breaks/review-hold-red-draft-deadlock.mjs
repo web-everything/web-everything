@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const PATHS = ['scripts/conveyor/reconcile-core.mjs', 'scripts/conveyor/draft-promotion-rule.mjs',
@@ -60,7 +61,7 @@ export default {
       log?.(`${name}: draft promotion owed=${result.owed}, expected=${expected}\n`);
     }
     // PR #5911 send-back: promotion must reach the fresh dispatch gate under fast-check fallback too.
-    const repo = 'frontier-ui/frontierui'; // No fast-check list for this repo.
+    const repo = CONSTELLATION_REPOS.frontierui.slug; // No fast-check list for this repo.
     const requiredChecks = ['test', 'review-gate'];
     const statusCheckRollup = [row('test'), row('review-gate', 'failure')];
     const reviewTiming = { startAfter: 'fast-checks', fastChecks: { we: ['standards'] } };
