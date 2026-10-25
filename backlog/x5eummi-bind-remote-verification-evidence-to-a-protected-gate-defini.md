@@ -17,11 +17,11 @@ This intentionally refuses **all content-changing lane commits**, including legi
 
 ## PR #5881 review prevention
 
-The client readiness preflight now shares the importer's complete-tree predicate and reads canonical main before dispatch. Regression cases in `scripts/__tests__/remote-route.test.mjs` and `scripts/__tests__/remote-test-cli.test.mjs` assert that a different or unreadable tree dispatches no lane/full run and falls back locally. The importer's final definition recheck remains required because main can change after preflight.
+The client readiness preflight now shares the importer's complete-tree predicate and reads canonical main before dispatch. Regression cases in `we:scripts/__tests__/remote-route.test.mjs` and `we:scripts/__tests__/remote-test-cli.test.mjs` assert that a different or unreadable tree dispatches no lane/full run and falls back locally. The importer's final definition recheck remains required because main can change after preflight.
 
-Workflow-dispatch evidence selection now allows only recognised lane-check/full JSON titles. `scripts/__tests__/remote-verify.test.mjs` excludes malformed, truncated, empty, non-string, unknown-mode and legacy mode-only titles so an ambiguous diagnostic run cannot shadow lane evidence. Explicit targeted diagnostics retain their separate complete-input matching path.
+Workflow-dispatch evidence selection now allows only recognised lane-check/full JSON titles. `we:scripts/__tests__/remote-verify.test.mjs` excludes malformed, truncated, empty, non-string, unknown-mode and legacy mode-only titles so an ambiguous diagnostic run cannot shadow lane evidence. Explicit targeted diagnostics retain their separate complete-input matching path.
 
-The routing entrypoint's settings regressions in `scripts/__tests__/remote-route.test.mjs` cover each standard/platform/tool/environment layer, exact preference key and settings path, invalid bounds and booleans, and effective-value provenance. These tests prevent a wiring change from silently bypassing an operator override. Validation results are recorded with the repair evidence; this provenance story remains open.
+The routing entrypoint's settings regressions in `we:scripts/__tests__/remote-route.test.mjs` cover each standard/platform/tool/environment layer, exact preference key and settings path, invalid bounds and booleans, and effective-value provenance. These tests prevent a wiring change from silently bypassing an operator override. Validation results are recorded with the repair evidence; this provenance story remains open.
 
 ## Acceptance
 
