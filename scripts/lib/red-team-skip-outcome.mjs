@@ -144,7 +144,8 @@ export function settleRedTeamSkip(input = {}) {
         if (redTeamForHead(thread, pr, head)) return { outcome: 'already' };
         io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\n${classified.notOwed
           ? 'Red team not required on this head: red team reported not-owed on an accepted head (policy clear)'
-          : 'Red team not required on this head: card-only diff (policy redTeam.skipCardOnly)'}` });
+          : 'Red team not required on this head: card-only diff (policy redTeam.skipCardOnly)'}${
+          typeof input.reason === 'string' && input.reason.trim() ? ` — ${boundReason(input.reason)}` : ''}` });
         return { outcome: 'policy-clear' };
       } catch (error) {
         reason = `policy-clear comment failed: ${safeErrorText(error)}`;
