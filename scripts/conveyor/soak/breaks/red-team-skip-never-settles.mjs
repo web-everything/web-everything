@@ -132,6 +132,14 @@ export default {
         }
       }
       const codePayload = payload('scripts/soak-code.mjs');
+      for (const [index, redTeam] of [
+        { status: 'not-owed' },
+        { status: 'not-owed', policy: 'card-only' },
+        { status: 'not-owed', reason: 'review verdict is needs-human, not accept' },
+      ].entries()) {
+        replay({ name: '#5890 accepted code head with contradictory not-owed',
+          pr: 9310 + index, redTeam, loopPayload: codePayload });
+      }
       const codeResult = await runRedTeam({ repo, pr: 9300, loopPayload: codePayload, env }, producerIo);
       check(providerChecks > 0 && codeResult.status === 'skipped' && codeResult.policy !== 'card-only',
         'code PR: skipCardOnly=true must still check providers and never produce policy');

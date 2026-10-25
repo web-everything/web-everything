@@ -26,6 +26,8 @@ const nonPolicyCases = [
   ['missing input', { status: 'skipped', reason: 'missing input' }],
   ['disabled', { status: 'disabled', policy: 'card-only', reason: 'disabled' }],
   ['error', { status: 'error', policy: 'card-only', reason: 'provider error' }],
+  ['not-owed', { status: 'not-owed' }],
+  ['not-owed with policy', { status: 'not-owed', policy: 'card-only' }],
   ['unknown shape', { unexpected: true }],
   ['null', null],
   ['undefined', undefined],
@@ -216,17 +218,21 @@ describe('settleRedTeamSkip', () => {
 
 
 describe('PR 5890 not-owed settlement', () => {
-  it('not-owed posts a head-bound policy marker without claiming card-only and dedupes', () => {
+  it.each([
+    { status: 'not-owed' },
+    { status: 'not-owed', policy: 'card-only' },
+    { status: 'not-owed', reason: 'review verdict is needs-human, not accept' },
+  ])('contradictory not-owed never clears and notifies once: %j', redTeam => {
     const f = fixture();
-    expect(f.settle({ status: 'not-owed' }).outcome).toBe('policy-clear');
-    const body = f.io.postComment.mock.calls[0][0].body;
-    expect(body).toContain(redTeamMarker(pr, head));
-    expect(body).toMatch(/not required.*policy/i);
-    expect(body).not.toContain('card-only');
-    expect(planRedTeamStatusLabels({ pr, head, comments: f.comments, evidence: {} }).add).toContain('red-team:clear');
-    expect(f.settle({ status: 'not-owed' }).outcome).toBe('already');
-    expect(f.io.postComment).toHaveBeenCalledTimes(1);
-    expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+    expect(f.settle(redTeam).outcome).toBe('non-policy');
+    expect(f.settle(redTeam).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(redTeamForHead(f.comments, pr, head)).toBeNull();
+    expect(planRedTeamStatusLabels({ pr, head, comments: f.comments, evidence: {} }).add).not.toContain('red-team:clear');
+    expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+    expect(f.io.publishNeedsYou.mock.calls[0][0]).toMatchObject({
+      repo, pr, head, reason: 'red team skipped (red team reported not-owed on an accepted head); not cleared',
+    });
   });
   it.each([
     { deferredByGuard: true }, { deferredByCap: true },

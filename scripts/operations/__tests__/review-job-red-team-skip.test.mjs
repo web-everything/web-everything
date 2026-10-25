@@ -329,11 +329,15 @@ describe('review-job red-team skip settlement', () => {
     expect(f.io.log).toHaveBeenCalledWith(expect.stringContaining('settlement unavailable'));
   });
 
-  it.each([false, true])('not-owed on an accepted head publishes a policy clear (redTeamOnly=%s)', redTeamOnly => {
+  it.each([false, true])('not-owed on an accepted head publishes needs-you (redTeamOnly=%s)', redTeamOnly => {
     const root = mkdtempSync(join(tmpdir(), 'review-not-owed-'));
     const postComment = vi.fn(), publishNeedsYou = vi.fn();
     try {
       const f = fixture({ status: 'not-owed' });
+      Object.assign(f.loopPayload.findings.read, {
+        title: 'Update code', netChangedFiles: ['scripts/example.mjs'],
+        diffText: 'diff --git a/scripts/example.mjs b/scripts/example.mjs\n+update\n',
+      });
       f.io.settleRedTeamSkip.mockImplementation(input => {
         f.events.push('settle');
         return settleRedTeamSkip({ ...input, comments: [], io: {
@@ -346,11 +350,12 @@ describe('review-job red-team skip settlement', () => {
       expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({
         redTeam: { status: 'not-owed' }, repo, pr, head, readHead: head,
       }));
-      expect(publishNeedsYou).not.toHaveBeenCalled();
-      expect(postComment).toHaveBeenCalledOnce();
-      expect(postComment.mock.calls[0][0].body).toMatch(/not required.*policy/i);
-      expect(postComment.mock.calls[0][0].body).not.toContain('card-only');
-      expect(out.redTeam.outcome).toBe('policy-clear');
+      expect(publishNeedsYou).toHaveBeenCalledOnce();
+      expect(publishNeedsYou.mock.calls[0][0]).toMatchObject({
+        repo, pr, head, reason: 'red team skipped (red team reported not-owed on an accepted head); not cleared',
+      });
+      expect(postComment).not.toHaveBeenCalled();
+      expect(out.redTeam.outcome).toBe('non-policy');
       expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
