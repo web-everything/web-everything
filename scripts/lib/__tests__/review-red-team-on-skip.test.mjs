@@ -198,6 +198,19 @@ describe('planRedTeamOnSkip', () => {
     expect(decide({ readStatus: () => ({ status: 'finished', result }) }))
       .toMatchObject({ action: 'dispatch', mode: 'fresh' });
   });
+  it.each([undefined, 'finished', 'running'])('f: a null completion without queued provenance skips (stored status %s)', storedStatus => {
+    const status = { status: 'finished', result: null };
+    expect(decide({ readStatus: () => status,
+      readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false,
+        ...(storedStatus ? { status: { ...status, status: storedStatus } } : {}) }) }))
+      .toMatchObject({ action: 'skip', why: 'prior result unknown (status finished); not re-run' });
+  });
+  it('f: a normalized null completion with original queued evidence dispatches fresh', () => {
+    expect(decide({ readStatus: () => ({ status: 'finished', result: null }),
+      readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false,
+        status: { status: 'queued', result: null } }) }))
+      .toMatchObject({ action: 'dispatch', mode: 'fresh' });
+  });
   it('f: a real ran payload without a scorecard never launches another model call', () => {
     expect(decide({ readStatus: () => ({ status: 'finished', result: { status: 'ran' } }) }).action).toBe('skip');
   });

@@ -28,7 +28,7 @@ describe('collectHeavyQueue — the real admissionStatus() export, everything el
 
     const read = collectHeavyQueue({
       readBaseline: null, // card xkyw1x4 — no host queue read in a unit test
-      repo: '/whatever', env: {}, now: () => T0 + 120_000,
+      repo: '/whatever', env: { WE_UNDER_TEST: '1' }, now: () => T0 + 120_000,
       readAdmission: ({ cap }) => ({
         cap, heldCount: 1, freeCount: cap - 1, staleWaiting: 0,
         held: [{ owner: '/lanes/lane-21#111', pid: 111, heartbeatAt: new Date(T0).toISOString(), meta: null }],
@@ -56,7 +56,7 @@ describe('collectHeavyQueue — the real admissionStatus() export, everything el
   it('a gone pid / unreadable command degrades to null rather than throwing', () => {
     const read = collectHeavyQueue({
       readBaseline: null, // card xkyw1x4 — no host queue read in a unit test
-      repo: '/whatever', env: {}, now: () => Date.now(),
+      repo: '/whatever', env: { WE_UNDER_TEST: '1' }, now: () => Date.now(),
       readAdmission: () => ({
         cap: 1, heldCount: 1, freeCount: 0, staleWaiting: 0,
         held: [{ owner: '/lanes/lane-9#999', pid: 999, heartbeatAt: new Date().toISOString() }],
@@ -73,7 +73,7 @@ describe('collectHeavyQueue — the real admissionStatus() export, everything el
     const T0 = Date.parse('2026-09-25T12:00:00.000Z');
     const read = collectHeavyQueue({
       readBaseline: null, // card xkyw1x4 — no host queue read in a unit test
-      repo: '/whatever', env: {}, now: () => T0,
+      repo: '/whatever', env: { WE_UNDER_TEST: '1' }, now: () => T0,
       readAdmission: () => ({
         cap: 1, heldCount: 1, freeCount: 0, staleWaiting: 0,
         held: [{ owner: '/lanes/lane-9#1', pid: 1, heartbeatAt: new Date(T0 - 7 * 60_000).toISOString() }],
@@ -104,7 +104,7 @@ describe('collectHeavyQueue — against a REAL (temp) admission lock root, real 
 
       const read = collectHeavyQueue({
       readBaseline: null, // card xkyw1x4 — no host queue read in a unit test
-        repo: '/anything', env: { WE_HEAVY_ADMISSION_CAP: '2' }, now: () => T0 + 120_000,
+        repo: '/anything', env: { WE_UNDER_TEST: '1', WE_HEAVY_ADMISSION_CAP: '2' }, now: () => T0 + 120_000,
         // The lock-root resolution seam isn't exposed on `collectHeavyQueue` directly, so bind the REAL
         // `admissionStatus` export to this temp root via closure — proving the real function's shape flows
         // through untouched (the injected-fakes test above already proves the row-building math independently).

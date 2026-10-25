@@ -4,6 +4,7 @@ import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTe
 import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 import { readRun, writeRun } from './run-store.mjs';
@@ -284,8 +285,8 @@ export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, r
   ];
 }
 
-/** A crashed resume keeps its clean prior result in the queued record. Only a confirmed dead
- * writer can expose that result as finished again; live/unknown liveness still blocks recovery.
+/** A crashed resume keeps its clean prior result; a fresh admission has no run to resume.
+ * Only a confirmed dead writer can expose either as finished; live/unknown liveness blocks recovery.
  * Daemon planning uses this reader, followed by its existing row guards.
  */
 export function readRedTeamRecoveryStatus(input, {
@@ -294,9 +295,10 @@ export function readRedTeamRecoveryStatus(input, {
   const status = readStatus(input);
   const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
   if (status?.status !== 'queued' || !Number.isInteger(status.pid) || status.pid <= 0
-    || !['ran', 'resumed'].includes(priorResult) || priorComment === 'posted') return status;
+    || priorComment === 'posted') return status;
   const evidence = readEvidence(input);
-  return evidence?.inFlight === false && !evidence.queued ? { ...status, status: 'finished' } : status;
+  if (evidence?.inFlight !== false || evidence.queued) return status;
+  return { ...status, status: 'finished', result: ['ran', 'resumed'].includes(priorResult) ? status.result : null };
 }
 
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -353,8 +355,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // apply today's policy; its independent comment and scorecard guards remain active.
           // readRedTeamStatus binds status.head to this job's head; the predicate
           // separately requires the stored read's netBasis.rev to equal status.head.
+          // A null result is eligible only when normalized from the original queued
+          // writer above. An ordinary finished/null prior must reach the guard intact.
           if (input.redTeamMode === 'fresh' && (redTeamSkipNeedsSettlement(admissionPrior)
-            || redTeamStatusWithoutRun(admissionPrior))) admissionPrior = null;
+            || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior }))) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
           input = { ...input, result: priorResult };
         }
@@ -1155,8 +1159,8 @@ export function dispatchReviewJob({
 
   const policy = resolveTimingPolicy({ env }).review;
   const ci = redTeamOnly ? { allowed: true } : ciGate({ repo: planned.repo, pr: planned.pr, policy });
-  // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
-  const waived = policy.startAfter === 'ci-green' && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
+  // Card 273, #5157: a waiver is pinned to readable CI on this exact head, including required-check fallback.
+  const waived = reviewUsesRequiredChecks(policy, planned.repo) && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));

@@ -27,6 +27,7 @@
  * `codex-prepare-pr-redispatched-as-unstamped.mjs` uses the same automatic registration.
  * `lease-reaper-stale-terminal-row.mjs` uses the same automatic registration.
  * `red-team-finished-result-never-published.mjs` uses the same automatic registration.
+ * `review-hold-red-draft-deadlock.mjs` uses the same automatic registration.
  *
  * This file itself stays a thin, EAGER entry point (a top-level `await` builds `BREAKS` once, at import time) —
  * the discovery/validation logic lives in `../registry-discovery.mjs` (generic, no eager directory scan) and

@@ -55,6 +55,9 @@ export function createDraftPromoteProvider({
   repo,
   exec = (args) => runGhSync(args, {
     cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-ready' },
+    // Observer lacks pull_requests write; reviewer lacks contents write, so neither can mark ready.
+    // Worker has both; role is explicit, never inferred from the caller.
+    env: { ...process.env, WE_GITHUB_APP_ROLE: 'worker' },
   }).trim(),
 } = {}) {
   return {
@@ -62,7 +65,21 @@ export function createDraftPromoteProvider({
     /** Un-draft `pr`. Returns the (usually empty) trimmed stdout, same convention as every other read/write
      *  method on `forge-land-provider.mjs`'s port. */
     ready(pr) {
-      return exec(buildReadyArgs(pr, repo));
+      try {
+        return exec(buildReadyArgs(pr, repo));
+      } catch (error) {
+        const collapse = (output) => String(output ?? '').replace(/\s+/g, ' ').trim();
+        const output = collapse(error?.stderr) || collapse(error?.stdout);
+        if (!output) throw error;
+
+        // Redact before truncating so a token crossing the bound cannot leak a prefix.
+        const redacted = output.replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, '<redacted>');
+        const detail = redacted.length > 400 ? `${redacted.slice(0, 400)}…` : redacted;
+        const command = String(error.message).split(/\r?\n/, 1)[0];
+        const message = `${command}: ${detail}`;
+        // Keep the subprocess fields and original error available for deeper diagnostics.
+        throw Object.assign(new Error(message, { cause: error }), error, { message, cause: error });
+      }
     },
   };
 }

@@ -637,6 +637,29 @@ describe('red-team-only review job', () => {
       expect(io.runRedTeamGate).toHaveBeenCalledOnce();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it('fresh recovery preserves unknown finished-null history through production admission and launches no call', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-null-history-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const production = createReviewJobIo({ env });
+    let observed;
+    const io = fakeIo({ redTeamStatus: production.redTeamStatus,
+      runRedTeam: input => {
+        expect(input.redTeamAdmission.prior).toMatchObject({ status: 'finished', result: null });
+        observed = runSharedRecovery(input, { status: read() });
+        return observed.result;
+      },
+    });
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'finished', result: null }, { env });
+      expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io).redTeam)
+        .toMatchObject({ status: 'not-owed', deferredByGuard: true,
+          reason: expect.stringContaining('prior red-team status; not re-run') });
+      expect(observed.calls).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0 });
+      expect(observed.comments).toEqual([]);
+      expect(read()).toMatchObject({ status: 'finished', result: null });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it.each([
     ['finished', 'ran'], ['finished', { status: 'resumed', comment: 'error' }], ['error', 'error'],
   ])('restores prior %s/%j evidence after a shared guard refusal and runs the gate once', (status, result) => {

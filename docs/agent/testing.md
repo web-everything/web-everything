@@ -283,7 +283,29 @@ Regression mapping (one representative assertion per guarantee; names are in the
 - Failed attempts count toward the bound and rotate fairly: **failed valid publications count toward 25 attempts and rotate oldest-first across settlements (mtime=%s)**.
 
 Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a confirmed-dead queued
-`ran`/`resumed` prior into the shared guard before writing its own queued status. A guard
+`ran`/`resumed` prior into the shared guard before writing its own queued status. A confirmed-dead
+queued writer without a resumable prior becomes a finished null-result placeholder, so the planner
+can dispatch fresh only when seat evidence establishes that no pass ran and the evidence reader
+retains the original queued status. An ordinary finished null result has unknown run provenance
+and never authorizes fresh dispatch. The shared placeholder predicate requires explicit original
+queued provenance for null results; admission supplies its pre-write record only after recovery
+normalization. The execution guard supplies no such provenance, so direct fresh calls and queued
+handoffs carrying an ordinary finished/null prior both refuse before provider selection.
+Regression prevention in `review-job-red-team-skip.test.mjs`:
+**fresh guard refuses a finished null prior without queued provenance (admitted=%s)** and
+**fresh admission preserves unknown null completion but recovers a dead queued writer (prior=%s)**.
+The back-port from `8173660fcf` also pins the guard in `review-red-team-resume-only.test.mjs`:
+**refuses a finished null result without queued provenance and with no seat or comment (admitted=%s)**.
+Its production admission regression in `review-job-red-team-only.test.mjs` is
+**fresh recovery preserves unknown finished-null history through production admission and launches no call**;
+it verifies that refusal restores the original finished/null status and publishes no comment.
+These exercise the shared execution guard and production admission, alongside the planner's
+**f: a null completion without queued provenance skips (stored status %s)** in
+`review-red-team-on-skip.test.mjs`. Live or unknown liveness
+and invalid writer PIDs keep the queued record blocked. Regressions in `review-job-red-team-skip.test.mjs`:
+**accepted code head dispatches fresh after queued fresh recovery crashes before running with no seat or result comment**,
+**queued fresh recovery still skips with %s**, and
+**dead queued fresh recovery cannot dispatch over an existing seat row**. A guard
 refusal that launches no call rolls back admission (removes queued status when no prior exists, or restores the
 prior status/result); only a trusted result already on the head is terminal. Regression:
 **a transient comments-unreadable guard refusal leaves status absent and fresh recovery eligible**
