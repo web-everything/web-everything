@@ -1,6 +1,7 @@
 /** PR #5919: a first up-to-date early push must not discard an open self-review's waiter. */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 import { runAwaitVerifyPass, AWAIT_VERIFY_LIMITS } from '../../await-verify-pass.mjs';
 import { selfReviewHold } from '../../await-verify.mjs';
 import { selfReviewReleaseRefusal } from '../../fix-procedure.mjs';
@@ -21,7 +22,7 @@ export default {
   async run({ log } = {}) {
     const violations = [];
     for (const state of ['pending', 'must-fix']) {
-      const record = { v: 1, sessionId: 'fix-5919-session', who: 'fix-5919', repo: 'web-everything/web-everything',
+      const record = { v: 1, sessionId: 'fix-5919-session', who: 'fix-5919', repo: CONSTELLATION_REPOS.we.slug,
         pr: 5919, kind: 'fix', sha: SHA, lane: '/lanes/lane-2', ref: 'lane/port-1023a-b', attempt: 1,
         requestedAt: new Date(NOW).toISOString() };
       let review = { ...record, state, startedAt: record.requestedAt, returnedAt: record.requestedAt };
