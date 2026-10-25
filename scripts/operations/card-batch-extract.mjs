@@ -221,7 +221,8 @@ export async function extractCard(input, opts = {}) {
       };
       const messageOf = member => git(['show', '-s', '--format=%B', member.commitSha]);
       const dateOf = member => git(['show', '-s', '--format=%cI', member.commitSha]).trim();
-      const standaloneRef = `lane/card-extract-${attribution.member.cardId}-${attribution.member.commitSha.slice(0, 7)}`;
+      // Raised-by identities contain colons, which Git refs cannot contain.
+      const standaloneRef = `lane/card-extract-${attribution.member.cardId.replaceAll(':', '-')}-${attribution.member.commitSha.slice(0, 7)}`;
       const standaloneSha = build(baseSha, attribution.member, messageOf(attribution.member), dateOf(attribution.member));
       const generation = (old.generation ?? 0) + 1;
       const remainderRef = `${old.batchRef.replace(/-r\d+$/, '')}-r${generation}`;
