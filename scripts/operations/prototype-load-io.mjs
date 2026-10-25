@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { cloneKey } from '../lib/daemon-overlays.mjs';
-import { buildReverseImportGraph, selectRelatedTests, testDepths, isVitestTestFile } from '../lib/related-test-selection.mjs';
+import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -44,7 +44,7 @@ function combinedTestEnv(env) {
 }
 
 /** Real combined-tree proof, rebound by the loader to its resolved settings and injected IO. */
-async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, { exec, fs, env, settings, queuedExec = exec === execFileSync ? spawnToCompletion : exec }) {
+async function defaultCombinedTest({ clone, candidateSha, refs }, { exec, fs, env, settings, queuedExec = exec === execFileSync ? spawnToCompletion : exec }) {
   const limits = settings.combinedTest;
   for (const key of Object.keys(COMBINED_TEST_DEFAULTS)) {
     if (!Number.isSafeInteger(limits?.[key]) || limits[key] <= 0) throw new Error(`invalid combinedTest.${key}; configure a positive bounded value and retry`);
@@ -84,23 +84,21 @@ async function defaultCombinedTest({ clone, candidateSha, changedFiles, refs }, 
     git('worktree', 'add', '--detach', worktree, commit);
     if (fs.existsSync(join(repo, 'node_modules'))) fs.symlinkSync(join(repo, 'node_modules'), join(worktree, 'node_modules'), 'dir');
     const files = run('git', ['ls-files', '-z'], worktree).split('\0').filter(Boolean);
-    // The shared graph skips unreadable sources; refuse incomplete reads here instead.
-    const readErrors = [];
-    const reverse = buildReverseImportGraph({ files, readFile: (file) => {
-      try { return fs.readFileSync(join(worktree, file), 'utf8'); }
-      catch (e) { readErrors.push(file); throw e; }
-    } });
-    if (readErrors.length) throw new Error('combined-tree graph incomplete; inspect unreadable tracked sources and retry');
     // This module loads its own settings: keep it out of injected-only loader construction.
     const { MAX_RELATED_TARGETS } = await import('../lib/verify-lane-gate.mjs');
-    const selection = selectRelatedTests({ changedFiles, reverse, maxTests: MAX_RELATED_TARGETS, maxDepth: 2 });
-    // A local gate's bounded subset is insufficient to waive an admission blocker.
-    if (selection.status === 'selection-truncated') return outcome = {
+    // Imports cannot prove which tests depend on filesystem reads, computed paths or
+    // subprocesses. Waiving an admission blocker requires the whole tracked test inventory.
+    const tests = [...new Set(files.filter(isVitestTestFile))].sort();
+    if (tests.length > MAX_RELATED_TARGETS) return outcome = {
       ok: false, reason: 'related-tests-truncated', testCount: 0,
-      result: `Incomplete evidence: selection omits ${selection.droppedCount} of ${selection.fullTestCount} related tests. Narrow the candidate or rebase and retest the overlapping refs before retrying.`,
+      result: `Incomplete evidence: the complete tracked test inventory has ${tests.length} files, above the ${MAX_RELATED_TARGETS}-file bound. Rebase and retest the overlapping refs or include their tips in a tested replacement before retrying.`,
     };
-    const tests = [...testDepths(changedFiles, reverse).keys()].filter(isVitestTestFile).sort();
     if (!tests.length) return outcome = { ok: false, reason: 'no-related-tests', testCount: 0 };
+    // Retain fail-closed handling for unreadable tracked sources.
+    for (const file of files.filter(isGraphSourceFile)) {
+      try { fs.readFileSync(join(worktree, file), 'utf8'); }
+      catch { throw new Error('combined-tree sources incomplete; inspect unreadable tracked sources and retry'); }
+    }
     const reportPath = join(worktree, '.prototype-vitest-results.json');
     // Admission is shell-backed: terminating its direct wrapper may leave descendants alive.
     // Keep the admission-wait ceiling and bound the direct wrapper separately.

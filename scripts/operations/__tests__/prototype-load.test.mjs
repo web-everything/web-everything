@@ -4,9 +4,12 @@
  * replacement, and adoption refusal with injected doubles, plus real filesystem refusal persistence.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
+import { runInNewContext } from 'node:vm';
 import { withRealRepo, withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
@@ -174,16 +177,18 @@ describe('default combined-tree test proof', () => {
       { name: 'one.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }, { status: 'skipped' }, { status: 'todo' }] },
       { name: 'two.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }, { status: 'passed' }] },
     ] };
-  async function runReport(value, { missing = false, failure, cleanupRemains = false, env = {}, sourceFiles, mergeConflict = false, unreadable = false } = {}) {
+  async function runReport(value, { missing = false, failure, cleanupRemains = false, env = {}, sourceFiles, changedFiles, runTests, mergeConflict = false, unreadable = false } = {}) {
     const worktree = '/tmp/prototype-combined-proof';
     const sources = new Map(sourceFiles || [['one.test.mjs', ''], ['two.test.mjs', '']]);
     let reportPath;
+    let selectedTests = [];
     const fs = {
       mkdtempSync: () => worktree, existsSync: vi.fn((path) => path === worktree && cleanupRemains), rmSync: vi.fn(),
       readFileSync: vi.fn((path) => {
         if (path === reportPath) {
           if (missing) throw new Error('missing report');
-          return typeof value === 'string' ? value : JSON.stringify(value);
+          const reported = typeof value === 'function' ? value(selectedTests) : value;
+          return typeof reported === 'string' ? reported : JSON.stringify(reported);
         }
         if (unreadable) throw new Error('permission denied');
         const source = sources.get(path.slice(worktree.length + 1));
@@ -193,8 +198,10 @@ describe('default combined-tree test proof', () => {
     };
     const exec = vi.fn((command, args) => {
       if (command === 'node') {
+        selectedTests = args.filter(arg => sources.has(arg));
         reportPath = args.find(arg => arg.startsWith('--outputFile='))?.slice('--outputFile='.length);
         if (failure) throw failure;
+        runTests?.(selectedTests);
         return ''; // Exit zero alone proves nothing.
       }
       if (args[0] === '-C' || args[0] === 'rev-parse') return SHA;
@@ -208,7 +215,7 @@ describe('default combined-tree test proof', () => {
       throw new Error('unexpected command');
     });
     const result = await defaultDeps().combinedTest({ clone: '/fixture/clone', candidateSha: SHA,
-      changedFiles: [...sources.keys()], refs: ['lane/old'] }, { exec, fs, env, settings: { combinedTest: limits } });
+      changedFiles: changedFiles ?? [...sources.keys()], refs: ['lane/old'] }, { exec, fs, env, settings: { combinedTest: limits } });
     return { result, exec, fs, worktree, reportPath };
   }
   it.each(Object.keys(limits).flatMap(key => [0, -1, 1.5].map(value => [key, value])))(
@@ -228,8 +235,75 @@ describe('default combined-tree test proof', () => {
     expect(result).toMatchObject({ ok: false, reason: 'no-related-tests', testCount: 0 });
     expect(exec.mock.calls.some(([command]) => command === 'node')).toBe(false);
   });
-  it('throws graph incomplete for unreadable tracked sources before spawning tests', async () => {
-    await expect(runReport(report, { unreadable: true })).rejects.toThrow('graph incomplete');
+  it('throws sources incomplete for unreadable tracked sources before spawning tests', async () => {
+    await expect(runReport(report, { unreadable: true })).rejects.toThrow('sources incomplete');
+  });
+  it('refuses combined evidence when an unimported filesystem-dependent test fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'prototype-fs-dependency-'));
+    const combination = `const { readFileSync } = require('node:fs');
+      const enabled = name => JSON.parse(readFileSync(require('node:path').join(root, name), 'utf8')).enabled;
+      if (enabled('a.json') && enabled('b.json')) throw new Error('both enabled');`;
+    const runCombination = () => runInNewContext(combination, { root, require: createRequire(import.meta.url) }, { timeout: 1000 });
+    const writeConfig = (a, b) => {
+      writeFileSync(join(root, 'a.json'), JSON.stringify({ enabled: a }));
+      writeFileSync(join(root, 'b.json'), JSON.stringify({ enabled: b }));
+    };
+    try {
+      for (const [a, b] of [[true, false], [false, true]]) {
+        writeConfig(a, b);
+        expect(runCombination).not.toThrow(); // Each branch alone passes.
+      }
+      writeConfig(true, true);
+      expect(runCombination).toThrow('both enabled');
+      const { result, exec } = await runReport({ success: true, numFailedTests: 0, numFailedTestSuites: 0,
+        numPassedTests: 1, numPendingTests: 0, numTodoTests: 0, numTotalTests: 1,
+        testResults: [{ name: 'shared.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }] }] }, {
+        sourceFiles: [['shared.mjs', 'export const shared = true;'], ['shared.test.mjs', "import './shared.mjs';"],
+          ['a.json', '{"enabled":true}'], ['b.json', '{"enabled":true}'], ['combination.test.mjs', combination]],
+        changedFiles: ['shared.mjs', 'a.json', 'b.json'],
+        runTests: tests => {
+          if (tests.includes('combination.test.mjs')) {
+            try { runCombination(); }
+            catch (error) { throw Object.assign(error, { status: 1, stderr: error.message }); }
+          }
+        },
+      });
+      expect(result).toMatchObject({ ok: false, reason: 'tests-failed' });
+      expect(exec.mock.calls.find(([command]) => command === 'node')[1]).toContain('combination.test.mjs');
+      const loader = fixture({ list: ['lane/old'], conflicts: ['lane/old'], combinedTest: result });
+      expect(await loader.run()).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
+      expect(mutations(loader, 'add')).toEqual([]);
+      expect(mutations(loader, 'remove')).toEqual([]);
+      expect(loader.records[0]).toMatchObject({ ok: false, stopReason: 'stale-registration' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  const passingReport = tests => ({ success: true, numFailedTests: 0, numFailedTestSuites: 0,
+    numPassedTests: tests.length, numPendingTests: 0, numTodoTests: 0, numTotalTests: tests.length,
+    testResults: tests.map(name => ({ name, status: 'passed', assertionResults: [{ status: 'passed' }] })) });
+  it('requires all tracked test suffixes even with no static import edges or changed tests', async () => {
+    const tests = ['mjs', 'cjs', 'js', 'jsx', 'ts', 'tsx', 'mts', 'cts'].map(ext => `indirect.test.${ext}`).sort();
+    const { result, exec } = await runReport(passingReport, {
+      sourceFiles: [['source.mjs', ''], ...tests.map(file => [file, ''])], changedFiles: ['source.mjs'],
+    });
+    expect(result).toMatchObject({ ok: true, testCount: tests.length });
+    expect(exec.mock.calls.find(([command]) => command === 'node')[1].slice(-tests.length)).toEqual(tests);
+  });
+  it('refuses a passing report that omits an unimported tracked test', async () => {
+    const { result } = await runReport(passingReport(['one.test.mjs']), { changedFiles: ['one.test.mjs'] });
+    expect(result).toMatchObject({ ok: false, reason: 'tests-unproven', testCount: 2 });
+  });
+  it.each([0, 1])('bounds the complete inventory even when no imports reveal its tests (over limit: %s)', async extra => {
+    const { MAX_RELATED_TARGETS } = await import('../../lib/verify-lane-gate.mjs');
+    const tests = Array.from({ length: MAX_RELATED_TARGETS + extra }, (_, i) => `indirect-${i}.test.mjs`);
+    const { result, exec, fs, worktree } = await runReport(passingReport, {
+      sourceFiles: [['source.mjs', ''], ...tests.map(file => [file, ''])], changedFiles: ['source.mjs'],
+    });
+    if (extra) {
+      expect(result).toMatchObject({ ok: false, reason: 'related-tests-truncated', testCount: 0,
+        result: expect.stringContaining('Rebase and retest the overlapping refs') });
+      expect(exec.mock.calls.some(([command]) => command === 'node')).toBe(false);
+    } else expect(result).toMatchObject({ ok: true, testCount: MAX_RELATED_TARGETS });
+    expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
   });
   it('drops credentials only from the tests child and preserves ordinary and NODE_* variables', async () => {
     const safe = { PATH: '/bin', HOME: '/home/test', TMPDIR: '/tmp', USER: 'tester', NODE_OPTIONS: '--no-warnings', NODE_ENV: 'test' };
@@ -574,7 +648,7 @@ describe('prototype-load', () => {
     const result = await f.run();
     expect(result).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'stale-registration',
       blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: related-tests-truncated' },
-      combinedTests: { testCount: 0, result: expect.stringContaining('Narrow the candidate or rebase and retest') }, staleTolerated: [] });
+      combinedTests: { testCount: 0, result: expect.stringContaining('Rebase and retest the overlapping refs') }, staleTolerated: [] });
     expect(queuedRun).not.toHaveBeenCalled();
     expect(commands).toContainEqual({ command: 'git', args: ['worktree', 'remove', '--force', worktree] });
     expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
