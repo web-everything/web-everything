@@ -21,7 +21,8 @@ const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { n
 
 describe('drain reads actual head-bound review scheduler inputs', () => {
   it('does not invent an accept when no review run exists', () => {
-    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false, scheduled: false, inFlight: false });
+    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false,
+      seatRecorded: false, completedRecorded: false, scheduled: false, inFlight: false });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();
@@ -156,6 +157,21 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     for (const mismatch of [{ rev: 'a'.repeat(40) }, { repo: 'other/repo' }, { pr: 5443 }, { dispatchKind: 'review-seat-speculative-discard' }]) {
       expect(readDrainRedTeamEvidence({ ...f, readScorecards: () => [{ ...row, ...mismatch }] }).recorded).toBe(false);
     }
+  });
+  it.each([
+    [{ status: 'ok', foldedVerdict: 'changes', confirmedMissCount: 1 }, true],
+    [{ status: 'error' }, false],
+    [{ status: 'ok', seatStatus: 'error' }, false],
+  ])('separates an existing seat from a completed execution: %j', (fields, completedRecorded) => {
+    const f = fixture();
+    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: f.head, ...fields };
+    expect(readDrainRedTeamEvidence({ ...f, readScorecards: () => [row] }))
+      .toMatchObject({ recorded: true, seatRecorded: true, completedRecorded });
+  });
+  it('a review-pr string ran cannot substitute for an actual completed seat', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), op: 'review-pr' }, status: 'finished', result: 'ran' }, f);
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ seatRecorded: false, completedRecorded: false });
   });
   it('a skipped provider pass is not evidence that a red team ran', () => {
     const f = fixture();

@@ -885,7 +885,7 @@ describe('red-team-only review job', () => {
         const retry = runRedTeamOnSkip({ repo,
           plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
           rawPrs: [{ number: pr, headRefOid: head, comments: [] }],
-          readEvidence: () => ({ loopPayload: payload(), recorded: true }), readStatus: status,
+          readEvidence: () => ({ loopPayload: payload(), recorded: true, completedRecorded: true }), readStatus: status,
           setting: { enabled: true, retryCooldownMin: 30 }, now: () => 1_801_000,
           lastDispatch: new Map([[`${repo}#${pr}@${head}`, 1_000]]), capacity: { lanes: 1 },
           dispatch: () => ({ jobPid: 42 }),
@@ -1246,5 +1246,34 @@ describe('red-team child resume enforcement', () => {
     expect(out.redTeam).toMatchObject({ status: 'skipped' });
     expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(['queued', 'finished']);
     for (const hook of ['runLoop', 'runExtraSeats', 'startSpeculativeRedTeam', 'report', 'restampVerdict']) expect(io[hook]).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('PR 5890 persisted review-pr recovery rows', () => {
+  it('fresh admission drops bare resumed provenance and reaches normal red-team dispatch', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'review-pr-bare-resumed-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const loopPayload = { ...payload(), op: 'review-pr' };
+    Object.assign(loopPayload.findings.read, { diffText: '+code', netChangedFiles: ['scripts/example.mjs'] });
+    const status = () => readRedTeamStatus({ repo, pr, head, env });
+    const production = createReviewJobIo({ env });
+    let observed;
+    const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }),
+      redTeamStatus: production.redTeamStatus,
+      runRedTeam: input => {
+        observed = runSharedRecovery(input, { status: status(), records: [] });
+        return observed.result;
+      },
+    });
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'resumed' }, { env });
+      const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io);
+      // The provider sentinel proves admission reached the normal dispatch path;
+      // no actual provider or paid call is available in this fixture.
+      expect(out.redTeam).toMatchObject({ status: 'error', reason: 'unexpected provider' });
+      expect(observed.calls).toEqual({ provider: 1, reserve: 0, model: 0, recheck: 0 });
+      expect(io.runRedTeamGate).toHaveBeenCalledOnce();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
