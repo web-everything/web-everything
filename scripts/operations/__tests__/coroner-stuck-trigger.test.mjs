@@ -272,3 +272,11 @@ describe('stuck trigger evidence and rendering regressions', () => {
     } finally { vi.useRealTimers(); }
   });
 });
+
+
+describe('audit: completeness is mandatory evidence', () => {
+  it.each([undefined,null])('keeps all triggers unknown with missing completeness (%s)', completeness => {
+    const input = {...raw(),completeness};
+    expect(evaluateStuckTriggers(input,{now}).map(t => t.status)).toEqual(Array(6).fill('unknown'));
+  });
+});

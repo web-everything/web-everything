@@ -5,6 +5,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildPostmortem, shouldPostmortem, publishPostmortem, resolvePostmortemSettings, collectPrTimeline, withCoronerLock } from '../coroner-pr-postmortem.mjs';
 import { runPostmortemPass as runPass, listMergedSince, listOpenPrs } from '../../conveyor/pass-daemons/pr-postmortem-pass.mjs';
+import * as passCli from '../../conveyor/pass-daemons/pr-postmortem-pass.mjs';
+import * as fileItemIo from '../file-item-io.mjs';
+import { SCAFFOLD_EFFECT } from '../scaffold.mjs';
 import { hostname } from 'node:os';
 import { reserve } from '../../readiness/file-locks.mjs';
 import { buildOperatorRulingComment } from '../../lib/jury-core.mjs';
@@ -1125,4 +1128,76 @@ describe('open discovery boundaries and publication restart regressions', () => 
         expect(retryBatch).toHaveBeenCalledTimes(1); expect(retryPlan).not.toHaveBeenCalled();
       } finally { fs.rmSync(dir,{recursive:true,force:true}); }
     });
+});
+
+
+describe('audit: open phase failure isolation and portable receipts', () => {
+  const scratch = () => fs.mkdtempSync(join(process.env.TMPDIR,'coroner-audit-'));
+  const timeline = pr => ({...fixture(pr),state:'open',openedAt:at(-4000),mergedAt:null,completeness:{core:'complete'}});
+  const identity = 'example/repo#7:open-age';
+  const receipt = {payload:{num:'xabcdef',rel:'backlog/xabcdef-improve.md',content:'card',identity},filed:false,batched:false};
+
+  it.each(['discovery','collection','filing','batching'])('signals %s incompleteness in one-shot and watch CLI modes', async failure => {
+    const dir = scratch(), previousExit = process.exitCode;
+    const refuse = () => { throw Error('refused'); };
+    const options = {repo:'example/repo',dir,now:at(700),settings,listMerged:() => [],
+      listOpen:failure === 'discovery' ? refuse : () => [{number:7}],
+      collectOpen:failure === 'collection' ? refuse : (_repo,pr) => timeline(pr),
+      planCard:() => receipt.payload,fileCard:failure === 'filing' ? refuse : vi.fn(),
+      batchCard:failure === 'batching' ? refuse : async () => ({batched:true})};
+    try {
+      const result = await runPass(options);
+      expect(result.open.incomplete).toBe(true);
+      for (const watch of [false,true]) {
+        process.exitCode = 0;
+        const abort = new AbortController(), log = vi.fn(), error = vi.fn();
+        await passCli.runPostmortemCli({watch},{runPass:async () => result,log,error,signal:abort.signal,
+          sleep:async () => abort.abort()});
+        expect(log).toHaveBeenCalledWith(JSON.stringify(result));
+        expect(error).toHaveBeenCalledWith(expect.stringMatching(/incomplete.*operator/));
+        expect(process.exitCode).toBe(watch ? 0 : 1);
+      }
+    } finally { process.exitCode = previousExit; fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+
+  it.each(['filing','batching'])('keeps a refused saved %s pending while discovering and publishing another PR', async failure => {
+    const dir = scratch(), statePath = join(dir,'open-stuck-example%2Frepo.json');
+    try {
+      fs.writeFileSync(statePath,JSON.stringify({cards:{[identity]:receipt}}));
+      const collectOpen = vi.fn((_repo,pr) => timeline(pr));
+      const fileCard = vi.fn(payload => {if (failure === 'filing' && payload.identity === identity) throw Error('still refused');});
+      const batchCard = vi.fn(async payload => ({batched:!(failure === 'batching' && payload.identity === identity)}));
+      const result = await runPass({repo:'example/repo',dir,now:at(700),settings,listMerged:() => [],
+        listOpen:() => [{number:8}],collectOpen,planCard:() => ({...receipt.payload,num:'xabcdee',rel:'backlog/xabcdee-other.md'}),fileCard,batchCard});
+      expect(result.open).toMatchObject({incomplete:true,fallback:expect.stringMatching(/operator/)});
+      expect(collectOpen).toHaveBeenCalledWith('example/repo',8);
+      const cards = JSON.parse(fs.readFileSync(statePath)).cards;
+      expect(cards[identity]).toMatchObject({filed:failure !== 'filing',batched:false});
+      expect(cards['example/repo#8:open-age']).toMatchObject({filed:true,batched:true});
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+
+  it.each([false,true])('never persists abs and derives the current checkout path on replay (legacy=%s)', async legacy => {
+    const dir = scratch(), statePath = join(dir,'open-stuck-example%2Frepo.json');
+    const stale = join(dir,'old-checkout','backlog/xabcdef-improve.md');
+    const sink = vi.fn(async () => {});
+    const sinks = vi.spyOn(fileItemIo,'createFileItemSinks').mockReturnValue({[SCAFFOLD_EFFECT]:sink});
+    try {
+      if (legacy) fs.writeFileSync(statePath,JSON.stringify({cards:{[identity]:{...receipt,payload:{...receipt.payload,abs:stale}}}}));
+      const options = {repo:'example/repo',dir,now:at(700),settings,listMerged:() => [],
+        listOpen:() => legacy ? [] : [{number:7}],collectOpen:(_repo,pr) => timeline(pr),
+        planCard:() => ({...receipt.payload,abs:stale}),batchCard:async () => ({batched:true})};
+      if (!legacy) {
+        const first = await runPass({...options,fileCard:() => {throw Error('interrupted');}});
+        expect(first.open.incomplete).toBe(true);
+        expect(JSON.parse(fs.readFileSync(statePath)).cards[identity].payload).not.toHaveProperty('abs');
+      }
+      const result = await runPass({...options,listOpen:() => []});
+      expect(result.open.incomplete).toBe(false);
+      expect(sink).toHaveBeenCalledWith({...receipt.payload,abs:join(fileItemIo.REPO_ROOT,receipt.payload.rel)});
+      const saved = fs.readFileSync(statePath,'utf8');
+      expect(saved).not.toContain(stale);
+      expect(JSON.parse(saved).cards[identity].payload).toEqual(receipt.payload);
+    } finally { sinks.mockRestore(); fs.rmSync(dir,{recursive:true,force:true}); }
+  });
 });
