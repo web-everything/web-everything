@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { isKnownMachineBody } from '../accept-carry-forward.mjs';
+import { buildClearanceComment } from '../drain-merge-strategy.mjs';
 import { buildLandingRetractionComment } from '../../operations/land-prevention-card.mjs';
 
 const body = buildLandingRetractionComment({
@@ -37,12 +38,14 @@ describe('approval prevention retraction carry exemption', () => {
   });
 });
 
-describe('drain enqueue clearance leading line', () => {
-  const marker = `<!-- we-drain-enqueue-clearance head=${'a'.repeat(40)} -->`;
-  it('requires a valid marker on its own leading line', () => {
-    expect(isKnownMachineBody(`${marker}\nDrain enqueue clearance`)).toBe(true);
-    expect(isKnownMachineBody(`prose\n${marker}`)).toBe(false);
-    expect(isKnownMachineBody(`${marker} inline prose`)).toBe(false);
-    expect(isKnownMachineBody(marker.replace('a'.repeat(40), 'not-a-sha'))).toBe(false);
+describe('drain enqueue clearance envelope', () => {
+  const head = 'a'.repeat(40);
+  const exact = buildClearanceComment(head);
+  it('accepts only the exact builder envelope', () => {
+    expect(isKnownMachineBody(exact)).toBe(true);
+    expect(isKnownMachineBody(`${exact}\nextra prose`)).toBe(false);
+    expect(isKnownMachineBody(`prose\n${exact}`)).toBe(false);
+    expect(isKnownMachineBody(`<!-- we-drain-enqueue-clearance head=${head} -->\nDrain enqueue clearance`)).toBe(false);
+    expect(isKnownMachineBody(exact.replace(head, 'not-a-sha'))).toBe(false);
   });
 });

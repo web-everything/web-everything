@@ -120,8 +120,6 @@ const KNOWN_MACHINE_SHAPE_RES = [
   // Posted on every final skip of an AI PR, so one always follows a clearance. NOT `drain-park-reason`: a park is a verdict
   // unless it is the mechanical shape above, and `isLaterVerdictBody` has already claimed it by the time this list runs.
   /^\s*<!--\s*drain-(?!park-)[a-z0-9-]+-reason\s*-->/,
-  // Importing CLEARANCE_MARKER from drain-merge-strategy would cycle back through numbering-carry.
-  /^<!-- we-drain-enqueue-clearance head=[0-9a-f]{7,40} -->(?:\r?\n|$)/,
   /^\s*(?:🔀 conveyor rebase-onto-main|⏱️ conveyor CI-hung-recovery|🚦 conveyor missing-run-recovery|⏳ conveyor —|🔎 stuck-PR inspection)/, // conveyor recovery / queue notes
 ];
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
@@ -146,6 +144,13 @@ function isApprovalPreventionNotice(text, comment) {
   // Both filer outcomes: an existing backlog card, or a detached landing job's tracking handle.
   const fixedText = /^\nFiled the prevention guard\(s\) owed by [A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9][0-9]*'s independent review, mechanically, on approval \(operator rule, 2026-09-27\) — (?:backlog\/[A-Za-z0-9._-]+\.md \(#(?:[1-9][0-9]*|\?)\)|queued for landing via a lane \(tracking (?:pid:[1-9][0-9]*|an untracked job)\))\./;
   return fixedText.exec(rest)?.[0] === rest;
+}
+
+/** Exact buildClearanceComment envelope (importing drain-merge-strategy would cycle back through numbering-carry). */
+function isDrainEnqueueClearance(text, comment) {
+  if (comment !== undefined && !isTrustedMarkerAuthor(comment)) return false;
+  const m = /^<!-- we-drain-enqueue-clearance head=([0-9a-f]{7,40}) -->\n\*\*Drain enqueue clearance\*\* — the drain judged head `([0-9a-f]{7,40})` ready \(every drain gate passed: couple whole, blockedBy landed\) and enqueued it on GitHub's merge queue \(xtpxusq\)\. The `merge-gate` check reads this for its couple-whole \/ blocked-by gates\.$/.exec(text);
+  return Boolean(m) && m[1].startsWith(m[2]);
 }
 
 /** Exact buildLandingRetractionComment envelope; an unknown shape still requires a fresh review. */
@@ -232,6 +237,7 @@ export function isKnownMachineBody(body, comment = undefined) {
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
   return isApprovalPreventionNotice(text, comment) || isApprovalPreventionRetraction(text, comment)
+    || isDrainEnqueueClearance(text, comment)
     || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
 }
 

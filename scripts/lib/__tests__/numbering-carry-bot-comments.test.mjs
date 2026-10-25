@@ -38,7 +38,7 @@ const gate = (outcome = 'card-queued') => buildGateComment({
 describe('numbering carry recognises trusted machine comments with author metadata', () => {
   it.each([
     ['landing retraction', retraction(), 'web-everything[bot]'],
-    ['drain enqueue clearance', buildClearanceComment(TO), 'plateau-merger'],
+    ['drain enqueue clearance', buildClearanceComment(TO), 'web-everything[bot]'],
     ['non-blocking red-team advisory', advisory(), 'web-everything[bot]'],
     ['card-queued red-team gate', gate(), 'web-everything[bot]'],
   ])('tolerates a trusted %s', (_kind, body, login) => {
@@ -83,8 +83,8 @@ function acceptedThread() {
 function machineNotes() {
   return [
     comment(retraction(), 'web-everything[bot]', 2),
-    comment('<!-- drain-skip-reason -->\nskipped: numbering carry awaiting recheck', 'plateau-merger', 3),
-    comment(buildClearanceComment(TO), 'plateau-merger', 4),
+    comment('<!-- drain-skip-reason -->\nskipped: numbering carry awaiting recheck', 'web-everything[bot]', 3),
+    comment(buildClearanceComment(TO), 'web-everything[bot]', 4),
   ];
 }
 const changes = () => comment('🔁 review — changes requested\nA genuine defect needs fixing.', 'chalbert', 5);
@@ -143,5 +143,19 @@ describe('#5759 numbering move after human clearance', () => {
     expect(result).toMatchObject({ action: 'defer', applyLabel: null });
     expect(result.reason).toContain('a later verdict or unknown comment stands');
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('enqueue-clearance recognition stays an exact, trusted-author envelope', () => {
+  const clearance = () => buildClearanceComment(TO);
+  it.each([
+    ['trailing prose after the envelope', `${clearance()}\nDo not merge; this approval is withdrawn.`],
+    ['marker line only plus a verdict', `<!-- we-drain-enqueue-clearance head=${TO} -->\nDo not merge; this approval is withdrawn.`],
+  ])('refuses %s even from a trusted author', (_k, body) => {
+    expect(isNumberingTolerableLaterBody(body, comment(body, 'web-everything[bot]'))).toBe(false);
+    expect(isNumberingTolerableLaterBody(body)).toBe(false);
+  });
+  it('refuses the exact envelope from an untrusted author', () => {
+    expect(isNumberingTolerableLaterBody(clearance(), comment(clearance(), 'mallory'))).toBe(false);
   });
 });
