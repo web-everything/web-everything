@@ -101,6 +101,26 @@ export default {
         violations.push({ invariant: 'cleanup-withdrawal', detail: `registered=[${kept.join(',')}], pending=${swaps.length}` });
       }
       log?.(`cleanup: registered=[${kept.join(',')}], pending=${swaps.length}`);
+      // An already absent original completes cleanup without entering the removal writer.
+      // Re-register at the next write boundary, whichever path cleanup chooses.
+      addOverlay(root, { ref: next, pr: 123, stackBases: [REF] }, { env });
+      operatorRemove(root, env, REF);
+      let removals = 0, completed = false;
+      const registerAgain = () => addOverlay(root, { ref: REF, pr: 999, reason: 'operator re-registration' }, { env });
+      finishPendingSwaps({
+        root, env,
+        run: args => success(args[0] === 'rev-parse' ? 'a'.repeat(40) : ''),
+        removeOverlay(r, ref, opts) { removals++; registerAgain(); return removeOverlay(r, ref, opts); },
+        appendOverlayEvent(_root, event) {
+          if (event.kind === 'auto-rebase-swapped') { registerAgain(); completed = true; }
+        },
+      });
+      const survived = readOverlays(root, { env }).some(o => o.ref === REF && o.pr === 999);
+      const remaining = fs.readdirSync(pending).filter(n => n.endsWith('.json')).length;
+      if (removals !== 0 || !completed || !survived || remaining !== 0) {
+        violations.push({ invariant: 'cleanup-absent-original', detail: `removals=${removals}, completed=${completed}, survived=${survived}, pending=${remaining}` });
+      }
+      log?.(`absent original: removals=${removals}, completed=${completed}, survived=${survived}, pending=${remaining}`);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
     return { violations };
   },

@@ -287,10 +287,13 @@ export function finishPendingSwaps({ root, env = process.env, run, removeOverlay
       if (containsReplacement.status !== 0 || containsReplacement.error) throw new Error('replacement origin tip no longer contains the pending SHA');
       const state = overlays.readOverlayState(root, { env });
       if (state.corrupt || !state.overlays.some(o => o?.ref === swap.new)) throw new Error('replacement registration unavailable');
+      const original = state.overlays.find(o => o?.ref === swap.old);
       // Rechecked under the list mutex against the registration recorded at swap time, never a fresh read: a
       // replacement withdrawn, or an original re-registered at any point since (this tick or an earlier one), keeps the
-      // original and this evidence. An original already gone is simply not removed.
-      removeOverlay(root, swap.old, { env, why: `auto-rebase adopted ${swap.new}`, requireRef: swap.new, expectedOverlay: swap.oldOverlay });
+      // original and this evidence. If already absent, finish without removal: a later registration is unrelated.
+      if (original) {
+        removeOverlay(root, swap.old, { env, why: `auto-rebase adopted ${swap.new}`, requireRef: swap.new, expectedOverlay: swap.oldOverlay });
+      }
       appendOverlayEvent(root, { kind: 'auto-rebase-swapped', ...swap }, { env });
       fs.unlinkSync(file);
     } catch (error) {

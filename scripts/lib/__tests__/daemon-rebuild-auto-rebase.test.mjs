@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { kickAutoRebase, resolveAutoRebaseSwitch, runAutoRebase, finishPendingSwaps } from '../daemon-rebuild/auto-rebase.mjs';
 import { addOverlay, removeOverlay, readOverlays, overlayFilePath, appendOverlayEvent, persistStackBases } from '../daemon-overlays.mjs';
+import * as overlays from '../daemon-overlays.mjs';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { writeRebuildState, readRebuildState, alertsFilePath } from '../daemon-rebuild/state.mjs';
@@ -842,22 +843,32 @@ describe('established overlay auto rebase', () => {
     expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
   });
 
-  it('never removes an original re-registered after cleanup read it as absent, on that tick or the next', async () => {
+  it('skips removal when the original is absent at recheck, preserving a subsequent re-registration', async () => {
     const f = fixture(); f.moveMain(); const replacement = await job(f);
     ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
     removeOverlay(f.root, ref, { env: f.env });
-    const remove = (root, r, opts) => { addOverlay(root, { ref, pr: 999, reason: 'operator re-registration' }, { env: f.env }); return removeOverlay(root, r, opts); };
-    expect(() => finishPendingSwaps({ root: f.root, env: f.env, run, removeOverlay: remove })).not.toThrow();
+    const readState = overlays.readOverlayState;
+    const recheck = vi.spyOn(overlays, 'readOverlayState').mockImplementationOnce((root, opts) => {
+      const snapshot = readState(root, opts);
+      expect(snapshot.overlays.some(o => o.ref === ref)).toBe(false);
+      addOverlay(root, { ref, pr: 999, reason: 'operator re-registration' }, { env: f.env });
+      return snapshot;
+    });
+    const remove = vi.fn(removeOverlay), event = vi.fn(appendOverlayEvent);
+    expect(() => finishPendingSwaps({ root: f.root, env: f.env, run, removeOverlay: remove, appendOverlayEvent: event })).not.toThrow();
+    expect(recheck).toHaveBeenCalledTimes(1);
+    expect(remove).not.toHaveBeenCalled();
     expect(readOverlays(f.root, { env: f.env })).toEqual(expect.arrayContaining([
       expect.objectContaining({ ref, pr: 999 }), expect.objectContaining({ ref: replacement.ref }),
     ]));
-    expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
-    expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: 'registration changed; refusing removal' } });
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+    expect(event).toHaveBeenCalledWith(f.root, expect.objectContaining({ kind: 'auto-rebase-swapped', old: ref }), { env: f.env });
+    expect(needsYouAlerts(f)).toEqual([]);
     expect(() => swaps(f)).not.toThrow();
     expect(readOverlays(f.root, { env: f.env })).toEqual(expect.arrayContaining([
       expect.objectContaining({ ref, pr: 999 }), expect.objectContaining({ ref: replacement.ref }),
     ]));
-    expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
   });
 
   it('never removes an identical-looking original the operator removed and re-added after the swap was recorded', async () => {
@@ -879,7 +890,8 @@ describe('established overlay auto rebase', () => {
     expect(() => swaps(f)).not.toThrow();
     expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([replacement.ref]);
     expect(fs.readdirSync(pendingDir(f))).toEqual([]);
-    expect(f.calls.slice(-2)).toEqual(['remove', 'auto-rebase-swapped']);
+    expect(f.calls).not.toContain('remove');
+    expect(f.calls.at(-1)).toBe('auto-rebase-swapped');
     expect(needsYouAlerts(f)).toEqual([]);
   });
 
