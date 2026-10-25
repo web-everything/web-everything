@@ -6,13 +6,14 @@
  */
 import { describe, expect, it } from 'vitest';
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { withNarrowClone } from './helpers/real-repo.mjs';
 import { acquireLease, admitCard } from '../card-batch-io.mjs';
 import { atomicRecord } from '../card-batch-io.mjs';
 import { HOLD_LABEL } from '../card-batch-seal-io.mjs';
 import { planSeal } from '../card-batch-seal.mjs';
+import { raisedByFile, raisedByMemberId, validateRaisedBy } from '../../lib/raised-by.mjs';
 import { attributeFindings, extractCard, findBatchState, isCardBatchRef, pushArgs } from '../card-batch-extract.mjs';
 
 const CARDS = [['5201', 'one'], ['5202', 'two'], ['5203', 'three']];
@@ -98,7 +99,150 @@ function doubles({ existing = {} } = {}) {
 
 const lsRemote = (ctx, ref) => ctx.git(['ls-remote', '--refs', 'origin', ref]).trim().split(/\s+/)[0];
 
+/** Validate the actual rebuilt tree rather than the filer's unchanged working copy. */
+function validateRaisedByTree(ctx, sha) {
+  const root = mkdtempSync(join(tmpdir(), 'extract-tree-'));
+  try {
+    const paths = ctx.git(['ls-tree', '-r', '--name-only', sha, '--', 'backlog']).trim().split('\n').filter(Boolean);
+    for (const path of paths) {
+      mkdirSync(dirname(join(root, path)), { recursive: true });
+      writeFileSync(join(root, path), ctx.git(['show', `${sha}:${path}`]));
+    }
+    return validateRaisedBy(root);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
 describe('extractCard (real git)', () => {
+  it.each([
+    ['parent', '6636', 'fresh'], ['sidecar', '6636', 'fresh'],
+    ['parent', 'xabc123', 'fresh'], ['sidecar', 'xabc123', 'fresh'],
+    ['parent', '6636', 'planned'], ['sidecar', 'xabc123', 'planned'],
+    ['parent', 'xabc123', 'pushed'], ['sidecar', '6636', 'pushed'],
+    ['unrelated', '6636', 'fresh'], ['unrelated', 'xabc123', 'fresh'],
+  ])('keeps dependencies together when extracting %s with raises under %s (%s)', async (target, raiseParent, stage) => {
+    await withNarrowClone(async ctx => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
+      try {
+        const baseSha = ctx.git(['rev-parse', 'HEAD']).trim();
+        const parentPath = 'backlog/6636-card.md';
+        mkdirSync(join(ctx.clone, 'backlog'), { recursive: true });
+        writeFileSync(join(ctx.clone, parentPath), '---\nbornAs: xabc123\n---\n# Card 6636\n');
+        let admitted = await admitCard({ laneDir: ctx.clone, baseSha, kind: 'prevention', cardId: '6636', idemKey: 'parent',
+          cardPath: parentPath, source: { repo: 'org/repo', pr: 77 } }, { stateDir });
+        expect(admitted.action).toBe('admit');
+        const raises = [77, 78].map(pr => raisedByFile(raiseParent,
+          `- Also raised by org/repo#${pr} (finding 1: \`we:scripts/example.mjs:1\` — Correct the guard) · key \`approval-prevention-key:org/repo#${pr}(at)abc\``));
+        for (const raise of raises) {
+          mkdirSync(join(ctx.clone, `backlog/raised-by/${raiseParent}`), { recursive: true });
+          writeFileSync(join(ctx.clone, raise.path), raise.content);
+          admitted = await admitCard({ laneDir: ctx.clone, baseSha, kind: 'prevention',
+            cardId: raisedByMemberId(raise.path), idemKey: raise.path, cardPath: raise.path,
+            source: { repo: 'org/repo', pr: 77 } }, { stateDir });
+          expect(admitted.action).toBe('admit');
+        }
+        expect(validateRaisedBy(ctx.clone)).toEqual([]);
+        if (target === 'unrelated') {
+          writeFileSync(join(ctx.clone, 'backlog/5201-card.md'), '# Unrelated card\n');
+          admitted = await admitCard({ laneDir: ctx.clone, baseSha, kind: 'prevention', cardId: '5201', idemKey: 'unrelated',
+            cardPath: 'backlog/5201-card.md', source: { repo: 'org/repo', pr: 77 } }, { stateDir });
+          expect(admitted.action).toBe('admit');
+        }
+        atomicRecord(join(stateDir, 'org-repo-prevention.json'), { ...admitted.state, kind: 'prevention', repo: 'org/repo',
+          pr: 50, sealedAt: '2026-10-07T00:00:00.000Z', verificationMarker: { sha: admitted.state.headSha, status: 'green' },
+          seal: { step: 'label-on-green', reason: 'count' } });
+        if (stage !== 'fresh') {
+          // Model a pre-upgrade journal whose one-file split was accepted by the old planner. Its target stays pinned
+          // even if this retry cites an unrelated path. `pushed` resumes used to skip attribution entirely.
+          const selectedId = target === 'parent' ? '6636' : raisedByMemberId(raises[0].path);
+          mkdirSync(join(stateDir, 'extractions'), { recursive: true });
+          atomicRecord(join(stateDir, 'extractions/org-repo-50.json'), {
+            pr: 50, repo: 'org/repo', kind: 'prevention', batchRef: admitted.state.batchRef,
+            plan: { baseSha, standalone: { member: selectedId, ref: 'lane/legacy-extract', sha: admitted.state.headSha }, remainder: null },
+            ...(stage === 'pushed' ? { pushed: true } : {}),
+          });
+        }
+        const refsBefore = ctx.git(['ls-remote', '--refs', 'origin']);
+        const d = doubles();
+        const citedPath = stage !== 'fresh' ? 'scripts/unrelated.mjs'
+          : target === 'unrelated' ? 'backlog/5201-card.md' : target === 'parent' ? parentPath : raises[0].path;
+        const input = { pr: 50, findings: [finding(citedPath)], laneDir: ctx.clone };
+        const result = await extractCard(input, { stateDir, exec: d.exec, gh: d.gh });
+        if (target === 'unrelated') {
+          expect(result.action).toBe('extracted');
+          ctx.git(['fetch', '--quiet', 'origin', '+refs/heads/*:refs/remotes/inspect/*']);
+          expect(validateRaisedByTree(ctx, result.journal.plan.standalone.sha)).toEqual([]);
+          expect(validateRaisedByTree(ctx, result.journal.plan.remainder.sha)).toEqual([]);
+          const remainder = JSON.parse(readFileSync(result.journal.remainderState, 'utf8'));
+          expect(remainder.members.map(member => member.cardId)).toEqual(['6636', ...raises.map(raise => raisedByMemberId(raise.path))]);
+          return;
+        }
+        expect(result.action).toBe('hold');
+        expect(result.reason).toMatch(/raised-by.*parent/);
+        expect(ctx.git(['ls-remote', '--refs', 'origin'])).toBe(refsBefore);
+        expect(d.calls.some(call => call[2] === 'close' || call[2] === 'open-pr')).toBe(false);
+        expect(d.calls.some(call => call.includes('review:human'))).toBe(true);
+        expect(findBatchState({ stateDir, pr: 50 }).state.headSha).toBe(admitted.state.headSha);
+        const callsBeforeRetry = d.calls.length;
+        expect((await extractCard(input, { stateDir, exec: d.exec, gh: d.gh })).action).toBe('hold');
+        expect(d.calls).toHaveLength(callsBeforeRetry);
+      } finally { rmSync(stateDir, { recursive: true, force: true }); }
+    });
+  }, 30000);
+
+  it('holds a pushed plan whose pinned member disappeared instead of checking a different extraction', async () => {
+    await withNarrowClone(async ctx => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
+      try {
+        const { baseSha, state } = await sealedBatch(ctx, stateDir);
+        mkdirSync(join(stateDir, 'extractions'), { recursive: true });
+        atomicRecord(join(stateDir, 'extractions/org-repo-50.json'), {
+          pr: 50, repo: 'org/repo', kind: 'prevention', batchRef: state.batchRef, pushed: true,
+          plan: { baseSha, standalone: { member: '9999', ref: 'lane/legacy-extract', sha: state.headSha }, remainder: null },
+        });
+        const d = doubles();
+        const refsBefore = ctx.git(['ls-remote', '--refs', 'origin']);
+        const result = await extractCard({ pr: 50, findings: [finding('backlog/5202-card.md')], laneDir: ctx.clone },
+          { stateDir, exec: d.exec, gh: d.gh });
+        expect(result).toEqual({ action: 'hold', reason: 'the planned extraction member no longer belongs to this batch' });
+        expect(ctx.git(['ls-remote', '--refs', 'origin'])).toBe(refsBefore);
+        expect(d.calls.some(call => call[2] === 'close' || call[2] === 'open-pr')).toBe(false);
+        expect(d.calls.some(call => call.includes('review:human'))).toBe(true);
+      } finally { rmSync(stateDir, { recursive: true, force: true }); }
+    });
+  }, 30000);
+
+  it('extracts a raised-by sidecar to a colon-free, valid standalone git ref', async () => {
+    await withNarrowClone(async ctx => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
+      try {
+        const raise = raisedByFile('6636', '- Also raised by org/repo#5885 (finding 1: `we:scripts/example.mjs:1` — Correct the guard)');
+        const cardPath = raise.path;
+        const cardId = raisedByMemberId(cardPath);
+        const suffix = cardId.slice('raised-by:6636:'.length);
+        ctx.seedOriginBranch('main', { 'backlog/6636-card.md': '# Existing parent\n' });
+        ctx.git(['fetch', '--quiet', 'origin', 'main']);
+        const baseSha = ctx.git(['rev-parse', 'FETCH_HEAD']).trim();
+        mkdirSync(join(ctx.clone, 'backlog/raised-by/6636'), { recursive: true });
+        writeFileSync(join(ctx.clone, cardPath), raise.content);
+        const admitted = await admitCard({ laneDir: ctx.clone, baseSha, kind: 'prevention', cardId, idemKey: cardId,
+          cardPath, source: { repo: 'org/repo', pr: 5885 } }, { stateDir });
+        atomicRecord(join(stateDir, 'org-repo-prevention.json'), { ...admitted.state, kind: 'prevention', repo: 'org/repo',
+          pr: 50, sealedAt: '2026-10-07T00:00:00.000Z', verificationMarker: { sha: admitted.state.headSha, status: 'green' },
+          seal: { step: 'label-on-green', reason: 'count' } });
+        const d = doubles();
+        const result = await extractCard({ pr: 50, findings: [finding(cardPath)], laneDir: ctx.clone },
+          { stateDir, exec: d.exec, gh: d.gh });
+        expect(result.action).toBe('extracted');
+        const { ref } = result.journal.plan.standalone;
+        expect(ref).not.toContain(':');
+        expect(ctx.git(['check-ref-format', `refs/heads/${ref}`]).trim()).toBe('');
+        expect(ref).toBe(`lane/card-extract-raised-by-6636-${suffix}-${admitted.state.members[0].commitSha.slice(0, 7)}`);
+        ctx.git(['fetch', '--quiet', 'origin', '+refs/heads/*:refs/remotes/inspect/*']);
+        expect(validateRaisedByTree(ctx, result.journal.plan.standalone.sha)).toEqual([]);
+      } finally { rmSync(stateDir, { recursive: true, force: true }); }
+    });
+  }, 30000);
+
   it('splits a 3-card batch around the middle card, with no force and nothing carried over', async () => {
     await withNarrowClone(async ctx => {
       const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));

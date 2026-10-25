@@ -1089,6 +1089,7 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  *   session's REAL process-liveness read from {@link sessionPidAliveByName} (`null` when not supplied/unknown —
  *   exact back-compat with every pre-#3383 caller); `wrapperAlive` (#3903) = whether a DETACHED delivery
  *   wrapper the dispatcher started for this session is still running (see {@link detachedWrapperPidsBySession});
+ *   a tracked wrapper with unreadable identity supplies `true`, while an untracked wrapper supplies `null`;
  *   `ownerAlive` (#xbk2is9) = whether the lease's declared occupant (`workerSession`) is confirmed alive in the
  *   same listing (see {@link ownerSessionAliveForLease}) — `null` when not supplied or unknown (back-compat with
  *   every pre-#xbk2is9 caller). Consulted ONLY in the absence branch below, and ONLY there: it can never override
@@ -1096,11 +1097,12 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  *   listed in a terminal state — because those are positive evidence about the actual worker, while
  *   `ownerAlive` is a proxy (`workerSession`) that can legitimately outlive the one delivery agent a lease was
  *   minted for — see {@link ownerSessionAliveForLease}'s own "known, accepted trade-offs" note
- *   for what this narrowing does and does not close. `claimRunnerAlive` requires a live claim-derived PID
- *   whose command contains the exact session token (`null` when no claim pid). This identifies the current
+ *   for what this narrowing does and does not close. `claimRunnerAlive` retains a fresh claim-derived PID
+ *   unless death or a readable command with no exact session token disproves it (`null` when no claim pid).
+ *   Unreadable process/command evidence keeps the veto until claim or lease expiry. This identifies the current
  *   borrowed runner even when a previous Claude round remains listed under the same deterministic name,
  *   with a terminal state or dead PID. Like live run-store wrapper evidence, it takes precedence over that
- *   name-keyed listing evidence. Without a validated live runner, the ordinary death checks still apply.
+ *   name-keyed listing evidence. Without a retained claim runner, the ordinary death checks still apply.
  *   `staleTerminalRows` defaults to false; true means the listed terminal rows predate the live claim
  *   (see {@link staleTerminalNamesForClaims}) and gives no verdict (`null`) after the live-wrapper and
  *   live-claim-runner checks.
@@ -1113,8 +1115,8 @@ export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DIS
   // or a restricted `claude -p`) in the foreground of its own process, so that slug is NEVER in `claude agents`.
   // Without this check the absence branch below reads a live, hour-long build as "never listed → gone" once the
   // 10-minute grace passes and force-releases its lane mid-build. The wrapper's own pid (the run store's `pid:<n>`
-  // handle) is the direct answer: alive means NOT gone, full stop. `false`/`null` change nothing — a dead
-  // wrapper falls through to the ordinary absence logic, which is what reclaims its lane after it exits.
+  // handle) is the direct answer: alive or unknown identity means NOT gone. `false` (confirmed dead) and
+  // `null` (no tracked wrapper) fall through to the ordinary absence logic.
   if (wrapperAlive === true) return false;
   // #x5wm9ot — was `itemNumFromSession(session) === null`, which after that function narrowed to item-kind-only
   // now reads EVERY PR_KIND session (review-/fix-/ci-heal-/inspect-) as "not dispatcher-minted, don't guess" —
@@ -1471,8 +1473,9 @@ function defaultPidCommand(pid) {
 /**
  * #4332 — the per-lease reap-signal builder `main()` drives (extracted so tests exercise the real wiring).
  * `ownerAlive` is computed BEFORE item resolution so it can veto the branch-derived PR-terminal fallback.
+ * `isPidAlive` defaults to the driver's existence-and-identity probe; tests can inject both IO seams.
  */
-export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids = new Map(), staleTerminalNames = new Set(), pidCommand = defaultPidCommand, nowMs }) {
+export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids = new Map(), staleTerminalNames = new Set(), pidCommand = defaultPidCommand, nowMs, isPidAlive = defaultIsPidAlive }) {
   return (c) => {
     // #x5wm9ot — an item-kind session (`conveyor-`/`prepare-`/`prepare-decision-`) checks `byItem` by its item
     // number; a PR_KIND session (`review-`/`fix-`/`ci-heal-`/`inspect-`) checks `byPr` by its OWN PR number —
@@ -1499,15 +1502,19 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
     const sessionPidAliveNow = c.lease?.session && sessionPidAlive.has(c.lease.session) ? sessionPidAlive.get(c.lease.session) : null;
     // #3903 — a detached delivery wrapper's own pid (see `detachedWrapperPidsBySession`).
     const wrapperPid = c.lease?.session ? wrapperPids.get(c.lease.session) : undefined;
-    const wrapperAlive = wrapperPid === undefined ? null : Boolean(defaultIsPidAlive(wrapperPid));
-    // Bind a live claim PID to this session so PID reuse cannot preserve a dead fixer's lane.
+    // Only explicit death lifts the wrapper veto; unreadable identity must keep the lane.
+    const wrapperAlive = wrapperPid === undefined ? null : isPidAlive(wrapperPid) !== false;
+    // Only positive death or readable command mismatch lifts a fresh claim runner's veto.
     const claimRunnerPid = c.lease?.session ? claimRunnerPids.get(c.lease.session) : undefined;
     let claimRunnerAlive = claimRunnerPid === undefined ? null : false;
-    if (claimRunnerPid !== undefined && defaultIsPidAlive(claimRunnerPid)) {
+    if (claimRunnerPid !== undefined && isPidAlive(claimRunnerPid) !== false) {
+      claimRunnerAlive = true;
       try {
         const command = pidCommand(claimRunnerPid);
-        claimRunnerAlive = typeof command === 'string' && command.split(/\s+/).includes(`--session=${c.lease.session}`);
-      } catch { /* Unknown identity falls through to ordinary session absence logic. */ }
+        if (typeof command === 'string' && command.trim()) {
+          claimRunnerAlive = command.split(/\s+/).includes(`--session=${c.lease.session}`);
+        }
+      } catch { /* Unreadable command evidence retains the fresh claim's veto. */ }
     }
     return {
       prState,
