@@ -126,7 +126,7 @@ describe('CLI marker delegation', () => {
     });
   }
   function fixture({ preExisting = [], postDispatch, mode = 'lane-check', inputs = {} } = {}) {
-    const run = { id: 123, event: 'workflow_dispatch', head_sha: SHA,
+    const run = { id: 123, event: 'workflow_dispatch', head_sha: SHA, head_branch: REF,
       created_at: CREATED_AFTER, status: 'completed', conclusion: 'success', display_title: title({ mode, ...inputs }) };
     let dispatched = false;
     let clock = Date.parse('2026-10-24T12:00:00.750Z');
@@ -146,7 +146,7 @@ describe('CLI marker delegation', () => {
   ])('discovers and waits for the rendered checked-in workflow title: %j', async request => {
     const options = { ref: REF, ...request };
     const display_title = workflowTitle(options);
-    const run = { id: 123, event: 'workflow_dispatch', head_sha: SHA, created_at: CREATED_AFTER,
+    const run = { id: 123, event: 'workflow_dispatch', head_sha: SHA, head_branch: REF, created_at: CREATED_AFTER,
       status: 'completed', conclusion: 'success', display_title };
     const io = fixture({ postDispatch: [run] });
     const api = io.live.api.getMockImplementation();
@@ -194,7 +194,7 @@ describe('CLI marker delegation', () => {
   });
 
   it('accepts a newly dispatched same-second run while rejecting pre-existing same-second runs', async () => {
-    const preExisting = [{ id: 999, event: 'workflow_dispatch', head_sha: SHA,
+    const preExisting = [{ id: 999, event: 'workflow_dispatch', head_sha: SHA, head_branch: REF,
       created_at: CREATED_AFTER, status: 'completed', conclusion: 'success' }];
     const io = fixture({ preExisting });
     expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, io)).toBe(0);
@@ -207,7 +207,7 @@ describe('CLI marker delegation', () => {
   });
 
   it('times out and falls back when only pre-existing same-second runs are available', async () => {
-    const preExisting = [{ id: 123, event: 'workflow_dispatch', head_sha: SHA,
+    const preExisting = [{ id: 123, event: 'workflow_dispatch', head_sha: SHA, head_branch: REF,
       created_at: CREATED_AFTER, status: 'completed', conclusion: 'success' }];
     const io = fixture({ preExisting, postDispatch: preExisting });
     expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, { ...io, quietFailure: true })).toBe(2);
@@ -219,7 +219,7 @@ describe('CLI marker delegation', () => {
   it.each(['incomplete', 'oversized'])('refuses an %s pre-dispatch snapshot before dispatch', async kind => {
     const io = fixture();
     const runs = Array.from({ length: kind === 'oversized' ? 101 : 1 }, (_, index) => ({
-      id: index + 1, event: 'workflow_dispatch', head_sha: SHA, created_at: CREATED_AFTER,
+      id: index + 1, event: 'workflow_dispatch', head_sha: SHA, head_branch: REF, created_at: CREATED_AFTER,
     }));
     io.live.api.mockImplementation(path => path.startsWith('commits/') ? { sha: SHA }
       : { total_count: kind === 'incomplete' ? 2 : runs.length, workflow_runs: runs });
@@ -235,7 +235,7 @@ describe('CLI marker delegation', () => {
     [{ operation: 'check-standards' }, { mode: 'targeted', operation: 'check-standards', ref: 'other/ref' }],
   ])('rejects successful concurrent same-SHA dispatches with different inputs and preserves the requested failure: %j', async (request, unrelated) => {
     const options = { ref: REF, mode: 'targeted', ...request };
-    const requested = { id: 123, event: 'workflow_dispatch', head_sha: SHA, created_at: CREATED_AFTER,
+    const requested = { id: 123, event: 'workflow_dispatch', head_sha: SHA, head_branch: REF, created_at: CREATED_AFTER,
       status: 'completed', conclusion: 'failure', display_title: title({ mode: 'targeted',
         tests: (request.tests ?? []).join(' '), operation: request.operation ?? '' }) };
     const foreign = { ...requested, id: 999, conclusion: 'success', display_title: title(unrelated) };
@@ -252,13 +252,61 @@ describe('CLI marker delegation', () => {
 
   it.each([undefined, 'Remote verify', 'remote-verify {bad', title({ tests: 'unexpected.test.ts' })])
     ('fails closed when fresh run input evidence is missing, malformed or mismatched: %j', async display_title => {
-      const run = { id: 123, event: 'workflow_dispatch', head_sha: SHA, created_at: CREATED_AFTER,
+      const run = { id: 123, event: 'workflow_dispatch', head_sha: SHA, head_branch: REF, created_at: CREATED_AFTER,
         status: 'completed', conclusion: 'success', display_title };
       const io = fixture({ postDispatch: [run] });
       expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, { ...io, quietFailure: true })).toBe(2);
       expect(io.live.api).not.toHaveBeenCalledWith('actions/runs/123');
       expect(io.execFile).not.toHaveBeenCalled();
     });
+
+  it.each(['lane-check', 'full', 'targeted'])('ignores a successful same-SHA run on another branch in %s discovery', async mode => {
+    const inputs = mode === 'targeted' ? { tests: tests.join(' ') } : {};
+    const requested = { id: 123, event: 'workflow_dispatch', head_sha: SHA, head_branch: REF,
+      created_at: CREATED_AFTER, status: 'completed', conclusion: 'failure', display_title: title({ mode, ...inputs }) };
+    const foreign = { ...requested, id: 999, head_branch: 'lane/other', conclusion: 'success' };
+    const io = fixture({ postDispatch: [requested, foreign] });
+    const api = io.live.api.getMockImplementation();
+    io.live.api.mockImplementation(path => path === 'actions/runs/123' ? requested
+      : path === 'actions/runs/999' ? foreign : api(path));
+    expect(await runRemoteCLI({ ref: REF, mode, ...(mode === 'targeted' ? { tests } : {}) },
+      { ...io, quietFailure: true })).toBe(2);
+    expect(io.live.api).toHaveBeenCalledWith('actions/runs/123');
+    expect(io.live.api).not.toHaveBeenCalledWith('actions/runs/999');
+    expect(io.execFile).not.toHaveBeenCalled();
+    expect(io.pause).not.toHaveBeenCalled();
+  });
+
+  it.each(['lane/other', undefined, null, ''])('never selects same-SHA discovery evidence with branch %j', async head_branch => {
+    const run = { id: 999, event: 'workflow_dispatch', head_sha: SHA, head_branch,
+      created_at: CREATED_AFTER, status: 'completed', conclusion: 'success', display_title: title() };
+    const io = fixture({ postDispatch: [run] });
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, { ...io, quietFailure: true })).toBe(2);
+    expect(io.live.api).not.toHaveBeenCalledWith('actions/runs/999');
+    expect(io.execFile).not.toHaveBeenCalled();
+    expect(io.pause).toHaveBeenCalledTimes(12);
+  });
+
+  it('scopes the pre-dispatch snapshot and subsequent listings to the encoded dispatched branch', async () => {
+    const io = fixture();
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, io)).toBe(0);
+    const listings = io.live.api.mock.calls.filter(([path]) => path.includes('workflows/'));
+    expect(listings).toHaveLength(2);
+    for (const [path] of listings) {
+      expect(new URL(path, 'https://example.test/').searchParams.get('branch')).toBe(REF);
+      expect(path).toContain(`branch=${encodeURIComponent(REF)}`);
+    }
+    expect(io.live.api.mock.invocationCallOrder[1]).toBeLessThan(io.live.gh.mock.invocationCallOrder[0]);
+  });
+
+  it.each(['lane/other', undefined])('rejects branch evidence changing to %j while waiting', async head_branch => {
+    const io = fixture();
+    const api = io.live.api.getMockImplementation();
+    io.live.api.mockImplementation(path => path === 'actions/runs/123' ? { ...api(path), head_branch } : api(path));
+    expect(await runRemoteCLI({ ref: REF, mode: 'lane-check' }, { ...io, quietFailure: true })).toBe(2);
+    expect(io.live.api).toHaveBeenCalledWith('actions/runs/123');
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
 
   it('rechecks dispatch inputs when waiting instead of accepting changed run evidence', async () => {
     const io = fixture();

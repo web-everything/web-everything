@@ -117,12 +117,13 @@ export async function runRemoteCLI(options, { repo = process.cwd(), json = false
   live ??= remoteIO(repo);
   let headSha;
   const fetchDispatchRuns = sha => {
-    const data = live.api(`actions/workflows/remote-verify.yml/runs?event=workflow_dispatch&head_sha=${sha}&per_page=100`);
+    const data = live.api(`actions/workflows/remote-verify.yml/runs?event=workflow_dispatch&head_sha=${sha}&branch=${encodeURIComponent(options.ref)}&per_page=100`);
     if (!Array.isArray(data.workflow_runs) || data.total_count !== data.workflow_runs.length
       || !validRunIds(data.workflow_runs.map(run => run?.id))
       || data.workflow_runs.some(run => run.event !== 'workflow_dispatch' || run.head_sha !== sha
         || !Number.isFinite(Date.parse(run.created_at)))) throw new Error('Incomplete runs; use local verify');
-    return data.workflow_runs;
+    // Bind both the pre-dispatch snapshot and discovery to the dispatched branch.
+    return data.workflow_runs.filter(run => run.head_branch === options.ref);
   };
   return runRemoteTest({ ...options,
     dispatch: async args => {
@@ -151,7 +152,8 @@ export async function runRemoteCLI(options, { repo = process.cwd(), json = false
       const deadline = now() + timeoutMs;
       do {
         const run = live.api(`actions/runs/${runId}`);
-        if (run.id !== runId || run.head_sha !== headSha || !matchesDispatchInputs(run, options)) throw new Error('Run changed or dispatch inputs unproven');
+        if (run.id !== runId || run.head_sha !== headSha || run.head_branch !== options.ref
+          || !matchesDispatchInputs(run, options)) throw new Error('Run changed or dispatch inputs unproven');
         if (['green', 'red', 'error'].includes(remoteVerdict(run).state)) return run;
         const remaining = deadline - now();
         if (remaining <= 0) return { timedOut: true };
