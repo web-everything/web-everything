@@ -13,7 +13,7 @@ const vmStat = [
 const swapUsage = 'vm.swapusage: total = 1024.00M  used = 768.00M  free = 256.00M';
 const denied = () => Object.assign(new Error('Operation not permitted'), { code: 'EPERM' });
 
-function probes({ denySwap = false, denyVm = false, vm = vmStat, free = () => 3072 * MB } = {}) {
+function probes({ denySwap = false, denyVm = false, vm = vmStat, swap = swapUsage, free = () => 3072 * MB } = {}) {
   const exec = vi.fn((command) => {
     if (command === 'vm_stat') {
       if (denyVm) throw denied();
@@ -21,7 +21,7 @@ function probes({ denySwap = false, denyVm = false, vm = vmStat, free = () => 30
     }
     if (command === 'sysctl') {
       if (denySwap) throw denied();
-      return swapUsage;
+      return swap;
     }
     throw new Error(`Unexpected probe: ${command}`);
   });
@@ -69,6 +69,45 @@ describe('readHostMemoryReading fallback sources', () => {
     expect(probe.free).toHaveBeenCalled();
   });
 
+  describe.each(['vm_stat', 'sysctl'])('%s exec failures', (command) => {
+    it.each([
+      ['EPERM', 'probe unavailable'],
+      ['EACCES', 'probe unavailable'],
+      ['ENOENT', 'probe unavailable'],
+      [undefined, 'Operation not permitted'],
+      [undefined, 'Permission denied'],
+      [undefined, 'probe NOT PERMITTED here'],
+    ])('falls back on denial/unavailability: code=%s message=%s', (code, message) => {
+      const probe = probes();
+      const workingExec = probe.exec;
+      probe.exec = vi.fn((name, ...args) => {
+        if (name === command) throw Object.assign(new Error(message), { code });
+        return workingExec(name, ...args);
+      });
+      expect(hostLoad.readHostMemoryReading(probe)).toEqual(command === 'vm_stat'
+        ? { mb: 3072, source: 'os.freemem' }
+        : { mb: 1408, source: 'vm_stat' });
+    });
+
+    it.each([
+      ['ETIMEDOUT', 'probe timed out'],
+      [undefined, 'ETIMEDOUT'],
+      ['EIO', 'probe failed'],
+    ])('refuses non-denial exec errors: code=%s message=%s', (code, message) => {
+      const probe = probes();
+      const workingExec = probe.exec;
+      probe.exec = vi.fn((name, ...args) => {
+        if (name === command) throw Object.assign(new Error(message), { code });
+        return workingExec(name, ...args);
+      });
+      expect(() => hostLoad.readHostMemoryHeadroomMb(probe)).toThrow(message);
+      const result = hostLoad.hostLoadAdmission(admissionOptions(probe));
+      expect(result.admitted).toBe(false);
+      expect(result.reason).toContain('host memory unknown');
+      expect(probe.free).not.toHaveBeenCalled();
+    });
+  });
+
   it.each([NaN, Infinity, -Infinity])('returns unknown without throwing when probes are denied and free() is %s', (value) => {
     const probe = probes({ denyVm: true, denySwap: true, free: () => value });
     expect(hostLoad.readHostMemoryReading(probe)).toEqual({ mb: null, source: 'unknown' });
@@ -107,6 +146,27 @@ describe('readHostMemoryHeadroomMb numeric compatibility', () => {
 });
 
 describe('hostLoadAdmission memory fallback policy', () => {
+  it.each([
+    ['malformed vm_stat output', { vm: 'garbage' }],
+    ['malformed swap output', { swap: 'garbage' }],
+    ['unparseable swap value', { swap: 'free = ..M' }],
+  ])('refuses %s instead of falling back', (_name, settings) => {
+    const probe = probes(settings);
+    expect(() => hostLoad.readHostMemoryHeadroomMb(probe)).toThrow();
+    const result = hostLoad.hostLoadAdmission(admissionOptions(probe));
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('host memory unknown');
+    expect(probe.free).not.toHaveBeenCalled();
+  });
+
+  it('refuses finite negative free() when native probes are denied', () => {
+    const probe = probes({ denyVm: true, denySwap: true, free: () => -MB });
+    expect(() => hostLoad.readHostMemoryHeadroomMb(probe)).toThrow();
+    const result = hostLoad.hostLoadAdmission(admissionOptions(probe));
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('host memory unknown');
+  });
+
   it('admits acceptable load when sysctl is denied and reports source=vm_stat', () => {
     const result = hostLoad.hostLoadAdmission(admissionOptions(probes({ denySwap: true })));
     expect(result.admitted).toBe(true);
@@ -120,8 +180,11 @@ describe('hostLoadAdmission memory fallback policy', () => {
   });
 
   it.each([
-    ['non-finite free()', () => NaN],
+    ['NaN free()', () => NaN],
+    ['infinite free()', () => Infinity],
+    ['negative infinite free()', () => -Infinity],
     ['denied free()', () => { throw denied(); }],
+    ['throwing free()', () => { throw new Error('unavailable'); }],
   ])('admits acceptable load with memory unknown after %s', (_name, free) => {
     const result = hostLoad.hostLoadAdmission(admissionOptions(probes({ denyVm: true, denySwap: true, free })));
     expect(result.admitted).toBe(true);
