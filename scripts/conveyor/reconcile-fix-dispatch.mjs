@@ -71,7 +71,7 @@ import { repeatedFindingPlan, resolveFixSafety } from './repeated-finding-reset.
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readDeclaredSettings } from '../lib/settings-files.mjs';
 import { advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun } from '../lib/advisor-trial.mjs';
-import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
+import { conflictHelperAllowRules, rearmReviewAllowRules } from '../lib/conflict-helper-allow.mjs';
 import { ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
 
 import { renderOperatorSendBackBrief } from '../lib/operator-send-backs.mjs';
@@ -891,6 +891,9 @@ export function tryResumeFix(planned, {
   // the candidate id being resumed rather than a freshly minted one (nothing else needs to address it).
   sessionCwdFor = (id) => dispatchSessionCwd(id, { root }),
   ensureSessionCwd = ensureDispatchSessionCwd,
+  grantConflictHelper = (cwd) => ensureSettingsFilePermissions({
+    cwd, allow: [...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)],
+  }),
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more: `runReconcileFixDispatch` is the ONE place that
   // decides whether this repo's `fix` capability is on (`docs/agent/platform-decisions.md#conveyor-multi-repo-
@@ -948,6 +951,12 @@ export function tryResumeFix(planned, {
   postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
   return resumeBgSession(planned, {
     candidate,
+    prepareResume: () => {
+      // The agent reloads its own cwd, not the trigger's scratch directory. Legacy builders and
+      // fixers need both repair helpers before this early-return path can resume them.
+      const permissions = grantConflictHelper(candidateCwd);
+      if (permissions?.ok !== true) throw new Error(`repair-helper permissions unwritten (${permissions?.reason ?? 'no result'})`);
+    },
     prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned),
     repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
   });
@@ -965,6 +974,7 @@ export function resumeBgSession(planned, {
   stop = stopSession, wait = defaultConfirmWait, claimOwner = fixDispatchClaimOwner(), acquireClaim = acquireFixDispatchClaim,
   releaseClaim = releaseFixDispatchClaim, claimRoot, sessionCwdFor = (id) => dispatchSessionCwd(id, { root: REPO_ROOT }),
   ensureSessionCwd = ensureDispatchSessionCwd,
+  prepareResume = () => {},
 } = {}) {
   // #x0jphk5 — TAKE THE CLAIM before ever issuing `--resume`. Ownership is confirmed above (both HEAD-sha and
   // name), so what remains is a genuine race: two dispatchers reading the same stale listing could BOTH reach
@@ -990,6 +1000,10 @@ export function resumeBgSession(planned, {
     };
   }
   const releaseOurClaim = () => releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
+
+  // Serialize settings migration with the resume attempt; a failed write must not launch the old session
+  // or strand its claim. The reconciler reports the error for this entry and continues the pass.
+  try { prepareResume(); } catch (e) { releaseOurClaim(); throw e; }
 
   const resumeArgv = buildAgentArgv({
     payload: { prompt },
@@ -1074,7 +1088,15 @@ export function tryResumeRoundFix(planned, {
   resumeOptions = {},
   scratchRoot = dispatchScratchRoot({ root }),
   realpath = realpathSync,
-  isolateSession = isolateDispatchSession,
+  isolateSession = (cwd) => {
+    // A previous round may predate these grants. Refresh them along with isolation/hooks;
+    // a successful resume bypasses dispatchFix and its fresh-session permission preparation.
+    const permissions = ensureSettingsFilePermissions({
+      cwd, allow: [...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)],
+    });
+    if (!permissions.ok) throw new Error(`repair-helper permissions unwritten (${permissions.reason})`);
+    return isolateDispatchSession(cwd);
+  },
   dryRun = false,
 } = {}) {
   if (!dryRun) assertNotALaneCheckout(root);
@@ -1101,7 +1123,8 @@ export function tryResumeRoundFix(planned, {
   // The resumed session reloads `<cwd>/.claude/settings.local.json`, whose guard hooks were written at its first
   // launch with absolute paths into the dispatcher's checkout of that time (a self-sync candidate dir may be gone
   // since: a missing hook script is a non-blocking error, so the guards would silently not run). Re-write them for
-  // THIS dispatcher before resuming, exactly as a fresh dispatch does; if that write fails, cold-start instead.
+  // THIS dispatcher before resuming, exactly as a fresh dispatch does. The default refresh also migrates the
+  // repair-helper permissions; if any preparation write fails, cold-start instead.
   let isolation = null;
   try { isolation = isolateSession(inputs.prior.cwd); } catch (e) { isolation = { hooks: { ok: false, reason: describeDispatchFailure(e) } }; }
   if (isolation?.hooks?.ok !== true || isolation?.write?.ok === false) {
@@ -1432,7 +1455,10 @@ export function dispatchFix(planned, {
   // never `root` itself) and making that directory real. See `dispatchSessionCwd`'s own header at the io shell.
   sessionCwdFor = (sessionId) => dispatchSessionCwd(sessionId, { root }),
   ensureSessionCwd = ensureDispatchSessionCwd,
-  grantConflictHelper = (cwd) => ensureSettingsFilePermissions({ cwd, allow: conflictHelperAllowRules(root) }),
+  // This fresh-fix path launches directly, bypassing dispatchLaneGrant's repair-helper grants.
+  grantConflictHelper = (cwd) => ensureSettingsFilePermissions({
+    cwd, allow: [...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)],
+  }),
   // build-path-codex-isolation — the shared bg-isolation helper (writes `<sessionCwd>/.claude/settings.local.json`
   // and returns the `--settings` worktree patch). Before this, only dispatch-lane's sink applied it, so this
   // path's sessions hit Claude Code's "Call EnterWorktree first" guard on their first Edit.
