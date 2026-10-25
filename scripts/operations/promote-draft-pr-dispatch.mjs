@@ -66,6 +66,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
+import { reviewHoldOnlyRed } from '../conveyor/reconcile-core.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
@@ -103,7 +104,7 @@ export function isPromoteCodePath(path, { closure = promoteCodeClosure() } = {})
  * `reduceCheckState`/`getRequiredStatusChecks` truth every other CI-truth reader in this family uses (never a
  * re-derived notion of "green"). Injectable so a test asserts the refusal with no `gh` on PATH.
  * @param {{repoSlug:string, sha:string, runGh?:Function, getRequiredChecks?:Function}} o
- * @returns {{state:string, why:string, counts:object}}
+ * @returns {{state:string, why:string, counts:object, reviewHoldOnly:boolean}}
  */
 export function defaultReadHeadCheckState({
   repoSlug, sha, prNumber, runGh = runGhSync, getRequiredChecks = getRequiredStatusChecks,
@@ -131,7 +132,8 @@ export function defaultReadHeadCheckState({
   const promotionChecks = forPromotion
     ? promotionRequiredChecks(requiredChecks, rows, absentNotApplicable ?? loadPromotionRequiredChecksSetting().value)
     : requiredChecks;
-  return reduceCheckState(rows, promotionChecks);
+  const result = reduceCheckState(rows, promotionChecks);
+  return { ...result, reviewHoldOnly: result.state === 'red' && reviewHoldOnlyRed(rows, promotionChecks) };
 }
 
 function validatePrLabels(labels) {
@@ -349,7 +351,7 @@ export function runReconcilePromoteDraftDispatch({
       });
       continue;
     }
-    if (fresh.state !== 'green') {
+    if (fresh.state !== 'green' && !(fresh.state === 'red' && fresh.reviewHoldOnly === true)) {
       refusals.push({
         pr: entry.prNumber, kind: 'stale-check-refused', headSha: sha, checkState: fresh.state,
         why: `the reconcile plan read this draft's required checks as green, but a fresh re-read of head ${sha} `
