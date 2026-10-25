@@ -1,7 +1,7 @@
 /** Cap-only shared-reader subset: human card records, author/wrapper and head/result binding. */
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, gateRoundGrants, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, gateRoundGrants, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
@@ -19,6 +19,11 @@ const rid = liveResultGateState([result], P, H).resultId;
 const gate = (who, outcome, line, at, id = rid, head = H) => who(`${redTeamGateMarker(P, head, outcome, id)}\n**Red-team gate** (setting \`redTeam.confirmedBreaks\`) on head \`${head.slice(0, 12)}\`:\n${line}`, at);
 const live = [result, gate(bot, 'round-cap', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T17:12:20Z')];
 const cardLine = (ix) => `- ${ix.length} finding(s) carded by the operator to \`${CARD}\` (${ix.map((i) => `#${i}`).join(', ')}).`;
+const operatorReleaseLines = [
+  ['existing card', cardLine([1])],
+  ['automatic card', '- 1 finding(s) filed as a follow-up card (#1) — landing job j.'],
+  ['advisory', '- 1 finding(s) left advisory (#1).'],
+];
 const disp = (comments, head = H) => readRedTeamDisposition({ comments, pr: P, head, setting: CONFIRMED_BREAKS_DEFAULTS });
 const held = (d) => [...d.held, ...d.sendBack].map((f) => f.index);
 const N = 'a'.repeat(40);
@@ -60,7 +65,8 @@ describe('operator card release at the cap (shared reader)', () => {
     comments.push(gate(human, 'operator-card', cardLine([1]), '2026-10-21T21:30:00Z'));
     expect(held(disp(comments))).toEqual([]);
   });
-  it.each(['missing', 'sent-back', 'wrong result', 'wrong head', 'untrusted', 'later'])('rejects an operator card with a %s round-cap handover across reader, queue and labels', (variant) => {
+  it.each(operatorReleaseLines.flatMap(([format, line]) =>
+    ['missing', 'sent-back', 'wrong result', 'wrong head', 'untrusted', 'later'].map(variant => [format, line, variant])))('rejects %s (%s) with a %s round-cap handover across reader, queue and labels', (_format, line, variant) => {
     const cap = gate(bot, 'round-cap', '', '2026-10-21T17:12:20Z');
     const before = {
       missing: [],
@@ -70,7 +76,7 @@ describe('operator card release at the cap (shared reader)', () => {
       untrusted: [{ ...cap, user: { login: 'mallory', type: 'User' } }],
       later: [],
     }[variant];
-    const comments = [result, ...before, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'),
+    const comments = [result, ...before, gate(human, 'operator-card', line, '2026-10-21T20:30:00Z'),
       ...(variant === 'later' ? [cap] : [])];
     const d = disp(comments);
     expect(held(d)).toEqual([1]);
@@ -82,7 +88,8 @@ describe('operator card release at the cap (shared reader)', () => {
     const d = disp([result, gate(human, 'operator-card', '- 1 confirmed break(s) NOT sent back: cap (#1).\n' + cardLine([1]), '2026-10-21T20:30:00Z')]);
     expect(held(d)).toEqual([1]);
   });
-  it.each(['human', 'standing ruling'])('rejects cards after pending or consumed %s grants, including stale cap posts', (kind) => {
+  it.each(operatorReleaseLines.flatMap(([format, line]) =>
+    ['human', 'standing ruling'].map(kind => [format, line, kind])))('rejects %s (%s) after pending or consumed %s grants, including stale cap posts', (_format, line, kind) => {
     const repo = 'o/r';
     const standingRuling = kind === 'standing ruling' ? { ok: true, id: `${repo}#6000`, author: 'chalbert', by: 1,
       maxPerPr: 3, repos: [repo], cardOnlyHeads: { [H]: true }, uneditedComments: ['IC_auto'] } : null;
@@ -94,7 +101,7 @@ describe('operator card release at the cap (shared reader)', () => {
     expect(ids).toHaveLength(1);
     const cap = bot(redTeamGateMarker(P, H, 'round-cap', rid, []), '2026-10-21T17:12:20Z');
     const sent = bot(`${redTeamGateMarker(P, H, 'sent-back', rid, ids)}\n- 1 confirmed break(s) sent back to the fixer (#1).`, at);
-    const card = gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z');
+    const card = gate(human, 'operator-card', line, '2026-10-21T20:30:00Z');
     for (const prefix of [[result, cap, grant], [result, grant, cap], [result, cap, grant, sent], [result, grant, sent, cap]]) {
       const comments = [...prefix, card];
       const context = { comments, pr: P, head: H, repo, standingRuling, env: {} };
@@ -142,6 +149,22 @@ describe('operator card release at the cap (shared reader)', () => {
     comments.push(gate(human, 'operator-card', cardLine([1]), '2026-10-21T21:40:00Z', nextId));
     expect(held(disp(comments))).toEqual([]);
   });
+  it.each([
+    ['legacy card', '- 1 finding(s) filed as a follow-up card (#1).', null],
+    ['legacy advisory', '- 1 finding(s) left advisory (#1).', null],
+    ['named card', '- 1 finding(s) filed as a follow-up card (#1).', rid],
+    ['named advisory', '- 1 finding(s) left advisory (#1).', rid],
+  ])('default-mode %s release on a source head does not release carried findings', (_, line, id) => {
+    const comments = [...live, gate(human, 'operator-card', line, '2026-10-21T20:30:00Z', id)];
+    const read = head => readRedTeamDisposition({ comments, pr: P, head, setting: CONFIRMED_BREAKS_DEFAULTS,
+      env: {}, operatorRulings: { anyState: false } });
+    expect(held(read(H))).toEqual([]);
+    comments.push(carried);
+    const disposition = read(N);
+    expect(disposition.result.rev).toBe(N);
+    expect(disposition.sendBack).toEqual([]);
+    expect(disposition.held.map(f => f.index)).toEqual([1]);
+  });
   it('does not inherit an operator card release through a verdict carry without cited-line proof', () => {
     const comments = [...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), carried];
     const d = disp(comments, N);
@@ -173,5 +196,101 @@ describe('operator card release at the cap (shared reader)', () => {
     const N = 'a'.repeat(40);
     const next = bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [F(159, 'broken')] }), '2026-10-21T21:00:00Z');
     expect(held(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), next], N))).toEqual([1]);
+  });
+});
+
+describe('operator ruling in any state (shared reader)', () => {
+  const live = [result, gate(bot, 'sent-back', '- 1 confirmed break(s) sent back to the fixer (#1).', '2026-10-21T17:12:20Z')];
+  const disp = (comments, anyState = true, head = H) => readRedTeamDisposition({ comments, pr: P, head, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState } });
+  const sent = (d) => d.sendBack.map(f => f.index);
+  it('#5502 before: #1 is sent back and blocks', () => { expect(sent(disp(live))).toEqual([1]); });
+  it('a human operator card record for this result releases #1', () => {
+    const d = disp([...live, gate(human, 'operator-card', cardLine([1, 2, 3]), '2026-10-21T20:30:00Z')]);
+    expect(d.sendBack).toEqual([]);
+    expect(d.held).toEqual([]);
+  });
+  it('automation can never use the operator card line, under any outcome', () => {
+    for (const outcome of ['operator-card', 'card-queued', 'sent-back']) {
+      expect(sent(disp([...live, gate(bot, outcome, cardLine([1]), '2026-10-21T20:30:00Z')]))).toEqual([1]);
+    }
+    expect(sent(disp([...live, gate(human, 'card-queued', cardLine([1]), '2026-10-21T20:30:00Z')]))).toEqual([1]);
+  });
+  it('a record naming another result releases nothing; a new head re-evaluates', () => {
+    expect(sent(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', '0123456789abcdef')]))).toEqual([1]);
+    const N = 'a'.repeat(40);
+    const next = bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [F(159, 'broken')] }), '2026-10-21T21:00:00Z');
+    expect(sent(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), next], true, N))).toEqual([1]);
+  });
+  it.each(operatorReleaseLines)('kill switch off for %s: never overrides a live send-back, still releases a break handed over at the cap', (_format, line) => {
+    const op = gate(human, 'operator-card', line, '2026-10-21T20:30:00Z');
+    expect(held(disp([...live, op], true))).toEqual([]);
+    expect(sent(disp([...live, op], false))).toEqual([1]);
+    const cap = gate(bot, 'round-cap', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T18:00:00Z');
+    expect(disp([...live, cap], false).held.map((f) => f.index)).toEqual([1]);
+    expect(disp([...live, cap, op], false).held).toEqual([]);
+  });
+  it('operatorRulingsOnLiveResult: the operator actions and every carded break of the live result', () => {
+    const gateCard = gate(bot, 'card-queued', '- 1 finding(s) filed as a follow-up card (#2) — landing job j.', '2026-10-21T17:12:23Z');
+    const r = operatorRulingsOnLiveResult([...live, gateCard, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z')], P, H);
+    expect(r.resultId).toBe(rid);
+    expect([...r.ruled]).toEqual([[1, ['card']]]);
+    expect([...r.carded].sort()).toEqual([1, 2]);
+  });
+  it('the cascade: default off, settings file and env opt in, invalid ignored', () => {
+    expect(resolveOperatorRulings({}).value.anyState).toBe(false);
+    expect(resolveOperatorRulings({ file: { redTeam: { operatorRulings: { anyState: false } } } }).value.anyState).toBe(false);
+    expect(resolveOperatorRulings({ file: { redTeam: { operatorRulings: { anyState: true } } }, env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: '0' } }).value.anyState).toBe(false);
+    expect(resolveOperatorRulings({ env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'banana' } }).value.anyState).toBe(false);
+    expect(resolveOperatorRulings({ file: { redTeam: { operatorRulings: { anyState: true } } } }).value.anyState).toBe(true);
+    expect(resolveOperatorRulings({ env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'true' } }))
+      .toMatchObject({ value: { anyState: true }, sources: { anyState: 'env' } });
+  });
+});
+
+describe('operator ruling policy provenance', () => {
+  it('resolves standard → platform → tool → environment and records each source', () => {
+    const platform = { operatorRulings: { anyState: false } };
+    const file = { redTeam: { operatorRulings: { anyState: true } } };
+    expect(resolveOperatorRulings({})).toMatchObject({ value: { anyState: false }, sources: { anyState: 'standard' } });
+    expect(resolveOperatorRulings({ platform })).toMatchObject({ value: { anyState: false }, sources: { anyState: 'platform' } });
+    expect(resolveOperatorRulings({ platform, file })).toMatchObject({ value: { anyState: true }, sources: { anyState: 'tool' } });
+    expect(resolveOperatorRulings({ platform, file, env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'false' } }))
+      .toMatchObject({ value: { anyState: false }, sources: { anyState: 'env' } });
+  });
+  it('logs the effective scope and source when reading settings', () => {
+    const logs = [];
+    const scope = readOperatorRulings({ env: { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'false' }, log: line => logs.push(line) });
+    expect(scope).toMatchObject({ value: { anyState: false }, sources: { anyState: 'env' } });
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain('redTeam.operatorRulings');
+    expect(logs[0]).toContain('false');
+    expect(logs[0]).toContain('env');
+  });
+  it('dedup ignores forged, missing-result and stale-result operator records', () => {
+    const line = cardLine([1]);
+    for (const record of [gate(bot, 'operator-card', line, '2026-10-21T20:30:00Z'),
+      gate(human, 'operator-card', line, '2026-10-21T20:30:00Z', null),
+      gate(human, 'operator-card', line, '2026-10-21T20:30:00Z', '0123456789abcdef')]) {
+      const r = operatorRulingsOnLiveResult([...live, record], P, H);
+      expect([...r.ruled]).toEqual([]);
+      expect([...r.carded]).toEqual([]);
+    }
+  });
+});
+
+describe('latest operator action deduplication', () => {
+  it('keeps action history in thread order and scopes it to the live result', () => {
+    const first = gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z');
+    const later = gate(human, 'operator-card', '- 1 finding(s) left advisory (#1).', '2026-10-21T20:40:00Z');
+    const r = operatorRulingsOnLiveResult([...live, later, first], P, H);
+    expect(r.ruled.get(1)).toEqual(['card', 'advisory']);
+    expect(r.ruled.get(1).at(-1)).toBe('advisory');
+    expect([...r.carded]).toEqual([1]);
+    const next = bot(renderRedTeamComment({ pr: P, rev: H, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [F(160, 'broken')] }), '2026-10-21T21:00:00Z');
+    const fresh = operatorRulingsOnLiveResult([...live, first, later, next], P, H);
+    expect([...fresh.ruled]).toEqual([]);
+    expect([...fresh.carded]).toEqual([]);
+    expect(operatorRulingsOnLiveResult([], P, H).resultId).toBeNull();
   });
 });
