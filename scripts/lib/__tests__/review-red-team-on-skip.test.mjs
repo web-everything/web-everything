@@ -5,9 +5,15 @@ import { normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveRev
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence } from '../drain-red-team-evidence.mjs';
+import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
+import { runGhSync } from '../gh-throttle.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+
+vi.mock('../gh-throttle.mjs', async importOriginal => ({
+  ...await importOriginal(), runGhSync: vi.fn(),
+}));
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
@@ -18,6 +24,152 @@ function fixture(over = {}) {
     now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), ...over };
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
+
+describe('R100 — #5910 accepted stored review does not owe a red team', () => {
+  const storedHead = '682e81b3ae1c'.padEnd(40, '0'), storedPr = 5910;
+  function storedFixture(over = {}) {
+    return fixture({
+      refusals: [{ kind: 'already-reviewed-head', prNumber: storedPr, headSha: storedHead }],
+      rawPrs: [{ number: storedPr, headRefOid: storedHead, labels: ['review:accepted'], comments: [] }],
+      readEvidence: () => ({ loopPayload: {
+        verdict: { verdict: 'needs-human', humanRequired: false },
+        findings: { read: { netBasis: { rev: storedHead },
+          diffText: 'diff --git a/backlog/5910-card.md b/backlog/5910-card.md\n+update',
+          netChangedFiles: ['backlog/5910-card.md'], netRenameSources: [] } },
+      } }),
+      ...over,
+    });
+  }
+  function storedRun(over = {}) {
+    const f = storedFixture();
+    return runFixture({ ...f, plan: { refusals: f.refusals }, now: () => f.now, ...over });
+  }
+
+  it.each([['review:accepted'], [{ name: 'review:accepted' }]].map(labels => [labels]))(
+    'plans clear for a matching stored review and accepted labels %j', labels => {
+      const f = storedFixture(); f.rawPrs[0].labels = labels;
+      expect(planRedTeamOnSkip(f)).toEqual([{ prNumber: storedPr, head: storedHead,
+        action: 'clear', why: 'not owed (stored review)' }]);
+    });
+
+  it.each(['inFlight', 'queued'])('skips an accepted not-owed review while %s', key => {
+    const f = storedFixture(), evidence = { ...f.readEvidence(), [key]: true };
+    f.readEvidence = () => evidence;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'red-team pass in flight' });
+  });
+
+  it('skips an accepted not-owed review with a prior error status row', () => {
+    const readStatus = vi.fn(() => ({ status: 'finished', head: storedHead, result: 'error' }));
+    expect(planRedTeamOnSkip(storedFixture({ readStatus }))[0])
+      .toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+    expect(readStatus).toHaveBeenCalledWith({ repo, pr: storedPr, head: storedHead });
+  });
+
+  it('skips an accepted not-owed review with recorded red-team evidence', () => {
+    const f = storedFixture(), evidence = { ...f.readEvidence(), recorded: true };
+    f.readEvidence = () => evidence;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+  });
+
+  it('fails closed when prior status is unreadable for an accepted not-owed review', () => {
+    const f = storedFixture({ readStatus: () => { throw Error('unreadable'); } });
+    expect(planRedTeamOnSkip(f)[0])
+      .toMatchObject({ action: 'skip', why: 'red-team evidence unreadable; inspect stored evidence before retrying' });
+  });
+
+  it.each([[], ['review:human'], undefined, null, 'review:accepted'].map(labels => [labels]))(
+    'keeps the existing skip without readable accepted labels %j', labels => {
+      const f = storedFixture(); f.rawPrs[0].labels = labels;
+      expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+    });
+
+  it.each(['b'.repeat(40), undefined])('keeps the existing skip for a mismatched or missing stored head %j', rev => {
+    const f = storedFixture(), evidence = f.readEvidence();
+    evidence.loopPayload.findings.read.netBasis.rev = rev;
+    f.readEvidence = () => evidence;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+  });
+
+  it('fails closed on unreadable stored evidence or comments on an accepted head', () => {
+    const f = storedFixture({ readEvidence: () => { throw Error('unreadable'); } });
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'red-team evidence unreadable; inspect stored evidence before retrying' });
+    f.rawPrs[0].comments = undefined;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'PR comments unreadable' });
+  });
+
+  it('default settlement posts the head-bound reasoned marker once without consuming dispatch capacity', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-stored-clear-'));
+    const take = vi.fn(), log = vi.fn();
+    const o = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs') }, log,
+      capacity: { lanes: 0, budget: { left: 0 }, remainingStarts: 0, take } });
+    runGhSync.mockImplementation((_args, options) => {
+      o.rawPrs[0].comments.push({ body: options.input, author: { login: 'web-everything' } });
+    });
+    try {
+      expect(runRedTeamOnSkip(o)).toMatchObject({
+        rows: [{ action: 'clear', why: 'not owed (stored review)' }], dispatched: [], notStarted: [],
+      });
+      expect(runGhSync).toHaveBeenCalledOnce();
+      expect(runGhSync).toHaveBeenCalledWith([
+        'pr', 'comment', String(storedPr), `--repo=${repo}`, '--body-file', '-',
+      ], expect.objectContaining({ input: expect.stringContaining('not owed (stored review)') }));
+      expect(o.rawPrs[0].comments[0].body.split('\n')[0]).toBe(redTeamMarker(storedPr, storedHead));
+      expect(redTeamForHead(o.rawPrs[0].comments, storedPr, storedHead)).toEqual({ pr: storedPr, rev: storedHead, findings: [] });
+      expect(redTeamForHead(o.rawPrs[0].comments, storedPr, 'b'.repeat(40))).toBeNull();
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+      expect(runGhSync).toHaveBeenCalledOnce();
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('red team cleared'));
+      expect(o.capacity).toEqual({ lanes: 0, budget: { left: 0 }, remainingStarts: 0, take });
+      expect(take).not.toHaveBeenCalled();
+      expect(o.dispatch).not.toHaveBeenCalled();
+      expect(o.lastDispatch.size).toBe(0);
+    } finally {
+      runGhSync.mockReset();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['policy-clear', 'already'])('retains clear for settlement outcome %s', outcome => {
+    const settle = vi.fn(() => ({ outcome })), o = storedRun({ settle });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
+    expect(settle).toHaveBeenCalledOnce();
+    expect(settle).toHaveBeenCalledWith(expect.objectContaining({
+      redTeam: { status: 'not-owed' }, repo, pr: storedPr, head: storedHead, readHead: storedHead,
+      accepted: true, comments: o.rawPrs[0].comments, reason: 'not owed (stored review)',
+    }));
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['throws', () => { throw Error('offline'); }, 'offline'],
+    ['throws an unprintable value', () => { throw { message: { toString: null } }; }, 'unprintable error'],
+    ['returns non-policy', () => ({ outcome: 'non-policy', reason: 'post failed' }), 'post failed'],
+    ['returns unknown', () => undefined, 'unknown outcome'],
+  ])('settlement that %s becomes a skip without throwing', (_name, settle, why) => {
+    const o = storedRun({ settle });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: `clear failed: ${why}` });
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
+    expect(o.lastDispatch.size).toBe(0);
+  });
+
+  it('dry run preserves the clear plan without settling or spending capacity', () => {
+    const settle = vi.fn(), o = storedRun({ settle, dryRun: true });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'dry run (clear)' });
+    expect(settle).not.toHaveBeenCalled();
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
+    expect(o.lastDispatch.size).toBe(0);
+  });
+
+  it('a red-team result already on the head keeps the existing skip and never settles', () => {
+    const settle = vi.fn(), readEvidence = vi.fn(), o = storedRun({ settle, readEvidence });
+    o.rawPrs[0].comments.push({ body: redTeamMarker(storedPr, storedHead), author: { login: 'web-everything' } });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+    expect(settle).not.toHaveBeenCalled();
+    expect(readEvidence).not.toHaveBeenCalled();
+  });
+});
 
 describe('planRedTeamOnSkip — heal a previously skipped card-only head', () => {
   const cardPayload = () => {
