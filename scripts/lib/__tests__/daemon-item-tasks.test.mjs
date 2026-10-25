@@ -7,7 +7,7 @@ import { createJobStore } from '../daemon-jobs-runtime.mjs';
 import { defineJobKind } from '../daemon-jobs.mjs';
 import { isValidRunId } from '../../operations/run-record.mjs';
 import { withFileLock } from '../atomic-json-file.mjs';
-import { enqueueItemTask, taskIdentity, taskTupleLockId, createRecordingFacts, validateTaskPlan } from '../daemon-item-tasks.mjs';
+import { enqueueItemTask, taskIdentity, taskTupleLockId, createRecordingFacts, validateTaskPlan, runItemTask } from '../daemon-item-tasks.mjs';
 
 let dir, store;
 const kindDef = defineJobKind({ kind: 'fix', entry: 'job.mjs' });
@@ -143,7 +143,7 @@ it('planning records nested reads and rejects incomplete effect declarations', (
   expect(() => validateTaskPlan({ facts: { outcome: 'ready', recordedReads: [] }, effects: [effect()] })).toThrow(/deferred-read/);
 });
 
-it('unreadable facts defer and incomplete comments cannot authorize effects', () => {
+it('unreadable facts defer and incomplete comments cannot authorize effects', async () => {
   for (const change of [null, { ...snapshot(), observedAt: 1 }, { ...snapshot(), observedAt: 1200 },
     { ...snapshot(), identity: { repo: 'other/repo', item: 12 } }, { ...snapshot(), complete: false },
     { ...snapshot(), data: undefined }]) {
@@ -163,6 +163,21 @@ it('unreadable facts defer and incomplete comments cannot authorize effects', ()
     expectedIdentity: snapshot().identity, now: 1100, snapshotMaxAgeMs: 200 });
   expect(torn.outcome).toBe('deferred-read');
   expect(() => torn.read('open')).toThrow(/deferred-read/);
+  for (const value of [null, { ...snapshot(), complete: false }, { ...snapshot(), source: 'cached-thread' }]) {
+    const h = taskHarness(); h.args.read = () => factsFor(value);
+    expect((await runItemTask(h.args)).outcome).toBe('deferred-read');
+    expect(h.calls).not.toContain('act');
+  }
+  const cached = taskHarness();
+  cached.args.read = () => factsFor({ ...snapshot(), data: { comments: [] } });
+  cached.args.plan = f => { f.read('comments'); return []; };
+  expect((await runItemTask(cached.args)).outcome).toBe('deferred-read');
+  expect(cached.calls).toEqual([]);
+  for (const thread of [undefined, { source: 'cached-thread', complete: true }, { source: 'live-thread', complete: false }]) {
+    const h = taskHarness([{ ...effect(), name: 'comment', appliedProbe: 'live-marker' }]);
+    h.args.effects.probe = () => ({ applied: false, thread });
+    expect((await runItemTask(h.args)).outcome).toBe('failed'); expect(h.calls).not.toContain('act');
+  }
 });
 
 it('task enqueue persists policy provenance and refuses invalid cascade layers', () => {
@@ -182,4 +197,259 @@ it('task enqueue persists policy provenance and refuses invalid cascade layers',
   const next = enqueueItemTask({ ...options(2, 'policy/repo'), policyOptions: { platform: null, env: {}, tool: { timeoutMs: 500 } } });
   expect(next.job.task.sources.timeoutMs).toBe('tool');
   expect(next.job.task.timeoutMs).toBe(500);
+});
+
+
+const executionEffect = () => ({ ...effect(), appliedProbe: 'live-head' });
+
+// A guarded in-memory record port models the child/store CAS without filesystem or GitHub IO.
+function taskHarness(effects = [executionEffect()]) {
+  let record = { job: { status: 'running', handle: 'host:1:start', attempts: 3,
+    task: { ...taskIdentity(identity()), failureCount: 0 } } };
+  const calls = [], logs = [], runs = new Map();
+  const h = { calls, logs, runs, get record() { return record; },
+    mutate: fn => { record = fn(record); } };
+  h.args = {
+    task: taskIdentity(identity()), attempt: 3, handle: 'host:1:start',
+    record: { read: () => structuredClone(record), update: fn => { record = fn(structuredClone(record)); return record; } },
+    read: () => factsFor(), plan: facts => { facts.read('pull.head.sha'); return effects; },
+    claim: { acquire: async () => 'claim-token', assert: async () => true, release: async () => calls.push('release') },
+    effects: {
+      probe: async ({ gh }) => gh.read(() => { calls.push('probe'); return { applied: false }; }),
+      fence: async ({ gh }) => gh.read(() => { calls.push('fence'); return factsFor(); }),
+      act: async ({ effectId, gh, precondition }) => gh.write(() => {
+        calls.push('act');
+        expect(record.job.task.execution.effects[effectId]).toMatchObject({ status: 'intent', precondition });
+        return { receipt: effectId };
+      }),
+    },
+    runStore: { find: async id => { calls.push('run-store'); return runs.get(id) ?? null; } },
+    budgets: { read: 100, write: 100 }, now: (() => { let n = 0; return () => ++n; })(),
+    timing: entry => logs.push(entry),
+  };
+  return h;
+}
+
+it('task outcomes preserve launch identity and charge only failed attempts', async () => {
+  for (const outcome of ['acted', 'nothing-owed', 'superseded', 'deferred-claim-held', 'deferred-read', 'failed']) {
+    const h = taskHarness();
+    if (outcome === 'nothing-owed') h.args.plan = () => [];
+    if (outcome === 'superseded') h.args.claim.assert = () => false;
+    if (outcome === 'deferred-claim-held') h.args.claim.acquire = () => null;
+    if (outcome === 'deferred-read') h.args.read = () => factsFor(null);
+    if (outcome === 'failed') h.args.effects.probe = () => { throw Error('probe unavailable'); };
+    expect((await runItemTask(h.args)).outcome).toBe(outcome);
+    expect((await runItemTask(h.args)).outcome).toBe(outcome);
+    expect(h.record.job.attempts).toBe(3);
+    expect(h.record.job.task.failureCount).toBe(outcome === 'failed' ? 1 : 0);
+    expect(h.logs).toHaveLength(1);
+    if (outcome === 'deferred-claim-held') expect(h.calls).toEqual([]);
+  }
+  const h = taskHarness();
+  h.mutate(r => ({ ...r, job: { ...r.job, attempts: 4 } }));
+  expect((await runItemTask(h.args)).outcome).toBe('superseded');
+  expect(h.calls).toEqual([]);
+  for (const change of [{ handle: 'another:2:start' }, { status: 'succeeded' }]) {
+    const stale = taskHarness(); stale.mutate(r => ({ ...r, job: { ...r.job, ...change } }));
+    expect((await runItemTask(stale.args)).outcome).toBe('superseded'); expect(stale.calls).toEqual([]);
+  }
+});
+
+it('superseded launches during planning or claim acquisition cannot start either probe port', async () => {
+  for (const boundary of ['plan', 'claim']) {
+    for (const appliedProbe of ['live-head', 'worker-run']) {
+      const h = taskHarness([{ ...executionEffect(), appliedProbe }]);
+      const supersede = () => h.mutate(r => ({ ...r, job: { ...r.job, attempts: 4 } }));
+      if (boundary === 'plan') {
+        const plan = h.args.plan;
+        h.args.plan = async facts => {
+          const declarations = plan(facts);
+          await Promise.resolve();
+          supersede();
+          return declarations;
+        };
+      } else {
+        h.args.claim.acquire = async () => {
+          await Promise.resolve();
+          supersede();
+          return 'claim-token';
+        };
+      }
+      const result = await runItemTask(h.args);
+      expect(result.outcome).toBe('superseded');
+      expect(h.calls).toEqual(['release']);
+      expect(result.gh).toEqual({ read: 0, write: 0 });
+      expect(h.record.job.task.failureCount).toBe(0);
+      expect(h.record.job.task.execution).toBeUndefined();
+    }
+  }
+});
+
+const effectRows = [
+  ['dispatch', 'worker-run', 'none'], ['promote', 'live-ready', 'none'],
+  ['label', 'live-label', 'none'], ['comment', 'live-marker', 'none'],
+  ['push', 'remote-head', { lease: 'abc' }], ['merge', 'merged', { matchHeadCommit: 'abc' }],
+];
+it.each(effectRows)('resume probes act-before-mark for every declared effect kind', async (name, appliedProbe, precondition) => {
+  const e = { ...executionEffect(), name, appliedProbe, precondition };
+  const h = taskHarness([e]); let applied = false, acts = 0;
+  const update = h.args.record.update;
+  h.args.record.update = fn => {
+    const candidate = fn(structuredClone(h.record));
+    if (candidate.job.task.execution?.effects[`${h.args.task.id}:${name}`]?.status === 'applied' && !applied) {
+      applied = true; throw Error('crash after act before mark');
+    }
+    return update(() => candidate);
+  };
+  h.args.effects.act = async ({ effectId }) => { acts++; h.runs.set(effectId, { status: 'done' }); return { receipt: 'written' }; };
+  h.args.effects.probe = async ({ gh }) => gh.read(() => ({ applied: acts > 0, evidence: { receipt: 'observed' }, thread: { source: 'live-thread', complete: true } }));
+  expect((await runItemTask(h.args)).outcome).toBe('failed');
+  // A new launch sees an incomplete intent, including if the new planner owes nothing.
+  h.mutate(r => ({ ...r, job: { ...r.job, attempts: 4 } })); h.args.attempt = 4;
+  h.args.plan = () => [];
+  h.args.read = () => factsFor({ ...snapshot(), data: { pull: { head: { sha: 'changed-by-effect' } } } });
+  h.args.effects.fence = () => { throw Error('positive probe must precede fence'); };
+  const result = await runItemTask(h.args);
+  expect(result.outcome).toBe('acted'); expect(acts).toBe(1);
+  expect(result.effects[0]).toMatchObject({ effectId: `${h.args.task.id}:${name}`, status: 'applied', inputs: { 'pull.head.sha': 'abc' } });
+  if (name === 'dispatch') { expect(result.gh.read).toBe(0); expect(h.calls).toContain('run-store'); }
+});
+
+it('live fence rejects merged drafted and changed inputs before act', async () => {
+  const values = { head: 'abc', base: 'base', open: true, draft: false, labels: ['review:ok'], checks: ['green'], review: 7, withdrawal: false, marker: 1, claim: 'ours' };
+  for (const key of Object.keys(values)) {
+    const h = taskHarness([{ ...executionEffect(), inputs: Object.keys(values), fences: Object.keys(values) }]);
+    h.args.read = () => factsFor({ ...snapshot(), data: values });
+    h.args.plan = f => { Object.keys(values).forEach(k => f.read(k)); return [{ ...executionEffect(), inputs: Object.keys(values), fences: Object.keys(values) }]; };
+    h.args.effects.fence = () => factsFor({ ...snapshot(), data: { ...values, [key]: null } });
+    expect((await runItemTask(h.args)).outcome).toBe('superseded'); expect(h.calls).not.toContain('act');
+  }
+  const h = taskHarness([executionEffect(), { ...executionEffect(), name: 'later' }]); let assertions = 0;
+  h.args.claim.assert = () => ++assertions <= 2;
+  expect((await runItemTask(h.args)).outcome).toBe('superseded');
+  expect(Object.values(h.record.job.task.execution.effects)[0].status).toBe('applied');
+  expect(h.calls.filter(c => c === 'act')).toHaveLength(1);
+  const boundary = taskHarness(); let checks = 0;
+  boundary.args.claim.assert = () => ++checks === 1;
+  expect((await runItemTask(boundary.args)).outcome).toBe('superseded');
+  expect(boundary.calls).not.toContain('act');
+  const suspended = taskHarness(); let claimChecks = 0, signalAssertion, resumeAssertion;
+  const assertionPending = new Promise(resolve => { signalAssertion = resolve; });
+  const assertionResumed = new Promise(resolve => { resumeAssertion = resolve; });
+  suspended.args.claim.assert = async () => {
+    if (++claimChecks === 2) {
+      signalAssertion();
+      await assertionResumed;
+    }
+    return true;
+  };
+  const running = runItemTask(suspended.args);
+  await assertionPending;
+  suspended.mutate(r => ({ ...r, job: { ...r.job, attempts: 4 } }));
+  resumeAssertion();
+  const superseded = await running;
+  expect(superseded.outcome).toBe('superseded');
+  expect(suspended.calls).not.toContain('act');
+  expect(superseded.gh.write).toBe(0);
+  expect(suspended.record.job.task.failureCount).toBe(0);
+  expect(Object.values(suspended.record.job.task.execution.effects)[0].status).toBe('intent');
+
+  for (const invalid of [null, { ...snapshot(), complete: false }, { ...snapshot(), observedAt: 1 }]) {
+    const unreadable = taskHarness(); unreadable.args.effects.fence = () => factsFor(invalid);
+    expect((await runItemTask(unreadable.args)).outcome).toBe('deferred-read');
+    expect(unreadable.calls).not.toContain('act');
+  }
+});
+
+it('fence-to-act races honor declared preconditions and reconcile next tick', async () => {
+  for (const [name, appliedProbe, precondition] of effectRows.slice(1)) {
+    const h = taskHarness([{ ...executionEffect(), name, appliedProbe, precondition }]); let head = 'abc', writes = 0;
+    h.args.effects.probe = () => ({ applied: false, thread: { source: 'live-thread', complete: true } });
+    h.args.effects.fence = () => { head = 'new'; return factsFor(); };
+    h.args.effects.act = ({ precondition: guard }) => {
+      if (guard !== 'none' && head !== 'abc') throw Error('server precondition rejected');
+      writes++; return { head };
+    };
+    expect((await runItemTask(h.args)).outcome).toBe(precondition === 'none' ? 'acted' : 'failed');
+    expect(writes).toBe(precondition === 'none' ? 1 : 0);
+    h.mutate(r => ({ ...r, job: { ...r.job, attempts: 4 } })); h.args.attempt = 4;
+    h.args.effects.probe = () => ({ applied: true, evidence: { reconciled: true }, thread: { source: 'live-thread', complete: true } });
+    expect((await runItemTask(h.args)).outcome).toBe('acted'); expect(writes).toBe(precondition === 'none' ? 1 : 0);
+  }
+});
+
+it('unknown applied probe fails without later effects', async () => {
+  for (const probe of [() => undefined, () => ({ applied: 'unknown' }), () => { throw Error('unreadable'); }]) {
+    const h = taskHarness([executionEffect(), { ...executionEffect(), name: 'later' }]); h.args.effects.probe = probe;
+    expect((await runItemTask(h.args)).outcome).toBe('failed'); expect(h.calls).toEqual(['release']);
+  }
+});
+
+it.each([
+  ['read', 'read', []], ['probe', 'read', ['read']],
+  ['fence', 'read', ['read', 'probe']], ['act', 'write', ['read', 'probe', 'fence']],
+])('superseded %s adapter cannot invoke metered gh.%s after awaiting', async (phase, _kind, priorCalls) => {
+  const h = taskHarness(); let signalAdapter, resumeAdapter;
+  const adapterPending = new Promise(resolve => { signalAdapter = resolve; });
+  const adapterResumed = new Promise(resolve => { resumeAdapter = resolve; });
+  h.args.read = ({ gh }) => gh.read(() => { h.calls.push('read'); return factsFor(); });
+  const target = phase === 'read' ? h.args : h.args.effects;
+  const adapter = target[phase];
+  target[phase] = async context => {
+    signalAdapter();
+    await adapterResumed;
+    return adapter(context);
+  };
+  const running = runItemTask(h.args);
+  await adapterPending;
+  expect(h.calls).toEqual(priorCalls);
+  h.mutate(r => ({ ...r, job: { ...r.job, attempts: 4 } }));
+  resumeAdapter();
+  const result = await running;
+  expect(result.outcome).toBe('superseded');
+  expect(h.calls).toEqual(phase === 'read' ? priorCalls : [...priorCalls, 'release']);
+  expect(result.gh).toEqual({ read: priorCalls.length, write: 0 });
+  expect(h.record.job.task.failureCount).toBe(0);
+  expect(h.record.job.task.execution?.results?.[3]).toBeUndefined();
+});
+
+it.each([
+  ['missing budgets', undefined], ['null budgets', null], ['missing limits', {}],
+  ...['read', 'write'].flatMap(kind => [
+    ['missing', undefined], ['negative', -1], ['fractional', 0.5], ['NaN', NaN],
+    ['infinite', Infinity], ['negative infinite', -Infinity], ['unsafe integer', Number.MAX_SAFE_INTEGER + 1],
+  ].map(([label, limit]) => [`${kind} ${label}`, { read: 100, write: 100, [kind]: limit }])),
+])('invalid task budgets reject %s before read probe fence or act', async (_label, budgets) => {
+  const h = taskHarness(); h.args.budgets = budgets;
+  const read = h.args.read;
+  h.args.read = context => { h.calls.push('read'); return read(context); };
+  const result = await runItemTask(h.args);
+  expect(result.outcome).toBe('deferred-read');
+  expect(result.reason).toBe('task requires finite read/write budgets; correct policy before rescheduling');
+  expect(h.calls).toEqual([]);
+  expect(result.gh).toEqual({ read: 0, write: 0 });
+  expect(result.recordedReads).toEqual([]);
+});
+
+it('task telemetry meters probes fences and acts before budget spend', async () => {
+  for (const [budgets, outcome, expected] of [
+    [{ read: 0, write: 1 }, 'failed', []], [{ read: 1, write: 1 }, 'deferred-read', ['probe']],
+    [{ read: 2, write: 0 }, 'failed', ['probe', 'fence']], [{ read: 2, write: 1 }, 'acted', ['probe', 'fence', 'act']],
+  ]) {
+    const h = taskHarness(); h.args.budgets = budgets;
+    const result = await runItemTask(h.args);
+    expect(result.outcome).toBe(outcome);
+    expect(h.calls.filter(c => c !== 'release')).toEqual(expected);
+    expect(result.gh).toEqual({ read: expected.filter(c => c !== 'act').length, write: expected.includes('act') ? 1 : 0 });
+    if (outcome !== 'acted') expect(result.reason).toContain('budget-exhausted');
+    expect(result.recordedReads).toHaveLength(1);
+    for (const phase of ['read', 'plan', 'claim', 'probe', 'fence', 'act', 'mark']) expect(result.timings[phase]).toBeGreaterThanOrEqual(0);
+    await runItemTask(h.args); expect(h.logs).toHaveLength(1);
+    expect(h.logs[0]).toMatchObject({ type: 'task-timing', key: `${h.args.task.id}:3`, attempt: 3 });
+  }
+  const h = taskHarness(); h.args.budgets.read = 0;
+  h.args.read = ({ gh }) => gh.read(() => { throw Error('denied call executed'); });
+  const result = await runItemTask(h.args);
+  expect(result.outcome).toBe('deferred-read'); expect(result.reason).toContain('budget-exhausted');
+  expect(result.gh.read).toBe(0);
 });
