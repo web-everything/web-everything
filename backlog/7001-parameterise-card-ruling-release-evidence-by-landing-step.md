@@ -1,4 +1,5 @@
 ---
+bornAs: x9k3m7q
 kind: task
 status: resolved
 scope: ["we:scripts/operations/__tests__/record-red-team-ruling.test.mjs"]
