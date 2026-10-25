@@ -106,9 +106,10 @@ picked up, retains the 45-minute never-scheduled recovery path; live passes and 
 cannot use it.
 
 Already-reviewed heads with an owed result can use the existing review job's `--red-team-only`
-mode (`--red-team-only=resume|fresh`; the bare flag retains fresh guards). A recorded scorecard row plus a finished status whose `result` string or `result.status` is `ran` or `resumed`
-resumes its missing comment/effects without another model call; a failed recovery persists `resumed` and remains eligible after cooldown, subject to the same clean-row guards;
-only a head with neither status nor row starts fresh. A trusted result comment, live pass,
+mode (`--red-team-only=resume|fresh`; the bare flag retains fresh guards). A completed scorecard seat (`completedRecorded === true`) plus a finished status whose `result` string or `result.status` is `ran` or `resumed`
+resumes its missing comment/effects without another model call; a failed recovery persists `resumed` and remains eligible after cooldown, subject to the same clean-row guards.
+Daemon and soak fixtures that expect legacy completion strings to resume must carry that seat evidence explicitly; with `recorded === true`, missing or incomplete completed-seat evidence refuses dispatch.
+Only a head with neither status nor row starts fresh. A trusted result comment, live pass,
 non-accept, unreadable evidence, recorded row without a status, or any prior result other than `ran` or `resumed`
 prevents dispatch, except a finished `skipped` status with `skipCardOnly === true` and a
 stored card-only net read with non-empty trimmed `diffText` and `netBasis.rev` matching the status head: that historical gap dispatches fresh to settle the skip. A structured result with an absent policy or any policy other than `card-only` never heals; legacy string `skipped` remains eligible.

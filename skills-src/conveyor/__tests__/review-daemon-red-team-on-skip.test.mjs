@@ -9,7 +9,7 @@ import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.m
 it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head in %s mode', mode => {
   const repo = 'web-everything/web-everything', head = (mode === 'fresh' ? 'c' : 'd').repeat(40), pr = 5762;
   const readEvidence = vi.spyOn(redTeamEvidence, 'readDrainRedTeamEvidence').mockReturnValue({
-    recorded: mode === 'resume', loopPayload: {
+    recorded: mode === 'resume', seatRecorded: mode === 'resume', completedRecorded: mode === 'resume', loopPayload: {
       verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } },
     },
   });
@@ -49,7 +49,7 @@ it.each(['fresh', 'resume'])('real reconcile recovers a queued accepted head in 
     expect.objectContaining({ kind: 'nothing-owed', phase: 'queued', prNumber: pr }),
   ]);
   const dispatch = vi.fn(() => ({ jobPid: 42 }));
-  const readEvidence = vi.fn(() => ({ recorded: mode === 'resume', loopPayload: {
+  const readEvidence = vi.fn(() => ({ recorded: mode === 'resume', seatRecorded: mode === 'resume', completedRecorded: mode === 'resume', loopPayload: {
     verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } } }));
   const out = runReviewTick({ repo, readPrs: () => [rawPr], readAgents: () => [], reconcile,
     holdReconcile: () => [], acquirableLanes: () => 1, tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
@@ -101,6 +101,25 @@ function recoveryTickFixture({ ordinary = false, queued = false } = {}) {
       readStatus: () => null, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map() }),
   } };
 }
+
+it.each([
+  { recorded: true },
+  { recorded: true, seatRecorded: true, completedRecorded: false },
+])('legacy completion strings cannot resume without a completed seat: %j', evidence => {
+  const { options, recoveryDispatch } = recoveryTickFixture();
+  for (const result of ['ran', 'resumed']) {
+    const out = runReviewTick({ ...options,
+      redTeamOnSkip: input => runRedTeamOnSkip({ ...input, dispatch: recoveryDispatch,
+        readEvidence: () => ({ ...evidence, loopPayload: { verdict: { verdict: 'accept' },
+          findings: { read: { netBasis: { rev: 'a'.repeat(40) } } } } }),
+        readStatus: () => ({ status: 'finished', result }),
+        setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map() }),
+    });
+    expect(out.redTeamOnSkip.rows).toHaveLength(2);
+    expect(out.redTeamOnSkip.dispatched).toEqual([]);
+  }
+  expect(recoveryDispatch).not.toHaveBeenCalled();
+});
 
 it.each([false, true].flatMap(ordinary => [false, true].map(queued => ({ ordinary, queued }))))(
   'host denial blocks recovery starts (ordinary: $ordinary, queued: $queued)', ({ ordinary, queued }) => {
