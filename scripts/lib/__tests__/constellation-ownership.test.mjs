@@ -1,3 +1,4 @@
+// @repo-scanning-test scope=full — ownership coverage and CLI totals require the complete tracked inventory.
 import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
