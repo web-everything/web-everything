@@ -61,6 +61,18 @@ describe('head-bound red-team operator labels', () => {
   });
 });
 
+it('a blocked label with no result and no local status record is kept, never planned for removal', () => {
+  expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:blocked'], comments: [], evidence: {} }))
+    .toEqual({ add: null, remove: [] });
+});
+
+it('a pending label with no result and nothing owed is kept, never planned for removal', () => {
+  expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], evidence: {} }))
+    .toEqual({ add: null, remove: [] });
+  expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending', 'red-team:clear'], comments: [], evidence: {} }))
+    .toEqual({ add: null, remove: ['red-team:clear'] });
+});
+
 describe('finished stored results without a marker', () => {
   it.each([
     ['changes', 1, 'red-team:blocked'], ['accept', 0, 'red-team:clear'],

@@ -2550,6 +2550,11 @@ mark("9b. Module-resolution exports-lock (#274/#271)");
 // must go through the FUI genWrapper pattern. The fs gather lives here; the pure rules do the asserting.
 if (!sectionGate.shouldRun('9c')) skippedMark('9c');
 else try {
+  // Timing merges have the same silent last-wins failure as package manifests.
+  const timingSource = 'scripts/ci/test-timings.json';
+  const timingRaw = readFileSync(join(ROOT, timingSource), 'utf8');
+  JSON.parse(timingRaw); // Invalid JSON must fail this check too.
+  for (const e of validateNoDuplicateManifestKeys(timingRaw, timingSource)) err(e.message, e.descriptor);
   // (1) gather every in-repo package.json manifest (root + nested, excluding node_modules) → name + exports.
   const manifests = [];
   const walkPkgs = (dir) => {

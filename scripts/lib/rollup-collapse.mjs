@@ -81,6 +81,69 @@ export function collapseRollupToLatestPerName(rollup) {
 }
 
 /**
+ * The latest run of ONE named check ({@link collapseRollupToLatestPerName}, then a by-name lookup), or `null` when
+ * that check has not reported. `we:scripts/merge-ai-prs.mjs#latestRequiredCheck` and the card group's combined-PR
+ * reconcile (`we:scripts/lib/card-group.mjs`) both read the required check through this one lookup. Pure.
+ * @param {Array<object>|null|undefined} rollup
+ * @param {string} name
+ * @returns {object|null}
+ */
+export function latestCheckNamed(rollup, name) {
+  return collapseRollupToLatestPerName(rollup).find((c) => (c?.name || c?.context) === name) || null;
+}
+
+/** Every conclusion (or legacy StatusContext `state`) that means a check DEFINITIVELY failed. The one list the
+ *  drain's `isRequiredCheckFailed` and the card group's dissolve read (xym8nt4: a copy of it in card-group.mjs
+ *  missed ACTION_REQUIRED/STARTUP_FAILURE, so a combined PR the drain would never land kept its sources held). */
+export const FAILED_CHECK_CONCLUSIONS = Object.freeze(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
+
+/** Did this (already latest) check row definitively fail? `null`/missing is not failed. Pure. */
+export function isFailedCheckRow(c) {
+  if (!c) return false;
+  return FAILED_CHECK_CONCLUSIONS.includes(String(c.conclusion || c.state || '').toUpperCase());
+}
+
+/**
+ * Must the required check be re-read from REST before it is trusted? gh caps rollup contexts at 100 (#3432), so a
+ * capped rollup may hide the check's newest run, and a missing check may simply be past the cap. A recorded read
+ * error is retried too. The drain's `resolveRequiredCheck` (async) and the card group's reconcile (sync) both ask
+ * this, then {@link mergeRequiredCheckRuns}. Pure.
+ */
+export function requiredCheckReadNeeded(pr, requiredCheck) {
+  const rollup = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
+  return !!pr?.requiredCheckReadError || rollup.length >= 100 || !latestCheckNamed(rollup, requiredCheck);
+}
+
+/** The REST read of every latest run of ONE check on ONE head (`gh api <this> --paginate --slurp`). Pure. */
+export function requiredCheckRunsEndpoint(repo, headSha, requiredCheck) {
+  return `repos/${repo || '{owner}/{repo}'}/commits/${encodeURIComponent(headSha)}/check-runs?check_name=${encodeURIComponent(requiredCheck)}&filter=latest&per_page=100`;
+}
+
+/**
+ * The rollup with the required check's CheckRun evidence replaced by the slurped REST pages (`stdout`). Throws on
+ * an invalid response or a run for another head/name: the caller records that as an unknown read, never as a CI
+ * verdict. A legacy commit status of the same name is a different source the check-runs endpoint never returns,
+ * so dropping it would delete the only verdict when the head has no check-run; it stays listed and the latest
+ * lookup ranks any CheckRun above it. Pure.
+ */
+export function mergeRequiredCheckRuns(pr, requiredCheck, stdout) {
+  const rollup = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
+  const pages = JSON.parse(stdout);
+  if (!Array.isArray(pages) || !pages.length || pages.some((page) => !Array.isArray(page?.check_runs))) {
+    throw new Error('invalid check-runs response');
+  }
+  const runs = pages.flatMap((page) => page.check_runs);
+  if (runs.some((run) => run?.name !== requiredCheck || run.head_sha !== pr?.headRefOid
+    || !Number.isSafeInteger(run.id) || run.id <= 0 || typeof run.status !== 'string')) {
+    throw new Error('invalid check-run evidence for the requested head/name');
+  }
+  return [
+    ...rollup.filter((row) => (row?.name || row?.context) !== requiredCheck || rollupRowKind(row) === 'StatusContext'),
+    ...runs.map((run) => ({ ...run, __typename: 'CheckRun', conclusion: run.status === 'completed' ? run.conclusion : null })),
+  ];
+}
+
+/**
  * The latest run among several runs of ONE check. PR #2894 review (CONFIRMED live): the two feeds this module
  * serves disagree on order — `gh pr view --json statusCheckRollup` is oldest→newest (creation order,
  * #xkfv491), but the REST `commits/<sha>/check-runs` feed (`we:scripts/operations/pr-status-io.mjs#checksArgv`)

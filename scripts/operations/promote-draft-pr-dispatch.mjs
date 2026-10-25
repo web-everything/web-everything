@@ -142,7 +142,7 @@ function validatePrLabels(labels) {
   return labels;
 }
 
-/** Fresh withdrawal state, scoped to the target PR and repository; fail closed on unreadable data. */
+/** Fresh draft hold labels, scoped to the target PR and repository; fail closed on unreadable data. */
 export function defaultReadPrLabels({ repoSlug, prNumber, runGh = runGhSync } = {}) {
   const raw = runGh(['pr', 'view', String(prNumber), '--repo', repoSlug, '--json', 'labels'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-labels', repo: repoSlug },
@@ -365,7 +365,7 @@ export function runReconcilePromoteDraftDispatch({
     } catch (e) {
       refusals.push({
         pr: entry.prNumber, kind: 'draft-state-unreadable', headSha: sha,
-        why: `could not read withdrawal state before promoting: ${String(e?.message ?? e).split('\n')[0]}`,
+        why: `could not read draft hold labels before promoting: ${String(e?.message ?? e).split('\n')[0]}`,
       });
       continue;
     }
@@ -373,6 +373,15 @@ export function runReconcilePromoteDraftDispatch({
       refusals.push({
         pr: entry.prNumber, kind: 'draft-withdrawn', headSha: sha,
         why: 'draft PR is withdrawn — explicit release is required before promotion',
+      });
+      continue;
+    }
+    const redTeamHold = labels.map(label => typeof label === 'string' ? label : label.name)
+      .find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
+    if (redTeamHold) {
+      refusals.push({
+        pr: entry.prNumber, kind: redTeamHold === 'red-team:blocked' ? 'red-team-blocked' : 'red-team-pending', headSha: sha,
+        why: `${redTeamHold} — a draft held by red team is never promoted`,
       });
       continue;
     }

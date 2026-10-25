@@ -46,9 +46,9 @@ export const SECTION_INPUTS = {
     impl: ['scripts/lib/utc-day-slice-scan.mjs', 'scripts/lib/invisible-source-scan.mjs',
       'scripts/lib/stdout-flush-scan.mjs', 'scripts/lib/rust-scan-bridge.mjs'],
   },
-  // Every package.json outside node_modules/dot-dirs, plus the serve() form catalog.
+  // Every package.json outside node_modules/dot-dirs, test timings, and the serve() form catalog.
   '9c': {
-    globs: ['**/package.json', 'blocks/renderers/module-service/moduleService.ts'],
+    globs: ['**/package.json', 'scripts/ci/test-timings.json', 'blocks/renderers/module-service/moduleService.ts'],
     impl: ['scripts/check-standards-rules.mjs'],
   },
   // codifiedIn cites + statuses + anchor references (backlog/, docs/agent/), the invariant catalogue, and every

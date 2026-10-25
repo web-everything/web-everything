@@ -26,9 +26,16 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
 }
 
 export const queueLabels = labels => (labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+/** Admission holds also cover pending work; pending alone must not evict a queued PR. */
+export function redTeamLabelHoldReason(labels) {
+  const names = queueLabels(labels);
+  const hold = ['red-team:blocked', 'red-team:pending'].find(l => names.includes(l));
+  return hold ? `state is ${hold}` : null;
+}
+
 export function sendBackReason(labels) {
   const names = queueLabels(labels);
-  const hold = ['review:changes', 'review:human', 'review:pending'].find(l => names.includes(l));
+  const hold = ['review:changes', 'review:human', 'review:pending', 'red-team:blocked'].find(l => names.includes(l));
   return hold ? `state is ${hold}` : !names.includes('ready-to-merge') ? 'ready-to-merge was removed' : null;
 }
 
