@@ -89,7 +89,7 @@ export function evaluateStuckTriggers(input, { now = new Date().toISOString() } 
   const end = Date.parse(now), start = Date.parse(input?.openedAt);
   if (!input || input.state !== 'open' || input.mergedAt != null
     || !Number.isFinite(end) || !Number.isFinite(start) || start > end
-    || (input.completeness && input.completeness.core !== 'complete')) return results;
+    || input.completeness?.core !== 'complete') return results;
   const ageHours = (end-start)/3600000;
   results[0] = { trigger: 'open-age', status: ageHours > 48 ? 'fired' : 'clear', ageHours, thresholdHours: 48 };
   if (Array.isArray(input.comments)) {

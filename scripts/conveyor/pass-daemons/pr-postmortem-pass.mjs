@@ -35,7 +35,7 @@ export function listOpenPrs(repo, { gh = ghJson, maxPages = 10 } = {}) {
 }
 
 const defaultPlanCard = input => planFileItem(createFileItemReader()(), input);
-const defaultFileCard = payload => createFileItemSinks()[SCAFFOLD_EFFECT](payload);
+const defaultFileCard = payload => createFileItemSinks()[SCAFFOLD_EFFECT]({...payload,abs:join(REPO_ROOT,payload.rel)});
 const defaultBatchCard = payload => fileIntoBatch({ laneDir:REPO_ROOT, cardPath:payload.rel, idemKey:payload.identity, kind:'prevention' });
 
 async function runOpenPhase({ repo, dir, now, listOpen, collectOpen, planCard, fileCard, batchCard, dryRun, beat }) {
@@ -55,8 +55,22 @@ async function runOpenPhase({ repo, dir, now, listOpen, collectOpen, planCard, f
         entry.batched = true; save();
       }
     };
-    // Retry saved identities even when discovery no longer returns their PR.
-    if (!dryRun) for (const entry of Object.values(state.cards)) await publish(entry);
+    // Migrate checkout-local paths before replaying any saved publication.
+    if (!dryRun) {
+      let migrated = false;
+      for (const entry of Object.values(state.cards)) {
+        if (entry?.payload && Object.hasOwn(entry.payload,'abs')) {
+          delete entry.payload.abs;
+          migrated = true;
+        }
+      }
+      if (migrated) save();
+      // One refused receipt must not starve discovery or other saved identities.
+      for (const entry of Object.values(state.cards)) {
+        try { await publish(entry); }
+        catch { result.incomplete = true; result.fallback = fallback; }
+      }
+    }
     const prs = await listOpen(repo);
     if (!Array.isArray(prs) || prs.length > 1000 || prs.some(p => !Number.isSafeInteger(p?.number) || p.number < 1)) throw Error('invalid or oversized open listing');
     for (const p of prs) {
@@ -75,7 +89,8 @@ async function runOpenPhase({ repo, dir, now, listOpen, collectOpen, planCard, f
           if (state.cards[identity]) continue;
           if (dryRun) { result.wouldFile.push(identity); continue; }
           const payload = await planCard({ kind:'investigation', title:`Investigate ${trigger.trigger} for ${repo} PR ${p.number}`, digest:report.markdown });
-          state.cards[identity] = { payload:{...payload,identity}, filed:false, batched:false };
+          const { abs, ...portable } = payload;
+          state.cards[identity] = { payload:{...portable,identity}, filed:false, batched:false };
           save(); // Identity and exact bytes survive failure before the first filing effect.
           await publish(state.cards[identity]);
         }
@@ -171,13 +186,24 @@ export async function runPostmortemPass({ repo, dir = coronerStateDir(), now = n
     return { published, cursor:state.cursor, done:state.done.length, quarantined:state.quarantined, open };
   });
 }
+export async function runPostmortemCli(values, { runPass = runPostmortemPass, log = console.log,
+  error = console.error, signal, sleep:wait = sleep } = {}) {
+  do {
+    try {
+      const result = await runPass({repo:values.repo,dir:values.out,dryRun:values['dry-run']});
+      log(JSON.stringify(result));
+      if (result.open?.incomplete) {
+        error('pr-postmortem-pass: open phase incomplete; operator must inspect open PR evidence and retry pending card publication');
+        if (!values.watch) process.exitCode = 1;
+      }
+    }
+    catch(e) { error(`pr-postmortem-pass: ${e.message}`); if (!values.watch) process.exitCode = 1; }
+    if (values.watch && !signal?.aborted) await wait(60000,undefined,{signal}).catch(() => {});
+  } while (values.watch && !signal?.aborted);
+}
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const { values } = parseArgs({ options: { repo:{type:'string'}, out:{type:'string'}, watch:{type:'boolean'}, 'dry-run':{type:'boolean'} } });
   const abort = new AbortController();
   process.once('SIGTERM',() => abort.abort()); process.once('SIGINT',() => abort.abort());
-  do {
-    try { console.log(JSON.stringify(await runPostmortemPass({repo:values.repo,dir:values.out,dryRun:values['dry-run']}))); }
-    catch(e) { console.error(`pr-postmortem-pass: ${e.message}`); if (!values.watch) process.exitCode = 1; }
-    if (values.watch && !abort.signal.aborted) await sleep(60000,undefined,{signal:abort.signal}).catch(() => {});
-  } while (values.watch && !abort.signal.aborted);
+  await runPostmortemCli(values,{signal:abort.signal});
 }

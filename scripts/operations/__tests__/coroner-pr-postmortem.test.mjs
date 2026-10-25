@@ -978,7 +978,7 @@ describe('per PR postmortem', () => {
 
 
 describe('stuck open PR phase', () => {
-  const open = () => ({...fixture(7),state:'open',openedAt:at(-4000),mergedAt:null});
+  const open = () => ({...fixture(7),state:'open',openedAt:at(-4000),mergedAt:null,completeness:{core:'complete'}});
   it('collects an open timeline only when explicitly enabled', () => {
     const gh = collectorGh({'/pulls/1':{state:'open',merged_at:null,created_at:at(0),changed_files:0,head:{ref:'lane/no-card'},base:{sha:'z'}}});
     expect(() => collectWith(gh)).toThrow('not merged');
