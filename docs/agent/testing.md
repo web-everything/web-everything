@@ -194,7 +194,9 @@ Regression mapping (one representative assertion per guarantee; names are in the
 Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a confirmed-dead queued
 `ran`/`resumed` prior into the shared guard before writing its own queued status. A confirmed-dead
 queued writer without a resumable prior becomes a finished null-result placeholder, so the planner
-can dispatch fresh only when seat evidence establishes that no pass ran. Live or unknown liveness
+can dispatch fresh only when seat evidence establishes that no pass ran and the evidence reader
+retains the original queued status. An ordinary finished null result has unknown run provenance
+and never authorizes fresh dispatch. Live or unknown liveness
 and invalid writer PIDs keep the queued record blocked. Regressions in `review-job-red-team-skip.test.mjs`:
 **accepted code head dispatches fresh after queued fresh recovery crashes before running with no seat or result comment**,
 **queued fresh recovery still skips with %s**, and
