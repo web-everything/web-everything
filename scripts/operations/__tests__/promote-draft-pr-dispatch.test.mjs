@@ -18,14 +18,14 @@ describe('review-hold-only red draft promotion', () => {
   const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
   const heldRows = () => [check('test'), check('review-gate', 'failure'), check('merge-gate', 'failure', { id: 123 })];
   const verdict = () => ({ num: 198, head_sha: HEAD, ok: false,
-    results: [{ id: 'review-gate', status: 'hold', reason: 'review required' }] });
+    results: [{ id: 'review-hold-labels', status: 'hold', reason: 'review required' }] });
 
   it.each([
     ['annotated merge-gate and review-gate red', heldRows(), 'red', true],
     ['review-gate red only', [check('test'), check('review-gate', 'failure'), check('merge-gate')], 'red', true],
     ['green', [check('test'), check('review-gate'), check('merge-gate')], 'green', false],
     ['another required failure', heldRows().map(row => row.name === 'test' ? check('test', 'failure') : row), 'red', false],
-    ['another required check pending', heldRows().map(row => row.name === 'test' ? { ...row, status: 'in_progress', conclusion: null } : row), 'red', false],
+    ['another required check pending', heldRows().map(row => row.name === 'test' ? { ...row, status: 'in_progress', conclusion: null } : row), 'pending', false],
     ['another required check absent', heldRows().filter(row => row.name !== 'test'), 'red', false],
     ['pending', [check('test'), check('merge-gate'), { name: 'review-gate', status: 'in_progress', conclusion: null }], 'pending', false],
     ['no evidence', [], 'unchecked', false],
