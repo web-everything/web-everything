@@ -1074,7 +1074,15 @@ export function tryResumeRoundFix(planned, {
   resumeOptions = {},
   scratchRoot = dispatchScratchRoot({ root }),
   realpath = realpathSync,
-  isolateSession = isolateDispatchSession,
+  isolateSession = (cwd) => {
+    // A previous round may predate these grants. Refresh them along with isolation/hooks;
+    // a successful resume bypasses dispatchFix and its fresh-session permission preparation.
+    const permissions = ensureSettingsFilePermissions({
+      cwd, allow: [...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)],
+    });
+    if (!permissions.ok) throw new Error(`repair-helper permissions unwritten (${permissions.reason})`);
+    return isolateDispatchSession(cwd);
+  },
   dryRun = false,
 } = {}) {
   if (!dryRun) assertNotALaneCheckout(root);
@@ -1101,7 +1109,8 @@ export function tryResumeRoundFix(planned, {
   // The resumed session reloads `<cwd>/.claude/settings.local.json`, whose guard hooks were written at its first
   // launch with absolute paths into the dispatcher's checkout of that time (a self-sync candidate dir may be gone
   // since: a missing hook script is a non-blocking error, so the guards would silently not run). Re-write them for
-  // THIS dispatcher before resuming, exactly as a fresh dispatch does; if that write fails, cold-start instead.
+  // THIS dispatcher before resuming, exactly as a fresh dispatch does. The default refresh also migrates the
+  // repair-helper permissions; if any preparation write fails, cold-start instead.
   let isolation = null;
   try { isolation = isolateSession(inputs.prior.cwd); } catch (e) { isolation = { hooks: { ok: false, reason: describeDispatchFailure(e) } }; }
   if (isolation?.hooks?.ok !== true || isolation?.write?.ok === false) {

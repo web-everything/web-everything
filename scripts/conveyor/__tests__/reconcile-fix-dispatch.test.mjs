@@ -11,7 +11,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import {
   withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
-  findResumeCandidate, buildResumePrompt, tryResumeFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
+  findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
@@ -742,6 +742,82 @@ describe('dispatchFix — the DEFAULT repair-helper grants really land on disk',
       expect(settings.permissions.allow.filter((r) => r.includes('resolve-conflict.mjs'))).toHaveLength(2);
       expect(settings.permissions.allow.filter((r) => r.includes('rearm-review.mjs'))).toHaveLength(2);
       expect(settings.env).toEqual({ KEEP: '1' });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+});
+
+describe('tryResumeRoundFix — migrate legacy repair-helper permissions before resuming', () => {
+  it('adds the hand-back grant to legacy settings before resume, preserving settings on repeated rounds', async () => {
+    const { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const scratch = mkdtempSync(join(tmpdir(), 'fix-round-helper-grant-'));
+    const cwd = join(scratch, 'previous-fixer');
+    const path = join(cwd, '.claude', 'settings.local.json');
+    const sessionId = '33333333-3333-4333-8333-333333333333';
+    const head = 'a'.repeat(40);
+    const oldAllow = [
+      'Bash(echo ok:*)',
+      'Bash(node /repo/scripts/conveyor/resolve-conflict.mjs:*)',
+      'Bash(node "/repo/scripts/conveyor/resolve-conflict.mjs":*)',
+    ];
+    mkdirSync(join(cwd, '.claude'), { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      permissions: { allow: oldAllow, deny: ['Bash(rm:*)'], additionalDirectories: ['/lanes/lane-4'] },
+      env: { KEEP: '1' },
+    }));
+    const resume = vi.fn(() => {
+      // Observe the actual file at the launch boundary, after the real isolation/hooks refresh.
+      const settings = JSON.parse(readFileSync(path, 'utf8'));
+      expect(settings.permissions.allow).toEqual([...oldAllow,
+        'Bash(node /repo/scripts/conveyor/rearm-review.mjs:*)',
+        'Bash(node "/repo/scripts/conveyor/rearm-review.mjs":*)',
+      ]);
+      expect(settings.permissions.deny).toEqual(['Bash(rm:*)']);
+      expect(settings.permissions.additionalDirectories).toEqual(['/lanes/lane-4']);
+      expect(settings.env).toEqual({ KEEP: '1' });
+      expect(settings.worktree).toEqual({ bgIsolation: 'none' });
+      expect(settings.hooks.PreToolUse.length).toBeGreaterThan(0);
+      return { resumed: true, result: { sessionId } };
+    });
+    const planned = { pr: 5931, itemNum: null, attempts: 1, headRefOid: head, baseRefName: 'main', scope: ['we:x'] };
+    const options = {
+      root: '/repo', scratchRoot: scratch, realpath: (p) => p, wrapFix: false,
+      fixSettings: { resumeAcrossRounds: 'on', strongerModelFromRound: 3 },
+      readHistoryInputs: () => null, postNotice: () => false, resume,
+      readInputs: () => ({
+        prior: { sessionId, name: 'fix-5931', state: 'done', cwd },
+        job: { template: 'bg', respawnFlags: ['--model', 'sonnet'] }, transcript: true,
+        lane: { lane: 4, path: '/lanes/lane-4', held: 'free', head, sessionHead: head },
+        base: { rebased: false },
+      }),
+    };
+    try {
+      const before = readFileSync(path, 'utf8');
+      expect(tryResumeRoundFix(planned, { ...options, dryRun: true }).decision.resume).toBe(true);
+      expect(tryResumeRoundFix({ ...planned, attempts: 0 }, options).resumed).toBe(false);
+      expect(readFileSync(path, 'utf8')).toBe(before);
+      expect(resume).not.toHaveBeenCalled();
+      // Do not inject isolateSession: a mock would hide the missing default permission refresh.
+      expect(tryResumeRoundFix(planned, options).resumed).toBe(true);
+      expect(tryResumeRoundFix(planned, options).resumed).toBe(true);
+      expect(resume).toHaveBeenCalledTimes(2);
+      const shim = await import('../../lib/gh-app-shim.mjs');
+      const grant = vi.spyOn(shim, 'ensureSettingsFilePermissions');
+      try {
+        for (const fails of [
+          () => ({ ok: false, reason: 'write-failed' }),
+          () => { throw new Error('EACCES'); },
+        ]) {
+          grant.mockImplementation(fails);
+          const beforeFailure = readFileSync(path, 'utf8');
+          const result = tryResumeRoundFix(planned, options);
+          expect(result.resumed).toBe(false);
+          expect(result.resumeAttempt).toMatchObject({ attempted: false, refused: 'guard-hooks-unwritten' });
+          expect(readFileSync(path, 'utf8')).toBe(beforeFailure);
+          expect(resume).toHaveBeenCalledTimes(2);
+        }
+      } finally { grant.mockRestore(); }
     } finally { rmSync(scratch, { recursive: true, force: true }); }
   });
 });
