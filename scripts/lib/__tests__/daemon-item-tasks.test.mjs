@@ -202,6 +202,161 @@ it('task enqueue persists policy provenance and refuses invalid cascade layers',
 
 const executionEffect = () => ({ ...effect(), appliedProbe: 'live-head' });
 
+it.each(['planning', 'fencing'])('parent comment reads require complete live-thread provenance during %s', async boundary => {
+  for (const thread of [undefined, { source: 'cached-thread', complete: false },
+    { source: 'cached-thread', complete: true }, { source: 'live-thread', complete: false }]) {
+    for (const data of [{ pull: { comments: [] } }, { pull: { reviews: [{ comments: [] }] } }]) {
+      const h = taskHarness();
+      const value = { ...snapshot(), thread: { source: 'live-thread', complete: true }, data };
+      const incomplete = { ...value, thread };
+      h.args.read = () => factsFor(boundary === 'planning' ? incomplete : value);
+      h.args.plan = facts => {
+        facts.read('pull');
+        return [{ ...executionEffect(), name: 'label', inputs: ['pull'], fences: ['pull'] }];
+      };
+      h.args.effects.fence = () => factsFor(boundary === 'fencing' ? incomplete : value);
+      const result = await runItemTask(h.args);
+      expect(result.outcome).toBe('deferred-read');
+      expect(h.calls).not.toContain('act');
+      expect(result.gh.write).toBe(0);
+      expect(h.record.job.task.failureCount).toBe(0);
+    }
+  }
+});
+
+it('complete parent comment reads work and unrelated leaves do not require thread provenance', async () => {
+  const value = { ...snapshot(), data: { pull: { head: { sha: 'abc' }, comments: [] } } };
+  expect(factsFor(value).read('pull.head.sha')).toBe('abc');
+  const h = taskHarness();
+  const live = { ...value, thread: { source: 'live-thread', complete: true } };
+  h.args.read = () => factsFor(live);
+  h.args.plan = facts => {
+    expect(facts.read('pull').comments).toEqual([]);
+    return [{ ...executionEffect(), name: 'label', inputs: ['pull'], fences: ['pull'] }];
+  };
+  h.args.effects.fence = () => factsFor(live);
+  expect((await runItemTask(h.args)).outcome).toBe('acted');
+  expect(h.calls.filter(c => c === 'act')).toHaveLength(1);
+});
+
+it('comment guards cover direct descendants and parents that are arrays, and poison refused accessors', () => {
+  const data = { pull: { head: { sha: 'abc' }, comments: { totalCount: 0 }, reviews: [{ comments: [] }] } };
+  for (const path of ['pull', 'pull.comments', 'pull.comments.totalCount', 'pull.reviews']) {
+    const incomplete = factsFor({ ...snapshot(), data, thread: { source: 'cached-thread', complete: false } });
+    expect(() => incomplete.read(path)).toThrow(/deferred-read/);
+    expect(incomplete.recordedReads).toEqual([]);
+    expect(() => incomplete.read('pull.head.sha')).toThrow(/deferred-read/);
+    expect(() => validateTaskPlan({ facts: incomplete, effects: [] })).toThrow(/deferred-read/);
+    const complete = factsFor({ ...snapshot(), data, thread: { source: 'live-thread', complete: true } });
+    expect(() => complete.read(path)).not.toThrow();
+    expect(complete.outcome).toBe('ready');
+  }
+});
+
+it.each([0, 1])('revoking a claim during an awaited act blocks the next write after %s writes', async priorWrites => {
+  const h = taskHarness();
+  let held = true, signalAct, resumeAct;
+  const actPending = new Promise(resolve => { signalAct = resolve; });
+  const actResumed = new Promise(resolve => { resumeAct = resolve; });
+  h.args.claim.assert = () => held;
+  h.args.effects.act = async ({ gh }) => {
+    if (priorWrites) await gh.write(() => h.calls.push('earlier-write'));
+    signalAct();
+    await actResumed;
+    return gh.write(() => { h.calls.push('denied-write'); return { receipt: 'invalid' }; });
+  };
+  const running = runItemTask(h.args);
+  await actPending;
+  held = false;
+  resumeAct();
+  const result = await running;
+  expect(result.outcome).toBe('superseded');
+  expect(h.calls).not.toContain('denied-write');
+  expect(result.gh.write).toBe(priorWrites);
+  expect(h.record.job.task.failureCount).toBe(0);
+  expect(Object.values(h.record.job.task.execution.effects)[0].status).toBe('intent');
+  expect(h.calls.at(-1)).toBe('release');
+});
+
+it.each(['revoked', 'unknown', 'unreadable', 'missing'])('write-boundary claim evidence fails closed when %s', async state => {
+  const h = taskHarness();
+  h.args.effects.act = async ({ gh }) => {
+    h.args.claim.assert = state === 'missing' ? undefined : () => {
+      if (state === 'unreadable') throw Error('claim store unavailable');
+      return state === 'revoked' ? false : undefined;
+    };
+    return gh.write(() => { h.calls.push('denied-write'); return {}; });
+  };
+  const result = await runItemTask(h.args);
+  expect(result.outcome).toBe(['revoked', 'unknown'].includes(state) ? 'superseded' : 'failed');
+  expect(h.calls).not.toContain('denied-write');
+  expect(result.gh.write).toBe(0);
+  expect(Object.values(h.record.job.task.execution.effects)[0].status).toBe('intent');
+});
+
+it.each([{ attempts: 4 }, { handle: 'replacement:2:start' }, { status: 'succeeded' }])(
+  'write-boundary claim assertions recheck launch ownership after awaiting: %j', async change => {
+    const h = taskHarness();
+    let inAct = false, signalAssertion, resumeAssertion;
+    const pending = new Promise(resolve => { signalAssertion = resolve; });
+    const resumed = new Promise(resolve => { resumeAssertion = resolve; });
+    h.args.claim.assert = async () => {
+      if (inAct) { signalAssertion(); await resumed; }
+      return true;
+    };
+    const act = h.args.effects.act;
+    h.args.effects.act = context => { inAct = true; return act(context); };
+    const running = runItemTask(h.args);
+    await Promise.race([pending, running.then(() => { throw Error('write executed without asserting the item claim'); })]);
+    h.mutate(r => ({ ...r, job: { ...r.job, ...change } }));
+    resumeAssertion();
+    const result = await running;
+    expect(result.outcome).toBe('superseded');
+    expect(h.calls).not.toContain('act');
+    expect(result.gh.write).toBe(0);
+    expect(h.record.job.task.failureCount).toBe(0);
+    expect(h.record.job.task.execution.results[3]).toBeUndefined();
+    expect(Object.values(h.record.job.task.execution.effects)[0].status).toBe('intent');
+  },
+);
+
+it('metered writes before claim acquisition cannot execute', async () => {
+  const h = taskHarness();
+  h.args.read = ({ gh }) => gh.write(() => { h.calls.push('denied-write'); return factsFor(); });
+  const result = await runItemTask(h.args);
+  expect(result.outcome).toBe('superseded');
+  expect(result.gh).toEqual({ read: 0, write: 0 });
+  expect(h.calls).toEqual([]);
+  expect(h.record.job.task.failureCount).toBe(0);
+});
+
+it.each(['probe', 'fence'])('claim revocation before a %s-side write remains superseded without failure charge', async phase => {
+  const h = taskHarness();
+  let held = true, signalAdapter, resumeAdapter;
+  const pending = new Promise(resolve => { signalAdapter = resolve; });
+  const resumed = new Promise(resolve => { resumeAdapter = resolve; });
+  h.args.claim.assert = () => held;
+  h.args.effects[phase] = async ({ gh }) => {
+    signalAdapter();
+    await resumed;
+    return gh.write(() => {
+      h.calls.push('denied-write');
+      return phase === 'probe' ? { applied: false } : factsFor();
+    });
+  };
+  const running = runItemTask(h.args);
+  await pending;
+  held = false;
+  resumeAdapter();
+  const result = await running;
+  expect(result.outcome).toBe('superseded');
+  expect(result.gh.write).toBe(0);
+  expect(h.calls).not.toContain('denied-write');
+  expect(h.calls).not.toContain('act');
+  expect(h.calls.at(-1)).toBe('release');
+  expect(h.record.job.task.failureCount).toBe(0);
+});
+
 // A guarded in-memory record port models the child/store CAS without filesystem or GitHub IO.
 function taskHarness(effects = [executionEffect()]) {
   let record = { job: { status: 'running', handle: 'host:1:start', attempts: 3,
@@ -324,8 +479,10 @@ it('live fence rejects merged drafted and changed inputs before act', async () =
     h.args.effects.fence = () => factsFor({ ...snapshot(), data: { ...values, [key]: null } });
     expect((await runItemTask(h.args)).outcome).toBe('superseded'); expect(h.calls).not.toContain('act');
   }
-  const h = taskHarness([executionEffect(), { ...executionEffect(), name: 'later' }]); let assertions = 0;
-  h.args.claim.assert = () => ++assertions <= 2;
+  const h = taskHarness([executionEffect(), { ...executionEffect(), name: 'later' }]); let held = true;
+  h.args.claim.assert = () => held;
+  const firstAct = h.args.effects.act;
+  h.args.effects.act = async context => { const evidence = await firstAct(context); held = false; return evidence; };
   expect((await runItemTask(h.args)).outcome).toBe('superseded');
   expect(Object.values(h.record.job.task.execution.effects)[0].status).toBe('applied');
   expect(h.calls.filter(c => c === 'act')).toHaveLength(1);

@@ -104,6 +104,8 @@ function freezeData(value, seen = new Set()) {
 const accessors = new WeakMap();
 const fieldPath = path => typeof path === 'string' && /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(path) &&
   !path.split('.').some(key => ['__proto__', 'constructor', 'prototype'].includes(key));
+const containsComments = value => value !== null && typeof value === 'object' &&
+  Object.entries(value).some(([key, child]) => key === 'comments' || containsComments(child));
 
 /**
  * load() synchronously supplies { identity, observedAt (epoch ms), source, complete, data }.
@@ -133,14 +135,15 @@ export function createRecordingFacts({ load, expectedIdentity, now, snapshotMaxA
     read(path) {
       try {
         if (reason || !fieldPath(path)) throw new Error('unavailable fact');
-        if (path.split('.').includes('comments') &&
-          (snapshot.thread?.source !== 'live-thread' || snapshot.thread.complete !== true)) {
-          throw new Error('comment facts require a complete live thread provider');
-        }
         let value = snapshot.data;
         for (const key of path.split('.')) {
           if (!value || typeof value !== 'object' || !Object.hasOwn(value, key)) throw new Error('missing field');
           value = value[key];
+        }
+        // A parent object can expose comments without naming them in the requested path.
+        if ((path.split('.').includes('comments') || containsComments(value)) &&
+          (snapshot.thread?.source !== 'live-thread' || snapshot.thread.complete !== true)) {
+          throw new Error('comment facts require a complete live thread provider');
         }
         reads.set(path, Object.freeze({ path, source: snapshot.source, observedAt: snapshot.observedAt, age: now - snapshot.observedAt }));
         return value;
@@ -228,7 +231,9 @@ export async function runItemTask({ task, attempt, handle, record, read, plan, c
     try { return await fn(); } finally { timings[name] += Math.max(0, now() - start); }
   };
   const metered = Object.freeze(Object.fromEntries(['read', 'write'].map(kind => [kind, async fn => {
-    await current(); // adapters may await after entry and lose launch ownership before IO
+    // Adapters may await or retry after entry: recheck both authorities before each write.
+    if (kind === 'write') await assertClaim();
+    else await current();
     if (gh[kind] >= budgets[kind]) throw Error(`budget-exhausted: GitHub ${kind}; reschedule with refreshed budget or correct the declared bound`);
     gh[kind]++;
     return fn();
@@ -244,6 +249,7 @@ export async function runItemTask({ task, attempt, handle, record, read, plan, c
   });
   const assertClaim = async () => {
     await current();
+    if (token === null || token === undefined || token === false) throw stop('superseded', 'item claim required before effect');
     if (await claim.assert(token, task) !== true) throw stop('superseded', 'item claim lost before effect');
     await current(); // the launch can be superseded while the claim assertion awaits
   };
@@ -325,7 +331,8 @@ export async function runItemTask({ task, attempt, handle, record, read, plan, c
       outcome = 'acted';
     }
   } catch (error) {
-    outcome = phase === 'probe' ? 'failed' : error.outcome ?? ((phase === 'read' || phase === 'fence' || facts?.outcome === 'deferred-read') ? 'deferred-read' : 'failed');
+    outcome = error.outcome ?? (phase === 'probe' ? 'failed' :
+      ((phase === 'read' || phase === 'fence' || facts?.outcome === 'deferred-read') ? 'deferred-read' : 'failed'));
     reason = error.message;
   } finally {
     if (token !== null && token !== undefined && token !== false) {
