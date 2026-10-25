@@ -229,6 +229,8 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
       tampered: gaming.tampered, netDiffScored: true,
       humanClearedSha: accepted && gaming.tampered ? acceptance.humanClearedSha ?? null : null,
       headSha: accepted && gaming.tampered ? acceptance.headSha ?? null : null,
+      // approval-binding (2026-10-21): the acceptance read's own git-proven coverage, bound to its (pinned) head.
+      clearanceCoverage: accepted && gaming.tampered ? acceptance.clearanceCoverage ?? null : null,
     });
     set('test-gaming', repark ? 'hold' : 'pass', repark ? `test-gaming suspected: ${gaming.reasons.join('; ')}` : (gaming.tampered ? 'tampering human-cleared at this head' : 'no test tampering'));
   }

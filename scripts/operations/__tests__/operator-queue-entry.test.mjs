@@ -34,6 +34,7 @@ const stage = (root) => {
   copyFileSync(join(dirname(LEAF), '../conveyor/stuck-pr-dispatch-marker.mjs'), join(root, 'conveyor/stuck-pr-dispatch-marker.mjs'));
   // #x5n4zn3 — `stand-down.mjs` now imports `../lib/bounded-child.mjs` (the shared per-child timeout budget its
   // own `gh` call reuses) — stage it too, same reason as every other transitive dependency above.
+  copyFileSync(join(dirname(LEAF), 'label-cache.mjs'), join(root, 'lib/label-cache.mjs'));
   copyFileSync(join(dirname(LEAF), 'bounded-child.mjs'), join(root, 'lib/bounded-child.mjs'));
   symlinkSync(join(dirname(LEAF), 'gh-throttle.mjs'), join(root, 'lib/gh-throttle.mjs'));
   // #3383 — `stand-down.mjs` now also imports `../lib/marker-authorship.mjs` (the shared trusted-author gate
@@ -75,6 +76,9 @@ const stage = (root) => {
   copyFileSync(join(dirname(LEAF), 'operator-identity.mjs'), join(root, 'lib/operator-identity.mjs'));
   copyFileSync(join(dirname(LEAF), 'review-verdict-carried-marker.mjs'), join(root, 'lib/review-verdict-carried-marker.mjs'));
   symlinkSync(join(dirname(LEAF), 'review-escalation.mjs'), join(root, 'lib/review-escalation.mjs'));
+  // approval-binding (the red-team ruling row's clearance coverage): linked like review-escalation, so its graph
+  // resolves from the source tree.
+  symlinkSync(join(dirname(LEAF), 'approval-binding.mjs'), join(root, 'lib/approval-binding.mjs'));
   // The disposition reader also reads the operator's round grants (a grant after a round-cap record reopens the
   // send-back step); its own imports (marker-authorship, constellation-repos) are already staged above.
   copyFileSync(join(dirname(LEAF), '../conveyor/round-extension-mark.mjs'), join(root, 'conveyor/round-extension-mark.mjs'));
@@ -134,6 +138,8 @@ describe('operator-queue CLI entry guard', () => {
     expect(result.status, result.stderr).toBe(0);
     const report = JSON.parse(result.stdout);
     expect(report.errors).toContainEqual(expect.stringMatching(/operator send-back check unavailable:.*operator-send-backs\.mjs/));
+    // PR #5551: a missing saved red-team reader is reported, never a silent gap in RULING NEEDED.
+    expect(report.errors).toContainEqual(expect.stringMatching(/saved red-team ruling check unavailable:.*drain-saved-red-team\.mjs/));
     expect(report.ready).toEqual([]);
     expect(report.notReady.map(row => row.number)).toEqual([1, 2]);
     for (const row of report.notReady) {
