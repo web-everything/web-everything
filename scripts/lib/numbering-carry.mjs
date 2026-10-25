@@ -400,7 +400,7 @@ function validatedThread(comments) {
     if (r) {
       const prior = latestAcceptRecord(view);
       if (!prior || prior.sha !== r.from || prior.laterBodyDerivedHold || !sameClearance(prior, r.rec)
-        || view.slice(prior.index + 1).some((x) => !isNumberingTolerableLaterBody(x?.body))) { dropped.push(c); continue; }
+        || view.slice(prior.index + 1).some((x) => !isNumberingTolerableLaterBody(x?.body, x))) { dropped.push(c); continue; }
       carried.set(c, { comment: view[prior.index], at: prior.at });
       // `has`, not `??`: an unknown (null) root time must stay unknown, which counts every formal review.
       rootAt.set(c, rootAt.has(view[prior.index]) ? rootAt.get(view[prior.index]) : prior.at);
@@ -444,8 +444,8 @@ const stalePark = /^\s*<!--\s*drain-park-reason\s*-->\s*\n⏸ \*\*Parked for rev
 const staleReason = /^(?:is STALE|could NOT be re-verified this pass) —/;
 
 /** PURE: head-move diagnostics cannot supersede the acceptance they describe. */
-export function isNumberingTolerableLaterBody(body) {
-  if (isKnownMachineBody(body)) return true;
+export function isNumberingTolerableLaterBody(body, comment = undefined) {
+  if (isKnownMachineBody(body, comment)) return true;
   if (typeof body !== 'string') return false;
   // A withdrawal is not itself a hold: whatever caused it still stands on the thread and is judged on its own.
   if (isWithdrawnNotice(body)) return true;
@@ -506,7 +506,7 @@ export function planNumberingRestamp({ labels, headSha, comments, reviews } = {}
   if (rec.sha === head && !labelsOnly) return out({ candidate: false, reason: 'already bound' });
   const held = (reason) => out({ candidate: false, reason, hold: true });
   if (rec.laterBodyDerivedHold) return held('later body-derived hold');
-  if (view.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body))) {
+  if (view.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body, c))) {
     return held('later verdict or unknown comment stands');
   }
   if (!Array.isArray(reviews)) return out({ candidate: false, reason: 'formal reviews unreadable', retryable: true });

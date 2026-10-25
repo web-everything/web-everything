@@ -35,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
-import { MARKER_RE, JOB_RE } from './approval-prevention-notice.mjs';
+import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
 import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
 
 export const ACCEPT_CARRY_FORWARD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'accept-carry-forward.json');
@@ -146,6 +146,26 @@ function isApprovalPreventionNotice(text, comment) {
   return fixedText.exec(rest)?.[0] === rest;
 }
 
+/** Exact buildClearanceComment envelope (importing drain-merge-strategy would cycle back through numbering-carry). */
+function isDrainEnqueueClearance(text, comment) {
+  if (comment !== undefined && !isTrustedMarkerAuthor(comment)) return false;
+  const m = /^<!-- we-drain-enqueue-clearance head=([0-9a-f]{7,40}) -->\n\*\*Drain enqueue clearance\*\* — the drain judged head `([0-9a-f]{7,40})` ready \(every drain gate passed: couple whole, blockedBy landed\) and enqueued it on GitHub's merge queue \(xtpxusq\)\. The `merge-gate` check reads this for its couple-whole \/ blocked-by gates\.$/.exec(text);
+  return Boolean(m) && m[2] === m[1].slice(0, 12);
+}
+
+/** Exact buildLandingRetractionComment envelope; an unknown shape still requires a fresh review. */
+function isApprovalPreventionRetraction(text, comment) {
+  if (comment !== undefined && !isTrustedMarkerAuthor(comment)) return false;
+  const marker = text.matchAll(RETRACTED_RE).next().value;
+  if (!marker || marker.index !== 0) return false;
+  const prefix = `\nThe approval-time prevention card for this head did not land (\`${marker[2]}\` failed at `;
+  const rest = text.slice(marker[0].length);
+  if (!rest.startsWith(prefix)) return false;
+  const reasonAndSuffix = rest.slice(prefix.length);
+  const fixedText = /^[^\r\n]{1,300}\)\. Its filing marker above is retracted, so the next approval on this head files the guard again\./;
+  return fixedText.exec(reasonAndSuffix)?.[0] === reasonAndSuffix;
+}
+
 /** A marker parser deliberately ignores trailing text; a carry exemption must consume the entire machine body. */
 function isNonBlockingRedTeamGate(text) {
   const gate = parseRedTeamGateMarker(text);
@@ -216,7 +236,9 @@ export function isKnownMachineBody(body, comment = undefined) {
   }
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
-  return isApprovalPreventionNotice(text, comment) || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
+  return isApprovalPreventionNotice(text, comment) || isApprovalPreventionRetraction(text, comment)
+    || isDrainEnqueueClearance(text, comment)
+    || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
 }
 
 /**
