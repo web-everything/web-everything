@@ -1,23 +1,21 @@
 ---
+bornAs: xqrfshz
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/red-team-skip-outcome.mjs", "we:backlog/7049-coverage-exercise-pending-skip-quarantine-removal-fallback.md", "we:scripts/lib/__tests__/red-team-skip-outcome.test.mjs"]
+scope: ["we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/lib/__tests__/drain-merge-strategy.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule that resolves each Regression-mapping title in we:docs/agent/testing.m… (from web-everything/web-everything#5890 review)
+# Prevention — Add an integration test that chains the real advisory-label-sweep with enqueue on a PR whose labe… (from web-everything/web-everything#5877 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:scripts/lib/red-team-skip-outcome.mjs:59` — Add a check:standards rule that resolves each Regression-mapping title in we:docs/agent/testing.md to an existing test title. Pair it with a lens that requires each prose guarantee ('or are removed if quarantine fails') to name a test. Card 7050 files this.
-2. `we:scripts/lib/red-team-skip-outcome.mjs:48` — Add the check:standards rule filed as card 7050, which resolves each Regression-mapping title to a real test. Also have the review lens require a fault-injection test for each documented fallback branch.
-3. `we:backlog/7049-coverage-exercise-pending-skip-quarantine-removal-fallback.md:16` — Add named fault-injection tests for rename failure, simultaneous rename/unlink failure, and subsequent settlement; extend the standards mapping gate proposed in card 7050 to require Acceptance-to-test references.
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 3 → #5360, finding 4 → #5360, finding 6 → #5473.
+1. `we:scripts/lib/drain-merge-strategy.mjs:376` — Add an integration test that chains the real advisory-label-sweep with `enqueue` on a PR whose label is stale-blocked after a clear ruling, and assert the PR enqueues within one sweep tick.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5890@3fcaa8a5fd81588ea142f766f0e8fdc872c5d95f
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5877@07d5d21eb709c0c6fd465a07c7e5c9b9a8f0c8f6
 
 ## Acceptance
 
