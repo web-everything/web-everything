@@ -3,7 +3,7 @@ import { createRedTeamIo, priorRedTeamRow, redTeamAlreadyRan, redTeamMarker, run
 import { readStore } from '../../conveyor/run-scorecard-store.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -83,6 +83,71 @@ describe('shared red-team recovery entry guards', () => {
     noLaunch(io);
     for (const key of ['postComment', 'append']) expect(io[key], key).not.toHaveBeenCalled();
   }
+  async function withOversizedComments(check) {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-large-comments-'));
+    try {
+      const comments = [{ author: { login: 'someone' }, body: 'x'.repeat(2 * 1024 * 1024 + 1024) }];
+      writeFileSync(join(dir, 'comments.json'), JSON.stringify({ comments }));
+      writeFileSync(join(dir, 'gh'), `#!${process.execPath}
+const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.includes('comments')) {
+  fs.writeFileSync(1, fs.readFileSync(path.join(__dirname, 'comments.json')));
+} else if (args[0] === 'pr' && args[1] === 'comment' && args.includes('--body-file')) {
+  fs.writeFileSync(path.join(__dirname, 'posted.txt'), fs.readFileSync(0));
+} else {
+  process.exitCode = 1;
+}
+`, { mode: 0o755 });
+      const production = createRedTeamIo({ env: { PATH: dir }, storePath: join(dir, 'scorecards.json') });
+      await check({ production, comments, postedBody: () => readFileSync(join(dir, 'posted.txt'), 'utf8') });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+  it('reads more than 2 MiB of comments and posts through the production gh helper', async () => {
+    await withOversizedComments(({ production, comments, postedBody }) => {
+      expect(production.listComments({ pr, repo })).toEqual(comments);
+      production.postComment({ pr, repo, body: 'red-team result' });
+      expect(postedBody()).toBe('red-team result');
+    });
+  });
+  it('resumes a recorded clean pass with oversized comments and posts its result without model calls', async () => {
+    await withOversizedComments(async ({ production, postedBody }) => {
+      const io = fakeIo('resume', { listComments: production.listComments, postComment: production.postComment });
+      const result = await run('resume', io);
+      expect(result).toMatchObject({ status: 'resumed', callId: prior.callId, comment: { status: 'posted' } });
+      expect(postedBody()).toBe(result.comment.body);
+      expect(postedBody()).toContain(redTeamMarker(pr, rev));
+      noLaunch(io);
+    });
+  });
+  it('reports a spawn error when gh has no stderr', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-missing-gh-'));
+    try {
+      const io = createRedTeamIo({ env: { PATH: dir }, storePath: join(dir, 'scorecards.json') });
+      expect(() => io.listComments({ pr, repo })).toThrow(/gh pr view failed: .*ENOENT/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('includes the comment failure reason in the resume summary', async () => {
+    const io = fakeIo('resume', { listComments: () => { throw Error('comment read failed: ENOBUFS'); } });
+    const result = await run('resume', io);
+    expect(result.comment).toMatchObject({ status: 'error', reason: 'comment read failed: ENOBUFS' });
+    expect(result.reason).toContain('comment error (comment read failed: ENOBUFS)');
+    expect(io.postComment).not.toHaveBeenCalled();
+    noLaunch(io);
+  });
+  it('live bare resumed review-pr row without a seat follows fresh dispatch', async () => {
+    const row = { repo, pr: 5762, head: rev, status: 'finished', result: 'resumed', loopPayload: { ...loopPayload, op: 'review-pr' } };
+    const io = fakeIo('fresh', { readRedTeamStatus: () => row });
+    expect(await run('fresh', io)).toEqual({ status: 'error', reason: 'provider reached' });
+    expect(io.cliAvailable).toHaveBeenCalled();
+  });
+  it('live bare resumed review-pr row with a clean seat resumes that seat', async () => {
+    const row = { repo, pr: 5762, head: rev, status: 'finished', result: 'resumed', loopPayload: { ...loopPayload, op: 'review-pr' } };
+    const io = fakeIo('resume', { readRedTeamStatus: () => row });
+    expect(await run('resume', io)).toMatchObject({ status: 'resumed', callId: prior.callId });
+    noLaunch(io);
+  });
   it.each(['fresh', 'resume'])('refuses a result posted after the daemon snapshot in %s mode with zero model calls', async mode => {
     const io = fakeIo(mode, { readRecoveryComments: vi.fn(() => [{ author: { login: 'web-everything' }, body: redTeamMarker(pr, rev) }]) });
     await refused(mode, io, 'red-team result already on head');
@@ -143,7 +208,13 @@ describe('shared red-team recovery entry guards', () => {
     expect(io.readRedTeamStatus).toHaveBeenCalledWith({ pr, repo, head: rev });
   });
   it.each(['finished', 'queued', 'running', 'error', 'unknown'])('refuses fresh recovery with prior %s status and zero model calls', async status => {
-    await refused('fresh', fakeIo('fresh', { readRedTeamStatus: () => ({ ...finished('ran'), status }) }), 'prior red-team status; not re-run');
+    await refused('fresh', fakeIo('fresh', { readRedTeamStatus: () => ({ ...finished({ status: 'ran' }), status }) }), 'prior red-team status; not re-run');
+  });
+  it.each(['ran', 'resumed', { status: 'resumed' }])('a finished placeholder %j without a seat reaches fresh dispatch', async result => {
+    const io = fakeIo('fresh', { readRedTeamStatus: () => finished(result) });
+    expect(await run('fresh', io)).toEqual({ status: 'error', reason: 'provider reached' });
+    expect(io.cliAvailable).toHaveBeenCalledOnce();
+    for (const hook of ['reserveCalls', 'runSeat', 'runRecheck']) expect(io[hook]).not.toHaveBeenCalled();
   });
   it.each(['ran', { status: 'ran', comment: 'error' }, 'resumed', { status: 'resumed', comment: { status: 'error' } }])(
     'resumes both production result shapes %j with a clean matching row and zero model calls', async result => {
@@ -365,7 +436,7 @@ for (const entry of [runRedTeam, speculateRedTeam]) {
       expect(await entry({ pr, repo, read: cardRead,
         loopPayload: { ...loopPayload, findings: { read: cardRead } },
         env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' } }, io)).toEqual({
-        status: 'skipped', reason: 'red team skipped: card-only',
+        status: 'skipped', reason: 'red team skipped: card-only', policy: 'card-only',
       });
       expect(io.postComment).not.toHaveBeenCalled();
       noCalls(io);
@@ -382,3 +453,47 @@ for (const entry of [runRedTeam, speculateRedTeam]) {
     }
   });
 }
+
+
+describe('PR 5890 completed-seat dedupe', () => {
+  it.each([{ status: 'error' }, { seatStatus: 'error' }])('does not treat a failed execution as a prior pass: %j', fields => {
+    expect(priorRedTeamRow([{ ...prior, ...fields }], pr, rev, repo)).toBeNull();
+  });
+  it('a completed broken row dedupes speculation without claiming a clean verdict', async () => {
+    const broken = { ...prior, foldedVerdict: 'changes', confirmedMissCount: 1,
+      findings: [{ summary: 'Confirmed break', confirmedByRecheck: true, impactIfUnfixed: 'broken' }] };
+    const io = { now: () => 1_000, log: () => {}, readRecords: () => [broken],
+      listComments: () => [{ author: { login: 'web-everything' }, body: redTeamMarker(pr, rev) }],
+      cliAvailable: vi.fn(() => { throw Error('must not launch another pass'); }) };
+    const result = await speculateRedTeam({ pr, repo, read, env: {}, resume: false }, io);
+    expect(priorRedTeamRow([broken], pr, rev, repo)).toBe(broken);
+    expect(result).toMatchObject({ status: 'prior-row', reason: expect.stringContaining('completed red-team seat row') });
+    expect(result.reason).not.toContain('clean');
+    expect(io.cliAvailable).not.toHaveBeenCalled();
+  });
+  it('a completed confirmed break resumes its effects with zero new model calls', async () => {
+    const broken = { ...prior, foldedVerdict: 'changes', confirmedMissCount: 1,
+      findings: [{ summary: 'Confirmed break', confirmedByRecheck: true, impactIfUnfixed: 'broken' }] };
+    const io = { now: () => 1_000, log: () => {}, readRecords: () => [broken], listComments: () => [],
+      postComment: vi.fn(), append: vi.fn(),
+      cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(), runRecheck: vi.fn() };
+    const result = await runRedTeam({ pr, repo, loopPayload, env: {} }, io);
+    expect(result).toMatchObject({ status: 'resumed', callId: prior.callId, comment: { status: 'posted' } });
+    expect(result.reason).not.toContain('clean');
+    expect(io.postComment.mock.calls[0][0].body).toContain('Confirmed break');
+    expect(io.append).toHaveBeenCalled();
+    for (const hook of ['cliAvailable', 'reserveCalls', 'runSeat', 'runRecheck']) expect(io[hook]).not.toHaveBeenCalled();
+  });
+  it.each([{ findings: null }, { findings: undefined }, { confirmedMissCount: 'unknown' },
+    { confirmedMissCount: 1 }, { foldedVerdict: 'changes' }, { foldedVerdict: 'needs-human' },
+    { foldedVerdict: 'unknown' }, { foldedVerdict: 'changes', findings: [{ summary: 'Unconfirmed' }] }])(
+    'incomplete completed-row evidence fails closed without publishing or rerunning: %j', async fields => {
+      const row = { ...prior, ...fields };
+      const io = { now: () => 1_000, log: () => {}, readRecords: () => [row],
+        listComments: () => [], postComment: vi.fn(), cliAvailable: vi.fn() };
+      expect(priorRedTeamRow([row], pr, rev, repo)).toBe(row);
+      expect(await runRedTeam({ pr, repo, loopPayload, env: {} }, io)).toMatchObject({ status: 'error' });
+      expect(io.postComment).not.toHaveBeenCalled();
+      expect(io.cliAvailable).not.toHaveBeenCalled();
+    });
+});
