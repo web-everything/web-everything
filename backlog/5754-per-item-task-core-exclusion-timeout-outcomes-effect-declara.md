@@ -3,9 +3,10 @@ bornAs: xs4ewgh
 kind: story
 size: 8
 parent: "5767"
-status: open
+status: resolved
 scope: ["we:scripts/lib/daemon-jobs.mjs", "we:scripts/lib/__tests__/daemon-jobs.test.mjs", "we:scripts/lib/daemon-jobs-runtime.mjs", "we:scripts/lib/__tests__/daemon-jobs-runtime.test.mjs", "we:scripts/lib/daemon-item-tasks.mjs", "we:scripts/lib/__tests__/daemon-item-tasks.test.mjs", "we:scripts/operations/job-record.mjs", "we:scripts/operations/__tests__/job-record.test.mjs", "we:scripts/operations/daemon-jobs-proof/run-proof.mjs", "we:scripts/operations/daemon-jobs-proof/__tests__/run-proof.test.mjs", "we:scripts/operations/daemon-jobs-proof/demo-daemon.mjs", "we:scripts/operations/daemon-jobs-proof/__tests__/demo-daemon.test.mjs", "we:scripts/operations/daemon-jobs-proof/noop-job.mjs", "we:scripts/operations/daemon-jobs-proof/__tests__/noop-job.test.mjs", "we:scripts/lib/__tests__/daemon-item-tasks-proof.test.mjs"]
 dateOpened: "2026-10-10"
+dateResolved: "2026-10-25"
 preparedDate: "2026-10-24"
 preparedAgainstSha: "3209aa0d9c045e98888991a4aeba8579ea4d836d"
 tags: []
