@@ -14,6 +14,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
+import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
 import {
   startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
   PID_START_TIMEOUT_MS, JOB_RECORD_INIT_DEADLINE_MS,
@@ -255,6 +256,31 @@ describe('buildCodexPrompt — folds in the do-not-commit instruction', () => {
   it('rejects an empty task', () => {
     expect(() => buildCodexPrompt('')).toThrow();
     expect(() => buildCodexPrompt('   ')).toThrow();
+  });
+});
+
+describe('buildCodexPrompt — fixed task rules', () => {
+  it('appends the verbatim build block exactly once', () => {
+    const prompt = buildCodexPrompt('Add a comment to notes.txt');
+    expect(prompt).toContain(CODEX_TASK_RULES);
+    expect(prompt.endsWith(CODEX_TASK_RULES)).toBe(true);
+    expect(prompt.split(CODEX_TASK_RULES)).toHaveLength(2);
+    expect(prompt.split('Task rules (fixed; follow them exactly):')).toHaveLength(2);
+  });
+
+  it('appends the read-only block exactly once without build-only rules', () => {
+    const prompt = buildCodexPrompt('Review notes.txt', { review: true });
+    expect(prompt).toContain(CODEX_REVIEW_TASK_RULES);
+    expect(prompt.endsWith(CODEX_REVIEW_TASK_RULES)).toBe(true);
+    expect(prompt.split(CODEX_REVIEW_TASK_RULES)).toHaveLength(2);
+    expect(prompt.split('Task rules (fixed; follow them exactly):')).toHaveLength(2);
+    expect(prompt).not.toContain('$TMPDIR');
+    expect(prompt).not.toContain('npm run test:unit');
+  });
+
+  it('keeps each fixed block within twelve lines', () => {
+    expect(CODEX_TASK_RULES.split('\n').length).toBeLessThanOrEqual(12);
+    expect(CODEX_REVIEW_TASK_RULES.split('\n').length).toBeLessThanOrEqual(12);
   });
 });
 
