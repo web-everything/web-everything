@@ -238,6 +238,56 @@ describe('default combined-tree test proof', () => {
   it('throws sources incomplete for unreadable tracked sources before spawning tests', async () => {
     await expect(runReport(report, { unreadable: true })).rejects.toThrow('sources incomplete');
   });
+  it.each(['file', 'symlink', 'directory', 'fresh'])('requires a report from this invocation (report fixture: %s)', async (kind) => {
+    const fs = defaultDeps().fs;
+    const root = fs.mkdtempSync(join(tmpdir(), 'prototype-report-freshness-'));
+    const worktree = join(root, 'worktree');
+    const reportPath = join(worktree, '.prototype-vitest-results.json');
+    const oldReport = join(root, 'old-report.json');
+    const passingReport = JSON.stringify({ success: true, numFailedTests: 0, numFailedTestSuites: 0,
+      numPassedTests: 1, numPendingTests: 0, numTodoTests: 0, numTotalTests: 1,
+      testResults: [{ name: 'one.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }] }] });
+    fs.mkdirSync(worktree);
+    fs.writeFileSync(oldReport, passingReport);
+    const exec = vi.fn((command, args) => {
+      if (command === 'node') {
+        if (kind === 'fresh') fs.writeFileSync(reportPath, passingReport);
+        return ''; // Other cases model config exiting zero without writing a report.
+      }
+      if (args[0] === 'worktree' && args[1] === 'add') {
+        fs.writeFileSync(join(worktree, 'one.test.mjs'), kind === 'fresh' ? '' : "throw new Error('test must fail');");
+        fs.writeFileSync(join(worktree, 'vitest.config.mjs'), kind === 'fresh' ? '' : 'process.exit(0);');
+        if (kind === 'symlink') fs.symlinkSync(oldReport, reportPath);
+        else if (kind === 'directory') fs.mkdirSync(reportPath);
+        else fs.writeFileSync(reportPath, passingReport);
+        return '';
+      }
+      if (args[0] === '-C' || args[0] === 'rev-parse') return SHA;
+      if (['fetch', 'merge-base', 'worktree'].includes(args[0])) return '';
+      if (args[0] === 'merge-tree') return TREE;
+      if (args[0] === 'commit-tree') return MERGE;
+      if (args[0] === 'ls-files') return 'one.test.mjs\0vitest.config.mjs\0.prototype-vitest-results.json\0';
+      throw new Error('unexpected command');
+    });
+    try {
+      const result = await defaultDeps().combinedTest({ clone: '/fixture/clone', candidateSha: SHA,
+        refs: ['lane/old'] }, { exec, fs: { ...fs, mkdtempSync: () => worktree }, env: {},
+        settings: { combinedTest: limits } });
+      expect(result).toMatchObject(kind === 'fresh' ? { ok: true, result: '1 passed, 0 skipped' }
+        : { ok: false, reason: kind === 'directory' ? 'tests-failed' : 'tests-unproven' });
+      if (kind === 'directory') expect(exec.mock.calls.some(([command]) => command === 'node')).toBe(false);
+      const loader = fixture({ list: ['lane/old'], conflicts: ['lane/old'], combinedTest: result });
+      expect((await loader.run()).ok).toBe(kind === 'fresh');
+      if (kind !== 'fresh') {
+        expect(mutations(loader, 'add')).toEqual([]);
+        expect(mutations(loader, 'remove')).toEqual([]);
+      }
+      expect(fs.existsSync(worktree)).toBe(false);
+      expect(fs.readFileSync(oldReport, 'utf8')).toBe(passingReport);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
   it('refuses combined evidence when an unimported filesystem-dependent test fails', async () => {
     const root = mkdtempSync(join(tmpdir(), 'prototype-fs-dependency-'));
     const combination = `const { readFileSync } = require('node:fs');

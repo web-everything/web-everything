@@ -107,6 +107,9 @@ async function defaultCombinedTest({ clone, candidateSha, refs }, { exec, fs, en
       ...Object.entries(VITEST_BOUNDS).map(([key, value]) => `--${key}=${value}`), ...tests];
     const command = ['node', 'scripts/readiness/heavy-admission.mjs', ...args.slice(1)].map((arg) => JSON.stringify(arg.replaceAll(worktree, '<worktree>'))).join(' ');
     try {
+      // A checked-in report (including a symlink) is not evidence from this run.
+      // Refuse cleanup errors before launching; a zero exit must leave a fresh report.
+      fs.rmSync(reportPath, { force: true });
       await queuedExec('node', args, { cwd: worktree, env: combinedTestEnv(env), encoding: 'utf8', timeout: limits.timeoutMs,
         maxBuffer: limits.maxBuffer, shell: false, stdio: ['ignore', 'pipe', 'pipe'], killSignal: 'SIGTERM' });
       let report;
