@@ -485,7 +485,7 @@ describe('automatic card filing with shared durable claims', () => {
     const resultId = liveResultGateState(initial, PR, HEAD).resultId;
     initial.push(bot(`${redTeamGateMarker(PR, HEAD, 'sent-back', resultId)}\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-10-20T23:41:12Z'));
     const f = fake({ initial });
-    const plan = () => planRedTeamRuling(read({ comments: f.comments, card: null, scope: { value: { anyState: true } } }), input({ card: undefined }));
+    const plan = () => planRedTeamRuling(read({ comments: f.comments, card: null, scope: { value: { anyState: true } } }), input({ repo, card: undefined }));
     expect(f.act(plan())).toMatchObject({ pending: true, released: false });
     await f.complete();
     expect(f.act(plan())).toMatchObject({ card: { ref: `we:${result.rel}` } });
