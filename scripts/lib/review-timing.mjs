@@ -17,6 +17,9 @@ export function fastChecksFor(fastChecks, repo) {
   const named = fastChecks && typeof fastChecks === 'object' && key ? normalizeFastChecks(fastChecks)[key] : null;
   return checkNames(named) ? named : null;
 }
+/** Whether review waits on branch protection, including a repo without configured fast checks. */
+export const reviewUsesRequiredChecks = (policy, repo) => policy.startAfter === 'ci-green'
+  || (policy.startAfter === 'fast-checks' && !fastChecksFor(policy.fastChecks, repo));
 /**
  * One settings layer's fastChecks as a map keyed by repo KEY, so layers merge per repo in the cascade: a list becomes
  * the same list for every constellation repo, and slug keys become repo keys. Anything else is returned unchanged.

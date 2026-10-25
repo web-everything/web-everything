@@ -3,9 +3,11 @@ bornAs: xdeqs8k
 kind: story
 size: 2
 parent: "5399"
-status: open
+status: resolved
 scope: ["we:scripts/backlog/task-agreement.mjs", "we:scripts/backlog/__tests__/task-agreement.test.mjs"]
 dateOpened: "2026-10-08"
+dateStarted: "2026-10-25"
+dateResolved: "2026-10-25"
 tags: []
 ---
 
