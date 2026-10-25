@@ -173,7 +173,7 @@ export function readRedTeamProbes({ env = process.env, path = RED_TEAM_SETTINGS_
  * `redTeam.operatorRulings.anyState` (default false; opt in via setting or env {@link OPERATOR_RULINGS_ENV}=true): may an
  * OPERATOR ruling (`record-red-team-ruling`, a human operator account) rule on a confirmed break in ANY state of the
  * live result (at the round cap, sent back, or carded)? By default the CLI refuses a result not parked at the cap,
- * and this reader requires that handover for operator-card action lines while retaining legacy card/advisory
+ * and this reader requires that handover for every operator release while retaining legacy card/advisory
  * record semantics. Automation never gets this: an operator release counts only from a human operator. */
 export const OPERATOR_RULINGS_DEFAULTS = Object.freeze({ anyState: false });
 export const OPERATOR_RULINGS_ENV = 'WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE';
@@ -634,16 +634,19 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
           // Operator card releases bind to the exact head/result; verdict carries cannot inherit them.
           if (!first || r.from || r.gate.result !== want) continue;
           if (!r.gate.outcome.startsWith('operator-') || !isHumanOperatorComment(r.c)) continue;
-          // Validate ownership when the ruling was posted, not against later handovers or grants.
-          // Use the same grant-aware decision as the writer: a pending extension belongs to automation.
-          const prior = sendBackStepState(gates.filter(g => g.at < r.at), grants.filter(g => g.index < r.at));
-          if (r.at <= hit.at || (!anyState && (prior.outcome !== GATE_OUTCOMES.ROUND_CAP || prior.reopened))) continue;
           action = 'card';
         }
         // Only a human operator may release a break held at the round cap; automation lines release only what the gate itself decided.
         // This is applied per action line (not by dropping the forged comment, which would also drop its restrictive `held` lines).
         const operatorRelease = RELEASING_ACTIONS.has(action) && !AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome);
-        if (operatorRelease && !isHumanOperatorComment(r.c)) continue;
+        if (operatorRelease) {
+          if (!isHumanOperatorComment(r.c) || r.at <= hit.at) continue;
+          // Validate ownership for every release spelling, including automatic card filing and advisory.
+          // Use ownership at posting time: later handovers/grants cannot change a ruling's validity.
+          // Match the writer's grant-aware decision: a pending extension belongs to automation.
+          const prior = sendBackStepState(gates.filter(g => g.at < r.at), grants.filter(g => g.index < r.at));
+          if (!anyState && (prior.outcome !== GATE_OUTCOMES.ROUND_CAP || prior.reopened)) continue;
+        }
         if (action === 'held' && !indices.length) legacyHeld = true;
         for (const index of indices) {
           // Operator releases never carry. Any-state releases also require an explicit result binding;
