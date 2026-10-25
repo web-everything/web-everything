@@ -99,7 +99,7 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
 export default {
   id: 'auto-rebase-operator-withdrawal',
   title: 'a detached repair requires executed tests and respects operator withdrawal',
-  card: 'PR #5848 send-back x1b8hlo (selected test execution, detached repair and adoption cleanup)',
+  card: 'PR #5848 send-back 5726 (selected test execution, detached repair and adoption cleanup)',
   fixedBy: { sha: 'launcher-pending', where: 'lane/loader-auto-rebase-r2', paths: [WORKER, 'scripts/lib/daemon-overlays.mjs'] },
   fixPresent(root) {
     const worker = fs.readFileSync(join(root, WORKER), 'utf8');

@@ -6,7 +6,7 @@
  *   already read `## Done when` (check:standards rules, provenance escape zones, the codex-worker card reader,
  *   the orphan-card sweep). Fails before S1: the module does not exist and every gate keys on `## Done when` only.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +19,7 @@ import { findMustWithoutDoneWhen, lintBacklogItemRendering, bodyDeliverablesMiss
 import { findUnresolvedIdentifiers } from '../../lib/citation-check.mjs';
 import { parseCard } from '../../operations/codex-worker.mjs';
 import { parseOrphanCard } from '../../operations/sweep-orphan-backlog-cards.mjs';
+import { prepareCardStatus } from '../../conveyor/prepare-result.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
@@ -141,12 +142,69 @@ describe('readTaskAgreement — legacy `## Done when` alias', () => {
 });
 
 describe('readTaskAgreement — draft marker', () => {
-  it('exposes the marker under either heading as draft: true, without counting it as an item', () => {
-    const body = `## Acceptance\n\n${AGREEMENT_DRAFT_MARKER}\n\n- [A1] a\n\n## Non-goals\n\n- [N1] b\n`;
-    const a = readTaskAgreement(body);
-    expect(a.draft).toBe(true);
-    expect(a.acceptance).toEqual([{ id: 'A1', text: 'a' }]);
-    expect(readTaskAgreement(`## Acceptance\n\n- [A1] a\n\n## Non-goals\n\n${AGREEMENT_DRAFT_MARKER}\n- [N1] b\n`).draft).toBe(true);
+  const visibleMarker = 'Draft: model-written, not yet confirmed.';
+
+  it.each([
+    ['Acceptance', 'acceptance', 'A1'],
+    ['Non-goals', 'nonGoals', 'N1'],
+  ])('treats a marker after the first %s item as ordinary continuation text', (heading, output, id) => {
+    const agreement = readTaskAgreement(`## ${heading}\n\n- [${id}] confirmed item.\n  ${visibleMarker}\n`);
+    expect(agreement.draft).toBe(false);
+    expect(agreement[output]).toEqual([{ id, text: `confirmed item. ${visibleMarker}` }]);
+  });
+
+  it.each(['Acceptance', 'Non-goals'])('ignores a marker inside a multi-line comment under %s', (heading) => {
+    const card = CARD.replace(`## ${heading}\n`, `## ${heading}\n\n<!-- authoring note\n${visibleMarker}\n-->\n`);
+    expect(readTaskAgreement(card)).toEqual(readTaskAgreement(CARD));
+  });
+
+  it.each(['Acceptance', 'Non-goals'])('does not recognize a marker after a leading comment or fence under %s', (heading) => {
+    for (const block of [`<!-- authoring note\n${visibleMarker}\n-->`, `\`\`\`text\n${visibleMarker}\n\`\`\``]) {
+      const card = CARD.replace(`## ${heading}\n`, `## ${heading}\n\n${block}\n${visibleMarker}\n`);
+      expect(readTaskAgreement(card)).toEqual(readTaskAgreement(CARD));
+    }
+  });
+
+  // Observe the actual prepare preprocessing output: do not duplicate its stripping regex here.
+  function afterPrepareStripping(card) {
+    const replace = vi.spyOn(String.prototype, 'replace');
+    try {
+      prepareCardStatus(card);
+      const index = replace.mock.calls.findIndex(([pattern]) => pattern instanceof RegExp && pattern.source === '<!--[^]*?-->');
+      expect(index).toBeGreaterThanOrEqual(0);
+      return replace.mock.results[index].value;
+    } finally {
+      replace.mockRestore();
+    }
+  }
+
+  it.each(['Acceptance', 'Non-goals'])('A1: reads the first non-blank visible line under %s as draft without adding an item', (heading) => {
+    const card = CARD.replace(`## ${heading}\n`, `## ${heading}\n\n\n${visibleMarker}\n`);
+    expect(readTaskAgreement(card)).toEqual({ ...readTaskAgreement(CARD), draft: true });
+  });
+
+  it.each(['Acceptance', 'Non-goals'])('A2: preserves the visible %s marker through real prepareCardStatus comment stripping', (heading) => {
+    const card = CARD.replace(`## ${heading}\n`, `## ${heading}\n\n${visibleMarker}\n`)
+      .replace('Digest.', '<!-- authoring note -->\nDigest.\n<!--\n## Acceptance\n- [A9] hidden\n-->');
+    const stripped = afterPrepareStripping(card);
+    expect(stripped).not.toContain('<!--');
+    expect(stripped).not.toContain('kind: story');
+    expect(stripped).toContain(visibleMarker);
+    expect(readTaskAgreement(stripped)).toEqual({ ...readTaskAgreement(CARD), draft: true });
+  });
+
+  it('A2: rejects the retired comment marker both directly and after real prepare stripping', () => {
+    const card = CARD.replace(/(## (?:Acceptance|Non-goals))\n/g, '$1\n\n<!-- agreement: draft -->\n');
+    expect(readTaskAgreement(card)).toEqual(readTaskAgreement(CARD));
+    expect(readTaskAgreement(afterPrepareStripping(card))).toEqual(readTaskAgreement(CARD));
+  });
+
+  it.each(['Acceptance', 'Non-goals'])('keeps a marker-only %s section empty', (heading) => {
+    const agreement = readTaskAgreement(`## ${heading}\n\n${visibleMarker}\n`);
+    expect(agreement.draft).toBe(true);
+    expect(agreement.acceptance).toEqual([]);
+    expect(agreement.nonGoals).toEqual([]);
+    expect(agreement.problems.map(p => p.code)).toContain(`${heading.toLowerCase()}-empty`);
   });
 
   it('ignores the marker outside the two sections and inside a fence', () => {
@@ -159,7 +217,7 @@ describe('the skeleton and the constants', () => {
   it('pins the section format and the draft marker', () => {
     expect(ACCEPTANCE_HEADING).toBe('## Acceptance');
     expect(NON_GOALS_HEADING).toBe('## Non-goals');
-    expect(AGREEMENT_DRAFT_MARKER).toBe('<!-- agreement: draft -->');
+    expect(AGREEMENT_DRAFT_MARKER).toBe('Draft: model-written, not yet confirmed.');
     expect(ACCEPTANCE_HEADING_RE.test('Acceptance')).toBe(true);
     expect(ACCEPTANCE_HEADING_RE.test('Done when')).toBe(true);
     expect(ACCEPTANCE_HEADING_RE.test('Design')).toBe(false);

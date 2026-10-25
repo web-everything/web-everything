@@ -20,6 +20,68 @@
  * purity test walks this file too because `run-record.mjs` imports it.
  */
 
+export const TASK_OUTCOMES = Object.freeze(['acted', 'nothing-owed', 'superseded', 'deferred-claim-held', 'deferred-read', 'failed']);
+export const DEFAULT_TASK_TIMEOUT_MS = 300000;
+export const DEFAULT_ACTING_REPO_CAP = 1;
+const SOURCE_LAYERS = ['standard', 'platform', 'tool', 'env'];
+const positiveInteger = v => Number.isSafeInteger(v) && v > 0;
+const positiveFinite = v => Number.isFinite(v) && v > 0;
+
+/** Logical identity stays separate from the run store's safe storage ID. */
+export function validateTaskIdentity(task) {
+  if (!isPlainObject(task)) return ['job.task must be an object'];
+  const errors = [];
+  if (!isValidJobKind(task.kind) || /\s/.test(task.kind)) errors.push('job.task.kind must be a valid kind');
+  if (typeof task.repo !== 'string' || /\s/.test(task.repo) || !/^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9][a-z0-9._-]{0,99}$/.test(task.repo)) errors.push('job.task.repo must be a canonical owner/repo slug');
+  for (const key of ['item', 'seq']) if (!positiveInteger(task[key])) errors.push(`job.task.${key} must be a positive safe integer`);
+  if (typeof task.id !== 'string' || task.id !== `${task.kind}:${task.repo}:${task.item}:${task.seq}`) errors.push('job.task.id must equal kind:repo:item:seq');
+  return errors;
+}
+
+/** Validate a pure resolveCascade result, refusing ignored overrides as well as invalid final values.
+ * Callers supply the cascade observation; this module never reads settings or logs. A refusal requires
+ * correcting the named policy/source before rescheduling, never silently falling back.
+ */
+export function validateTaskPolicy(resolved = {
+  value: { timeoutMs: DEFAULT_TASK_TIMEOUT_MS }, sources: { timeoutMs: 'standard' }, invalid: [],
+}) {
+  const { value, sources, invalid } = resolved ?? {};
+  const refuse = reason => { throw new TypeError(`task policy refused: ${reason}; correct policy before rescheduling`); };
+  if (!Array.isArray(invalid) || invalid.length) refuse(`invalid overrides ${JSON.stringify(invalid)}`);
+  if (!isPlainObject(value) || !positiveFinite(value.timeoutMs)) refuse('timeoutMs must be finite and positive');
+  if (!isPlainObject(sources)) refuse('source layers are required');
+  const leaves = [];
+  const visit = (object, prefix = '') => {
+    for (const [key, v] of Object.entries(object)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (isPlainObject(v)) visit(v, path);
+      else leaves.push(path);
+    }
+  };
+  visit(value);
+  if (leaves.some(key => !SOURCE_LAYERS.includes(sources[key])) || Object.keys(sources).some(key => !leaves.includes(key))) refuse('every policy leaf needs a known source layer');
+  return { policy: { ...value }, sources: { ...sources } };
+}
+
+/** Optional task block: opt-in validation leaves old job records byte-for-byte alone. */
+export function validateTaskMetadata(task) {
+  const errors = validateTaskIdentity(task);
+  if (!isPlainObject(task)) return errors;
+  if (!positiveFinite(task.timeoutMs)) errors.push('job.task.timeoutMs must be finite and positive');
+  try { validateTaskPolicy({ value: task.policy, sources: task.sources, invalid: [] }); }
+  catch (error) { errors.push(`job.task ${error.message}`); }
+  if (task.policy?.timeoutMs !== task.timeoutMs) errors.push('job.task.timeoutMs must match persisted policy');
+  if (typeof task.acting !== 'boolean') errors.push('job.task.acting must be boolean');
+  if (Object.hasOwn(task, 'actingRepoCap') && !positiveInteger(task.actingRepoCap)) errors.push('job.task.actingRepoCap must be a positive safe integer');
+  // Structural identifier only: the daemon policy checks the shared resource registry before admission.
+  if (!isValidJobKind(task.resourceKind) || /\s/.test(task.resourceKind)) errors.push('job.task.resourceKind must be a valid kind');
+  if (!Number.isSafeInteger(task.failureCount) || task.failureCount < 0) errors.push('job.task.failureCount must be a non-negative safe integer');
+  if (task.outcome !== null && !TASK_OUTCOMES.includes(task.outcome)) errors.push('job.task.outcome must be null or a semantic outcome');
+  if (task.resultRef !== null && (typeof task.resultRef !== 'string' || task.resultRef.length > 256 ||
+    /\s/.test(task.resultRef) || !/^results\/[A-Za-z0-9][A-Za-z0-9._-]*\.json$/.test(task.resultRef))) errors.push('job.task.resultRef must be null or a relative results JSON reference');
+  return errors;
+}
+
 /** A job's lifecycle. `launching` = the daemon spawned it but the child has not claimed the record yet. */
 export const JOB_STATUSES = Object.freeze(['queued', 'launching', 'running', 'succeeded', 'failed']);
 
@@ -163,6 +225,10 @@ export function validateJobBlock(job) {
   if (!(job.error === null || typeof job.error === 'string')) errors.push('job.error must be a string or null');
   if (!Array.isArray(job.timeline) || job.timeline.some((e) => !isPlainObject(e) || typeof e.event !== 'string' || !isIsoOrNull(e.at))) {
     errors.push('job.timeline must be an array of { at, event } rows');
+  }
+  if (Object.hasOwn(job, 'task')) {
+    errors.push(...validateTaskMetadata(job.task));
+    if (isPlainObject(job.task) && job.task.kind !== job.kind) errors.push('job.task.kind must match job.kind');
   }
   return errors;
 }

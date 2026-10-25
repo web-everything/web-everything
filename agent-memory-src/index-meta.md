@@ -100,3 +100,5 @@ Agent Meta · Memory · Model Routing cluster — open a leaf with `node scripts
 - [Prefer Codex workers, keep one Claude review](prefer-codex-keep-one-claude-review.md) — Claude quota is binding: unblock via Codex workers (codex-direct-task), Codex-first routing for fixers/builders; reviews keep ≥1 Claude seat
 - [AI subscription plans](reference-ai-subscription-plans.md) — 2× Claude 20x, 1× Google Ultra 20x, 1× Codex 500; Gemini only where it adds most value (high-care PRs, long context), daily cap
 - [Load fixes after review accepts](feedback-edge-load-after-review-accept.md) — load a guard/fixer/drain fix on its daemon once its review ACCEPTS, not before and not after the merge; prove it on the live case
+- [Investigate before asking for an override](investigate-before-asking-override.md) — before asking the operator to raise a cap or override, find why it tripped (2026-10-24 a stale fixture lane inflated the lane-pool check); "You could have investigated"
+- [Never touch secrets, even file names](never-touch-secrets-even-filenames.md) — never read, list or print anything under ~/.secrets; listing github-apps filenames on 2026-10-25 was a violation
