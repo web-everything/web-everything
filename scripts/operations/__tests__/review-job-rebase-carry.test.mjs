@@ -6,7 +6,8 @@ const a = 'a'.repeat(40), b = 'b'.repeat(40), p = 'c'.repeat(40);
 const trusted = body => ({ author: { login: 'chalbert' }, body });
 function fixture() {
   return { root: '.', now: () => 0, claim: () => ({ ok: true }), unclaim: vi.fn(), report: vi.fn(), log: vi.fn(),
-    readPrevCompletion: () => null, newActorId: () => 'actor', acquireLane: () => ({ lanePath: 'fake-lane' }), updateRecord: vi.fn(), releaseLane: vi.fn(),
+    redTeamStatus: () => {},
+    readPrevCompletion: () => null, newActorId: () => 'actor', prepareLane: () => ({ head: 'a'.repeat(40) }), acquireLane: () => ({ lanePath: 'fake-lane' }), updateRecord: vi.fn(), releaseLane: vi.fn(),
     carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
     readCarryEvidence: () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`), trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`)] }),
     contributionPatchId: () => p, restampVerdict: vi.fn(() => ({ ok: true })), postCarryComment: vi.fn(),

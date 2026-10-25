@@ -852,6 +852,32 @@ export function prStatesByPrNumber(prs) {
 export const AGENT_GONE_STATES = new Set(['done', 'failed', 'stopped']);
 
 /**
+ * Names whose listed background rows are terminal and all started before the live claim.
+ * @param {Array<{kind?:string, name?:string, state?:string, startedAt?:string|number, sessionId?:string}>} agents
+ * @param {Array<{meta?:{repo:string, pr:number, kind?:string, claimedAt?:string, sessionId?:string}}>} claims
+ * @returns {Set<string>} Names with only earlier terminal background rows; non-array inputs yield an empty Set.
+ */
+export function staleTerminalNamesForClaims(agents, claims) {
+  const stale = new Set();
+  if (!Array.isArray(agents) || !Array.isArray(claims)) return stale;
+  for (const claim of claims) {
+    const meta = claim?.meta;
+    if (!meta) continue;
+    const claimedAt = Date.parse(meta.claimedAt);
+    if (!Number.isFinite(claimedAt)) continue;
+    let name;
+    try { name = fixDispatchSessionName(meta); } catch { continue; }
+    const rows = agents.filter((row) => row?.kind === 'background' && row.name === name);
+    if (rows.length && rows.every((row) => {
+      const startedAt = typeof row.startedAt === 'number' ? row.startedAt : Date.parse(row.startedAt);
+      return AGENT_GONE_STATES.has(row.state) && Number.isFinite(startedAt) && startedAt < claimedAt
+        && !(meta.sessionId && row.sessionId === meta.sessionId);
+    })) stale.add(name);
+  }
+  return stale;
+}
+
+/**
  * Reduce a `claude agents --json --all` listing → a Map of session `name` → its own `state`, background rows
  * only. Pure (no exec) so the risky reduction is unit-tested directly, mirroring {@link prStatesFromList}'s
  * split. `kind !== 'background'` rows (a human's own interactive terminal session) are excluded — mirrors
@@ -1057,12 +1083,13 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  *
  * @param {object|null} lease
  * @param {Map<string,string|null>|null} sessionStates  from {@link sessionStatesForReap}; null = axis off.
- * @param {{nowMs?:number, graceMs?:number, pidAlive?:boolean|null, wrapperAlive?:boolean|null, ownerAlive?:boolean|null, claimRunnerAlive?:boolean|null}} [o]  `nowMs` = the clock reading to age the
+ * @param {{nowMs?:number, graceMs?:number, pidAlive?:boolean|null, wrapperAlive?:boolean|null, ownerAlive?:boolean|null, claimRunnerAlive?:boolean|null, staleTerminalRows?:boolean}} [o]  `nowMs` = the clock reading to age the
  *   lease against (no default — omitting it makes the absence branch always `null`, never guessing at an
  *   unknown age); `graceMs` defaults to {@link DISPATCH_GUARD_LISTING_GRACE_MINUTES}; `pidAlive` (#3383) = this
  *   session's REAL process-liveness read from {@link sessionPidAliveByName} (`null` when not supplied/unknown —
  *   exact back-compat with every pre-#3383 caller); `wrapperAlive` (#3903) = whether a DETACHED delivery
  *   wrapper the dispatcher started for this session is still running (see {@link detachedWrapperPidsBySession});
+ *   a tracked wrapper with unreadable identity supplies `true`, while an untracked wrapper supplies `null`;
  *   `ownerAlive` (#xbk2is9) = whether the lease's declared occupant (`workerSession`) is confirmed alive in the
  *   same listing (see {@link ownerSessionAliveForLease}) — `null` when not supplied or unknown (back-compat with
  *   every pre-#xbk2is9 caller). Consulted ONLY in the absence branch below, and ONLY there: it can never override
@@ -1075,17 +1102,20 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  *   borrowed runner even when a previous Claude round remains listed under the same deterministic name,
  *   with a terminal state or dead PID. Like live run-store wrapper evidence, it takes precedence over that
  *   name-keyed listing evidence. Without a validated live runner, the ordinary death checks still apply.
+ *   `staleTerminalRows` defaults to false; true means the listed terminal rows predate the live claim
+ *   (see {@link staleTerminalNamesForClaims}) and gives no verdict (`null`) after the live-wrapper and
+ *   live-claim-runner checks.
  * @returns {boolean|null}
  */
-export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DISPATCH_GUARD_LISTING_GRACE_MINUTES * 60_000, pidAlive = null, wrapperAlive = null, ownerAlive = null, claimRunnerAlive = null } = {}) {
+export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DISPATCH_GUARD_LISTING_GRACE_MINUTES * 60_000, pidAlive = null, wrapperAlive = null, ownerAlive = null, claimRunnerAlive = null, staleTerminalRows = false } = {}) {
   const session = lease && typeof lease.session === 'string' ? lease.session : null;
   // #3903 — A MECHANICAL DISPATCH'S LEASE IS HELD BY A DETACHED WRAPPER PROCESS, NOT A `claude --bg` SESSION.
   // `deliver-item-run.mjs` acquires the lane under the dispatcher's session slug and then runs its agent (Codex,
   // or a restricted `claude -p`) in the foreground of its own process, so that slug is NEVER in `claude agents`.
   // Without this check the absence branch below reads a live, hour-long build as "never listed → gone" once the
   // 10-minute grace passes and force-releases its lane mid-build. The wrapper's own pid (the run store's `pid:<n>`
-  // handle) is the direct answer: alive means NOT gone, full stop. `false`/`null` change nothing — a dead
-  // wrapper falls through to the ordinary absence logic, which is what reclaims its lane after it exits.
+  // handle) is the direct answer: alive or unknown identity means NOT gone. `false` (confirmed dead) and
+  // `null` (no tracked wrapper) fall through to the ordinary absence logic.
   if (wrapperAlive === true) return false;
   // #x5wm9ot — was `itemNumFromSession(session) === null`, which after that function narrowed to item-kind-only
   // now reads EVERY PR_KIND session (review-/fix-/ci-heal-/inspect-) as "not dispatcher-minted, don't guess" —
@@ -1096,6 +1126,7 @@ export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DIS
   // A fresh claim's live, session-bound runner is the current borrowed round. `--all` can retain an older
   // Claude round's terminal row and dead PID under this same name; neither describes the borrowed process.
   if (claimRunnerAlive === true) return false;
+  if (staleTerminalRows) return null; // Earlier rounds give no current-session verdict.
   // #3383 — without a validated current wrapper, a REAL death signal wins: no grace window (it is not an inference from silence),
   // and it fires even when the row is LISTED with a non-terminal state (the phantom shape neither branch below
   // can see — see the docblock above). Deliberately checked BEFORE `ownerAlive` — see the `ownerAlive` @param
@@ -1441,8 +1472,9 @@ function defaultPidCommand(pid) {
 /**
  * #4332 — the per-lease reap-signal builder `main()` drives (extracted so tests exercise the real wiring).
  * `ownerAlive` is computed BEFORE item resolution so it can veto the branch-derived PR-terminal fallback.
+ * `isPidAlive` defaults to the driver's existence-and-identity probe; tests can inject both IO seams.
  */
-export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids = new Map(), pidCommand = defaultPidCommand, nowMs }) {
+export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids = new Map(), staleTerminalNames = new Set(), pidCommand = defaultPidCommand, nowMs, isPidAlive = defaultIsPidAlive }) {
   return (c) => {
     // #x5wm9ot — an item-kind session (`conveyor-`/`prepare-`/`prepare-decision-`) checks `byItem` by its item
     // number; a PR_KIND session (`review-`/`fix-`/`ci-heal-`/`inspect-`) checks `byPr` by its OWN PR number —
@@ -1465,10 +1497,12 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
     // #3383 — the lease's own session's REAL process-liveness read (`null` when unknown/unlisted), threaded
     // into sessionGoneForLease's phantom-listing widening. Distinct from `pidAliveForLease` below, which
     // remains the dormant future-`agentPid` axis (today's leases carry no durable per-agent pid at all).
+    const staleTerminalRows = staleTerminalNames.has(c.lease?.session);
     const sessionPidAliveNow = c.lease?.session && sessionPidAlive.has(c.lease.session) ? sessionPidAlive.get(c.lease.session) : null;
     // #3903 — a detached delivery wrapper's own pid (see `detachedWrapperPidsBySession`).
     const wrapperPid = c.lease?.session ? wrapperPids.get(c.lease.session) : undefined;
-    const wrapperAlive = wrapperPid === undefined ? null : Boolean(defaultIsPidAlive(wrapperPid));
+    // Only explicit death lifts the wrapper veto; unreadable identity must keep the lane.
+    const wrapperAlive = wrapperPid === undefined ? null : isPidAlive(wrapperPid) !== false;
     // Bind a live claim PID to this session so PID reuse cannot preserve a dead fixer's lane.
     const claimRunnerPid = c.lease?.session ? claimRunnerPids.get(c.lease.session) : undefined;
     let claimRunnerAlive = claimRunnerPid === undefined ? null : false;
@@ -1480,7 +1514,7 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
     }
     return {
       prState,
-      sessionGone: sessionGoneForLease(c.lease, sessionStates, { nowMs, pidAlive: sessionPidAliveNow, wrapperAlive, ownerAlive, claimRunnerAlive }),
+      sessionGone: sessionGoneForLease(c.lease, sessionStates, { nowMs, pidAlive: sessionPidAliveNow, wrapperAlive, ownerAlive, claimRunnerAlive, staleTerminalRows }),
       pidAlive: pidAliveForLease(c.lease),
     };
   };
@@ -1530,12 +1564,15 @@ function main(argv) {
   // store or record leaves the map empty/partial, which only means the old (listing-only) behaviour applies.
   const wrapperPids = readWrapperPidsForPass({ env: process.env, log });
   let claimRunnerPids = new Map();
+  let staleTerminalNames = new Set();
   try {
     const claims = listFixDispatchClaims(undefined, { liveOnly: true });
     // Listing/run-store I/O can outlast the future-skew allowance. Validate the
     // heartbeat against a clock sampled AFTER the claim read, not pass start.
     claimRunnerPids = claimRunnerPidsBySession(claims, { nowMs: Date.now() });
     log(`lease-reaper: added ${claimRunnerPids.size} claim runner pid(s)`);
+    if (sessionAgents?.length) staleTerminalNames = staleTerminalNamesForClaims(sessionAgents, claims);
+    log(`lease-reaper: ignored ${staleTerminalNames.size} stale terminal session name(s)`);
   } catch {
     log('lease-reaper: fix-dispatch claim read failed — old behaviour applies (run-store pids only)');
   }
@@ -1561,7 +1598,7 @@ function main(argv) {
   const distinctRepoKeys = [...new Set(candidates.map((c) => c.repoKey).filter(Boolean))];
   const prStatesByRepo = new Map(distinctRepoKeys.map((repoKey) => [repoKey, fetchPrStatesForRepo(repoKey, flags)]));
 
-  const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids, nowMs });
+  const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids, staleTerminalNames, nowMs });
   const plan = reapPlan(candidates, { nowMs, ttlMs, signalsFor });
   const { reap, keep } = applyLaneHold(plan, { nowMs });
 
