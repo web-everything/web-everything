@@ -807,21 +807,31 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(f.postComment).toHaveBeenCalledTimes(3);
   });
 
-  it('a deferred trigger posts the normal cancel-failed marker and counts toward the shared cap', () => {
-    const f = fixture('hung-cancel-rerun', { ok: false, deferred: true, action: 'pull-request-push' });
-    for (let i = 0; i < 2; i++) {
-      expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining(missingRun)]);
-      expect(f.postComment.mock.calls[i][1]).not.toHaveProperty('reason');
-      expect(f.comments[i].body).toContain('and it FAILED:');
-      expect(f.comments[i].body).toContain(missingRun.error);
+  it.each([0, 1])('temporary retrigger deferrals preserve eligibility with %s prior failed attempts', (spent) => {
+    const deferred = { ok: false, deferred: true, action: 'pull-request-push', error: 'mergeability temporarily unknown' };
+    const f = fixture('hung-cancel-rerun', deferred);
+    if (spent) {
+      f.cancelAndRerun.mockReturnValueOnce({ ok: false, action: 'cancel-failed', error: 'permission denied' });
+      sweepHungCiRecovery(f.options);
     }
-    expect(f.cancelAndRerun).toHaveBeenCalledTimes(2);
-    expect(f.trigger).toHaveBeenCalledTimes(2);
-    expect(f.postComment).toHaveBeenCalledTimes(2);
-    expect(countHungCiComments(f.comments, PR_2636_HUNG.headRefOid)).toBe(2);
-    expect(sweepHungCiRecovery(f.options).dispatch).toEqual([expect.objectContaining({ kind: 'hung-cap-escalate', attempts: 2 })]);
-    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
-    expect(f.trigger).toHaveBeenCalledTimes(2);
+    for (let i = 0; i < 3; i++) {
+      const result = sweepHungCiRecovery(f.options);
+      expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'hung-cancel-rerun', attempts: spent })]);
+      expect(result.applied).toEqual([expect.objectContaining(deferred)]);
+      expect(formatHungReport(result)).toContain('… deferred PR #2636');
+      expect(f.postComment).toHaveBeenCalledTimes(spent);
+      expect(countHungCiComments(f.comments, PR_2636_HUNG.headRefOid)).toBe(spent);
+    }
+    f.trigger.mockReturnValue(triggered);
+    expect(sweepHungCiRecovery(f.options).applied).toEqual([expect.objectContaining(triggered)]);
+    expect(f.cancelAndRerun).toHaveBeenCalledTimes(spent + 4);
+    expect(f.cancelOnly).not.toHaveBeenCalled();
+    expect(f.trigger).toHaveBeenCalledTimes(4);
+    expect(f.postComment).toHaveBeenCalledTimes(spent + 1);
+    expect(countHungCiComments(f.comments, PR_2636_HUNG.headRefOid)).toBe(spent + 1);
+    expect(f.postComment).toHaveBeenLastCalledWith(2636, expect.objectContaining({ reason, ...triggered }));
+    expect(sweepHungCiRecovery(f.options).applied).toEqual([]);
+    expect(f.trigger).toHaveBeenCalledTimes(4);
   });
 
   it('permission-denied cancel failure never triggers, posts the normal marker, and counts toward the cap', () => {

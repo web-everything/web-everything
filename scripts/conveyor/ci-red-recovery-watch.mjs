@@ -889,6 +889,8 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
  * fix. Counting every ATTEMPT (never just every success) is what makes the retry cap a real ceiling under a
  * permanently-failing write, not just under a flaky one; once the cap trips, `hung-cap-exhausted` hands off to
  * GitHub's own job `timeout-minutes` exactly as a successful-but-still-hung run would.
+ * A missing-run retrigger that defers on a temporary precondition is not an attempt: report it without
+ * posting a counted marker, so the trigger remains eligible when that precondition clears.
  * @param {{repo?:string|null, apply?:boolean, requiredCheck?:string, workflowName?:string, thresholdMs?:number,
  *   maxRetriesPerSha?:number, readOpenPrs?:Function, readComments?:Function, cancelAndRerun?:Function,
  *   cancelOnly?:Function, trigger?:Function, defaultBranch?:string, postComment?:Function, now?:number}} [o]
@@ -957,13 +959,13 @@ export function sweepHungCiRecovery({
       let cancelError = null;
       if (d.kind === 'hung-cancel-rerun' && !result.ok && result.action === 'cancel-failed' && isRunNotFoundError(result.error)) {
         const triggered = trigger(d, { repo: repoSlug(repo), defaultBranch });
-        if (!triggered.deferred) {
-          cancelError = result.error;
-          result = triggered;
-          reason = 'run-not-found-retrigger';
-        }
+        cancelError = result.error;
+        result = triggered;
+        reason = 'run-not-found-retrigger';
       }
-      if (d.runId != null) {
+      // A temporary trigger hold is not a spent recovery attempt. Keep it visible in the report,
+      // without a counted marker that would exhaust the only retrigger path before the hold clears.
+      if (d.runId != null && !result.deferred) {
         postComment(d.prNumber, {
           repo, runId: d.runId, headSha: d.headSha, jobName: d.jobName, kind: d.kind, ok: result.ok, action: result.action, error: result.error ?? null,
           ...(reason ? { reason, cancelError } : {}),
@@ -986,7 +988,7 @@ export function formatHungReport({ dispatch = [], refusals = [], applied = [] } 
   const lines = [`ci-red-recovery-watch (hung) — ${dispatch.length} owed an action, ${refusals.length} refusal(s), ${applied.length} applied`];
   for (const d of dispatch) lines.push(`  → ${d.kind} PR #${d.prNumber} run ${d.runId ?? '?'} — ${d.why}`);
   for (const r of refusals) if (r.kind !== 'not-hung') lines.push(`  ✗ ${r.kind} PR #${r.prNumber} — ${r.why}`);
-  for (const a of applied) lines.push(a.ok ? `  ✓ applied: ${a.action} run ${a.runId ?? '?'} (PR #${a.prNumber}) — ${a.why ?? '(no reason recorded)'}` : `  ✗ apply ${a.action} PR #${a.prNumber} run ${a.runId ?? '?'} — ${a.error} (reason it was attempted: ${a.why ?? '(none)'})`);
+  for (const a of applied) lines.push(a.deferred ? `  … deferred PR #${a.prNumber} run ${a.runId ?? '?'} — ${a.error}` : a.ok ? `  ✓ applied: ${a.action} run ${a.runId ?? '?'} (PR #${a.prNumber}) — ${a.why ?? '(no reason recorded)'}` : `  ✗ apply ${a.action} PR #${a.prNumber} run ${a.runId ?? '?'} — ${a.error} (reason it was attempted: ${a.why ?? '(none)'})`);
   return lines.join('\n');
 }
 
