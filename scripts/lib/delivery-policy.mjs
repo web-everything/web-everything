@@ -138,9 +138,9 @@ export async function loadDeliveryPolicy({ root = process.cwd(), env = process.e
       if (!/^[a-f0-9]{40,64}$/.test(commit)) throw Error('Invalid base commit');
     }
     let registry;
-    const registered = path => commit ? registry?.has(basename(path)) === true : isPolicySpecPath(path);
-    // Defaults/root are registered in the live contract; pointers additionally use the base roster.
-    const policySource = path => commit ? registry?.has(basename(path)) === true : isPolicySpecPath(path);
+    // Defaults/post-check fall back to the live registry if the base registry is unavailable; ref pointers do not.
+    const registered = (path, requireBaseRegistry = false) => commit && (registry || requireBaseRegistry)
+      ? registry?.has(basename(path)) === true : isPolicySpecPath(path);
     const filesRead = [];
     const opened = new Set();
     const mark = path => { if (!opened.has(path)) { opened.add(path); filesRead.push(path); } };
@@ -174,7 +174,7 @@ export async function loadDeliveryPolicy({ root = process.cwd(), env = process.e
     let defaults;
     try {
       const location = locate(DEFAULTS_FILE);
-      if (!(commit && registry ? policySource(location.path) : isPolicySpecPath(location.path))) throw Error('Ungated defaults');
+      if (!registered(location.path)) throw Error('Ungated defaults');
       defaults = await read(location, 'defaults');
     } catch {
       emergency.filesRead = filesRead;
@@ -216,7 +216,7 @@ export async function loadDeliveryPolicy({ root = process.cwd(), env = process.e
       if (typeof value !== 'string') return { value, chain };
       if (chain.length >= 20 || isAbsolute(value) || !value.endsWith('.json') || !inside(root, resolve(root, value))) throw Error(`Policy pointer refused: ${value}`);
       const target = locate(value);
-      if (!registered(target.path)) throw Error(`Unregistered policy pointer: ${target.path}`);
+      if (!registered(target.path, true)) throw Error(`Unregistered policy pointer: ${target.path}`);
       if (chain.includes(target.path)) throw Error(`Policy pointer cycle: ${target.path}`);
       return entry(await read(target, 'json'), [...chain, target.path]);
     }
@@ -241,7 +241,7 @@ export async function loadDeliveryPolicy({ root = process.cwd(), env = process.e
     // Independent post-check over every opened value source, even if an earlier guard was bypassed.
     const exempt = file => external && envSource && file === sourcePath && !inside(root, file) && inside(realpathSync(daemonStateDir(env)), file);
     for (const file of filesRead) {
-      const allowed = exempt(file) || (commit && registry ? policySource(file) : isPolicySpecPath(file));
+      const allowed = exempt(file) || registered(file);
       if (allowed) continue;
       warn(`Ungated policy source dropped by post-check: ${file}`);
       if (file === DEFAULTS_FILE) {

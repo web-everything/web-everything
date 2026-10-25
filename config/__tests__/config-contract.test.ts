@@ -123,16 +123,19 @@ describe('delivery policy contract (#5113)', () => {
     drain: { onStepRefusal: ['alert', 'log'] },
   };
 
-  it('types every listed value inline and as extendsFlavor overrides through the public barrel', () => {
+  it('types every listed value in complete and partial inline policies and extendsFlavor overrides through the public barrel', () => {
     const fixture = resolve('config/__tests__/delivery-policy-contract.fixture.ts');
     const names = { prCi: 'PrCiPolicyValue', mergeGate: 'MergeGatePolicyValue', dispatchGate: 'DispatchGatePolicyValue', heavyQueue: 'HeavyQueuePolicyValue', drain: 'DrainPolicyValue' };
     const lines = [`import { defineConfig, extendsFlavor, type WebEverythingConfig, ${Object.values(names).map(name => `type ${name}`).join(', ')} } from '../index';`];
     for (const [dimension, fields] of Object.entries(values)) {
       lines.push(`const ${dimension}: ${names[dimension as keyof typeof names]} = ${JSON.stringify(defaults[dimension as keyof typeof defaults])};`);
+      lines.push(`defineConfig({ ${dimension}: {} });`);
       for (const [field, options] of Object.entries(fields)) {
         for (const value of options) {
           const inline = { ...defaults[dimension as keyof typeof defaults], [field]: value };
           lines.push(`defineConfig({ ${dimension}: ${JSON.stringify(inline)} });`);
+          lines.push(`defineConfig({ ${dimension}: ${JSON.stringify({ [field]: value })} });`);
+          lines.push(`const partial_${dimension}_${field}_${options.indexOf(value)}: WebEverythingConfig = { ${dimension}: ${JSON.stringify({ [field]: value })} };`);
           lines.push(`defineConfig({ ${dimension}: extendsFlavor('platform', ${JSON.stringify({ [field]: value })}) });`);
         }
         lines.push(`// @ts-expect-error invalid policy field must be rejected even with the open dimension index`);
@@ -154,6 +157,8 @@ describe('delivery policy contract (#5113)', () => {
         for (const value of options) {
           const config = { [dimension]: { ...defaults[dimension as keyof typeof defaults], [field]: value } };
           expect(defineConfig(config)).toBe(config);
+          const partial = { [dimension]: { [field]: value } };
+          expect(defineConfig(partial)).toBe(partial);
           const descriptor = extendsFlavor('platform', { [field]: value });
           expect(defineConfig({ [dimension]: descriptor })[dimension]).toBe(descriptor);
         }

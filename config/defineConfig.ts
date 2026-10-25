@@ -125,7 +125,7 @@ export interface DispatchGatePolicyValue {
 /** Heavy-run scheduling policy (#5113). */
 export interface HeavyQueuePolicyValue {
   priority: 'repairs-first' | 'fifo';
-  /** Nonnegative integer; consumers clamp to the slot cap minus one. */
+  /** Loader accepts any integer >= 0; a future consumer is expected to clamp to the slot cap minus one. No consumer exists yet. */
   reservedForRepairs: number;
   /** Positive integer minutes before an idle reserved slot may be borrowed. */
   reservedBorrowAfterMin: number;
@@ -169,12 +169,12 @@ export interface WebEverythingConfig {
   backlogIdNumbering?: DimensionEntry<BacklogIdNumberingSetting, BacklogIdNumberingSetting>;
   /** Backlog reach-main extent; resolved and enforced by repo tooling (#4985). */
   backlogIdReach?: DimensionEntry<BacklogIdReachSetting, BacklogIdReachSetting>;
-  /** Delivery-flow policy dimensions (#5113), each with its own platform default. */
-  prCi?: DimensionEntry<string, PrCiPolicyValue>;
-  mergeGate?: DimensionEntry<string, MergeGatePolicyValue>;
-  dispatchGate?: DimensionEntry<string, DispatchGatePolicyValue>;
-  heavyQueue?: DimensionEntry<string, HeavyQueuePolicyValue>;
-  drain?: DimensionEntry<string, DrainPolicyValue>;
+  /** Delivery-flow policy dimensions (#5113); omitted inline fields retain their platform defaults. */
+  prCi?: DimensionEntry<string, Partial<PrCiPolicyValue>>;
+  mergeGate?: DimensionEntry<string, Partial<MergeGatePolicyValue>>;
+  dispatchGate?: DimensionEntry<string, Partial<DispatchGatePolicyValue>>;
+  heavyQueue?: DimensionEntry<string, Partial<HeavyQueuePolicyValue>>;
+  drain?: DimensionEntry<string, Partial<DrainPolicyValue>>;
   /** Open-set: any further dimension keyed by name. */
   [dimension: string]: DimensionEntry | undefined;
 }

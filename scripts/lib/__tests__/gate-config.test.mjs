@@ -18,6 +18,7 @@ import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { scoreEscalation, producerReviewLabel } from '../review-escalation.mjs';
@@ -247,7 +248,7 @@ describe('delivery policy trust boundary (#5113 Part A)', () => {
   });
 
   async function fixture(run) {
-    const root = mkdtempSync(join(process.env.TMPDIR, 'delivery-registry-'));
+    const root = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'delivery-registry-'));
     const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
     const registryPath = join(root, 'scripts/lib/gate-config.mjs');
     try {
@@ -317,6 +318,14 @@ describe('delivery policy trust boundary (#5113 Part A)', () => {
         { file: 'repair-policy.json', tier: 'policy', leash: 'spec' },`));
       const registry = await readPolicySpecRegistryAt(base, { root });
       expect(registry?.has('repair-policy.json')).toBe(false);
+    });
+  });
+
+  it.each([
+    ['empty', ''], ['whitespace', ' '], ['undefined', undefined], ['null', null], ['number', 42], ['object', {}], ['option-like', '--help'],
+  ])('returns null without throwing for a %s registry ref', async (_name, ref) => {
+    await fixture(async ({ root }) => {
+      await expect(readPolicySpecRegistryAt(ref, { root })).resolves.toBeNull();
     });
   });
 

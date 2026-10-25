@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import ts from 'typescript';
 import { PLATFORM_DELIVERY_POLICY_DEFAULTS as defaults } from '../../../config/deliveryPolicyDefaults';
 import * as gate from '../gate-config.mjs';
@@ -33,7 +34,7 @@ function reach(result, extra = []) {
   for (const file of result.filesRead) expect(gate.isPolicySpecPath(file) || extra.includes(file)).toBe(true);
 }
 beforeEach(() => {
-  dir = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'delivery-policy-')));
+  dir = realpathSync(mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'delivery-policy-')));
   root = join(dir, 'repo');
   mkdirSync(root);
   mkdirSync(join(dir, 'state'));
@@ -43,6 +44,43 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); gate.POLICY_SPEC_BASENAMES.delete('repair-policy.json'); gate.POLICY_SPEC_BASENAMES.delete('repair-policy.txt'); rmSync(dir, { recursive: true, force: true }); });
 
 describe('delivery policy values', () => {
+  it.each([
+    ['empty', ''], ['whitespace', ' '], ['null', null], ['number', 42], ['object', {}], ['option-like', '--help'],
+  ])('uses the protective failsafe without throwing for a %s ref', async (_name, ref) => {
+    put(rootFile, { mergeGate: { onMainRed: 'off' } });
+    const result = await load({ ref });
+    expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
+    expect(result.sources.mergeGate.onMainRed).toBe('default');
+    expect(result.filesRead).toEqual([]);
+    expect(result.warnings).toEqual([
+      'Policy sources unavailable; using most-protective failsafe. Check the root and trusted base ref.',
+    ]);
+  });
+
+  it('CLI --ref without a value returns the protective failsafe with a warning', () => {
+    put(rootFile, { mergeGate: { onMainRed: 'off' } });
+    const result = JSON.parse(execFileSync(process.execPath, [resolve('scripts/lib/delivery-policy.mjs'), '--json', '--ref'], {
+      cwd: root, env: { ...process.env, ...env, WE_POLICY_CONFIG: '' }, encoding: 'utf8', timeout: 20000,
+    }));
+    expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
+    expect(result.filesRead).toEqual([]);
+    expect(result.warnings).toEqual([
+      'Policy sources unavailable; using most-protective failsafe. Check the root and trusted base ref.',
+    ]);
+  });
+
+  it('refuses a non-cyclic registered pointer chain beyond the 20 depth cap with a warning', async () => {
+    const targets = Array.from({ length: 21 }, (_, i) => `depth-policy-${i}.json`);
+    targets.forEach((target, i) => put(target, i + 1 < targets.length ? JSON.stringify(`./${targets[i + 1]}`) : { onMainRed: 'off' }));
+    put(rootFile, { mergeGate: `./${targets[0]}` });
+    const result = await load({ ref: repository(targets) });
+    expect(policy(result)).toEqual(defaults);
+    expect(result.sources.mergeGate.onMainRed).toBe('default');
+    expect(result.warnings).toEqual([`Policy pointer refused: ./${targets[19]}`]);
+    expect(result.filesRead).toEqual([defaultFile, rootFile, ...targets.slice(0, 19)]);
+    reach(result, targets);
+  });
+
   it('defaults include the stop and alert absent in the incident, with default provenance', async () => {
     const result = await load();
     expect(policy(result)).toEqual(defaults);
@@ -75,6 +113,24 @@ describe('delivery policy values', () => {
     const result = await load();
     expect(result.mergeGate).toEqual({ ...defaults.mergeGate, onMainRed: 'warn' });
     expect(result.sources.mergeGate).toEqual({ recheckWhenMainMoved: 'default', recheckMaxAgeMin: 'default', onMainRed: 'config' });
+  });
+  it.each([undefined, null, 'platform', {}, [42], ['platform', null]])(
+    'rejects an extends-flavor descriptor whose flavors is not a string array: %j', async flavors => {
+      put(rootFile, { mergeGate: { kind: 'extends-flavor', flavors, overrides: { onMainRed: 'off' } } });
+      const result = await load();
+      expect(policy(result)).toEqual(defaults);
+      expect(result.sources.mergeGate.onMainRed).toBe('default');
+      expect(result.warnings).toEqual(['Invalid descriptor: mergeGate']);
+      reach(result);
+    },
+  );
+  it('ignores an unknown field inside a valid dimension with a warning and keeps valid overrides', async () => {
+    put(rootFile, { mergeGate: { onMainRed: 'warn', onMainRead: 'off' } });
+    const result = await load();
+    expect(policy(result)).toEqual({ ...defaults, mergeGate: { ...defaults.mergeGate, onMainRed: 'warn' } });
+    expect(result.sources.mergeGate).toEqual({ recheckWhenMainMoved: 'default', recheckMaxAgeMin: 'default', onMainRed: 'config' });
+    expect(result.warnings).toEqual(['Invalid policy value: mergeGate.onMainRead']);
+    reach(result);
   });
   it.each([
     ['unknown value', { mergeGate: { onMainRed: 'explode' } }],
@@ -224,6 +280,28 @@ describe('trust, confinement and reach set', () => {
     expect(result.warnings).toHaveLength(1);
     reach(result);
   });
+  it('uses the live registry for base defaults and root config when the base registry is null, but refuses pointers', async () => {
+    gate.POLICY_SPEC_BASENAMES.add('repair-policy.json');
+    put(rootFile, { prCi: { mainStateParity: 'off' }, mergeGate: './repair-policy.json' });
+    put('repair-policy.json', { onMainRed: 'off' });
+    repository(['repair-policy.json']);
+    put('scripts/lib/gate-config.mjs', "throw Error('unreadable registry');");
+    const ref = commit();
+    const registry = vi.spyOn(gate, 'readPolicySpecRegistryAt');
+    const liveRegistry = vi.spyOn(gate, 'isPolicySpecPath');
+    const result = await load({ ref });
+    expect(registry).toHaveBeenCalledWith(ref, { root });
+    expect(await registry.mock.results[0].value).toBeNull();
+    expect(liveRegistry).toHaveBeenCalledWith(defaultFile);
+    expect(liveRegistry).toHaveBeenCalledWith(rootFile);
+    expect(policy(result)).toEqual({ ...defaults, prCi: { mainStateParity: 'off' } });
+    expect(policy(result)).not.toEqual(DELIVERY_POLICY_FAILSAFE);
+    expect(result.sources.prCi.mainStateParity).toBe('config');
+    expect(result.sources.mergeGate).toEqual({ recheckWhenMainMoved: 'default', recheckMaxAgeMin: 'default', onMainRed: 'default' });
+    expect(result.filesRead).toEqual([defaultFile, rootFile]);
+    expect(result.warnings).toEqual(['Unregistered policy pointer: repair-policy.json']);
+    reach(result);
+  });
   it('refuses registered symlinks locally and git mode 120000, non-blobs, and non-JSON targets', async () => {
     gate.POLICY_SPEC_BASENAMES.add('repair-policy.json');
     put('ungated.json', { onMainRed: 'off' });
@@ -261,6 +339,20 @@ describe('trust, confinement and reach set', () => {
     expect(result.mergeGate.onMainRed).toBe('halt');
     expect(result.sources.mergeGate.onMainRed).toBe('default');
     expect(result.warnings).toHaveLength(1);
+  });
+  it('returns the most-protective failsafe when the defaults file is unregistered at post-check', async () => {
+    put(defaultFile, readFileSync(join(root, defaultFile), 'utf8').replace("onMainRed: 'halt'", "onMainRed: 'off'"));
+    put(rootFile, { drain: { onStepRefusal: 'log' } });
+    const real = gate.isPolicySpecPath;
+    let defaultChecks = 0;
+    vi.spyOn(gate, 'isPolicySpecPath').mockImplementation(path => path === defaultFile ? ++defaultChecks === 1 : real(path));
+    const result = await load();
+    expect(defaultChecks).toBe(2);
+    expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
+    expect(policy(result)).not.toEqual(defaults);
+    expect(Object.values(result.sources).flatMap(Object.values)).toEqual(Array(9).fill('default'));
+    expect(result.filesRead).toEqual([defaultFile, rootFile]);
+    expect(result.warnings).toEqual([`Ungated policy source dropped by post-check: ${defaultFile}`]);
   });
   it('pointer cache refreshes on mtime changes and cycles have a bounded default fallback', async () => {
     gate.POLICY_SPEC_BASENAMES.add('repair-policy.json');
