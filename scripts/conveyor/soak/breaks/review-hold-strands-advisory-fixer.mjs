@@ -56,10 +56,14 @@ export default {
     if (addressed.dispatch.length !== 1 || addressed.dispatch[0].advisoryReview?.head !== pr.headRefOid
         || addressed.dispatch[0].advisoryReview?.ciWaived !== true)
       violations.push('the repaired head must receive a head-pinned held-gate review');
-    for (const blocker of [{ isDraft: true }, { referralHold: { kind: 'same-head', why: 'awaiting ruling' } }]) {
-      if (planReconcile({ ...options, prs: [{ ...pr, ...blocker }] }).dispatch.length)
-        violations.push('recovery reviews must retain draft and referral guards');
-    }
+    // Review-only red now permits draft promotion, but a draft must still never be reviewed.
+    const draft = planReconcile({ ...options, prs: [{ ...pr, isDraft: true }] }).dispatch;
+    if (draft.length !== 1 || draft[0].kind !== 'promote-draft' || draft[0].prNumber !== pr.number)
+      violations.push('a draft recovery must dispatch exactly one promotion instead of a review');
+    const referred = planReconcile({ ...options,
+      prs: [{ ...pr, referralHold: { kind: 'same-head', why: 'awaiting ruling' } }] }).dispatch;
+    if (referred.length)
+      violations.push('recovery reviews must retain the referral guard');
     pr.comments.pop();
     pr.headRefOid = oldHead;
     // Genuine required CI failures still belong to ci-heal, even with an admitted advisory.

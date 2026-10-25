@@ -116,7 +116,7 @@ export function runDraftPromotionStep({
         const fresh = readHeadCheckState({ repoSlug: repo, sha: pr.headRefOid, prNumber: n,
           ...(readHeadCheckState === defaultReadHeadCheckState ? { forPromotion: true, absentNotApplicable: notApplicable } : {}),
         });
-        checks = { state: fresh?.state, sha: pr.headRefOid };
+        checks = { state: fresh?.state, sha: pr.headRefOid, reviewHoldOnly: fresh?.reviewHoldOnly === true };
       } catch (e) { row('error', `check read: ${oneLine(e)}`); continue; }
       const decision = isDraftOwedPromotion({ pr, checks });
       if (!decision.owed) { row('skip', decision.why); continue; }
