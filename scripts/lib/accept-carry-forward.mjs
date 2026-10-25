@@ -150,7 +150,7 @@ function isApprovalPreventionNotice(text, comment) {
 function isDrainEnqueueClearance(text, comment) {
   if (comment !== undefined && !isTrustedMarkerAuthor(comment)) return false;
   const m = /^<!-- we-drain-enqueue-clearance head=([0-9a-f]{7,40}) -->\n\*\*Drain enqueue clearance\*\* — the drain judged head `([0-9a-f]{7,40})` ready \(every drain gate passed: couple whole, blockedBy landed\) and enqueued it on GitHub's merge queue \(xtpxusq\)\. The `merge-gate` check reads this for its couple-whole \/ blocked-by gates\.$/.exec(text);
-  return Boolean(m) && m[1].startsWith(m[2]);
+  return Boolean(m) && m[2] === m[1].slice(0, 12);
 }
 
 /** Exact buildLandingRetractionComment envelope; an unknown shape still requires a fresh review. */

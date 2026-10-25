@@ -47,5 +47,6 @@ describe('drain enqueue clearance envelope', () => {
     expect(isKnownMachineBody(`prose\n${exact}`)).toBe(false);
     expect(isKnownMachineBody(`<!-- we-drain-enqueue-clearance head=${head} -->\nDrain enqueue clearance`)).toBe(false);
     expect(isKnownMachineBody(exact.replace(head, 'not-a-sha'))).toBe(false);
+    expect(isKnownMachineBody(exact.replace(`\`${head.slice(0, 12)}\``, `\`${head.slice(0, 7)}\``))).toBe(false);
   });
 });
