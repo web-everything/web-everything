@@ -1,0 +1,1 @@
+- Also raised by web-everything/web-everything#5890 (finding 3: `we:backlog/xebglin-prevention-validate-regression-mapping-test-titles-in-standa.md:16` — Add a deterministic card check requiring executable acceptance criteria to identify a test file and named implemented or planned cases.)
