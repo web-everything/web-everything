@@ -1320,7 +1320,8 @@ async function finishRedTeamEffects({
   // ONE advisory comment per head.
   let comment;
   const body = renderRedTeamComment({ pr, rev, provider, model, findings, recheckStatus, foldedVerdict });
-  if (scrubPublish(body).length) {
+  // Exclude only the generated PR/head marker line; scrub all remaining comment content.
+  if (scrubPublish(body.slice(body.indexOf('\n') + 1)).length) {
     comment = { status: 'withheld', reason: 'the comment failed the secret scrub' };
   } else if (!post) {
     comment = { status: 'not-posted', reason: 'replay: comments are never posted', body };
@@ -1332,7 +1333,7 @@ async function finishRedTeamEffects({
       comment = { status: 'error', reason: String(e?.message ?? e).slice(0, 300), body };
     }
   }
-  const failed = rowErrors > 0 || /^(error|store-write-failed)/.test(delegationTrial) || comment.status === 'error';
+  const failed = rowErrors > 0 || /^(error|store-write-failed)/.test(delegationTrial) || comment.status === 'error' || comment.status === 'withheld';
   const didWork = rowsWritten > 0 || delegationTrial === 'logged' || comment.status === 'posted';
   return { rowsWritten, delegationTrial, comment, failed, didWork };
 }

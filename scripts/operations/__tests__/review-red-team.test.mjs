@@ -349,12 +349,12 @@ describe('x00g3tt — the ONE advisory comment, deduped by a trusted marker', ()
     expect(text).toMatch(/no break found/);
   });
 
-  it('the rendered marker for PR 5848 does not trigger the secret scrub', () => {
+  it('the rendered marker for PR 5848 body outside the generated marker line is clean for the secret scrub', () => {
     const rev = 'bc0ffddd262712cf405cafbf7e8118b335c267ff';
     const body = renderRedTeamComment({ pr: 5848, rev, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' });
     const marker = body.split('\n')[0];
     expect(marker).toBe(redTeamMarker(5848, rev));
-    expect(scrubPublish(marker)).toEqual([]);
+    expect(scrubPublish(body.slice(body.indexOf('\n') + 1))).toEqual([]);
   });
 });
 
@@ -393,7 +393,8 @@ describe('x00g3tt — a clean seat row never strands an unfinished effect (PR #2
     expect(scrubPublish(body)).not.toEqual([]);
     const { io, calls } = fakeIo({ readRecords: () => [prior] });
     const r = await run(io, { post: true });
-    expect(r).toMatchObject({ failed: true, comment: { status: 'withheld' } });
+    expect(r).toMatchObject({ status: 'resumed', comment: { status: 'withheld' } });
+    expect(r.reason).toContain('still failing');
     expect(r.status).not.toBe('already-ran');
     expect(calls.some(c => c[0] === 'post')).toBe(false);
   });
