@@ -1391,6 +1391,29 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       }
     });
 
+    it.each([
+      { reason: 'ephemeral run', ephemeral: true, stdout: '{"type":"thread.started","thread_id":"t1"}\n' },
+      { reason: 'no threadId', ephemeral: false, stdout: '{"type":"turn.completed","usage":{}}\n' },
+    ])('enforces fail mode when transcript checking is skipped for $reason', async ({ ephemeral, stdout }) => {
+      const dir = mkdtempSync(join(tmpdir(), 'we-codex-transcript-skip-'));
+      const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'git-metadata') : args.includes('rev-parse') ? 'sha0\n' : '';
+      try {
+        for (const mode of ['fail', 'warn']) {
+          const { fn: spawnFn } = fakeSpawn(stdout);
+          const readQuotaFn = vi.fn(), collectQuotaFn = vi.fn(), log = vi.fn();
+          const report = await codexDirectTask({ task: 'fixture', dir, gate: 'none', stream: false, ephemeral,
+            selfReview: false, execFn, spawnFn, readQuotaFn, collectQuotaFn, log,
+            env: { ...process.env, WE_CODEX_TRANSCRIPT_CHECK_MODE: mode } });
+          expect(report.transcriptCheck).toMatchObject({ mode, error: expect.stringMatching(ephemeral ? /ephemeral/ : /threadId/) });
+          expect(log.mock.calls.flat().join(' ')).toContain('transcriptCheck');
+          expect(cliExitCode(report)).toBe(mode === 'fail' ? 1 : 0);
+          expect(cliExitCode(report, { json: true })).toBe(mode === 'fail' ? 1 : 0);
+          expect(readQuotaFn).not.toHaveBeenCalled();
+          expect(collectQuotaFn).not.toHaveBeenCalled();
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
     it('never looks up quota for an --ephemeral run (no rollout was ever written)', async () => {
       const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
       const { fn: spawnFn } = fakeSpawn(stdout);
@@ -2863,6 +2886,14 @@ describe('detached jobs', () => {
       report: { transcriptCheck: { mode: 'fail', error: 'Run rollout transcript not found' } } },
     { label: 'missing transcript in warn mode', args: [...jsonTaskArgs, '--gate=none'], processCode: 0, recordCode: 0, transcriptMode: 'warn',
       report: { transcriptCheck: { mode: 'warn', error: 'Run rollout transcript not found' } } },
+    ...['fail', 'warn'].flatMap(mode => [
+      { label: `ephemeral transcript skip in ${mode} mode`, args: [...jsonTaskArgs, '--gate=none', '--ephemeral'],
+        processCode: mode === 'fail' ? 1 : 0, recordCode: mode === 'fail' ? 1 : 0, transcriptMode: mode,
+        report: { transcriptCheck: { mode, error: expect.stringMatching(/ephemeral/) } } },
+      { label: `no-threadId transcript skip in ${mode} mode`, args: [...jsonTaskArgs, '--gate=none'], noThread: true,
+        processCode: mode === 'fail' ? 1 : 0, recordCode: mode === 'fail' ? 1 : 0, transcriptMode: mode,
+        report: { transcriptCheck: { mode, error: expect.stringMatching(/threadId/) } } },
+    ]),
     { label: 'validation failure', args: [], processCode: 2, recordCode: 2 },
     { label: 'success', args: [...jsonTaskArgs, '--review'], processCode: 0, recordCode: 0,
       report: { exitCode: 0, timedOut: false, gate: { pass: true } } },
@@ -2875,7 +2906,7 @@ describe('detached jobs', () => {
     { label: 'failed gate in JSON mode', args: [...jsonTaskArgs, '--gate=standards'], processCode: 0, recordCode: 1, gateFails: true,
       report: { exitCode: 0, timedOut: false, gate: { ran: true, pass: false } } },
     { label: 'unreadable task file', args: ['--task-file=missing-detached-task-fixture'], processCode: 1, recordCode: 1 },
-  ])('CLI $label atomically records the internal job outcome', async ({ args, processCode, recordCode, runCode = 0, timeout = false, gateFails = false, report, transcriptMode, transcriptExists }) => {
+  ])('CLI $label atomically records the internal job outcome', async ({ args, processCode, recordCode, runCode = 0, timeout = false, gateFails = false, report, transcriptMode, transcriptExists, noThread }) => {
     // Bootstrap the record with the actual child PID; task execution and gates stay hermetic.
     const boot = `
       import { writeFileSync, mkdirSync } from 'node:fs';
@@ -2909,7 +2940,7 @@ describe('detached jobs', () => {
         }
         let completion;
         child.stdin = { on() {}, end() {
-          if (scenario.transcriptMode) child.stdout.emit('data', Buffer.from('{"type":"thread.started","thread_id":"t1"}\\n'));
+          if (scenario.transcriptMode && !scenario.noThread) child.stdout.emit('data', Buffer.from('{"type":"thread.started","thread_id":"t1"}\\n'));
           if (scenario.timeout) completion = setTimeout(() => child.emit('close', 0), 1000);
           else queueMicrotask(() => child.emit('close', scenario.runCode));
         } };
@@ -2929,7 +2960,7 @@ describe('detached jobs', () => {
       encoding: 'utf8', timeout: 10000,
       maxBuffer: 1024 * 1024,
       env: { ...process.env, CODEX_JOBS_DIR: jobsDir, TEST_JOB_ARGS: JSON.stringify(args),
-        TEST_JOB_SCENARIO: JSON.stringify({ runCode, timeout, gateFails, transcriptMode, transcriptExists }) },
+        TEST_JOB_SCENARIO: JSON.stringify({ runCode, timeout, gateFails, transcriptMode, transcriptExists, noThread }) },
     });
     expect(child.error).toBeUndefined();
     expect(child.status, child.stderr).toBe(processCode);

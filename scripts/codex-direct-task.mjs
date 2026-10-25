@@ -93,7 +93,10 @@
  * Exit status: with --json, a completed run exits 0 and its report carries `exitCode`, `timedOut` and `gate.pass`,
  * the contract machine callers already read (codex-worker, the probation launchers). Without --json, a failed run
  * or a red gate exits 1. A thrown error (including an unavailable self-review) exits 1 in both modes.
- * A transcript fail verdict or check error in fail mode exits nonzero in both output modes.
+ * Transcript detection uses best-effort heuristics: wrapped shells like `bash -c`, absolute
+ * command paths and other tools are not covered. In fail mode, flagged runs, check errors and
+ * checks skipped for ephemeral runs or a missing threadId exit nonzero in both output modes.
+ * Warn mode preserves exit status, including when the transcript check is skipped.
  * Detached job records preserve the task's nonzero code; timeout, a red gate or a failed transcript check falls back to 1.
  */
 
@@ -1134,10 +1137,10 @@ export async function codexDirectTask({
   let quota = null;
   let quotaRolloutFile = null;
   let quotaRolloutCleared = false;
-  let transcriptCheck = null;
+  const transcriptCheck = checkRunTranscript({ codexHome: resolveCodexHome(env), threadId: summary.threadId,
+    ephemeral, findRolloutFile, env, emit });
   if (!ephemeral && summary.threadId) {
     const codexHome = resolveCodexHome(env);
-    transcriptCheck = checkRunTranscript({ codexHome, threadId: summary.threadId, findRolloutFile, env, emit });
     const lookup = clearRolloutAfterRun
       ? collectQuotaFn({ codexHome, threadId: summary.threadId })
       : readQuotaFn({ codexHome, threadId: summary.threadId });

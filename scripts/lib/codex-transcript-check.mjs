@@ -1,4 +1,9 @@
-/** Post-run diagnostics over one Codex rollout; never execute transcript text. */
+/**
+ * Post-run diagnostics over one Codex rollout; never execute transcript text.
+ * Detection uses best-effort heuristics: wrapped shells like `bash -c`, absolute
+ * command paths and other tools are not covered. Fail mode rejects flagged runs,
+ * check errors and checks skipped for ephemeral runs or a missing threadId.
+ */
 import { readFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -105,7 +110,9 @@ function flagDetail(excerpt) {
   // Drop the sensitive suffix before truncation, including incomplete or multiline
   // quoted values: a truncated header/token must never leave its tail in a flag.
   return String(excerpt)
-    .replace(/(?:^|\s)-H[\s\S]*/g, ' -H [REDACTED]')
+    .replace(/(?:^|\s)(--(?:user|header|cookie|data)(?=\s|=|$)|-[uHbd])[\s\S]*/g, ' $1 [REDACTED]')
+    .replace(/\b[A-Za-z_][\w+.-]*:\/\/[^\s/]*@[^\s]*[\s\S]*/g, '[REDACTED]')
+    .replace(/\b[\w]*(?:TOKEN|SECRET|PASSWORD|KEY|PASS)[\w]*\s*=[\s\S]*/gi, '[REDACTED]')
     .replace(/\bAuthorization\s*:[\s\S]*/gi, 'Authorization: [REDACTED]')
     .replace(/\bBearer\s+[\s\S]*/gi, 'Bearer [REDACTED]')
     .replace(/\btoken\s*=[\s\S]*/gi, 'token=[REDACTED]')
@@ -163,12 +170,14 @@ export function runTranscriptCheck({ rolloutFile, policy, threadId, readFile = r
 }
 
 /** Preserve the effective mode on lookup, policy, read and log failures for exit enforcement. */
-export function checkRunTranscript({ codexHome, threadId, findRolloutFile, env = process.env, emit,
+export function checkRunTranscript({ codexHome, threadId, ephemeral = false, findRolloutFile, env = process.env, emit,
   resolvePolicy = resolveTranscriptCheckPolicy, runCheck = runTranscriptCheck }) {
   let policy;
   try {
     policy = resolvePolicy({ env });
     emit(formatCascadeSourcesLine('transcriptCheck', { value: policy, sources: policy.sources }));
+    if (ephemeral) throw new Error('Transcript check skipped: ephemeral run has no persisted rollout');
+    if (!threadId) throw new Error('Transcript check skipped: no threadId');
     const result = runCheck({ rolloutFile: findRolloutFile({ codexHome, threadId }), policy, threadId });
     emit(`codex-transcript-check · verdict=${result.verdict} flags=${[...new Set(result.flags.map(flag => flag.kind))].join(',')}`);
     return result;

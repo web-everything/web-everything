@@ -136,6 +136,47 @@ describe('checkTranscriptText fixture rollouts', () => {
     expect(result.flags[0].detail).toContain('[REDACTED]');
     expect(result.flags[0].detail.length).toBeLessThanOrEqual(160);
   });
+  it.each([
+    'GH_TOKEN=credential-value curl x',
+    'API_KEY=credential-value curl x',
+    'MY_SECRET_VALUE=credential-value curl x',
+    'PASSWORD=credential-value curl x',
+    'DB_PASS=credential-value curl x',
+    'MONKEY=credential-value curl x',
+    'curl x password=credential-value',
+    'curl x api_key="credential-value with spaces"',
+    'curl x secret=credential-value',
+    'curl x -u user:credential-value',
+    'curl x -uuser:credential-value',
+    'curl x --user "user:credential-value"',
+    'curl x --user=user:credential-value',
+    'curl x --header "X-Custom: credential-value"',
+    'curl x --header="X-Custom: credential-value"',
+    'curl x -b "session=credential-value"',
+    'curl x -bsession=credential-value',
+    'curl x --cookie=session=credential-value',
+    'curl x --cookie "session=credential-value"',
+    'curl x -d "field=credential-value"',
+    'curl x -dfield=credential-value',
+    'curl x --data "field=credential-value"',
+    'curl x --data=field=credential-value',
+    'curl https://user:credential-value@example.test/path',
+    'curl x --header "X-Custom: credential-value',
+    'curl x --user "user:\ncredential-value"',
+    'curl x --cookie "session=\ncredential-value',
+    'curl x --data "field=\ncredential-value',
+    'API_KEY="credential-value\ntrailing-sensitive-value" curl x; echo x > /tmp/x',
+    'curl x ' + 'x'.repeat(100) + ' --data "credential-value trailing-sensitive-value"',
+  ])('redacts additional credential forms before persisting or truncating: %s', command => {
+    const appendLog = vi.fn();
+    const result = runTranscriptCheck({ rolloutFile: 'fixture', policy: { mode: 'warn' }, readFile: () => call(command), appendLog });
+    expect(result.flags).toHaveLength(1);
+    const persisted = JSON.stringify(result.flags) + appendLog.mock.calls[0][1];
+    expect(persisted).not.toContain('credential-value');
+    expect(persisted).not.toContain('trailing-sensitive-value');
+    expect(result.flags[0].detail).toContain('[REDACTED]');
+    expect(result.flags[0].detail.length).toBeLessThanOrEqual(160);
+  });
   it('flags apply_patch and edit targets', () => {
     const patch = JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'apply_patch', input: '*** Begin Patch\n*** Add File: /tmp/x\n+hi\n*** End Patch' } });
     const edit = JSON.stringify({ type: 'response_item', payload: { type: 'function_call', name: 'edit', arguments: '{"file_path":"/tmp/x","text":"hello"}' } });
@@ -217,7 +258,7 @@ describe('runTranscriptCheck', () => {
   });
   it.each(['lookup', 'read', 'log', 'emit'])('retains resolved fail mode after %s failure', stage => {
     const error = () => { throw new Error(`${stage} denied`); };
-    const result = checkRunTranscript({ env: { WE_CODEX_TRANSCRIPT_CHECK_MODE: 'warn' },
+    const result = checkRunTranscript({ threadId: 'own', env: { WE_CODEX_TRANSCRIPT_CHECK_MODE: 'warn' },
       resolvePolicy: () => ({ mode: 'fail' }), runCheck: options => runTranscriptCheck({ ...options, readFile: stage === 'read' ? error : () => call('true'), appendLog: stage === 'log' ? error : vi.fn() }),
       findRolloutFile: stage === 'lookup' ? error : () => 'fixture', emit: stage === 'emit' ? error : vi.fn() });
     expect(result).toEqual({ mode: 'fail', error: `${stage} denied` });

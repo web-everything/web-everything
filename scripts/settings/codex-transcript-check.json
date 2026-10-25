@@ -1,4 +1,4 @@
 {
-  "$comment": "Post-run Codex transcript diagnostics. Cascade: standard → platform transcriptCheck → this file → WE_CODEX_TRANSCRIPT_CHECK_MODE / WE_CODEX_TRANSCRIPT_TOKEN_CAP. Warn preserves exit status; fail rejects flagged runs.",
+  "$comment": "Post-run Codex transcript diagnostics. Detection uses best-effort heuristics: wrapped shells like bash -c, absolute command paths and other tools are not covered. Cascade: standard → platform transcriptCheck → this file → WE_CODEX_TRANSCRIPT_CHECK_MODE / WE_CODEX_TRANSCRIPT_TOKEN_CAP. Warn preserves exit status, including skipped checks; fail rejects flagged runs, check errors and checks skipped for ephemeral runs or a missing threadId.",
   "transcriptCheck": { "mode": "warn", "tokenCap": 3000000 }
 }
