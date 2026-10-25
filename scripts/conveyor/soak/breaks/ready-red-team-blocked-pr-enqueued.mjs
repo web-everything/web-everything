@@ -16,13 +16,15 @@ export default {
   card: 'PR #5877 (lane/no-merge-red-team-blocked-v2); live PRs #5838/#5839',
   fixedBy: {
     sha: 'HEAD', where: 'lane/no-merge-red-team-blocked-v2',
-    paths: ['scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-merge-strategy.mjs'],
+    paths: ['scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-merge-strategy.mjs', 'scripts/lib/red-team-status-labels.mjs'],
   },
   fixPresent(root) {
     try {
       const source = readFileSync(join(root, 'scripts/lib/drain-queue-safety.mjs'), 'utf8');
       const hold = /export function redTeamLabelHoldReason\b[^}]*?const hold\s*=\s*\[([^\]]*)\]/.exec(source)?.[1] ?? '';
-      return /['"]red-team:blocked['"]/.test(hold) && /['"]red-team:pending['"]/.test(hold);
+      const labels = readFileSync(join(root, 'scripts/lib/red-team-status-labels.mjs'), 'utf8');
+      return /['"]red-team:blocked['"]/.test(hold) && /['"]red-team:pending['"]/.test(hold)
+        && /l === 'red-team:pending' && desired === null/.test(labels);
     } catch { return false; }
   },
   async run({ sourceRoot = ROOT, log } = {}) {
@@ -152,6 +154,20 @@ export default {
         check(dequeues === (status === 'red-team:blocked' ? 1 : 0),
           `wait=${wait ?? 'default'} / ${status}: queue sweep/followup sent ${dequeues} dequeue mutations`);
       }
+      // The runner's label sweep must not publish a bare removal of a label-only pending hold (no result owed).
+      const { sweepAdvisoryLabels } = await load('scripts/conveyor/advisory-label-sweep.mjs');
+      const sweepLabels = ['review:accepted', 'ready-to-merge', 'red-team:pending'];
+      const removals = [];
+      sweepAdvisoryLabels({
+        repo: REPO,
+        provider: { ensureLabel: () => {}, currentRepo: () => REPO, readComments: () => [], postComment: () => {},
+          setLabels: (_repo, _pr, { remove = [] }) => { removals.push(...remove); } },
+        listPrs: () => [{ number: PR, headRefOid: HEAD, labels: sweepLabels.map(name => ({ name })) }],
+        readPr: () => ({ state: 'OPEN', headRefOid: HEAD, labels: sweepLabels.map(name => ({ name })), comments: [] }),
+        readStatusEvidence: () => ({ scheduled: false, inFlight: false, queued: false, recorded: false }),
+        listUnpublishedStatuses: () => [], log: () => {},
+      });
+      check(!removals.includes('red-team:pending'), 'runner label sweep removed a label-only red-team:pending hold with no result');
     } catch (error) {
       violations.push(`scenario failed: ${error.stack ?? error}`);
     }

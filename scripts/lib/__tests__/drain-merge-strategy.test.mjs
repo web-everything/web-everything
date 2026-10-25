@@ -16,6 +16,7 @@ import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { publishAttention } from '../../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../under-test.mjs';
 import { syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+import { sweepAdvisoryLabels } from '../../conveyor/advisory-label-sweep.mjs';
 
 // The real operator feed is never written from this file: every test either injects a publisher or relies on the
 // test-run guard, and the guard's own tests assert against this stand-in.
@@ -991,6 +992,32 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     thread.push(clean);
     expect(restarted.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: true });
     expect(labelProvider.setLabels).toHaveBeenCalledWith(LOCAL, 5283, { add: 'red-team:clear', remove: ['red-team:pending'] });
+  });
+
+  it('the runner label sweep never removes a label-only red-team:pending hold, so the next enqueue still refuses', () => {
+    const labels = [...ACCEPTED, 'red-team:pending'];
+    const published = [];
+    const labelProvider = { ensureLabel: vi.fn(), setLabels: vi.fn((_repo, _pr, spec) => {
+      published.push(spec);
+      const next = labels.filter(label => !(spec.remove ?? []).includes(label));
+      if (spec.add) next.push(spec.add);
+      labels.splice(0, labels.length, ...next);
+    }) };
+    const evidence = { scheduled: false, inFlight: false, queued: false, recorded: false };
+    const live = () => ({ state: 'OPEN', headRefOid: HEAD, labels: labels.map(name => ({ name })), comments: [] });
+    // The REAL sweep, with injected IO only: unchanged head, no result comment, nothing scheduled/in flight/queued/recorded.
+    const results = sweepAdvisoryLabels({
+      repo: LOCAL, provider: { ...labelProvider, currentRepo: () => LOCAL, readComments: () => [], postComment: vi.fn() },
+      listPrs: () => [{ number: 5283, headRefOid: HEAD, labels: labels.map(name => ({ name })) }],
+      readPr: live, readStatusEvidence: () => evidence, listUnpublishedStatuses: () => [], log: () => {},
+    });
+    expect(published.some(spec => (spec.remove ?? []).includes('red-team:pending'))).toBe(false);
+    expect(results.some(entry => (entry.remove ?? []).includes('red-team:pending'))).toBe(false);
+    expect(labels).toContain('red-team:pending');
+    const h = harness({ strategy: 'github-merge-queue', labels, liveComments: [], labelProvider,
+      env: { WE_UNDER_TEST: '1' }, evidence });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(enqueuedAny(h)).toBe(false);
   });
 
   it('a failed pending-to-clear sync holds admission, then retries successfully', () => {
