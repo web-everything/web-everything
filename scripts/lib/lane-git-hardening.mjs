@@ -88,8 +88,9 @@ export function configKeyCandidates(entry) {
   const candidates = [];
   let end = -1;
   // Bounded: every prefix of a hostile many-line entry would cost O(lines^2) in time and memory, and the config is lane-
-  // writable. Real keys never span lines, so the first few prefixes plus the whole entry cover every misparse we defend
-  // against while the cost stays linear in the entry's size.
+  // writable. Git rejects a newline in a key, so the first few prefixes plus the whole entry cover the misparse shapes we
+  // defend against (a short key followed by value text) while the cost stays linear in the entry's size. A key spanning
+  // more than MAX_KEY_PREFIXES lines is not a shape git can produce and is not examined line by line.
   for (let i = 0; i < MAX_KEY_PREFIXES; i += 1) {
     end = text.indexOf('\n', end + 1);
     if (end === -1) break;

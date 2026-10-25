@@ -611,9 +611,12 @@ describe('untrusted lane Git configuration', () => {
     });
     // Every key the refusal knows has a pin, so no host-level setting survives unpinned.
     for (const key of ['core.ignoreStat', 'core.sparseCheckout', 'core.sparseCheckoutCone', 'index.sparse', 'core.untrackedCache',
-      'core.fileMode', 'core.symlinks', 'core.trustctime', 'core.autocrlf', 'core.eol', 'core.checkStat']) {
+      'core.fileMode', 'core.symlinks', 'core.trustctime', 'core.checkStat']) {
       expect(LANE_HONEST_REPORTING_PINS.map(([k]) => k)).toContain(key);
     }
+    // Line-ending settings are refused in a lane's own config but never pinned: a host with autocrlf=true must not be refused for good.
+    expect(LANE_HONEST_REPORTING_PINS.map(([k]) => k)).not.toContain('core.autocrlf');
+    expect(LANE_HONEST_REPORTING_PINS.map(([k]) => k)).not.toContain('core.eol');
     const probe = vi.fn(() => '');
     freshLaneSafety({ path: '/l', exec: probe });
     for (const [, , options] of probe.mock.calls) {

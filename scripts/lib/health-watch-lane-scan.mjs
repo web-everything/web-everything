@@ -137,7 +137,9 @@ export function laneMaskingConfig(listOutput) {
 export const LANE_HONEST_REPORTING_PINS = Object.freeze([
   ['core.ignoreStat', 'false'], ['core.sparseCheckout', 'false'], ['core.sparseCheckoutCone', 'false'], ['index.sparse', 'false'],
   ['core.untrackedCache', 'false'], ['core.fileMode', 'true'], ['core.symlinks', 'true'], ['core.trustctime', 'true'],
-  ['core.autocrlf', 'false'], ['core.eol', 'native'], ['core.checkStat', 'default'],
+  ['core.checkStat', 'default'],
+  // core.autocrlf / core.eol are deliberately NOT pinned: they only normalise line endings, so a host that legitimately sets
+  // autocrlf=true would read every CRLF checkout as changed and refuse its lanes for good. A lane's OWN value is still refused.
 ]);
 
 /** `env` with {@link LANE_HONEST_REPORTING_PINS} appended after its existing `GIT_CONFIG_COUNT` entries (the later entry wins). Pure. */
