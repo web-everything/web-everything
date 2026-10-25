@@ -891,6 +891,9 @@ export function tryResumeFix(planned, {
   // the candidate id being resumed rather than a freshly minted one (nothing else needs to address it).
   sessionCwdFor = (id) => dispatchSessionCwd(id, { root }),
   ensureSessionCwd = ensureDispatchSessionCwd,
+  grantConflictHelper = (cwd) => ensureSettingsFilePermissions({
+    cwd, allow: [...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)],
+  }),
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more: `runReconcileFixDispatch` is the ONE place that
   // decides whether this repo's `fix` capability is on (`docs/agent/platform-decisions.md#conveyor-multi-repo-
@@ -948,6 +951,12 @@ export function tryResumeFix(planned, {
   postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
   return resumeBgSession(planned, {
     candidate,
+    prepareResume: () => {
+      // The agent reloads its own cwd, not the trigger's scratch directory. Legacy builders and
+      // fixers need both repair helpers before this early-return path can resume them.
+      const permissions = grantConflictHelper(candidateCwd);
+      if (permissions?.ok !== true) throw new Error(`repair-helper permissions unwritten (${permissions?.reason ?? 'no result'})`);
+    },
     prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned),
     repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
   });
@@ -965,6 +974,7 @@ export function resumeBgSession(planned, {
   stop = stopSession, wait = defaultConfirmWait, claimOwner = fixDispatchClaimOwner(), acquireClaim = acquireFixDispatchClaim,
   releaseClaim = releaseFixDispatchClaim, claimRoot, sessionCwdFor = (id) => dispatchSessionCwd(id, { root: REPO_ROOT }),
   ensureSessionCwd = ensureDispatchSessionCwd,
+  prepareResume = () => {},
 } = {}) {
   // #x0jphk5 — TAKE THE CLAIM before ever issuing `--resume`. Ownership is confirmed above (both HEAD-sha and
   // name), so what remains is a genuine race: two dispatchers reading the same stale listing could BOTH reach
@@ -990,6 +1000,10 @@ export function resumeBgSession(planned, {
     };
   }
   const releaseOurClaim = () => releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
+
+  // Serialize settings migration with the resume attempt; a failed write must not launch the old session
+  // or strand its claim. The reconciler reports the error for this entry and continues the pass.
+  try { prepareResume(); } catch (e) { releaseOurClaim(); throw e; }
 
   const resumeArgv = buildAgentArgv({
     payload: { prompt },

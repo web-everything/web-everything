@@ -942,6 +942,88 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
 });
 
 describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exist: this runs with NO lane involved at all', () => {
+  it('refreshes legacy conflict-session grants through reconcile before resume, and refuses failed writes', async () => {
+    const { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const scratch = mkdtempSync(join(tmpdir(), 'conflict-resume-grant-'));
+    const cwd = join(scratch, 'legacy-session');
+    const path = join(cwd, '.claude', 'settings.local.json');
+    const sessionId = '33333333-3333-4333-8333-333333333333';
+    const prior = { permissions: { allow: ['Bash(echo ok:*)'], deny: ['Bash(rm:*)'] }, env: { KEEP: '1' } };
+    mkdirSync(join(cwd, '.claude'), { recursive: true });
+    writeFileSync(path, JSON.stringify(prior));
+    let name = 'fix-1764';
+    let head = MATCHING_HEAD;
+    const acquireClaim = vi.fn(() => ({ ok: true }));
+    const releaseClaim = vi.fn();
+    const observed = [];
+    const spawnAgent = vi.fn(() => {
+      observed.push(JSON.parse(readFileSync(path, 'utf8')));
+      return 'backgrounded · candxxxx\n';
+    });
+    const resumeOptions = {
+      root: '/repo', postNotice: () => false, spawnAgent,
+      listAgentsAll: () => [{ sessionId, id: 'candxxxx', cwd, name }],
+      resolveHead: () => head,
+      acquireClaim, releaseClaim,
+      sessionCwdFor: () => join(scratch, 'trigger'), ensureSessionCwd: (p) => p,
+    };
+    const entry = {
+      kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass',
+      labels: [CONFLICT_LABEL, 'review:changes'], headRefOid: MATCHING_HEAD,
+      body: buildAuthorActorMarker(sessionId),
+    };
+    const dispatch = vi.fn();
+    const run = () => runReconcileFixDispatch({
+      root: '/repo', checkStaleness: FRESH, findItemFn: findItemStub, loadItems: () => [],
+      fetchItemlessDiffPaths: () => [], listFixClaims: () => [],
+      reconcile: () => ({ dispatch: [entry], refusals: [], notes: [] }),
+      pickFreeLanes: () => [], dispatch, tryResumeRound: null, fixExecutorRoute: null,
+      tryResume: (planned, options) => tryResumeFix(planned, { ...options, ...resumeOptions }),
+    });
+    try {
+      for (const candidateName of ['fix-1764', 'conveyor-3438']) {
+        name = candidateName;
+        expect(run().dispatched).toHaveLength(1);
+        expect(observed.at(-1)).toEqual({ ...prior, permissions: { ...prior.permissions,
+          additionalDirectories: [], allow: [...prior.permissions.allow,
+            'Bash(node /repo/scripts/conveyor/resolve-conflict.mjs:*)',
+            'Bash(node "/repo/scripts/conveyor/resolve-conflict.mjs":*)',
+            'Bash(node /repo/scripts/conveyor/rearm-review.mjs:*)',
+            'Bash(node "/repo/scripts/conveyor/rearm-review.mjs":*)',
+          ],
+        } });
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+      const shim = await import('../../lib/gh-app-shim.mjs');
+      const grant = vi.spyOn(shim, 'ensureSettingsFilePermissions');
+      try {
+        head = 'wrong-head';
+        expect(run().dispatched).toHaveLength(0);
+        head = MATCHING_HEAD;
+        name = 'fix-9999';
+        expect(run().dispatched).toHaveLength(0);
+        expect(grant).not.toHaveBeenCalled();
+        name = 'fix-1764';
+        acquireClaim.mockReturnValueOnce({ ok: false, reason: 'held' });
+        expect(run().dispatched).toHaveLength(0);
+        expect(grant).not.toHaveBeenCalled();
+        for (const fail of [() => ({ ok: false, reason: 'write-failed' }), () => { throw new Error('EACCES'); }, () => undefined]) {
+          grant.mockImplementation(fail);
+          const releasedBefore = releaseClaim.mock.calls.length;
+          const settingsBefore = readFileSync(path, 'utf8');
+          const result = run();
+          expect(result.dispatched).toHaveLength(0);
+          expect(result.refusals).toEqual([expect.objectContaining({ pr: 1764, kind: 'dispatch-failed' })]);
+          expect(releaseClaim).toHaveBeenCalledTimes(releasedBefore + 1);
+          expect(readFileSync(path, 'utf8')).toBe(settingsBefore);
+          expect(spawnAgent).toHaveBeenCalledTimes(2);
+        }
+      } finally { grant.mockRestore(); }
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
   it('a non-conflict planned entry never consults `claude agents` at all, and reports `resumed: false`/no attempt', () => {
     let listAgentsAllCalls = 0;
     const result = tryResumeFix(
@@ -977,6 +1059,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       {
         root: '/repo',
         postNotice: notice => notices.push(notice),
+        grantConflictHelper: () => ({ ok: true }),
         spawnAgent: (argv) => { spawnCalls.push(argv); return 'backgrounded · candxxxx\n'; },
         listAgentsAll: () => [{ sessionId: 'cand-0000-0000-0000-000000000000', id: 'candxxxx', cwd: '/lanes/lane-4', name: 'conveyor-3438' }],
         resolveHead: (cwd) => (cwd === '/lanes/lane-4' ? MATCHING_HEAD : null),
@@ -1060,6 +1143,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       {
         root: '/repo',
         spawnAgent: (argv) => { spawnCalls.push(argv); return 'backgrounded · forkedid\n'; },
+        grantConflictHelper: () => ({ ok: true }),
         // Row 1 (before the resume attempt): the candidate is listed, so a resume is attempted.
         // Every read AFTER: only a DIFFERENT id ("forkedid") is listed — the CLI forked a copy. The retry
         // loop (hardening 2) reads this same wrong answer every time, so it correctly exhausts, not stalls.
@@ -1093,6 +1177,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       {
         root: '/repo',
         spawnAgent: () => 'backgrounded · candxxxx\n',
+        grantConflictHelper: () => ({ ok: true }),
         // Call 1: the pre-spawn candidate lookup. Call 2 (the FIRST post-spawn confirm read): the listing has
         // not caught up yet — no row at all, simulating exactly the propagation lag #3331 documents. Call 3
         // onward: caught up.
@@ -1125,6 +1210,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       {
         root: '/repo',
         spawnAgent: () => 'backgrounded · candxxxx\n',
+        grantConflictHelper: () => ({ ok: true }),
         // Call 1 (the pre-resume ownership check): the candidate is listed with its `id`, as always. Every
         // call AFTER: the SAME session, still listed by `sessionId` — but this time its `id` is gone, the
         // exact `#x3gdu12` scenario this item was filed to worry about.
@@ -1160,6 +1246,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       },
       {
         root: '/repo',
+        grantConflictHelper: () => ({ ok: true }),
         // The CLI actually forked a copy under `forkedid`, but that fork's row never shows up within this
         // dispatch's retry budget — every read looks identical (candidate still listed, id present, nothing new).
         spawnAgent: () => 'backgrounded · forkedid\n',
