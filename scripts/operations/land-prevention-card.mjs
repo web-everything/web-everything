@@ -86,13 +86,14 @@ import { machinePrTitle, preventionCardTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
 import { loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
+import { cardOnlyEligibility } from '../lib/card-batch-policy.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
@@ -352,19 +353,20 @@ const pendingPreventionDir = () => join(cardBatchStateDir(), 'pending-prevention
 
 function spoolPrevention(entry, pendingDir) {
   mkdirSync(pendingDir, { recursive: true });
-  const temporary = join(pendingDir, `.${entry.cardId}-${process.pid}-${Date.now()}.tmp`);
+  const filename = encodeURIComponent(entry.cardId);
+  const temporary = join(pendingDir, `.${filename}-${process.pid}-${Date.now()}.tmp`);
   try {
     writeFileSync(temporary, JSON.stringify(entry), 'utf8');
-    renameSync(temporary, join(pendingDir, `${entry.cardId}.json`));
+    renameSync(temporary, join(pendingDir, `${filename}.json`));
   } finally { rmSync(temporary, { force: true }); }
 }
 
 // Restoring the prior working-tree bytes keeps recovery content out of the run's own commit.
 async function withRecoveryCard(lane, rel, content, admit) {
-  if (!/^backlog\/x?[a-z0-9]+-[^/]+\.md$/.test(rel)) throw new Error('invalid pending card path');
+  if (!cardOnlyEligibility([{ status: 'A', mode: '100644', path: rel }]).ok) throw new Error('invalid pending card path');
   const path = join(lane, rel);
   const previous = existsSync(path) ? readFileSync(path) : null;
-  mkdirSync(join(lane, 'backlog'), { recursive: true });
+  mkdirSync(dirname(path), { recursive: true });
   try {
     writeFileSync(path, content);
     return await admit();
@@ -389,7 +391,7 @@ export async function drainPendingPrevention({ lane }, {
     const path = join(pendingDir, name);
     try {
       const entry = JSON.parse(readFileSync(path, 'utf8'));
-      if (!/^backlog\/x?[a-z0-9]+-[^/]+\.md$/.test(entry.rel)) throw new Error('invalid pending card path');
+      if (!cardOnlyEligibility([{ status: 'A', mode: '100644', path: entry.rel }]).ok) throw new Error('invalid pending card path');
       if (String(exec('git', ['-C', lane, 'ls-tree', 'origin/main', '--', entry.rel], {})).trim()) {
         rmSync(path);
         continue;
@@ -620,8 +622,11 @@ export async function landPreventionCard(input, {
       return { ok: true, step: 'mentioned', num: null, rel: null, pr: null, url: null, reason: null, mentions: recorded.length };
     }
 
-    if (rel && mentioned.length === 0) {
-      const cardId = cardIdOf(rel) ?? num ?? input.session;
+    const filingPaths = [...new Set([rel, ...mentioned.flatMap(m => m.paths)].filter(Boolean))];
+    const outcomes = [];
+    for (const cardPath of filingPaths) {
+      const cardId = cardIdOf(cardPath) ?? (cardPath === rel ? (num ?? input.session) : null);
+      if (!cardId) return fail('batch', `invalid collector member: ${cardPath}`, { num, rel });
       const idemKey = `prevention:${cardId}`;
       const source = { repo: CONSTELLATION_REPOS.we.slug, pr: input.retract?.pr ?? null, head: input.retract?.headSha ?? null,
         note: input.retract?.repo ? `${input.title} (from ${input.retract.repo}#${input.retract.pr})` : input.title };
@@ -629,20 +634,31 @@ export async function landPreventionCard(input, {
       try {
         const preventionSettings = loadBatchSettings();
         const retries = Math.ceil(preventionSettings.batchLeaseWaitMinutes * 60 / 30);
-        result = await batch({ laneDir: lane, cardPath: rel, kind: 'prevention', actor: 'mechanical', idemKey, source },
+        result = await batch({ laneDir: lane, cardPath, kind: 'prevention', actor: 'mechanical', idemKey, source },
           { preventionSettings, retries, pause: () => wait(30_000) });
       } catch (error) { result = { batched: false, reason: `admission failed: ${errorReason(error)}` }; }
-      if (result?.batched) {
-        write(`land-prevention-card: batched ${rel} into ${result.batchRef}\n`);
-        return { ok: true, step: 'batched', num, rel, pr: null, url: null, reason: null, batchRef: result.batchRef };
-      }
-      if (result?.disabled !== true) {
+      outcomes.push({ cardId, cardPath, idemKey, source, result });
+    }
+    // Only an explicit opt-out for every member takes the ordinary PR path. Once any
+    // member reaches the collector, retain all outstanding files there, even if a
+    // later settings read disables admission. Never publish a partially admitted filing.
+    if (outcomes.some(({ result }) => result?.batched || result?.disabled !== true)) {
+      let heldReason = null;
+      let batchRef = null;
+      for (const { cardId, cardPath, idemKey, source, result } of outcomes) {
+        if (result?.batched) {
+          batchRef = result.batchRef;
+          write(`land-prevention-card: batched ${cardPath} into ${batchRef}\n`);
+          continue;
+        }
         const reason = result?.reason ?? 'admission returned no result';
-        spoolPrevention({ cardId, rel, content: readFile(join(lane, rel)), idemKey, source, num,
+        spoolPrevention({ cardId, rel: cardPath, content: readFile(join(lane, cardPath)), idemKey, source, num,
           title: input.title, spooledAt: new Date().toISOString(), reason }, pendingDir);
-        write(`land-prevention-card: held ${rel} for the next batch window — ${reason}\n`);
-        return { ok: true, step: 'held', num, rel, pr: null, url: null, reason };
+        heldReason ??= reason;
+        write(`land-prevention-card: held ${cardPath} for the next batch window — ${reason}\n`);
       }
+      return { ok: true, step: heldReason === null ? 'batched' : 'held', num, rel, pr: null, url: null,
+        reason: heldReason, ...(batchRef ? { batchRef } : {}), ...(recorded.length ? { mentions: recorded.length } : {}) };
     }
 
     write(`land-prevention-card: committing ${[rel, ...mentioned.flatMap((m) => m.paths)].filter(Boolean).join(', ')}…\n`);
