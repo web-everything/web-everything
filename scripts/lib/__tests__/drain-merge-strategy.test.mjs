@@ -1004,13 +1004,17 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
       labels.splice(0, labels.length, ...next);
     }) };
     const evidence = { scheduled: false, inFlight: false, queued: false, recorded: false };
-    const live = () => ({ state: 'OPEN', headRefOid: HEAD, labels: labels.map(name => ({ name })), comments: [] });
+    const live = vi.fn(() => ({ state: 'OPEN', headRefOid: HEAD, labels: labels.map(name => ({ name })), comments: [] }));
+    const readStatusEvidence = vi.fn(() => evidence);
     // The REAL sweep, with injected IO only: unchanged head, no result comment, nothing scheduled/in flight/queued/recorded.
     const results = sweepAdvisoryLabels({
       repo: LOCAL, provider: { ...labelProvider, currentRepo: () => LOCAL, readComments: () => [], postComment: vi.fn() },
       listPrs: () => [{ number: 5283, headRefOid: HEAD, labels: labels.map(name => ({ name })) }],
-      readPr: live, readStatusEvidence: () => evidence, listUnpublishedStatuses: () => [], log: () => {},
+      readPr: live, readStatusEvidence, listUnpublishedStatuses: () => [], log: () => {},
     });
+    expect(live).toHaveBeenCalledWith({ repo: LOCAL, number: 5283 });
+    expect(readStatusEvidence).toHaveBeenCalledWith({ repo: LOCAL, pr: 5283, head: HEAD });
+    expect(results.some(entry => entry.skipped || entry.error)).toBe(false);
     expect(published.some(spec => (spec.remove ?? []).includes('red-team:pending'))).toBe(false);
     expect(results.some(entry => (entry.remove ?? []).includes('red-team:pending'))).toBe(false);
     expect(labels).toContain('red-team:pending');
