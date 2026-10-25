@@ -19,6 +19,7 @@ const view = { labels: [{ name: 'advisory:ruling-needed' }], headRefOid: head,
 const viewArgs = pr => ['pr', 'view', String(pr), '--repo', repo, '--json', 'labels,headRefOid,body,createdAt'];
 const commentArgs = pr => ['api', '--paginate', '--slurp', `repos/${repo}/issues/${pr}/comments?per_page=100`];
 const event = pr => ({ kind: 'needs-you-suppressed', repo, pr, detail });
+const expectOnce = (mock, ...args) => { expect(mock).toHaveBeenCalledTimes(1); expect(mock).toHaveBeenCalledWith(...args); };
 const roots = [];
 afterEach(() => {
   vi.restoreAllMocks();
@@ -51,7 +52,7 @@ describe('gateRulingItems: suppress only live findings that already have rulings
     expect(kept).toHaveLength(0);
     expect(opts.lookup).toHaveBeenCalledTimes(1);
     expect(opts.log).toHaveBeenCalledWith(`needs-you-feed ${repo}#42 needs-you-suppressed: ${detail}`);
-    expect(opts.emitEvent).toHaveBeenCalledExactlyOnceWith(event(42));
+    expectOnce(opts.emitEvent, event(42));
   });
 
   it('passes LIVE head, labels, body, creation time and every mapped comment page to lookup', async () => {
@@ -64,7 +65,7 @@ describe('gateRulingItems: suppress only live findings that already have rulings
       cwd: opts.cwd, encoding: 'utf8', timeout: expect.any(Number), killSignal: 'SIGKILL', maxBuffer: expect.any(Number),
     }));
     expect(opts.gh).toHaveBeenNthCalledWith(2, 'gh', commentArgs(42), expect.objectContaining({ cwd: opts.cwd }));
-    expect(opts.lookup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    expectOnce(opts.lookup, expect.objectContaining({
       number: 42, ...view, comments: [
         { author: { login: 'web-everything' }, body: 'first page', createdAt: at },
         { author: { login: 'chalbert' }, body: 'later ruling', createdAt: at },
@@ -134,7 +135,7 @@ describe('gateRulingItems: suppress only live findings that already have rulings
     expect(kept).toEqual(originals.slice(1));
     expect(opts.gh).toHaveBeenCalledTimes(2);
     expect(opts.lookup).toHaveBeenCalledTimes(1);
-    expect(opts.emitEvent).toHaveBeenCalledExactlyOnceWith(event(42));
+    expectOnce(opts.emitEvent, event(42));
     expect(opts.log.mock.calls.some(([line]) => /deadline.*keeping/i.test(line))).toBe(true);
   });
 
@@ -165,7 +166,7 @@ describe('gateRulingItems: suppress only live findings that already have rulings
     const opts = options({ emitEvent });
     const { kept } = await feed.gateRulingItems([item()], opts);
     expect(kept).toHaveLength(0);
-    expect(emitEvent).toHaveBeenCalledExactlyOnceWith(event(42));
+    expectOnce(emitEvent, event(42));
   });
 
   it('preserves survivor order and the report incomplete flag', async () => {
@@ -174,7 +175,7 @@ describe('gateRulingItems: suppress only live findings that already have rulings
     const { kept } = await feed.gateRulingItems(originals, opts);
     expect([...kept]).toEqual([originals[0], originals[2], originals[3]]);
     expect(kept.incomplete).toBe(true);
-    expect(opts.emitEvent).toHaveBeenCalledExactlyOnceWith(event(42));
+    expectOnce(opts.emitEvent, event(42));
   });
 });
 
@@ -212,6 +213,6 @@ describe('runOnce liveGate ruling suppression', () => {
     expect(readFileSync(path, 'utf8')).not.toContain('ruling-needed');
     expect(existsSync(feed.sidecarsOf(path).state)).toBe(true);
     expect(JSON.parse(readFileSync(feed.sidecarsOf(path).state, 'utf8')).openKeys).toEqual(result.openKeys);
-    expect(appendDaemonEvent).toHaveBeenCalledExactlyOnceWith(event(42));
+    expectOnce(appendDaemonEvent, event(42));
   });
 });
