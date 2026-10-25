@@ -42,6 +42,7 @@ import {
   restPullToPrStateShape,
   detachedWrapperPidsBySession,
   claimRunnerPidsBySession,
+  staleTerminalNamesForClaims,
   readDetachedWrapperPids,
   laneBranchItemNum,
   laneQuietSincePr,
@@ -616,17 +617,200 @@ describe('claimRunnerPidsBySession — borrowed fixer runner pids (PR #5806 regr
   });
 });
 
+describe('staleTerminalNamesForClaims — earlier fix rounds cannot condemn the current lease (PR #5848)', () => {
+  const claimedAt = '2026-10-24T21:15:47Z';
+  const claim = (over = {}) => ({ meta: { repo: 'we', pr: 5848, kind: 'fix', claimedAt, ...over } });
+  const row = (over = {}) => ({ kind: 'background', name: 'fix-5848', state: 'stopped', startedAt: '2026-10-24T21:00:00Z', sessionId: 'previous-round', ...over });
+
+  it('returns a Set when ALL same-name terminal rows predate the claim, regardless of listing order', () => {
+    const agents = [row(), row({ state: 'failed', startedAt: '2026-10-24T21:10:00Z', sessionId: 'another-round' })];
+    expect(staleTerminalNamesForClaims(agents, [claim()])).toEqual(new Set(['fix-5848']));
+    expect(staleTerminalNamesForClaims([...agents].reverse(), [claim()])).toEqual(new Set(['fix-5848']));
+  });
+
+  it.each(['done', 'failed', 'stopped'])('recognizes an earlier %s round as stale', (state) => {
+    expect(staleTerminalNamesForClaims([row({ state })], [claim()])).toEqual(new Set(['fix-5848']));
+  });
+
+  it('recognizes numeric epoch-ms startedAt before claimedAt as stale', () => {
+    const startedAt = 1792630008356;
+    expect(staleTerminalNamesForClaims([row({ startedAt })], [claim({
+      claimedAt: new Date(startedAt + 1).toISOString(),
+    })])).toEqual(new Set(['fix-5848']));
+  });
+
+  it.each([0, 1])('numeric epoch-ms startedAt at/after claimedAt (+%s ms) prevents stale classification', (offset) => {
+    const startedAt = Date.parse(claimedAt) + offset;
+    expect(staleTerminalNamesForClaims([row(), row({ startedAt })], [claim()])).toEqual(new Set());
+  });
+
+  it('ignores a non-background same-name row: it neither counts nor vetoes stale background rows', () => {
+    expect(staleTerminalNamesForClaims([row({ kind: 'interactive' })], [claim()])).toEqual(new Set());
+    const agents = [row(), row({ kind: 'interactive', state: 'working', startedAt: claimedAt })];
+    expect(staleTerminalNamesForClaims(agents, [claim()])).toEqual(new Set(['fix-5848']));
+    expect(staleTerminalNamesForClaims([...agents].reverse(), [claim()])).toEqual(new Set(['fix-5848']));
+  });
+
+  it('skips bad claim meta when fixDispatchSessionName throws, without throwing or skipping valid claims', () => {
+    const badClaim = claim({ kind: 'unknown-kind' });
+    expect(() => fixDispatchSessionName(badClaim.meta)).toThrow();
+    expect(() => staleTerminalNamesForClaims([row()], [badClaim])).not.toThrow();
+    expect(staleTerminalNamesForClaims([row()], [badClaim])).toEqual(new Set());
+    expect(staleTerminalNamesForClaims([row()], [badClaim, claim()])).toEqual(new Set(['fix-5848']));
+  });
+
+  it.each([null, undefined, {}, 'corrupt', 123])('non-array agents %s return an empty Set', (agents) => {
+    expect(staleTerminalNamesForClaims(agents, [claim()])).toEqual(new Set());
+  });
+
+  it.each([null, undefined, {}, 'corrupt', 123])('non-array claims %s return an empty Set', (claims) => {
+    expect(staleTerminalNamesForClaims([row()], claims)).toEqual(new Set());
+  });
+
+  it('uses shared repo/kind session names, including ci-heal, without mutating inputs', () => {
+    const claims = [claim(), claim({ kind: 'ci-heal' }), claim({ repo: 'frontierui' })];
+    const agents = claims.map(({ meta }) => Object.freeze(row({ name: fixDispatchSessionName(meta) })));
+    claims.forEach((entry) => { Object.freeze(entry.meta); Object.freeze(entry); });
+    expect(staleTerminalNamesForClaims(Object.freeze(agents), Object.freeze(claims)))
+      .toEqual(new Set(claims.map(({ meta }) => fixDispatchSessionName(meta))));
+  });
+
+  it.each([claimedAt, '2026-10-24T21:15:48Z'])('a terminal sibling started at/after the claim (%s) prevents stale classification', (startedAt) => {
+    expect(staleTerminalNamesForClaims([row(), row({ startedAt })], [claim()])).toEqual(new Set());
+  });
+
+  it('an exact claim sessionId match prevents stale classification even when the row started earlier', () => {
+    expect(staleTerminalNamesForClaims([row(), row({ sessionId: 'current-round' })], [claim({ sessionId: 'current-round' })])).toEqual(new Set());
+  });
+
+  it('no matching claim leaves terminal rows actionable', () => {
+    expect(staleTerminalNamesForClaims([row()], [])).toEqual(new Set());
+    expect(staleTerminalNamesForClaims([row()], [claim({ pr: 5849 })])).toEqual(new Set());
+  });
+
+  it.each(['working', 'blocked'])('a %s sibling prevents stale classification in either listing order', (state) => {
+    const agents = [row(), row({ state })];
+    expect(staleTerminalNamesForClaims(agents, [claim()])).toEqual(new Set());
+    expect(staleTerminalNamesForClaims([...agents].reverse(), [claim()])).toEqual(new Set());
+  });
+
+  it.each([undefined, null, '', 'not-a-date'])('does not infer an earlier round from unreadable startedAt %s', (startedAt) => {
+    expect(staleTerminalNamesForClaims([row(), row({ startedAt })], [claim()])).toEqual(new Set());
+  });
+
+  it.each([undefined, null, '', 'not-a-date'])('does not infer an earlier round from unreadable claimedAt %s', (claimedAt) => {
+    expect(staleTerminalNamesForClaims([row()], [claim({ claimedAt })])).toEqual(new Set());
+  });
+
+  it('a claim without any listed rows does not create a stale name', () => {
+    expect(staleTerminalNamesForClaims([], [claim()])).toEqual(new Set());
+  });
+});
+
+describe('sessionGoneForLease — stale terminal rows give no verdict (PR #5848)', () => {
+  it.each(['fix-5848', 'ci-heal-5848'])('%s ignores both terminal state and dead listing PID from an earlier round', (session) => {
+    const lease = fresh({ session });
+    const states = new Map([[session, 'stopped']]);
+    expect(sessionGoneForLease(lease, states, { nowMs: NOW, staleTerminalRows: true })).toBe(null);
+    expect(sessionGoneForLease(lease, states, { nowMs: NOW, staleTerminalRows: true, pidAlive: false })).toBe(null);
+  });
+
+  it('a live claim runner still returns not-gone before the stale-row no-verdict guard', () => {
+    expect(sessionGoneForLease(fresh({ session: 'fix-5848' }), new Map([['fix-5848', 'stopped']]), {
+      nowMs: NOW, staleTerminalRows: true, pidAlive: false, claimRunnerAlive: true,
+    })).toBe(false);
+  });
+
+  it('a live wrapper still returns not-gone before the stale-row no-verdict guard', () => {
+    expect(sessionGoneForLease(fresh({ session: 'fix-5848' }), new Map([['fix-5848', 'stopped']]), {
+      nowMs: NOW, staleTerminalRows: true, pidAlive: false, wrapperAlive: true,
+    })).toBe(false);
+  });
+});
+
+describe('buildLeaseSignalsFor + reapPlan — lane-8 old stopped rounds (PR #5848)', () => {
+  const claimedAt = '2026-10-24T21:15:47Z';
+  const nowMs = Date.parse(claimedAt) + 93_000;
+  const lease = { session: 'fix-5848', acquiredAt: claimedAt, ttlMinutes: DEFAULT_LEASE_TTL_MINUTES };
+  const cand = { pool: 'web-everything', lane: 8, dir: join(tmpdir(), 'lease-reaper-5848-no-such-lane'), repoKey: 'we', lease };
+  const claims = [{ meta: { repo: 'we', pr: 5848, kind: 'fix', claimedAt, sessionId: 'current-round' } }];
+  const agents = [
+    { kind: 'background', name: 'fix-5848', state: 'stopped', startedAt: '2026-10-24T20:55:00Z', sessionId: 'old-round-1' },
+    { kind: 'background', name: 'fix-5848', state: 'stopped', startedAt: '2026-10-24T21:10:00Z', sessionId: 'old-round-2' },
+  ];
+  const signalsWith = (rows = agents, staleTerminalNames = new Set(['fix-5848'])) => buildLeaseSignalsFor({
+    prStatesByRepo: new Map(), sessionStates: sessionStateByName(rows),
+    sessionPidAlive: new Map([['fix-5848', false]]), sessionAgents: rows,
+    wrapperPids: new Map(), staleTerminalNames, nowMs,
+  });
+
+  it('does not release the live fixer 93 seconds after acquire when both stopped rows belong to earlier rounds', () => {
+    // Pin the wiring separately from the new helper so a missing helper cannot hide a dropped option.
+    const signalsFor = signalsWith();
+    expect(signalsFor(cand).sessionGone).toBe(null);
+    const { reap, keep } = reapPlan([cand], { nowMs, ttlMs: TTL_MS, signalsFor });
+    expect(reap).toEqual([]);
+    expect(keep).toHaveLength(1);
+    expect(keep[0].lease).toEqual(lease);
+  });
+
+  it('threads stale names derived from the two stopped rows and the current fix-dispatch claim', () => {
+    const staleTerminalNames = staleTerminalNamesForClaims(agents, claims);
+    expect(staleTerminalNames).toEqual(new Set(['fix-5848']));
+    expect(signalsWith(agents, staleTerminalNames)(cand).sessionGone).toBe(null);
+  });
+
+  it.each([
+    ['started exactly at claimedAt', { startedAt: claimedAt }],
+    ['started after claimedAt', { startedAt: '2026-10-24T21:15:48Z' }],
+    ['matching claim sessionId despite earlier start', { sessionId: 'current-round' }],
+  ])('still reaps a current terminal round: %s', (_label, over) => {
+    const rows = [agents[0], { ...agents[1], ...over }];
+    const names = staleTerminalNamesForClaims(rows, claims);
+    expect(names).toEqual(new Set());
+    const signalsFor = signalsWith(rows, names);
+    expect(signalsFor(cand).sessionGone).toBe(true);
+    expect(reapPlan([cand], { nowMs, ttlMs: TTL_MS, signalsFor }).reap.map((r) => r.reason)).toEqual(['session-gone']);
+  });
+
+  it('without a claim the same stopped rows still condemn the lease', () => {
+    const names = staleTerminalNamesForClaims(agents, []);
+    expect(names).toEqual(new Set());
+    expect(signalsWith(agents, names)(cand).sessionGone).toBe(true);
+  });
+
+  it('omitting the optional staleTerminalNames preserves terminal-row reaping', () => {
+    const signalsFor = buildLeaseSignalsFor({
+      prStatesByRepo: new Map(), sessionStates: sessionStateByName(agents),
+      sessionPidAlive: new Map([['fix-5848', false]]), sessionAgents: agents,
+      wrapperPids: new Map(), nowMs,
+    });
+    expect(signalsFor(cand).sessionGone).toBe(true);
+  });
+
+  it('stale listing rows leave TTL expiry and PR-terminal reclamation active', () => {
+    const sig = signalsWith()(cand);
+    expect(sig.sessionGone).toBe(null);
+    const expiredLease = { ...lease, acquiredAt: new Date(nowMs - TTL_MS - 1).toISOString() };
+    expect(classifyReap(expiredLease, { nowMs, ttlMs: TTL_MS, ...sig })).toEqual({ reap: true, reason: 'ttl-stale' });
+    expect(classifyReap(lease, { nowMs, ttlMs: TTL_MS, ...sig, prState: 'merged' })).toEqual({ reap: true, reason: 'pr-merged' });
+  });
+});
+
 describe('main — claim freshness after slow I/O (PR #5846)', () => {
   // Execute the checked-in CLI shell with real claim/signal/reap helpers. Only I/O
   // is replaced, so a stale clock passed by main cannot hide behind a unit fixture.
   const source = readFileSync(join(process.cwd(), 'scripts/conveyor/lease-reaper.mjs'), 'utf8');
   const shell = source.slice(source.indexOf('function parseFlags('), source.indexOf('// Run the IO shell only'));
-  const dryRun = ({ delayAt, heartbeatOffset = 0, retainedRound = false }) => {
+  const dryRun = ({ delayAt, heartbeatOffset = 0, retainedRound = false, terminalStartOffsets = null }) => {
     let clock = NOW;
     let stdout = '';
     const logs = [];
     const advance = (stage) => { if (stage === delayAt) clock += 61_000; };
-    const lease = { session: 'fix-5806', acquiredAt: new Date(NOW - 20 * 60_000).toISOString(), ttlMinutes: 240 };
+    const claimedAt = new Date(NOW - 93_000).toISOString();
+    const lease = terminalStartOffsets
+      ? { session: 'fix-5848', acquiredAt: claimedAt, ttlMinutes: 240 }
+      : { session: 'fix-5806', acquiredAt: new Date(NOW - 20 * 60_000).toISOString(), ttlMinutes: 240 };
     runInNewContext(`${shell}\nmain(['--dry-run', '--json']);`, {
       Date: class extends Date { static now() { return clock; } },
       Map, Set, Number, JSON,
@@ -636,6 +820,13 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
       process: { env: {}, stdout: { write: (s) => { stdout += s; } }, exit: (code) => expect(code).toBe(0) },
       fetchSessionSignals: () => {
         advance('listing');
+        if (terminalStartOffsets) {
+          const agents = terminalStartOffsets.map((offset, i) => ({
+            kind: 'background', name: 'fix-5848', state: 'stopped',
+            startedAt: new Date(Date.parse(claimedAt) + offset).toISOString(), sessionId: `listed-round-${i}`,
+          }));
+          return { states: sessionStateByName(agents), pidAlive: new Map([['fix-5848', false]]), agents };
+        }
         return retainedRound
           ? { states: new Map([['fix-5806', 'done']]), pidAlive: new Map([['fix-5806', false]]), agents: [] }
           : { states: new Map([['conveyor-1', 'working']]), pidAlive: new Map(), agents: [] };
@@ -644,11 +835,13 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
       listFixDispatchClaims: () => {
         advance('claims');
         return [{ heartbeatAt: new Date(clock + heartbeatOffset).toISOString(),
-          meta: { repo: 'we', pr: 5806, kind: 'fix', runnerPid: process.pid } }];
+          meta: terminalStartOffsets
+            ? { repo: 'we', pr: 5848, kind: 'fix', claimedAt, sessionId: 'current-round' }
+            : { repo: 'we', pr: 5806, kind: 'fix', runnerPid: process.pid } }];
       },
-      claimRunnerPidsBySession,
+      claimRunnerPidsBySession, staleTerminalNamesForClaims,
       poolsToScan: () => ['fixture'], repoKeyForPool: () => null,
-      laneIndicesIn: () => [53], readLease: () => lease,
+      laneIndicesIn: () => [terminalStartOffsets ? 8 : 53], readLease: () => lease,
       fetchPrStatesForRepo: () => { throw new Error('no PR lookup expected'); },
       buildLeaseSignalsFor: (opts) => buildLeaseSignalsFor({ ...opts,
         pidCommand: () => 'node fix-run.mjs --session=fix-5806' }),
@@ -668,6 +861,18 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
     const { report, logs } = dryRun({ delayAt, retainedRound: true });
     expect(logs).toContain('lease-reaper: added 1 claim runner pid(s)');
     expect(report).toMatchObject({ scanned: 1, kept: 1, wouldReap: [], sessionAxis: 'on' });
+  });
+
+  it.each([
+    ['earlier stopped rounds', [-20 * 60_000, -5 * 60_000], true],
+    ['stopped rounds starting at/after claimedAt', [0, 1000], false],
+  ])('threads claim freshness through main for lane-8: %s', (_label, terminalStartOffsets, kept) => {
+    // No runner PID can mask a dropped staleTerminalNames option at the main boundary.
+    const { report, logs } = dryRun({ terminalStartOffsets });
+    expect(logs).toContain('lease-reaper: added 0 claim runner pid(s)');
+    expect(logs).toContain(`lease-reaper: ignored ${kept ? 1 : 0} stale terminal session name(s)`);
+    expect(report).toMatchObject({ scanned: 1, kept: kept ? 1 : 0, sessionAxis: 'on',
+      wouldReap: kept ? [] : [{ pool: 'fixture', lane: 8, reason: 'session-gone', session: 'fix-5848' }] });
   });
 
   it.each([

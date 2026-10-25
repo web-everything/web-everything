@@ -2125,6 +2125,25 @@ describe('detached jobs', () => {
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [250, [0], [[250], [1]]],
+    [1500, [0, 1000], [[1000], [1], [500], [1]]],
+  ])('finishes an early-waking poll sleep before reading again with maxMs=%s', async (maxMs, expectedReads, expectedSleeps) => {
+    const f = fixture();
+    const readAt = [];
+    const readRecord = vi.fn(() => {
+      readAt.push(f.options.now());
+      return f.options.readRecord();
+    });
+    const sleep = vi.fn(async ms => { await f.sleep(ms > 1 ? ms - 1 : ms); });
+    expect(await waitForJob({ ...f.options, maxMs, readRecord, sleep }))
+      .toEqual({ status: 'running', exitCode: null, resultPath: 'test-job.result.json', code: 75 });
+    expect(readAt).toEqual(expectedReads);
+    expect(sleep.mock.calls).toEqual(expectedSleeps);
+    expect(f.options.now()).toBe(maxMs);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
   it('documents usage errors, the default, the cap and the single deadline in --help and the header', () => {
     const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--help'], {
       encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,

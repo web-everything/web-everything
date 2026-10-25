@@ -109,6 +109,8 @@ export default {
           root: sourceRoot, now: () => 0, claim: () => ({ ok: true }), unclaim: () => {}, report: () => {},
           log: line => log?.(line), readPrevCompletion: () => null, newActorId: () => 'soak-review',
           acquireLane: () => { calls.push('lane'); return { lanePath: 'injected-soak-lane' }; },
+          prepareLane: () => ({ head: NEXT }),
+          redTeamStatus: () => {},
           updateRecord: () => {}, releaseLane: () => {},
           carryAcrossRebaseSetting: () => ({ value: mode === 'off' ? 'off' : 'on', source: 'soak' }),
           readCarryEvidence: () => ({ headSha: NEXT, comments: [clearance,
