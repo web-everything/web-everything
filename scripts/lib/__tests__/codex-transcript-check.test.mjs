@@ -127,14 +127,13 @@ describe('checkTranscriptText fixture rollouts', () => {
     'curl x -H "X-Secret: header-secret',
     'curl x -H "X-Secret:\nheader-secret"',
     'curl x token="quoted secret',
-  ])('redacts secrets from returned and persisted flag details: %s', command => {
+  ])('omits secret arguments from returned and persisted flags: %s', command => {
     const appendLog = vi.fn();
     const result = runTranscriptCheck({ rolloutFile: 'fixture', policy: { mode: 'warn' }, readFile: () => call(command), appendLog });
     expect(result.flags).toHaveLength(1);
     const persisted = JSON.stringify(result.flags) + appendLog.mock.calls[0][1];
     for (const secret of ['header-secret', 'auth-secret', 'bearer-secret', 'query-secret', 'quoted secret']) expect(persisted).not.toContain(secret);
-    expect(result.flags[0].detail).toContain('[REDACTED]');
-    expect(result.flags[0].detail.length).toBeLessThanOrEqual(160);
+    expect(result.flags[0]).toEqual({ kind: result.flags[0].kind, length: command.length });
   });
   it.each([
     'GH_TOKEN=credential-value curl x',
@@ -167,15 +166,14 @@ describe('checkTranscriptText fixture rollouts', () => {
     'curl x --data "field=\ncredential-value',
     'API_KEY="credential-value\ntrailing-sensitive-value" curl x; echo x > /tmp/x',
     'curl x ' + 'x'.repeat(100) + ' --data "credential-value trailing-sensitive-value"',
-  ])('redacts additional credential forms before persisting or truncating: %s', command => {
+  ])('omits additional credential forms from returned and persisted flags: %s', command => {
     const appendLog = vi.fn();
     const result = runTranscriptCheck({ rolloutFile: 'fixture', policy: { mode: 'warn' }, readFile: () => call(command), appendLog });
     expect(result.flags).toHaveLength(1);
     const persisted = JSON.stringify(result.flags) + appendLog.mock.calls[0][1];
     expect(persisted).not.toContain('credential-value');
     expect(persisted).not.toContain('trailing-sensitive-value');
-    expect(result.flags[0].detail).toContain('[REDACTED]');
-    expect(result.flags[0].detail.length).toBeLessThanOrEqual(160);
+    expect(result.flags[0]).toEqual({ kind: result.flags[0].kind, length: command.length });
   });
   it('flags apply_patch and edit targets', () => {
     const patch = JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'apply_patch', input: '*** Begin Patch\n*** Add File: /tmp/x\n+hi\n*** End Patch' } });
@@ -198,21 +196,58 @@ describe('checkTranscriptText fixture rollouts', () => {
     const message = JSON.stringify({ payload: { type: 'message', content: [{ type: 'text', text: 'gh issue list' }] } });
     const result = checkTranscriptText(fixture(array, custom, message));
     expect(result.flags.map(flag => flag.kind)).toEqual(['network', 'tmp-write']);
-    expect(result.commands).toEqual(['git fetch origin', 'echo hello > /tmp/file']);
+    expect(result).not.toHaveProperty('commands');
   });
   it('uses maximum cumulative tokens and flags only above the cap', () => {
     expect(checkTranscriptText(fixture(tokens(100), tokens(90)), { tokenCap: 100 })).toMatchObject({ totalTokens: 100, flags: [] });
     expect(checkTranscriptText(fixture(tokens(100), tokens(90)), { tokenCap: 99 }).flags[0].kind).toBe('token-cap');
   });
-  it('deduplicates identical findings and bounds excerpts and findings on oversized input', () => {
+  it('deduplicates identical findings and bounds findings without retaining arguments', () => {
     const input = fixture(call('gh issue list'), call('gh issue list'), ...Array.from({ length: 30 }, (_, i) => call(`curl https://example.test/${i}/${'x'.repeat(300)}`)));
     const result = checkTranscriptText(input);
     expect(result.flags).toHaveLength(20);
-    expect(result.flags.filter(flag => flag.detail === 'gh issue list')).toHaveLength(1);
-    expect(result.flags.every(flag => flag.detail.length <= 160)).toBe(true);
+    expect(result.flags.filter(flag => flag.kind === 'network' && flag.length === 'gh issue list'.length)).toHaveLength(1);
+    expect(result.flags.every(flag => Object.keys(flag).sort().join(',') === 'kind,length' && Number.isSafeInteger(flag.length))).toBe(true);
   });
   it('inspects long tool arguments without the summarizer default truncation', () => {
     expect(check(`echo ${'x'.repeat(10000)}; git fetch origin`).flags[0].kind).toBe('network');
+  });
+  it.each([
+    'gh api /private/path --field arbitrary=unclassified-value',
+    'curl https://example.test/private?session=unclassified-value',
+    'unknown-private-executable unclassified-value > /tmp/private-path',
+    'while true; do echo unclassified-value; sleep 1; done',
+    'echo unclassified-value',
+  ])('returns no command text or arguments for any inspected command: %s', command => {
+    const appendLog = vi.fn();
+    const inspected = check(command);
+    const report = runTranscriptCheck({ rolloutFile: 'fixture', policy: { mode: 'warn' }, readFile: () => call(command), appendLog });
+    expect(inspected).not.toHaveProperty('commands');
+    const output = JSON.stringify({ inspected, report }) + appendLog.mock.calls[0][1];
+    for (const argument of ['unclassified-value', '/private/path', 'unknown-private-executable', '/tmp/private-path', 'https://example.test']) expect(output).not.toContain(argument);
+    for (const flag of inspected.flags) expect(flag).toEqual({ kind: flag.kind, length: command.length });
+  });
+  it.each(['warn', 'fail'])('flags capped tool input as truncated and returns %s for unverifiable evidence', mode => {
+    const command = `echo ${'x'.repeat(200001)}; gh api /hidden-tail`;
+    const appendLog = vi.fn();
+    const result = runTranscriptCheck({ rolloutFile: 'fixture', policy: { mode }, readFile: () => call(command), appendLog });
+    expect(result.verdict).toBe(mode);
+    expect(result.flags).toEqual([{ kind: 'truncated', length: JSON.stringify({ cmd: command }).length }]);
+    expect(appendLog.mock.calls[0][1]).not.toContain('/hidden-tail');
+  });
+  it('inspects tool input at the cap and flags custom snippets above it', () => {
+    const suffix = '; git fetch origin';
+    const command = `echo ${'x'.repeat(200000 - JSON.stringify({ cmd: 'echo ' + suffix }).length)}${suffix}`;
+    expect(JSON.stringify({ cmd: command })).toHaveLength(200000);
+    expect(check(command).flags).toEqual([{ kind: 'network', length: command.length }]);
+    const input = `await tools.exec_command({cmd: "${'x'.repeat(200001)}; gh api /private-tail"})`;
+    const custom = JSON.stringify({ payload: { type: 'custom_tool_call', name: 'exec', input } });
+    expect(checkTranscriptText(custom).flags).toEqual([{ kind: 'truncated', length: input.length }]);
+  });
+  it('flags oversized raw tool input even when printable sanitization shrinks it', () => {
+    const input = '\u001b[31m'.repeat(40001) + 'echo clean';
+    const custom = JSON.stringify({ payload: { type: 'custom_tool_call', name: 'exec', input } });
+    expect(checkTranscriptText(custom).flags).toEqual([{ kind: 'truncated', length: input.length }]);
   });
   it('refuses empty or malformed evidence instead of reporting clean', () => {
     expect(() => checkTranscriptText('')).toThrow('Empty');
@@ -247,6 +282,23 @@ describe('runTranscriptCheck', () => {
     expect(appendLog.mock.calls[0][0]).toBe(join(resolveCoordinationRoot(), 'codex-transcript-check.jsonl'));
     expect(appendLog.mock.calls[0][1].split('\n')).toHaveLength(2);
     expect(JSON.parse(appendLog.mock.calls[0][1])).toEqual({ ts: '2026-10-22T12:00:00.000Z', threadId: 'own-thread', rolloutFile: 'fixture.jsonl', verdict: mode, totalTokens: 123, flags: result.flags });
+  });
+  it('uses the supplied runner env coordination root for the log', () => {
+    const appendLog = vi.fn();
+    const env = { WE_COORDINATION_ROOT: './fixture-coordination-root' };
+    const result = checkRunTranscript({ env, threadId: 'own', emit: vi.fn(),
+      resolvePolicy: () => ({ mode: 'warn' }), findRolloutFile: () => 'fixture',
+      runCheck: options => runTranscriptCheck({ ...options, readFile: () => call('true'), appendLog }) });
+    expect(result.verdict).toBe('clean');
+    expect(appendLog.mock.calls[0][0]).toBe(join(resolveCoordinationRoot({ env }), 'codex-transcript-check.jsonl'));
+  });
+  it('tells the operator to inspect the full rollout when capped evidence is rejected', () => {
+    const emit = vi.fn();
+    const result = checkRunTranscript({ env: {}, threadId: 'own', emit,
+      resolvePolicy: () => ({ mode: 'fail' }), findRolloutFile: () => 'fixture',
+      runCheck: options => runTranscriptCheck({ ...options, readFile: () => call('x'.repeat(200001)), appendLog: vi.fn() }) });
+    expect(result.verdict).toBe('fail');
+    expect(emit).toHaveBeenCalledWith('codex-transcript-check · truncated input: inspect the full rollout manually; retry with smaller commands');
   });
   it('returns clean and supplies a real timestamp by default', () => {
     const appendLog = vi.fn();

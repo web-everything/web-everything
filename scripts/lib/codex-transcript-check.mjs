@@ -12,6 +12,7 @@ import { cascadePolicy, platformPreference, formatCascadeSourcesLine } from './p
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), '../settings/codex-transcript-check.json');
+const INSPECTION_CAP = 200000;
 
 export function resolveTranscriptCheckPolicy({ env = process.env, tool, platform, readFile = readFileSync } = {}) {
   if (tool === undefined) {
@@ -106,36 +107,32 @@ function hasRiskyLoop(command) {
   return false;
 }
 
-function flagDetail(excerpt) {
-  // Drop the sensitive suffix before truncation, including incomplete or multiline
-  // quoted values: a truncated header/token must never leave its tail in a flag.
-  return String(excerpt)
-    .replace(/(?:^|\s)(--(?:user|header|cookie|data)(?=\s|=|$)|-[uHbd])[\s\S]*/g, ' $1 [REDACTED]')
-    .replace(/\b[A-Za-z_][\w+.-]*:\/\/[^\s/]*@[^\s]*[\s\S]*/g, '[REDACTED]')
-    .replace(/\b[\w]*(?:TOKEN|SECRET|PASSWORD|KEY|PASS)[\w]*\s*=[\s\S]*/gi, '[REDACTED]')
-    .replace(/\bAuthorization\s*:[\s\S]*/gi, 'Authorization: [REDACTED]')
-    .replace(/\bBearer\s+[\s\S]*/gi, 'Bearer [REDACTED]')
-    .replace(/\btoken\s*=[\s\S]*/gi, 'token=[REDACTED]')
-    .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
-}
-
 export function checkTranscriptText(jsonlText, { tokenCap = 3000000 } = {}) {
-  const flags = [], commands = [], seen = new Set();
+  const flags = [], seen = new Set();
   let totalTokens = 0;
   const flag = (kind, excerpt) => {
-    const detail = flagDetail(excerpt);
-    const key = JSON.stringify([kind, detail]);
-    if (!seen.has(key) && flags.length < 20) { seen.add(key); flags.push({ kind, detail }); }
+    // Raw evidence stays local to inspection and deduplication. Only numeric lengths
+    // cross the return/log boundary; arbitrary argument forms cannot leak through redaction.
+    const key = JSON.stringify([kind, excerpt]);
+    if (!seen.has(key) && flags.length < 20) { seen.add(key); flags.push({ kind, length: excerpt.length }); }
   };
   const lines = String(jsonlText).split('\n').filter(line => line.trim());
   if (!lines.length) throw new Error('Empty rollout transcript');
   for (const line of lines) {
-    const record = summarizeRecord(line, 200000);
+    const record = summarizeRecord(line, INSPECTION_CAP);
     if (record.kind === 'unparseable') throw new Error('Malformed rollout JSONL');
     if (record.kind === 'tokens' && Number.isFinite(record.totalTokens)) totalTokens = Math.max(totalTokens, record.totalTokens);
     if (record.kind !== 'tool_call') continue;
+    // Check the raw field before the summarizer's printable sanitization. Incomplete
+    // tool input cannot prove a clean run: fail mode rejects it.
+    const payload = JSON.parse(line).payload;
+    const input = payload.input ?? payload.arguments ?? '';
+    const rawInput = typeof input === 'string' ? input : JSON.stringify(input);
+    if (rawInput.length > INSPECTION_CAP) {
+      flag('truncated', rawInput);
+      continue;
+    }
     for (const command of toolCommands(record)) {
-      commands.push(command);
       if (hasRiskyLoop(command)) flag('loop', command);
       const tmp = `(?:["']?)/tmp/`;
       if (new RegExp(`(?:>{1,2}\\s*|\\btee\\s+(?:-[^\\s]+\\s+)*|(?:^|\\s)-o\\s*)${tmp}`).test(command)
@@ -152,7 +149,7 @@ export function checkTranscriptText(jsonlText, { tokenCap = 3000000 } = {}) {
     }
   }
   if (totalTokens > tokenCap) flag('token-cap', `${totalTokens} tokens exceeds cap ${tokenCap}`);
-  return { flags, totalTokens, commands };
+  return { flags, totalTokens };
 }
 
 function appendTranscriptLog(path, line) {
@@ -160,12 +157,12 @@ function appendTranscriptLog(path, line) {
   appendFileSync(path, line, 'utf8');
 }
 
-export function runTranscriptCheck({ rolloutFile, policy, threadId, readFile = readFileSync, appendLog = appendTranscriptLog, now = () => new Date() }) {
+export function runTranscriptCheck({ rolloutFile, policy, threadId, env = process.env, readFile = readFileSync, appendLog = appendTranscriptLog, now = () => new Date() }) {
   if (!rolloutFile) throw new Error('Run rollout transcript not found');
   const { totalTokens, flags } = checkTranscriptText(readFile(rolloutFile, 'utf8'), policy);
   const verdict = flags.length ? (policy.mode === 'fail' ? 'fail' : 'warn') : 'clean';
   const result = { mode: policy.mode, rolloutFile, totalTokens, flags, verdict };
-  appendLog(join(resolveCoordinationRoot(), 'codex-transcript-check.jsonl'), `${JSON.stringify({ ts: now().toISOString(), threadId, rolloutFile, verdict, totalTokens, flags })}\n`);
+  appendLog(join(resolveCoordinationRoot({ env }), 'codex-transcript-check.jsonl'), `${JSON.stringify({ ts: now().toISOString(), threadId, rolloutFile, verdict, totalTokens, flags })}\n`);
   return result;
 }
 
@@ -178,8 +175,9 @@ export function checkRunTranscript({ codexHome, threadId, ephemeral = false, fin
     emit(formatCascadeSourcesLine('transcriptCheck', { value: policy, sources: policy.sources }));
     if (ephemeral) throw new Error('Transcript check skipped: ephemeral run has no persisted rollout');
     if (!threadId) throw new Error('Transcript check skipped: no threadId');
-    const result = runCheck({ rolloutFile: findRolloutFile({ codexHome, threadId }), policy, threadId });
+    const result = runCheck({ rolloutFile: findRolloutFile({ codexHome, threadId }), policy, threadId, env });
     emit(`codex-transcript-check · verdict=${result.verdict} flags=${[...new Set(result.flags.map(flag => flag.kind))].join(',')}`);
+    if (result.flags.some(flag => flag.kind === 'truncated')) emit('codex-transcript-check · truncated input: inspect the full rollout manually; retry with smaller commands');
     return result;
   } catch (error) {
     const mode = policy?.mode ?? (env.WE_CODEX_TRANSCRIPT_CHECK_MODE?.trim() === 'fail' ? 'fail' : 'warn');

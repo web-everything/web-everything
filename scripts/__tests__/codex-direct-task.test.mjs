@@ -345,11 +345,19 @@ describe('summarizeEvents — the real agentic-mode event shape observed in a li
     const s = summarizeEvents(REAL_EVENTS);
     expect(s.threadId).toBe('01a08aed-f2ec-7ad0-b4e2-7a7ab89abb98');
     expect(s.turns).toBe(1);
-    expect(s.commands).toEqual(["/bin/bash -lc 'pwd; rg --files'", "/bin/bash -lc 'cat notes.txt'"]);
+    expect(s.commands).toEqual([{ length: "/bin/bash -lc 'pwd; rg --files'".length }, { length: "/bin/bash -lc 'cat notes.txt'".length }]);
     expect(s.filesChanged).toEqual([{ path: '/scratch/notes.txt', kind: 'update' }]);
     expect(s.agentMessages).toEqual(['I will read notes.txt…', 'Added a purpose comment. No other edits.']);
     expect(s.terminal).toBe('turn.completed');
     expect(s.usage.input_tokens).toBe(62159);
+  });
+
+  it('returns only command lengths for arbitrary arguments in completed command events', () => {
+    const command = 'curl https://private.test --field arbitrary=private-argument';
+    const result = summarizeEvents([{ type: 'item.completed', item: { type: 'command_execution', command } }]);
+    expect(result.commands).toEqual([{ length: command.length }]);
+    expect(JSON.stringify(result)).not.toContain('private-argument');
+    expect(JSON.stringify(result)).not.toContain('https://private.test');
   });
 
   it('reads the LAST terminal event, never the first, over a multi-turn stream', () => {
@@ -1323,7 +1331,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       if (mode !== 'missing') writeFileSync(rollout, fixture);
       // A different run must never be inspected, even when this run has no rollout.
       writeFileSync(join(sessions, 'rollout-other.jsonl'), fixture);
-      vi.stubEnv('WE_COORDINATION_ROOT', join(dir, 'coordination'));
+      vi.stubEnv('WE_COORDINATION_ROOT', join(dir, 'process-coordination'));
       const { fn: spawnFn } = fakeSpawn('{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n');
       const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'git-metadata') : args.includes('rev-parse') ? 'sha0\n' : '';
       const collectQuotaFn = vi.fn(() => {
@@ -1336,11 +1344,13 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       const log = vi.fn();
       try {
         const report = await codexDirectTask({ task: 'fixture', dir, gate: 'none', stream: false, spawnFn, execFn, collectQuotaFn, clearRolloutAfterRun: true, log,
-          env: { ...process.env, CODEX_HOME: dir, WE_CODEX_TRANSCRIPT_CHECK_MODE: mode === 'fail' ? 'fail' : 'warn' } });
+          env: { ...process.env, CODEX_HOME: dir, WE_COORDINATION_ROOT: join(dir, 'coordination'), WE_CODEX_TRANSCRIPT_CHECK_MODE: mode === 'fail' ? 'fail' : 'warn' } });
         expect(collectQuotaFn).toHaveBeenCalledOnce();
         if (mode === 'missing') expect(report.transcriptCheck.error).toMatch(/not found/);
         else {
-          expect(report.transcriptCheck).toMatchObject({ mode, rolloutFile: rollout, verdict: mode, flags: [{ kind: 'network', detail: 'gh issue list' }] });
+          expect(report.transcriptCheck).toMatchObject({ mode, rolloutFile: rollout, verdict: mode, flags: [{ kind: 'network', length: 'gh issue list'.length }] });
+          expect(JSON.stringify(report)).not.toContain('gh issue list');
+          expect(readFileSync(join(dir, 'coordination', 'codex-transcript-check.jsonl'), 'utf8')).not.toContain('gh issue list');
           expect(log).toHaveBeenCalledWith(`codex-transcript-check · verdict=${mode} flags=network`);
         }
         expect(cliExitCode(report)).toBe(mode === 'fail' ? 1 : 0);
@@ -2881,7 +2891,7 @@ describe('detached jobs', () => {
 
   it.each([
     { label: 'transcript fail verdict', args: [...jsonTaskArgs, '--gate=none'], processCode: 1, recordCode: 1, transcriptMode: 'fail', transcriptExists: true,
-      report: { transcriptCheck: { mode: 'fail', verdict: 'fail', flags: [{ kind: 'network', detail: 'gh issue list' }] } } },
+      report: { transcriptCheck: { mode: 'fail', verdict: 'fail', flags: [{ kind: 'network', length: 'gh issue list'.length }] } } },
     { label: 'missing transcript in fail mode', args: [...jsonTaskArgs, '--gate=none'], processCode: 1, recordCode: 1, transcriptMode: 'fail',
       report: { transcriptCheck: { mode: 'fail', error: 'Run rollout transcript not found' } } },
     { label: 'missing transcript in warn mode', args: [...jsonTaskArgs, '--gate=none'], processCode: 0, recordCode: 0, transcriptMode: 'warn',
