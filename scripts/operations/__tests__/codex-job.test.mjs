@@ -15,7 +15,7 @@ import { registerScope, releaseScope, assessFreeScope } from '../free-scope.mjs'
 // This fixture executes the runner's Git argv verbatim. Only Codex, admission,
 // scope and lane leasing are simulated; repositories, config, objects, diff,
 // staging, commits and publication all use real Git in disposable directories.
-async function withRealJob(run) {
+async function withRealJob(run, { objectFormat = 'sha1' } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'codex-job-real-'));
   const seed = path.join(root, 'seed'), origin = path.join(root, 'origin.git');
   const primary = path.join(root, 'primary'), lane = path.join(root, 'lane');
@@ -30,7 +30,7 @@ async function withRealJob(run) {
   let audit = () => {}, test = () => {};
   try {
     mkdirSync(seed);
-    git(seed, ['init', '--quiet', '--initial-branch=main', '--template=']);
+    git(seed, ['init', '--quiet', '--initial-branch=main', '--template=', `--object-format=${objectFormat}`]);
     mkdirSync(path.join(seed, 'scripts'));
     mkdirSync(path.join(seed, '.githooks'));
     writeFileSync(path.join(seed, '.githooks/pre-commit'), '#!/bin/sh\nexit 99\n', { mode: 0o755 });
@@ -81,7 +81,7 @@ async function withGitEnvironment(values, run) {
   }
 }
 
-it.each(['Apple system helper', 'lane hooks', 'relative repo', 'full SHA', 'abbreviated SHA', 'stale local base',
+it.each(['Apple system helper', 'lane hooks', 'global hooks', 'relative repo', 'full SHA', 'abbreviated SHA', 'stale local base',
   'inherited GIT_DIR', 'hostile lane commands', 'invalid lane config', 'replacement refs', 'followTags', 'submodule config'])(
   'real Git end-to-end setup matrix: %s', async variant => {
     await withRealJob(async f => {
@@ -90,10 +90,19 @@ it.each(['Apple system helper', 'lane hooks', 'relative repo', 'full SHA', 'abbr
       if (variant === 'Apple system helper') {
         const config = path.join(f.root, 'apple.gitconfig');
         writeFileSync(config, '[credential]\n\thelper = osxkeychain\n');
-        Object.assign(inherited, { GIT_CONFIG_SYSTEM: config, GIT_CONFIG_NOSYSTEM: '0' });
+        const home = path.join(f.root, 'home');
+        mkdirSync(home);
+        writeFileSync(path.join(home, '.gitconfig'), '[credential]\n\thelper = !touch "' + marker + '"\n');
+        Object.assign(inherited, { GIT_CONFIG_SYSTEM: config, GIT_CONFIG_NOSYSTEM: '0', HOME: home });
       }
       if (variant === 'lane hooks') {
         f.git(f.lane, ['config', 'core.hooksPath', '.githooks']);
+      }
+      if (variant === 'global hooks') {
+        const home = path.join(f.root, 'home');
+        mkdirSync(home);
+        writeFileSync(path.join(home, '.gitconfig'), '[core]\n\thooksPath = .githooks\n');
+        Object.assign(inherited, { HOME: home });
       }
       if (variant === 'relative repo') extra.repo = path.relative(process.cwd(), f.primary);
       if (variant === 'full SHA') extra.base = f.base;
@@ -358,13 +367,13 @@ it('normalizes a relative repo before any child process', async () => {
 });
 
 // Stage what the publisher wrote, independently of the source lane's bytes/modes.
-function stagedEntries(writes, dir, files) {
+function stagedEntries(writes, dir, files, algorithm = 'sha1') {
   const out = [];
   for (const file of files) {
     const written = writes.findLast(w => w.file === path.join(dir, file));
     if (!written) continue;
     const bytes = written.data, mode = written.options?.mode ?? 0o644;
-    out.push(`${mode & 0o100 ? '100755' : '100644'} ${createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')} 0\t${file}\0`);
+    out.push(`${mode & 0o100 ? '100755' : '100644'} ${createHash(algorithm).update(`blob ${bytes.length}\0`).update(bytes).digest('hex')} 0\t${file}\0`);
   }
   return out.join('');
 }
@@ -395,6 +404,7 @@ function fixture(rules = [], { ready = true } = {}) {
         if (args.includes('config')) return ok(laneConfig);
         if (args.includes('write-tree') || args.some(a => a.endsWith('^{tree}'))) return ok('a'.repeat(40) + '\n');
         if (args.includes('--show-toplevel')) return ok('/repo\n');
+        if (args.includes('--show-object-format')) return ok('sha1\n');
         if (args.includes('rev-parse')) return ok('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n');
         if (args.includes('rev-list')) return ok('1\n');
         if (args.includes('diff') && args.includes('--quiet')) return ok();
@@ -469,6 +479,7 @@ async function publicationFixture({ config = '', laneTip = 'aaaaaaaaaaaaaaaaaaaa
     if (cmd === 'git' && isFresh(call) && !args.includes('clone')) {
       // Log through the shared transcript, then model only the trusted checkout.
       await exec(cmd, args, options);
+      if (args.includes('--show-object-format')) return ok('sha1\n');
       if (args.includes('rev-parse')) {
         const ref = args.at(-1);
         if (ref.includes('origin/')) return ok(`${remoteTip}\n`);
@@ -1578,3 +1589,67 @@ it('refuses to commit when staging rewrote bytes through in-tree attributes (eol
   expect(pushes(f)).toHaveLength(0);
   expect(f.calls.some(c => c.args.includes('commit'))).toBe(false);
 });
+
+
+it.each([86400000, 1, 0])('lane lease covers the wait budget plus publication slack (%s ms)', async waitMs => {
+  const f = fixture();
+  expect((await f.run([`--wait-ms=${waitMs}`])).result.ok).toBe(true);
+  const acquire = f.calls.find(c => c.args[1] === 'acquire');
+  const ttl = acquire.args.find(arg => arg.startsWith('--ttl-minutes='));
+  expect(ttl).toBeDefined();
+  expect(Number(ttl.split('=')[1])).toBe(Math.ceil(2 * waitMs / 60000) + 1440);
+  expect(Number(ttl.split('=')[1])).toBeGreaterThanOrEqual(2 * waitMs / 60000);
+});
+
+it.each(['sha1', 'sha256'])('accepts exact staged changed bytes in a %s repository', async algorithm => {
+  const f = fixture([
+    ['--show-object-format', ok(algorithm + '\n')],
+    ['ls-files --stage', call => ok(stagedEntries(f.writes, call.cwd, ['scripts/a.mjs'], algorithm))],
+  ]);
+  const read = f.io.readFile;
+  f.io.readFile = (file, encoding) => file === '/lane/scripts/a.mjs' ? Buffer.from('changed\n') : read(file, encoding);
+  expect((await f.run()).result).toMatchObject({ ok: true });
+  expect(f.calls.filter(c => c.args.includes('--show-object-format'))).toHaveLength(1);
+  expect(pushes(f)).toHaveLength(1);
+});
+
+it('rejects a tampered 64-hex staged blob in a sha256 repository', async () => {
+  const f = fixture([
+    ['--show-object-format', ok('sha256\n')],
+    ['ls-files --stage', ok(`100644 ${createHash('sha256').update('blob 9\0tampered\n').digest('hex')} 0\tscripts/a.mjs\0`)],
+  ]);
+  const read = f.io.readFile;
+  f.io.readFile = (file, encoding) => file === '/lane/scripts/a.mjs' ? Buffer.from('changed\n') : read(file, encoding);
+  expect((await f.run()).result).toMatchObject({ ok: false, stopReason: 'changed-after-audit' });
+  expect(f.calls.filter(c => c.args.includes('--show-object-format'))).toHaveLength(1);
+  expect(f.calls.some(c => c.args.includes('commit'))).toBe(false);
+  expect(pushes(f)).toEqual([]);
+});
+
+it.each([ok('unknown\n'), red(), { status: 0 }, ok('')])('fails closed with commit-failed for unreadable or unsupported object format %j', async response => {
+  const f = fixture([['--show-object-format', response]]);
+  expect((await f.run()).result).toMatchObject({ ok: false, stopReason: 'commit-failed' });
+  expect(f.calls.filter(c => c.args.includes('--show-object-format'))).toHaveLength(1);
+  expect(f.calls.some(c => c.args.includes('commit'))).toBe(false);
+  expect(pushes(f)).toEqual([]);
+  released(f); scopeReleased(f);
+});
+
+it('real sha256 Git publishes exact staged bytes end to end', async context => {
+  const probeDir = mkdtempSync(path.join(tmpdir(), 'codex-job-sha256-probe-'));
+  try {
+    const probe = spawnSync('git', ['init', '--bare', '--template=', '--object-format=sha256', probeDir],
+      { encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }, timeout: 10000 });
+    if (probe.status !== 0) { context.skip('Installed Git does not support SHA-256 repositories'); return; }
+  } finally { rmSync(probeDir, { recursive: true, force: true }); }
+  await withRealJob(async f => {
+    const result = await f.job();
+    expect(result, result.detail).toMatchObject({ ok: true });
+    expect(result.sha).toMatch(/^[a-f0-9]{64}$/);
+    expect(f.git(f.origin, ['rev-parse', result.sha + '^'])).toBe(f.base);
+    expect(f.git(f.origin, ['show', result.sha + ':scripts/a.mjs'])).toBe('changed');
+    expect(f.calls.filter(c => c.args.includes('--show-object-format'))).toHaveLength(1);
+    expect(f.git(f.origin, ['rev-parse', result.sha + ':scripts/a.mjs'])).toBe(
+      createHash('sha256').update('blob 8\0changed\n').digest('hex'));
+  }, { objectFormat: 'sha256' });
+}, 30000);

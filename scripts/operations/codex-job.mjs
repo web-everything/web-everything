@@ -149,7 +149,7 @@ export async function checkFreeScope(s) {
   }
 }
 export async function acquireLane(s) {
-  const r = await exec(s, 'node', ['scripts/lane-pool.mjs', 'acquire', `--purpose=${s.opts.purpose}`, '--adopt', `--base=${s.startSha}`, '--json']);
+  const r = await exec(s, 'node', ['scripts/lane-pool.mjs', 'acquire', `--purpose=${s.opts.purpose}`, '--adopt', `--base=${s.startSha}`, `--ttl-minutes=${Math.ceil(2 * s.opts.waitMs / 60000) + 1440}`, '--json']);
   try { s.lane = parseReport(r.stdout ?? ''); } catch { fail('lane-acquire-failed'); }
   if (!good(r) || !Number.isInteger(s.lane.lane) || !s.lane.path || !s.lane.holder) fail('lane-acquire-failed');
   s.result.lane = s.lane.lane;
@@ -396,9 +396,14 @@ export async function commitAndPush(s) {
   if (!good(await publishGit(['add', '--', ...s.files]))) fail('commit-failed');
   // In-tree .gitattributes can make add rewrite bytes (eol, ident, encoding). Require the
   // staged blobs and modes to equal the frozen export exactly, else refuse to commit.
+  const objectFormat = await publishGit(['rev-parse', '--show-object-format']);
+  const algorithm = typeof objectFormat.stdout === 'string' ? objectFormat.stdout.trim() : '';
+  if (!good(objectFormat) || !['sha1', 'sha256'].includes(algorithm)) {
+    fail('commit-failed', 'Cannot read a supported repository object format; inspect the publication repository before retrying');
+  }
   const staged = await publishGit(['ls-files', '--stage', '-z', '--', ...s.files]);
   const want = exported.map(({ file, bytes, mode }) => `${mode === 0o755 ? '100755' : '100644'} ${
-    createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')} 0\t${file}`).sort();
+    createHash(algorithm).update(`blob ${bytes.length}\0`).update(bytes).digest('hex')} 0\t${file}`).sort();
   if (!good(staged) || typeof staged.stdout !== 'string' || JSON.stringify(staged.stdout.split('\0').filter(Boolean).sort()) !== JSON.stringify(want)) {
     fail('changed-after-audit', 'Staged blobs differ from the exported bytes (attribute filters?); inspect the lane files before retrying');
   }
