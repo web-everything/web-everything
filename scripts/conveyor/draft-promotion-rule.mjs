@@ -14,7 +14,7 @@
  * immediately before the one write (the #2811 stale-green guard), exactly like the tick's promote half.
  *
  * Owed promotion = open + draft + a same-repo agent lane branch (`lane/*`, what `pr-land --park` opens) + every
- * required check green FOR THE CURRENT HEAD + not withdrawn (`review-status:draft-withdrawn`). It never decides a
+ * required check green or proved review-hold-only red FOR THE CURRENT HEAD + not withdrawn (`review-status:draft-withdrawn`). It never decides a
  * review, a merge or a label.
  *
  * This rule is only the CHEAP half. The loop (`draft-promotion-loop.mjs`) also asks `planReconcile` — the tick's own
@@ -68,9 +68,10 @@ const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => 
 /**
  * PURE. Is this PR owed `gh pr ready` right now?
  * @param {{pr?:{state?:string, isDraft?:boolean, headRefName?:string, headRefOid?:string, labels?:Array},
- *   checks?:{state?:string, sha?:string}|null, reviewWhileBaseOpen?:boolean, defaultBranch?:string}} o — `checks`: the
+ *   checks?:{state?:string, sha?:string, reviewHoldOnly?:boolean}|null, reviewWhileBaseOpen?:boolean, defaultBranch?:string}} o — `checks`: the
  *   required-check verdict read for `checks.sha` (`reduceCheckState`'s `green`/`pending`/`red`/`unchecked`); `null` =
- *   not read yet. `reviewWhileBaseOpen`: the `stack.reviewWhileBaseOpen` setting (read when omitted). A GitHub-stacked
+ *   not read yet. `reviewHoldOnly: true` proves red checks are exclusively review-owned holds.
+ *   `reviewWhileBaseOpen`: the `stack.reviewWhileBaseOpen` setting (read when omitted). A GitHub-stacked
  *   draft (base is another lane branch) is owed promotion on its OWN green checks only while it is on; off, it waits for
  *   its base to land and the drain to retarget it (the behaviour before 2026-10-10).
  * @returns {{owed:boolean, why:string}}
@@ -90,7 +91,10 @@ export function isDraftOwedPromotion({ pr = {}, checks = null, reviewWhileBaseOp
   }
   if (!checks) return { owed: false, why: 'required checks not read yet' };
   if (!pr?.headRefOid || checks.sha !== pr.headRefOid) return { owed: false, why: 'check verdict is for a different head' };
-  if (checks.state !== 'green') return { owed: false, why: `required checks read ${checks.state ?? 'unknown'}, not green` };
+  if (checks.state !== 'green' && !(checks.state === 'red' && checks.reviewHoldOnly === true)) {
+    return { owed: false, why: `required checks read ${checks.state ?? 'unknown'}, not green` };
+  }
+  if (checks.state === 'red') return { owed: true, why: 'draft lane PR — required checks are held only for review on its head; promote it to ready for review' };
   if (stacked) return { owed: true, why: `stacked draft lane PR (base ${pr.baseRefName}, still open) — its own required checks are green on its head; promote it to ready for review while the base is open (stack.reviewWhileBaseOpen); merge still waits for the base` };
   return { owed: true, why: 'draft lane PR — every required check is green on its head; promote it to ready for review (draft-first PRs)' };
 }

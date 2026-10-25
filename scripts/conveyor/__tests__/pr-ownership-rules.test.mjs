@@ -89,9 +89,11 @@ describe('cards 273 and 278 incident replays', () => {
       const recovery = { ...options, prs: [pr], advisoryFixCap: 0, roundCapAction: 'person' };
       expect(planReconcile(recovery).dispatch).toEqual([expect.objectContaining({ kind: 'review',
         advisoryReview: { head: pr.headRefOid, reason: 'review-hold', ciWaived: true } })]);
-      for (const blocker of [{ isDraft: true }, { referralHold: { kind: 'same-head', why: 'awaiting ruling' } }]) {
-        expect(planReconcile({ ...recovery, prs: [{ ...pr, ...blocker }] }).dispatch).toEqual([]);
-      }
+      // A draft is never reviewed; since review holds no longer deadlock promotion it is promoted instead.
+      const draft = planReconcile({ ...recovery, prs: [{ ...pr, isDraft: true }] }).dispatch;
+      expect(draft).toEqual([expect.objectContaining({ kind: 'promote-draft' })]);
+      expect(draft.some(d => d.kind === 'review')).toBe(false);
+      expect(planReconcile({ ...recovery, prs: [{ ...pr, referralHold: { kind: 'same-head', why: 'awaiting ruling' } }] }).dispatch).toEqual([]);
     }
     fx.pr.statusCheckRollup.filter(r => r.name === 'test').at(-1).conclusion = 'FAILURE';
     expect(planReconcile(options).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));

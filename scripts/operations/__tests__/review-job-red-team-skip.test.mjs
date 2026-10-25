@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runReviewJob, createReviewJobIo, readRedTeamRecoveryStatus } from '../review-job.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus } from '../../lib/drain-red-team-evidence.mjs';
-import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../../lib/review-red-team-on-skip.mjs';
+import { normalizeRedTeamResult, planRedTeamOnSkip, redTeamSkipNeedsSettlement } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamOwedOnHead } from '../../lib/review-red-team-policy.mjs';
 import { planRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
@@ -100,6 +100,73 @@ describe('review-job red-team skip settlement', () => {
       expect(readRedTeamRecoveryStatus(key, { readEvidence }))
         .toMatchObject({ status: 'finished', result: 'resumed' });
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  function freshRecoveryFixture(check) {
+    const root = mkdtempSync(join(tmpdir(), 'fresh-recovery-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_STATUS_LABELS: '0' };
+    const key = { repo, pr, head, env };
+    const loopPayload = payload();
+    Object.assign(loopPayload.findings.read, {
+      netChangedFiles: ['scripts/example.mjs'],
+      diffText: 'diff --git a/scripts/example.mjs b/scripts/example.mjs\n+export const value = 1;\n',
+    });
+    try {
+      const production = createReviewJobIo({ env, readEvidence: () => ({ inFlight: false, queued: false }) });
+      production.redTeamStatus({ repo, pr, loopPayload, status: 'queued', redTeamMode: 'fresh' });
+      const stored = readRedTeamStatus(key);
+      expect(stored).toMatchObject({ status: 'queued', result: null, pid: process.pid });
+      const evidence = readDrainRedTeamEvidence({ ...key, list: () => [], readScorecards: () => [], isAlive: () => false });
+      expect(evidence).toMatchObject({ inFlight: false, seatRecorded: false, recorded: false });
+      const decide = (status, facts = evidence) => planRedTeamOnSkip({
+        repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+        rawPrs: [{ number: pr, headRefOid: head, comments: [] }],
+        readEvidence: () => facts, readStatus: () => status,
+        now: 1_000, setting: { enabled: true, retryCooldownMin: 0 }, lastDispatch: new Map(),
+      })[0];
+      check({ key, stored, evidence, decide });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+
+  it('accepted code head dispatches fresh after queued fresh recovery crashes before running with no seat or result comment', () => {
+    freshRecoveryFixture(({ key, evidence, decide }) => {
+      const status = readRedTeamRecoveryStatus(key, { readEvidence: () => evidence });
+      expect(decide(status)).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+      expect(status).toMatchObject({ status: 'finished', result: null });
+      expect(readRedTeamStatus(key)).toMatchObject({ status: 'queued', result: null });
+    });
+  });
+
+  it.each([
+    ['live queued writer', { inFlight: false, queued: true }],
+    ['live running writer', { inFlight: true, queued: false }],
+    ['unknown liveness', { inFlight: undefined, queued: false }],
+  ])('queued fresh recovery still skips with %s', (_name, liveness) => {
+    freshRecoveryFixture(({ key, stored, evidence, decide }) => {
+      const facts = { ...evidence, ...liveness };
+      const status = readRedTeamRecoveryStatus(key, { readEvidence: () => facts });
+      expect(status).toEqual(stored);
+      expect(decide(status, facts).action).toBe('skip');
+    });
+  });
+
+  it.each([undefined, null, 0, -1, 1.5, '123'])('queued fresh recovery still skips with invalid writer pid %j', pid => {
+    freshRecoveryFixture(({ key, stored, evidence, decide }) => {
+      const readEvidence = vi.fn(() => evidence);
+      const status = readRedTeamRecoveryStatus(key, { readStatus: () => ({ ...stored, pid }), readEvidence });
+      expect(status.status).toBe('queued');
+      expect(readEvidence).not.toHaveBeenCalled();
+      expect(decide(status).action).toBe('skip');
+    });
+  });
+
+  it('dead queued fresh recovery cannot dispatch over an existing seat row', () => {
+    freshRecoveryFixture(({ key, evidence, decide }) => {
+      const facts = { ...evidence, seatRecorded: true, recorded: true };
+      const status = readRedTeamRecoveryStatus(key, { readEvidence: () => facts });
+      expect(status).toMatchObject({ status: 'finished', result: null });
+      expect(decide(status, facts).action).toBe('skip');
+    });
   });
 
   it.each([false, true])('skipped redTeam with policy settles before finished status and gate (redTeamOnly=%s)', redTeamOnly => {
