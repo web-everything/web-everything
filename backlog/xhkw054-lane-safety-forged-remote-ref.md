@@ -13,7 +13,8 @@ PR 5759 self-review: freshLaneSafety in we:scripts/lib/health-watch-lane-scan.mj
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `q=we:scripts/readiness/heavy-admission.mjs; t=we:scripts/operations/__tests__/health-watch-lane-scan.test.mjs; node "${q#we:}" run -- npx vitest run "${t#we:}" -t 'reporting ignores forged'` runs the real-Git loose/packed-ref regressions: an unrelated origin ref pointing at unpublished HEAD cannot yield ahead zero; removing the expected branch ref yields unknown. These cases fail before the reporting fix and pass after.
+- [A2] **Executable** — **Must refuse on error:** `q=we:scripts/readiness/heavy-admission.mjs; t=we:scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs; node "${q#we:}" run -- npx vitest run "${t#we:}" -t 'publication'` proves destructive actions refuse missing, malformed, oversized or unreadable trusted publication evidence, without falling back to lane-owned refs.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

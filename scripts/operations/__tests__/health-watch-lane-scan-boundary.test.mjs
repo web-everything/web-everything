@@ -67,10 +67,11 @@ describe('health-watch destructive lane action call-site contract', () => {
   // reset/reuse/reclaim/release command (even in an unexercised branch) fails this
   // allowlist. Health-watch has no lane mutations today; adding one requires a
   // guardLaneAction integration test before extending this list.
-  const commands = source => {
+  const commands = (source, { qualifyHelpers = false } = {}) => {
     const tree = ts.createSourceFile('calls.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const runners = new Set(['run', 'exec', 'execFileSync', 'spawn', 'laneGit', 'git']);
     const helpers = new Set();
+    const helperOrigins = new Map();
     const bindings = [];
     const walk = (node, fn) => { fn(node); ts.forEachChild(node, child => walk(child, fn)); };
     walk(tree, node => {
@@ -79,10 +80,14 @@ describe('health-watch destructive lane action call-site contract', () => {
         // instead of assuming only child_process can cross the action boundary.
         if (/^(node:)?(path|os|url)$/.test(node.moduleSpecifier.text)) return;
         const target = /^(node:)?child_process$/.test(node.moduleSpecifier.text) ? runners : helpers;
-        if (node.importClause?.name) target.add(node.importClause.name.text);
+        const imported = (name, exported) => {
+          target.add(name);
+          if (target === helpers) helperOrigins.set(name, new Set([`${node.moduleSpecifier.text}#${exported}`]));
+        };
+        if (node.importClause?.name) imported(node.importClause.name.text, 'default');
         const named = node.importClause?.namedBindings;
-        if (named && ts.isNamespaceImport(named)) target.add(named.name.text);
-        else for (const binding of named?.elements ?? []) target.add(binding.name.text);
+        if (named && ts.isNamespaceImport(named)) imported(named.name.text, '*');
+        else for (const binding of named?.elements ?? []) imported(binding.name.text, binding.propertyName?.text ?? binding.name.text);
       }
       if (ts.isVariableDeclaration(node) && node.initializer) {
         bindings.push({ name: node.name, initializer: node.initializer });
@@ -115,6 +120,8 @@ describe('health-watch destructive lane action call-site contract', () => {
       }
       return false;
     };
+    const origins = expression => new Set([...helperOrigins].filter(([name]) => uses(expression, new Set([name])))
+      .flatMap(([, values]) => [...values]));
     // Conservative, scope-independent propagation: aliases can only add sites to
     // the review inventory. Iterate to cover chains declared or assigned in
     // either order, including destructuring and member assignment targets.
@@ -129,6 +136,13 @@ describe('health-watch destructive lane action call-site contract', () => {
           if (ts.isIdentifier(name) || ts.isPropertyAccessExpression(name) || ts.isElementAccessExpression(name)) {
             const key = name.getText(tree);
             if (!target.has(key)) { target.add(key); changed = true; }
+            if (target === helpers) {
+              const values = helperOrigins.get(key) ?? new Set();
+              for (const origin of origins(binding.initializer)) {
+                if (!values.has(origin)) { values.add(origin); changed = true; }
+              }
+              helperOrigins.set(key, values);
+            }
           } else if (ts.isParenthesizedExpression(name)) bind(name.expression);
           else if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
             for (const element of name.elements) if (ts.isBindingElement(element)) bind(element.name);
@@ -154,14 +168,294 @@ describe('health-watch destructive lane action call-site contract', () => {
         calls.push(`${name}(${node.arguments.slice(0, ['git', 'laneGit'].includes(name) ? 1 : 2)
           .map(arg => arg.getText(tree).replace(/\s+/g, ' ')).join(', ')})`);
       } else if (ts.isCallExpression(node) && uses(node.expression, helpers)) {
-        calls.push(`helper:${node.expression.getText(tree)}`);
+        const callee = node.expression.getText(tree);
+        if (qualifyHelpers) {
+          for (const origin of origins(node.expression)) calls.push(`helper:${origin}:${callee}`);
+        } else calls.push(`helper:${callee}`);
       }
       ts.forEachChild(node, visit);
     };
     visit(tree);
     return calls;
   };
+  // Review all imported helper targets, including wrappers outside the lane-safety modules.
+  // Module/export identity prevents an alias from impersonating a reviewed helper.
+  const helperInventory = source => [...new Set(commands(source, { qualifyHelpers: true })
+    .filter(call => call.startsWith('helper:')))].sort();
+  const retainsExactCount = call => {
+    const [, target, exported] = /^helper:(.+)#([^:]+):/.exec(call);
+    // Only known read-only/noise helpers may vary in count. Mutating names/targets
+    // and every helper owned by this PR override that exemption, including aliases.
+    if (/\/(health-watch-lane-scan|lane-git-hardening|git-transport-branch)\.mjs$/.test(target)
+      || /unlink|\brm|rename|write|mkdir|append|release|reclaim|reset|reuse|remove|trim|kill|spawn|exec|guardLaneAction|cachedLaneScan|laneRedirectConfig|hardenLaneGitArgs/i.test(call)) return true;
+    const readOnlyFs = /^(?:node:)?fs$/.test(target)
+      && /^(readFileSync|statSync|existsSync|readdirSync|realpathSync|readSync|closeSync)$/.test(exported);
+    return !readOnlyFs && !/^(format|render)/.test(exported);
+  };
+  // No deduplication: each retained call occurrence increments its module/export/callee key.
+  const helperCounts = source => commands(source, { qualifyHelpers: true })
+    .filter(call => call.startsWith('helper:') && retainsExactCount(call)).reduce((counts, call) => {
+      counts[call] = (counts[call] ?? 0) + 1;
+      return counts;
+    }, {});
+  it.each(['unlinkSync', 'rmSync', 'renameSync', 'writeFileSync', 'mkdirSync', 'appendFileSync',
+    'releaseLane', 'reclaimLane', 'resetLane', 'reuseLane', 'removeLane', 'trimPool', 'killLane',
+    'spawnLane', 'execLane', 'guardLaneAction', 'cachedLaneScan', 'laneRedirectConfig', 'hardenLaneGitArgs'])(
+    'counts every occurrence of mutating helper %s, including an alias', exported => {
+      const source = `import { ${exported} as reviewedHelper } from './lane-actions.mjs';
+        reviewedHelper(); reviewedHelper();`;
+      const call = `helper:./lane-actions.mjs#${exported}:reviewedHelper`;
+      expect(helperInventory(source)).toEqual([call]);
+      expect(helperCounts(source)).toEqual({ [call]: 2 });
+      expect(helperCounts(`${source}\nconst again = reviewedHelper; again();`)).toEqual({
+        [call]: 2, [`helper:./lane-actions.mjs#${exported}:again`]: 1,
+      });
+    });
+  it.each([
+    ["./trim-lane.mjs", 'formatPreview'],
+    ["./release-lane.mjs", 'readFileSync'],
+    ["./lane-actions.mjs", 'scrubAndReset'],
+    ["../lib/health-watch-lane-scan.mjs", 'laneProbeEnv'],
+    ["../lib/lane-git-hardening.mjs", 'scrubInheritedGitEnv'],
+    ["../lib/git-transport-branch.mjs", 'assertPushRef'],
+  ])('keeps exact counts for safety helper %s#%s despite a read-only-looking name or alias', (target, exported) => {
+    const source = `import { ${exported} as renderPreview } from '${target}'; renderPreview(); renderPreview();`;
+    expect(helperCounts(source)).toEqual({ [`helper:${target}#${exported}:renderPreview`]: 2 });
+  });
+  it('counts identical local call names separately by imported module and export', () => {
+    const source = `import { writeLane as first } from './one.mjs';
+      import { resetLane as second } from './two.mjs';
+      let action; action = first; action = second; action(); action();`;
+    expect(helperCounts(source)).toEqual({
+      'helper:./one.mjs#writeLane:action': 2,
+      'helper:./two.mjs#resetLane:action': 2,
+    });
+  });
+  const allowedHelperInventory = {
+    "scripts/conveyor/health-watch.mjs": [
+      "helper:../backlog-stranded-sweep.mjs#readBacklogCards:readBacklogCards",
+      "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf",
+      "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents",
+      "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches",
+      "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots",
+      "helper:../lib/gh-throttle.mjs#budgetProbeArgs:budgetProbeArgs",
+      "helper:../lib/gh-throttle.mjs#ghThrottleLockRoot:ghThrottleLockRoot",
+      "helper:../lib/gh-throttle.mjs#ghThrottleLogPath:ghThrottleLogPath",
+      "helper:../lib/github-app-auth-env.mjs#defaultCachePath:defaultCachePath",
+      "helper:../lib/github-app-auth-env.mjs#readGithubAppStatus:readGithubAppStatus",
+      "helper:../lib/lane-history.mjs#laneJournalPath:laneJournalPath",
+      "helper:../lib/lane-history.mjs#readLaneJournalTail:readLaneJournalTail",
+      "helper:../lib/lane-history.mjs#reconcileLaneJournalEntry:reconcileLaneJournalEntry",
+      "helper:../lib/lane-pool-paths.mjs#defaultPoolRoot:defaultPoolRoot",
+      "helper:../lib/lane-pool-scan.mjs#laneIndicesIn:laneIndicesIn",
+      "helper:../lib/lane-pool-scan.mjs#poolsWithLanes:poolsWithLanes",
+      "helper:../lib/lane-verify.mjs#readVerifyMarker:readVerifyMarker",
+      "helper:../lib/ledger-readiness-daily.mjs#ledgerReadinessHistoryPath:ledgerReadinessHistoryPath",
+      "helper:../lib/ledger-readiness-daily.mjs#runDailyReadinessCheck:runDailyReadinessCheck",
+      "helper:../lib/pr-events.mjs#readPrEventsStatuses:readPrEventsStatuses",
+      "helper:../lib/pr-limit.mjs#isGlobalOffNow:isGlobalOffNow",
+      "helper:../lib/pr-limit.mjs#resolvePrLimit:resolvePrLimit",
+      "helper:../lib/pr-snapshot.mjs#readSharedOpenPrs:readSharedOpenPrs",
+      "helper:../lib/proc-read.mjs#readGit:readGit",
+      "helper:../lib/quiet-hours-io.mjs#flushDigest:flushDigest",
+      "helper:../lib/quiet-hours-io.mjs#loadQuietSettings:loadQuietSettings",
+      "helper:../lib/quiet-hours.mjs#breaksThrough:breaksThrough",
+      "helper:../operations/card-batch-seal-io.mjs#sealDueBatches:sealDueBatches",
+      "helper:../operations/coordination-root.mjs#resolveCoordinationRoot:resolveCoordinationRoot",
+      "helper:../operations/live-state-io.mjs#defaultDrainHistoryPath:defaultDrainHistoryPath",
+      "helper:../operations/needs-you-feed.mjs#publishAttention:publishAttention",
+      "helper:../operations/review-extra-seats.mjs#readSeatCapUsage:readSeatCapUsage",
+      "helper:../operations/run-store.mjs#daemonJobsRoot:daemonJobsRoot",
+      "helper:./branch-sync.mjs#notifyDesktopChecked:notifyDesktopChecked",
+      "helper:./build-supervision.mjs#probeBuildSessions:probeBuildSessions",
+      "helper:./build-supervision.mjs#probeExternalRuns:probeExternalRuns",
+      "helper:./claude-jobs-archive.mjs#archiveClaudeJobs:archiveClaudeJobs",
+      "helper:./claude-jobs-archive.mjs#formatClaudeJobsArchiveLine:formatClaudeJobsArchiveLine",
+      "helper:./credential-inventory.mjs#normalizeInventory:normalizeInventory",
+      "helper:./fix-loop-ledger.mjs#readFixLoopRows:readFixLoopRows",
+      "helper:./health-file-request.mjs#planFileRequests:planFileRequests",
+      "helper:./health-file-request.mjs#readLedgerStrict:readLedgerStrict",
+      "helper:./health-file-request.mjs#recordRequested:recordRequested",
+      "helper:./health-file-request.mjs#spliceFilingSection:spliceFilingSection",
+      "helper:./health-file-request.mjs#withLedgerLock:withLedgerLock",
+      "helper:./health-file-request.mjs#writeLedger:writeLedger",
+      "helper:./health-investigate-dispatch.mjs#runInvestigations:runInvestigations",
+      "helper:./health-smells/dispatch-permission-stall.mjs#stuckOnPermissionPrompt:stuckOnPermissionPrompt",
+      "helper:./health-smells/index.mjs#SMELLS:(deps.smells || SMELLS).map",
+      "helper:./health-smells/index.mjs#SMELLS:SMELLS.map",
+      "helper:./health-watch-core.mjs#emptyHealthState:emptyHealthState",
+      "helper:./health-watch-core.mjs#parsePsOutput:parsePsOutput",
+      "helper:./health-watch-core.mjs#renderEpisodeReport:renderEpisodeReport",
+      "helper:./health-watch-core.mjs#renderHealthSection:renderHealthSection",
+      "helper:./health-watch-core.mjs#runHealthTick:runHealthTick",
+      "helper:./health-watch-core.mjs#scrubDeep:scrubDeep",
+      "helper:./health-watch-core.mjs#scrubText:scrubText",
+      "helper:./health-watch-core.mjs#summarizeDiagnosisOutput:summarizeDiagnosisOutput",
+      "helper:./health-watch-job.mjs#resolveHealthJobSwitches:resolveHealthJobSwitches",
+      "helper:./health-watch-job.mjs#runGhProbeJobs:runGhProbeJobs",
+      "helper:./health-watch-section.mjs#healthDir:healthDir",
+      "helper:./health-watch-section.mjs#healthSectionLines:healthSectionLines",
+      "helper:./heavy-run-ungated.mjs#appendSample:appendSample",
+      "helper:./heavy-run-ungated.mjs#findUngatedHeavyRuns:findUngatedHeavyRuns",
+      "helper:./heavy-run-ungated.mjs#readRecentSamples:readRecentSamples",
+      "helper:./heavy-run-ungated.mjs#summarizeSample:summarizeSample",
+      "helper:./main-ci-red-io.mjs#probeAndOwnMainCi:probeAndOwnMainCi",
+      "helper:./needs-you-feed-job.mjs#superviseNeedsYouFeed:(deps.ensureNeedsYouFeedJob ?? superviseNeedsYouFeed)",
+      "helper:./nightly-coroner-job.mjs#coronerNightDue:coronerNightDue",
+      "helper:./nightly-coroner-job.mjs#nightlyCoronerTickAllowed:nightlyCoronerTickAllowed",
+      "helper:./nightly-coroner-job.mjs#publishCoronerFailure:(deps.publishCoronerFailure ?? publishCoronerFailure)",
+      "helper:./nightly-coroner-job.mjs#resolveNightlyCoronerSettings:resolveNightlyCoronerSettings",
+      "helper:./nightly-coroner-job.mjs#runNightlyCoronerJob:(deps.runNightlyCoronerJob ?? runNightlyCoronerJob)",
+      "helper:./pr-sweep-job.mjs#prSweepTickAllowed:prSweepTickAllowed",
+      "helper:./pr-sweep-job.mjs#resolvePrSweepSettings:resolvePrSweepSettings",
+      "helper:./pr-sweep-job.mjs#runPrSweepJob:(deps.runPrSweepJob ?? runPrSweepJob)",
+      "helper:./review-tmp-health.mjs#probeDiskSpace:probeDiskSpace",
+      "helper:./review-tmp-health.mjs#sweepReviewTmp:sweepReviewTmp",
+      "helper:./session-watchdog.mjs#resolveSessionWatchdogConfig:resolveSessionWatchdogConfig",
+      "helper:./tmp-sweep.mjs#formatTmpSweepLine:formatTmpSweepLine",
+      "helper:./tmp-sweep.mjs#readBusyTopLevel:readBusyTopLevel",
+      "helper:./tmp-sweep.mjs#sweepOurTmp:sweepOurTmp",
+      "helper:node:fs#closeSync:closeSync",
+      "helper:node:fs#existsSync:existsSync",
+      "helper:node:fs#mkdirSync:mkdirSync",
+      "helper:node:fs#openSync:openSync",
+      "helper:node:fs#readFileSync:readFileSync",
+      "helper:node:fs#readSync:readSync",
+      "helper:node:fs#readdirSync:readdirSync",
+      "helper:node:fs#realpathSync:realpathSync",
+      "helper:node:fs#renameSync:renameSync",
+      "helper:node:fs#statSync:statSync",
+      "helper:node:fs#unlinkSync:unlinkSync",
+      "helper:node:fs#writeFileSync:writeFileSync"
+    ],
+    "scripts/operations/stale-state-io.mjs": [
+      "helper:../backlog/frontmatter.mjs#readField:readField",
+      "helper:../backlog/id.mjs#idFromName:idFromName",
+      "helper:../lib/git-transport-branch.mjs#assertPushRef:assertPushRef",
+      "helper:../lib/health-watch-lane-scan.mjs#cachedLaneScan:cachedLaneScan",
+      "helper:../lib/health-watch-lane-scan.mjs#laneProbeEnv:laneProbeEnv",
+      "helper:../lib/health-watch-lane-scan.mjs#laneRedirectConfig:laneRedirectConfig",
+      "helper:../lib/lane-git-hardening.mjs#hardenLaneGitArgs:hardenLaneGitArgs",
+      "helper:../lib/lane-lease.mjs#isLeaseStale:isLeaseStale",
+      "helper:./claim-io.mjs#createClaimReader:createClaimReader",
+      "helper:./run-store.mjs#createFileRunStore:createFileRunStore",
+      "helper:node:fs#readFileSync:readFileSync",
+      "helper:node:fs#readdirSync:readdirSync"
+    ]
+  };
+  // Reviewed per-file, per-module invocation counts; read-only noise alone is exempt.
+  const allowedHelperCounts = {
+    "scripts/conveyor/health-watch.mjs": {
+      "helper:../backlog-stranded-sweep.mjs#readBacklogCards:readBacklogCards": 1,
+      "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf": 8,
+      "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents": 1,
+      "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches": 1,
+      "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots": 5,
+      "helper:../lib/gh-throttle.mjs#budgetProbeArgs:budgetProbeArgs": 2,
+      "helper:../lib/gh-throttle.mjs#ghThrottleLockRoot:ghThrottleLockRoot": 3,
+      "helper:../lib/gh-throttle.mjs#ghThrottleLogPath:ghThrottleLogPath": 2,
+      "helper:../lib/github-app-auth-env.mjs#defaultCachePath:defaultCachePath": 1,
+      "helper:../lib/github-app-auth-env.mjs#readGithubAppStatus:readGithubAppStatus": 1,
+      "helper:../lib/lane-history.mjs#laneJournalPath:laneJournalPath": 1,
+      "helper:../lib/lane-history.mjs#readLaneJournalTail:readLaneJournalTail": 1,
+      "helper:../lib/lane-history.mjs#reconcileLaneJournalEntry:reconcileLaneJournalEntry": 1,
+      "helper:../lib/lane-pool-paths.mjs#defaultPoolRoot:defaultPoolRoot": 2,
+      "helper:../lib/lane-pool-scan.mjs#laneIndicesIn:laneIndicesIn": 1,
+      "helper:../lib/lane-pool-scan.mjs#poolsWithLanes:poolsWithLanes": 1,
+      "helper:../lib/lane-verify.mjs#readVerifyMarker:readVerifyMarker": 1,
+      "helper:../lib/ledger-readiness-daily.mjs#ledgerReadinessHistoryPath:ledgerReadinessHistoryPath": 1,
+      "helper:../lib/ledger-readiness-daily.mjs#runDailyReadinessCheck:runDailyReadinessCheck": 1,
+      "helper:../lib/pr-events.mjs#readPrEventsStatuses:readPrEventsStatuses": 1,
+      "helper:../lib/pr-limit.mjs#isGlobalOffNow:isGlobalOffNow": 1,
+      "helper:../lib/pr-limit.mjs#resolvePrLimit:resolvePrLimit": 1,
+      "helper:../lib/pr-snapshot.mjs#readSharedOpenPrs:readSharedOpenPrs": 1,
+      "helper:../lib/proc-read.mjs#readGit:readGit": 1,
+      "helper:../lib/quiet-hours-io.mjs#flushDigest:flushDigest": 1,
+      "helper:../lib/quiet-hours-io.mjs#loadQuietSettings:loadQuietSettings": 1,
+      "helper:../lib/quiet-hours.mjs#breaksThrough:breaksThrough": 1,
+      "helper:../operations/card-batch-seal-io.mjs#sealDueBatches:sealDueBatches": 1,
+      "helper:../operations/coordination-root.mjs#resolveCoordinationRoot:resolveCoordinationRoot": 1,
+      "helper:../operations/live-state-io.mjs#defaultDrainHistoryPath:defaultDrainHistoryPath": 1,
+      "helper:../operations/needs-you-feed.mjs#publishAttention:publishAttention": 1,
+      "helper:../operations/review-extra-seats.mjs#readSeatCapUsage:readSeatCapUsage": 1,
+      "helper:../operations/run-store.mjs#daemonJobsRoot:daemonJobsRoot": 1,
+      "helper:./branch-sync.mjs#notifyDesktopChecked:notifyDesktopChecked": 4,
+      "helper:./build-supervision.mjs#probeBuildSessions:probeBuildSessions": 1,
+      "helper:./build-supervision.mjs#probeExternalRuns:probeExternalRuns": 1,
+      "helper:./claude-jobs-archive.mjs#archiveClaudeJobs:archiveClaudeJobs": 2,
+      "helper:./credential-inventory.mjs#normalizeInventory:normalizeInventory": 1,
+      "helper:./fix-loop-ledger.mjs#readFixLoopRows:readFixLoopRows": 2,
+      "helper:./health-file-request.mjs#planFileRequests:planFileRequests": 1,
+      "helper:./health-file-request.mjs#readLedgerStrict:readLedgerStrict": 1,
+      "helper:./health-file-request.mjs#recordRequested:recordRequested": 1,
+      "helper:./health-file-request.mjs#spliceFilingSection:spliceFilingSection": 1,
+      "helper:./health-file-request.mjs#withLedgerLock:withLedgerLock": 1,
+      "helper:./health-file-request.mjs#writeLedger:writeLedger": 1,
+      "helper:./health-investigate-dispatch.mjs#runInvestigations:runInvestigations": 1,
+      "helper:./health-smells/dispatch-permission-stall.mjs#stuckOnPermissionPrompt:stuckOnPermissionPrompt": 1,
+      "helper:./health-smells/index.mjs#SMELLS:(deps.smells || SMELLS).map": 1,
+      "helper:./health-smells/index.mjs#SMELLS:SMELLS.map": 2,
+      "helper:./health-watch-core.mjs#emptyHealthState:emptyHealthState": 1,
+      "helper:./health-watch-core.mjs#parsePsOutput:parsePsOutput": 2,
+      "helper:./health-watch-core.mjs#scrubDeep:scrubDeep": 3,
+      "helper:./health-watch-core.mjs#scrubText:scrubText": 14,
+      "helper:./health-watch-core.mjs#runHealthTick:runHealthTick": 1,
+      "helper:./health-watch-core.mjs#summarizeDiagnosisOutput:summarizeDiagnosisOutput": 1,
+      "helper:./health-watch-job.mjs#resolveHealthJobSwitches:resolveHealthJobSwitches": 1,
+      "helper:./health-watch-job.mjs#runGhProbeJobs:runGhProbeJobs": 1,
+      "helper:./health-watch-section.mjs#healthDir:healthDir": 2,
+      "helper:./health-watch-section.mjs#healthSectionLines:healthSectionLines": 1,
+      "helper:./heavy-run-ungated.mjs#appendSample:appendSample": 1,
+      "helper:./heavy-run-ungated.mjs#findUngatedHeavyRuns:findUngatedHeavyRuns": 1,
+      "helper:./heavy-run-ungated.mjs#readRecentSamples:readRecentSamples": 1,
+      "helper:./heavy-run-ungated.mjs#summarizeSample:summarizeSample": 1,
+      "helper:./main-ci-red-io.mjs#probeAndOwnMainCi:probeAndOwnMainCi": 1,
+      "helper:./needs-you-feed-job.mjs#superviseNeedsYouFeed:(deps.ensureNeedsYouFeedJob ?? superviseNeedsYouFeed)": 1,
+      "helper:./nightly-coroner-job.mjs#coronerNightDue:coronerNightDue": 1,
+      "helper:./nightly-coroner-job.mjs#nightlyCoronerTickAllowed:nightlyCoronerTickAllowed": 1,
+      "helper:./nightly-coroner-job.mjs#publishCoronerFailure:(deps.publishCoronerFailure ?? publishCoronerFailure)": 1,
+      "helper:./nightly-coroner-job.mjs#resolveNightlyCoronerSettings:resolveNightlyCoronerSettings": 1,
+      "helper:./nightly-coroner-job.mjs#runNightlyCoronerJob:(deps.runNightlyCoronerJob ?? runNightlyCoronerJob)": 1,
+      "helper:./pr-sweep-job.mjs#prSweepTickAllowed:prSweepTickAllowed": 1,
+      "helper:./pr-sweep-job.mjs#resolvePrSweepSettings:resolvePrSweepSettings": 1,
+      "helper:./pr-sweep-job.mjs#runPrSweepJob:(deps.runPrSweepJob ?? runPrSweepJob)": 1,
+      "helper:./review-tmp-health.mjs#probeDiskSpace:probeDiskSpace": 1,
+      "helper:./review-tmp-health.mjs#sweepReviewTmp:sweepReviewTmp": 1,
+      "helper:./session-watchdog.mjs#resolveSessionWatchdogConfig:resolveSessionWatchdogConfig": 1,
+      "helper:./tmp-sweep.mjs#readBusyTopLevel:readBusyTopLevel": 1,
+      "helper:./tmp-sweep.mjs#sweepOurTmp:sweepOurTmp": 2,
+      "helper:node:fs#openSync:openSync": 3,
+      "helper:node:fs#mkdirSync:mkdirSync": 2,
+      "helper:node:fs#renameSync:renameSync": 1,
+      "helper:node:fs#unlinkSync:unlinkSync": 3,
+      "helper:node:fs#writeFileSync:writeFileSync": 2
+    },
+    "scripts/operations/stale-state-io.mjs": {
+      "helper:../backlog/frontmatter.mjs#readField:readField": 2,
+      "helper:../backlog/id.mjs#idFromName:idFromName": 2,
+      "helper:../lib/git-transport-branch.mjs#assertPushRef:assertPushRef": 1,
+      "helper:../lib/health-watch-lane-scan.mjs#cachedLaneScan:cachedLaneScan": 1,
+      "helper:../lib/health-watch-lane-scan.mjs#laneProbeEnv:laneProbeEnv": 2,
+      "helper:../lib/health-watch-lane-scan.mjs#laneRedirectConfig:laneRedirectConfig": 1,
+      "helper:../lib/lane-git-hardening.mjs#hardenLaneGitArgs:hardenLaneGitArgs": 1,
+      "helper:../lib/lane-lease.mjs#isLeaseStale:isLeaseStale": 1,
+      "helper:./claim-io.mjs#createClaimReader:createClaimReader": 1,
+      "helper:./run-store.mjs#createFileRunStore:createFileRunStore": 1
+    }
+  };
   for (const file of scopedScanFiles(['scripts/conveyor/health-watch.mjs', 'scripts/operations/stale-state-io.mjs'])) {
+    it.each(['reclaim', 'reset', 'reuse', 'release'])(
+      `${file}: rejects an aliased %s wrapper imported from another module`, action => {
+        const source = readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8');
+        const allowed = allowedHelperInventory[file];
+        expect(helperInventory(source)).toEqual(allowed);
+        const proposed = `${source}
+          import { ${action}Lane as proposedCleanup } from './unreviewed-lane-actions.mjs';
+          const invokeCleanup = proposedCleanup;
+          if (false) invokeCleanup('/fixture/lane');`;
+        expect(helperInventory(proposed)).toContain(`helper:./unreviewed-lane-actions.mjs#${action}Lane:invokeCleanup`);
+        expect(helperInventory(proposed)).not.toEqual(allowed);
+      });
     it.each(['reclaim', 'reset', 'reuse', 'release-on-behalf'])(
       `${file}: every added %s call site requires guardLaneAction review, including assigned runners`, action => {
         const source = readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8');
@@ -247,50 +541,33 @@ describe('health-watch destructive lane action call-site contract', () => {
       'run(bin, argv)', "run('git', hardenLaneGitArgs(argv))",
       "exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json'])",
       'laneGit([...LANE_CONFIG_LIST_ARGS])',
-      "laneGit(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'])",
+      "laneGit(['rev-parse', '--verify', '--quiet', ref])",
+      "laneGit(['rev-list', '--count', 'HEAD', '--not', ...tips])",
     ];
     const subprocesses = source => commands(source).filter(call => !call.startsWith('helper:'));
-    const helperCounts = source => commands(source).filter(call => call.startsWith('helper:')).reduce((counts, call) => {
-      const name = call.slice('helper:'.length);
-      counts[name] = (counts[name] ?? 0) + 1;
-      return counts;
-    }, {});
     const allowed = file === 'scripts/conveyor/health-watch.mjs' ? allowedWatch : allowedReader;
     expect(subprocesses(source)).toEqual(allowed);
-    // Keep imported-helper coverage visible and reviewable. A new helper call or
-    // additional invocation requires inspection even if its name hides its effect.
-    const allowedHelpers = file === 'scripts/conveyor/health-watch.mjs' ? {
-      resolveCoordinationRoot: 1, readFileSync: 12, mkdirSync: 2, writeFileSync: 2, renameSync: 1,
-      openSync: 3, readSync: 3, closeSync: 3, statSync: 9, existsSync: 14, readdirSync: 8,
-      daemonCloneRoots: 5, workspaceOf: 8, daemonJobsRoot: 1, realpathSync: 3, readGit: 1,
-      poolsWithLanes: 1, laneIndicesIn: 1, readVerifyMarker: 1, laneJournalPath: 1,
-      readLaneJournalTail: 1, reconcileLaneJournalEntry: 1, parsePsOutput: 2,
-      ghThrottleLogPath: 2, ghThrottleLockRoot: 3, budgetProbeArgs: 2, resolvePrLimit: 1,
-      isGlobalOffNow: 1, defaultCachePath: 1, readSharedOpenPrs: 1, cachedClaudeAgents: 1,
-      resolveSessionWatchdogConfig: 1, defaultDrainHistoryPath: 1, stuckOnPermissionPrompt: 1,
-      readBacklogCards: 1, scrubText: 14, probeBuildSessions: 1, unlinkSync: 3, readBusyTopLevel: 1,
-      healthDir: 2, emptyHealthState: 1, sweepOurTmp: 2, sweepReviewTmp: 1, sealDueBatches: 1,
-      archiveClaudeJobs: 2, resolvePrSweepSettings: 1, prSweepTickAllowed: 1,
-      '(deps.runPrSweepJob ?? runPrSweepJob)': 1, resolveNightlyCoronerSettings: 1,
-      nightlyCoronerTickAllowed: 1, '(deps.runNightlyCoronerJob ?? runNightlyCoronerJob)': 1,
-      '(deps.publishCoronerFailure ?? publishCoronerFailure)': 1, coronerNightDue: 1,
-      probeDaemonCloneBranches: 1, readFixLoopRows: 2, defaultPoolRoot: 2, readGithubAppStatus: 1,
-      probeDiskSpace: 1, readRecentSamples: 1, readSeatCapUsage: 1, readPrEventsStatuses: 1,
-      runDailyReadinessCheck: 1, ledgerReadinessHistoryPath: 1, probeExternalRuns: 1,
-      probeAndOwnMainCi: 1, normalizeInventory: 1, resolveHealthJobSwitches: 1, runGhProbeJobs: 1,
-      '(deps.ensureNeedsYouFeedJob ?? superviseNeedsYouFeed)': 1, runHealthTick: 1,
-      appendSample: 1, summarizeSample: 1, findUngatedHeavyRuns: 1, scrubDeep: 3,
-      publishAttention: 1, '(deps.smells || SMELLS).map': 1, summarizeDiagnosisOutput: 1,
-      runInvestigations: 1, 'SMELLS.map': 2, withLedgerLock: 1, readLedgerStrict: 1,
-      planFileRequests: 1, recordRequested: 1, writeLedger: 1, notifyDesktopChecked: 4,
-      loadQuietSettings: 1, breaksThrough: 1, flushDigest: 1, renderEpisodeReport: 1,
-      spliceFilingSection: 1, renderHealthSection: 1, formatClaudeJobsArchiveLine: 2,
-      formatTmpSweepLine: 2, healthSectionLines: 1,
-    } : {
-      readdirSync: 1, readFileSync: 1, createFileRunStore: 1, laneProbeEnv: 2, hardenLaneGitArgs: 1,
-      laneRedirectConfig: 1, cachedLaneScan: 1, isLeaseStale: 1, idFromName: 2, createClaimReader: 1, readField: 2,
-    };
+    expect(helperInventory(source)).toEqual(allowedHelperInventory[file]);
+    const allowedHelpers = allowedHelperCounts[file];
     expect(helperCounts(source)).toEqual(allowedHelpers);
+    // Repeating an already reviewed mutation must fail even though the distinct
+    // module/export inventory is unchanged. Pin each occurrence in both readers.
+    const repeatedHelpers = file === 'scripts/conveyor/health-watch.mjs'
+      ? ['writeFileSync', 'renameSync', 'unlinkSync', 'mkdirSync']
+      : ['cachedLaneScan', 'laneRedirectConfig', 'hardenLaneGitArgs', 'laneProbeEnv', 'assertPushRef'];
+    for (const callee of repeatedHelpers) {
+      const call = Object.keys(allowedHelpers).find(key => key.endsWith(`:${callee}`));
+      expect(call, `${file}: ${callee} must retain an exact invocation count`).toBeDefined();
+      const proposed = `${source}\nif (false) ${callee}();`;
+      expect(helperInventory(proposed)).toEqual(allowedHelperInventory[file]);
+      expect(helperCounts(proposed)).toEqual({ ...allowedHelpers, [call]: allowedHelpers[call] + 1 });
+      expect(helperCounts(proposed)).not.toEqual(allowedHelpers);
+    }
+    // Read-only noise may vary in count, but its module/export identity remains pinned.
+    expect(helperCounts(`${source}\nif (false) readFileSync('unrelated');`)).toEqual(helperCounts(source));
+    expect(helperInventory(`${source}\nif (false) readFileSync('unrelated');`)).toEqual(allowedHelperInventory[file]);
+    expect(helperCounts(`${source}\nimport { guardLaneAction as checkAction } from '../lib/health-watch-lane-scan.mjs';
+      if (false) checkAction({ path: '/fixture/lane', action: 'reset' });`)).not.toEqual(allowedHelpers);
     // Negative controls: real command shapes in an otherwise dormant branch
     // cannot be admitted by the allowlist. Comments/strings aren't call sites.
     for (const action of ['reclaim', 'reset', 'reuse', 'release']) {
@@ -300,14 +577,16 @@ describe('health-watch destructive lane action call-site contract', () => {
   });
 
   it('pins the real stale-state call sites to reporting only, with no destructive lane action bypassing guardLaneAction', () => {
-    const run = vi.fn((bin) => bin === 'git' ? '0' : JSON.stringify({ lanes: [{
-      path: '/fixture/lane', clean: true, lease: { agentPid: 123, acquiredAt: '2000-01-01T00:00:00Z' },
+    const run = vi.fn((bin, argv) => bin === 'git'
+      ? argv[0] === 'rev-parse' ? published : '0' : JSON.stringify({ lanes: [{
+      path: '/fixture/lane', branch: 'lane/fixture', clean: true, lease: { agentPid: 123, acquiredAt: '2000-01-01T00:00:00Z' },
     }] }));
     const read = createStaleStateReader({ root: '/fixture', run, listFiles: () => [],
       probe: () => false, runStore: { list: () => [] } });
     const exec = vi.fn(() => JSON.stringify({ verdict: read() }));
     const result = probeStaleState({ repoRoot: '/fixture', exec });
-    expect(result.records[0]).toMatchObject({ ownerPidAlive: false, hasUnsafeWork: false });
+    expect(result.records[0]).toMatchObject({ ownerPidAlive: false, hasUnsafeWork: null, lane: { clean: true, ahead: 0 },
+      safety: { reason: 'local tracking refs cannot prove publication' } });
     expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([
       ['/fixture/scripts/operations/run.mjs', 'stale-state', '--json'],
     ]);
@@ -316,7 +595,9 @@ describe('health-watch destructive lane action call-site contract', () => {
     expect(run.mock.calls.map(([, argv]) => argv)).toEqual([
       ['/fixture/scripts/lane-pool.mjs', 'status', '--json'],
       ['config', '--show-scope', '--list', '--includes', '-z'],
-      ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'],
+      ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/lane/fixture'],
+      ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'],
+      ['rev-list', '--count', 'HEAD', '--not', published, published],
     ]);
     expect(OPERATIONS['stale-state']().sinks).toEqual({});
   });

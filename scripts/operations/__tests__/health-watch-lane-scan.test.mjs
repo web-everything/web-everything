@@ -6,8 +6,21 @@ import { execFileSync } from 'node:child_process';
 import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety as checkFreshLaneSafety, guardLaneAction as checkGuardLaneAction, laneProbeEnv, laneRedirectConfig, laneMaskingConfig, withHonestReportingPins, LANE_HONEST_REPORTING_PINS } from '../../lib/health-watch-lane-scan.mjs';
 import { createStaleStateReader } from '../stale-state-io.mjs';
 import { OPERATIONS } from '../run.mjs';
+import * as policyCascade from '../../lib/policy-cascade.mjs';
+import * as settingsFiles from '../../lib/settings-files.mjs';
 import { DIRTY_PROBE_ARGS, laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
 import { LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS, configKeyCandidates, laneFilterDrivers, riskyLaneConfig, scrubInheritedGitEnv } from '../../lib/lane-git-hardening.mjs';
+
+// Mock at the module boundary so default-parameter imports see these functions.
+// Post-import namespace spies do not replace those bindings in this test setup.
+vi.mock('../../lib/policy-cascade.mjs', async original => {
+  const real = await original();
+  return { ...real, platformPreference: vi.fn(real.platformPreference) };
+});
+vi.mock('../../lib/settings-files.mjs', async original => {
+  const real = await original();
+  return { ...real, readDeclaredSettings: vi.fn(real.readDeclaredSettings) };
+});
 
 vi.mock('../stale-state-io.mjs', async original => {
   const real = await original();
@@ -79,11 +92,12 @@ describe('operator send-back regressions', () => {
   });
 
   const cachedReader = (initial = {}) => {
-    const lane = { path: '/fixture/lane-1', clean: true,
+    const lane = { path: '/fixture/lane-1', branch: 'lane/fixture', clean: true,
       lease: { workerSession: 'old-worker', pid: 10, agentPid: 11 }, ...initial };
     let now = 0;
     let leaseText = JSON.stringify(lane.lease);
-    const run = vi.fn(bin => bin === 'git' ? '0' : JSON.stringify({ lanes: [lane] }));
+    const run = vi.fn((bin, argv) => bin === 'git'
+      ? argv[0] === 'rev-parse' ? PUBLISHED_TIP : '0' : JSON.stringify({ lanes: [lane] }));
     const readText = vi.fn(() => {
       if (leaseText instanceof Error) throw leaseText;
       return leaseText;
@@ -129,6 +143,25 @@ describe('operator send-back regressions', () => {
 });
 
 describe('health-watch persistent lane scan', () => {
+  it.each([
+    ['wrong version', { version: 2 }], ['wrong root', { root: '/other' }],
+    ['non-finite at', { at: Infinity }], ['non-number at', { at: '1000' }],
+    ['non-array lanes', { lanes: {} }], ['row without lane', { lanes: [{ ahead: 0 }] }],
+    ['non-object lane', { lanes: [{ lane: '/lane', ahead: 0 }] }],
+    ['lane without string path', { lanes: [{ lane: { path: 42 }, ahead: 0 }] }],
+    ...[-1, 0.5, '0', Number.MAX_SAFE_INTEGER + 1].map(ahead => [`invalid ahead ${ahead}`, { lanes: [{ lane: { path: '/lane' }, ahead }] }]),
+    ['future at', { at: 2001 }],
+  ])('rescans for cache guard: %s', (_name, patch) => {
+    const dir = temp();
+    // JSON permits overflowing numeric literals, although JSON.stringify(Infinity) writes null.
+    const content = JSON.stringify({ version: 1, root: '/fixture', at: 1000, lanes: rows, ...patch });
+    writeFileSync(join(dir, 'lane-scan.json'), patch.at === Infinity ? content.replace('"at":null', '"at":1e999') : content);
+    const scan = vi.fn(() => rows);
+    expect(cachedLaneScan(scan, { dir, root: '/fixture', now: 2000, policy, log: vi.fn() })).toEqual(rows);
+    expect(scan).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(join(dir, 'lane-scan.json'), 'utf8'))).toEqual({ version: 1, root: '/fixture', at: 2000, lanes: rows });
+  });
+
   it('skips within the interval across readers, retains lane data and logs interval/source once', () => {
     const dir = temp();
     const scan = vi.fn(() => rows);
@@ -175,9 +208,11 @@ describe('health-watch persistent lane scan', () => {
     const dir = temp();
     let now = 1000;
     let alive = true;
-    const lane = { path: '/fixture/lane-1', leased: false, clean: true,
+    const lane = { path: '/fixture/lane-1', branch: 'lane/fixture', leased: false, clean: true,
       lease: { pid: 12, agentPid: 123, workerSession: 'worker', acquiredAt: '1970-01-01T00:00:00Z' } };
-    const run = vi.fn((bin) => bin === 'git' ? '2' : JSON.stringify({ lanes: [lane, { path: '/fixture/lane-2', readError: 'bad lease' }] }));
+    const run = vi.fn((bin, argv) => bin === 'git'
+      ? argv[0] === 'rev-parse' ? PUBLISHED_TIP : '2'
+      : JSON.stringify({ lanes: [lane, { path: '/fixture/lane-2', readError: 'bad lease' }] }));
     const readClaim = vi.fn(() => ({ found: true, status: 'active', rel: 'backlog/123-active.md',
       content: '---\nstatus: active\npid: 123\n---\n' }));
     const options = { root: '/fixture', run, now: () => now, probe: () => alive,
@@ -191,7 +226,7 @@ describe('health-watch persistent lane scan', () => {
     now = 42000;
     alive = false;
     const second = createStaleStateReader(options)();
-    expect(run).toHaveBeenCalledTimes(3); // one full status, one leased-lane config read and one ahead probe
+    expect(run).toHaveBeenCalledTimes(5); // status, config, two verified reporting refs and ahead
     expect(readClaim).toHaveBeenCalledTimes(2);
     expect(second.records.map(r => r.kind)).toEqual(['lane-lease', 'lane-lease', 'claim']);
     expect(first.records[0]).toMatchObject({ ownerPidAlive: true, hasUnsafeWork: true, lane: { ahead: 2 } });
@@ -206,22 +241,27 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
   const lease = { pid: 12, agentPid: 123, workerSession: 'worker', acquiredAt: '1970-01-01T00:00:00Z' };
   const reader = (dir, lanes, aheadOut) => {
     let now = 1000;
-    const run = vi.fn((bin) => bin === 'git' ? aheadOut : JSON.stringify({ lanes }));
+    lanes = lanes.map(lane => ({ branch: 'lane/fixture', ...lane }));
+    const run = vi.fn((bin, argv) => bin === 'git'
+      ? argv[0] === 'rev-parse' ? PUBLISHED_TIP : aheadOut : JSON.stringify({ lanes }));
     const options = { root: '/fixture', run, now: () => now, probe: () => false, listFiles: () => [],
       readText: path => JSON.stringify(lanes.find(lane => path === `${lane.path}/.git/.lane-lease`)?.lease),
       readClaim: vi.fn(), runStore: { list: () => [] }, laneScan: { dir, policy, log: vi.fn() } };
     return { read: () => createStaleStateReader(options)(), tick: ms => { now += ms; }, run };
   };
-  it('a cached SAFE row is reported unknown (never safe), keeps the cached value for reporting, and says so in gaps', () => {
+  it('zero local ahead stays unknown in fresh and cached rows, with the publication limit visible', () => {
     const dir = temp();
     const r = reader(dir, [{ path: '/fixture/lane-1', clean: true, lease }], '0');
     const first = r.read();
-    expect(first.records[0]).toMatchObject({ hasUnsafeWork: false, safety: { source: 'fresh', cachedHasUnsafeWork: null } });
+    expect(first.records[0]).toMatchObject({ hasUnsafeWork: null, lane: { clean: true, ahead: 0 },
+      safety: { source: 'fresh', cachedHasUnsafeWork: null, reason: 'local tracking refs cannot prove publication' } });
     r.tick(41000);
     const second = r.read();
     expect(second.records[0]).toMatchObject({ hasUnsafeWork: null,
-      safety: { source: 'cache', observedAt: new Date(1000).toISOString(), cachedHasUnsafeWork: false } });
+      lane: { clean: true, ahead: 0 }, safety: { source: 'cache', observedAt: new Date(1000).toISOString(),
+        cachedHasUnsafeWork: null, reason: 'local tracking refs cannot prove publication' } });
     expect(second.gaps.some(g => g.includes('reporting only, never safe'))).toBe(true);
+    expect(second.gaps.some(g => g.includes('Local tracking refs cannot prove publication'))).toBe(true);
     expect(Object.keys(second.records[0])).toEqual(Object.keys(first.records[0]));
   });
   it('a cached UNKNOWN row stays unknown and a cached UNSAFE row stays unsafe', () => {
@@ -232,6 +272,16 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
     const [a, b] = r.read().records;
     expect(a).toMatchObject({ hasUnsafeWork: null, safety: { source: 'cache', cachedHasUnsafeWork: null } });
     expect(b).toMatchObject({ hasUnsafeWork: true, safety: { source: 'cache', cachedHasUnsafeWork: true } });
+  });
+  it('a persisted version-1 clean zero-ahead row from the old safe mapping remains unknown', () => {
+    const dir = temp();
+    const lane = { path: '/fixture/lane-1', branch: 'lane/fixture', clean: true, lease };
+    writeFileSync(join(dir, 'lane-scan.json'), JSON.stringify({ version: 1, root: '/fixture', at: 1000,
+      lanes: [{ lane, ahead: 0 }] }));
+    const r = reader(dir, [lane], '0');
+    expect(r.read().records[0]).toMatchObject({ hasUnsafeWork: null, lane: { ahead: 0 },
+      safety: { source: 'cache', cachedHasUnsafeWork: null, reason: 'local tracking refs cannot prove publication' } });
+    expect(r.run).not.toHaveBeenCalled();
   });
   it('never writes an unsafe or unknown row into the cache as safe', () => {
     const dir = temp();
@@ -251,7 +301,7 @@ describe('cached lane safety is reporting only (operator ruling 2026-10-20)', ()
     try {
       r.read();
       expect(r.run.mock.calls.map(([bin, , options]) => [bin === 'git', options.cwd, options.env.GIT_CEILING_DIRECTORIES]))
-        .toEqual([[false, '/fixture', '/'], [true, '/fixture/lane-1', '/fixture'], [true, '/fixture/lane-1', '/fixture']]);
+        .toEqual([[false, '/fixture', '/'], ...Array.from({ length: 4 }, () => [true, '/fixture/lane-1', '/fixture'])]);
       for (const [, , options] of r.run.mock.calls) {
         expect(options.env).not.toHaveProperty('GIT_DIR');
         expect(options.env).not.toHaveProperty('GIT_CONFIG_PARAMETERS');
@@ -724,6 +774,80 @@ describe('lane action guard with real Git', () => {
     expect(readFileSync(join(path, 'tracked.txt'), 'utf8')).toBe('never published\n');
   });
 
+  it.each(['loose', 'packed'])('reporting ignores forged %s unrelated origin refs with real Git', storage => {
+    const { path, git, commit } = fixture();
+    const branch = git(['branch', '--show-current']).trim();
+    git(['update-ref', `refs/remotes/origin/${branch}`, 'HEAD']);
+    git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    writeFileSync(join(path, 'tracked.txt'), 'never published\n');
+    git(['add', 'tracked.txt']);
+    commit();
+    git(['update-ref', 'refs/remotes/origin/x', 'HEAD']);
+    if (storage === 'packed') git(['pack-refs', '--all', '--prune']);
+    expect(git(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'])).toBe('0\n');
+    const lane = { path, branch, clean: true, lease: { agentPid: 123 } };
+    const run = vi.fn((bin, argv, options) => bin === 'git' ? execFileSync(bin, argv, options) : JSON.stringify({ lanes: [lane] }));
+    const read = () => createStaleStateReader({ root: path, run, listFiles: () => [], runStore: { list: () => [] }, probe: () => false })().records[0];
+    expect(read()).toMatchObject({ hasUnsafeWork: true, lane: { ahead: 1 } });
+    git(['update-ref', '-d', `refs/remotes/origin/${branch}`]);
+    expect(read()).toMatchObject({ hasUnsafeWork: null, lane: { ahead: null } });
+    expect(readFileSync(join(path, 'tracked.txt'), 'utf8')).toBe('never published\n');
+  });
+
+  it.each(['loose', 'packed'].flatMap(storage => ['expected branch', 'main', 'both'].map(target => ({ storage, target }))))(
+    'reporting stays unknown when $storage $target tracking refs are forged to HEAD with real Git', ({ storage, target }) => {
+      const { path, git, commit } = fixture();
+      const branch = 'lane/reporting-forgery';
+      git(['checkout', '--quiet', '-b', branch]);
+      const branchRef = `refs/remotes/origin/${branch}`;
+      const mainRef = 'refs/remotes/origin/main';
+      git(['update-ref', branchRef, 'HEAD']);
+      git(['update-ref', mainRef, 'HEAD']);
+      writeFileSync(join(path, 'tracked.txt'), 'never published\n');
+      git(['add', 'tracked.txt']);
+      commit();
+      const lane = { path, branch, clean: true, lease: { agentPid: 123 } };
+      const run = vi.fn((bin, argv, options) => bin === 'git' ? execFileSync(bin, argv, options) : JSON.stringify({ lanes: [lane] }));
+      const read = () => createStaleStateReader({ root: path, run, listFiles: () => [], runStore: { list: () => [] }, probe: () => false })().records[0];
+      expect(read()).toMatchObject({ hasUnsafeWork: true, lane: { clean: true, ahead: 1 } });
+      if (target !== 'main') git(['update-ref', branchRef, 'HEAD']);
+      if (target !== 'expected branch') git(['update-ref', mainRef, 'HEAD']);
+      if (storage === 'packed') git(['pack-refs', '--all', '--prune']);
+      expect(git(['rev-list', '--count', 'HEAD', '--not', branchRef, mainRef])).toBe('0\n');
+      expect(read()).toMatchObject({ hasUnsafeWork: null, lane: { clean: true, ahead: 0 },
+        safety: { reason: 'local tracking refs cannot prove publication' } });
+      for (const action of actions) {
+        expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
+          act: false, fresh: { hasUnsafeWork: true, reason: '1 unpushed commit(s)' },
+        });
+      }
+      expect(readFileSync(join(path, 'tracked.txt'), 'utf8')).toBe('never published\n');
+    });
+
+  it.each(['core.sparseCheckout', 'core.sparseCheckoutCone', 'index.sparse'])(
+    'refuses sparse-checkout masking config %s with real Git', key => {
+      const { path, git } = fixture();
+      git(['config', key, 'true']);
+      for (const action of actions) {
+        expect(guardLaneAction({ path, action, log: vi.fn() }))
+          .toMatchObject({ act: false, fresh: { reason: 'lane Git config can hide worktree changes' } });
+      }
+    });
+
+  it.each(['K', 'ı'])('refuses a non-ASCII filter name %s before executing its driver with real Git', name => {
+    const { path, git } = fixture();
+    const marker = join(temp(), 'executed');
+    git(['config', `filter.${name}.clean`, `echo executed > '${marker}'; cat`]);
+    writeFileSync(join(path, '.git', 'info', 'attributes'), `tracked.txt filter=${name}\n`);
+    const config = git([...LANE_CONFIG_LIST_ARGS]);
+    expect(laneFilterDrivers(config)).toContain(`filter.${name}.clean`);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { reason: 'lane Git filter drivers present' } });
+    }
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it.each([
     ['extensions.partialclone', 'origin', 'partial-clone lazy fetch'],
     ['remote.origin.promisor', 'true', 'promisor remote lazy fetch'],
@@ -991,6 +1115,41 @@ describe('stale-state operation factory cache opt-in', () => {
 });
 
 describe('lane scan setting cascade', () => {
+  it.each([
+    ['platform', 60, undefined, undefined, 60, 'platform'],
+    ['tool', 60, 90, undefined, 90, 'tool'],
+    ['env', 60, 90, '120', 120, 'env'],
+    ['invalid platform', -1, undefined, undefined, 300, 'standard'],
+    ['invalid tool', 60, '90', undefined, 300, 'standard'],
+    ['invalid env', 60, 90, '0', 300, 'standard'],
+  ])('default settings path resolves %s with provenance', (_label, platform, tool, env, interval, source) => {
+    const platformSpy = vi.mocked(policyCascade.platformPreference).mockClear()
+      .mockReturnValueOnce({ laneScanIntervalSec: platform });
+    const toolSpy = vi.mocked(settingsFiles.readDeclaredSettings).mockClear()
+      .mockReturnValueOnce({ settings: { healthWatch: { laneScanIntervalSec: tool } } });
+    vi.stubEnv('WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC', env ?? '');
+    if (env === undefined) delete process.env.WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC;
+    try {
+      const result = resolveLaneScanPolicy();
+      expect(result).toMatchObject({ interval, source });
+      expect(result.invalid.length).toBe(source === 'standard' ? 1 : 0);
+      expect(platformSpy).toHaveBeenCalledWith('healthWatch', { env: process.env });
+      expect(toolSpy).toHaveBeenCalledWith();
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('reads the real platform default file when no platform argument is supplied', () => {
+    const file = join(temp(), 'preferences.json');
+    writeFileSync(file, JSON.stringify({ healthWatch: { laneScanIntervalSec: 75 } }));
+    vi.mocked(settingsFiles.readDeclaredSettings).mockReturnValueOnce({ settings: {} });
+    vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', file);
+    vi.stubEnv('WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC', '');
+    delete process.env.WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC;
+    try {
+      expect(resolveLaneScanPolicy()).toEqual({ interval: 75, source: 'platform', invalid: [] });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   const resolve = options => resolveLaneScanPolicy({ env: {}, platform: {}, tool: {}, ...options });
   it('uses standard, platform, tool, then environment and logs the winning source', () => {
     expect(resolve()).toEqual(policy);

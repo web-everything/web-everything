@@ -6,12 +6,18 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
 
 const at = '2026-09-15T12:00:00.000Z';
-function fixture({ leases = [], claims = {}, runs = {}, probe = () => false, ahead = '0', configList = '' } = {}) {
+const published = 'a'.repeat(40);
+function fixture({ leases = [], claims = {}, runs = {}, probe = () => false, ahead = '0', tip = published, configList = '' } = {}) {
   const run = vi.fn((bin, argv, opts) => {
     expect(opts.env.GIT_OPTIONAL_LOCKS).toBe('0');
     if (bin === 'git') {
       if (argv[0] === 'config') return configList;
-      expect(argv).toEqual(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin']);
+      if (argv[0] === 'rev-parse') {
+        expect(argv).toEqual(['rev-parse', '--verify', '--quiet', expect.stringMatching(/^refs\/remotes\/origin\/(lane\/fixture|main)$/)]);
+        if (tip instanceof Error) throw tip;
+        return tip;
+      }
+      expect(argv).toEqual(['rev-list', '--count', 'HEAD', '--not', published, published]);
       if (ahead instanceof Error) throw ahead;
       return ahead;
     }
@@ -35,7 +41,7 @@ function fixture({ leases = [], claims = {}, runs = {}, probe = () => false, ahe
   return { run, read, declaration };
 }
 const lease = (extra = {}, clean = true) => ({
-  path: '/pool/lane-1', clean, behind: 0, leased: false,
+  path: '/pool/lane-1', branch: 'lane/fixture', clean, behind: 0, leased: false,
   lease: { session: 'worker', pid: 11, agentPid: 22, host: 'here', acquiredAt: '2026-09-15T11:00:00.000Z', ...extra },
 });
 async function invoke(declaration) {
@@ -55,9 +61,10 @@ describe('stale-state — observed liveness, no cleanup', () => {
     expect((await invoke(declaration)).records[0]).toMatchObject({ kind: 'lane-lease',
       owner: 'worker', pid: 11, pidChecked: true, pidAlive: true, verdict: 'live', ageMs: 3600000 });
   });
-  it('reports a dead lease owner with no observed unsafe work', async () => {
+  it('reports a dead lease owner with unknown publication despite clean status and zero local ahead', async () => {
     const { declaration } = fixture({ leases: [lease()] });
-    expect((await invoke(declaration)).records[0]).toMatchObject({ verdict: 'dead', hasUnsafeWork: false });
+    expect((await invoke(declaration)).records[0]).toMatchObject({ verdict: 'dead', hasUnsafeWork: null,
+      lane: { clean: true, ahead: 0 }, safety: { reason: 'local tracking refs cannot prove publication' } });
   });
   it.each([['dirty', false, '0'], ['unpushed', true, '2']])('separates dead owners with %s work', async (_, clean, ahead) => {
     const { declaration } = fixture({ leases: [lease({}, clean)], ahead });
@@ -83,6 +90,23 @@ describe('stale-state — observed liveness, no cleanup', () => {
     const { declaration } = fixture({ leases: [lease()], ahead: new Error('git failed') });
     expect((await invoke(declaration)).records[0].hasUnsafeWork).toBeNull();
   });
+  it.each(['-1', '0.5', 'not a count', '9007199254740992'])(
+    'keeps reporting unknown for an invalid ahead count (%s)', async ahead => {
+      const { declaration } = fixture({ leases: [lease()], ahead });
+      expect((await invoke(declaration)).records[0]).toMatchObject({ hasUnsafeWork: null, lane: { ahead: null } });
+    });
+  it.each([undefined, '', 'main^{}', '../main', '--all'])(
+    'keeps reporting unknown without a valid lane branch (%s)', async branch => {
+      const { run, declaration } = fixture({ leases: [{ ...lease(), branch }] });
+      expect((await invoke(declaration)).records[0]).toMatchObject({ hasUnsafeWork: null, lane: { ahead: null } });
+      expect(run.mock.calls.some(([bin, argv]) => bin === 'git' && argv[0] === 'rev-list')).toBe(false);
+    });
+  it.each(['', 'HEAD', 'a'.repeat(41), new Error('ref missing')])(
+    'keeps reporting unknown when a candidate ref cannot be verified (%s)', async tip => {
+      const { run, declaration } = fixture({ leases: [lease()], tip });
+      expect((await invoke(declaration)).records[0]).toMatchObject({ hasUnsafeWork: null, lane: { ahead: null } });
+      expect(run.mock.calls.some(([bin, argv]) => bin === 'git' && argv[0] === 'rev-list')).toBe(false);
+    });
   it('runs the ahead probe in a lane under lane Git hardening, never a bare process env', async () => {
     const { run, read } = fixture({ leases: [lease()] });
     vi.stubEnv('GIT_EXTERNAL_DIFF', 'echo inherited');

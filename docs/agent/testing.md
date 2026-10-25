@@ -728,6 +728,27 @@ applies to every "does it work / why is it broken" moment, not just to written t
   run the 11ty build, so render-layer bugs stay green-invisible — smoke template changes with a real
   build/probe too.
 
+### Default-parameter dependency tests
+
+The lane-scan resolver's default-parameter tests must mock `platformPreference` and
+`readDeclaredSettings` at the module boundary with hoisted `vi.mock` factories; post-import
+namespace spies did not reach the resolver's named imports in this suite. Preserve the real
+exports and use `mockReturnValueOnce` for each layer case so other callers retain real IO.
+Also exercise the real platform reader with a temporary `WE_PLATFORM_PREFERENCES_FILE`
+and an empty mocked tool layer, calling `resolveLaneScanPolicy()` without injected arguments.
+For an unset environment layer, register the stub for restoration, then explicitly delete the
+key; passing `undefined` to `vi.stubEnv` can leave a string value in older Vitest versions.
+
+### Imported action-wrapper inventories
+
+Lane-action boundary tests inventory imported helper targets from every module, including
+module/export identity and aliased callees. Keep exact per-occurrence counts, keyed by file,
+module, export and callee, for mutating helpers and every helper owned by the change. Only
+known read-only/noise helpers (filesystem reads, pure formatters and renderers; redaction scrubbers keep exact counts) may vary in
+count; a mutating name or target overrides that exemption. Keep distinct module/export identity
+checks for every helper, including noise. Named negative controls must reject repeated existing
+mutations as well as aliased cleanup wrappers imported from outside the owned modules.
+
 ### Gates in git fixtures
 
 When a publish gate runs the suite that tests its own caller, use a fixture-local npm script in the
@@ -972,9 +993,12 @@ owner liveness even if their recorded PID is dead. Probes reuse `reconcile-pass.
 null/invalid PIDs and foreign-host PIDs remain unknown. TTL and run completion never prove death.
 Claims do not normally record an owner or PID; the report preserves that missing evidence as null.
 
-`hasUnsafeWork` reuses lane status cleanliness and supplements its behind count with a read-only
-count of commits absent from local origin refs. No fetch occurs: remote ref freshness is a named
-limit, and false is never cleanup authorization. Unassociated claims/runs have null work safety.
+`hasUnsafeWork` reuses lane status cleanliness and supplements it with a read-only count of commits
+absent from the verified expected branch and main origin refs. Dirty status or a positive ahead
+count reports true. A zero local ahead count reports null with a publication reason: even these
+expected tracking refs are lane-writable and cannot prove publication. This reader never reports
+false, whether fresh or cached; destructive actions require `guardLaneAction` with fresh trusted
+publication evidence. Unassociated claims/runs have null work safety.
 Age is milliseconds since the recorded acquisition/start time, or null when missing/unreadable.
 
 The CLI normally persists runs and call telemetry even for compute-only operations. This inventory

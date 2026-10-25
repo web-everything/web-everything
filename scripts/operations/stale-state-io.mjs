@@ -14,6 +14,7 @@ import { readField } from '../backlog/frontmatter.mjs';
 import { cachedLaneScan, laneProbeEnv, laneRedirectConfig } from '../lib/health-watch-lane-scan.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { hardenLaneGitArgs, LANE_CONFIG_LIST_ARGS } from '../lib/lane-git-hardening.mjs';
+import { assertPushRef } from '../lib/git-transport-branch.mjs';
 import { probePid } from '../conveyor/reconcile-pass.mjs';
 
 /** Bind external reads, including subprocesses and clock, for fixture-only tests. */
@@ -40,7 +41,7 @@ export function createStaleStateReader({
     const gaps = [
       'Scope: this checkout backlog, its repository lane pool, and the configured operation run store.',
       'Lease pid identifies the acquire CLI, not the owner; owner liveness needs a same-host agentPid.',
-      'Work safety is best-effort against local origin refs, without fetching; false is not cleanup authorization.',
+      'Local tracking refs cannot prove publication; a zero ahead count leaves work safety unknown. Destructive lane actions require a fresh trusted publication check (health-watch-lane-scan.mjs#guardLaneAction).',
       'Claims and run records may lack owner, pid, or timestamps; missing evidence remains null/unknown.',
     ];
     const observe = (pid, recordHost) => {
@@ -71,9 +72,18 @@ export function createStaleStateReader({
             try {
               // A lane redirecting its worktree or transport is reported unknown, never probed.
               if (laneRedirectConfig(laneGit([...LANE_CONFIG_LIST_ARGS], lane.path)).length) throw new Error('redirecting lane config');
-              // Behind cannot detect unpushed commits. Count commits absent from local origin refs.
-              const raw = String(laneGit(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'], lane.path)).trim();
-              if (/^\d+$/.test(raw)) ahead = Number(raw);
+              // Reporting only: unrelated lane-writable origin refs cannot prove publication.
+              // Require the expected branch and main, resolving fully qualified refs to OIDs.
+              if (typeof lane.branch !== 'string') throw new Error('missing lane branch');
+              const branchRef = assertPushRef(lane.branch).replace(/^refs\/heads\//, 'refs/remotes/origin/');
+              const refs = [...new Set([branchRef, 'refs/remotes/origin/main'])];
+              const tips = refs.map(ref => {
+                const tip = String(laneGit(['rev-parse', '--verify', '--quiet', ref], lane.path)).trim();
+                if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tip)) throw new Error('unverified reporting ref');
+                return tip;
+              });
+              const raw = String(laneGit(['rev-list', '--count', 'HEAD', '--not', ...tips], lane.path)).trim();
+              if (/^\d+$/.test(raw) && Number.isSafeInteger(Number(raw))) ahead = Number(raw);
             } catch { /* unknown, never zero */ }
           }
           return { lane, ahead };
@@ -105,15 +115,17 @@ export function createStaleStateReader({
         }
         if (!lane.lease) continue; // include raw expired leases regardless of `leased`
         const lease = lane.lease;
-        const computed = lane.clean === false || (ahead !== null && ahead > 0) ? true
-          : lane.clean === true && ahead === 0 ? false : null;
-        // A cached row is reporting only: cached unsafe stays unsafe, cached safe/unknown is reported unknown. Acting
+        // Even verified expected refs are lane-writable: zero cannot prove publication.
+        const computed = lane.clean === false || (ahead !== null && ahead > 0) ? true : null;
+        const reason = computed === true ? (lane.clean === false ? 'worktree has changes' : 'local ahead count is positive')
+          : ahead === 0 ? 'local tracking refs cannot prove publication' : 'work safety evidence is incomplete';
+        // Cached unsafe stays unsafe; all other cached or fresh evidence remains unknown. Acting
         // on a lane needs health-watch-lane-scan.mjs#guardLaneAction's fresh check, never this field.
         const hasUnsafeWork = fromCache ? (computed === true ? true : null) : computed;
         add('lane-lease', lane.path, {
           ...lease, owner: lease.workerSession ?? lease.ownerSession ?? lease.session ?? lease.holder,
         }, lease.acquiredAt, { hasUnsafeWork,
-          safety: { source: fromCache ? 'cache' : 'fresh', observedAt: fromCache ? new Date(cachedAt).toISOString() : observedAt,
+          safety: { source: fromCache ? 'cache' : 'fresh', reason, observedAt: fromCache ? new Date(cachedAt).toISOString() : observedAt,
             cachedHasUnsafeWork: fromCache ? computed : null },
           lane: { ...lane, ahead }, lease });
       }

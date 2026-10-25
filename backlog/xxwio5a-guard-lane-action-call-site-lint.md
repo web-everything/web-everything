@@ -13,7 +13,7 @@ PR 5759 advisory (security/coverage): guardLaneAction in we:scripts/lib/health-w
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `q=we:scripts/readiness/heavy-admission.mjs; t=we:scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs; node "${q#we:}" run -- npx vitest run "${t#we:}" -t 'health-watch destructive lane action call-site contract'` checks the health-watch and stale-state command allowlists. Adding an unguarded reclaim/reset/reuse/release call must fail the inventory, including assigned or aliased runners; negative controls prove each action is detected. Any admitted destructive action must have an integration test proving it calls guardLaneAction and refuses unsafe work.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
