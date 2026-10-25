@@ -283,7 +283,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const blockingReasons = Object.create(null);
       out.staleChecks = {};
       for (const ref of established.filter((ref) => ref !== out.effectiveRef)) {
-        if (git('fetch', 'origin', ref).code !== 0) return stop('check-unverifiable', { detail: `could not fetch registered ref ${ref}` });
+        if (git('fetch', 'origin', ref).code !== 0) {
+          if (git('ls-remote', '--exit-code', 'origin', `refs/heads/${ref}`).code === 2) {
+            // Registrations do not pin an authoritative tip. A cached tracking ref may
+            // predate deleted work, so even cached containment cannot authorize adoption.
+            return stop('check-unverifiable', {
+              detail: `could not fetch registered ref ${ref}`,
+              fallback: `Remote ref ${ref} was deleted, and its authoritative registered tip is unavailable. Retain the registration; recover and verify its latest work before retrying.`,
+            });
+          }
+          return stop('check-unverifiable', { detail: `could not fetch registered ref ${ref}` });
+        }
         const included = ancestor(`origin/${ref}`, out.effectiveSha);
         const landed = landedByContent(ref);
         if (included || landed) {

@@ -158,7 +158,13 @@ function fixture(options = {}) {
       return (options.contained || []).includes(args[2].slice(7)) ? '' : fail(1);
     }
     if (args[0] === 'merge-tree') return options.mergeConflict ? fail(1, `${TREE}\n100644 ${SHA} 1\tx\nCONFLICT (content): Merge conflict in x\n`) : TREE;
-    if (args[0] === 'ls-remote') return options.remote || '';
+    if (args[0] === 'ls-remote') {
+      if (args[1] === '--exit-code') {
+        expect(args).toEqual(['ls-remote', '--exit-code', 'origin', `refs/heads/${options.staleFetchFails}`]);
+        if (options.staleRemoteCode) return fail(options.staleRemoteCode);
+      }
+      return options.remote || '';
+    }
     if (args[0] === 'commit-tree') return MERGE;
     if (args[0] === 'push') { remoteTip = MERGE; return ''; }
     throw new Error(`unexpected command ${cmd} ${args}`);
@@ -1000,10 +1006,43 @@ describe('prototype-load', () => {
     const f = fixture({ list: ['lane/old'], noPrWarning, safetySettings: { overlaySafety: { noPr: 'warn' } } });
     expect(await f.run()).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null });
   });
-  it('fails closed when fetching a registered ref fails even if containment would pass', async () => {
-    const f = fixture({ list: ['lane/old'], contained: ['lane/old'], staleFetchFails: 'lane/old' });
-    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable', detail: 'could not fetch registered ref lane/old' });
+  it.each([
+    ['included in the candidate', { contained: ['lane/old'] }],
+    ['landed by content', { cherry: { 'lane/old': `- ${SHA}\n` } }],
+  ])('fails closed when a deleted remote ref has only cached evidence %s', async (_, evidence) => {
+    const f = fixture({ list: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode: 2, ...evidence });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false,
+      staleChecks: {}, stopReason: 'check-unverifiable', fallback: expect.stringContaining('authoritative registered tip is unavailable') });
+    expect(f.calls.filter(c => c.cmd === 'git' && c.args[0] === 'ls-remote' && c.args[1] === '--exit-code')).toHaveLength(1);
+    expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check')).map(c => c.args.find(a => a.startsWith('--ref=')))).toEqual([`--ref=${BASE.branch}`]);
     expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('fails closed when a deleted remote ref has unlanded changes absent from the candidate', async () => {
+    const f = fixture({ list: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode: 2 });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false,
+      stopReason: 'check-unverifiable', detail: 'could not fetch registered ref lane/old', staleChecks: {} });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('rejects deleted remote ref when cached tip predates registered tip', async () => {
+    // The cached tip appears contained, but the listing claims a newer, uncontained
+    // SHA. The registry has no authoritative tip contract; neither is safe evidence.
+    const f = fixture({ list: ['lane/old'], contained: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode: 2,
+      listRaw: JSON.stringify({ list: [{ ref: 'lane/old', sha: TREE }] }) });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'check-unverifiable' });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(f.calls.some(c => c.cmd === 'git' && ['cherry', 'rev-parse', 'merge-base'].includes(c.args[0])
+      && c.args.some(arg => arg.includes('origin/lane/old')))).toBe(false);
+  });
+  it.each([0, 1, 128])('fails closed when fetching a registered ref fails and ls-remote exits %s even if containment would pass', async (staleRemoteCode) => {
+    const f = fixture({ list: ['lane/old'], contained: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable', detail: 'could not fetch registered ref lane/old' });
+    expect(f.calls.filter(c => c.cmd === 'git' && c.args[0] === 'ls-remote' && c.args[1] === '--exit-code')).toHaveLength(1);
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
   });
   it('does not accept a conflicting JSON check with a no-PR warning exit', async () => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], noPrWarning: 'lane/old' });
