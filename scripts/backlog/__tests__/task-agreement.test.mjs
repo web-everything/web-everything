@@ -144,6 +144,27 @@ describe('readTaskAgreement — legacy `## Done when` alias', () => {
 describe('readTaskAgreement — draft marker', () => {
   const visibleMarker = 'Draft: model-written, not yet confirmed.';
 
+  it.each([
+    ['Acceptance', 'acceptance', 'A1'],
+    ['Non-goals', 'nonGoals', 'N1'],
+  ])('treats a marker after the first %s item as ordinary continuation text', (heading, output, id) => {
+    const agreement = readTaskAgreement(`## ${heading}\n\n- [${id}] confirmed item.\n  ${visibleMarker}\n`);
+    expect(agreement.draft).toBe(false);
+    expect(agreement[output]).toEqual([{ id, text: `confirmed item. ${visibleMarker}` }]);
+  });
+
+  it.each(['Acceptance', 'Non-goals'])('ignores a marker inside a multi-line comment under %s', (heading) => {
+    const card = CARD.replace(`## ${heading}\n`, `## ${heading}\n\n<!-- authoring note\n${visibleMarker}\n-->\n`);
+    expect(readTaskAgreement(card)).toEqual(readTaskAgreement(CARD));
+  });
+
+  it.each(['Acceptance', 'Non-goals'])('does not recognize a marker after a leading comment or fence under %s', (heading) => {
+    for (const block of [`<!-- authoring note\n${visibleMarker}\n-->`, `\`\`\`text\n${visibleMarker}\n\`\`\``]) {
+      const card = CARD.replace(`## ${heading}\n`, `## ${heading}\n\n${block}\n${visibleMarker}\n`);
+      expect(readTaskAgreement(card)).toEqual(readTaskAgreement(CARD));
+    }
+  });
+
   // Observe the actual prepare preprocessing output: do not duplicate its stripping regex here.
   function afterPrepareStripping(card) {
     const replace = vi.spyOn(String.prototype, 'replace');
