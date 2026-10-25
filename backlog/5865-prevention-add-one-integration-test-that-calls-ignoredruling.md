@@ -3,9 +3,10 @@ bornAs: xq5ng41
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/ruling-ledger.mjs", "we:scripts/lib/restack-equivalence.mjs", "we:scripts/lib/__tests__/ruling-ledger.test.mjs", "we:scripts/lib/__tests__/restack-equivalence.test.mjs"]
 dateOpened: "2026-10-11"
+dateResolved: "2026-10-24"
 tags: []
 ---
 
