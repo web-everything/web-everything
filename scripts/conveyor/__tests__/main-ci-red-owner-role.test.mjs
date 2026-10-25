@@ -5,17 +5,15 @@
  * The real sink plumbing runs (createDispatchSinks -> defaultClaudeProvider -> defaultSpawnAgent / launchWrapped, and
  * the real gh-shim settings writer); only OS effects and this host's App configuration are injected.
  */
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const ROLE = 'WE_GITHUB_APP_ROLE';
 let priorRole; let tmp;
-beforeEach(() => {
-  priorRole = process.env[ROLE]; process.env[ROLE] = 'observer';
-  tmp = mkdtempSync(join(tmpdir(), 'ci-heal-role-'));
-  mkdirSync(join(tmp, 'bin')); writeFileSync(join(tmp, 'bin', 'gh'), '');
+let io; let defaultDispatchOwner; let DISPATCH_EFFECT;
+beforeAll(async () => {
   // This host's App configuration, injected into the REAL settings writer (two roles configured, a real `gh` on PATH).
   vi.doMock('../../lib/gh-app-shim.mjs', async (importOriginal) => {
     const real = await importOriginal();
@@ -24,15 +22,26 @@ beforeEach(() => {
       identity: { anyConfigured: true, roles: { worker: { appId: '1', installations: { o: 1 } }, observer: { appId: '2', installations: { o: 2 } } } },
     }) };
   });
+  // Load the real dispatch graph once, outside the 5s behavioral test budget. The owner also lazily imports
+  // ci-heal routing; warm that here too. The shim callback reads each test's current tmp directory at call time.
+  io = await import('../../operations/dispatch-lane-io.mjs');
+  ({ defaultDispatchOwner } = await import('../main-ci-red-io.mjs'));
+  ({ DISPATCH_EFFECT } = await import('../../operations/dispatch-lane.mjs'));
+  await import('../../operations/ci-heal-pr-dispatch.mjs');
+}, 30_000);
+afterAll(() => { vi.doUnmock('../../lib/gh-app-shim.mjs'); });
+beforeEach(() => {
+  priorRole = process.env[ROLE]; process.env[ROLE] = 'observer';
+  tmp = mkdtempSync(join(tmpdir(), 'ci-heal-role-'));
+  mkdirSync(join(tmp, 'bin')); writeFileSync(join(tmp, 'bin', 'gh'), '');
 });
 afterEach(() => {
-  vi.resetModules(); vi.doUnmock('../../lib/gh-app-shim.mjs');
   if (priorRole === undefined) delete process.env[ROLE]; else process.env[ROLE] = priorRole;
+  rmSync(tmp, { recursive: true, force: true });
 });
 
 let sessions = 0;
 const plumbing = async ({ wrapped = false, beforeLaunch = async () => {} } = {}) => {
-  const io = await import('../../operations/dispatch-lane-io.mjs');
   const seen = { settingsFile: [], argvSettings: [], execEnv: [], wrapperEnv: [] };
   const sinkOptions = {
     root: tmp, reserveLane: () => ({ reserved: false }), releaseLane: () => {},
@@ -64,7 +73,6 @@ const plumbing = async ({ wrapped = false, beforeLaunch = async () => {} } = {})
 
 it('delivers the worker role in the real settings.local.json, the --settings argv and the spawn env; the parent stays observer', async () => {
   const { sinkOptions, seen } = await plumbing();
-  const { defaultDispatchOwner } = await import('../main-ci-red-io.mjs');
   await defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, sinkOptions);
   expect(seen).toEqual({ settingsFile: ['worker'], argvSettings: ['worker'], execEnv: ['worker'], wrapperEnv: [] });
   expect(process.env[ROLE]).toBe('observer');
@@ -72,7 +80,6 @@ it('delivers the worker role in the real settings.local.json, the --settings arg
 
 it('launches the detached worker wrapper with the worker role in its env', async () => {
   const { sinkOptions, seen } = await plumbing({ wrapped: true });
-  const { defaultDispatchOwner } = await import('../main-ci-red-io.mjs');
   await defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, sinkOptions);
   expect(seen).toEqual({ settingsFile: ['worker'], argvSettings: ['worker'], execEnv: [], wrapperEnv: ['worker'] });
   expect(process.env[ROLE]).toBe('observer');
@@ -81,7 +88,6 @@ it('launches the detached worker wrapper with the worker role in its env', async
 it('two overlapping owner dispatches and an unrelated observer call in between: observer stays observer throughout', async () => {
   let release; const gate = new Promise((r) => { release = r; });
   const { io, sinkOptions, seen } = await plumbing({ beforeLaunch: () => gate });
-  const { defaultDispatchOwner } = await import('../main-ci-red-io.mjs');
   const first = defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, sinkOptions);
   const second = defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, sinkOptions);
   await new Promise((r) => setTimeout(r, 0));
@@ -96,7 +102,6 @@ it('two overlapping owner dispatches and an unrelated observer call in between: 
 
 it('a dispatch that passes no spawnEnv keeps the dispatcher role on every channel (other kinds unchanged)', async () => {
   const { io, sinkOptions, seen } = await plumbing();
-  const { DISPATCH_EFFECT } = await import('../../operations/dispatch-lane.mjs');
   await io.createDispatchSinks(sinkOptions)[DISPATCH_EFFECT]({ launchKind: 'ci-heal', prompt: 'p', sessionSlug: 'ci-heal-main', scope: [], repo: 'we' });
   expect(seen).toEqual({ settingsFile: ['observer'], argvSettings: ['observer'], execEnv: ['observer'], wrapperEnv: [] });
 });

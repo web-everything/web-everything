@@ -22,6 +22,7 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.attributesFile', '/dev/null'],
   ['core.sshCommand', 'ssh'],
   ['commit.gpgsign', 'false'],
+  ['push.gpgSign', 'false'],
   // PR #5775 self-review: `log.showSignature` makes every `git log` run `gpg.program` (lane-chosen) on a commit the
   // agent gave a gpgsig header, and puts signature lines in output callers parse. A `--reference` lane has alternates,
   // so a lane-set `core.alternateRefsCommand` runs on every fetch; `true` prints no refs (objects still resolve).
