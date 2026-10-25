@@ -340,8 +340,12 @@ describe('runRedTeamOnSkip', () => {
 
 
 describe('PR 5890 review-pr status payloads', () => {
-  it('bare resumed is not a red-team run result', () => {
-    expect(normalizeRedTeamResult('resumed')).toEqual({ priorResult: undefined, priorComment: undefined });
+  it('a finished string resumed result survives normalization and resumes with completed seat evidence', () => {
+    const status = { status: 'finished', result: 'resumed' };
+    expect(normalizeRedTeamResult(status.result)).toEqual({ priorResult: 'resumed', priorComment: undefined });
+    expect(decide({ readStatus: () => status,
+      readEvidence: () => ({ loopPayload: payload(), recorded: true, completedRecorded: true }) }))
+      .toMatchObject({ action: 'dispatch', mode: 'resume' });
   });
   it.each(['resumed', 'ran', { status: 'resumed' }])('review-pr row %j with no seat dispatches fresh', result => {
     const loopPayload = { ...payload(), op: 'review-pr' };

@@ -5,7 +5,7 @@ import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { publishAttention, replay } from '../needs-you-feed.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { runReviewJob, createReviewJobIo } from '../review-job.mjs';
+import { runReviewJob, createReviewJobIo, readRedTeamRecoveryStatus } from '../review-job.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus } from '../../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamOwedOnHead } from '../../lib/review-red-team-policy.mjs';
@@ -81,6 +81,24 @@ describe('review-job red-team skip settlement', () => {
       expect(admission.redTeamAdmission.prior).toEqual(cardOnly ? null : {
         repo, pr, head, status: 'finished', result: { status: 'skipped' },
       });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('queued admission preserves string resumed so a crashed worker can recover its finished result', () => {
+    const root = mkdtempSync(join(tmpdir(), 'resumed-admission-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_STATUS_LABELS: '0' };
+    const key = { repo, pr, head, env };
+    const readEvidence = () => ({ inFlight: false, queued: false });
+    const production = createReviewJobIo({ env, readEvidence });
+    const loopPayload = payload();
+    try {
+      production.redTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'resumed' });
+      const admission = production.redTeamStatus({ repo, pr, loopPayload, status: 'queued', redTeamMode: 'resume' });
+      expect(admission.priorResult).toBe('resumed');
+      expect(admission.redTeamAdmission.prior).toMatchObject({ status: 'finished', result: 'resumed' });
+      expect(readRedTeamStatus(key)).toMatchObject({ status: 'queued', pid: process.pid, result: 'resumed' });
+      expect(readRedTeamRecoveryStatus(key, { readEvidence }))
+        .toMatchObject({ status: 'finished', result: 'resumed' });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

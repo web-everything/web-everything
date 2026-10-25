@@ -12,7 +12,7 @@ import { redTeamStatusWithoutRun } from './red-team-run-result.mjs';
 /** Normalize both persisted production result shapes at the recovery boundary. */
 export function normalizeRedTeamResult(result) {
   return {
-    priorResult: typeof result === 'string' ? (result === 'resumed' ? undefined : result) : result?.status,
+    priorResult: typeof result === 'string' ? result : result?.status,
     priorComment: typeof result === 'object' ? (result?.comment?.status ?? result?.comment) : undefined,
   };
 }
