@@ -50,6 +50,31 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
         action: 'clear', why: 'not owed (stored review)' }]);
     });
 
+  it.each(['inFlight', 'queued'])('skips an accepted not-owed review while %s', key => {
+    const f = storedFixture(), evidence = { ...f.readEvidence(), [key]: true };
+    f.readEvidence = () => evidence;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'red-team pass in flight' });
+  });
+
+  it('skips an accepted not-owed review with a prior error status row', () => {
+    const readStatus = vi.fn(() => ({ status: 'finished', head: storedHead, result: 'error' }));
+    expect(planRedTeamOnSkip(storedFixture({ readStatus }))[0])
+      .toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+    expect(readStatus).toHaveBeenCalledWith({ repo, pr: storedPr, head: storedHead });
+  });
+
+  it('skips an accepted not-owed review with recorded red-team evidence', () => {
+    const f = storedFixture(), evidence = { ...f.readEvidence(), recorded: true };
+    f.readEvidence = () => evidence;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+  });
+
+  it('fails closed when prior status is unreadable for an accepted not-owed review', () => {
+    const f = storedFixture({ readStatus: () => { throw Error('unreadable'); } });
+    expect(planRedTeamOnSkip(f)[0])
+      .toMatchObject({ action: 'skip', why: 'red-team evidence unreadable; inspect stored evidence before retrying' });
+  });
+
   it.each([[], ['review:human'], undefined, null, 'review:accepted'].map(labels => [labels]))(
     'keeps the existing skip without readable accepted labels %j', labels => {
       const f = storedFixture(); f.rawPrs[0].labels = labels;
