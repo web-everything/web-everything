@@ -70,6 +70,7 @@ import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlin
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
 import { recordRemoteVerification, waitForRemoteVerify, MAX_REMOTE_WAIT_MS } from './lib/remote-verify.mjs';
+import { CONSTELLATION_REPOS } from './lib/constellation-repos.mjs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
@@ -218,7 +219,7 @@ if (MODE === 'remote') {
     if (!match || ['.', '..'].includes(match[1]) || ['.', '..'].includes(match[2])) {
       throw new Error('Unsupported origin URL; use local verify');
     }
-    const slug = 'web-everything/web-everything';
+    const slug = CONSTELLATION_REPOS.we.slug;
     if (`${match[1]}/${match[2]}`.toLowerCase() !== slug) {
       throw new Error('Remote verification requires the canonical origin; use local verify');
     }
