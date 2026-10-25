@@ -3510,6 +3510,20 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     expect(calls).toEqual([]);
   });
 
+  it('plain rearm refuses a head that moves on the second read after the initial pin check, leaving no label or re-arm marker', () => {
+    const expectedHead = 'a'.repeat(40);
+    // The first read passes the initial pin check; only the second read sees the push.
+    const { exitCode, calls, payload, readPrState } = run(['9', '--repo=o/n', `--expect-head=${expectedHead}`],
+      [REVIEW_LABELS.changes], { headRefOid: expectedHead, freshState: { headRefOid: 'b'.repeat(40) } });
+    expect(readPrState).toHaveBeenCalledTimes(2);
+    expect(readPrState.mock.results.map(({ value }) => value.headRefOid)).toEqual([expectedHead, 'b'.repeat(40)]);
+    expect(exitCode).toBe(1);
+    expect(payload.error).toContain('live head differs from --expect-head');
+    expect(calls).not.toContain('setLabels');
+    expect(calls).not.toContain('postComment');
+    expect(calls).toEqual([]);
+  });
+
   it.each(['', 'abcdef0', 'z'.repeat(40), 'a'.repeat(41)])('plain rearm refuses non-40-hex --expect-head=%s', head => {
     const { exitCode, calls, payload } = run(['9', '--repo=o/n', `--expect-head=${head}`], [REVIEW_LABELS.changes]);
     expect(exitCode).not.toBe(0);
