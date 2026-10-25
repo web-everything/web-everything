@@ -496,15 +496,22 @@ export function splitFailingChecks(rollup, requiredChecks) {
   return out;
 }
 
-/** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
-export function reviewHoldOnlyRed(rollup, requiredChecks) {
+/** PURE: every failing required check is a review-owned hold (review-gate, or an annotated merge-gate). */
+export function reviewHoldGatesOnlyRed(rollup, requiredChecks) {
   if (!Array.isArray(rollup)) return false;
   const latest = collapseRollupToLatestPerName(rollup);
   if (latest.some(row => !row || typeof (row.name || row.context) !== 'string')) return false;
   const failing = splitFailingChecks(latest, requiredChecks).required;
   const mergeGate = latest.find(row => row?.name === 'merge-gate');
-  if (!failing.length || !failing.every(name => name === 'review-gate'
-    || (name === 'merge-gate' && mergeGate?.mergeGateReviewHold))) return false;
+  return failing.length > 0 && failing.every(name => name === 'review-gate'
+    || (name === 'merge-gate' && Boolean(mergeGate?.mergeGateReviewHold)));
+}
+
+/** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
+export function reviewHoldOnlyRed(rollup, requiredChecks) {
+  if (!reviewHoldGatesOnlyRed(rollup, requiredChecks)) return false;
+  const latest = collapseRollupToLatestPerName(rollup);
+  const failing = splitFailingChecks(latest, requiredChecks).required;
   // Removing the proven holds must leave complete, readable green CI, never pending or unknown evidence.
   return reduceCheckState(latest.map(row => failing.includes(row?.name || row?.context)
     ? { ...row, conclusion: 'success' } : row), requiredChecks).state === 'green'
@@ -2898,7 +2905,7 @@ export function planReconcile({
     const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
     const reviewHoldRed = ciRepairOwed
       && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
-      && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks);
+      && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
     if (reviewHoldRed) {
       refuse('review-hold-red', { ...withPhase, why: `review daemon owns held gates: ${heldGates.join(', ')}` });
       // An admitted advisory owns a repair next. Keep the existing finding/cap/ruling
