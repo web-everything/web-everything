@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction, laneProbeEnv, laneRedirectConfig, laneMaskingConfig } from '../../lib/health-watch-lane-scan.mjs';
+import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction, laneProbeEnv, laneRedirectConfig, laneMaskingConfig, withHonestReportingPins, LANE_HONEST_REPORTING_PINS } from '../../lib/health-watch-lane-scan.mjs';
 import { createStaleStateReader } from '../stale-state-io.mjs';
 import { OPERATIONS } from '../run.mjs';
 import { DIRTY_PROBE_ARGS, laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
@@ -585,6 +585,42 @@ describe('untrusted lane Git configuration', () => {
     expect(laneMaskingConfig(`local\0core.ignoreStat\n${term}true\0`)).toEqual(['core.ignoreStat']);
   });
 
+  it('parses a hostile many-line config entry in linear time and still sees the key on its first lines', () => {
+    const hostile = `x.y\n${'\n'.repeat(200_000)}`;
+    const started = Date.now();
+    expect(configKeyCandidates(hostile).length).toBeLessThanOrEqual(9);
+    expect(laneMaskingConfig(`local\0${hostile}\0`)).toEqual([]);
+    expect(laneFilterDrivers(`local\0${hostile}\0`)).toEqual([]);
+    expect(riskyLaneConfig(`local\0${hostile}\0`)).toEqual([]);
+    expect(laneRedirectConfig(`local\0${hostile}\0`)).toEqual([]);
+    // The keys that matter are on the first lines and are still found past a huge value.
+    expect(laneMaskingConfig(`local\0core.ignoreStat\ntrue${'\n'.repeat(200_000)}\0`)).toEqual(['core.ignoreStat']);
+    expect(laneFilterDrivers(`local\0filter.a.clean\n${'x\n'.repeat(100_000)}\0`)).toEqual(['filter.a.clean']);
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it('pins the honest value of every masking key at command scope, after any existing pins, and agrees with the refusal', () => {
+    const env = withHonestReportingPins({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'a.b', GIT_CONFIG_VALUE_0: '1',
+      GIT_CONFIG_KEY_1: 'c.d', GIT_CONFIG_VALUE_1: '2', KEEP: 'x' });
+    expect(env.GIT_CONFIG_COUNT).toBe(String(2 + LANE_HONEST_REPORTING_PINS.length));
+    expect(env).toMatchObject({ GIT_CONFIG_KEY_0: 'a.b', GIT_CONFIG_VALUE_1: '2', KEEP: 'x' });
+    LANE_HONEST_REPORTING_PINS.forEach(([key, value], i) => {
+      expect([env[`GIT_CONFIG_KEY_${2 + i}`], env[`GIT_CONFIG_VALUE_${2 + i}`]]).toEqual([key, value]);
+      // A pin is only honest if the refusal would accept that very value in a lane's own config.
+      expect(laneMaskingConfig(entry(key, value))).toEqual([]);
+    });
+    // Every key the refusal knows has a pin, so no host-level setting survives unpinned.
+    for (const key of ['core.ignoreStat', 'core.sparseCheckout', 'core.sparseCheckoutCone', 'index.sparse', 'core.untrackedCache',
+      'core.fileMode', 'core.symlinks', 'core.trustctime', 'core.autocrlf', 'core.eol', 'core.checkStat']) {
+      expect(LANE_HONEST_REPORTING_PINS.map(([k]) => k)).toContain(key);
+    }
+    const probe = vi.fn(() => '');
+    freshLaneSafety({ path: '/l', exec: probe });
+    for (const [, , options] of probe.mock.calls) {
+      expect(options.env.GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length + LANE_HONEST_REPORTING_PINS.length));
+    }
+  });
+
   // The closed path for the guarantee "output we cannot parse is unsafe", one case per parsed probe.
   const CLEAN_STAGE = `100644 ${'a'.repeat(40)} 0\ttracked.txt\0`;
   const CLEAN_CONFIG = 'local\0core.repositoryformatversion\n0\0';
@@ -729,6 +765,30 @@ describe('lane action guard with real Git', () => {
     writeFileSync(join(path, 'tracked.txt'), 'edited behind the stat cache\n');
     expect(git(['status', '--porcelain']).trim()).toBe('');
     expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'lane Git config can hide worktree changes' });
+  });
+
+  it('a host-level (global) core.fileMode=false cannot make a lane with edits read as clean', () => {
+    const { path, git } = fixture();
+    const home = temp();
+    writeFileSync(join(home, '.gitconfig'), '[core]\n\tfileMode = false\n');
+    git(['config', '--unset', 'core.fileMode']); // `git init` wrote it locally, which would outrank the global file
+    chmodSync(join(path, 'tracked.txt'), 0o755);
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('XDG_CONFIG_HOME', join(home, '.config'));
+    try {
+      // The global file is what an UNPINNED git would read: it reports the mode change as nothing.
+      const unpinned = execFileSync('git', ['status', '--porcelain'], { cwd: path, encoding: 'utf8',
+        env: { ...laneGitEnv(path), HOME: home, XDG_CONFIG_HOME: join(home, '.config'), GIT_CONFIG_NOSYSTEM: '1',
+          GIT_CONFIG_GLOBAL: join(home, '.gitconfig') } }); // the test runner pins its own global; the probe scrubs it and reads HOME
+      expect(unpinned.trim()).toBe('');
+      for (const action of actions) {
+        expect(guardLaneAction({ path, action, log: vi.fn() }))
+          .toMatchObject({ act: false, fresh: { hasUnsafeWork: true, reason: 'worktree has changes' } });
+      }
+      chmodSync(join(path, 'tracked.txt'), 0o644);
+      expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: false });
+    } finally { vi.unstubAllEnvs(); }
+    expect(git(['status', '--porcelain']).trim()).toBe('');
   });
 
   it('refuses a lane whose grafts path cannot be resolved (fail closed)', () => {

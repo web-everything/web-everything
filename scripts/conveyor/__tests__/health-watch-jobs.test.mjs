@@ -497,6 +497,14 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     expect([...GH_GROUP_PROBE_NAMES].sort()).toEqual([...new Set(used)].sort());
   });
 
+  it('the worker\'s probe group hands its lane-scan cache target to the stale-state probe, and defaults to no cache', () => {
+    // The worker thread calls collectGhProbes(input) with the stored job input; a dropped key would silently fall back to defaults.
+    const source = collectGhProbes.toString();
+    expect(source).toMatch(/probeStaleState\(\{[^}]*\blaneScanDir\b[^}]*\blaneScanWrite\b[^}]*\}\)/);
+    expect(source).toMatch(/laneScanDir\s*=\s*null/);
+    expect(source).toMatch(/laneScanWrite\s*=\s*false/);
+  });
+
   it('a job that keeps failing builds its own ghJob streak across the queued ticks between failures', async () => {
     const { flags, hd } = setup('jobstreak');
     const store = createJobStore(join(dir, 'jobs-jobstreak'));

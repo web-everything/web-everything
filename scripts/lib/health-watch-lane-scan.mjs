@@ -118,8 +118,9 @@ export function laneMaskingConfig(listOutput) {
   for (let i = 0; i + 1 < parts.length; i += 2) {
     if (parts[i] !== 'local' && parts[i] !== 'worktree') continue;
     const entry = parts[i + 1];
+    const candidates = configKeyCandidates(entry); // once per entry: the entry is lane-writable and may be huge
     for (const [re, honest] of LANE_MASKING_KEYS) {
-      const key = configKeyCandidates(entry).find(c => re.test(c));
+      const key = candidates.find(c => re.test(c));
       if (key === undefined) continue;
       // A bare key has no `\n<value>` and reads as true.
       const value = entry.length > key.length ? entry.slice(key.length + 1) : 'true';
@@ -128,6 +129,28 @@ export function laneMaskingConfig(listOutput) {
     }
   }
   return found;
+}
+
+// The honest value of every key in LANE_MASKING_KEYS, pinned at command scope for the fresh safety probe. The refusal above
+// only sees the lane's own scopes; these pins also beat a host-level (global) `core.fileMode=false` or `core.ignoreStat=true`
+// that would hide lane edits from status, and they cannot be undone by anything in the lane.
+export const LANE_HONEST_REPORTING_PINS = Object.freeze([
+  ['core.ignoreStat', 'false'], ['core.sparseCheckout', 'false'], ['core.sparseCheckoutCone', 'false'], ['index.sparse', 'false'],
+  ['core.untrackedCache', 'false'], ['core.fileMode', 'true'], ['core.symlinks', 'true'], ['core.trustctime', 'true'],
+  ['core.autocrlf', 'false'], ['core.eol', 'native'], ['core.checkStat', 'default'],
+]);
+
+/** `env` with {@link LANE_HONEST_REPORTING_PINS} appended after its existing `GIT_CONFIG_COUNT` entries (the later entry wins). Pure. */
+export function withHonestReportingPins(env) {
+  const out = { ...env };
+  const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
+  const start = Number.isInteger(n) && n > 0 ? n : 0;
+  LANE_HONEST_REPORTING_PINS.forEach(([k, v], i) => {
+    out[`GIT_CONFIG_KEY_${start + i}`] = k;
+    out[`GIT_CONFIG_VALUE_${start + i}`] = v;
+  });
+  out.GIT_CONFIG_COUNT = String(start + LANE_HONEST_REPORTING_PINS.length);
+  return out;
 }
 
 /** Env every lane probe git runs under, on top of the repo's lane hardening. */
@@ -158,7 +181,7 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
   const unsafe = (reason, error) => ({ hasUnsafeWork: true, fresh: true, observedAt, reason, ...(error ? { error } : {}) });
   if (typeof path !== 'string' || !path) return unsafe('no lane path');
   const git = argv => String(exec('git', hardenLaneGitArgs(argv), { cwd: path, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
-    env: laneProbeEnv(path), stdio: ['ignore', 'pipe', 'pipe'] }));
+    env: withHonestReportingPins(laneProbeEnv(path)), stdio: ['ignore', 'pipe', 'pipe'] }));
   try {
     // Config reads execute no drivers. Refuse lane-owned filters before status can run a clean filter.
     const config = git([...LANE_CONFIG_LIST_ARGS]);

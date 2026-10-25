@@ -84,9 +84,21 @@ const FILTER_DRIVER_KEY_RE = /^filter\..+\.(clean|smudge|process)$/is;
  * @returns {string[]}
  */
 export function configKeyCandidates(entry) {
-  const lines = String(entry ?? '').split('\n');
-  return lines.map((_, i) => lines.slice(0, i + 1).join('\n'));
+  const text = String(entry ?? '');
+  const candidates = [];
+  let end = -1;
+  // Bounded: every prefix of a hostile many-line entry would cost O(lines^2) in time and memory, and the config is lane-
+  // writable. Real keys never span lines, so the first few prefixes plus the whole entry cover every misparse we defend
+  // against while the cost stays linear in the entry's size.
+  for (let i = 0; i < MAX_KEY_PREFIXES; i += 1) {
+    end = text.indexOf('\n', end + 1);
+    if (end === -1) break;
+    candidates.push(text.slice(0, end));
+  }
+  candidates.push(text);
+  return candidates;
 }
+const MAX_KEY_PREFIXES = 8;
 
 /**
  * The `filter.<name>.clean|smudge|process` keys a lane's OWN config (local / worktree scope, includes followed) defines,
