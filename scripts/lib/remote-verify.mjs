@@ -1,5 +1,6 @@
 /** Pure remote verification decisions; network, clock and timers belong to the caller. */
 import { verifyStartBody, verifyFinishBody } from './lane-verify.mjs';
+import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 const fullSha = (sha) => typeof sha === 'string' && /^[a-f0-9]{40}$/i.test(sha);
 const sameSha = (a, b) => fullSha(a) && fullSha(b) && a.toLowerCase() === b.toLowerCase();
@@ -44,7 +45,7 @@ async function protectedDefinition(sha, fetchDefinition) {
     const { head, base } = await fetchDefinition();
     if (!sameSha(head?.sha, sha) || !fullSha(base?.sha)
       || !sameSha(head?.commit?.tree?.sha, base?.commit?.tree?.sha)) throw new Error();
-    return { repository: 'web-everything/web-everything', protectedSha: base.sha.toLowerCase(),
+    return { repository: CONSTELLATION_REPOS.we.slug, protectedSha: base.sha.toLowerCase(),
       definitionTree: base.commit.tree.sha.toLowerCase() };
   } catch {
     throw Object.assign(new Error('Untrusted or unreadable protected definition; use local verify'),

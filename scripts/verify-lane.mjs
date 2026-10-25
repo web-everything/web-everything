@@ -58,6 +58,7 @@
  * marker written) / `request` refused because no verify daemon is alive / `reset` refused because a FOREIGN lease is live (own live lease no longer refuses, #3378).
  */
 import { resolveBuildPolicy } from './lib/build-policy.mjs';
+import { CONSTELLATION_REPOS } from './lib/constellation-repos.mjs';
 import { redFirstWarning } from './lib/tests-first-policy.mjs';
 import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mjs';
@@ -221,7 +222,7 @@ if (MODE === 'remote') {
     if (!match || ['.', '..'].includes(match[1]) || ['.', '..'].includes(match[2])) {
       throw new Error('Unsupported origin URL; use local verify');
     }
-    const slug = 'web-everything/web-everything';
+    const slug = CONSTELLATION_REPOS.we.slug;
     if (`${match[1]}/${match[2]}`.toLowerCase() !== slug) {
       throw new Error('Remote verification requires the canonical origin; use local verify');
     }
