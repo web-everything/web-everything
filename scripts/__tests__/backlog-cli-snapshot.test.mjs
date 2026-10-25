@@ -18,7 +18,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, cpSync, renameSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, cpSync, renameSync, readdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,6 +44,8 @@ beforeAll(() => {
   // import.meta.url) resolves inside the throwaway clone, not the real repo — the mutation genuinely
   // lands only in `clone/backlog/*`, never touches this lane's real `backlog/`.
   cpSync(WE_SCRIPTS_DIR, join(clone, 'scripts'), { recursive: true, filter: skipTestDirs });
+  // Copied CLI imports need installed packages while their ROOT stays inside this fixture.
+  symlinkSync(join(dirname(WE_SCRIPTS_DIR), 'node_modules'), join(clone, 'node_modules'), 'dir');
   // `claim`/`resolve`/etc unconditionally re-save reservations/claims state alongside the frontmatter
   // write (best-effort convenience bookkeeping, not gated on it existing) — seed empty state so that
   // save doesn't ENOENT on a directory this throwaway clone never had a reason to create otherwise.

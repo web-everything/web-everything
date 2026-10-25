@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
-import { cpSync } from 'node:fs';
+import { cpSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +21,7 @@ let clone;
 beforeAll(() => {
   clone = mkdtempSync(join(tmpdir(), 'we-resolve-parent-'));
   cpSync(WE_SCRIPTS_DIR, join(clone, 'scripts'), { recursive: true });
+  symlinkSync(join(dirname(WE_SCRIPTS_DIR), 'node_modules'), join(clone, 'node_modules'), 'dir');
   mkdirSync(join(clone, '.claude', 'skills', 'batch-backlog-items'), { recursive: true });
   mkdirSync(join(clone, 'backlog'), { recursive: true });
 });

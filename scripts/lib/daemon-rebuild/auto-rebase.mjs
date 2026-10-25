@@ -260,10 +260,19 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     throw e;
   } finally {
     clearInterval(heartbeat);
+    const cleanupErrors = [];
+    let scratchCleanupFailed = false;
     if (testReport) try { io.rmSync(testReport, { force: true }); }
-    catch (e) { reportNeedsYou({ root, env, ref, stage: 'cleanup', error: e, io, event, now }); }
+    catch (e) { cleanupErrors.push(e); }
     if (scratch) try { io.rmSync(scratch, { recursive: true, force: true }); }
-    catch (e) { stage = 'cleanup'; reportFailure(e); throw e; }
+    catch (e) { scratchCleanupFailed = true; cleanupErrors.push(e); }
+    // Both removals must run, but one cleanup incident should produce one needs-you alert.
+    if (cleanupErrors.length) {
+      const error = cleanupErrors.length === 1 ? cleanupErrors[0]
+        : new AggregateError(cleanupErrors, cleanupErrors.map(e => String(e?.message ?? e)).join('; '));
+      reportNeedsYou({ root, env, ref, stage: 'cleanup', error, io, event, now });
+      if (scratchCleanupFailed) throw cleanupErrors[cleanupErrors.length - 1];
+    }
   }
 }
 
