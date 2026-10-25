@@ -41,6 +41,10 @@ import {
 export async function prepareRebuild({
   root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase,
 }) {
+  // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
+  if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
+    env = { ...env, WE_DAEMON_AUTO_REBASE: '0' };
+  }
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
   const alertsList = [];

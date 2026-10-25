@@ -33,6 +33,15 @@ if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.
 if (a[0] === 'pr' && a[1] === 'list' && process.env.RMH_LATE_FREEZE && !fs.existsSync(process.env.RMH_LATE_FREEZE)) {
   fs.writeFileSync(process.env.RMH_LATE_FREEZE, JSON.stringify({ frozen: true, at: new Date().toISOString(), reason: 'raised mid-pass' }));
 }
+// RMH_LATE_GROUP: a card group claims PR <n> AFTER the drain's pre-pass hold check — written while the drain lists the PRs
+// stacked on lane/leaf-<n>, the last gh call before the merge-write mutex (xym8nt4).
+if (a[0] === 'pr' && a[1] === 'list' && process.env.RMH_LATE_GROUP) {
+  const [file, n] = process.env.RMH_LATE_GROUP.split('#');
+  if (a.includes('lane/leaf-' + n) && !fs.existsSync(file)) {
+    fs.writeFileSync(file, JSON.stringify({ groups: [{ id: 'late', repo: 'fixture/drain-rmh', pr: 4100, branch: 'lane/card-group-late',
+      createdAt: Date.now(), files: ['backlog/leaf-' + n + '.md'], sources: [{ num: Number(n), headSha: 'sha-' + n }] }], failed: {} }));
+  }
+}
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
 // The drain's candidate listing reads small GraphQL pages (pr-list-paged.mjs); the shared fixture serves them.
 if (a[0] === 'api' && a[1] === 'graphql') {
@@ -85,7 +94,7 @@ const OTHER = 3002; // an unrelated PR that is otherwise fully mergeable
  * @param {{ freeze?: 'env'|'legacy'|'both'|null, priorityPrs?: number[]|null, publishedRed?: boolean, holdSetting?: 'on'|'off'|null,
  *           fixMergeable?: string, unfreezeFirst?: boolean, dryRun?: boolean, stranded?: boolean, lateFreeze?: boolean }} o
  */
-function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdSetting = null, fixMergeable = 'MERGEABLE', unfreezeFirst = false, dryRun = false, stranded = false, lateFreeze = false, shared = null, markerKind = null, manualFix = 'hold' } = {}) {
+function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdSetting = null, fixMergeable = 'MERGEABLE', unfreezeFirst = false, dryRun = false, stranded = false, lateFreeze = false, shared = null, markerKind = null, manualFix = 'hold', cardGroup = false, lateGroup = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-rmh-'));
   try {
     const bin = join(dir, 'bin');
@@ -113,6 +122,9 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     if (freeze === 'sibling') { mkdirSync(dirname(siblingMarker), { recursive: true }); writeFileSync(siblingMarker, JSON.stringify(marker)); }
     if (freeze === 'both') writeFileSync(newMarker, JSON.stringify({ ...marker, reason: 'raised at the new path' }));
     if (priorityPrs) writeFileSync(join(coord, 'main-red-priority.json'), JSON.stringify({ repo: 'we', pr: priorityPrs[0], prs: priorityPrs, firstRedSha: 'abc1234567', expiresAt: FUTURE }));
+    // xym8nt4 — an open card group (combined #4000, awaiting review) that RESERVES the fix PR's card file.
+    if (cardGroup) writeFileSync(join(coord, 'drain-card-groups.json'), JSON.stringify({ groups: [{ id: 'g', repo: 'fixture/drain-rmh', pr: 4000,
+      branch: 'lane/card-group-g', createdAt: NOW, files: [`backlog/leaf-${FIX}.md`], sources: [{ num: 4001, headSha: 'sha-4001' }] }], failed: {} }));
     if (publishedRed) writeFileSync(join(coord, 'main-ci-red-state.json'), JSON.stringify({ red: true, firstRedSha: 'abc1234567', since: NOW - 60_000, setAt: NOW, expiresAt: FUTURE }));
     // The merge-queue/freshness hook is a separate gate (its own wiring test); with VITEST cleared the live ON file would
     // be read and refuse these fixture PRs (facts-incomplete), so pin it OFF to isolate the red-main hold.
@@ -125,6 +137,7 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
       WE_MERGE_DELIVERY_SETTINGS_FILE: mqSettings,
       WE_RED_MAIN_FREEZE_SHARED: 'off' }; // VITEST is cleared below, so the unfreeze CLI must not push the live shared ops branch (xyd06qo)
     if (freeze === 'sibling') delete env.WE_RED_MAIN_FREEZE_LEGACY;
+    if (lateGroup) env.RMH_LATE_GROUP = `${join(coord, 'drain-card-groups.json')}#${lateGroup}`;
     const gitLog = join(dir, 'git-calls.log');
     if (stranded) { // an open card whose delivery is already on main: the stranded-card sweep's job is to resolve + push it
       mkdirSync(join(dir, 'backlog'));
@@ -163,6 +176,28 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
       migratedFrom: existsSync(newMarker) ? JSON.parse(readFileSync(newMarker, 'utf8')).migratedFrom ?? null : null, legacyMarker };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
+
+describe('xym8nt4 — a card group never deadlocks the published main-red repair PR (real drain CLI)', () => {
+  it('control: on green main the group reservation holds the PR touching its card', () => {
+    const { attempts, stderr, result } = runCli({ cardGroup: true });
+    expect(attempts, stderr).toEqual([OTHER]);
+    expect(result.enqueueOutcomes).toContainEqual(expect.objectContaining({ num: FIX, outcome: 'not-enqueued', kind: 'card-grouped',
+      reason: expect.stringMatching(/reserved by open card group #4000/) }));
+  }, 30000);
+
+  it('a PR a card group claims after the pre-pass check is re-checked inside the merge-write mutex: not merged', () => {
+    const { attempts, stderr, result } = runCli({ lateGroup: FIX });
+    expect(attempts, stderr).toEqual([OTHER]);
+    expect(result.enqueueOutcomes).toContainEqual(expect.objectContaining({ num: FIX, outcome: 'not-enqueued', kind: 'card-group-hold',
+      reason: expect.stringMatching(/grouped into #4100/) }));
+    expect(result.enqueueOutcomes.filter(o => o.num === FIX && o.outcome === 'enqueued')).toEqual([]);
+  }, 30000);
+
+  it('main red: the published fix PR lands although the group reserves its card; the unrelated PR stays held', () => {
+    const { attempts, stderr } = runCli({ publishedRed: true, priorityPrs: [FIX], cardGroup: true });
+    expect(attempts, stderr).toEqual([FIX]);
+  }, 30000);
+});
 
 describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-red-main-freeze)', () => {
   it('control: main not red → both PRs merge', () => {

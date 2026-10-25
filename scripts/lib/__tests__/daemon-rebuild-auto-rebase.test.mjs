@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
@@ -125,6 +125,107 @@ describe('auto-rebase executed-test inventory', () => {
 });
 
 describe('established overlay auto rebase', () => {
+  it.each(['success', 'test failure'])('links the sibling Frontier UI checkout for selected tests and unlinks only the link on %s', async outcome => {
+    const f = fixture(); f.moveMain();
+    const source = resolve(f.root, '..', 'frontierui');
+    write(source, 'plugs/marker.txt', 'keep source checkout');
+    const symlink = vi.spyOn(f.deps.io, 'symlinkSync');
+    const unlink = vi.spyOn(f.deps.io, 'unlinkSync');
+    const remove = vi.spyOn(f.deps.io, 'rmSync');
+    let scratch, target;
+    f.deps.testRunner = vi.fn(async options => {
+      scratch = options.root;
+      target = join(dirname(scratch), 'frontierui');
+      expect(options.args).toContain('worker.test.mjs');
+      expect(symlink).toHaveBeenCalledWith(source, target, 'dir');
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+      expect(fs.readlinkSync(target)).toBe(source);
+      expect(fs.readFileSync(join(target, 'plugs/marker.txt'), 'utf8')).toBe('keep source checkout');
+      expect(dirname(scratch)).toBe(f.scratched[0]);
+      expect(fs.statSync(dirname(scratch)).mode & 0o777).toBe(0o700);
+      return outcome === 'success' ? reportPassingTests(options) : { status: 1, stderr: 'selected test failed' };
+    });
+    if (outcome === 'success') await job(f);
+    else await expect(job(f)).rejects.toThrow('selected test failed');
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(unlink).toHaveBeenCalledOnce();
+    expect(unlink).toHaveBeenCalledWith(target);
+    expect(unlink.mock.invocationCallOrder[0]).toBeLessThan(remove.mock.invocationCallOrder.at(-1));
+    expect(remove).toHaveBeenCalledWith(dirname(scratch), { recursive: true, force: true });
+    expect(remove.mock.calls.some(([file]) => file === source || file.startsWith(`${source}/`))).toBe(false);
+    expect(fs.existsSync(dirname(scratch))).toBe(false);
+    expect(fs.readFileSync(join(source, 'plugs/marker.txt'), 'utf8')).toBe('keep source checkout');
+  });
+
+  it('runs selected tests without throwing or creating a Frontier UI link when the sibling is missing', async () => {
+    const f = fixture(); f.moveMain();
+    const source = resolve(f.root, '..', 'frontierui');
+    const stat = vi.spyOn(f.deps.io, 'statSync');
+    const symlink = vi.spyOn(f.deps.io, 'symlinkSync');
+    const unlink = vi.spyOn(f.deps.io, 'unlinkSync');
+    f.deps.testRunner = vi.fn(async options => {
+      expect(options.args).toContain('worker.test.mjs');
+      expect(stat).toHaveBeenCalledWith(source);
+      expect(fs.existsSync(join(dirname(options.root), 'frontierui'))).toBe(false);
+      return reportPassingTests(options);
+    });
+    await expect(job(f)).resolves.toMatchObject({ ref: `${ref}-auto-1` });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(symlink.mock.calls.some(([file]) => file === source)).toBe(false);
+    expect(unlink).not.toHaveBeenCalled();
+    expect(f.scratched.every(p => !fs.existsSync(p))).toBe(true);
+  });
+
+  it.each(['auditor', 'addOverlay'])('accepts stackBases rewrites during %s and completes adoption', async phase => {
+    const f = fixture(); f.moveMain();
+    const original = f.deps[phase];
+    f.deps[phase] = (...args) => {
+      persistStackBases(f.root, new Map([[overlay.pr, ['lane/stack-base']]]), { env: f.env });
+      return original(...args);
+    };
+    const replacement = await job(f);
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref, replacement.ref]);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    swaps(f);
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([replacement.ref]);
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+  });
+
+  it.each(['writeFileSync', 'renameSync'])('recovers registration when pending-swap persistence fails (%s)', async operation => {
+    const f = fixture(); f.moveMain();
+    const original = readOverlays(f.root, { env: f.env });
+    f.deps.io[operation] = (file, ...args) => {
+      if (file.startsWith(pendingDir(f)) && file.endsWith('.tmp')) throw new Error('pending persistence failed');
+      return fs[operation](file, ...args);
+    };
+    await expect(job(f)).rejects.toThrow('pending persistence failed');
+    expect(readOverlays(f.root, { env: f.env })).toEqual(original);
+    expect(f.calls).not.toContain('add');
+    expect(f.calls).not.toContain('auto-rebase-registered');
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+    expect(needsYouAlert(f).detail.stage).toBe('register');
+    f.deps.io[operation] = fs[operation];
+    const replacement = await job(f);
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref, replacement.ref]);
+  });
+
+  it.each([undefined, '0', '1'])('requires explicit auto-rebase opt-in under Vitest (switch %s)', async setting => {
+    const f = fixture();
+    const live = await planRebuild({ git: (a, o) => run(a, { cwd: f.root, ...o }), headSha: f.baseSha, mainRef: 'origin/main', overlays: [overlay] });
+    f.moveMain(); ok(f.root, ['reset', '--hard', live.finalSha]);
+    writeRebuildState(f.root, { adopted: { head: live.finalSha } }, f.env);
+    const env = { ...f.env }; delete env.WE_DAEMON_AUTO_REBASE;
+    if (setting !== undefined) env.WE_DAEMON_AUTO_REBASE = setting;
+    const kick = vi.fn(() => ({ started: [ref], skipped: [] })), cleanup = vi.fn();
+    const result = await prepareRebuild({ root: f.root, env, run, log: {}, now: Date.now,
+      prState: async () => 'OPEN', prBaseChain: async () => null,
+      autoRebase: { resolveAutoRebaseSwitch, kickAutoRebase: kick, finishPendingSwaps: cleanup } });
+    expect(result.result.reason).toBe('established-overlay-conflict');
+    expect(kick).toHaveBeenCalledTimes(setting === '1' ? 1 : 0);
+    expect(cleanup).toHaveBeenCalledTimes(setting === '1' ? 1 : 0);
+    expect(env.WE_DAEMON_AUTO_REBASE).toBe(setting);
+  });
+
   describe('operator withdrawal during detached repair', () => {
     it.each(['codex', 'testRunner', 'auditor', 'push', 'register'])(
       'does not resurrect an overlay removed during %s', async phase => {
@@ -595,13 +696,20 @@ describe('established overlay auto rebase', () => {
       assertRule(f, result, 'related-tests');
     });
 
-    it('records related-tests evidence before a failing test run and never registers a pass', async () => {
+    it.each([
+      ['nonzero exit', { status: 1, stderr: 'regression failed' }],
+      ['signal exit', { status: null, signal: 'SIGTERM' }],
+      ['process error', { status: 0, error: new Error('runner error') }],
+      ['missing status', {}],
+      ['missing result', undefined],
+    ])('records related-tests evidence before a failing test run (%s) and never registers a pass', async (_mode, result) => {
       const f = fixture(); f.moveMain();
-      f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'regression failed' }));
-      await expect(job(f)).rejects.toThrow();
+      f.deps.testRunner = vi.fn(async () => result);
+      await expect(job(f)).rejects.toThrow('selected test failed or incomplete');
       expect(f.deps.testRunner).toHaveBeenCalledOnce();
       expect(f.deps.auditor).not.toHaveBeenCalled();
       assertUnregistered(f);
+      expect(needsYouAlert(f).detail).toMatchObject({ stage: 'tests', reason: 'selected test failed or incomplete' });
       expect(records(alertsFilePath(f.root, f.env))).toContainEqual(expect.objectContaining({
         kind: 'auto-rebase-evidence', detail: expect.objectContaining({ ref, rule: 'related-tests', noTestFiles: [] }),
       }));

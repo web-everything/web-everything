@@ -9,6 +9,14 @@ creates no pending swap and reports `auto-rebase-needs-you`. A removal during pu
 unregistered remote branch; it never authorizes loading that branch. Unrelated list edits are preserved.
 The `operator withdrawal during detached repair` tests cover each async phase and the final write boundary;
 the `auto-rebase-operator-withdrawal` soak scenario uses the real removal CLI with injected Git and agents.
+All three registration guards share `registrationIdentity`: cached `stackBases` rewrites do not change
+operator intent, while every other field still participates in the comparison. Worker regressions rewrite
+the cache during audit and at registration, then exercise adoption cleanup.
+Pending evidence is persisted before replacement registration. Write or rename failure leaves only the
+original registration; a rejected registration removes its pending file. An interruption between persistence
+and registration leaves evidence for cleanup to escalate safely. The persistence regressions also retry the repair.
+Under Vitest, `prepareRebuild` defaults auto-rebase to off without mutating the caller's environment;
+tests exercising worker launch or pending cleanup must explicitly set `WE_DAEMON_AUTO_REBASE=1`.
 
 The detached worker in `scripts/lib/daemon-rebuild/auto-rebase.mjs` merges main into a new
 `<ref>-auto-<n>` branch so ancestry preserves the original tip. It retains the old registration
@@ -258,6 +266,26 @@ Verify-daemon orphan fixtures must inject both `isAlive` and `groupAlive`: a fak
 does not imply its host process group is gone. Signal-zero probes can return `EPERM` in a
 restricted execution environment, which correctly retains the entry. The real-process adoption
 test additionally requires permission to inspect child argv with `ps`.
+
+Runner fixtures using synthetic PIDs must inject `identity` alongside `alive`: a successful
+existence probe still checks process identity. Stamp fixtures must also inject `identityOf`
+or supply both `runnerStart` and `runnerArgv`, so stamping cannot inspect a host process.
+
+Keep production PID caller tests in a dedicated file using injected IO: the Vitest
+`node:child_process` module mock does not reach `pid-alive.mjs` in this configuration.
+Inject `buildLeaseSignalsFor`'s `isPidAlive`, composing `defaultIsPidAlive` with a fake
+`kill` and `pidIdentity` with a fake `exec`. Assert the `ps` call as well as liveness
+and reclamation outcomes; see `pid-identity-lease-reaper.test.mjs`.
+
+PID identity probes return `true`, `false`, or `null`: callers must compare explicitly,
+never truthiness-test `defaultIsPidAlive` or `probePid`. Only `false` establishes death;
+unreadable identity or claim-runner command evidence retains a fresh claim's lane veto.
+Test both wrapper and claim-runner wiring. Cover every changed `catch` branch with an
+injected error: existence success and `EPERM` must consult identity (including false and
+null verdicts), `ESRCH` proves death, and other errors remain unknown without identity IO.
+Include invalid PID inputs and an identity probe that throws. A working Claude session
+can retain `claude bg-spare` argv; require stored start/argv mismatch or other positive
+death evidence to reclaim it. Legacy unstamped spares retain TTL recovery.
 
 The host queue needs write access to the admission pool's parent as well as the pool:
 `releaseLockDirIf` atomically renames a lock to a sibling tombstone before removal.

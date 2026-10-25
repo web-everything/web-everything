@@ -79,8 +79,8 @@ const executeAsync = (bin, args, opts) => new Promise(resolve => {
   execFile(bin, args, { encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024, ...opts },
     (error, stdout, stderr) => resolve({ status: error ? 1 : 0, error, stdout, stderr }));
 });
-const requireOutput = r => { if (r?.status !== 0 || r?.error) throw new Error('command failed or incomplete'); return String(r.stdout ?? ''); };
-const requireOk = r => requireOutput(r).trim();
+const requireOutput = (r, failure = 'command failed or incomplete') => { if (r?.status !== 0 || r?.error) throw new Error(failure); return String(r.stdout ?? ''); };
+const requireOk = (r, failure) => requireOutput(r, failure).trim();
 // Git -z listings preserve literal paths, including non-ASCII characters and whitespace.
 const requirePaths = r => requireOutput(r).split('\0').filter(Boolean);
 const requireAgentSuccess = result => {
@@ -91,7 +91,12 @@ const requireAgentSuccess = result => {
 const readPending = (io, file) => JSON.parse(io.readFileSync(file, 'utf8'));
 const writePending = (io, file, data) => {
   const temp = `${file}.${process.pid}.tmp`;
-  io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file);
+  try {
+    io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file);
+  } catch (error) {
+    io.rmSync(temp, { force: true });
+    throw error;
+  }
 };
 
 export async function runAutoRebase({ root, ref, token, env = process.env, deps = {} }) {
@@ -101,7 +106,7 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     { cwd, env: { ...env, ...REBUILD_IDENTITY_ENV }, timeout: 60_000 });
   const add = deps.addOverlay ?? overlays.addOverlay, event = deps.appendOverlayEvent ?? overlays.appendOverlayEvent;
   const p = paths(root, env, ref);
-  let scratch, testReport, heartbeat, stage = 'registration';
+  let scratchParent, scratch, frontierLink, testReport, heartbeat, stage = 'registration';
   const reportFailure = error => reportNeedsYou({ root, env, ref, stage, error, io, event, now });
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe ref');
@@ -128,7 +133,9 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     if (!Number.isSafeInteger(n)) throw new Error('counter exhausted; human review required');
     const next = `${ref}-auto-${n}`;
     stage = 'clone';
-    scratch = io.mkdtempSync(join(tmpdir(), 'we-auto-rebase-'));
+    scratchParent = io.mkdtempSync(join(tmpdir(), 'we-auto-rebase-'));
+    scratch = join(scratchParent, 'repo');
+    io.mkdirSync(scratch);
     const url = requireOk(git(['remote', 'get-url', 'origin']));
     const origin = isAbsolute(url) || url.includes(':') || url.startsWith('~') ? url : resolve(root, url);
     requireOk(git(['clone', '--shared', '--no-checkout', root, scratch]));
@@ -217,13 +224,23 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
       io.appendFileSync(join(scratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
       io.statSync(join(root, 'node_modules'));
       io.symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
+      // Vitest resolves Frontier UI aliases relative to the clone's parent directory.
+      const frontierSource = resolve(root, '..', 'frontierui');
+      let hasFrontier = false;
+      try { io.statSync(frontierSource); hasFrontier = true; }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (hasFrontier) {
+        const target = join(dirname(scratch), 'frontierui');
+        io.symlinkSync(frontierSource, target, 'dir');
+        frontierLink = target;
+      }
       // File arguments are filters: Vitest can exit zero while excluding selected integration tests.
       // A fresh report outside the candidate tree proves every selected file actually executed.
       io.mkdirSync(p.dir, { recursive: true });
       testReport = join(p.dir, `${randomUUID()}.vitest-report`);
       const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected,
         '--reporter=default', '--reporter=json', `--outputFile.json=${testReport}`];
-      requireOk(await (deps.testRunner ?? ((o) => execAsync(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }));
+      requireOk(await (deps.testRunner ?? ((o) => execAsync(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }), 'selected test failed or incomplete');
       let reportText;
       try {
         if (io.statSync(testReport).size > 8 * 1024 * 1024) throw new Error('test inventory over 8 MiB');
@@ -244,16 +261,22 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     if (requireOk(git(['rev-parse', 'HEAD'], scratch)) !== candidate || requireOk(git(['status', '--porcelain'], scratch))) throw new Error('candidate changed after tests');
     stage = 'push';
     const current = (deps.readOverlayState ?? overlays.readOverlayState)(root, { env });
-    if (current.corrupt || !isDeepStrictEqual(current.overlays?.find(o => o?.ref === ref), old)) {
+    if (current.corrupt || !isDeepStrictEqual(overlays.registrationIdentity(current.overlays?.find(o => o?.ref === ref)), overlays.registrationIdentity(old))) {
       throw new Error('source registration unavailable or changed; refusing replacement');
     }
     requireOk(git(['push', 'origin', `HEAD:refs/heads/${next}`], scratch));
     stage = 'register';
-    // Recheck under the list mutex: removal during push or lock acquisition must win too.
-    add(root, { ref: next, pr: old.pr, stackBases: [ref], reason: `auto-rebase of ${ref}` }, { env, expectedOverlay: old });
     io.mkdirSync(p.dir, { recursive: true });
-    // The registration this swap retires, recorded once: cleanup removes the original only while it still matches.
+    // Persist recovery evidence before exposing the replacement to the loader.
+    // Cleanup removes the original only while its recorded registration still matches.
     writePending(io, p.pending, { old: ref, oldOverlay: old, new: next, newSha: candidate, rule, at: now() });
+    try {
+      // Recheck under the list mutex: removal during push or lock acquisition must win too.
+      add(root, { ref: next, pr: old.pr, stackBases: [ref], reason: `auto-rebase of ${ref}` }, { env, expectedOverlay: old });
+    } catch (error) {
+      io.rmSync(p.pending, { force: true });
+      throw error;
+    }
     event(root, { kind: 'auto-rebase-registered', ref, new: next, newSha: candidate, rule }, { env });
     return { ref: next, newSha: candidate };
   } catch (e) {
@@ -264,9 +287,12 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     const cleanupErrors = [];
     if (testReport) try { io.rmSync(testReport, { force: true }); }
     catch (e) { cleanupErrors.push(e); }
-    if (scratch) try { io.rmSync(scratch, { recursive: true, force: true }); }
+    // Unlink the borrowed checkout before removing our private container, never its target.
+    if (frontierLink) try { io.unlinkSync(frontierLink); }
+    catch (e) { if (e.code !== 'ENOENT') cleanupErrors.push(e); }
+    if (scratchParent) try { io.rmSync(scratchParent, { recursive: true, force: true }); }
     catch (e) { cleanupErrors.push(e); }
-    // Both removals belong to one cleanup phase; attempt both before reporting or rejecting.
+    // Attempt every cleanup before reporting or rejecting a removal failure.
     if (cleanupErrors.length) {
       const error = cleanupErrors.length === 1 ? cleanupErrors[0]
         : new AggregateError(cleanupErrors, cleanupErrors.map(e => String(e?.message ?? e)).join('; '));

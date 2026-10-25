@@ -246,6 +246,14 @@ export async function readOverrideViewerLogin() {
   } catch { return null; }
 }
 
+/** Registration intent excludes the rebuild's mutable base-chain cache. */
+export function registrationIdentity(entry) {
+  if (entry == null) return entry;
+  const { stackBases, ...identity } = entry;
+  void stackBases;
+  return identity;
+}
+
 export function addOverlay(root, {
   ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
 } = {}, { env = process.env, expectedOverlay } = {}) {
@@ -257,7 +265,7 @@ export function addOverlay(root, {
     const list = readOverlaysForWrite(root, env).slice();
     pause();
     if (expectedOverlay !== undefined && (!expectedOverlay || !isSafeBranchName(expectedOverlay.ref)
-      || !isDeepStrictEqual(list.find(o => o?.ref === expectedOverlay.ref), expectedOverlay))) {
+      || !isDeepStrictEqual(registrationIdentity(list.find(o => o?.ref === expectedOverlay.ref)), registrationIdentity(expectedOverlay)))) {
       throw new Error('source registration unavailable or changed; refusing replacement');
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
@@ -340,8 +348,7 @@ export function removeOverlay(root, ref, { env = process.env, why, requireRef, e
       throw new Error('replacement registration unavailable');
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
-    const identity = (o) => { const { stackBases, ...rest } = o ?? {}; void stackBases; return rest; };
-    if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(identity(list[idx]), identity(expectedOverlay))) {
+    if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {
       throw new Error('registration changed; refusing removal');
     }
     if (idx === -1) return { removed: false, list };
