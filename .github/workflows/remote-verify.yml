@@ -97,6 +97,8 @@ jobs:
           VERIFY_MODE: ${{ inputs.mode || 'lane-check' }}
           VERIFY_TESTS: ${{ inputs.tests }}
           VERIFY_OPERATION: ${{ inputs.operation }}
+          # lane-check runs the full gate: a related selection blocks on an unchanged checkout. Blank is unset.
+          WE_BUILD_FINAL_GATE: ${{ (inputs.mode || 'lane-check') == 'lane-check' && 'full' || '' }}
         run: |
           node --input-type=module <<'NODE'
           import { execFileSync } from 'node:child_process';

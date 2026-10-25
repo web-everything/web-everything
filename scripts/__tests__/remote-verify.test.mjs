@@ -786,6 +786,46 @@ describe('remote verification dispatcher — validated argv', () => {
   it.each(['unknown', '', 'targeted;full'])('rejects unknown mode %j', async (mode) => {
     await expect(commands({ mode })).rejects.toThrow(/Unknown verification mode/);
   });
+
+  it('lane-check runs the full gate on an unchanged checkout', async () => {
+    const step = yaml.safeLoad(readFileSync(join(process.cwd(), '.github/workflows/remote-verify.yml'), 'utf8'))
+      .jobs.verify.steps.find((s) => s.env?.VERIFY_MODE);
+    const pin = (inputs) => String(step.env.WE_BUILD_FINAL_GATE ?? '').replace(/\$\{\{([\s\S]*?)\}\}/g,
+      (_, expression) => Function('inputs', `return (${expression});`)(inputs));
+    // A push (no inputs) and an explicit lane-check pin the full gate; the other modes leave it unset.
+    expect(pin({})).toBe('full');
+    expect(pin({ mode: 'lane-check' })).toBe('full');
+    expect(pin({ mode: 'targeted' })).toBe('');
+    expect(pin({ mode: 'full' })).toBe('');
+    const [[file, args]] = await commands({ mode: 'lane-check' });
+    expect([file, ...args]).toEqual(['node', 'scripts/verify-lane.mjs', 'run']);
+    // A clean checkout of main (empty diff), with a platform preference of finalGate=related.
+    const dir = mkdtempSync(join(tmpdir(), 'remote-verify-lane-check-'));
+    try {
+      const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+      git('init', '-q');
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'exit 99', 'check:standards': 'exit 99' } }));
+      git('add', '-A'); git('commit', '-qm', 'main');
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      const preferences = join(dir, '.git', 'platform-preferences.json');
+      writeFileSync(preferences, JSON.stringify({ build: { finalGate: 'related' } }));
+      const env = { ...process.env, WE_PLATFORM_PREFERENCES_FILE: preferences };
+      for (const name of Object.keys(env)) if (/^WE_(BUILD|VERIFY)_/.test(name)) delete env[name];
+      const preview = (extra) => {
+        const result = spawnSync(file, [join(process.cwd(), args[0]), ...args.slice(1), '--dry-run'],
+          { cwd: dir, env: { ...env, ...extra }, encoding: 'utf8', timeout: 20_000 });
+        expect(result.status, result.stderr).toBe(0);
+        return JSON.parse(result.stdout);
+      };
+      // Control: unpinned, the same checkout resolves a blocked selection (verify-lane exits selection-required).
+      expect(preview({}).decision.mode).toBe('blocked');
+      const gate = preview({ WE_BUILD_FINAL_GATE: pin({}) });
+      expect(gate.decision.mode).toBe('full');
+      expect(gate.command).toBe('npm run test:unit && npm run check:standards');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('remote-verify workflow — source contract', () => {
@@ -799,7 +839,8 @@ describe('remote-verify workflow — source contract', () => {
     expect(step.run).toContain('remoteVerifyCommands(');
     expect(step.run).toContain('execFileSync(file, args,');
     expect(step.env).toEqual({ VERIFY_MODE: "${{ inputs.mode || 'lane-check' }}",
-      VERIFY_TESTS: '${{ inputs.tests }}', VERIFY_OPERATION: '${{ inputs.operation }}' });
+      VERIFY_TESTS: '${{ inputs.tests }}', VERIFY_OPERATION: '${{ inputs.operation }}',
+      WE_BUILD_FINAL_GATE: "${{ (inputs.mode || 'lane-check') == 'lane-check' && 'full' || '' }}" });
   });
 
   it('targeted, full and lane-check dispatch groups can never cancel a push group', () => {
