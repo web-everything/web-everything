@@ -353,13 +353,13 @@ describe('remote CLI — local preconditions', () => {
       expect(result.status).toBe(0);
       expect(JSON.parse(result.stdout).ok).toBe(true);
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-      expect(calls).toHaveLength(7);
+      expect(calls).toHaveLength(8);
       const runPath = `repos/web-everything/web-everything/actions/workflows/remote-verify.yml/runs?head_sha=${ctx.initial}&per_page=100`;
       const headPath = `repos/web-everything/web-everything/commits/${ctx.initial}`;
       const basePath = 'repos/web-everything/web-everything/commits/main';
       expect(calls.map(call => call.args.at(-1))).toEqual([runPath,
         'repos/web-everything/web-everything/actions/runs/123/attempts/2/jobs?per_page=100',
-        headPath, basePath, runPath, headPath, basePath]);
+        headPath, basePath, runPath, headPath, basePath, runPath]);
       for (const call of calls) {
         expect(call.repo).toBe('web-everything/web-everything');
         expect(call.args[0]).toBe('api');
@@ -437,7 +437,7 @@ describe('remote CLI — local preconditions', () => {
       const result = ctx.invoke({ ...mock.env, GH_HOST: 'enterprise.example.test' });
       expect(result.status).toBe(0);
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(JSON.parse);
-      expect(calls).toHaveLength(7);
+      expect(calls).toHaveLength(8);
       for (const call of calls) {
         expect(call.host).toBe('github.com');
         expect(call.args).toEqual(expect.arrayContaining(['--hostname', 'github.com']));
@@ -455,8 +455,8 @@ describe('remote CLI — local preconditions', () => {
       expect(result.status).toBe(rerun ? 2 : 0);
       expect(JSON.parse(result.stdout).ok).toBe(!rerun);
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(JSON.parse);
-      expect(calls).toHaveLength(rerun ? 5 : 7);
-      expect(calls.filter(call => call.args.some(arg => arg.includes('/runs?')))).toHaveLength(2);
+      expect(calls).toHaveLength(rerun ? 5 : 8);
+      expect(calls.filter(call => call.args.some(arg => arg.includes('/runs?')))).toHaveLength(rerun ? 2 : 3);
       expect(calls.filter(call => call.args.some(arg => arg.includes('/jobs?')))).toHaveLength(1);
       for (const call of calls) expect(call).not.toHaveProperty('memo');
       expect(readdirSync(memo)).toEqual([]);
