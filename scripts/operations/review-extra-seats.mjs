@@ -1508,12 +1508,7 @@ export async function speculateRedTeam({
       io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
     }
     const completed = priorRedTeamRow(records, pr, rev, repo);
-    // Historical, unversioned seats predate review-job attestations. The sequential
-    // post-accept path must still finish their effects (including the final secret
-    // scrub), without promoting those rows into saved panel findings.
-    const legacyEffects = resume && completed && completed.rubricVersion === undefined
-      && !redTeamPanelSeatOwed({ findings: { read } }, env);
-    const prior = resumeOnly || legacyEffects ? completed
+    const prior = resumeOnly ? completed
       : verifiedPriorRedTeamRow(records, { repo, pr, rev, env });
     if (resumeOnly && !prior) return { status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' };
     // A published, trusted exact-head result is independent evidence of completion.
@@ -1766,13 +1761,7 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     }
     let records = [];
     try { records = io.readRecords(); } catch { records = []; }
-    const completed = priorRedTeamRow(records, pr, pass.rev, repo);
-    // A legacy completion event with no saved findings can stop duplicate effects,
-    // but cannot supply a clean result. Sequential recovery will require its missing
-    // evidence or a trusted published comment; reusing panel findings still needs attestation.
-    const legacyCompletion = completed && completed.rubricVersion === undefined
-      && completed.findings === undefined;
-    if (legacyCompletion || verifiedPriorRedTeamRow(records, { repo, pr, rev: pass.rev, env })) return { status: 'superseded', reason: `a completed red-team seat row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
+    if (verifiedPriorRedTeamRow(records, { repo, pr, rev: pass.rev, env })) return { status: 'superseded', reason: `a completed red-team seat row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
     const recording = loopPayload?.replay !== true;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);
   } catch (e) {

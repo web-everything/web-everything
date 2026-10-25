@@ -26,8 +26,8 @@ const carryComment = bot([redTeamGateMarker(P, B, 'sent-back', rid), redTeamGate
   buildVerdictCarriedMarker({ fromSha: A, toSha: B, patchId: 'c'.repeat(40) }), 'Review verdict carried across an identical contribution.',
   advisoryBody.replace(redTeamMarker(P, A), redTeamMarker(P, B))].join('\n'), '2026-10-21T21:30:00Z');
 const lines = (unchanged, who = bot) => who(redTeamCarryLinesMarker({ pr: P, from: A, to: B, result: rid, unchanged }), '2026-10-21T21:30:01Z');
-const blocking = (comments, scope = { anyState: true, carryAcrossRebase: true }) => {
-  const d = readRedTeamDisposition({ comments, pr: P, head: B, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: scope });
+const blocking = (comments, scope = { anyState: true, carryAcrossRebase: true }, head = B) => {
+  const d = readRedTeamDisposition({ comments, pr: P, head, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: scope });
   return [...d.sendBack, ...d.held].map((f) => f.index).sort();
 };
 
@@ -40,6 +40,30 @@ describe('operator rulings across a verdict carry (reader)', () => {
   });
   it('cited-line proof cannot carry an operator card without the original cap handover', () => {
     expect(blocking([...ruled.filter(c => !c.body.includes('outcome=round-cap')), carryComment, lines([1, 2, 3])])).toEqual([1]);
+  });
+  it.each(['bot', 'wrong-result', 'before-cap'])('cited-line proof cannot carry a %s operator card', variant => {
+    const original = ruled.at(-1);
+    const invalid = variant === 'bot' ? { ...original, author: { login: 'web-everything' } }
+      : variant === 'wrong-result' ? { ...original, body: original.body.replace(`result=${rid}`, 'result=0123456789abcdef') }
+        : { ...original, createdAt: '2026-10-21T19:00:00Z' };
+    const source = variant === 'before-cap' ? [...ruled.slice(0, 2), invalid, ruled[2]] : [...ruled.slice(0, -1), invalid];
+    expect(blocking([...source, carryComment, lines([1, 2, 3])])).toEqual([1]);
+  });
+  it('cited-line proof alone cannot release a fresh live result without a verdict carry', () => {
+    const fresh = bot(advisoryBody.replace(redTeamMarker(P, A), redTeamMarker(P, B)), '2026-10-21T21:30:00Z');
+    expect(blocking([...ruled, fresh, lines([1, 2, 3])])).toEqual([1]);
+  });
+  it.each([
+    [[1, 2, 3], [1, 2, 3], []],
+    [[1, 2, 3], [2, 3], [1]],
+    [[2, 3], [1, 2, 3], [1]],
+  ])('requires cited-line proof on every hop (A→B %j, B→C %j)', (ab, bc, expected) => {
+    const C = 'd'.repeat(40);
+    const next = bot([redTeamGateMarker(P, C, 'sent-back', rid), redTeamGateMarker(P, C, 'operator-card', rid),
+      buildVerdictCarriedMarker({ fromSha: B, toSha: C, patchId: 'c'.repeat(40) }), 'Review verdict carried across an identical contribution.',
+      advisoryBody.replace(redTeamMarker(P, A), redTeamMarker(P, C))].join('\n'), '2026-10-21T22:00:00Z');
+    const proof = bot(redTeamCarryLinesMarker({ pr: P, from: B, to: C, result: rid, unchanged: bc }), '2026-10-21T22:00:01Z');
+    expect(blocking([...ruled, carryComment, lines(ab), next, proof], undefined, C)).toEqual(expected);
   });
   it('no cited-line record: the gate send-back carries, the operator release does not (#1 blocks)', () => {
     expect(blocking([...ruled, carryComment])).toEqual([1]);

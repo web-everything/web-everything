@@ -43,12 +43,12 @@ const REV = 'a'.repeat(40);
 // Legacy publication tests attest their legacy snapshot before exercising its sanitizer.
 const provenanceRoots = [];
 afterEach(() => { for (const root of provenanceRoots.splice(0)) rmSync(root, { recursive: true, force: true }); });
-function attestRows(rows) {
+function attestRows(rows, { repo = REPO, pr = 5, head = REV } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'red-team-retry-provenance-'));
   provenanceRoots.push(root);
   const env = { WE_RED_TEAM_TIMING: 'post-accept', OPERATION_RUNS_DIR: join(root, 'runs'), CONVEYOR_STATE_ROOT: root };
   const indexes = rows.flatMap((row, index) => row.dispatchKind === REVIEW_SEAT_DISPATCH_KIND && row.seat === 'red-team' ? [index] : []);
-  writeRun(provenanceRun({ env, rows, indexes, repo: REPO, pr: 5, head: REV }), env.OPERATION_RUNS_DIR);
+  writeRun(provenanceRun({ env, rows, indexes, repo, pr, head }), env.OPERATION_RUNS_DIR);
   return env;
 }
 
@@ -108,14 +108,14 @@ function fakeIo(over = {}) {
 }
 
 describe('speculative red-team repository isolation', () => {
-  it('an unattested row cannot supersede a completed speculative pass', async () => {
+  it.each([[undefined], [[]]])('an unattested row (findings: %j) cannot supersede a completed speculative pass', async findings => {
     const { io, calls, rows } = fakeIo();
     const loopPayload = payload('accept');
     const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: loopPayload.findings.read,
       env: {}, resume: false }, io);
     expect(pass.status).toBe('speculated');
     io.readRecords = () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team',
-      pr: 5, repo: REPO, rev: REV, status: 'ok', callId: 'unattested-call', findings: [] }];
+      pr: 5, repo: REPO, rev: REV, status: 'ok', callId: 'unattested-call', findings }];
     expect((await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env: {} }, io)).status).toBe('ran');
     expect(calls.filter(c => c[0] === 'post')).toHaveLength(1);
     expect(rows.filter(row => row.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toHaveLength(1);
@@ -126,9 +126,11 @@ describe('speculative red-team repository isolation', () => {
     const loopPayload = payload('accept');
     const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: loopPayload.findings.read, env: {}, resume: false }, io);
     expect(pass.status).toBe('speculated');
-    io.readRecords = () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team',
-      pr: 5, repo: rowRepo, rev: REV, status: 'ok', callId: 'later-call' }];
-    const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env: {} }, io);
+    const completed = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team',
+      pr: 5, repo: rowRepo, rev: REV, status: 'ok', callId: 'later-call', findings: [] }];
+    const env = attestRows(completed);
+    io.readRecords = () => completed;
+    const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env }, io);
     expect(result.status).toBe(rowRepo === REPO ? 'superseded' : 'ran');
     expect(calls.filter(c => c[0] === 'post')).toHaveLength(rowRepo === REPO ? 0 : 1);
     expect(rows.filter(row => row.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toHaveLength(rowRepo === REPO ? 0 : 1);
@@ -421,6 +423,22 @@ describe('x00g3tt — a clean seat row never strands an unfinished effect (PR #2
   const run = (io, over = {}) => runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { WE_RED_TEAM_TIMING: 'post-accept' }, ...over }, io);
   const trustedMarker = () => [{ body: `${redTeamMarker(5, REV)}\nold`, author: { login: 'web-everything' } }];
 
+  it.each(['missing', 'tampered'])('does not resume a legacy row with %s provenance under post-accept timing', async proof => {
+    const prior = {
+      dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: RED_TEAM_SEAT.seat, status: 'ok',
+      provider: 'codex', model: 'm', callId: 'unattested-call', rev: REV, pr: 5, repo: REPO,
+      findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept',
+    };
+    const env = attestRows([prior]);
+    if (proof === 'missing') rmSync(env.OPERATION_RUNS_DIR, { recursive: true });
+    else prior.model = 'changed-after-attestation';
+    const { io, calls } = fakeIo({ readRecords: () => [prior] });
+    const r = await run(io, { env });
+    expect(r.status).toBe('ran');
+    expect(calls.filter(c => c[0] === 'seat')).toHaveLength(1);
+    expect(r.comment.body).toContain(BREAK.summary);
+  });
+
   it('resumes a completed zero-finding row for PR 5848 and posts its missing comment', async () => {
     const rev = 'bc0ffddd262712cf405cafbf7e8118b335c267ff';
     const prior = {
@@ -431,7 +449,8 @@ describe('x00g3tt — a clean seat row never strands an unfinished effect (PR #2
     const p = payload('accept');
     p.findings.read.netBasis.rev = rev;
     const { io, calls } = fakeIo({ readRecords: () => [prior] });
-    const r = await run(io, { pr: 5848, loopPayload: p, post: true });
+    const env = attestRows([prior], { pr: 5848, head: rev });
+    const r = await run(io, { pr: 5848, loopPayload: p, post: true, env });
     expect(r).toMatchObject({ status: 'resumed', comment: { status: 'posted' } });
     expect(r.comment.body.startsWith(redTeamMarker(5848, rev))).toBe(true);
     expect(calls.filter(c => c[0] === 'post')).toHaveLength(1);
@@ -450,7 +469,8 @@ describe('x00g3tt — a clean seat row never strands an unfinished effect (PR #2
     expect(scrubPublish(body.split('\n')[0])).toEqual([]);
     expect(scrubPublish(body)).not.toEqual([]);
     const { io, calls } = fakeIo({ readRecords: () => [prior] });
-    const r = await run(io, { post: true });
+    const env = attestRows([prior]);
+    const r = await run(io, { post: true, env });
     expect(r).toMatchObject({ status: 'resumed', comment: { status: 'withheld' } });
     expect(r.reason).toContain('still failing');
     expect(r.status).not.toBe('already-ran');

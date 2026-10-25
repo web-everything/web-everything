@@ -675,6 +675,14 @@ function gateActionLines(body) {
   return found;
 }
 
+function operatorCardAfterHandover(r, hit, gates, grants) {
+  if (!r.gate.outcome.startsWith('operator-') || !isHumanOperatorComment(r.c)) return false;
+  // Validate ownership when the ruling was posted, not against later handovers or grants.
+  // Use the same grant-aware decision as the writer: a pending extension belongs to automation.
+  const prior = sendBackStepState(gates.filter(g => g.at < r.at), grants.filter(g => g.index < r.at));
+  return r.at > hit.at && prior.outcome === GATE_OUTCOMES.ROUND_CAP && !prior.reopened;
+}
+
 /** Shared live-head disposition reader. Recorded per-finding actions override today's policy.
  * Without a recorded action, policy send-back candidates still block admission while the gate acts: a missing gate
  * record keeps holding. Older round-cap records omit indices: all remaining send-back candidates belong to the operator.
@@ -713,15 +721,17 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
       for (const line of gateActionLines(recordBody(r))) {
         const { indices } = line;
         let { action } = line;
+        if (action === 'operator-card' && !first) {
+          // A carried release is a separate, proof-bound path: an original human ruling
+          // after its cap, reached through carries proving the cited line on EVERY hop.
+          if (!carryRulings || !indices.some(index => carryAllowed?.has(index))
+            || r.from || r.gate.result !== want || !operatorCardAfterHandover(r, hit, gates, grants)) continue;
+          action = 'card';
+        }
         if (action === 'operator-card') {
-          // Read the original human ruling, never a synthetic restamp of it. The per-finding
-          // carry proof below binds an inherited release to this same result on every hop.
-          if (r.from || r.gate.result !== want) continue;
-          if (!r.gate.outcome.startsWith('operator-') || !isHumanOperatorComment(r.c)) continue;
-          // Validate ownership when the ruling was posted, not against later handovers or grants.
-          // Use the same grant-aware decision as the writer: a pending extension belongs to automation.
-          const prior = sendBackStepState(gates.filter(g => g.at < r.at), grants.filter(g => g.index < r.at));
-          if (r.at <= hit.at || prior.outcome !== GATE_OUTCOMES.ROUND_CAP || prior.reopened) continue;
+          // Direct operator card releases bind to the exact live head/result.
+          if (!first || r.from || r.gate.result !== want) continue;
+          if (!operatorCardAfterHandover(r, hit, gates, grants)) continue;
           action = 'card';
         }
         // Only a human operator may release a break held at the round cap; automation lines release only what the gate itself decided.
