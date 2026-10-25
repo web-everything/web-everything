@@ -1,7 +1,7 @@
 /** Shared size evidence and non-blocking PR admission. */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { REVIEW_LABELS } from './review-labels.mjs';
 
@@ -131,7 +131,7 @@ export function planSizeAdmission(result) {
 }
 
 function fileSplitItem(fields, cwd) {
-  const cli = fileURLToPath(new URL('../operations/run.mjs', import.meta.url));
+  const cli = join(dirname(fileURLToPath(import.meta.url)), '../operations/run.mjs');
   const output = execFileSync(process.execPath, [cli, 'file-item', ...Object.entries(fields).map(([key, value]) => `--${key}=${value}`), '--json'], {
     cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -149,6 +149,11 @@ function lookupLocalSplitCard({ ref }, cwd) {
     if (text.includes(`${token}. `)) return { id: name.split('-')[0], rel: `backlog/${name}` };
   }
   return null;
+}
+
+function splitCardId(value) {
+  const id = typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : value;
+  return typeof id === 'string' && id.length > 0 && !/[^A-Za-z0-9]/.test(id) ? id : null;
 }
 
 export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = createPrDiffStatReader({ cwd }),
@@ -183,21 +188,21 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     }
     const groupLine = `File groups: ${groups.size ? [...groups].map(([group, lines]) => `we:${group}: ${lines}`).join('; ') : 'unavailable (size unknown)'}`;
     let cardId = null;
-    try { if (existing && existing[2] !== '-') cardId = decodeURIComponent(existing[2]); } catch { /* malformed marker is not filing evidence */ }
+    try { if (existing && existing[2] !== '-') cardId = splitCardId(decodeURIComponent(existing[2])); } catch { /* malformed marker is not filing evidence */ }
     let cardNote = '';
     if (plan.status === 'over') {
       try {
         if (!cardId) {
           let card;
           try { card = await lookupSplitCard({ ref }); } catch { /* filing remains available */ }
-          if (!card) {
+          if (!splitCardId(card?.num || card?.id) || card?.outcome === 'refused') {
             const filed = await fileItem({ title: `Split PR ${request.pr ? `#${request.pr}` : ref} into focused changes`, kind: 'story', size: 3,
               digest: `Plan follow-up splits for PR ${request.pr ? `#${request.pr}` : ref}. size-split-ref:${refToken}. ${groupLine}`,
               scope: [...files].map((path) => `we:${path}`).join(',') });
-            card = filed?.run?.verdict;
+            card = filed?.verdict;
           }
-          if (!card || (!card.num && !card.id) || card.outcome === 'refused') throw new Error(card?.reason || 'file-item returned no card');
-          cardId = String(card.num || card.id);
+          if (card?.outcome !== 'refused') cardId = splitCardId(card?.num || card?.id);
+          if (!cardId) throw new Error(card?.reason || 'file-item returned no card');
         }
         cardNote = `split card ${cardId} filed`;
       } catch (error) { cardNote = `split card not filed: ${String(error?.message || error).replace(/[\r\n\x00-\x1f]/g, ' ').slice(0, 300)}`; }

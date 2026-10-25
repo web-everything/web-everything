@@ -93,6 +93,11 @@ export function admitPrSize(request, effects = {}) {
   return createSizeAdmissionRunner(effects)(request);
 }
 
+/** Measure the resolved commit published by runCli, against its selected remote base. */
+export function buildSizeAdmissionRequest({ ref, pr, remote, base, refSha, body }) {
+  return { ref, pr, base: `${remote}/${base}`, sha: refSha, body };
+}
+
 import { assertMayMerge, hasNonEmptyBody } from './lib/pr-merge-gate.mjs';
 import { soakPrecheckAtOpen, soakPrecheckEnabled } from './lib/soak-precheck-at-open.mjs';
 import { parseNameStatus } from './soak-replay-gate-cli.mjs';
@@ -1010,7 +1015,7 @@ async function runCli() {
   }
   let sizeAdmission;
   try {
-    sizeAdmission = await admitPrSize({ ref: REF, pr: prNum, base: `${REMOTE}/${BASE}`, sha: refSha, body: sizeBody }, { cwd: REPO });
+    sizeAdmission = await admitPrSize(buildSizeAdmissionRequest({ ref: REF, pr: prNum, remote: REMOTE, base: BASE, refSha, body: sizeBody }), { cwd: REPO });
   } catch {
     sizeAdmission = { status: 'unknown', body: sizeBody, reviewLabel: REVIEW_LABELS.pending };
   }

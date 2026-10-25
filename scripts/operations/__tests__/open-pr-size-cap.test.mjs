@@ -12,7 +12,7 @@ const argv = ['--ref=lane/size-admission'];
 const opened = { outcome: 'opened', pr: 5854, url: 'https://example.invalid/pull/5854' };
 const text = '200\t0\tdocs/agent/a.md\0' + '101\t0\tdocs/agent/b.md\0';
 const request = { ref: 'lane/size-admission', pr: 5854, base: 'main', sha: 'HEAD', body: 'Describe the change.' };
-const card = { run: { verdict: { num: 9001, id: 'xsplit1', rel: 'backlog/xsplit1-split.md' } } };
+const card = { verdict: { num: 9001, id: 'xsplit1', rel: 'backlog/xsplit1-split.md' } };
 
 function wrapper(overrides = {}) {
   const diffStat = vi.fn(() => text);
@@ -227,13 +227,39 @@ describe('pr-land CLI size failure boundaries', () => {
   // Execute the production block with injected IO without running publication or Git commands.
   const block = source.slice(source.indexOf('  let sizeBody = CREATE_BODY;'), source.indexOf('\n  if (prNum == null) {', source.indexOf('  let sizeBody = CREATE_BODY;')));
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  const runBlock = new AsyncFunction('forge', 'admitPrSize', 'prNum', 'REVIEW_LABELS', `
-    const CREATE_BODY = 'create body', REF = 'lane/test', REMOTE = 'origin', BASE = 'main', refSha = 'sha', REPO = '.';
+  const executeBlock = new AsyncFunction('forge', 'admitPrSize', 'prNum', 'REVIEW_LABELS', 'buildSizeAdmissionRequest', 'publication', `
+    const CREATE_BODY = 'create body', REPO = '.';
+    const { REF, REMOTE, BASE, refSha, SRC } = publication;
     const composePrBody = (body) => body;
     const createParams = {};
     ${block}
     return { sizeAdmission, createParams };
   `);
+  const runBlock = (forge, admit, prNum, labels, publication = { REF: 'lane/test', REMOTE: 'origin', BASE: 'main', refSha: 'sha', SRC: 'HEAD' }) =>
+    executeBlock(forge, admit, prNum, labels, prLand.buildSizeAdmissionRequest, publication);
+
+  it('builds admission arguments from the resolved publication SHA and remote base', () => {
+    expect(prLand.buildSizeAdmissionRequest).toBeTypeOf('function');
+    expect(prLand.buildSizeAdmissionRequest({ ref: 'lane/reviewed', pr: 5854, remote: 'upstream',
+      base: 'release', refSha: 'resolved-reviewed-commit', body: 'live body' })).toEqual({
+      ref: 'lane/reviewed', pr: 5854, base: 'upstream/release', sha: 'resolved-reviewed-commit', body: 'live body',
+    });
+  });
+
+  it.each([null, 5854])('CLI admission measures the exact SHA pushed and the selected remote base (PR %s)', async (prNum) => {
+    const publication = { REF: 'lane/reviewed', REMOTE: 'upstream', BASE: 'release', refSha: 'resolved-reviewed-commit', SRC: 'unresolved-source' };
+    const forge = { viewPr: vi.fn(() => ({ body: 'live body' })), editBody: vi.fn() };
+    const admit = vi.fn(async ({ body }) => ({ status: 'ok', body, reviewLabel: null }));
+    // Run the actual push statement and admission block against the same bindings.
+    const push = source.match(/gitC\(\['push', REMOTE, `\$\{refSha\}:refs\/heads\/\$\{REF\}`\]\)/)?.[0];
+    expect(push).toBeTypeOf('string');
+    const gitC = vi.fn();
+    new Function('gitC', 'REMOTE', 'refSha', 'REF', push)(gitC, publication.REMOTE, publication.refSha, publication.REF);
+    await runBlock(forge, admit, prNum, REVIEW_LABELS, publication);
+    const pushedSha = gitC.mock.calls[0][0][2].split(':')[0];
+    expect(admit).toHaveBeenCalledWith({ ref: publication.REF, pr: prNum, base: 'upstream/release',
+      sha: pushedSha, body: prNum == null ? 'create body' : 'live body' }, { cwd: '.' });
+  });
 
   it.each([false, true])('only edits an existing PR after a successful live body read (read succeeds: %s)', async (readSucceeds) => {
     const forge = {

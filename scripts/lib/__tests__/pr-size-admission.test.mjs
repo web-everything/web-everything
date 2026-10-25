@@ -5,11 +5,18 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as sizeAdmission from '../pr-size-admission.mjs';
+import { outcomePayload } from '../../operations/cli-adapter.mjs';
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal();
+  const execFileSync = vi.fn(actual.execFileSync);
+  return { ...actual, execFileSync, default: { ...actual.default, execFileSync } };
+});
 
 // Proposed effect seam: createSizeAdmissionRunner({ diffStat, fileItem, lookupSplitCard })
 // returns a runner({ ref, pr?, base, sha, body }) -> { status, lines, body, reviewLabel, sha? }.
 // fileItem accepts the declared operation's title/kind/size/digest/scope fields and returns
-// its native { run: { verdict: { num, id, rel } } } result. No real operation runs here.
+// the CLI's outcomePayload envelope with a top-level verdict.
 afterEach(() => vi.restoreAllMocks());
 
 describe('measureNonTestLines — pure numstat accounting', () => {
@@ -141,7 +148,7 @@ const evidence = '100\t50\tscripts/operations/a.mjs\0'
   + '101\t0\tdocs/agent/a.md\0'
   + '900\t0\tscripts/operations/__tests__/a.test.mjs\0';
 const request = { ref: 'lane/size-admission', pr: 5854, base: 'main', sha: 'HEAD', body: 'Existing PR description.' };
-const cardResult = { run: { verdict: { num: 9001, id: 'xsplit1', rel: 'backlog/xsplit1-split.md' } } };
+const cardResult = { verdict: { num: 9001, id: 'xsplit1', rel: 'backlog/xsplit1-split.md' } };
 function effects(overrides = {}) {
   return {
     diffStat: vi.fn(() => ({ text: evidence, sha: 'pinned-sha' })),
@@ -162,6 +169,88 @@ function expectSizeNote(body) {
 }
 
 describe('shared admission effects', () => {
+  it.each([
+    ['numbered', { num: 9001, id: '9001' }, '9001'],
+    ['hash-only', { num: null, id: 'xsplit1' }, 'xsplit1'],
+  ])('default file-item adapter creates and returns a reusable split card through the CLI output contract (%s)', async (_name, verdict, id) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'size-split-adapter-'));
+    mkdirSync(join(cwd, 'backlog'));
+    const exec = vi.fn((command, args, options) => {
+      expect(command).toBe(process.execPath);
+      expect(args[0]).toMatch(/scripts\/operations\/run\.mjs$/);
+      expect(args[1]).toBe('file-item');
+      expect(args.at(-1)).toBe('--json');
+      expect(options).toMatchObject({ cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024 });
+      const fields = Object.fromEntries(args.slice(2, -1).map((arg) => {
+        const separator = arg.indexOf('=');
+        return [arg.slice(2, separator), arg.slice(separator + 1)];
+      }));
+      expect(fields).toEqual({
+        title: 'Split PR #5854 into focused changes', kind: 'story', size: '3',
+        digest: expect.stringContaining(`size-split-ref:${encodeURIComponent(request.ref)}. `),
+        scope: 'we:scripts/operations/a.mjs,we:scripts/operations/b.mjs,we:docs/agent/a.md',
+      });
+      const rel = `backlog/${id}-split.md`;
+      writeFileSync(join(cwd, rel), fields.digest);
+      return JSON.stringify(outcomePayload({
+        run: { id: 'split-contract', op: 'file-item', effects: [], pending: null,
+          verdict: { ...verdict, rel }, findings: [] },
+        stopped: 'complete',
+      }));
+    });
+    vi.mocked(execFileSync).mockImplementation(exec);
+    const run = (body = request.body) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence })({ ...request, body });
+    try {
+      const first = await run();
+      expectSizeNote(first.body);
+      expectSizeNote((await run()).body); // unpublished body: durable local lookup
+      expectSizeNote((await run(first.body)).body); // published marker
+      expect(exec).toHaveBeenCalledTimes(1);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each(['\n## Injected', '\rInjected', '\u2028Injected', '9001\n', '9001\r', '9001\u2028', '`bad`', '"bad"', '--bad', '../bad', 'ｂａｄ', 'bad\u200b', 'safe%0Abad', '%'])
+  ('rejects a hostile or malformed marker card id %j and files a real card', async (id) => {
+    const io = effects();
+    const body = `${request.body}\n\n## Size\n\nstale\n<!-- size-admission:${encodeURIComponent(request.ref)} ${id === '%' ? id : encodeURIComponent(id)} -->\n`;
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body });
+    expect(io.fileItem).toHaveBeenCalledTimes(1);
+    expectSizeNote(result.body);
+    expect(result.body).not.toContain('Injected');
+  });
+
+  it('invalid local card identifiers cannot suppress filing or inject body text', async () => {
+    const io = effects({ lookupSplitCard: () => ({ id: '9001\n## Injected' }) });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(io.fileItem).toHaveBeenCalledTimes(1);
+    expectSizeNote(result.body);
+    expect(result.body).not.toContain('Injected');
+  });
+
+  it('invalid CLI card identifiers are not published or persisted as filing evidence', async () => {
+    const io = effects({ fileItem: () => ({ verdict: { id: '9001\n## Injected' } }) });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(result.body).toContain('split card not filed: file-item returned no card');
+    expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
+    expect(result.body).not.toContain('Injected');
+  });
+
+  it.each(['successful', 'unknown-size', 'failed-filing'])
+  ('preserves unrelated body sections when retrying %s admission', async (prior) => {
+    const io = effects(prior === 'unknown-size' ? { diffStat: () => { throw new Error('unavailable'); } }
+      : prior === 'failed-filing' ? { fileItem: () => { throw new Error('unavailable'); } } : {});
+    const unrelated = '\n\n## Testing\n\nKeep this section exactly.\n';
+    const other = '\n\n## Size\n\nOther ref size note.\n<!-- size-admission:lane%2Fother 123 -->\n';
+    const first = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: request.body + other });
+    const body = first.body + unrelated;
+    const second = await sizeAdmission.createSizeAdmissionRunner(effects())({ ...request, body });
+    expect(second.body).toContain(request.body + other);
+    expect(second.body).toContain(unrelated);
+    expect(second.body.match(/^## Size$/gm)).toHaveLength(2);
+    expect(second.body.match(/<!-- size-admission:lane%2Fsize-admission /g)).toHaveLength(1);
+    expectSizeNote(second.body);
+  });
+
   it('301 non-test lines proceed with one split card naming PR and file groups, reviewers escalated and body noting both', async () => {
     const io = effects();
     const run = sizeAdmission.createSizeAdmissionRunner(io);
@@ -221,7 +310,7 @@ describe('shared admission effects', () => {
   });
 
   it('an unsuccessful file-item verdict also proceeds without claiming a card was filed', async () => {
-    const io = effects({ fileItem: vi.fn(() => ({ run: { verdict: { outcome: 'refused', reason: 'operation unavailable' } } })) });
+    const io = effects({ fileItem: vi.fn(() => ({ verdict: { outcome: 'refused', reason: 'operation unavailable' } })) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
     expect(result.body).toContain('split card not filed: operation unavailable');
@@ -238,7 +327,7 @@ describe('shared admission effects', () => {
   });
 
   it('injected lookup reuses a card for the same ref even when the body has no marker', async () => {
-    const io = effects({ lookupSplitCard: vi.fn(() => cardResult.run.verdict) });
+    const io = effects({ lookupSplitCard: vi.fn(() => cardResult.verdict) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(io.lookupSplitCard).toHaveBeenCalledWith(expect.objectContaining({ ref: request.ref }));
     expect(io.fileItem).not.toHaveBeenCalled();
@@ -251,7 +340,7 @@ describe('shared admission effects', () => {
     const fileItem = vi.fn((fields) => {
       const num = 9000 + fileItem.mock.calls.length;
       writeFileSync(join(cwd, 'backlog', `${num}-split.md`), fields.digest);
-      return { run: { verdict: { num } } };
+      return { verdict: { num } };
     });
     const run = (ref) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence, fileItem })({ ...request, ref, pr: null });
     try {
