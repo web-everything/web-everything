@@ -20,6 +20,44 @@ vi.mock('../../lib/atomic-json-file.mjs', async importOriginal => {
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 
+describe('lane Git hardening', () => {
+  it.each(['prepareLane', 'fetchRedTeamHead'])('%s hardens every Git call against inherited lane commands', method => {
+    const env = {
+      ...process.env,
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'core.alternateRefsCommand', GIT_CONFIG_VALUE_0: 'lane-owned-alternate-command',
+      GIT_CONFIG_KEY_1: 'review.fixture', GIT_CONFIG_VALUE_1: 'preserved',
+      GIT_EXTERNAL_DIFF: 'lane-owned-diff-command', REVIEW_FIXTURE_TOKEN: 'preserved',
+    };
+    const original = { ...env }, calls = [];
+    const exec = (file, args, options) => {
+      calls.push({ file, args, options });
+      if (file === 'gh') return JSON.stringify({ headRefOid: head });
+      return args.includes('fetch') ? '' : `${head}\n`;
+    };
+    const io = createReviewJobIo({ env, exec });
+    expect(io[method]({ lanePath: '/lanes/lane-7', repo, pr, head })).toEqual({ head });
+    const gitCalls = calls.filter(call => call.file === 'git');
+    expect(gitCalls).toHaveLength(method === 'prepareLane' ? 2 : 3);
+    for (const { options } of gitCalls) {
+      // Read Git's effective configuration, not just our helper's object shape.
+      // This executes no fetch, callback, or repository write.
+      const config = key => execFileSync('git', ['config', '--get', key], {
+        env: options.env, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+      }).trim();
+      expect(config('core.alternateRefsCommand')).toBe('true');
+      expect(config('core.fsmonitor')).toBe('false');
+      expect(config('core.hooksPath')).toBe('/dev/null');
+      expect(config('review.fixture')).toBe('preserved');
+      expect(options.env.GIT_EXTERNAL_DIFF).toBeUndefined();
+      expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
+      expect(options.env.REVIEW_FIXTURE_TOKEN).toBe('preserved');
+      expect(options).toMatchObject({ cwd: '/lanes/lane-7', timeout: 180_000, maxBuffer: 1024 * 1024 });
+    }
+    expect(env).toEqual(original);
+  });
+});
+
 describe('review-job CLI --red-team-only', () => {
   it.each([
     [[], 1],

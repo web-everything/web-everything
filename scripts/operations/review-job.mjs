@@ -83,6 +83,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
 
 import { spawn, spawnSync } from 'node:child_process';
 import { execRead } from '../lib/proc-read.mjs';
+import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
@@ -367,7 +368,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     root,
     fetchRedTeamHead: ({ lanePath, pr, head }) => {
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing pinned red-team head');
-      const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
+      const options = { cwd: lanePath, env: laneGitHardeningEnv(env), timeout: 180_000, maxBuffer: 1024 * 1024 };
       exec('git', ['-C', lanePath, 'fetch', '--quiet', '--no-tags', 'origin', `pull/${pr}/head`], options);
       const fetched = exec('git', ['-C', lanePath, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}'], options).trim();
       if (fetched !== head) throw Error('red-team head changed during fetch');
@@ -379,8 +380,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
-      exec('git', ['fetch', '--no-tags', `https://github.com/${repo}.git`, `refs/pull/${pr}/head`], options);
-      const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], options).trim();
+      // Acquisition scrubs unsafe config, but command-valued pins must also apply to every lane Git call.
+      const gitOptions = { ...options, env: laneGitHardeningEnv(env) };
+      exec('git', ['fetch', '--no-tags', `https://github.com/${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
+      const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
     },
