@@ -217,6 +217,25 @@ describe('automatic reclaim backup-to-reset guard', () => {
     expect(result.keptUnpushed[0].reason).toContain('staged changes');
     expect(git(['show', ':backlog/tracked-card.md'], laneDir)).toBe(changed);
     expect(readFileSync(card, 'utf8')).toBe('committed card\n');
+    expect(existsSync(join(laneDir, '.git', '.lane-lease'))).toBe(false);
+  });
+
+  it('refuses new non-card work after a preserved lane was backed up without override', async () => {
+    const work = join(laneDir, 'work.txt');
+    const io = realRecoverIo({ repo, lanePoolPath: script, backupRoot: join(base, 'backups'), isLeased: () => false });
+    const backup = io.backup;
+    io.backup = async n => {
+      const saved = await backup(n);
+      expect(saved.ok, saved.error).toBe(true);
+      writeFileSync(work, 'new work after backup\n');
+      return saved;
+    };
+    const result = await recoverPool({ lanes: [1], io });
+    expect(result.backedUp).toEqual([1]);
+    expect(result.reclaimed).toEqual([]);
+    expect(result.keptUnpushed[0].reason).toContain('content changed after backup');
+    expect(readFileSync(work, 'utf8')).toBe('new work after backup\n');
+    expect(existsSync(join(laneDir, '.git', '.lane-lease'))).toBe(false);
   });
 
   it('refuses unreadable index evidence even with a valid working-tree backup', async () => {

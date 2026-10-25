@@ -4290,7 +4290,8 @@ function cmdReclaim(repo) {
   }
   const dryRun = !!flags['dry-run'];
   const override = !!flags.override;
-  const requireLiveness = !override || process.env.WE_LANE_RECOVERY_BACKUP !== undefined;
+  const automaticRecovery = process.env.WE_LANE_RECOVERY_BACKUP !== undefined;
+  const requireLiveness = !override || automaticRecovery;
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) fail(`lane-${n} does not exist under ${repo.poolDir}`);
 
@@ -4317,7 +4318,7 @@ function cmdReclaim(repo) {
     cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof });
     return;
   }
-  if (!proof.preserved && !override) {
+  if (!proof.preserved && !override && (!automaticRecovery || dryRun)) {
     log(`  lane-${n}: NOT reclaimed — ${proof.reason}`);
     if (!dryRun) journalReclaimRefusal(dir, repo, `not reclaimed — ${proof.reason}`, { unpushed: true });
     if (flags.json) process.stdout.write(`${JSON.stringify({ lane: n, path: dir, dryRun, reclaimed: false, ...proof }, null, 2)}\n`);
@@ -4377,6 +4378,17 @@ function cmdReclaim(repo) {
     writeFileSync(file, body, { flag: 'wx' });
   } catch {
     fail(`lane-${n}: a lease appeared between the read above and the claim attempt — not reclaimed, safe to retry`);
+  }
+  // A clean lane can gain staged work after recovery's backup. Diagnose that index
+  // under our lease before the generic preservation refusal hides it. This does not
+  // authorize new content; the preservation re-check and final backup guard still apply.
+  if (automaticRecovery && !proof.preserved && !override) {
+    const backup = verifyRecoveryBackup({ laneDir: dir, proof, manifestPath: process.env.WE_LANE_RECOVERY_BACKUP });
+    if (!backup.ok) {
+      takeMarkerIf(dir, (moved) => moved?.session === session, n);
+      log(`  lane-${n}: NOT reclaimed — ${backup.error}`);
+      return;
+    }
   }
   // Re-check UNDER the hold — closes the race window between the first read above and this claim.
   const reproof = laneReclaimPreservationProof(dir, repo.branch, repo);

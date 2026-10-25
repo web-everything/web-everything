@@ -31,22 +31,22 @@ export function verifyRecoveryBackup({ laneDir, proof, manifestPath }) {
     if (proof?.error || manifest.version !== 1 || !manifest.files || typeof manifest.files !== 'object'
       || !Array.isArray(proof.unpreservedFiles) || !Array.isArray(proof.unpreservedCommitShas)
       || proof.unpreservedCommitShas.length) throw new Error('incomplete backup evidence');
-    for (const file of proof.unpreservedFiles) {
-      if (!qualifiesForCardBackup({ preserved: false, unpreservedFiles: [file], unpreservedCommitShas: [] })
-        || !Object.hasOwn(manifest.files, file) || !/^[a-f0-9]{64}$/.test(manifest.files[file])
-        || cardDigest(join(laneDir, file)) !== manifest.files[file]) throw new Error('content changed after backup');
-    }
     // The manifest preserves working-tree bytes only. Refuse every staged change, including
     // additions, deletions and mode changes, both after backup and under reclaim's lease.
     // This compares trees without reading worktree content or invoking clean filters.
     try {
       execFileSync('git', ['diff', '--cached', '--quiet', '--no-ext-diff', '--no-textconv',
-        '--ignore-submodules=none', 'HEAD', '--'], { ...processOptions, cwd: laneDir,
+        '--ignore-submodules=none', 'HEAD', '--'], { ...processOptions, stdio: 'ignore', cwd: laneDir,
         env: laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0',
           GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null', GIT_SHALLOW_FILE: '/dev/null' }) });
     } catch (e) {
       throw new Error(e.status === 1 ? 'staged changes are not covered by the working-tree backup'
         : 'cannot verify the index against HEAD');
+    }
+    for (const file of proof.unpreservedFiles) {
+      if (!qualifiesForCardBackup({ preserved: false, unpreservedFiles: [file], unpreservedCommitShas: [] })
+        || !Object.hasOwn(manifest.files, file) || !/^[a-f0-9]{64}$/.test(manifest.files[file])
+        || cardDigest(join(laneDir, file)) !== manifest.files[file]) throw new Error('content changed after backup');
     }
     return { ok: true };
   } catch (e) { return { ok: false, error: `recovery backup verification failed: ${message(e)}; inspect the lane or retry recovery` }; }
