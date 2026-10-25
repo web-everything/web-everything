@@ -1164,12 +1164,25 @@ describe('established overlay auto rebase', () => {
     },
   );
 
-  it('reports cleanup failures while preserving the original registration', async () => {
+  it.each(['report', 'scratch', 'both'])('reports %s cleanup failures once while preserving the original registration', async failure => {
     const f = fixture(); f.moveMain();
-    f.deps.io.rmSync = (p, opts) => { fs.rmSync(p, opts); throw new Error('cleanup failed'); };
+    const cleaned = [];
+    f.deps.io.rmSync = (p, opts) => {
+      cleaned.push(p); fs.rmSync(p, opts);
+      const kind = p.endsWith('.vitest-report') ? 'report' : 'scratch';
+      if (failure === 'both' || failure === kind) throw new Error(`${kind} cleanup failed`);
+    };
     await expect(job(f)).rejects.toThrow('cleanup failed');
     expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toContain(ref);
-    expect(needsYouAlert(f).detail.stage).toBe('cleanup');
+    const alert = needsYouAlert(f);
+    expect(alert.detail.stage).toBe('cleanup');
+    for (const kind of failure === 'both' ? ['report', 'scratch'] : [failure]) {
+      expect(alert.detail.reason).toContain(`${kind} cleanup failed`);
+    }
+    expect(cleaned).toEqual([expect.stringMatching(/\.vitest-report$/), ...f.scratched]);
+    expect(cleaned.every(p => !fs.existsSync(p))).toBe(true);
+    expect(f.calls.filter(c => c === 'auto-rebase-needs-you')).toHaveLength(1);
+    expect(fs.readdirSync(pendingDir(f)).filter(n => n.endsWith('.json'))).toHaveLength(1);
     expect(f.scratched.every(p => !fs.existsSync(p))).toBe(true);
   });
 

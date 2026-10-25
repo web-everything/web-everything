@@ -13,7 +13,6 @@ import { alertsFilePath } from './state.mjs';
 import { REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../mandate-fence.mjs';
 import { buildReverseImportGraph, testDepths, isGraphSourceFile, isVitestTestFile } from '../related-test-selection.mjs';
-import { alwaysRunInventory } from '../verify-lane-gate.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
@@ -234,6 +233,8 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
           Array.isArray(r?.assertionResults) && r.assertionResults.some(a => ['passed', 'failed'].includes(a?.status)));
         reportText = JSON.stringify(report);
       } catch { /* missing, malformed or oversized inventory fails closed below */ }
+      // This helper's graph needs npm packages; ordinary backlog CLI startup must stay dependency-free.
+      const { alwaysRunInventory } = await import('../verify-lane-gate.mjs');
       const inventory = alwaysRunInventory({ reportText, files: [...selected], cwd: io.realpathSync(scratch) });
       if (inventory.missing.length) throw new Error(`selected tests did not execute (${inventory.reason}): ${inventory.missing.join(', ')}; human review required`);
     }
@@ -260,10 +261,17 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     throw e;
   } finally {
     clearInterval(heartbeat);
+    const cleanupErrors = [];
     if (testReport) try { io.rmSync(testReport, { force: true }); }
-    catch (e) { reportNeedsYou({ root, env, ref, stage: 'cleanup', error: e, io, event, now }); }
+    catch (e) { cleanupErrors.push(e); }
     if (scratch) try { io.rmSync(scratch, { recursive: true, force: true }); }
-    catch (e) { stage = 'cleanup'; reportFailure(e); throw e; }
+    catch (e) { cleanupErrors.push(e); }
+    // Both removals belong to one cleanup phase; attempt both before reporting or rejecting.
+    if (cleanupErrors.length) {
+      const error = cleanupErrors.length === 1 ? cleanupErrors[0]
+        : new AggregateError(cleanupErrors, cleanupErrors.map(e => String(e?.message ?? e)).join('; '));
+      stage = 'cleanup'; reportFailure(error); throw error;
+    }
   }
 }
 
