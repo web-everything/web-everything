@@ -31,6 +31,7 @@ import {
 } from './completion-store.mjs';
 import { envelopeFromLegacy } from './worker-result-router.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 
 /** The SAME two grammars `dispatch-lane.mjs#sessionSlugFor` (fix) and `review-dispatch.mjs` (review) mint. */
 export function sessionSlugForCompletion({ kind, pr, repo = 'we' }) {
@@ -97,7 +98,7 @@ function parseFlags(argv) {
   return flags;
 }
 
-export function runReport(flags) {
+export function runReport(flags, { emitEvent = appendDaemonEvent } = {}) {
   const kind = flags.kind;
   const pr = flags.pr ?? null;
   const item = flags.item ?? null;
@@ -155,6 +156,16 @@ export function runReport(flags) {
       now: () => new Date().toISOString(),
     });
     writeCompletion(record);
+    const alreadyBlocked = existing?.status === 'done' && existing.kind === 'fix'
+      && existing.outcome === 'blocked-on-permission'
+      && (existing.sessionId ?? null) === (record.sessionId ?? null);
+    if (record.kind === 'fix' && record.outcome === 'blocked-on-permission' && !alreadyBlocked) {
+      try {
+        Promise.resolve(emitEvent({
+          kind: 'fixer-blocked', pr: record.pr, detail: { command: record.denied },
+        })).catch(() => {});
+      } catch { /* Coordination events are best-effort; the completion is already persisted. */ }
+    }
     return { changed: true, record };
   });
 }
