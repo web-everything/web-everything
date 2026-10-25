@@ -47,6 +47,7 @@ export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, 
     try { fn = (await import(heartbeat.module))[heartbeat.exportName]; } catch { /* no heartbeat; the ceiling still holds */ }
     if (typeof fn === 'function' && Atomics.load(flag, 0) === 0) beat = setInterval(() => { try { fn(heartbeat.args); } catch { /* best-effort */ } }, heartbeat.everyMs);
   }
+  port.postMessage('ready');
 }
 
 /**
@@ -57,8 +58,10 @@ export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, 
  * is free). `heartbeat` (`{ module, exportName, args, everyMs }`) is called on that thread until the ceiling, then
  * stops, so a caller still stuck after the kill no longer keeps its slot. If the worker cannot run, the same ceiling
  * falls back to a main-thread timer, which a blocked main thread defeats — so that downgrade is logged through `warn`.
+ * Await `ready()` before blocking the caller's loop: heartbeat imports may still be loading when this returns.
+ * Readiness also settles on a fire or fallback, so an unavailable heartbeat cannot prevent timeout handling.
  * Unref'd; `stop()` ends it.
- * @returns {{ fired: () => boolean, settled: (maxWaitMs?: number) => Promise<void>, stop: () => void }}
+ * @returns {{ ready: () => Promise<void>, fired: () => boolean, settled: (maxWaitMs?: number) => Promise<void>, stop: () => void }}
  */
 export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null, onFire = () => {},
   warn = (m) => { try { process.stderr.write(m); } catch { /* logging only */ } }, moduleUrl = OWN_SOURCE_URL }) {
@@ -66,10 +69,13 @@ export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null,
   const deadline = Date.now() + timeoutMs;
   let fallback = null;
   let stopped = false;
+  let markReady = () => {};
+  const ready = new Promise((r) => { markReady = r; });
   let markSwept = () => {};
   const swept = new Promise((r) => { markSwept = r; });
   const fire = () => { if (!stopped && Atomics.load(flag, 0) === 0) { fireTreeKill({ pid, kill, flag }); markSwept(); onFire(); } };
   const fallBack = (why) => {
+    markReady();
     if (Atomics.load(flag, 0) === 2) markSwept();
     if (stopped || fallback || Atomics.load(flag, 0) !== 0) return;
     warn(`⚠ tree watchdog: its thread failed (${String(why?.message ?? why).split('\n')[0]}) — the ceiling falls back to a main-thread timer, which a blocked event loop cannot run\n`);
@@ -80,14 +86,19 @@ export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null,
   try {
     if (!moduleUrl) throw new Error('own module source unavailable');
     worker = new Worker(WATCHDOG_SOURCE, { eval: true, workerData: { module: moduleUrl, pid, deadline, kill, heartbeat, flag } });
-    worker.on('message', (m) => { if (m === 'fired' && !stopped) onFire(); if (m === 'swept') markSwept(); });
+    worker.on('message', (m) => {
+      if (m === 'ready' || m === 'fired' || m === 'swept') markReady();
+      if (m === 'fired' && !stopped) onFire();
+      if (m === 'swept') markSwept();
+    });
     worker.on('error', fallBack);
-    worker.on('exit', () => markSwept());
+    worker.on('exit', () => { markReady(); markSwept(); });
     worker.unref();
   } catch (e) {
     fallBack(e);
   }
   return {
+    ready: () => ready,
     fired: () => Atomics.load(flag, 0) >= 1,
     // After a fire, the kill is complete only once the escape sweeps ran: a caller must await this before it
     // reports the phase done or exits (an exit, or `stop()`, would cut the sweeps short). Bounded by `maxWaitMs`.
@@ -99,6 +110,6 @@ export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null,
       return Promise.race([swept, new Promise((r) => { hold = setTimeout(r, maxWaitMs); })]).finally(() => clearTimeout(hold));
     },
     // Disarms an unfired ceiling. A fired worker is left to finish its sweeps and exit on its own.
-    stop: () => { stopped = true; clearTimeout(fallback); if (Atomics.load(flag, 0) === 0) worker?.terminate().catch(() => {}); },
+    stop: () => { stopped = true; markReady(); clearTimeout(fallback); if (Atomics.load(flag, 0) === 0) worker?.terminate().catch(() => {}); },
   };
 }

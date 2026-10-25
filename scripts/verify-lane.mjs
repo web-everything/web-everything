@@ -802,6 +802,9 @@ async function runGate(command, args) {
       env: { ...process.env, [ADMISSION_HELD_ENV]: '1', [GATE_PHASE_MARKER_ENV]: phaseToken } });
     for (const [name, fd] of [['stdout', 1], ['stderr', 2]]) {
       child[name].setEncoding('utf8');
+      // Keep this loop free for the main-thread slot heartbeat until the watchdog has armed its own.
+      // Pipe buffers bound pending output and backpressure the gate while the worker loads its imports.
+      child[name].pause();
       child[name].on('data', chunk => {
         collector.push(chunk, name);
         bytes += Buffer.byteLength(chunk);
@@ -853,6 +856,9 @@ async function runGate(command, args) {
         grace.unref();
       },
     }) : null;
+    const forwardOutput = () => { child.stdout?.resume(); child.stderr?.resume(); };
+    if (watchdog) watchdog.ready().then(forwardOutput);
+    else forwardOutput();
     child.on('error', (e) => { watchdog?.stop(); clearTimeout(grace); if (!settled) { settled = true; reject(e); } });
     child.on('exit', (code, sig) => { exited = { code, signal: sig }; });
     child.on('close', (code, closeSignal) => finish(code, closeSignal));

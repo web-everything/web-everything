@@ -4,7 +4,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -42,6 +42,40 @@ describe('escaped-descendant listings (PR #5768)', () => {
 });
 
 describe('startTreeWatchdog (PR #5768)', () => {
+  it('waits for a delayed heartbeat import before declaring the worker ready for a blocked caller', async () => {
+    const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
+    const dir = mkdtempSync(join(tmpdir(), 'tree-watchdog-ready-'));
+    const entered = join(dir, 'entered');
+    const release = join(dir, 'release');
+    const beats = join(dir, 'beats.log');
+    const beatModule = join(dir, 'beat.mjs');
+    writeFileSync(beatModule, `import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(entered)}, 'loading');
+while (!existsSync(${JSON.stringify(release)})) await new Promise(r => setTimeout(r, 10));
+export const beat = ({ file }) => appendFileSync(file, 'b');
+`);
+    const watchdog = startTreeWatchdog({ pid: child.pid, timeoutMs: 10_000,
+      heartbeat: { module: pathToFileURL(beatModule).href, exportName: 'beat', args: { file: beats }, everyMs: 50 } });
+    try {
+      let ready = false;
+      const readiness = watchdog.ready().then(() => { ready = true; });
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(entered) && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
+      expect(existsSync(entered), 'the heartbeat import must have started').toBe(true);
+      expect(ready, 'output forwarding must wait while the heartbeat import is pending').toBe(false);
+      writeFileSync(release, 'continue');
+      await readiness;
+      // Only now may forwarding block the main loop: the worker must refresh without its help.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+      expect(readFileSync(beats, 'utf8').length).toBeGreaterThan(0);
+      expect(watchdog.fired()).toBe(false);
+    } finally {
+      watchdog.stop();
+      child.kill('SIGKILL');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it('kills the tree from its own thread while the main thread is blocked, and heartbeats only until then', async () => {
     const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
     const exited = new Promise((r) => child.once('exit', (code, signal) => r(signal)));
@@ -69,6 +103,26 @@ describe('startTreeWatchdog (PR #5768)', () => {
     }
   });
 
+  it('settles readiness at the ceiling even when the heartbeat import never finishes', async () => {
+    const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
+    const exited = new Promise((r) => child.once('exit', (_code, signal) => r(signal)));
+    const dir = mkdtempSync(join(tmpdir(), 'tree-watchdog-stalled-import-'));
+    const beatModule = join(dir, 'beat.mjs');
+    writeFileSync(beatModule, 'await new Promise(() => {});\nexport const beat = () => {};\n');
+    const watchdog = startTreeWatchdog({ pid: child.pid, timeoutMs: 600,
+      heartbeat: { module: pathToFileURL(beatModule).href, exportName: 'beat', args: {}, everyMs: 100 } });
+    try {
+      await watchdog.ready();
+      expect(watchdog.fired()).toBe(true);
+      expect(await exited).toBe('SIGKILL');
+      await watchdog.settled();
+    } finally {
+      watchdog.stop();
+      child.kill('SIGKILL');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the ceiling on its thread when the heartbeat module fails to load (self-review A)', async () => {
     const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
     const exited = new Promise((r) => child.once('exit', (code, signal) => r(signal)));
@@ -76,6 +130,7 @@ describe('startTreeWatchdog (PR #5768)', () => {
     try {
       const watchdog = startTreeWatchdog({ pid: child.pid, timeoutMs: 600, warn: (m) => warned.push(m),
         heartbeat: { module: pathToFileURL(join(tmpdir(), 'no-such-heartbeat-module.mjs')).href, exportName: 'beat', args: {}, everyMs: 100 } });
+      await watchdog.ready();
       const blockUntil = Date.now() + 1_500;
       while (Date.now() < blockUntil) { /* a blocked event loop: no main-thread timer can run */ }
       expect(watchdog.fired()).toBe(true);
@@ -93,6 +148,7 @@ describe('startTreeWatchdog (PR #5768)', () => {
     const warned = [];
     try {
       const watchdog = startTreeWatchdog({ pid: child.pid, timeoutMs: 200, moduleUrl: null, warn: (m) => warned.push(m) });
+      await watchdog.ready();
       expect(warned.join('')).toMatch(/falls back to a main-thread timer/);
       expect(await exited).toBe('SIGKILL');
       expect(watchdog.fired()).toBe(true);
