@@ -166,7 +166,10 @@ describe('real salvage preservation and transport', () => {
       const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
       git(['init', '-q']);
       const included = join(dir, 'transport.config'), sentinel = join(dir, 'helper-ran');
-      git(['config', '--file', included, 'credential.https://example.test/\nquoted.helper', `!touch '${sentinel}'`]);
+      // Git rejects LF in config keys; U+2028 is a valid subsection line separator.
+      const key = 'credential.https://example.test/\u2028quoted.helper';
+      git(['config', '--file', included, key, `!touch '${sentinel}'`]);
+      expect(git(['config', '--file', included, '--null', '--name-only', '--list'])).toBe(`${key}\0`);
       if (scope === 'worktree') git(['config', 'extensions.worktreeConfig', 'true']);
       git(['config', `--${scope}`, 'include.path', included]);
       const commands = [];
