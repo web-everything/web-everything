@@ -1835,9 +1835,19 @@ export function runReviewLabelCli({
     if (live !== expectedHead) fail('live head differs from --expect-head; nothing written', 1);
   }
 
+  // Check the pin before each write. At the label write, reuse the clearance check's
+  // fresh state so a push during that read cannot bypass the pin.
+  const assertPinnedRearmHead = (fresh) => {
+    if (pinnedRearm && onlyIf !== 'missing' && (fresh ?? provider.readPrState(repo, pr)).headRefOid !== expectedHead) {
+      throw new Error('live head differs from --expect-head');
+    }
+  };
   const recheckRearmClearance = () => {
     let fresh;
-    try { fresh = provider.readPrState(repo, pr); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
+    try {
+      fresh = provider.readPrState(repo, pr);
+      assertPinnedRearmHead(fresh);
+    } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (!Array.isArray(fresh.comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
     if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
     const freshComments = fullThread(fresh.comments, fresh.headRefOid).filter(isTrustedMarkerAuthor);
@@ -1930,16 +1940,8 @@ export function runReviewLabelCli({
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SWAP: add the verdict label, remove the stale ones
   // (argv array, no shell). Intersect the decision's removals with the labels the PR ACTUALLY carries so
   // `gh pr edit --remove-label` is never handed an absent label (which errors).
-  // A pinned plain re-arm re-reads the head before EACH write, so a refused pin never leaves a re-arm marker comment behind
-  // (the orphan guard treats a trusted marker after the verdict as "already re-armed").
-  const assertPinnedRearmHead = () => {
-    if (pinnedRearm && onlyIf !== 'missing' && provider.readPrState(repo, pr).headRefOid !== expectedHead) {
-      throw new Error('live head differs from --expect-head');
-    }
-  };
   const applySwap = () => {
     try {
-      assertPinnedRearmHead();
       if (['accepted', 'restamp', 'clear-human'].includes(to)) {
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
@@ -1981,7 +1983,7 @@ export function runReviewLabelCli({
   // SAFE TO LOSE depends on one thing: whether `review:accepted` is ALREADY live on this PR.
   //
   //   • NOT already accepted (the ordinary first accept, and every `changes` / `rearm` / `clear-human` bounce) —
-  //     COMMENT FIRST. An orphan comment is INERT: `parseReviewedSha` is only ever reached behind a live
+  //     COMMENT FIRST, except the pinned plain re-arm below. An orphan acceptance comment is INERT: `parseReviewedSha` is only ever reached behind a live
   //     `review:accepted` check (lazily, inside `if (hasReviewLabel(...accepted))` in `we:scripts/merge-ai-prs.mjs`,
   //     and again inside `decideReviewGate`'s accepted branch), so a marker with no label behind it is never read
   //     and the command stays re-runnable. An orphan LABEL is not inert: `review:accepted` with no marker makes
@@ -2016,7 +2018,13 @@ export function runReviewLabelCli({
   const acceptanceAlreadyLive = hasReviewLabel(currentLabels, REVIEW_LABELS.accepted);
   // Guarded carry leaves the live acceptance label alone; its fresh-state check already ran before the ledger.
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
-  for (const step of writeOrder({ acceptanceAlreadyLive })) { steps[step](); }
+  // A re-arm marker is consumed even while review:changes is live. For a pinned
+  // plain re-arm, swap first: a failed swap or pin then leaves no marker that can
+  // suppress orphan recovery. A successful swap only requests review; losing its
+  // comment cannot grant acceptance. Missing-only recovery keeps its own protocol.
+  const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
+  const order = pinnedPlainRearm ? ['swap', 'comment'] : writeOrder({ acceptanceAlreadyLive });
+  for (const step of order) { steps[step](); }
   signalFix({ repo, pr, label: decision.addLabel });
   // PR #5273: labels have no conditional write. A re-park that read before this clearance can land its
   // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.
