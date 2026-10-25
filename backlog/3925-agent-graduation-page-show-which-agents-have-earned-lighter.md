@@ -2,13 +2,15 @@
 bornAs: xj4ksy4
 kind: epic
 parent: "3383"
-status: open
+status: resolved
 scaffoldedBy: "graduation-page-file"
 dateScaffolded: "2026-09-22"
 scope: ["we:scripts/operations/", "plateau:src/graduation/", "plateau:docs/"]
 scopeRationale: "Epic container; each slice carries its own file-level scope and the epic itself writes nothing."
 relatedTo: ["3690", "3784", "3893", "3734", "3443"]
 dateOpened: "2026-09-22"
+dateResolved: "2026-10-25"
+graduatedTo: none
 tags: [delegation, graduation, supervision, operator-page]
 ---
 
