@@ -30,25 +30,12 @@ export function resolveMergeWatchSettings({ env = process.env, log = console.err
   return result.value;
 }
 
-/** Bound every page (including comments) against the same tick budget. */
-function commentsFor(repo, number, gh, ghPages) {
-  return ghPages(`repos/${repo}/issues/${number}/comments`, args => {
-    const pages = [];
-    for (let page = 1; page <= 10; page++) {
-      const rows = gh(['api', `${args.at(-1)}?per_page=100&page=${page}`]);
-      if (!Array.isArray(rows) || rows.length > 100) throw Error('incomplete comment evidence');
-      pages.push(rows);
-      if (rows.length < 100) return pages;
-    }
-    throw Error('comment evidence exceeds page cap');
-  }).map(c => ({ ...c, author: c.user ?? c.author, createdAt: c.created_at ?? c.createdAt }));
-}
-
 export async function runMergeWatch({ repos = [], gh, now = new Date().toISOString(),
   stateDir = join(handoffHome(), 'pr-merge-watch'), settings, emitEvent = appendDaemonEvent,
   log = console.error } = {}) {
   // Load the analysis graph after the shared gate graph has finished evaluating.
-  const { atomicJson, readOptionalJson, ghJson, ghPages, repoFilenameKey } = await import('../../operations/coroner-pr-postmortem.mjs');
+  const { atomicJson, readOptionalJson, ghJson, repoFilenameKey } = await import('../../operations/coroner-pr-postmortem.mjs');
+  const { defaultListPrComments } = await import('../pr-comments-list.mjs');
   const { listOpenPrs } = await import('./pr-postmortem-pass.mjs');
   gh ??= ghJson;
   const config = settings ?? resolveMergeWatchSettings({ log });
@@ -82,12 +69,12 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
       for (const listed of open) {
         try {
           const pr = read(['pr', 'view', String(listed.number), '--repo', repo, '--json',
-            'number,state,isDraft,headRefOid,labels,comments,mergeStateStatus']);
+            'number,state,isDraft,headRefOid,labels,mergeStateStatus']);
           if (pr?.number !== listed.number || pr.state !== 'OPEN' || typeof pr.isDraft !== 'boolean'
             || !sha(pr.headRefOid) || !Array.isArray(pr.labels) || pr.labels.some(l => typeof l?.name !== 'string')
-            || !Array.isArray(pr.comments) || typeof pr.mergeStateStatus !== 'string'
+            || typeof pr.mergeStateStatus !== 'string'
             || !pr.mergeStateStatus || pr.headRefOid !== listed.head?.sha) throw Error('incomplete PR evidence');
-          pr.comments = commentsFor(repo, pr.number, read, ghPages);
+          pr.comments = defaultListPrComments({ number: pr.number, repo, gh: read, maxPages: 10 });
           if (pr.comments.some(c => typeof c.body !== 'string' || typeof c.author?.login !== 'string'
             || !Number.isFinite(Date.parse(c.createdAt)))) throw Error('incomplete comment evidence');
           const tracked = state.prs[pr.number] ??= { heads: {}, merged: false };
