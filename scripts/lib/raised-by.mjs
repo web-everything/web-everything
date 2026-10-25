@@ -5,5 +5,5 @@ export { parseRaisedBy, raisedByKey, mergeRaisedBy, raisedByFile, raisedByParent
 export function raisedByMemberId(path) {
   if (typeof path !== 'string') return null;
   const match = /^backlog\/raised-by\/(\d{1,5}|x[a-z0-9]{6})\/(\d+-[a-f0-9]{24})\.md$/.exec(path);
-  return match && match[0] === path ? `raised-by:${match[1]}:${match[2]}` : null;
+  return match ? `raised-by:${match[1]}:${match[2]}` : null;
 }

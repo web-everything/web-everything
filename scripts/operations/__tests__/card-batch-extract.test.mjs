@@ -99,6 +99,33 @@ function doubles({ existing = {} } = {}) {
 const lsRemote = (ctx, ref) => ctx.git(['ls-remote', '--refs', 'origin', ref]).trim().split(/\s+/)[0];
 
 describe('extractCard (real git)', () => {
+  it('extracts a raised-by sidecar to a colon-free, valid standalone git ref', async () => {
+    await withNarrowClone(async ctx => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
+      try {
+        const hex = '0123456789abcdef01234567';
+        const cardId = `raised-by:6636:5885-${hex}`;
+        const cardPath = `backlog/raised-by/6636/5885-${hex}.md`;
+        const baseSha = ctx.git(['rev-parse', 'HEAD']).trim();
+        mkdirSync(join(ctx.clone, 'backlog/raised-by/6636'), { recursive: true });
+        writeFileSync(join(ctx.clone, cardPath), '# Raised-by sidecar\n\nFollow-up finding\n');
+        const admitted = await admitCard({ laneDir: ctx.clone, baseSha, kind: 'prevention', cardId, idemKey: cardId,
+          cardPath, source: { repo: 'org/repo', pr: 5885 } }, { stateDir });
+        atomicRecord(join(stateDir, 'org-repo-prevention.json'), { ...admitted.state, kind: 'prevention', repo: 'org/repo',
+          pr: 50, sealedAt: '2026-10-07T00:00:00.000Z', verificationMarker: { sha: admitted.state.headSha, status: 'green' },
+          seal: { step: 'label-on-green', reason: 'count' } });
+        const d = doubles();
+        const result = await extractCard({ pr: 50, findings: [finding(cardPath)], laneDir: ctx.clone },
+          { stateDir, exec: d.exec, gh: d.gh });
+        expect(result.action).toBe('extracted');
+        const { ref } = result.journal.plan.standalone;
+        expect(ref).not.toContain(':');
+        expect(ctx.git(['check-ref-format', `refs/heads/${ref}`]).trim()).toBe('');
+        expect(ref).toBe(`lane/card-extract-raised-by-6636-5885-${hex}-${admitted.state.members[0].commitSha.slice(0, 7)}`);
+      } finally { rmSync(stateDir, { recursive: true, force: true }); }
+    });
+  }, 30000);
+
   it('splits a 3-card batch around the middle card, with no force and nothing carried over', async () => {
     await withNarrowClone(async ctx => {
       const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
