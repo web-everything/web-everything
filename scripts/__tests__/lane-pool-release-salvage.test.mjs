@@ -97,7 +97,7 @@ describe('lane-pool release salvage push against a throwaway origin', () => {
     return { callerOrigin, cwd, originUrl: null, referencePath: null };
   }
 
-  it.each(['release', 'release --all-pools', 'gc'])(
+  it.each(['release --lane=1', 'release --all-pools', 'gc'])(
     'selected pool recovery never uses the caller origin: %s', command => {
       const sha = commitLocalWork();
       const caller = primaryCaller();
@@ -120,7 +120,7 @@ describe('lane-pool release salvage push against a throwaway origin', () => {
       expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd)).toBe('');
     }, 35_000);
 
-  it.each(['insteadOf', 'pushInsteadOf', 'included insteadOf'])(
+  it.each(['insteadOf', 'pushInsteadOf', 'included insteadOf', 'worktree insteadOf'])(
     'refuses lane-controlled %s rather than accepting redirected preservation', kind => {
       const sha = commitLocalWork();
       const attacker = join(base, 'attacker.git');
@@ -130,6 +130,9 @@ describe('lane-pool release salvage push against a throwaway origin', () => {
         const config = join(base, 'rewrites.config');
         git(['config', '--file', config, key, origin]);
         git(['config', 'include.path', config], laneDir);
+      } else if (kind.startsWith('worktree')) {
+        git(['config', 'extensions.worktreeConfig', 'true'], laneDir);
+        git(['config', '--worktree', key, origin], laneDir);
       } else git(['config', key, origin], laneDir);
       assertReleased(runPool(['release', '--lane=1'], {}, { stderr: /SALVAGE PUSH FAILED.*URL rewriting.*canonical origin/ }));
       expect(salvageBranches()).toEqual([]);

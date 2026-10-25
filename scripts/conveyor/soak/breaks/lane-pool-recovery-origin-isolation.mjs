@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
-const cases = ['release', 'release --all-pools', 'gc', 'gc insteadOf', 'gc pushInsteadOf'];
+const cases = ['release --lane=1', 'release --all-pools', 'gc', 'gc insteadOf', 'gc pushInsteadOf'];
 
 export function replayRecoveryOrigin(root = ROOT, mode) {
   const base = mkdtempSync(join(tmpdir(), 'soak-recovery-origin-'));

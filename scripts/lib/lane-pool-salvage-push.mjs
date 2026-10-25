@@ -41,7 +41,7 @@ export async function salvagePushLane({ lane, laneDir, io, now = () => new Date(
   }
 }
 
-export function realSalvageIo({ repo, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), runGit = execFileSync }) {
+export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), runGit = execFileSync }) {
   const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
   // resolveRepo makes configured local origins absolute; explicit --origin paths remain invocation-relative.
   const origin = repo.originUrl ? (/^[^/]*:/.test(repo.originUrl) ? repo.originUrl : resolve(repo.originUrl)) : null;
@@ -54,7 +54,7 @@ export function realSalvageIo({ repo, backupRoot = process.env.WE_LANE_BACKUP_RO
     cwd: dir, env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
-  const transportGit = (dir, command, ...args) => {
+  const checkTransportConfig = dir => {
     // An explicit URL still passes through url.*.insteadOf / pushInsteadOf. Refuse
     // every effective rewrite (including includes and global config) before transport.
     // NUL-delimited names keep newlines in a subsection from hiding a rewrite key.
@@ -62,6 +62,17 @@ export function realSalvageIo({ repo, backupRoot = process.env.WE_LANE_BACKUP_RO
     if (keys.split('\0').some(key => /^url\.[\s\S]*\.(?:push)?insteadof$/i.test(key))) {
       throw new Error('URL rewriting configured; canonical origin cannot be trusted — remove the rewrite and retry');
     }
+  };
+  // Release must scrub executable lane config before its status/litter checks. Keep a
+  // refusal observed before that scrub: removing an include or rewrite cannot erase it.
+  let preflightError;
+  if (preflightLaneDir) {
+    try { checkTransportConfig(preflightLaneDir); }
+    catch (error) { preflightError = error; }
+  }
+  const transportGit = (dir, command, ...args) => {
+    if (preflightError) throw preflightError;
+    checkTransportConfig(dir);
     return git(dir, transport(command, ...args));
   };
   return {

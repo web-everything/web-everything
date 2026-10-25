@@ -2917,6 +2917,7 @@ async function cmdRelease(repo) {
     // litter, the other 2 clean-but-ahead — the whole pool read 0 of 48 acquirable at once). Any
     // non-allowlisted dirty state (real uncommitted work) is left completely untouched by this call.
     // The snapshot and litter `status` / `clean` would run a lane-set clean filter, which no env pin reaches (PR #5775).
+    const salvageIo = recoveryEnabled() && repo.originUrl ? realSalvageIo({ repo, preflightLaneDir: dir }) : null;
     scrubClaimedLaneConfig(dir, 'before release snapshot');
     const beforeLitter = laneStateSnapshot(dir, `origin/${repo.branch}`);
     // xbdixjc — a release by anyone but the holder (the reaper's `--force`, a delivered-lease release) may not
@@ -2945,7 +2946,7 @@ async function cmdRelease(repo) {
       if (!repo.originUrl) {
         log(`  WARNING lane-${n}: canonical origin unresolved for pool ${repo.name}; skipping salvage and releasing anyway — inspect the lane before reuse`);
       } else {
-        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo }) });
+        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: salvageIo });
         if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
         else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
       }

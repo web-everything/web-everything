@@ -179,6 +179,38 @@ describe('real salvage preservation and transport', () => {
     expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
   });
 
+  it.each(['URL rewrite', 'unreadable config'])(
+    'retains a pre-scrub %s refusal after lane config is cleaned', async failure => {
+      let scrubbed = false;
+      const runGit = vi.fn((_command, args) => {
+        if (args.includes('config')) {
+          if (scrubbed) return '';
+          if (failure === 'unreadable config') throw new Error('configuration unreadable');
+          return 'url./untrusted/remote.insteadof\0';
+        }
+        if (args.includes('rev-list')) return head;
+        return '';
+      });
+      const io = realSalvageIo({ repo, preflightLaneDir: laneDir, runGit });
+      scrubbed = true;
+      expect(await salvagePushLane({ lane: 7, laneDir, io })).toMatchObject({
+        status: 'failed', reason: expect.stringMatching(failure === 'URL rewrite'
+          ? /URL rewriting.*canonical origin/ : /configuration unreadable/),
+      });
+      expect(runGit.mock.calls.filter(([, args]) => args.includes('config'))).toHaveLength(1);
+      expect(runGit.mock.calls.some(([, args]) => args.some(arg => ['fetch', 'push', 'ls-remote'].includes(arg)))).toBe(false);
+    });
+
+  it('still checks transport config when a rewrite appears after a clean preflight', () => {
+    let rewritten = false;
+    const runGit = vi.fn((_command, args) => args.includes('config') && rewritten
+      ? 'url./untrusted/remote.pushinsteadof\0' : '');
+    const io = realSalvageIo({ repo, preflightLaneDir: laneDir, runGit });
+    rewritten = true;
+    expect(() => io.push(laneDir, ref, head)).toThrow(/URL rewriting.*canonical origin/);
+    expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
+  });
+
   function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', fail } = {}) {
     const runGit = vi.fn((_command, args) => {
       if (fail && args.includes(fail)) throw new Error(`${fail} unavailable`);
