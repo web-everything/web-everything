@@ -118,7 +118,14 @@ export function createPrDiffStatReader({ cwd = process.cwd(), exec = execFileSyn
     if (!base || base.startsWith('-') || !sha || sha.startsWith('-')) throw new Error('invalid diff ref');
     const resolvedSha = git(['rev-parse', '--verify', `${sha}^{commit}`]).trim();
     let ref = base;
-    try { git(['rev-parse', '--verify', '--quiet', `origin/${base}`]); ref = `origin/${base}`; } catch { /* use local base */ }
+    // Explicit refs and remote-qualified bases must not be shadowed by a branch
+    // named origin/<base>. Slash-containing local branches still prefer origin.
+    const qualified = base.startsWith('refs/') || base.startsWith('origin/')
+      || (base.includes('/') && git(['remote'], { timeout: 60_000 }).split('\n')
+        .some((remote) => remote && base.startsWith(`${remote}/`)));
+    if (!qualified) {
+      try { git(['rev-parse', '--verify', '--quiet', `origin/${base}`]); ref = `origin/${base}`; } catch { /* use local base */ }
+    }
     // Remove Git's record terminator only; trailing whitespace can belong to the
     // directory name, and trimming it could select a different repository.
     const topLevel = git(['rev-parse', '--show-toplevel']).replace(/\n$/, '');

@@ -435,6 +435,51 @@ function readerFixture({ numstat = '301\t0\tscripts/a.mjs\0', root = 'repo-top\n
 }
 
 describe('shared reader — retained sha, rename, binary and timeout audits', () => {
+  it.each(['origin/main', 'origin/release/stable', 'upstream/main', 'refs/remotes/origin/main', 'refs/heads/main', 'refs/tags/base'])(
+    'preserves qualified base %s despite an origin-prefixed shadow and escalates 301 lines', async (base) => {
+      const { git, read } = readerFixture({ read: (args) => {
+        if (args[0] === 'remote') return 'origin\nupstream\n';
+        if (args.includes('diff')) return args.at(-1) === `${base}...resolved-sha` ? '301\t0\tREADME.md\0' : '';
+      } });
+      const io = effects({ diffStat: read });
+      const result = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, base });
+      expect(result).toMatchObject({ status: 'over', lines: 301, reviewLabel: 'review:pending' });
+      expect(io.fileItem).toHaveBeenCalledTimes(1);
+      expect(io.publishSplitCard).toHaveBeenCalledTimes(1);
+      expect(result.body).toContain('split card 9001 filed');
+      expect(git.mock.calls.some(([args]) => args.includes(`origin/${base}`))).toBe(false);
+    });
+
+  it('keeps a missing qualified base unknown instead of using its origin-prefixed shadow', async () => {
+    const { read } = readerFixture({ read: (args) => {
+      if (args.includes('diff')) {
+        if (args.at(-1) === 'origin/missing...resolved-sha') throw new Error('unknown revision');
+        return '';
+      }
+    } });
+    const result = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: read }))({ ...request, base: 'origin/missing' });
+    expect(result).toMatchObject({ status: 'unknown', lines: null, reviewLabel: 'review:pending' });
+  });
+
+  it.each([true, false])('retains remote-first resolution of an unqualified slash branch (remote exists: %s)', (exists) => {
+    const { git, read } = readerFixture({ read: (args) => {
+      if (args[0] === 'remote') return 'origin\nupstream\n';
+      if (args.includes('--quiet') && !exists) throw new Error('no remote branch');
+    } });
+    read({ base: 'release/stable' });
+    expect(git.mock.calls.find(([args]) => args.includes('diff'))[0].at(-1))
+      .toBe(`${exists ? 'origin/' : ''}release/stable...resolved-sha`);
+  });
+
+  it('escalates unknown size when configured remotes cannot be read', async () => {
+    const { git, read } = readerFixture({ read: (args) => {
+      if (args[0] === 'remote') throw new Error('remote read failed');
+    } });
+    const result = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: read }))({ ...request, base: 'upstream/main' });
+    expect(result).toMatchObject({ status: 'unknown', lines: null, reviewLabel: 'review:pending' });
+    expect(git.mock.calls.some(([args]) => args.includes('diff'))).toBe(false);
+  });
+
   it('pins the measured SHA, roots the diff, clears attributes and disables external diff/textconv', () => {
     const { git, read } = readerFixture();
     expect(read({ base: 'release', sha: 'moving-ref' })).toEqual({ text: '301\t0\tscripts/a.mjs\0', sha: 'resolved-sha' });
