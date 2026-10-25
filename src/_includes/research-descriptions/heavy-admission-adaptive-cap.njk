@@ -1,0 +1,33 @@
+{% raw %}
+<h2>Question and recommendation</h2>
+<p>Decision <a href="/backlog/3610-how-far-to-take-heavy-command-admission-control-beyond-stage/">#3610</a> asks how far to take host admission beyond visibility. The current tree already has resource sampling, shared admission verdicts, and bounded fast-slot scaling. The recommended rule is an <strong>independently configured capacity envelope</strong>; fixed, EWMA and learned targets can all operate within it. No controller is implemented or promoted by this research.</p>
+<h2>What the repository actually contains</h2>
+<table>
+  <caption>Current mechanisms and evidence limits</caption>
+  <thead><tr><th scope="col">Mechanism</th><th scope="col">Source</th><th scope="col">Limit</th></tr></thead>
+  <tbody>
+    <tr><th scope="row">Host snapshots with occupancy</th><td><code>we:scripts/lib/resource-sampler.mjs:136</code>; 10-second loop at <code>we:scripts/conveyor/resource-sampler-job.mjs:13</code></td><td>Host correlation is not command-level demand attribution.</td></tr>
+    <tr><th scope="row">Calibrated resource thresholds</th><td><code>we:scripts/lib/resource-policy.mjs:8</code>: 1,261 snapshots, 2026-10-09 19:27–23:01 ET; idle percentiles 11/19/24/49%, load 11–109</td><td>Recorded calibration evidence, not a fresh experiment or an EWMA performance comparison.</td></tr>
+    <tr><th scope="row">Resource verdict plus slot ceiling</th><td><code>we:scripts/readiness/heavy-admission.mjs:730</code> and <code>:220</code></td><td>The built-in cap 2 does not reveal effective host settings; fast capacity is separate.</td></tr>
+    <tr><th scope="row">Historical wait feedback</th><td>Open card #3975 records wait on 2 of 927 episodes.</td><td>Missing wait cannot be treated as zero; Stage 1 card #3608 remains open.</td></tr>
+  </tbody>
+</table>
+<h2>Prepared choice and supported strategies</h2>
+<p>The forced-invariant fork is controller authority: (a) a separately configured ceiling, (b) an EWMA-owned ceiling, or (c) a learned ceiling plus weights and parallelism. <strong>Recommend (a)</strong>. Feedback that can enlarge its own constraint cannot guarantee the operator's resource bound. Adding an independent clamp to either alternative is composition with (a), not rejection of the algorithm.</p>
+<p>Fixed targets and explicitly enabled adaptive estimators are compatible configuration strategies beneath an independent operator envelope. The <a href="/docs/agent/platform-decisions.md#delivery-decider-under-fixed-settings">fixed-settings decider rule</a> makes fixed values final and permits automatic fields only inside sibling bounds, initially in shadow. The <a href="/docs/agent/platform-decisions.md#operator-override-settings-layer">operator override settings layer</a> extends the earlier committed-settings source: resolve standard, platform, tool, environment and then operator overrides, logging the effective source; only the operator authorizes writes and loosening requires confirmation. Resolve these settings first, then bound any automatic target by the independent envelope and invariants. The delivery decider remains deterministic in v1 and only orders heavy-work priority; learned heavy-target estimation is a proposed extension. Keep the existing target and resource gates while collecting comparative evidence. A lower target drains existing work naturally. Missing or partial required inputs cannot expand capacity; defer visibly when the resource gate holds. Current legacy fallback paths do not establish a universal fail-closed guarantee.</p>
+<h2>Known occurrences and prior art</h2>
+<table>
+  <caption>Useful precedents, without importing a controller</caption>
+  <thead><tr><th scope="col">Occurrence</th><th scope="col">Relevant pattern</th><th scope="col">Transfer limit</th></tr></thead>
+  <tbody>
+    <tr><th scope="row">WE fast-slot scaling</th><td>Freshness, demand and resource checks beneath a maximum</td><td>Not an EWMA heavy-cap implementation</td></tr>
+    <tr><th scope="row">GNU Parallel and Bazel</th><td>Load-sensitive starts and declared budgets, recorded in the <a href="/research/heavy-command-admission-queue-capacity-throttle/">September survey</a></td><td>Historical comparison; no measured winner for this host</td></tr>
+    <tr><th scope="row">Linux PSI</th><td><a href="https://docs.kernel.org/accounting/psi.html">Stall-time accounting and pressure triggers</a></td><td>A Linux outcome signal, not available from this macOS sampler</td></tr>
+  </tbody>
+</table>
+<h2>Classification and validation</h2>
+<p>This is operational scheduling, not a browser plug, protocol, or intent. Sampling, admission, atomic reservation and execution remain separate. The <a href="/docs/agent/platform-decisions.md#heavy-command-admission-queue">standing admission rule</a> supports conservative capacity bounds and reserved workstation headroom; it does not itself settle adaptive ownership. Keeping the operator envelope independent of future adaptive strategies is this proposed extension. Related open work #6678 supplies weighted-accounting requirements, not a ratified premise.</p>
+<p>A promotion comparison needs joined command kind, policy version, wait, occupancy, resource signals, duration and outcome. Report excluded records, wait tails, throughput, timeouts and pressure together. Add tests for simultaneous expansion, oversized proposals, stale/partial input, natural drain and deferred fallback before a future controller is enabled.</p>
+<h2>Session artifact and cross-references</h2>
+<p>The topic's <code>relatedReport</code> is <code>reports/2026-10-25-heavy-admission-adaptive-cap.md</code>. The report distinguishes directly inspected code from historical measurements and records external-fetch limits. The full options, code example and acceptance commands are on <a href="/backlog/3610-how-far-to-take-heavy-command-admission-control-beyond-stage/">decision #3610</a>; the staged implementation remains under #3611.</p>
+{% endraw %}
