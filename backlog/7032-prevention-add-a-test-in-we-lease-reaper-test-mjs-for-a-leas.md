@@ -1,20 +1,21 @@
 ---
+bornAs: x4vfcjz
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/land-prevention-card.mjs", "we:scripts/operations/__tests__/land-prevention-card.test.mjs"]
+scope: ["we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Add a drain/withRecoveryCard negative test table (traversal, wrong raised-by target shape, wrong… (from web-everything/web-everything#5898 review)
+# Prevention — Add a test in we:lease-reaper.test.mjs for a lease acquired before claimedAt with stopped rows, a… (from web-everything/web-everything#5888 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/land-prevention-card.mjs:402` — Add a drain/withRecoveryCard negative test table (traversal, wrong raised-by target shape, wrong extension). Longer term, a check:standards rule that requires a refusal-path test next to each 'invalid ... path' throw.
+1. `we:scripts/conveyor/lease-reaper.mjs:866` — Add a test in we:lease-reaper.test.mjs for a lease acquired before claimedAt with stopped rows, asserting the intended outcome (reaped or kept). Longer term, record the claim/lease round pairing explicitly so staleness is decided by round identity, not timestamps.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5898@c39b5162b54eb0e9a49a8efeffc4946aabd2c030
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5888@7dec7849d4a01a0f5ef7f9a29e24b22a790a04c3
 
 ## Acceptance
 

@@ -1,22 +1,21 @@
 ---
+bornAs: xf3lg5f
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/pid-alive.mjs", "we:scripts/lib/fix-slot-borrow.mjs", "we:scripts/conveyor/fix-dispatch-claim.mjs", "we:scripts/lib/__tests__/pid-alive.test.mjs", "we:scripts/lib/__tests__/fix-slot-borrow.test.mjs", "we:scripts/conveyor/__tests__/fix-dispatch-claim.test.mjs"]
-dateOpened: "2026-10-25"
+scope: ["we:scripts/lib/pid-alive.mjs", "we:scripts/lib/__tests__/pid-alive.test.mjs"]
+dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — File a card to compare the session row's startedAt against the process lstart for session-bound c… (from web-everything/web-everything#5880 review)
+# Prevention — Add a PR-description check that a bullet claiming 'dead on X' cites the test that asserts X is de… (from web-everything/web-everything#5880 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/pid-alive.mjs:62` — File a card to compare the session row's `startedAt` against the process `lstart` for session-bound claims. Add a soak variant that recycles the pid into a spare while the claim is unstamped.
-2. `we:scripts/lib/fix-slot-borrow.mjs:293` — Add a standards check or a test asserting that all runner-liveness predicates in we:dispatch-throttle.mjs accept an `identity` seam. Alternatively, collapse `isBorrowedRunnerDead` into `isClaimRunnerDead`.
-3. `we:scripts/conveyor/fix-dispatch-claim.mjs:356` — A table-driven test for any new release branch that crosses each guard condition (awaiting, terminal, no pid) at least once. A mutation-testing gate on guard conditions in we:scripts/conveyor/fix-dispatch-claim.mjs would catch this class.
+1. `we:scripts/lib/pid-alive.mjs:62` — Add a PR-description check that a bullet claiming 'dead on X' cites the test that asserts X is dead. A review lens on description-versus-test consistency is the cheapest available guard.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5880@096b0c9f7c86d3e4ae77ca3066ae349db91577fa
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5880@b9593bf48711a9872e14e6b965161695dcfda0f1
 
 ## Acceptance
 

@@ -1,20 +1,20 @@
 ---
+bornAs: xh9unrf
 kind: story
-size: 3
-parent: "4075"
+size: 2
 status: open
-scope: ["we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs"]
+scope: ["we:scripts/operations/codex-job.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Add a test in we:lease-reaper.test.mjs for a lease acquired before claimedAt with stopped rows, a… (from web-everything/web-everything#5888 review)
+# Red-team follow-ups from web-everything/web-everything#5839 (head 962b8ac59)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5839 (reviewed head `962b8ac59d5357740a2ac42fe1c9e928145353c3`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/conveyor/lease-reaper.mjs:866` — Add a test in we:lease-reaper.test.mjs for a lease acquired before claimedAt with stopped rows, asserting the intended outcome (reaped or kept). Longer term, record the claim/lease round pairing explicitly so staleness is decided by round identity, not timestamps.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5888@7dec7849d4a01a0f5ef7f9a29e24b22a790a04c3
+1. `we:scripts/operations/codex-job.mjs:55` — (failing-input, degraded) Accepted wait budgets exceed the test wrapper's supported maximum
+   - Scenario: Supply otherwise valid arguments with --wait-ms=86400001. parseArgs accepts it, but heavy-admission supports at most 86400000 milliseconds. Probing the runner with the actual heavy-admission subprocess reproduced two wrapper refusals, an unnecessary Codex repair invocation, and final exit 30 with tests marked red although no tests ran. Reject unsupported budgets as bad-args before acquiring resources or invoking Codex.
+   - Claude's re-check: demonstrated break
 
 ## Acceptance
 

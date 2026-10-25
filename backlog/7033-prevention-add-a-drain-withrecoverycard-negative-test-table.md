@@ -1,19 +1,21 @@
 ---
+bornAs: x6anr4g
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/operations/codex-job.mjs"]
+scope: ["we:scripts/operations/land-prevention-card.mjs", "we:scripts/operations/__tests__/land-prevention-card.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5839 (head 962b8ac59)
+# Prevention — Add a drain/withRecoveryCard negative test table (traversal, wrong raised-by target shape, wrong… (from web-everything/web-everything#5898 review)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5839 (reviewed head `962b8ac59d5357740a2ac42fe1c9e928145353c3`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/codex-job.mjs:55` — (failing-input, degraded) Accepted wait budgets exceed the test wrapper's supported maximum
-   - Scenario: Supply otherwise valid arguments with --wait-ms=86400001. parseArgs accepts it, but heavy-admission supports at most 86400000 milliseconds. Probing the runner with the actual heavy-admission subprocess reproduced two wrapper refusals, an unnecessary Codex repair invocation, and final exit 30 with tests marked red although no tests ran. Reject unsupported budgets as bad-args before acquiring resources or invoking Codex.
-   - Claude's re-check: demonstrated break
+1. `we:scripts/operations/land-prevention-card.mjs:402` — Add a drain/withRecoveryCard negative test table (traversal, wrong raised-by target shape, wrong extension). Longer term, a check:standards rule that requires a refusal-path test next to each 'invalid ... path' throw.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5898@c39b5162b54eb0e9a49a8efeffc4946aabd2c030
 
 ## Acceptance
 
