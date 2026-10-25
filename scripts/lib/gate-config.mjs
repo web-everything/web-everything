@@ -126,6 +126,13 @@ export const TRUST_CHAIN = [
     homes: ['config/deliveryPolicyDefaults.ts'],
   },
   {
+    role: 'delivery-policy-loader',
+    file: 'delivery-policy.mjs',
+    tier: 'engine',
+    desc: 'delivery-flow loader obeys the human-gated policy sources (#5113), like the lander',
+    homes: ['scripts/lib/delivery-policy.mjs'],
+  },
+  {
     role: 'escalation-rubric',
     file: 'review-escalation.mjs',
     tier: 'policy',

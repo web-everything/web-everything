@@ -3,9 +3,12 @@ bornAs: xcs4nce
 kind: story
 size: 3
 parent: "5112"
-status: open
-scope: ["we:config/defineConfig.ts", "we:config/platformDefaults.ts", "we:config/deliveryPolicyDefaults.ts", "we:config/index.ts", "we:config/__tests__/config-contract.test.ts", "we:scripts/lib/delivery-policy.mjs", "we:scripts/lib/__tests__/delivery-policy.test.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs"]
+status: resolved
+scope: ["we:config/defineConfig.ts", "we:config/platformDefaults.ts", "we:config/deliveryPolicyDefaults.ts", "we:config/index.ts", "we:config/__tests__/config-contract.test.ts", "we:scripts/lib/delivery-policy.mjs", "we:scripts/lib/__tests__/delivery-policy.test.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs", "we:webeverything.config.json", "we:scripts/check-standards-rules.mjs", "we:scripts/lib/__tests__/trust-chain-tier.test.mjs"]
 dateOpened: "2026-10-03"
+dateStarted: "2026-10-25"
+dateResolved: "2026-10-25"
+graduatedTo: none
 preparedDate: "2026-10-03"
 preparedAgainstSha: "838e849ab8b35fa4b94216b7d474b3138d979ba5"
 tags: [policy, config, drain, conveyor]
