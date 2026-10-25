@@ -1,0 +1,1182 @@
+{
+  "version": 1,
+  "order": "first-match",
+  "description": "Repo-relative, case-sensitive full-path globs: * excludes /, ** includes /, **/ includes zero directories, ? matches one non-slash. First match wins. Every earlier rule overlapping a later different destination must declare override: true; classify validates this for every supplied path. No universal fallback: unknown directory roots fail closed. original records the pre-S4 standard-side destination of reclassified product code, per 5481/5488; the external handoff plan is not vendored. Text lines count newline terminators plus a nonempty final line; binary (NUL) files have zero lines; symlinks count their stored link text.",
+  "destinations": [
+    "standard-def",
+    "everstandards-conformance",
+    "longshore",
+    "plateau",
+    "repo-local",
+    "data-by-topic"
+  ],
+  "rules": [
+    {
+      "glob": "config/constellation-ownership.json",
+      "destination": "repo-local",
+      "note": "Repository extraction configuration; the TypeScript config runtime follows Plateau.",
+      "override": true
+    },
+    {
+      "glob": "src/_data/researchTopics/**",
+      "destination": "data-by-topic",
+      "note": "Research follows its topic, including rendered research prose.",
+      "override": true
+    },
+    {
+      "glob": "src/_includes/research-descriptions/**",
+      "destination": "data-by-topic",
+      "note": "Research follows its topic, including rendered research prose.",
+      "override": true
+    },
+    {
+      "glob": "src/_data/**/*.json",
+      "destination": "standard-def",
+      "note": "Declarative standard registries, vocabularies and schemas.",
+      "override": true
+    },
+    {
+      "glob": "src/_includes/*-descriptions/**",
+      "destination": "standard-def",
+      "note": "Normative standard descriptions; research is excepted above.",
+      "override": true
+    },
+    {
+      "glob": "src/**",
+      "destination": "plateau",
+      "note": "Website/product rendering and build implementation; S4 product destination.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "site/**",
+      "destination": "plateau",
+      "note": "Website/product rendering and build implementation; S4 product destination.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "eleventy/**",
+      "destination": "plateau",
+      "note": "Website/product rendering and build implementation; S4 product destination.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": ".eleventy.js",
+      "destination": "plateau",
+      "note": "Website/product rendering and build implementation; S4 product destination.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "vite.config.mts",
+      "destination": "plateau",
+      "note": "Website/product rendering and build implementation; S4 product destination.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "worker.js",
+      "destination": "plateau",
+      "note": "Website/product rendering and build implementation; S4 product destination.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "functions/**",
+      "destination": "plateau",
+      "note": "Website/product rendering and build implementation; S4 product destination.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/check-standards-rules.mjs",
+      "destination": "longshore",
+      "note": "Legacy mixed rules module includes delivery hygiene and backlog rules; split web rules into their pack under S3.",
+      "override": true
+    },
+    {
+      "glob": "scripts/__tests__/check-standards-rules*.mjs",
+      "destination": "longshore",
+      "note": "Legacy mixed rules module includes delivery hygiene and backlog rules; split web rules into their pack under S3.",
+      "override": true
+    },
+    {
+      "glob": "scripts/__tests__/fixtures/check-standards-rules*.mjs",
+      "destination": "longshore",
+      "note": "Legacy mixed rules module includes delivery hygiene and backlog rules; split web rules into their pack under S3.",
+      "override": true
+    },
+    {
+      "glob": "scripts/web-rules/**",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/validators/**",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/conformance/**",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/check-standards.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/check-standards.contract.json",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/check-app-conformance.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/check-demos.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/parity-conformance.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/conformance-autofix.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/validate-*.cjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/validate-*.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/conformanceReport.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/registry-loader.cjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/standards-sections.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/standards-cache.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/__tests__/check-standards*.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/__tests__/*conformance*.mjs",
+      "destination": "everstandards-conformance",
+      "note": "S3 standalone runner, web rule pack, validators and their tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/delivery-rules/**",
+      "destination": "longshore",
+      "note": "S3 delivery and backlog rule packs.",
+      "override": true
+    },
+    {
+      "glob": "scripts/backlog-rules/**",
+      "destination": "longshore",
+      "note": "S3 delivery and backlog rule packs.",
+      "override": true
+    },
+    {
+      "glob": "scripts/gen-*.mjs",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/progress-board.mjs",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/produce-pr-view.mjs",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/codex-usage-report.mjs",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/usage-report/**",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/dev/**",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/design-refs/**",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/design-refs.mjs",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/capability-search.mjs",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/codemap.mjs",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/validation-normalize/**",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/ingest-adapter/**",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/gen-wrapper/**",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/auth-capture/**",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/probes/**",
+      "destination": "plateau",
+      "note": "S4 dashboards, generators, usage views and development tools.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/*build-hook.cjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/decision-docket-*.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/pr-view-*.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/usage-report-*.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/codex-usage-ledger.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/token-css.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/component-tokens.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/intents-loader.cjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/render-check.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/buildReport.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/prototype-tracker-render.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/__tests__/*docket*.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/__tests__/*pr-view*.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/__tests__/*usage*.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/__tests__/*token-css*.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/__tests__/*component-tokens*.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/__tests__/progress-board.test.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/__tests__/produce-pr-view.test.mjs",
+      "destination": "plateau",
+      "note": "S4 site build helpers and product presentation modules and tests.",
+      "original": "standard-def",
+      "override": true
+    },
+    {
+      "glob": "scripts/conveyor/**",
+      "destination": "longshore",
+      "note": "Delivery engine, operations, host admission, backlog tooling and shared delivery kit.",
+      "override": true
+    },
+    {
+      "glob": "scripts/operations/**",
+      "destination": "longshore",
+      "note": "Delivery engine, operations, host admission, backlog tooling and shared delivery kit.",
+      "override": true
+    },
+    {
+      "glob": "scripts/readiness/**",
+      "destination": "longshore",
+      "note": "Delivery engine, operations, host admission, backlog tooling and shared delivery kit.",
+      "override": true
+    },
+    {
+      "glob": "scripts/backlog/**",
+      "destination": "longshore",
+      "note": "Delivery engine, operations, host admission, backlog tooling and shared delivery kit.",
+      "override": true
+    },
+    {
+      "glob": "scripts/settings/**",
+      "destination": "longshore",
+      "note": "Delivery engine, operations, host admission, backlog tooling and shared delivery kit.",
+      "override": true
+    },
+    {
+      "glob": "scripts/golden-corpus/**",
+      "destination": "longshore",
+      "note": "Delivery engine, operations, host admission, backlog tooling and shared delivery kit.",
+      "override": true
+    },
+    {
+      "glob": "scripts/review-corpus/**",
+      "destination": "longshore",
+      "note": "Delivery engine, operations, host admission, backlog tooling and shared delivery kit.",
+      "override": true
+    },
+    {
+      "glob": "scripts/workflows/**",
+      "destination": "longshore",
+      "note": "Delivery engine, operations, host admission, backlog tooling and shared delivery kit.",
+      "override": true
+    },
+    {
+      "glob": "scripts/autofix/**",
+      "destination": "longshore",
+      "note": "Delivery engine, operations, host admission, backlog tooling and shared delivery kit.",
+      "override": true
+    },
+    {
+      "glob": "scripts/lib/**",
+      "destination": "longshore",
+      "note": "Delivery engine, operations, host admission, backlog tooling and shared delivery kit.",
+      "override": true
+    },
+    {
+      "glob": "scripts/lane-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/*lane*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/guard-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/guard-*.json",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/check-backlog*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/backlog*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/check-memory*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/memory-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/check-readiness.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/check-review-gate.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/check-statute.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/audit-backlog-health.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/held-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/review-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/review-*.json",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/pr-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/pr-*.json",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/*dispatch*.json",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/*review*.json",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/merge-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/merge-ai-prs.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/drain-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/drain-*.json",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/converge-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/converge-cli.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/daemon-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/*direct-task.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/collect-review-requests.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/apply-review-request.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/push-if-green.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/wait-green.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/fetch-parked.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/worker-brief.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/quiet-hours*",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/sync-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/bootstrap-session.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/state.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/land-*.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/broadcast-inject.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/run-fresh.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/session-replay.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/soak-replay-gate-cli.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/ledger-readiness.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/propose-readiness.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/gap-sweep-status.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/prototype-tracker.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/graduation-import-check.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/normalize-graduated.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/ci-card-only.mjs",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/__tests__/**",
+      "destination": "longshore",
+      "note": "Delivery lifecycle entry points, hygiene and regression tests.",
+      "override": true
+    },
+    {
+      "glob": "scripts/ci/**",
+      "destination": "repo-local",
+      "note": "Repository CI and branch configuration.",
+      "override": true
+    },
+    {
+      "glob": "scripts/rulesets/**",
+      "destination": "repo-local",
+      "note": "Repository CI and branch configuration.",
+      "override": true
+    },
+    {
+      "glob": "scripts/**",
+      "destination": "plateau",
+      "note": "Remaining runnable tools are product implementation under S4, never standard definitions."
+    },
+    {
+      "glob": "backlog/**",
+      "destination": "data-by-topic",
+      "note": "Cards, memory, research and audit/reference evidence are sorted by topic at extraction."
+    },
+    {
+      "glob": "agent-memory-src/**",
+      "destination": "data-by-topic",
+      "note": "Cards, memory, research and audit/reference evidence are sorted by topic at extraction."
+    },
+    {
+      "glob": "reports/**",
+      "destination": "data-by-topic",
+      "note": "Cards, memory, research and audit/reference evidence are sorted by topic at extraction."
+    },
+    {
+      "glob": "audits/**",
+      "destination": "data-by-topic",
+      "note": "Cards, memory, research and audit/reference evidence are sorted by topic at extraction."
+    },
+    {
+      "glob": "design-refs/**",
+      "destination": "data-by-topic",
+      "note": "Cards, memory, research and audit/reference evidence are sorted by topic at extraction."
+    },
+    {
+      "glob": "docs/**",
+      "destination": "repo-local",
+      "note": "Repository-local agent instructions, skills, hooks and CI configuration."
+    },
+    {
+      "glob": ".claude/**",
+      "destination": "repo-local",
+      "note": "Repository-local agent instructions, skills, hooks and CI configuration."
+    },
+    {
+      "glob": ".github/**",
+      "destination": "repo-local",
+      "note": "Repository-local agent instructions, skills, hooks and CI configuration."
+    },
+    {
+      "glob": ".githooks/**",
+      "destination": "repo-local",
+      "note": "Repository-local agent instructions, skills, hooks and CI configuration."
+    },
+    {
+      "glob": "skills-src/**",
+      "destination": "repo-local",
+      "note": "Repository-local agent instructions, skills, hooks and CI configuration."
+    },
+    {
+      "glob": "contracts/**/*.test.ts",
+      "destination": "everstandards-conformance",
+      "note": "Contract validation tests.",
+      "override": true
+    },
+    {
+      "glob": "contracts/**",
+      "destination": "standard-def",
+      "note": "Type contracts, schema definitions and declarative conformance vectors.",
+      "override": true
+    },
+    {
+      "glob": "conformance-vectors/**/*.json",
+      "destination": "standard-def",
+      "note": "Type contracts, schema definitions and declarative conformance vectors.",
+      "override": true
+    },
+    {
+      "glob": "capabilities/**/check.ts",
+      "destination": "everstandards-conformance",
+      "note": "Standard check entry points, conformance validators and runner tests.",
+      "override": true
+    },
+    {
+      "glob": "conformance-vectors/**",
+      "destination": "everstandards-conformance",
+      "note": "Standard check entry points, conformance validators and runner tests.",
+      "override": true
+    },
+    {
+      "glob": "capability-manifest/**",
+      "destination": "everstandards-conformance",
+      "note": "Standard check entry points, conformance validators and runner tests.",
+      "override": true
+    },
+    {
+      "glob": "wrapper-conformance/**",
+      "destination": "everstandards-conformance",
+      "note": "Standard check entry points, conformance validators and runner tests.",
+      "override": true
+    },
+    {
+      "glob": "schemas/**",
+      "destination": "repo-local",
+      "note": "Delivery result schema configuration."
+    },
+    {
+      "glob": "analytics/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "blocks/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "bun-trial/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "capabilities/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "charts/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "commitment-policy/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "config/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "conformance-evidence/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "custom-elements.json",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests.",
+      "override": true
+    },
+    {
+      "glob": "demos/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "design-systems/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "error-summary/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "experiment/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "explorer/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "graphs/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "guard/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "identity/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "interaction-state/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "intl/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "manifests/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "module-resolution/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "notifications/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "permissions/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "plug-parity/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "positioning/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "process/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "range-anchor/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "realtime/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "reliability/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "repro-bundle/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "reproduction-parity/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "resources/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "source-resolution/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "suggested-edit/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "test-pages/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "tests/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "tools/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "trainable-judge/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "validation-generation/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "validator-resolution/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "validity-merge/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "webcases/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "webcompliance/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "webcontexts/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "webdocs/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "webinjectors/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "webpolicy/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "webtheme/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "webtraits/**",
+      "destination": "plateau",
+      "note": "S4 remaining runtime implementations, exercise apps, tooling and their tests."
+    },
+    {
+      "glob": "*",
+      "destination": "repo-local",
+      "note": "Root repository metadata, configuration and documentation; executable site entry points are excepted above."
+    }
+  ]
+}
