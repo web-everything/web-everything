@@ -8,7 +8,7 @@ import { describe, it, expect } from 'vitest';
 
 import {
   admitJobs, backoffMs, classifyJob, defineJobKind, detectSleep, kindRegistry, markClaimed, markCheckpoint,
-  markLaunching, markQueued, markRequeued, planReattach, selectEvictions, SLEEP_GAP_THRESHOLD_MS,
+  markLaunching, markQueued, markRequeued, markHeartbeat, planReattach, selectEvictions, SLEEP_GAP_THRESHOLD_MS,
   validateTaskPolicy, taskDeadlineDecision, TASK_OUTCOMES, taskFailureCharge, taskRunId,
 } from '../daemon-jobs.mjs';
 import { newJobRunRecord, isValidRunId } from '../../operations/run-record.mjs';
@@ -61,7 +61,7 @@ describe('pure item-task policy', () => {
     }
   });
 
-  it('task deadlines coexist with legacy absolute deadlines', () => {
+  it('heartbeats and host sleep never extend task deadlines, which coexist with legacy absolute deadlines', () => {
     const queued = taskRecord('q');
     expect(taskDeadlineDecision(queued, { now: T0 + 999999 })).toBeNull();
     const launch = markLaunching(queued, { at: at(T0) });
@@ -69,6 +69,14 @@ describe('pure item-task policy', () => {
     const live = markClaimed(launch, { at: at(T0 + 300000), handle: HANDLE });
     const persisted = JSON.parse(JSON.stringify(live));
     expect(taskDeadlineDecision(persisted, { now: T0 + 300000 })).toEqual({ deadlineAt: T0 + 300000, expired: true });
+    const heartbeat = markHeartbeat(persisted, { at: at(T0 + 300001) });
+    expect(heartbeat.job.heartbeatAt).toBe(at(T0 + 300001));
+    expect(taskDeadlineDecision(heartbeat, { now: T0 + 300001 })).toEqual({ deadlineAt: T0 + 300000, expired: true });
+    const wakeAt = T0 + 900001;
+    const sleepDetected = detectSleep({ wallMs: T0 + 300001, monoMs: 0 }, { wallMs: wakeAt, monoMs: 1 }).slept;
+    expect(sleepDetected).toBe(true);
+    expect(classifyJob(heartbeat, { now: wakeAt, liveness: 'alive', sleepDetected })).toBe('live');
+    expect(taskDeadlineDecision(heartbeat, { now: wakeAt })).toEqual({ deadlineAt: T0 + 300000, expired: true });
     const backoff = markRequeued(live, { at: at(T0 + 400000), now: T0 + 400000, reason: 'retry' });
     expect(taskDeadlineDecision(backoff, { now: T0 + 999999 })).toBeNull();
     const retry = markLaunching(backoff, { at: at(T0 + 500000) });

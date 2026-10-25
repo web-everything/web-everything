@@ -4,6 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { withFileLock } from './atomic-json-file.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { RESOURCE_POLICY_KINDS } from './resource-policy.mjs';
 import { taskRunId, markQueued, DEFAULT_TASK_TIMEOUT_MS, validateTaskPolicy } from './daemon-jobs.mjs';
 import { validateTaskIdentity, validateTaskMetadata, TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
 import { newJobRunRecord, isValidRunId } from '../operations/run-record.mjs';
@@ -26,7 +27,7 @@ export function taskTupleLockId(identity) {
 const positive = value => typeof value === 'number' && Number.isFinite(value) && value > 0;
 const policyLeaf = value => positive(value); // Explicit caller budgets/age bounds must also be positive.
 
-/** Lock order is tuple then record. All work inside the tuple callback is synchronous. */
+/** All work inside the tuple callback is synchronous. */
 export function enqueueItemTask({ store, kindDef, kind = kindDef?.kind, repo, item, seq, id,
   input = {}, codeSha = null, now = Date.now(), acting, resourceKind, actingRepoCap,
   policyOptions = {}, lockOptions = {},
@@ -34,6 +35,9 @@ export function enqueueItemTask({ store, kindDef, kind = kindDef?.kind, repo, it
   const identity = taskIdentity({ kind, repo, item, seq, ...(id === undefined ? {} : { id }) });
   if (kind !== kindDef?.kind) throw new TypeError('task identity kind must match kindDef');
   if (kindDef.codeMode === 'readonly-tree' && !codeSha) throw new TypeError('item task needs a codeSha to pin its snapshot');
+  if (!RESOURCE_POLICY_KINDS.includes(resourceKind)) {
+    throw new TypeError(`item task enqueue refused: resourceKind must be declared in RESOURCE_POLICY_KINDS (${RESOURCE_POLICY_KINDS.join(', ')}); correct resourceKind before rescheduling`);
+  }
   // A positive scalar would pass a leaf validator but disappear when merged with object defaults.
   for (const layer of ['standard', 'platform', 'tool', 'envValues']) {
     const block = policyOptions[layer];
@@ -102,8 +106,8 @@ const fieldPath = path => typeof path === 'string' && /^[A-Za-z_][A-Za-z0-9_]*(\
 
 /**
  * load() synchronously supplies { identity, observedAt (epoch ms), source, complete, data }.
- * expectedIdentity includes every caller-required identity field. Discovery snapshots must label their
- * source 'discovery'; they may nominate candidates but cannot authorize effects. complete is an explicit
+ * expectedIdentity includes every caller-required identity field. Only source 'live-pr' can authorize
+ * effects. complete is an explicit
  * provider assertion (including pagination for comment-dependent facts), never inferred from an array.
  * No mutable snapshot escapes; missing later field reads poison this accessor for planning.
  */

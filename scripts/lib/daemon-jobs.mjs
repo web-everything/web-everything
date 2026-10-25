@@ -21,11 +21,14 @@
  * caller's probe.
  */
 
-import { TERMINAL_JOB_STATUSES, JOB_CODE_MODES, DEFAULT_MAX_ATTEMPTS, isValidJobKind, withTimelineEvent } from '../operations/job-record.mjs';
-import { TASK_OUTCOMES, DEFAULT_ACTING_REPO_CAP, validateTaskIdentity, validateTaskMetadata } from '../operations/job-record.mjs';
+import {
+  TERMINAL_JOB_STATUSES, JOB_CODE_MODES, DEFAULT_MAX_ATTEMPTS, isValidJobKind, withTimelineEvent,
+  TASK_OUTCOMES, DEFAULT_ACTING_REPO_CAP, validateTaskIdentity, validateTaskMetadata,
+} from '../operations/job-record.mjs';
 import { createHash } from 'node:crypto';
 import { isValidRunId } from '../operations/run-record.mjs';
 import { RESOURCE_POLICY_KINDS } from './resource-policy.mjs';
+
 export { TASK_OUTCOMES, DEFAULT_TASK_TIMEOUT_MS, DEFAULT_ACTING_REPO_CAP, validateTaskPolicy } from '../operations/job-record.mjs';
 
 /** Bounded digest of validated structured identity; never put a logical ID directly in a path. */

@@ -16,6 +16,36 @@ const options = (seq = 1, repo) => ({ store, kindDef, ...identity(seq, repo), co
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'item-tasks-')); store = createJobStore(dir); });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
+it('readonly-tree enqueue requires a codeSha to pin its snapshot', () => {
+  for (const codeSha of [undefined, null, '']) {
+    expect(() => enqueueItemTask({ ...options(), codeSha })).toThrow(/codeSha.*pin its snapshot/);
+    expect(store.list().records).toHaveLength(0);
+  }
+  expect(enqueueItemTask(options()).job.task.seq).toBe(1);
+});
+
+it('enqueue refuses an identity kind that mismatches kindDef.kind', () => {
+  expect(() => enqueueItemTask({ ...options(), kind: 'review' })).toThrow(/kind must match kindDef/);
+  expect(store.list().records).toHaveLength(0);
+});
+
+it.each([undefined, null, '', 'invented', 'a'.repeat(1000)])('enqueue refuses undeclared resourceKind %s before persisting', resourceKind => {
+  expect(() => enqueueItemTask({ ...options(), resourceKind })).toThrow(/resourceKind must be declared in RESOURCE_POLICY_KINDS.*correct resourceKind before rescheduling/);
+  expect(store.list().records).toHaveLength(0);
+  expect(enqueueItemTask(options()).job.task.resourceKind).toBe('build');
+});
+
+it('tuple exclusion is per kind: the same repo and item admit different kinds', () => {
+  const first = enqueueItemTask(options());
+  const review = { ...options(), kind: 'review', kindDef: defineJobKind({ kind: 'review', entry: 'job.mjs' }) };
+  const second = enqueueItemTask(review);
+  expect(second.job.task).toMatchObject({ repo: first.job.task.repo, item: first.job.task.item, kind: 'review' });
+  expect(second.id).not.toBe(first.id);
+  expect(store.list().records).toHaveLength(2);
+  expect(() => enqueueItemTask({ ...review, seq: 2 })).toThrow(/active tuple/);
+  expect(() => enqueueItemTask(options(2))).toThrow(/active tuple/);
+});
+
 it('tuple exclusion spans sequences and fails closed on corrupt records', async () => {
   for (const state of ['queued', 'backoff', 'launching', 'running']) {
     const first = enqueueItemTask(options());
@@ -66,6 +96,31 @@ const snapshot = () => ({ identity: { repo: 'owner/repo', item: 12 }, observedAt
   data: { pull: { head: { sha: 'abc' } }, open: true } });
 const factsFor = (value = snapshot()) => createRecordingFacts({ load: () => value, expectedIdentity: { repo: 'owner/repo', item: 12 }, now: 1100, snapshotMaxAgeMs: 200 });
 const effect = () => ({ name: 'dispatch', inputs: ['pull.head.sha'], fences: ['pull.head.sha'], appliedProbe: 'worker-run', precondition: 'none' });
+
+it.each(['__proto__', 'constructor', 'prototype'])('freezeData rejects the prototype-pollution key %s in snapshots and plans', key => {
+  const unsafe = JSON.parse(`{"${key}":{"polluted":true}}`);
+  const facts = factsFor({ ...snapshot(), data: { nested: unsafe } });
+  expect(facts.outcome).toBe('deferred-read');
+  expect(() => validateTaskPlan({ facts, effects: [] })).toThrow(/deferred-read/);
+  const valid = factsFor();
+  valid.read('pull.head.sha');
+  expect(() => validateTaskPlan({ facts: valid, effects: [{ ...effect(), precondition: unsafe }] })).toThrow(/plan must be serializable: unsafe data key/);
+});
+
+it.each(['__proto__', 'constructor', 'prototype'])('fieldPath rejects the prototype-pollution segment %s in reads, inputs and fences', key => {
+  for (const path of [key, `pull.${key}.sha`]) {
+    const facts = factsFor();
+    expect(facts.outcome).toBe('ready');
+    expect(() => facts.read(path)).toThrow(/deferred-read/);
+    expect(facts.outcome).toBe('deferred-read');
+    expect(() => validateTaskPlan({ facts, effects: [] })).toThrow(/deferred-read/);
+    for (const field of ['inputs', 'fences']) {
+      const valid = factsFor();
+      valid.read('pull.head.sha');
+      expect(() => validateTaskPlan({ facts: valid, effects: [{ ...effect(), [field]: [path] }] })).toThrow(/declared inputs and fences required/);
+    }
+  }
+});
 
 it('planning records nested reads and rejects incomplete effect declarations', () => {
   const facts = factsFor();
