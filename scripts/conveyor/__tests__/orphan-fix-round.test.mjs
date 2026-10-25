@@ -8,6 +8,7 @@ import {
   planOrphanFixRound, runOrphanFixRoundPass, formatOrphanFixRoundLines, buildOrphanGuardComment, verdictReviewedHead,
   ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultRearm,
 } from '../orphan-fix-round.mjs';
+import { STAND_DOWN_MARKER } from '../stand-down.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../fixer-stuck-reclaim.mjs';
@@ -184,6 +185,12 @@ describe('planOrphanFixRound — #5608 operator referral rulings', () => {
   it('re-arms a fully carded thread without a fix round even with review:human', () => {
     expect(plan(thread())).toMatchObject({ decision: 'rearm', verdictAt: new Date(verdictAt).toISOString(),
       rulingAt: new Date(rulingAt).toISOString(), reason: expect.stringContaining('no fix is owed') });
+  });
+
+  it('does not re-arm a fully carded thread while a stand-down is unresolved', () => {
+    const pr = thread();
+    pr.comments.splice(2, 0, c('2026-10-10T12:30:00Z', `${STAND_DOWN_MARKER}\n\nneeds a person`));
+    expect(plan(pr)).toMatchObject({ decision: 'none', reason: expect.stringContaining('stood down') });
   });
 
   it('does not re-arm a fully carded thread followed by a malformed operator ruling', () => {

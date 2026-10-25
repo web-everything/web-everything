@@ -105,6 +105,9 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
         if (gate.malformed || gate.protectionMalformed) throw new Error('malformed referral history');
         const settled = !gate.pending?.length && !gate.blocked?.length && !gate.disputed?.length;
         const ctx = { verdictAt: new Date(vAt).toISOString(), rulingAt: new Date(atMs(ruling)).toISOString() };
+        if (!open.length && ruled.length && settled && countUnresolvedStandDowns(annotateLapsedStandDowns(pr)?.comments) > 0) {
+          return { ...none('stood down — the stand-down answer owns it'), ...ctx };
+        }
         if (!open.length && ruled.length && settled) return { decision: 'rearm', ...ctx,
           reason: `operator ruling ${ctx.rulingAt} answered every referral finding the send-back blocked on head ${head.slice(0, 9)} (card/not-real) — no fix is owed, so the review is re-armed; review:human, if present, stays` };
         if (open.length || !settled) return { ...none(`operator ruling ${ctx.rulingAt} is partial: ${open.length} referral finding(s) still open on head ${head.slice(0, 9)} (${open.filter(isBlockedFinding).length} blocked, ${open.filter(isAwaitingRuling).length} awaiting a ruling or re-check) — it stays with a person`), ...ctx };
