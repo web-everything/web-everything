@@ -106,7 +106,7 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     { cwd, env: { ...env, ...REBUILD_IDENTITY_ENV }, timeout: 60_000 });
   const add = deps.addOverlay ?? overlays.addOverlay, event = deps.appendOverlayEvent ?? overlays.appendOverlayEvent;
   const p = paths(root, env, ref);
-  let scratch, testReport, heartbeat, stage = 'registration';
+  let scratchParent, scratch, frontierLink, testReport, heartbeat, stage = 'registration';
   const reportFailure = error => reportNeedsYou({ root, env, ref, stage, error, io, event, now });
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe ref');
@@ -133,7 +133,9 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     if (!Number.isSafeInteger(n)) throw new Error('counter exhausted; human review required');
     const next = `${ref}-auto-${n}`;
     stage = 'clone';
-    scratch = io.mkdtempSync(join(tmpdir(), 'we-auto-rebase-'));
+    scratchParent = io.mkdtempSync(join(tmpdir(), 'we-auto-rebase-'));
+    scratch = join(scratchParent, 'repo');
+    io.mkdirSync(scratch);
     const url = requireOk(git(['remote', 'get-url', 'origin']));
     const origin = isAbsolute(url) || url.includes(':') || url.startsWith('~') ? url : resolve(root, url);
     requireOk(git(['clone', '--shared', '--no-checkout', root, scratch]));
@@ -222,6 +224,16 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
       io.appendFileSync(join(scratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
       io.statSync(join(root, 'node_modules'));
       io.symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
+      // Vitest resolves Frontier UI aliases relative to the clone's parent directory.
+      const frontierSource = resolve(root, '..', 'frontierui');
+      let hasFrontier = false;
+      try { io.statSync(frontierSource); hasFrontier = true; }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (hasFrontier) {
+        const target = join(dirname(scratch), 'frontierui');
+        io.symlinkSync(frontierSource, target, 'dir');
+        frontierLink = target;
+      }
       // File arguments are filters: Vitest can exit zero while excluding selected integration tests.
       // A fresh report outside the candidate tree proves every selected file actually executed.
       io.mkdirSync(p.dir, { recursive: true });
@@ -275,9 +287,12 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     const cleanupErrors = [];
     if (testReport) try { io.rmSync(testReport, { force: true }); }
     catch (e) { cleanupErrors.push(e); }
-    if (scratch) try { io.rmSync(scratch, { recursive: true, force: true }); }
+    // Unlink the borrowed checkout before removing our private container, never its target.
+    if (frontierLink) try { io.unlinkSync(frontierLink); }
+    catch (e) { if (e.code !== 'ENOENT') cleanupErrors.push(e); }
+    if (scratchParent) try { io.rmSync(scratchParent, { recursive: true, force: true }); }
     catch (e) { cleanupErrors.push(e); }
-    // Both removals belong to one cleanup phase; attempt both before reporting or rejecting.
+    // Attempt every cleanup before reporting or rejecting a removal failure.
     if (cleanupErrors.length) {
       const error = cleanupErrors.length === 1 ? cleanupErrors[0]
         : new AggregateError(cleanupErrors, cleanupErrors.map(e => String(e?.message ?? e)).join('; '));

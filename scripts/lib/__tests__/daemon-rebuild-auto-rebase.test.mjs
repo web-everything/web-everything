@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
@@ -125,6 +125,57 @@ describe('auto-rebase executed-test inventory', () => {
 });
 
 describe('established overlay auto rebase', () => {
+  it.each(['success', 'test failure'])('links the sibling Frontier UI checkout for selected tests and unlinks only the link on %s', async outcome => {
+    const f = fixture(); f.moveMain();
+    const source = resolve(f.root, '..', 'frontierui');
+    write(source, 'plugs/marker.txt', 'keep source checkout');
+    const symlink = vi.spyOn(f.deps.io, 'symlinkSync');
+    const unlink = vi.spyOn(f.deps.io, 'unlinkSync');
+    const remove = vi.spyOn(f.deps.io, 'rmSync');
+    let scratch, target;
+    f.deps.testRunner = vi.fn(async options => {
+      scratch = options.root;
+      target = join(dirname(scratch), 'frontierui');
+      expect(options.args).toContain('worker.test.mjs');
+      expect(symlink).toHaveBeenCalledWith(source, target, 'dir');
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+      expect(fs.readlinkSync(target)).toBe(source);
+      expect(fs.readFileSync(join(target, 'plugs/marker.txt'), 'utf8')).toBe('keep source checkout');
+      expect(dirname(scratch)).toBe(f.scratched[0]);
+      expect(fs.statSync(dirname(scratch)).mode & 0o777).toBe(0o700);
+      return outcome === 'success' ? reportPassingTests(options) : { status: 1, stderr: 'selected test failed' };
+    });
+    if (outcome === 'success') await job(f);
+    else await expect(job(f)).rejects.toThrow('selected test failed');
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(unlink).toHaveBeenCalledOnce();
+    expect(unlink).toHaveBeenCalledWith(target);
+    expect(unlink.mock.invocationCallOrder[0]).toBeLessThan(remove.mock.invocationCallOrder.at(-1));
+    expect(remove).toHaveBeenCalledWith(dirname(scratch), { recursive: true, force: true });
+    expect(remove.mock.calls.some(([file]) => file === source || file.startsWith(`${source}/`))).toBe(false);
+    expect(fs.existsSync(dirname(scratch))).toBe(false);
+    expect(fs.readFileSync(join(source, 'plugs/marker.txt'), 'utf8')).toBe('keep source checkout');
+  });
+
+  it('runs selected tests without throwing or creating a Frontier UI link when the sibling is missing', async () => {
+    const f = fixture(); f.moveMain();
+    const source = resolve(f.root, '..', 'frontierui');
+    const stat = vi.spyOn(f.deps.io, 'statSync');
+    const symlink = vi.spyOn(f.deps.io, 'symlinkSync');
+    const unlink = vi.spyOn(f.deps.io, 'unlinkSync');
+    f.deps.testRunner = vi.fn(async options => {
+      expect(options.args).toContain('worker.test.mjs');
+      expect(stat).toHaveBeenCalledWith(source);
+      expect(fs.existsSync(join(dirname(options.root), 'frontierui'))).toBe(false);
+      return reportPassingTests(options);
+    });
+    await expect(job(f)).resolves.toMatchObject({ ref: `${ref}-auto-1` });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(symlink.mock.calls.some(([file]) => file === source)).toBe(false);
+    expect(unlink).not.toHaveBeenCalled();
+    expect(f.scratched.every(p => !fs.existsSync(p))).toBe(true);
+  });
+
   it.each(['auditor', 'addOverlay'])('accepts stackBases rewrites during %s and completes adoption', async phase => {
     const f = fixture(); f.moveMain();
     const original = f.deps[phase];
