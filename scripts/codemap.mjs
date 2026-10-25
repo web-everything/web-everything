@@ -298,8 +298,10 @@ console.log(JSON.stringify(${JSON.stringify({
   await test('source changed after initial hashing is neither written nor checkpointed', () => {
     verifyRetry(script);
   });
-  await test('source-change regression test rejects removal of the hash guard', () => {
-    const fixture = mkdtempSync(join(tmpdir(), 'codemap-mutation-'));
+  await test('source-change regression test rejects removal of the hash guard', async () => {
+    const { realpathSync } = await import('node:fs');
+    // Node resolves module symlinks; match argv[1] to import.meta.url for the entry-point check.
+    const fixture = realpathSync(mkdtempSync(join(tmpdir(), 'codemap-mutation-')));
     try {
       const source = readFileSync(script, 'utf8');
       const guard = 'if (hash(root, path) !== hashes[path]) {';
