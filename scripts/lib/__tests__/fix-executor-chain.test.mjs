@@ -64,7 +64,11 @@ describe('fix executor chain', () => {
     expect(chooseFixExecutor({chain:{value:chain},mainFix:true,critical:true,launcherAvailable:true}).executor).toBe('claude');
   });
   it('still skips unavailable launchers before applying the critical threshold', () => {
-    expect(pick({critical:true,trigger:'stronger-model',launcherAvailable:()=>false})).toMatchObject({executor:'claude'});
+    const input = {chain:['argon','codex-alt','claude'],critical:true,launcherAvailable:executor=>executor==='codex'};
+    expect(pick({...input,criticalClaudeFromRung:2})).toMatchObject({executor:'codex',rung:'codex-alt',
+      reason:expect.stringContaining('argon launcher unavailable, fallback')});
+    expect(pick({...input,criticalClaudeFromRung:1})).toMatchObject({executor:'claude',rung:'claude',
+      reason:'critical work reaches Claude from rung 1 (criticalClaudeFromRung=1, source=default)'});
   });
   it('honors thresholds beyond the chain while retaining its Claude fallback', () => {
     expect(pick({critical:true,criticalClaudeFromRung:99,codexUnproductive:9})).toMatchObject({executor:'claude',
@@ -100,7 +104,7 @@ describe('chain settings cascade', () => {
     input.env.WE_FIX_EXECUTOR_CRITICAL_CLAUDE_FROM_RUNG = '4';
     expect(resolve(input)).toEqual({value:FIX_EXECUTOR_CHAIN_DEFAULT,source:'default',criticalClaudeFromRung:4,criticalClaudeFromRungSource:'env'});
   });
-  it.each([0,-1,1.5,null,true,'1',[],{}, {nested:1},Number.MAX_SAFE_INTEGER+1])('ignores invalid critical threshold layers %j', raw => {
+  it.each([0,-1,1.5,null,true,'1',[],{}, {nested:1},Number.MAX_SAFE_INTEGER+1].map(value => [value]))('ignores invalid critical threshold layers %j', raw => {
     expect(resolve({platform:{fixExecutor:{criticalClaudeFromRung:raw}}})).toEqual({...defaults,value:FIX_EXECUTOR_CHAIN_DEFAULT,source:'default'});
     expect(resolve({platform:{fixExecutor:{criticalClaudeFromRung:3}},repo:{fixExecutor:{criticalClaudeFromRung:raw}}}))
       .toEqual({value:FIX_EXECUTOR_CHAIN_DEFAULT,source:'default',criticalClaudeFromRung:3,criticalClaudeFromRungSource:'platform'});
