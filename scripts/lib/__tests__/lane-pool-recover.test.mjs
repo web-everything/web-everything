@@ -268,7 +268,47 @@ describe('backupLaneContent verified preservation', () => {
 });
 
 describe('real recovery backup Git hardening', () => {
-  it('restores every stash from standalone packs, including binary, index, ignored and untracked trees', async () => {
+  it('successive recovery backups retain earlier bytes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'recover-successive-'));
+    try {
+      const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
+      const dir = join(repo.poolDir, 'lane-1');
+      mkdirSync(join(dir, 'drafts'), { recursive: true });
+      const versions = [
+        { file: Buffer.from([0, 1, 255]), patch: 'first stash patch\n', pack: Buffer.from('PACK first archive'), sha: 'a'.repeat(40) },
+        { file: Buffer.from([0, 2, 128]), patch: 'later stash patch\n', pack: Buffer.from('PACK later archive'), sha: 'b'.repeat(40) },
+      ];
+      let version = versions[0];
+      // Inject only Git reads; directory creation, copying, and archive writes are real.
+      const runGit = (_git, args) => {
+        if (['config', 'index-pack'].includes(args[0])) return '';
+        if (args[0] === 'status') return '?? drafts/note.bin\0';
+        if (args[0] === 'stash' && args[1] === 'list') return 'stash@{0}\n';
+        if (args[0] === 'stash' && args[1] === 'show') return version.patch;
+        if (args[0] === 'rev-parse') return version.sha;
+        if (args.includes('pack-objects')) return version.pack;
+        throw new Error(`Unexpected Git command: ${args.join(' ')}`);
+      };
+      const io = realRecoverIo({ repo, backupRoot: root, isLeased: () => false, runGit });
+      writeFileSync(join(dir, 'drafts/note.bin'), version.file);
+      const first = await io.backup(1);
+      expect(first).toMatchObject({ ok: true, stashes: 1 });
+      version = versions[1];
+      writeFileSync(join(dir, 'drafts/note.bin'), version.file);
+      const second = await io.backup(1);
+      expect(second).toMatchObject({ ok: true, stashes: 1 });
+      expect(second.dir).not.toBe(first.dir);
+      rmSync(repo.poolDir, { recursive: true, force: true });
+      for (const [i, backup] of [first, second].entries()) {
+        expect(readFileSync(join(backup.dir, 'drafts/note.bin'))).toEqual(versions[i].file);
+        expect(readFileSync(join(backup.dir, 'stash-0.patch'), 'utf8')).toBe(versions[i].patch);
+        expect(readFileSync(join(backup.dir, 'stash-0.pack'))).toEqual(versions[i].pack);
+        expect(readFileSync(join(backup.dir, 'stash-0.restore.txt'), 'utf8')).toContain(versions[i].sha);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('stash backups restore every content kind', async () => {
     const root = mkdtempSync(join(tmpdir(), 'recover-stash-objects-'));
     try {
       const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
