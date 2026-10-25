@@ -22,6 +22,41 @@
  */
 
 import { TERMINAL_JOB_STATUSES, JOB_CODE_MODES, DEFAULT_MAX_ATTEMPTS, isValidJobKind, withTimelineEvent } from '../operations/job-record.mjs';
+import { TASK_OUTCOMES, DEFAULT_ACTING_REPO_CAP, validateTaskIdentity, validateTaskMetadata } from '../operations/job-record.mjs';
+import { createHash } from 'node:crypto';
+import { isValidRunId } from '../operations/run-record.mjs';
+import { RESOURCE_POLICY_KINDS } from './resource-policy.mjs';
+export { TASK_OUTCOMES, DEFAULT_TASK_TIMEOUT_MS, DEFAULT_ACTING_REPO_CAP, validateTaskPolicy } from '../operations/job-record.mjs';
+
+/** Bounded digest of validated structured identity; never put a logical ID directly in a path. */
+export function taskRunId(task) {
+  const errors = validateTaskIdentity(task);
+  if (errors.length) throw new TypeError(errors.join('; '));
+  const id = `task-${createHash('sha256').update(JSON.stringify([task.kind, task.repo, task.item, task.seq])).digest('hex')}`;
+  if (!isValidRunId(id)) throw new TypeError('task storage ID refused by run-ID validator');
+  return id;
+}
+
+/** Semantic failures are a separate budget from monotonic launch-attempt tokens. */
+export function taskFailureCharge(outcome) {
+  if (!TASK_OUTCOMES.includes(outcome)) throw new TypeError('task outcome must be a declared semantic outcome');
+  return outcome === 'failed' ? 1 : 0;
+}
+
+/** Pure attempt deadline observation. Null delegates ordinary jobs to their existing deadline callback.
+ * Queue/backoff and terminal records have no active task deadline; heartbeat/sleep never extend one.
+ */
+export function taskDeadlineDecision(record, { now }) {
+  if (!Object.hasOwn(record.job, 'task')) return null;
+  const errors = validateTaskMetadata(record.job.task);
+  if (errors.length) throw new TypeError(errors.join('; '));
+  if (!occupiesSlot(record)) return null;
+  if (!Number.isFinite(now)) throw new TypeError('task deadline needs a finite now');
+  const launchedAt = ms(record.job.launchedAt);
+  const deadlineAt = launchedAt + record.job.task.timeoutMs;
+  if (!Number.isFinite(launchedAt) || !Number.isFinite(deadlineAt)) throw new TypeError('task deadline needs a valid persisted launch time and finite deadline');
+  return { deadlineAt, expired: now >= deadlineAt };
+}
 
 /** How often a running job stamps `heartbeatAt`. */
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
@@ -184,6 +219,20 @@ export function admitJobs({ records, kinds, maxConcurrent, now }) {
   if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) throw new TypeError('daemon-jobs: maxConcurrent must be a positive integer');
   const isSerial = (r) => !!kinds.get(r.job.kind)?.serial;
   const occupying = records.filter(occupiesSlot);
+  const repoCounts = new Map();
+  const repoCaps = new Map();
+  for (const r of records) {
+    if (!Object.hasOwn(r.job, 'task')) continue;
+    const errors = validateTaskMetadata(r.job.task);
+    if (r.job.task?.kind !== r.job.kind) errors.push('job.task.kind must match job.kind');
+    if (!RESOURCE_POLICY_KINDS.includes(r.job.task?.resourceKind)) errors.push('job.task.resourceKind must be declared');
+    if (errors.length) throw new TypeError(errors.join('; '));
+    const task = r.job.task;
+    if (!task.acting || TERMINAL_JOB_STATUSES.includes(r.job.status)) continue;
+    // Persisted policies may differ after a settings change: honor the strictest live repo cap.
+    repoCaps.set(task.repo, Math.min(repoCaps.get(task.repo) ?? Infinity, task.actingRepoCap ?? DEFAULT_ACTING_REPO_CAP));
+    if (occupiesSlot(r)) repoCounts.set(task.repo, (repoCounts.get(task.repo) ?? 0) + 1);
+  }
   let free = maxConcurrent - occupying.length;
   let serialBusy = occupying.some(isSerial);
   const queuedAt = (r) => ms(r.job.timeline?.find((e) => e.event === 'queued')?.at) || 0;
@@ -194,11 +243,14 @@ export function admitJobs({ records, kinds, maxConcurrent, now }) {
   const admitted = [];
   for (const r of due) {
     if (free <= 0) break;
+    const task = r.job.task;
+    if (task?.acting && (repoCounts.get(task.repo) ?? 0) >= repoCaps.get(task.repo)) continue;
     if (isSerial(r)) {
       if (serialBusy) continue;
       serialBusy = true;
     }
     admitted.push(r.id);
+    if (task?.acting) repoCounts.set(task.repo, (repoCounts.get(task.repo) ?? 0) + 1);
     free -= 1;
   }
   return admitted;

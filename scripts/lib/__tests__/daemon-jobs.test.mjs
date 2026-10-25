@@ -9,8 +9,10 @@ import { describe, it, expect } from 'vitest';
 import {
   admitJobs, backoffMs, classifyJob, defineJobKind, detectSleep, kindRegistry, markClaimed, markCheckpoint,
   markLaunching, markQueued, markRequeued, planReattach, selectEvictions, SLEEP_GAP_THRESHOLD_MS,
+  validateTaskPolicy, taskDeadlineDecision, TASK_OUTCOMES, taskFailureCharge, taskRunId,
 } from '../daemon-jobs.mjs';
-import { newJobRunRecord } from '../../operations/run-record.mjs';
+import { newJobRunRecord, isValidRunId } from '../../operations/run-record.mjs';
+import { resolveCascade } from '../policy-cascade.mjs';
 
 const T0 = Date.parse('2026-09-28T12:00:00.000Z');
 const at = (ms) => new Date(ms).toISOString();
@@ -28,6 +30,102 @@ const kinds = kindRegistry([
   defineJobKind({ kind: 'writer', entry: 'scripts/writer.mjs', serial: true }),
   defineJobKind({ kind: 'session', entry: 'scripts/session.mjs', resumable: false }),
 ]);
+
+function taskRecord(id, { repo = 'owner/repo', acting = true, kind = 'noop', actingRepoCap = 1 } = {}) {
+  const r = markQueued(newJobRunRecord({ id, kind }), { at: at(T0) });
+  r.job.task = {
+    id: `${kind}:${repo}:42:1`, kind, repo, item: 42, seq: 1, acting, actingRepoCap,
+    timeoutMs: 300000, policy: { timeoutMs: 300000 }, sources: { timeoutMs: 'standard' },
+    resourceKind: 'review', failureCount: 0, outcome: null, resultRef: null,
+  };
+  return r;
+}
+
+describe('pure item-task policy', () => {
+  it('task policy persists the 300000ms default and cascade provenance', () => {
+    expect(validateTaskPolicy()).toEqual({ policy: { timeoutMs: 300000 }, sources: { timeoutMs: 'standard' } });
+    const valid = { timeoutMs: v => Number.isFinite(v) && v > 0 };
+    const layers = { standard: { timeoutMs: 300000 }, platform: { timeoutMs: 2000 }, tool: { timeoutMs: 1000 }, envValues: { timeoutMs: 500 }, valid };
+    expect(validateTaskPolicy(resolveCascade(layers))).toEqual({ policy: { timeoutMs: 500 }, sources: { timeoutMs: 'env' } });
+    expect(validateTaskPolicy(resolveCascade({ standard: layers.standard, platform: layers.platform, valid })).sources.timeoutMs).toBe('platform');
+    expect(validateTaskPolicy(resolveCascade({ standard: layers.standard, tool: layers.tool, valid })).sources.timeoutMs).toBe('tool');
+    for (const layer of ['standard', 'platform', 'tool', 'envValues']) {
+      for (const timeoutMs of [0, -1, Infinity, NaN, '1000', null]) {
+        // The cascade does not validate its standard layer; exercise the final-policy guard there.
+        const input = layer === 'standard' ? { standard: { timeoutMs }, valid } : { ...layers, [layer]: { timeoutMs } };
+        expect(() => validateTaskPolicy(resolveCascade(input))).toThrow(/policy/);
+      }
+    }
+    for (const invalid of [null, {}, { value: {} }, { value: { timeoutMs: 1 }, sources: {} }, { value: { timeoutMs: 1 }, sources: { timeoutMs: 'unknown' }, invalid: [] }]) {
+      expect(() => validateTaskPolicy(invalid)).toThrow(/policy/);
+    }
+  });
+
+  it('task deadlines coexist with legacy absolute deadlines', () => {
+    const queued = taskRecord('q');
+    expect(taskDeadlineDecision(queued, { now: T0 + 999999 })).toBeNull();
+    const launch = markLaunching(queued, { at: at(T0) });
+    expect(taskDeadlineDecision(launch, { now: T0 + 299999 })).toEqual({ deadlineAt: T0 + 300000, expired: false });
+    const live = markClaimed(launch, { at: at(T0 + 300000), handle: HANDLE });
+    const persisted = JSON.parse(JSON.stringify(live));
+    expect(taskDeadlineDecision(persisted, { now: T0 + 300000 })).toEqual({ deadlineAt: T0 + 300000, expired: true });
+    const backoff = markRequeued(live, { at: at(T0 + 400000), now: T0 + 400000, reason: 'retry' });
+    expect(taskDeadlineDecision(backoff, { now: T0 + 999999 })).toBeNull();
+    const retry = markLaunching(backoff, { at: at(T0 + 500000) });
+    expect(taskDeadlineDecision(retry, { now: T0 + 500001 }).deadlineAt).toBe(T0 + 800000);
+    expect(taskDeadlineDecision(running(), { now: T0 + 999999 })).toBeNull();
+    expect(taskDeadlineDecision({ ...live, job: { ...live.job, status: 'succeeded' } }, { now: T0 + 999999 })).toBeNull();
+    expect(() => taskDeadlineDecision({ ...live, job: { ...live.job, launchedAt: null } }, { now: T0 })).toThrow(/launch/);
+    expect(() => taskDeadlineDecision(live, { now: NaN })).toThrow(/now/);
+  });
+
+  it('task outcomes preserve launch identity and charge only failed attempts', () => {
+    expect(TASK_OUTCOMES).toEqual(['acted', 'nothing-owed', 'superseded', 'deferred-claim-held', 'deferred-read', 'failed']);
+    let r = taskRecord('outcome');
+    for (const [index, outcome] of TASK_OUTCOMES.entries()) {
+      r = markLaunching(r, { at: at(T0 + index) });
+      expect(r.job.attempts).toBe(index + 1);
+      expect(r.job.task.failureCount).toBe(0);
+      expect(taskFailureCharge(outcome)).toBe(outcome === 'failed' ? 1 : 0);
+    }
+    expect(() => taskFailureCharge('success')).toThrow(/outcome/);
+    expect(() => taskFailureCharge(null)).toThrow(/outcome/);
+    const identity = taskRecord('identity').job.task;
+    const id = taskRunId(identity);
+    expect(isValidRunId(id)).toBe(true);
+    expect(isValidRunId(identity.id)).toBe(false);
+    expect(taskRunId(JSON.parse(JSON.stringify(identity)))).toBe(id);
+    expect(taskRunId({ ...identity, seq: 2, id: 'noop:owner/repo:42:2' })).not.toBe(id);
+    expect(taskRunId({ ...identity, repo: 'owner/other', id: 'noop:owner/other:42:1' })).not.toBe(id);
+    expect(() => taskRunId({ ...identity, item: '../escape' })).toThrow(/task/);
+  });
+
+  it('acting tasks share the default one-per-repo cap across kinds', () => {
+    const a = taskRecord('a');
+    const b = taskRecord('b', { kind: 'session' });
+    const c = taskRecord('c', { repo: 'owner/other' });
+    const d = taskRecord('d', { acting: false });
+    delete a.job.task.actingRepoCap;
+    const records = [a, b, c, d];
+    const admit = (rows, cap = 10) => admitJobs({ records: rows, kinds, maxConcurrent: cap, now: T0 });
+    const before = structuredClone(records);
+    expect(admit(records)).toEqual(['a', 'c', 'd']);
+    expect(records).toEqual(before);
+    for (const busy of [markLaunching(a, { at: at(T0) }), markClaimed(markLaunching(a, { at: at(T0) }), { at: at(T0), handle: HANDLE })]) {
+      expect(admit([busy, b, c, d])).toEqual(['c', 'd']);
+    }
+    expect(admit(records, 1)).toEqual(['a']);
+    expect(admit([a, taskRecord('b', { actingRepoCap: 2 }), taskRecord('c', { actingRepoCap: 2 })])).toEqual(['a']);
+    expect(admit([taskRecord('a', { actingRepoCap: 2 }), taskRecord('b', { actingRepoCap: 2 }), taskRecord('c', { actingRepoCap: 2 })])).toEqual(['a', 'b']);
+    const serial = [taskRecord('a', { kind: 'writer' }), taskRecord('b', { kind: 'writer', repo: 'owner/other' }), c];
+    expect(admit(serial)).toEqual(['a', 'c']);
+    expect(() => admit([{ ...b, job: { ...b.job, task: {} } }])).toThrow(/task/);
+    expect(() => admit([taskRecord('bad', { actingRepoCap: 0 })])).toThrow(/task/);
+    const unknownResource = taskRecord('unknown');
+    unknownResource.job.task.resourceKind = 'invented';
+    expect(() => admit([unknownResource])).toThrow(/resourceKind/);
+  });
+});
 
 describe('classifyJob', () => {
   it('live pid + fresh heartbeat = live; live pid + stale heartbeat = stalled', () => {
