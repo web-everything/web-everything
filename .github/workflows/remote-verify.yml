@@ -1,0 +1,110 @@
+name: Remote verify
+run-name: remote-verify (${{ inputs.mode || 'lane-check' }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Targeted mode only — branch or SHA (empty uses the triggering SHA)
+        type: string
+        default: ''
+      mode:
+        description: Verification scope
+        type: choice
+        options: [lane-check, targeted, full]
+        default: lane-check
+      tests:
+        description: Space-separated test files for targeted mode
+        type: string
+        default: ''
+      operation:
+        description: Operation whose related tests run in targeted mode
+        type: string
+        default: ''
+  push:
+    branches: ['lane/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-verify-${{ github.event_name }}-${{ inputs.mode || 'lane-check' }}-${{ inputs.mode == 'targeted' && (inputs.ref || github.ref) || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ${{ vars.WE_SHARD_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: web-everything
+    steps:
+      # Targeted refs may predate the dispatcher; keep orchestration with the workflow.
+      - name: Checkout verification dispatcher
+        uses: actions/checkout@v4
+        with:
+          path: remote-verify-source
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/lib/remote-verify-dispatch.mjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Checkout WE
+        uses: actions/checkout@v4
+        with:
+          path: web-everything
+          fetch-depth: 0
+          ref: ${{ inputs.mode == 'targeted' && (inputs.ref || github.sha) || github.sha }}
+      - name: Verify checkout SHA
+        if: ${{ inputs.mode != 'targeted' }}
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      # Same sibling layout and tool build as CI's test job.
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Checkout FUI (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
+          path: frontierui
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web-everything/package-lock.json
+            frontierui/package-lock.json
+      - name: Install + build FUI tools
+        working-directory: frontierui
+        run: |
+          npm ci
+          npm run build:tools
+      - name: Install
+        run: npm ci
+      # Import also requires the entire run tree to equal canonical main's tree.
+      # Lane changes use local verify until protected gate execution is available.
+      - name: ${{ inputs.mode == 'targeted' && 'Targeted tests' || 'Required lane gate' }}
+        env:
+          VERIFY_MODE: ${{ inputs.mode || 'lane-check' }}
+          VERIFY_TESTS: ${{ inputs.tests }}
+          VERIFY_OPERATION: ${{ inputs.operation }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { existsSync } from 'node:fs';
+          import { remoteVerifyCommands } from '../remote-verify-source/scripts/lib/remote-verify-dispatch.mjs';
+          const commands = remoteVerifyCommands({ mode: process.env.VERIFY_MODE,
+            tests: process.env.VERIFY_TESTS, operation: process.env.VERIFY_OPERATION }, existsSync);
+          for (const [file, args] of commands) {
+            execFileSync(file, args, { stdio: 'inherit' });
+          }
+          NODE

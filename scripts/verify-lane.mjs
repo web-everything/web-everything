@@ -27,6 +27,7 @@
  *   node scripts/verify-lane.mjs --gate="npm run test:unit"   # override the suite command (skips diff-driven selection entirely)
  *   node scripts/verify-lane.mjs --repo=~/workspace/.lanes/web-everything/lane-3   # verify a specific lane clone
  *   node scripts/verify-lane.mjs run                  # xpnhz4o — run the SAME default gate foreground, but record NO marker (the fix/ci-heal gate)
+ *   node scripts/verify-lane.mjs remote --wait=540000 --json # import exact-HEAD success (clean, pushed tree matching canonical main)
  *   node scripts/verify-lane.mjs --json              # machine-readable {sha, status, exitCode} on stdout
  *   node scripts/verify-lane.mjs check               # READ-ONLY: print the current marker's gate verdict for HEAD, run nothing
  *   node scripts/verify-lane.mjs check --require-verified   # exit non-zero unless HEAD has a fresh GREEN marker (the gate pr-land applies)
@@ -67,6 +68,8 @@ import { isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY
 import * as nodeFs from 'node:fs';
 import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
+import { recordRemoteVerification, waitForRemoteVerify, MAX_REMOTE_WAIT_MS } from './lib/remote-verify.mjs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
@@ -95,12 +98,14 @@ const positionals = [];
 if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) {
   process.stdout.write(`verify-lane — verify a lane clone before it lands (writes the .lane-verify marker).
 
-Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run] [flags]
+Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run|remote] [flags]
   (none)    run the diff-selected gate here and stamp the marker
   request   stamp a running marker; the verify daemon runs the gate
   check     read-only verdict for HEAD (--wait=<ms> blocks until it settles)
   reset     clear a stale marker
   run       synchronous marker-less run
+  remote    stamp exact-HEAD remote success; requires a clean pushed tree matching canonical main
+            --wait=<ms> polls up to 540000ms (default: one probe); local verify is the fallback
 Flags: --repo=<dir> --json --require-verified --dry-run (print default gate only) --help/-h
 Exit: 0 ok, 2 red, 3 usage/refused. Full docs: the header of scripts/verify-lane.mjs.
 `);
@@ -125,7 +130,7 @@ const { requireVerified: REQUIRE_VERIFIED, breakGlass: VERIFY_BREAK_GLASS } = re
 // commands nor any other child we spawn can read it. Later in-band queue markers echo it (see `timedRunGate`).
 const MARKER_NONCE_SUFFIX = markerNonceSuffix(process.env[VERIFY_MARKER_NONCE_ENV]);
 delete process.env[VERIFY_MARKER_NONCE_ENV];
-const MODE = flags['dry-run'] ? 'print-gate' : positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
+const MODE = positionals[0] === 'remote' ? 'remote' : flags['dry-run'] ? 'print-gate' : positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
   : positionals[0] === 'request' ? 'request' : positionals[0] === 'run' ? 'run' : 'verify';
 
 // The lane is agent-writable, and the fix daemon runs `request` against it: its `.git/config` must never be able to execute
@@ -192,7 +197,85 @@ function emit(result, exitCode) {
 }
 
 const headSha = tryGit(['rev-parse', 'HEAD']);
-if (!headSha) emit({ sha: null, status: 'error', reason: 'no-head', detail: `could not resolve HEAD in ${REPO} — is this a git checkout?` }, 3);
+if (!headSha) emit({ sha: null, status: 'error', reason: 'no-head', detail: `could not resolve HEAD in ${REPO} — is this a git checkout?` }, MODE === 'remote' ? 2 : 3);
+const treeHashNow = () => computeWorkingTreeHash({ runGit: git, fileMode: (f) => lstatSync(join(REPO, f)).mode });
+
+if (MODE === 'remote') {
+  const waitMs = flags.wait === undefined ? 0 : typeof flags.wait === 'string' && flags.wait.trim() ? Number(flags.wait) : NaN;
+  if (!Number.isFinite(waitMs) || waitMs < 0 || positionals.length !== 1
+    || Object.keys(flags).some((key) => !['wait', 'json', 'repo'].includes(key))) {
+    emit({ sha: headSha, status: 'error', ok: false, detail: 'Usage: remote [--wait=<nonnegative ms>] [--json] [--repo=<dir>]' }, 3);
+  }
+  if (waitMs > MAX_REMOTE_WAIT_MS) process.stderr.write(`Remote wait capped at ${MAX_REMOTE_WAIT_MS}ms; on timeout use local verify or retry remote.\n`);
+  try {
+    if (git(['status', '--porcelain', '--untracked-files=all']) !== '') {
+      throw Object.assign(new Error('Remote verification requires a clean tree'), { code: 'REMOTE_DIRTY_TREE' });
+    }
+    const initialTree = treeHashNow();
+    if (!initialTree) throw new Error('Could not hash the working tree');
+    const origin = git(['remote', 'get-url', 'origin']);
+    const match = /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(origin);
+    if (!match || ['.', '..'].includes(match[1]) || ['.', '..'].includes(match[2])) {
+      throw new Error('Unsupported origin URL; use local verify');
+    }
+    const slug = 'web-everything/web-everything';
+    if (`${match[1]}/${match[2]}`.toLowerCase() !== slug) {
+      throw new Error('Remote verification requires the canonical origin; use local verify');
+    }
+    const pushed = execFileSync('git', hardenLaneGitArgs(['-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
+      '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never', 'ls-remote', '--heads', 'origin']), {
+      cwd: REPO, encoding: 'utf8', env: GIT_ENV, timeout: 15000, maxBuffer: 2 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (!pushed.split('\n').some((line) => line.split(/\s+/)[0] === headSha)) {
+      throw Object.assign(new Error('HEAD must be pushed to an origin branch'), { code: 'REMOTE_UNPUSHED_HEAD' });
+    }
+    // Exact-HEAD evidence must be live, including the final run-attempt re-check.
+    // The throttle reads its own env bag separately from the child's environment.
+    const ghEnv = { ...process.env, GH_REPO: slug, GH_HOST: 'github.com', WE_FINISHED_CI_CACHE: '0' };
+    delete ghEnv.WE_GH_READ_MEMO_DIR;
+    const gh = (args) => execFileSyncThrottled('gh', args, {
+      cwd: REPO, env: ghEnv, throttle: { env: ghEnv }, encoding: 'utf8',
+      timeout: 15000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const fetchRuns = async () => {
+      const data = JSON.parse(gh(['api', '--hostname', 'github.com', `repos/${slug}/actions/workflows/remote-verify.yml/runs?head_sha=${headSha}&per_page=100`]));
+      if (!Array.isArray(data.workflow_runs) || !Number.isSafeInteger(data.total_count)
+        || data.total_count !== data.workflow_runs.length) throw new Error('Incomplete workflow run listing; use local verify');
+      return data.workflow_runs;
+    };
+    const result = await waitForRemoteVerify({
+      sha: headSha, waitMs, now: Date.now, sleep: (ms) => new Promise((done) => setTimeout(done, ms)), fetchRuns,
+    });
+    if (!result.ok) emit({ sha: headSha, ...result, status: result.state, detail: 'Remote verification did not pass; retry remote or use local verify.' }, 2);
+    const marker = await recordRemoteVerification({
+      sha: headSha, treeHash: initialTree, run: result.run, now: Date.now, writeMarker, fetchRuns,
+      // Read canonical main live, never the lane's origin/main or a caller-selected ref.
+      // Whole-tree equality includes workflow, installation hooks and gate dependencies.
+      fetchDefinition: async () => ({
+        head: JSON.parse(gh(['api', '--hostname', 'github.com', `repos/${slug}/commits/${headSha}`])),
+        base: JSON.parse(gh(['api', '--hostname', 'github.com', `repos/${slug}/commits/main`])),
+      }),
+      treeUnchanged: () => git(['rev-parse', 'HEAD']) === headSha
+        && git(['status', '--porcelain', '--untracked-files=all']) === '' && treeHashNow() === initialTree,
+      fetchJobs: async (run) => {
+        const data = JSON.parse(gh(['api', '--hostname', 'github.com', `repos/${slug}/actions/runs/${run.id}/attempts/${run.run_attempt}/jobs?per_page=100`]));
+        if (!Array.isArray(data.jobs) || !Number.isSafeInteger(data.total_count)
+          || data.total_count !== data.jobs.length) throw new Error('Incomplete remote job listing; use local verify');
+        return data.jobs;
+      },
+    });
+    emit({ ...marker, ok: true, detail: 'Remote verification passed; marker recorded.' }, 0);
+  } catch (error) {
+    const reason = error?.code === 'REMOTE_DIRTY_TREE' ? 'dirty-tree'
+      : error?.code === 'REMOTE_UNPUSHED_HEAD' ? 'head-not-pushed'
+        : error?.code === 'REMOTE_UNTRUSTED_DEFINITION' ? 'untrusted-definition' : 'remote-unavailable';
+    const detail = reason === 'untrusted-definition'
+      ? 'Remote evidence requires the complete tree protected on canonical main; use local verify for lane changes or unavailable definitions.'
+      : 'Remote verification unavailable or tree not clean/pushed; use local verify or retry remote.';
+    emit({ sha: headSha, status: 'error', ok: false, reason, detail }, 2);
+  }
+}
 
 // #5466 — a revert-red run that was killed mid-revert left a journal: put the fixed content back from git BEFORE this run
 // hashes or tests the tree, whatever the current revert-red mode. If it cannot be put back, refuse to verify that tree.
@@ -520,7 +603,6 @@ if (preStart && !preStart.corrupt && (['green', 'red', 'infrastructure-failure']
 // the child's policy. That stamp alone cannot prove the child's checks ran (the requester may have skipped
 // them entirely). Also compare the command that actually ran with this execution plan. Legacy records without
 // that evidence miss the cache once; the next completed run records it.
-const treeHashNow = () => computeWorkingTreeHash({ runGit: git, fileMode: (f) => lstatSync(join(REPO, f)).mode });
 const currentTreeHash = MODE === 'run' ? null : treeHashNow();
 const cacheHit = MODE !== 'run' && preStart && !preStart.corrupt
   && preStart.status === 'green'
