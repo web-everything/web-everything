@@ -7,6 +7,10 @@
  * **FUI** (`config/__tests__/config-resolve.test.ts` there), since the runtime is standard impl (#1282).
  */
 import { describe, it, expect } from 'vitest';
+import ts from 'typescript';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { PLATFORM_DELIVERY_POLICY_DEFAULTS } from '../platformDefaults';
 import {
   defineConfig,
   extendsFlavor,
@@ -99,5 +103,80 @@ describe('extendsFlavor — descriptor shape', () => {
     expect(isExtendsFlavorDescriptor({ foo: 1 })).toBe(false);
     expect(isDimensionPointer('./a.ts')).toBe(true);
     expect(isDimensionPointer({})).toBe(false);
+  });
+});
+
+
+describe('delivery policy contract (#5113)', () => {
+  const defaults = {
+    prCi: { mainStateParity: 'on' },
+    mergeGate: { recheckWhenMainMoved: 'if-older-than-N-min', recheckMaxAgeMin: 30, onMainRed: 'halt' },
+    dispatchGate: { overlapOverride: 'off' },
+    heavyQueue: { priority: 'repairs-first', reservedForRepairs: 1, reservedBorrowAfterMin: 10 },
+    drain: { onStepRefusal: 'alert' },
+  };
+  const values = {
+    prCi: { mainStateParity: ['on', 'off'] },
+    mergeGate: { recheckWhenMainMoved: ['if-older-than-N-min', 'always', 'off'], recheckMaxAgeMin: [1, 30], onMainRed: ['halt', 'warn', 'off'] },
+    dispatchGate: { overlapOverride: ['off', 'logged', 'free'] },
+    heavyQueue: { priority: ['repairs-first', 'fifo'], reservedForRepairs: [0, 1, 2], reservedBorrowAfterMin: [1, 10] },
+    drain: { onStepRefusal: ['alert', 'log'] },
+  };
+
+  it('types every listed value inline and as extendsFlavor overrides through the public barrel', () => {
+    const fixture = resolve('config/__tests__/delivery-policy-contract.fixture.ts');
+    const names = { prCi: 'PrCiPolicyValue', mergeGate: 'MergeGatePolicyValue', dispatchGate: 'DispatchGatePolicyValue', heavyQueue: 'HeavyQueuePolicyValue', drain: 'DrainPolicyValue' };
+    const lines = [`import { defineConfig, extendsFlavor, type WebEverythingConfig, ${Object.values(names).map(name => `type ${name}`).join(', ')} } from '../index';`];
+    for (const [dimension, fields] of Object.entries(values)) {
+      lines.push(`const ${dimension}: ${names[dimension as keyof typeof names]} = ${JSON.stringify(defaults[dimension as keyof typeof defaults])};`);
+      for (const [field, options] of Object.entries(fields)) {
+        for (const value of options) {
+          const inline = { ...defaults[dimension as keyof typeof defaults], [field]: value };
+          lines.push(`defineConfig({ ${dimension}: ${JSON.stringify(inline)} });`);
+          lines.push(`defineConfig({ ${dimension}: extendsFlavor('platform', ${JSON.stringify({ [field]: value })}) });`);
+        }
+        lines.push(`// @ts-expect-error invalid policy field must be rejected even with the open dimension index`);
+        lines.push(`const invalid_${dimension}_${field}: WebEverythingConfig = { ${dimension}: { ...${dimension}, ${field}: 'unknown' } };`);
+      }
+    }
+    const host = ts.createCompilerHost({});
+    // Module discovery must stay in this checkout rather than probing sibling lanes for ambient types.
+    const directoryExists = host.directoryExists!.bind(host);
+    host.directoryExists = directory => directory.startsWith(process.cwd()) && directoryExists(directory);
+    const getSourceFile = host.getSourceFile.bind(host);
+    host.getSourceFile = (name, languageVersion, onError, shouldCreateNewSourceFile) => name === fixture
+      ? ts.createSourceFile(name, lines.join('\n'), languageVersion, true)
+      : getSourceFile(name, languageVersion, onError, shouldCreateNewSourceFile);
+    const program = ts.createProgram([fixture], { types: [], noEmit: true, strict: true, skipLibCheck: true, target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler }, host);
+    expect(ts.getPreEmitDiagnostics(program).map(d => ts.flattenDiagnosticMessageText(d.messageText, '\n'))).toEqual([]);
+    for (const [dimension, fields] of Object.entries(values)) {
+      for (const [field, options] of Object.entries(fields)) {
+        for (const value of options) {
+          const config = { [dimension]: { ...defaults[dimension as keyof typeof defaults], [field]: value } };
+          expect(defineConfig(config)).toBe(config);
+          const descriptor = extendsFlavor('platform', { [field]: value });
+          expect(defineConfig({ [dimension]: descriptor })[dimension]).toBe(descriptor);
+        }
+      }
+    }
+  });
+
+  it('equals all nine Defaults-column values exactly', () => {
+    expect(PLATFORM_DELIVERY_POLICY_DEFAULTS).toEqual(defaults);
+  });
+
+  it('replays the failure with halt, alert and overlap override off by default', () => {
+    expect(PLATFORM_DELIVERY_POLICY_DEFAULTS?.mergeGate.onMainRed).toBe('halt');
+    expect(PLATFORM_DELIVERY_POLICY_DEFAULTS?.drain.onStepRefusal).toBe('alert');
+    expect(PLATFORM_DELIVERY_POLICY_DEFAULTS?.dispatchGate.overlapOverride).toBe('off');
+  });
+
+  it('has only type imports so ungated modules cannot supply default values', () => {
+    const source = ts.createSourceFile('deliveryPolicyDefaults.ts', readFileSync(resolve('config/deliveryPolicyDefaults.ts'), 'utf8'), ts.ScriptTarget.Latest, true);
+    const imports = source.statements.filter(ts.isImportDeclaration);
+    expect(imports.length).toBeGreaterThan(0);
+    expect(imports.every(node => node.importClause?.isTypeOnly === true)).toBe(true);
+    expect(source.statements.some(node => ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined)).toBe(false);
+    expect(source.parseDiagnostics).toEqual([]);
   });
 });

@@ -15,6 +15,12 @@
  * tier (escalate + agent-reviewable — they obey the gate the WE child defines, they do not define it).
  */
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
+import { scoreEscalation, producerReviewLabel } from '../review-escalation.mjs';
 import {
   TRUST_CHAIN,
   TRUST_CHAIN_BASENAMES,
@@ -28,6 +34,7 @@ import {
   POLICY_DERIVATION_BASENAMES,
   isPolicySpecPath,
   isPolicyDerivationPath,
+  readPolicySpecRegistryAt,
 } from '../gate-config.mjs';
 
 // The phase-1 drain-daemon gate-deciding files (WE #2480). Each maps a registered basename to the shipped
@@ -202,5 +209,126 @@ describe('ENGINE_BASENAMES / isEngineTierPath — #2412 layer 4\'s "is this the 
   });
   it('the basename match TRAVELS across directories, like the rest of the trust chain', () => {
     expect(isEngineTierPath('packages/plateau-loop/src/merge-ai-prs.mjs')).toBe(true);
+  });
+});
+
+
+describe('delivery policy trust boundary (#5113 Part A)', () => {
+  it('every file the loader reads is gated, including an honoured pointer target', async () => {
+    const { loadDeliveryPolicy } = await import('../delivery-policy.mjs');
+    await fixture(async ({ root }) => {
+      mkdirSync(join(root, 'config'));
+      writeFileSync(join(root, 'config/deliveryPolicyDefaults.ts'), readFileSync(resolve('config/deliveryPolicyDefaults.ts')));
+      writeFileSync(join(root, 'webeverything.config.json'), JSON.stringify({ mergeGate: './repair-policy.json' }));
+      writeFileSync(join(root, 'repair-policy.json'), JSON.stringify({ onMainRed: 'off' }));
+      POLICY_SPEC_BASENAMES.add('repair-policy.json');
+      try {
+        const result = await loadDeliveryPolicy({ root, env: { WE_POLICY_EVENTS_FILE: join(root, 'events.jsonl') } });
+        expect(result.mergeGate.onMainRed).toBe('off');
+        expect(result.filesRead).toEqual(['config/deliveryPolicyDefaults.ts', 'webeverything.config.json', 'repair-policy.json']);
+        for (const file of result.filesRead) expect(isPolicySpecPath(file)).toBe(true);
+      } finally { POLICY_SPEC_BASENAMES.delete('repair-policy.json'); }
+    });
+  });
+
+  it.each(['webeverything.config.json', 'config/deliveryPolicyDefaults.ts'])('%s alone forces review:human as policy/spec', (path) => {
+    const entry = TRUST_CHAIN.find(member => member.file === path.split('/').at(-1));
+    expect(entry).toMatchObject({ tier: 'policy', leash: 'spec', homes: [path] });
+    expect(isPolicySpecPath(path)).toBe(true);
+    expect(producerReviewLabel(scoreEscalation({ changedFiles: [path], humanSurfaces: 'broad' }))).toBe('review:human');
+  });
+
+  it('registers the delivery policy loader as engine tier without a leash', () => {
+    const entry = TRUST_CHAIN.find(member => member.file === 'delivery-policy.mjs');
+    expect(entry).toMatchObject({ tier: 'engine', homes: ['scripts/lib/delivery-policy.mjs'] });
+    expect(entry.leash).toBeUndefined();
+    expect(isEngineTierPath('scripts/lib/delivery-policy.mjs')).toBe(true);
+    expect(isPolicySpecPath('scripts/lib/delivery-policy.mjs')).toBe(false);
+  });
+
+  async function fixture(run) {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'delivery-registry-'));
+    const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
+    const registryPath = join(root, 'scripts/lib/gate-config.mjs');
+    try {
+      mkdirSync(join(root, 'scripts/lib'), { recursive: true });
+      writeFileSync(registryPath, readFileSync(resolve('scripts/lib/gate-config.mjs')));
+      writeFileSync(join(root, 'scripts/lib/rules-loader.cjs'), readFileSync(resolve('scripts/lib/rules-loader.cjs')));
+      git('init', '--quiet');
+      git('add', '.');
+      git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--quiet', '-m', 'base registry');
+      const base = git('rev-parse', 'HEAD').trim();
+      await run({ root, git, registryPath, base });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it('a registered pointer target edited alone forces review:human with the root config untouched', async () => {
+    await fixture(async ({ root, registryPath }) => {
+      writeFileSync(join(root, 'repair-policy.json'), JSON.stringify({ onMainRed: 'off' }));
+      writeFileSync(registryPath, readFileSync(registryPath, 'utf8').replace('export const TRUST_CHAIN = [', `export const TRUST_CHAIN = [
+        { role: 'fixture-pointer', file: 'repair-policy.json', tier: 'policy', leash: 'spec', homes: ['repair-policy.json'] },`));
+      // Run the real rubric with the fixture registry under Node, outside Vite's transform root.
+      const rubricPath = resolve('scripts/lib/review-escalation.mjs');
+      const require = createRequire(rubricPath);
+      const rubricSource = readFileSync(rubricPath, 'utf8')
+        .replace(/from '(\.\/[^']+)'/g, (_match, specifier) => {
+          const path = specifier === './gate-config.mjs' ? registryPath : resolve('scripts/lib', specifier);
+          return `from '${pathToFileURL(path).href}'`;
+        })
+        .replace("from 'markdown-it'", `from '${pathToFileURL(require.resolve('markdown-it')).href}'`);
+      const fixtureRubricPath = join(root, 'scripts/lib/review-escalation.mjs');
+      writeFileSync(fixtureRubricPath, rubricSource);
+      const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+        const registry = await import(process.argv[1]);
+        const rubric = await import(process.argv[2]);
+        const changedFiles = ['repair-policy.json'];
+        const verdict = rubric.scoreEscalation({ changedFiles, humanSurfaces: 'broad' });
+        process.stdout.write(JSON.stringify({
+          registered: registry.isPolicySpecPath(changedFiles[0]),
+          label: rubric.producerReviewLabel(verdict),
+        }));
+      `, pathToFileURL(registryPath).href, pathToFileURL(fixtureRubricPath).href], {
+        cwd: root, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+      });
+      expect(JSON.parse(output)).toEqual({ registered: true, label: 'review:human' });
+    });
+  });
+
+  it('reads the base registry from a temp copy and never executes the PR registry or dependency', async () => {
+    await fixture(async ({ root, registryPath, base }) => {
+      const marker = join(root, 'pr-executed');
+      const sideEffect = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'executed');`;
+      writeFileSync(registryPath, `import { createRequire } from 'node:module'; const require = createRequire(import.meta.url); ${sideEffect} throw Error('PR registry executed');`);
+      writeFileSync(join(root, 'scripts/lib/rules-loader.cjs'), sideEffect);
+      const registry = await readPolicySpecRegistryAt(base, { root });
+      expect(registry).not.toBeNull();
+      expect(registry.has('webeverything.config.json')).toBe(true);
+      expect(registry.has('deliveryPolicyDefaults.ts')).toBe(true);
+      expect(registry.has('repair-policy.json')).toBe(false);
+      expect(existsSync(marker)).toBe(false);
+    });
+  });
+
+  it('refuses a PR-only registration when the requested base did not register the target', async () => {
+    await fixture(async ({ root, registryPath, base }) => {
+      writeFileSync(registryPath, readFileSync(registryPath, 'utf8').replace('export const TRUST_CHAIN = [', `export const TRUST_CHAIN = [
+        { file: 'repair-policy.json', tier: 'policy', leash: 'spec' },`));
+      const registry = await readPolicySpecRegistryAt(base, { root });
+      expect(registry?.has('repair-policy.json')).toBe(false);
+    });
+  });
+
+  it('returns null for missing, unreadable, incomplete or oversized base evidence so callers refuse all pointers', async () => {
+    await fixture(async ({ root, registryPath, git }) => {
+      expect(await readPolicySpecRegistryAt('missing-ref', { root })).toBeNull();
+      for (const source of ['throw Error("unreadable");', 'export const POLICY_SPEC_BASENAMES = new Set();', 'export const POLICY_SPEC_BASENAMES = new Set([42]);', `/*${'x'.repeat(1024 * 1024)}*/export const POLICY_SPEC_BASENAMES = new Set(['oversized.json']);`]) {
+        writeFileSync(registryPath, source);
+        git('add', '.');
+        git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--quiet', '-m', 'unreadable registry');
+        expect(await readPolicySpecRegistryAt(git('rev-parse', 'HEAD').trim(), { root })).toBeNull();
+      }
+    });
   });
 });
