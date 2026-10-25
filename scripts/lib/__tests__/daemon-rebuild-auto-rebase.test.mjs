@@ -125,6 +125,56 @@ describe('auto-rebase executed-test inventory', () => {
 });
 
 describe('established overlay auto rebase', () => {
+  it.each(['auditor', 'addOverlay'])('accepts stackBases rewrites during %s and completes adoption', async phase => {
+    const f = fixture(); f.moveMain();
+    const original = f.deps[phase];
+    f.deps[phase] = (...args) => {
+      persistStackBases(f.root, new Map([[overlay.pr, ['lane/stack-base']]]), { env: f.env });
+      return original(...args);
+    };
+    const replacement = await job(f);
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref, replacement.ref]);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    swaps(f);
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([replacement.ref]);
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+  });
+
+  it.each(['writeFileSync', 'renameSync'])('recovers registration when pending-swap persistence fails (%s)', async operation => {
+    const f = fixture(); f.moveMain();
+    const original = readOverlays(f.root, { env: f.env });
+    f.deps.io[operation] = (file, ...args) => {
+      if (file.startsWith(pendingDir(f)) && file.endsWith('.tmp')) throw new Error('pending persistence failed');
+      return fs[operation](file, ...args);
+    };
+    await expect(job(f)).rejects.toThrow('pending persistence failed');
+    expect(readOverlays(f.root, { env: f.env })).toEqual(original);
+    expect(f.calls).not.toContain('add');
+    expect(f.calls).not.toContain('auto-rebase-registered');
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+    expect(needsYouAlert(f).detail.stage).toBe('register');
+    f.deps.io[operation] = fs[operation];
+    const replacement = await job(f);
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref, replacement.ref]);
+  });
+
+  it.each([undefined, '0', '1'])('requires explicit auto-rebase opt-in under Vitest (switch %s)', async setting => {
+    const f = fixture();
+    const live = await planRebuild({ git: (a, o) => run(a, { cwd: f.root, ...o }), headSha: f.baseSha, mainRef: 'origin/main', overlays: [overlay] });
+    f.moveMain(); ok(f.root, ['reset', '--hard', live.finalSha]);
+    writeRebuildState(f.root, { adopted: { head: live.finalSha } }, f.env);
+    const env = { ...f.env }; delete env.WE_DAEMON_AUTO_REBASE;
+    if (setting !== undefined) env.WE_DAEMON_AUTO_REBASE = setting;
+    const kick = vi.fn(() => ({ started: [ref], skipped: [] })), cleanup = vi.fn();
+    const result = await prepareRebuild({ root: f.root, env, run, log: {}, now: Date.now,
+      prState: async () => 'OPEN', prBaseChain: async () => null,
+      autoRebase: { resolveAutoRebaseSwitch, kickAutoRebase: kick, finishPendingSwaps: cleanup } });
+    expect(result.result.reason).toBe('established-overlay-conflict');
+    expect(kick).toHaveBeenCalledTimes(setting === '1' ? 1 : 0);
+    expect(cleanup).toHaveBeenCalledTimes(setting === '1' ? 1 : 0);
+    expect(env.WE_DAEMON_AUTO_REBASE).toBe(setting);
+  });
+
   describe('operator withdrawal during detached repair', () => {
     it.each(['codex', 'testRunner', 'auditor', 'push', 'register'])(
       'does not resurrect an overlay removed during %s', async phase => {

@@ -91,7 +91,12 @@ const requireAgentSuccess = result => {
 const readPending = (io, file) => JSON.parse(io.readFileSync(file, 'utf8'));
 const writePending = (io, file, data) => {
   const temp = `${file}.${process.pid}.tmp`;
-  io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file);
+  try {
+    io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file);
+  } catch (error) {
+    io.rmSync(temp, { force: true });
+    throw error;
+  }
 };
 
 export async function runAutoRebase({ root, ref, token, env = process.env, deps = {} }) {
@@ -244,16 +249,22 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     if (requireOk(git(['rev-parse', 'HEAD'], scratch)) !== candidate || requireOk(git(['status', '--porcelain'], scratch))) throw new Error('candidate changed after tests');
     stage = 'push';
     const current = (deps.readOverlayState ?? overlays.readOverlayState)(root, { env });
-    if (current.corrupt || !isDeepStrictEqual(current.overlays?.find(o => o?.ref === ref), old)) {
+    if (current.corrupt || !isDeepStrictEqual(overlays.registrationIdentity(current.overlays?.find(o => o?.ref === ref)), overlays.registrationIdentity(old))) {
       throw new Error('source registration unavailable or changed; refusing replacement');
     }
     requireOk(git(['push', 'origin', `HEAD:refs/heads/${next}`], scratch));
     stage = 'register';
-    // Recheck under the list mutex: removal during push or lock acquisition must win too.
-    add(root, { ref: next, pr: old.pr, stackBases: [ref], reason: `auto-rebase of ${ref}` }, { env, expectedOverlay: old });
     io.mkdirSync(p.dir, { recursive: true });
-    // The registration this swap retires, recorded once: cleanup removes the original only while it still matches.
+    // Persist recovery evidence before exposing the replacement to the loader.
+    // Cleanup removes the original only while its recorded registration still matches.
     writePending(io, p.pending, { old: ref, oldOverlay: old, new: next, newSha: candidate, rule, at: now() });
+    try {
+      // Recheck under the list mutex: removal during push or lock acquisition must win too.
+      add(root, { ref: next, pr: old.pr, stackBases: [ref], reason: `auto-rebase of ${ref}` }, { env, expectedOverlay: old });
+    } catch (error) {
+      io.rmSync(p.pending, { force: true });
+      throw error;
+    }
     event(root, { kind: 'auto-rebase-registered', ref, new: next, newSha: candidate, rule }, { env });
     return { ref: next, newSha: candidate };
   } catch (e) {

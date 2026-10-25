@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runAutoRebase, finishPendingSwaps } from '../../../lib/daemon-rebuild/auto-rebase.mjs';
-import { addOverlay, removeOverlay, readOverlays, overlayFilePath } from '../../../lib/daemon-overlays.mjs';
+import { addOverlay, removeOverlay, readOverlays, overlayFilePath, persistStackBases } from '../../../lib/daemon-overlays.mjs';
 
 const REPO = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const WORKER = 'scripts/lib/daemon-rebuild/auto-rebase.mjs';
@@ -15,7 +15,7 @@ const agent = lastMessage => success(JSON.stringify({ exitCode: 0, events: { ter
 
 // The worker is real; Git is virtual so this probe never mutates repository metadata.
 // realRunner exercises Vitest's actual file-filter/exclude behavior with the reported paths.
-export async function runTestInventoryCase({ mode = 'excluded', realRunner = false } = {}) {
+export async function runTestInventoryCase({ mode = 'excluded', realRunner = false, rewriteBases, pendingFailure } = {}) {
   const dir = fs.mkdtempSync(join(tmpdir(), 'soak-auto-inventory-'));
   const root = join(dir, 'clone');
   fs.mkdirSync(root);
@@ -30,7 +30,14 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
     io: {
       ...fs,
       mkdtempSync(prefix) { const path = fs.mkdtempSync(prefix); scratches.push(path); return path; },
-      writeFileSync: (file, ...args) => file.includes('/.git/') ? undefined : fs.writeFileSync(file, ...args),
+      writeFileSync: (file, ...args) => {
+        if (pendingFailure === 'write' && file.endsWith('.tmp')) throw new Error('pending persistence failed');
+        return file.includes('/.git/') ? undefined : fs.writeFileSync(file, ...args);
+      },
+      renameSync: (from, to) => {
+        if (pendingFailure === 'rename' && from.endsWith('.tmp')) throw new Error('pending persistence failed');
+        return fs.renameSync(from, to);
+      },
       appendFileSync: (file, ...args) => file.includes('/.git/') ? undefined : fs.appendFileSync(file, ...args),
       readFileSync: (file, ...args) => files.some(f => file.endsWith(`/${f}`)) ? '// selected test\n' : fs.readFileSync(file, ...args),
       statSync: file => file.endsWith('/node_modules') ? {} : fs.statSync(file),
@@ -68,8 +75,14 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
       }
       return { status: mode === 'failed' ? 1 : 0 };
     },
-    async auditor() { audited = true; return agent('NOT WEAKENED'); },
-    addOverlay(...args) { registered = true; return addOverlay(...args); },
+    async auditor() {
+      if (rewriteBases === 'audit') persistStackBases(root, new Map([[123, ['lane/base']]]), { env });
+      audited = true; return agent('NOT WEAKENED');
+    },
+    addOverlay(...args) {
+      if (rewriteBases === 'register') persistStackBases(root, new Map([[123, ['lane/base']]]), { env });
+      const result = addOverlay(...args); registered = true; return result;
+    },
     appendOverlayEvent(_root, event) { events.push(event); },
   };
   try {
@@ -94,6 +107,18 @@ export default {
   },
   async run({ log } = {}) {
     const violations = [];
+    for (const rewriteBases of ['audit', 'register']) {
+      const result = await runTestInventoryCase({ mode: 'complete', rewriteBases });
+      if (result.failure || !result.registered || result.remaining.length !== 1) {
+        violations.push({ invariant: 'stack-base-cache-rewrite', detail: `${rewriteBases}: ${JSON.stringify(result)}` });
+      }
+    }
+    for (const pendingFailure of ['write', 'rename']) {
+      const result = await runTestInventoryCase({ mode: 'complete', pendingFailure });
+      if (result.failure !== 'pending persistence failed' || result.registered || result.overlays.join(',') !== REF || result.remaining.length) {
+        violations.push({ invariant: 'pending-persistence', detail: `${pendingFailure}: ${JSON.stringify(result)}` });
+      }
+    }
     const inventory = await runTestInventoryCase();
     if (!inventory.failure?.includes('selected tests did not execute') || inventory.pushed || inventory.registered || inventory.audited) {
       violations.push({ invariant: 'selected-test-inventory', detail: 'an excluded integration test authorized repair' });

@@ -9,6 +9,14 @@ creates no pending swap and reports `auto-rebase-needs-you`. A removal during pu
 unregistered remote branch; it never authorizes loading that branch. Unrelated list edits are preserved.
 The `operator withdrawal during detached repair` tests cover each async phase and the final write boundary;
 the `auto-rebase-operator-withdrawal` soak scenario uses the real removal CLI with injected Git and agents.
+All three registration guards share `registrationIdentity`: cached `stackBases` rewrites do not change
+operator intent, while every other field still participates in the comparison. Worker regressions rewrite
+the cache during audit and at registration, then exercise adoption cleanup.
+Pending evidence is persisted before replacement registration. Write or rename failure leaves only the
+original registration; a rejected registration removes its pending file. An interruption between persistence
+and registration leaves evidence for cleanup to escalate safely. The persistence regressions also retry the repair.
+Under Vitest, `prepareRebuild` defaults auto-rebase to off without mutating the caller's environment;
+tests exercising worker launch or pending cleanup must explicitly set `WE_DAEMON_AUTO_REBASE=1`.
 
 The detached worker in `scripts/lib/daemon-rebuild/auto-rebase.mjs` merges main into a new
 `<ref>-auto-<n>` branch so ancestry preserves the original tip. It retains the old registration
