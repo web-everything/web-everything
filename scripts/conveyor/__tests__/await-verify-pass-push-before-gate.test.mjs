@@ -85,6 +85,26 @@ describe('pushShaFromScratch: first-attempt no-op evidence', () => {
   it('does not mark a retry upToDate after a transient failure even when it prints =', () => {
     expect(push({ failure: 'fatal: The requested URL returned error: 502' })).toEqual({ result: { remote: SHA }, attempts: 2 });
   });
+  it('classifies a fetch-first rejection on stdout with empty stderr as moved, not unknown or transient', () => {
+    let attempts = 0;
+    const exec = (cmd, args) => {
+      expect(cmd).toBe('git');
+      if (args.includes('init')) return '';
+      if (args.includes('push')) {
+        expect(args).toContain('--porcelain');
+        attempts += 1;
+        throw Object.assign(new Error('git push failed'), {
+          stderr: '', stdout: `To remote\n!\t${SHA}:refs/heads/x\t[rejected] (fetch first)\nDone\n`,
+        });
+      }
+      // A diverged remote would classify even an unknown failure as moved, masking a stdout regression.
+      if (args.includes('fetch')) throw new Error('remote probe unavailable');
+      throw new Error(`unexpected git argv: ${args.join(' ')}`);
+    };
+    expect(() => pushShaFromScratch({ laneGitDir: '/unused', url: 'https://example.test/repo', sha: SHA, ref: 'x', exec,
+      sleep: () => {}, tuning: { attempts: 2, baseMs: 1, capMs: 1 } })).toThrow(expect.objectContaining({ pushKind: 'moved' }));
+    expect(attempts).toBe(1);
+  });
 });
 
 describe('push-before-gate: the early push', () => {
@@ -147,6 +167,17 @@ describe('push-before-gate: the early push', () => {
     expect(h.calls.resume).toEqual([]);
     expect(h.store.has(SESSION)).toBe(true);
     expect(rows).toContainEqual(expect.objectContaining({ action: 'wait' }));
+  });
+  it.each(['wait', 'rerequest'])('keeps a non-fix record on the %s path despite persisted upToDate evidence', async (action) => {
+    const h = harness({ records: [rec({ kind: 'ci-heal', earlyPush: { sha: SHA, attempts: 1, ok: true, done: true, upToDate: true } })] });
+    if (action === 'rerequest') h.state.marker = null;
+    const { rows } = await pass(h);
+    expect(rows).toContainEqual(expect.objectContaining({ action }));
+    expect(rows).not.toContainEqual(expect.objectContaining({ reason: 'no-new-commit' }));
+    expect(h.calls.push).toEqual([]);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.calls.rerequest).toEqual(action === 'rerequest' ? [rec().lane] : []);
+    expect(h.store.has(SESSION)).toBe(true);
   });
   it('keeps the green path when the push was upToDate', async () => {
     const h = harness({ records: [rec({ attempt: 1, earlyPush: { sha: SHA, attempts: 1, done: true, ok: true, upToDate: true } })] });
