@@ -77,7 +77,7 @@ export function verdictReviewedHead(body) {
  * @returns {{decision:'none'|'rearm'|'redispatch'|'escalate', reason:string, verdictAt?:string, roundAt?:string, rulingAt?:string}}
  */
 export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT_ORPHAN_GRACE_MS, cap = ORPHAN_REDISPATCH_CAP,
-  repo = 'web-everything/web-everything', cardReadable = () => false }) {
+  repo = CONSTELLATION_REPOS.we.slug, cardReadable = () => false }) {
   const none = (reason) => ({ decision: 'none', reason });
   const labels = labelNames(pr?.labels);
   if (!labels.includes('review:changes')) return none('not bounced (no review:changes)');
