@@ -313,8 +313,9 @@ export async function planOverlayStacks({
  * Held item 212 — in `stackMode: 'tops'` (default) stacked overlays are planned as stacks (see {@link planOverlayStacks}):
  * only the tops apply, and a base contained in a top, or a base that moved away from its children, is SKIPPED (stays
  * registered) and comes back on its own only if none of its tops could apply. Exceptions: a PINNED base is never set
- * aside (it applies on its own; listed after a top that contains it, it is `skip`ped as `pinned-contained-in-applied`
- * rather than removed as `in-main`), and an overlay already an ancestor of main is not part of any stack.
+ * aside (it is deferred after its last strictly containing tip when established priority permits, then `skip`ped
+ * as `pinned-contained-in-applied` if carried by the applied top, rather than removed as `in-main`), and an overlay
+ * already an ancestor of main is not part of any stack.
  * @param {{git:(args:string[], opts?:{env?:object})=>{status:number,stdout:string,stderr:string},
  *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null}>,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean,
@@ -409,6 +410,31 @@ export async function planRebuild({
   const toProcess = [
     ...listed.filter((o) => establishedRefs.has(o?.ref)), ...listed.filter((o) => !establishedRefs.has(o?.ref)),
   ];
+  // In tops mode only, defer a pinned base until immediately after its last containing overlay.
+  // Keep an established base ahead of unrelated newcomers, even if that prevents deferring it to its top.
+  // If no containing overlay applies, the base still goes through ordinary pin protections.
+  if (stackMode === 'tops') {
+    const entries = toProcess.map((raw) => ({
+      raw, sha: raw?.ref ? verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`) : null,
+    }));
+    for (const base of entries) {
+      if (!base.sha || !pinnedStatus(git, base.raw, mainSha, base.sha).pinned
+        || git(['merge-base', '--is-ancestor', base.sha, mainSha]).status !== 1) continue;
+      const containers = entries.filter((top) => top.sha && top.sha !== base.sha
+        && git(['merge-base', '--is-ancestor', base.sha, top.sha]).status === 0);
+      const baseIndex = toProcess.indexOf(base.raw);
+      const lastContainer = Math.max(-1, ...containers.map((top) => toProcess.indexOf(top.raw)));
+      // Moving only the base would otherwise let an intervening newcomer claim its conflicting content first.
+      // Unknown containment also keeps established priority: only proven containers may pass the base.
+      if (establishedRefs.has(base.raw.ref) && lastContainer > baseIndex
+        && toProcess.slice(baseIndex + 1, lastContainer + 1).some((raw) => !establishedRefs.has(raw?.ref)
+          && !containers.some((top) => top.raw === raw))) continue;
+      if (lastContainer >= 0 && lastContainer !== baseIndex - 1) {
+        toProcess.splice(baseIndex, 1);
+        toProcess.splice(lastContainer > baseIndex ? lastContainer : lastContainer + 1, 0, base.raw);
+      }
+    }
+  }
   if (mainOnly && overlays.length > 0) {
     alerts.push({ kind: 'overlays-refused-main-only', detail: { count: overlays.length } });
   }
