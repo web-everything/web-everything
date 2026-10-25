@@ -320,14 +320,18 @@ describe('existing-card IO', () => {
   });
   it.each(['head', 'standing grant'])('refuses release if the %s changes during the reason POST', variant => {
     let postedReason = false;
-    const posted = [], synced = [];
+    const posted = [], synced = [], resolutions = [];
     const sinks = createRecordRedTeamRulingSinks({
       readThread: () => ({ headRefOid: postedReason && variant === 'head' ? OTHER : HEAD,
         comments: postedReason && variant === 'standing grant' ? standingThread() : thread() }),
       readStandingRulingScope: verifiedScope, resolveIdentity: () => OP,
+      resolveCard: (ref, context) => { resolutions.push([ref, context, postedReason]); return card; },
       post: (_r, _n, body) => { posted.push(body); postedReason = true; }, syncLabels: args => synced.push(args),
     });
-    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/reason posted; no release record written/);
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(variant === 'head'
+      ? /head moved.*reason posted; no release record written/
+      : /no red-team break is held.*reason posted; no release record written/);
+    expect(resolutions).toEqual([[CARD, { repo, pr: PR, head: HEAD }, true]]);
     expect(posted).toHaveLength(1);
     expect(posted[0]).toContain('> card it, ship the PR');
     expect(synced).toEqual([]);
