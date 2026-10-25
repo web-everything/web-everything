@@ -68,7 +68,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const status = readStatus({ repo, pr, head });
       const { priorResult: prior, priorComment: comment } = normalizeRedTeamResult(status?.result);
       const completedSeat = evidence.completedRecorded === true || evidence.cleanRecorded === true;
-      const placeholder = redTeamStatusWithoutRun(status);
+      // A null completion alone is unknown. Only the recovery reader's normalization
+      // of an originally queued writer can make it a never-started placeholder.
+      const placeholder = redTeamStatusWithoutRun(status, { originalStatus: evidence.status });
       let mode;
       if (comment === 'posted') return skip('result posted; comment not visible yet');
       // Any seat row (including an error) blocks a new call. Successful execution
