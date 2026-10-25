@@ -66,14 +66,15 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
   // Release must scrub executable lane config before its status/litter checks. Keep a
   // refusal observed before that scrub: removing an include or rewrite cannot erase it.
   let preflightError;
-  if (preflightLaneDir) {
+  if (preflightLaneDir && origin) {
     try { checkTransportConfig(preflightLaneDir); }
     catch (error) { preflightError = error; }
   }
   const transportGit = (dir, command, ...args) => {
+    const transportArgs = transport(command, ...args);
     if (preflightError) throw preflightError;
     checkTransportConfig(dir);
-    return git(dir, transport(command, ...args));
+    return git(dir, transportArgs);
   };
   return {
     aheadShas: dir => git(dir, ['rev-list', `origin/${repo.branch}..HEAD`]).split('\n').filter(Boolean),

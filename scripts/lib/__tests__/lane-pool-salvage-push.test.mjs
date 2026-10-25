@@ -272,12 +272,22 @@ describe('real salvage preservation and transport', () => {
     expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
   });
 
-  it('fails closed with an operator fallback when the canonical origin is unresolved', async () => {
+  it.each([undefined, laneDir])('fails closed with an operator fallback when the canonical origin is unresolved (preflight %s)', async preflightLaneDir => {
     const runGit = vi.fn(() => head);
-    const io = realSalvageIo({ repo: { ...repo, originUrl: null }, runGit });
+    const io = realSalvageIo({ repo: { ...repo, originUrl: null }, preflightLaneDir, runGit });
     expect(await salvagePushLane({ lane: 7, laneDir, io })).toMatchObject({
       status: 'failed', reason: expect.stringContaining('supply --origin or a primary --reference'),
     });
     expect(runGit.mock.calls.map(([, args]) => args)).toEqual([['rev-list', 'origin/main..HEAD']]);
+  });
+
+  it('rejects every transport operation before reading config when the canonical origin is unresolved', () => {
+    const runGit = vi.fn(() => { throw new Error('configuration unreadable'); });
+    const io = realSalvageIo({ repo: { ...repo, originUrl: null }, preflightLaneDir: laneDir, runGit });
+    for (const operation of [() => io.unmatchedShas(laneDir, [head]),
+      () => io.push(laneDir, ref, head), () => io.remoteSha(ref)]) {
+      expect(operation).toThrow('canonical origin unresolved; supply --origin or a primary --reference');
+    }
+    expect(runGit).not.toHaveBeenCalled();
   });
 });

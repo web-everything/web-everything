@@ -407,7 +407,9 @@ function resolveRepo(repoFlags = flags) {
   // Explicit --origin / --reference remain authoritative, even when unresolved.
   if ((cmd === 'gc' || cmd === 'release') && explicitPool && !repoFlags.origin && !repoFlags.reference
     && explicitPool !== basename(originUrl || '').replace(/\.git$/, '')) {
-    return resolveRepo({ ...repoFlags, reference: join(dirname(topLevel), explicitPool) });
+    const selectedRepo = resolveRepo({ ...repoFlags, reference: join(dirname(topLevel), explicitPool) });
+    // Origin authority comes from the selected primary; release still cleans the caller's registry.
+    return cmd === 'release' ? { ...selectedRepo, registryReferencePath: topLevel } : selectedRepo;
   }
   if (!originUrl && !explicitPool) {
     fail(`could not determine an origin URL — pass --origin=<url> (looked in ${topLevel})`);
@@ -2746,8 +2748,9 @@ async function cmdReleaseAllPools(repo) {
   // the identical mutating thing (`rmSync(LEASE_MARKER(dir))`) via a SEPARATE code path, and it is the one the
   // drain's land-time cleanup (`lane-drain.mjs`'s `releaseItemLeases`) and pr-watch's merge-time auto-release
   // (`pr-watch.mjs`'s `releaseSessionAcrossPools`) actually call — the dominant real-world release triggers, not
-  // just the reaper's reclaim. `referencePath` REUSES `repo.referencePath` from `resolveRepo()` (already
-  // git-toplevel-normalized) rather than a raw `resolve(process.cwd())` — round-2 review caught that the raw
+  // just the reaper's reclaim. Registry cleanup uses the caller's git-toplevel-normalized reference,
+  // retained in `registryReferencePath` when --pool selects another primary for origin trust,
+  // rather than a raw `resolve(process.cwd())` — round-2 review caught that the raw
   // form computes a WRONG registry path (and so silently no-ops) whenever the caller's cwd is a subdirectory
   // of the checkout, exactly `pr-watch.mjs`'s `releaseSessionAcrossPools` call shape (no `cwd` override on its
   // `execFileSync`, so it inherits whatever directory that process happens to be running from).
@@ -2795,7 +2798,7 @@ async function cmdReleaseAllPools(repo) {
       // is the pool this iteration actually released from — round-2 review caught that `unmapLanes` matches
       // by `repo` field as well as lane number (see its own comment), so passing the wrong pool name here
       // would silently fail to clear this pool's own entries.
-      unmapLanes({ referencePath: repo.referencePath, name }, lanes);
+      unmapLanes({ referencePath: repo.registryReferencePath || repo.referencePath, name }, lanes);
     }
   }
   if (released === 0) log(`  no leases held by ${selectorLabel} in any pool (${pools.length} pool(s) scanned)`);
@@ -2982,7 +2985,7 @@ async function cmdRelease(repo) {
     // cmdRefresh/cmdRemove/the acquire-time reset already clear it. Without this a release (or the reaper's
     // `release --force` reclaim, which delegates here) leaves the registry pointing at a lane that is free
     // again, and conveyor-state.mjs's health-stall scan overcounts `building` forever.
-    unmapLanes(repo, [n]);
+    unmapLanes({ ...repo, referencePath: repo.registryReferencePath || repo.referencePath }, [n]);
     log(`  released lane-${n} (was ${describeLease(lease)})`);
     released++;
   }

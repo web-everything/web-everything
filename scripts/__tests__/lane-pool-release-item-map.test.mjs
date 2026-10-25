@@ -62,6 +62,7 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  rmSync(join(fixtureRoot, 'basetest'), { recursive: true, force: true });
   sharedFixture.restore();
 });
 
@@ -129,6 +130,26 @@ describe('lane-pool release clears the lane-ports registry entry (#3466)', () =>
     expect(r.code).toBe(0);
     expect(readRegistry()).toEqual({});
   });
+
+  it.each([['--lane=1', '--force'], ['--all-pools', '--session=conveyor-3466']])(
+    'release with %s clears the caller registry and preserves the selected primary registry', (target, releaseFlag) => {
+      provision(1, 'basetest');
+      expect(acquire(['--lane=1', '--item=3466', '--session=conveyor-3466'], 'basetest').code).toBe(0);
+      const selectedPrimary = join(fixtureRoot, 'basetest');
+      git(['clone', '--quiet', originDir, selectedPrimary]);
+      const selectedRegistry = join(selectedPrimary, '.claude', 'lane-ports.json');
+      mkdirSync(join(selectedPrimary, '.claude'), { recursive: true });
+      const siblingEntries = { 9999: { lane: 1, repo: 'basetest' } };
+      writeFileSync(selectedRegistry, JSON.stringify(siblingEntries));
+      const callerSubdir = join(referenceDir, 'sub', 'dir');
+      mkdirSync(callerSubdir, { recursive: true });
+
+      const r = runPool(['release', '--pool=basetest', target, releaseFlag], { LANE_POOL_ROOT: poolRoot }, { cwd: callerSubdir });
+      expect(r.code, r.err).toBe(0);
+      expect(readRegistry()).toEqual({});
+      expect(JSON.parse(readFileSync(selectedRegistry, 'utf8'))).toEqual(siblingEntries);
+      expect(existsSync(join(poolRoot, 'basetest', 'lane-1', '.git', '.lane-lease'))).toBe(false);
+    });
 
   it('a release that fails ownership (no --force, foreign lease) leaves the registry untouched', () => {
     provision(1, 'basetest');
