@@ -51,7 +51,7 @@ export async function autoRouteVerify({ settings, mode, eligible, readQueue, rea
           const ready = await readiness();
           ref = ready.ref;
           remoteReady = typeof ref === 'string' && ref.length > 0;
-        } catch { remoteReady = { ready: false, reason: 'remote unavailable: clean pushed HEAD and gh required' }; }
+        } catch { remoteReady = { ready: false, reason: 'remote unavailable: clean pushed HEAD, canonical main tree and gh required' }; }
         decision = decideRoute({ ...evidence, remoteReady });
       }
     } catch { decision = { path: 'local', reason: 'queue or load evidence unavailable; using local gate' }; }

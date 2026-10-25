@@ -8,11 +8,12 @@ export const MAX_REMOTE_WAIT_MS = 540000;
 
 function targetedDispatch(run) {
   if (run.event !== 'workflow_dispatch') return false;
-  if (run.display_title === 'remote-verify (targeted)') return true;
   const prefix = 'remote-verify ';
-  if (typeof run.display_title !== 'string' || !run.display_title.startsWith(prefix)) return false;
-  try { return JSON.parse(run.display_title.slice(prefix.length))?.mode === 'targeted'; }
-  catch { return false; }
+  if (typeof run.display_title !== 'string' || !run.display_title.startsWith(prefix)) return true;
+  // Only recognised gate modes can be evidence; truncated or legacy titles
+  // cannot establish that this dispatch ran the required lane gate.
+  try { return !['lane-check', 'full'].includes(JSON.parse(run.display_title.slice(prefix.length))?.mode); }
+  catch { return true; }
 }
 
 export function selectRemoteVerifyRun(runs, sha, { includeTargeted = false } = {}) {
@@ -50,11 +51,15 @@ export function buildRemoteMarker({ sha, treeHash, run, now }) {
 // A path allow-list cannot establish the complete executable dependency closure:
 // npm lifecycle hooks, configuration and transitive helpers can all replace a gate.
 // Until protected gate execution exists, accept only the entire protected tree.
+export function matchesProtectedDefinition(sha, { head, base } = {}) {
+  return sameSha(head?.sha, sha) && fullSha(base?.sha)
+    && sameSha(head?.commit?.tree?.sha, base?.commit?.tree?.sha);
+}
+
 async function protectedDefinition(sha, fetchDefinition) {
   try {
     const { head, base } = await fetchDefinition();
-    if (!sameSha(head?.sha, sha) || !fullSha(base?.sha)
-      || !sameSha(head?.commit?.tree?.sha, base?.commit?.tree?.sha)) throw new Error();
+    if (!matchesProtectedDefinition(sha, { head, base })) throw new Error();
     return { repository: CONSTELLATION_REPOS.we.slug, protectedSha: base.sha.toLowerCase(),
       definitionTree: base.commit.tree.sha.toLowerCase() };
   } catch {

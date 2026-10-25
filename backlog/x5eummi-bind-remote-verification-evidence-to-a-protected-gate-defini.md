@@ -15,6 +15,14 @@ PR #5878's next repair closes import conservatively: the importer reads canonica
 
 This intentionally refuses **all content-changing lane commits**, including legitimate gate changes, until their complete tree is protected on `main`. Remote workflows remain useful for diagnostics; normal lane changes use local verification. Keep this card open for protected execution that can safely verify content-changing lanes. Import and consumption checks must be designed together before relaxing the complete-tree restriction.
 
+## PR #5881 review prevention
+
+The client readiness preflight now shares the importer's complete-tree predicate and reads canonical main before dispatch. Regression cases in `scripts/__tests__/remote-route.test.mjs` and `scripts/__tests__/remote-test-cli.test.mjs` assert that a different or unreadable tree dispatches no lane/full run and falls back locally. The importer's final definition recheck remains required because main can change after preflight.
+
+Workflow-dispatch evidence selection now allows only recognised lane-check/full JSON titles. `scripts/__tests__/remote-verify.test.mjs` excludes malformed, truncated, empty, non-string, unknown-mode and legacy mode-only titles so an ambiguous diagnostic run cannot shadow lane evidence. Explicit targeted diagnostics retain their separate complete-input matching path.
+
+The routing entrypoint's settings regressions in `scripts/__tests__/remote-route.test.mjs` cover each standard/platform/tool/environment layer, exact preference key and settings path, invalid bounds and booleans, and effective-value provenance. These tests prevent a wiring change from silently bypassing an operator override. Validation results are recorded with the repair evidence; this provenance story remains open.
+
 ## Acceptance
 
 - [A1] Execute the lane gate from a protected required workflow, or have the importer/land-time gate compare the run's workflow and executable gate dependency tree to the protected base. Fail closed when the protected definition cannot be read or when a lane-edited definition would be imported as proof. Comparing only job and step names is insufficient.

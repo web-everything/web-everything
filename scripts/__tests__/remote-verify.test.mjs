@@ -52,7 +52,7 @@ describe('selectRemoteVerifyRun — newest run for the exact full SHA', () => {
 
   it('sorts by created_at, independent of array order, run id, event or conclusion', () => {
     const old = run({ id: 999, created_at: new Date(T0 - 1000).toISOString() });
-    const newest = run({ id: 1, event: 'workflow_dispatch', status: 'queued', conclusion: null });
+    const newest = run({ id: 1, event: 'workflow_dispatch', display_title: 'remote-verify {"mode":"lane-check"}', status: 'queued', conclusion: null });
     const unrelated = run({ head_sha: OTHER, created_at: new Date(T0 + 1000).toISOString() });
     for (const runs of [[old, unrelated, newest], [newest, old, unrelated]]) {
       expect(selectRemoteVerifyRun(runs, SHA)).toEqual(newest);
@@ -73,9 +73,25 @@ describe('selectRemoteVerifyRun — newest run for the exact full SHA', () => {
     // A push's title is not a reliable mode indicator on legacy runs.
     expect(selectRemoteVerifyRun([{ ...targeted, event: 'push' }], SHA)?.id).toBe(456);
     for (const mode of ['lane-check', 'full']) {
-      const gate = { ...targeted, display_title: `remote-verify (${mode})` };
+      const gate = { ...targeted, display_title: `remote-verify ${JSON.stringify({ mode })}` };
       expect(selectRemoteVerifyRun([push, gate], SHA)).toEqual(gate);
     }
+  });
+
+  it.each([
+    'remote-verify {"mode":"targeted","tests":"truncated',
+    'remote-verify {broken JSON}', '', undefined, null, 42, {},
+    'remote-verify null', 'remote-verify []', 'remote-verify {}',
+    'remote-verify {"mode":"unknown"}', 'remote-verify {"mode":false}',
+    'remote-verify (targeted)', 'remote-verify (lane-check)', 'remote-verify (full)',
+    'unrelated {"mode":"lane-check"}',
+  ])('excludes unrecognised dispatch title %j without shadowing a lane gate', display_title => {
+    const push = run();
+    const unknown = run({ id: 456, event: 'workflow_dispatch', display_title,
+      created_at: new Date(T0 + 1000).toISOString() });
+    expect(selectRemoteVerifyRun([unknown], SHA)).toBeNull();
+    expect(selectRemoteVerifyRun([unknown, push], SHA)).toEqual(push);
+    expect(selectRemoteVerifyRun([unknown], SHA, { includeTargeted: true })).toEqual(unknown);
   });
 
   it.each(['pretty', 'whitespace-normalized'])('excludes %s JSON targeted titles from lane evidence while allowing explicit diagnostics', format => {

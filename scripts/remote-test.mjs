@@ -3,7 +3,8 @@ import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
-import { MAX_REMOTE_WAIT_MS, remoteVerdict, selectRemoteVerifyRun } from './lib/remote-verify.mjs';
+import { MAX_REMOTE_WAIT_MS, matchesProtectedDefinition, remoteVerdict, selectRemoteVerifyRun } from './lib/remote-verify.mjs';
+import { CONSTELLATION_REPOS } from './lib/constellation-repos.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { cleanRouteText } from './lib/remote-route.mjs';
 const usage = () => new Error('Usage: remote-test --ref <branch|SHA> --mode <lane-check|full|targeted> [--tests=<files> | --operation <name>]');
@@ -100,6 +101,12 @@ export function remoteIO(repo = process.cwd(), { env: parentEnv = process.env, e
     const branch = pushed.split('\n').map(line => line.split(/\s+/)).find(([head, ref]) => head === sha && ref?.startsWith('refs/heads/'));
     if (!branch) throw new Error('HEAD not pushed');
     gh(['auth', 'status', '--hostname', 'github.com']);
+    if (slug.toLowerCase() !== CONSTELLATION_REPOS.we.slug) throw new Error('Remote verification requires the canonical origin');
+    // Mirror marker import before dispatching work that cannot become evidence.
+    // Read canonical main live; a lane's local origin/main may be stale.
+    if (!matchesProtectedDefinition(sha, { head: api(`commits/${sha}`), base: api('commits/main') })) {
+      throw new Error('HEAD tree differs from canonical main or definition is unreadable; use local verify');
+    }
     return { sha, ref: branch[1].slice('refs/heads/'.length) };
   };
   return { git, gh, api, ready };

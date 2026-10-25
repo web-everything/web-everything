@@ -14,16 +14,24 @@ const tests = ['scripts/__tests__/remote-route.test.mjs', 'blocks/example.test.t
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '../..');
 
 describe('live IO construction with injected children', () => {
-  function readinessFixture({ dirty = '', pushed = `${SHA}\trefs/heads/${REF}`, authenticated = true } = {}) {
+  function readinessFixture({ dirty = '', pushed = `${SHA}\trefs/heads/${REF}`, authenticated = true,
+    origin = 'https://github.com/web-everything/web-everything.git',
+    head = { sha: SHA, commit: { tree: { sha: 'c'.repeat(40) } } },
+    base = { sha: 'b'.repeat(40), commit: { tree: { sha: 'c'.repeat(40) } } }, unavailable = false } = {}) {
     const execFile = vi.fn((file, args) => {
       if (file !== 'git') throw new Error('unexpected child');
-      if (args.includes('get-url')) return 'https://github.com/example/repo.git';
+      if (args.includes('get-url')) return origin;
       if (args.includes('status')) return dirty;
       if (args.includes('rev-parse')) return SHA;
       if (args.includes('ls-remote')) return pushed;
       throw new Error(`unexpected git args: ${args}`);
     });
     const execGh = vi.fn((file, args) => {
+      if (args[0] === 'api') {
+        if (unavailable) throw new Error('definition unavailable');
+        if (args.at(-1) === `repos/web-everything/web-everything/commits/${SHA}`) return JSON.stringify(head);
+        if (args.at(-1) === 'repos/web-everything/web-everything/commits/main') return JSON.stringify(base);
+      }
       if (args[0] !== 'auth') throw new Error('unexpected dispatch or API call');
       if (!authenticated) throw new Error('authentication unavailable');
       return '';
@@ -49,6 +57,25 @@ describe('live IO construction with injected children', () => {
     expect(io.live.ready()).toEqual({ sha: SHA, ref: REF });
     expect(io.execGh).toHaveBeenCalledWith('gh', ['auth', 'status', '--hostname', 'github.com'], expect.any(Object));
     expect(io.execFile.mock.calls.find(([, args]) => args.includes('status'))[1]).toContain('--untracked-files=all');
+    expect(io.execGh).toHaveBeenCalledWith('gh', ['api', '--hostname', 'github.com', 'repos/web-everything/web-everything/commits/main'], expect.any(Object));
+  });
+  it.each([
+    ['different tree', { base: { sha: 'b'.repeat(40), commit: { tree: { sha: 'd'.repeat(40) } } } }],
+    ['unreadable main', { unavailable: true }],
+    ['missing main', { base: null }],
+    ['missing HEAD tree', { head: { sha: SHA } }],
+    ['wrong HEAD', { head: { sha: 'e'.repeat(40), commit: { tree: { sha: 'c'.repeat(40) } } } }],
+    ['malformed main SHA', { base: { sha: 'bad', commit: { tree: { sha: 'c'.repeat(40) } } } }],
+    ['noncanonical origin', { origin: 'https://github.com/example/fork.git' }],
+  ])('preflights %s before any lane/full dispatch', async (_name, changes) => {
+    for (const mode of ['lane-check', 'full']) {
+      const io = readinessFixture(changes);
+      const importer = vi.fn();
+      expect(() => io.live.ready()).toThrow();
+      expect(await runRemoteCLI({ ref: REF, mode }, { live: io.live, execFile: importer, quietFailure: true })).toBe(2);
+      expect(io.execGh.mock.calls.some(([, args]) => args[0] === 'workflow')).toBe(false);
+      expect(importer).not.toHaveBeenCalled();
+    }
   });
   it('pins GitHub host, bypasses both caches, and bounds argv-only children', () => {
     const execFile = vi.fn().mockReturnValue('https://github.com/example/repo.git\n');
@@ -246,6 +273,7 @@ describe('CLI marker delegation', () => {
     ('accepts green targeted verification only with the matching normalized inputs: %j', async request => {
       const io = fixture({ mode: 'targeted', inputs: { tests: (request.tests ?? []).join(' '), operation: request.operation ?? '' } });
       expect(await runRemoteCLI({ ref: REF, mode: 'targeted', ...request }, io)).toBe(0);
+      expect(io.live.ready).not.toHaveBeenCalled();
       expect(io.live.api).toHaveBeenCalledWith('actions/runs/123');
       expect(io.execFile).not.toHaveBeenCalled();
     });

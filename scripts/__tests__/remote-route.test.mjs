@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { autoRouteVerify, decideRoute, resolveRouteSettings, formatRouteLog, ROUTE_DEFAULTS } from '../lib/remote-route.mjs';
 import { resolveCascade } from '../lib/policy-cascade.mjs';
+import { remoteIO } from '../remote-test.mjs';
 
 // Execute the actual entrypoint's orchestration, from selection through admission,
 // with in-memory marker/child IO. No git repository, network or heavy gate is needed.
@@ -16,7 +17,8 @@ const dispatchDeclaration = entry.slice(entry.indexOf('const DISPATCHED_RUN ='),
 const orchestration = entry.slice(entry.indexOf('SELECTION = summarizeSelection'), entry.indexOf('// 2. Admission:'))
   .replaceAll('import.meta.url', JSON.stringify(pathToFileURL(entryPath).href));
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-async function entryFixture({ command, flags = {}, selected = 'related', cached = false, remoteCode = 0, readySha } = {}) {
+async function entryFixture({ command, flags = {}, selected = 'related', cached = false, remoteCode = 0, readySha,
+  platform, tool, toolText, env = { WE_REMOTE_ROUTE_LOAD_CAP: '0' }, live } = {}) {
   const sha = 'a'.repeat(40);
   const exit = code => { throw { fixtureExit: true, code }; };
   const emit = vi.fn((result, code) => { throw { fixtureExit: true, code, result }; });
@@ -26,15 +28,22 @@ async function entryFixture({ command, flags = {}, selected = 'related', cached 
   const writeMarker = vi.fn();
   const stderr = vi.fn();
   const localGate = vi.fn();
+  const platformPreference = vi.fn(key => key === 'remoteRoute' ? platform : undefined);
+  const readTool = vi.fn((path, encoding) => {
+    if (path.href !== new URL('../settings/remote-route.json', import.meta.url).href || encoding !== 'utf8' || (tool === undefined && toolText === undefined)) {
+      throw new Error('no tool/lease override');
+    }
+    return toolText ?? JSON.stringify(tool);
+  });
   const bindings = {
     flags, positionals: command ? [command] : [],
     SELECTION: null, summarizeSelection: () => ({}), selectionNotice: () => 'selection',
     resolvedGate: { command: 'selected gate', decision: { mode: selected } }, GATE: 'selected gate',
     headSha: sha, REPO: '/fixture', GIT_DIR: '/fixture/markers', AS_JSON: false,
-    process: { env: { WE_REMOTE_ROUTE_LOAD_CAP: '0' }, execPath: 'node', stderr: { write: stderr }, exit },
-    readFileSync: () => { throw new Error('no tool/lease override'); }, URL,
-    resolveCascade, platformPreference: () => undefined, ROUTE_DEFAULTS, resolveRouteSettings, autoRouteVerify,
-    execFileSync: queue, loadavg: () => [99], remoteIO: () => ({ ready: readiness }), runRemoteCLI: remote,
+    process: { env, execPath: 'node', stderr: { write: stderr }, exit },
+    readFileSync: readTool, URL,
+    resolveCascade, platformPreference, ROUTE_DEFAULTS, resolveRouteSettings, autoRouteVerify,
+    execFileSync: queue, loadavg: () => [99], remoteIO: () => live ?? ({ ready: readiness }), runRemoteCLI: remote,
     readMarker: () => cached ? { status: 'green', sha, treeHash: 'tree', suites: 'selected gate', executedGate: 'selected gate' } : null,
     treeHashNow: () => 'tree', describeIsolatedRetry: () => '', markerRedCause: () => ({}), emit,
     join, VERIFY_PREVIOUS_FILENAME: 'previous', LEASE_FILENAME: 'lease', writeFileSync: vi.fn(),
@@ -51,10 +60,80 @@ async function entryFixture({ command, flags = {}, selected = 'related', cached 
     if (!error.fixtureExit) throw error;
     outcome = error;
   }
-  return { outcome, remote, queue, readiness, writeMarker, stderr, localGate };
+  return { outcome, remote, queue, readiness, writeMarker, stderr, localGate, platformPreference, readTool };
 }
 
 describe('verify-lane entrypoint auto-routing wiring', () => {
+  it('does not dispatch a non-main tree despite high queue wait and load', async () => {
+    const sha = 'a'.repeat(40);
+    const execFile = vi.fn((_file, args) => {
+      if (args.includes('get-url')) return 'https://github.com/web-everything/web-everything.git';
+      if (args.includes('status')) return '';
+      if (args.includes('rev-parse')) return sha;
+      if (args.includes('ls-remote')) return `${sha}\trefs/heads/lane/changed`;
+      throw new Error('unexpected git command');
+    });
+    const execGh = vi.fn((_file, args) => {
+      if (args[0] === 'auth') return '';
+      if (args.at(-1) === `repos/web-everything/web-everything/commits/${sha}`) {
+        return JSON.stringify({ sha, commit: { tree: { sha: 'b'.repeat(40) } } });
+      }
+      if (args.at(-1) === 'repos/web-everything/web-everything/commits/main') {
+        return JSON.stringify({ sha: 'c'.repeat(40), commit: { tree: { sha: 'd'.repeat(40) } } });
+      }
+      throw new Error('unexpected GitHub command');
+    });
+    const io = await entryFixture({ live: remoteIO('.', { env: {}, execFile, execGh }) });
+    expect(io.queue).toHaveBeenCalledOnce();
+    expect(io.remote).not.toHaveBeenCalled();
+    expect(io.localGate).toHaveBeenCalledOnce();
+    expect(execGh.mock.calls.some(([, args]) => args[0] === 'workflow')).toBe(false);
+    expect(execGh).toHaveBeenCalledWith('gh', ['api', '--hostname', 'github.com', 'repos/web-everything/web-everything/commits/main'], expect.any(Object));
+  });
+
+  it.each([
+    ['standard', {}, { thresholdMinutes: 10, loadCap: 36, enabled: true }],
+    ['platform', { platform: { thresholdMinutes: 150, loadCap: 160, enabled: false } }, { thresholdMinutes: 150, loadCap: 160, enabled: false }],
+    ['tool', { platform: { thresholdMinutes: 150, loadCap: 160, enabled: false }, tool: { thresholdMinutes: 200, loadCap: 210, enabled: true } },
+      { thresholdMinutes: 200, loadCap: 210, enabled: true }],
+    ['environment', { platform: { thresholdMinutes: 150, loadCap: 160, enabled: false }, tool: { thresholdMinutes: 200, loadCap: 210, enabled: false },
+      env: { WE_REMOTE_ROUTE_THRESHOLD_MINUTES: '1', WE_REMOTE_ROUTE_LOAD_CAP: '2', WE_REMOTE_ROUTE: 'on' } },
+      { thresholdMinutes: 1, loadCap: 2, enabled: true }],
+  ])('uses the %s cascade layer and logs its effective values and provenance', async (source, overrides, values) => {
+    const io = await entryFixture({ env: {}, ...overrides });
+    const log = io.stderr.mock.calls.flat().join('');
+    for (const [key, value] of Object.entries(values)) expect(log).toContain(`${key}=${value} (${source})`);
+    expect(io.platformPreference).toHaveBeenCalledWith('remoteRoute');
+    expect(io.readTool).toHaveBeenCalledWith(new URL('../settings/remote-route.json', import.meta.url), 'utf8');
+    if (source === 'platform' || source === 'tool') {
+      expect(io.remote).not.toHaveBeenCalled();
+      expect(io.localGate).toHaveBeenCalledOnce();
+    } else expect(io.remote).toHaveBeenCalledOnce();
+  });
+
+  it.each(['platform', 'tool'])('rejects invalid %s values through the entrypoint predicates', async layer => {
+    for (const bad of [-1, '12', null, Infinity, NaN]) {
+      const io = await entryFixture({ env: {}, platform: { thresholdMinutes: 150, loadCap: 160, enabled: false },
+        [layer]: { thresholdMinutes: bad, loadCap: bad, enabled: 'true' } });
+      const source = layer === 'tool' ? 'platform' : 'standard';
+      const expected = layer === 'tool' ? { thresholdMinutes: 150, loadCap: 160, enabled: false }
+        : { thresholdMinutes: 10, loadCap: 36, enabled: true };
+      for (const [key, value] of Object.entries(expected)) {
+        expect(io.stderr.mock.calls.flat().join('')).toContain(`${key}=${value} (${source})`);
+      }
+    }
+  });
+
+  it.each(['{broken JSON', '{"thresholdMinutes":1e999,"loadCap":1e999,"enabled":"true"}'])
+    ('retains platform values when tool JSON is malformed or overflows: %s', async toolText => {
+      const io = await entryFixture({ env: {}, platform: { thresholdMinutes: 150, loadCap: 160, enabled: false }, toolText });
+      const log = io.stderr.mock.calls.flat().join('');
+      expect(log).toContain('thresholdMinutes=150 (platform)');
+      expect(log).toContain('loadCap=160 (platform)');
+      expect(log).toContain('enabled=false (platform)');
+      expect(io.remote).not.toHaveBeenCalled();
+    });
+
   it.each([
     { cached: true, reason: 'cached' },
     { selected: 'card-only-skip', reason: 'card-only-skip' },
