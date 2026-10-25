@@ -10,7 +10,7 @@ const HEAD = 'b'.repeat(40);
 export default {
   id: 'blocked-draft-reconcile-promotion',
   title: 'the daemon promotes a red-team:blocked or red-team:pending draft through reconcile or a stale promotion plan',
-  card: 'PR #5877 send-back x1b8hlo item 1; live blocked draft #5839',
+  card: 'PR #5877 send-back 5726 item 1; live blocked draft #5839',
   fixedBy: { sha: 'HEAD', where: 'lane/no-merge-red-team-blocked-v2', paths: PATHS },
   fixPresent(root) {
     return PATHS.every(path => {
