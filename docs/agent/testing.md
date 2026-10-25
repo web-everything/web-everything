@@ -171,6 +171,14 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Moved card-only skips recover through the normal red-team-only review job. The planner requires a
+finished policy skip with a pinned card-only read and no seat, then proves the move with
+`card-only-head-move.mjs` (shared numbering proof, otherwise a complete no-renames card-path diff).
+The job repeats that proof before settling the policy comment on the new head; it never sends
+the historical diff to a model or changes the stored panel verdict. Unknown moves stay skipped.
+The moved-card cases in `review-red-team-on-skip.test.mjs`, `drain-red-team-evidence.test.mjs`
+and `review-job-red-team-only.test.mjs` pin selection, fail-closed proof and real comment settlement.
+
 Accept carry-forward's advisory exemption must use `readConfirmedBreaks` and `planRedTeamActions`,
 including settings and `WE_RED_TEAM_CONFIRMED_BREAKS` overrides. A send-back finding or an
 unresolved policy supersedes the stale accept; the fallback is a fresh review. Regression cases

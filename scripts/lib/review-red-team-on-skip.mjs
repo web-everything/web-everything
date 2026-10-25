@@ -1,4 +1,6 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
+import { execFileSync } from 'node:child_process';
+import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -32,6 +34,16 @@ export function redTeamSkipNeedsSettlement(status) {
     && status.skipCardOnly === true && redTeamCardOnly(status.loopPayload?.findings?.read);
 }
 
+/** A finished policy skip with no seat can be re-settled after a proven card-only move. PURE. */
+export function cardOnlyHeadMoveCandidate(evidence, head) {
+  const read = evidence?.loopPayload?.findings?.read;
+  return isRealHead(read?.netBasis?.rev) && read.netBasis.rev !== head
+    && redTeamCardOnly(read) && redTeamSkipNeedsSettlement(evidence?.status)
+    && evidence.status.head === read.netBasis.rev
+    && evidence.recorded === false && evidence.seatRecorded === false
+    && !evidence.inFlight && !evidence.queued;
+}
+
 export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = readFileSync,
   toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/review-red-team-on-skip.json') } = {}) {
   let tool;
@@ -48,7 +60,7 @@ export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = 
 
 /** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
-  setting, lastDispatch }) {
+  setting, lastDispatch, proveMove = () => ({ ok: false }) }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -62,8 +74,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
       if (redTeamForHead(rawPr.comments, pr, head)) return skip('red-team result already on head');
       const evidence = readEvidence({ repo, pr, head });
-      if (!redTeamOwedFor(evidence?.loopPayload)) return skip('stored review does not owe a red team');
-      if (evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
+      const movedCardOnly = cardOnlyHeadMoveCandidate(evidence, head)
+        && proveMove({ fromSha: evidence.loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true;
+      if (!movedCardOnly && !redTeamOwedFor(evidence?.loopPayload)) return skip('stored review does not owe a red team');
+      if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
       const status = readStatus({ repo, pr, head });
       const { priorResult: prior, priorComment: comment } = normalizeRedTeamResult(status?.result);
@@ -72,10 +86,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       // of an originally queued writer can make it a never-started placeholder.
       const placeholder = redTeamStatusWithoutRun(status, { originalStatus: evidence.status });
       let mode;
+      if (movedCardOnly && (status != null || evidence.completedRecorded === true)) return skip('live head already has red-team state');
       if (comment === 'posted') return skip('result posted; comment not visible yet');
       // Any seat row (including an error) blocks a new call. Successful execution
       // can resume effects even when its verdict contains confirmed breaks.
-      if (status?.status === 'finished' && (['ran', 'resumed'].includes(prior) || status.result === 'resumed')
+      if (movedCardOnly) mode = 'fresh';
+      else if (status?.status === 'finished' && (['ran', 'resumed'].includes(prior) || status.result === 'resumed')
         && (completedSeat || (!placeholder && typeof status.result === 'object'
           && evidence.recorded === true && evidence.completedRecorded !== false))) {
         mode = 'resume';
@@ -100,6 +116,8 @@ const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, 
  */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
   env = process.env, setting, readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
+  exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
+  proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane } = {}) {
   const rows = [], dispatched = [], notStarted = [];
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
@@ -107,7 +125,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     const at = now();
     const resolved = setting ?? resolveReviewRedTeamOnSkip({ env, log: note }).value;
     rows.push(...planRedTeamOnSkip({ repo, refusals: plan?.refusals, rawPrs, readEvidence, readStatus,
-      now: at, setting: resolved, lastDispatch: history }));
+      now: at, setting: resolved, lastDispatch: history, proveMove }));
     for (const row of rows) {
       let started = false;
       if (row.action === 'dispatch') {
