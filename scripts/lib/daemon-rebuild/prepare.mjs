@@ -24,6 +24,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
@@ -38,8 +39,12 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase,
 }) {
+  // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
+  if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
+    env = { ...env, WE_DAEMON_AUTO_REBASE: '0' };
+  }
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
   const alertsList = [];
@@ -66,6 +71,19 @@ export async function prepareRebuild({
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
+
+  const finishVerifiedSwaps = async () => {
+    try {
+      if (!state.inProgress && !state.unverified && !state.quarantine && state.adopted?.head
+        && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled) {
+        await autoRebase.finishPendingSwaps({ root, env, run, removeOverlay, appendOverlayEvent });
+      }
+    } catch (error) {
+      const detail = realAutoRebase.reportNeedsYou({ root, env: stEnv, ref: 'pending-swaps', stage: 'swap', error, now: nowIso });
+      alertsList.push({ kind: 'auto-rebase-needs-you', detail });
+      log?.error?.(`daemon-rebuild: auto-rebase-needs-you ${JSON.stringify(detail)}`);
+    }
+  };
 
   // ── Step 0: recovery ──────────────────────────────────────────────────────────────────────────────────
   const indexLockPath = join(root, '.git', 'index.lock');
@@ -121,6 +139,7 @@ export async function prepareRebuild({
           state.held = null;
           writeState();
           alert('rebuild-interrupted-recovered', { target: ip.target, headNow, promoted: true });
+          await finishVerifiedSwaps();
           // Short-circuit here (unlike the non-promoted branch below, which falls through to a fresh plan this
           // same tick): this build is now FULLY adopted, so there is nothing else for this tick to decide.
           return terminal({
@@ -169,6 +188,8 @@ export async function prepareRebuild({
       return terminal({ moved: false, reason: 'quarantined' });
     }
   }
+
+  await finishVerifiedSwaps();
 
   // ── Step 1: must be on main, and the local tree must be safe to move ────────────────────────────────────
   let headRef = git(['symbolic-ref', '--short', 'HEAD']);
@@ -331,12 +352,24 @@ export async function prepareRebuild({
   // adopted, silently dropping live hotfixes. Instead HOLD on the last-good build (dispatch continues from it via
   // x5wbsbc; `daemon-held-on-last-good` raises needs-you after 15 min) and leave the overlay list untouched, until the
   // lost overlays are rebased onto main (or retired). Nothing is applied from this plan.
-  if (!mainOnly && plan.establishedLost?.length > 0) {
-    const lost = plan.establishedLost;
+  // A lost overlay whose current tip this build still contains is live through its carrier — e.g. a mechanism-pinned
+  // original (never set aside as stack-contained) beside its registered auto-rebase repair. Holding on it would keep
+  // the repair from ever being adopted. Only a tip the running build already carries qualifies: a changed tip says
+  // nothing about the older live heads it replaced. Ancestry git cannot confirm keeps the overlay lost (fail closed).
+  const contains = (sha, build) => !!build && git(['merge-base', '--is-ancestor', sha, build]).status === 0;
+  const lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha
+    && contains(l.sha, prevHead) && contains(l.sha, plan.finalSha)));
+  if (!mainOnly && lost.length > 0) {
     const detail = {
       refs: lost.map((l) => l.ref), lost,
       message: `${lost.length} overlay(s) in the running build would be lost (${lost.map((l) => l.ref).join(', ')}) — holding on the last-good build; rebase them onto main (or merge main into the stack top) and re-register`,
     };
+    let setting;
+    try { setting = autoRebase.resolveAutoRebaseSwitch(env); } catch { setting = { enabled: false, source: 'unavailable' }; detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
+    if (setting.enabled) {
+      try { detail.autoRebase = { ...await autoRebase.kickAutoRebase({ root, env, lost }), source: setting.source }; }
+      catch { detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
+    }
     alert('established-overlay-hold', detail);
     if (state.adopted?.head && state.adopted.head === prevHead) {
       state.held = {

@@ -42,6 +42,7 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -207,7 +208,9 @@ export function writeOverlays(root, list, { env = process.env } = {}) {
  * stacked on lane/b, itself on lane/a). The rebuild reads it only when gh cannot answer; leaving it out keeps it as is.
  * @param {{ref:string, pr?:number|null, addedBy?:string|null, reason?:string|null, now?:string, pinned?:boolean,
  *   stackBases?:string[]}} entry
- * @param {{env?:NodeJS.ProcessEnv}} [o]
+ * @param {{env?:NodeJS.ProcessEnv, expectedOverlay?:object}} [o]
+ * `expectedOverlay`, when supplied, must still match the source registration under the list mutex.
+ * Detached repairs use this snapshot to avoid undoing a concurrent unload or update.
  * @returns {Array<object>} the new list
  */
 /**
@@ -243,9 +246,17 @@ export async function readOverrideViewerLogin() {
   } catch { return null; }
 }
 
+/** Registration intent excludes the rebuild's mutable base-chain cache. */
+export function registrationIdentity(entry) {
+  if (entry == null) return entry;
+  const { stackBases, ...identity } = entry;
+  void stackBases;
+  return identity;
+}
+
 export function addOverlay(root, {
   ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
-} = {}, { env = process.env } = {}) {
+} = {}, { env = process.env, expectedOverlay } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
   }
@@ -253,6 +264,10 @@ export function addOverlay(root, {
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env).slice();
     pause();
+    if (expectedOverlay !== undefined && (!expectedOverlay || !isSafeBranchName(expectedOverlay.ref)
+      || !isDeepStrictEqual(registrationIdentity(list.find(o => o?.ref === expectedOverlay.ref)), registrationIdentity(expectedOverlay)))) {
+      throw new Error('source registration unavailable or changed; refusing replacement');
+    }
     const idx = list.findIndex((o) => o && o.ref === ref);
     if (idx === -1) {
       list.push({
@@ -317,15 +332,25 @@ export function recordEdgeResolution(root, ref, {
  * {@link appendOverlayEvent} when the removal should be recorded.
  * @param {string} root
  * @param {string} ref
- * @param {{env?:NodeJS.ProcessEnv, why?:string}} [o]
+ * `requireRef`, when supplied, must still be registered under the list mutex, else nothing is removed: a swap that
+ * retires `ref` for its replacement never leaves the list without both. `expectedOverlay`, when supplied, must still
+ * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed. `stackBases` is
+ * left out of that comparison: the rebuild rewrites it on its own ({@link persistStackBases}), which is no re-registration.
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object}} [o]
  * @returns {{removed:boolean, list:Array<object>}}
  */
-export function removeOverlay(root, ref, { env = process.env, why } = {}) {
+export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay } = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
     pause();
+    if (requireRef !== undefined && !list.some((o) => o && o.ref === requireRef)) {
+      throw new Error('replacement registration unavailable');
+    }
     const idx = list.findIndex((o) => o && o.ref === ref);
+    if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {
+      throw new Error('registration changed; refusing removal');
+    }
     if (idx === -1) return { removed: false, list };
     const next = list.slice(0, idx).concat(list.slice(idx + 1));
     writeOverlays(root, next, { env });

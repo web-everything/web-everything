@@ -345,7 +345,7 @@ describe('prototype-load', () => {
       const initial = () => execFileSync('git', ['-C', clone, 'merge-base', '--is-ancestor', sha, 'HEAD'], { encoding: 'utf8', stdio: 'pipe' });
       expect(initial).toThrow(/Command failed/);
       const f = fixture({ sha,
-        adoptionExec: (args, config) => execFileSync('git', ['-C', clone, ...args.slice(2)], config),
+        adoptionExec: (args, config) => execFileSync('git', ['-C', clone, ...args.slice(2)], { ...config, env: { ...config.env, PATH: process.env.PATH } }),
         onSleep: () => { if (adopts) { git(['fetch', 'origin', BASE.branch]); git(['merge', '--ff-only', 'FETCH_HEAD']); } },
       });
       expect(await f.run()).toMatchObject(adopts

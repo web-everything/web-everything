@@ -1040,6 +1040,7 @@
   "scripts/conveyor/soak/breaks/already-landed-pr-gets-fixer.soak.test.mjs": 65.56,
   "scripts/conveyor/soak/breaks/answered-stand-down-never-redispatched.soak.test.mjs": 99.38,
   "scripts/conveyor/soak/breaks/argon-feature-dispatch.soak.test.mjs": 2.31,
+  "scripts/conveyor/soak/breaks/auto-rebase-operator-withdrawal.soak.test.mjs": 0.62,
   "scripts/conveyor/soak/breaks/await-verify-lane-config-executes.soak.test.mjs": 1.33,
   "scripts/conveyor/soak/breaks/await-verify-real-lane-tree-hash.soak.test.mjs": 1.35,
   "scripts/conveyor/soak/breaks/bad-overlay-falls-back.soak.test.mjs": 225.35,
