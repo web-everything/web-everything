@@ -14,12 +14,7 @@ PR #5878 review identified provenance debt: an exact-SHA successful run can stil
 ## Acceptance
 
 - [A1] Execute the lane gate from a protected required workflow, or have the importer/land-time gate compare the run's workflow and executable gate dependency tree to the protected base. Fail closed when the protected definition cannot be read or when a lane-edited definition would be imported as proof. Comparing only job and step names is insufficient.
-- [A2] Planned tests in `we:scripts/__tests__/remote-verify.test.mjs`: **lane-edited workflow cannot mint trusted remote evidence** makes a step named Required lane gate a no-op and asserts no trusted marker; **lane-edited gate dependency cannot mint trusted remote evidence** changes the invoked script or an imported helper and asserts refusal; **unchanged protected gate admits exact-SHA success** accepts complete successful evidence; **unreadable protected definition refuses import** asserts no marker and the local-verify fallback. Run with:
-
-  ```sh
-  npm run test:unit -- scripts/__tests__/remote-verify.test.mjs
-  ```
-
+- [A2] Planned tests in `we:scripts/__tests__/remote-verify.test.mjs`: **lane-edited workflow cannot mint trusted remote evidence** makes a step named Required lane gate a no-op and asserts no trusted marker; **lane-edited gate dependency cannot mint trusted remote evidence** changes the invoked script or an imported helper and asserts refusal; **unchanged protected gate admits exact-SHA success** accepts complete successful evidence; **unreadable protected definition refuses import** asserts no marker and the local-verify fallback. Pass that test file to `npm run test:unit --`.
 - [A3] Retain the canonical `web-everything/web-everything` repository pin, exact SHA, successful attempt/job/step evidence, final live recheck, and tree-stability checks. Record repository and protected-definition provenance in the accepted evidence and verify them on consumption.
 - [A4] Define the policy for a legitimate gate-definition change: require protected review and execution after approval, with an operator-visible refusal/fallback until that evidence exists. An unavailable comparison must never silently admit a lane's own definition.
 
