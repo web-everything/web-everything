@@ -1,19 +1,22 @@
 ---
+bornAs: xyok3ik
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/operations/codex-job.mjs"]
+scope: ["we:scripts/operations/prototype-load-io.mjs", "we:docs/agent/testing.md", "we:scripts/operations/__tests__/prototype-load-io.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5839 (head 2673ff131)
+# Prevention — File a hardening card: run the tests child with a scratch HOME and a read-only or copied node_mod… (from web-everything/web-everything#5884 review)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5839 (reviewed head `2673ff131886fa1e8bb6bc7dd8114f3729d067f9`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/codex-job.mjs:418` — (edge-case, degraded) Branch availability checks do not prevent updating a concurrently created branch.
-   - Scenario: After ls-remote reports lane/example absent, another actor creates that branch at the job's pinned base SHA before the push connects. The job's commit descends from that base, so the ordinary push fast-forwards the other actor's branch and reports success. The injected transcript confirmed no creation-only condition accompanies the push. Enforce branch absence atomically and retry a suffix when another actor wins.
-   - Claude's re-check: demonstrated break
+1. `we:scripts/operations/prototype-load-io.mjs:78` — File a hardening card: run the tests child with a scratch HOME and a read-only or copied node_modules. Add a test asserting the child env HOME is not the operator HOME.
+2. `we:docs/agent/testing.md:71` — Add a deterministic documentation check requiring behavioral guarantees to reference existing test files and exact named cases; inspect assertion adequacy during review.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5884@1c8f79fde18f832123b595e6b2385f4b4e258f03
 
 ## Acceptance
 

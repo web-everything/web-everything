@@ -1,21 +1,20 @@
 ---
+bornAs: xn39hc7
 kind: story
-size: 3
-parent: "4075"
+size: 2
 status: open
-scope: ["we:backlog/xe63fd8-prevention-add-a-test-that-starts-with-red-team-blocked-and.md"]
+scope: ["we:scripts/operations/codex-job.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Require structured behavioral acceptance mappings with a qualified test file, explicit case name,… (from web-everything/web-everything#5908 review)
+# Red-team follow-ups from web-everything/web-everything#5839 (head 2673ff131)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xe63fd8-prevention-add-a-test-that-starts-with-red-team-blocked-and.md:15` — Require structured behavioral acceptance mappings with a qualified test file, explicit case name, and concrete expected output; deterministically reject missing mappings and review whether the expected output resolves the behavioral decision.
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5839 (reviewed head `2673ff131886fa1e8bb6bc7dd8114f3729d067f9`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5360.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5908@13f0efb0a38774fd1e2e6b2ffcd33ff2f6ddf8be
+1. `we:scripts/operations/codex-job.mjs:418` — (edge-case, degraded) Branch availability checks do not prevent updating a concurrently created branch.
+   - Scenario: After ls-remote reports lane/example absent, another actor creates that branch at the job's pinned base SHA before the push connects. The job's commit descends from that base, so the ordinary push fast-forwards the other actor's branch and reports success. The injected transcript confirmed no creation-only condition accompanies the push. Enforce branch absence atomically and retry a suffix when another actor wins.
+   - Claude's re-check: demonstrated break
 
 ## Acceptance
 

@@ -1,21 +1,22 @@
 ---
+bornAs: xhbjl53
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/prototype-load-io.mjs", "we:docs/agent/testing.md", "we:scripts/operations/__tests__/prototype-load-io.test.mjs"]
+scope: ["we:backlog/xe63fd8-prevention-add-a-test-that-starts-with-red-team-blocked-and.md"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — File a hardening card: run the tests child with a scratch HOME and a read-only or copied node_mod… (from web-everything/web-everything#5884 review)
+# Prevention — Require structured behavioral acceptance mappings with a qualified test file, explicit case name,… (from web-everything/web-everything#5908 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:backlog/7057-prevention-add-a-test-that-starts-with-red-team-blocked-and.md:15` — Require structured behavioral acceptance mappings with a qualified test file, explicit case name, and concrete expected output; deterministically reject missing mappings and review whether the expected output resolves the behavioral decision.
 
-1. `we:scripts/operations/prototype-load-io.mjs:78` — File a hardening card: run the tests child with a scratch HOME and a read-only or copied node_modules. Add a test asserting the child env HOME is not the operator HOME.
-2. `we:docs/agent/testing.md:71` — Add a deterministic documentation check requiring behavioral guarantees to reference existing test files and exact named cases; inspect assertion adequacy during review.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5360.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5884@1c8f79fde18f832123b595e6b2385f4b4e258f03
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5908@13f0efb0a38774fd1e2e6b2ffcd33ff2f6ddf8be
 
 ## Acceptance
 
