@@ -3,6 +3,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { join, dirname, isAbsolute, resolve as resolvePath } from 'node:path';
 import { stateDir } from './state.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
@@ -10,6 +11,7 @@ import { makeGit } from './shared.mjs';
 import { rmSync, mkdirSync, existsSync, symlinkSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { defaultPoolRoot, workspaceFor } from '../lane-pool-paths.mjs';
+import { scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 
 // ── candidate worktree (xa4qo7n) — where the live smoke actually runs, never `root` ─────────────────────────
 
@@ -118,7 +120,9 @@ export const SMOKE_LIVE_CLONE_ENV = 'WE_SMOKE_LIVE_CLONE';
 export const DISPATCH_CWD_ROOT_ENV = 'WE_DISPATCH_CWD_ROOT';
 
 /**
- * PURE: the env the live smoke runs with when its tree is a disposable candidate worktree instead of `root`.
+ * The env the live smoke runs with when its tree is a disposable candidate worktree instead of `root`.
+ * Best-effort reads the live clone's origin as LANE_POOL_CANONICAL_ORIGIN so the candidate need not trust
+ * its shared, pool-owned Git config. An already-set env value wins; a failed read leaves the guard closed.
  *
  * x5wbsbc, live 2026-09-26 12:11-12:40 ET on `wev-review-daemon`: every rebuild since #2731 was
  * `smoke-rejected` (sticky) on `lane-acquire-release` — "no lanes provisioned for web-everything under
@@ -137,6 +141,15 @@ export function candidateSmokeEnv({ root, env = process.env }) {
   const out = { ...env };
   if (!out.PATH) out.PATH = process.env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin';
   if (!out.HOME) out.HOME = process.env.HOME || homedir();
+  if (out.LANE_POOL_CANONICAL_ORIGIN == null) {
+    try {
+      const origin = spawnSync('git', ['remote', 'get-url', 'origin'], {
+        cwd: root, env: scrubGitRepoEnv(out), encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
+      });
+      const url = origin.stdout?.trim();
+      if (origin.status === 0 && url) out.LANE_POOL_CANONICAL_ORIGIN = url;
+    } catch { /* best-effort — lane-pool still requires an explicit canonical origin */ }
+  }
   out.LANE_POOL_ROOT = defaultPoolRoot(root, out);
   if (!String(out[DISPATCH_CWD_ROOT_ENV] ?? '').trim()) {
     out[DISPATCH_CWD_ROOT_ENV] = join(workspaceFor(root), '.operations', 'dispatch');
