@@ -1,7 +1,7 @@
 /** Shared admission for background work; operator interactive commands bypass this check.
  * Memory readings report provenance: macOS pages + free swap, pages alone, then os.freemem.
  * Unavailable memory admits with an explicit unknown reason after the load check; measured low
- * headroom still refuses. Native probe timeouts and legacy numeric-reader failures fail closed.
+ * headroom still refuses. Malformed readings, non-denial probe errors and legacy numeric-reader failures fail closed.
  * No network endpoint: body size/rate/CSRF do not apply. Scan/GC triggers use host single-flight locks.
  */
 import { createHash } from 'node:crypto';
@@ -32,7 +32,20 @@ export function parseDarwinMemoryHeadroomMb(vmStat, swapUsage) {
   if (![page, free, spec].every(Number.isFinite) || swapFree === undefined) throw Error('unparseable vm_stat/swapusage');
   return ((free + spec + (Number.isFinite(purge) ? purge : 0)) * page) / 1048576 + Number(swapFree);
 }
-/** Headroom in MB with its probe source; unavailable probes fall back without inventing headroom. */
+function isMemoryProbeDenied(error) {
+  if (error?.code === 'ETIMEDOUT' || error?.message === 'ETIMEDOUT') return false;
+  return ['EPERM', 'EACCES', 'ENOENT'].includes(error?.code)
+    || /operation not permitted|permission denied|not permitted/i.test(error?.message ?? '');
+}
+function readFreeMemoryReading(free) {
+  let mb;
+  try { mb = free() / 1048576; }
+  catch { return { mb: null, source: 'unknown' }; }
+  if (!Number.isFinite(mb)) return { mb: null, source: 'unknown' };
+  if (mb < 0) throw Error('invalid free memory');
+  return { mb, source: 'os.freemem' };
+}
+/** Headroom in MB with its probe source; only denied/unavailable probes fall back. Invalid readings throw. */
 export function readHostMemoryReading({ env = process.env, platform = process.platform, exec = execFileSync, free = freemem } = {}) {
   if (env.VITEST === 'true' && env.WE_TEST_HOST_MEMORY_MB !== undefined) {
     const value = Number(env.WE_TEST_HOST_MEMORY_MB);
@@ -41,28 +54,28 @@ export function readHostMemoryReading({ env = process.env, platform = process.pl
   }
   if (platform === 'darwin') {
     const opts = { encoding: 'utf8', timeout: 5000 };
+    let vm;
     try {
-      const vm = exec('vm_stat', [], opts);
-      const pagesMb = parseDarwinMemoryHeadroomMb(vm, 'free = 0M');
-      try {
-        const mb = parseDarwinMemoryHeadroomMb(vm, exec('sysctl', ['vm.swapusage'], opts));
-        if (!Number.isFinite(mb) || mb < 0) throw Error('invalid swap headroom');
-        return { mb, source: 'vm_stat+swap' };
-      } catch (e) {
-        if (e.code === 'ETIMEDOUT' || e.message === 'ETIMEDOUT') throw e;
-        return { mb: pagesMb, source: 'vm_stat' };
-      }
+      vm = exec('vm_stat', [], opts);
     } catch (e) {
-      if (e.code === 'ETIMEDOUT' || e.message === 'ETIMEDOUT') throw e;
+      if (!isMemoryProbeDenied(e)) throw e;
+      return readFreeMemoryReading(free);
     }
+    const pagesMb = parseDarwinMemoryHeadroomMb(vm, 'free = 0M');
+    if (!Number.isFinite(pagesMb) || pagesMb < 0) throw Error('invalid page headroom');
+    let swap;
+    try { swap = exec('sysctl', ['vm.swapusage'], opts); }
+    catch (e) {
+      if (!isMemoryProbeDenied(e)) throw e;
+      return { mb: pagesMb, source: 'vm_stat' };
+    }
+    const mb = parseDarwinMemoryHeadroomMb(vm, swap);
+    if (!Number.isFinite(mb) || mb < 0) throw Error('invalid swap headroom');
+    return { mb, source: 'vm_stat+swap' };
   }
-  try {
-    const mb = free() / 1048576;
-    if (Number.isFinite(mb) && mb >= 0) return { mb, source: 'os.freemem' };
-  } catch { /* No usable memory source remains. */ }
-  return { mb: null, source: 'unknown' };
+  return readFreeMemoryReading(free);
 }
-/** Numeric compatibility reader: unknown memory is NaN; invalid test overrides still throw. */
+/** Numeric compatibility reader: unavailable memory is NaN; invalid readings still throw. */
 export function readHostMemoryHeadroomMb(options = {}) {
   return readHostMemoryReading(options).mb ?? NaN;
 }
