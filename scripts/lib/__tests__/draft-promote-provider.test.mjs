@@ -123,6 +123,12 @@ describe('draft-promote-provider (draft-first PRs)', () => {
       },
     );
 
+    it('redacts a token glued to a preceding word character', () => {
+      const original = Object.assign(new Error(command), { stderr: 'credential_ghp_Synthetic_123abc rejected' });
+      const message = readyError(original).message;
+      expect(message).not.toContain('Synthetic_123abc');
+    });
+
     it.each([{}, { stderr: '', stdout: '' }])(
       'rethrows the identical original error unchanged when no output is available (%j)', (output) => {
         const original = Object.assign(new Error(`${command}\noriginal trailing detail`), output, { status: 2 });

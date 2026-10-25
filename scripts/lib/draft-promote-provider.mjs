@@ -70,7 +70,7 @@ export function createDraftPromoteProvider({
         if (!output) throw error;
 
         // Redact before truncating so a token crossing the bound cannot leak a prefix.
-        const redacted = output.replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, '<redacted>');
+        const redacted = output.replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, '<redacted>');
         const detail = redacted.length > 400 ? `${redacted.slice(0, 400)}…` : redacted;
         const command = String(error.message).split(/\r?\n/, 1)[0];
         const message = `${command}: ${detail}`;
