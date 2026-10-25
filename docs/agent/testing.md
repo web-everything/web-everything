@@ -196,7 +196,16 @@ Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a co
 queued writer without a resumable prior becomes a finished null-result placeholder, so the planner
 can dispatch fresh only when seat evidence establishes that no pass ran and the evidence reader
 retains the original queued status. An ordinary finished null result has unknown run provenance
-and never authorizes fresh dispatch. Live or unknown liveness
+and never authorizes fresh dispatch. The shared placeholder predicate requires explicit original
+queued provenance for null results; admission supplies its pre-write record only after recovery
+normalization. The execution guard supplies no such provenance, so direct fresh calls and queued
+handoffs carrying an ordinary finished/null prior both refuse before provider selection.
+Regression prevention in `review-job-red-team-skip.test.mjs`:
+**fresh guard refuses a finished null prior without queued provenance (admitted=%s)** and
+**fresh admission preserves unknown null completion but recovers a dead queued writer (prior=%s)**.
+These exercise the shared execution guard and production admission, alongside the planner's
+**f: a null completion without queued provenance skips (stored status %s)** in
+`review-red-team-on-skip.test.mjs`. Live or unknown liveness
 and invalid writer PIDs keep the queued record blocked. Regressions in `review-job-red-team-skip.test.mjs`:
 **accepted code head dispatches fresh after queued fresh recovery crashes before running with no seat or result comment**,
 **queued fresh recovery still skips with %s**, and
