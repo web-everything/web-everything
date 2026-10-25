@@ -187,9 +187,24 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const git = (...args) => execute('git', args);
   const requireGit = (...args) => { const r = git(...args); if (r.code !== 0) throw new Error(r.error || `git ${args[0]} failed (${r.code})`); return r.stdout.trim(); };
   const ancestor = (tip, sha) => { const r = git('merge-base', '--is-ancestor', tip, sha); if (![0, 1].includes(r.code)) throw new Error(r.error || 'ancestry unverifiable'); return r.code === 0; };
-  const landedByContent = (ref) => {
+  const landedByContent = (ref, candidateSha) => {
     const cherry = git('cherry', 'origin/main', `origin/${ref}`);
-    return cherry.code === 0 && cherry.stdout.trimEnd().split(/\r?\n/).every((line) => line.startsWith('-'));
+    if (cherry.code !== 0 || !cherry.stdout.trimEnd().split(/\r?\n/).every((line) => line.startsWith('-'))) return false;
+    // Patch IDs ignore whitespace even inside string literals. Require exact tree
+    // entries for every stale-changed path in both targets; a merge result can be
+    // influenced by merge drivers. Conservative mismatches use normal stale checks.
+    const changed = git('diff', '--name-only', '--no-renames', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv',
+      '-z', `origin/main...origin/${ref}`);
+    if (changed.code !== 0 || !changed.stdout.endsWith('\0')) return false;
+    const paths = changed.stdout.slice(0, -1).split('\0');
+    // UTF-8 decoding can replace invalid filename bytes; that pathspec could match
+    // nothing and falsely prove equality. Retain normal checking for lossy names.
+    if (paths.some((path) => !path || path.includes('\uFFFD'))) return false;
+    return ['origin/main', candidateSha].every((target) => {
+      const difference = git('--literal-pathspecs', 'diff', '--quiet', '--no-ext-diff', '--no-textconv',
+        '--no-renames', '--ignore-submodules=none', target, `origin/${ref}`, '--', ...paths);
+      return difference.code === 0 && difference.stdout === '';
+    });
   };
   const loader = (action, clone, ref, extra = []) => execute('node', [resolve(repo, config.loaderCli), action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])]);
   const lastJson = (r) => { try { return JSON.parse(r.stdout.trim().split(/\r?\n/).at(-1)); } catch { return null; } };
@@ -293,17 +308,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           return stop('check-unverifiable', { detail: `could not fetch registered ref ${ref}` });
         }
         const included = ancestor(`origin/${ref}`, out.effectiveSha);
-        const landed = landedByContent(ref);
+        const landed = landedByContent(ref, out.effectiveSha);
         if (included) {
           contained.push(ref);
           out.staleChecks[ref] = { skipped: 'contained', included, landed };
           continue;
         }
         if (landed) {
-          // Patch equivalence on main does not imply tip ancestry in the replacement.
+          // Exact content containment does not imply tip ancestry in the replacement.
           // Leave these registrations for normal rebuild cleanup, outside the swap path.
           out.staleChecks[ref] = { skipped: 'landed', included, landed };
-          out.staleTolerated.push({ ref, landedByContent: true, why: 'commits already on main by patch-id' });
+          out.staleTolerated.push({ ref, landedByContent: true, why: 'exact content already in main and candidate' });
           continue;
         }
         const evidence = check(out.clone, ref);
@@ -331,10 +346,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
               }
             }
             else {
-              const landed = landedByContent(ref);
+              const landed = landedByContent(ref, out.effectiveSha);
               out.staleTolerated.push({ ref, landedByContent: landed,
                 why: 'pre-existing stale registration; candidate clean and file-disjoint'
-                  + (landed ? ', commits already on main by patch-id' : '') });
+                  + (landed ? ', exact content already in main and candidate' : '') });
             }
           }
         }
@@ -360,7 +375,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           if (!passed) { blockingReasons[ref] += `; ${failure}`; continue; }
           blocking.splice(blocking.indexOf(ref), 1);
           delete blockingReasons[ref];
-          out.staleTolerated.push({ ref, landedByContent: landedByContent(ref), why: 'pre-existing stale registration; combined-tree tests passed', combinedTests: out.combinedTests });
+          out.staleTolerated.push({ ref, landedByContent: landedByContent(ref, out.effectiveSha), why: 'pre-existing stale registration; combined-tree tests passed', combinedTests: out.combinedTests });
         }
         out.staleTolerated.sort((a, b) => established.indexOf(a.ref) - established.indexOf(b.ref));
       }

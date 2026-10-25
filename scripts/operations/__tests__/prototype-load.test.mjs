@@ -131,6 +131,11 @@ function fixture(options = {}) {
       return options.tip || remoteTip;
     }
     if (args[0] === 'diff') {
+      if (args[1] === '--name-only') {
+        expect(args).toEqual(['diff', '--name-only', '--no-renames', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv',
+          '-z', 'origin/main...origin/lane/old']);
+        return options.landedPathsError ? fail(128) : options.landedPaths ?? 'x\0';
+      }
       const ref = args.at(-1).startsWith('origin/main...origin/') ? args.at(-1).slice('origin/main...origin/'.length) : null;
       if (registrations.has(ref)) {
         expect(args.slice(1, 4)).toEqual(['--name-status', '-z', `origin/main...origin/${ref}`]);
@@ -162,6 +167,14 @@ function fixture(options = {}) {
         return '';
       }
       return (options.contained || []).includes(args[2].slice(7)) ? '' : fail(1);
+    }
+    if (args[0] === '--literal-pathspecs') {
+      expect(args.slice(1, 7)).toEqual(['diff', '--quiet', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none']);
+      expect(['origin/main', candidateSha].includes(args[7])).toBe(true);
+      expect(args.slice(8, 10)).toEqual(['origin/lane/old', '--']);
+      const proof = options.landedProof?.[args[7]];
+      if (proof && typeof proof === 'object') return fail(proof.code, proof.stdout || '');
+      return proof ?? '';
     }
     if (args[0] === 'merge-tree') return options.mergeConflict ? fail(1, `${TREE}\n100644 ${SHA} 1\tx\nCONFLICT (content): Merge conflict in x\n`) : TREE;
     if (args[0] === 'ls-remote') {
@@ -961,17 +974,90 @@ describe('prototype-load', () => {
     expect(r.message).toContain('candidate-not-clean');
     expect(mutations(f, 'add')).toEqual([]);
   });
+  it.each([
+    ['main differs', { 'origin/main': { code: 1 } }],
+    ['candidate differs', { [SHA]: { code: 1 } }],
+    ['unreadable proof', { 'origin/main': { code: 128 } }],
+    ['spawn or buffer failure', { 'origin/main': { code: -1 } }],
+    ['partial proof with diagnostics', { 'origin/main': `${TREE}\npartial` }],
+  ])('does not waive a patch-id match without exact content containment: %s', async (_, landedProof) => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      cherry: { 'lane/old': `- ${SHA}\n` }, landedProof });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: false, registered: false, adopted: false,
+      stopReason: 'stale-registration', blocking: ['lane/old'] });
+    expect(r.staleChecks['lane/old']).toMatchObject({ ok: true, clean: false });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it.each([{ landedPaths: '' }, { landedPaths: 'x' }, { landedPaths: 'x\0\0' }, { landedPaths: 'x\uFFFD.mjs\0' }, { landedPathsError: true }])('does not waive a patch-id match with incomplete or lossy path evidence: %j', async (options) => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], cherry: { 'lane/old': `- ${SHA}\n` }, ...options });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'stale-registration', registered: false, adopted: false });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('compares exact tree entries including gitlinks with literal paths and ignores merge-driver results', async () => {
+    const paths = ['module', 'x[1].mjs', ':(exclude)x', '--option', 'line\nbreak', 'quote"`', 'a\rb', 'a\u2028b', 'e\u0301.mjs'];
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], cherry: { 'lane/old': `- ${SHA}\n` },
+      landedPaths: paths.join('\0') + '\0', landedProof: { 'origin/main': { code: 1 } } });
+    // The fixture's merge-tree returns a clean unchanged tree, as a keep-ours
+    // merge driver would. It cannot substitute for exact tree-entry comparison.
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'stale-registration', registered: false, adopted: false });
+    expect(f.calls.find(c => c.cmd === 'git' && c.args[0] === '--literal-pathspecs')?.args).toEqual([
+      '--literal-pathspecs', 'diff', '--quiet', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none',
+      'origin/main', 'origin/lane/old', '--', ...paths,
+    ]);
+    expect(f.calls.some(c => c.cmd === 'git' && c.args[0] === 'merge-tree')).toBe(false);
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it.each(['ab', 'a\tb'])('protects conflicting live string content ignored by Git patch-id: %j', async (oldValue) => {
+    const root = mkdtempSync(join(tmpdir(), 'prototype-patch-id-'));
+    try {
+      const base = join(root, 'base'), old = join(root, 'old'), main = join(root, 'main'), candidate = join(root, 'candidate');
+      for (const [path, value] of [[base, 'a'], [old, oldValue], [main, 'a b'], [candidate, 'a b c']]) {
+        writeFileSync(path, `export const s = "${value}";\n`);
+      }
+      const patchId = (path) => {
+        let patch;
+        try { execFileSync('git', ['diff', '--no-index', '--', base, path], { encoding: 'utf8', stdio: 'pipe' }); }
+        catch (e) { expect(e.status).toBe(1); patch = e.stdout; }
+        // Use the same file names: only the content difference participates in this probe.
+        patch = String(patch).replaceAll(path, old);
+        return execFileSync('git', ['patch-id', '--stable'], { input: patch, encoding: 'utf8' }).split(' ')[0];
+      };
+      expect(patchId(old)).toMatch(/^[a-f0-9]{40}$/);
+      expect(patchId(old)).toBe(patchId(main));
+      const landedProof = {};
+      for (const [target, path] of [['origin/main', main], [SHA, candidate]]) {
+        try { execFileSync('git', ['merge-file', '-p', path, base, old], { encoding: 'utf8', stdio: 'pipe' }); }
+        catch (e) { expect(e.status).toBe(1); landedProof[target] = { code: e.status, stdout: e.stdout }; }
+        expect(landedProof[target]).toBeDefined();
+        let comparisonCode = 0;
+        try { execFileSync('git', ['diff', '--no-index', '--quiet', '--no-ext-diff', '--no-textconv', '--', path, old], { encoding: 'utf8', stdio: 'pipe' }); }
+        catch (e) { expect(e.status).toBe(1); comparisonCode = e.status; landedProof[target] = { code: e.status }; }
+        expect(comparisonCode).toBe(1);
+      }
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], cherry: { 'lane/old': `- ${SHA}\n` }, landedProof });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false,
+        stopReason: 'stale-registration', blocking: ['lane/old'] });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('adopts with a content-landed stale ref without pairwise checks or ancestry-only swap', async () => {
-    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' }, cherry: { 'lane/old': `- ${SHA}\n- ${TREE}\n` } });
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' }, landedPaths: 'old-only.mjs\0', cherry: { 'lane/old': `- ${SHA}\n- ${TREE}\n` } });
     const r = await f.run();
     expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, contained: [],
       swap: { contained: [], removed: [] }, staleChecks: { 'lane/old': { skipped: 'landed', included: false, landed: true } } });
     expect(r.swap.failed).toBeUndefined();
-    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: true, why: expect.stringMatching(/main.*patch-id/) }]);
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: true, why: expect.stringMatching(/exact.*main.*candidate/) }]);
     expect(mutations(f, 'remove')).toEqual([]);
     expect([...f.registrations.keys()]).toEqual(['lane/old']);
     expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check'))).toHaveLength(1);
     expect(f.calls.some(c => c.cmd === 'git' && c.args.join(' ') === 'cherry origin/main origin/lane/old')).toBe(true);
+    for (const target of ['origin/main', SHA]) {
+      expect(f.calls.some(c => c.cmd === 'git' && c.args.join(' ') === `--literal-pathspecs diff --quiet --no-ext-diff --no-textconv --no-renames --ignore-submodules=none ${target} origin/lane/old -- old-only.mjs`)).toBe(true);
+    }
     expect(f.records[0].staleTolerated).toEqual(r.staleTolerated);
     expect(mutations(f, 'add')).toHaveLength(1);
   });
