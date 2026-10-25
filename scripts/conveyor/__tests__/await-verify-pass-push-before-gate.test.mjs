@@ -4,7 +4,7 @@
  * real reconcile planner, ci-heal admission and drain classifier.
  */
 import { describe, it, expect } from 'vitest';
-import { runAwaitVerifyPass, isEarlyPushOwed, buildAwaitVerifyResumePrompt, formatAwaitVerifyLines, AWAIT_VERIFY_LIMITS } from '../await-verify-pass.mjs';
+import { runAwaitVerifyPass, isEarlyPushOwed, buildAwaitVerifyResumePrompt, formatAwaitVerifyLines, AWAIT_VERIFY_LIMITS, pushShaFromScratch } from '../await-verify-pass.mjs';
 import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
 // This historical fixture exercises the serial policy; new defaults have their own timing suite.
 const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
@@ -48,16 +48,285 @@ function harness({ records = [rec()], policy = ON } = {}) {
 }
 const pass = (h, over = {}) => runAwaitVerifyPass({ io: h.io, nowMs: T0 + 30_000, ttlMs: TTL, loggedPolicyLine: { value: null }, ...over });
 
+describe('pushShaFromScratch: first-attempt no-op evidence', () => {
+  function push({ flag = '=', failure, remote = SHA } = {}) {
+    let attempts = 0;
+    const exec = (cmd, args) => {
+      expect(cmd).toBe('git');
+      if (args.includes('init') || args.includes('fetch')) return '';
+      if (args.includes('push')) {
+        expect(args).toContain('--porcelain');
+        attempts += 1;
+        if (attempts === 1 && failure) throw Object.assign(new Error(failure), { stderr: failure });
+        return `To remote\n${flag}\trefs/source:refs/heads/x\t${flag === '=' ? '[up to date]' : '[new branch]'}\nDone\n`;
+      }
+      if (args.includes('rev-parse')) return remote;
+      if (args.includes('merge-base')) {
+        if (args.at(-2) === remote) throw new Error('not an ancestor');
+        return ''; // sha is an ancestor of the remote: contains
+      }
+      if (args.includes('ls-remote')) return `${remote}\trefs/heads/x\n`;
+      throw new Error(`unexpected git argv: ${args.join(' ')}`);
+    };
+    const result = pushShaFromScratch({ laneGitDir: '/unused', url: 'https://example.test/repo', sha: SHA, ref: 'x', exec,
+      sleep: () => {}, tuning: { attempts: 2, baseMs: 1, capMs: 1 } });
+    return { result, attempts };
+  }
+
+  it('marks upToDate only for a first-attempt = porcelain status', () => {
+    expect(push()).toEqual({ result: { remote: SHA, upToDate: true }, attempts: 1 });
+  });
+  it.each(['*', ' '])('does not mark a normal %s push upToDate', (flag) => {
+    expect(push({ flag })).toEqual({ result: { remote: SHA }, attempts: 1 });
+  });
+  it.each([['equal', SHA], ['contains', SHA2]])('keeps lost-response %s reconciliation as alreadyThere without upToDate', (_state, remote) => {
+    expect(push({ failure: 'unknown push response', remote })).toEqual({ result: { remote, alreadyThere: true }, attempts: 1 });
+  });
+  it('does not mark a retry upToDate after a transient failure even when it prints =', () => {
+    expect(push({ failure: 'fatal: The requested URL returned error: 502' })).toEqual({ result: { remote: SHA }, attempts: 2 });
+  });
+  it('classifies a fetch-first rejection on stdout with empty stderr as moved, not unknown or transient', () => {
+    let attempts = 0;
+    const exec = (cmd, args) => {
+      expect(cmd).toBe('git');
+      if (args.includes('init')) return '';
+      if (args.includes('push')) {
+        expect(args).toContain('--porcelain');
+        attempts += 1;
+        throw Object.assign(new Error('git push failed'), {
+          stderr: '', stdout: `To remote\n!\t${SHA}:refs/heads/x\t[rejected] (fetch first)\nDone\n`,
+        });
+      }
+      // A diverged remote would classify even an unknown failure as moved, masking a stdout regression.
+      if (args.includes('fetch')) throw new Error('remote probe unavailable');
+      throw new Error(`unexpected git argv: ${args.join(' ')}`);
+    };
+    expect(() => pushShaFromScratch({ laneGitDir: '/unused', url: 'https://example.test/repo', sha: SHA, ref: 'x', exec,
+      sleep: () => {}, tuning: { attempts: 2, baseMs: 1, capMs: 1 } })).toThrow(expect.objectContaining({ pushKind: 'moved' }));
+    expect(attempts).toBe(1);
+  });
+});
+
 describe('push-before-gate: the early push', () => {
   it('pushes the marked sha while verify is still running, keeps the record waiting, logs the push time', async () => {
     const h = harness();
     const { rows } = await pass(h);
     expect(h.calls.push).toEqual([expect.objectContaining({ sha: SHA, ref: 'lane/item-68b', sessionId: SESSION })]);
     expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(SESSION).earlyPush.upToDate).toBeUndefined();
     expect(h.store.get(SESSION).earlyPush).toMatchObject({ sha: SHA, ok: true, done: true, at: new Date(T0 + 30_000).toISOString() });
     const lines = formatAwaitVerifyLines({ rows });
     expect(lines[0]).toBe('await-verify: fix-push-policy: pushBeforeGate=true (standard)');
     expect(lines.some((l) => /early-push \(push-before-gate \(standard\)\) → sent 65a382e8 to lane\/item-68b at 2026-10-10T14:05:30.000Z, before the verify verdict; fix claim still held/.test(l))).toBe(true);
+  });
+  it.each(['wait', 'rerequest'])('resumes once for evidence when an early push reports upToDate (%s)', async (action) => {
+    const h = harness();
+    if (action === 'rerequest') h.state.marker = null;
+    h.io.push = (a) => { h.calls.push.push(a); return { ok: true, upToDate: true }; };
+    const { rows } = await pass(h);
+    expect(h.calls.push).toHaveLength(1);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('## Fix evidence');
+    expect(h.calls.resume[0].prompt).toContain(SHA);
+    expect(rows).toContainEqual(expect.objectContaining({ action: 'resume', reason: 'no-new-commit' }));
+    expect(h.calls.rerequest).toEqual([]);
+    expect(h.store.size).toBe(0);
+    await pass(h);
+    expect(h.calls.resume).toHaveLength(1);
+  });
+  it.each(['pending', 'must-fix'].flatMap(state => ['wait', 'rerequest'].map(action => [state, action])))
+  ('holds a no-op %s review on the %s path until it returns clean', async (state, action) => {
+    const h = harness();
+    if (action === 'rerequest') h.state.marker = null;
+    let review = { ...rec(), state, startedAt: new Date(T0).toISOString(), returnedAt: new Date(T0 + 5_000).toISOString() };
+    h.io.readSelfReview = () => review;
+    h.io.push = (a) => { h.calls.push.push(a); return { ok: true, upToDate: true }; };
+    const held = await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.has(SESSION)).toBe(true);
+    expect(held.rows).toContainEqual(expect.objectContaining({ action: 'self-review-hold' }));
+    await pass(h, { nowMs: T0 + 60_000 });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.calls.push).toHaveLength(1);
+    review = { ...review, state: 'clean', returnedAt: new Date(T0 + 70_000).toISOString() };
+    await pass(h, { nowMs: T0 + 80_000 });
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('## Fix evidence');
+    expect(h.calls.resume[0].prompt).toContain('fix-end');
+    expect(h.store.has(SESSION)).toBe(false);
+    expect(h.calls.rerequest).toEqual([]);
+  });
+  it.each(['pending', 'must-fix', 'invalid-time'])('recovers an overdue no-op %s review without authorizing hand-back', async (state) => {
+    const h = harness();
+    h.io.readSelfReview = () => ({ ...rec(), state: state === 'invalid-time' ? 'pending' : state,
+      startedAt: state === 'invalid-time' ? 'invalid' : new Date(T0).toISOString(), returnedAt: new Date(T0).toISOString() });
+    h.io.push = () => ({ ok: true, upToDate: true });
+    await pass(h, { nowMs: T0 + AWAIT_VERIFY_LIMITS.selfReviewMaxMs + 1 });
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Do not hand back yet');
+    expect(h.calls.resume[0].prompt).toContain('self-review clean|must-fix');
+    expect(h.calls.resume[0].prompt).not.toContain('Verify is GREEN');
+    expect(h.calls.resume[0].prompt).not.toContain('Then follow your fix brief');
+    expect(h.store.has(SESSION)).toBe(false);
+  });
+  it('rechecks the self-review before delivering a saved no-op resume', async () => {
+    const h = harness({ records: [rec({ pendingResume: { kind: 'no-new-commit' } })] });
+    h.io.readSelfReview = () => ({ ...rec(), state: 'pending', startedAt: new Date(T0).toISOString() });
+    await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.has(SESSION)).toBe(true);
+  });
+  it('fails closed when the no-op self-review cannot be read', async () => {
+    const h = harness();
+    h.io.readSelfReview = () => { throw new Error('unreadable review'); };
+    h.io.push = () => ({ ok: true, upToDate: true });
+    const { rows } = await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.has(SESSION)).toBe(true);
+    expect(rows).toContainEqual(expect.objectContaining({ result: 'error: unreadable review' }));
+  });
+  it.each(['clean', 'repaired', 'foreign-owner'])('allows a no-op completion for a %s review', async (state) => {
+    const h = harness();
+    h.io.readSelfReview = () => ({ ...rec(), state: state === 'foreign-owner' ? 'pending' : state,
+      sessionId: state === 'foreign-owner' ? 'other-session' : SESSION, startedAt: new Date(T0).toISOString() });
+    h.io.push = () => ({ ok: true, upToDate: true });
+    await pass(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('## Fix evidence');
+    expect(h.store.has(SESSION)).toBe(false);
+  });
+  it.each(['red', 'lane-moved'])('still observes %s after a no-op self-review hold', async (change) => {
+    const h = harness();
+    h.io.readSelfReview = () => ({ ...rec(), state: 'pending', startedAt: new Date(T0).toISOString() });
+    h.io.push = () => ({ ok: true, upToDate: true });
+    await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(SESSION).pendingResume).toBeUndefined();
+    if (change === 'red') h.state.marker = marker('red');
+    else h.state.lane.head = SHA2;
+    const { rows } = await pass(h, { nowMs: T0 + 60_000 });
+    expect(h.calls.resume).toHaveLength(1);
+    expect(rows).toContainEqual(expect.objectContaining({ reason: change, result: `resumed:${change === 'red' ? 'red' : 'void'}` }));
+    expect(h.calls.resume[0].prompt).not.toContain('## Fix evidence');
+  });
+  it('persists overdue recovery across a busy session and a failed recovery write', async () => {
+    const h = harness({ records: [rec({ pendingResume: { kind: 'no-new-commit' } })] });
+    h.io.readSelfReview = () => ({ ...rec(), state: 'pending', startedAt: new Date(T0).toISOString() });
+    const write = h.io.writeRecord;
+    h.io.writeRecord = r => r.pendingResume?.selfReviewOverdue ? { ok: false } : write(r);
+    const nowMs = T0 + AWAIT_VERIFY_LIMITS.selfReviewMaxMs + 1;
+    await pass(h, { nowMs });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(SESSION).pendingResume.selfReviewOverdue).toBeUndefined();
+    h.io.writeRecord = write;
+    const sessions = h.io.listSessions;
+    h.io.listSessions = () => [{ ...sessions()[0], state: 'running' }];
+    await pass(h, { nowMs });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(SESSION).pendingResume.selfReviewOverdue).toContain('pending');
+    h.io.listSessions = sessions;
+    await pass(h, { nowMs: nowMs + 1_000 });
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Do not hand back yet');
+    expect(h.store.has(SESSION)).toBe(false);
+  });
+  it('keeps waiting when a landed push loses its success persist and the next tick reports upToDate', async () => {
+    const h = harness();
+    const writeRecord = h.io.writeRecord;
+    h.io.writeRecord = (r) => r.earlyPush?.ok ? { ok: false } : writeRecord(r);
+    await pass(h);
+    expect(h.state.remote).toBe(SHA);
+    expect(h.store.get(SESSION).earlyPush).toEqual({ sha: SHA, attempts: 1, done: false });
+    expect(h.calls.resume).toEqual([]);
+
+    h.io.writeRecord = writeRecord;
+    h.io.push = (a) => { h.calls.push.push(a); return { ok: true, upToDate: true }; };
+    const { rows } = await pass(h);
+    expect(h.calls.push).toHaveLength(2);
+    expect(h.store.get(SESSION).earlyPush).toMatchObject({ attempts: 2, ok: true, done: true });
+    expect(h.store.get(SESSION).earlyPush.upToDate).toBeUndefined();
+    expect(h.calls.resume).toEqual([]);
+    expect(rows).toContainEqual(expect.objectContaining({ action: 'wait' }));
+  });
+  it('keeps waiting for verify on repair attempt 2 even when its first push reports upToDate', async () => {
+    const h = harness({ records: [rec({ attempt: 2 })] });
+    h.io.push = (a) => { h.calls.push.push(a); return { ok: true, upToDate: true }; };
+    const { rows } = await pass(h);
+    expect(h.store.get(SESSION).earlyPush).toMatchObject({ attempts: 1, upToDate: true });
+    expect(h.calls.resume).toEqual([]);
+    expect(rows).toContainEqual(expect.objectContaining({ action: 'wait' }));
+  });
+  it.each([undefined, 2])('keeps waiting for persisted upToDate evidence with early-push attempts=%s', async (attempts) => {
+    const h = harness({ records: [rec({ earlyPush: { sha: SHA, attempts, ok: true, done: true, upToDate: true } })] });
+    const { rows } = await pass(h);
+    expect(h.calls.push).toEqual([]);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.has(SESSION)).toBe(true);
+    expect(rows).toContainEqual(expect.objectContaining({ action: 'wait' }));
+  });
+  it.each(['wait', 'rerequest'])('keeps a non-fix record on the %s path despite persisted upToDate evidence', async (action) => {
+    const h = harness({ records: [rec({ kind: 'ci-heal', earlyPush: { sha: SHA, attempts: 1, ok: true, done: true, upToDate: true } })] });
+    if (action === 'rerequest') h.state.marker = null;
+    const { rows } = await pass(h);
+    expect(rows).toContainEqual(expect.objectContaining({ action }));
+    expect(rows).not.toContainEqual(expect.objectContaining({ reason: 'no-new-commit' }));
+    expect(h.calls.push).toEqual([]);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.calls.rerequest).toEqual(action === 'rerequest' ? [rec().lane] : []);
+    expect(h.store.has(SESSION)).toBe(true);
+  });
+  it('keeps the green path when the push was upToDate', async () => {
+    const h = harness({ records: [rec({ attempt: 1, earlyPush: { sha: SHA, attempts: 1, done: true, ok: true, upToDate: true } })] });
+    h.state.marker = marker('green');
+    h.io.push = (a) => { h.calls.push.push(a); return { ok: true, upToDate: true }; };
+    const { rows } = await pass(h);
+    expect(h.calls.push).toHaveLength(1);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Verify is GREEN');
+    expect(h.calls.resume[0].prompt).not.toContain('Do NOT re-mark');
+    expect(rows).toContainEqual(expect.objectContaining({ action: 'push', reason: 'green' }));
+    expect(h.store.size).toBe(0);
+  });
+  it('preserves a pending resume even when the push was upToDate', async () => {
+    const h = harness({ records: [rec({ attempt: 1, earlyPush: { sha: SHA, attempts: 1, done: true, ok: true, upToDate: true }, pendingResume: { kind: 'red' } })] });
+    const { rows } = await pass(h);
+    expect(h.calls.push).toEqual([]);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Verify is RED');
+    expect(rows).toContainEqual(expect.objectContaining({ action: 'resume', reason: 'pending-resume', result: 'resumed:red' }));
+    expect(h.store.size).toBe(0);
+  });
+  it('keeps the red verdict resume when the push was upToDate', async () => {
+    const h = harness({ records: [rec({ attempt: 1, earlyPush: { sha: SHA, attempts: 1, done: true, ok: true, upToDate: true } })] });
+    h.state.marker = marker('red');
+    const { rows } = await pass(h);
+    expect(h.calls.push).toEqual([]);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Verify is RED');
+    expect(rows).toContainEqual(expect.objectContaining({ action: 'resume', reason: 'red', result: 'resumed:red' }));
+    expect(rows).not.toContainEqual(expect.objectContaining({ reason: 'no-new-commit' }));
+    expect(h.store.size).toBe(0);
+  });
+  it('does not resume for an upToDate result belonging to another sha', async () => {
+    const h = harness({ policy: OFF, records: [rec({ attempt: 1, earlyPush: { sha: SHA2, attempts: 1, ok: true, done: true, upToDate: true } })] });
+    await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.has(SESSION)).toBe(true);
+  });
+  it('keeps waiting for legacy alreadyThere evidence from failure reconciliation', async () => {
+    const h = harness({ records: [rec({ earlyPush: { sha: SHA, ok: true, done: true, alreadyThere: true } })] });
+    await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.has(SESSION)).toBe(true);
+  });
+  it('no-new-commit prompt directs the fixer to post durable evidence and finish', () => {
+    const prompt = buildAwaitVerifyResumePrompt({ kind: 'no-new-commit', record: rec() });
+    expect(prompt).toMatch(/^\[harness verify verdict/);
+    for (const text of ['already had this exact sha when the harness tried to push it (upToDate)', 'Do NOT re-mark',
+      'standalone heading `## Fix evidence`', `Head: ${SHA}`, '<!-- addresses-operator-send-back: <id> -->',
+      'per open operator send-back you addressed', 'file:line citations', 'hand-back', 'completion report', 'fix-end']) {
+      expect(prompt).toContain(text);
+    }
   });
   it('pushes once per sha: the next tick only waits', async () => {
     const h = harness();
