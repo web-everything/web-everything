@@ -154,3 +154,5 @@ export const PLATFORM_VERDICT_LEDGER_DEFAULTS = {
 export const PLATFORM_MERGE_GATE_DEFAULTS = {
   reviewAuthority: 'labels' as 'labels' | 'both' | 'ledger',
 } as const;
+
+export { PLATFORM_DELIVERY_POLICY_DEFAULTS } from './deliveryPolicyDefaults';

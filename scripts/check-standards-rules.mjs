@@ -4451,6 +4451,8 @@ export const LEASH_PIN_SNAPSHOT = Object.freeze([
   'gate-invariants.test.mjs',
   'drain-gate-settings.json',
   'drain-workflow-edit-hold.mjs',
+  'webeverything.config.json',
+  'deliveryPolicyDefaults.ts',
 ]);
 
 /** A REAL-shaped diff section for `path` whose only change is whitespace — exactly the hunk a content trigger

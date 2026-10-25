@@ -74,6 +74,11 @@
  * such change is human-reviewed by construction. That is the point.
  */
 import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 
 // #2892 — the anchored-rule-heading grammar (`### … {#anchor}`) the statute-anchor trigger reads, imported from
 // the ONE inventory `rules-loader.cjs` exposes (`extractAnchors`) so the render, the `codifiedIn:` gate and this
@@ -104,6 +109,29 @@ const { extractAnchors } = createRequire(import.meta.url)('./rules-loader.cjs');
  * fail-closed direction is human, never committee.
  */
 export const TRUST_CHAIN = [
+  {
+    role: 'delivery-policy-config',
+    file: 'webeverything.config.json',
+    tier: 'policy',
+    leash: 'spec',
+    desc: 'delivery-flow settings decide whether protections fire (#5113); value changes require human review',
+    homes: ['webeverything.config.json'],
+  },
+  {
+    role: 'delivery-policy-defaults',
+    file: 'deliveryPolicyDefaults.ts',
+    tier: 'policy',
+    leash: 'spec',
+    desc: 'delivery-flow defaults supply policy when no project setting exists (#5113); value changes require human review',
+    homes: ['config/deliveryPolicyDefaults.ts'],
+  },
+  {
+    role: 'delivery-policy-loader',
+    file: 'delivery-policy.mjs',
+    tier: 'engine',
+    desc: 'delivery-flow loader obeys the human-gated policy sources (#5113), like the lander',
+    homes: ['scripts/lib/delivery-policy.mjs'],
+  },
   {
     role: 'escalation-rubric',
     file: 'review-escalation.mjs',
@@ -780,4 +808,44 @@ export function principleSurfaceTriggers(changedFile, fileHunks) {
 // @invariant principle-surface-is-the-union (#human-is-principle-surface-not-path) — the leash-path floor is unconditional and the two content triggers join it; never drop a term
 export function isPrincipleSurface(changedFile, fileHunks) {
   return isDeclarativeLeashPath(changedFile) || isStatuteAnchorEdit(changedFile, fileHunks) || isMarkedInvariantEdit(changedFile, fileHunks);
+}
+
+
+/**
+ * Read the policy-spec basename Set from a trusted base ref (#5113), never the PR's working tree.
+ * `root` permits isolated repositories. The registry and its load-time dependency both come from git.
+ * Loads run in a bounded child process; null means unavailable/incomplete evidence, including oversized
+ * files/output or a timeout. Callers MUST refuse every pointer on null and surface a warning for the operator.
+ */
+export async function readPolicySpecRegistryAt(ref, { root = resolve(dirname(fileURLToPath(import.meta.url)), '../..') } = {}) {
+  let scratch;
+  try {
+    if (typeof ref !== 'string' || !ref.trim() || ref.startsWith('-')) return null;
+    const options = { cwd: root, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] };
+    // Resolve once so a moving branch cannot supply the registry and dependency from different commits.
+    const commit = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], options).trim();
+    if (!/^[a-f0-9]{40,64}$/.test(commit)) return null;
+    scratch = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'delivery-policy-registry-'));
+    for (const file of ['gate-config.mjs', 'rules-loader.cjs']) {
+      const source = execFileSync('git', ['show', `${commit}:scripts/lib/${file}`], options);
+      writeFileSync(join(scratch, file), source);
+    }
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import { pathToFileURL } from 'node:url';
+      const registry = await import(pathToFileURL(process.argv[1]).href);
+      const entries = registry.POLICY_SPEC_BASENAMES;
+      if (!(entries instanceof Set) || entries.size === 0) process.exit(1);
+      process.stdout.write(JSON.stringify([...entries]));
+    `, join(scratch, 'gate-config.mjs')], options);
+    const entries = JSON.parse(output);
+    if (!Array.isArray(entries) || entries.length === 0 || entries.some(entry =>
+      typeof entry !== 'string' || !entry || entry === '.' || entry === '..' || /[\\/\x00-\x1f\x7f-\x9f]/.test(entry))) return null;
+    return new Set(entries);
+  } catch {
+    return null;
+  } finally {
+    if (scratch) {
+      try { rmSync(scratch, { recursive: true, force: true }); } catch { /* Best-effort scratch cleanup. */ }
+    }
+  }
 }

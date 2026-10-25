@@ -104,6 +104,38 @@ export interface CrossProviderFallbackValue {
   waitTimeoutMs: number;
 }
 
+/** PR CI parity with the main branch (#5113). */
+export interface PrCiPolicyValue {
+  mainStateParity: 'on' | 'off';
+}
+
+/** Main-branch health and freshness required for merging (#5113). */
+export interface MergeGatePolicyValue {
+  recheckWhenMainMoved: 'if-older-than-N-min' | 'always' | 'off';
+  /** Positive integer; used only by `if-older-than-N-min`. */
+  recheckMaxAgeMin: number;
+  onMainRed: 'halt' | 'warn' | 'off';
+}
+
+/** Dispatch overlap override policy (#5113). */
+export interface DispatchGatePolicyValue {
+  overlapOverride: 'off' | 'logged' | 'free';
+}
+
+/** Heavy-run scheduling policy (#5113). */
+export interface HeavyQueuePolicyValue {
+  priority: 'repairs-first' | 'fifo';
+  /** Loader accepts any integer >= 0; a future consumer is expected to clamp to the slot cap minus one. No consumer exists yet. */
+  reservedForRepairs: number;
+  /** Positive integer minutes before an idle reserved slot may be borrowed. */
+  reservedBorrowAfterMin: number;
+}
+
+/** Drain response to a refused delivery step (#5113). */
+export interface DrainPolicyValue {
+  onStepRefusal: 'alert' | 'log';
+}
+
 /**
  * The root author surface. One key per dimension; the four known dimensions are typed to their own
  * flavor-id union (the compiler invariant). The index signature keeps the surface **open** — new
@@ -137,6 +169,12 @@ export interface WebEverythingConfig {
   backlogIdNumbering?: DimensionEntry<BacklogIdNumberingSetting, BacklogIdNumberingSetting>;
   /** Backlog reach-main extent; resolved and enforced by repo tooling (#4985). */
   backlogIdReach?: DimensionEntry<BacklogIdReachSetting, BacklogIdReachSetting>;
+  /** Delivery-flow policy dimensions (#5113); omitted inline fields retain their platform defaults. */
+  prCi?: DimensionEntry<string, Partial<PrCiPolicyValue>>;
+  mergeGate?: DimensionEntry<string, Partial<MergeGatePolicyValue>>;
+  dispatchGate?: DimensionEntry<string, Partial<DispatchGatePolicyValue>>;
+  heavyQueue?: DimensionEntry<string, Partial<HeavyQueuePolicyValue>>;
+  drain?: DimensionEntry<string, Partial<DrainPolicyValue>>;
   /** Open-set: any further dimension keyed by name. */
   [dimension: string]: DimensionEntry | undefined;
 }
