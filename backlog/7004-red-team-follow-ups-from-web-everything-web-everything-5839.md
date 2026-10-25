@@ -1,18 +1,19 @@
 ---
+bornAs: x371wkf
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/conveyor/soak/breaks/non-human-referral-hold-never-resumes.mjs"]
+scope: ["we:scripts/operations/codex-job.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5865 (head 247d05b63)
+# Red-team follow-ups from web-everything/web-everything#5839 (head f83fcf49c)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5865 (reviewed head `247d05b63fcf6a6d2b74088e74447adfd6746e88`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5839 (reviewed head `f83fcf49c51729aecd0adbd559f8e1db145d3113`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/conveyor/soak/breaks/non-human-referral-hold-never-resumes.mjs:34` — (edge-case, degraded) The new soak test treats recurrence of its original bug as an expected failure
-   - Scenario: Restore the human-only resume guard, then run the new soak test. fixPresent runs probe(), which tests the positive resume scenario; that regression makes it return false. defineBreakTest consequently selects it.fails, and the same broken scenario now passes as an expected failure. A read-only probe also confirmed this failure-masking path for the checkout's missing markdown-it dependency: present=false and assertionFails=true. Fix presence must be determined independently of the scenario's success so a regression in a tree carrying the fix fails the soak test.
+1. `we:scripts/operations/codex-job.mjs:55` — (failing-input, degraded) An accepted wait value triggers a pointless repair and reports tests-red without running tests
+   - Scenario: Supply otherwise valid arguments with --wait-ms=86400001. parseArgs accepts it, but heavy-admission permits at most 86400000 and exits 3 before executing Vitest. runTests treats that usage error as failing tests, invokes repair Codex, retries the same invalid command, and returns tests-red. A probe running the real admission CLI with injected repair/filesystem effects observed two exit-3 refusals, one repair invocation, and tests.status=red. Reject the unsupported wait value as bad-args before acquiring resources or running Codex.
    - Claude's re-check: demonstrated break
 
 ## Acceptance

@@ -1,21 +1,24 @@
 ---
+bornAs: xe5ale0
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
+scope: ["we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Add an invariant test over all review-referrals-pending refusal rows that none carries referralHo… (from web-everything/web-everything#5865 review)
+# Prevention — Add a lint or checklist rule that every new try/catch fallback in a CLI shell needs a test that m… (from web-everything/web-everything#5846 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/reconcile-core.mjs:1364` — Add an invariant test over all `review-referrals-pending` refusal rows that none carries `referralHoldAutoResolve.outcome === 'resume'`. Better, have `refuseReferralHold` normalize any non-cleared `resume` to `stay` with a generic reason. The test can be a write-gate in the planner test suite.
-2. `we:scripts/conveyor/reconcile-core.mjs:1364` — In the 'cannot consume a resume' it.each cases, assert `referralHoldAutoResolve.outcome === 'stay'` (or deliberately pin the current behaviour). Longer term, a planner invariant test that a `review-referrals-pending` refusal never carries `outcome: 'resume'`.
+1. `we:scripts/conveyor/lease-reaper.mjs:1535` — Add a lint or checklist rule that every new try/catch fallback in a CLI shell needs a test that makes the guarded call throw. Alternatively, put the claim-read wrapper in an exported function and unit-test it.
+2. `we:scripts/conveyor/lease-reaper.mjs:1535` — Have stubs for guard-bearing calls record their arguments and assert them.
+3. `we:scripts/conveyor/lease-reaper.mjs:1097` — When a PR description lists guards, reconcile them against the docblock before opening the PR. A deterministic gate is hard here; a review-lens note is enough.
+4. `we:scripts/conveyor/lease-reaper.mjs:1145` — Make `nowMs` required, or default it to `Date.now()`, so the safe path is the default. Alternatively add a lint rule against helpers that default a freshness clock to null.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5865@247d05b63fcf6a6d2b74088e74447adfd6746e88
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5846@62dbc0bc8e48754f54f900c1771ce28c7e55337c
 
 ## Acceptance
 

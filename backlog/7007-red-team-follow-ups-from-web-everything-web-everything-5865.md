@@ -1,18 +1,19 @@
 ---
+bornAs: x737jur
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/record-red-team-ruling-io.mjs"]
+scope: ["we:scripts/conveyor/soak/breaks/non-human-referral-hold-never-resumes.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5873 (head 53e90ebc5)
+# Red-team follow-ups from web-everything/web-everything#5865 (head 247d05b63)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5873 (reviewed head `53e90ebc5b22405757b0aea29e9cfbfdda757661`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5865 (reviewed head `247d05b63fcf6a6d2b74088e74447adfd6746e88`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/record-red-team-ruling-io.mjs:287` — (failing-input, degraded) Successful batch admission cannot release the break before the card lands on main
-   - Scenario: Run an automatic card ruling whose child returns {ok:true,step:'batched',rel:'we:backlog/xabcdef-card.md',pr:null,batchRef:'lane/card-batch-prevention-1'}, as we:land-prevention-card.mjs does after successful batch admission. Retry while the card exists on that batch branch but has not merged. The sink checks only origin/main, ignores batchRef, and allows spool fallback only for step='held'. It posts the reason, then throws 'card completion evidence no longer resolves', leaving the break held despite successful durable filing. The isolated sink probe reproduced this. It should validate the admitted
+1. `we:scripts/conveyor/soak/breaks/non-human-referral-hold-never-resumes.mjs:34` — (edge-case, degraded) The new soak test treats recurrence of its original bug as an expected failure
+   - Scenario: Restore the human-only resume guard, then run the new soak test. fixPresent runs probe(), which tests the positive resume scenario; that regression makes it return false. defineBreakTest consequently selects it.fails, and the same broken scenario now passes as an expected failure. A read-only probe also confirmed this failure-masking path for the checkout's missing markdown-it dependency: present=false and assertionFails=true. Fix presence must be determined independently of the scenario's success so a regression in a tree carrying the fix fails the soak test.
    - Claude's re-check: demonstrated break
 
 ## Acceptance

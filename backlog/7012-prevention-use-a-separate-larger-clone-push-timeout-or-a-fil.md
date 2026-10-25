@@ -1,23 +1,23 @@
 ---
+bornAs: xekt3s3
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs"]
+scope: ["we:scripts/operations/codex-job.mjs", "we:scripts/operations/__tests__/codex-job.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Add a lint or checklist rule that every new try/catch fallback in a CLI shell needs a test that m… (from web-everything/web-everything#5846 review)
+# Prevention — Use a separate, larger clone/push timeout, or a --filter=blob:none / reference clone. Add a test… (from web-everything/web-everything#5839 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/lease-reaper.mjs:1535` — Add a lint or checklist rule that every new try/catch fallback in a CLI shell needs a test that makes the guarded call throw. Alternatively, put the claim-read wrapper in an exported function and unit-test it.
-2. `we:scripts/conveyor/lease-reaper.mjs:1535` — Have stubs for guard-bearing calls record their arguments and assert them.
-3. `we:scripts/conveyor/lease-reaper.mjs:1097` — When a PR description lists guards, reconcile them against the docblock before opening the PR. A deterministic gate is hard here; a review-lens note is enough.
-4. `we:scripts/conveyor/lease-reaper.mjs:1145` — Make `nowMs` required, or default it to `Date.now()`, so the safe path is the default. Alternatively add a lint rule against helpers that default a freshness clock to null.
+1. `we:scripts/operations/codex-job.mjs:267` — Use a separate, larger clone/push timeout, or a `--filter=blob:none` / reference clone. Add a test asserting the clone call's timeout is at least the push timeout. Lower priority: a standards rule requiring timeouts on network git calls to be named constants.
+2. `we:scripts/operations/codex-job.mjs:297` — Extend the argv-shape assertion for the publication `add` call to require `--literal-pathspecs`, and set `GIT_LITERAL_PATHSPECS=1` in the trusted env so it covers `ls-files` as well.
+3. `we:scripts/operations/codex-job.mjs` — Add a deterministic real-Git regression test with a bracket-containing export path and a neighboring matching tracked filename, asserting successful publication of only the requested file.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5846@62dbc0bc8e48754f54f900c1771ce28c7e55337c
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5839@f83fcf49c51729aecd0adbd559f8e1db145d3113
 
 ## Acceptance
 

@@ -1,22 +1,22 @@
 ---
+bornAs: x42b5kn
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:.github/workflows/ci.yml"]
+scope: ["we:scripts/operations/run.mjs", "we:scripts/operations/__tests__/pr-status.test.mjs", "we:scripts/operations/__tests__/run.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Add a note to the CI authoring doc that expressions reading github.event.pull_request.* are froze… (from web-everything/web-everything#5886 review)
+# Prevention — Add a test in we:scripts/operations/run.mjs coverage that asserts every op in the read-only regis… (from web-everything/web-everything#5867 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:.github/workflows/ci.yml:167` — Add a note to the CI authoring doc that expressions reading `github.event.pull_request.*` are frozen at trigger time. A script-decidable gate is not practical here.
-2. `we:.github/workflows/ci.yml:168` — Add a CI regression using representative original-run and re-run event payloads that asserts the selected runner after a label change; align the comment with the demonstrated behavior.
-3. `we:.github/workflows/ci.yml:168` — Add a deterministic event-payload replay test covering label changes followed by reruns, and align the documented instructions with the observed behavior.
+1. `we:scripts/operations/run.mjs:752` — Add a test in we:scripts/operations/run.mjs coverage that asserts every op in the read-only registry maps to a memory store and zero-writes in the CLI path, or derive both lists from one shared constant.
+2. `we:scripts/operations/__tests__/pr-status.test.mjs:520` — When a renderer states a width cap, add a table-driven test that feeds each column a value longer than its width and asserts every output line has the expected length. A lint or review lens on 'fixture values must exceed the cap' would catch the class.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5886@155b32b9d466744ec1719e39f13ae946128445c8
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5867@96d026070626e67444ccbdc8678087b708ca1a49
 
 ## Acceptance
 

@@ -1,21 +1,23 @@
 ---
+bornAs: x6qfajh
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/run.mjs", "we:scripts/operations/__tests__/pr-status.test.mjs", "we:scripts/operations/__tests__/run.test.mjs"]
+scope: ["we:scripts/lib/__tests__/numbering-carry.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Add a test in we:scripts/operations/run.mjs coverage that asserts every op in the read-only regis… (from web-everything/web-everything#5867 review)
+# Prevention — When widening a path allow-list in a proof guard, add one agent-doc test that exercises each stat… (from web-everything/web-everything#5876 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/run.mjs:752` — Add a test in we:scripts/operations/run.mjs coverage that asserts every op in the read-only registry maps to a memory store and zero-writes in the CLI path, or derive both lists from one shared constant.
-2. `we:scripts/operations/__tests__/pr-status.test.mjs:520` — When a renderer states a width cap, add a table-driven test that feeds each column a value longer than its width and asserts every output line has the expected length. A lint or review lens on 'fixture values must exceed the cap' would catch the class.
+1. `we:scripts/lib/__tests__/numbering-carry.test.mjs:81` — When widening a path allow-list in a proof guard, add one agent-doc test that exercises each stated invariant (bornAs kept, mode unchanged, unchanged-content refusal), e.g. by running the existing backlog invariant tests over both path families with `it.each`.
+2. `we:scripts/lib/__tests__/numbering-carry.test.mjs:81` — Add the named regression test to the automated test gate, pairing rejection of changed bornAs with acceptance when bornAs remains unchanged.
+3. `we:scripts/lib/__tests__/numbering-carry.test.mjs:81` — Add a named regression test containing both an ordinary mapped reference and a bornAs line; assert acceptance when bornAs is preserved and refusal when it is rewritten, and run it in the existing test gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5867@96d026070626e67444ccbdc8678087b708ca1a49
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5876@8102490fea3e7fef347cb2a38f758b68f416f803
 
 ## Acceptance
 

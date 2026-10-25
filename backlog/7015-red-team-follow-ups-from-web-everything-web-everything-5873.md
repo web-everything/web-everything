@@ -1,18 +1,19 @@
 ---
+bornAs: xmdsbsc
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/adoption-matrix-io.mjs"]
+scope: ["we:scripts/operations/record-red-team-ruling-io.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5867 (head 5e4c1c665)
+# Red-team follow-ups from web-everything/web-everything#5873 (head 53e90ebc5)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5867 (reviewed head `5e4c1c665b4767e7ca841fdfc6841327cda7a135`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5873 (reviewed head `53e90ebc5b22405757b0aea29e9cfbfdda757661`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/adoption-matrix-io.mjs:111` — (edge-case, degraded) Missing objects bypass the shallow-history safeguard and produce false negative adoption results.
-   - Scenario: Use a shallow clone whose HEAD directly descends from a logged fix SHA omitted by the shallow boundary. Reproduced read-only against this checkout: HEAD 5e4c1c665b4767e7ca841fdfc6841327cda7a135 names parent 499e2eb6d79b526e702dd7afc5951fea72838ede, and Git confirms the repository is shallow. Supplying that parent as the logged SHA to createAdoptionMatrixReader, using the installed CommandLineTools Git executable, returns cells:["no (not in clone)"] without an incomplete warning. The missing-object return occurs before the shallow check. Because the fix is already HEAD's parent, this is a false
+1. `we:scripts/operations/record-red-team-ruling-io.mjs:287` — (failing-input, degraded) Successful batch admission cannot release the break before the card lands on main
+   - Scenario: Run an automatic card ruling whose child returns {ok:true,step:'batched',rel:'we:backlog/xabcdef-card.md',pr:null,batchRef:'lane/card-batch-prevention-1'}, as we:land-prevention-card.mjs does after successful batch admission. Retry while the card exists on that batch branch but has not merged. The sink checks only origin/main, ignores batchRef, and allows spool fallback only for step='held'. It posts the reason, then throws 'card completion evidence no longer resolves', leaving the break held despite successful durable filing. The isolated sink probe reproduced this. It should validate the admitted
    - Claude's re-check: demonstrated break
 
 ## Acceptance

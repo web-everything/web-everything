@@ -1,22 +1,22 @@
 ---
+bornAs: x98txf9
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/__tests__/codex-direct-task.test.mjs"]
+scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Add key-phrase assertions for each guaranteed rule, using literals rather than the exported const… (from web-everything/web-everything#5871 review)
+# Prevention — Add an invariant test over all review-referrals-pending refusal rows that none carries referralHo… (from web-everything/web-everything#5865 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/__tests__/codex-direct-task.test.mjs:262` — Add key-phrase assertions for each guaranteed rule, using literals rather than the exported constant. A lint rule banning 'expect(x).toContain(IMPORTED_CONST)' as the only assertion on a prompt-text constant would be a deterministic gate.
-2. `we:scripts/__tests__/codex-direct-task.test.mjs:265` — Add a deterministic test named 'preserves required clauses in both task-rule variants' in we:scripts/__tests__/codex-direct-task.test.mjs, independently asserting the promised commands, limits, prohibitions, and applicable variants.
-3. `we:scripts/__tests__/codex-direct-task.test.mjs:263` — Add an independently maintained literal expectation or checked-in snapshot for both complete blocks, and confirm that deleting or weakening each required rule makes the named test fail.
+1. `we:scripts/conveyor/reconcile-core.mjs:1364` — Add an invariant test over all `review-referrals-pending` refusal rows that none carries `referralHoldAutoResolve.outcome === 'resume'`. Better, have `refuseReferralHold` normalize any non-cleared `resume` to `stay` with a generic reason. The test can be a write-gate in the planner test suite.
+2. `we:scripts/conveyor/reconcile-core.mjs:1364` — In the 'cannot consume a resume' it.each cases, assert `referralHoldAutoResolve.outcome === 'stay'` (or deliberately pin the current behaviour). Longer term, a planner invariant test that a `review-referrals-pending` refusal never carries `outcome: 'resume'`.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5871@424828cd7889fce2e7d77285a3da97afe4b9c1da
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5865@247d05b63fcf6a6d2b74088e74447adfd6746e88
 
 ## Acceptance
 

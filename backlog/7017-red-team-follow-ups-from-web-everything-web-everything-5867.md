@@ -1,18 +1,19 @@
 ---
+bornAs: xp6xw0p
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/codex-job.mjs"]
+scope: ["we:scripts/operations/adoption-matrix-io.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5839 (head f83fcf49c)
+# Red-team follow-ups from web-everything/web-everything#5867 (head 5e4c1c665)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5839 (reviewed head `f83fcf49c51729aecd0adbd559f8e1db145d3113`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5867 (reviewed head `5e4c1c665b4767e7ca841fdfc6841327cda7a135`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/codex-job.mjs:55` — (failing-input, degraded) An accepted wait value triggers a pointless repair and reports tests-red without running tests
-   - Scenario: Supply otherwise valid arguments with --wait-ms=86400001. parseArgs accepts it, but heavy-admission permits at most 86400000 and exits 3 before executing Vitest. runTests treats that usage error as failing tests, invokes repair Codex, retries the same invalid command, and returns tests-red. A probe running the real admission CLI with injected repair/filesystem effects observed two exit-3 refusals, one repair invocation, and tests.status=red. Reject the unsupported wait value as bad-args before acquiring resources or running Codex.
+1. `we:scripts/operations/adoption-matrix-io.mjs:111` — (edge-case, degraded) Missing objects bypass the shallow-history safeguard and produce false negative adoption results.
+   - Scenario: Use a shallow clone whose HEAD directly descends from a logged fix SHA omitted by the shallow boundary. Reproduced read-only against this checkout: HEAD 5e4c1c665b4767e7ca841fdfc6841327cda7a135 names parent 499e2eb6d79b526e702dd7afc5951fea72838ede, and Git confirms the repository is shallow. Supplying that parent as the logged SHA to createAdoptionMatrixReader, using the installed CommandLineTools Git executable, returns cells:["no (not in clone)"] without an incomplete warning. The missing-object return occurs before the shallow check. Because the fix is already HEAD's parent, this is a false
    - Claude's re-check: demonstrated break
 
 ## Acceptance

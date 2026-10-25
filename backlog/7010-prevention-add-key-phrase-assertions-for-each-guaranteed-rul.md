@@ -1,22 +1,23 @@
 ---
+bornAs: xdhrw5i
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/codex-job.mjs", "we:scripts/operations/__tests__/codex-job.test.mjs"]
+scope: ["we:scripts/__tests__/codex-direct-task.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
 ---
 
-# Prevention — Use a separate, larger clone/push timeout, or a --filter=blob:none / reference clone. Add a test… (from web-everything/web-everything#5839 review)
+# Prevention — Add key-phrase assertions for each guaranteed rule, using literals rather than the exported const… (from web-everything/web-everything#5871 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/codex-job.mjs:267` — Use a separate, larger clone/push timeout, or a `--filter=blob:none` / reference clone. Add a test asserting the clone call's timeout is at least the push timeout. Lower priority: a standards rule requiring timeouts on network git calls to be named constants.
-2. `we:scripts/operations/codex-job.mjs:297` — Extend the argv-shape assertion for the publication `add` call to require `--literal-pathspecs`, and set `GIT_LITERAL_PATHSPECS=1` in the trusted env so it covers `ls-files` as well.
-3. `we:scripts/operations/codex-job.mjs` — Add a deterministic real-Git regression test with a bracket-containing export path and a neighboring matching tracked filename, asserting successful publication of only the requested file.
+1. `we:scripts/__tests__/codex-direct-task.test.mjs:262` — Add key-phrase assertions for each guaranteed rule, using literals rather than the exported constant. A lint rule banning 'expect(x).toContain(IMPORTED_CONST)' as the only assertion on a prompt-text constant would be a deterministic gate.
+2. `we:scripts/__tests__/codex-direct-task.test.mjs:265` — Add a deterministic test named 'preserves required clauses in both task-rule variants' in we:scripts/__tests__/codex-direct-task.test.mjs, independently asserting the promised commands, limits, prohibitions, and applicable variants.
+3. `we:scripts/__tests__/codex-direct-task.test.mjs:263` — Add an independently maintained literal expectation or checked-in snapshot for both complete blocks, and confirm that deleting or weakening each required rule makes the named test fail.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5839@f83fcf49c51729aecd0adbd559f8e1db145d3113
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5871@424828cd7889fce2e7d77285a3da97afe4b9c1da
 
 ## Acceptance
 
