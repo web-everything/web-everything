@@ -18,7 +18,7 @@ export function pidStartTime(pid, exec = execFileSync) {
   } catch { return null; }
 }
 
-/** PID liveness probe, same contract as `reconcile-pass.mjs#probePid` (EPERM = alive, ESRCH = dead). */
+/** Existence-only probe (EPERM = exists); identity-aware callers also use pidIdentity. */
 export function pidAlive(pid, kill = (p, s) => process.kill(p, s)) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
@@ -57,10 +57,8 @@ export function pidIdentity(pid, { expectStart = null, expectArgv = null, exec =
   const row = readPidIdentity(pid, exec);
   if ('alive' in row) return row;
   if (row.stat.startsWith('Z')) return { alive: false, reason: 'zombie' };
-  // Only the Claude launcher's first subcommand proves recycling; prompt text is not identity evidence.
-  if (/^(?:(?:\S*\/)?node\s+)?(?:\S*\/)?[^/\s]*claude[^/\s]*\s+bg-spare(?:\s|$)/.test(row.runnerArgv)) {
-    return { alive: false, reason: 'recycled-spare' };
-  }
+  // Working Claude sessions can retain their pre-warmed bg-spare argv. That command alone
+  // cannot prove recycling: require a stored start/argv mismatch, zombie, or gone evidence.
   if (expectStart && row.runnerStart !== String(expectStart).trim().replace(/\s+/g, ' ')) {
     return { alive: false, reason: 'start-mismatch' };
   }

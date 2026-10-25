@@ -411,7 +411,7 @@ export function resolveLaneHead(cwd, exec = execFileSync) {
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#probePid — `process.kill(pid, 0)`, three-valued.
  *
- * `true` = an ordinary live process. `false` = ESRCH or a dead identity (zombie/recycled spare).
+ * `true` = a live process. `false` = ESRCH or a dead identity (gone, zombie, or stored identity mismatch).
  * `null` = invalid input or unreadable evidence. Unknown refuses lane reuse rather than reporting death.
  * EPERM establishes existence but still requires the identity probe.
  * @param {*} pid

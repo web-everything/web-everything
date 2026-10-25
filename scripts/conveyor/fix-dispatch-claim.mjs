@@ -357,7 +357,7 @@ export function refreshLiveFixDispatchClaims({
       }
       continue;
     }
-    // A stale working row may point at a recycled spare, but reusable names alone cannot associate it with
+    // A stale working row may point at a dead process, but reusable names alone cannot associate it with
     // this claim during listing lag. Every non-terminal row must belong to this claim; only claims without
     // a sessionId can fall back to start time. Ambiguous rows, unknown identities or missing pids retain it.
     const nonTerminal = agentsAll.filter((a) => !['done', 'stopped', 'failed'].includes(a.state));
