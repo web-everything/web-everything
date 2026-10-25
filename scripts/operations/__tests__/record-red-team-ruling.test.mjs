@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createActionStore } from '../action-store.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, operatorRulingsOnLiveResult, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, operatorRulingsOnLiveResult, redTeamGateMarker, readRedTeamDisposition, readOperatorRulings, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
 import { assertRulingCardInputFits, planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
@@ -273,12 +273,12 @@ describe('automatic card filing with shared durable claims', () => {
   const result = { ok: true, step: 'held', rel: 'backlog/xabcdef-card.md' };
   function fake({ coordinationRoot = root(), initial = thread(), fileCard, postFails, changeAfterReason,
     cardOk = true, noPid = false, transitionFails, liveHead = () => HEAD,
-    env = {}, runGit, readOnPr, resolveCard = runGit ? undefined : ref => ({ ref, readable: true }) } = {}) {
+    env = {}, runGit, readOnPr, readScope = () => OFF, resolveCard = runGit ? undefined : ref => ({ ref, readable: true }) } = {}) {
     const comments = [...initial], posted = [], cards = [], labelSyncs = [];
     const actions = createActionStore({ root: coordinationRoot });
     const realTransition = actions.transition;
     if (transitionFails) actions.transition = (...args) => transitionFails(...args) || realTransition(...args);
-    const sinks = createRecordRedTeamRulingSinks({ coordinationRoot, actions, env, runGit, readOnPr, resolveCard,
+    const sinks = createRecordRedTeamRulingSinks({ coordinationRoot, actions, env, runGit, readOnPr, readScope, resolveCard,
       readThread: () => ({ headRefOid: liveHead(), labels: [], comments: [...comments] }),
       resolveIdentity: () => OP, readStandingRulingScope: () => null,
       fileCard: (input, session, binding) => {
@@ -484,7 +484,7 @@ describe('automatic card filing with shared durable claims', () => {
     const initial = [redTeam()];
     const resultId = liveResultGateState(initial, PR, HEAD).resultId;
     initial.push(bot(`${redTeamGateMarker(PR, HEAD, 'sent-back', resultId)}\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-10-20T23:41:12Z'));
-    const f = fake({ initial });
+    const f = fake({ initial, readScope: () => ({ value: { anyState: true } }) });
     const plan = () => planRedTeamRuling(read({ comments: f.comments, card: null, scope: { value: { anyState: true } } }), input({ repo, card: undefined }));
     expect(f.act(plan())).toMatchObject({ pending: true, released: false });
     await f.complete();
@@ -498,6 +498,45 @@ describe('automatic card filing with shared durable claims', () => {
     expect(disposition({ anyState: false }).sendBack.map(f => f.index)).toEqual([1]);
     expect(disposition().sendBack.map(f => f.index)).toEqual([1]);
     expect(disposition({ anyState: false }).held).toEqual([]);
+  });
+  it('automatic card retry honors a live opt-out after child completion without posting a release', async () => {
+    let anyState = true;
+    const f = fake({ initial: [redTeam()], readScope: () => ({ value: { anyState } }) });
+    const p = planRedTeamRuling(read({ comments: f.comments, card: null, scope: { value: { anyState: true } } }),
+      input({ repo, card: undefined }));
+    expect(f.act(p)).toMatchObject({ pending: true, released: false });
+    await f.complete();
+    anyState = false;
+    expect(() => f.act(p)).toThrow(/not parked at the round cap.*nothing written/);
+    expect(f.cards).toHaveLength(1);
+    expect(f.posted).toHaveLength(1);
+    expect(f.posted[0]).toContain('outcome=card-pending');
+  });
+  it('automatic card release rechecks scope after posting the reason', async () => {
+    let anyState = true;
+    const f = fake({ initial: [redTeam()], readScope: () => ({ value: { anyState } }),
+      changeAfterReason: () => { anyState = false; } });
+    const p = planRedTeamRuling(read({ comments: f.comments, card: null, scope: { value: { anyState: true } } }),
+      input({ repo, card: undefined }));
+    f.act(p);
+    await f.complete();
+    expect(() => f.act(p)).toThrow(/not parked at the round cap.*card queued and reason posted; no release record written/);
+    expect(f.posted).toHaveLength(2);
+    expect(f.posted.every(body => !body.includes('outcome=operator-card'))).toBe(true);
+  });
+  it('an opt-out while posting the pending intent fences dispatch and leaves the claim retryable', () => {
+    let anyState = true;
+    const f = fake({ initial: [redTeam()], readScope: () => ({ value: { anyState } }),
+      postFails: body => { if (body.includes('outcome=card-pending')) anyState = false; return false; } });
+    const p = planRedTeamRuling(read({ comments: f.comments, card: null, scope: { value: { anyState: true } } }),
+      input({ repo, card: undefined }));
+    expect(() => f.act(p)).toThrow(/not parked at the round cap.*no card job started/);
+    expect(f.cards).toEqual([]);
+    expect(f.actions.attempts(rulingCardResource(p)).at(-1)).toMatchObject({ state: 'terminal', outcome: 'not-started' });
+    anyState = true;
+    expect(f.act(p)).toMatchObject({ pending: true, released: false });
+    expect(f.cards).toHaveLength(1);
+    expect(f.posted).toHaveLength(1);
   });
   it('card: a second run refuses (no duplicate card)', async () => {
     const f = fake(), p = payloadFor();
@@ -1152,6 +1191,7 @@ describe('operator ruling in ANY state (live #5502 shape: sent back at repair ca
     const comments = [...initial], posted = [], cards = [], labelSyncs = [];
     const sinks = createRecordRedTeamRulingSinks({
       readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
+      readScope: () => ({ value: { anyState: true } }),
       readStandingRulingScope: () => null, resolveIdentity: () => OP,
       resolveCard: ref => ({ ref, readable: true }),
       fileCard: (...args) => { cards.push(args); throw new Error('existing-card ruling must not file'); },
@@ -1266,6 +1306,23 @@ describe('operator ruling in ANY state (live #5502 shape: sent back at repair ca
 });
 
 describe('any-state duplicate filing protection', () => {
+  it.each(['gate', 'operator'])('cap-only refuses a new card for a previously carded finding held again (%s)', author => {
+    const resultId = liveResultGateState(thread(), PR, HEAD).resultId;
+    const prior = author === 'gate'
+      ? bot(`${redTeamGateMarker(PR, HEAD, 'card-queued', resultId)}\n- 1 finding(s) filed as a follow-up card (#1) — landing job j.`, '2026-10-20T23:50:00Z')
+      : { author: OP, createdAt: '2026-10-20T23:50:00Z',
+        body: `${redTeamGateMarker(PR, HEAD, 'operator-card', resultId)}\n- 1 finding(s) carded by the operator to \`${CARD}\` (#1).` };
+    const comments = thread([prior,
+      bot(`${redTeamGateMarker(PR, HEAD, 'round-cap', resultId)}\n- 1 confirmed break(s) NOT sent back: cap (#1).`, '2026-10-21T00:01:00Z')]);
+    // Keep every other refusal inert: same result, held at the cap, existing-card ruling allowed.
+    expect(readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: OFF.value }).held.map(f => f.index)).toEqual([1]);
+    expect(operatorRulingsOnLiveResult(comments, PR, HEAD).carded.has(1)).toBe(true);
+    expect(planRedTeamRuling(read({ comments, scope: OFF }), input()))
+      .toMatchObject({ indices: [1], cardRef: CARD, scope: OFF.value, resultId });
+    expect(() => planRedTeamRuling(read({ comments, scope: OFF, card: null }), input({ card: undefined })))
+      .toThrow(/no red-team break is held/);
+  });
   it.each([false, true])('a prior operator card neither releases nor prevents ruling on an identical repost (anyState: %s)', anyState => {
     const scope = { value: { anyState } };
     const resultId = liveResultGateState(thread(), PR, HEAD).resultId;
@@ -1303,6 +1360,99 @@ describe('any-state duplicate filing protection', () => {
 });
 
 describe('ruling scope binding and provenance', () => {
+  it.each(['environment', 'settings file'])('the sink re-reads a real %s opt-out after preview', source => {
+    const root = mkdtempSync(join(tmpdir(), 'ruling-scope-'));
+    try {
+      const path = join(root, 'red-team.json');
+      writeFileSync(path, JSON.stringify({ redTeam: { operatorRulings: { anyState: true } } }));
+      const env = {};
+      const readScope = () => readOperatorRulings({ path, env });
+      const comments = [redTeam()];
+      const payload = planRedTeamRuling(read({ comments, scope: readScope() }), input());
+      expect(payload.scope.anyState).toBe(true);
+      if (source === 'environment') env.WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE = 'false';
+      else writeFileSync(path, JSON.stringify({ redTeam: { operatorRulings: { anyState: false } } }));
+      const posted = [];
+      const sinks = createRecordRedTeamRulingSinks({ readScope,
+        readThread: () => ({ headRefOid: HEAD, labels: [], comments }),
+        resolveIdentity: () => OP, readStandingRulingScope: () => null,
+        resolveCard: () => card, post: (...args) => posted.push(args),
+      });
+      expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payload)).toThrow(/not parked at the round cap.*nothing written/);
+      expect(posted).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each([false, true])('live opt-out refuses an any-state payload before writing (automatic card: %s)', automatic => {
+    const comments = [redTeam()];
+    const payload = planRedTeamRuling(read({ comments, scope: { value: { anyState: true } },
+      card: automatic ? null : card }), input({ card: automatic ? undefined : CARD }));
+    const posted = [], cards = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments }),
+      readScope: () => OFF, resolveIdentity: () => OP, readStandingRulingScope: () => null,
+      resolveCard: () => card, post: (...args) => posted.push(args),
+      fileCard: (...args) => { cards.push(args); throw new Error('must not dispatch'); },
+    });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payload)).toThrow(/not parked at the round cap.*nothing written/);
+    expect(posted).toEqual([]);
+    expect(cards).toEqual([]);
+  });
+  it.each(['reason', 'card read'])('live opt-out during %s refuses the existing-card release record', phase => {
+    const comments = [redTeam()], posted = [];
+    let liveScope = { value: { anyState: true } };
+    const payload = planRedTeamRuling(read({ comments, scope: liveScope }), input());
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments }),
+      readScope: () => liveScope, resolveIdentity: () => OP, readStandingRulingScope: () => null,
+      resolveCard: () => { if (phase === 'card read') liveScope = OFF; return card; },
+      post: (_repo, _pr, body) => {
+        posted.push(body); comments.push({ author: OP, body });
+        if (phase === 'reason') liveScope = OFF;
+      },
+      syncLabels: () => { throw new Error('must not sync'); },
+    });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payload))
+      .toThrow(/not parked at the round cap.*reason posted; no release record written/);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toContain("The operator's reason");
+  });
+  it('live opt-out still permits a cap-eligible existing-card ruling', () => {
+    const comments = thread(), posted = [];
+    const payload = planRedTeamRuling(read({ comments, scope: { value: { anyState: true } } }), input());
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments }), readScope: () => OFF,
+      resolveIdentity: () => OP, readStandingRulingScope: () => null, resolveCard: () => card,
+      post: (_repo, _pr, body) => { posted.push(body); comments.push({ author: OP, body }); }, syncLabels: () => null,
+    });
+    expect(sinks[RED_TEAM_RULING_CARD_EFFECT](payload)).toMatchObject({ indices: [1], card: { ref: CARD } });
+    expect(posted).toHaveLength(2);
+  });
+  it('read-back uses live scope if the opt-out happens while posting the release', () => {
+    const comments = [redTeam()], posted = [];
+    let liveScope = { value: { anyState: true } };
+    const payload = planRedTeamRuling(read({ comments, scope: liveScope }), input());
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments }), readScope: () => liveScope,
+      resolveIdentity: () => OP, readStandingRulingScope: () => null, resolveCard: () => card,
+      post: (_repo, _pr, body) => {
+        posted.push(body); comments.push({ author: OP, body });
+        if (body.includes('outcome=operator-card')) liveScope = OFF;
+      }, syncLabels: () => { throw new Error('must not sync'); },
+    });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payload)).toThrow(/record was posted but the gate still holds break/);
+    expect(posted).toHaveLength(2);
+  });
+  it('live opt-in cannot widen a planned cap-only ruling', () => {
+    const posted = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments: [redTeam()] }),
+      readScope: () => ({ value: { anyState: true } }),
+      resolveIdentity: () => OP, readStandingRulingScope: () => null, post: (...args) => posted.push(args),
+    });
+    expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(read(), input())))
+      .toThrow(/not parked at the round cap.*nothing written/);
+    expect(posted).toEqual([]);
+  });
   it('default cap-only policy permits review:changes with a trusted cap', () => {
     expect(planRedTeamRuling(read({ labels: ['review:changes'] }), input())).toMatchObject({ scope: { anyState: false }, indices: [1] });
   });

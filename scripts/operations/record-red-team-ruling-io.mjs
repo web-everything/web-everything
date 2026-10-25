@@ -143,6 +143,7 @@ export const spawnStableCardJob = (input, session, binding, { spawnDetached = de
 
 export function createRecordRedTeamRulingSinks({ env = process.env, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
+  readScope = () => readScopeLogged(env),
   runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = () => resolveOperatorIdentity({ env }),
@@ -150,6 +151,11 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
   post = (repo, pr, body) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env),
   syncLabels = ({ repo, pr, head }) => syncRedTeamStatusLabels({ repo, pr, head, env }),
   warn = (m) => process.stderr.write(`${m}\n`) } = {}) {
+  // An opt-out takes effect on retries too; a later opt-in cannot widen the approved plan.
+  const effectiveScope = p => {
+    const live = readScope();
+    return { anyState: p.scope?.anyState === true && live?.value?.anyState === true };
+  };
   /** Right before any write: the poster, the head, the SAME result, and every selected break still rulable the same way
    *  the plan found it (the same `rulableBreaks` rule, so the cap and held-break checks apply here too). */
   const recheck = (p, noWrite = 'nothing written') => {
@@ -160,7 +166,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
     const comments = operatorBoundComments(thread.comments);
     const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...thread, number: p.pr, headRefOid: head } });
     let now;
-    try { now = rulableBreaks({ comments, repo: p.repo, labels: thread.labels, pr: p.pr, head, setting: p.setting, scope: p.scope, ruling: p.ruling, citesCard: Boolean(p.cardRef), standingRuling }); }
+    try { now = rulableBreaks({ comments, repo: p.repo, labels: thread.labels, pr: p.pr, head, setting: p.setting, scope: effectiveScope(p), ruling: p.ruling, citesCard: Boolean(p.cardRef), standingRuling }); }
     catch (e) { throw new Error(`${e.message}; ${noWrite}`); }
     if (now.state.resultId !== p.resultId) throw new Error(`the red-team result on the live head changed since the plan (${p.resultId} -> ${now.state.resultId}); ${noWrite} — re-run`);
     const rulable = now.rulable.map((f) => f.index);
@@ -180,7 +186,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
     if (record && !comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isHumanOperatorComment(c))) {
       throw new Error(`${what} is not in the read-back as a human operator's comment (altered, or posted as another account); inspect the thread before retrying`);
     }
-    const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: p.scope, standingRuling });
+    const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: effectiveScope(p), standingRuling });
     const still = p.indices.filter((i) => d.held.some((f) => f.index === i) || d.sendBack.some((f) => f.index === i));
     if (still.length) throw new Error(`${what} was posted but the gate still holds break(s) ${still.map((i) => `#${i}`).join(', ')} `
       + '(not authored by the operator account, or an altered body); inspect the thread before retrying');
@@ -206,7 +212,6 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         if (!/^we:backlog\/[A-Za-z0-9][A-Za-z0-9._-]*\.md(?:@pr[1-9]\d{0,8})?$/.test(p.cardRef)) throw new Error(`--card resolved to an unsafe reference ${JSON.stringify(p.cardRef)}; nothing written`);
         const record = operatorRecord(p, OPERATOR_CARD_OUTCOME, `- ${p.indices.length} finding(s) carded by the operator to \`${p.cardRef}\` ${indexList(p)}.`);
         post(p.repo, p.pr, reasonBody(p, `Carded to the existing card \`${p.cardRef}\`; no new card is filed.`));
-        recheck(p, 'reason posted; no release record written'); // Re-read changes made while posting the reason.
         // The reason POST may outlive the card. Validate the exact planned reference at the release boundary.
         let card;
         try { card = resolveCard(p.cardRef, { repo: p.repo, pr: p.pr, head: p.head }); }
@@ -214,6 +219,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         if (!card?.readable || card.ref !== p.cardRef) {
           throw new Error(`--card ${p.cardRef} no longer resolves to the same readable backlog card (${card?.reason ?? 'unreadable'}); reason posted; no release record written`);
         }
+        recheck(p, 'reason posted; no release record written');
         post(p.repo, p.pr, record);
         proveReleased(p, 'the operator-card record', record);
         return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
@@ -257,7 +263,10 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         }
         // Fence BEFORE any side effect. Ambiguous spawn failures remain dispatching, never auto-reclaimed.
         r = transition(actions, r, 'dispatching', { dispatchingSince: Date.now() });
-        try { if (!hasIntent) post(p.repo, p.pr, intentBody(p)); }
+        try {
+          if (!hasIntent) post(p.repo, p.pr, intentBody(p));
+          recheck(p, 'pending intent posted; no card job started');
+        }
         catch (error) {
           // Even an ambiguously published intent cannot have started a child: fileCard has not run.
           transition(actions, r, 'terminal', { outcome: 'not-started' });
@@ -282,7 +291,6 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
       const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
         plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card });
       post(p.repo, p.pr, reasonBody(p, `Follow-up card queued through the prevention landing job (${session}); filing may be paused, in which case it is owed in the spool.`));
-      recheck(p, 'card queued and reason posted; no release record written');
       // A receipt survives its backing card/spool. Re-read that evidence on every release attempt.
       const result = r.evidence.result, ref = landingRef(result);
       let readable = false;
@@ -324,6 +332,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, readThread =
         readable = inventoried && (ref ? readable : matched > 0) && backing.every(readableCard);
       } catch { readable = false; }
       if (!readable) throw new Error(`card completion evidence no longer resolves to a readable card or spool; no release record written — inspect the landing log for ${session}; recover the owed card and cite its readable --card reference`);
+      recheck(p, 'card queued and reason posted; no release record written');
       post(p.repo, p.pr, record);
       proveReleased(p, 'the operator-card record', record);
       return { ruling: 'card', head: p.head, indices: p.indices, card, labels: resync(p) };
