@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { LANE_GIT_CONFIG_PINS } from '../lane-git-hardening.mjs';
 
@@ -160,6 +160,60 @@ describe('salvage push contract', () => {
 
 describe('real salvage preservation and transport', () => {
   const repo = { branch: 'main', originUrl: 'https://example.test/canonical.git', referencePath: 'reference' };
+  describe.each(['local', 'worktree'])('%s signing configuration isolation', scope => {
+    it.each(['gpg.ssh.defaultKeyCommand', 'gpg.program', 'push.gpgSign', 'user.signingKey',
+      'commit.gpgSign', 'gpg.format', 'combined SSH signing payload'])(
+      'refuses %s without executing a signer or publishing a ref', async key => {
+        const dir = mkdtempSync(join(tmpdir(), 'salvage-signing-'));
+        try {
+          const lane = join(dir, 'lane'), origin = join(dir, 'origin.git');
+          const marker = join(dir, 'signer-ran'), script = join(dir, 'signer.sh');
+          writeFileSync(script, '#!/bin/sh\ntouch "$(dirname "$0")/signer-ran"\n', { mode: 0o700 });
+          const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+          const git = (cwd, args) => execFileSync('git', args, { cwd, env, encoding: 'utf8', timeout: 10000 });
+          git(dir, ['init', '--bare', '-q', origin]);
+          git(dir, ['init', '-q', '-b', 'main', lane]);
+          const commit = message => git(lane, ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test',
+            '-c', 'commit.gpgSign=false', 'commit', '--allow-empty', '-qm', message]);
+          commit('base');
+          git(lane, ['-c', 'push.gpgSign=false', 'push', '-q', origin, 'HEAD:refs/heads/main']);
+          git(lane, ['fetch', '-q', origin, 'refs/heads/main:refs/remotes/origin/main']);
+          writeFileSync(join(lane, 'work.txt'), 'unique lane work\n');
+          git(lane, ['add', 'work.txt']);
+          commit('unpushed');
+          const sha = git(lane, ['rev-parse', 'HEAD']).trim();
+          const before = git(origin, ['for-each-ref', '--format=%(refname) %(objectname)']);
+          if (scope === 'worktree') git(lane, ['config', 'extensions.worktreeConfig', 'true']);
+          const config = {
+            'gpg.ssh.defaultKeyCommand': script, 'gpg.program': script, 'push.gpgSign': 'true',
+            'user.signingKey': script, 'commit.gpgSign': 'true', 'gpg.format': 'ssh',
+          };
+          const keys = key === 'combined SSH signing payload'
+            ? ['push.gpgSign', 'gpg.format', 'gpg.ssh.defaultKeyCommand'] : [key];
+          for (const setting of keys) git(lane, ['config', `--${scope}`, setting, config[setting]]);
+          const runGit = (command, args, options) => execFileSync(command, args, {
+            ...options, env: { ...options.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+          });
+          const io = realSalvageIo({ repo: { ...repo, originUrl: origin, referencePath: lane },
+            backupRoot: join(dir, 'backups'), runGit });
+          // Exercise the release/recovery entry and each shared transport boundary with real Git.
+          const result = await salvagePushLane({ lane: 7, laneDir: lane, io, now: () => date });
+          expect.soft(result).toMatchObject({ status: 'failed', reason: expect.stringMatching(/lane-controlled transport/i) });
+          for (const operation of [() => io.unmatchedShas(lane, [sha]),
+            () => io.push(lane, ref, sha), () => io.remoteSha(ref)]) {
+            expect.soft(operation).toThrow(/lane-controlled transport.*inspect/i);
+          }
+          expect.soft(existsSync(marker)).toBe(false);
+          expect.soft(git(origin, ['for-each-ref', '--format=%(refname) %(objectname)'])).toBe(before);
+          // Release scrubbing must not erase the refusal captured by preflight.
+          const releaseIo = realSalvageIo({ repo: { ...repo, originUrl: origin, referencePath: lane },
+            preflightLaneDir: lane, runGit });
+          for (const setting of keys) git(lane, ['config', `--${scope}`, '--unset-all', setting]);
+          expect.soft(() => releaseIo.push(lane, ref, sha)).toThrow(/lane-controlled transport/i);
+        } finally { rmSync(dir, { recursive: true, force: true }); }
+      });
+  });
+
   describe.each(['local', 'worktree'])('%s remote alias isolation', scope => {
     it.each([
       ['url', origin => origin],
@@ -363,7 +417,9 @@ describe('real salvage preservation and transport', () => {
       expect(args).toEqual(expect.arrayContaining([
         '-c', 'remote.origin.uploadpack=git-upload-pack',
         '-c', 'remote.origin.receivepack=git-receive-pack', '-c', 'remote.origin.pushurl=', repo.originUrl,
+        '-c', 'push.gpgSign=false', '-c', 'gpg.ssh.defaultKeyCommand=',
       ]));
+      expect(LANE_GIT_CONFIG_PINS).toContainEqual(['push.gpgSign', 'false']);
       expect(args).not.toContain('origin');
       for (const [key, value] of LANE_GIT_CONFIG_PINS) {
         const index = Object.keys(options.env).find(k => /^GIT_CONFIG_KEY_\d+$/.test(k) && options.env[k] === key).replace('KEY', 'VALUE');

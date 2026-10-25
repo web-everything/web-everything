@@ -49,7 +49,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
   const transport = (command, ...args) => {
     if (!origin) throw new Error('canonical origin unresolved; supply --origin or a primary --reference');
     return ['-c', 'remote.origin.uploadpack=git-upload-pack', '-c', 'remote.origin.receivepack=git-receive-pack',
-      '-c', 'remote.origin.pushurl=', command, ...args];
+      '-c', 'remote.origin.pushurl=', '-c', 'push.gpgSign=false', '-c', 'gpg.ssh.defaultKeyCommand=', command, ...args];
   };
   const git = (dir, args, timeout = 120_000) => runGit('git', args, {
     cwd: dir, env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
@@ -83,7 +83,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       const unsafeRemote = remoteName !== null && (remoteName !== 'origin'
         || (origin && normalizeRemoteName(remoteName) === normalizeRemoteName(origin)));
       if (['local', 'worktree'].includes(scope)
-        && (unsafeRemote || /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
+        && (unsafeRemote || /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|gpg\.|push\.gpgsign$|user\.signingkey$|commit\.gpgsign$|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
         throw new Error('lane-controlled transport configuration; inspect the lane manually and remove it before retrying');
       }
     }
