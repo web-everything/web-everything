@@ -3524,6 +3524,23 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     expect(calls).toEqual([]);
   });
 
+  it('plain rearm of an accepted PR refuses a second-read head change before the label write and leaves no re-arm marker', () => {
+    const expectedHead = 'a'.repeat(40);
+    const movedHead = 'b'.repeat(40);
+    // An accepted PR swaps before commenting, so this reaches the label-write pin check.
+    // Only the second read reports the push; later reads return the original head so
+    // the marker-write check cannot mask a missing label-write check.
+    const { exitCode, calls, payload, readPrState } = run(['9', '--repo=o/n', `--expect-head=${expectedHead}`],
+      [REVIEW_LABELS.accepted], { headRefOid: expectedHead, freshState: { headRefOid: movedHead }, swapState: { headRefOid: expectedHead } });
+    expect(readPrState).toHaveBeenCalledTimes(2);
+    expect(readPrState.mock.results.map(({ value }) => value.headRefOid)).toEqual([expectedHead, movedHead]);
+    expect(exitCode).toBe(1);
+    expect(payload.error).toContain('live head differs from --expect-head');
+    expect(calls).not.toContain('setLabels');
+    expect(calls).not.toContain('postComment');
+    expect(calls).toEqual([]);
+  });
+
   it.each(['', 'abcdef0', 'z'.repeat(40), 'a'.repeat(41)])('plain rearm refuses non-40-hex --expect-head=%s', head => {
     const { exitCode, calls, payload } = run(['9', '--repo=o/n', `--expect-head=${head}`], [REVIEW_LABELS.changes]);
     expect(exitCode).not.toBe(0);
