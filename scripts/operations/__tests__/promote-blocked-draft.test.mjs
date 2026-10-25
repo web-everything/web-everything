@@ -20,19 +20,19 @@ const dispatch = (reconcile, readPrLabels, ready) => runReconcilePromoteDraftDis
   readPrLabels, clearAwaitingCi: () => {},
 });
 
-describe('red-team:blocked draft promotion across daemon planning and dispatch', () => {
+describe.each(['red-team:blocked', 'red-team:pending'])('%s draft promotion across daemon planning and dispatch', hold => {
   it.each([
-    ['red-team:blocked'], [{ name: 'red-team:blocked' }],
+    [hold], [{ name: hold }],
   ])('the planner holds a green draft with labels %j', label => {
     const result = plan([label]);
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toEqual([expect.objectContaining({
-      kind: 'draft', why: expect.stringContaining('red-team:blocked'),
+      kind: 'draft', why: expect.stringContaining(hold),
     })]);
   });
 
   it.each([
-    ['red-team:blocked'], [{ name: 'red-team:blocked' }],
+    [hold], [{ name: hold }],
   ])('the fresh label read refuses a hold added after planning: %j', label => {
     const ready = vi.fn();
     const planned = plan(['red-team:clear']);
@@ -41,13 +41,13 @@ describe('red-team:blocked draft promotion across daemon planning and dispatch',
     expect(ready).not.toHaveBeenCalled();
     expect(result.dispatched).toEqual([]);
     expect(result.refusals).toEqual([expect.objectContaining({
-      kind: 'red-team-blocked', why: expect.stringContaining('red-team:blocked'),
+      kind: hold === 'red-team:blocked' ? 'red-team-blocked' : 'red-team-pending', why: expect.stringContaining(hold),
     })]);
   });
 
   it('the real planner and dispatch preserve the draft until the hold is cleared on a later tick', () => {
     const ready = vi.fn();
-    let labels = ['red-team:blocked'];
+    let labels = [hold];
     const reconcile = () => plan(labels);
     const readPrLabels = () => labels;
     expect(dispatch(reconcile, readPrLabels, ready).dispatched).toEqual([]);

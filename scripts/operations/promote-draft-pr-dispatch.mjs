@@ -376,10 +376,12 @@ export function runReconcilePromoteDraftDispatch({
       });
       continue;
     }
-    if (labels.some(label => (typeof label === 'string' ? label : label.name) === 'red-team:blocked')) {
+    const redTeamHold = labels.map(label => typeof label === 'string' ? label : label.name)
+      .find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
+    if (redTeamHold) {
       refusals.push({
-        pr: entry.prNumber, kind: 'red-team-blocked', headSha: sha,
-        why: 'red-team:blocked — a blocked draft is never promoted',
+        pr: entry.prNumber, kind: redTeamHold === 'red-team:blocked' ? 'red-team-blocked' : 'red-team-pending', headSha: sha,
+        why: `${redTeamHold} — a draft held by red team is never promoted`,
       });
       continue;
     }

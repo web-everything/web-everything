@@ -82,7 +82,8 @@ export function isDraftOwedPromotion({ pr = {}, checks = null, reviewWhileBaseOp
   if (pr?.isCrossRepository === true) return { owed: false, why: 'cross-repository (fork) branch — a lane/ prefix there is not agent authorship' };
   if (!String(pr?.headRefName ?? '').startsWith(AGENT_HEAD_PREFIX)) return { owed: false, why: 'not an agent lane branch (draft-first covers lane/* only)' };
   if (labelNames(pr?.labels).includes(WITHDRAWN_LABEL)) return { owed: false, why: 'draft is withdrawn — explicit release is required before promotion' };
-  if (labelNames(pr?.labels).includes('red-team:blocked')) return { owed: false, why: 'red-team:blocked — a blocked draft is never promoted' };
+  const redTeamHold = labelNames(pr?.labels).find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
+  if (redTeamHold) return { owed: false, why: `${redTeamHold} — a draft held by red team is never promoted` };
   const stacked = isGithubStacked(pr, defaultBranch);
   if (stacked && !(reviewWhileBaseOpen ?? stackReviewWhileBaseOpen())) {
     return { owed: false, why: `stacked on ${pr.baseRefName} — stack.reviewWhileBaseOpen is off, so it waits for its base to land` };

@@ -34,7 +34,7 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
  */
 import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
-import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
+import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
 import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -324,7 +324,7 @@ export function createDrainMergeStrategy({
       try {
         const live = readLive(c.repo, c.num);
         if (live.headRefOid !== headSha || !Array.isArray(live.labels)) return { allowed: false, reason: 'live state unreadable' };
-        const held = sendBackReason(live.labels);
+        const held = sendBackReason(live.labels) ?? redTeamLabelHoldReason(live.labels);
         if (held) return { allowed: false, reason: held };
         const base = c.baseRefName || 'main';
         const pinned = readPinnedChangedFiles({ headSha, base, cwd, exec, withBaseSha: true });
@@ -450,6 +450,10 @@ export function createDrainMergeStrategy({
           }
         }
       }
+      // Let pending evidence reach its retry/deadline path above. A live hold label still refuses admission
+      // when no pass is owed or the wait setting is off; it never becomes a dequeue reason on its own.
+      const labelHold = redTeamLabelHoldReason(live.labels);
+      if (labelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: labelHold };
       if (before.redTeamPending?.[key]) {
         delete before.redTeamPending[key];
         writeState(statePath, before);

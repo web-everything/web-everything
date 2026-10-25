@@ -2636,8 +2636,9 @@ export function planReconcile({
         refuse('draft', { ...withPhase, why: 'draft PR is withdrawn — explicit release is required before promotion' });
         continue;
       }
-      if (labelNames(pr.labels).includes('red-team:blocked')) {
-        refuse('draft', { ...withPhase, why: 'red-team:blocked — a blocked draft is never promoted' });
+      const redTeamHold = labelNames(pr.labels).find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
+      if (redTeamHold) {
+        refuse('draft', { ...withPhase, why: `${redTeamHold} — a draft held by red team is never promoted` });
         continue;
       }
       dispatch.push({
