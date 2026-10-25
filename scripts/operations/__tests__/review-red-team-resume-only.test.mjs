@@ -83,6 +83,18 @@ describe('shared red-team recovery entry guards', () => {
     noLaunch(io);
     for (const key of ['postComment', 'append']) expect(io[key], key).not.toHaveBeenCalled();
   }
+  it('live bare resumed review-pr row without a seat follows fresh dispatch', async () => {
+    const row = { repo, pr: 5762, head: rev, status: 'finished', result: 'resumed', loopPayload: { ...loopPayload, op: 'review-pr' } };
+    const io = fakeIo('fresh', { readRedTeamStatus: () => row });
+    expect(await run('fresh', io)).toEqual({ status: 'error', reason: 'provider reached' });
+    expect(io.cliAvailable).toHaveBeenCalled();
+  });
+  it('live bare resumed review-pr row with a clean seat resumes that seat', async () => {
+    const row = { repo, pr: 5762, head: rev, status: 'finished', result: 'resumed', loopPayload: { ...loopPayload, op: 'review-pr' } };
+    const io = fakeIo('resume', { readRedTeamStatus: () => row });
+    expect(await run('resume', io)).toMatchObject({ status: 'resumed', callId: prior.callId });
+    noLaunch(io);
+  });
   async function withOversizedComments(check) {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-large-comments-'));
     try {
@@ -196,7 +208,13 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
     expect(io.readRedTeamStatus).toHaveBeenCalledWith({ pr, repo, head: rev });
   });
   it.each(['finished', 'queued', 'running', 'error', 'unknown'])('refuses fresh recovery with prior %s status and zero model calls', async status => {
-    await refused('fresh', fakeIo('fresh', { readRedTeamStatus: () => ({ ...finished('ran'), status }) }), 'prior red-team status; not re-run');
+    await refused('fresh', fakeIo('fresh', { readRedTeamStatus: () => ({ ...finished({ status: 'ran' }), status }) }), 'prior red-team status; not re-run');
+  });
+  it.each(['ran', 'resumed', { status: 'resumed' }])('a finished placeholder %j without a seat reaches fresh dispatch', async result => {
+    const io = fakeIo('fresh', { readRedTeamStatus: () => finished(result) });
+    expect(await run('fresh', io)).toEqual({ status: 'error', reason: 'provider reached' });
+    expect(io.cliAvailable).toHaveBeenCalledOnce();
+    for (const hook of ['reserveCalls', 'runSeat', 'runRecheck']) expect(io[hook]).not.toHaveBeenCalled();
   });
   it.each(['ran', { status: 'ran', comment: 'error' }, 'resumed', { status: 'resumed', comment: { status: 'error' } }])(
     'resumes both production result shapes %j with a clean matching row and zero model calls', async result => {
@@ -418,7 +436,7 @@ for (const entry of [runRedTeam, speculateRedTeam]) {
       expect(await entry({ pr, repo, read: cardRead,
         loopPayload: { ...loopPayload, findings: { read: cardRead } },
         env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' } }, io)).toEqual({
-        status: 'skipped', reason: 'red team skipped: card-only',
+        status: 'skipped', reason: 'red team skipped: card-only', policy: 'card-only',
       });
       expect(io.postComment).not.toHaveBeenCalled();
       noCalls(io);
@@ -435,3 +453,47 @@ for (const entry of [runRedTeam, speculateRedTeam]) {
     }
   });
 }
+
+
+describe('PR 5890 completed-seat dedupe', () => {
+  it.each([{ status: 'error' }, { seatStatus: 'error' }])('does not treat a failed execution as a prior pass: %j', fields => {
+    expect(priorRedTeamRow([{ ...prior, ...fields }], pr, rev, repo)).toBeNull();
+  });
+  it('a completed broken row dedupes speculation without claiming a clean verdict', async () => {
+    const broken = { ...prior, foldedVerdict: 'changes', confirmedMissCount: 1,
+      findings: [{ summary: 'Confirmed break', confirmedByRecheck: true, impactIfUnfixed: 'broken' }] };
+    const io = { now: () => 1_000, log: () => {}, readRecords: () => [broken],
+      listComments: () => [{ author: { login: 'web-everything' }, body: redTeamMarker(pr, rev) }],
+      cliAvailable: vi.fn(() => { throw Error('must not launch another pass'); }) };
+    const result = await speculateRedTeam({ pr, repo, read, env: {}, resume: false }, io);
+    expect(priorRedTeamRow([broken], pr, rev, repo)).toBe(broken);
+    expect(result).toMatchObject({ status: 'prior-row', reason: expect.stringContaining('completed red-team seat row') });
+    expect(result.reason).not.toContain('clean');
+    expect(io.cliAvailable).not.toHaveBeenCalled();
+  });
+  it('a completed confirmed break resumes its effects with zero new model calls', async () => {
+    const broken = { ...prior, foldedVerdict: 'changes', confirmedMissCount: 1,
+      findings: [{ summary: 'Confirmed break', confirmedByRecheck: true, impactIfUnfixed: 'broken' }] };
+    const io = { now: () => 1_000, log: () => {}, readRecords: () => [broken], listComments: () => [],
+      postComment: vi.fn(), append: vi.fn(),
+      cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(), runRecheck: vi.fn() };
+    const result = await runRedTeam({ pr, repo, loopPayload, env: {} }, io);
+    expect(result).toMatchObject({ status: 'resumed', callId: prior.callId, comment: { status: 'posted' } });
+    expect(result.reason).not.toContain('clean');
+    expect(io.postComment.mock.calls[0][0].body).toContain('Confirmed break');
+    expect(io.append).toHaveBeenCalled();
+    for (const hook of ['cliAvailable', 'reserveCalls', 'runSeat', 'runRecheck']) expect(io[hook]).not.toHaveBeenCalled();
+  });
+  it.each([{ findings: null }, { findings: undefined }, { confirmedMissCount: 'unknown' },
+    { confirmedMissCount: 1 }, { foldedVerdict: 'changes' }, { foldedVerdict: 'needs-human' },
+    { foldedVerdict: 'unknown' }, { foldedVerdict: 'changes', findings: [{ summary: 'Unconfirmed' }] }])(
+    'incomplete completed-row evidence fails closed without publishing or rerunning: %j', async fields => {
+      const row = { ...prior, ...fields };
+      const io = { now: () => 1_000, log: () => {}, readRecords: () => [row],
+        listComments: () => [], postComment: vi.fn(), cliAvailable: vi.fn() };
+      expect(priorRedTeamRow([row], pr, rev, repo)).toBe(row);
+      expect(await runRedTeam({ pr, repo, loopPayload, env: {} }, io)).toMatchObject({ status: 'error' });
+      expect(io.postComment).not.toHaveBeenCalled();
+      expect(io.cliAvailable).not.toHaveBeenCalled();
+    });
+});

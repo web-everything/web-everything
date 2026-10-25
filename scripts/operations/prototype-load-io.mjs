@@ -6,25 +6,171 @@
  */
 import { execFileSync } from 'node:child_process';
 import nodeFs from 'node:fs';
-import { homedir } from 'node:os';
-import { basename, dirname, resolve, join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { basename, dirname, resolve, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
+import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { cloneKey } from '../lib/daemon-overlays.mjs';
+import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+
+// Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
+const VITEST_BOUNDS = Object.freeze({ testTimeout: 30000, hookTimeout: 60000, teardownTimeout: 10000 });
+const ABSOLUTE_POSIX_PATH = /(?<![\w.<>])\/[^\s"'()<>]+/g;
+const ANSI_SEQUENCE = /\x1b\[[0-9;?]*[ -\/]*[@-~]/g;
+const CHILD_PROCESS_NOTE = 'child processes may outlive the timeout; heavy-admission owns them';
+// prototypeLoad.combinedTest settings, resolved and recorded through the usual cascade.
+// Defaults: ten minutes for admission, twenty minutes before SIGTERM, 16 MiB child output.
+const COMBINED_TEST_DEFAULTS = Object.freeze({ waitMs: 600000, timeoutMs: 1200000, maxBuffer: 16 * 1024 * 1024 });
+
+/** Keep runner diagnostics safe for both terminal output and persisted evidence. */
+function sanitizeCombinedOutput(value, env, worktree, preserveLines = false) {
+  let message = String(value).replace(ANSI_SEQUENCE, '').replace(/[\p{Cc}\p{Cf}]/gu, (char) => preserveLines && /[\t\n]/.test(char) ? char : '');
+  const roots = [[worktree, '<worktree>'], [repo, '<repo>'], [env.HOME, '<home>'], [homedir(), '<home>'],
+    [env.TMPDIR, '<tmp>'], [tmpdir(), '<tmp>'], ['/private/tmp', '<tmp>'], ['/tmp', '<tmp>']]
+    .filter(([root]) => typeof root === 'string' && root.length > 1)
+    .map(([root, placeholder]) => [root.replace(/\/+$/, ''), placeholder])
+    .sort(([a], [b]) => b.length - a.length);
+  for (const [root, placeholder] of roots) message = message.replaceAll(root, placeholder);
+  return message.replace(ABSOLUTE_POSIX_PATH, '<path>');
+}
+
+// Candidate and stale-ref tests are untrusted code; git retains its authentication env.
+function combinedTestEnv(env) {
+  const credentials = /^(?:SSH_AUTH_SOCK|GIT_ASKPASS|GIT_SSH_COMMAND|GH_TOKEN|GITHUB_TOKEN)$|_(?:TOKEN|SECRET|KEY)$/i;
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !credentials.test(key)));
+}
+
+/** Real combined-tree proof, rebound by the loader to its resolved settings and injected IO. */
+async function defaultCombinedTest({ clone, candidateSha, refs }, { exec, fs, env, settings, queuedExec = exec === execFileSync ? spawnToCompletion : exec }) {
+  const limits = settings.combinedTest;
+  for (const key of Object.keys(COMBINED_TEST_DEFAULTS)) {
+    if (!Number.isSafeInteger(limits?.[key]) || limits[key] <= 0) throw new Error(`invalid combinedTest.${key}; configure a positive bounded value and retry`);
+  }
+  const run = (command, args, cwd = repo, timeout = 120000) => String(exec(command, args, {
+    cwd, env, encoding: 'utf8', timeout, maxBuffer: limits.maxBuffer, shell: false, stdio: ['ignore', 'pipe', 'pipe'],
+  }) || '');
+  const git = (...args) => run('git', args).trim();
+  const head = git('-C', clone, 'rev-parse', 'HEAD');
+  if (!validSha(head) || !validSha(candidateSha)) throw new Error('invalid combined-tree parent');
+  git('fetch', clone, head);
+  if (!Array.isArray(refs) || !refs.length || !refs.every(safeRegistrationRef)) throw new Error('invalid combined-tree refs');
+  const containedIn = (tip, parent) => {
+    try { git('merge-base', '--is-ancestor', tip, parent); return true; }
+    catch (e) { if (e.status === 1) return false; throw e; }
+  };
+  // Only waive refs whose fetched tips are included in the immutable proof parents.
+  // Fetch into this lane, never into the daemon clone; do not trust a cached origin ref.
+  for (const ref of new Set(refs)) {
+    git('fetch', 'origin', `refs/heads/${ref}`);
+    const tip = git('rev-parse', '--verify', 'FETCH_HEAD^{commit}');
+    if (!validSha(tip)) throw new Error(`invalid combined-tree ref tip: ${ref}`);
+    if (!containedIn(tip, head) && !containedIn(tip, candidateSha)) return {
+      ok: false, reason: 'combined-ref-not-contained', testCount: 0,
+      result: `Registered ref ${ref} is absent from the combined-tree parents. Include its current tip in a tested replacement or wait for daemon adoption, then retry.`,
+    };
+  }
+  let tree;
+  try { tree = git('merge-tree', '--write-tree', head, candidateSha).split(/\r?\n/)[0]; }
+  catch (e) { if (e.status === 1) return { ok: false, reason: 'combined-merge-conflict' }; throw e; }
+  if (!validSha(tree)) throw new Error('invalid combined tree');
+  const commit = git('commit-tree', tree, '-p', head, '-p', candidateSha, '-m', 'Prototype combined-tree test');
+  if (!validSha(commit)) throw new Error('invalid combined-tree commit');
+  const worktree = fs.mkdtempSync(join(env.TMPDIR || tmpdir(), 'prototype-combined-'));
+  let outcome;
+  try {
+    git('worktree', 'add', '--detach', worktree, commit);
+    if (fs.existsSync(join(repo, 'node_modules'))) fs.symlinkSync(join(repo, 'node_modules'), join(worktree, 'node_modules'), 'dir');
+    const files = run('git', ['ls-files', '-z'], worktree).split('\0').filter(Boolean);
+    // This module loads its own settings: keep it out of injected-only loader construction.
+    const { MAX_RELATED_TARGETS } = await import('../lib/verify-lane-gate.mjs');
+    // Imports cannot prove which tests depend on filesystem reads, computed paths or
+    // subprocesses. Waiving an admission blocker requires the whole tracked test inventory.
+    const tests = [...new Set(files.filter(isVitestTestFile))].sort();
+    if (tests.length > MAX_RELATED_TARGETS) return outcome = {
+      ok: false, reason: 'related-tests-truncated', testCount: 0,
+      result: `Incomplete evidence: the complete tracked test inventory has ${tests.length} files, above the ${MAX_RELATED_TARGETS}-file bound. Rebase and retest the overlapping refs or include their tips in a tested replacement before retrying.`,
+    };
+    if (!tests.length) return outcome = { ok: false, reason: 'no-related-tests', testCount: 0 };
+    // Retain fail-closed handling for unreadable tracked sources.
+    for (const file of files.filter(isGraphSourceFile)) {
+      try { fs.readFileSync(join(worktree, file), 'utf8'); }
+      catch { throw new Error('combined-tree sources incomplete; inspect unreadable tracked sources and retry'); }
+    }
+    const reportPath = join(worktree, '.prototype-vitest-results.json');
+    // Admission is shell-backed: terminating its direct wrapper may leave descendants alive.
+    // Keep the admission-wait ceiling and bound the direct wrapper separately.
+    const args = [join(repo, 'scripts/readiness/heavy-admission.mjs'), 'run', `--wait-ms=${limits.waitMs}`,
+      `--ceiling-ms=${limits.timeoutMs}`, '--', 'npx', 'vitest', 'run', '--reporter=json', `--outputFile=${reportPath}`,
+      ...Object.entries(VITEST_BOUNDS).map(([key, value]) => `--${key}=${value}`), ...tests];
+    const command = ['node', 'scripts/readiness/heavy-admission.mjs', ...args.slice(1)].map((arg) => JSON.stringify(arg.replaceAll(worktree, '<worktree>'))).join(' ');
+    try {
+      // A checked-in report (including a symlink) is not evidence from this run.
+      // Refuse cleanup errors before launching; a zero exit must leave a fresh report.
+      fs.rmSync(reportPath, { force: true });
+      await queuedExec('node', args, { cwd: worktree, env: combinedTestEnv(env), encoding: 'utf8', timeout: limits.timeoutMs,
+        maxBuffer: limits.maxBuffer, shell: false, stdio: ['ignore', 'pipe', 'pipe'], killSignal: 'SIGTERM' });
+      let report;
+      try { report = JSON.parse(fs.readFileSync(reportPath, 'utf8')); }
+      catch { return outcome = { ok: false, reason: 'tests-unproven', command, testCount: tests.length,
+        result: 'Unproven passed/skipped counts; JSON report missing, unreadable or unparseable' }; }
+      const countsValid = ['numPassedTests', 'numFailedTests', 'numPendingTests', 'numTodoTests', 'numTotalTests']
+        .every((key) => Number.isSafeInteger(report?.[key]) && report[key] >= 0);
+      const assertions = { passed: 0, failed: 0, skipped: 0, todo: 0 };
+      const selected = new Set(tests);
+      const filesProven = Array.isArray(report?.testResults) && report.testResults.length === tests.length
+        && report.testResults.every((file) => {
+          if (typeof file?.name !== 'string') return false;
+          const path = relative(worktree, resolve(worktree, file.name));
+          if (!selected.delete(path) || file.status !== 'passed' || !Array.isArray(file.assertionResults)
+            || !file.assertionResults.length) return false;
+          for (const assertion of file.assertionResults) {
+            if (Object.hasOwn(assertions, assertion?.status)) assertions[assertion.status]++;
+          }
+          return file.assertionResults.every((assertion) => ['passed', 'skipped', 'todo'].includes(assertion?.status))
+            && file.assertionResults.some((assertion) => assertion.status === 'passed');
+        }) && selected.size === 0;
+      // Vitest can count todos as pending and serialize them as skipped assertions.
+      // Do not add overlapping aggregate counters or infer a missing todo count.
+      const skippedAssertions = assertions.skipped + assertions.todo;
+      const countsMatch = countsValid && report.numPassedTests === assertions.passed
+        && report.numFailedTests === assertions.failed
+        && (report.numPendingTests === assertions.skipped || report.numPendingTests === skippedAssertions)
+        && (assertions.todo > 0 ? report.numTodoTests === assertions.todo : report.numTodoTests <= assertions.skipped)
+        && report.numTotalTests === Object.values(assertions).reduce((sum, count) => sum + count, 0);
+      const proven = report?.success === true && report.numFailedTests === 0 && report.numFailedTestSuites === 0
+        && assertions.passed > 0 && filesProven && countsMatch;
+      const summary = countsValid ? `${report.numPassedTests} passed, ${skippedAssertions} skipped`
+        : 'Unproven passed/skipped counts';
+      return outcome = { ok: proven, command, result: `${summary}${proven ? '' : '; JSON evidence incomplete or counts mismatch'}`,
+        testCount: tests.length, ...(proven ? {} : { reason: 'tests-unproven' }) };
+    } catch (e) {
+      const output = sanitizeCombinedOutput(`${e.stdout || ''}${e.stderr || ''}`, env, worktree, true);
+      return outcome = { ok: false, command, result: `exit ${Number.isInteger(e.status) ? e.status : 'unknown'}: ${output.slice(-400)}`, testCount: tests.length, reason: 'tests-failed' };
+    }
+  } finally {
+    try { git('worktree', 'remove', '--force', worktree); }
+    finally {
+      fs.rmSync(worktree, { recursive: true, force: true });
+      if (fs.existsSync(worktree)) throw new Error('combined-test worktree cleanup unproven; remove the temporary worktree and retry');
+      if (outcome && !outcome.ok) outcome.result = `${outcome.result || outcome.reason}; temp worktree removed; ${CHILD_PROCESS_NOTE}`;
+    }
+  }
+}
 
 /** The sole real IO binding; constructing an injected loader performs no ambient reads. */
 export function defaultDeps() {
   return { exec: execFileSync, fs: nodeFs, now: () => Date.now(), sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
-    env: { ...process.env, HOME: homedir() }, settings: undefined, cloneKey };
+    env: { ...process.env, HOME: homedir() }, settings: undefined, cloneKey, combinedTest: defaultCombinedTest };
 }
-export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, cloneKey: keyForClone = cloneKey }) {
+export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
-  const policy = resolveCascade({ standard: {}, platform: platform.prefs.prototypeLoad, tool });
+  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS }, platform: platform.prefs.prototypeLoad, tool });
   const config = policy.value;
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
@@ -32,6 +178,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
   if (env.WE_OVERLAY_NO_PR?.trim() === 'refuse') childEnv.WE_OVERLAY_NO_PR = 'refuse';
   // A state location is safe configuration, unlike credential or admission-bypass variables.
   if (env.WE_DAEMON_OVERLAY_DIR) childEnv.WE_DAEMON_OVERLAY_DIR = expand(env.WE_DAEMON_OVERLAY_DIR);
+  const runCombinedTest = combinedTest && combinedTest !== defaultCombinedTest ? combinedTest
+    : (input) => defaultCombinedTest(input, { exec, fs, env: childEnv, settings: config });
   const execute = (command, args) => {
     try { return { code: 0, stdout: String(exec(command, args, { cwd: repo, env: childEnv, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) || '') }; }
     catch (e) { return { code: Number.isInteger(e.status) ? e.status : -1, stdout: String(e.stdout || ''), error: String(e.stderr || e.message || e) }; }
@@ -39,6 +187,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
   const git = (...args) => execute('git', args);
   const requireGit = (...args) => { const r = git(...args); if (r.code !== 0) throw new Error(r.error || `git ${args[0]} failed (${r.code})`); return r.stdout.trim(); };
   const ancestor = (tip, sha) => { const r = git('merge-base', '--is-ancestor', tip, sha); if (![0, 1].includes(r.code)) throw new Error(r.error || 'ancestry unverifiable'); return r.code === 0; };
+  const landedByContent = (ref) => {
+    const cherry = git('cherry', 'origin/main', `origin/${ref}`);
+    return cherry.code === 0 && cherry.stdout.trimEnd().split(/\r?\n/).every((line) => line.startsWith('-'));
+  };
   const loader = (action, clone, ref, extra = []) => execute('node', [resolve(repo, config.loaderCli), action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])]);
   const lastJson = (r) => { try { return JSON.parse(r.stdout.trim().split(/\r?\n/).at(-1)); } catch { return null; } };
   const check = (clone, ref, expectedSha) => {
@@ -56,7 +208,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
   return async function load(input) {
     const out = { ok: false, daemon: input.daemon, clone: null, cloneSource: null, registered: false, adopted: false,
       stopReason: null, branch: input.branch, sha: input.sha, effectiveRef: input.branch, effectiveSha: input.sha,
-      dryRun: !!input.dryRun, stale: [], removed: [], removedTips: {}, why: input.why || '',
+      dryRun: !!input.dryRun, stale: [], staleTolerated: [], removed: [], removedTips: {}, why: input.why || '',
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
@@ -126,6 +278,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
       if (listing.code !== 0 || !Array.isArray(rows) || rows.some((r) => !safeRegistrationRef(r?.ref))) return stop('check-unverifiable', { listing });
       const established = [...new Set(rows.map((r) => r.ref))];
       const contained = [], blocking = [];
+      const overlapping = [], combinedChanged = new Set(effectivePaths);
+      const blockingReasons = Object.create(null);
       out.staleChecks = {};
       for (const ref of established.filter((ref) => ref !== out.effectiveRef)) {
         const evidence = check(out.clone, ref);
@@ -134,10 +288,65 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, clo
         if (git('fetch', 'origin', ref).code !== 0) return stop('check-unverifiable', { detail: `could not fetch registered ref ${ref}` });
         const included = ancestor(`origin/${ref}`, out.effectiveSha);
         if (included) contained.push(ref);
-        if (!evidence.clean) { out.stale.push(ref); if (!included) blocking.push(ref); }
+        if (!evidence.clean) {
+          out.stale.push(ref);
+          if (!included) {
+            let staleChanged = [];
+            try {
+              const raw = requireGit('diff', '--name-status', '-z', `origin/main...origin/${ref}`);
+              // Unterminated NUL output is partial evidence: leave staleChanged empty so the ref stays blocking.
+              if (raw.endsWith('\0')) staleChanged = changedPaths(raw);
+            } catch { /* Unreadable changed-file evidence keeps this registration blocking. */ }
+            const staleFiles = new Set([...staleChanged, ...(Array.isArray(evidence.files) ? evidence.files : [])]);
+            const overlap = effectivePaths.filter((file) => staleFiles.has(file));
+            const reason = !staleChanged.length ? 'stale-files-unknown'
+              : out.check.ok !== true || out.check.clean !== true ? 'candidate-not-clean'
+              : overlap.length ? `overlap-with-candidate: ${overlap.join(', ')}` : null;
+            if (reason) {
+              blocking.push(ref); blockingReasons[ref] = reason;
+              if (reason.startsWith('overlap-with-candidate:')) {
+                overlapping.push(ref);
+                for (const file of staleFiles) combinedChanged.add(file);
+              }
+            }
+            else {
+              const landed = landedByContent(ref);
+              out.staleTolerated.push({ ref, landedByContent: landed,
+                why: 'pre-existing stale registration; candidate clean and file-disjoint'
+                  + (landed ? ', commits already on main by patch-id' : '') });
+            }
+          }
+        }
       }
       out.contained = contained;
-      if (blocking.length) return stop('stale-registration', { message: blocking.map((ref) => `stale-registration: ${ref}`).join('; '), blocking });
+      if (overlapping.length && blocking.every((ref) => overlapping.includes(ref))) {
+        let passed = false;
+        let failure;
+        try {
+          const evidence = await runCombinedTest({ clone: out.clone, candidateSha: out.effectiveSha,
+            changedFiles: [...combinedChanged].sort(), refs: overlapping });
+          if (!evidence || typeof evidence.ok !== 'boolean') throw new Error('incomplete combined-test evidence');
+          const { ok, reason, ...summary } = evidence;
+          out.combinedTests = summary;
+          passed = ok === true;
+          failure = `combined-tests-failed: ${reason || 'tests-failed'}`;
+        } catch (e) {
+          const message = sanitizeCombinedOutput(e.message || e, env).slice(0, 300);
+          out.combinedTests = { result: message };
+          failure = `combined-tests-unrunnable: ${message}`;
+        }
+        for (const ref of overlapping) {
+          if (!passed) { blockingReasons[ref] += `; ${failure}`; continue; }
+          blocking.splice(blocking.indexOf(ref), 1);
+          delete blockingReasons[ref];
+          out.staleTolerated.push({ ref, landedByContent: landedByContent(ref), why: 'pre-existing stale registration; combined-tree tests passed', combinedTests: out.combinedTests });
+        }
+        out.staleTolerated.sort((a, b) => established.indexOf(a.ref) - established.indexOf(b.ref));
+      }
+      if (blocking.length) return stop('stale-registration', {
+        message: blocking.map((ref) => `stale-registration: ${ref} (${blockingReasons[ref]})`).join('; '), blocking, blockingReasons,
+        fallback: 'Retain the registrations; rebase and retest the overlapping refs, or resolve the combined-test evidence failure and retry.',
+      });
       if (!out.check.ok) return stop('check-unverifiable');
       if (!out.check.clean) return stop('check-conflict');
       out.swap = { contained };
