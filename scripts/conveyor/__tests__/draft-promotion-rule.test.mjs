@@ -45,6 +45,17 @@ describe('isDraftOwedPromotion', () => {
     expect(isPromotionCandidate(draft())).toBe(true);
     expect(isPromotionCandidate(draft({ isDraft: false }))).toBe(false);
   });
+  it.each(['red-team:blocked', 'red-team:pending'])('does not owe a green lane draft with %s', label => {
+    const result = isDraftOwedPromotion({ pr: draft({ labels: [{ name: label }] }), checks: green });
+    expect(result.owed).toBe(false);
+    expect(result.why).toMatch(/red-team/);
+  });
+  it.each(['red-team:blocked', 'red-team:pending'])('excludes a %s draft from promotion candidates', label => {
+    expect(isPromotionCandidate(draft({ labels: [{ name: label }] }))).toBe(false);
+  });
+  it('still owes a green lane draft with red-team:clear', () => {
+    expect(isDraftOwedPromotion({ pr: draft({ labels: [{ name: 'red-team:clear' }] }), checks: green }).owed).toBe(true);
+  });
 });
 
 describe('resolveDraftPromotionSettings', () => {

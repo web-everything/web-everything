@@ -34,7 +34,7 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
  */
 import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
-import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from './drain-queue-safety.mjs';
+import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
 import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -336,7 +336,7 @@ export function createDrainMergeStrategy({
       try {
         const live = readLive(c.repo, c.num);
         if (live.headRefOid !== headSha || !Array.isArray(live.labels)) return { allowed: false, reason: 'live state unreadable' };
-        const held = sendBackReason(live.labels);
+        const held = sendBackReason(live.labels) ?? redTeamLabelHoldReason(live.labels);
         if (held) return { allowed: false, reason: held };
         const base = c.baseRefName || 'main';
         const pinned = readPinnedChangedFiles({ headSha, base, cwd, exec, withBaseSha: true });
@@ -378,6 +378,8 @@ export function createDrainMergeStrategy({
         removeSentBack(c.repo, c.num, live.labels);
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
+      let admissionLabels = queueLabels(live.labels);
+      let deadlineOverride = false;
       // Head-bound file preparation is reusable; authorization evidence is always live.
       if (safety.value.waitForRedTeamBeforeEnqueue) {
         const evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
@@ -398,8 +400,25 @@ export function createDrainMergeStrategy({
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const standingRuling = grantScopeFor(c, headSha, pages.flat());
         const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
-        try { syncRedTeamStatusLabels({ repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
-          live, comments: pages.flat(), provider: statusProvider, dryRun, log: say }); }
+        try {
+          const statusInput = { repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
+            live, comments: pages.flat(), provider: statusProvider, log: say };
+          const plan = syncRedTeamStatusLabels({ ...statusInput, dryRun: true });
+          const syncedLabels = admissionLabels.filter(label => !plan.remove.includes(label));
+          if (plan.add) syncedLabels.push(plan.add);
+          // Cleanup without a result must preserve the hold on GitHub, too: the next attempt (or a
+          // restarted drain) reads those labels afresh and must not mistake our cleanup for clearance.
+          const dropsPendingHold = admissionLabels.includes('red-team:pending')
+            && plan.remove.includes('red-team:pending')
+            && !syncedLabels.includes('red-team:clear') && !syncedLabels.includes('red-team:blocked');
+          if (!dropsPendingHold) {
+            const published = syncRedTeamStatusLabels({ ...statusInput, dryRun });
+            const publishedLabels = admissionLabels.filter(label => !published.remove.includes(label));
+            if (published.add) publishedLabels.push(published.add);
+            // Release pending in this call only after the clear result was successfully published.
+            if (publishedLabels.includes('red-team:clear')) admissionLabels = publishedLabels;
+          }
+        }
         catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
         if (reason) {
           before.redTeamPending ??= {};
@@ -441,6 +460,7 @@ export function createDrainMergeStrategy({
           }
           if (missing && deadlineAction === RED_TEAM_DEADLINE_OVERRIDE && deadline.operatorOverride?.by) {
             // The only path to merge-without-result: the operator's own env, named, logged on every use.
+            deadlineOverride = true;
             log.write(`  ⚠ OPERATOR OVERRIDE: enqueuing ${slugOf(c.repo)}#${c.num} on ${headSha} with NO red-team result after ${maxMin} min (redTeam.deadlineAction=${RED_TEAM_DEADLINE_OVERRIDE}, env, by ${deadline.operatorOverride.by})\n`);
           } else {
             const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
@@ -464,6 +484,12 @@ export function createDrainMergeStrategy({
           }
         }
       }
+      // Let pending evidence reach its retry/deadline path above. A live hold label still refuses admission
+      // when no pass is owed or the wait setting is off; it never becomes a dequeue reason on its own.
+      // The named deadline override waives only pending, never a blocked label or a confirmed break.
+      const labelHold = redTeamLabelHoldReason(deadlineOverride
+        ? admissionLabels.filter(label => label !== 'red-team:pending') : admissionLabels);
+      if (labelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: labelHold };
       if (before.redTeamPending?.[key]) {
         delete before.redTeamPending[key];
         writeState(statePath, before);
@@ -477,6 +503,24 @@ export function createDrainMergeStrategy({
           return { enqueued: false, deferred: true, reason: g.reason };
         }
       } catch (e) { say(`  ⚠ merge-queue batching admission failed (${firstLine(e)}) — continuing enqueue`); }
+      // Comments, label publication and batching can race another writer. Revalidate at admission,
+      // while retaining the in-memory hold above even if status-label cleanup removed it remotely.
+      let fresh;
+      try { fresh = readLive(c.repo, c.num); }
+      catch { return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'final live head or labels could not be read' }; }
+      if (fresh?.headRefOid !== headSha || !Array.isArray(fresh?.labels)) {
+        return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'final live head or labels do not match the judged state' };
+      }
+      const freshHeld = sendBackReason(fresh.labels);
+      const freshLabels = queueLabels(fresh.labels);
+      const freshLabelHold = redTeamLabelHoldReason(deadlineOverride
+        ? freshLabels.filter(label => label !== 'red-team:pending') : freshLabels);
+      if (freshHeld) {
+        removeSentBack(c.repo, c.num, fresh.labels);
+        // Blocked labels still get send-back cleanup, with the admission hold's pending outcome.
+        if (freshHeld !== freshLabelHold) return { enqueued: false, deferred: true, kind: 'sent-back', reason: freshHeld };
+      }
+      if (freshLabelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: freshLabelHold };
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });
       if (!r.ok) {
         // A shortcut refusal delegates to the full cascade in this pass. Do not install
