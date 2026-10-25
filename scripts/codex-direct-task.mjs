@@ -1407,9 +1407,15 @@ export async function waitForJob({
       }
     }
     if (record.status !== 'running') return terminalResult();
-    const remaining = deadline - now();
-    if (remaining <= 0) return { ...result(), code: 75 };
-    if (await withinBudget(() => sleep(Math.min(Math.max(1, pollMs), remaining))) === expired) return { ...result(), code: 75 };
+    // Timers can wake just before their requested interval has elapsed. Finish
+    // the same poll interval before reading again, including its final slice
+    // at the job deadline; an early wake must not trigger extra job IO.
+    const pollDeadline = Math.min(deadline, now() + Math.max(1, pollMs));
+    let remaining = pollDeadline - now();
+    while (remaining > 0) {
+      if (await withinBudget(() => sleep(remaining)) === expired) return { ...result(), code: 75 };
+      remaining = pollDeadline - now();
+    }
   }
 }
 

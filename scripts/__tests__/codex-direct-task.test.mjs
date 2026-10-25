@@ -2099,6 +2099,24 @@ describe('detached jobs', () => {
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
 
+  it.each([250, 1000])('waits out an early timer wake before the next poll with pollMs=%s', async pollMs => {
+    const f = fixture();
+    const sleep = vi.fn()
+      .mockImplementationOnce(ms => f.sleep(ms - 1))
+      .mockImplementation(ms => f.sleep(ms));
+    const readTimes = [];
+    const readRecord = vi.fn(() => {
+      readTimes.push(f.options.now());
+      return f.options.readRecord();
+    });
+    expect(await waitForJob({ ...f.options, maxMs: 500, pollMs, sleep, readRecord }))
+      .toMatchObject({ status: 'running', code: 75 });
+    expect(sleep.mock.calls).toEqual(pollMs === 250 ? [[250], [1], [250]] : [[500], [1]]);
+    expect(readTimes).toEqual(pollMs === 250 ? [0, 250] : [0]);
+    expect(readRecord).toHaveBeenCalledTimes(pollMs === 250 ? 2 : 1);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
   it('documents usage errors, the default, the cap and the single deadline in --help and the header', () => {
     const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--help'], {
       encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
