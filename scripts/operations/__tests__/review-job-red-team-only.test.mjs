@@ -621,7 +621,7 @@ describe('red-team-only review job', () => {
       expect(io.redTeamStatus.mock.invocationCallOrder[1]).toBeLessThan(io.runRedTeamGate.mock.invocationCallOrder[0]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it.each(['fresh', 'resume'])('a cap deferral rolls back %s admission without running the gate', redTeamMode => {
+  it.each(['fresh', 'resume'])('a cap deferral rolls back %s admission and still runs the gate', redTeamMode => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-cap-gate-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
     const read = () => readRedTeamStatus({ repo, pr, head, env });
@@ -647,8 +647,9 @@ describe('red-team-only review job', () => {
         expect(io.clearRedTeamQueued).toHaveBeenCalledOnce();
         expect(io.clearRedTeamQueued).toHaveBeenCalledWith({ repo, pr, head });
       }
-      expect(io.runRedTeamGate).not.toHaveBeenCalled();
-      expect(out).not.toHaveProperty('redTeamGate');
+      expect(io.runRedTeamGate).toHaveBeenCalledOnce();
+      expect(io.runRedTeamGate).toHaveBeenCalledWith({ repo, pr });
+      expect(out).toHaveProperty('redTeamGate');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('keeps a shared result-already-on-head refusal terminal', () => {
@@ -1048,7 +1049,8 @@ describe('red-team-only review job', () => {
         expect(io.clearRedTeamQueued).toHaveBeenCalledWith({ repo, pr, head });
         expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(['queued']);
         expect(evidence()).toMatchObject({ scheduled: true, recorded: false, inFlight: false });
-        expect(io.runRedTeamGate).not.toHaveBeenCalled();
+        expect(io.runRedTeamGate).toHaveBeenCalledOnce();
+        expect(io.runRedTeamGate).toHaveBeenCalledWith({ repo, pr });
         if (redTeamOnly) expect(recover().rows[0].why).toBe('retry cooldown active');
         at += cap === 'quota-hold' ? 60 * 60_000 + 1 : 24 * 60 * 60_000;
         expect(recover().dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
@@ -1057,7 +1059,7 @@ describe('red-team-only review job', () => {
         expect(read()).toMatchObject({ status: 'finished', result: 'ran' });
         expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(['queued', 'queued', 'finished']);
         expect(redTeamForHead(observed.comments, pr, head)).toMatchObject({ pr, rev: head });
-        expect(io.runRedTeamGate).toHaveBeenCalledOnce();
+        expect(io.runRedTeamGate).toHaveBeenCalledTimes(2);
         expect(recover().dispatched).toEqual([]);
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });

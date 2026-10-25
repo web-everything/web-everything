@@ -180,15 +180,14 @@ describe('review-job red-team skip settlement', () => {
         expect(publishNeedsYou).toHaveBeenCalledTimes(1);
         expect(publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
         expect(postComment).not.toHaveBeenCalled();
-        // Guard deferrals clear admission for retry; cap deferrals suppress the gate.
-        // Neither is a completed pass, so the unconditional five-event expectation was wrong.
+        // Guard deferrals clear admission for retry; all outcomes still run the gate.
         expect(f.events).toEqual(redTeam.deferredByGuard
           ? ['queued', 'red-team', 'settle', 'gate']
-          : redTeam.deferredByCap ? ['queued', 'red-team', 'settle', 'finished']
-            : ['queued', 'red-team', 'settle', 'finished', 'gate']);
+          : ['queued', 'red-team', 'settle', 'finished', 'gate']);
         expect(f.io.clearRedTeamQueued.mock.calls).toEqual(redTeam.deferredByGuard ? [[{ repo, pr, head }]] : []);
         expect(f.io.redTeamStatus.mock.calls.filter(([row]) => row.status === 'finished')).toHaveLength(redTeam.deferredByGuard ? 0 : 1);
-        expect(f.io.runRedTeamGate).toHaveBeenCalledTimes(redTeam.deferredByCap ? 0 : 1);
+        expect(f.io.runRedTeamGate).toHaveBeenCalledTimes(1);
+        expect(f.io.runRedTeamGate).toHaveBeenCalledWith({ repo, pr });
       } finally { rmSync(root, { recursive: true, force: true }); }
     }
   });

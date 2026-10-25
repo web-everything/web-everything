@@ -865,8 +865,8 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       } catch (e) {
         io.log(`review-job ${out.sessionSlug}: red-team deferral status cleanup failed (${tail(e?.message ?? e, 300)})`);
       }
-      // A cap deferral ends here; a guard refusal still runs the independent gate below.
-      if (!guardDeferred) return out;
+      // Cap and guard deferrals both still run the independent gate below, so already-finished findings
+      // (e.g. a failed scorecard write) are processed even when no new seat could start.
     } else {
       // An unsuccessful effects retry must keep the durable clean pass eligible for recovery.
       const result = guardDeferred && prior ? prior.result
@@ -881,7 +881,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
   // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
   // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
-  if (out.redTeam && !out.redTeam.deferredByCap && typeof io.runRedTeamGate === 'function') {
+  if (out.redTeam && typeof io.runRedTeamGate === 'function') {
     let gate;
     try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
     io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);
