@@ -86,9 +86,11 @@ import { execRead } from '../lib/proc-read.mjs';
 import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
-import { liveResultGateState, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
+import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../lib/review-red-team-on-skip.mjs';
+import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
+import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -307,7 +309,20 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     env: { ...env, ...(actorId ? { [ACTOR_ENV]: actorId } : {}), ...(extraEnv ?? {}) },
     ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
+  const readComments = ({ repo, pr }) => readCompletePrComments(Number(pr), {
+    repo, exec: (file, args, options) => exec(file, args, { ...options, cwd: root, env }),
+  });
   return {
+    redTeamResultVisible: ({ repo, pr, head }) => Boolean(redTeamForHead(readComments({ repo, pr }), pr, head)),
+    settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
+      env,
+      log: line => process.stderr.write(`${line}\n`),
+      readComments,
+      postComment: ({ repo, pr, body }) => exec('gh', [
+        'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
+      ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 }),
+      publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
+    } }),
     clearRedTeamQueued: ({ repo, pr, head }) => {
       rmSync(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`), { force: true });
     },
@@ -333,6 +348,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // the guard before replacing that evidence with our own queued writer.
           admissionPrior = input.redTeamMode
             ? readRedTeamRecoveryStatus(key, { readStatus: () => prior, readEvidence }) : prior;
+          // A healed policy skip has no model result to resume. Let the fresh seat
+          // apply today's policy; its independent comment and scorecard guards remain active.
+          // readRedTeamStatus binds status.head to this job's head; the predicate
+          // separately requires the stored read's netBasis.rev to equal status.head.
+          if (input.redTeamMode === 'fresh' && redTeamSkipNeedsSettlement(admissionPrior)) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(prior?.result).priorResult)) priorResult = prior.result;
           input = { ...input, result: priorResult };
         }
@@ -670,9 +690,10 @@ export function summarizeRedTeam(r) {
   if (!r || typeof r !== 'object') return null;
   return {
     status: r.status ?? null,
-    ...(r.deferredByCap === true ? { deferredByCap: true } : {}),
-    ...(r.deferredByGuard === true ? { deferredByGuard: true } : {}),
+    ...(r.deferredByCap ? { deferredByCap: true } : {}),
+    ...(r.deferredByGuard ? { deferredByGuard: true } : {}),
     ...(r.reason ? { reason: r.reason } : {}),
+    ...(classifyRedTeamSkip(r).kind === 'policy' ? { policy: 'card-only' } : {}),
     ...(r.status === 'ran' ? {
       provider: r.provider, model: r.model, seatStatus: r.seat?.status ?? null, foldedVerdict: r.foldedVerdict ?? null,
       recheckStatus: r.recheckStatus ?? null, confirmedMissCount: r.confirmedMissCount ?? 0,
@@ -773,20 +794,68 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       out.redTeamSpeculative = { decision: 'error', reason: tail(e?.message ?? e, 300) };
     }
   }
+  let redTeamDeferredByCap = false;
   if (accepted && (out.redTeamSpeculative?.result || typeof io.runRedTeam === 'function')) {
     let redTeam = out.redTeamSpeculative?.result ?? null;
     if (!redTeam) {
       try {
         redTeam = io.runRedTeam(seatsBox.input);
       } catch (e) {
-        redTeam = { status: 'error', reason: tail(e?.message ?? e, 300) };
+        redTeam = { status: 'error', reason: tail(safeErrorText(e), 300) };
       }
     }
     if (out.redTeamSpeculative) delete out.redTeamSpeculative.result;
-    io.log(`review-job ${out.sessionSlug}: red team — ${redTeam?.status ?? 'none'}${redTeam?.reason ? ` (${redTeam.reason})` : ''}`
-      + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
-    recordSeats(redTeam?.seat ? [redTeam.seat] : []);
-    out.redTeam = summarizeRedTeam(redTeam);
+    // Diagnostic formatting must never prevent settlement, the finished write or the gate.
+    // String coercion can itself throw for malformed JSON objects such as { toString: null }.
+    const diagnosticText = (value, fallback) => {
+      try { return String(value ?? fallback); } catch { return fallback; }
+    };
+    let settlementOutcome = { status: 'error', reason: 'malformed red-team outcome' };
+    let bypassSettlement = false;
+    out.redTeam = settlementOutcome;
+    try {
+      // Gate admission must survive failures while deriving the printable summary.
+      redTeamDeferredByCap = Boolean(redTeam?.deferredByCap);
+      const status = redTeam?.status;
+      // Retain lifecycle evidence before reading comment or summary diagnostics.
+      out.redTeam = { status: typeof status === 'string' ? status : 'error',
+        ...(redTeam?.deferredByGuard ? { deferredByGuard: true } : {}),
+        ...(redTeamDeferredByCap ? { deferredByCap: true } : {}) };
+      const completed = ['ran', 'resumed'].includes(status);
+      const published = ['posted', 'deduped'].includes(redTeam?.comment?.status);
+      // Acceptance already established that a pass was owed; not-owed cannot exempt it.
+      const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
+      // A completion claim remains unpublished until all derivations and live evidence succeed.
+      settlementOutcome = completed
+        ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}` }
+        : status === 'not-owed' && !deferred
+          ? { status, reason: 'red team reported not-owed on an accepted head' } : redTeam;
+      let wellFormed = false;
+      try { out.redTeam = summarizeRedTeam(redTeam); wellFormed = true; }
+      catch { /* malformed findings must not suppress settlement or erase retry evidence */ }
+      recordSeats(redTeam?.seat ? [redTeam.seat] : []);
+      io.log(`review-job ${out.sessionSlug}: red team — ${diagnosticText(status, 'none')}${redTeam?.reason ? ` (${diagnosticText(redTeam.reason, 'unknown')})` : ''}`
+        + `${status === 'ran' ? `: ${diagnosticText(redTeam.findings?.length, '0')} break(s), ${diagnosticText(redTeam.confirmedMissCount, '0')} confirmed, comment ${diagnosticText(redTeam.comment?.status, '-')}` : ''}`);
+      if (completed && published && !deferred && wellFormed) {
+        const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
+        const head = isRealHead(rev) ? rev : seatsBox.laneHead;
+        // Missing readers, unreadable threads and stale/untrusted markers cannot authorize bypass.
+        bypassSettlement = io.redTeamResultVisible?.({ repo: out.repo, pr: out.pr, head }) === true;
+      }
+    } catch { /* malformed diagnostics cannot prevent settlement */ }
+    if (!bypassSettlement && typeof io.settleRedTeamSkip === 'function') {
+      try {
+        const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
+        const readHead = isRealHead(rev) ? rev : null;
+        const head = readHead ?? seatsBox.laneHead;
+        const settled = io.settleRedTeamSkip({ redTeam: settlementOutcome, repo: out.repo, pr: out.pr,
+          head, readHead, runId: out.runId });
+        out.redTeam = { ...out.redTeam, ...settled };
+      } catch (error) {
+        try { io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`); }
+        catch { /* diagnostics cannot abort the finished status write or gate */ }
+      }
+    }
   }
   if (accepted) {
     // Deferrals launch no model call or seat row. Roll back admission so the next
@@ -806,7 +875,9 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       // An unsuccessful effects retry must keep the durable clean pass eligible for recovery.
       const result = guardDeferred && prior ? prior.result
         : seatsBox.priorRedTeamResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
-          ? seatsBox.priorRedTeamResult : out.redTeam?.status ?? null;
+          ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
+            ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
+            : out.redTeam?.status ?? null;
       io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
     }
   }
@@ -828,7 +899,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
 export function prepareReviewArc(input, io) {
   try {
     const { head } = io.prepareLane(input);
-    if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing pinned review head');
+    if (!isRealHead(head)) throw Error('missing pinned review head');
     return { head };
   } catch (e) {
     throw Error(`review lane setup failed: ${tail(e?.message ?? e, 300)}; inspect the PR head and retry`);
@@ -930,6 +1001,7 @@ function runReviewArc({
 
     const { head } = prepareReviewArc({ pr: planned.pr, repo: planned.repo, lanePath }, io);
     const finishArc = input => {
+      seatsBox.laneHead = head;
       // Both modes persist and verify admission while the job claim still excludes another writer.
       if (input && redTeamOwedFor(input.loopPayload) && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
         try {

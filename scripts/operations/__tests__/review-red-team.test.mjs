@@ -611,7 +611,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     const r = speculative
       ? await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: p.findings.read, env: {} }, io)
       : await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io);
-    expect(r).toEqual({ status: 'skipped', reason: 'red team skipped: card-only' });
+    expect(r).toEqual({ status: 'skipped', reason: 'red team skipped: card-only', policy: 'card-only' });
     expect(calls.every(c => c[0] === 'log')).toBe(true);
     expect(calls.some(c => c[1] === 'red team skipped: card-only')).toBe(true);
     expect(calls.find(c => c[0] === 'log')[1]).toMatch(/recheckReadsRepo=true.*standard.*skipCardOnly=true.*standard/);
