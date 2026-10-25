@@ -120,9 +120,9 @@ function parseBlocks(message, paths) {
     if (seen.has(path)) duplicates.add(path);
     seen.add(path);
     const lines = match[2].split(/\r?\n/).map(clean).map(line => line.trim()).filter(Boolean);
-    if (lines.length >= 2 && lines[0].startsWith('Purpose:')
+    if (lines.length >= 2 && lines.length <= 14 && lines[0].startsWith('Purpose:')
       && ['CLI:', 'Settings:', 'Lines:'].every(label => lines.some(line => line.startsWith(label)))) {
-      blocks.set(path, lines.slice(0, 14));
+      blocks.set(path, lines);
     }
   }
   for (const path of duplicates) blocks.delete(path);
@@ -180,12 +180,11 @@ function main() {
     return;
   }
   mkdirSync(out, { recursive: true });
-  for (const path of deleted) {
+  // Invalidate directly addressable summaries too, including changed batches deferred by --limit.
+  for (const path of [...deleted, ...changed]) {
     rmSync(join(out, entryName(path)), { force: true });
     delete manifest[path];
   }
-  // Drop missing entries before rebuilding the index, including batches deferred by --limit.
-  for (const path of changed) delete manifest[path];
   checkpoint(out, manifest);
   let summarized = 0;
   let tokens = 0;
