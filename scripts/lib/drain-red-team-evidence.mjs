@@ -28,7 +28,8 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return;
   const path = statusPath({ repo, pr, head }, env);
   mkdirSync(dirname(path), { recursive: true });
-  // The writer's own card-only skip decision: the drain may resolve a different setting in its own process.
+  // skipCardOnly is the writer's resolved setting, NOT evidence that this PR is card-only.
+  // Consumers must classify the stored net read; the drain may resolve a different setting in its own process.
   writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }

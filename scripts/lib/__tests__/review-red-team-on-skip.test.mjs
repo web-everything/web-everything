@@ -17,6 +17,87 @@ function fixture(over = {}) {
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
 
+describe('planRedTeamOnSkip — heal a previously skipped card-only head', () => {
+  const cardPayload = () => {
+    const loopPayload = payload();
+    Object.assign(loopPayload.findings.read, { diffText: 'diff --git a/backlog/5872-card.md b/backlog/5872-card.md\n+update', netChangedFiles: ['backlog/5872-card.md'], netRenameSources: [] });
+    return loopPayload;
+  };
+  const heal = (over = {}) => ({
+    readEvidence: () => ({ loopPayload: cardPayload(), recorded: false }),
+    readStatus: () => ({ status: 'finished', head, result: 'skipped', skipCardOnly: true, loopPayload: cardPayload() }),
+    ...over,
+  });
+
+  it.each(['skipped', { status: 'skipped', policy: 'card-only' }])(
+    'legacy string or explicit card-only object %j dispatches fresh', result => {
+      expect(decide(heal({ readStatus: () => ({ status: 'finished', head, result, skipCardOnly: true, loopPayload: cardPayload() }) })))
+        .toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    });
+
+  it.each([{ status: 'skipped' }, { status: 'skipped', reason: 'quota exhausted' },
+    { status: 'skipped', reason: 'red team skipped: card-only' }])(
+    'policy-absent object %j never heals even with a complete card-only read', result => {
+      expect(decide(heal({ readStatus: () => ({ status: 'finished', head, result, skipCardOnly: true, loopPayload: cardPayload() }) })))
+        .toMatchObject({ action: 'skip', why: 'prior result skipped (status finished); not re-run' });
+    });
+
+  it.each(['other', null, false, ''])('does not heal an explicit non-card-only policy %j', policy => {
+    const result = { status: 'skipped', policy, reason: 'quota exhausted' };
+    expect(decide(heal({ readStatus: () => ({ status: 'finished', head, result, skipCardOnly: true, loopPayload: cardPayload() }) })))
+      .toMatchObject({ action: 'skip', why: 'prior result skipped (status finished); not re-run' });
+  });
+
+  it.each([
+    { diffText: '' }, { diffText: '  \n ' }, { diffText: undefined },
+    { netBasis: { rev: 'b'.repeat(40) } }, { netBasis: {} },
+  ])('does not heal incomplete or mismatched stored read %j', read => {
+    const loopPayload = cardPayload(); Object.assign(loopPayload.findings.read, read);
+    expect(decide(heal({ readStatus: () => ({ status: 'finished', head, result: 'skipped', skipCardOnly: true, loopPayload }) })))
+      .toMatchObject({ action: 'skip', why: 'prior result skipped (status finished); not re-run' });
+  });
+
+  it('non-card-only skipped status still skips with its existing not-re-run reason', () => {
+    const loopPayload = cardPayload();
+    loopPayload.findings.read.netChangedFiles = ['scripts/example.mjs'];
+    expect(decide(heal({ readEvidence: () => ({ loopPayload, recorded: false }),
+      readStatus: () => ({ status: 'finished', head, result: 'skipped', skipCardOnly: true, loopPayload }) })))
+      .toMatchObject({ action: 'skip', why: 'prior result skipped (status finished); not re-run' });
+  });
+
+  it('a trusted comment already on the head skips healing before reading evidence', () => {
+    const body = renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' });
+    const readEvidence = vi.fn();
+    expect(decide(heal({ rawPrs: [{ number: pr, headRefOid: head, comments: [{ body, author: { login: 'web-everything' } }] }], readEvidence })))
+      .toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+    expect(readEvidence).not.toHaveBeenCalled();
+  });
+
+  it.each([false, undefined, 'true'])('fails closed when stored skipCardOnly is %j instead of true', skipCardOnly => {
+    expect(decide(heal({ readStatus: () => ({ status: 'finished', head, result: 'skipped', skipCardOnly, loopPayload: cardPayload() }) })).action).toBe('skip');
+  });
+
+  it.each(['queued', 'running'])('does not heal an unfinished %s skip', status => {
+    expect(decide(heal({ readStatus: () => ({ status, head, result: 'skipped', skipCardOnly: true, loopPayload: cardPayload() }) })).action).toBe('skip');
+  });
+
+  it.each([
+    { netChangedFiles: [] },
+    { netChangedFiles: null },
+    { netChangedFiles: ['backlog/5872-card.md'], netRenameSources: ['scripts/moved-code.mjs'] },
+    { netChangedFiles: ['backlog/5872-card.md'], netRenameSources: 'unreadable' },
+  ])('does not heal unknown or non-card-only net paths %j', paths => {
+    const loopPayload = cardPayload(); Object.assign(loopPayload.findings.read, paths);
+    expect(decide(heal({ readEvidence: () => ({ loopPayload, recorded: false }),
+      readStatus: () => ({ status: 'finished', head, result: 'skipped', skipCardOnly: true, loopPayload }) })).action).toBe('skip');
+  });
+
+  it('card-only healing still observes the recovery cooldown', () => {
+    const lastDispatch = new Map([[`${repo}#${pr}@${head}`, 200_001]]);
+    expect(decide(heal({ lastDispatch })).why).toBe('retry cooldown active');
+  });
+});
+
 describe('planRedTeamOnSkip', () => {
   it('ignores every other refusal kind', () => {
     expect(planRedTeamOnSkip(fixture({ refusals: [{ kind: 'live-job', prNumber: pr }] }))).toEqual([]);

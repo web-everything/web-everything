@@ -88,6 +88,21 @@ function fakeIo(over = {}) {
   return { io, calls, rows, trials };
 }
 
+describe('speculative red-team repository isolation', () => {
+  it.each([REPO, 'other/repo', undefined])('only a clean row from the target repository supersedes a pass: %s', async rowRepo => {
+    const { io, calls, rows } = fakeIo();
+    const loopPayload = payload('accept');
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: loopPayload.findings.read, env: {}, resume: false }, io);
+    expect(pass.status).toBe('speculated');
+    io.readRecords = () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team',
+      pr: 5, repo: rowRepo, rev: REV, status: 'ok', callId: 'later-call' }];
+    const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env: {} }, io);
+    expect(result.status).toBe(rowRepo === REPO ? 'superseded' : 'ran');
+    expect(calls.filter(c => c[0] === 'post')).toHaveLength(rowRepo === REPO ? 0 : 1);
+    expect(rows.filter(row => row.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toHaveLength(rowRepo === REPO ? 0 : 1);
+  });
+});
+
 describe('x00g3tt — the red team fires on ACCEPT only', () => {
   it('an accepted PR gets exactly one red-team dispatch to a non-Claude provider', async () => {
     const { io, calls } = fakeIo();
@@ -162,9 +177,9 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
   });
 
   it('never runs twice for the same head once a clean row exists', async () => {
-    const prior = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team', pr: 5, rev: REV, status: 'ok' }];
-    expect(redTeamAlreadyRan(prior, 5, REV)).toBe(true);
-    expect(redTeamAlreadyRan(prior, 5, 'c'.repeat(40))).toBe(false);
+    const prior = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team', pr: 5, repo: REPO, rev: REV, status: 'ok' }];
+    expect(redTeamAlreadyRan(prior, 5, REV, REPO)).toBe(true);
+    expect(redTeamAlreadyRan(prior, 5, 'c'.repeat(40), REPO)).toBe(false);
     // The pass finished (its comment is up), so nothing is owed. When the comment is missing, see the resume tests.
     const { io, calls } = fakeIo({ readRecords: () => prior, listComments: () => [{ body: redTeamMarker(5, REV), author: { login: 'web-everything' } }] });
     expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io)).status).toBe('already-ran');
@@ -288,7 +303,7 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
     const prior = {
       dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: RED_TEAM_SEAT.seat, status: 'ok',
       provider: 'agy-gemini', model: RED_TEAM_MODELS['agy-gemini'].model, callId: 'call-1', rev: REV,
-      pr: 5, findings: [{ ...BREAK, confirmedByRecheck: true }], builder: { provider: 'claude', model: 'claude-opus-5.5', source: 'co-authored-by' },
+      pr: 5, repo: REPO, findings: [{ ...BREAK, confirmedByRecheck: true }], builder: { provider: 'claude', model: 'claude-opus-5.5', source: 'co-authored-by' },
       recheckStatus: 'ok', foldedVerdict: 'changes', changedFiles: ['prior/scope.mjs'],
     };
     const { io, rows } = fakeIo({ readRecords: () => [prior] });
@@ -461,6 +476,8 @@ describe('x00g3tt — review-job: the red team is the post-accept hook, after th
       claim: () => ({ ok: true }),
       updateRecord: () => {},
       unclaim: () => calls.push(['unclaim']),
+      redTeamStatus: () => {},
+      prepareLane: () => ({ head: 'a'.repeat(40) }),
       acquireLane: () => ({ lanePath: '/lanes/lane-7' }),
       runLoop: () => ({ status: 0, stdout: JSON.stringify(loop), stderr: '' }),
       releaseLane: () => calls.push(['release']),
@@ -594,7 +611,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     const r = speculative
       ? await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: p.findings.read, env: {} }, io)
       : await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io);
-    expect(r).toEqual({ status: 'skipped', reason: 'red team skipped: card-only' });
+    expect(r).toEqual({ status: 'skipped', reason: 'red team skipped: card-only', policy: 'card-only' });
     expect(calls.every(c => c[0] === 'log')).toBe(true);
     expect(calls.some(c => c[1] === 'red team skipped: card-only')).toBe(true);
     expect(calls.find(c => c[0] === 'log')[1]).toMatch(/recheckReadsRepo=true.*standard.*skipCardOnly=true.*standard/);
