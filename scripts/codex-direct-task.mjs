@@ -1,10 +1,4 @@
 #!/usr/bin/env node
-/* ==================== FOREGROUND ONLY ====================
- * This script is SYNCHRONOUS: it blocks until the delegated Codex task actually completes.
- * Invoke it as a normal FOREGROUND Bash call. NEVER use run_in_background: true.
- * NEVER wrap it in Monitor or a nested wait — there is nothing to watch;
- * the call itself already returns the final result when it finishes.
- * ========================================================= */
 /**
  * codex-direct-task.mjs — a PERSONAL, manually-invoked escape hatch: delegate one real coding task to Codex
  * CLI's agentic (tool-bearing) mode, for a Claude Code operator whose own usage is running low.
@@ -71,12 +65,23 @@
  * live `codex exec` invocation before this file was written, per
  * `we:docs/agent/prototype-based-dev.md`'s "mocking the spawn is the exact seam every real bug lived in" lesson.
  *
+ * Runs inline by default. --detach launches a persistent background job with stdout/stderr files;
+ * wait --job=<id>: poll until the requested deadline (exit 75 means still running).
+ * A terminal task exit 75 is preserved in JSON but wait exits 1, so callers stop retrying.
+ * Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.
+ * Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.
+ * All IO shares that single requested deadline; no floor or additional grace.
+ * Records live in CODEX_JOBS_DIR or ~/workspace/.operations/coordination/codex-jobs.
+ *
  * USAGE
  *   node scripts/codex-direct-task.mjs --task="Add a README section documenting X" --dir=<existing checkout>
  *   node scripts/codex-direct-task.mjs --task-file=/path/to/prompt.txt                # no --dir → fresh scratch clone of THIS repo
  *   node scripts/codex-direct-task.mjs --task="…" --dir=<dir> --gate=full --json
  *
- * Flags: --task=<text> | --task-file=<path> (one required), --dir=<existing dir> (default: fresh scratch
+ *   node scripts/codex-direct-task.mjs --task="…" --detach
+ *   node scripts/codex-direct-task.mjs wait --job=<id> [--max-ms=540000]
+ *
+ * Flags: --detach (return a job id immediately), --task=<text> | --task-file=<path> (one required), --dir=<existing dir> (default: fresh scratch
  * clone), --repo-root=<path> (default: this script's own repo root — where a scratch clone is cloned FROM),
  * --model=<model>, --effort=low|medium|high|xhigh|max|ultra, --timeout-ms=<n> (default 30 min), --gate=none|
  * related|standards|full (default full), --ephemeral, --no-stream (still logs to file, just not to stdout too),
@@ -88,19 +93,25 @@
  * Exit status: with --json, a completed run exits 0 and its report carries `exitCode`, `timedOut` and `gate.pass`,
  * the contract machine callers already read (codex-worker, the probation launchers). Without --json, a failed run
  * or a red gate exits 1. A thrown error (including an unavailable self-review) exits 1 in both modes.
+ * Detached job records preserve the task's nonzero code; timeout or a red gate falls back to 1.
  */
 
 import { randomUUID } from 'node:crypto';
+import { writeLineSync } from './lib/write-all-sync.mjs';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
 import { resolveBuildPolicy, appendBuildRequirements } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
 import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
+import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
-  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync,
+  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
 } from 'node:fs';
+import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { withCodexUsage } from './lib/codex-usage-ledger.mjs';
 import { admissionLockRoot } from './readiness/heavy-admission.mjs';
@@ -120,6 +131,12 @@ export const REVIEW_MODE_SUFFIX = 'This is a READ-ONLY review. Do not edit, crea
   + '`git commit`/`git push`/`git add`, do not install dependencies, and do not open a pull request. Read what you '
   + 'need, then put your whole answer in your final message.';
 export const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000; // 30 min — an open-ended coding task, not a quick judge call.
+export const DEFAULT_INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
+export const DEFAULT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
+/** Deadline for each local git read (status/diff/log/rev-parse) so a hung one fails the run. */
+export const GIT_STEP_TIMEOUT_MS = 5 * 60 * 1000;
+/** Bytes of a piped clone/install step's output relayed to stderr, so diagnostics survive without flooding it. */
+export const EXEC_DIAGNOSTIC_TAIL_BYTES = 16 * 1024;
 
 /**
  * #x8wbivt (`#3635`)'s ratified routing constants are RE-EXPORTED here, not defined here.
@@ -502,6 +519,97 @@ export function collectAndClearRolloutQuota({
 export const defaultExecFn = (bin, args, opts = {}) =>
   execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 50 * 1024 * 1024, ...opts });
 
+/** How long a gate may hold its pipes after it exited or failed before the wrapper settles without `close`. */
+export const GATE_CLOSE_GRACE_MS = 2000;
+
+/** Detached gates must yield to signal handlers, including while npm's descendants run. */
+export function detachedGateExecFn(bin, args, opts = {}) {
+  return new Promise((resolveExec, reject) => {
+    const { timeout = DEFAULT_TIMEOUT_MS, maxBuffer = 50 * 1024 * 1024, closeGraceMs = GATE_CLOSE_GRACE_MS,
+      ...spawnOpts } = opts;
+    const child = nodeSpawn(bin, args, { ...spawnOpts, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const output = { stdout: [], stderr: [] };
+    const sizes = { stdout: 0, stderr: 0 };
+    let failure;
+    let timer;
+    let graceTimer;
+    let exitStatus = { code: null, signal: null };
+    let settled = false;
+    const killGroup = () => {
+      try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    };
+    const removeListeners = () => {
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
+      process.removeListener('SIGINT', onSigint);
+      process.removeListener('SIGTERM', onSigterm);
+    };
+    const settle = (code, signal) => {
+      if (settled) return;
+      settled = true;
+      removeListeners();
+      const stdout = Buffer.concat(output.stdout).toString('utf8');
+      const stderr = Buffer.concat(output.stderr).toString('utf8');
+      if (failure || code !== 0 || signal) {
+        const error = failure ?? new Error(`gate exited ${signal ?? code}`);
+        reject(Object.assign(error, { stdout, stderr: stderr || error.message }));
+      } else resolveExec(stdout);
+    };
+    // A descendant that left the process group (its own `detached`/setsid) survives the group kill and can
+    // hold the inherited pipes forever, so `close` may never come: stop reading and settle on our own.
+    const startGrace = () => {
+      if (settled || graceTimer) return;
+      graceTimer = setTimeout(() => {
+        killGroup(); // same-group stragglers of a gate that already exited
+        child.stdout.destroy();
+        child.stderr.destroy();
+        settle(exitStatus.code, exitStatus.signal);
+      }, closeGraceMs);
+    };
+    const cancel = signal => {
+      killGroup();
+      removeListeners();
+      process.kill(process.pid, signal);
+    };
+    const onSigint = () => cancel('SIGINT');
+    const onSigterm = () => cancel('SIGTERM');
+    const fail = error => { failure ??= error; killGroup(); startGrace(); };
+    for (const stream of ['stdout', 'stderr']) {
+      child[stream].on('data', chunk => {
+        if (failure) return;
+        const bytes = Buffer.from(chunk);
+        sizes[stream] += bytes.length;
+        if (sizes[stream] > maxBuffer) {
+          fail(new Error(`gate ${stream} exceeded maxBuffer (${maxBuffer} bytes)`));
+        } else output[stream].push(bytes);
+      });
+    }
+    child.once('error', error => {
+      failure ??= error;
+      killGroup();
+      if (settled) return;
+      settled = true;
+      removeListeners();
+      reject(error);
+    });
+    child.once('close', (code, signal) => settle(code, signal));
+    // A failed parent can exit before descendants close their inherited pipes.
+    child.once('exit', (code, signal) => {
+      exitStatus = { code, signal };
+      if (code !== 0 || signal) killGroup();
+      startGrace();
+    });
+    if (timeout > 0) {
+      timer = setTimeout(() => fail(new Error(`gate timed out after ${timeout}ms`)), timeout);
+      timer.unref();
+    }
+    // Run before the internal-job listener exits and writes the failed job record.
+    process.prependListener('SIGINT', onSigint);
+    process.prependListener('SIGTERM', onSigterm);
+  });
+}
+
 /**
  * Make a fresh, isolated scratch clone of `repoRoot` and install its deps — the default target when the
  * caller names no existing directory. Injectable `execFn`/`mkTempDir`/`existsFn` for testing without a real
@@ -531,11 +639,17 @@ export const defaultExecFn = (bin, args, opts = {}) =>
  * @param {(path: string) => boolean} [opts.existsFn]
  * @param {boolean} [opts.installDeps] - default true; a caller in a hurry for a task that touches no code
  *   dependent on `node_modules` may pass false.
+ * @param {string|Array} [opts.installStdio] - defaults to inherit; JSON callers redirect stdout to stderr.
+ * @param {Function} [opts.installExecFn] - optional async installer; returns a Promise when given.
+ * @param {number} [opts.installTimeoutMs] - async install deadline, default five minutes.
+ * @param {Function} [opts.cloneExecFn] - optional async `git clone` runner; returns a Promise when given.
+ * @param {number} [opts.cloneTimeoutMs] - async clone deadline, default ten minutes.
+ * @param {(text: string) => void} [opts.diagnosticFn] - where async clone/install output is relayed (stderr).
  * @param {boolean} [opts.wireOriginToRemote] - default false (#3782). When true, opts back into the pre-#3782
  *   behavior: rewrite the clone's `origin` to the real remote so a human can push straight from it. Best-effort
  *   either way — an offline/no-remote `repoRoot` (e.g. a test fixture) just leaves `realOrigin` null.
  * @returns {{dest: string, cloned: true, depsInstall: {bin: string, args: string[]}|null, realOrigin:
- *   string|null, originWired: boolean}}
+ *   string|null, originWired: boolean}|Promise<object>}
  */
 export function setupScratchClone({
   repoRoot,
@@ -543,33 +657,83 @@ export function setupScratchClone({
   execFn = defaultExecFn,
   existsFn = existsSync,
   installDeps = true,
+  installStdio = 'inherit',
+  installExecFn,
+  installTimeoutMs = DEFAULT_INSTALL_TIMEOUT_MS,
+  cloneExecFn,
+  cloneTimeoutMs = DEFAULT_CLONE_TIMEOUT_MS,
+  diagnosticFn = text => process.stderr.write(text),
   wireOriginToRemote = false,
 } = {}) {
   if (typeof repoRoot !== 'string' || !repoRoot.trim()) {
     throw new TypeError('codex-direct-task: `repoRoot` must be a non-empty path');
   }
   const dest = mkTempDir(join(tmpdir(), 'we-codex-direct-'));
-  execFn('git', buildScratchCloneArgv({ repoRoot, dest }));
+  const cloneArgs = buildScratchCloneArgv({ repoRoot, dest });
+  const afterClone = () => finishScratchClone({
+    repoRoot, dest, execFn, existsFn, installDeps, installStdio, installExecFn, installTimeoutMs, diagnosticFn,
+    wireOriginToRemote,
+  });
+  if (cloneExecFn) {
+    return runDiagnosedStep(cloneExecFn, 'scratch clone (git clone)', 'git', cloneArgs,
+      { timeout: cloneTimeoutMs }, diagnosticFn).then(afterClone);
+  }
+  execFn('git', cloneArgs);
+  return afterClone();
+}
+
+/** Relay a bounded tail of a piped step's output, so a detached job's stderr log keeps its diagnostics. */
+function relayStepOutput(diagnosticFn, ...texts) {
+  for (const text of texts) {
+    const s = typeof text === 'string' ? text : Buffer.isBuffer(text) ? text.toString('utf8') : '';
+    if (!s) continue;
+    const tail = s.length > EXEC_DIAGNOSTIC_TAIL_BYTES ? `…${s.slice(-EXEC_DIAGNOSTIC_TAIL_BYTES)}` : s;
+    diagnosticFn(tail.endsWith('\n') ? tail : `${tail}\n`);
+  }
+}
+
+/** Await an async exec step; relay its output and name the step in any failure. */
+function runDiagnosedStep(runner, label, bin, args, opts, diagnosticFn) {
+  // Start synchronously so the runner's signal listeners attach before any queued signal is dispatched.
+  let pending;
+  try { pending = Promise.resolve(runner(bin, args, opts)); } catch (error) { pending = Promise.reject(error); }
+  return pending.then(stdout => { relayStepOutput(diagnosticFn, stdout); return stdout; }, error => {
+    relayStepOutput(diagnosticFn, error?.stdout, error?.stderr);
+    const reason = String(error?.message ?? error).replace(/^gate /, '');
+    throw new Error(`${label} failed: ${reason}`, { cause: error });
+  });
+}
+
+function finishScratchClone({
+  repoRoot, dest, execFn, existsFn, installDeps, installStdio, installExecFn, installTimeoutMs, diagnosticFn,
+  wireOriginToRemote,
+}) {
   // Resolve the real push remote so it can be REPORTED — never silently wired in by default (#3782). Best-
   // effort: an offline/no-remote repoRoot (e.g. a test fixture) just leaves `realOrigin` null; `origin` in the
   // clone stays at the local `repoRoot` path (git clone's own default), which is not push-capable to anywhere
   // that matters.
   let realOrigin = null;
   try {
-    const url = execFn('git', ['-C', repoRoot, 'remote', 'get-url', 'origin']).trim();
+    const url = execFn('git', ['-C', repoRoot, 'remote', 'get-url', 'origin'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
     if (url) realOrigin = url;
   } catch { /* no origin on repoRoot, or remote command unavailable */ }
   let originWired = false;
   if (wireOriginToRemote && realOrigin) {
     try {
-      execFn('git', ['-C', dest, 'remote', 'set-url', 'origin', realOrigin]);
+      execFn('git', ['-C', dest, 'remote', 'set-url', 'origin', realOrigin], { timeout: GIT_STEP_TIMEOUT_MS });
       originWired = true;
     } catch { /* set-url failed — clone still works with the local-path origin */ }
   }
 
   const depsInstall = installDeps ? planDepsInstall(dest, existsFn) : null;
-  if (depsInstall) execFn(depsInstall.bin, depsInstall.args, { cwd: dest, stdio: 'inherit' });
-  return { dest, cloned: true, depsInstall, realOrigin, originWired };
+  const result = { dest, cloned: true, depsInstall, realOrigin, originWired };
+  if (depsInstall && installExecFn) {
+    return runDiagnosedStep(installExecFn, `dependency install (${depsInstall.bin} ${depsInstall.args.join(' ')})`,
+      depsInstall.bin, depsInstall.args, { cwd: dest, stdio: installStdio, timeout: installTimeoutMs }, diagnosticFn)
+      .then(() => result);
+  }
+  if (depsInstall) execFn(depsInstall.bin, depsInstall.args, { cwd: dest, stdio: installStdio });
+  return result;
 }
 
 /**
@@ -596,7 +760,7 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
   // Codex can write this checkout's git config: the shared lane pins apply, diff drivers and textconv stay off, and a
   // checkout that defines a filter driver (which `status`/`diff` would run on worktree content) is refused first.
   const git = (args) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
-    { env: laneGitHardeningEnv() });
+    { env: laneGitHardeningEnv(), timeout: GIT_STEP_TIMEOUT_MS });
   assertNoLaneFilterDrivers(git);
   const status = git(['status', '--porcelain', '-z']);
   const untracked = status.split('\0').filter((l) => l.startsWith('?? ')).map((l) => l.slice(3));
@@ -618,6 +782,7 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
  *   - `'full'` (default for edit tasks): verify-lane whole unit tier plus standards.
  * `full` and `related` need this repo's `scripts/verify-lane.mjs`; a checkout without it (a sibling repo's `--dir`)
  * gets the named failed outcome `unavailable: 'gate-unavailable'`, never a pass.
+ * With `asyncExecFn`, an executed gate returns a Promise; synchronous callers keep the existing contract.
  * @param {object} opts
  * @param {string} opts.dir
  * @param {'none'|'standards'|'related'|'full'} opts.mode
@@ -625,7 +790,7 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
  * @param {(path: string) => boolean} [opts.existsFn]
  * @returns {{ran: boolean, mode: string, steps: {cmd: string, pass: boolean, output: string}[], pass: boolean, unavailable?: string}}
  */
-export function runGate({ dir, mode, execFn = defaultExecFn, env = process.env, existsFn = existsSync }) {
+export function runGate({ dir, mode, execFn = defaultExecFn, asyncExecFn, env = process.env, existsFn = existsSync }) {
   if (mode === 'none' || !mode) return { ran: false, mode: 'none', steps: [], pass: true };
   if (!['full', 'related', 'standards'].includes(mode)) throw new Error('invalid build gate');
   if (mode !== 'standards' && !existsFn(join(dir, 'scripts', 'verify-lane.mjs'))) {
@@ -637,19 +802,20 @@ export function runGate({ dir, mode, execFn = defaultExecFn, env = process.env, 
     : mode === 'related' ? [['node', ['scripts/verify-lane.mjs', 'run']]]
       : [['npm', ['run', 'check:standards']]];
   const gateEnv = mode === 'related' ? { ...env, WE_BUILD_FINAL_GATE: 'related' } : env;
-  const steps = [];
-  for (const [bin, args] of plan) {
-    let output = '';
-    let pass = true;
-    try {
-      output = execFn(bin, args, { cwd: dir, env: gateEnv });
-    } catch (e) {
-      pass = false;
-      output = `${e.stdout ?? ''}${e.stderr ?? e.message ?? ''}`;
-    }
-    steps.push({ cmd: `${bin} ${args.join(' ')}`, pass, output });
+  const [bin, args] = plan[0];
+  const result = (pass, output) => ({ ran: true, mode, pass,
+    steps: [{ cmd: `${bin} ${args.join(' ')}`, pass, output }] });
+  const failed = e => result(false, `${e.stdout ?? ''}${e.stderr ?? e.message ?? ''}`);
+  if (asyncExecFn) {
+    return Promise.resolve().then(() => asyncExecFn(bin, args, { cwd: dir, env: gateEnv }))
+      .then(output => result(true, output), failed);
   }
-  return { ran: true, mode, steps, pass: steps.every((s) => s.pass) };
+  try {
+    // Same wall the async gate gets: a descendant holding the pipes must not block the sync gate forever.
+    return result(true, execFn(bin, args, { cwd: dir, env: gateEnv, timeout: DEFAULT_TIMEOUT_MS }));
+  } catch (e) {
+    return failed(e);
+  }
 }
 
 // ── impure: the real codex exec spawn, streaming JSONL to a log file + (optionally) stdout ─────────
@@ -691,6 +857,7 @@ export async function runCodexDirectExec({
   env = process.env,
   review = false,
   policy, resumeThreadId,
+  closeGraceMs = GATE_CLOSE_GRACE_MS,
 } = {}) {
   // Inside `.git/` — NEVER inside the working tree. A real live run against this very script found the bug
   // this avoids: a last-message/log file written into `dir` shows up as an untracked `??` file and pollutes
@@ -717,17 +884,22 @@ export async function runCodexDirectExec({
     let out = '';
     let err = '';
     let timer = null;
+    let graceTimer = null;
+    let exitCode = null;
     let killed = false;
     let settled = false;
     const removeSignalListeners = () => {
       process.removeListener('SIGINT', onSigint);
       process.removeListener('SIGTERM', onSigterm);
     };
-    const onSignal = (signal) => {
+    const killWorker = () => {
       try {
         if (Number.isInteger(child.pid) && child.pid > 0) process.kill(-child.pid, 'SIGKILL');
       } catch { /* already gone, or process-group kill is unavailable */ }
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    };
+    const onSignal = (signal) => {
+      killWorker();
       removeSignalListeners();
       process.kill(process.pid, signal);
     };
@@ -737,18 +909,32 @@ export async function runCodexDirectExec({
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       removeSignalListeners();
       resolvePromise(r);
     };
-    process.on('SIGINT', onSigint);
-    process.on('SIGTERM', onSigterm);
+    // A descendant outside the worker's process group can hold its pipes after it exited or was killed,
+    // so `close` may never come: stop reading after a short grace and settle on our own.
+    const startGrace = () => {
+      if (settled || graceTimer) return;
+      graceTimer = setTimeout(() => {
+        // Same-group stragglers must not keep editing the worktree that diff capture and the gate read next.
+        killWorker();
+        child.stdout?.destroy?.();
+        child.stderr?.destroy?.();
+        recordStdout(stdoutDecoder.decode());
+        settle({ stdout: out, stderr: err, code: exitCode, timedOut: killed, argv, outputLastMessageFile });
+      }, closeGraceMs);
+    };
+    // Job bookkeeping installs an exit handler before execution starts. Kill the worker group
+    // first, before that handler can exit the wrapper and leave its detached worker running.
+    process.prependListener('SIGINT', onSigint);
+    process.prependListener('SIGTERM', onSigterm);
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         killed = true;
-        try {
-          if (Number.isInteger(child.pid) && child.pid > 0) process.kill(-child.pid, 'SIGKILL');
-        } catch { /* already gone, or process-group kill is unavailable */ }
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        killWorker();
+        startGrace();
       }, timeoutMs);
       if (typeof timer.unref === 'function') timer.unref();
     }
@@ -763,6 +949,7 @@ export async function runCodexDirectExec({
     child.stderr?.on('data', (d) => { err += d.toString(); });
     child.on('error', (e) => {
       if (timer) clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       removeSignalListeners();
       reject(new Error(`codex-direct-task: \`${cli}\` failed to run: ${e.message}`));
     });
@@ -770,6 +957,7 @@ export async function runCodexDirectExec({
       recordStdout(stdoutDecoder.decode());
       settle({ stdout: out, stderr: err, code, timedOut: killed, argv, outputLastMessageFile });
     });
+    child.on('exit', (code) => { exitCode = code; startGrace(); });
     // NO POSITIONAL PROMPT — the task rides stdin, and `.end()` closes it (the stdin-trap avoidance).
     child.stdin?.on('error', () => { /* the child may exit before we finish writing; `close` reports it */ });
     child.stdin?.end(prompt);
@@ -797,6 +985,10 @@ export async function runCodexDirectExec({
  * @param {string} [opts.logFile]
  * @param {boolean} [opts.stream]
  * @param {boolean} [opts.installDeps]
+ * @param {Function} [opts.installExecFn] - async install runner, awaited before starting Codex.
+ * @param {number} [opts.installTimeoutMs] - async install deadline, default five minutes.
+ * @param {Function} [opts.cloneExecFn] - async scratch-clone runner, awaited before installing.
+ * @param {number} [opts.cloneTimeoutMs] - async clone deadline, default ten minutes.
  * @param {boolean} [opts.wireOriginToRemote] - #3782: default false — forwarded to `setupScratchClone`. Only
  *   meaningful when `dir` is omitted (a scratch clone is actually made); ignored for a caller-named `--dir`.
  * @param {boolean} [opts.clearRolloutAfterRun] - #x8wbivt Fork 4: when true, use the ratified read-then-delete
@@ -826,11 +1018,17 @@ export async function codexDirectTask({
   logFile,
   stream = true,
   installDeps = true,
+  installStdio = 'inherit',
+  installExecFn,
+  installTimeoutMs = DEFAULT_INSTALL_TIMEOUT_MS,
+  cloneExecFn,
+  cloneTimeoutMs = DEFAULT_CLONE_TIMEOUT_MS,
   wireOriginToRemote = false,
   clearRolloutAfterRun = false,
   review = false,
   env = process.env,
   execFn = defaultExecFn,
+  gateExecFn,
   spawnFn = nodeSpawn,
   mkTempDir = (prefix) => mkdtempSync(prefix),
   existsFn = existsSync,
@@ -870,8 +1068,9 @@ export async function codexDirectTask({
     if (!review && (gate === 'full' || gate === 'related') && !existsFn(join(repoRoot, 'scripts', 'verify-lane.mjs'))) {
       throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${repoRoot} does not have; pass --gate=standards or --gate=none`);
     }
-    scratch = setupScratchClone({
-      repoRoot, mkTempDir, execFn, existsFn, installDeps, wireOriginToRemote,
+    scratch = await setupScratchClone({
+      repoRoot, mkTempDir, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
+      installExecFn, installTimeoutMs, cloneExecFn, cloneTimeoutMs,
     });
     targetDir = scratch.dest;
   } else if (!existsFn(targetDir)) {
@@ -882,10 +1081,10 @@ export async function codexDirectTask({
     throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${targetDir} does not have; pass --gate=standards or --gate=none`);
   }
 
-  const startSha = execFn('git', ['-C', targetDir, 'rev-parse', 'HEAD']).trim();
+  const startSha = execFn('git', ['-C', targetDir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
   // Same `.git/`-hiding reasoning as `outputLastMessageFile` above — the default log file must never leak
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
-  const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir']).trim();
+  const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
   const resolvedLogFile = logFile || join(gitDir, review ? `codex-self-review-${randomUUID()}.jsonl` : 'codex-direct-task.jsonl');
   mkdirSync(dirname(resolvedLogFile), { recursive: true });
 
@@ -906,7 +1105,8 @@ export async function codexDirectTask({
   let lastMessage = null;
   try { lastMessage = readFileSync(run.outputLastMessageFile, 'utf8'); } catch { lastMessage = null; }
 
-  let gateResult = review ? runGate({ mode: 'none' }) : runGate({ dir: targetDir, mode: gate, execFn, env, existsFn });
+  const executeGate = () => runGate({ dir: targetDir, mode: gate, execFn, asyncExecFn: gateExecFn, env, existsFn });
+  let gateResult = review ? runGate({ mode: 'none' }) : await executeGate();
   const selfReview = !review && run.code === 0 && !run.timedOut && gateResult.pass ? await runBuildSelfReview({
     policy, dir: targetDir, env, ...(selfReviewFn ? { review: selfReviewFn } : {}),
     readDiff: () => boundedSelfReviewDiff(() => captureDiff({ dir: targetDir, startSha, execFn }).diff),
@@ -921,7 +1121,7 @@ export async function codexDirectTask({
       summary = summarizeEvents(events);
       try { lastMessage = readFileSync(fixed.outputLastMessageFile, 'utf8'); } catch { lastMessage = null; }
     },
-    gate: () => { gateResult = runGate({ dir: targetDir, mode: gate, execFn, env, existsFn }); return gateResult.pass; },
+    gate: async () => { gateResult = await executeGate(); return gateResult.pass; },
   }) : { skipped: true, rounds: 0, notes: [] };
   const diff = captureDiff({ dir: targetDir, startSha, execFn });
 
@@ -984,11 +1184,246 @@ export async function codexDirectTask({
   };
 }
 
+// ── detached jobs ────────────────────────────────────────────────────────────────────────────────
+export const MAX_JOB_WAIT_MS = 540000;
+const MIN_JOB_WAIT_MS = 250;
+function jobWaitBudget(maxMs = MAX_JOB_WAIT_MS) {
+  const requested = Number(maxMs);
+  if (!Number.isFinite(requested) || requested < MIN_JOB_WAIT_MS) {
+    throw new RangeError(`codex-direct-task wait: --max-ms must be between ${MIN_JOB_WAIT_MS} and ${MAX_JOB_WAIT_MS}`);
+  }
+  return Math.min(requested, MAX_JOB_WAIT_MS);
+}
+const jobFs = { mkdirSync, readFileSync, writeFileSync, renameSync, openSync, closeSync };
+export function resolveJobsDir(env = process.env) {
+  return resolve(env.CODEX_JOBS_DIR || join(homedir(), 'workspace', '.operations', 'coordination', 'codex-jobs'));
+}
+function jobRecordPath(jobsDir, id) {
+  if (typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id)) throw new Error('invalid job id');
+  return join(jobsDir, `${id}.json`);
+}
+export function writeJobRecord(record, { jobsDir = resolveJobsDir(), fsDeps = jobFs } = {}) {
+  const path = jobRecordPath(jobsDir, record.id);
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  fsDeps.writeFileSync(tmp, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  fsDeps.renameSync(tmp, path);
+}
+export function readJobRecord(id, { jobsDir = resolveJobsDir(), fsDeps = jobFs } = {}) {
+  return validateJobRecord(JSON.parse(fsDeps.readFileSync(jobRecordPath(jobsDir, id), 'utf8')), id);
+}
+function validateJobRecord(record, id) {
+  if (record.id !== id || !['running', 'done', 'failed'].includes(record.status)
+    || typeof record.resultPath !== 'string' || !record.resultPath
+    || !Number.isInteger(record.pid) || record.pid <= 0
+    // Optional: records written before PID start times were captured carry none.
+    || (record.pidStart != null && (typeof record.pidStart !== 'string' || !record.pidStart))
+    || (record.status === 'done' && record.exitCode !== 0)
+    || (record.status === 'running' && record.exitCode !== null)
+    || (record.status === 'failed' && record.exitCode !== null
+      && (!Number.isInteger(record.exitCode) || record.exitCode < 0 || record.exitCode > 255))) {
+    throw new Error('incomplete job record');
+  }
+  return record;
+}
+export async function startDetachedJob({
+  args = process.argv.slice(2), spawnFn = nodeSpawn, fsDeps = jobFs, now = Date.now,
+  random = randomUUID, jobsDir = resolveJobsDir(), nodePath = process.execPath,
+  scriptPath = fileURLToPath(import.meta.url), env = process.env, readStart = readPidStart,
+} = {}) {
+  const startedAt = new Date(now()).toISOString();
+  const id = `${Date.parse(startedAt)}-${random()}`;
+  const recordPath = jobRecordPath(jobsDir, id);
+  fsDeps.mkdirSync(jobsDir, { recursive: true });
+  const resultPath = join(jobsDir, `${id}.result.json`);
+  const fds = [];
+  try {
+    fds.push(fsDeps.openSync(resultPath, 'w', 0o600));
+    fds.push(fsDeps.openSync(join(jobsDir, `${id}.stderr.log`), 'w', 0o600));
+    const child = spawnFn(nodePath, [scriptPath, ...args.filter(a => a !== '--detach' && !a.startsWith('--detach=')), '--json', '--no-stream', `--job=${id}`], {
+      detached: true, stdio: ['ignore', ...fds], env: { ...env, CODEX_JOBS_DIR: jobsDir },
+    });
+    await new Promise((resolveSpawn, reject) => {
+      child.once('spawn', resolveSpawn);
+      child.once('error', reject);
+    });
+    // The start time pins the PID to this child, so `wait` can tell a reused PID from a live job.
+    const record = { id, pid: child.pid, pidStart: pidStartOrNull(readStart, child.pid), status: 'running', startedAt, resultPath,
+      exitCode: null };
+    writeJobRecord(record, { jobsDir, fsDeps });
+    child.unref();
+    return { ...record, recordPath };
+  } finally {
+    for (const fd of fds) fsDeps.closeSync(fd);
+  }
+}
+const jobSleep = (ms, options) => delay(ms, undefined, options);
+/** How long the job child waits for the launcher to write its record before giving up. */
+export const JOB_RECORD_INIT_DEADLINE_MS = 5000;
+/** One start-time probe's deadline: it runs between spawn and the record write, well inside the child's wait. */
+export const PID_START_TIMEOUT_MS = 1000;
+/**
+ * The shared `ps -o lstart=` probe (null when the pid does not exist; throws when ps does not answer), with a
+ * short deadline and the zone pinned too, so a launcher and a later `wait` from another shell agree.
+ */
+export function readPidStart(pid, { execFn = execFileSync, timeoutMs = PID_START_TIMEOUT_MS } = {}) {
+  return readProcStart(pid, {
+    execFn: (bin, args, opts) => execFn(bin, args, { ...opts, timeout: timeoutMs, env: { ...opts.env, TZ: 'UTC' } }),
+  });
+}
+/**
+ * The process state (`ps -o stat=`, e.g. `S`, `R+`, `Z`) under the same bounded, locale- and zone-pinned ps
+ * as readPidStart: null when the pid does not exist; throws when ps does not answer.
+ */
+export function readPidState(pid, { execFn = execFileSync, timeoutMs = PID_START_TIMEOUT_MS } = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const out = execFn('ps', ['-o', 'stat=', '-p', String(pid)], {
+      env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' }, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return String(out ?? '').trim() || null;
+  } catch (error) {
+    if (error && error.status === 1) return null; // ps: no such process
+    throw error;
+  }
+}
+const pidStartOrNull = (readStart, pid) => { try { return readStart(pid); } catch { return null; } };
+/**
+ * Whether the job's own process is alive: the PID exists, is not an unreaped zombie, AND, when recorded, still
+ * has the same start time.
+ */
+export function jobIsAlive({ pid, pidStart }, { readStart = readPidStart, readState = readPidState } = {}) {
+  try { process.kill(pid, 0); } catch (error) {
+    if (error.code === 'ESRCH') return false;
+    if (error.code !== 'EPERM') throw error;
+  }
+  // An exited job its parent never reaped still answers kill(pid, 0) with an unchanged start time. A state
+  // probe that does not answer throws, so `wait` fails closed; a pid gone by now (null) is dead.
+  const state = readState(pid);
+  if (!state || state.startsWith('Z')) return false;
+  // Legacy records (or a ps failure at spawn) carry no start time: the PID and state probes alone decide.
+  if (typeof pidStart !== 'string' || !pidStart) return true;
+  // A different (or no) start time means the PID now names another process. A probe that does not
+  // answer throws, so `wait` fails closed (exit 2) instead of marking a possibly-live job failed.
+  return readStart(pid) === pidStart;
+}
+export async function waitForJob({
+  jobId, maxMs = MAX_JOB_WAIT_MS,
+  readRecord,
+  writeRecord,
+  isAlive = jobIsAlive, sleep = jobSleep, now = Date.now, pollMs = 1000,
+  jobsDir = resolveJobsDir(),
+  updateRecord,
+} = {}) {
+  const budget = jobWaitBudget(maxMs);
+  const deadline = now() + budget;
+  readRecord ??= async id => validateJobRecord(
+    JSON.parse(await jobAsyncFs.readFile(jobRecordPath(jobsDir, id), 'utf8')), id);
+  const expired = Symbol('wait budget exhausted');
+  // Every read, probe, mutation, cleanup and poll shares the requested deadline.
+  const withinBudget = async operation => {
+    if (now() >= deadline) return expired;
+    const pending = operation();
+    if (!pending || typeof pending.then !== 'function') return now() >= deadline ? expired : pending;
+    const remaining = deadline - now();
+    if (remaining <= 0) {
+      Promise.resolve(pending).catch(() => {});
+      return expired;
+    }
+    let timer;
+    try {
+      const value = await Promise.race([pending, new Promise(resolveTimer => {
+        timer = setTimeout(() => resolveTimer(expired), remaining);
+      })]);
+      return now() >= deadline ? expired : value;
+    } catch (error) {
+      if (now() >= deadline) return expired;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const budgeted = async operation => {
+    if (now() >= deadline) throw expired;
+    const value = await withinBudget(operation);
+    if (value === expired) throw expired;
+    return value;
+  };
+  // Cleanup may depend on IO that never settles. Observe it in the background;
+  // callers may wait only for the remainder of the same job-wait budget.
+  const cleanupAfter = (pending, cleanup) => Promise.resolve(pending).catch(() => {}).then(cleanup).catch(() => {});
+  writeRecord ??= async record => {
+    const path = jobRecordPath(jobsDir, record.id);
+    const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    let pending;
+    try {
+      await budgeted(() => (pending = jobAsyncFs.writeFile(tmp, `${JSON.stringify(record)}\n`, { mode: 0o600 })));
+      await budgeted(() => (pending = jobAsyncFs.rename(tmp, path)));
+    } finally {
+      // Remove the temporary file only after in-flight IO settles; cleanup must
+      // not hold up the result beyond the deadline either.
+      const cleanup = cleanupAfter(pending, () => jobAsyncFs.rm(tmp, { force: true }));
+      if (await withinBudget(() => cleanup) === expired) throw expired;
+    }
+  };
+  updateRecord ??= async (id, update) => {
+    // A dead PID cannot write again, but its terminal record may have landed
+    // since the liveness probe. Re-read before deciding to mark it failed.
+    const current = await budgeted(() => readRecord(id));
+    if (current.status !== 'running') return current;
+    const updated = update(current);
+    await budgeted(() => writeRecord(updated));
+    return updated;
+  };
+  let record = { status: 'running', exitCode: null, resultPath: null };
+  const result = () => ({ status: record.status, exitCode: record.exitCode, resultPath: record.resultPath });
+  const terminalResult = () => {
+    const code = record.status === 'done' ? 0 : record.exitCode || 1;
+    // Exit 75 is exclusively the wait-again signal; retain the task code in JSON.
+    return { ...result(), code: code === 75 ? 1 : code };
+  };
+  for (;;) {
+    let snapshot;
+    try { snapshot = await withinBudget(() => readRecord(jobId)); }
+    catch { return { status: 'failed', exitCode: null, resultPath: null, code: 2 }; }
+    if (snapshot === expired) return { ...result(), code: 75 };
+    record = snapshot;
+    if (record.status !== 'running') return terminalResult();
+    if (now() >= deadline) return { ...result(), code: 75 };
+    let alive;
+    try { alive = await withinBudget(() => isAlive(record)); }
+    catch { return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 }; }
+    if (alive === expired) return { ...result(), code: 75 };
+    if (!alive) {
+      if (now() >= deadline) return { ...result(), code: 75 };
+      // The child may have committed its terminal record since our initial read.
+      try {
+        snapshot = await withinBudget(() => updateRecord(jobId, current => ({ ...current, status: 'failed', exitCode: 1,
+          finishedAt: new Date(now()).toISOString() })));
+        if (snapshot === expired) return { ...result(), code: 75 };
+        record = snapshot;
+      } catch (e) {
+        if (e === expired) return { ...result(), code: 75 };
+        return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 };
+      }
+    }
+    if (record.status !== 'running') return terminalResult();
+    const remaining = deadline - now();
+    if (remaining <= 0) return { ...result(), code: 75 };
+    if (await withinBudget(() => sleep(Math.min(Math.max(1, pollMs), remaining))) === expired) return { ...result(), code: 75 };
+  }
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────
 /** Process exit status for a completed run; see the file header's "Exit status". PURE. */
 export function cliExitCode(report, { json = false } = {}) {
   if (json) return 0;
   return report.exitCode !== 0 || report.timedOut || !report.gate.pass ? 1 : 0;
+}
+
+/** Internal job records preserve a nonzero task code independently of the foreground contract. */
+function jobExitCode(report) {
+  if (report.exitCode !== 0) return report.exitCode || 1;
+  return report.timedOut || !report.gate.pass ? 1 : 0;
 }
 
 function parseFlags(argv) {
@@ -1002,18 +1437,30 @@ function parseFlags(argv) {
   return flags;
 }
 
+function isWaitInvocation(args) {
+  return args.find(arg => !arg.startsWith('--')) === 'wait';
+}
+
 function repoRootFromCwd() {
-  return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+  return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: GIT_STEP_TIMEOUT_MS }).trim();
 }
 
 async function main() {
-  const flags = parseFlags(process.argv.slice(2));
+  const args = process.argv.slice(2);
+  const flags = parseFlags(args);
   if (flags.help) {
     console.log(
       'usage: node scripts/codex-direct-task.mjs --task=<text>|--task-file=<path> [--dir=<checkout>] '
       + '[--repo-root=<path>] [--model=<m>] [--effort=low|medium|high|xhigh|max|ultra] [--tier=haiku|sonnet|opus] '
       + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=full|related|none|standards] [--ephemeral] [--clear-rollout-after-run] '
-      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json]\n'
+      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json] [--detach]\n'
+      + '  --detach: launch a detached job; print its id and record path immediately.\n'
+      + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
+      + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
+      + '    Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.\n'
+      + '    Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.\n'
+      + '    All IO shares that single requested deadline; no floor or additional grace.\n'
+      + '  CODEX_JOBS_DIR overrides ~/workspace/.operations/coordination/codex-jobs.\n'
       + '  --review (#4194): a READ-ONLY review task — Codex runs under `-s read-only` and is told to answer in its '
       + 'final message (the report\'s `lastMessage`) instead of editing files.\n'
       + '  --task-kind defaults to worker (review with --review). Model AND effort follow codex.modelByTask; '
@@ -1024,6 +1471,24 @@ async function main() {
       + 'by default (not push-capable) — the real remote is only printed. Pass this to opt back into rewriting '
       + "origin to the real remote so a human can push straight from the clone. No effect with --dir.",
     );
+    return;
+  }
+  if (isWaitInvocation(args)) {
+    let maxMs;
+    try { maxMs = jobWaitBudget(flags['max-ms']); }
+    catch (error) {
+      writeLineSync(2, error.message);
+      process.exit(2);
+    }
+    const { code, ...result } = await waitForJob({ jobId: flags.job, maxMs });
+    // Pending filesystem requests must not keep a timed-out wait CLI alive.
+    writeLineSync(1, JSON.stringify(result));
+    process.exit(code);
+  }
+  if (flags.detach) {
+    const job = await startDetachedJob({ args });
+    console.log(JSON.stringify({ id: job.id, recordPath: job.recordPath }));
+    process.exitCode = 0;
     return;
   }
   const task = flags['task-file'] ? readFileSync(resolve(flags['task-file']), 'utf8') : flags.task;
@@ -1054,6 +1519,12 @@ async function main() {
       logFile: flags.log ? resolve(flags.log) : undefined,
       stream: !flags['no-stream'],
       installDeps: !flags['no-install'],
+      installStdio: flags.json ? ['ignore', 2, 2] : 'inherit',
+      installExecFn: flags.job ? detachedGateExecFn : undefined,
+      cloneExecFn: flags.job ? detachedGateExecFn : undefined,
+      cloneTimeoutMs: DEFAULT_CLONE_TIMEOUT_MS,
+      installTimeoutMs: DEFAULT_INSTALL_TIMEOUT_MS,
+      gateExecFn: flags.job ? detachedGateExecFn : undefined,
       wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
       clearRolloutAfterRun: Boolean(flags['clear-rollout-after-run']),
       review: Boolean(flags.review),
@@ -1097,9 +1568,46 @@ async function main() {
     console.log('\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
     console.log('──────────────────────────────────────────────────────────\n');
   }
+  if (flags.job) return jobExitCode(report);
 }
 
 const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  main().catch((e) => { console.error(e); process.exitCode = 1; });
+  const flags = parseFlags(process.argv.slice(2));
+  const internalJob = flags.job && !isWaitInvocation(process.argv.slice(2)) && !flags.detach && !flags.help;
+  let finished = false;
+  const finish = code => {
+    if (!internalJob || finished) return;
+    const record = readJobRecord(flags.job);
+    if (record.status === 'running' && record.pid === process.pid) {
+      writeJobRecord({ ...record, status: code === 0 ? 'done' : 'failed', exitCode: code,
+        finishedAt: new Date().toISOString() });
+    }
+    finished = true;
+  };
+  // Synchronous exit bookkeeping also covers uncaught exceptions and explicit process.exit().
+  process.on('exit', code => {
+    try { finish(code); } catch (e) { console.error(`codex-direct-task: job update failed: ${e.message}`); process.exitCode = 1; }
+  });
+  if (internalJob) {
+    for (const signal of ['SIGINT', 'SIGTERM']) {
+      process.once(signal, () => process.exit(signal === 'SIGINT' ? 130 : 143));
+    }
+  }
+  (async () => {
+    if (internalJob) {
+      // The launcher persists the PID after spawn. Do not let a fast child finish before that write.
+      const deadline = Date.now() + JOB_RECORD_INIT_DEADLINE_MS;
+      for (;;) {
+        try { if (readJobRecord(flags.job).pid === process.pid) break; } catch { /* launcher is writing */ }
+        if (Date.now() >= deadline) throw new Error('job record was not initialized by launcher');
+        await jobSleep(10);
+      }
+      // Integration-test hook: keep only the --job child alive after its launcher exits.
+      const testDelayMs = Number(process.env.CODEX_DIRECT_TASK_TEST_CHILD_DELAY_MS);
+      if (Number.isFinite(testDelayMs) && testDelayMs > 0) await jobSleep(testDelayMs);
+    }
+    const jobExitCode = await main();
+    finish(jobExitCode ?? process.exitCode ?? 0);
+  })().catch(e => { console.error(e); process.exitCode = 1; });
 }

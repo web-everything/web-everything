@@ -13,7 +13,7 @@ import { scenario, runScenario } from './sim/scenario.mjs';
 const IMPORTED = 'scripts/lib/daemon-self-sync.mjs';
 
 describe('simulator git and budget regressions', () => {
-  it('renders the living reviewer checklist from the isolated simulator clone', async () => {
+  it('imports the operation registry and renders the living reviewer checklist from the isolated simulator clone', async () => {
     const checklistPath = 'docs/agent/reviewer-expectations.md';
     const checklist = readFileSync(resolve(process.cwd(), checklistPath), 'utf8').trim();
     await runScenario(scenario('dispatch brief dependencies', {
@@ -21,13 +21,17 @@ describe('simulator git and budget regressions', () => {
       play: [(w) => {
         expect(readFileSync(join(w.simCloneRoot, checklistPath), 'utf8').trim()).toBe(checklist);
         const policyModule = pathToFileURL(join(w.simCloneRoot, 'scripts/lib/build-policy.mjs')).href;
+        const operationsModule = pathToFileURL(join(w.simCloneRoot, 'scripts/operations/run.mjs')).href;
         const brief = execFileSync(process.execPath, ['--input-type=module', '-e', `
           import { renderBuildRequirements, resolveBuildPolicy } from ${JSON.stringify(policyModule)};
+          import { rootUsage } from ${JSON.stringify(operationsModule)};
+          process.stdout.write(rootUsage());
           process.stdout.write(renderBuildRequirements({
             policy: resolveBuildPolicy({ env: {}, tool: {}, platform: {} }),
           }));
         `], { cwd: w.simCloneRoot, env: w.env, encoding: 'utf8', timeout: 5_000 });
         expect(brief).toContain(checklist);
+        expect(brief).toContain('judge-sweep-facts');
         expect(brief).toContain('not done until `node scripts/verify-lane.mjs` is green');
       }],
     }));
@@ -183,7 +187,9 @@ describe('simulator git and budget regressions', () => {
         expect(() => w.git.commitToMain('unknown')).toThrow('world.git: unknown repo "unknown"');
         expect(() => w.git.createBranch('unknown', 'new')).toThrow('world.git: unknown repo "unknown"');
         const paths = execFileSync('git', ['ls-tree', '-r', '--name-only', 'main'], { cwd: origin, encoding: 'utf8' });
-        expect(paths).not.toMatch(/__tests__\/|\.(test|spec)\.[^/\n]+|scripts\/(golden-corpus|review-corpus)\/|scripts\/(?:[^\n]*\/)?fixtures\//);
+        expect(paths).not.toMatch(/__tests__\/|\.(test|spec)\.[^/\n]+|scripts\/(?:[^\n]*\/)?fixtures\//);
+        expect(paths.split('\n').filter(path => /^scripts\/(?:golden-corpus|review-corpus)\//.test(path)))
+          .toEqual(['scripts/review-corpus/mine-review-corpus.mjs']);
       }],
       expect(s) { expect(s.trace).toEqual([]); },
     }));
