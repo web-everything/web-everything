@@ -44,8 +44,15 @@ it.each(['unknown', 'system'])('rejects unlisted or non-file system helper origi
   }
 });
 
+it.each(['core.hooksPath', 'CORE.HOOKSPATH'])('completes a default lane job with local %s=.githooks', async key => {
+  const f = fixture([['config --show-scope', ok(`${laneConfig}local\0${key}\n.githooks\0`)]]);
+  expect((await f.run()).result.ok).toBe(true);
+  expect(codexCalls(f)).toHaveLength(1);
+  expect(f.calls.some(c => c.args.includes('push'))).toBe(true);
+});
+
 it.each(['diff.orderFile', 'diff.relative', 'diff.driver.textconv', 'diff.driver.command',
-  'core.excludesFile', 'core.attributesFile', 'core.hooksPath', 'core.worktree', 'core.fsmonitor', 'core.sshCommand'])(
+  'core.excludesFile', 'core.attributesFile', 'core.otherPath', 'CORE.OTHERPATH', 'core.worktree', 'core.fsmonitor', 'core.sshCommand'])(
   'refuses worker-controlled file/path setting %s before running another diff', async key => {
     for (const scope of ['local', 'worktree', 'unknown']) {
       let poisoned = false;
@@ -481,7 +488,7 @@ it.each([false, true])('removes the fresh throwaway clone after publication (pus
 });
 
 it('scope-claim ttl-hours covers waitMs and the claim remains held until finally on success and failure', async () => {
-  const waitMs = 49 * 60 * 60 * 1000 + 1;
+  const waitMs = 23 * 60 * 60 * 1000 + 1;
   for (const fails of [false, true]) {
     const f = fixture();
     const exec = f.io.exec;
@@ -507,6 +514,20 @@ it('scope-claim ttl-hours covers waitMs and the claim remains held until finally
   }
 });
 
+it.each([0, 86400000])('accepts the wait-ms boundary %s', async waitMs => {
+  const f = fixture();
+  expect((await f.run([`--wait-ms=${waitMs}`])).result.ok).toBe(true);
+});
+
+it('rejects wait-ms above 24 hours before any lane or Codex work', async () => {
+  const f = fixture();
+  const { code, result } = await f.run(['--wait-ms=86400001']);
+  expect(code).toBe(EXIT_CODES['bad-args']);
+  expect(result).toMatchObject({ stopReason: 'bad-args', detail: 'Invalid wait-ms' });
+  expect(codexCalls(f)).toHaveLength(0);
+  expect(f.calls).toHaveLength(0);
+});
+
 it('resolves a remote-only base once and resets to its pinned commit', async () => {
   const f = fixture([
     ['rev-parse --verify lane/predecessor^{commit}', red()],
@@ -517,7 +538,27 @@ it('resolves a remote-only base once and resets to its pinned commit', async () 
   expect(s.baseSha).toBe('abc123');
   expect(s.startSha).toBe(s.baseSha);
   expect(f.calls.find(c => c.args.includes('reset')).args).toContain(s.baseSha);
-  expect(f.calls.filter(c => c.args.includes('--verify'))).toHaveLength(2);
+  expect(f.calls.filter(c => c.args.includes('--verify'))).toHaveLength(1);
+});
+
+it('falls back to the bare base only when its origin ref cannot resolve', async () => {
+  const f = fixture([
+    ['rev-parse --verify origin/local-base^{commit}', red()],
+    ['rev-parse --verify local-base^{commit}', ok('abc123\n')],
+  ]);
+  const s = { opts: { repo: '/repo', base: 'local-base' }, lane: { path: '/lane', holder: 'session' }, io: f.io };
+  await resetLane(s);
+  expect(s.baseSha).toBe('abc123');
+  expect(f.calls.filter(c => c.args.includes('--verify')).map(c => c.args.at(-1)))
+    .toEqual(['origin/local-base^{commit}', 'local-base^{commit}']);
+});
+
+it('uses an explicitly origin-prefixed base without adding a second origin prefix', async () => {
+  const f = fixture();
+  const s = { opts: { repo: '/repo', base: 'origin/lane/predecessor' }, lane: { path: '/lane', holder: 'session' }, io: f.io };
+  await resetLane(s);
+  expect(f.calls.filter(c => c.args.includes('--verify')).map(c => c.args.at(-1)))
+    .toEqual(['origin/lane/predecessor^{commit}']);
 });
 
 it.each([red(), { status: 0 }, ok('')])('refuses unresolved base commits before resetting (%j)', async response => {
@@ -571,6 +612,20 @@ it('resets to origin/lane/predecessor when no local predecessor exists (real Git
     expect(s.startSha).toBe(startSha);
     expect(git(['rev-parse', 'HEAD']).trim()).toBe(startSha);
     expect(f.calls.find(c => c.args.includes('reset')).args).toContain(startSha);
+  });
+});
+
+it('prefers the descendant origin base over a stale local predecessor (real Git)', async () => {
+  await withPublicationRepo(async ({ repo, git, commit, startSha, f }) => {
+    git(['update-ref', 'refs/heads/lane/predecessor', startSha]);
+    const nextSha = commit('new predecessor', startSha);
+    git(['update-ref', 'refs/remotes/origin/lane/predecessor', nextSha]);
+    const s = { opts: { repo, base: 'lane/predecessor' }, lane: { path: repo, holder: 'session' }, io: f.io };
+    await resetLane(s);
+    expect(s.baseSha).toBe(nextSha);
+    expect(s.startSha).toBe(nextSha);
+    expect(git(['rev-parse', 'HEAD']).trim()).toBe(nextSha);
+    expect(git(['rev-parse', 'lane/predecessor']).trim()).toBe(startSha);
   });
 });
 

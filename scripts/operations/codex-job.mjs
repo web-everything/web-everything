@@ -54,6 +54,7 @@ export function parseArgs(argv) {
   if (!opts.brief || !/^[a-z0-9][a-z0-9-]*$/.test(opts.purpose ?? '') || !opts.scope || !opts.tests) fail('bad-args');
   if (!/^\d+$/.test(String(opts.waitMs)) || !Number.isSafeInteger(Number(opts.waitMs))) fail('bad-args', 'Invalid wait-ms');
   opts.waitMs = Number(opts.waitMs);
+  if (opts.waitMs > 86400000) fail('bad-args', 'Invalid wait-ms');
   opts.scope = opts.scope.split(','); opts.tests = opts.tests.split(',');
   const relative = p => p && !p.startsWith('-') && !path.isAbsolute(p) && !p.includes('\\') && !p.split('/').some(v => v === '..' || v === '.') && !/[\x00-\x20\x7f]/.test(p);
   if (opts.scope.some(s => !relative(s.includes(':') ? s.slice(s.indexOf(':') + 1) : s) || (s.includes(':') && !/^[a-z0-9-]+:[^:]+$/.test(s))) || opts.tests.some(t => !relative(t))) fail('bad-args', 'Invalid scope or tests');
@@ -107,6 +108,8 @@ function riskyLaneConfig(listOutput) {
   const parts = listOutput.split('\0');
   for (let i = 0; i + 1 < parts.length; i += 2) {
     const key = parts[i + 1].split('\n')[0];
+    // Lane setup installs .githooks; all lane Git calls pin this to /dev/null.
+    if (key.toLowerCase() === 'core.hookspath') continue;
     if (['local', 'worktree', 'unknown'].includes(parts[i]) &&
         /^(diff\.(orderfile|relative|external|.*\.(command|textconv))|core\.(.*(?:file|path)|worktree|fsmonitor|sshcommand|alternaterefscommand|pager))$/i.test(key)) found.push(key);
   }
@@ -199,8 +202,9 @@ export async function resetLane(s) {
   const origin = await exec(s, 'git', ['-C', s.opts.repo, 'remote', 'get-url', 'origin']);
   if (!good(origin) || typeof origin.stdout !== 'string' || !origin.stdout.trim()) fail('push-failed', 'Cannot read trusted origin URL');
   s.originUrl = origin.stdout.trim();
-  let base = await git(s, ['rev-parse', '--verify', `${s.opts.base}^{commit}`]);
-  if (!good(base)) base = await git(s, ['rev-parse', '--verify', `origin/${s.opts.base}^{commit}`]);
+  const remoteBase = s.opts.base.startsWith('origin/') ? s.opts.base : `origin/${s.opts.base}`;
+  let base = await git(s, ['rev-parse', '--verify', `${remoteBase}^{commit}`]);
+  if (!good(base) && remoteBase !== s.opts.base) base = await git(s, ['rev-parse', '--verify', `${s.opts.base}^{commit}`]);
   if (!good(base) || typeof base.stdout !== 'string' || !base.stdout.trim()) fail('lane-reset-failed');
   s.baseSha = base.stdout.trim();
   if (!good(await git(s, ['reset', '--hard', s.baseSha], true))) fail('lane-reset-failed');
