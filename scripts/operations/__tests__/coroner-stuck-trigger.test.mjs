@@ -3,6 +3,7 @@ import { vi } from 'vitest';
 import { evaluateStuckTriggers, buildStuckPostmortem } from '../coroner-stuck-trigger.mjs';
 import { classifyEvent, normalizeComment } from '../coroner-rounds.mjs';
 import { buildPostmortem } from '../coroner-pr-postmortem.mjs';
+import { buildFixBeginComment, buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 
 const openedAt = '2026-10-01T00:00:00.000Z';
 const now = '2026-10-04T00:00:00.000Z';
@@ -69,6 +70,53 @@ describe('R90 structured timeline evidence (implementation pending)', () => {
       type:'round', trigger:'referral-block', rulings:[{file:'src/a.js',line:2,claim:'missing guard',result:'block'}],
     });
     expect(postmortem(input).rounds.map(r => r.fixSessions.length)).toEqual([1,1,0]);
+    expect(status(input,'recurrence')).toBe('fired');
+  });
+
+  it('fires recurrence using production fix comments with abbreviated repair heads', () => {
+    const input = {...raw(),comments:[1,2,3].flatMap(round => [
+      referral(round),
+      ...(round < 3 ? [
+        comment(round * 3 + 1, buildFixBeginComment({who:'fixer',branch:'lane/test',headSha:head(round)})),
+        comment(round * 3 + 2, buildFixEndComment({who:'fixer',headSha:head(round + 1)})),
+      ] : []),
+    ])};
+    const triggers = evaluateStuckTriggers(input,{now:at(24)});
+    expect(triggers.find(t => t.trigger === 'recurrence').status).toBe('fired');
+    expect(triggers.filter(t => t.status === 'fired').map(t => t.trigger)).toEqual(['recurrence']);
+    expect(buildStuckPostmortem(input,{now:at(24)}).markdown).toContain('- recurrence: fired');
+  });
+
+  it.each([7,9,12,40])('matches completed repairs recorded with %i-character heads', length => {
+    const input = returned(3);
+    for (const round of [1,2]) {
+      const begin = input.comments[(round - 1) * 3 + 1];
+      begin.body = begin.body.replace(head(round),head(round).slice(0,length));
+    }
+    expect(status(input,'recurrence')).toBe('fired');
+  });
+
+  it.each(['different','missing','ambiguous'])('does not count %s repair heads as recurrence evidence', variant => {
+    const input = returned(3);
+    for (const round of [1,2]) {
+      const repairHead = variant === 'missing' ? null : variant === 'different' ? 'f'.repeat(40) : head(round);
+      input.comments[(round - 1) * 3 + 1] = comment(round * 3 + 1,
+        buildFixBeginComment({who:'fixer',branch:'lane/test',headSha:repairHead}));
+      if (variant === 'ambiguous') {
+        const collision = referral(round,JSON.stringify(['judgeCorrectnessAdvisory','src/other.js',2,'other finding']));
+        collision.body = collision.body.replace(encodeURIComponent(JSON.stringify({version:1,head:head(round)})),
+          encodeURIComponent(JSON.stringify({version:1,head:head(round).slice(0,9) + 'f'.repeat(31)})));
+        input.comments.push(collision);
+      }
+    }
+    expect(status(input,'recurrence')).toBe('clear');
+  });
+
+  it.each([123,{},'1'])('ignores malformed unrelated referral heads during repair resolution: %j', invalidHead => {
+    const input = returned(3), malformed = referral(4);
+    malformed.body = malformed.body.replace(encodeURIComponent(JSON.stringify({version:1,head:head(4)})),
+      encodeURIComponent(JSON.stringify({version:1,head:invalidHead})));
+    input.comments.push(malformed);
     expect(status(input,'recurrence')).toBe('fired');
   });
 

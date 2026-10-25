@@ -39,6 +39,15 @@ function evaluateTimeline(comments, start, end, results) {
   const timeline = events.filter(e => e.time >= start && e.time <= end).sort((a, b) => a.time - b.time);
   // Valid heads prove this lower bound even when other events are unreadable.
   const heads = new Set(timeline.filter(e => e.type === 'round' && e.head).map(e => e.head));
+  // Fix helpers print abbreviated SHAs. Resolve only an unambiguous observed
+  // round head so a shared prefix cannot establish a completed repair.
+  const repairHead = head => {
+    if (!head) return null;
+    const matches = [...heads].filter(candidate => typeof candidate === 'string'
+      && /^[0-9a-f]{7,40}$/.test(candidate)
+      && (candidate.startsWith(head) || head.startsWith(candidate)));
+    return matches.length === 1 ? matches[0] : null;
+  };
   if (heads.size >= 8) results[1] = { trigger: 'fix-rounds', status: 'fired', observedRounds: heads.size, thresholdRounds: 8 };
   // An unreadable event might interrupt a streak or supply an unobserved repair.
   if (events.some(e => !Number.isFinite(e.time))) return;
@@ -47,7 +56,7 @@ function evaluateTimeline(comments, start, end, results) {
     if (event.type === 'fix-begin') pending.set(event.who, event);
     if (event.type === 'fix-end' && pending.has(event.who)) {
       const begin = pending.get(event.who);
-      if (begin.time < event.time) repairs.push({ head: begin.head, from: begin.time, to: event.time });
+      if (begin.time < event.time) repairs.push({ head: repairHead(begin.head), from: begin.time, to: event.time });
       pending.delete(event.who);
     }
     if (event.type !== 'round' || !event.head) continue;
