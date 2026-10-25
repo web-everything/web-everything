@@ -3507,6 +3507,70 @@ describe('draft-first PRs — reconcile-core.mjs (operator-approved 2026-09-27)'
   });
 });
 
+describe('review-hold-only required reds do not deadlock draft promotion or review', () => {
+  const requiredChecks = ['test', 'merge-gate', 'review-gate'];
+  const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+  // Shape attached by excuseMergeGateRows: a review hold keeps merge-gate red but annotates its owner.
+  const heldRollup = () => [
+    check('test'),
+    check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 5874001 } }),
+    check('review-gate', 'failure'),
+  ];
+  const reviewOnlyRollup = () => [check('test'), check('merge-gate'), check('review-gate', 'failure')];
+  const plan = (over = {}) => planReconcile({
+    prs: [pr1563({ isDraft: true, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup(), ...over })],
+    requiredChecks, agents: [], durableCounts: {}, now: NOW,
+  });
+
+  it.each([
+    ['annotated merge-gate and review-gate red', heldRollup],
+    ['review-gate red only', reviewOnlyRollup],
+  ])('promotes a draft with %s instead of refusing review-hold-red', (_, rollup) => {
+    const result = plan({ statusCheckRollup: rollup() });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'promote-draft', prNumber: 1563 })]);
+    expect(result.refusals).toEqual([]);
+  });
+
+  it.each([
+    ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
+    ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
+  ])('does not promote a draft with %s; CI healing still owns the failure', (_, rollup) => {
+    const result = plan({ statusCheckRollup: rollup() });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 1563 })]);
+    expect(result.dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+  });
+
+  it.each(['red-team:blocked', 'red-team:pending', 'review-status:draft-withdrawn'])(
+    'still refuses a review-hold-only-red draft carrying %s', label => {
+      const result = plan({ labels: lbl('review:pending', label) });
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'draft', prNumber: 1563 }));
+    },
+  );
+
+  it.each([
+    ['annotated merge-gate and review-gate red', heldRollup],
+    ['review-gate red only', reviewOnlyRollup],
+  ])('dispatches review for a non-draft with %s without a review-ci refusal', (_, rollup) => {
+    const result = plan({ isDraft: false, statusCheckRollup: rollup() });
+    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: 1563 }));
+    expect(result.refusals.filter(row => row.kind === 'review-ci' || row.reviewRefusal?.kind === 'review-ci')).toEqual([]);
+  });
+
+  it.each([
+    ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
+    ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
+  ])('reviewChecksAllow still refuses a non-draft with %s even after not-a-ci-break escalation', (_, rollup) => {
+    const result = plan({ isDraft: false, statusCheckRollup: rollup(), comments: [{ author: AUTOMATION,
+      body: buildCiHealEscalationComment({ headSha: pr1563().headRefOid, outcome: 'not-a-ci-break', reason: 'review hold' }),
+    }] });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(result.refusals).toContainEqual(expect.objectContaining({
+      kind: 'ci-heal-escalated', reviewRefusal: expect.objectContaining({ kind: 'review-ci' }),
+    }));
+  });
+});
+
 describe('fix waiting episode', () => {
   it('ages a PR without an episode marker from its creation, and refuses a capped file snapshot', () => {
     const source = pr1563({ createdAt: '2026-09-29T12:00:00Z',
