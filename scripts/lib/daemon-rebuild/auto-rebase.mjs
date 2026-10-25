@@ -13,6 +13,7 @@ import { alertsFilePath } from './state.mjs';
 import { REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../mandate-fence.mjs';
 import { buildReverseImportGraph, testDepths, isGraphSourceFile, isVitestTestFile } from '../related-test-selection.mjs';
+import { alwaysRunInventory } from '../verify-lane-gate.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
@@ -101,7 +102,7 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     { cwd, env: { ...env, ...REBUILD_IDENTITY_ENV }, timeout: 60_000 });
   const add = deps.addOverlay ?? overlays.addOverlay, event = deps.appendOverlayEvent ?? overlays.appendOverlayEvent;
   const p = paths(root, env, ref);
-  let scratch, heartbeat, stage = 'registration';
+  let scratch, testReport, heartbeat, stage = 'registration';
   const reportFailure = error => reportNeedsYou({ root, env, ref, stage, error, io, event, now });
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe ref');
@@ -217,8 +218,24 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
       io.appendFileSync(join(scratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
       io.statSync(join(root, 'node_modules'));
       io.symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
-      const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected];
+      // File arguments are filters: Vitest can exit zero while excluding selected integration tests.
+      // A fresh report outside the candidate tree proves every selected file actually executed.
+      io.mkdirSync(p.dir, { recursive: true });
+      testReport = join(p.dir, `${randomUUID()}.vitest-report`);
+      const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected,
+        '--reporter=default', '--reporter=json', `--outputFile.json=${testReport}`];
       requireOk(await (deps.testRunner ?? ((o) => execAsync(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }));
+      let reportText;
+      try {
+        if (io.statSync(testReport).size > 8 * 1024 * 1024) throw new Error('test inventory over 8 MiB');
+        const report = JSON.parse(io.readFileSync(testReport, 'utf8'));
+        // A name without a completed assertion is not execution evidence (empty/unknown report shapes).
+        if (Array.isArray(report?.testResults)) report.testResults = report.testResults.filter(r =>
+          Array.isArray(r?.assertionResults) && r.assertionResults.some(a => ['passed', 'failed'].includes(a?.status)));
+        reportText = JSON.stringify(report);
+      } catch { /* missing, malformed or oversized inventory fails closed below */ }
+      const inventory = alwaysRunInventory({ reportText, files: [...selected], cwd: io.realpathSync(scratch) });
+      if (inventory.missing.length) throw new Error(`selected tests did not execute (${inventory.reason}): ${inventory.missing.join(', ')}; human review required`);
     }
     stage = 'audit';
     const audit = await agent(true, 'Read-only audit: inspect the merge against BOTH parent tips, especially conflict resolutions, tests and guards. Review every file listed in noTestFiles in the material: these files have no related tests, so certification requires inspecting their changes directly. This audit is REQUIRED even when no tests can run. Answer exactly NOT WEAKENED only if neither side’s intent, tests nor guards were weakened; otherwise report failure.', { noTestFiles, rule });
@@ -243,6 +260,8 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     throw e;
   } finally {
     clearInterval(heartbeat);
+    if (testReport) try { io.rmSync(testReport, { force: true }); }
+    catch (e) { reportNeedsYou({ root, env, ref, stage: 'cleanup', error: e, io, event, now }); }
     if (scratch) try { io.rmSync(scratch, { recursive: true, force: true }); }
     catch (e) { stage = 'cleanup'; reportFailure(e); throw e; }
   }

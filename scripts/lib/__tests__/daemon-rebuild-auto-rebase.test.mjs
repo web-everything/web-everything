@@ -10,6 +10,7 @@ import * as overlays from '../daemon-overlays.mjs';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { writeRebuildState, readRebuildState, alertsFilePath } from '../daemon-rebuild/state.mjs';
+import { runTestInventoryCase } from '../../conveyor/soak/breaks/auto-rebase-operator-withdrawal.mjs';
 
 const temps = [];
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-auto-test-')); temps.push(p); return p; };
@@ -20,6 +21,14 @@ const write = (root, name, text) => { fs.mkdirSync(dirname(join(root, name)), { 
 const ref = 'lane/fix';
 const overlay = { ref, pr: 123 };
 const agentResult = (report = {}) => ({ status: 0, stdout: JSON.stringify({ exitCode: 0, timedOut: false, events: { terminal: 'turn.completed' }, ...report }) });
+const reportPassingTests = ({ root, args }) => {
+  const report = args.find(a => a.startsWith('--outputFile.json='));
+  expect(args.slice(-3, -1)).toEqual(['--reporter=default', '--reporter=json']);
+  fs.writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({
+    testResults: args.slice(7, -3).map(file => ({ name: join(fs.realpathSync(root), file), assertionResults: [{ status: 'passed' }] })),
+  }));
+  return { status: 0 };
+};
 function fixture({ extraModule = false, workerTest = true, baseFiles = {}, branchFiles = {}, mainFiles = {}, resolvedFiles = {} } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
@@ -63,10 +72,10 @@ function fixture({ extraModule = false, workerTest = true, baseFiles = {}, branc
       }
       return agentResult();
     }),
-    testRunner: vi.fn(async ({ args }) => {
+    testRunner: vi.fn(async ({ root, args }) => {
       calls.push('tests');
-      expect(args).toEqual(['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', 'worker.test.mjs']);
-      return { status: 0 };
+      expect(args.slice(0, -3)).toEqual(['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', 'worker.test.mjs']);
+      return reportPassingTests({ root, args });
     }),
     auditor: vi.fn(async ({ args }) => { calls.push('audit'); expect(args).toContain('--review'); return agentResult({ lastMessage: 'NOT WEAKENED' }); }),
     addOverlay: (...args) => { calls.push('add'); return addOverlay(...args); },
@@ -87,6 +96,33 @@ const job = f => runAutoRebase({ root: f.root, ref, env: f.env, deps: f.deps });
 const swaps = f => finishPendingSwaps({ root: f.root, env: f.env, run,
   removeOverlay: (...args) => { f.calls.push('remove'); return removeOverlay(...args); },
   appendOverlayEvent: (...args) => { f.calls.push(args[1].kind); return appendOverlayEvent(...args); } });
+
+describe('auto-rebase executed-test inventory', () => {
+  it.each(['excluded', 'all-excluded', 'missing', 'malformed', 'oversized', 'empty-assertions', 'unknown-status', 'skipped', 'wrong-root', 'failed'])(
+    'refuses %s evidence before audit, push and registration', async mode => {
+      const result = await runTestInventoryCase({ mode });
+      expect(result.failure).toBeTruthy();
+      expect(result).toMatchObject({ pushed: false, registered: false, audited: false, cleaned: true, remaining: [], overlays: ['lane/fix'] });
+      expect(result.events).toContainEqual(expect.objectContaining({ kind: 'auto-rebase-needs-you', stage: 'tests' }));
+    },
+  );
+  it('accepts a complete executed-file inventory', async () => {
+    const result = await runTestInventoryCase({ mode: 'complete' });
+    expect(result.failure).toBeUndefined();
+    expect(result).toMatchObject({ pushed: true, registered: true, audited: true, cleaned: true });
+    expect(result.remaining).toEqual(['lane%2Ffix.json']);
+  });
+  it('rejects the real Vitest zero exit when a failing selected integration file is excluded', async () => {
+    const integration = 'scripts/operations/__tests__/dispatch-spawn-live.test.mjs';
+    expect(fs.readFileSync('vitest.config.ts', 'utf8')).toContain(integration);
+    expect(fs.readFileSync('vitest.integration.config.ts', 'utf8')).toContain(integration);
+    const result = await runTestInventoryCase({ realRunner: true });
+    expect(result.runnerResult.status, result.runnerResult.stderr).toBe(0);
+    expect(result.runnerResult.stdout).toContain('1 passed');
+    expect(result.failure).toMatch(/selected tests did not execute/);
+    expect(result).toMatchObject({ pushed: false, registered: false, audited: false, cleaned: true, remaining: [] });
+  }, 40_000);
+});
 
 describe('established overlay auto rebase', () => {
   describe('operator withdrawal during detached repair', () => {
@@ -196,10 +232,10 @@ describe('established overlay auto rebase', () => {
         resolvedFiles: { 'uncovered.txt': 'overlay + main\n' },
       });
       f.moveMain();
-      f.deps.testRunner = vi.fn(async ({ args }) => {
+      f.deps.testRunner = vi.fn(async ({ root, args }) => {
         expect(args.slice(0, 7)).toEqual(['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run']);
-        expect(args.slice(7).sort()).toEqual(['branch.test.mjs', 'worker.test.mjs']);
-        return { status: 0 };
+        expect(args.slice(7, -3).sort()).toEqual(['branch.test.mjs', 'worker.test.mjs']);
+        return reportPassingTests({ root, args });
       });
       const result = await job(f);
       expect(f.deps.testRunner).toHaveBeenCalledOnce();
@@ -222,8 +258,8 @@ describe('established overlay auto rebase', () => {
       expect(ok(f.root, ['diff', '--name-only', f.baseSha, f.oldSha]).split('\n')).not.toContain('feature.test.mjs');
       f.deps.testRunner = vi.fn(async ({ root, args }) => {
         expect(ok(root, ['show', 'HEAD:feature.mjs'])).toBe('export const value = 2;');
-        expect(args.slice(7).sort()).toEqual(['feature.test.mjs', 'worker.test.mjs']);
-        return { status: 0 };
+        expect(args.slice(7, -3).sort()).toEqual(['feature.test.mjs', 'worker.test.mjs']);
+        return reportPassingTests({ root, args });
       });
       const result = await job(f);
       expect(f.deps.testRunner).toHaveBeenCalledOnce();
@@ -242,9 +278,9 @@ describe('established overlay auto rebase', () => {
       f.deps.git = (args, opts) => run(['-c', 'core.quotepath=true', ...args], opts);
       f.moveMain();
       f.deps.testRunner = vi.fn(async ({ root, args }) => {
-        expect(args.slice(7).sort()).toEqual([test, 'worker.test.mjs']);
+        expect(args.slice(7, -3).sort()).toEqual([test, 'worker.test.mjs']);
         expect(ok(root, ['show', `HEAD:${file}`])).toBe('export const value = 4;');
-        return { status: 0 };
+        return reportPassingTests({ root, args });
       });
       const result = await job(f);
       expect(f.deps.testRunner).toHaveBeenCalledOnce();
@@ -263,9 +299,9 @@ describe('established overlay auto rebase', () => {
       });
       f.deps.git = (args, opts) => run(['-c', 'core.quotepath=true', ...args], opts);
       f.moveMain();
-      f.deps.testRunner = vi.fn(async ({ args }) => {
-        expect(args.slice(7)).toEqual([test]);
-        return { status: 0 };
+      f.deps.testRunner = vi.fn(async ({ root, args }) => {
+        expect(args.slice(7, -3)).toEqual([test]);
+        return reportPassingTests({ root, args });
       });
       const result = await job(f);
       expect(f.deps.testRunner).toHaveBeenCalledOnce();
@@ -719,9 +755,9 @@ describe('established overlay auto rebase', () => {
     };
     f.deps.testRunner = vi.fn(async ({ root, args }) => {
       expect(args.slice(0, 7)).toEqual(['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run']);
-      expect(args.slice(7).sort()).toEqual(['extra.test.mjs', 'worker.test.mjs']);
+      expect(args.slice(7, -3).sort()).toEqual(['extra.test.mjs', 'worker.test.mjs']);
       expect(ok(root, ['show', 'HEAD:extra.mjs'])).toBe('fixer also changed this module');
-      return { status: 0 };
+      return reportPassingTests({ root, args });
     });
     await job(f);
     expect(f.deps.testRunner).toHaveBeenCalledOnce();
@@ -928,7 +964,7 @@ describe('established overlay auto rebase', () => {
         baseFiles: { 'scripts/lib/daemon-rebuild.mjs': 'core\n', 'scripts/lib/daemon-overlays.mjs': 'core\n', [mechanism]: 'base\n' },
         branchFiles: { [mechanism]: 'overlay\n' }, mainFiles: { [mechanism]: 'main\n' }, resolvedFiles: { [mechanism]: 'overlay + main\n' },
       });
-      f.deps.testRunner = vi.fn(async () => ({ status: 0 }));
+      f.deps.testRunner = vi.fn(async options => reportPassingTests(options));
       const live = await planRebuild({ git: (a, o) => run(a, { cwd: f.root, ...o }), headSha: f.baseSha, mainRef: 'origin/main', overlays: [overlay] });
       f.moveMain(); ok(f.root, ['reset', '--hard', live.finalSha]);
       writeRebuildState(f.root, { adopted: { head: live.finalSha } }, f.env);
