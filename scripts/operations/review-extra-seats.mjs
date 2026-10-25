@@ -1378,7 +1378,7 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
   if (!done.didWork && !done.failed) return { status: 'already-ran', reason: `a completed red-team seat row already exists for #${pr} at ${rev.slice(0, 12)}` };
   return {
     status: 'resumed', rev, callId: prior.callId, provider: prior.provider, model: prior.model,
-    reason: `${done.failed ? 'retried (still failing)' : 'finished'} what the completed pass for #${pr} at ${rev.slice(0, 12)} left undone — ${done.rowsWritten} row(s) written, delegation trial ${done.delegationTrial}, comment ${done.comment.status}`,
+    reason: `${done.failed ? 'retried (still failing)' : 'finished'} what the completed pass for #${pr} at ${rev.slice(0, 12)} left undone — ${done.rowsWritten} row(s) written, delegation trial ${done.delegationTrial}, comment ${done.comment.status}${done.comment.status === 'error' && done.comment.reason ? ` (${done.comment.reason})` : ''}`,
     rowsWritten: done.rowsWritten, delegationTrial: done.delegationTrial, comment: done.comment,
   };
 }
@@ -1783,8 +1783,10 @@ export function renderRedTeamSummary(r) {
 export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, ...rest } = {}) {
   const base = createExtraSeatsIo({ env, root, storePath, ...rest });
   const gh = (args, input) => {
-    const r = spawnSync('gh', args, { env, encoding: 'utf8', timeout: 60_000, input, stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
-    if (r.status !== 0) throw new Error(`gh ${args[0]} ${args[1]} failed: ${String(r.stderr ?? r.error?.message ?? '').trim().slice(0, 300)}`);
+    // maxBuffer: long-lived PRs carry multi-MB comment lists (`pr view --json comments`); the 1 MiB default made
+    // spawnSync fail with ENOBUFS, so the red-team result comment could never be listed or posted.
+    const r = spawnSync('gh', args, { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024, input, stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    if (r.status !== 0) throw new Error(`gh ${args[0]} ${args[1]} failed: ${String(r.stderr || r.error?.message || '').trim().slice(0, 300)}`);
     return String(r.stdout ?? '');
   };
   return {

@@ -3,7 +3,7 @@ import { createRedTeamIo, priorRedTeamRow, redTeamAlreadyRan, redTeamMarker, run
 import { readStore } from '../../conveyor/run-scorecard-store.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -83,6 +83,59 @@ describe('shared red-team recovery entry guards', () => {
     noLaunch(io);
     for (const key of ['postComment', 'append']) expect(io[key], key).not.toHaveBeenCalled();
   }
+  async function withOversizedComments(check) {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-large-comments-'));
+    try {
+      const comments = [{ author: { login: 'someone' }, body: 'x'.repeat(2 * 1024 * 1024 + 1024) }];
+      writeFileSync(join(dir, 'comments.json'), JSON.stringify({ comments }));
+      writeFileSync(join(dir, 'gh'), `#!${process.execPath}
+const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.includes('comments')) {
+  fs.writeFileSync(1, fs.readFileSync(path.join(__dirname, 'comments.json')));
+} else if (args[0] === 'pr' && args[1] === 'comment' && args.includes('--body-file')) {
+  fs.writeFileSync(path.join(__dirname, 'posted.txt'), fs.readFileSync(0));
+} else {
+  process.exitCode = 1;
+}
+`, { mode: 0o755 });
+      const production = createRedTeamIo({ env: { PATH: dir }, storePath: join(dir, 'scorecards.json') });
+      await check({ production, comments, postedBody: () => readFileSync(join(dir, 'posted.txt'), 'utf8') });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+  it('reads more than 2 MiB of comments and posts through the production gh helper', async () => {
+    await withOversizedComments(({ production, comments, postedBody }) => {
+      expect(production.listComments({ pr, repo })).toEqual(comments);
+      production.postComment({ pr, repo, body: 'red-team result' });
+      expect(postedBody()).toBe('red-team result');
+    });
+  });
+  it('resumes a recorded clean pass with oversized comments and posts its result without model calls', async () => {
+    await withOversizedComments(async ({ production, postedBody }) => {
+      const io = fakeIo('resume', { listComments: production.listComments, postComment: production.postComment });
+      const result = await run('resume', io);
+      expect(result).toMatchObject({ status: 'resumed', callId: prior.callId, comment: { status: 'posted' } });
+      expect(postedBody()).toBe(result.comment.body);
+      expect(postedBody()).toContain(redTeamMarker(pr, rev));
+      noLaunch(io);
+    });
+  });
+  it('reports a spawn error when gh has no stderr', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-missing-gh-'));
+    try {
+      const io = createRedTeamIo({ env: { PATH: dir }, storePath: join(dir, 'scorecards.json') });
+      expect(() => io.listComments({ pr, repo })).toThrow(/gh pr view failed: .*ENOENT/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('includes the comment failure reason in the resume summary', async () => {
+    const io = fakeIo('resume', { listComments: () => { throw Error('comment read failed: ENOBUFS'); } });
+    const result = await run('resume', io);
+    expect(result.comment).toMatchObject({ status: 'error', reason: 'comment read failed: ENOBUFS' });
+    expect(result.reason).toContain('comment error (comment read failed: ENOBUFS)');
+    expect(io.postComment).not.toHaveBeenCalled();
+    noLaunch(io);
+  });
   it('live bare resumed review-pr row without a seat follows fresh dispatch', async () => {
     const row = { repo, pr: 5762, head: rev, status: 'finished', result: 'resumed', loopPayload: { ...loopPayload, op: 'review-pr' } };
     const io = fakeIo('fresh', { readRedTeamStatus: () => row });
