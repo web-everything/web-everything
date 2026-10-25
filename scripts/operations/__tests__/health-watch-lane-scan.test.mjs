@@ -517,7 +517,7 @@ describe('untrusted lane Git configuration', () => {
   });
 
   // `.` does not match a line terminator, so a key such as `filter.red<U+2028>team.clean` slipped past every `.+` key regex.
-  const LINE_TERMINATORS = [['U+2028', '\u2028'], ['U+2029', '\u2029'], ['CR', '\r'], ['CRLF', '\r\n'], ['VT/FF', '\v\f']];
+  const LINE_TERMINATORS = [['LF', '\n'], ['U+2028', '\u2028'], ['U+2029', '\u2029'], ['CR', '\r'], ['CRLF', '\r\n'], ['VT/FF', '\v\f']];
   it.each(LINE_TERMINATORS)('line-terminator filter name (%s) still refuses the lane and never calls status', (_label, term) => {
     for (const driver of ['clean', 'smudge', 'process']) {
       const exec = vi.fn(() => `local\0filter.red${term}team.${driver}\nmarker-command\0`);
