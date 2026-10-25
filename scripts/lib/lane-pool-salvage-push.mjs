@@ -58,9 +58,26 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     // An explicit URL still passes through url.*.insteadOf / pushInsteadOf. Refuse
     // every effective rewrite (including includes and global config) before transport.
     // NUL-delimited names keep newlines in a subsection from hiding a rewrite key.
-    const keys = git(dir, ['config', '--null', '--name-only', '--list']);
+    const keys = git(dir, ['config', '--null', '--name-only', '--list', '--includes']);
     if (keys.split('\0').some(key => /^url\.[\s\S]*\.(?:push)?insteadof$/i.test(key))) {
       throw new Error('URL rewriting configured; canonical origin cannot be trusted — remove the rewrite and retry');
+    }
+    // Keep operator auth from global/system scope, but never give a lane's helper,
+    // proxy, headers or TLS settings access to the unattended transport. Name-only
+    // records avoid confusing newlines in URL subsections with key/value separators.
+    const scoped = git(dir, ['config', '--null', '--name-only', '--show-scope', '--list', '--includes']);
+    const parts = scoped ? scoped.split('\0') : [];
+    if (parts.length && parts.pop() !== '') throw new Error('incomplete transport config; inspect the lane manually');
+    if (parts.length % 2) throw new Error('incomplete transport config; inspect the lane manually');
+    for (let i = 0; i < parts.length; i += 2) {
+      const [scope, key] = parts.slice(i, i + 2);
+      if (!['system', 'global', 'local', 'worktree', 'command'].includes(scope) || !key) {
+        throw new Error('unknown transport config scope; inspect the lane manually');
+      }
+      if (['local', 'worktree'].includes(scope)
+        && /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key)) {
+        throw new Error('lane-controlled transport configuration; inspect the lane manually and remove it before retrying');
+      }
     }
   };
   // Release must scrub executable lane config before its status/litter checks. Keep a
@@ -81,7 +98,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     unmatchedShas: (dir, ahead) => {
       // All branch tips are needed for exact-SHA reachability, but only the integration branch
       // participates in patch equivalence. Explicit refspecs also make pruning independent of lane config.
-      transportGit(dir, 'fetch', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*');
+      transportGit(dir, 'fetch', '--recurse-submodules=no', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*');
       const matched = new Set();
       for (const line of git(dir, ['cherry', `origin/${repo.branch}`, 'HEAD']).split('\n')) {
         if (line.startsWith('- ')) matched.add(line.slice(2).trim());
@@ -90,7 +107,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
         && !git(dir, ['for-each-ref', '--contains', sha, 'refs/remotes/origin', '--count=1']));
     },
     push: (dir, ref, sha) => {
-      transportGit(dir, 'push', origin, `${sha}:refs/heads/${ref}`);
+      transportGit(dir, 'push', '--recurse-submodules=no', origin, `${sha}:refs/heads/${ref}`);
       return { ok: true };
     },
     remoteSha: ref => {

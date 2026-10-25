@@ -6,7 +6,8 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
-const cases = ['release --lane=1', 'release --all-pools', 'gc', 'gc insteadOf', 'gc pushInsteadOf'];
+const cases = ['release --lane=1', 'release --all-pools', 'gc', 'gc insteadOf', 'gc pushInsteadOf',
+  'gc credential.helper', 'gc core.gitProxy', 'gc core.askpass', 'gc http.proxy'];
 
 export function replayRecoveryOrigin(root = ROOT, mode) {
   const base = mkdtempSync(join(tmpdir(), 'soak-recovery-origin-'));
@@ -33,11 +34,16 @@ export function replayRecoveryOrigin(root = ROOT, mode) {
     git([...identity, 'commit', '--quiet', '-m', 'unique work'], lane);
     const sha = git(['rev-parse', 'HEAD'], lane);
     const rewrite = mode.includes('InsteadOf') || mode.includes('insteadOf');
+    const transportConfig = mode.startsWith('gc ') && !rewrite ? mode.split(' ')[1] : null;
     let attacker;
     if (rewrite) {
       attacker = join(base, 'attacker.git');
       git(['clone', '--quiet', '--bare', lane, attacker]);
       git(['config', `url.${attacker}.${mode.split(' ')[1]}`, origin], lane);
+    } else if (transportConfig) {
+      // These options are unused by a file transport, so transport success would
+      // expose a missing guard without executing a helper or contacting a network.
+      git(['config', transportConfig, 'unused-lane-transport-setting'], lane);
     } else {
       // The lane's own configured remote is also not the pool's authority.
       git(['remote', 'set-url', 'origin', callerOrigin], lane);
@@ -67,9 +73,9 @@ export function replayRecoveryOrigin(root = ROOT, mode) {
     const saved = git(['ls-remote', '--heads', origin, 'refs/heads/salvage/*'], primary);
     const leaked = git(['ls-remote', '--heads', callerOrigin, 'refs/heads/salvage/*'], primary);
     if (leaked) violations.push(`${mode}: work sent to caller origin`);
-    if (rewrite) {
+    if (rewrite || transportConfig) {
       if (git(['rev-parse', 'HEAD'], lane) !== sha) violations.push(`${mode}: reset unpreserved work`);
-      if (saved || git(['ls-remote', '--heads', attacker, 'refs/heads/salvage/*'], primary)) {
+      if (saved || (attacker && git(['ls-remote', '--heads', attacker, 'refs/heads/salvage/*'], primary))) {
         violations.push(`${mode}: refused rewrite still transported work`);
       }
       if (!result.stderr.includes('auto-recover: reclaimed 0, kept-unpushed 1')) {
@@ -90,7 +96,8 @@ export default {
     paths: ['scripts/lane-pool.mjs', 'scripts/lib/lane-pool-salvage-push.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/lane-pool.mjs'), 'utf8').includes('reference: join(dirname(topLevel), explicitPool)')
-      && readFileSync(join(root, 'scripts/lib/lane-pool-salvage-push.mjs'), 'utf8').includes('URL rewriting configured');
+      && readFileSync(join(root, 'scripts/lib/lane-pool-salvage-push.mjs'), 'utf8').includes('URL rewriting configured')
+      && readFileSync(join(root, 'scripts/lib/lane-pool-salvage-push.mjs'), 'utf8').includes('lane-controlled transport configuration');
   },
   async run({ root = ROOT, log } = {}) {
     const violations = [];

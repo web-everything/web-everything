@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -188,6 +188,7 @@ function fixture() {
     untracked: path => { expect(path).toBe(laneDir); return files; },
     stashCount: path => { expect(path).toBe(laneDir); return 2; },
     stashPatch: (path, i) => { expect(path).toBe(laneDir); return `patch ${i}`; },
+    archiveStash: vi.fn(),
     copyFile: (src, dst) => { copies.push([src, dst]); data.set(dst, data.get(src)); },
     writeFile: (path, text) => { patches.push([path, text]); data.set(path, text); },
     exists: path => data.has(path),
@@ -199,6 +200,25 @@ function fixture() {
 }
 
 describe('backupLaneContent verified preservation', () => {
+  describe('complete stash archive regression', () => {
+    it('requires a verified object archive for every stash before authorizing reclaim', async () => {
+      const f = fixture();
+      f.io.archiveStash = vi.fn();
+      expect(await f.run()).toMatchObject({ ok: true, stashes: 2 });
+      expect(f.io.archiveStash.mock.calls).toEqual([
+        [f.laneDir, 0, join(f.dir, 'stash-0')], [f.laneDir, 1, join(f.dir, 'stash-1')],
+      ]);
+    });
+
+    it('keeps the lane when complete stash preservation fails even if patch writes succeed', async () => {
+      const f = fixture();
+      f.io.archiveStash = () => { throw new Error('stash archive exceeds limit; inspect the lane manually'); };
+      const h = harness({ backup: f.run });
+      expect(await h.run({ lanes: [1] })).toMatchObject({ reclaimed: [], backedUp: [],
+        keptUnpushed: [{ lane: 1, reason: expect.stringMatching(/archive exceeds limit/) }] });
+      expect(h.calls.some(([method]) => method === 'reclaim')).toBe(false);
+    });
+  });
   it('copies all untracked contents without basename collisions and saves every stash patch', async () => {
     const f = fixture();
     const result = await f.run();
@@ -238,7 +258,7 @@ describe('backupLaneContent verified preservation', () => {
     f.io.writeFile = () => {};
     expect((await f.run()).ok).toBe(false);
   });
-  it.each(['untracked', 'stashCount', 'stashPatch', 'copyFile', 'writeFile', 'exists', 'size', 'mkdirp'])(
+  it.each(['untracked', 'stashCount', 'stashPatch', 'archiveStash', 'copyFile', 'writeFile', 'exists', 'size', 'mkdirp'])(
     'contains %s failures and returns ok:false instead of throwing', async method => {
       const f = fixture();
       f.io[method] = () => { throw new Error(`${method} failed`); };
@@ -248,6 +268,119 @@ describe('backupLaneContent verified preservation', () => {
 });
 
 describe('real recovery backup Git hardening', () => {
+  it('restores every stash from standalone packs, including binary, index, ignored and untracked trees', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'recover-stash-objects-'));
+    try {
+      const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
+      const dir = join(repo.poolDir, 'lane-1');
+      mkdirSync(dir, { recursive: true });
+      const env = laneGitHardeningEnv(scrubGitRepoEnv(process.env));
+      const git = (args, cwd = dir, options = {}) => execFileSync('git', args,
+        { cwd, env, encoding: 'utf8', ...options });
+      git(['init', '-q']);
+      git(['config', 'user.name', 'Fixture']);
+      git(['config', 'user.email', 'fixture@example.test']);
+      writeFileSync(join(dir, '.gitignore'), 'ignored.bin\n');
+      writeFileSync(join(dir, 'binary.bin'), Buffer.from([0, 1, 2]));
+      writeFileSync(join(dir, 'staged.txt'), 'base\n');
+      writeFileSync(join(dir, 'deleted.txt'), 'remove me\n');
+      writeFileSync(join(dir, 'renamed.txt'), 'rename me\n');
+      writeFileSync(join(dir, 'executable'), 'script\n');
+      git(['add', '.']);
+      git(['commit', '-qm', 'base']);
+      const base = git(['rev-parse', 'HEAD']).trim();
+      const binary = Buffer.from([0, 255, 128, 10, 0]);
+      writeFileSync(join(dir, 'binary.bin'), binary);
+      writeFileSync(join(dir, 'staged.txt'), 'index version\n');
+      git(['add', 'staged.txt']);
+      writeFileSync(join(dir, 'staged.txt'), 'worktree version\n');
+      git(['rm', '-q', 'deleted.txt']);
+      git(['mv', 'renamed.txt', 'new-name.txt']);
+      chmodSync(join(dir, 'executable'), 0o755);
+      symlinkSync('staged.txt', join(dir, 'link'));
+      git(['add', 'link', 'executable']);
+      writeFileSync(join(dir, 'untracked.bin'), binary);
+      writeFileSync(join(dir, 'ignored.bin'), binary);
+      git(['stash', 'push', '-aq', '-m', 'all content kinds']);
+      writeFileSync(join(dir, 'staged.txt'), 'second stash\n');
+      git(['stash', 'push', '-q', '-m', 'newer stash']);
+      const shas = git(['stash', 'list', '--format=%H']).trim().split('\n');
+      // Lane metadata must not prune the stash's index or untracked parent graph.
+      writeFileSync(join(dir, '.git', 'shallow'), `${shas.join('\n')}\n`);
+      writeFileSync(join(dir, '.git', 'info', 'grafts'), `${shas.join('\n')}\n`);
+      const backup = await realRecoverIo({ repo, backupRoot: root, isLeased: () => false }).backup(1);
+      expect(backup).toMatchObject({ ok: true, stashes: 2 });
+      // Remove the source entirely: no alternate object store can mask missing data.
+      rmSync(repo.poolDir, { recursive: true, force: true });
+      for (const [i, sha] of shas.entries()) {
+        const restored = join(root, `restored-${i}`);
+        mkdirSync(restored);
+        git(['init', '-q'], restored);
+        git(['unpack-objects'], restored, { input: readFileSync(join(backup.dir, `stash-${i}.pack`)) });
+        git(['checkout', '-q', base], restored);
+        git(['stash', 'store', sha], restored);
+        git(['stash', 'apply', '--index'], restored);
+        expect(git(['rev-parse', 'stash@{0}'], restored).trim()).toBe(sha);
+        expect(readFileSync(join(backup.dir, `stash-${i}.restore.txt`), 'utf8')).toContain(sha);
+        if (i === 0) {
+          expect(readFileSync(join(restored, 'staged.txt'), 'utf8')).toBe('second stash\n');
+        } else {
+          for (const file of ['binary.bin', 'untracked.bin', 'ignored.bin']) {
+            expect(readFileSync(join(restored, file))).toEqual(binary);
+          }
+          expect(readFileSync(join(restored, 'staged.txt'), 'utf8')).toBe('worktree version\n');
+          expect(git(['show', ':staged.txt'], restored)).toBe('index version\n');
+          expect(existsSync(join(restored, 'deleted.txt'))).toBe(false);
+          expect(existsSync(join(restored, 'renamed.txt'))).toBe(false);
+          expect(readFileSync(join(restored, 'new-name.txt'), 'utf8')).toBe('rename me\n');
+          expect(lstatSync(join(restored, 'executable')).mode & 0o111).not.toBe(0);
+          expect(readlinkSync(join(restored, 'link'))).toBe('staged.txt');
+        }
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('rejects an archive missing parents even while the source lane still has those objects', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'recover-incomplete-pack-'));
+    try {
+      const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
+      const dir = join(repo.poolDir, 'lane-1');
+      mkdirSync(dir, { recursive: true });
+      const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8',
+        env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)) });
+      git(['init', '-q']);
+      writeFileSync(join(dir, 'tracked'), 'base\n');
+      git(['add', '.']);
+      git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'base']);
+      writeFileSync(join(dir, 'tracked'), 'work\n');
+      git(['stash', 'push', '-q']);
+      const io = realRecoverIo({ repo, backupRoot: root, isLeased: () => false,
+        runGit: (command, args, options) => execFileSync(command,
+          args.includes('pack-objects') ? ['pack-objects', '--stdout'] : args, options) });
+      const backup = await io.backup(1);
+      expect(backup).toMatchObject({ ok: false, error: expect.stringMatching(/complete stash backup failed/) });
+      expect(git(['stash', 'list', '--format=%gd']).trim()).toBe('stash@{0}');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['pack-objects', 'index-pack'])('refuses reclaim if complete stash %s fails', async failure => {
+    const root = mkdtempSync(join(tmpdir(), 'recover-stash-failure-'));
+    try {
+      const runGit = vi.fn((_git, args) => {
+        if (args.includes(failure)) throw new Error('archive unreadable or oversized');
+        if (['config', 'status'].includes(args[0])) return '';
+        if (args[0] === 'rev-parse') return 'a'.repeat(40);
+        if (args.includes('pack-objects')) return Buffer.from('PACK fixture bytes');
+        return args[1] === 'list' ? 'stash@{0}\n' : 'patch\n';
+      });
+      const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
+      const io = realRecoverIo({ repo, backupRoot: root, isLeased: () => false, runGit });
+      const h = harness({ backup: () => io.backup(1) });
+      expect(await h.run({ lanes: [1] })).toMatchObject({ reclaimed: [], backedUp: [],
+        keptUnpushed: [{ lane: 1, reason: expect.stringMatching(/complete stash backup failed.*inspect/) }] });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('refuses a lane clean filter before status can execute its sentinel command', async () => {
     const root = mkdtempSync(join(tmpdir(), 'recover-filter-'));
     try {
@@ -326,21 +459,33 @@ describe('real recovery backup Git hardening', () => {
       vi.stubEnv('GIT_CONFIG_KEY_0', 'remote.origin.url');
       vi.stubEnv('GIT_CONFIG_VALUE_0', 'untrusted-origin');
       vi.stubEnv('GIT_EXTERNAL_DIFF', 'untrusted-command');
-      const runGit = vi.fn((_git, args) => ['config', 'status'].includes(args[0]) ? '' : args[1] === 'list' ? 'stash@{0}\n' : 'patch\n');
+      const sha = 'a'.repeat(40);
+      const runGit = vi.fn((_git, args) => {
+        if (['config', 'status', 'index-pack'].includes(args[0])) return '';
+        if (args[0] === 'rev-parse') return `${sha}\n`;
+        if (args.includes('pack-objects')) return Buffer.from('PACK fixture bytes');
+        return args[1] === 'list' ? 'stash@{0}\n' : 'patch\n';
+      });
       const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
       const io = realRecoverIo({ repo, backupRoot: root, isLeased: () => false, runGit });
-      expect(await io.backup(1)).toMatchObject({ ok: true, stashes: 1 });
+      const backup = await io.backup(1);
+      expect(backup).toMatchObject({ ok: true, stashes: 1 });
       expect(runGit.mock.calls.map(([, args]) => args)).toEqual([
         [...LANE_CONFIG_LIST_ARGS],
         ['status', '--porcelain', '--untracked-files=all', '-z'],
         [...LANE_CONFIG_LIST_ARGS], ['stash', 'list', '--format=%gd'],
         [...LANE_CONFIG_LIST_ARGS], ['stash', 'show', '--no-ext-diff', '--no-textconv', '-p', 'stash@{0}'],
+        [...LANE_CONFIG_LIST_ARGS], ['rev-parse', '--verify', 'stash@{0}^{commit}'],
+        [...LANE_CONFIG_LIST_ARGS], ['-c', 'pack.threads=1', 'pack-objects', '--stdout', '--revs'],
+        [...LANE_CONFIG_LIST_ARGS], ['index-pack', '--strict', '-o', join(backup.dir, 'stash-0.idx'), join(backup.dir, 'stash-0.pack')],
       ]);
-      const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
-      for (const [command, , options] of runGit.mock.calls) {
+      const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0',
+        GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null', GIT_SHALLOW_FILE: '/dev/null' });
+      for (const [command, args, options] of runGit.mock.calls) {
         expect(command).toBe('git');
         expect(options.cwd).toBe(join(repo.poolDir, 'lane-1'));
-        expect(options.env).toEqual(env);
+        expect(options.env).toEqual(args[0] === 'index-pack'
+          ? { ...env, GIT_OBJECT_DIRECTORY: join(backup.dir, 'stash-0.verify-objects') } : env);
         expect(options.env.GIT_DIR).toBeUndefined();
         expect(options.env.GIT_EXTERNAL_DIFF).toBeUndefined();
         expect(options.env.GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));

@@ -70,7 +70,7 @@ export function qualifiesForCardBackup(proof) {
     && proof.unpreservedFiles.every(file => /^backlog\/[^/]+\.md$/.test(file) && file !== 'backlog/.md' && file.endsWith('.md'));
 }
 
-/** IO is injected so an incomplete copy or patch write can never authorize reclaim. */
+/** IO is injected so an incomplete copy or stash archive can never authorize reclaim. */
 export async function backupLaneContent({ lane, laneDir, backupRoot, io }) {
   const dir = join(backupRoot, `lane-${lane}-preserve`), files = [];
   try {
@@ -91,6 +91,9 @@ export async function backupLaneContent({ lane, laneDir, backupRoot, io }) {
       if (typeof patch !== 'string') throw new Error('unreadable stash patch');
       await io.writeFile(path, patch);
       if (!await io.exists(path) || await io.size(path) !== Buffer.byteLength(patch)) throw new Error(`stash backup verification failed: ${i}`);
+      // Patches are previews only: they lose binary data, index state and the third
+      // (untracked/ignored) parent. Reclaim requires the complete object graph too.
+      await io.archiveStash(laneDir, i, join(dir, `stash-${i}`));
     }
     return { ok: true, dir, files, stashes };
   } catch (e) { return { ok: false, dir, error: message(e) }; }
@@ -183,8 +186,9 @@ export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_
   const run = (args, env = {}) => spawnSync(process.execPath, [lanePoolPath, 'reclaim', ...args, `--repo=${repo.referencePath}`,
     ...Object.entries({ origin: repo.originUrl, reference: repo.referencePath, name: repo.name, branch: repo.branch })
       .filter(([, value]) => value != null).map(([key, value]) => `--${key}=${value}`)], { ...processOptions, env: { ...process.env, ...env } });
-  const gitEnv = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
-  const git = (dir, args) => {
+  const gitEnv = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0',
+    GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null', GIT_SHALLOW_FILE: '/dev/null' });
+  const git = (dir, args, extraOptions = {}) => {
     const options = { ...processOptions, cwd: dir, env: gitEnv };
     // Config reads execute no drivers. Check before EVERY content read, following includes
     // and worktree config; env pins cannot neutralize an arbitrary filter name.
@@ -194,7 +198,7 @@ export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_
       console.error(`lane-pool recovery: WARNING ${warning}`);
       throw new Error(warning);
     }
-    return runGit('git', args, options);
+    return runGit('git', args, { ...options, ...extraOptions });
   };
   const backupIo = {
     untracked: dir => {
@@ -208,6 +212,34 @@ export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_
     },
     stashCount: dir => git(dir, ['stash', 'list', '--format=%gd']).split('\n').filter(Boolean).length,
     stashPatch: (dir, i) => git(dir, ['stash', 'show', '--no-ext-diff', '--no-textconv', '-p', `stash@{${i}}`]),
+    archiveStash: (dir, i, path) => {
+      try {
+        const sha = git(dir, ['rev-parse', '--verify', `stash@{${i}}^{commit}`]).trim();
+        if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(sha)) throw new Error('unreadable stash object id');
+        // No exclusions or thin packs: each archive includes every parent and blob,
+        // including the original base, index and untracked trees. Bound memory/time;
+        // an oversized or incomplete history keeps the lane for manual preservation.
+        const pack = git(dir, ['-c', 'pack.threads=1', 'pack-objects', '--stdout', '--revs'],
+          { input: `${sha}\n`, encoding: null });
+        if (!Buffer.isBuffer(pack) || pack.length < 12) throw new Error('unreadable stash pack');
+        const packPath = `${path}.pack`;
+        writeFileSync(packPath, pack, { flag: 'wx' });
+        if (!readFileSync(packPath).equals(pack)) throw new Error('stash pack readback mismatch');
+        // Index beside the backup, never in the lane's object store. --strict checks
+        // object integrity and graph connectivity before the backup can authorize reset.
+        const verifyObjects = `${path}.verify-objects`;
+        mkdirSync(verifyObjects);
+        git(dir, ['index-pack', '--strict', '-o', `${path}.idx`, packPath],
+          { env: { ...gitEnv, GIT_OBJECT_DIRECTORY: verifyObjects } });
+        writeFileSync(`${path}.restore.txt`,
+          `Stash ${i}: ${sha}\nIn a repository with the same object format, run:\n`
+          + `git unpack-objects < stash-${i}.pack\ngit stash store ${sha}\n`
+          + 'Restore entries from highest stash number to lowest to retain their order.\n'
+          + 'git stash apply --index restores staged state as well as worktree content.\n', { flag: 'wx' });
+      } catch (e) {
+        throw new Error(`complete stash backup failed: ${message(e)}; inspect the lane manually before reclaim`);
+      }
+    },
     mkdirp: path => mkdirSync(path, { recursive: true }),
     copyFile: (src, dst) => {
       if (!lstatSync(src).isFile()) throw new Error('backup refuses non-regular untracked content');
@@ -233,7 +265,7 @@ export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_
     backup: async n => {
       backups.delete(n);
       // Each attempt gets a fresh directory: never overwrite an earlier lane's preserved content.
-      const root = join(backupRoot, repo.name);
+      const root = resolve(backupRoot, repo.name);
       mkdirSync(root, { recursive: true });
       const proof = proofs.get(n);
       // A top-level card can also be a tracked edit; preserve it alongside all ?? entries.

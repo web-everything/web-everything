@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { LANE_GIT_CONFIG_PINS } from '../lane-git-hardening.mjs';
 
 // Intentionally absent in this red-first change: no implementation or import stub.
@@ -157,6 +160,80 @@ describe('salvage push contract', () => {
 
 describe('real salvage preservation and transport', () => {
   const repo = { branch: 'main', originUrl: 'https://example.test/canonical.git', referencePath: 'reference' };
+  it.each(['local', 'worktree'])('follows real %s includes before allowing any transport', scope => {
+    const dir = mkdtempSync(join(tmpdir(), 'salvage-transport-config-'));
+    try {
+      const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+      git(['init', '-q']);
+      const included = join(dir, 'transport.config'), sentinel = join(dir, 'helper-ran');
+      git(['config', '--file', included, 'credential.https://example.test/\nquoted.helper', `!touch '${sentinel}'`]);
+      if (scope === 'worktree') git(['config', 'extensions.worktreeConfig', 'true']);
+      git(['config', `--${scope}`, 'include.path', included]);
+      const commands = [];
+      const io = realSalvageIo({ repo: { ...repo, referencePath: dir }, runGit: (command, args, options) => {
+        commands.push(args);
+        // A regression must fail without attempting a real network connection.
+        if (!args.includes('config')) throw new Error('unguarded transport reached');
+        return execFileSync(command, args, options);
+      } });
+      for (const operation of [() => io.unmatchedShas(dir, [head]),
+        () => io.push(dir, ref, head), () => io.remoteSha(ref)]) {
+        expect(operation).toThrow(/lane-controlled transport/);
+      }
+      expect(commands.every(args => args.includes('config'))).toBe(true);
+      expect(existsSync(sentinel)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  describe('unattended transport config regression', () => {
+    it.each(['credential.helper', 'credential.https://example.test.helper', 'core.gitproxy',
+      'core.askpass', 'http.proxy', 'http.https://example.test.extraheader',
+      'credential.https://example.test/\nquoted.helper', 'https.proxy', 'remote.origin.proxy',
+      'remote.other.vcs', 'core.sshcommand', 'ssh.variant', 'fetch.bundleuri'])(
+      'refuses lane-controlled %s before every transport', key => {
+        for (const scope of ['local', 'worktree']) {
+          const runGit = vi.fn((_command, args) => args.includes('config')
+            ? args.includes('--show-scope') ? `${scope}\0${key}\0` : `${key}\0` : '');
+          const io = realSalvageIo({ repo, runGit });
+          for (const operation of [() => io.unmatchedShas(laneDir, [head]),
+            () => io.push(laneDir, ref, head), () => io.remoteSha(ref)]) {
+            expect(operation).toThrow(/lane-controlled transport.*inspect/i);
+          }
+          expect(runGit.mock.calls.every(([, args]) => args.includes('config'))).toBe(true);
+        }
+      });
+
+    it('retains a credential refusal observed before release scrubs the lane', async () => {
+      let scrubbed = false;
+      const runGit = vi.fn((_command, args) => {
+        if (args.includes('config')) return scrubbed ? '' : args.includes('--show-scope')
+          ? 'local\0credential.helper\0' : 'credential.helper\0';
+        return args.includes('rev-list') ? head : '';
+      });
+      const io = realSalvageIo({ repo, runGit, preflightLaneDir: laneDir });
+      scrubbed = true;
+      expect(await salvagePushLane({ lane: 7, laneDir, io })).toMatchObject({
+        status: 'failed', reason: expect.stringMatching(/lane-controlled transport/i),
+      });
+      expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+    });
+
+    it.each(['global', 'system'])('preserves operator transport credentials from %s scope', scope => {
+      const runGit = vi.fn((_command, args) => args.includes('config')
+        ? args.includes('--show-scope') ? `${scope}\0credential.helper\0` : 'credential.helper\0' : '');
+      const io = realSalvageIo({ repo, runGit });
+      expect(io.push(laneDir, ref, head)).toEqual({ ok: true });
+      expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(true);
+    });
+
+    it.each(['local\0credential.helper', 'local\0', 'unknown\0credential.helper\0'])(
+      'fails closed on incomplete or unknown config evidence %j', scoped => {
+        const runGit = vi.fn((_command, args) => args.includes('--show-scope') ? scoped : '');
+        const io = realSalvageIo({ repo, runGit });
+        expect(() => io.push(laneDir, ref, head)).toThrow(/transport config.*inspect/);
+        expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
+      });
+  });
   it.each(['insteadOf', 'pushInsteadOf', 'newline subsection'])(
     'refuses %s rewrites before fetch, push, and remote verification', key => {
       const runGit = vi.fn((_command, args) => args.includes('config')
@@ -243,9 +320,9 @@ describe('real salvage preservation and transport', () => {
       }
     }
     const fetchArgs = runGit.mock.calls.find(([, args]) => args.includes('fetch'))[1];
-    expect(fetchArgs).toEqual(expect.arrayContaining(['--prune', '--no-tags', '+refs/heads/*:refs/remotes/origin/*']));
+    expect(fetchArgs).toEqual(expect.arrayContaining(['--recurse-submodules=no', '--prune', '--no-tags', '+refs/heads/*:refs/remotes/origin/*']));
     const pushArgs = runGit.mock.calls.find(([, args]) => args.includes('push'))[1];
-    expect(pushArgs.slice(pushArgs.indexOf('push'))).toEqual(['push', repo.originUrl, `${head}:refs/heads/${ref}`]);
+    expect(pushArgs.slice(pushArgs.indexOf('push'))).toEqual(['push', '--recurse-submodules=no', repo.originUrl, `${head}:refs/heads/${ref}`]);
     expect(runGit.mock.calls.findIndex(([, args]) => args.includes('fetch')))
       .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('for-each-ref')));
   });
