@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
 import { pidNamespace } from '../lib/pid-alive.mjs';
@@ -89,7 +90,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { normalizeRedTeamResult, redTeamSkipNeedsSettlement } from '../lib/review-red-team-on-skip.mjs';
+import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
@@ -413,8 +414,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
     },
-    readRedTeamOnlyPayload: ({ pr, repo, head }) => ({ head,
-      loopPayload: readDrainRedTeamEvidence({ repo, pr, head, env }).loopPayload }),
+    readRedTeamOnlyPayload: ({ pr, repo, head }) => ({ ...readEvidence({ repo, pr, head, env }), head }),
+    proveCardOnlyHeadMove: move => proveCardOnlyHeadMove({ ...move, exec, cwd: root }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
     readCarryEvidence: ({ pr, repo }) => {
@@ -771,7 +772,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   const spec = seatsBox.speculative ?? null;
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
-  const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && redTeamOwedFor(seatsBox.input.loopPayload);
+  const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && (seatsBox.cardOnlyRecovery || redTeamOwedFor(seatsBox.input.loopPayload));
   // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
   // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
   // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
@@ -802,7 +803,9 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   }
   let redTeamCompletionDeferredByCap = false;
   if (accepted && (out.redTeamSpeculative?.result || typeof io.runRedTeam === 'function')) {
-    let redTeam = out.redTeamSpeculative?.result ?? null;
+    let redTeam = seatsBox.cardOnlyRecovery
+      ? { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' }
+      : out.redTeamSpeculative?.result ?? null;
     if (!redTeam) {
       try {
         redTeam = io.runRedTeam(seatsBox.input);
@@ -858,7 +861,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         const readHead = isRealHead(rev) ? rev : null;
         const head = readHead ?? seatsBox.laneHead;
         const settled = io.settleRedTeamSkip({ redTeam: settlementOutcome, repo: out.repo, pr: out.pr,
-          head, readHead, runId: out.runId });
+          head, readHead, runId: out.runId, accepted: true });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
         try { io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`); }
@@ -1014,7 +1017,7 @@ function runReviewArc({
     const finishArc = input => {
       seatsBox.laneHead = head;
       // Both modes persist and verify admission while the job claim still excludes another writer.
-      if (input && redTeamOwedFor(input.loopPayload) && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
+      if (input && (seatsBox.cardOnlyRecovery || redTeamOwedFor(input.loopPayload)) && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
         try {
           const queued = io.redTeamStatus({ ...input, status: 'queued',
             ...(seatsBox.speculative ? { speculativePid: seatsBox.speculative.pid } : {}) });
@@ -1032,9 +1035,17 @@ function runReviewArc({
     if (redTeamOnly) {
       if (!['fresh', 'resume'].includes(redTeamMode)) throw Error('unknown red-team mode; inspect recovery settings before retrying');
       const stored = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head });
-      const loopPayload = stored?.loopPayload;
+      let loopPayload = stored?.loopPayload;
+      // Re-prove at execution: planner evidence may have changed since dispatch. Never run
+      // a model against the old read; this path only settles the card-only policy exemption.
+      if (redTeamMode === 'fresh' && stored?.head === head && cardOnlyHeadMoveCandidate(stored, head)
+        && io.proveCardOnlyHeadMove?.({ fromSha: loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true) {
+        seatsBox.cardOnlyRecovery = true;
+        loopPayload = { ...loopPayload, findings: { ...loopPayload.findings,
+          read: { ...loopPayload.findings.read, netBasis: { ...loopPayload.findings.read.netBasis, rev: head } } } };
+      }
       const pinned = stored?.head === head && loopPayload?.findings?.read?.netBasis?.rev === head;
-      if (!pinned || !redTeamOwedFor(loopPayload)) {
+      if (!pinned || (!seatsBox.cardOnlyRecovery && !redTeamOwedFor(loopPayload))) {
         classified = { outcome: 'red-team-not-owed', reason: pinned ? 'stored review does not owe a red team' : 'stored review does not match live head' };
         return result({ ...classified, lanePath });
       }

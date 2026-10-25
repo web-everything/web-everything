@@ -188,3 +188,20 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true })).toMatchObject({ recorded: true, inFlight: false });
   });
 });
+
+
+it('surfaces a finished old card-only skip when the live head has no read', () => {
+  const f = fixture(), oldHead = 'b'.repeat(40);
+  const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+    netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
+  } } };
+  writeRun({ ...newRunRecord({ id: 'review-pr-old-card', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+    ...loopPayload }, f.runsDir);
+  recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'skipped' }, f);
+  expect(readDrainRedTeamEvidence(f)).toMatchObject({ loopPayload, recorded: false, seatRecorded: false,
+    status: { status: 'finished', head: oldHead, skipCardOnly: true } });
+  // The exact live-head read always wins over this historical fallback.
+  writeRun({ ...newRunRecord({ id: 'review-pr-live', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+    ...payload(f.head) }, f.runsDir);
+  expect(readDrainRedTeamEvidence(f).loopPayload.findings.read.netBasis.rev).toBe(f.head);
+});
