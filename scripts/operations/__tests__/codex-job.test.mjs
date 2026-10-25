@@ -1584,6 +1584,58 @@ it('reads global and inherited command credential helpers without inheriting Git
   }
 });
 
+it.each(['credential', 'credential "https://github.com"'])(
+  'preserves global credential useHttpPath for a path-keyed helper in publication clone and push (%s)', async section => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'codex-job-http-path-'));
+  const config = path.join(dir, 'operator.config');
+  const helper = '!f() { while IFS= read -r line; do if test "$line" = "path=team/private.git"; then printf "%s\\n" "username=path-user" "password=path-token"; fi; done; }; f';
+  writeFileSync(config, `[credential]\n\thelper = ${JSON.stringify(helper)}\n[${section}]\n\tuseHttpPath = true\n`);
+  const f = fixture();
+  const exec = f.io.exec;
+  const lookups = [];
+  f.io.exec = async (cmd, args, options) => {
+    if (cmd === 'git' && args.includes('--get-regexp')) {
+      const env = Object.fromEntries(Object.entries(options.env).filter(([key]) => !key.startsWith('GIT_')));
+      return spawnSync(cmd, args.slice(2), { ...options, cwd: dir, encoding: 'utf8',
+        env: { ...env, GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: '1' } });
+    }
+    if (cmd === 'git' && (args.includes('clone') || args.includes('push'))) {
+      const pins = args.flatMap((arg, i) => arg === '-c' ? ['-c', args[i + 1]] : []);
+      // Exercise the publication argv with real Git locally; no remote or index writes.
+      lookups.push(spawnSync('git', [...pins, 'credential', 'fill'], { ...options, cwd: dir,
+        encoding: 'utf8', input: 'protocol=https\nhost=github.com\npath=team/private.git\n\n',
+        env: { ...options.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/usr/bin/false', SSH_ASKPASS: '/usr/bin/false' } }));
+    }
+    return exec(cmd, args, options);
+  };
+  try {
+    expect((await f.run()).result.ok).toBe(true);
+    const key = section === 'credential' ? 'credential.usehttppath' : 'credential.https://github.com.usehttppath';
+    for (const verb of ['clone', 'push']) {
+      const call = f.calls.find(c => c.args.includes(verb));
+      const pins = call.args.flatMap((arg, i) => arg === '-c' ? [call.args[i + 1]] : []);
+      expect(pins).toContain(`${key}=true`);
+    }
+    expect(lookups).toHaveLength(2);
+    for (const lookup of lookups) {
+      expect(lookup.status).toBe(0);
+      expect(lookup.stdout).toContain('username=path-user\n');
+      expect(lookup.stdout).toContain('password=path-token\n');
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each(['local', 'worktree', 'global', 'system', 'unknown', 'command'])(
+  'never forwards lane-owned credential useHttpPath with %s scope', async scope => {
+  for (const key of ['credential.usehttppath', 'credential.https://github.com.usehttppath']) {
+    const f = fixture([['--get-regexp', ok(`${scope}\0file:/lane/operator.config\0${key}\ntrue\0`)]]);
+    expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
+    expect(codexCalls(f)).toHaveLength(0);
+    expect(f.calls.some(c => c.args.includes('clone') || c.args.includes('push'))).toBe(false);
+    released(f);
+  }
+});
+
 it.each([red(), { status: 0 }, ok('global\0file:/operator/.gitconfig\0credential.helper\ntruncated'), ok('global\0file:/operator/.gitconfig\0missing-value-separator\0')])(
   'refuses unreadable or incomplete operator credential configuration (%j)', async response => {
   const f = fixture([['--get-regexp', response]]);

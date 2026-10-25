@@ -157,13 +157,13 @@ const SYSTEM_GIT_CONFIG_FILES = new Set([
   '/Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig',
 ]);
 async function captureCredentialHelpers(s) {
-  // Read operator config before the worker runs. Only credential helpers from
-  // known system files (including Apple's unknown scope), global and command
-  // scope cross into publication; lane config never does.
+  // Read operator config before the worker runs. Only credential helpers and
+  // their useHttpPath policy from known system files (including Apple's unknown
+  // scope), global and command scope cross into publication; lane config never does.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_') ||
     /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM)$/.test(key)));
   const r = await exec(s, 'git', ['-C', s.opts.repo, 'config', '--show-scope', '--show-origin', '--includes', '-z',
-    '--get-regexp', '^credential(\\..*)?\\.helper$'], false, false,
+    '--get-regexp', '^credential(\\..*)?\\.(helper|usehttppath)$'], false, false,
     { env, timeout: 30000, maxBuffer: 1024 * 1024 });
   if (r.status === 1 && r.stdout === '') return [];
   const parts = typeof r.stdout === 'string' ? r.stdout.split('\0') : [];
@@ -178,7 +178,7 @@ async function captureCredentialHelpers(s) {
       fail('unsafe-git-config', 'Cannot parse trusted credential helpers; inspect operator Git configuration before retrying');
     }
     const key = entry.slice(0, split), value = entry.slice(split + 1);
-    if (/^credential(?:\..*)?\.helper$/i.test(key)) {
+    if (/^credential(?:\..*)?\.(?:helper|usehttppath)$/i.test(key)) {
       const systemFile = origin.startsWith('file:') && SYSTEM_GIT_CONFIG_FILES.has(origin.slice(5));
       const file = origin.startsWith('file:') ? path.resolve(s.opts.repo, origin.slice(5)) : null;
       const laneRelative = file ? path.relative(s.lane.path, file) : null;
@@ -392,7 +392,7 @@ export async function commitAndPush(s) {
     fail('changed-after-audit', 'Exported bytes or modes differ from the audit input; rerun tests and audit before retrying');
   }
   // Drop inherited Git overrides and config, then restore only the operator's
-  // frozen credential helpers. Lane helpers, object stores and identity stay out.
+  // frozen credential helpers and useHttpPath policy. Lane config stays out.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
   Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1',
     GIT_AUTHOR_NAME: 'Codex Job', GIT_AUTHOR_EMAIL: 'codex-job@users.noreply.github.com',
@@ -400,7 +400,7 @@ export async function commitAndPush(s) {
   const dir = await s.io.mkdtemp(path.join(tmpdir(), 'codex-job-publish-'));
   // Stage and query the same literal paths, including names containing * ? or [].
   const trustedGit = args => exec(s, 'git', ['-C', dir, '--literal-pathspecs', '-c', 'core.hooksPath=/dev/null',
-    ...(s.credentialHelpers ?? []).flatMap(helper => ['-c', helper]),
+    ...(s.credentialHelpers ?? []).flatMap(setting => ['-c', setting]),
     '-c', 'user.name=Codex Job', '-c', 'user.email=codex-job@users.noreply.github.com', ...args],
     false, false, { cwd: dir, env, maxBuffer: 64 * 1024 * 1024 });
   try {
