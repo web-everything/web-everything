@@ -1,6 +1,6 @@
 ---
 name: draft-alone-does-not-hold-a-pr
-description: "A draft alone does not hold a PR off the drain because draft-promotion promotes green lane/* drafts; hold with draft plus review-status:draft-withdrawn, or review:changes via review-set-label."
+description: "Draft and review labels are not durable PR holds: CI repair can remove draft-withdrawn and review:changes triggers repair. Close the PR while retaining its branch when withdrawing it from the drain."
 metadata:
   type: feedback
 ---
@@ -9,4 +9,4 @@ Marking a PR as draft is not enough to keep it from merging.
 
 **Why:** Draft-promotion promotes green `lane/*` drafts. On 2026-10-24 #5853 merged and #5839 and #5849 were un-drafted despite being held as drafts.
 
-**How to apply:** To hold a PR, set it to draft AND add `review-status:draft-withdrawn`, or set `review:changes` through `review-set-label`. Check the labels afterwards. Related: [[drain-is-a-resident-daemon]].
+**How to apply:** To withdraw a PR from the drain, close it while retaining its branch for later work; verify that its state is CLOSED. Draft and review labels are not durable holds. CI repair can remove `review-status:draft-withdrawn`: red CI still dispatches repair, ordinary `fix-begin` replaces the withdrawal label with `review-status:fixing`, and `fix-end` removes fixing without restoring withdrawal. Once CI is green, draft-promotion can make the PR ready again. Likewise, `review:changes` requests automated repair rather than an indefinite pause. Related: [[drain-is-a-resident-daemon]].
