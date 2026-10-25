@@ -1,3 +1,5 @@
+import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
+import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -379,5 +381,95 @@ describe('PR 5890 review-pr status payloads', () => {
     expect(decide({ readStatus: () => ({ repo, pr, head, status: 'finished', result: 'ran', loopPayload: { ...payload(), op: 'review-pr' } }),
       readEvidence: () => ({ loopPayload: payload(), recorded: true, seatRecorded: true, completedRecorded: true }) }))
       .toMatchObject({ action: 'dispatch', mode: 'resume' });
+  });
+});
+
+
+describe('card-only head move recovery', () => {
+  const fromSha = 'b'.repeat(40);
+  const oldPayload = () => ({ verdict: { verdict: 'changes' }, findings: { read: {
+    netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+  } } });
+  const oldEvidence = () => {
+    const loopPayload = oldPayload();
+    return { loopPayload, recorded: false, seatRecorded: false, completedRecorded: false, inFlight: false,
+      status: { head: fromSha, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload } };
+  };
+  it.each(['numbering-only', 'card-only'])('%s move dispatches fresh despite a not-owed old review', kind => {
+    const proveMove = vi.fn(() => ({ ok: true, kind }));
+    expect(decide({ readEvidence: oldEvidence, proveMove })).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    expect(proveMove).toHaveBeenCalledWith({ fromSha, toSha: head });
+  });
+  it.each(['code change', 'unprovable move'])('keeps the skip for %s', reason => {
+    expect(decide({ readEvidence: oldEvidence, proveMove: () => ({ ok: false, reason }) }).action).toBe('skip');
+  });
+  it.each([
+    { recorded: true }, { seatRecorded: true }, { inFlight: true }, { queued: true },
+    { status: null }, { completedRecorded: true },
+  ])('does not dispatch with existing or unknown evidence %j', over => {
+    expect(decide({ readEvidence: () => ({ ...oldEvidence(), ...over }), proveMove: () => ({ ok: true }) }).action).toBe('skip');
+  });
+  it.each(['missing head', 'code read', 'not skipped', 'skip disabled'])('refuses %s provenance', kind => {
+    const evidence = oldEvidence();
+    if (kind === 'missing head') delete evidence.loopPayload.findings.read.netBasis.rev;
+    if (kind === 'code read') evidence.loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs'];
+    if (kind === 'not skipped') evidence.status.result = 'ran';
+    if (kind === 'skip disabled') evidence.status.skipCardOnly = false;
+    expect(decide({ readEvidence: () => evidence, proveMove: () => ({ ok: true }) }).action).toBe('skip');
+  });
+  it('observes cooldown and existing live-head state after the proof', () => {
+    const base = { readEvidence: oldEvidence, proveMove: () => ({ ok: true }) };
+    expect(decide({ ...base, lastDispatch: new Map([[`${repo}#${pr}@${head}`, 200_001]]) }).why).toBe('retry cooldown active');
+    expect(decide({ ...base, readStatus: () => ({ status: 'finished' }) }).action).toBe('skip');
+  });
+  it('runner uses the injected move proof and dispatches the normal red-team-only job', () => {
+    const dispatch = vi.fn(() => ({ jobPid: 42 }));
+    const out = runRedTeamOnSkip({ ...fixture(), plan: { refusals: fixture().refusals },
+      now: () => 2_000_000, readEvidence: oldEvidence, proveMove: () => ({ ok: true }),
+      capacity: { lanes: 1 }, dispatch });
+    expect(out.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+  });
+});
+
+describe('proveCardOnlyHeadMove', () => {
+  const fromSha = 'b'.repeat(40), toSha = head;
+  it('reuses the numbering detector before checking card paths', () => {
+    const proof = { ok: true, kind: 'numbering-only' };
+    const detector = vi.spyOn(numbering, 'proveNumberingOnlyMove').mockReturnValue(proof);
+    const exec = vi.fn();
+    try {
+      expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd: 'checkout', mainRef: 'main' })).toBe(proof);
+      expect(detector).toHaveBeenCalledWith({ exec, fromSha, toSha, cwd: 'checkout', mainRef: 'main' });
+      expect(exec).not.toHaveBeenCalled();
+    } finally { detector.mockRestore(); }
+  });
+  const c1 = 'c'.repeat(40);
+  const fake = ({ ancestor = true, revList = `${c1} ${fromSha}`, tree }) => vi.fn((file, args) => {
+    if (args[0] === 'merge-base') { if (!ancestor) throw Error('not ancestor'); return ''; }
+    if (args[0] === 'rev-list') return revList;
+    if (args[0] === 'diff-tree') return tree;
+    throw Error('not numbering');
+  });
+  it.each([
+    ['backlog/123-card.md\0', true],
+    ['backlog/123-card.md\0scripts/code.mjs\0', false],
+    ['scripts/code.mjs\0backlog/123-moved.md\0', false],
+    ['', false], ['backlog/123-card.md', false], ['x'.repeat(1024 * 1024 + 1) + '\0', false],
+  ])('fails closed unless every commit contains only card paths (case %#)', (tree, ok) => {
+    const exec = fake({ tree });
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd: 'checkout' }).ok).toBe(ok);
+  });
+  it('refuses a non-descendant head, a merge commit, and submodule-blind diffs', () => {
+    expect(proveCardOnlyHeadMove({ exec: fake({ ancestor: false, tree: 'backlog/1-a.md\0' }), fromSha, toSha }).ok).toBe(false);
+    expect(proveCardOnlyHeadMove({ exec: fake({ revList: `${c1} ${fromSha} ${'d'.repeat(40)}`, tree: 'backlog/1-a.md\0' }), fromSha, toSha }).ok).toBe(false);
+    const exec = fake({ tree: 'backlog/1-a.md\0' });
+    proveCardOnlyHeadMove({ exec, fromSha, toSha });
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--ignore-submodules=none', '--no-ext-diff']), expect.anything());
+  });
+  it('refuses missing heads and unreadable Git evidence', () => {
+    const exec = () => { throw Error('missing commit'); };
+    expect(proveCardOnlyHeadMove({ exec, toSha }).ok).toBe(false);
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha }).ok).toBe(false);
   });
 });
