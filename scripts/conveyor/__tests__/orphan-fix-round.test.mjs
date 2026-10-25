@@ -234,8 +234,34 @@ describe('planOrphanFixRound — #5608 operator referral rulings', () => {
     expect(plan(pr).reason).toContain('no fix round since the latest verdict');
   });
 
-  it.each(['web-everything', 'mallory'])('does not treat %s as an operator', (login) => {
-    expect(plan(thread(ruling(2, {}, { login }))).reason).toContain('no fix round since the latest verdict');
+  it.each(['card', 'not-real'])('re-arms an automation-posted operator %s ruling', (result) => {
+    const answer = ruling(2, { rulings: referrals.map(({ key }) => ({
+      runId: record.runId, key, result, ...(result === 'card' ? { card } : {}),
+    })) }, BOT);
+    expect(plan(thread(answer))).toMatchObject({ decision: 'rearm',
+      rulingAt: new Date(rulingAt).toISOString() });
+  });
+
+  it('does not treat an untrusted author as an operator', () => {
+    expect(plan(thread(ruling(2, {}, { login: 'mallory' }))).reason).toContain('no fix round since the latest verdict');
+  });
+
+  it('keeps an automation-posted partial ruling with a person', () => {
+    expect(plan(thread(ruling(1, {}, BOT)))).toMatchObject({ decision: 'none',
+      reason: expect.stringContaining('partial: 1 referral finding(s) still open') });
+  });
+
+  it('rejects an automation-posted ruling with a hand-edited operator assertion', () => {
+    const answer = ruling(2, {}, BOT);
+    answer.body = answer.body.replace('@chalbert', '@mallory');
+    expect(plan(thread(answer)).decision).toBe('none');
+  });
+
+  it('does not treat an automation-posted policy block as an operator answer', () => {
+    const answer = ruling(2, { actor: 'auto-policy', channel: 'policy',
+      rulings: referrals.map(({ key }) => ({ runId: record.runId, key, result: 'block' })),
+    }, BOT);
+    expect(plan(thread(answer)).reason).toContain('no fix round since the latest verdict');
   });
 
   it('matches an abbreviated send-back head and falls back to Net basis', () => {
@@ -251,8 +277,8 @@ describe('planOrphanFixRound — #5608 operator referral rulings', () => {
       .toContain('no fix round since the latest verdict');
   });
 
-  it('passes the repo slug and injected card reader through the IO shell', async () => {
-    const pr = thread();
+  it.each(['chalbert', 'web-everything'])('passes a ruling posted by %s through the IO shell', async (login) => {
+    const pr = thread(ruling(2, {}, { login }));
     const rearm = vi.fn(async () => ({ ok: true }));
     const cardReadable = vi.fn((ref) => ref === card);
     const result = await runOrphanFixRoundPass({ repos: [{ key: 'test', slug: repo }], nowMs: NOW, env: {},

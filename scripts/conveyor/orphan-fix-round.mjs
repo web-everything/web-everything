@@ -36,7 +36,8 @@ import { stripVTControlCharacters } from 'node:util';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { parseOperatorRulingComment } from '../lib/jury-core.mjs';
 import { headEverHumanCleared } from '../lib/review-escalation.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { openReferralFindings, isBlockedFinding, isAwaitingRuling } from '../operations/record-referral-ruling.mjs';
@@ -94,7 +95,9 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   if (String(verdict.body).includes('### Blocked referral findings')) {
     const reviewed = String(verdict.body).match(/on head `([0-9a-f]{7,40})`/i)?.[1]?.toLowerCase() ?? verdictReviewedHead(verdict.body);
     const head = String(pr.headRefOid ?? '').toLowerCase();
-    const ruling = after.filter((c) => lead(c).startsWith('## Operator ruling on mandatory referrals') && isOperatorAuthored(c))
+    // The sanctioned writer posts the operator's assertion through automation credentials.
+    // Use the referral gate's parser to validate both that provenance and the operator assertion.
+    const ruling = after.filter((c) => lead(c).startsWith('## Operator ruling on mandatory referrals') && parseOperatorRulingComment(c)?.record)
       .reduce((latest, c) => !latest || atMs(c) >= atMs(latest) ? c : latest, null);
     if (reviewed && head && (head.startsWith(reviewed) || reviewed.startsWith(head)) && ruling) {
       try {
