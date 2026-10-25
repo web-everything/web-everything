@@ -16,6 +16,7 @@ import { deriveReferrals, openReferralKeys } from './pr-state/referrals.mjs';
 import { evaluateHolds } from './pr-state/holds/index.mjs';
 import { approvalLiftsAfter } from './pr-state/holds/verdict.mjs';
 import { HUMAN_HOLD_CI_RED, lifecycleRow, renderLabels } from '../conveyor/pr-lifecycle.mjs';
+import { ledgerAt } from './ledger-binding.mjs';
 
 const isVerdictRow = e => e.type === EVENT_TYPES.VERDICT || e.type === undefined;
 const slug = r => String(r ?? '').trim().toLowerCase();
@@ -44,6 +45,37 @@ function scopedEvents(events, scope) {
     mine.push(record);
   }
   return mine;
+}
+
+/**
+ * #5492 rebuild slice 3 — THE BINDING SHADOW. The head-binding fold's answer for the same rows, live head and clock,
+ * computed BESIDE today's and never read by any hold rule or decision. OPT-IN (`settings.bindingShadow: true`): only the
+ * drain's ledger shadow asks for it, so no live derive (label mirror, merge-gate check) runs it at all. `legacyApprovals`
+ * counts approvals with no judgment boundary (`seen`), which stop answering at cutover. Never throws. BOUNDED: a PR with
+ * more than {@link BINDING_SHADOW_MAX_ROWS} rows, {@link BINDING_SHADOW_MAX_BYTES} UTF-8 bytes or 8 carried rows is not
+ * folded (a capped fold measured ≤ ~0.6 s adversarially); a skipped fold, or one that crashed inside, is `skipped`.
+ */
+export const BINDING_SHADOW_MAX_ROWS = 2000;
+export const BINDING_SHADOW_MAX_BYTES = 1_000_000;
+export const BINDING_SHADOW_MAX_CARRIES = 8; // carry checks re-fold prefixes; no writer emits `carried` rows yet
+const tooLarge = (mine) => {
+  if (mine.length > BINDING_SHADOW_MAX_ROWS) return true;
+  if (mine.filter((e) => e.verdict === 'carried').length > BINDING_SHADOW_MAX_CARRIES) return true;
+  let bytes = 0;
+  for (const e of mine) if ((bytes += Buffer.byteLength(JSON.stringify(e), 'utf8')) > BINDING_SHADOW_MAX_BYTES) return true;
+  return false;
+};
+export function bindingShadow(mine, head, now) {
+  let legacyApprovals = null;
+  try {
+    legacyApprovals = mine.filter((e) => e.type === EVENT_TYPES.APPROVAL && e.seen === undefined).length;
+    if (tooLarge(mine)) return { skipped: 'too-large', legacyApprovals };
+    const r = ledgerAt(mine, head, { now });
+    if (r.holds.some((h) => h.code === 'fold-crashed')) return { skipped: 'crashed', legacyApprovals };
+    return { clears: r.clears, holds: r.holds.map((h) => h.code), base: r.base, humanDependent: r.humanDependent, legacyApprovals };
+  } catch (e) {
+    return { skipped: 'crashed', error: String(e?.message ?? e).slice(0, 120), legacyApprovals };
+  }
 }
 
 /** Fold ONE PR's events (this repo, this number; never "all PRs") into the view every hold rule reads. Throws `ledgerUnreadable` on an invalid row. */
@@ -113,7 +145,14 @@ function derive(events, facts, settings) {
   const humanGate = (cur?.verdict === 'human' && !view.clears) || holds.some(h => h.code === 'label-input:review:human');
   const lifecycleState = lifecycleOf(phase, { holds, humanGate, facts });
   const clears = view.clears && holds.length === 0;
-  return finish({ lifecycleState, verdict: cur?.verdict ?? null, clears, reviewExempt: view.reviewExempt && clears, holds, phase });
+  const result = finish({ lifecycleState, verdict: cur?.verdict ?? null, clears, reviewExempt: view.reviewExempt && clears, holds, phase });
+  // The binding shadow rides along, decided by nothing (slice 3); absent unless opted in, so other callers see no change.
+  // It runs AFTER today's answer is final and reads the head and clock only then, so it cannot alter that answer.
+  let input = null;
+  try { input = settings.bindingShadow === true ? { head: facts?.head?.sha ?? null, now: facts?.now } : null; }
+  catch { return result; } // an unreadable opt-in or fact never touches today's answer
+  if (!input) return result;
+  return { ...result, binding: bindingShadow(view.events, input.head, input.now) };
 }
 
 /** A derive that cannot trust its input holds the PR in NEEDS-OPERATOR without consulting the core. */

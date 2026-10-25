@@ -22,6 +22,7 @@ import { execFileSync } from 'node:child_process';
 import { buildPrRounds, normalizeComment, classifyEvent } from '../operations/coroner-rounds.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { readPinnedPrContext, readSnapshotPrView } from '../lib/review-pr-snapshot.mjs';
 
 export const ROUND_HISTORY_MAX_CHARS = 8000;
 export const ROUND_HISTORY_MAX_FINDINGS = 8;
@@ -137,21 +138,32 @@ export function withRoundHistory(prompt, section) {
 
 /**
  * IO: the COMPLETE comment thread (`pr-comments-complete.mjs`, paginated — a long thread is never cut at 100) plus
- * one `gh pr view` read of commits and refs, mapped to the coroner's input shape. Returns null on any failure — the
- * history is best effort and must never block a fix dispatch.
+ * bounded head-pinned reads of commits and refs, mapped to the coroner's input shape.
+ * Metadata failures preserve comments already obtained; an unreadable thread returns null.
  */
-export function readRoundHistoryInputs({ pr, repoSlug, exec = execFileSync, readComments = readCompletePrComments }) {
+export function readRoundHistoryInputs({ pr, repoSlug, headSha, exec = execFileSync, readComments = readCompletePrComments, snapshotOptions = {} }) {
+  let comments;
   try {
-    const comments = readComments(pr, { repo: repoSlug });
-    const raw = exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'commits,baseRefName,headRefName'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
-    const j = JSON.parse(raw);
+    // These comments also feed repeated-finding guards: they must stay live.
+    comments = readComments(pr, { repo: repoSlug, exec });
+    const run = args => exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
+    let j;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        j = headSha
+          ? readPinnedPrContext({ ...snapshotOptions, ttlMs: attempt ? 0 : snapshotOptions.ttlMs, repo: repoSlug, pr, headSha, exec: run })
+          : readSnapshotPrView({ ...snapshotOptions, repo: repoSlug, pr, fields: ['commits', 'baseRefName', 'headRefName'], exec: run });
+        break;
+      } catch (error) {
+        if (!headSha || !String(error.message).includes('PR or head changed') || attempt === 2) throw error;
+      }
+    }
     return {
       comments: Array.isArray(comments) ? comments : [],
       commits: (Array.isArray(j.commits) ? j.commits : []).map((c) => ({ sha: c.oid, commit: { committer: { date: c.committedDate } }, parents: (c.parents ?? []).map((p) => ({ sha: p.oid })) })),
       baseRefName: j.baseRefName ?? null, headRefName: j.headRefName ?? null,
     };
   } catch {
-    return null;
+    return Array.isArray(comments) ? { comments, commits: [], baseRefName: null, headRefName: null } : null;
   }
 }

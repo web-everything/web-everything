@@ -44,6 +44,7 @@ import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { CI_HEAL_COMMENT_MARKER, buildCiHealComment } from '../ci-heal-mark.mjs';
+import { ciHealOwed } from '../ci-heal-rule.mjs';
 import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 import {
@@ -909,13 +910,13 @@ describe('case 5h — a CANCELLED required check reads ci-red and is ci-healed, 
     // the regression; this case additionally documents, in the plan's own vocabulary, what the pre-fix output
     // looked like — `nothing-owed` must never again be the verdict for a PR whose rollup carries a real failing
     // conclusion, cancelled or otherwise.
-    const plan = planReconcile({ prs: [pr2636()], agents: [], now: NOW });
+    const plan = planReconcile({ prs: [pr2636()], agents: [], now: NOW, requiredChecks: ['test-shard (1)', 'smoke'] });
     expect(plan.refusals.map((r) => r.kind)).not.toContain('nothing-owed');
   });
 
   it('under the cap: dispatches `ci-heal`, exactly PR #2636\'s real live count (2 of 3) at the moment of the incident', () => {
     const comments = Array.from({ length: 2 }, () => ({ body: buildCiHealComment({ reason: 'red-ci' }), author: AUTOMATION }));
-    const plan = planReconcile({ prs: [pr2636({ comments })], agents: [], now: NOW });
+    const plan = planReconcile({ prs: [pr2636({ comments })], agents: [], now: NOW, requiredChecks: ['test-shard (1)', 'smoke'] });
     expect(plan.refusals).toEqual([]);
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2636, attempts: 2 })]);
     expect(plan.dispatch[0].phase).toBe('ci-red');
@@ -923,7 +924,7 @@ describe('case 5h — a CANCELLED required check reads ci-red and is ci-healed, 
 
   it(`AT the cap (${CI_HEAL_ROUND_CAP} durable heal-mark comments): refused \`cap-exhausted\` AND escalated visibly — never silently \`nothing-owed\``, () => {
     const comments = Array.from({ length: CI_HEAL_ROUND_CAP }, () => ({ body: buildCiHealComment({ reason: 'red-ci' }), author: AUTOMATION }));
-    const plan = planReconcile({ prs: [pr2636({ comments })], agents: [], now: NOW });
+    const plan = planReconcile({ prs: [pr2636({ comments })], agents: [], now: NOW, requiredChecks: ['test-shard (1)', 'smoke'] });
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({
       kind: 'cap-exhausted', prNumber: 2636, attempts: CI_HEAL_ROUND_CAP, cap: CI_HEAL_ROUND_CAP, phase: 'ci-red',
@@ -1017,6 +1018,17 @@ describe('bounced PR CI repair — real required failures on the fixer head (#57
   const escalation = headSha => ({
     body: buildCiHealEscalationComment({ headSha, outcome: 'needs-human', reason: 'requires human judgment' }),
     author: AUTOMATION,
+  });
+
+  it.each([
+    ['unproven required failure', { bouncedRealRed: false }],
+    ['another phase', { phase: 'ci-red' }],
+    ['closed PR', { state: 'CLOSED' }],
+    ['spent CI-heal budget', { attempts: 3, cap: 3 }],
+    ['pending checks', { ci: 'pending' }],
+  ])('shared CI-heal predicate refuses a bounced exception with %s', (_name, over) => {
+    expect(ciHealOwed({ labels: ['review:changes'], phase: 'bounced', bouncedRealRed: true,
+      ci: 'red', ...over })).toBe(false);
   });
 
   it.each(['test-shard (2)', 'test'])('dispatches ci-heal for bounced + required red %s with no escalation', name => {
@@ -1144,7 +1156,7 @@ describe('case 5k — a stale ci:failed label beside a RESTARTED (not yet conclu
   });
 
   it('AFTER: planReconcile never dispatches ci-heal for the restarted-but-unconcluded check — nothing owed', () => {
-    const plan = planReconcile({ prs: [pr2782()], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS });
+    const plan = planReconcile({ prs: [pr2782()], agents: [], now: NOW, requiredChecks: ['test', 'smoke', 'daemon-soak'], mainRedWindows: MAIN_RED_WINDOWS });
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'nothing-owed', phase: 'queued', prNumber: 2782 })]);
   });
@@ -1152,7 +1164,7 @@ describe('case 5k — a stale ci:failed label beside a RESTARTED (not yet conclu
   it('still reviewed correctly once the SAME rebase lands and test genuinely concludes green (no regression on the ordinary path)', () => {
     const greenAfterRebase = restartedRollup.map((c) => (c.name === 'test' ? { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' } : c));
     const plan = planReconcile({
-      prs: [pr2782({ statusCheckRollup: greenAfterRebase })], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS,
+      prs: [pr2782({ statusCheckRollup: greenAfterRebase })], agents: [], now: NOW, requiredChecks: ['test', 'smoke', 'daemon-soak'], mainRedWindows: MAIN_RED_WINDOWS,
     });
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'nothing-owed', phase: 'queued', prNumber: 2782 })]);
@@ -1162,7 +1174,7 @@ describe('case 5k — a stale ci:failed label beside a RESTARTED (not yet conclu
     const genuinelyFailed = restartedRollup.map((c) => (c.name === 'test' ? { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' } : c));
     const plan = planReconcile({
       prs: [pr2782({ statusCheckRollup: genuinelyFailed, labels: lbl('ci:failed') })],
-      agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS,
+      agents: [], now: NOW, requiredChecks: ['test', 'smoke', 'daemon-soak'], mainRedWindows: MAIN_RED_WINDOWS,
     });
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2782, phase: 'ci-red' })]);
   });
