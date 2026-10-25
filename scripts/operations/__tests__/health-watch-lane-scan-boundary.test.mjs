@@ -1,3 +1,5 @@
+// @vitest-environment node
+// Read command call sites from disk without Vite's browser asset URL rewriting.
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
