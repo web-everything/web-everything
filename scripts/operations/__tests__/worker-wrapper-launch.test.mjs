@@ -180,7 +180,7 @@ describe('runWorker legacy words with an injected child', () => {
 describe('dispatch throttle runner liveness', () => {
   it('only declares claims dead when they have a dead runner pid', () => {
     expect(isClaimRunnerDead({ meta: { runnerPid: 12 } }, () => false)).toBe(true);
-    expect(isClaimRunnerDead({ meta: { runnerPid: 12 } }, () => true)).toBe(false);
+    expect(isClaimRunnerDead({ meta: { runnerPid: 12 } }, () => true, () => ({ alive: true, reason: 'match' }))).toBe(false);
     expect(isClaimRunnerDead({ meta: {} }, () => false)).toBe(false);
   });
   it('excludes a dead fix runner while retaining a ci-heal without a pid', () => {
