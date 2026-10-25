@@ -103,6 +103,26 @@ describe('draft-promote-provider (draft-first PRs)', () => {
       },
     );
 
+    it.each(['ghp', 'gho', 'ghu', 'ghs', 'ghr', 'github_pat'])(
+      'redacts a %s token straddling the 400-character boundary before bounding diagnostics', (prefix) => {
+        const token = `${prefix}_Synthetic_123abc`;
+        for (const stream of ['stderr', 'stdout']) {
+          // Only the first two token characters fit before the truncation boundary.
+          const original = Object.assign(new Error(command), {
+            [stream]: `${'x'.repeat(397)} ${token} ${'y'.repeat(5000)}`,
+          });
+          const message = readyError(original).message;
+          expect(message.startsWith(`${command}: `)).toBe(true);
+          const detail = message.slice(`${command}: `.length);
+          expect(message).not.toContain(token);
+          expect(detail).not.toContain(`${prefix}_`);
+          expect(detail).not.toContain(token.slice(0, 2));
+          expect(detail.length).toBeLessThanOrEqual(401);
+          expect(detail).toBe(`${'x'.repeat(397)} <r…`);
+        }
+      },
+    );
+
     it.each([{}, { stderr: '', stdout: '' }])(
       'rethrows the identical original error unchanged when no output is available (%j)', (output) => {
         const original = Object.assign(new Error(`${command}\noriginal trailing detail`), output, { status: 2 });
