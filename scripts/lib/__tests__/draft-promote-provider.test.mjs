@@ -23,7 +23,7 @@ describe('draft-promote-provider (draft-first PRs)', () => {
       vi.mocked(runGhSync).mockReset();
     });
 
-    it('the default exec explicitly passes reviewer in a copied env when the process role is observer', () => {
+    it('the default exec explicitly passes worker in a copied env when the process role is observer', () => {
       vi.stubEnv('WE_GITHUB_APP_ROLE', 'observer');
       const originalEnv = process.env;
       const before = { ...process.env };
@@ -36,9 +36,9 @@ describe('draft-promote-provider (draft-first PRs)', () => {
       expect(args).toEqual(['pr', 'ready', '42', '--repo', 'example/project']);
       expect(process.env).toBe(originalEnv);
       expect(process.env).toEqual(before);
-      expect(opts.env?.WE_GITHUB_APP_ROLE).toBe('reviewer');
+      expect(opts.env?.WE_GITHUB_APP_ROLE).toBe('worker');
       expect(opts.env).not.toBe(process.env);
-      expect(opts.env).toEqual({ ...before, WE_GITHUB_APP_ROLE: 'reviewer' });
+      expect(opts.env).toEqual({ ...before, WE_GITHUB_APP_ROLE: 'worker' });
     });
 
     it('leaves a custom injected exec and its observer process env unaffected', () => {

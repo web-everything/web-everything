@@ -55,8 +55,9 @@ export function createDraftPromoteProvider({
   repo,
   exec = (args) => runGhSync(args, {
     cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-ready' },
-    // Draft-promotion needs pull_requests write, which observer lacks; role is explicit, never inferred from the caller.
-    env: { ...process.env, WE_GITHUB_APP_ROLE: 'reviewer' },
+    // Observer lacks pull_requests write; reviewer lacks contents write, so neither can mark ready.
+    // Worker has both; role is explicit, never inferred from the caller.
+    env: { ...process.env, WE_GITHUB_APP_ROLE: 'worker' },
   }).trim(),
 } = {}) {
   return {
