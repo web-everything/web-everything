@@ -71,18 +71,16 @@ export async function recordRemoteVerification({ sha, treeHash, run, fetchJobs, 
     throw new Error('Run did not prove the required lane gate; use local verify');
   }
   const definition = await protectedDefinition(sha, fetchDefinition);
-  const runs = await fetchRuns();
-  if (!readableRuns(runs)) throw new Error('Unreadable final workflow runs; retry remote or use local verify');
-  const newest = selectRemoteVerifyRun(runs, sha);
-  if (newest?.id !== run.id || newest?.run_attempt !== run.run_attempt || remoteVerdict(newest).state !== 'green') {
-    throw new Error('Remote run changed after job verification; retry remote or use local verify');
-  }
+  await assertNewestAttempt({ sha, run, fetchRuns });
   const finalDefinition = await protectedDefinition(sha, fetchDefinition);
   if (finalDefinition.protectedSha !== definition.protectedSha
     || finalDefinition.definitionTree !== definition.definitionTree) {
     throw Object.assign(new Error('Changed protected definition; retry remote or use local verify'),
       { code: 'REMOTE_UNTRUSTED_DEFINITION' });
   }
+  // A rerun can start or fail while the final definition reads are in flight, so
+  // the attempt check is the last remote read before the marker is written.
+  await assertNewestAttempt({ sha, run, fetchRuns });
   if (!treeUnchanged()) throw new Error('HEAD or tree changed during remote verification');
   const marker = buildRemoteMarker({ sha, treeHash, run, now });
   Object.assign(marker.remote, definition, { runAttempt: run.run_attempt });
@@ -92,6 +90,15 @@ export async function recordRemoteVerification({ sha, treeHash, run, fetchJobs, 
 
 const readableRuns = (runs) => Array.isArray(runs) && runs.every((r) => fullSha(r?.head_sha)
   && Number.isFinite(Date.parse(r.created_at)) && Number.isSafeInteger(r.id) && r.id > 0);
+
+async function assertNewestAttempt({ sha, run, fetchRuns }) {
+  const runs = await fetchRuns();
+  if (!readableRuns(runs)) throw new Error('Unreadable final workflow runs; retry remote or use local verify');
+  const newest = selectRemoteVerifyRun(runs, sha);
+  if (newest?.id !== run.id || newest?.run_attempt !== run.run_attempt || remoteVerdict(newest).state !== 'green') {
+    throw new Error('Remote run changed after job verification; retry remote or use local verify');
+  }
+}
 
 export async function waitForRemoteVerify({ fetchRuns, sha, waitMs = 0, pollMs = 5000, now, sleep }) {
   let run = null;

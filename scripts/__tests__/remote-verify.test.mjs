@@ -668,14 +668,28 @@ describe('remote lane marker import — required gate evidence', () => {
     expect(writeMarker).not.toHaveBeenCalled();
   });
 
-  it('rechecks the run list after the attempt jobs and before writing', async () => {
+  it('rechecks the run list after the attempt jobs and after the final definition read, before writing', async () => {
     const order = [];
     await importRun([job()], {
       fetchJobs: async (selected) => { expect(selected).toEqual(successful); order.push('jobs'); return [job()]; },
+      fetchDefinition: async () => { order.push('definition'); return definition(); },
       fetchRuns: async () => { order.push('runs'); return [successful]; },
       writeMarker: () => order.push('write'),
     });
-    expect(order).toEqual(['jobs', 'runs', 'write']);
+    expect(order).toEqual(['jobs', 'definition', 'runs', 'definition', 'runs', 'write']);
+  });
+
+  it.each([
+    ['pending rerun attempt', [{ ...successful, run_attempt: 2, status: 'in_progress', conclusion: null }]],
+    ['failed rerun attempt', [{ ...successful, run_attempt: 2, conclusion: 'failure' }]],
+    ['newer queued run', [successful, run({ id: 456, created_at: new Date(T0 + 1000).toISOString(), status: 'queued', conclusion: null })]],
+    ['unreadable listing', null],
+  ])('writes no marker when a %s appears during the final definition read', async (_label, laterRuns) => {
+    const writeMarker = vi.fn();
+    const fetchRuns = vi.fn().mockResolvedValueOnce([successful]).mockResolvedValue(laterRuns);
+    await expect(importRun([job()], { fetchRuns, writeMarker })).rejects.toThrow(/local verify/);
+    expect(fetchRuns).toHaveBeenCalledTimes(2);
+    expect(writeMarker).not.toHaveBeenCalled();
   });
 
   it('a targeted dispatch during job verification does not invalidate the required lane run', async () => {
