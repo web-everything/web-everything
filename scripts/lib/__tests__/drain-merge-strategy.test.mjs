@@ -27,6 +27,7 @@ const DRAIN = 'drain-bot';
 
 function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline, labelProvider } = {}) {
   const calls = [];
+  const readLive = onView.readLive;
   const logs = [];
   let stored = initial;
   let mutated = false;
@@ -41,7 +42,15 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
       return out;
     }
     if (args[0] === 'pr' && args[1] === 'merge') throw new Error('merge API must never be called');
-    if (args[0] === 'pr' && ['comment', 'edit'].includes(args[1])) return '';
+    if (args[0] === 'pr' && args[1] === 'edit') {
+      // A subsequent live read must see successful status-label publication.
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--remove-label') labels = labels.filter(label => (typeof label === 'string' ? label : label.name) !== args[i + 1]);
+        if (args[i] === '--add-label') labels = [...labels, args[i + 1]];
+      }
+      return '';
+    }
+    if (args[0] === 'pr' && args[1] === 'comment') return '';
     if (args[0] === 'label' && args[1] === 'create') return '';
     if (args[0] === 'api' && args[1] === 'user') { if (selfLogin == null) throw new Error('gh: not logged in'); return `${selfLogin}\n`; }
     if (cmd === 'git' && args[0] === 'rev-parse') return `${baseTip()}\n`; // the base tip the pinned diff used
@@ -49,6 +58,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : ''; // the pinned change list of the judged head
     if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
     if (args[0] === 'pr' && args[1] === 'view' && viewThrows.includes(Number(args[2]))) throw new Error('gh: HTTP 502');
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid,labels,reviews') && readLive) return JSON.stringify(readLive());
     if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN', headRefOid: HEAD, labels, id: 'PR_NODE' }); }
     if (args[0] === 'api' && args[1] === 'graphql') {
       if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify(queueFacts ?? { data: { repository: { mergeQueue: { entries: {
@@ -1011,6 +1021,16 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
   });
 
   const OVERRIDE_ENV = { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: 'chalbert' };
+  it.each(['red-team:pending', 'red-team:blocked'])('deadline override waives only pending on the fresh read: %s', status => {
+    // pastDeadline makes one held attempt, then the overdue attempt reads live state twice.
+    const readLive = vi.fn().mockReturnValueOnce({ headRefOid: HEAD, labels: ACCEPTED })
+      .mockReturnValueOnce({ headRefOid: HEAD, labels: ACCEPTED })
+      .mockReturnValue({ headRefOid: HEAD, labels: [...ACCEPTED, status] });
+    const { h } = pastDeadline({ env: OVERRIDE_ENV, onView: { readLive } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(status === 'red-team:pending');
+    expect(readLive).toHaveBeenCalledTimes(3);
+    expect(enqueuedAny(h)).toBe(status === 'red-team:pending');
+  });
   // Admission gates must cover every fall-through path and every live red-team label state.
   const admissionCases = ['clear', 'pending', 'deadline-hold', 'override', 'ruling'].flatMap(path =>
     [null, 'red-team:pending', 'red-team:blocked', 'red-team:clear'].map(status => ({ path, status })));
@@ -1152,6 +1172,52 @@ describe('redTeam.deadlineAction resolver: an invalid higher layer preserves the
 });
 
 describe('queue safeguard overrides and untracked queue entries', () => {
+  it.each(['red-team:blocked', 'red-team:pending'])('defers when the second live read adds %s after readThreadPages', status => {
+    let h;
+    const readLive = vi.fn(() => {
+      if (readLive.mock.calls.length === 1) return { headRefOid: HEAD, labels: ['ready-to-merge'] };
+      expect(h.calls.some(call => call.includes('--slurp'))).toBe(true);
+      return { headRefOid: HEAD, labels: ['ready-to-merge', { name: status }] };
+    });
+    h = harness({ strategy: 'github-merge-queue', queued: true, env: { WE_UNDER_TEST: '1' }, onView: { readLive } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({
+      enqueued: false, deferred: true, kind: 'red-team-pending', reason: `state is ${status}`,
+    });
+    expect(readLive).toHaveBeenCalledTimes(2);
+    expect(h.calls.filter(call => call.some(arg => String(arg).includes('dequeuePullRequest')))).toHaveLength(status === 'red-team:blocked' ? 1 : 0);
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+
+  it.each([
+    ['changes head', { headRefOid: 'f'.repeat(40), labels: ['ready-to-merge'] }],
+    ['has unreadable labels', { headRefOid: HEAD, labels: null }],
+    ['has no state', null],
+  ])('defers with live-state-unreadable when the fresh read %s', (_name, fresh) => {
+    const readLive = vi.fn().mockReturnValueOnce({ headRefOid: HEAD, labels: ['ready-to-merge'] }).mockReturnValue(fresh);
+    const h = harness({ strategy: 'github-merge-queue', env: { WE_UNDER_TEST: '1' }, onView: { readLive } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deferred: true, kind: 'live-state-unreadable' });
+    expect(readLive).toHaveBeenCalledTimes(2);
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+
+  it('dequeues a newly sent-back PR on the final live read', () => {
+    const readLive = vi.fn().mockReturnValueOnce({ headRefOid: HEAD, labels: ['ready-to-merge'] })
+      .mockReturnValue({ headRefOid: HEAD, labels: ['ready-to-merge', 'review:changes'] });
+    const h = harness({ strategy: 'github-merge-queue', queued: true, env: { WE_UNDER_TEST: '1' }, onView: { readLive } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deferred: true, kind: 'sent-back' });
+    expect(h.calls.filter(call => call.some(arg => String(arg).includes('dequeuePullRequest')))).toHaveLength(1);
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+
+  it('defers with live-state-unreadable when the final read throws', () => {
+    const readLive = vi.fn().mockReturnValueOnce({ headRefOid: HEAD, labels: ['ready-to-merge'] })
+      .mockImplementation(() => { throw new Error('gh: HTTP 502'); });
+    const h = harness({ strategy: 'github-merge-queue', env: { WE_UNDER_TEST: '1' }, onView: { readLive } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deferred: true, kind: 'live-state-unreadable' });
+    expect(readLive).toHaveBeenCalledTimes(2);
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+
   it('a live pending label preserves overdue re-request, health reporting, and later notification', () => {
     const labels = ['review:accepted', 'ready-to-merge', 'red-team:pending'];
     let clock = 45 * 60_000;

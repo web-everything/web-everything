@@ -489,6 +489,24 @@ export function createDrainMergeStrategy({
           return { enqueued: false, deferred: true, reason: g.reason };
         }
       } catch (e) { say(`  ⚠ merge-queue batching admission failed (${firstLine(e)}) — continuing enqueue`); }
+      // Comments, label publication and batching can race another writer. Revalidate at admission,
+      // while retaining the in-memory hold above even if status-label cleanup removed it remotely.
+      let fresh;
+      try { fresh = readLive(c.repo, c.num); }
+      catch { return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'final live head or labels could not be read' }; }
+      if (fresh?.headRefOid !== headSha || !Array.isArray(fresh?.labels)) {
+        return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'final live head or labels do not match the judged state' };
+      }
+      const freshHeld = sendBackReason(fresh.labels);
+      const freshLabels = queueLabels(fresh.labels);
+      const freshLabelHold = redTeamLabelHoldReason(deadlineOverride
+        ? freshLabels.filter(label => label !== 'red-team:pending') : freshLabels);
+      if (freshHeld) {
+        removeSentBack(c.repo, c.num, fresh.labels);
+        // Blocked labels still get send-back cleanup, with the admission hold's pending outcome.
+        if (freshHeld !== freshLabelHold) return { enqueued: false, deferred: true, kind: 'sent-back', reason: freshHeld };
+      }
+      if (freshLabelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: freshLabelHold };
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });
       if (!r.ok) {
         // A shortcut refusal delegates to the full cascade in this pass. Do not install
