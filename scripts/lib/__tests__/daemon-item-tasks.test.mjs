@@ -535,6 +535,65 @@ it('fence-to-act races honor declared preconditions and reconcile next tick', as
   }
 });
 
+it.each([
+  ['undefined', () => undefined],
+  ['empty record', () => ({})],
+  ['failed worker', () => ({ status: 'failed' })],
+  ['dead worker', () => ({ status: 'dead' })],
+  ['unknown status', () => ({ status: 'unknown' })],
+  ['non-string status', () => ({ status: true })],
+  ['false', () => false],
+  ['scalar', () => 'done'],
+  ['array', () => []],
+  ['lookup failure', () => { throw Error('run store unavailable'); }],
+])('worker-run probes reject %s before fencing, acting or later effects', async (_name, find) => {
+  const h = taskHarness([effect(), { ...executionEffect(), name: 'later' }]);
+  const effectId = `${h.args.task.id}:dispatch`;
+  h.args.runStore.find = async id => {
+    expect(id).toBe(effectId);
+    h.calls.push('run-store');
+    return find();
+  };
+  const result = await runItemTask(h.args);
+  expect(result.outcome).toBe('failed');
+  expect(result.reason).toMatch(/indeterminate worker run-store probe|run store unavailable/);
+  expect(result.effects).toEqual([]);
+  expect(h.record.job.task.execution.effects).toEqual({});
+  expect(h.record.job.task.failureCount).toBe(1);
+  expect(result.gh).toEqual({ read: 0, write: 0 });
+  expect(h.calls).toEqual(['run-store', 'release']);
+});
+
+it.each(['launching', 'running', 'done'])('worker-run probes recognize %s without a GitHub probe or replay', async status => {
+  const h = taskHarness([effect()]);
+  const effectId = `${h.args.task.id}:dispatch`;
+  const worker = { status, runId: 'existing-worker' };
+  h.runs.set(effectId, worker);
+  const result = await runItemTask(h.args);
+  expect(result.outcome).toBe('acted');
+  expect(result.effects).toEqual([expect.objectContaining({ effectId, status: 'applied', evidence: worker })]);
+  expect(h.record.job.task.execution.effects[effectId]).toMatchObject({ status: 'applied', evidence: worker });
+  expect(h.record.job.task.failureCount).toBe(0);
+  expect(result.gh).toEqual({ read: 0, write: 0 });
+  expect(h.calls).toEqual(['run-store', 'release']);
+});
+
+it('worker-run probes treat only authoritative absence as permission to fence and dispatch', async () => {
+  const h = taskHarness([effect()]);
+  const effectId = `${h.args.task.id}:dispatch`;
+  h.args.runStore.find = async id => {
+    expect(id).toBe(effectId);
+    h.calls.push('run-store');
+    return null;
+  };
+  const result = await runItemTask(h.args);
+  expect(result.outcome).toBe('acted');
+  expect(result.effects).toEqual([expect.objectContaining({ effectId, status: 'applied', evidence: { receipt: effectId } })]);
+  expect(h.record.job.task.failureCount).toBe(0);
+  expect(result.gh).toEqual({ read: 1, write: 1 });
+  expect(h.calls).toEqual(['run-store', 'fence', 'act', 'release']);
+});
+
 it('unknown applied probe fails without later effects', async () => {
   for (const probe of [() => undefined, () => ({ applied: 'unknown' }), () => { throw Error('unreadable'); }]) {
     const h = taskHarness([executionEffect(), { ...executionEffect(), name: 'later' }]); h.args.effects.probe = probe;
