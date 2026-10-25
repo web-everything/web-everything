@@ -480,6 +480,25 @@ describe('automatic card filing with shared durable claims', () => {
     expect(f.posted[1]).toContain('> card it, ship the PR');
     expect(heldAfter(f.comments)).toHaveLength(0);
   });
+  it('automatic card: disabling anyState restores a sent-back break after the real sink completes without a cap', async () => {
+    const initial = [redTeam()];
+    const resultId = liveResultGateState(initial, PR, HEAD).resultId;
+    initial.push(bot(`${redTeamGateMarker(PR, HEAD, 'sent-back', resultId)}\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-10-20T23:41:12Z'));
+    const f = fake({ initial });
+    const plan = () => planRedTeamRuling(read({ comments: f.comments, card: null, scope: { value: { anyState: true } } }), input({ card: undefined }));
+    expect(f.act(plan())).toMatchObject({ pending: true, released: false });
+    await f.complete();
+    expect(f.act(plan())).toMatchObject({ card: { ref: `we:${result.rel}` } });
+    expect(f.cards).toHaveLength(1);
+    expect(f.posted[2]).toContain(`outcome=operator-card result=${resultId}`);
+    expect(f.posted[2]).toContain('filed as a follow-up card (#1) — landing job');
+    const disposition = operatorRulings => readRedTeamDisposition({ comments: operatorBoundComments(f.comments), repo, pr: PR, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS, env: {}, operatorRulings });
+    expect(disposition({ anyState: true })).toMatchObject({ sendBack: [], held: [] });
+    expect(disposition({ anyState: false }).sendBack.map(f => f.index)).toEqual([1]);
+    expect(disposition().sendBack.map(f => f.index)).toEqual([1]);
+    expect(disposition({ anyState: false }).held).toEqual([]);
+  });
   it('card: a second run refuses (no duplicate card)', async () => {
     const f = fake(), p = payloadFor();
     f.act(p); await f.complete(); f.act(p);
