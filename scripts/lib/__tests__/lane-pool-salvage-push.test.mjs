@@ -160,6 +160,54 @@ describe('salvage push contract', () => {
 
 describe('real salvage preservation and transport', () => {
   const repo = { branch: 'main', originUrl: 'https://example.test/canonical.git', referencePath: 'reference' };
+  describe.each(['local', 'worktree'])('%s remote alias isolation', scope => {
+    it.each([
+      ['url', origin => origin],
+      ['pushurl', origin => origin],
+      ['url', origin => `${origin.toUpperCase()}.git/`],
+      ['pushurl', origin => `${origin.toUpperCase()}.git/`],
+      ['url', () => 'other'],
+      ['fetch', () => 'Origin'],
+      ['url', origin => `${origin}/\u2028quoted.with.dots`],
+    ])('refuses alias %s configuration (case %#) before every transport', (setting, aliasFor) => {
+      const dir = mkdtempSync(join(tmpdir(), 'salvage-remote-alias-'));
+      try {
+        const lane = join(dir, 'lane.git'), origin = join(dir, 'canonical');
+        const otherRepo = join(dir, 'other.git');
+        const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+        for (const path of [lane, origin, otherRepo]) git(dir, ['init', '--bare', '-q', path]);
+        git(lane, ['config', 'remote.origin.url', origin]);
+        if (scope === 'worktree') git(lane, ['config', 'extensions.worktreeConfig', 'true']);
+        git(lane, ['config', `--${scope}`, `remote.${aliasFor(origin)}.${setting}`, otherRepo]);
+        const commands = [];
+        const io = realSalvageIo({ repo: { ...repo, originUrl: origin, referencePath: lane },
+          runGit: (command, args, options) => {
+            commands.push(args);
+            // A failing regression must not leak even fixture commits to an alias.
+            if (!args.includes('config')) throw new Error('unguarded transport reached');
+            return execFileSync(command, args, { ...options,
+              env: { ...options.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } });
+          } });
+        for (const operation of [() => io.unmatchedShas(lane, [head]),
+          () => io.push(lane, ref, head), () => io.remoteSha(ref)]) {
+          expect(operation).toThrow(/lane-controlled transport.*inspect/i);
+        }
+        expect(commands.every(args => args.includes('config'))).toBe(true);
+        expect(git(otherRepo, ['for-each-ref', '--format=%(refname)'])).toBe('');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('allows ordinary exact-origin URL and fetch configuration', () => {
+      const runGit = vi.fn((_command, args) => args.includes('config')
+        ? args.includes('--show-scope')
+          ? `${scope}\0remote.origin.url\0${scope}\0remote.origin.fetch\0`
+          : 'remote.origin.url\0remote.origin.fetch\0' : '');
+      const io = realSalvageIo({ repo, runGit });
+      expect(io.push(laneDir, ref, head)).toEqual({ ok: true });
+      expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(true);
+    });
+  });
+
   it.each(['local', 'worktree'])('follows real %s includes before allowing any transport', scope => {
     const dir = mkdtempSync(join(tmpdir(), 'salvage-transport-config-'));
     try {

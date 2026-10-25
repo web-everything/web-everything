@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const cases = ['release --lane=1', 'release --all-pools', 'gc', 'gc insteadOf', 'gc pushInsteadOf',
   'gc credential.helper', 'gc core.gitProxy', 'gc core.askpass', 'gc http.proxy',
+  'gc remote-alias-url', 'gc remote-alias-pushurl', 'gc remote-alias-normalized',
   'gc staged-card', 'gc staged-card-preserved-worktree'];
 
 export function replayRecoveryOrigin(root = ROOT, mode) {
@@ -44,9 +45,16 @@ export function replayRecoveryOrigin(root = ROOT, mode) {
       writeFileSync(join(lane, 'backlog/card.md'), worktreeCard);
     }
     const rewrite = mode.includes('InsteadOf') || mode.includes('insteadOf');
-    const transportConfig = mode.startsWith('gc ') && !rewrite && !stagedCard ? mode.split(' ')[1] : null;
+    const remoteAlias = mode.startsWith('gc remote-alias-');
+    const transportConfig = mode.startsWith('gc ') && !rewrite && !stagedCard && !remoteAlias ? mode.split(' ')[1] : null;
     let attacker;
-    if (rewrite) {
+    if (remoteAlias) {
+      attacker = join(base, 'attacker.git');
+      git(['clone', '--quiet', '--bare', origin, attacker]);
+      const alias = mode.endsWith('normalized') ? `${origin.toUpperCase().replace(/\.GIT$/, '')}/` : origin;
+      const setting = mode.endsWith('pushurl') ? 'pushurl' : 'url';
+      git(['config', `remote.${alias}.${setting}`, attacker], lane);
+    } else if (rewrite) {
       attacker = join(base, 'attacker.git');
       git(['clone', '--quiet', '--bare', lane, attacker]);
       git(['config', `url.${attacker}.${mode.split(' ')[1]}`, origin], lane);
@@ -91,7 +99,7 @@ export function replayRecoveryOrigin(root = ROOT, mode) {
       if (!result.stderr.includes('auto-recover: reclaimed 0, kept-unpushed 1')) {
         violations.push(`${mode}: did not exercise recovery refusal`);
       }
-    } else if (rewrite || transportConfig) {
+    } else if (rewrite || transportConfig || remoteAlias) {
       if (git(['rev-parse', 'HEAD'], lane) !== sha) violations.push(`${mode}: reset unpreserved work`);
       if (saved || (attacker && git(['ls-remote', '--heads', attacker, 'refs/heads/salvage/*'], primary))) {
         violations.push(`${mode}: refused rewrite still transported work`);
@@ -116,6 +124,7 @@ export default {
     return readFileSync(join(root, 'scripts/lane-pool.mjs'), 'utf8').includes('reference: join(dirname(topLevel), explicitPool)')
       && readFileSync(join(root, 'scripts/lib/lane-pool-salvage-push.mjs'), 'utf8').includes('URL rewriting configured')
       && readFileSync(join(root, 'scripts/lib/lane-pool-salvage-push.mjs'), 'utf8').includes('lane-controlled transport configuration')
+      && readFileSync(join(root, 'scripts/lib/lane-pool-salvage-push.mjs'), 'utf8').includes('const unsafeRemote =')
       && readFileSync(join(root, 'scripts/lib/lane-pool-recover.mjs'), 'utf8').includes('staged changes are not covered');
   },
   async run({ root = ROOT, log } = {}) {

@@ -45,6 +45,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
   const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
   // resolveRepo makes configured local origins absolute; explicit --origin paths remain invocation-relative.
   const origin = repo.originUrl ? (/^[^/]*:/.test(repo.originUrl) ? repo.originUrl : resolve(repo.originUrl)) : null;
+  const normalizeRemoteName = name => name.toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '');
   const transport = (command, ...args) => {
     if (!origin) throw new Error('canonical origin unresolved; supply --origin or a primary --reference');
     return ['-c', 'remote.origin.uploadpack=git-upload-pack', '-c', 'remote.origin.receivepack=git-receive-pack',
@@ -74,8 +75,15 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       if (!['system', 'global', 'local', 'worktree', 'command'].includes(scope) || !key) {
         throw new Error('unknown transport config scope; inspect the lane manually');
       }
+      // Git resolves even a URL argument as a remote name first. Only the exact
+      // origin subsection is allowed in lane config; URL aliases must be refused,
+      // not overridden with -c (remote URLs are multi-valued). Split at the LAST
+      // dot because a remote subsection can itself contain dots or line separators.
+      const remoteName = /^remote\./i.test(key) ? key.slice(7, key.lastIndexOf('.')) : null;
+      const unsafeRemote = remoteName !== null && (remoteName !== 'origin'
+        || (origin && normalizeRemoteName(remoteName) === normalizeRemoteName(origin)));
       if (['local', 'worktree'].includes(scope)
-        && /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key)) {
+        && (unsafeRemote || /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
         throw new Error('lane-controlled transport configuration; inspect the lane manually and remove it before retrying');
       }
     }
