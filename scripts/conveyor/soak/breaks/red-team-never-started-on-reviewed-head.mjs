@@ -170,7 +170,7 @@ export default {
         reserveCalls: () => { throw Error('cap check must precede reservation'); },
       });
       check(capped.status === 'skipped' && capped.reason.includes('daily-cap:'), '#5838: cap fixture did not hit the daily cap');
-      let status = null, calls = 0, capReset = false, fetchReady = false, headAvailable = false, job;
+      let status = null, calls = 0, gateCalls = 0, capReset = false, fetchReady = false, headAvailable = false, job;
       const capHistory = new Map();
       const io = {
         root: sourceRoot, now: () => at, newActorId: () => 'soak-cap',
@@ -190,7 +190,11 @@ export default {
           calls++;
           return capReset ? { status: 'ran', findings: [], comment: { status: 'posted' } } : capped;
         },
-        runRedTeamGate: () => { check(capReset, '#5838: cap deferral ran the gate'); return { status: 'ok' }; },
+        runRedTeamGate: input => {
+          check(input.repo === repo && input.pr === 5839, '#5838: gate targeted the wrong PR');
+          gateCalls++;
+          return { status: 'ok' };
+        },
         report: () => { throw Error('recovery must not write review completion'); },
         runLoop: () => { throw Error('recovery must not run a new review'); },
       };
@@ -202,18 +206,20 @@ export default {
         dispatch: options => { job = runReviewJob(options, io); return { jobPid: 42 }; },
       });
       retryCap();
-      check(job?.refused === true && calls === 0 && status == null,
+      check(job?.refused === true && calls === 0 && gateCalls === 0 && status == null,
         '#5838: failed head fetch persisted status or started a red team');
       at += 31 * 60_000;
       fetchReady = true;
       retryCap();
       check(calls === 1 && status == null, '#5838: capped recovery persisted terminal evidence');
+      check(gateCalls === 1 && job?.redTeamGate?.status === 'ok', '#5838: cap deferral skipped the gate');
       check(retryCap()?.rows[0]?.why === 'retry cooldown active', '#5838: cap retry ignored cooldown');
       at += 24 * 60 * 60_000;
       capReset = true;
       retryCap();
       check(calls === 2 && job?.redTeam?.status === 'ran' && status?.result === 'ran',
         '#5838: recovery never ran after the daily cap reset');
+      check(gateCalls === 2, '#5838: recovery after the cap reset skipped the gate');
     } catch (error) {
       violations.push(`scenario failed: ${error.stack ?? error}`);
     }
