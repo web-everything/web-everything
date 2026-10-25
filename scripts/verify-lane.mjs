@@ -27,7 +27,7 @@
  *   node scripts/verify-lane.mjs --gate="npm run test:unit"   # override the suite command (skips diff-driven selection entirely)
  *   node scripts/verify-lane.mjs --repo=~/workspace/.lanes/web-everything/lane-3   # verify a specific lane clone
  *   node scripts/verify-lane.mjs run                  # xpnhz4o — run the SAME default gate foreground, but record NO marker (the fix/ci-heal gate)
- *   node scripts/verify-lane.mjs remote --wait=540000 --json # import exact-HEAD remote success (clean, pushed tree required)
+ *   node scripts/verify-lane.mjs remote --wait=540000 --json # import exact-HEAD success (clean, pushed tree matching canonical main)
  *   node scripts/verify-lane.mjs --json              # machine-readable {sha, status, exitCode} on stdout
  *   node scripts/verify-lane.mjs check               # READ-ONLY: print the current marker's gate verdict for HEAD, run nothing
  *   node scripts/verify-lane.mjs check --require-verified   # exit non-zero unless HEAD has a fresh GREEN marker (the gate pr-land applies)
@@ -107,7 +107,7 @@ Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run|remote] [fla
   check     read-only verdict for HEAD (--wait=<ms> blocks until it settles)
   reset     clear a stale marker
   run       synchronous marker-less run
-  remote    stamp exact-HEAD remote success; requires a clean pushed tree
+  remote    stamp exact-HEAD remote success; requires a clean pushed tree matching canonical main
             --wait=<ms> polls up to 540000ms (default: one probe); local verify is the fallback
 Flags: --repo=<dir> --json --require-verified --dry-run (print default gate only) --help/-h
 Exit: 0 ok, 2 red, 3 usage/refused. Full docs: the header of scripts/verify-lane.mjs.
@@ -253,6 +253,12 @@ if (MODE === 'remote') {
     if (!result.ok) emit({ sha: headSha, ...result, status: result.state, detail: 'Remote verification did not pass; retry remote or use local verify.' }, 2);
     const marker = await recordRemoteVerification({
       sha: headSha, treeHash: initialTree, run: result.run, now: Date.now, writeMarker, fetchRuns,
+      // Read canonical main live, never the lane's origin/main or a caller-selected ref.
+      // Whole-tree equality includes workflow, installation hooks and gate dependencies.
+      fetchDefinition: async () => ({
+        head: JSON.parse(gh(['api', '--hostname', 'github.com', `repos/${slug}/commits/${headSha}`])),
+        base: JSON.parse(gh(['api', '--hostname', 'github.com', `repos/${slug}/commits/main`])),
+      }),
       treeUnchanged: () => git(['rev-parse', 'HEAD']) === headSha
         && git(['status', '--porcelain', '--untracked-files=all']) === '' && treeHashNow() === initialTree,
       fetchJobs: async (run) => {
@@ -265,8 +271,12 @@ if (MODE === 'remote') {
     emit({ ...marker, ok: true, detail: 'Remote verification passed; marker recorded.' }, 0);
   } catch (error) {
     const reason = error?.code === 'REMOTE_DIRTY_TREE' ? 'dirty-tree'
-      : error?.code === 'REMOTE_UNPUSHED_HEAD' ? 'head-not-pushed' : 'remote-unavailable';
-    emit({ sha: headSha, status: 'error', ok: false, reason, detail: 'Remote verification unavailable or tree not clean/pushed; use local verify or retry remote.' }, 2);
+      : error?.code === 'REMOTE_UNPUSHED_HEAD' ? 'head-not-pushed'
+        : error?.code === 'REMOTE_UNTRUSTED_DEFINITION' ? 'untrusted-definition' : 'remote-unavailable';
+    const detail = reason === 'untrusted-definition'
+      ? 'Remote evidence requires the complete tree protected on canonical main; use local verify for lane changes or unavailable definitions.'
+      : 'Remote verification unavailable or tree not clean/pushed; use local verify or retry remote.';
+    emit({ sha: headSha, status: 'error', ok: false, reason, detail }, 2);
   }
 }
 
