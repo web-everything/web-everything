@@ -120,7 +120,7 @@ The migration can regress live seat eligibility even when the pure lookup passes
 
 Done when #3 is the guarantee-to-test manifest: every entry names the proposed file/case and its observable assertion. These are planned follow-on tests, not existing coverage. The generic watcher uses injected readers, clock, filer and a temporary coordination store, plus one CLI dry-run fixture using real temporary files. This allows acceptance before #4011. The producer's real-record integration is owned by #4011 and cannot be claimed from the generic fixture. The authoring gate checks this preparation only.
 
-Review prevention is filed as #xezensp: caller-symbol citations, normative guarantee mappings, two-subject isolation, independent activation-state assertions, dependency-safe acceptance and corrupt scheduled-job state. It reuses the existing #5473/#3528 gate work; these checks are not claimed implemented here.
+Review prevention is filed as #7199: caller-symbol citations, normative guarantee mappings, two-subject isolation, independent activation-state assertions, dependency-safe acceptance and corrupt scheduled-job state. It reuses the existing #5473/#3528 gate work; these checks are not claimed implemented here.
 
 ## Done when
 
