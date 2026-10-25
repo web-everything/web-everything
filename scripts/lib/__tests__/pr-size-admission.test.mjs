@@ -6,6 +6,10 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as sizeAdmission from '../pr-size-admission.mjs';
 import { outcomePayload } from '../../operations/cli-adapter.mjs';
+import { fileIntoBatch } from '../../operations/card-batch-file.mjs';
+
+vi.mock('../../operations/card-batch-file.mjs', () => ({ fileIntoBatch: vi.fn() }));
+vi.mock('../../conveyor/infra-blocked.mjs', () => ({ originSlugOf: () => 'web-everything/web-everything' }));
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal();
@@ -13,7 +17,7 @@ vi.mock('node:child_process', async (importOriginal) => {
   return { ...actual, execFileSync, default: { ...actual.default, execFileSync } };
 });
 
-// Proposed effect seam: createSizeAdmissionRunner({ diffStat, fileItem, lookupSplitCard })
+// Effect seam: createSizeAdmissionRunner({ diffStat, fileItem, lookupSplitCard, publishSplitCard })
 // returns a runner({ ref, pr?, base, sha, body }) -> { status, lines, body, reviewLabel, sha? }.
 // fileItem accepts the declared operation's title/kind/size/digest/scope fields and returns
 // the CLI's outcomePayload envelope with a top-level verdict.
@@ -49,6 +53,7 @@ function effects(overrides = {}) {
     diffStat: vi.fn(() => ({ text: evidence, sha: 'pinned-sha' })),
     fileItem: vi.fn(() => cardResult),
     lookupSplitCard: vi.fn(() => null),
+    publishSplitCard: vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-filing-1' })),
     ...overrides,
   };
 }
@@ -64,14 +69,146 @@ function expectSizeNote(body) {
 }
 
 describe('shared admission effects', () => {
+  it.each(['new', 'local retry', 'old body marker'])('awaits durable publication before reporting a %s split card filed', async (mode) => {
+    let finish;
+    const io = effects({
+      lookupSplitCard: () => mode === 'new' ? null : cardResult.verdict,
+      publishSplitCard: vi.fn(() => new Promise((resolve) => { finish = resolve; })),
+    });
+    const body = mode === 'old body marker'
+      ? `${request.body}\n\n## Size\n\nstale\n<!-- size-admission:${encodeURIComponent(request.ref)} 9001 -->\n`
+      : request.body;
+    let completed = false;
+    const pending = sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body }).then((result) => {
+      completed = true;
+      return result;
+    });
+    // Allow lookup and filing to finish; publication must still hold the body back.
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    expect(io.publishSplitCard).toHaveBeenCalledWith(cardResult.verdict, expect.objectContaining({ ref: request.ref }));
+    expect(completed).toBe(false);
+    finish({ batched: true, batchRef: 'lane/card-batch-filing-1' });
+    expectSizeNote((await pending).body);
+    expect(io.fileItem).toHaveBeenCalledTimes(mode === 'new' ? 1 : 0);
+  });
+
+  it.each(['refusal', 'exception', 'missing confirmation'])('publication %s proceeds without a filed claim or success marker, then retries the same card', async (failure) => {
+    const io = effects({ lookupSplitCard: () => cardResult.verdict,
+      publishSplitCard: vi.fn(async () => {
+        if (failure === 'exception') throw new Error('publication failed');
+        return failure === 'refusal' ? { batched: false, reason: 'lease held' } : undefined;
+      }),
+    });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
+    expect(result.body).toContain('split card not filed:');
+    expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
+    io.publishSplitCard.mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
+    expectSizeNote((await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: result.body })).body);
+    expect(io.fileItem).not.toHaveBeenCalled();
+  });
+
+  it('reports the durably published member when concurrent filers created different local card ids', async () => {
+    const io = effects({ publishSplitCard: async () => ({ batched: true, deduped: true,
+      member: { cardId: 'xwinner' }, batchRef: 'lane/card-batch-filing-1' }) });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(result.body).toContain('split card xwinner filed via lane/card-batch-filing-1');
+    expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission xwinner -->');
+    expect(result.body).not.toContain('split card 9001 filed');
+  });
+
+  it.each([undefined, { cardId: 'bad\nidentity' }])('does not claim publication when a deduplicated member lacks a safe identity (%j)', async (member) => {
+    const io = effects({ publishSplitCard: async () => ({ batched: true, deduped: true, member }) });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(result.body).toContain('split card not filed: published split-card identity was not confirmed');
+    expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
+  });
+
+  it.each(['a', '界'])('bounds both PR notes and file-item arguments for twelve thousand long %s file groups', async (letter) => {
+    const text = Array.from({ length: 12_000 }, (_, i) =>
+      `1\t0\tpackages/${String(i).padStart(5, '0')}-${letter.repeat(180)}/index.mjs\0`).join('');
+    const io = effects({ diffStat: () => text });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(result.status).toBe('over');
+    expect(Buffer.byteLength(result.body)).toBeLessThan(16_384);
+    expect(result.body).toMatch(/omitted/);
+    const fields = io.fileItem.mock.calls[0][0];
+    for (const value of Object.values(fields)) expect(Buffer.byteLength(String(value))).toBeLessThan(16_384);
+    expect(fields.digest).toMatch(/omitted/);
+    expect(fields.scope.split(',').every((path) => path.startsWith('we:packages/'))).toBe(true);
+  });
+
+  it('omits a single over-budget group and scope path whole, including when filing fails', async () => {
+    const path = `packages/${'界'.repeat(20_000)}/index.mjs`;
+    const io = effects({ diffStat: () => `301\t0\t${path}\0`, fileItem: vi.fn(() => { throw new Error('unavailable'); }) });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(Buffer.byteLength(result.body)).toBeLessThan(16_384);
+    expect(result.body).toContain('1 group omitted');
+    expect(result.body).toContain('split card not filed: unavailable');
+    const fields = io.fileItem.mock.calls[0][0];
+    expect(fields.scope).toBe('');
+    expect(fields.digest).toContain('1 scope path omitted');
+  });
+
+  it.each(['refusal', 'exception'])('default publisher does not mistake a locally scaffolded card for publication after batch %s', async (mode) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'size-split-publish-'));
+    mkdirSync(join(cwd, 'backlog'));
+    writeFileSync(join(cwd, cardResult.verdict.rel), `size-split-ref:${encodeURIComponent(request.ref)}. File groups: we:scripts: 301`);
+    vi.mocked(execFileSync).mockReturnValue(''); // absent from the canonical remote base
+    vi.mocked(fileIntoBatch).mockImplementation(async () => {
+      if (mode === 'exception') throw new Error('publication failed');
+      return { batched: false, reason: 'batch unavailable' };
+    });
+    const fileItem = vi.fn();
+    try {
+      const result = await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence, fileItem })(request);
+      expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
+      expect(result.body).toContain(`split card not filed: ${mode === 'exception' ? 'publication failed' : 'batch unavailable'}`);
+      expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
+      expect(fileItem).not.toHaveBeenCalled();
+      vi.mocked(fileIntoBatch).mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
+      expectSizeNote((await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence, fileItem })({ ...request, body: result.body })).body);
+      expect(fileItem).not.toHaveBeenCalled();
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('default publisher reuses a card already in the canonical backlog without batching it again', async () => {
+    const io = effects();
+    delete io.publishSplitCard;
+    vi.mocked(execFileSync).mockReturnValue(`100644 blob ${'a'.repeat(40)}\t${cardResult.verdict.rel}\0`);
+    vi.mocked(fileIntoBatch).mockClear();
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expectSizeNote(result.body);
+    expect(fileIntoBatch).not.toHaveBeenCalled();
+  });
+
+  it.each(['unreadable entry', `040000 tree ${'a'.repeat(40)}\tbacklog/xsplit1-split.md\0`,
+    `120000 blob ${'a'.repeat(40)}\tbacklog/xsplit1-split.md\0`])
+  ('default publisher does not treat incomplete or nonregular canonical evidence as a published card (%j)', async (entry) => {
+    const io = effects();
+    delete io.publishSplitCard;
+    vi.mocked(execFileSync).mockReturnValue(entry);
+    vi.mocked(fileIntoBatch).mockResolvedValue({ batched: false, reason: 'publication unavailable' });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(result.body).toContain('split card not filed: publication unavailable');
+    expect(result.body).not.toContain('<!-- size-published:');
+  });
+
   it.each([
     ['numbered', { num: 9001, id: '9001' }, '9001'],
     ['hash-only', { num: null, id: 'xsplit1' }, 'xsplit1'],
   ])('default file-item adapter creates and returns a reusable split card through the CLI output contract (%s)', async (_name, verdict, id) => {
     const cwd = mkdtempSync(join(tmpdir(), 'size-split-adapter-'));
     mkdirSync(join(cwd, 'backlog'));
+    vi.mocked(fileIntoBatch).mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
     const exec = vi.fn((command, args, options) => {
+      if (command === 'git') {
+        expect(args).toEqual(['ls-tree', '-z', '--full-tree', 'origin/main', '--', expect.stringMatching(/^backlog\//)]);
+        expect(options).toMatchObject({ cwd, timeout: 5000 });
+        return '';
+      }
       expect(command).toBe(process.execPath);
+      expect(args[0]).toBe(join(cwd, 'scripts/operations/run.mjs'));
       expect(args[0]).toMatch(/scripts\/operations\/run\.mjs$/);
       expect(args[1]).toBe('file-item');
       expect(args.at(-1)).toBe('--json');
@@ -100,7 +237,11 @@ describe('shared admission effects', () => {
       expectSizeNote(first.body);
       expectSizeNote((await run()).body); // unpublished body: durable local lookup
       expectSizeNote((await run(first.body)).body); // published marker
-      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec.mock.calls.filter(([command]) => command === process.execPath)).toHaveLength(1);
+      expect(fileIntoBatch).toHaveBeenCalledWith({ laneDir: cwd, cardPath: `backlog/${id}-split.md`,
+        actor: 'mechanical', idemKey: `size-split:${request.ref}`,
+        source: { repo: 'web-everything/web-everything', pr: request.pr, head: request.sha, note: `Split oversized PR ${request.ref}` },
+      });
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 
@@ -217,8 +358,22 @@ describe('shared admission effects', () => {
     const first = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     const second = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: first.body });
     expect(io.fileItem).toHaveBeenCalledTimes(1);
+    expect(io.publishSplitCard).toHaveBeenCalledTimes(1);
     expect(second.body.match(/^## Size$/gm)).toHaveLength(1);
     expectSizeNote(second.body);
+  });
+
+  it('retains confirmed publication through unknown-size retries after the original batch has sealed', async () => {
+    const io = effects();
+    const first = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(first.body).toContain('<!-- size-published:lane%2Fsize-admission 9001 -->');
+    const unknown = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: () => { throw new Error('unknown'); } }))({ ...request, body: first.body });
+    io.publishSplitCard.mockRejectedValue(new Error('original batch sealed'));
+    io.lookupSplitCard.mockReturnValue(null);
+    const retry = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: unknown.body });
+    expectSizeNote(retry.body);
+    expect(io.publishSplitCard).toHaveBeenCalledTimes(1);
+    expect(retry.body.match(/<!-- size-published:/g)).toHaveLength(1);
   });
 
   it('injected lookup reuses a card for the same ref even when the body has no marker', async () => {
@@ -237,7 +392,8 @@ describe('shared admission effects', () => {
       writeFileSync(join(cwd, 'backlog', `${num}-split.md`), fields.digest);
       return { verdict: { num } };
     });
-    const run = (ref) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence, fileItem })({ ...request, ref, pr: null });
+    const run = (ref) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence, fileItem,
+      publishSplitCard: effects().publishSplitCard })({ ...request, ref, pr: null });
     try {
       expect((await run('lane/foobar')).body).toContain('split card 9001 filed');
       expect((await run('lane/foo')).body).toContain('split card 9002 filed');

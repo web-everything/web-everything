@@ -28,7 +28,8 @@ function wrapper(overrides = {}) {
 // in createParams/applyReviewEscalationLabel. All effects here are injected.
 function direct(overrides = {}) {
   const effects = { diffStat: vi.fn(() => ({ text, sha: 'pinned-sha' })),
-    fileItem: vi.fn(() => card), lookupSplitCard: vi.fn(() => null), ...overrides };
+    fileItem: vi.fn(() => card), lookupSplitCard: vi.fn(() => null),
+    publishSplitCard: vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-filing-1' })), ...overrides };
   return { effects, run: (input = request) => {
     expect(prLand.admitPrSize, 'direct pr-land must expose its injected admission seam').toBeTypeOf('function');
     return prLand.admitPrSize(input, effects);
@@ -343,6 +344,17 @@ describe('pr-land CLI size failure boundaries', () => {
   `);
   const runBlock = (forge, admit, prNum, labels, publication = { REF: 'lane/test', REMOTE: 'origin', BASE: 'main', refSha: 'sha', SRC: 'HEAD' }) =>
     executeBlock(forge, admit, prNum, labels, prLand.buildSizeAdmissionRequest, publication);
+
+  it.each([null, 5854])('CLI body reports a split card only after shared admission publishes it (PR %s)', async (prNum) => {
+    const forge = { viewPr: vi.fn(() => ({ body: 'live body' })), editBody: vi.fn() };
+    const { effects, run } = direct({ publishSplitCard: vi.fn(async () => ({ batched: false, reason: 'publication unavailable' })) });
+    const result = await runBlock(forge, (input) => run(input), prNum, REVIEW_LABELS);
+    expect(effects.publishSplitCard).toHaveBeenCalledTimes(1);
+    expect(result.createParams.body).toContain('split card not filed: publication unavailable');
+    expect(result.sizeAdmission.reviewLabel).toBe(REVIEW_LABELS.pending);
+    expect(result.createParams.body).toContain('<!-- size-admission:lane%2Ftest - -->');
+    if (prNum != null) expect(forge.editBody).toHaveBeenCalledWith(prNum, result.createParams.body);
+  });
 
   it('builds admission arguments from the resolved publication SHA and remote base', () => {
     expect(prLand.buildSizeAdmissionRequest).toBeTypeOf('function');

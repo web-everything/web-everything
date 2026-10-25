@@ -1,11 +1,30 @@
 /** Shared size evidence and non-blocking PR admission. */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, resolve } from 'node:path';
 import { REVIEW_LABELS } from './review-labels.mjs';
 
 export const OPEN_PR_MAX_NON_TEST_LINES = 300;
+const SUMMARY_BYTES = 4096;
+
+// Keep complete entries: scope is a comma-separated path list, so truncating it
+// mid-path changes its meaning. Byte budgets also cover multibyte filenames.
+function boundedEntries(entries, separator, budget = SUMMARY_BYTES) {
+  const kept = [];
+  let bytes = 0, omitted = 0;
+  for (const entry of entries) {
+    const cost = Buffer.byteLength(entry) + (kept.length ? Buffer.byteLength(separator) : 0);
+    if (bytes + cost > budget) { omitted++; continue; }
+    kept.push(entry);
+    bytes += cost;
+  }
+  return { text: kept.join(separator), omitted };
+}
+
+function summaryText(text) {
+  return text.replace(/[\x00-\x1f\x7f\u2028\u2029]/g, ' ')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
 /** Pure git --numstat -z accounting (also accepts legacy unquoted newline rows).
  * Binary rows are unmeasurable; malformed or incomplete evidence must never become a zero-sized diff.
@@ -131,11 +150,38 @@ export function planSizeAdmission(result) {
 }
 
 function fileSplitItem(fields, cwd) {
-  const cli = join(dirname(fileURLToPath(import.meta.url)), '../operations/run.mjs');
+  // Scaffold resolves its root by script location, not cwd. Use the target lane's
+  // copy so a direct pr-land caller cannot file in the dispatcher's checkout.
+  const cli = resolve(cwd, 'scripts/operations/run.mjs');
   const output = execFileSync(process.execPath, [cli, 'file-item', ...Object.entries(fields).map(([key, value]) => `--${key}=${value}`), '--json'], {
     cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
   });
   return JSON.parse(output);
+}
+
+async function publishLocalSplitCard(card, request, cwd) {
+  if (typeof card?.rel !== 'string' || !/^backlog\/[A-Za-z0-9]+-[^/\\\x00-\x1f]+\.md$/.test(card.rel)) {
+    throw new Error('split card has no publishable backlog path');
+  }
+  const git = createGitReader(cwd);
+  // A card already in the canonical remote base needs no second publication.
+  try {
+    const entry = git(['ls-tree', '-z', '--full-tree', 'origin/main', '--', card.rel], { timeout: 5000 });
+    const blob = /^100644 blob [a-f0-9]{40,64}\t([^\0]+)\0$/.exec(entry);
+    if (blob?.[1] === card.rel) return { batched: true };
+  } catch { /* the batch coordinator still checks its own publication evidence */ }
+  const [{ fileIntoBatch }, { originSlugOf }] = await Promise.all([
+    import('../operations/card-batch-file.mjs'), import('../conveyor/infra-blocked.mjs'),
+  ]);
+  const repo = originSlugOf(cwd);
+  if (!repo) throw new Error('split-card publication repository is unknown');
+  // The shared coordinator commits and pushes before returning batched:true. It
+  // owns concurrency, retry dedupe and the later card-only PR/seal, without
+  // changing the verified source SHA published by pr-land.
+  return fileIntoBatch({ laneDir: cwd, cardPath: card.rel, actor: 'mechanical',
+    idemKey: `size-split:${request.ref}`,
+    source: { repo, pr: request.pr ?? null, head: request.sha, note: `Split oversized PR ${request.ref}` },
+  });
 }
 
 // A durable local lookup also covers a failed forge create before its body was published.
@@ -158,6 +204,7 @@ function splitCardId(value) {
 
 export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = createPrDiffStatReader({ cwd }),
   fileItem = (fields) => fileSplitItem(fields, cwd), lookupSplitCard = (request) => lookupLocalSplitCard(request, cwd),
+  publishSplitCard = (card, request) => publishLocalSplitCard(card, request, cwd),
 } = {}) {
   return async (request) => {
     const { ref, base = 'main', sha = 'HEAD', body = '' } = request;
@@ -186,26 +233,54 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
         for (const path of paths.filter((path) => !isTestPath(path))) files.add(path);
       }
     }
-    const groupLine = `File groups: ${groups.size ? [...groups].map(([group, lines]) => `we:${group}: ${lines}`).join('; ') : 'unavailable (size unknown)'}`;
+    const groupSummary = boundedEntries([...groups].map(([group, lines]) => `we:${summaryText(group)}: ${lines}`), '; ');
+    const groupLine = `File groups: ${groups.size ? groupSummary.text : 'unavailable (size unknown)'}`
+      + (groupSummary.omitted ? `; ${groupSummary.omitted} group${groupSummary.omitted === 1 ? '' : 's'} omitted (summary budget)` : '');
+    const scopePaths = [...files].filter((path) => !/[,\r\n]/.test(path));
+    const scopeSummary = boundedEntries(scopePaths.map((path) => `we:${path}`), ',');
+    const scopeOmitted = scopeSummary.omitted + files.size - scopePaths.length;
     let cardId = null;
     try { if (existing && existing[2] !== '-') cardId = splitCardId(decodeURIComponent(existing[2])); } catch { /* malformed marker is not filing evidence */ }
+    // Older admission markers were written after scaffold alone. Only this new
+    // receipt, emitted after publication, permits a retry to skip the publisher
+    // (including after its batch has sealed and the coordinator moved on).
+    const receipt = cardId ? `<!-- size-published:${refToken} ${encodeURIComponent(cardId)} -->\n` : '';
+    let cardPublished = Boolean(receipt && body.slice(0, existing.index).endsWith(receipt));
     let cardNote = '';
-    if (plan.status === 'over') {
+    if (plan.status === 'over' && cardPublished) cardNote = `split card ${cardId} filed`;
+    else if (plan.status === 'over') {
       try {
-        if (!cardId) {
-          let card;
-          try { card = await lookupSplitCard({ ref }); } catch { /* filing remains available */ }
-          if (!splitCardId(card?.num || card?.id) || card?.outcome === 'refused') {
+        let card;
+        try { card = await lookupSplitCard({ ref }); } catch { /* filing remains available */ }
+        if (!splitCardId(card?.num || card?.id) || card?.outcome === 'refused') {
+          if (cardId) card = { id: cardId };
+          else {
             const filed = await fileItem({ title: `Split PR ${request.pr ? `#${request.pr}` : ref} into focused changes`, kind: 'story', size: 3,
-              digest: `Plan follow-up splits for PR ${request.pr ? `#${request.pr}` : ref}. size-split-ref:${refToken}. ${groupLine}`,
-              scope: [...files].map((path) => `we:${path}`).join(',') });
+              digest: `Plan follow-up splits for PR ${request.pr ? `#${request.pr}` : ref}. size-split-ref:${refToken}. ${groupLine}`
+                + (scopeOmitted ? `; ${scopeOmitted} scope path${scopeOmitted === 1 ? '' : 's'} omitted (scope budget or unrepresentable delimiter)` : ''),
+              scope: scopeSummary.text });
             card = filed?.verdict;
           }
-          if (card?.outcome !== 'refused') cardId = splitCardId(card?.num || card?.id);
-          if (!cardId) throw new Error(card?.reason || 'file-item returned no card');
         }
-        cardNote = `split card ${cardId} filed`;
-      } catch (error) { cardNote = `split card not filed: ${String(error?.message || error).replace(/[\r\n\x00-\x1f]/g, ' ').slice(0, 300)}`; }
+        cardId = card?.outcome !== 'refused' ? splitCardId(card?.num || card?.id) : null;
+        if (!cardId) throw new Error(card?.reason || 'file-item returned no card');
+        const publication = await publishSplitCard(card, request);
+        if (publication?.batched !== true) throw new Error(publication?.reason || 'split-card publication was not confirmed');
+        if (publication.deduped) {
+          // Concurrent filers can scaffold different local ids for this ref.
+          // The coordinator's existing member is the card actually published.
+          cardId = splitCardId(publication.member?.cardId);
+          if (!cardId) throw new Error('published split-card identity was not confirmed');
+        }
+        cardPublished = true;
+        cardNote = `split card ${cardId} filed`
+          + (typeof publication.batchRef === 'string' && /^lane\/[A-Za-z0-9-]{1,100}$/.test(publication.batchRef)
+            ? ` via ${publication.batchRef}` : '');
+      } catch (error) {
+        cardId = null;
+        cardPublished = false;
+        cardNote = `split card not filed: ${summaryText(String(error?.message || error).slice(0, 300))}`;
+      }
     }
     // Replace only this ref's generated section, including unknown-size/failure retries.
     let previousBody = body;
@@ -216,7 +291,8 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     const note = plan.status === 'over'
       ? `${plan.lines} non-test lines (> ${OPEN_PR_MAX_NON_TEST_LINES}): ${cardNote}; extra reviewers requested via the size escalation (review:pending)`
       : 'size unknown: extra reviewers requested via the size escalation (review:pending)';
-    result.body = `${previousBody}\n\n## Size\n\n${note}\n${groupLine}\n<!-- size-admission:${refToken} ${cardId ? encodeURIComponent(cardId) : '-'} -->\n`;
+    const publicationReceipt = cardPublished ? `<!-- size-published:${refToken} ${encodeURIComponent(cardId)} -->\n` : '';
+    result.body = `${previousBody}\n\n## Size\n\n${note}\n${groupLine}\n${publicationReceipt}<!-- size-admission:${refToken} ${cardId ? encodeURIComponent(cardId) : '-'} -->\n`;
     return result;
   };
 }

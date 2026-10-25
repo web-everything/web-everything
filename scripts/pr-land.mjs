@@ -1015,6 +1015,8 @@ async function runCli() {
   }
   let sizeAdmission;
   try {
+    // Admission publishes split cards through the shared card-only batch before
+    // claiming they are filed; it never changes the verified source SHA above.
     sizeAdmission = await admitPrSize(buildSizeAdmissionRequest({ ref: REF, pr: prNum, remote: REMOTE, base: BASE, refSha, body: sizeBody }), { cwd: REPO });
   } catch {
     sizeAdmission = { status: 'unknown', body: sizeBody, reviewLabel: REVIEW_LABELS.pending };
