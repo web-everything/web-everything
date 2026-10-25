@@ -84,12 +84,27 @@ describe('health-watch destructive lane action call-site contract', () => {
         if (named && ts.isNamespaceImport(named)) target.add(named.name.text);
         else for (const binding of named?.elements ?? []) target.add(binding.name.text);
       }
-      if (ts.isVariableDeclaration(node) && node.initializer) bindings.push(node);
+      if (ts.isVariableDeclaration(node) && node.initializer) {
+        bindings.push({ name: node.name, initializer: node.initializer });
+      } else if (ts.isBinaryExpression(node)
+        && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+        && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
+        bindings.push({ name: node.left, initializer: node.right });
+      }
     });
     const uses = (node, names) => {
       if (ts.isIdentifier(node)) return names.has(node.text);
       if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)
-        || ts.isParenthesizedExpression(node) || ts.isAwaitExpression(node)) return uses(node.expression, names);
+        || ts.isParenthesizedExpression(node) || ts.isAwaitExpression(node)) {
+        return names.has(node.getText(tree)) || uses(node.expression, names);
+      }
+      if (ts.isObjectLiteralExpression(node)) return node.properties.some(property => {
+        if (ts.isPropertyAssignment(property)) return uses(property.initializer, names);
+        if (ts.isShorthandPropertyAssignment(property)) return uses(property.name, names);
+        return ts.isSpreadAssignment(property) && uses(property.expression, names);
+      });
+      if (ts.isArrayLiteralExpression(node)) return node.elements.some(element =>
+        uses(ts.isSpreadElement(element) ? element.expression : element, names));
       if (ts.isBinaryExpression(node)) return uses(node.left, names) || uses(node.right, names);
       if (ts.isConditionalExpression(node)) return uses(node.whenTrue, names) || uses(node.whenFalse, names);
       if (ts.isCallExpression(node)) {
@@ -101,7 +116,8 @@ describe('health-watch destructive lane action call-site contract', () => {
       return false;
     };
     // Conservative, scope-independent propagation: aliases can only add sites to
-    // the review inventory. Iterate to cover chains declared in either order.
+    // the review inventory. Iterate to cover chains declared or assigned in
+    // either order, including destructuring and member assignment targets.
     let changed;
     do {
       changed = false;
@@ -110,9 +126,23 @@ describe('health-watch destructive lane action call-site contract', () => {
           : uses(binding.initializer, helpers) ? helpers : null;
         if (!target) continue;
         const bind = name => {
-          if (ts.isIdentifier(name)) {
-            if (!target.has(name.text)) { target.add(name.text); changed = true; }
-          } else for (const element of name.elements) if (ts.isBindingElement(element)) bind(element.name);
+          if (ts.isIdentifier(name) || ts.isPropertyAccessExpression(name) || ts.isElementAccessExpression(name)) {
+            const key = name.getText(tree);
+            if (!target.has(key)) { target.add(key); changed = true; }
+          } else if (ts.isParenthesizedExpression(name)) bind(name.expression);
+          else if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+            for (const element of name.elements) if (ts.isBindingElement(element)) bind(element.name);
+          } else if (ts.isObjectLiteralExpression(name)) {
+            for (const property of name.properties) {
+              if (ts.isPropertyAssignment(property)) bind(property.initializer);
+              else if (ts.isShorthandPropertyAssignment(property)) bind(property.name);
+              else if (ts.isSpreadAssignment(property)) bind(property.expression);
+            }
+          } else if (ts.isArrayLiteralExpression(name)) {
+            for (const element of name.elements) bind(ts.isSpreadElement(element) ? element.expression : element);
+          } else if (ts.isBinaryExpression(name) && name.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+            bind(name.left);
+          }
         };
         bind(binding.name);
       }
@@ -168,10 +198,24 @@ describe('health-watch destructive lane action call-site contract', () => {
     ["const launch = exec.bind(null); launch('git', ['reset', '--hard']);", 'launch('],
     ["exec.call(null, 'git', ['reset', '--hard']);", 'exec.call('],
     ["import { reclaimLane } from './lane-actions.mjs'; reclaimLane(path);", 'helper:reclaimLane'],
+    ["import { reclaimLane } from './lane-actions.mjs'; let launch; launch ||= reclaimLane; launch(path);", 'helper:launch'],
+    ["import { reclaimLane } from './lane-actions.mjs'; let launch; ({ action: launch } = { action: reclaimLane }); launch(path);", 'helper:launch'],
+    ["let launch; [launch] = [exec]; launch('git', ['reset', '--hard']);", 'launch('],
+    ["const actions = {}; actions['launch'] = exec; actions['launch']('git', ['reset', '--hard']);", "actions['launch']("],
+    ["let launch; ({ action: [launch = null] } = { action: [exec] }); launch('git', ['reset', '--hard']);", 'launch('],
+    ["let launch; [...launch] = [exec]; launch[0]('git', ['reset', '--hard']);", 'launch[0]('],
   ])('inventories indirect action call sites: %s', (source, site) => {
     // These are parsed, never executed. Each used to escape the literal-name
     // inventory, letting an unguarded action appear without changing its list.
     expect(commands(source).some(call => call.startsWith(site))).toBe(true);
+  });
+  it('keeps unrelated assignments and sibling members out of the command inventory', () => {
+    expect(commands(`
+      let launch; launch = unrelated; launch('node', ['lane-pool.mjs', 'reset']);
+      const actions = {}; actions.launch = exec; actions.report();
+      // launch = exec; launch('git', ['reset']);
+      const example = "launch = exec; launch('git', ['reset'])";
+    `)).toEqual([]);
   });
   it.each(scopedScanFiles(['scripts/conveyor/health-watch.mjs', 'scripts/operations/stale-state-io.mjs']))(
     'allowlists every command call site in %s; new destructive lane actions require a guard', file => {
