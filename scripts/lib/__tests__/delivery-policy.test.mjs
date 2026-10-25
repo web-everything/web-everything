@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import ts from 'typescript';
@@ -369,6 +369,29 @@ describe('trust, confinement and reach set', () => {
     expect(cycle.warnings).toHaveLength(1);
     reach(cycle);
   });
+  it('rechecks pointer registration on cache hits without a file or mtime change', async () => {
+    gate.POLICY_SPEC_BASENAMES.add('repair-policy.json');
+    const path = put('repair-policy.json', { onMainRed: 'off' });
+    put(rootFile, { mergeGate: './repair-policy.json' });
+    const source = readFileSync(path, 'utf8');
+    const mtime = statSync(path).mtimeMs;
+    const allowed = await load();
+    expect(allowed.mergeGate.onMainRed).toBe('off');
+    expect(allowed.sources.mergeGate.onMainRed).toBe('config');
+    expect(allowed.filesRead).toEqual([defaultFile, rootFile, 'repair-policy.json']);
+    expect(allowed.warnings).toEqual([]);
+    reach(allowed);
+
+    gate.POLICY_SPEC_BASENAMES.delete('repair-policy.json');
+    const refused = await load();
+    expect(readFileSync(path, 'utf8')).toBe(source);
+    expect(statSync(path).mtimeMs).toBe(mtime);
+    expect(refused.mergeGate.onMainRed).toBe('halt');
+    expect(refused.sources.mergeGate.onMainRed).toBe('default');
+    expect(refused.warnings).toEqual(['Unregistered policy pointer: repair-policy.json']);
+    expect(refused.filesRead).toEqual([defaultFile, rootFile]);
+    reach(refused);
+  });
   it('registered missing JSON and invalid pointer JSON have a single warning', async () => {
     gate.POLICY_SPEC_BASENAMES.add('repair-policy.json');
     put(rootFile, { mergeGate: './repair-policy.json' });
@@ -413,14 +436,35 @@ describe('trust, confinement and reach set', () => {
       reach(result);
     }
   });
-  it('env config is JSON only, and ref reads cannot be redirected even outside Actions', async () => {
-    const base = repository();
+  it('env config is JSON only outside Actions', async () => {
     const path = join(dir, 'state/config.txt');
     writeFileSync(path, JSON.stringify({ mergeGate: { onMainRed: 'off' } }));
-    for (const ref of [undefined, base]) {
-      const result = await load({ ref, env: { ...env, WE_POLICY_CONFIG: path } });
+    const result = await load({ env: { ...env, WE_POLICY_CONFIG: path } });
+    expect(result.mergeGate.onMainRed).toBe('halt');
+    expect(result.warnings).toEqual(['WE_POLICY_CONFIG must be JSON']);
+    reach(result);
+  });
+  it('ref reads and CLI reject an otherwise valid state-dir JSON env redirect outside Actions', async () => {
+    put(rootFile, { mergeGate: { onMainRed: 'halt' } });
+    const base = repository();
+    const path = join(dir, 'state/config.json');
+    writeFileSync(path, JSON.stringify({ mergeGate: { onMainRed: 'off' } }));
+    const overrideEnv = { ...env, WE_POLICY_CONFIG: path };
+    const local = await load({ env: overrideEnv });
+    expect(local.mergeGate.onMainRed).toBe('off');
+    expect(local.sources.mergeGate.onMainRed).toBe('config');
+    expect(local.warnings).toEqual([]);
+    reach(local, [path]);
+
+    const fromRef = await load({ ref: base, env: overrideEnv });
+    const fromCli = JSON.parse(execFileSync(process.execPath, [resolve('scripts/lib/delivery-policy.mjs'), '--json', `--ref=${base}`], {
+      cwd: root, env: { ...process.env, ...overrideEnv, GITHUB_ACTIONS: '' }, encoding: 'utf8', timeout: 20000,
+    }));
+    for (const result of [fromRef, fromCli]) {
       expect(result.mergeGate.onMainRed).toBe('halt');
-      expect(result.warnings).toHaveLength(1);
+      expect(result.sources.mergeGate.onMainRed).toBe('config');
+      expect(result.warnings).toEqual(['WE_POLICY_CONFIG ignored for PR/Actions gates']);
+      expect(result.filesRead).toEqual([defaultFile, rootFile]);
       reach(result);
     }
   });
