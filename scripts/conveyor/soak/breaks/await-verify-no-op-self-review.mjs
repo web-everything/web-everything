@@ -14,7 +14,7 @@ export default {
   id: 'await-verify-no-op-self-review',
   title: 'a no-op early push retains the self-review hold and bounded recovery',
   card: 'PR #5919, send-back x1b8hlo item 1',
-  fixedBy: { sha: 'HEAD', where: 'lane/port-1023a-b', paths: [PASS] },
+  fixedBy: { sha: '2a59d0141268899ef3fad095a40c8e79f63ff925', where: 'lane/port-1023a-b', paths: [PASS] },
   fixPresent(root) {
     return readFileSync(join(root, PASS), 'utf8').includes("['green', 'no-new-commit'].includes(record.pendingResume?.kind)");
   },
