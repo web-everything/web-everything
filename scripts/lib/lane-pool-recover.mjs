@@ -36,6 +36,18 @@ export function verifyRecoveryBackup({ laneDir, proof, manifestPath }) {
         || !Object.hasOwn(manifest.files, file) || !/^[a-f0-9]{64}$/.test(manifest.files[file])
         || cardDigest(join(laneDir, file)) !== manifest.files[file]) throw new Error('content changed after backup');
     }
+    // The manifest preserves working-tree bytes only. Refuse every staged change, including
+    // additions, deletions and mode changes, both after backup and under reclaim's lease.
+    // This compares trees without reading worktree content or invoking clean filters.
+    try {
+      execFileSync('git', ['diff', '--cached', '--quiet', '--no-ext-diff', '--no-textconv',
+        '--ignore-submodules=none', 'HEAD', '--'], { ...processOptions, cwd: laneDir,
+        env: laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0',
+          GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null', GIT_SHALLOW_FILE: '/dev/null' }) });
+    } catch (e) {
+      throw new Error(e.status === 1 ? 'staged changes are not covered by the working-tree backup'
+        : 'cannot verify the index against HEAD');
+    }
     return { ok: true };
   } catch (e) { return { ok: false, error: `recovery backup verification failed: ${message(e)}; inspect the lane or retry recovery` }; }
 }
@@ -273,7 +285,7 @@ export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_
         ...(qualifiesForCardBackup(proof) ? proof.unpreservedFiles : [])])] };
       const laneDir = join(repo.poolDir, `lane-${n}`);
       const backup = await backupLaneContent({ lane: n, laneDir, backupRoot: mkdtempSync(join(root, 'recover-')), io });
-      if (!backup.ok || !qualifiesForCardBackup(proof)) return backup;
+      if (!backup.ok || (!qualifiesForCardBackup(proof) && proof?.preserved !== true)) return backup;
       try {
         const files = Object.fromEntries(proof.unpreservedFiles.map(file => [file, cardDigest(join(backup.dir, file))]));
         const manifestPath = join(backup.dir, 'reclaim-proof.json');
@@ -287,7 +299,7 @@ export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_
     reclaim: (n, { override }) => {
       if (override && !backups.has(n)) return { reclaimed: false, error: 'verified card backup is required' };
       const result = run([`--lane=${n}`, ...(override ? ['--override'] : []), '--reason=auto-recover: content backed up'],
-        override ? { WE_LANE_RECOVERY_BACKUP: backups.get(n) } : {});
+        backups.has(n) ? { WE_LANE_RECOVERY_BACKUP: backups.get(n) } : {});
       return { reclaimed: result.status === 0 && !result.error && /lane-\d+: reclaimed\b/i.test(`${result.stdout}\n${result.stderr}`), error: result.error ? message(result.error) : clean(result.stderr || result.stdout || 'reclaim refused') };
     },
   };

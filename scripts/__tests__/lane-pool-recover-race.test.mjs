@@ -165,6 +165,74 @@ function assertRaceRefused({ result, card, saved }) {
 }
 
 describe('automatic reclaim backup-to-reset guard', () => {
+  it.each([
+    ['tracked-card.md', original],
+    ['new-card.md', original],
+    ['tracked-card.md', 'committed card\n'],
+  ])('automatic card recovery preserves distinct index and worktree bytes: %s / %s', async (file, worktree) => {
+    const card = join(laneDir, 'backlog', file);
+    const staged = 'staged card version\n';
+    writeFileSync(card, staged);
+    git(['add', '--', `backlog/${file}`], laneDir);
+    writeFileSync(card, worktree);
+    const io = realRecoverIo({ repo, lanePoolPath: script, backupRoot: join(base, 'backups'), isLeased: () => false });
+    const result = await recoverPool({ lanes: [1], io });
+    expect(result.reclaimed).toEqual([]);
+    expect(result.keptUnpushed[0].reason).toContain('staged changes');
+    expect(git(['show', `:backlog/${file}`], laneDir)).toBe(staged);
+    expect(readFileSync(card, 'utf8')).toBe(worktree);
+    expect(existsSync(join(laneDir, '.git', '.lane-lease'))).toBe(false);
+  });
+
+  it('refuses staged card bytes introduced after backup even when worktree bytes are unchanged', async () => {
+    const { result, card } = await recoverWithRace({ file: 'tracked-card.md', mutate: false,
+      afterBackup: () => {
+        const card = join(laneDir, 'backlog', 'tracked-card.md');
+        writeFileSync(card, changed);
+        git(['add', '--', 'backlog/tracked-card.md'], laneDir);
+        writeFileSync(card, original);
+      } });
+    expect(result.backedUp).toEqual([1]);
+    expect(result.reclaimed).toEqual([]);
+    expect(result.keptUnpushed[0].reason).toContain('staged changes');
+    expect(git(['show', ':backlog/tracked-card.md'], laneDir)).toBe(changed);
+    expect(readFileSync(card, 'utf8')).toBe(original);
+  });
+
+  it('checks the index under the reclaim lease even when the original proof was preserved', async () => {
+    const card = join(laneDir, 'backlog', 'tracked-card.md');
+    const io = realRecoverIo({ repo, lanePoolPath: script, backupRoot: join(base, 'backups'), isLeased: () => false });
+    const backup = io.backup;
+    io.backup = async n => {
+      const saved = await backup(n);
+      expect(saved.ok, saved.error).toBe(true);
+      writeFileSync(card, changed);
+      git(['add', '--', 'backlog/tracked-card.md'], laneDir);
+      writeFileSync(card, 'committed card\n');
+      return saved;
+    };
+    const result = await recoverPool({ lanes: [1], io });
+    expect(result.backedUp).toEqual([1]);
+    expect(result.reclaimed).toEqual([]);
+    expect(result.keptUnpushed[0].reason).toContain('staged changes');
+    expect(git(['show', ':backlog/tracked-card.md'], laneDir)).toBe(changed);
+    expect(readFileSync(card, 'utf8')).toBe('committed card\n');
+  });
+
+  it('refuses unreadable index evidence even with a valid working-tree backup', async () => {
+    await recoverWithRace({ mutate: false, afterBackup: saved => {
+      // GIT_INDEX_FILE must be scrubbed: a caller cannot redirect the check to a clean index.
+      const cleanIndex = join(base, 'clean-index');
+      writeFileSync(cleanIndex, readFileSync(join(laneDir, '.git', 'index')));
+      vi.stubEnv('GIT_INDEX_FILE', cleanIndex);
+      writeFileSync(join(laneDir, '.git', 'index'), 'unreadable index');
+      const result = verifyRecoveryBackup({ laneDir, manifestPath: saved.manifestPath,
+        proof: { unpreservedFiles: ['backlog/new-card.md'], unpreservedCommitShas: [] } });
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('cannot verify the index against HEAD');
+    } });
+  });
+
   it('keeps the real lane when matched salvage is followed by an unpreserved reclaim re-proof', async () => {
     writeFileSync(join(laneDir, 'unpublished.txt'), 'unpublished work\n');
     git(['add', 'unpublished.txt'], laneDir);

@@ -1,4 +1,4 @@
-/** PR #5859: replay cross-pool recovery and lane-controlled URL rewrites with local Git repositories. */
+/** PR #5859: replay recovery origin isolation and preservation of staged card bytes with local Git repositories. */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const cases = ['release --lane=1', 'release --all-pools', 'gc', 'gc insteadOf', 'gc pushInsteadOf',
-  'gc credential.helper', 'gc core.gitProxy', 'gc core.askpass', 'gc http.proxy'];
+  'gc credential.helper', 'gc core.gitProxy', 'gc core.askpass', 'gc http.proxy',
+  'gc staged-card', 'gc staged-card-preserved-worktree'];
 
 export function replayRecoveryOrigin(root = ROOT, mode) {
   const base = mkdtempSync(join(tmpdir(), 'soak-recovery-origin-'));
@@ -21,6 +22,8 @@ export function replayRecoveryOrigin(root = ROOT, mode) {
     git(['init', '--quiet', '--bare', '--initial-branch=main', origin]);
     git(['clone', '--quiet', origin, primary]);
     writeFileSync(join(primary, 'work.txt'), 'seed\n');
+    mkdirSync(join(primary, 'backlog'));
+    writeFileSync(join(primary, 'backlog/card.md'), 'committed card\n');
     git(['add', '.'], primary);
     const identity = ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'commit.gpgsign=false'];
     git([...identity, 'commit', '--quiet', '-m', 'seed'], primary);
@@ -33,8 +36,15 @@ export function replayRecoveryOrigin(root = ROOT, mode) {
     git(['add', '.'], lane);
     git([...identity, 'commit', '--quiet', '-m', 'unique work'], lane);
     const sha = git(['rev-parse', 'HEAD'], lane);
+    const stagedCard = mode.startsWith('gc staged-card');
+    const worktreeCard = mode.endsWith('preserved-worktree') ? 'committed card\n' : 'worktree card\n';
+    if (stagedCard) {
+      writeFileSync(join(lane, 'backlog/card.md'), 'staged card\n');
+      git(['add', '--', 'backlog/card.md'], lane);
+      writeFileSync(join(lane, 'backlog/card.md'), worktreeCard);
+    }
     const rewrite = mode.includes('InsteadOf') || mode.includes('insteadOf');
-    const transportConfig = mode.startsWith('gc ') && !rewrite ? mode.split(' ')[1] : null;
+    const transportConfig = mode.startsWith('gc ') && !rewrite && !stagedCard ? mode.split(' ')[1] : null;
     let attacker;
     if (rewrite) {
       attacker = join(base, 'attacker.git');
@@ -73,7 +83,15 @@ export function replayRecoveryOrigin(root = ROOT, mode) {
     const saved = git(['ls-remote', '--heads', origin, 'refs/heads/salvage/*'], primary);
     const leaked = git(['ls-remote', '--heads', callerOrigin, 'refs/heads/salvage/*'], primary);
     if (leaked) violations.push(`${mode}: work sent to caller origin`);
-    if (rewrite || transportConfig) {
+    if (stagedCard) {
+      if (git(['show', ':backlog/card.md'], lane) !== 'staged card'
+        || readFileSync(join(lane, 'backlog/card.md'), 'utf8') !== worktreeCard) {
+        violations.push(`${mode}: discarded distinct index or worktree bytes`);
+      }
+      if (!result.stderr.includes('auto-recover: reclaimed 0, kept-unpushed 1')) {
+        violations.push(`${mode}: did not exercise recovery refusal`);
+      }
+    } else if (rewrite || transportConfig) {
       if (git(['rev-parse', 'HEAD'], lane) !== sha) violations.push(`${mode}: reset unpreserved work`);
       if (saved || (attacker && git(['ls-remote', '--heads', attacker, 'refs/heads/salvage/*'], primary))) {
         violations.push(`${mode}: refused rewrite still transported work`);
@@ -90,14 +108,15 @@ export function replayRecoveryOrigin(root = ROOT, mode) {
 
 export default {
   id: 'lane-pool-recovery-origin-isolation',
-  title: 'pool selection and lane URL rewriting cannot redirect recovery preservation',
+  title: 'recovery preserves pool identity and distinct staged card bytes',
   card: 'we:PR#5859',
   fixedBy: { sha: 'HEAD', where: 'lane/lane-pool-cap-count-main',
-    paths: ['scripts/lane-pool.mjs', 'scripts/lib/lane-pool-salvage-push.mjs'] },
+    paths: ['scripts/lane-pool.mjs', 'scripts/lib/lane-pool-salvage-push.mjs', 'scripts/lib/lane-pool-recover.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/lane-pool.mjs'), 'utf8').includes('reference: join(dirname(topLevel), explicitPool)')
       && readFileSync(join(root, 'scripts/lib/lane-pool-salvage-push.mjs'), 'utf8').includes('URL rewriting configured')
-      && readFileSync(join(root, 'scripts/lib/lane-pool-salvage-push.mjs'), 'utf8').includes('lane-controlled transport configuration');
+      && readFileSync(join(root, 'scripts/lib/lane-pool-salvage-push.mjs'), 'utf8').includes('lane-controlled transport configuration')
+      && readFileSync(join(root, 'scripts/lib/lane-pool-recover.mjs'), 'utf8').includes('staged changes are not covered');
   },
   async run({ root = ROOT, log } = {}) {
     const violations = [];
