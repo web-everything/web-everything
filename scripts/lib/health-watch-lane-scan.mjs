@@ -160,7 +160,8 @@ export function laneProbeEnv(path) {
   // Command-scope parameters outrank the indexed pins, and GIT_CONFIG_GLOBAL/SYSTEM/GIT_CONFIG can re-scope the lane's own
   // keys. Drop every inherited override and location variable before installing our own pins; none is trusted input to a
   // safety probe.
-  const env = scrubInheritedGitEnv(laneGitEnv(path));
+  // Scrub first: it also removes GIT_CEILING_DIRECTORIES. Install our lane-bound discovery ceiling afterwards.
+  const env = laneGitEnv(path, scrubInheritedGitEnv());
   return { ...laneGitHardeningEnv(env), GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0',
     GIT_NO_LAZY_FETCH: '1',
     // A lane's refs/replace/* (or a grafts file) can make an unpushed commit read as an already-pushed one.
