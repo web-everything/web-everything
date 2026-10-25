@@ -2,9 +2,10 @@
 bornAs: xym8nt4
 kind: story
 size: 8
-status: open
+status: resolved
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/", "we:scripts/conveyor/"]
 dateOpened: "2026-10-19"
+dateResolved: "2026-10-25"
 tags: []
 ---
 

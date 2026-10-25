@@ -71,6 +71,18 @@ export function scrubGitLocationEnv(env) {
 }
 
 /**
+ * Deletes {@link GIT_REPO_LOCATION_ENV_KEYS} from `env` IN PLACE — for `process.env` of a lane CLI, so the git a
+ * library spawns from `process.env` (status proofs, history snapshots, salvage refs) is not redirected either. An
+ * inherited `GIT_REF_PARANOIA=0` is dropped back to git's default; callers that want `1` use {@link scrubGitLocationEnv}.
+ * @param {Record<string,string|undefined>} env
+ * @returns {Record<string,string|undefined>} the same `env`
+ */
+export function dropGitLocationEnv(env) {
+  for (const key of GIT_REPO_LOCATION_ENV_KEYS) delete env[key];
+  return env;
+}
+
+/**
  * {@link scrubGitLocationEnv}, and also without any env config source (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` /
  * `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`, `GIT_CONFIG_GLOBAL` / `SYSTEM`): for a check that reads the lane's config
  * and must see exactly what git will use. Run it BEFORE {@link laneGitHardeningEnv}: the pins are appended after any
@@ -151,7 +163,7 @@ export function hardenLaneGitArgs(args) {
 /** Lane-local config keys that name a command, proxy, remote rewrite or credential source and are NOT pinned inert
  *  (a pin to a fixed value would break legitimate auth). A lane whose local/worktree scope defines one is refused
  *  BEFORE the agent runs and again before the push — a baseline an earlier agent poisoned is not trusted. Pure. */
-export const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+)$/i;
+export const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+|hook\..+)$/i;
 export const SAFE_REMOTE_URL_RE = /^(https:\/\/|ssh:\/\/|git@[\w.-]+:)/i;
 export function riskyLaneConfig(listOutput) {
   const parts = String(listOutput ?? '').split('\0');
@@ -162,6 +174,9 @@ export function riskyLaneConfig(listOutput) {
     const [key, ...rest] = parts[i + 1].split('\n');
     if (RISKY_LANE_CONFIG_RE.test(key)) found.push(key);
     else if (/^remote\..+\.url$/i.test(key) && !SAFE_REMOTE_URL_RE.test(rest.join('\n'))) found.push(key);
+    // `<format>://<path>` puts the refs in another repository: every ref write lands there. A bare format is never
+    // flagged: the scrub unsets flagged keys, and unsetting a real reftable lane's format would hide all its refs.
+    else if (/^extensions\.refstorage$/i.test(key) && rest.join('\n').includes('://')) found.push(key);
   }
   return found;
 }
@@ -173,7 +188,8 @@ export function riskyLaneConfig(listOutput) {
  * `onConfig` receives the successful scoped listing so callers can reuse settings the scrub never changes.
  */
 export function scrubRiskyLaneConfig(dir, {
-  run = (args, opts) => execFileSync('git', args, { ...opts, encoding: 'utf8', env: laneGitHardeningEnv(), timeout: 30000, maxBuffer: 16 * 1024 * 1024 }),
+  // Full env scrub: an inherited GIT_CONFIG would hide the lane's own config from the listing this scrub decides on.
+  run = (args, opts) => execFileSync('git', args, { ...opts, encoding: 'utf8', env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)), timeout: 30000, maxBuffer: 16 * 1024 * 1024 }),
   log = () => {},
   onConfig = () => {},
 } = {}) {

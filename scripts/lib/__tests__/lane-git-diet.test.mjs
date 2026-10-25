@@ -87,6 +87,15 @@ describe('laneDietConfigOps (pure)', () => {
       ['config', '--local', '--replace-all', 'transfer.unpackLimit', '1'],
     ]);
   });
+  it('includes every effective fetch mapping when preparing a reset proof', () => {
+    const entry = (scope, value) => `${scope}\0remote.origin.fetch\n${value}\0`;
+    const values = [LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH,
+      '+refs/heads/ops/review-requests:refs/remotes/origin/saved', '^refs/heads/saved',
+      '+refs/heads/trunk:refs/remotes/origin/trunk'];
+    const output = ['local', 'local', 'global', 'worktree', 'command'].map((scope, i) => entry(scope, values[i])).join('');
+    expect(laneDietConfigState(output).fetchValues).toEqual(values.slice(0, 2));
+    expect(laneDietConfigState(output).effectiveFetchValues).toEqual(values);
+  });
 });
 
 describe('ops-ref reader inventory', () => {
@@ -109,6 +118,7 @@ describe('ops-ref reader inventory', () => {
     'scripts/merge-ai-prs.mjs': 'message text',
     'scripts/operations/stage-pr-view.mjs': 'compares provenance against TRANSPORT_REF; the read is the injected stage-pr-view-io reader',
     'scripts/lib/lane-git-diet.mjs': 'this inventory',
+    'scripts/lane-git-diet.mjs': 'the one-time cleanup (deletes stale tracking refs)',
     'scripts/lane-pool.mjs': 'drops stale tracking refs after clone',
     'scripts/conveyor/soak/breaks/lane-reset-symbolic-ops-proof.mjs': 'disposable real-git regression fixture, not a production reader',
   };

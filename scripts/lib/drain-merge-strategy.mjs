@@ -51,6 +51,8 @@ import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { createAdaptiveBatching, readQueueFacts } from './merge-queue-adaptive-batching.mjs';
 import { cancelObsoleteQueueRuns } from './merge-queue-obsolete-runs.mjs';
+import { cardGroupHold as pureCardGroupHold, readGroupState, resolveCardGroupStatePath } from './card-group.mjs';
+import { existsSync } from 'node:fs';
 
 export const DRY_RUN_STRATEGY_ENV = 'WE_DRAIN_MERGE_STRATEGY';
 /** Env: a JSON settings file read INSTEAD of the declared files for the `mergeDelivery` tool layer (always honoured — how a
@@ -218,6 +220,16 @@ export function createDrainMergeStrategy({
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
+  // xym8nt4 — a source PR of a post-approval card group never enqueues on its own (the combined PR carries it).
+  // The SAME path resolver grouping writes through (`resolveCardGroupStatePath`), so an override never splits them.
+  // `isMainFix(c)`: is `c` a published main-red repair PR per THIS pass's live red-main signal (never a cached flag)?
+  isMainFix = () => false,
+  cardGroupHold = (c) => {
+    const path = resolveCardGroupStatePath(env);
+    if (!path || !existsSync(path)) return null;
+    return pureCardGroupHold(readGroupState(path), { num: c?.num, repo: c?.repo || localSlug, localSlug,
+      files: c?.listedFilesComplete === true ? c.listedFiles : null, mainFix: isMainFix(c) === true });
+  },
   readGrantScope = standingRulingScope, // PR #5758: the verified standing-ruling scope the red-team gate also reads
   redTeamDeadline, // resolved redTeam.deadlineAction (test seam); read from the cascade when absent
   publishNeedsYou, // operator note publisher; the real needs-you feed outside a test run
@@ -346,6 +358,8 @@ export function createDrainMergeStrategy({
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
+      const grouped = cardGroupHold(c);
+      if (grouped) { say(`  merge-queue: defer #${c.num}: ${grouped.reason}`); return { enqueued: false, deferred: true, ...grouped }; }
       const preparedAdmission = prepared?.allowed === true && JSON.stringify(prepared.safety) === JSON.stringify(safety.value);
       if (prepared != null && !preparedAdmission) return { fallback: true };
       // An unreadable state file would be overwritten with just this PR once enqueued, erasing every other pending follow-up.

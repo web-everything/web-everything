@@ -1228,6 +1228,7 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       'file-locks.mjs',             // the lease TTL primitive
       'git-run.mjs',                // #x8pcbf3 — branch-sync's ensureFullHistory (shallow-checkout recovery)
       'infra-blocked.mjs',          // branch-sync's backoff primitives
+      'pid-alive.mjs',              // process identity probe (leaf: builtins only)
       'policy-cascade.mjs',         // #5600 — quiet-hours-io's settings resolve through the shared cascade (builtins + under-test only)
       'pr-land-reasons.mjs',        // #4348-open-pr-retry — infra-blocked's refused/unrun split (leaf: no imports)
       'queue-store.mjs',            // the sidecar GRAMMAR — parseQueue / normNum
@@ -1238,6 +1239,14 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       'under-test.mjs',             // #5187 — claude-agents-cache's runner-neutral test-isolation predicate
       'write-all-sync.mjs',
     ]);
+  });
+
+  it('the shared process identity probe remains a leaf with only Node builtin imports', () => {
+    const entry = join(WATCHDOG_REPO_ROOT, 'scripts', 'lib', 'pid-alive.mjs');
+    expect(importGraph(entry)).toEqual({
+      files: [entry],
+      external: ['node:child_process', 'node:fs'],
+    });
   });
 
   it('reads the queue sidecar as BYTES through the shared parser, never through the driver\'s planner', () => {
